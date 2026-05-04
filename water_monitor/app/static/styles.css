@@ -1529,3 +1529,158 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .dev-toggle input[type="checkbox"]:checked + .dev-toggle-track::before {
   left: 17px;
 }
+
+/* ============================================================
+   HISTORY PAGE — design refresh page 4/7
+   ============================================================ */
+
+.hist-page-title {
+  font-size: 20px; font-weight: 700; letter-spacing: -.02em;
+  margin-bottom: 20px; color: var(--text);
+}
+
+/* Shared card shell for all history sections */
+.hist-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  margin-bottom: 16px;
+  box-shadow: var(--shadow);
+}
+
+/* Date filter card */
+.hist-filter-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 20px;
+  box-shadow: var(--shadow);
+}
+.hist-filter-row {
+  display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
+}
+.hist-filter-group {
+  display: flex; flex-direction: column; gap: 3px;
+}
+.hist-filter-label {
+  font-size: 11px; font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase; letter-spacing: .05em;
+}
+.hist-filter-actions {
+  display: flex; gap: 6px; align-items: center;
+  padding-top: 18px; /* align with inputs after label */
+}
+.hist-filter-hint {
+  font-size: 12px; color: var(--text-3);
+  margin-top: 10px;
+}
+.hist-filter-hint strong { color: var(--text-2); }
+
+/* Chart header row — title + subtitle + range pill buttons */
+.hist-chart-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.hist-chart-title {
+  font-size: 14px; font-weight: 700; letter-spacing: -.01em;
+  color: var(--text);
+}
+.hist-chart-subtitle {
+  font-size: 12px; color: var(--text-3);
+  display: block;
+}
+.hist-chart-wrap {
+  position: relative; height: 140px;
+}
+
+/* Range pill buttons */
+.hist-range-btns {
+  display: flex; gap: 4px; flex-wrap: wrap; align-items: center;
+}
+.hist-range-btn {
+  display: inline-block;
+  padding: 3px 10px;
+  font-size: 11px; font-weight: 500;
+  border-radius: 999px;
+  cursor: pointer;
+  text-decoration: none;
+  font-family: var(--font);
+  background: none;
+  color: var(--text-3);
+  border: 1px solid var(--border);
+  transition: background .1s, color .1s, border-color .1s;
+}
+.hist-range-btn:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+.hist-range-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: transparent;
+}
+
+/* Section title (leak tests, events) */
+.hist-section-title {
+  font-size: 14px; font-weight: 700; letter-spacing: -.01em;
+  margin-bottom: 14px; color: var(--text);
+}
+.hist-event-count {
+  font-weight: 400; color: var(--text-3);
+}
+
+.hist-empty {
+  font-size: 12px; color: var(--text-3);
+  padding: 8px 0;
+}
+
+/* Table wrapper — horizontal scroll on narrow viewports */
+.hist-table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* History table */
+.hist-table {
+  width: 100%; min-width: 480px;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.hist-table thead tr {
+  border-bottom: 2px solid var(--border);
+}
+.hist-table th {
+  padding: 6px 10px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--text-2);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  white-space: nowrap;
+}
+
+/* Table data cells */
+.hist-td {
+  padding: 8px 10px;
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+.hist-td-mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.hist-td-time { font-size: 11px; }
+
+/* Row backgrounds for leak test results */
+.hist-row-pass { background: var(--green-bg); }
+.hist-row-fail { background: var(--red-bg); }
+.hist-row-composite { background: var(--accent-bg); }
+
+/* Event rows — hover highlight */
+.hist-event-row:hover { background: var(--surface-2); }
