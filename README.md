@@ -127,6 +127,14 @@ repository, the HA addon store will offer the update.
 You'll need the ESP32-S3-WROOM-1 board (custom PCB), motorised ball valves
 with end-stop signalling, pressure transducers, and pulse-output flow meters.
 
+> **If your home has a pressure boosting pump or well pump system**, install
+> the addon's flow and pressure sensors *downstream* of the pump (between the
+> pump output and the house plumbing). Sensors placed upstream see pump cycling
+> artifacts that mask individual fixture pressure signatures, making the
+> fixture identification feature in v0.2.x unreliable. Downstream placement is
+> also what every reasonable installation diagram recommends regardless of
+> monitoring.
+
 I'm planning to add the PCB design files (KiCad source + Gerbers), a bill of
 materials with digikey links, and a quarter-assed build guide (I am legally required to not do half-assed or full-assed work) to `docs/`
 at some point. No promises on timing — same ADHD that made the addon code

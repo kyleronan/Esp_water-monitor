@@ -242,6 +242,141 @@ def _migrate_012(conn: sqlite3.Connection) -> None:
     log.info("Migration 012: removed budget/cost columns from home_profile")
 
 
+def _migrate_013(conn: sqlite3.Connection) -> None:
+    """
+    Phase 2.1 — Fixture clustering foundation.
+
+    Adds:
+    - sequence-context columns to events
+    - 2.3 placeholder columns to events
+    - match_confidence and match_level on events
+    - new tables: fixture_clusters, cluster_cooccurrence,
+      cluster_sequences (empty placeholder), cluster_metrics_history
+    - publish_fixtures_to_ha column on home_profile
+    - extension columns on the existing fixtures table
+
+    The pre-existing fixture_id column on events is reused for
+    user-confirmed fixtures (Path C — clusters and fixtures coexist).
+    cluster_id is reused (already INTEGER) for raw DBSTREAM cluster IDs.
+    """
+    # events table — sequence and clustering metadata
+    new_event_cols = [
+        ("match_confidence",          "REAL"),
+        ("match_level",               "TEXT"),
+        ("seconds_since_prev_event",  "REAL"),
+        ("prev_cluster_id",           "INTEGER"),
+        ("seconds_to_next_event",     "REAL"),
+        ("parent_compound_id",        "TEXT"),
+        ("compound_phase",            "TEXT"),
+    ]
+    for col, sql_type in new_event_cols:
+        if not _has_column(conn, "events", col):
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {sql_type}")
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_cluster_id "
+        "ON events (circuit, cluster_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_prev_cluster "
+        "ON events (circuit, prev_cluster_id)"
+    )
+
+    # fixture_clusters: raw DBSTREAM output, one row per cluster
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fixture_clusters (
+            id                    INTEGER NOT NULL,
+            circuit               TEXT NOT NULL,
+            centroid              TEXT NOT NULL,
+            feature_std           TEXT NOT NULL,
+            transient_template    TEXT,
+            member_count          INTEGER DEFAULT 0,
+            suggested_type        TEXT,
+            suggested_confidence  REAL DEFAULT 0,
+            confidence_level      TEXT DEFAULT 'preliminary',
+            fixture_id            TEXT REFERENCES fixtures(id) ON DELETE SET NULL,
+            is_compound           INTEGER DEFAULT 0,
+            component_cluster_ids TEXT,
+            publish_to_ha         INTEGER DEFAULT 1,
+            created_at            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_match_at         TIMESTAMP,
+            PRIMARY KEY (circuit, id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clusters_circuit "
+        "ON fixture_clusters (circuit)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clusters_fixture "
+        "ON fixture_clusters (fixture_id)"
+    )
+
+    # cluster_cooccurrence: Option F sequence boost
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cluster_cooccurrence (
+            circuit             TEXT NOT NULL,
+            from_cluster_id     INTEGER NOT NULL,
+            to_cluster_id       INTEGER NOT NULL,
+            count               INTEGER DEFAULT 0,
+            median_gap_seconds  REAL,
+            last_seen_at        TIMESTAMP,
+            PRIMARY KEY (circuit, from_cluster_id, to_cluster_id)
+        )
+    """)
+
+    # cluster_sequences: 2.2 placeholder, empty in 2.1
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cluster_sequences (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            circuit           TEXT NOT NULL,
+            pattern_hash      TEXT,
+            event_chain       TEXT,
+            occurrence_count  INTEGER DEFAULT 0,
+            confidence        REAL DEFAULT 0,
+            created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # cluster_metrics_history: rolling cluster quality metrics
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cluster_metrics_history (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            measured_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            circuit               TEXT NOT NULL,
+            cluster_count         INTEGER,
+            coverage_pct          REAL,
+            avg_purity            REAL,
+            avg_stability         REAL,
+            unmatched_recent_24h  INTEGER
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_metrics_circuit_ts "
+        "ON cluster_metrics_history (circuit, measured_at)"
+    )
+
+    # home_profile: master toggle for HA fixture publishing
+    if not _has_column(conn, "home_profile", "publish_fixtures_to_ha"):
+        conn.execute(
+            "ALTER TABLE home_profile ADD COLUMN "
+            "publish_fixtures_to_ha INTEGER DEFAULT 1"
+        )
+
+    # fixtures table — extend the existing Path C target
+    new_fixture_cols = [
+        ("fixture_type",  "TEXT"),
+        ("display_name",  "TEXT"),
+        ("user_locked",   "INTEGER DEFAULT 0"),
+        ("publish_to_ha", "INTEGER DEFAULT 1"),
+    ]
+    for col, sql_type in new_fixture_cols:
+        if not _has_column(conn, "fixtures", col):
+            conn.execute(f"ALTER TABLE fixtures ADD COLUMN {col} {sql_type}")
+
+    log.info("Migration 013: Phase 2.1 fixture clustering foundation")
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -255,6 +390,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (10, _migrate_010),
     (11, _migrate_011),
     (12, _migrate_012),
+    (13, _migrate_013),
 ]
 
 
