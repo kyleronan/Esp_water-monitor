@@ -163,33 +163,71 @@
 {# ──────────────────────────────────────────────────────────────────── #}
 {% if step == 3 %}
 <section class="setup-card">
-  <h2>Review discovered entities</h2>
+  <h2>Device ready</h2>
   <p class="muted">
-    Found device: <strong>{{ device.name }}</strong>
+    Found: <strong>{{ device.name }}</strong>
     {% if device.manufacturer %} · {{ device.manufacturer }}{% endif %}
     {% if device.model %} · {{ device.model }}{% endif %}
   </p>
 
-  {% if all_matched %}
-  <div class="alert-banner alert-ok" style="margin-bottom:1rem">
-    ✓ All entities matched automatically
-  </div>
-  {% else %}
-  <div class="alert-banner alert-warn" style="margin-bottom:1rem">
-    ⚠ Some entities could not be matched — please select them manually below
-  </div>
-  {% endif %}
-
   <form method="post" action="{{ ingress_path }}/setup/confirm/{{ device.id }}">
 
+    {% if all_matched %}
+    {# ── Clean "all matched" state — green callout + collapsible table ── #}
+    <div class="setup-match-ok">
+      <span class="setup-match-check">✓</span>
+      <div>
+        <div class="setup-match-title">All entities matched automatically</div>
+        <div class="setup-match-roles">
+          {% for circuit, matches in circuit_data.items() %}
+          {{ matches | map(attribute='label') | join(' · ') }}
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    {# Hidden inputs so the form still submits the matched entity IDs #}
     {% for circuit, matches in circuit_data.items() %}
-    <h3 style="margin:1rem 0 .5rem;text-transform:capitalize">
-      {{ circuit }} circuit
-    </h3>
+    {% for m in matches %}
+    {% if m.matched %}
+    <input type="hidden" name="{{ circuit }}__{{ m.role }}" value="{{ m.entity_id }}">
+    {% endif %}
+    {% endfor %}
+    {% endfor %}
+
+    <details class="setup-entities-details">
+      <summary class="setup-entities-summary">View matched entities</summary>
+      <div class="setup-entities-table-wrap">
+        {% for circuit, matches in circuit_data.items() %}
+        {% if circuit_data | length > 1 %}
+        <h3 class="setup-circuit-label">{{ circuit | title }} circuit</h3>
+        {% endif %}
+        <table class="setup-entity-table">
+          <tbody>
+            {% for m in matches %}
+            <tr>
+              <td class="setup-entity-role">{{ m.label }}</td>
+              <td class="setup-entity-id"><code>{{ m.entity_id }}</code></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% endfor %}
+      </div>
+    </details>
+
+    {% else %}
+    {# ── Manual selection state — show table for unmatched roles ────── #}
+    <div class="alert-banner alert-warn" style="margin-bottom:1rem">
+      ⚠ Some entities could not be matched — please select them manually below
+    </div>
+
+    {% for circuit, matches in circuit_data.items() %}
+    {% if circuit_data | length > 1 %}
+    <h3 class="setup-circuit-label">{{ circuit | title }} circuit</h3>
+    {% endif %}
     <table class="data-table">
-      <thead>
-        <tr><th>Role</th><th>Entity</th><th>Status</th></tr>
-      </thead>
+      <thead><tr><th>Role</th><th>Entity</th><th>Status</th></tr></thead>
       <tbody>
         {% for m in matches %}
         <tr class="{% if not m.matched and not m.optional %}row-warn{% elif not m.matched %}row-optional{% endif %}">
@@ -200,28 +238,21 @@
           <td>
             {% if m.matched %}
             <code class="entity-id">{{ m.entity_id }}</code>
-            <input type="hidden" name="{{ circuit }}__{{ m.role }}"
-                   value="{{ m.entity_id }}">
+            <input type="hidden" name="{{ circuit }}__{{ m.role }}" value="{{ m.entity_id }}">
             {% else %}
             <select name="{{ circuit }}__{{ m.role }}" class="entity-select"
                     {% if not m.optional %}required{% endif %}>
               <option value="">— {% if m.optional %}not configured{% else %}select entity{% endif %} —</option>
               {% for e in device_entities %}
-              <option value="{{ e.entity_id }}">
-                {{ e.entity_id }}
-                {% if e.name %} ({{ e.name }}){% endif %}
-              </option>
+              <option value="{{ e.entity_id }}">{{ e.entity_id }}{% if e.name %} ({{ e.name }}){% endif %}</option>
               {% endfor %}
             </select>
             {% endif %}
           </td>
           <td>
-            {% if m.matched %}
-            <span class="status-pill status-ok">✓ matched</span>
-            {% elif m.optional %}
-            <span class="status-pill status-neutral">optional</span>
-            {% else %}
-            <span class="status-pill status-warn">⚠ needs selection</span>
+            {% if m.matched %}<span class="status-pill status-ok">✓ matched</span>
+            {% elif m.optional %}<span class="status-pill status-neutral">optional</span>
+            {% else %}<span class="status-pill status-warn">⚠ needs selection</span>
             {% endif %}
           </td>
         </tr>
@@ -235,16 +266,16 @@
       Detected device prefix: <code>{{ prefix }}</code>
     </p>
     {% endif %}
+    {% endif %}
 
-    <div class="control-row" style="margin-top:1.5rem">
-      <a href="{{ ingress_path }}/setup" class="btn btn-secondary">← Start over</a>
-      <button type="submit" class="btn btn-primary">Confirm and continue →</button>
+    <div class="setup-step-actions">
+      <a href="{{ ingress_path }}/setup" class="btn btn-ghost btn-sm">← Back</a>
+      <button type="submit" class="btn btn-primary btn-sm">Continue →</button>
     </div>
+
   </form>
 </section>
 {% endif %}
-
-{# ──────────────────────────────────────────────────────────────────── #}
 
 {# ──────────────────────────────────────────────────────────────────── #}
 {# STEP 4 — Display units                                               #}

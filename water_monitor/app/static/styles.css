@@ -1962,3 +1962,344 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .setup-learning-callout-icon { font-size: 22px; line-height: 1; flex-shrink: 0; }
 .setup-learning-callout-title { font-weight: 700; font-size: 13px; margin-bottom: 4px; }
 .setup-learning-callout-body  { font-size: 12.5px; color: var(--text-2); line-height: 1.5; }
+
+/* ============================================================
+   SETUP PAGE — Step 3 matched-state refinements
+   ============================================================ */
+
+/* Green matched callout */
+.setup-match-ok {
+  display: flex; gap: 12px; align-items: flex-start;
+  background: var(--green-bg);
+  border: 1px solid var(--green);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.setup-match-check {
+  font-size: 22px; line-height: 1; color: var(--green); flex-shrink: 0;
+}
+.setup-match-title {
+  font-weight: 700; font-size: 13px;
+  color: var(--green-text); margin-bottom: 2px;
+}
+.setup-match-roles {
+  font-size: 12px; color: var(--green-text); opacity: .8;
+}
+
+/* View matched entities collapsible */
+.setup-entities-details { margin-bottom: 16px; }
+.setup-entities-summary {
+  font-size: 12px; color: var(--accent); font-weight: 500;
+  cursor: pointer; user-select: none; list-style: none;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.setup-entities-summary::-webkit-details-marker { display: none; }
+.setup-entities-summary::before { content: '\25b8'; font-size: 10px; transition: transform .15s; }
+.setup-entities-details[open] > .setup-entities-summary::before { transform: rotate(90deg); }
+
+.setup-entities-table-wrap {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px; overflow: hidden;
+}
+.setup-entity-table {
+  width: 100%; border-collapse: collapse; font-size: 12px;
+}
+.setup-entity-table tr { border-bottom: 1px solid var(--border); }
+.setup-entity-table tr:last-child { border-bottom: none; }
+.setup-entity-role {
+  padding: 7px 10px; font-weight: 500; color: var(--text-2);
+  width: 40%; background: var(--surface-2);
+}
+.setup-entity-id {
+  padding: 7px 10px; font-family: var(--mono); font-size: 11px; color: var(--text-3);
+}
+
+/* Circuit label between tables */
+.setup-circuit-label {
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-3);
+  padding: 6px 10px 2px;
+  margin: 0;
+}
+
+/* Step action row — Back + Continue */
+.setup-step-actions {
+  display: flex; gap: 8px; margin-top: 16px;
+}
+
+/* ============================================================
+   SETTINGS PAGE — design refresh page 7/7
+   Full-bleed sidebar + content layout.
+   ============================================================ */
+
+/* Break out of app-main's padding to go full-width */
+.sett-layout {
+  display: flex;
+  min-height: calc(100vh - 104px); /* header 52 + nav 52 */
+  margin: -20px -24px;             /* cancel app-main padding */
+}
+
+/* ── Sidebar (desktop) ────────────────────────────────────────────── */
+.sett-sidebar {
+  width: 200px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  padding: 16px 8px;
+  position: sticky;
+  top: 104px;           /* below header + nav */
+  height: calc(100vh - 104px);
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.sett-sidebar::-webkit-scrollbar { display: none; }
+
+.sett-nav-btn {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: none; cursor: pointer;
+  font-family: var(--font); font-size: 13px; font-weight: 400;
+  background: transparent;
+  color: var(--text-2);
+  text-align: left;
+  margin-bottom: 2px;
+  transition: background .1s, color .1s;
+}
+.sett-nav-btn:hover { background: var(--surface-2); }
+.sett-nav-btn.active {
+  background: var(--accent-bg2);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.sett-nav-icon { font-size: 14px; width: 18px; text-align: center; flex-shrink: 0; }
+.sett-nav-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Training state badges on sidebar */
+.sett-nav-badge {
+  font-size: 9px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .04em;
+  padding: 1px 5px; border-radius: 999px;
+  flex-shrink: 0;
+}
+.sett-badge-live {
+  background: var(--green-bg); color: var(--green-text);
+}
+.sett-badge-calibrating {
+  background: var(--accent-bg2); color: var(--accent);
+}
+.sett-badge-idle {
+  background: var(--surface-2); color: var(--text-3);
+}
+
+/* ── Mobile: sidebar becomes horizontal tab strip ───────────────── */
+@media (max-width: 640px) {
+  .sett-layout { flex-direction: column; margin: -20px -24px; }
+  .sett-sidebar {
+    width: 100%; height: auto;
+    display: flex; flex-direction: row;
+    overflow-x: auto; overflow-y: hidden;
+    flex-wrap: nowrap; gap: 6px;
+    padding: 10px 12px;
+    border-right: none; border-bottom: 1px solid var(--border);
+    position: sticky; top: 104px; z-index: 10;
+  }
+  .sett-nav-btn {
+    flex-shrink: 0; flex-direction: row;
+    padding: 6px 12px; border-radius: 999px;
+    width: auto; margin-bottom: 0;
+    font-size: 12px;
+  }
+  .sett-nav-btn.active {
+    background: var(--accent); color: #fff;
+  }
+  .sett-nav-label { white-space: nowrap; overflow: visible; }
+  .sett-nav-badge { display: none; } /* hide state badges on mobile */
+}
+
+/* ── Content area ────────────────────────────────────────────────── */
+.sett-content {
+  flex: 1;
+  padding: 24px 28px;
+  max-width: 720px;
+  overflow-y: auto;
+}
+@media (max-width: 640px) {
+  .sett-content { padding: 16px; max-width: 100%; }
+}
+
+/* ── Section header ──────────────────────────────────────────────── */
+.sett-section-title {
+  font-size: 17px; font-weight: 700; letter-spacing: -.01em;
+  margin-bottom: 4px; color: var(--text);
+}
+.sett-section-desc {
+  font-size: 13px; color: var(--text-3);
+  margin-bottom: 20px; line-height: 1.5;
+}
+
+/* Circuit section: name + status pill side-by-side */
+.sett-circuit-header {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 4px;
+}
+
+/* ── Sub-cards within a section ──────────────────────────────────── */
+.sett-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 14px;
+}
+.sett-card-title {
+  font-size: 13px; font-weight: 700; letter-spacing: -.01em;
+  margin-bottom: 12px; color: var(--text);
+}
+.sett-card-desc {
+  font-size: 12.5px; color: var(--text-3);
+  margin-bottom: 12px; line-height: 1.5;
+}
+
+/* ── Form groups within settings ─────────────────────────────────── */
+.sett-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.sett-form-group {
+  display: flex; flex-direction: column; gap: 4px;
+}
+.sett-form-group label {
+  font-size: 11.5px; font-weight: 500; color: var(--text-3);
+}
+.sett-form-group input,
+.sett-form-group select {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* ── Learning mode radio cards ───────────────────────────────────── */
+.sett-radio-card {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  border-radius: 7px;
+  cursor: pointer;
+  margin-bottom: 6px;
+}
+.sett-radio-card:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+.sett-radio-card input[type=radio] { margin-top: 2px; accent-color: var(--accent); }
+.sett-radio-label { font-size: 13px; font-weight: 600; color: var(--text); }
+.sett-radio-desc  { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+
+/* ── Sensitivity segmented buttons ───────────────────────────────── */
+.sett-sens-grid {
+  display: grid; grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px; margin-bottom: 12px;
+}
+.sett-sens-btn {
+  padding: 8px; border-radius: 7px; cursor: pointer;
+  font-family: var(--font); font-size: 12px; font-weight: 600;
+  text-transform: capitalize; text-align: center;
+  border: 1px solid var(--border);
+  background: var(--surface-2); color: var(--text-2);
+  transition: border-color .1s, background .1s, color .1s;
+}
+.sett-sens-btn input[type=radio] { display: none; }
+.sett-sens-btn.active,
+.sett-sens-btn:has(input:checked) {
+  border: 2px solid var(--accent);
+  background: var(--accent-bg2);
+  color: var(--accent);
+}
+
+/* ── Alert toggle rows ───────────────────────────────────────────── */
+.sett-toggle-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+}
+.sett-toggle-row:last-child { border-bottom: none; }
+.sett-toggle-label { font-size: 13px; font-weight: 500; color: var(--text); }
+.sett-toggle-desc  { font-size: 11px; color: var(--text-3); margin-top: 1px; }
+
+/* ── Away mode status row ────────────────────────────────────────── */
+.sett-away-status-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.sett-away-status-info { display: flex; align-items: center; gap: 10px; }
+.sett-away-icon { font-size: 20px; line-height: 1; }
+.sett-away-status-label { font-weight: 600; font-size: 14px; color: var(--text); }
+.sett-away-since { font-size: 11.5px; color: var(--amber-text); margin-top: 1px; }
+
+/* ── Data retention sliders ──────────────────────────────────────── */
+.sett-retention-row { margin-bottom: 18px; }
+.sett-retention-info { display: flex; justify-content: space-between; margin-bottom: 3px; }
+.sett-retention-label { font-size: 13px; font-weight: 500; color: var(--text); }
+.sett-retention-desc  { font-size: 11.5px; color: var(--text-3); margin-left: 8px; }
+.sett-retention-val   { font-family: var(--mono); font-size: 12px; color: var(--accent); font-weight: 600; }
+
+/* ============================================================
+   RESPONSIVE / MOBILE — targeted fixes across pages
+   ============================================================ */
+
+/* 1. Reduce app-main padding on narrow screens — benefits every page */
+@media (max-width: 640px) {
+  .app-main { padding: 12px 16px; }
+}
+
+/* 2. Dashboard: hide sparkline on very narrow screens to prevent overflow */
+@media (max-width: 480px) {
+  .dash-volume-spark { display: none; }
+}
+
+/* 3. Dashboard: away-toggle wraps cleanly below title on small screens */
+@media (max-width: 520px) {
+  .dash-title-row { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .dash-away-toggle { width: 100%; justify-content: center; }
+}
+
+/* 4. Dashboard: away banner stacks button below text on small screens */
+@media (max-width: 520px) {
+  .dash-away-banner { flex-direction: column; align-items: flex-start; gap: 8px; }
+}
+
+/* 5. Device: readings wrap below circuit name on narrow screens */
+.dev-card-readings { flex-wrap: wrap; }
+
+@media (max-width: 520px) {
+  .dev-card-header { flex-direction: column; align-items: flex-start; gap: 8px; }
+}
+
+/* 6. Reduce card padding on very narrow screens for breathing room */
+@media (max-width: 480px) {
+  .dash-circuit-card { padding: 14px 16px; }
+  .dev-circuit-card  { padding: 14px 16px; }
+  .hist-card         { padding: 14px 16px; }
+  .bk-tier           { padding: 16px; }
+}
+
+/* 7. History range buttons wrap cleanly */
+@media (max-width: 520px) {
+  .hist-chart-header { flex-direction: column; align-items: flex-start; }
+}
+
+/* 8. Nav: shrink nav item padding slightly on very small screens */
+@media (max-width: 380px) {
+  .nav-item { padding: 11px 10px; font-size: 12px; }
+}
