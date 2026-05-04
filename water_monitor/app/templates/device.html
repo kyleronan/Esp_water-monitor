@@ -153,6 +153,13 @@
             <input type="checkbox" name="enabled"
                    {% if c.schedule.enabled %}checked{% endif %}>
           </div>
+          <div class="schedule-row schedule-row-inline">
+            <label title="When ON, the addon picks the quietest hour of the day from your usage history. When OFF, the time below is used as-is.">
+              Auto-pick quiet hour
+            </label>
+            <input type="checkbox" name="auto_learn_hour"
+                   {% if c.schedule.auto_learn_hour != False %}checked{% endif %}>
+          </div>
           <div class="schedule-row">
             <label>Frequency</label>
             <select name="frequency">
@@ -173,13 +180,20 @@
           </div>
           {% endif %}
           <div class="schedule-row">
-            <label>Time</label>
+            <label>
+              Time
+              {% if c.schedule.auto_learn_hour != False %}
+              <span class="muted" style="font-weight:normal; font-size:.72rem">(auto-learned)</span>
+              {% endif %}
+            </label>
             <div class="schedule-time">
               <input type="number" name="run_hour" min="0" max="23"
-                     value="{{ c.schedule.run_hour or 2 }}">
+                     value="{{ c.schedule.run_hour or 2 }}"
+                     {% if c.schedule.auto_learn_hour != False %}disabled{% endif %}>
               <span>:</span>
               <input type="number" name="run_minute" min="0" max="59"
-                     value="{{ c.schedule.run_minute or 0 }}">
+                     value="{{ c.schedule.run_minute or 0 }}"
+                     {% if c.schedule.auto_learn_hour != False %}disabled{% endif %}>
             </div>
           </div>
           <div class="schedule-row schedule-row-inline">
