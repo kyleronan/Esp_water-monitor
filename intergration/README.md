@@ -1,0 +1,1 @@
+# Native HA Integration\n\nPlanned for v2.4. Will provide an alternative to MQTT for exposing fixture entities to Home Assistant.

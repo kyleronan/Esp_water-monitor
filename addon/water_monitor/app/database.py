@@ -1,0 +1,1068 @@
+"""
+SQLite database setup, migrations, and data access helpers.
+
+Single database file at /data/water_monitor.db.
+Schema is created in full on first run. All Phase 2 tables are
+created now so Phase 2 never needs a schema migration.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Generator, List, Optional
+
+log = logging.getLogger(__name__)
+
+# Module-level write lock — serialises concurrent async writes.
+# Created lazily within the running event loop.
+_WRITE_LOCK: Optional[Any] = None
+
+def get_write_lock():
+    """Return the singleton asyncio write lock, creating it on first call."""
+    import asyncio
+    global _WRITE_LOCK
+    if _WRITE_LOCK is None:
+        _WRITE_LOCK = asyncio.Lock()
+    return _WRITE_LOCK
+
+SCHEMA_VERSION = 1
+
+
+def get_connection(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection) -> Generator:
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def init_db(db_path: Path) -> sqlite3.Connection:
+    """Create database and all tables. Safe to call on existing database."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = get_connection(db_path)
+
+    # Integrity check before creating/using schema
+    result = conn.execute("PRAGMA integrity_check").fetchone()
+    if result and result[0] != "ok":
+        log.error("DATABASE INTEGRITY CHECK FAILED: %s — proceed with caution",
+                  result[0])
+    else:
+        log.debug("Database integrity check passed")
+
+    _create_schema(conn)
+    log.info("Database initialised at %s", db_path)
+    return conn
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+-- ==========================================================================
+-- DEVICE DISCOVERY — stores auto-discovered HA device and entity IDs.
+-- Populated by the setup wizard; replaces manual config.yaml entity IDs.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS device_config (
+    id                  INTEGER PRIMARY KEY DEFAULT 1,
+    esp_device_name     TEXT,       -- name user searched for
+    ha_device_id        TEXT,       -- HA device registry ID
+    ha_device_name      TEXT,       -- HA device display name
+    esp_device_prefix   TEXT,       -- derived entity ID prefix
+    setup_complete      BOOLEAN DEFAULT 0,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT OR IGNORE INTO device_config (id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS circuit_entity_map (
+    circuit     TEXT NOT NULL,
+    role        TEXT NOT NULL,      -- flow_sensor, valve_entity, etc.
+    entity_id   TEXT NOT NULL DEFAULT '',
+    entity_name TEXT,               -- original_name from HA entity registry
+    confirmed   BOOLEAN DEFAULT 0,
+    PRIMARY KEY (circuit, role)
+);
+
+-- ==========================================================================
+-- HOME & CIRCUIT PROFILE
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS home_profile (
+    id              INTEGER PRIMARY KEY DEFAULT 1,
+    bathrooms_full  INTEGER DEFAULT 0,
+    bathrooms_half  INTEGER DEFAULT 0,
+    sqft            INTEGER DEFAULT 0,
+    floors          INTEGER DEFAULT 1,
+    occupants       INTEGER DEFAULT 2,
+    build_year      INTEGER,
+    supply_type     TEXT DEFAULT 'mains',
+    setup_complete  BOOLEAN DEFAULT 0,
+    -- Away / vacation mode
+    away_mode       BOOLEAN DEFAULT 0,
+    away_since      TIMESTAMP,
+    away_until      TIMESTAMP,
+    -- Display unit preferences (keys match units.FLOW_OPTIONS / PRESSURE_OPTIONS)
+    flow_unit               TEXT DEFAULT 'L/min',
+    pressure_unit           TEXT DEFAULT 'psi',
+    -- Mobile push notification targets (comma-separated HA notify service names)
+    mobile_notify_targets   TEXT DEFAULT '',
+    -- HA presence tracking — auto-toggle away mode from HA entity state changes.
+    -- ha_presence_entities: comma-separated entity IDs to watch
+    --   (person.*, device_tracker.*, input_boolean.*, alarm_control_panel.*)
+    -- ha_away_state: state value that means "away" (default: not_home)
+    -- ha_home_state: state value that means "home"  (default: home)
+    -- When ALL entities reach ha_away_state → enable away mode.
+    -- When ANY entity reaches ha_home_state  → disable away mode.
+    ha_presence_entities    TEXT DEFAULT '',
+    ha_away_state           TEXT DEFAULT 'not_home',
+    ha_home_state           TEXT DEFAULT 'home',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT OR IGNORE INTO home_profile (id) VALUES (1);
+
+-- CSRF tokens (one per browser session, rotated on use)
+CREATE TABLE IF NOT EXISTS csrf_tokens (
+    token       TEXT PRIMARY KEY,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS circuit_profile (
+    circuit             TEXT PRIMARY KEY,
+    circuit_type        TEXT DEFAULT 'fixture',
+    zone_count_expected INTEGER,
+    controller_type     TEXT DEFAULT 'manual',
+    has_drip_zones      BOOLEAN DEFAULT 0,
+    initial_priors_json TEXT,
+    priors_computed_at  TIMESTAMP,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
+-- TRAINING STATE MACHINE
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS training_state (
+    circuit             TEXT PRIMARY KEY,
+    state               TEXT DEFAULT 'idle',
+    calibration_days    INTEGER DEFAULT 14,
+    started_at          TIMESTAMP,
+    calibration_ends_at TIMESTAMP,
+    minimum_events      INTEGER DEFAULT 150,
+    events_collected    INTEGER DEFAULT 0,
+    labelling_deadline  TIMESTAMP,
+    completed_at        TIMESTAMP,
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
+-- LEARNING CONFIGURATION
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS learning_config (
+    circuit                         TEXT PRIMARY KEY,
+    learning_mode                   TEXT DEFAULT 'adaptive',
+    accelerated_adaptation_until    TIMESTAMP,
+    accelerated_adaptation_reason   TEXT,
+    threshold_update_interval_hours INTEGER DEFAULT 24,
+    threshold_lookback_days         INTEGER DEFAULT 30,
+    updated_at                      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
+-- SENSITIVITY CONFIGURATION
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS sensitivity_config (
+    circuit                     TEXT PRIMARY KEY,
+    mode                        TEXT DEFAULT 'simple',
+    simple_level                TEXT DEFAULT 'medium',
+    -- Event detection
+    pressure_drop_event_psi     REAL DEFAULT 2.0,
+    min_event_duration_seconds  REAL DEFAULT 3.0,
+    -- Anomaly thresholds
+    score_alert                 REAL DEFAULT 0.60,
+    score_shutoff               REAL DEFAULT 0.80,
+    -- Tolerances
+    flow_tolerance_pct          REAL DEFAULT 20.0,
+    duration_tolerance_pct      REAL DEFAULT 30.0,
+    schedule_window_minutes     REAL DEFAULT 15.0,
+    sustained_alert_minutes     REAL DEFAULT 10.0,
+    max_shutoffs_per_12h        INTEGER DEFAULT 2,
+    -- Baseline stats (updated on calibration)
+    baseline_anomaly_p85        REAL,
+    baseline_anomaly_p95        REAL,
+    baseline_anomaly_p99        REAL,
+    baseline_cluster_std_mean   REAL,
+    baseline_computed_at        TIMESTAMP,
+    updated_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
+-- ALERT CONFIGURATION
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS alert_config (
+    id          TEXT PRIMARY KEY,
+    circuit     TEXT NOT NULL,
+    alert_type  TEXT NOT NULL,
+    fixture_id  TEXT,
+    label       TEXT,
+    description TEXT,
+    enabled     BOOLEAN DEFAULT 1,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
+-- FIXTURES (Phase 2 — created now to avoid future migrations)
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS fixtures (
+    id          TEXT PRIMARY KEY,
+    circuit     TEXT NOT NULL,
+    name        TEXT,
+    auto_name   TEXT,
+    confirmed   BOOLEAN DEFAULT 0,
+    notes       TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS fixture_signatures (
+    fixture_id  TEXT REFERENCES fixtures(id) ON DELETE CASCADE,
+    feature     TEXT NOT NULL,
+    centroid    REAL,
+    std_dev     REAL,
+    p5          REAL,
+    p25         REAL,
+    p75         REAL,
+    p95         REAL,
+    PRIMARY KEY (fixture_id, feature)
+);
+
+-- ==========================================================================
+-- EVENT LOG
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS events (
+    id                          TEXT PRIMARY KEY,
+    circuit                     TEXT NOT NULL,
+    start_ts                    TIMESTAMP NOT NULL,
+    end_ts                      TIMESTAMP,
+    duration_seconds            REAL,
+    avg_flow_lpm                REAL,
+    peak_flow_lpm               REAL,
+    flow_variability            REAL DEFAULT 0,
+    pressure_delta_psi          REAL,
+    pre_event_pressure_psi      REAL,
+    min_pressure_psi            REAL,
+    hydraulic_resistance        REAL,
+    resistance_curve_shape      TEXT,
+    propagation_delay_seconds   REAL,
+    flow_onset_delay_seconds    REAL,
+    start_trigger               TEXT DEFAULT 'unknown',
+    has_pressure_transient      BOOLEAN DEFAULT 0,
+    hour_of_day                 INTEGER,
+    day_of_week                 INTEGER,
+    duration_log                REAL DEFAULT 0,
+    hour_sin                    REAL DEFAULT 0,
+    hour_cos                    REAL DEFAULT 1,
+    is_weekend                  BOOLEAN DEFAULT 0,
+    is_composite                BOOLEAN DEFAULT 0,
+    other_valve_open            INTEGER,           -- NULL=unknown 0=closed 1=open
+    excluded_from_training      BOOLEAN DEFAULT 0,
+    cluster_id                  INTEGER,
+    fixture_id                  TEXT REFERENCES fixtures(id),
+    anomaly_score               REAL,
+    anomaly_type                TEXT,
+    flagged                     BOOLEAN DEFAULT 0,
+    user_reviewed               BOOLEAN DEFAULT 0,
+    triggered_alert             BOOLEAN DEFAULT 0,
+    volume_litres               REAL DEFAULT 0,
+    created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_circuit_ts
+    ON events (circuit, start_ts);
+CREATE INDEX IF NOT EXISTS idx_events_start_ts
+    ON events (start_ts);
+
+-- ==========================================================================
+-- HOURLY VOLUME (pre-aggregated for fast chart queries)
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS hourly_volume (
+    circuit         TEXT NOT NULL,
+    hour_ts         TIMESTAMP NOT NULL,
+    volume_litres   REAL DEFAULT 0,
+    PRIMARY KEY (circuit, hour_ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hourly_volume_circuit_ts
+    ON hourly_volume (circuit, hour_ts);
+
+-- ==========================================================================
+-- VOLUME SNAPSHOTS (HA sensor baselines for accurate daily / weekly totals)
+-- Stores the HA cumulative volume sensor reading at the start of each
+-- calendar period so we can compute delta volumes without relying solely
+-- on the internal event-based estimates.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS volume_snapshots (
+    circuit     TEXT NOT NULL,
+    period_ts   TEXT NOT NULL,   -- ISO datetime of period start (midnight)
+    ha_volume   REAL NOT NULL,   -- HA sensor reading at that moment
+    PRIMARY KEY (circuit, period_ts)
+);
+
+-- ==========================================================================
+-- HISTORICAL IMPORT STATE
+-- Tracks the last time the historical importer ran per circuit so periodic
+-- catch-up checks know how far back to look.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS import_state (
+    circuit         TEXT PRIMARY KEY,
+    last_check_ts   TEXT,           -- ISO timestamp of last successful check
+    total_imported  INTEGER DEFAULT 0
+);
+
+-- ==========================================================================
+-- DAILY SUMMARY (pre-aggregated from events, calculated nightly)
+-- Kept indefinitely — drives history charts and year-over-year views.
+-- One row per circuit per calendar day.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS daily_summary (
+    circuit             TEXT NOT NULL,
+    day                 DATE NOT NULL,          -- YYYY-MM-DD
+    -- Volume
+    total_volume_litres REAL DEFAULT 0,
+    -- Events
+    event_count         INTEGER DEFAULT 0,
+    -- Flow
+    avg_flow_lpm        REAL,
+    peak_flow_lpm       REAL,
+    -- Pressure
+    avg_pressure_psi    REAL,
+    min_pressure_psi    REAL,
+    -- Anomalies / alerts
+    anomaly_count       INTEGER DEFAULT 0,
+    alert_count         INTEGER DEFAULT 0,
+    -- Top fixture
+    top_fixture_id      TEXT,
+    top_fixture_count   INTEGER DEFAULT 0,
+    -- Top-5 fixtures as JSON: [{"fixture_id":"...","count":N}, ...]
+    fixture_breakdown   TEXT,
+    -- Computed at
+    computed_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (circuit, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_summary_circuit_day
+    ON daily_summary (circuit, day);
+
+-- ==========================================================================
+-- LEAK TEST SCHEDULE AND HISTORY
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS leak_test_schedule (
+    circuit                 TEXT PRIMARY KEY,
+    enabled                 BOOLEAN DEFAULT 0,
+    frequency               TEXT DEFAULT 'monthly',
+    custom_interval_days    INTEGER,
+    day_of_week             INTEGER DEFAULT 0,
+    week_of_month           INTEGER DEFAULT 1,
+    run_hour                INTEGER DEFAULT 2,
+    run_minute              INTEGER DEFAULT 0,
+    -- quiet_period_minutes / retry_delay_minutes / retry_count removed:
+    -- the scheduler now learns the quietest hour from usage history instead.
+    notify_on_pass          BOOLEAN DEFAULT 1,
+    notify_on_fail          BOOLEAN DEFAULT 1,
+    last_run_at             TIMESTAMP,
+    last_result             TEXT,
+    next_run_at             TIMESTAMP,
+    updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS leak_test_history (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit             TEXT NOT NULL,
+    run_at              TIMESTAMP NOT NULL,
+    triggered_by        TEXT DEFAULT 'manual',
+    result              TEXT,
+    duration_minutes    REAL,
+    baseline_psi        REAL,
+    final_psi           REAL,
+    pressure_drop_psi   REAL
+);
+
+-- ==========================================================================
+-- THRESHOLD HISTORY
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS threshold_history (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit                 TEXT NOT NULL,
+    recorded_at             TIMESTAMP NOT NULL,
+    trigger                 TEXT,
+    score_alert             REAL,
+    score_shutoff           REAL,
+    flow_tolerance_pct      REAL,
+    duration_tolerance_pct  REAL,
+    event_count_basis       INTEGER
+);
+
+-- ==========================================================================
+-- ZONE SCHEDULES (irrigation-specific)
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS zone_schedules (
+    fixture_id              TEXT REFERENCES fixtures(id) ON DELETE CASCADE,
+    day_of_week             INTEGER,
+    scheduled_start_minutes INTEGER,
+    scheduled_duration_sec  INTEGER,
+    updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (fixture_id, day_of_week)
+);
+
+CREATE TABLE IF NOT EXISTS zone_flow_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    fixture_id  TEXT REFERENCES fixtures(id) ON DELETE CASCADE,
+    event_id    TEXT REFERENCES events(id) ON DELETE CASCADE,
+    avg_flow    REAL,
+    duration_s  REAL,
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
+-- DATA RETENTION CONFIGURATION
+-- Controls how aggressively old history is pruned.
+-- Training-era data is always protected regardless of these settings.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS data_retention (
+    id                          INTEGER PRIMARY KEY DEFAULT 1,
+    -- Raw events: 1 year default (daily summaries cover longer history)
+    events_retain_years         INTEGER DEFAULT 1,
+    -- Hourly volume: 2 years (learn_best_hour only looks back 60 days)
+    hourly_volume_retain_years  INTEGER DEFAULT 2,
+    -- Pruning enabled
+    enabled                     BOOLEAN DEFAULT 1,
+    last_pruned_at              TIMESTAMP,
+    -- Auto-backup (Quick Restore JSON written to filesystem on a schedule)
+    auto_backup_enabled         BOOLEAN DEFAULT 0,
+    auto_backup_path            TEXT    DEFAULT '/share/water_monitor_backups',
+    auto_backup_day_of_week     INTEGER DEFAULT 0,  -- 0=Monday
+    last_auto_backup_at         TIMESTAMP,
+    updated_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT OR IGNORE INTO data_retention (id) VALUES (1);
+    """)
+    conn.commit()
+    log.info("Schema created/verified")
+
+
+# ==========================================================================
+# Data access helpers
+# ==========================================================================
+
+def compute_daily_summary(conn: sqlite3.Connection,
+                          circuit: str, day: str) -> Optional[Dict[str, Any]]:
+    """
+    Compute and upsert a daily summary row for the given circuit and day.
+    day format: 'YYYY-MM-DD'.
+    Returns the summary dict, or None if no events that day.
+    """
+    rows = conn.execute("""
+        SELECT
+            COUNT(*)                    AS event_count,
+            SUM(volume_litres)          AS total_volume_litres,
+            AVG(avg_flow_lpm)           AS avg_flow_lpm,
+            MAX(peak_flow_lpm)          AS peak_flow_lpm,
+            AVG(pre_event_pressure_psi) AS avg_pressure_psi,
+            MIN(min_pressure_psi)       AS min_pressure_psi,
+            SUM(CASE WHEN anomaly_score IS NOT NULL
+                      AND anomaly_score > 0.6 THEN 1 ELSE 0 END) AS anomaly_count,
+            SUM(CASE WHEN triggered_alert = 1  THEN 1 ELSE 0 END) AS alert_count
+        FROM events
+        WHERE circuit = ?
+          AND date(start_ts) = ?
+    """, (circuit, day)).fetchone()
+
+    if not rows or rows["event_count"] == 0:
+        return None
+
+    # Top-5 fixtures for the day (JSON for breakdown chart)
+    top5 = conn.execute("""
+        SELECT fixture_id, COUNT(*) AS cnt
+        FROM events
+        WHERE circuit = ? AND date(start_ts) = ?
+          AND fixture_id IS NOT NULL
+        GROUP BY fixture_id
+        ORDER BY cnt DESC
+        LIMIT 5
+    """, (circuit, day)).fetchall()
+    fixture_breakdown = json.dumps(
+        [{"fixture_id": r["fixture_id"], "count": r["cnt"]} for r in top5]
+    ) if top5 else None
+
+    summary = {
+        "circuit":             circuit,
+        "day":                 day,
+        "total_volume_litres": rows["total_volume_litres"] or 0,
+        "event_count":         rows["event_count"] or 0,
+        "avg_flow_lpm":        rows["avg_flow_lpm"],
+        "peak_flow_lpm":       rows["peak_flow_lpm"],
+        "avg_pressure_psi":    rows["avg_pressure_psi"],
+        "min_pressure_psi":    rows["min_pressure_psi"],
+        "anomaly_count":       rows["anomaly_count"] or 0,
+        "alert_count":         rows["alert_count"] or 0,
+        "top_fixture_id":      top5[0]["fixture_id"] if top5 else None,
+        "top_fixture_count":   top5[0]["cnt"] if top5 else 0,
+        "fixture_breakdown":   fixture_breakdown,
+        "computed_at":         datetime.now(timezone.utc).isoformat(),
+    }
+
+    cols = ", ".join(summary.keys())
+    ph   = ", ".join("?" for _ in summary)
+    updates = ", ".join(f"{k}=excluded.{k}" for k in summary if k not in ("circuit", "day"))
+    conn.execute(
+        f"INSERT INTO daily_summary ({cols}) VALUES ({ph}) "
+        f"ON CONFLICT(circuit, day) DO UPDATE SET {updates}",
+        list(summary.values()),
+    )
+    return summary
+
+
+def get_daily_summaries(
+    conn: sqlite3.Connection,
+    circuit: str,
+    date_from: str = None,
+    date_to: str = None,
+) -> List[Dict[str, Any]]:
+    """Return daily_summary rows for a circuit, ordered oldest-first for charting."""
+    conditions = ["circuit = ?"]
+    params: list = [circuit]
+    if date_from:
+        conditions.append("day >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("day <= ?")
+        params.append(date_to)
+    where = " AND ".join(conditions)
+    rows = conn.execute(
+        f"SELECT * FROM daily_summary WHERE {where} ORDER BY day ASC",
+        params,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_data_retention(conn: sqlite3.Connection) -> dict:
+    row = conn.execute("SELECT * FROM data_retention WHERE id = 1").fetchone()
+    if row:
+        return dict(row)
+    return {
+        "events_retain_years":        1,
+        "hourly_volume_retain_years": 2,
+        "enabled":                    1,
+        "last_pruned_at":             None,
+        "auto_backup_enabled":        0,
+        "auto_backup_path":           "/share/water_monitor_backups",
+        "auto_backup_day_of_week":    0,
+        "last_auto_backup_at":        None,
+    }
+
+
+def update_data_retention(conn: sqlite3.Connection, **kwargs) -> None:
+    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
+    sets = ", ".join(f"{k} = ?" for k in kwargs)
+    conn.execute(
+        f"UPDATE data_retention SET {sets} WHERE id = 1",
+        list(kwargs.values()),
+    )
+    conn.commit()
+
+
+def generate_csrf_token(conn: sqlite3.Connection) -> str:
+    """Generate and store a new CSRF token. Cleans up tokens older than 24h."""
+    import secrets
+    conn.execute(
+        "DELETE FROM csrf_tokens WHERE created_at < datetime('now', '-1 day')")
+    token = secrets.token_hex(32)
+    conn.execute("INSERT INTO csrf_tokens (token) VALUES (?)", (token,))
+    conn.commit()
+    return token
+
+
+def validate_csrf_token(conn: sqlite3.Connection, token: str) -> bool:
+    """Return True if the token exists and is less than 24h old."""
+    if not token:
+        return False
+    row = conn.execute(
+        "SELECT token FROM csrf_tokens "
+        "WHERE token = ? AND created_at >= datetime('now', '-1 day')",
+        (token,)
+    ).fetchone()
+    return row is not None
+
+
+def get_home_profile(conn: sqlite3.Connection) -> sqlite3.Row:
+    return conn.execute("SELECT * FROM home_profile WHERE id = 1").fetchone()
+
+
+def update_home_profile(conn: sqlite3.Connection, **kwargs) -> None:
+    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
+    sets = ", ".join(f"{k} = ?" for k in kwargs)
+    values = list(kwargs.values()) + [1]
+    conn.execute(f"UPDATE home_profile SET {sets} WHERE id = ?", values)
+    conn.commit()
+
+
+def get_training_state(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM training_state WHERE circuit = ?", (circuit,)
+    ).fetchone()
+
+
+def upsert_training_state(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
+    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
+    existing = get_training_state(conn, circuit)
+    if existing:
+        sets = ", ".join(f"{k} = ?" for k in kwargs)
+        values = list(kwargs.values()) + [circuit]
+        conn.execute(f"UPDATE training_state SET {sets} WHERE circuit = ?", values)
+    else:
+        kwargs["circuit"] = circuit
+        cols = ", ".join(kwargs.keys())
+        placeholders = ", ".join("?" for _ in kwargs)
+        conn.execute(f"INSERT INTO training_state ({cols}) VALUES ({placeholders})",
+                     list(kwargs.values()))
+    conn.commit()
+
+
+def get_sensitivity_config(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM sensitivity_config WHERE circuit = ?", (circuit,)
+    ).fetchone()
+
+
+def upsert_sensitivity_config(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
+    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
+    existing = get_sensitivity_config(conn, circuit)
+    if existing:
+        sets = ", ".join(f"{k} = ?" for k in kwargs)
+        values = list(kwargs.values()) + [circuit]
+        conn.execute(f"UPDATE sensitivity_config SET {sets} WHERE circuit = ?", values)
+    else:
+        kwargs["circuit"] = circuit
+        cols = ", ".join(kwargs.keys())
+        placeholders = ", ".join("?" for _ in kwargs)
+        conn.execute(f"INSERT INTO sensitivity_config ({cols}) VALUES ({placeholders})",
+                     list(kwargs.values()))
+    conn.commit()
+
+
+def get_learning_config(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM learning_config WHERE circuit = ?", (circuit,)
+    ).fetchone()
+
+
+def upsert_learning_config(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
+    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
+    existing = get_learning_config(conn, circuit)
+    if existing:
+        sets = ", ".join(f"{k} = ?" for k in kwargs)
+        values = list(kwargs.values()) + [circuit]
+        conn.execute(f"UPDATE learning_config SET {sets} WHERE circuit = ?", values)
+    else:
+        kwargs["circuit"] = circuit
+        cols = ", ".join(kwargs.keys())
+        placeholders = ", ".join("?" for _ in kwargs)
+        conn.execute(f"INSERT INTO learning_config ({cols}) VALUES ({placeholders})",
+                     list(kwargs.values()))
+    conn.commit()
+
+
+def get_alert_configs(conn: sqlite3.Connection, circuit: str) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM alert_config WHERE circuit = ? ORDER BY alert_type",
+        (circuit,)
+    ).fetchall()
+
+
+def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) -> None:
+    conn.execute(
+        "UPDATE alert_config SET enabled = ?, updated_at = ? WHERE id = ?",
+        (1 if enabled else 0, datetime.now(timezone.utc).isoformat(), alert_id)
+    )
+    conn.commit()
+
+
+def insert_event(conn: sqlite3.Connection, event: dict) -> None:
+    cols = ", ".join(event.keys())
+    placeholders = ", ".join("?" for _ in event)
+    conn.execute(f"INSERT OR REPLACE INTO events ({cols}) VALUES ({placeholders})",
+                 list(event.values()))
+    conn.commit()
+
+
+def get_daily_volume(conn: sqlite3.Connection, circuit: str) -> float:
+    """
+    Total volume since midnight UTC today.
+    Computed from the internal hourly_volume table.
+    """
+    row = conn.execute("""
+        SELECT COALESCE(SUM(volume_litres), 0)
+        FROM hourly_volume
+        WHERE circuit = ?
+          AND hour_ts >= strftime('%Y-%m-%dT00:00:00', 'now')
+    """, (circuit,)).fetchone()
+    return round(row[0], 1) if row else 0.0
+
+
+def get_weekly_volume(conn: sqlite3.Connection, circuit: str) -> float:
+    """
+    Total volume since the most recent Monday midnight UTC.
+    Computed from the internal hourly_volume table.
+    """
+    # SQLite: 'weekday 1' = Monday; subtract 6 days to get Monday of this week
+    row = conn.execute("""
+        SELECT COALESCE(SUM(volume_litres), 0)
+        FROM hourly_volume
+        WHERE circuit = ?
+          AND hour_ts >= strftime('%Y-%m-%dT00:00:00',
+                         date('now', 'weekday 1', '-6 days'))
+    """, (circuit,)).fetchone()
+    return round(row[0], 1) if row else 0.0
+
+
+def get_hourly_volumes(
+    conn: sqlite3.Connection,
+    circuit: str,
+    hours: int = 24
+) -> List[Dict[str, Any]]:
+    """Get per-hour volume for the past N hours (rolling from now)."""
+    rows = conn.execute("""
+        SELECT hour_ts, volume_litres
+        FROM hourly_volume
+        WHERE circuit = ?
+          AND hour_ts >= datetime('now', ? || ' hours')
+        ORDER BY hour_ts ASC
+    """, (circuit, f"-{hours}")).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_hourly_volume(
+    conn: sqlite3.Connection,
+    circuit: str,
+    hour_ts: str,
+    volume_litres: float
+) -> None:
+    conn.execute("""
+        INSERT INTO hourly_volume (circuit, hour_ts, volume_litres)
+        VALUES (?, ?, ?)
+        ON CONFLICT (circuit, hour_ts)
+        DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres
+    """, (circuit, hour_ts, volume_litres))
+    conn.commit()
+
+
+def _get_volume_baseline(
+    conn: sqlite3.Connection,
+    circuit: str,
+    period_ts: str,
+    current_ha_value: float,
+) -> float:
+    """
+    Return the stored HA sensor baseline for period_ts, creating it if absent.
+
+    If the stored baseline is HIGHER than the current reading the sensor has
+    reset (device restart / firmware flash).  In that case we update the
+    baseline to the current reading so the delta starts from zero again.
+    """
+    row = conn.execute(
+        "SELECT ha_volume FROM volume_snapshots WHERE circuit=? AND period_ts=?",
+        (circuit, period_ts),
+    ).fetchone()
+
+    if row is None:
+        # No baseline yet — store 0.0 as placeholder.
+        # The orchestrator's _init_volume_baselines() will overwrite this
+        # with the real midnight reading from HA history shortly after startup.
+        conn.execute(
+            "INSERT INTO volume_snapshots (circuit, period_ts, ha_volume) VALUES (?,?,?)",
+            (circuit, period_ts, 0.0),
+        )
+        conn.commit()
+        return 0.0
+
+    baseline = row[0]
+    if current_ha_value < baseline:
+        # Sensor reset (device restarted) — update baseline to new zero point
+        conn.execute(
+            "UPDATE volume_snapshots SET ha_volume=? WHERE circuit=? AND period_ts=?",
+            (current_ha_value, circuit, period_ts),
+        )
+        conn.commit()
+        return current_ha_value
+
+    return baseline
+
+
+def compute_ha_daily_volume(
+    conn: sqlite3.Connection,
+    circuit: str,
+    current_ha_value: float,
+) -> float:
+    """
+    Daily volume from the authoritative HA cumulative sensor.
+    Uses midnight local-time today as the baseline period.
+    """
+    from datetime import datetime
+    today_midnight = datetime.now().replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat(timespec="seconds")
+    baseline = _get_volume_baseline(conn, circuit, today_midnight, current_ha_value)
+    return round(max(0.0, current_ha_value - baseline), 1)
+
+
+def compute_ha_weekly_volume(
+    conn: sqlite3.Connection,
+    circuit: str,
+    current_ha_value: float,
+) -> float:
+    """
+    Weekly volume from the authoritative HA cumulative sensor.
+    Uses Monday midnight local-time as the baseline period.
+    """
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    monday = now - timedelta(days=now.weekday())
+    week_midnight = monday.replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat(timespec="seconds")
+    baseline = _get_volume_baseline(conn, circuit, week_midnight, current_ha_value)
+    return round(max(0.0, current_ha_value - baseline), 1)
+
+
+def get_recent_events(
+    conn: sqlite3.Connection,
+    circuit: str,
+    limit: int = 100,
+    date_from: str = None,
+    date_to: str = None,
+) -> List[Dict[str, Any]]:
+    """
+    Return events for a circuit ordered newest first.
+    If date_from / date_to are provided (ISO strings) they act as a
+    range filter and limit is ignored so the full range is returned.
+    Otherwise returns the most recent `limit` rows.
+    """
+    if date_from or date_to:
+        conditions = ["circuit = ?"]
+        params: list = [circuit]
+        if date_from:
+            conditions.append("start_ts >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("start_ts <= ?")
+            params.append(date_to + "T23:59:59")
+        where = " AND ".join(conditions)
+        rows = conn.execute(
+            f"SELECT * FROM events WHERE {where} ORDER BY start_ts DESC",
+            params,
+        ).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT * FROM events
+            WHERE circuit = ?
+            ORDER BY start_ts DESC
+            LIMIT ?
+        """, (circuit, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_leak_test_schedule(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM leak_test_schedule WHERE circuit = ?", (circuit,)
+    ).fetchone()
+
+
+def upsert_leak_test_schedule(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
+    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
+    existing = get_leak_test_schedule(conn, circuit)
+    if existing:
+        sets = ", ".join(f"{k} = ?" for k in kwargs)
+        values = list(kwargs.values()) + [circuit]
+        conn.execute(f"UPDATE leak_test_schedule SET {sets} WHERE circuit = ?", values)
+    else:
+        kwargs["circuit"] = circuit
+        cols = ", ".join(kwargs.keys())
+        placeholders = ", ".join("?" for _ in kwargs)
+        conn.execute(f"INSERT INTO leak_test_schedule ({cols}) VALUES ({placeholders})",
+                     list(kwargs.values()))
+    conn.commit()
+
+
+def insert_leak_test_history(conn: sqlite3.Connection, **kwargs) -> None:
+    cols = ", ".join(kwargs.keys())
+    placeholders = ", ".join("?" for _ in kwargs)
+    conn.execute(f"INSERT INTO leak_test_history ({cols}) VALUES ({placeholders})",
+                 list(kwargs.values()))
+    conn.commit()
+
+
+def get_leak_test_history(
+    conn: sqlite3.Connection,
+    circuit: str,
+    limit: int = 20
+) -> List[Dict[str, Any]]:
+    rows = conn.execute("""
+        SELECT * FROM leak_test_history
+        WHERE circuit = ?
+        ORDER BY run_at DESC
+        LIMIT ?
+    """, (circuit, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def ensure_circuit_defaults(conn: sqlite3.Connection, circuit: str,
+                             circuit_type: str = "fixture") -> None:
+    """Ensure all per-circuit config rows exist with defaults."""
+    # Training state
+    conn.execute("""
+        INSERT OR IGNORE INTO training_state (circuit, state)
+        VALUES (?, 'idle')
+    """, (circuit,))
+
+    # Sensitivity config
+    conn.execute("""
+        INSERT OR IGNORE INTO sensitivity_config (circuit)
+        VALUES (?)
+    """, (circuit,))
+
+    # Learning config
+    conn.execute("""
+        INSERT OR IGNORE INTO learning_config (circuit)
+        VALUES (?)
+    """, (circuit,))
+
+    # Circuit profile
+    conn.execute("""
+        INSERT OR IGNORE INTO circuit_profile (circuit, circuit_type)
+        VALUES (?, ?)
+    """, (circuit, circuit_type))
+
+    # Leak test schedule
+    conn.execute("""
+        INSERT OR IGNORE INTO leak_test_schedule (circuit)
+        VALUES (?)
+    """, (circuit,))
+
+    # Alert configs — seed with defaults if not present
+    _seed_alert_configs(conn, circuit, circuit_type)
+
+    conn.commit()
+
+
+def _seed_alert_configs(conn: sqlite3.Connection, circuit: str,
+                        circuit_type: str) -> None:
+    """Insert default alert config rows for a circuit."""
+    base_alerts = [
+        ("pressure_drop", "Pressure Drop",
+         "Alert when pressure drops rapidly — possible burst pipe"),
+        ("high_flow", "High Flow",
+         "Alert when flow rate exceeds burst threshold"),
+        ("leak_test", "Micro Leak Test",
+         "Alert when leak test detects pressure decay"),
+        ("trickle", "Trickle Flow",
+         "Alert on sustained low flow — possible running toilet or dripping tap"),
+        ("flow_anomaly", "Flow Anomaly",
+         "Alert when flow pattern doesn't match any known fixture"),
+        ("schedule_deviation", "Schedule Deviation",
+         "Alert when flow occurs outside expected time patterns"),
+    ]
+
+    zone_only_alerts = [
+        ("pre_solenoid_leak", "Pre-Solenoid Leak",
+         "Alert when flow detected with no zone commanded open"),
+        ("solenoid_weeping", "Solenoid Weeping",
+         "Alert when flow persists after zone commanded closed"),
+        ("zone_flow_deviation_high", "Zone Flow High",
+         "Alert when zone flow exceeds learned range"),
+        ("zone_flow_deviation_low", "Zone Flow Low",
+         "Alert when zone flow is below learned range — possible blocked head"),
+        ("zone_duration_overrun", "Zone Duration Overrun",
+         "Alert when zone runs significantly longer than expected"),
+    ]
+
+    alerts = base_alerts
+    if circuit_type == "zone":
+        alerts = alerts + zone_only_alerts
+
+    for alert_type, label, description in alerts:
+        alert_id = f"{alert_type}_{circuit}"
+        conn.execute("""
+            INSERT OR IGNORE INTO alert_config
+                (id, circuit, alert_type, label, description, enabled)
+            VALUES (?, ?, ?, ?, ?, 1)
+        """, (alert_id, circuit, alert_type, label, description))
+
+
+def get_import_state(conn: sqlite3.Connection, circuit: str) -> dict:
+    """Return import state for a circuit, creating defaults if absent."""
+    row = conn.execute(
+        "SELECT * FROM import_state WHERE circuit = ?", (circuit,)
+    ).fetchone()
+    if row:
+        return dict(row)
+    conn.execute(
+        "INSERT OR IGNORE INTO import_state (circuit) VALUES (?)", (circuit,)
+    )
+    conn.commit()
+    return {"circuit": circuit, "last_check_ts": None, "total_imported": 0}
+
+
+def update_import_state(
+    conn: sqlite3.Connection,
+    circuit: str,
+    last_check_ts: str,
+    imported_count: int = 0,
+) -> None:
+    conn.execute("""
+        INSERT INTO import_state (circuit, last_check_ts, total_imported)
+        VALUES (?, ?, ?)
+        ON CONFLICT (circuit) DO UPDATE SET
+            last_check_ts  = excluded.last_check_ts,
+            total_imported = total_imported + excluded.total_imported
+    """, (circuit, last_check_ts, imported_count))
+    conn.commit()
+
+
+def get_last_event_ts(conn: sqlite3.Connection, circuit: str) -> Optional[str]:
+    """Return ISO timestamp of the most recent event for this circuit, or None."""
+    row = conn.execute(
+        "SELECT MAX(start_ts) FROM events WHERE circuit = ?", (circuit,)
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def event_exists_near(
+    conn: sqlite3.Connection,
+    circuit: str,
+    start_ts: str,
+    window_seconds: int = 30,
+) -> bool:
+    """True if an event with start_ts within ±window_seconds already exists."""
+    row = conn.execute("""
+        SELECT id FROM events
+        WHERE circuit = ?
+          AND start_ts >= datetime(?, ?)
+          AND start_ts <= datetime(?, ?)
+        LIMIT 1
+    """, (circuit,
+          start_ts, f"-{window_seconds} seconds",
+          start_ts, f"+{window_seconds} seconds")).fetchone()
+    return row is not None

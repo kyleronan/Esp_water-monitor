@@ -1,0 +1,44 @@
+name: "Water Monitor"
+version: "0.1.2"
+slug: water_monitor
+description: >-
+  Intelligent water monitoring with fixture signature recognition,
+  anomaly detection, and scheduled leak testing. Learns your home's
+  normal water usage patterns and alerts on unusual events.
+url: "https://github.com/local/water-monitor-addons"
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+init: false
+startup: services
+boot: auto
+hassio_api: true
+hassio_role: default
+homeassistant_api: true
+host_network: false
+ingress: true
+ingress_port: 8765
+panel_icon: mdi:water-check
+panel_title: "Water Monitor"
+panel_admin: true
+ports:
+  8765/tcp: null
+ports_description:
+  8765/tcp: "Web UI (use Ingress)"
+options:
+  log_level: "info"
+  esp_device_name: "ESP Water Shut off"
+  circuits:
+    - circuit: "main"
+      circuit_type: "fixture"
+    - circuit: "irrigation"
+      circuit_type: "zone"
+schema:
+  log_level: "list(trace|debug|info|warning|error|fatal)"
+  esp_device_name: "str"
+  circuits:
+    - circuit: "str"
+      circuit_type: "list(fixture|zone)"

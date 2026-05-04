@@ -1,0 +1,2920 @@
+# =============================================================================
+# ESP Smart Water Shut-Off Controller
+# Device: ESP32-S3-DevKitC-1
+# Controls two motorized ball valves:
+#   Valve 1 — Main water supply shutoff
+#   Valve 2 — Irrigation supply shutoff
+#
+# Each valve is driven by a gear motor with a built-in motor controller that
+# cuts power automatically when the valve reaches end of travel. Direction is
+# set by dual-coil latching relays — one coil latches the relay OPEN (drives
+# motor to open position), the other latches it CLOSED (drives motor to close).
+# The relay holds its position mechanically with no power after latching.
+#
+# Physical end stop switches confirm when each valve has fully opened or closed.
+# These are used to:
+#   - Update valve state in Home Assistant
+#   - Drive the open/closed indicator LEDs on the control panel
+#   - Detect motor/wiring faults if travel takes longer than expected
+#
+# Safety features:
+#   - High flow rate shutoff (possible burst pipe)
+#   - Rapid pressure drop shutoff (possible pipe break)
+#   - Leak test mode (monitors pressure decay with valves closed)
+#   - Sustained low flow alert (running toilet, dripping faucet, tap left on)
+#   - End stop timeout fault (motor or wiring fault detection)
+#   - All safety faults require manual reset — no auto-recovery
+#   - Valves operate independently; a fault on one does not affect the other
+#
+# Bypass switches on the control board allow manual valve operation without
+# the ESP32. On power-up or return from bypass, the ESP reads the end stops
+# and immediately restores the correct valve state in Home Assistant.
+#
+# Water signature sensors:
+#   pressure_main_base / pressure_irrigation_base (internal)
+#     Single ADC sensor per pressure GPIO pin. Performs calibration and
+#     clamping only. All derived sensors are copy platform sensors.
+#   pressure_main / pressure_irrigation
+#     Copy of base sensor, 1.375s window (275 samples), 2Hz to HA.
+#     Normal entity (recorded by HA recorder). Used for historical event
+#     import and anomaly detection. 1.375s smoothing preserves transient
+#     shape with minimal distortion.
+#   pressure_main_fast / pressure_irrigation_fast
+#     Copy of base sensor, 50ms window (10 samples), 40Hz to HA.
+#     entity_category: diagnostic (not recorded). Used by the add-on for
+#     live pressure transient detection and resistance curve computation.
+#   flow_pulse_onset_main / flow_pulse_onset_irr
+#     Template binary sensors derived from the raw base pulse counters
+#     (flow_base_main / flow_base_irr). Transition ON when any pulse
+#     arrives in the 1s window, delayed_off: 8s prevents fragmentation.
+#     ~1s onset latency (ESPHome 2026.4+ prevents GPIO pin sharing).
+# =============================================================================
+
+esphome:
+  name: esp-water-shut-off-3
+  friendly_name: ESP Water Shut off 3.4
+  min_version: 2024.6.0
+  name_add_mac_suffix: false
+  platformio_options:
+    # DIO flash mode required for ESP32-S3
+    board_build.flash_mode: dio
+  project:
+    name: esphome.web
+    version: dev
+
+  # ---------------------------------------------------------------------------
+  # BOOT SEQUENCE
+  # Runs once after all components have initialised (priority -100 ensures
+  # sensors and binary_sensors are ready before this executes).
+  #
+  # Purpose: If the ESP has just powered on, or the bypass switch has returned
+  # the valves to ESP "auto" control, the end stops reflect the true physical
+  # valve positions. We read them here and publish the correct state to Home
+  # Assistant so the dashboard is accurate immediately without needing to
+  # move either valve first.
+  # ---------------------------------------------------------------------------
+  on_boot:
+    priority: -100
+    then:
+      # --- Valve 1 (Main) ---
+      # If the open end stop is active, valve is fully open
+      - if:
+          condition:
+            binary_sensor.is_on: open_end_stop_valve1
+          then:
+            - output.turn_on: led_open_valve1
+            - output.turn_off: led_closed_valve1
+            - valve.template.publish:
+                id: main_water_valve
+                state: OPEN
+      # If the closed end stop is active, valve is fully closed
+      - if:
+          condition:
+            binary_sensor.is_on: closed_end_stop_valve1
+          then:
+            - output.turn_on: led_closed_valve1
+            - output.turn_off: led_open_valve1
+            - valve.template.publish:
+                id: main_water_valve
+                state: CLOSED
+      # Note: if neither end stop is active on boot, state stays unknown
+      # in HA until the next valve movement completes.
+
+      # --- Valve 2 (Irrigation) ---
+      - if:
+          condition:
+            binary_sensor.is_on: open_end_stop_valve2
+          then:
+            - output.turn_on: led_open_valve2
+            - output.turn_off: led_closed_valve2
+            - valve.template.publish:
+                id: irrigation_water_valve
+                state: OPEN
+      - if:
+          condition:
+            binary_sensor.is_on: closed_end_stop_valve2
+          then:
+            - output.turn_on: led_closed_valve2
+            - output.turn_off: led_open_valve2
+            - valve.template.publish:
+                id: irrigation_water_valve
+                state: CLOSED
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: arduino
+
+logger:      # Enable serial logging for debugging
+
+api:         # Enable Home Assistant native API integration
+
+ota:         # Enable over-the-air firmware updates
+  - platform: esphome
+
+improv_serial:   # Allows Wi-Fi provisioning via USB serial on first setup
+
+wifi:
+  ap: {}     # Create a fallback Wi-Fi access point if no credentials are stored
+             # Used with captive_portal below to provision Wi-Fi credentials
+
+captive_portal:  # Serves a Wi-Fi setup page when connected to the fallback AP
+
+dashboard_import:
+  # Allows this device to appear in the ESPHome dashboard for adoption
+  package_import_url: github://esphome/firmware/esphome-web/esp32s3.yaml@main
+  import_full_config: true
+
+esp32_improv:
+  # Bluetooth-based Wi-Fi provisioning — no authorizer button required
+  authorizer: none
+
+web_server:
+  version: 3  # Required for sorting_groups support
+  # Organises the built-in web UI into collapsible sections per valve.
+  # Each entity is assigned to a group via its web_server: sorting_group_id.
+  sorting_groups:
+    - id: group_main_status
+      name: "Main Valve — Status & Controls"
+      sorting_weight: 10
+    - id: group_main_settings
+      name: "Main Valve — Settings"
+      sorting_weight: 30
+    - id: group_irr_status
+      name: "Irrigation Valve — Status & Controls"
+      sorting_weight: 20
+    - id: group_irr_settings
+      name: "Irrigation Valve — Settings"
+      sorting_weight: 40
+    - id: group_system
+      name: "System"
+      sorting_weight: 50
+
+# =============================================================================
+# GLOBALS
+# Runtime variables that persist across automations within a session.
+# restore_value: no means faults always start cleared on boot. A fault that
+# existed before a power cycle should be reviewed, not silently carried forward.
+# =============================================================================
+globals:
+  # True when a safety condition has triggered on the main valve circuit.
+  # Blocks valve open_action until manually reset from Home Assistant.
+  - id: fault_main
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Same fault flag for the irrigation valve circuit.
+  - id: fault_irrigation
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # True while leak test mode is active on the main valve circuit.
+  # Enables pressure decay monitoring on the main pressure sensor.
+  - id: leak_test_active_main
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # True while leak test mode is active on the irrigation valve circuit.
+  # Enables pressure decay monitoring on the irrigation pressure sensor.
+  - id: leak_test_active_irr
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Pressure reading captured when leak test was started on the main circuit.
+  # Used as the reference point to detect pressure decay during the test.
+  - id: leak_test_baseline_main
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # Pressure reading captured when leak test was started on the irrigation circuit.
+  - id: leak_test_baseline_irr
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # Tracks elapsed time (seconds) since leak test started on the main circuit.
+  # Compared against the user-adjustable duration threshold each sensor cycle.
+  - id: leak_test_elapsed_main
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # Same elapsed time tracker for the irrigation circuit.
+  - id: leak_test_elapsed_irr
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # True during the 60-second valve-close and EMA settle phase before the
+  # test officially starts monitoring. Distinct from leak_test_active so the
+  # switch and active indicator show ON throughout, and cancellation during
+  # settle is handled cleanly without the monitoring lambda firing.
+  - id: leak_test_preparing_main
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: leak_test_preparing_irr
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # ---------------------------------------------------------------------------
+  # TRICKLE FLOW GLOBALS — Main circuit
+  #
+  # Trickle detection tracks low but sustained flow that suggests a running
+  # toilet, incompletely closed faucet, or slow fitting leak — situations not
+  # large enough to trip the burst threshold but representing abnormal
+  # continuous consumption.
+  #
+  # The alert fires when the smoothed flow rate stays continuously within the
+  # trickle band (between min and max thresholds) for the full alert duration.
+  # Any reading outside the band resets the elapsed timer — flow must be
+  # sustained without interruption.
+  #
+  # Trickle alert is intentionally separate from the safety fault flag:
+  #   - A running toilet is not a safety emergency.
+  #   - The valve can be manually re-opened after a trickle shutoff without
+  #     needing a full fault reset — just acknowledge and reset the alert.
+  #   - If auto-shutoff is enabled, the valve closes once when the alert fires.
+  #     The closed end stop guard prevents repeated close calls each tick.
+  #
+  # Auto-shutoff preference persists across reboots (restore_value: yes) so
+  # the user's choice survives a power cycle without reconfiguring.
+  # ---------------------------------------------------------------------------
+
+  # True when the trickle alert has fired on the main circuit.
+  # Cleared by the "Reset Trickle Alert - Main" button.
+  - id: trickle_alert_main
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Elapsed time (seconds) that flow has been continuously within the trickle
+  # band on the main circuit. Reset whenever flow leaves the band.
+  - id: trickle_elapsed_main
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # True to close the main valve automatically when a trickle alert fires.
+  # Persists across reboots — user sets this once in HA and it is remembered.
+  - id: trickle_shutoff_main
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  # ---------------------------------------------------------------------------
+  # TRICKLE FLOW GLOBALS — Irrigation circuit
+  # Same set as main circuit, operating fully independently.
+  # ---------------------------------------------------------------------------
+
+  - id: trickle_alert_irr
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: trickle_elapsed_irr
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # True to close the irrigation valve automatically when a trickle alert fires.
+  - id: trickle_shutoff_irr
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  # ---------------------------------------------------------------------------
+  # VALVE SEAL ALERT GLOBALS
+  # Tracks how long flow has been detected on a circuit whose closed end stop
+  # is active. If flow persists beyond 90 seconds the valve has likely failed
+  # to seat. Alert auto-clears when flow stops. No manual reset needed.
+  # ---------------------------------------------------------------------------
+  - id: valve_seal_alert_main
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: valve_seal_elapsed_main
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # Separate elapsed timer for the fast seal check (flow_base based, 10s threshold).
+  # Distinct from valve_seal_elapsed_main so the two check paths don't interfere.
+  - id: valve_seal_fast_elapsed_main
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: valve_seal_alert_irr
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: valve_seal_elapsed_irr
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # Fast seal elapsed for irrigation — mirrors valve_seal_fast_elapsed_main.
+  - id: valve_seal_fast_elapsed_irr
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # ---------------------------------------------------------------------------
+  # CLOSE-IN-FLIGHT GUARD GLOBALS
+  #
+  # When a fault, trickle alert, or rapid pressure drop fires while the valve
+  # is open, the on_value handler runs once per second and would call
+  # valve.close on every tick until the closed end stop activates (~7 seconds).
+  # ESPHome doesn't preempt running actions, so each extra invocation either
+  # queues another full close sequence or fires concurrently — both noisy.
+  #
+  # The guard is set inside close_action when the close starts, and cleared by
+  # the end-stop on_press handlers — closed end stop on a successful close,
+  # open end stop if the valve is later reopened (e.g. after a failed close
+  # leaves the guard stuck). A duplicate valve.close while the guard is set
+  # logs a debug message and exits without re-pulsing the relays.
+  #
+  # RECOVERY FROM A FAILED CLOSE
+  # If a close fails (motor/wiring fault, debris, low voltage), the closed end
+  # stop never activates, so the guard stays set AND a safety fault is raised.
+  # The system is now in a state where future close requests are silently
+  # ignored — they hit the guard and exit.
+  #
+  # After fixing the underlying hardware problem, recover with BOTH steps in
+  # order — neither alone is sufficient:
+  #   1. Reset the safety fault (the "Reset Safety Fault" button in HA).
+  #      The open_action checks the fault flag, so without this step the
+  #      valve cannot be opened.
+  #   2. Open the valve from HA. The open_action runs, the valve travels
+  #      open, and the open end stop on_press clears the close-in-flight
+  #      guard. Only after this can future close requests proceed.
+  # Skipping step 2 leaves the guard set, so a subsequent close request
+  # (manual or automatic from a fault) will appear to do nothing.
+  # ---------------------------------------------------------------------------
+  - id: close_in_flight_main
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: close_in_flight_irr
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # ---------------------------------------------------------------------------
+  # RAPID PRESSURE DROP DETECTION GLOBALS
+  #
+  # Rapid pressure drop indicates either a burst pipe (during normal operation)
+  # or a sudden draw on the system (during a leak test).
+  #
+  # A 5-sample circular buffer per circuit holds the last five pressure readings
+  # (one per second from pressure_main / pressure_irrigation). The on_value
+  # lambda compares the current reading against the value 5 seconds ago — if
+  # the drop exceeds the user-set threshold a fault is raised (or, during a
+  # leak test, the test is aborted with code 9 "demand detected").
+  #
+  # The buffer is invalidated whenever detection should not run — mid-valve-
+  # travel, manually closed valve, or leak-test prepare phase. After re-entering
+  # a valid state the buffer takes 5 seconds to refill before detection resumes,
+  # giving a brief blackout that prevents false trips from legitimate transients
+  # such as the controlled close at the start of a leak test.
+  # ---------------------------------------------------------------------------
+  - id: pressure_history_main
+    type: float[5]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0, 0}'
+
+  - id: pressure_history_main_idx
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: pressure_history_main_filled
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: pressure_history_irr
+    type: float[5]
+    restore_value: no
+    initial_value: '{0, 0, 0, 0, 0}'
+
+  - id: pressure_history_irr_idx
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: pressure_history_irr_filled
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # ---------------------------------------------------------------------------
+  # ALERT ENABLE FLAGS
+  # Each flag independently enables or disables a safety alert. All default to
+  # true (enabled) and persist across reboots via NVS. When disabled, the
+  # detection logic still runs but no fault is raised and no valve action taken.
+  # Controlled via the Enable switches in each valve's Settings group in HA.
+  # ---------------------------------------------------------------------------
+  - id: alert_pressure_drop_main
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  - id: alert_pressure_drop_irr
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  - id: alert_high_flow_main
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  - id: alert_high_flow_irr
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  - id: alert_leak_test_main
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  - id: alert_leak_test_irr
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  - id: alert_trickle_main
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  - id: alert_trickle_irr
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  # ---------------------------------------------------------------------------
+  # LEAK TEST RESULT CODES — persisted across reboots via NVS
+  # Strings cannot be restored in ESPHome globals, so an integer code is stored
+  # and the text_sensor below maps it to a human-readable string.
+  #
+  #   0 — No test run (initial state after first flash)
+  #   1 — In progress
+  #   2 — Passed — no leak detected
+  #   3 — Failed — leak detected
+  #   4 — Aborted — external pressure influence
+  #   5 — Stopped manually
+  #   6 — Not run — valve was closed (open valve first)
+  #   7 — Not run — fault active (reset fault first)
+  #   8 — Preparing — closing valve and settling
+  #   9 — Aborted — demand detected (sudden pressure drop)
+  # ---------------------------------------------------------------------------
+  - id: leak_test_result_main
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: leak_test_result_irr
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  # ---------------------------------------------------------------------------
+  # FAULT REASON STRINGS
+  # Holds a human-readable description of why the last safety fault was raised
+  # on each circuit. Set at the same time as the fault flag; cleared when the
+  # fault is reset. Exposed via text_sensor (see "Fault Reason" sensors below)
+  # for the water signature add-on and HA automations/notifications.
+  #
+  # std::string globals are supported in ESPHome but cannot be NVS-restored
+  # (restore_value: no). The text_sensor adds a separate 5s polling lambda
+  # so HA receives the value even if the WebSocket event was missed on boot.
+  # ---------------------------------------------------------------------------
+  - id: fault_reason_main_str
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  - id: fault_reason_irr_str
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+# =============================================================================
+# SENSORS
+# =============================================================================
+sensor:
+  # Wi-Fi signal strength — useful for diagnosing connectivity issues
+  - platform: wifi_signal
+    name: "Water Shutoff WiFi Signal"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_system
+      sorting_weight: 1
+    update_interval: 60s
+
+  # ---------------------------------------------------------------------------
+  # PRESSURE BASE SENSORS — Main (GPIO01) and Irrigation (GPIO02)
+  #
+  # Single ADC sensor per GPIO pin — ESPHome 2026.4+ forbids multiple
+  # components on the same pin. All pressure-derived sensors (safety,
+  # fast, averaged) are copy platform sensors sourced from these bases.
+  #
+  # The base sensors perform calibration and clamping only. No smoothing
+  # window — each copy sensor applies its own window to suit its purpose.
+  # internal: true — not exposed to HA; purely an internal signal source.
+  # ---------------------------------------------------------------------------
+  - platform: adc
+    pin:
+      number: GPIO01
+    attenuation: auto
+    id: pressure_main_base
+    internal: true
+    update_interval: 5ms
+    filters:
+      - calibrate_linear:
+          method: least_squares
+          datapoints:
+            - 0.0 -> -9.4359
+            - 3.1 -> 104.1172
+      - clamp:
+          min_value: 0
+          max_value: 104
+          ignore_out_of_range: false
+      - round: 2
+
+  - platform: adc
+    pin:
+      number: GPIO02
+    attenuation: auto
+    id: pressure_irrigation_base
+    internal: true
+    update_interval: 5ms
+    filters:
+      - calibrate_linear:
+          method: least_squares
+          datapoints:
+            - 0.0 -> -9.4359
+            - 3.1 -> 104.1172
+      - clamp:
+          min_value: 0
+          max_value: 104
+          ignore_out_of_range: false
+      - round: 2
+
+  # ---------------------------------------------------------------------------
+  # PRESSURE SENSOR 1 — Main line (GPIO01)
+  # Reads raw ADC voltage and converts to PSI using a linear calibration.
+  # Sampled at 10ms, averaged with exponential moving average, reported
+  # to HA every 100 samples (~1s). Clamped to valid sensor range (0-104 PSI).
+  #
+  # Safety checks on every reported value:
+  #   1. Rapid pressure drop — indicates a burst pipe or sudden large leak
+  #   2. Leak test decay — monitors slow pressure loss with valve closed
+  # ---------------------------------------------------------------------------
+  - platform: copy
+    source_id: pressure_main_base
+    id: pressure_main
+    name: "Water Pressure 1 - Main"
+    entity_category: ""        # recorded by HA — used for historical event import
+    device_class: pressure
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 3
+    unit_of_measurement: "PSI"
+    filters:
+      # 275-sample window on the 200Hz base sensor = 1.375s effective smoothing.
+      # send_every: 100 × 5ms = 500ms publish rate (2Hz to HA).
+      # Calibration and clamping are applied in pressure_main_base.
+      - sliding_window_moving_average:
+          window_size: 275
+          send_every: 100
+      - round: 2
+    on_value:
+      then:
+        # --- Rapid pressure drop detection (Main) ---
+        # 5-second window: compares current pressure against the value held
+        # 5 samples ago in the circular buffer (pressure_main reports every 1s).
+        #
+        # Detection is gated to states where a sudden drop is meaningful:
+        #   - Valve open during normal operation: a sudden drop indicates a
+        #     burst pipe or sudden large leak — raise safety fault.
+        #   - Valve closed during active leak test: a sudden drop indicates
+        #     someone opened a tap (real demand, not a leak) — abort the test
+        #     with result code 9 so it can be retried later.
+        #
+        # In all other states (mid-travel, manually closed valve, leak-test
+        # prepare phase) the buffer is invalidated and detection is skipped —
+        # the controlled close transient must not be flagged as a burst.
+        #
+        # Aborting a running leak test is independent of alert_pressure_drop_main:
+        # if the test continued through obvious demand it would falsely report
+        # a leak, which is worse than aborting and asking the user to retry.
+        - lambda: |-
+            // 30-second startup grace period — pressure may still be settling
+            // after boot, or a tap may have been opened just before the ESP
+            // came up. Skip detection during this window and keep the buffer
+            // invalidated so the post-grace fill captures stable values.
+            // The static is initialised on the first call to this lambda,
+            // a few seconds after boot.
+            static const uint32_t startup_time = millis();
+            if (millis() - startup_time < 30000) {
+              id(pressure_history_main_filled) = false;
+              id(pressure_history_main_idx) = 0;
+              return;
+            }
+
+            bool valve_open_normal = id(open_end_stop_valve1).state
+                                     && !id(leak_test_active_main)
+                                     && !id(leak_test_preparing_main);
+            bool leak_test_running = id(leak_test_active_main);
+            bool should_detect = valve_open_normal || leak_test_running;
+
+            if (!should_detect) {
+              // Invalidate buffer — stale samples from a different state would
+              // cause false trips when detection resumes.
+              id(pressure_history_main_filled) = false;
+              id(pressure_history_main_idx) = 0;
+              return;
+            }
+
+            // Run detection only after the buffer has been populated for 5s.
+            if (id(pressure_history_main_filled)) {
+              float prev = id(pressure_history_main)[id(pressure_history_main_idx)];
+              float drop = prev - x;  // positive = pressure fell
+              if (drop > id(pressure_drop_threshold_main).state) {
+                if (leak_test_running) {
+                  // Abort leak test — sudden drop is demand, not a slow leak.
+                  id(leak_test_active_main) = false;
+                  id(leak_test_elapsed_main) = 0.0f;
+                  id(leak_test_result_main) = 9;  // Aborted — demand detected
+                  id(leak_test_restore_main).execute();
+                  ESP_LOGW("leak_test", "MAIN: leak test aborted — sudden pressure drop %.1f PSI in 5s "
+                    "(threshold %.1f PSI). Likely demand (tap opened) rather than a leak. Retry the test.",
+                    drop, id(pressure_drop_threshold_main).state);
+                  return;
+                } else if (!id(fault_main)) {
+                  if (id(alert_pressure_drop_main)) {
+                    // Only raise a burst fault if flow is confirmed.
+                    // A pressure drop with no flow is almost certainly water
+                    // hammer or a supply fluctuation — not a burst pipe.
+                    if (id(flow_base_main).state > 0) {
+                      id(fault_main) = true;
+                      id(fault_reason_main_str) = "Rapid pressure drop — possible burst pipe";
+                      id(fault_reason_main).publish_state(id(fault_reason_main_str));
+                      ESP_LOGW("safety", "MAIN: rapid pressure drop fault — %.1f PSI in 5s "
+                        "(threshold %.1f PSI) — flow confirmed, possible burst pipe",
+                        drop, id(pressure_drop_threshold_main).state);
+                    } else {
+                      ESP_LOGD("safety", "MAIN: rapid pressure drop %.1f PSI in 5s — "
+                        "no flow detected, likely water hammer or supply fluctuation, ignoring",
+                        drop);
+                    }
+                  } else {
+                    ESP_LOGD("safety", "MAIN: rapid pressure drop %.1f PSI — alert disabled, no fault raised",
+                      drop);
+                  }
+                }
+              }
+            }
+
+            // Update the circular buffer with the latest sample.
+            id(pressure_history_main)[id(pressure_history_main_idx)] = x;
+            id(pressure_history_main_idx) = (id(pressure_history_main_idx) + 1) % 5;
+            if (!id(pressure_history_main_filled) && id(pressure_history_main_idx) == 0) {
+              id(pressure_history_main_filled) = true;
+            }
+
+        # --- Leak test pressure decay (Main) ---
+        # Only active when leak_test_active_main is true. Compares current
+        # pressure to the baseline. Raises a fault if pressure has dropped more
+        # than the user-adjustable threshold (leak_threshold_psi_main).
+        # Also tracks elapsed time and auto-stops the test when the user-set
+        # duration (leak_duration_main) is reached.
+        - lambda: |-
+            if (!id(leak_test_active_main)) return;
+
+            // Accumulate elapsed time — sensor fires every 500ms (send_every 100 at 5ms)
+            // so increment by 0.5s per tick to keep elapsed time in seconds.
+            id(leak_test_elapsed_main) += 0.5f;
+
+            float drop = id(leak_test_baseline_main) - x;  // positive = pressure fell, negative = pressure rose
+
+            // --- Pressure increase detected ---
+            // A rising pressure with the valve closed means something external is
+            // influencing the system (thermal expansion, water hammer, upstream pump,
+            // etc.). The test result would be unreliable — stop and advise retry.
+            // Using the same threshold magnitude to filter out normal sensor noise.
+            if (drop < -id(leak_threshold_psi_main).state) {
+              id(leak_test_active_main) = false;
+              id(leak_test_elapsed_main) = 0.0f;
+              id(leak_test_result_main) = 4;  // Aborted — external pressure influence
+              id(leak_test_restore_main).execute();
+              ESP_LOGW("leak_test", "MAIN: leak test aborted — pressure ROSE by %.1f PSI (baseline %.1f PSI, now %.1f PSI). "
+                "External influence detected (thermal expansion, water hammer, or upstream pressure change). "
+                "Wait for system to stabilise and run the test again.",
+                -drop, id(leak_test_baseline_main), x);
+              return;
+            }
+
+            // --- Pressure drop: leak detected ---
+            if (drop > id(leak_threshold_psi_main).state) {
+              id(leak_test_active_main) = false;
+              id(leak_test_elapsed_main) = 0.0f;
+              id(leak_test_result_main) = 3;  // Failed — leak detected
+              id(leak_test_restore_main).execute();
+              if (id(alert_leak_test_main)) {
+                id(fault_main) = true;
+                id(fault_reason_main_str) = "Leak test failed — pressure decay detected";
+                id(fault_reason_main).publish_state(id(fault_reason_main_str));
+                ESP_LOGW("safety", "MAIN: leak detected — %.1f PSI drop exceeds %.1f PSI threshold",
+                  drop, id(leak_threshold_psi_main).state);
+              } else {
+                ESP_LOGW("leak_test", "MAIN: leak detected — %.1f PSI drop exceeds threshold — alert disabled, no fault raised",
+                  drop);
+              }
+              return;
+            }
+
+            // --- Duration expired: no leak found ---
+            // Auto-stop when the user-set duration is reached.
+            float duration_secs = id(leak_duration_main).state * 60.0f;
+            if (id(leak_test_elapsed_main) >= duration_secs) {
+              id(leak_test_active_main) = false;
+              id(leak_test_elapsed_main) = 0.0f;
+              id(leak_test_result_main) = 2;  // Passed — no leak detected
+              id(leak_test_restore_main).execute();
+              ESP_LOGI("leak_test", "MAIN: leak test complete — no leak detected after %.0f minutes",
+                id(leak_duration_main).state);
+            }
+
+        # --- Fault response: close the main valve ---
+        # Guarded by the closed end stop so valve.close is only called once —
+        # not repeatedly on every sensor tick while the valve is already shut.
+        - if:
+            condition:
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state;'
+            then:
+              - valve.close: main_water_valve
+
+  # ---------------------------------------------------------------------------
+  # PRESSURE SENSOR 2 — Irrigation line (GPIO02)
+  # Identical configuration and safety logic to pressure sensor 1.
+  # Operates independently — a fault here only affects the irrigation valve.
+  # ---------------------------------------------------------------------------
+  - platform: copy
+    source_id: pressure_irrigation_base
+    id: pressure_irrigation
+    name: "Water Pressure 2 - Irrigation"
+    entity_category: ""        # recorded by HA — used for historical event import
+    device_class: pressure
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 3
+    unit_of_measurement: "PSI"
+    filters:
+      # Same as pressure_main — see comments above.
+      # Calibration and clamping are applied in pressure_irrigation_base.
+      - sliding_window_moving_average:
+          window_size: 275
+          send_every: 100
+      - round: 2
+    on_value:
+      then:
+        # --- Rapid pressure drop detection (Irrigation) ---
+        # Same logic as main sensor — see comments above for full detail.
+        - lambda: |-
+            // 30-second startup grace period — see comments on the main
+            // sensor for rationale.
+            static const uint32_t startup_time = millis();
+            if (millis() - startup_time < 30000) {
+              id(pressure_history_irr_filled) = false;
+              id(pressure_history_irr_idx) = 0;
+              return;
+            }
+
+            bool valve_open_normal = id(open_end_stop_valve2).state
+                                     && !id(leak_test_active_irr)
+                                     && !id(leak_test_preparing_irr);
+            bool leak_test_running = id(leak_test_active_irr);
+            bool should_detect = valve_open_normal || leak_test_running;
+
+            if (!should_detect) {
+              id(pressure_history_irr_filled) = false;
+              id(pressure_history_irr_idx) = 0;
+              return;
+            }
+
+            if (id(pressure_history_irr_filled)) {
+              float prev = id(pressure_history_irr)[id(pressure_history_irr_idx)];
+              float drop = prev - x;
+              if (drop > id(pressure_drop_threshold_irr).state) {
+                if (leak_test_running) {
+                  id(leak_test_active_irr) = false;
+                  id(leak_test_elapsed_irr) = 0.0f;
+                  id(leak_test_result_irr) = 9;  // Aborted — demand detected
+                  id(leak_test_restore_irr).execute();
+                  ESP_LOGW("leak_test", "IRRIGATION: leak test aborted — sudden pressure drop %.1f PSI in 5s "
+                    "(threshold %.1f PSI). Likely demand (zone opened) rather than a leak. Retry the test.",
+                    drop, id(pressure_drop_threshold_irr).state);
+                  return;
+                } else if (!id(fault_irrigation)) {
+                  if (id(alert_pressure_drop_irr)) {
+                    if (id(flow_base_irr).state > 0) {
+                      id(fault_irrigation) = true;
+                      id(fault_reason_irr_str) = "Rapid pressure drop — possible burst pipe";
+                      id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+                      ESP_LOGW("safety", "IRRIGATION: rapid pressure drop fault — %.1f PSI in 5s "
+                        "(threshold %.1f PSI) — flow confirmed, possible burst pipe",
+                        drop, id(pressure_drop_threshold_irr).state);
+                    } else {
+                      ESP_LOGD("safety", "IRRIGATION: rapid pressure drop %.1f PSI in 5s — "
+                        "no flow detected, likely water hammer or supply fluctuation, ignoring",
+                        drop);
+                    }
+                  } else {
+                    ESP_LOGD("safety", "IRRIGATION: rapid pressure drop %.1f PSI — alert disabled, no fault raised",
+                      drop);
+                  }
+                }
+              }
+            }
+
+            id(pressure_history_irr)[id(pressure_history_irr_idx)] = x;
+            id(pressure_history_irr_idx) = (id(pressure_history_irr_idx) + 1) % 5;
+            if (!id(pressure_history_irr_filled) && id(pressure_history_irr_idx) == 0) {
+              id(pressure_history_irr_filled) = true;
+            }
+
+        # Leak test pressure decay — same logic as main sensor.
+        - lambda: |-
+            if (!id(leak_test_active_irr)) return;
+
+            // Sensor fires every 500ms (send_every 100 at 5ms) — increment by 0.5s.
+            id(leak_test_elapsed_irr) += 0.5f;
+
+            float drop = id(leak_test_baseline_irr) - x;  // positive = pressure fell, negative = pressure rose
+
+            if (drop < -id(leak_threshold_psi_irr).state) {
+              id(leak_test_active_irr) = false;
+              id(leak_test_elapsed_irr) = 0.0f;
+              id(leak_test_result_irr) = 4;  // Aborted — external pressure influence
+              id(leak_test_restore_irr).execute();
+              ESP_LOGW("leak_test", "IRRIGATION: leak test aborted — pressure ROSE by %.1f PSI (baseline %.1f PSI, now %.1f PSI). "
+                "External influence detected (thermal expansion, water hammer, or upstream pressure change). "
+                "Wait for system to stabilise and run the test again.",
+                -drop, id(leak_test_baseline_irr), x);
+              return;
+            }
+
+            if (drop > id(leak_threshold_psi_irr).state) {
+              id(leak_test_active_irr) = false;
+              id(leak_test_elapsed_irr) = 0.0f;
+              id(leak_test_result_irr) = 3;  // Failed — leak detected
+              id(leak_test_restore_irr).execute();
+              if (id(alert_leak_test_irr)) {
+                id(fault_irrigation) = true;
+                id(fault_reason_irr_str) = "Leak test failed — pressure decay detected";
+                id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+                ESP_LOGW("safety", "IRRIGATION: leak detected — %.1f PSI drop exceeds %.1f PSI threshold",
+                  drop, id(leak_threshold_psi_irr).state);
+              } else {
+                ESP_LOGW("leak_test", "IRRIGATION: leak detected — %.1f PSI drop exceeds threshold — alert disabled, no fault raised",
+                  drop);
+              }
+              return;
+            }
+
+            float duration_secs = id(leak_duration_irr).state * 60.0f;
+            if (id(leak_test_elapsed_irr) >= duration_secs) {
+              id(leak_test_active_irr) = false;
+              id(leak_test_elapsed_irr) = 0.0f;
+              id(leak_test_result_irr) = 2;  // Passed — no leak detected
+              id(leak_test_restore_irr).execute();
+              ESP_LOGI("leak_test", "IRRIGATION: leak test complete — no leak detected after %.0f minutes",
+                id(leak_duration_irr).state);
+            }
+        # Guarded by the closed end stop so valve.close is only called once —
+        # not repeatedly on every sensor tick while the valve is already shut.
+        - if:
+            condition:
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state;'
+            then:
+              - valve.close: irrigation_water_valve
+
+
+  # ---------------------------------------------------------------------------
+  # PRESSURE SENSOR 1 (AVERAGED) — Main line
+  # Derived from pressure_main via the copy platform — no separate ADC read.
+  # The source publishes every 1 second (already calibrated, clamped, and
+  # smoothed by its 1.25s sliding window); this sensor adds a longer 30-sample
+  # sliding window to average out the upstream solenoid pulses (~30s period).
+  #
+  # Filter chain:
+  #   sliding_window_moving_average: 30 samples × 1s = 30 second window
+  #     send_every: 1 → publishes once per second (inherited from source rate)
+  #   round: 1 → 1 decimal place for display
+  #   Memory: 30 × 4 bytes = 120 bytes (half of the previous 60-sample buffer).
+  #
+  # This sensor is for display and trend monitoring only. All safety checks
+  # (burst detection, leak test, rapid pressure drop) use the faster
+  # pressure_main sensor above.
+  # ---------------------------------------------------------------------------
+  - platform: copy
+    source_id: pressure_main
+    id: pressure_main_avg
+    name: "Water Pressure 1 - Main (Averaged)"
+    # Clear the entity_category inherited from the source (pressure_main is
+    # diagnostic; the averaged copy is the user-facing primary entity).
+    entity_category: ""
+    device_class: pressure
+    state_class: measurement
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 2
+    unit_of_measurement: "PSI"
+    filters:
+      # Round source value to 1 decimal before windowing to reduce noise
+      # entering the average.
+      - round: 1
+      # 50-sample window × 500ms (source publish rate) = 25-second average.
+      # send_every: 2 → publishes every 1 second to HA.
+      # Smooths out upstream solenoid pressure pulses (~30s period).
+      - sliding_window_moving_average:
+          window_size: 50
+          send_every: 2
+      # Round to nearest 0.5 PSI for a clean display reading:
+      #   × 2 → round to integer → × 0.5 = nearest 0.5 PSI.
+      - multiply: 2
+      - round: 0
+      - multiply: 0.5
+      - round: 1
+
+  # ---------------------------------------------------------------------------
+  # PRESSURE SENSOR 2 (AVERAGED) — Irrigation line
+  # Same approach as the main averaged sensor — copies from pressure_irrigation.
+  # ---------------------------------------------------------------------------
+  - platform: copy
+    source_id: pressure_irrigation
+    id: pressure_irrigation_avg
+    name: "Water Pressure 2 - Irrigation (Averaged)"
+    # See pressure_main_avg above.
+    entity_category: ""
+    device_class: pressure
+    state_class: measurement
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 2
+    unit_of_measurement: "PSI"
+    filters:
+      - round: 1
+      - sliding_window_moving_average:
+          window_size: 50
+          send_every: 2
+      - multiply: 2
+      - round: 0
+      - multiply: 0.5
+      - round: 1
+
+  # ---------------------------------------------------------------------------
+  # PRESSURE SENSOR 1 (FAST) — Main line (GPIO01)
+  #
+  # 200 Hz ADC read (5ms), 50ms sliding window (10 samples). Exists solely
+  # for the water signature add-on to:
+  #   - Detect pressure transients (fixture opening / closing) with sub-second
+  #     resolution.
+  #   - Compute the instantaneous ΔP/Q hydraulic resistance curve during an
+  #     event, paired with the flow pulse onset sensor below.
+  #   - Measure the propagation delay between pressure onset and flow onset
+  #     (a proxy for fixture distance from the sensors).
+  #
+  # All safety logic (burst detection, leak test, rapid drop) remains on the
+  # slower 1Hz pressure_main sensor — this sensor is diagnostic/add-on use only.
+  #
+  # entity_category: diagnostic keeps it off the main HA overview.
+  # The add-on subscribes to state_changed events for this entity via WebSocket.
+  # ---------------------------------------------------------------------------
+  - platform: copy
+    source_id: pressure_main_base
+    id: pressure_main_fast
+    name: "Water Pressure 1 - Main (Fast)"
+    entity_category: diagnostic
+    device_class: pressure
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 48
+    unit_of_measurement: "PSI"
+    filters:
+      # 10-sample × 5ms = 50ms effective window at 200Hz.
+      # send_every: 5 → 25ms publish rate (40Hz to HA).
+      # Calibration and clamping are in pressure_main_base.
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 5
+      - round: 2
+
+  # ---------------------------------------------------------------------------
+  # PRESSURE SENSOR 2 (FAST) — Irrigation line (GPIO02)
+  # Same configuration as the main fast sensor — see comments above.
+  # ---------------------------------------------------------------------------
+  - platform: copy
+    source_id: pressure_irrigation_base
+    id: pressure_irrigation_fast
+    name: "Water Pressure 2 - Irrigation (Fast)"
+    entity_category: diagnostic
+    device_class: pressure
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 48
+    unit_of_measurement: "PSI"
+    filters:
+      # See pressure_main_fast above — same configuration.
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 5
+      - round: 2
+
+  # ---------------------------------------------------------------------------
+  # FLOW SENSOR 1 — Main line (GPIO39)
+  # Pulse counter connected to a turbine flow meter.
+  # Converts pulse frequency to flow rate in litres per minute.
+  # Formula: pulses per minute / (6.6 * 60) = L/min
+  #   where 6.6 is the sensor pulse factor (pulses per litre).
+  #
+  # Timing strategy:
+  #   update_interval: 1s — counts pulses over a 1 second window. This is the
+  #     shortest practical window that still gives accurate readings at low flow.
+  #   Filter chain (applied in order):
+  #     1. lambda — converts raw counts/min to L/min
+  #     2. sliding_window_moving_average (window 30s) — averages the last 30
+  #        one-second readings. At low flow (<1 L/min) pulses are sparse and
+  #        irregular; a 30s window captures several pulses for a stable average.
+  #     3. exponential_moving_average (alpha 0.2) — further smooths step changes.
+  #
+  # Safety checks on every reported value:
+  #   1. Burst pipe — high flow above threshold triggers safety fault
+  #   2. Trickle flow — low but sustained flow triggers trickle alert
+  #
+  # Note on trickle detection and the 30s sliding window:
+  #   The window means flow must enter the trickle band and stay there long
+  #   enough for the average to stabilise before the elapsed timer accumulates
+  #   meaningfully. In practice this adds ~30s of natural lag before the timer
+  #   counts reliably — desirable, as it prevents brief spikes from starting
+  #   the timer. The alert duration should be several minutes or more so this
+  #   is insignificant relative to the total detection time.
+  # ---------------------------------------------------------------------------
+  # FLOW SENSOR 1 BASE — Main line (GPIO39)
+  # Single pulse_counter on this GPIO — the only component on GPIO39.
+  # Reports raw pulses/min (x). internal: true — not exposed to HA.
+  # Derived sensors below convert to L/min and detect flow onset.
+  #
+  # on_value runs two safety checks that benefit from the raw 1s pulse count
+  # rather than the 30s-smoothed water_usage1:
+  #
+  #   1. INSTANT BURST — catches a burst pipe within 1-2 seconds rather than
+  #      waiting ~30s for the smoothing window to fill. Uses 1.5× the
+  #      configured burst threshold to tolerate 1s window variability while
+  #      still catching genuinely large bursts immediately.
+  #
+  #   2. FAST VALVE SEAL — detects flow pulses within 10s of the closed end
+  #      stop activating. The existing slow seal check (water_usage1, 90s)
+  #      was padded to tolerate the 30s smoothing window draining. With raw
+  #      pulse data, 10s is enough to be confident the valve hasn't seated.
+  #      Clearing the alert is handled by water_usage1 when flow stops.
+  # ---------------------------------------------------------------------------
+  - platform: pulse_counter
+    pin:
+      number: GPIO39
+      mode:
+        input: true
+        pulldown: true    # pulldown prevents floating input causing false counts
+    id: flow_base_main
+    internal: true
+    update_interval: 1s
+    on_value:
+      then:
+        # --- Instant burst detection ---
+        # x is raw pulses/min. x/396 = instantaneous L/min.
+        # 1.5× multiplier compensates for single-second window variability —
+        # a genuine burst at 25 L/min still reads >>37.5 on the raw counter.
+        # Gated by the open end stop so this only fires while the valve is open
+        # and the system is in normal operation.
+        - lambda: |-
+            float instant_lpm = x / 396.0f;
+            if (!id(fault_main)
+                && id(alert_high_flow_main)
+                && id(open_end_stop_valve1).state
+                && instant_lpm > id(burst_threshold_main).state * 1.5f) {
+              id(fault_main) = true;
+              id(fault_reason_main_str) = "High flow — burst pipe (instant)";
+              id(fault_reason_main).publish_state(id(fault_reason_main_str));
+              ESP_LOGW("safety", "MAIN: instant burst detected — %.2f L/min (1s raw) "
+                "exceeds %.1f L/min × 1.5 — closing valve",
+                instant_lpm, id(burst_threshold_main).state);
+            }
+        # Fault response — close valve if not already closing.
+        - if:
+            condition:
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state;'
+            then:
+              - valve.close: main_water_valve
+
+        # --- Fast valve seal check ---
+        # If the closed end stop is active but the raw pulse counter is still
+        # non-zero, the valve has not fully sealed. 10s threshold — tight
+        # because raw pulse data has no smoothing lag unlike water_usage1.
+        # Alert cleared by water_usage1 when flow drops to zero (the smoothed
+        # sensor is the right place to confirm sustained zero-flow).
+        - lambda: |-
+            if (id(closed_end_stop_valve1).state) {
+              if (x > 0) {
+                id(valve_seal_fast_elapsed_main) += 1.0f;
+                if (!id(valve_seal_alert_main)
+                    && id(valve_seal_fast_elapsed_main) >= 10.0f) {
+                  id(valve_seal_alert_main) = true;
+                  ESP_LOGW("seal", "MAIN: pulses detected %.0fs after valve closed "
+                    "(raw check) — possible valve seal failure",
+                    id(valve_seal_fast_elapsed_main));
+                }
+              } else {
+                // No pulses — reset fast timer. Alert cleared by water_usage1.
+                id(valve_seal_fast_elapsed_main) = 0.0f;
+              }
+            } else {
+              // Valve open — reset fast seal timer silently.
+              id(valve_seal_fast_elapsed_main) = 0.0f;
+            }
+
+  # ---------------------------------------------------------------------------
+  # FLOW SENSOR 1 — Main line (GPIO39, via flow_base_main)
+  # Copy of the base pulse counter. Applies unit conversion and smoothing.
+  # All safety on_value logic runs here at the smoothed 1s publish rate.
+  # ---------------------------------------------------------------------------
+  - platform: copy
+    source_id: flow_base_main
+    unit_of_measurement: 'L/min'
+    accuracy_decimals: 2
+    id: water_usage1
+    name: "Water Flow Rate - Main"
+    device_class: volume_flow_rate
+    state_class: measurement
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 4
+    filters:
+      # Step 1: Convert raw counts/min to L/min (6.6 pulses/litre × 60s = 396)
+      - lambda: return (x / 396);
+      # Step 2: 30-second sliding window. At 0.5 L/min a pulse arrives every
+      # ~18s — a 30s window captures 1-2 pulses for a stable non-zero reading.
+      - sliding_window_moving_average:
+          window_size: 30
+          send_every: 1
+      # Step 3: EMA further smooths step changes from the sliding window output.
+      - exponential_moving_average:
+          alpha: 0.2
+          send_every: 1
+    on_value:
+      then:
+        # --- Check 1: Burst pipe high flow fault ---
+        - lambda: |-
+            if (!id(fault_main) && x > id(burst_threshold_main).state) {
+              if (id(alert_high_flow_main)) {
+                id(fault_main) = true;
+                id(fault_reason_main_str) = "High flow — burst pipe";
+                id(fault_reason_main).publish_state(id(fault_reason_main_str));
+                ESP_LOGW("safety", "MAIN: high flow fault — %.2f L/min exceeds %.1f L/min threshold",
+                  x, id(burst_threshold_main).state);
+              } else {
+                ESP_LOGD("safety", "MAIN: high flow detected (%.2f L/min) — alert disabled", x);
+              }
+            }
+        # Guarded by the closed end stop so valve.close is only called once.
+        - if:
+            condition:
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state;'
+            then:
+              - valve.close: main_water_valve
+
+        # --- Check 2: Trickle flow detection ---
+        # Detects a running toilet, dripping faucet, or tap not fully closed.
+        # Fires when the smoothed flow stays within the trickle band (between
+        # trickle_min and trickle_max thresholds) continuously for the full
+        # alert duration. Any reading outside the band resets the elapsed timer
+        # — the flow must be sustained without interruption to trigger an alert.
+        #
+        # Trickle alert is separate from the safety fault — a running toilet is
+        # not an emergency. The valve can be re-opened after a trickle shutoff
+        # without requiring a safety fault reset.
+        #
+        # Auto-shutoff only closes the valve if trickle_shutoff_main is enabled.
+        # The closed end stop guard prevents repeated close calls each tick.
+        - lambda: |-
+            if (!id(trickle_alert_main) && id(alert_trickle_main)) {
+              float min_flow = id(trickle_min_flow_main).state;
+              float max_flow = id(trickle_max_flow_main).state;
+              if (x >= min_flow && x <= max_flow) {
+                // Flow is in the trickle band — accumulate elapsed time
+                id(trickle_elapsed_main) += 1.0f;
+                float threshold_secs = id(trickle_duration_main).state * 60.0f;
+                if (id(trickle_elapsed_main) >= threshold_secs) {
+                  id(trickle_alert_main) = true;
+                  id(trickle_elapsed_main) = 0.0f;
+                  ESP_LOGW("trickle", "MAIN: sustained low flow alert — %.2f L/min for %.0f min "
+                    "(band: %.2f–%.2f L/min)",
+                    x, id(trickle_duration_main).state, min_flow, max_flow);
+                }
+              } else {
+                // Flow left the trickle band — reset timer.
+                // The flow must be continuously sustained; intermittent flow
+                // (e.g. a toilet refill then idle) will not trigger the alert.
+                if (id(trickle_elapsed_main) > 0.0f) {
+                  id(trickle_elapsed_main) = 0.0f;
+                }
+              }
+            }
+        - if:
+            condition:
+              lambda: 'return id(trickle_alert_main) && id(trickle_shutoff_main) && !id(closed_end_stop_valve1).state;'
+            then:
+              - valve.close: main_water_valve
+
+        # --- Check 3: Valve seal check ---
+        # If the closed end stop is active but flow is still detected, the valve
+        # has not fully seated. Accumulates elapsed time. After 90 seconds raises
+        # an informational alert. Auto-clears when flow drops to zero with a log
+        # message. Resets silently when the valve opens.
+        # Threshold: 0.02 L/min — below this the pulse counter is effectively silent.
+        - lambda: |-
+            if (id(closed_end_stop_valve1).state) {
+              if (x > 0.02f) {
+                // Closed end stop active but flow still detected
+                id(valve_seal_elapsed_main) += 1.0f;
+                if (!id(valve_seal_alert_main) && id(valve_seal_elapsed_main) >= 90.0f) {
+                  id(valve_seal_alert_main) = true;
+                  ESP_LOGW("seal", "MAIN: flow detected %.0fs after valve closed — "
+                    "possible valve seal failure (%.2f L/min)",
+                    id(valve_seal_elapsed_main), x);
+                }
+              } else {
+                // Flow has stopped — reset timer and clear alert if active
+                if (id(valve_seal_alert_main)) {
+                  id(valve_seal_alert_main) = false;
+                  ESP_LOGI("seal", "MAIN: valve seal alert cleared — flow has stopped");
+                }
+                id(valve_seal_elapsed_main) = 0.0f;
+              }
+            } else {
+              // Valve open — reset silently
+              id(valve_seal_elapsed_main) = 0.0f;
+              id(valve_seal_alert_main) = false;
+            }
+
+  # ---------------------------------------------------------------------------
+  # FLOW SENSOR 2 BASE — Irrigation line (GPIO38)
+  # Same architecture as flow_base_main — see comments above.
+  # ---------------------------------------------------------------------------
+  - platform: pulse_counter
+    pin:
+      number: GPIO38
+      mode:
+        input: true
+        pulldown: true
+    id: flow_base_irr
+    internal: true
+    update_interval: 1s
+    on_value:
+      then:
+        # --- Instant burst detection (Irrigation) ---
+        # Same logic as flow_base_main — see comments above.
+        # Irrigation auto-shutoff fires on the irrigation valve only.
+        - lambda: |-
+            float instant_lpm = x / 396.0f;
+            if (!id(fault_irrigation)
+                && id(alert_high_flow_irr)
+                && id(open_end_stop_valve2).state
+                && instant_lpm > id(burst_threshold_irr).state * 1.5f) {
+              id(fault_irrigation) = true;
+              id(fault_reason_irr_str) = "High flow — burst pipe (instant)";
+              id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+              ESP_LOGW("safety", "IRRIGATION: instant burst detected — %.2f L/min (1s raw) "
+                "exceeds %.1f L/min × 1.5 — closing valve",
+                instant_lpm, id(burst_threshold_irr).state);
+            }
+        - if:
+            condition:
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state;'
+            then:
+              - valve.close: irrigation_water_valve
+
+        # --- Fast valve seal check (Irrigation) ---
+        - lambda: |-
+            if (id(closed_end_stop_valve2).state) {
+              if (x > 0) {
+                id(valve_seal_fast_elapsed_irr) += 1.0f;
+                if (!id(valve_seal_alert_irr)
+                    && id(valve_seal_fast_elapsed_irr) >= 10.0f) {
+                  id(valve_seal_alert_irr) = true;
+                  ESP_LOGW("seal", "IRRIGATION: pulses detected %.0fs after valve closed "
+                    "(raw check) — possible valve seal failure",
+                    id(valve_seal_fast_elapsed_irr));
+                }
+              } else {
+                id(valve_seal_fast_elapsed_irr) = 0.0f;
+              }
+            } else {
+              id(valve_seal_fast_elapsed_irr) = 0.0f;
+            }
+
+  # ---------------------------------------------------------------------------
+  # FLOW SENSOR 2 — Irrigation line (GPIO38, via flow_base_irr)
+  # Same configuration as flow sensor 1. Independent fault and valve control.
+  # ---------------------------------------------------------------------------
+  - platform: copy
+    source_id: flow_base_irr
+    unit_of_measurement: 'L/min'
+    accuracy_decimals: 2
+    id: water_usage2
+    name: "Water Flow Rate - Irrigation"
+    device_class: volume_flow_rate
+    state_class: measurement
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 4
+    filters:
+      - lambda: return (x / 396);
+      - sliding_window_moving_average:
+          window_size: 30
+          send_every: 1
+      - exponential_moving_average:
+          alpha: 0.2
+          send_every: 1
+    on_value:
+      then:
+        # --- Check 1: Burst pipe high flow fault ---
+        - lambda: |-
+            if (!id(fault_irrigation) && x > id(burst_threshold_irr).state) {
+              if (id(alert_high_flow_irr)) {
+                id(fault_irrigation) = true;
+                id(fault_reason_irr_str) = "High flow — burst pipe";
+                id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+                ESP_LOGW("safety", "IRRIGATION: high flow fault — %.2f L/min exceeds %.1f L/min threshold",
+                  x, id(burst_threshold_irr).state);
+              } else {
+                ESP_LOGD("safety", "IRRIGATION: high flow detected (%.2f L/min) — alert disabled", x);
+              }
+            }
+        # Guarded by the closed end stop so valve.close is only called once.
+        - if:
+            condition:
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state;'
+            then:
+              - valve.close: irrigation_water_valve
+
+        # --- Check 2: Trickle flow detection ---
+        # Same logic as main circuit — operates independently on irrigation line.
+        - lambda: |-
+            if (!id(trickle_alert_irr) && id(alert_trickle_irr)) {
+              float min_flow = id(trickle_min_flow_irr).state;
+              float max_flow = id(trickle_max_flow_irr).state;
+              if (x >= min_flow && x <= max_flow) {
+                id(trickle_elapsed_irr) += 1.0f;
+                float threshold_secs = id(trickle_duration_irr).state * 60.0f;
+                if (id(trickle_elapsed_irr) >= threshold_secs) {
+                  id(trickle_alert_irr) = true;
+                  id(trickle_elapsed_irr) = 0.0f;
+                  ESP_LOGW("trickle", "IRRIGATION: sustained low flow alert — %.2f L/min for %.0f min "
+                    "(band: %.2f–%.2f L/min)",
+                    x, id(trickle_duration_irr).state, min_flow, max_flow);
+                }
+              } else {
+                if (id(trickle_elapsed_irr) > 0.0f) {
+                  id(trickle_elapsed_irr) = 0.0f;
+                }
+              }
+            }
+        - if:
+            condition:
+              lambda: 'return id(trickle_alert_irr) && id(trickle_shutoff_irr) && !id(closed_end_stop_valve2).state;'
+            then:
+              - valve.close: irrigation_water_valve
+
+        # --- Check 3: Valve seal check ---
+        # Same logic as main circuit — operates independently on irrigation line.
+        - lambda: |-
+            if (id(closed_end_stop_valve2).state) {
+              if (x > 0.02f) {
+                id(valve_seal_elapsed_irr) += 1.0f;
+                if (!id(valve_seal_alert_irr) && id(valve_seal_elapsed_irr) >= 90.0f) {
+                  id(valve_seal_alert_irr) = true;
+                  ESP_LOGW("seal", "IRRIGATION: flow detected %.0fs after valve closed — "
+                    "possible valve seal failure (%.2f L/min)",
+                    id(valve_seal_elapsed_irr), x);
+                }
+              } else {
+                if (id(valve_seal_alert_irr)) {
+                  id(valve_seal_alert_irr) = false;
+                  ESP_LOGI("seal", "IRRIGATION: valve seal alert cleared — flow has stopped");
+                }
+                id(valve_seal_elapsed_irr) = 0.0f;
+              }
+            } else {
+              id(valve_seal_elapsed_irr) = 0.0f;
+              id(valve_seal_alert_irr) = false;
+            }
+
+
+# =============================================================================
+# WATER VOLUME SENSORS — Cumulative consumption per circuit
+#
+# The integration platform converts flow rate (L/min) to cumulative volume (L)
+# by integrating over time. Two sensors per circuit:
+#   _total  — monotonically increasing lifetime total (never resets on the ESP)
+#             state_class: total_increasing makes HA treat it as a utility meter,
+#             enabling the Energy dashboard and long-term statistics.
+#             HA utility_meter helpers (configured separately in HA) derive the
+#             daily and weekly reset totals from this entity.
+#
+# time_unit: min — because flow rate is in L/min, integration over minutes
+# gives litres directly (L/min × min = L).
+#
+# restore: true — the running total survives ESP reboots via NVS flash.
+# accuracy_decimals: 2 — 10mL resolution, sufficient for household tracking.
+#
+# device_class: water + state_class: total_increasing — exposes these to the
+# HA Energy dashboard and enables long-term statistics (daily/monthly/yearly
+# totals that survive recorder purge cycles).
+# =============================================================================
+  - platform: integration
+    name: "Water Volume Total - Main"
+    id: water_volume_total_main
+    sensor: water_usage1
+    time_unit: min
+    unit_of_measurement: "L"
+    device_class: water
+    state_class: total_increasing
+    accuracy_decimals: 2
+    restore: true
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 49
+
+  - platform: integration
+    name: "Water Volume Total - Irrigation"
+    id: water_volume_total_irr
+    sensor: water_usage2
+    time_unit: min
+    unit_of_measurement: "L"
+    device_class: water
+    state_class: total_increasing
+    accuracy_decimals: 2
+    restore: true
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 49
+
+# =============================================================================
+# TEXT SENSORS — Leak test results
+# Persists the last result of each leak test as a human-readable string.
+# The underlying integer is stored in a restore_value global so the result
+# survives an ESP reboot and is immediately visible in HA on reconnect.
+# HA records full history so past results are always retrievable.
+# The text sensor updates within 5 seconds of any result change.
+# =============================================================================
+text_sensor:
+  - platform: template
+    name: "Leak Test Result - Main"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 8
+    id: leak_test_result_sensor_main
+    icon: mdi:clipboard-check-outline
+    update_interval: 5s
+    lambda: |-
+      switch (id(leak_test_result_main)) {
+        case 1: return {"In progress"};
+        case 2: return {"Passed — no leak detected"};
+        case 3: return {"Failed — leak detected"};
+        case 4: return {"Aborted — external pressure influence"};
+        case 5: return {"Stopped manually"};
+        case 6: return {"Not run — valve was closed (open valve first)"};
+        case 7: return {"Not run — fault active (reset fault first)"};
+        case 8: return {"Preparing — closing valve and settling"};
+        case 9: return {"Aborted — demand detected (sudden pressure drop)"};
+        default: return {"No test run"};
+      }
+
+  - platform: template
+    name: "Leak Test Result - Irrigation"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 8
+    id: leak_test_result_sensor_irr
+    icon: mdi:clipboard-check-outline
+    update_interval: 5s
+    lambda: |-
+      switch (id(leak_test_result_irr)) {
+        case 1: return {"In progress"};
+        case 2: return {"Passed — no leak detected"};
+        case 3: return {"Failed — leak detected"};
+        case 4: return {"Aborted — external pressure influence"};
+        case 5: return {"Stopped manually"};
+        case 6: return {"Not run — valve was closed (open valve first)"};
+        case 7: return {"Not run — fault active (reset fault first)"};
+        case 8: return {"Preparing — closing valve and settling"};
+        case 9: return {"Aborted — demand detected (sudden pressure drop)"};
+        default: return {"No test run"};
+      }
+
+  # ---------------------------------------------------------------------------
+  # FAULT REASON SENSORS — Main and Irrigation
+  #
+  # Reports why the last safety fault was raised. Updated immediately when a
+  # fault fires (via publish_state), and polled every 5s from the global so HA
+  # receives the value even after a reconnect or missed WebSocket event.
+  #
+  # Possible values:
+  #   ""                                         — no fault since last reset
+  #   "High flow — burst pipe (instant)"         — raw pulse burst >1.5× threshold
+  #   "High flow — burst pipe"                   — smoothed flow >threshold
+  #   "Rapid pressure drop — possible burst pipe"— 5s pressure window exceeded
+  #   "Leak test failed — pressure decay detected"
+  #   "Motor fault — open end stop not reached"
+  #   "Motor fault — closed end stop not reached"
+  #
+  # entity_category: diagnostic keeps it off the main HA overview.
+  # Matched by the water signature add-on via pattern "fault reason.*main".
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Fault Reason - Main"
+    id: fault_reason_main
+    entity_category: diagnostic
+    icon: mdi:alert-circle-outline
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 5.5
+    update_interval: 5s
+    lambda: 'return {id(fault_reason_main_str)};'
+
+  - platform: template
+    name: "Fault Reason - Irrigation"
+    id: fault_reason_irr
+    entity_category: diagnostic
+    icon: mdi:alert-circle-outline
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 5.5
+    update_interval: 5s
+    lambda: 'return {id(fault_reason_irr_str)};'
+
+# =============================================================================
+# BINARY SENSORS
+# Includes: flow indicators, fault status, leak test status, trickle alerts,
+#           end stops
+# =============================================================================
+binary_sensor:
+  # ---------------------------------------------------------------------------
+  # FLOW ONSET SENSORS — Main and Irrigation
+  #
+  # ESPHome 2026.4+ no longer allows multiple components on the same physical
+  # GPIO pin. The previous GPIO binary sensor approach (sharing GPIO38/39 with
+  # the pulse counters) no longer compiles.
+  #
+  # Replacement: template binary sensors derived from the smoothed flow rate.
+  # These transition ON when the flow rate exceeds the noise floor (0.02 L/min)
+  # and stay ON for 8 seconds after the last above-threshold reading.
+  #
+  # Timing note: these sensors update every 1 second (the pulse counter rate).
+  # Flow onset detection now has up to ~1s latency rather than the near-
+  # instantaneous first-pulse response of the previous GPIO approach. In
+  # practice this is acceptable because HA WebSocket event timestamps already
+  # carry 1-2s delivery jitter, so sub-second propagation delay measurement
+  # via the HA event stream was not achievable anyway.
+  #
+  # The water signature add-on uses these to detect event start/end and
+  # pair with pressure_main_fast state_changed events for propagation delay
+  # estimation at ~1s resolution.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    id: flow_pulse_onset_main
+    name: "Flow Pulse Onset - Main"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 46
+    # Uses the raw base pulse counter (> 0 means at least one pulse in the
+    # last 1s window) rather than the smoothed flow rate. This gives a
+    # cleaner onset signal — a single pulse definitely registers, with no
+    # risk of the smoothing window masking a low-flow event.
+    lambda: 'return id(flow_base_main).state > 0;'
+    filters:
+      - delayed_off: 8s
+
+  - platform: template
+    id: flow_pulse_onset_irr
+    name: "Flow Pulse Onset - Irrigation"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 46
+    lambda: 'return id(flow_base_irr).state > 0;'
+    filters:
+      - delayed_off: 8s
+
+  # ---------------------------------------------------------------------------
+  # FLOW INDICATORS
+  # Boolean "is water flowing right now?" view, derived from the smoothed
+  # pulse counter — no separate GPIO sensor, no shared pin.
+  #
+  # Threshold 0.02 L/min is below any real flow but above floating-point zero.
+  # The 30s sliding window upstream means the indicator stays ON for ~30s
+  # after flow physically stops, replicating the original delayed_off: 25s
+  # behaviour without needing the binary sensor's debounce.
+  #
+  # entity_category: diagnostic — kept for HA automations that need an
+  # immediate boolean signal, but tucked away from default dashboards because
+  # the flow rate sensor already conveys the same information numerically.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    id: flow_indicator1
+    name: "Water Flowing - Main"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 45
+    lambda: 'return id(water_usage1).state > 0.02;'
+
+  - platform: template
+    id: flow_indicator2
+    name: "Water Flowing - Irrigation"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 45
+    lambda: 'return id(water_usage2).state > 0.02;'
+
+  # ---------------------------------------------------------------------------
+  # FAULT STATUS SENSORS
+  # device_class: problem shows a warning icon in HA and enables actionable
+  # mobile push notifications.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Safety Fault - Main"
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 5
+    lambda: 'return id(fault_main);'
+    device_class: problem
+
+  - platform: template
+    name: "Safety Fault - Irrigation"
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 5
+    lambda: 'return id(fault_irrigation);'
+    device_class: problem
+
+  # Indicates whether leak test mode is active on each circuit
+  - platform: template
+    name: "Leak Test Active - Main"
+    entity_category: diagnostic
+    device_class: running
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 7
+    lambda: 'return id(leak_test_active_main) || id(leak_test_preparing_main);'
+
+  - platform: template
+    name: "Leak Test Active - Irrigation"
+    entity_category: diagnostic
+    device_class: running
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 7
+    lambda: 'return id(leak_test_active_irr) || id(leak_test_preparing_irr);'
+
+  # ---------------------------------------------------------------------------
+  # TRICKLE FLOW ALERT SENSORS
+  # Exposed with device_class: problem so they appear as warning entities in HA
+  # and can drive mobile push notifications.
+  #
+  # Suggested HA automation: send an actionable notification with options:
+  #   "Acknowledge" — presses "Reset Trickle Alert" button, valve stays open
+  #   "Shut off"    — presses "Reset Trickle Alert" then calls valve.close
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Trickle Flow Alert - Main"
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 6
+    lambda: 'return id(trickle_alert_main);'
+    device_class: problem
+
+  - platform: template
+    name: "Trickle Flow Alert - Irrigation"
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 6
+    lambda: 'return id(trickle_alert_irr);'
+    device_class: problem
+
+  # ---------------------------------------------------------------------------
+  # VALVE SEAL ALERT SENSORS
+  # Fires when the closed end stop is active but flow is still detected after
+  # 90 seconds. Indicates the valve has not fully seated. Auto-clears when
+  # flow drops to zero. device_class: problem triggers HA warning icon and
+  # can drive mobile push notifications.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Valve Seal Alert - Main"
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 85
+    lambda: 'return id(valve_seal_alert_main);'
+    device_class: problem
+
+  - platform: template
+    name: "Valve Seal Alert - Irrigation"
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 85
+    lambda: 'return id(valve_seal_alert_irr);'
+    device_class: problem
+
+  # ---------------------------------------------------------------------------
+  # END STOP SWITCHES — Valve 1 (Main)
+  # Physical microswitches that close when the valve reaches fully open or
+  # fully closed position. Pins use internal pullup — switch closes to GND.
+  # on_press fires only on the leading edge (valve arriving at position).
+  # ---------------------------------------------------------------------------
+  - platform: gpio
+    pin:
+      number: GPIO16
+      mode:
+        input: true
+        pullup: true
+    id: open_end_stop_valve1
+    name: "Open End Stop - Main"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 9
+    on_press:
+      then:
+        - output.turn_on: led_open_valve1
+        - output.turn_off: led_closed_valve1
+        - valve.template.publish:
+            id: main_water_valve
+            state: OPEN
+        # Valve has reached the open position — any prior close-in-flight is
+        # moot. Clear the guard so future closes can proceed normally even if
+        # a previous close failed and left the guard set.
+        - lambda: 'id(close_in_flight_main) = false;'
+
+  - platform: gpio
+    pin:
+      number: GPIO15
+      mode:
+        input: true
+        pullup: true
+    id: closed_end_stop_valve1
+    name: "Closed End Stop - Main"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 10
+    on_press:
+      then:
+        - output.turn_on: led_closed_valve1
+        - output.turn_off: led_open_valve1
+        - valve.template.publish:
+            id: main_water_valve
+            state: CLOSED
+        # Valve has reached the closed position — clear the close-in-flight
+        # guard so future closes can be requested again if needed.
+        - lambda: 'id(close_in_flight_main) = false;'
+
+  # ---------------------------------------------------------------------------
+  # END STOP SWITCHES — Valve 2 (Irrigation)
+  # Same configuration and behaviour as Valve 1 end stops.
+  # ---------------------------------------------------------------------------
+  - platform: gpio
+    pin:
+      number: GPIO18
+      mode:
+        input: true
+        pullup: true
+    id: open_end_stop_valve2
+    name: "Open End Stop - Irrigation"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 9
+    on_press:
+      then:
+        - output.turn_on: led_open_valve2
+        - output.turn_off: led_closed_valve2
+        - valve.template.publish:
+            id: irrigation_water_valve
+            state: OPEN
+        - lambda: 'id(close_in_flight_irr) = false;'
+
+  - platform: gpio
+    pin:
+      number: GPIO17
+      mode:
+        input: true
+        pullup: true
+    id: closed_end_stop_valve2
+    name: "Closed End Stop - Irrigation"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 10
+    on_press:
+      then:
+        - output.turn_on: led_closed_valve2
+        - output.turn_off: led_open_valve2
+        - valve.template.publish:
+            id: irrigation_water_valve
+            state: CLOSED
+        - lambda: 'id(close_in_flight_irr) = false;'
+
+# =============================================================================
+# OUTPUTS — Panel indicator LEDs
+# =============================================================================
+output:
+  - platform: gpio
+    pin: GPIO07
+    id: led_open_valve1    # Green: Main valve fully open
+
+  - platform: gpio
+    pin: GPIO04
+    id: led_closed_valve1  # Red: Main valve fully closed
+
+  - platform: gpio
+    pin: GPIO06
+    id: led_open_valve2    # Green: Irrigation valve fully open
+
+  - platform: gpio
+    pin: GPIO05
+    id: led_closed_valve2  # Red: Irrigation valve fully closed
+
+# =============================================================================
+# NUMBER ENTITIES — Adjustable thresholds and durations
+# All values persist across reboots (restore_value: yes).
+# =============================================================================
+number:
+  # ---------------------------------------------------------------------------
+  # BURST PIPE HIGH FLOW THRESHOLD
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Burst Pipe Flow Threshold - Main"
+    entity_category: config
+    device_class: volume_flow_rate
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 1
+    id: burst_threshold_main
+    icon: mdi:pipe-leak
+    unit_of_measurement: "L/min"
+    min_value: 5
+    max_value: 30
+    step: 0.5
+    initial_value: 25
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Main burst pipe flow threshold set to %.1f L/min"
+          args: ['x']
+
+  - platform: template
+    name: "Burst Pipe Flow Threshold - Irrigation"
+    entity_category: config
+    device_class: volume_flow_rate
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 1
+    id: burst_threshold_irr
+    icon: mdi:pipe-leak
+    unit_of_measurement: "L/min"
+    min_value: 5
+    max_value: 30
+    step: 0.5
+    initial_value: 25
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Irrigation burst pipe flow threshold set to %.1f L/min"
+          args: ['x']
+
+  # ---------------------------------------------------------------------------
+  # RAPID PRESSURE DROP THRESHOLD
+  #
+  # Maximum allowable pressure drop in a 5-second window before a fault is
+  # raised (or, during a leak test, the test is aborted with code 9).
+  #
+  # Tuning guidance:
+  #   - Set well above the largest drop seen during normal heavy demand
+  #     (filling a bath, irrigation zone start, dishwasher fill). Watch the
+  #     "(Averaged)" pressure entity in HA over a few days to find a baseline.
+  #   - Set well below the drop expected from a burst pipe — typically 15+
+  #     PSI as the system attempts to maintain flow into a wide-open break.
+  #   - Default 10 PSI is a reasonable starting point for a typical mains
+  #     supply. Lower it (5-7 PSI) for sensitive detection if your system
+  #     pressure is stable; raise it (15-20 PSI) if you see false trips on
+  #     normal demand events.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Pressure Drop Threshold - Main"
+    entity_category: config
+    device_class: pressure
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 12
+    id: pressure_drop_threshold_main
+    icon: mdi:gauge-low
+    unit_of_measurement: "PSI"
+    min_value: 2
+    max_value: 30
+    step: 0.5
+    initial_value: 10
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Main pressure drop threshold set to %.1f PSI"
+          args: ['x']
+
+  - platform: template
+    name: "Pressure Drop Threshold - Irrigation"
+    entity_category: config
+    device_class: pressure
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 12
+    id: pressure_drop_threshold_irr
+    icon: mdi:gauge-low
+    unit_of_measurement: "PSI"
+    min_value: 2
+    max_value: 30
+    step: 0.5
+    initial_value: 10
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Irrigation pressure drop threshold set to %.1f PSI"
+          args: ['x']
+
+  # ---------------------------------------------------------------------------
+  # LEAK TEST PRESSURE THRESHOLD AND DURATION
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Leak Test Pressure Threshold - Main"
+    entity_category: config
+    device_class: pressure
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 6
+    id: leak_threshold_psi_main
+    icon: mdi:gauge
+    unit_of_measurement: "PSI"
+    min_value: 0.5
+    max_value: 20.0
+    step: 0.5
+    initial_value: 3.0
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Main leak pressure threshold set to %.1f PSI"
+          args: ['x']
+
+  - platform: template
+    name: "Leak Test Pressure Threshold - Irrigation"
+    entity_category: config
+    device_class: pressure
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 6
+    id: leak_threshold_psi_irr
+    icon: mdi:gauge
+    unit_of_measurement: "PSI"
+    min_value: 0.5
+    max_value: 20.0
+    step: 0.5
+    initial_value: 3.0
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Irrigation leak pressure threshold set to %.1f PSI"
+          args: ['x']
+
+  - platform: template
+    name: "Leak Test Duration - Main"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 7
+    id: leak_duration_main
+    icon: mdi:timer-outline
+    unit_of_measurement: "min"
+    min_value: 3
+    max_value: 30
+    step: 1
+    initial_value: 10
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Main leak test duration set to %.0f minutes"
+          args: ['x']
+
+  - platform: template
+    name: "Leak Test Duration - Irrigation"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 7
+    id: leak_duration_irr
+    icon: mdi:timer-outline
+    unit_of_measurement: "min"
+    min_value: 3
+    max_value: 30
+    step: 1
+    initial_value: 10
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Irrigation leak test duration set to %.0f minutes"
+          args: ['x']
+
+  # ---------------------------------------------------------------------------
+  # TRICKLE FLOW THRESHOLDS AND DURATION — Main circuit
+  #
+  # The alert fires when smoothed flow stays continuously within the band
+  # defined by min and max thresholds for the full alert duration.
+  #
+  # Min threshold — lower edge of the trickle band. Flow below this is treated
+  #   as no flow and the timer resets. Set just above your flow meter's noise
+  #   floor at zero flow. Default: 0.1 L/min. Range: 0.05–5 L/min.
+  #
+  # Max threshold — upper edge of the trickle band. Flow above this is treated
+  #   as intentional demand (shower, tap running, irrigation zone) and the timer
+  #   resets. Set below the lowest single-fixture demand in normal use.
+  #   Default: 3.0 L/min. Range: 0.5–15 L/min.
+  #
+  # Duration — minutes of uninterrupted in-band flow required to fire the alert.
+  #   Set high enough to clear normal brief low-flow events such as a toilet
+  #   cistern refilling (~1–2 min) without triggering. Default: 90 min.
+  #   Range: 1–120 min.
+  #
+  # Example reference values:
+  #   Running toilet (flapper leak):  ~0.1–1.5 L/min continuously
+  #   Dripping tap:                   ~0.05–0.3 L/min (may be below meter range)
+  #   Tap left barely open:           ~0.5–3.0 L/min
+  #   Toilet cistern refilling:       ~0.5–2.0 L/min for 1–2 minutes then stops
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Trickle Flow Min Threshold - Main"
+    entity_category: config
+    device_class: volume_flow_rate
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 2
+    id: trickle_min_flow_main
+    icon: mdi:water-minus
+    unit_of_measurement: "L/min"
+    min_value: 0.05
+    max_value: 5.0
+    step: 0.05
+    initial_value: 0.1
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Main trickle min flow threshold set to %.2f L/min"
+          args: ['x']
+
+  - platform: template
+    name: "Trickle Flow Max Threshold - Main"
+    entity_category: config
+    device_class: volume_flow_rate
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 3
+    id: trickle_max_flow_main
+    icon: mdi:water-plus
+    unit_of_measurement: "L/min"
+    min_value: 0.5
+    max_value: 15.0
+    step: 0.5
+    initial_value: 3.0
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Main trickle max flow threshold set to %.1f L/min"
+          args: ['x']
+
+  - platform: template
+    name: "Trickle Flow Alert Duration - Main"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 4
+    id: trickle_duration_main
+    icon: mdi:timer-sand
+    unit_of_measurement: "min"
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 90
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Main trickle alert duration set to %.0f minutes"
+          args: ['x']
+
+  # ---------------------------------------------------------------------------
+  # TRICKLE FLOW THRESHOLDS AND DURATION — Irrigation circuit
+  # Same parameters as main circuit, independently adjustable.
+  #
+  # Note: irrigation solenoids can have small bleeder flows (~0.1–0.5 L/min)
+  # even when nominally closed. The default min threshold of 0.1 L/min sits
+  # at the low end of that range and may produce continuous false alerts on
+  # a system with measurable bleed. On first run, watch the irrigation flow
+  # rate at idle (no zone active) for a few hours; if you see sustained flow
+  # above 0.1 L/min, raise this threshold above the observed bleed rate.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Trickle Flow Min Threshold - Irrigation"
+    entity_category: config
+    device_class: volume_flow_rate
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 2
+    id: trickle_min_flow_irr
+    icon: mdi:water-minus
+    unit_of_measurement: "L/min"
+    min_value: 0.05
+    max_value: 5.0
+    step: 0.05
+    initial_value: 0.1
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Irrigation trickle min flow threshold set to %.2f L/min"
+          args: ['x']
+
+  - platform: template
+    name: "Trickle Flow Max Threshold - Irrigation"
+    entity_category: config
+    device_class: volume_flow_rate
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 3
+    id: trickle_max_flow_irr
+    icon: mdi:water-plus
+    unit_of_measurement: "L/min"
+    min_value: 0.5
+    max_value: 15.0
+    step: 0.5
+    initial_value: 3.0
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Irrigation trickle max flow threshold set to %.1f L/min"
+          args: ['x']
+
+  - platform: template
+    name: "Trickle Flow Alert Duration - Irrigation"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 4
+    id: trickle_duration_irr
+    icon: mdi:timer-sand
+    unit_of_measurement: "min"
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 90
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Irrigation trickle alert duration set to %.0f minutes"
+          args: ['x']
+
+# =============================================================================
+# SWITCHES
+# Includes: relay coil GPIO switches, leak test switches, trickle auto-shutoff
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# RELAY COIL SWITCHES — Two-coil polarized bistable (latching) relays
+#
+# Relay type: two-coil, polarized, bistable
+#
+#   "Two-coil"   — separate SET and RESET coils; one drives the relay to its
+#                  OPEN contact, the other drives it to its CLOSED contact.
+#
+#   "Polarized"  — each coil requires current in the correct direction.
+#                  Reversing polarity or cross-energising both coils
+#                  simultaneously can burn out the windings.
+#
+#   "Bistable"   — the relay holds its contact position mechanically with no
+#                  continuous power until the opposite coil is pulsed.
+#
+# *** CRITICAL: Both coils must NEVER be energised at the same time. ***
+# The valve action sequences enforce this with a mandatory inter-coil gap:
+#   turn_off opposite coil → delay 20ms → turn_on drive coil → delay 15ms → turn_off
+#
+# Timing derived from TE RT424F12 datasheet:
+#   Operate time (SET coil):   max 10ms
+#   Reset time (RESET coil):   max  5ms
+#   Inter-coil gap used:            20ms — 2x operate time
+#   Coil pulse used:                15ms — satisfies both specs with margin
+#
+# No restore_mode set: GPIO state is irrelevant after a power cycle —
+# the bistable relay stays latched in its last position regardless.
+# ---------------------------------------------------------------------------
+switch:
+  - platform: gpio
+    pin: GPIO48
+    name: "Relay Open Valve 1"
+    id: relay_open_valve1
+    internal: true
+
+  - platform: gpio
+    pin: GPIO47
+    name: "Relay Closed Valve 1"
+    id: relay_closed_valve1
+    internal: true
+
+  - platform: gpio
+    pin: GPIO14
+    name: "Relay Open Valve 2"
+    id: relay_open_valve2
+    internal: true
+
+  - platform: gpio
+    pin: GPIO21
+    name: "Relay Closed Valve 2"
+    id: relay_closed_valve2
+    internal: true
+
+  # ---------------------------------------------------------------------------
+  # MICRO LEAK TEST — Main circuit
+  #
+  # How to use:
+  #   1. Ensure the main valve is OPEN and no fault is active.
+  #   2. Enable this switch — the ESP closes the valve automatically, waits
+  #      60 seconds for the pressure EMA to settle, then begins monitoring.
+  #   3. When the test ends (pass, fail, or abort) the valve is automatically
+  #      restored to open. If a safety fault fires during the test, the valve
+  #      stays closed — the fault takes precedence.
+  #   4. Disable the switch at any time to stop the test early and restore.
+  #
+  # The lambda shows ON during both the prepare and active phases.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Micro Leak Test - Main"
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 13
+    icon: mdi:water-alert
+    lambda: 'return id(leak_test_active_main) || id(leak_test_preparing_main);'
+    turn_on_action:
+      - script.execute: leak_test_run_main
+    turn_off_action:
+      - script.stop: leak_test_run_main
+      - lambda: |-
+          if (id(leak_test_active_main) || id(leak_test_preparing_main)) {
+            id(leak_test_result_main) = 5;  // Stopped manually
+          }
+          id(leak_test_active_main) = false;
+          id(leak_test_preparing_main) = false;
+          id(leak_test_elapsed_main) = 0.0f;
+          ESP_LOGI("leak_test", "Main leak test manually stopped.");
+      - script.execute: leak_test_restore_main
+
+  # ---------------------------------------------------------------------------
+  # MICRO LEAK TEST — Irrigation circuit
+  # Same as main — see main comments above for full usage instructions.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Micro Leak Test - Irrigation"
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 13
+    icon: mdi:water-alert
+    lambda: 'return id(leak_test_active_irr) || id(leak_test_preparing_irr);'
+    turn_on_action:
+      - script.execute: leak_test_run_irr
+    turn_off_action:
+      - script.stop: leak_test_run_irr
+      - lambda: |-
+          if (id(leak_test_active_irr) || id(leak_test_preparing_irr)) {
+            id(leak_test_result_irr) = 5;  // Stopped manually
+          }
+          id(leak_test_active_irr) = false;
+          id(leak_test_preparing_irr) = false;
+          id(leak_test_elapsed_irr) = 0.0f;
+          ESP_LOGI("leak_test", "Irrigation leak test manually stopped.");
+      - script.execute: leak_test_restore_irr
+
+  # ---------------------------------------------------------------------------
+  # ALERT ENABLE SWITCHES
+  # Each switch enables or disables a specific alert for one circuit.
+  # Disabling an alert suppresses the fault and valve action but the detection
+  # logic still runs and logs — so you can re-enable at any time without missing
+  # context. All default to ON. State persists across reboots.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Enable Pressure Drop Alert - Main"
+    entity_category: config
+    id: enable_pressure_drop_main
+    icon: mdi:gauge-low
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 8
+    lambda: 'return id(alert_pressure_drop_main);'
+    turn_on_action:
+      - lambda: 'id(alert_pressure_drop_main) = true;'
+    turn_off_action:
+      - lambda: 'id(alert_pressure_drop_main) = false;'
+
+  - platform: template
+    name: "Enable High Flow Alert - Main"
+    entity_category: config
+    id: enable_high_flow_main
+    icon: mdi:water-alert
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 9
+    lambda: 'return id(alert_high_flow_main);'
+    turn_on_action:
+      - lambda: 'id(alert_high_flow_main) = true;'
+    turn_off_action:
+      - lambda: 'id(alert_high_flow_main) = false;'
+
+  - platform: template
+    name: "Enable Leak Test Alert - Main"
+    entity_category: config
+    id: enable_leak_test_main
+    icon: mdi:water-check
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 10
+    lambda: 'return id(alert_leak_test_main);'
+    turn_on_action:
+      - lambda: 'id(alert_leak_test_main) = true;'
+    turn_off_action:
+      - lambda: 'id(alert_leak_test_main) = false;'
+
+  - platform: template
+    name: "Enable Trickle Alert - Main"
+    entity_category: config
+    id: enable_trickle_main
+    icon: mdi:water-minus
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 11
+    lambda: 'return id(alert_trickle_main);'
+    turn_on_action:
+      - lambda: 'id(alert_trickle_main) = true;'
+    turn_off_action:
+      - lambda: 'id(alert_trickle_main) = false;'
+
+  - platform: template
+    name: "Enable Pressure Drop Alert - Irrigation"
+    entity_category: config
+    id: enable_pressure_drop_irr
+    icon: mdi:gauge-low
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 8
+    lambda: 'return id(alert_pressure_drop_irr);'
+    turn_on_action:
+      - lambda: 'id(alert_pressure_drop_irr) = true;'
+    turn_off_action:
+      - lambda: 'id(alert_pressure_drop_irr) = false;'
+
+  - platform: template
+    name: "Enable High Flow Alert - Irrigation"
+    entity_category: config
+    id: enable_high_flow_irr
+    icon: mdi:water-alert
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 9
+    lambda: 'return id(alert_high_flow_irr);'
+    turn_on_action:
+      - lambda: 'id(alert_high_flow_irr) = true;'
+    turn_off_action:
+      - lambda: 'id(alert_high_flow_irr) = false;'
+
+  - platform: template
+    name: "Enable Leak Test Alert - Irrigation"
+    entity_category: config
+    id: enable_leak_test_irr
+    icon: mdi:water-check
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 10
+    lambda: 'return id(alert_leak_test_irr);'
+    turn_on_action:
+      - lambda: 'id(alert_leak_test_irr) = true;'
+    turn_off_action:
+      - lambda: 'id(alert_leak_test_irr) = false;'
+
+  - platform: template
+    name: "Enable Trickle Alert - Irrigation"
+    entity_category: config
+    id: enable_trickle_irr
+    icon: mdi:water-minus
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 11
+    lambda: 'return id(alert_trickle_irr);'
+    turn_on_action:
+      - lambda: 'id(alert_trickle_irr) = true;'
+    turn_off_action:
+      - lambda: 'id(alert_trickle_irr) = false;'
+
+  # ---------------------------------------------------------------------------
+  # TRICKLE FLOW AUTO-SHUTOFF — Main circuit
+  #
+  # When ON:  the main valve closes automatically when the trickle alert fires.
+  #           After resetting the alert, the valve can be re-opened normally —
+  #           no safety fault is raised, so no fault reset is needed.
+  #
+  # When OFF: the alert still fires and appears in HA (and can drive
+  #           notifications/automations), but the valve is left open. Useful
+  #           when you want to be notified but prefer to decide manually.
+  #
+  # The preference is backed by a restore_value global and persists across
+  # reboots — set it once and it is remembered.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Trickle Flow Auto-Shutoff - Main"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 5
+    id: trickle_shutoff_switch_main
+    icon: mdi:water-off
+    lambda: 'return id(trickle_shutoff_main);'
+    turn_on_action:
+      - lambda: |-
+          id(trickle_shutoff_main) = true;
+          ESP_LOGI("trickle", "Main trickle flow auto-shutoff ENABLED");
+    turn_off_action:
+      - lambda: |-
+          id(trickle_shutoff_main) = false;
+          ESP_LOGI("trickle", "Main trickle flow auto-shutoff DISABLED");
+
+  # ---------------------------------------------------------------------------
+  # TRICKLE FLOW AUTO-SHUTOFF — Irrigation circuit
+  #
+  # Same as main circuit. Note: irrigation systems run at low flow rates by
+  # design — if auto-shutoff is enabled here, set the trickle band carefully
+  # above your normal irrigation zone flow rates to avoid false shutoffs.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Trickle Flow Auto-Shutoff - Irrigation"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 5
+    id: trickle_shutoff_switch_irr
+    icon: mdi:water-off
+    lambda: 'return id(trickle_shutoff_irr);'
+    turn_on_action:
+      - lambda: |-
+          id(trickle_shutoff_irr) = true;
+          ESP_LOGI("trickle", "Irrigation trickle flow auto-shutoff ENABLED");
+    turn_off_action:
+      - lambda: |-
+          id(trickle_shutoff_irr) = false;
+          ESP_LOGI("trickle", "Irrigation trickle flow auto-shutoff DISABLED");
+
+# =============================================================================
+# BUTTONS — One-shot actions
+#
+# All reset actions are buttons (not switches) — they are stateless one-shot
+# events. Buttons appear in HA as momentary push buttons, not toggles.
+#
+# SAFETY FAULT RESETS
+#   Require deliberate acknowledgement. Verify the cause has been resolved
+#   before resetting. Valve open is blocked until fault is cleared.
+#
+#   IMPORTANT: If the fault was caused by a failed close (closed end stop
+#   not reached), resetting the fault alone is NOT enough — you must also
+#   open the valve afterward to clear the close-in-flight guard. See the
+#   CLOSE-IN-FLIGHT GUARD GLOBALS comment near the top of this file for
+#   the full recovery procedure.
+#
+# TRICKLE ALERT RESETS
+#   Separate from safety faults. Resetting does not block the valve —
+#   it clears the flag and restarts the elapsed timer. If auto-shutoff
+#   closed the valve, re-open it manually after resetting the alert.
+# =============================================================================
+button:
+  - platform: template
+    name: "Reset Safety Fault - Main"
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 11
+    icon: mdi:restore-alert
+    on_press:
+      - lambda: |-
+          id(fault_main) = false;
+          id(fault_reason_main_str) = "";
+          id(fault_reason_main).publish_state("");
+      - logger.log: "Main safety fault manually reset"
+
+  - platform: template
+    name: "Reset Safety Fault - Irrigation"
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 11
+    icon: mdi:restore-alert
+    on_press:
+      - lambda: |-
+          id(fault_irrigation) = false;
+          id(fault_reason_irr_str) = "";
+          id(fault_reason_irr).publish_state("");
+      - logger.log: "Irrigation safety fault manually reset"
+
+  - platform: template
+    name: "Reset Trickle Alert - Main"
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 12
+    icon: mdi:water-check
+    on_press:
+      - lambda: |-
+          id(trickle_alert_main) = false;
+          id(trickle_elapsed_main) = 0.0f;
+          ESP_LOGI("trickle", "Main trickle flow alert manually reset");
+
+  - platform: template
+    name: "Reset Trickle Alert - Irrigation"
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 12
+    icon: mdi:water-check
+    on_press:
+      - lambda: |-
+          id(trickle_alert_irr) = false;
+          id(trickle_elapsed_irr) = 0.0f;
+          ESP_LOGI("trickle", "Irrigation trickle flow alert manually reset");
+
+# =============================================================================
+# SCRIPTS — Leak test sequences
+#
+# Scripts are used for the leak test because they:
+#   - Can be stopped mid-execution (script.stop cancels the settle delay cleanly)
+#   - Run asynchronously so they don't block the sensor loop
+#   - Can call valve actions (open/close) with the full action sequence
+#
+# Two scripts per circuit:
+#   leak_test_run     — full test sequence (pre-checks, close, settle, monitor)
+#   leak_test_restore — open valve if no fault is active; called by all outcomes
+# =============================================================================
+script:
+  # ---------------------------------------------------------------------------
+  # LEAK TEST RUN — Main circuit
+  # Pre-checks valve state and fault, closes valve, waits 60s for EMA to settle,
+  # then activates monitoring. If cancelled during settle, restore is called by
+  # the turn_off_action which stops this script before calling restore.
+  # ---------------------------------------------------------------------------
+  - id: leak_test_run_main
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: closed_end_stop_valve1
+          then:
+            - lambda: |-
+                id(leak_test_result_main) = 6;  // Not run — valve was closed
+                ESP_LOGW("leak_test", "MAIN: test not started — valve is already closed. "
+                  "Open the valve first so the line is pressurised.");
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(fault_main);'
+                then:
+                  - lambda: |-
+                      id(leak_test_result_main) = 7;  // Not run — fault active
+                      ESP_LOGW("leak_test", "MAIN: test not started — safety fault is active. "
+                        "Reset the fault first.");
+                else:
+                  # Pre-checks passed — begin sequence
+                  - lambda: |-
+                      id(leak_test_preparing_main) = true;
+                      id(leak_test_result_main) = 8;  // Preparing
+                      ESP_LOGI("leak_test", "MAIN: closing valve and waiting 60s for pressure to settle...");
+                  - valve.close: main_water_valve
+                  # 60-second settle — allows residual pressure dynamics
+                  # (water hammer, thermal expansion, residual flow) to
+                  # dissipate after the valve closes, so the baseline reading
+                  # captured next is stable and noise-free.
+                  - delay: 60s
+                  # Guard: if cancelled during settle, preparing will be false
+                  - lambda: |-
+                      if (!id(leak_test_preparing_main)) return;
+                      id(leak_test_preparing_main) = false;
+                      id(leak_test_elapsed_main) = 0.0f;
+                      id(leak_test_baseline_main) = id(pressure_main).state;
+                      id(leak_test_active_main) = true;
+                      id(leak_test_result_main) = 1;  // In progress
+                      ESP_LOGI("leak_test", "MAIN: test started. Baseline: %.1f PSI, "
+                        "Threshold: %.1f PSI, Duration: %.0f min",
+                        id(leak_test_baseline_main),
+                        id(leak_threshold_psi_main).state,
+                        id(leak_duration_main).state);
+
+  # ---------------------------------------------------------------------------
+  # LEAK TEST RESTORE — Main circuit
+  # Opens the main valve if no safety fault is active. Called by every test
+  # outcome — the fault guard ensures a concurrent high-flow fault (which closed
+  # the valve for a real reason) is not overridden by the restore.
+  # ---------------------------------------------------------------------------
+  - id: leak_test_restore_main
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(fault_main);'
+          then:
+            - valve.open: main_water_valve
+            - logger.log:
+                level: INFO
+                tag: leak_test
+                format: "MAIN: valve restored to open after leak test"
+
+  # ---------------------------------------------------------------------------
+  # LEAK TEST RUN — Irrigation circuit
+  # Same sequence as main circuit.
+  # ---------------------------------------------------------------------------
+  - id: leak_test_run_irr
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: closed_end_stop_valve2
+          then:
+            - lambda: |-
+                id(leak_test_result_irr) = 6;  // Not run — valve was closed
+                ESP_LOGW("leak_test", "IRRIGATION: test not started — valve is already closed. "
+                  "Open the valve first so the line is pressurised.");
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(fault_irrigation);'
+                then:
+                  - lambda: |-
+                      id(leak_test_result_irr) = 7;  // Not run — fault active
+                      ESP_LOGW("leak_test", "IRRIGATION: test not started — safety fault is active. "
+                        "Reset the fault first.");
+                else:
+                  - lambda: |-
+                      id(leak_test_preparing_irr) = true;
+                      id(leak_test_result_irr) = 8;  // Preparing
+                      ESP_LOGI("leak_test", "IRRIGATION: closing valve and waiting 60s for pressure to settle...");
+                  - valve.close: irrigation_water_valve
+                  - delay: 60s
+                  - lambda: |-
+                      if (!id(leak_test_preparing_irr)) return;
+                      id(leak_test_preparing_irr) = false;
+                      id(leak_test_elapsed_irr) = 0.0f;
+                      id(leak_test_baseline_irr) = id(pressure_irrigation).state;
+                      id(leak_test_active_irr) = true;
+                      id(leak_test_result_irr) = 1;  // In progress
+                      ESP_LOGI("leak_test", "IRRIGATION: test started. Baseline: %.1f PSI, "
+                        "Threshold: %.1f PSI, Duration: %.0f min",
+                        id(leak_test_baseline_irr),
+                        id(leak_threshold_psi_irr).state,
+                        id(leak_duration_irr).state);
+
+  # ---------------------------------------------------------------------------
+  # LEAK TEST RESTORE — Irrigation circuit
+  # ---------------------------------------------------------------------------
+  - id: leak_test_restore_irr
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(fault_irrigation);'
+          then:
+            - valve.open: irrigation_water_valve
+            - logger.log:
+                level: INFO
+                tag: leak_test
+                format: "IRRIGATION: valve restored to open after leak test"
+
+# =============================================================================
+# VALVES
+# Template valves provide the Home Assistant valve entity for each circuit.
+#
+# State reporting (lambda):
+#   - Returns OPEN if the open end stop is active (valve fully open)
+#   - Returns CLOSED if the closed end stop is active (valve fully closed)
+#   - Returns unknown {} if neither end stop is active (mid-travel or
+#     position not yet confirmed after boot)
+#
+# Open action sequence:
+#   1. Check fault flag — block open if fault active, log a warning
+#   2. De-energise RESET (close) coil — ensures it is fully off
+#   3. Wait 20ms — mandatory inter-coil gap (2x the RT424F12 max operate time)
+#   4. Pulse SET coil 15ms then de-energise — relay latches, motor starts
+#   5. Wait 15000ms — allow time for full valve travel
+#      (increase if spurious end-stop-timeout faults occur at low temperature
+#      or low supply voltage; decrease if your motor travels much faster)
+#   6. Check open end stop — if not active, raise fault, publish CLOSED
+#
+# Close action (always permitted — safety action, no fault check):
+#   Same sequence in reverse. Fault raised if closed end stop not reached.
+#
+# Relay coil timing (TE RT424F12):
+#   SET operate time: max 10ms  |  RESET time: max 5ms
+#   Pulse used: 15ms  |  Inter-coil gap: 20ms
+# =============================================================================
+valve:
+  - platform: template
+    name: "Main Water Valve"
+    device_class: water
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 1
+    id: main_water_valve
+    lambda: |-
+      if (id(open_end_stop_valve1).state) return VALVE_OPEN;
+      if (id(closed_end_stop_valve1).state) return VALVE_CLOSED;
+      return {};
+    open_action:
+      - if:
+          condition:
+            lambda: 'return id(fault_main);'
+          then:
+            - logger.log:
+                level: WARN
+                format: "Main valve open blocked — safety fault active. Reset fault first."
+          else:
+            - switch.turn_off: relay_closed_valve1
+            - delay: 20ms
+            - switch.turn_on: relay_open_valve1
+            - delay: 15ms
+            - switch.turn_off: relay_open_valve1
+            - delay: 15000ms
+            - if:
+                condition:
+                  binary_sensor.is_off: open_end_stop_valve1
+                then:
+                  - lambda: |-
+                      id(fault_main) = true;
+                      id(fault_reason_main_str) = "Motor fault — open end stop not reached";
+                      id(fault_reason_main).publish_state(id(fault_reason_main_str));
+                      ESP_LOGE("valve", "MAIN: open end stop not reached after 15000ms — motor/wiring fault");
+                  - valve.template.publish:
+                      id: main_water_valve
+                      state: CLOSED
+    close_action:
+      # Guard against repeated valve.close calls while a close is already
+      # in flight. The guard is set on first entry, cleared when the open
+      # or closed end stop fires (see end stop on_press handlers above).
+      # If a close fails (end stop never reached) the guard stays set —
+      # opening the valve later clears it via the open end stop on_press.
+      - if:
+          condition:
+            lambda: 'return id(close_in_flight_main);'
+          then:
+            - logger.log:
+                level: DEBUG
+                tag: valve
+                format: "MAIN: close already in flight — ignoring duplicate request"
+          else:
+            - lambda: 'id(close_in_flight_main) = true;'
+            - switch.turn_off: relay_open_valve1
+            - delay: 20ms
+            - switch.turn_on: relay_closed_valve1
+            - delay: 15ms
+            - switch.turn_off: relay_closed_valve1
+            - delay: 15000ms
+            - if:
+                condition:
+                  binary_sensor.is_off: closed_end_stop_valve1
+                then:
+                  - lambda: |-
+                      id(fault_main) = true;
+                      id(fault_reason_main_str) = "Motor fault — closed end stop not reached";
+                      id(fault_reason_main).publish_state(id(fault_reason_main_str));
+                      ESP_LOGE("valve", "MAIN: closed end stop not reached after 15000ms — motor/wiring fault");
+
+  - platform: template
+    name: "Irrigation Water Valve"
+    device_class: water
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 1
+    id: irrigation_water_valve
+    lambda: |-
+      if (id(open_end_stop_valve2).state) return VALVE_OPEN;
+      if (id(closed_end_stop_valve2).state) return VALVE_CLOSED;
+      return {};
+    open_action:
+      - if:
+          condition:
+            lambda: 'return id(fault_irrigation);'
+          then:
+            - logger.log:
+                level: WARN
+                format: "Irrigation valve open blocked — safety fault active. Reset fault first."
+          else:
+            - switch.turn_off: relay_closed_valve2
+            - delay: 20ms
+            - switch.turn_on: relay_open_valve2
+            - delay: 15ms
+            - switch.turn_off: relay_open_valve2
+            - delay: 15000ms
+            - if:
+                condition:
+                  binary_sensor.is_off: open_end_stop_valve2
+                then:
+                  - lambda: |-
+                      id(fault_irrigation) = true;
+                      id(fault_reason_irr_str) = "Motor fault — open end stop not reached";
+                      id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+                      ESP_LOGE("valve", "IRRIGATION: open end stop not reached after 15000ms — motor/wiring fault");
+                  - valve.template.publish:
+                      id: irrigation_water_valve
+                      state: CLOSED
+    close_action:
+      # See main valve close_action for explanation of the close-in-flight guard.
+      - if:
+          condition:
+            lambda: 'return id(close_in_flight_irr);'
+          then:
+            - logger.log:
+                level: DEBUG
+                tag: valve
+                format: "IRRIGATION: close already in flight — ignoring duplicate request"
+          else:
+            - lambda: 'id(close_in_flight_irr) = true;'
+            - switch.turn_off: relay_open_valve2
+            - delay: 20ms
+            - switch.turn_on: relay_closed_valve2
+            - delay: 15ms
+            - switch.turn_off: relay_closed_valve2
+            - delay: 15000ms
+            - if:
+                condition:
+                  binary_sensor.is_off: closed_end_stop_valve2
+                then:
+                  - lambda: |-
+                      id(fault_irrigation) = true;
+                      id(fault_reason_irr_str) = "Motor fault — closed end stop not reached";
+                      id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+                      ESP_LOGE("valve", "IRRIGATION: closed end stop not reached after 15000ms — motor/wiring fault");

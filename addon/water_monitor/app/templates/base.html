@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>💧 Water Monitor</title>
+  <link rel="stylesheet" href="{{ ingress_path }}/static/styles.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="app-title">💧 Water Monitor</div>
+    <div class="conn-status" id="conn-status">● Connected</div>
+  </header>
+
+  <nav class="app-nav">
+    <a href="{{ ingress_path }}/"         class="nav-item {% if page == 'dashboard' %}active{% endif %}">Dashboard</a>
+    <a href="{{ ingress_path }}/device"   class="nav-item {% if page == 'device' %}active{% endif %}">Device</a>
+    <a href="{{ ingress_path }}/history"  class="nav-item {% if page == 'history' %}active{% endif %}">History</a>
+    <a href="{{ ingress_path }}/fixtures" class="nav-item {% if page == 'fixtures' %}active{% endif %}">Fixtures</a>
+    <a href="{{ ingress_path }}/settings" class="nav-item {% if page == 'settings' %}active{% endif %}">Settings</a>
+    <a href="{{ ingress_path }}/backup"   class="nav-item {% if page == 'backup'   %}active{% endif %}">Backup</a>
+  </nav>
+
+  <main class="app-main">
+    {% block content %}{% endblock %}
+  </main>
+
+  <script>window.INGRESS_PATH = {{ ingress_path|tojson }};
+  window.UNITS = {
+    flow_factor:        {{ flow_factor }},
+    flow_unit:          {{ flow_unit|tojson }},
+    flow_decimals:      {{ flow_decimals }},
+    vol_factor:         {{ vol_factor }},
+    vol_unit:           {{ vol_unit|tojson }},
+    vol_decimals:       {{ vol_decimals }},
+    pressure_factor:    {{ pressure_factor }},
+    pressure_unit:      {{ pressure_unit|tojson }},
+    pressure_decimals:  {{ pressure_decimals }},
+  };</script>
+  <script src="{{ ingress_path }}/static/app.js"></script>
+  <script>
+  // Auto-inject CSRF token into every HTML form on the page
+  (function() {
+    const token = {{ csrf_token|tojson if csrf_token else '""' }};
+    if (!token) return;
+    document.addEventListener('DOMContentLoaded', () => {
+      document.querySelectorAll('form[method="post"],form[method="POST"]').forEach(f => {
+        if (!f.querySelector('input[name="_csrf"]')) {
+          const inp = document.createElement('input');
+          inp.type = 'hidden';
+          inp.name = '_csrf';
+          inp.value = token;
+          f.prepend(inp);
+        }
+      });
+    });
+  })();
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

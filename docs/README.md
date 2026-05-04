@@ -1,0 +1,1 @@
+# Hardware documentation\n\nSee firmware/esp-water-shut-off-3_4.yaml for the current ESPHome configuration.

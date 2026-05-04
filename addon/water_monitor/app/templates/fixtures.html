@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="page-title">Fixtures</h1>
+
+<div class="placeholder-card">
+  <div class="placeholder-icon">🔧</div>
+  <h2>Coming in Phase 2</h2>
+  <p>
+    Fixture recognition uses your collected event data to automatically
+    discover and classify the fixtures and appliances in your home.
+  </p>
+  <p>
+    Once enough events have been collected during training, this page
+    will show:
+  </p>
+  <ul>
+    <li>Automatically discovered fixture types and their signatures</li>
+    <li>Tools to name and correct automatic classifications</li>
+    <li>Per-fixture usage statistics and trend data</li>
+    <li>Manual entry for low-flow appliances (ice maker, humidifier, fridge)</li>
+  </ul>
+  <p class="muted">
+    In the meantime, event data is being collected and stored.
+    Check the History page to see detected events.
+  </p>
+</div>
+{% endblock %}
