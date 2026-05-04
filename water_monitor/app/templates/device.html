@@ -177,11 +177,6 @@
                    value="{{ c.schedule.run_minute or 0 }}" style="width:4rem">
           </div>
           <div class="form-row">
-            <label>Quiet period (min)</label>
-            <input type="number" name="quiet_period_minutes" min="5" max="60"
-                   value="{{ c.schedule.quiet_period_minutes or 30 }}" style="width:5rem">
-          </div>
-          <div class="form-row">
             <label>Notify on pass</label>
             <input type="checkbox" name="notify_on_pass"
                    {% if c.schedule.notify_on_pass != False %}checked{% endif %}>
