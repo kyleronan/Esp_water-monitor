@@ -1,5 +1,5 @@
 name: "Water Monitor"
-version: "0.1.2"
+version: "0.2.0-dev"
 slug: water_monitor
 description: >-
   Intelligent water monitoring with fixture signature recognition,

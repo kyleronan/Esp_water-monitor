@@ -116,6 +116,8 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- Display unit preferences (keys match units.FLOW_OPTIONS / PRESSURE_OPTIONS)
     flow_unit               TEXT DEFAULT 'L/min',
     pressure_unit           TEXT DEFAULT 'psi',
+    -- Phase 2.1 fixture publishing
+    publish_fixtures_to_ha  INTEGER DEFAULT 1,
     -- Mobile push notification targets (comma-separated HA notify service names)
     mobile_notify_targets   TEXT DEFAULT '',
     -- HA presence tracking — auto-toggle away mode from HA entity state changes.
@@ -226,14 +228,19 @@ CREATE TABLE IF NOT EXISTS alert_config (
 -- FIXTURES (Phase 2 — created now to avoid future migrations)
 -- ==========================================================================
 CREATE TABLE IF NOT EXISTS fixtures (
-    id          TEXT PRIMARY KEY,
-    circuit     TEXT NOT NULL,
-    name        TEXT,
-    auto_name   TEXT,
-    confirmed   BOOLEAN DEFAULT 0,
-    notes       TEXT,
-    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    id            TEXT PRIMARY KEY,
+    circuit       TEXT NOT NULL,
+    name          TEXT,
+    auto_name     TEXT,
+    confirmed     BOOLEAN DEFAULT 0,
+    notes         TEXT,
+    -- Phase 2.1 additions (Path C)
+    fixture_type  TEXT,         -- from fixtures.FIXTURE_TYPES
+    display_name  TEXT,         -- may differ from `name` for HA entity slug
+    user_locked   INTEGER DEFAULT 0,
+    publish_to_ha INTEGER DEFAULT 1,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS fixture_signatures (
@@ -247,6 +254,76 @@ CREATE TABLE IF NOT EXISTS fixture_signatures (
     p95         REAL,
     PRIMARY KEY (fixture_id, feature)
 );
+
+-- ==========================================================================
+-- FIXTURE CLUSTERS (Phase 2.1) — raw DBSTREAM clustering output
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS fixture_clusters (
+    id                    INTEGER NOT NULL,
+    circuit               TEXT NOT NULL,
+    centroid              TEXT NOT NULL,        -- JSON dict of feature means
+    feature_std           TEXT NOT NULL,        -- JSON dict of feature stddevs
+    transient_template    TEXT,                 -- JSON list, NULL until enough members
+    member_count          INTEGER DEFAULT 0,
+    suggested_type        TEXT,                 -- from fixtures.suggest_fixture_type
+    suggested_confidence  REAL DEFAULT 0,
+    confidence_level      TEXT DEFAULT 'preliminary',  -- preliminary/learning/confirmed
+    fixture_id            TEXT REFERENCES fixtures(id) ON DELETE SET NULL,
+    is_compound           INTEGER DEFAULT 0,    -- 2.3 placeholder
+    component_cluster_ids TEXT,                 -- 2.3 placeholder, JSON list
+    publish_to_ha         INTEGER DEFAULT 1,
+    created_at            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_match_at         TIMESTAMP,
+    PRIMARY KEY (circuit, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_clusters_circuit
+    ON fixture_clusters (circuit);
+CREATE INDEX IF NOT EXISTS idx_clusters_fixture
+    ON fixture_clusters (fixture_id);
+
+-- ==========================================================================
+-- CLUSTER CO-OCCURRENCE (Phase 2.1) — sequence boost for fixture matching
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS cluster_cooccurrence (
+    circuit             TEXT NOT NULL,
+    from_cluster_id     INTEGER NOT NULL,
+    to_cluster_id       INTEGER NOT NULL,
+    count               INTEGER DEFAULT 0,
+    median_gap_seconds  REAL,
+    last_seen_at        TIMESTAMP,
+    PRIMARY KEY (circuit, from_cluster_id, to_cluster_id)
+);
+
+-- ==========================================================================
+-- CLUSTER SEQUENCES (Phase 2.2 placeholder, empty in 2.1)
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS cluster_sequences (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit           TEXT NOT NULL,
+    pattern_hash      TEXT,
+    event_chain       TEXT,                 -- JSON list of cluster IDs
+    occurrence_count  INTEGER DEFAULT 0,
+    confidence        REAL DEFAULT 0,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
+-- CLUSTER METRICS HISTORY — rolling cluster quality stats
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS cluster_metrics_history (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    measured_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    circuit               TEXT NOT NULL,
+    cluster_count         INTEGER,
+    coverage_pct          REAL,
+    avg_purity            REAL,
+    avg_stability         REAL,
+    unmatched_recent_24h  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_metrics_circuit_ts
+    ON cluster_metrics_history (circuit, measured_at);
 
 -- ==========================================================================
 -- EVENT LOG
