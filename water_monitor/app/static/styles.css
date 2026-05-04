@@ -46,6 +46,8 @@
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
+*::before, *::after { box-sizing: border-box; }
+
 body {
   font-family: var(--font);
   background: var(--bg); color: var(--text);
@@ -61,10 +63,9 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* ── Layout / Chrome ─────────────────────────────────────────────────
-   Header is 52px sticky bar; nav is a horizontal tab strip with
-   active tab marked by a 2px accent underline (per design spec).
-   ────────────────────────────────────────────────────────────────── */
+/* ============================================================
+   Layout / Chrome — header + nav (Page 1 of design refresh)
+   ============================================================ */
 
 .app-header {
   display: flex; align-items: center; justify-content: space-between;
@@ -108,7 +109,6 @@ body {
   overflow-x: auto;
   padding: 0 16px;
   gap: 2px;
-  /* Hide horizontal scrollbar on overflow without breaking scroll */
   scrollbar-width: none;
 }
 .app-nav::-webkit-scrollbar { display: none; }
@@ -125,12 +125,10 @@ body {
   text-transform: capitalize;
   letter-spacing: .005em;
   border-bottom: 2px solid transparent;
-  margin-bottom: -1px;       /* overlap nav border so the underline aligns */
+  margin-bottom: -1px;
   transition: color .12s;
 }
-.nav-item:hover {
-  color: var(--text);
-}
+.nav-item:hover { color: var(--text); }
 .nav-item.active {
   color: var(--accent);
   font-weight: 600;
@@ -148,154 +146,85 @@ body {
   margin-bottom: 16px;
 }
 
-/* ── Cards ────────────────────────────────────────────────────────── */
-.circuit-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 1rem; margin-bottom: 1.5rem;
-}
-.circuit-card {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 1rem;
-  box-shadow: var(--shadow);
-}
-.circuit-card.fault { border-color: var(--red); }
-.circuit-card.warn  { border-color: var(--amber); }
-
-.circuit-card-header {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: .75rem;
-}
-.circuit-card-header h2 { font-size: 1rem; font-weight: 700; }
-.circuit-type-badge {
-  font-size: .7rem; text-transform: uppercase; letter-spacing: .05em;
-  background: var(--bg); border: 1px solid var(--border);
-  padding: .1rem .4rem; border-radius: 999px; color: var(--muted);
-}
-
-.alert-banner {
-  padding: .4rem .7rem; border-radius: 6px; font-size: .82rem;
-  margin-bottom: .75rem; display: flex; align-items: center;
-  justify-content: space-between;
-}
-.alert-ok   { background: var(--green-bg); color: var(--green-text); }
-.alert-warn { background: var(--amber-bg); color: var(--amber-text); }
-.alert-fault{ background: var(--red-bg); color: var(--red-text); }
-
-.readings-row {
-  display: flex; gap: 1rem; margin-bottom: .75rem;
-  align-items: center;
-}
-.reading { display: flex; align-items: baseline; gap: .3rem; }
-.reading-value { font-size: 1.1rem; font-weight: 600; }
-.reading-unit  { font-size: .75rem; color: var(--muted); }
-
-.valve-indicator { font-size: 1rem; }
-.valve-open   { color: var(--green); }
-.valve-closed { color: var(--red); }
-.valve-unknown { color: var(--muted); }
-
-.valve-controls { margin-bottom: .75rem; display: flex; gap: .5rem; }
-
-.volume-row {
-  display: flex; gap: 1.5rem; margin-bottom: .75rem;
-  padding: .5rem 0; border-top: 1px solid var(--border);
-}
-.volume-stat { display: flex; flex-direction: column; }
-.volume-label { font-size: .72rem; color: var(--muted); text-transform: uppercase; }
-.volume-value { font-size: 1rem; font-weight: 600; }
-
-.leak-test-row {
-  display: flex; align-items: center; justify-content: space-between;
-  font-size: .8rem;
-}
-
-/* ── Status pills ─────────────────────────────────────────────────── */
-.status-pill {
+/* ============================================================
+   Pill component (inline status badges)
+   ============================================================ */
+.pill {
   display: inline-flex; align-items: center; gap: .25rem;
   padding: 2px 9px; border-radius: 999px;
   font-size: 11px; font-weight: 600; letter-spacing: .01em;
   white-space: nowrap; line-height: 1.4;
+  background: var(--surface-2); color: var(--text-2);
+  border: 1px solid var(--border);
 }
-.status-ok       { background: var(--green-bg);   color: var(--green-text); }
-.status-warn     { background: var(--red-bg);     color: var(--red-text); }
-.status-running  { background: var(--accent-bg2); color: var(--accent); }
-.status-neutral  { background: var(--surface-2);  color: var(--text-2);
-                   border: 1px solid var(--border); }
+.pill-lg { padding: 4px 12px; font-size: 12px; }
 
-/* ── Charts ───────────────────────────────────────────────────────── */
-.chart-section {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 1rem; margin-bottom: 1rem;
+.pill-green   { background: var(--green-bg);  color: var(--green-text); border-color: transparent; }
+.pill-amber   { background: var(--amber-bg);  color: var(--amber-text); border-color: transparent; }
+.pill-red     { background: var(--red-bg);    color: var(--red-text);   border-color: transparent; }
+.pill-blue    { background: var(--accent-bg2);color: var(--accent);     border-color: transparent; }
+.pill-neutral { /* default */ }
+
+/* ============================================================
+   Form control polish
+   ============================================================ */
+input[type="text"],
+input[type="number"],
+input[type="date"],
+input[type="time"],
+input[type="email"],
+input[type="password"],
+select,
+textarea {
+  font-family: var(--font);
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: .35rem .5rem;
+  font-size: 13px;
+  transition: border-color .12s, box-shadow .12s;
+}
+input[type="text"]:focus,
+input[type="number"]:focus,
+input[type="date"]:focus,
+input[type="time"]:focus,
+input[type="email"]:focus,
+input[type="password"]:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+input[disabled] {
+  background: var(--surface-2);
+  color: var(--text-3);
+  cursor: not-allowed;
+}
+
+/* ============================================================
+   Headings
+   ============================================================ */
+h1, h2, h3, h4 { letter-spacing: -.02em; }
+
+/* ============================================================
+   Misc utilities
+   ============================================================ */
+.muted { color: var(--text-3); font-size: .82rem; }
+
+/* ============================================================
+   Refined cards / shadows on shared card classes
+   ============================================================ */
+.settings-card,
+.history-card {
   box-shadow: var(--shadow);
 }
-.chart-header {
-  display: flex; justify-content: space-between; align-items: center;
-  margin-bottom: .75rem;
-}
-.chart-header h3 { font-size: .9rem; font-weight: 600; }
-.chart-total { font-size: .85rem; color: var(--muted); }
-.chart-wrap { position: relative; height: 160px; }
+.settings-card { border-radius: var(--radius); }
 
-/* ── Training progress ────────────────────────────────────────────── */
-.training-section {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 1rem; margin-bottom: 1rem;
-}
-.training-header {
-  display: flex; justify-content: space-between;
-  margin-bottom: .5rem; font-size: .85rem;
-}
-.training-label { font-weight: 600; }
-.progress-bar {
-  height: 8px; background: var(--bg); border-radius: 999px;
-  border: 1px solid var(--border); overflow: hidden; margin-bottom: .3rem;
-}
-.progress-fill {
-  height: 100%; width: 0; background: var(--accent); border-radius: 999px;
-  transition: width .5s ease;
-}
-.progress-pct { font-size: .75rem; color: var(--muted); }
-
-/* ── Buttons ──────────────────────────────────────────────────────── */
-.btn {
-  display: inline-flex; align-items: center; gap: .3rem;
-  padding: .4rem .9rem; border-radius: 6px; font-size: .85rem;
-  font-weight: 500; cursor: pointer; border: none; transition: filter .15s;
-}
-.btn:hover { filter: brightness(.95); }
-.btn:active { transform: translateY(1px); }
-.btn:disabled { opacity: .5; cursor: not-allowed; }
-.btn-primary { background: var(--accent); color: white; }
-.btn-danger  { background: var(--red); color: white; }
-.btn-warning { background: var(--amber); color: white; }
-.btn-secondary { background: var(--bg); color: var(--text);
-                 border: 1px solid var(--border); }
-.btn-sm { padding: .2rem .6rem; font-size: .75rem; }
-
-/* ── Device page ──────────────────────────────────────────────────── */
-.device-section {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 1rem; margin-bottom: 1rem;
-}
-.device-section h2 { font-size: 1rem; font-weight: 700; margin-bottom: .75rem; }
-.status-strip {
-  display: flex; gap: 1rem; align-items: center; font-size: .85rem;
-  padding: .5rem; background: var(--bg); border-radius: 6px;
-  margin-bottom: .75rem;
-}
 .control-row { display: flex; gap: .5rem; margin-bottom: .75rem;
                flex-wrap: wrap; }
-.device-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 1rem; margin-top: .75rem;
-}
-.device-card {
-  background: var(--bg); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: .75rem;
-}
-.device-card h3 { font-size: .85rem; font-weight: 600; margin-bottom: .75rem; }
-
 .toggle-row {
   display: flex; align-items: center; justify-content: space-between;
   padding: .35rem 0; border-bottom: 1px solid var(--border);
@@ -317,16 +246,6 @@ body {
 }
 input:checked + .toggle-slider { background: var(--accent); }
 input:checked + .toggle-slider:before { transform: translateX(16px); }
-
-.threshold-row {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: .3rem 0; border-bottom: 1px solid var(--border); font-size: .82rem;
-}
-.threshold-row:last-child { border-bottom: none; }
-.threshold-input input {
-  width: 80px; padding: .2rem .4rem; text-align: right;
-  border: 1px solid var(--border); border-radius: 4px; font-size: .82rem;
-}
 
 /* ── Settings page ────────────────────────────────────────────────── */
 .settings-section {
@@ -392,39 +311,10 @@ input:checked + .toggle-slider:before { transform: translateX(16px); }
 
 details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
                   margin-bottom: .5rem; user-select: none; }
-.advanced-details, .recal-details, .schedule-details {
+.advanced-details, .recal-details {
   margin-top: .75rem; padding: .75rem;
   background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
 }
-.schedule-form { display: flex; flex-direction: column; gap: .5rem; }
-
-/* Schedule rows: stacked label-above-field for narrow device cards */
-.schedule-row {
-  display: flex; flex-direction: column; gap: .2rem;
-  font-size: .82rem;
-}
-.schedule-row > label { color: var(--muted); font-size: .78rem; }
-.schedule-row select,
-.schedule-row input[type=number] {
-  padding: .3rem .4rem; border: 1px solid var(--border); border-radius: 4px;
-  font-size: .85rem; width: 100%; box-sizing: border-box;
-}
-
-/* Inline rows for checkboxes — label and toggle on one line */
-.schedule-row-inline {
-  flex-direction: row; align-items: center; justify-content: space-between;
-  padding: .15rem 0;
-}
-.schedule-row-inline > label { font-size: .82rem; }
-
-/* Time row — hour:minute side-by-side */
-.schedule-time {
-  display: flex; align-items: center; gap: .3rem;
-}
-.schedule-time input[type=number] {
-  width: 3.2rem; flex: 0 0 auto; text-align: center;
-}
-.schedule-time span { color: var(--muted); }
 
 /* ── History page ─────────────────────────────────────────────────── */
 .history-section { background: var(--surface); border: 1px solid var(--border);
@@ -1027,16 +917,26 @@ textarea:focus {
 }
 
 /* ============================================================
-   Button refinements (override flat colors with token-based)
+   Buttons — base rules + variants
    ============================================================ */
 .btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
   font-family: var(--font);
   font-weight: 500;
+  font-size: 13px;
   letter-spacing: -.005em;
-  transition: filter .12s, transform .08s;
+  cursor: pointer;
+  border: none;
+  transition: filter .12s, transform .08s, opacity .12s;
 }
+.btn:disabled { cursor: not-allowed; opacity: .5; }
 .btn:hover:not(:disabled) { filter: brightness(.93); }
 .btn:active:not(:disabled) { transform: translateY(1px); }
+
+.btn-sm  { padding: 4px 10px; font-size: 12px; }
+.btn-lg  { padding: 10px 20px; font-size: 15px; }
 
 .btn-primary {
   background: var(--accent);
@@ -1054,6 +954,11 @@ textarea:focus {
 .btn-warning {
   background: var(--amber);
   color: #fff;
+}
+.btn-ghost {
+  background: transparent;
+  color: var(--text-2);
+  border: 1px solid var(--border);
 }
 
 /* ============================================================
@@ -1348,4 +1253,279 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .dash-chart-canvas-wrap {
   position: relative;
   height: 140px;
+}
+
+
+/* ============================================================
+   Restored shared rules (used by setup.html, settings.html, etc.)
+   that were inadvertently deleted in the device-page CSS cleanup.
+   These are kept here to avoid an even larger reshuffle.
+   ============================================================ */
+
+/* Status pills (legacy class — used by setup, settings) */
+.status-pill {
+  display: inline-flex; align-items: center; gap: .25rem;
+  padding: 2px 9px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; letter-spacing: .01em;
+  white-space: nowrap; line-height: 1.4;
+}
+.status-ok       { background: var(--green-bg);   color: var(--green-text); }
+.status-warn     { background: var(--red-bg);     color: var(--red-text); }
+.status-running  { background: var(--accent-bg2); color: var(--accent); }
+.status-neutral  { background: var(--surface-2);  color: var(--text-2);
+                   border: 1px solid var(--border); }
+.status-training { background: var(--accent-bg2); color: var(--accent); }
+
+/* Alert banners (legacy — used by setup, settings) */
+.alert-banner {
+  padding: .4rem .7rem; border-radius: 6px; font-size: .82rem;
+  margin-bottom: .75rem; display: flex; align-items: center;
+  justify-content: space-between;
+}
+.alert-ok   { background: var(--green-bg); color: var(--green-text); }
+.alert-warn { background: var(--amber-bg); color: var(--amber-text); }
+.alert-fault{ background: var(--red-bg); color: var(--red-text); }
+
+/* Away banner (legacy — settings page) */
+.away-banner {
+  background: var(--amber-bg); color: var(--amber-text);
+  border: 1px solid var(--amber);
+  border-radius: var(--radius);
+  padding: .65rem 1rem; margin-bottom: 1rem;
+  font-size: .88rem; display: flex;
+  align-items: center; gap: .75rem;
+}
+.away-banner-link { color: var(--amber-text); font-weight: 600; }
+.away-status-row {
+  display: flex; justify-content: space-between;
+  align-items: center; gap: 1rem; flex-wrap: wrap;
+}
+
+/* Valve indicator (legacy — referenced in case any template still uses it) */
+.valve-indicator { font-size: 1rem; }
+.valve-open   { color: var(--green); }
+.valve-closed { color: var(--red); }
+.valve-unknown { color: var(--muted); }
+
+/* ============================================================
+   DEVICE PAGE — design refresh page 3/7
+   ============================================================ */
+
+.dev-page-title {
+  font-size: 20px; font-weight: 700; letter-spacing: -.02em;
+  margin-bottom: 20px;
+  color: var(--text);
+}
+
+/* Per-circuit card — surface bg, 20px padding, 16px gap between cards */
+.dev-circuit-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 16px;
+  box-shadow: var(--shadow);
+}
+
+/* Card header — name on left, valve pill + mono readings on right */
+.dev-card-header {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.dev-card-title {
+  font-size: 16px; font-weight: 700; letter-spacing: -.01em;
+  color: var(--text);
+}
+.dev-card-readings {
+  display: flex; align-items: center; gap: 10px;
+  flex-wrap: wrap;
+}
+.dev-reading-mono {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+.dev-valve-dot {
+  font-size: 9px;
+  line-height: 1;
+}
+.dev-valve-open    { color: var(--green); }
+.dev-valve-closed  { color: var(--red); }
+.dev-valve-unknown { color: var(--text-3); }
+
+/* Fault banner — red left-border, body + reset button row */
+.dev-fault-banner {
+  border-left: 3px solid var(--red);
+  background: var(--red-bg);
+  border-radius: 0 8px 8px 0;
+  padding: 10px 14px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.dev-fault-body { flex: 1; }
+.dev-fault-title {
+  font-weight: 700; font-size: 13px;
+  color: var(--red-text);
+  margin-bottom: 3px;
+}
+.dev-fault-detail {
+  font-size: 12px;
+  color: var(--red-text);
+  opacity: .85;
+}
+.dev-fault-muted { font-style: italic; opacity: .65; }
+
+/* Valve control row */
+.dev-valve-controls {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+/* Micro Leak Test sub-card on surface-2 */
+.dev-leak-card {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.dev-leak-header {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.dev-leak-title {
+  font-size: 13px; font-weight: 700; letter-spacing: -.01em;
+  color: var(--text);
+}
+.dev-leak-status {
+  display: flex; align-items: center; gap: 8px;
+}
+
+.dev-leak-actions {
+  display: flex; gap: 8px;
+  margin-bottom: 16px;
+}
+
+/* Schedule details (collapsed by default) */
+.dev-schedule-details {
+  margin-top: 4px;
+}
+.dev-schedule-summary {
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  user-select: none;
+  font-weight: 500;
+  list-style: none;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.dev-schedule-summary::-webkit-details-marker { display: none; }
+.dev-schedule-summary::before {
+  content: '▸';
+  font-size: 10px;
+  transition: transform .15s;
+}
+.dev-schedule-details[open] > .dev-schedule-summary::before {
+  transform: rotate(90deg);
+}
+
+.dev-schedule-form {
+  margin-top: 12px;
+}
+
+/* Schedule grid — 2 columns on desktop, 1 on narrow */
+.dev-sched-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 4px 16px;
+}
+
+/* Each row: label on left, control on right, with bottom border */
+.dev-sched-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.dev-sched-row:last-child { border-bottom: none; }
+
+.dev-sched-label {
+  font-size: 12px;
+  color: var(--text-2);
+  font-weight: 500;
+  flex: 1;
+}
+.dev-sched-hint {
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--text-3);
+  margin-left: 4px;
+}
+
+.dev-sched-select {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: var(--font);
+  background: var(--surface);
+  color: var(--text);
+  min-width: 100px;
+}
+
+.dev-sched-time {
+  display: flex; align-items: center; gap: 4px;
+  font-family: var(--mono);
+}
+.dev-sched-time input[type=number] {
+  width: 3.2rem;
+  padding: 4px 6px;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.dev-sched-time span { color: var(--text-3); }
+
+.dev-schedule-save {
+  margin-top: 12px;
+}
+
+/* Toggle switch — 34×19 pill, accent when on, white knob ─────── */
+.dev-toggle {
+  position: relative;
+  display: inline-block;
+  width: 34px; height: 19px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.dev-toggle input[type="checkbox"] {
+  opacity: 0; width: 0; height: 0;
+  position: absolute;
+}
+.dev-toggle-track {
+  position: absolute; inset: 0;
+  background: var(--border-strong);
+  border-radius: 999px;
+  transition: background .2s;
+}
+.dev-toggle-track::before {
+  content: '';
+  position: absolute;
+  width: 14px; height: 14px;
+  left: 2.5px; top: 2.5px;
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0,0,0,.2);
+  transition: left .15s;
+}
+.dev-toggle input[type="checkbox"]:checked + .dev-toggle-track {
+  background: var(--accent);
+}
+.dev-toggle input[type="checkbox"]:checked + .dev-toggle-track::before {
+  left: 17px;
 }
