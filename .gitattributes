@@ -1,0 +1,50 @@
+# =============================================================================
+# Line ending policy for the Water Monitor repository
+# =============================================================================
+# The HA addon runs on Alpine Linux (musl + s6-overlay). Shell scripts and
+# s6 service runners MUST have LF line endings — CRLF causes the kernel to
+# try to exec `sh\r` instead of `sh` and the entire addon fails to start.
+#
+# This file forces LF on every text file regardless of the developer's OS,
+# so a Windows clone via GitHub Desktop (which defaults to autocrlf=true)
+# can't silently break the addon.
+
+# Default for everything that isn't explicitly listed below
+* text=auto eol=lf
+
+# Critical — these MUST be LF or the addon won't boot
+**/rootfs/**         text eol=lf
+**/services.d/**     text eol=lf
+*.sh                 text eol=lf
+**/run               text eol=lf
+**/finish            text eol=lf
+
+# Source code — also LF
+*.py                 text eol=lf
+*.yaml               text eol=lf
+*.yml                text eol=lf
+*.json               text eol=lf
+*.html               text eol=lf
+*.css                text eol=lf
+*.js                 text eol=lf
+*.md                 text eol=lf
+*.toml               text eol=lf
+*.txt                text eol=lf
+
+# Dockerfile and similar
+Dockerfile           text eol=lf
+.gitignore           text eol=lf
+.gitattributes       text eol=lf
+LICENSE              text eol=lf
+
+# Binary files — never normalise
+*.png                binary
+*.jpg                binary
+*.jpeg               binary
+*.gif                binary
+*.ico                binary
+*.pdf                binary
+*.zip                binary
+*.tar                binary
+*.tar.gz             binary
+*.bin                binary
