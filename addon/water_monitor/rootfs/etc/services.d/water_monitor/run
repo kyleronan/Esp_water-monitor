@@ -1,0 +1,30 @@
+#!/usr/bin/with-contenv sh
+# Read log_level from /data/options.json if it exists.
+# Avoids bashio dependency which requires a different shebang.
+OPTIONS_FILE="/data/options.json"
+LOG_LEVEL="info"
+
+if [ -f "${OPTIONS_FILE}" ]; then
+    # Extract log_level value with grep/sed — no jq or bashio needed
+    EXTRACTED=$(grep -o '"log_level"[[:space:]]*:[[:space:]]*"[^"]*"' "${OPTIONS_FILE}" \
+                | sed 's/.*"log_level"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    if [ -n "${EXTRACTED}" ]; then
+        LOG_LEVEL="${EXTRACTED}"
+    fi
+fi
+
+case "${LOG_LEVEL}" in
+    trace|debug) UVICORN_LOG="debug" ;;
+    info)        UVICORN_LOG="info" ;;
+    warning)     UVICORN_LOG="warning" ;;
+    error|fatal) UVICORN_LOG="error" ;;
+    *)           UVICORN_LOG="info" ;;
+esac
+
+cd /opt/water_monitor || exit 1
+
+exec python3 -m uvicorn app.main:app \
+    --host 0.0.0.0 \
+    --port 8765 \
+    --log-level "${UVICORN_LOG}" \
+    --no-access-log

@@ -1,0 +1,257 @@
+{% extends "base.html" %}
+{% block content %}
+
+{# ── Away mode banner ─────────────────────────────────────────────────── #}
+{% if away_mode %}
+<div class="away-banner">
+  🏖 <strong>Away mode active</strong> — baseline learning paused.
+  Leak tests and valve control are still running.
+  <a href="{{ ingress_path }}/settings#away" class="away-banner-link">
+    Disable in Settings
+  </a>
+</div>
+{% endif %}
+
+{# ── Circuit status cards ─────────────────────────────────────────── #}
+<div class="circuit-grid">
+  {% for c in circuits %}
+  <div class="circuit-card {% if c.fault_active %}fault{% elif c.trickle_active %}warn{% endif %}"
+       data-circuit="{{ c.circuit }}">
+
+    <div class="circuit-card-header">
+      <h2>{{ c.display_name }}</h2>
+      <span class="circuit-type-badge">{{ c.circuit_type }}</span>
+    </div>
+
+    {# Alert banner #}
+    {% if c.fault_active %}
+    <div class="alert-banner alert-fault">
+      <div class="alert-fault-body">
+        <span class="alert-fault-title">⚠ Safety Fault</span>
+        {% if c.fault_reason %}
+        <span class="alert-fault-reason">{{ c.fault_reason }}</span>
+        {% endif %}
+      </div>
+      <button class="btn-sm" onclick="resetFault('{{ c.circuit }}')">Reset</button>
+    </div>
+    {% elif c.trickle_active %}
+    <div class="alert-banner alert-warn">
+      ⚠ Trickle flow alert
+      <button class="btn-sm" onclick="resetTrickle('{{ c.circuit }}')">Reset</button>
+    </div>
+    {% else %}
+    <div class="alert-banner alert-ok">✓ All clear</div>
+    {% endif %}
+
+    {# Live readings #}
+    <div class="readings-row">
+      <div class="reading">
+        <span class="valve-indicator valve-{{ c.valve_state | lower }}"
+              id="valve-dot-{{ c.circuit }}">⬤</span>
+        <span class="reading-label"
+              id="valve-label-{{ c.circuit }}">{{ c.valve_state | upper }}</span>
+      </div>
+      <div class="reading">
+        <span class="reading-value" id="pressure-{{ c.circuit }}">{{ c.pressure }}</span>
+        <span class="reading-unit">{{ pressure_unit }}</span>
+      </div>
+      <div class="reading">
+        <span class="reading-value" id="flow-{{ c.circuit }}">{{ c.flow_rate }}</span>
+        <span class="reading-unit">{{ flow_unit }}</span>
+      </div>
+    </div>
+
+    {# Valve control buttons #}
+    <div class="valve-controls" id="valve-controls-{{ c.circuit }}"
+         data-fault="{{ 'true' if c.fault_active else 'false' }}"
+         data-fault-reason="{{ c.fault_reason or '' }}">
+      {% if c.valve_state == 'open' %}
+      <button class="btn btn-danger" onclick="valveClose('{{ c.circuit }}')">Close Valve</button>
+      {% elif c.valve_state == 'closed' %}
+        {% if c.fault_active %}
+        <button class="btn btn-secondary btn-fault-warn"
+                onclick="valveOpenWithFaultWarning('{{ c.circuit }}', {{ c.fault_reason|tojson if c.fault_reason else '\'\''}})">
+          Open Valve
+        </button>
+        {% else %}
+        <button class="btn btn-primary" onclick="valveOpen('{{ c.circuit }}')">Open Valve</button>
+        {% endif %}
+      {% else %}
+      <button class="btn btn-secondary" disabled>{{ c.valve_state | title }}</button>
+      {% endif %}
+    </div>
+
+    {# Volume summary #}
+    <div class="volume-row">
+      <div class="volume-stat">
+        <span class="volume-label">Daily</span>
+        <span class="volume-value">{{ c.volume_daily }} {{ vol_unit }}</span>
+      </div>
+      <div class="volume-stat">
+        <span class="volume-label">Weekly</span>
+        <span class="volume-value">{{ c.volume_weekly }} {{ vol_unit }}</span>
+      </div>
+    </div>
+
+    {# Leak test status + run button #}
+    <div class="leak-test-section">
+      <div class="leak-test-row">
+        {% if c.leak_test_active or c.leak_test_running %}
+        <span class="status-pill status-running">🔵 Leak test running</span>
+        <span class="leak-test-etc"
+              id="etc-{{ c.circuit }}"
+              data-start="{{ c.leak_test_started_at or '' }}"
+              data-duration="{{ c.leak_test_duration_secs or '' }}"
+              data-circuit="{{ c.circuit }}">
+          {{ c.leak_test_etc or "Running…" }}
+        </span>
+        {% elif c.last_leak_result %}
+        <span class="status-pill {% if 'Passed' in c.last_leak_result %}status-ok{% else %}status-warn{% endif %}">
+          {{ c.last_leak_result[:30] }}
+        </span>
+        {% else %}
+        <span class="status-pill status-neutral">No leak test run</span>
+        {% endif %}
+        {% if c.next_leak_test %}
+        <span class="muted">Next: {{ c.next_leak_test[:10] }}</span>
+        {% endif %}
+      </div>
+      {% if c.leak_test_active or c.leak_test_running %}
+      <button class="btn btn-sm btn-danger leak-test-btn"
+              onclick="abortLeakTest('{{ c.circuit }}')">
+        ✕ Abort Leak Test
+      </button>
+      {% else %}
+      <button class="btn btn-sm btn-secondary leak-test-btn"
+              onclick="runLeakTest('{{ c.circuit }}')">
+        Run Leak Test
+      </button>
+      {% endif %}
+    </div>
+
+  </div>
+  {% endfor %}
+</div>
+
+{# ── Hourly volume charts ─────────────────────────────────────────── #}
+{% for c in circuits %}
+<section class="chart-section">
+  <div class="chart-header">
+    <h3>{{ c.display_name }} — past 24 hours</h3>
+    <span class="chart-total" id="total-{{ c.circuit }}">— {{ vol_unit }} total</span>
+  </div>
+  <div class="chart-wrap">
+    <canvas id="chart-{{ c.circuit }}" height="160"></canvas>
+  </div>
+</section>
+{% endfor %}
+
+{# ── Training progress (only while calibrating) ───────────────────── #}
+{% for c in circuits %}
+{% if c.training.state == 'calibrating' %}
+<section class="training-section">
+  <div class="training-header">
+    <div>
+      <span class="training-label">🎓 {{ c.display_name }} — Learning period in progress</span>
+      {% if c.training.calibration_ends_at %}
+      <span class="training-ends muted">
+        Completes {{ c.training.calibration_ends_at[:10] }}
+      </span>
+      {% endif %}
+    </div>
+    <span class="training-detail">
+      {% if c.training.days_remaining > 0 %}
+        {{ c.training.days_remaining }}d {{ c.training.hours_remaining }}h remaining
+      {% else %}
+        {{ c.training.hours_remaining }}h remaining
+      {% endif %}
+    </span>
+  </div>
+  <div class="progress-bar">
+    <div class="progress-fill" style="width: {{ c.training.percent_complete }}%"></div>
+  </div>
+  <div class="training-footer">
+    <span class="progress-pct">{{ c.training.percent_complete }}% complete</span>
+    <span class="muted training-hint">
+      Anomaly detection activates when learning is complete.
+      Leak tests and valve control work normally during this period.
+    </span>
+  </div>
+</section>
+{% endif %}
+{% endfor %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Initialise charts from server-provided data
+const chartData = {{ chart_data_json | safe }};
+
+{% for c in circuits %}
+(function() {
+  const circuit = "{{ c.circuit }}";
+  const data = chartData[circuit] || {labels: [], values: [], total: 0};
+
+  const vf = window.UNITS.vol_factor;
+  const vd = window.UNITS.vol_decimals;
+  const vu = window.UNITS.vol_unit;
+  document.getElementById("total-" + circuit).textContent =
+    (data.total * vf).toFixed(vd) + " " + vu + " total";
+
+  const ctx = document.getElementById("chart-" + circuit);
+  if (!ctx) return;
+
+  new Chart(ctx, {
+    type: "bar",
+    data: {
+      labels: data.labels,
+      datasets: [{
+        label: "Volume (" + window.UNITS.vol_unit + ")",
+        data: data.values.map(v => +(v * vf).toFixed(vd)),
+        backgroundColor: "rgba(37, 99, 235, 0.7)",
+        borderColor: "rgba(37, 99, 235, 1)",
+        borderWidth: 1,
+        borderRadius: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => ctx.parsed.y.toFixed(window.UNITS.vol_decimals) + " " + window.UNITS.vol_unit
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { display: false },
+          ticks: { font: { size: 11 }, maxRotation: 0 }
+        },
+        y: {
+          beginAtZero: true,
+          ticks: { font: { size: 11 } },
+          title: { display: true, text: "Litres", font: { size: 11 } }
+        }
+      }
+    }
+  });
+})();
+{% endfor %}
+
+// Auto-refresh chart data every 60 seconds
+setInterval(async () => {
+  {% for c in circuits %}
+  try {
+    const resp = await fetch(window.INGRESS_PATH + "/api/chart/{{ c.circuit }}");
+    const data = await resp.json();
+    document.getElementById("total-{{ c.circuit }}").textContent =
+      (data.total * window.UNITS.vol_factor).toFixed(window.UNITS.vol_decimals) + " " + window.UNITS.vol_unit + " total";
+  } catch(e) {}
+  {% endfor %}
+}, 60000);
+</script>
+{% endblock %}

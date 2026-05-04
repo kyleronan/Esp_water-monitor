@@ -1,0 +1,468 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="setup-container">
+
+{# ── Step progress indicator ──────────────────────────────────────── #}
+<div class="setup-steps">
+  {% for i, label in [(1,'Find Device'),(2,'Select'),(3,'Entities'),(4,'Units'),(5,'Your Home'),(6,'Done')] %}
+  <div class="setup-step {% if step == i %}active{% elif step > i %}done{% endif %}">
+    <span class="step-num">{% if step > i %}✓{% else %}{{ i }}{% endif %}</span>
+    <span class="step-label">{{ label }}</span>
+  </div>
+  {% if not loop.last %}<div class="step-connector"></div>{% endif %}
+  {% endfor %}
+</div>
+
+{# ──────────────────────────────────────────────────────────────────── #}
+{# STEP 0 — New setup or restore                                        #}
+{# ──────────────────────────────────────────────────────────────────── #}
+{% if step == 0 %}
+<section class="setup-card">
+  <h2>Welcome to Water Monitor</h2>
+  <p class="muted">
+    Is this a fresh installation or are you restoring from a previous backup?
+  </p>
+
+  <div class="choice-cards">
+
+    <button class="choice-card" onclick="location.href='{{ ingress_path }}/setup/new'">
+      <span class="choice-icon">🆕</span>
+      <strong>New setup</strong>
+      <span class="muted">Connect your ESP device and configure the system from scratch.</span>
+    </button>
+
+    <button class="choice-card" onclick="document.getElementById('restore-section').style.display='block';this.closest('.choice-cards').style.display='none'">
+      <span class="choice-icon">📦</span>
+      <strong>Restore from backup</strong>
+      <span class="muted">Upload a backup file to restore your settings and history, then verify your device connection.</span>
+    </button>
+
+  </div>
+
+  <div id="restore-section" style="display:none">
+    <hr style="margin:1.5rem 0; border:none; border-top:1px solid var(--border)">
+    <h3>Restore from backup</h3>
+    <p class="muted">
+      Your device connection will still need to be verified after the restore —
+      entity IDs may differ on a new Home Assistant instance.
+    </p>
+
+    {% if restore_error %}
+    <div class="alert-banner alert-fault">⚠ {{ restore_error }}</div>
+    {% endif %}
+    {% if restore_ok %}
+    <div class="alert-banner alert-ok">✓ {{ restore_ok }}</div>
+    {% endif %}
+
+    <form method="post" action="{{ ingress_path }}/setup/restore"
+          enctype="multipart/form-data" class="restore-form">
+
+      <div class="restore-file-row">
+        <label class="btn btn-secondary" for="restore-file">
+          📂 Choose backup file…
+        </label>
+        <input type="file" id="restore-file" name="file" accept=".json"
+               required style="display:none"
+               onchange="document.getElementById('restore-fname').textContent = this.files[0]?.name || ''">
+        <span id="restore-fname" class="muted">No file chosen</span>
+      </div>
+
+      <div class="restore-groups">
+        <label class="import-check">
+          <input type="checkbox" name="import_settings" value="1" checked>
+          Restore Settings
+        </label>
+        <label class="import-check">
+          <input type="checkbox" name="import_history" value="1" checked>
+          Restore History &amp; Training data
+        </label>
+      </div>
+
+      <div class="control-row" style="margin-top:1rem">
+        <button type="button" class="btn btn-secondary"
+                onclick="document.getElementById('restore-section').style.display='none';document.querySelector('.choice-cards').style.display='grid'">
+          ← Back
+        </button>
+        <button type="submit" class="btn btn-primary">Restore &amp; Continue →</button>
+      </div>
+    </form>
+  </div>
+</section>
+{% endif %}
+
+{# ──────────────────────────────────────────────────────────────────── #}
+{# STEP 1 — Search                                                      #}
+{# ──────────────────────────────────────────────────────────────────── #}
+{% if step == 1 %}
+<section class="setup-card">
+  <h2>Find your ESP device</h2>
+  <p class="muted">
+    Enter the name of your ESPHome water monitor device. This is the
+    <strong>device name</strong> set in your ESPHome YAML
+    (e.g. <code>esp-water-shut-off-3</code>).
+  </p>
+
+  {% if error %}
+  <div class="alert-banner alert-fault">⚠ {{ error }}</div>
+  {% endif %}
+
+  <form method="post" action="{{ ingress_path }}/setup/search" class="search-form">
+    <div class="search-row">
+      <input type="text" name="device_name"
+             value="{{ initial_name }}"
+             placeholder="e.g. esp-water-shut-off-3"
+             class="search-input" autofocus required>
+      <button type="submit" class="btn btn-primary">Search</button>
+    </div>
+  </form>
+
+  <p class="muted" style="margin-top:1rem">
+    The device must already be connected to Home Assistant via the
+    ESPHome integration before running this wizard.
+  </p>
+</section>
+{% endif %}
+
+{# ──────────────────────────────────────────────────────────────────── #}
+{# STEP 2 — Device suggestions                                          #}
+{# ──────────────────────────────────────────────────────────────────── #}
+{% if step == 2 %}
+<section class="setup-card">
+  <h2>Multiple devices found</h2>
+  <p class="muted">
+    No exact match for <strong>{{ initial_name }}</strong>.
+    Select the correct device below.
+  </p>
+
+  <form method="post" action="{{ ingress_path }}/setup/select">
+    <div class="device-list">
+      {% for d in suggestions %}
+      <label class="device-option">
+        <input type="radio" name="device_id" value="{{ d.id }}" required>
+        <div class="device-option-body">
+          <div class="device-option-name">{{ d.name }}</div>
+          <div class="device-option-meta muted">
+            {% if d.manufacturer %}{{ d.manufacturer }}{% endif %}
+            {% if d.model %} · {{ d.model }}{% endif %}
+            {% if d.is_esphome %} · ESPHome{% endif %}
+          </div>
+        </div>
+      </label>
+      {% endfor %}
+    </div>
+    <div class="control-row" style="margin-top:1rem">
+      <a href="{{ ingress_path }}/setup" class="btn btn-secondary">← Back</a>
+      <button type="submit" class="btn btn-primary">Select device</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+
+{# ──────────────────────────────────────────────────────────────────── #}
+{# STEP 3 — Review discovered entities                                  #}
+{# ──────────────────────────────────────────────────────────────────── #}
+{% if step == 3 %}
+<section class="setup-card">
+  <h2>Review discovered entities</h2>
+  <p class="muted">
+    Found device: <strong>{{ device.name }}</strong>
+    {% if device.manufacturer %} · {{ device.manufacturer }}{% endif %}
+    {% if device.model %} · {{ device.model }}{% endif %}
+  </p>
+
+  {% if all_matched %}
+  <div class="alert-banner alert-ok" style="margin-bottom:1rem">
+    ✓ All entities matched automatically
+  </div>
+  {% else %}
+  <div class="alert-banner alert-warn" style="margin-bottom:1rem">
+    ⚠ Some entities could not be matched — please select them manually below
+  </div>
+  {% endif %}
+
+  <form method="post" action="{{ ingress_path }}/setup/confirm/{{ device.id }}">
+
+    {% for circuit, matches in circuit_data.items() %}
+    <h3 style="margin:1rem 0 .5rem;text-transform:capitalize">
+      {{ circuit }} circuit
+    </h3>
+    <table class="data-table">
+      <thead>
+        <tr><th>Role</th><th>Entity</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        {% for m in matches %}
+        <tr class="{% if not m.matched and not m.optional %}row-warn{% elif not m.matched %}row-optional{% endif %}">
+          <td>
+            {{ m.label }}
+            {% if m.optional %}<span class="optional-tag">optional</span>{% endif %}
+          </td>
+          <td>
+            {% if m.matched %}
+            <code class="entity-id">{{ m.entity_id }}</code>
+            <input type="hidden" name="{{ circuit }}__{{ m.role }}"
+                   value="{{ m.entity_id }}">
+            {% else %}
+            <select name="{{ circuit }}__{{ m.role }}" class="entity-select"
+                    {% if not m.optional %}required{% endif %}>
+              <option value="">— {% if m.optional %}not configured{% else %}select entity{% endif %} —</option>
+              {% for e in device_entities %}
+              <option value="{{ e.entity_id }}">
+                {{ e.entity_id }}
+                {% if e.name %} ({{ e.name }}){% endif %}
+              </option>
+              {% endfor %}
+            </select>
+            {% endif %}
+          </td>
+          <td>
+            {% if m.matched %}
+            <span class="status-pill status-ok">✓ matched</span>
+            {% elif m.optional %}
+            <span class="status-pill status-neutral">optional</span>
+            {% else %}
+            <span class="status-pill status-warn">⚠ needs selection</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endfor %}
+
+    {% if prefix %}
+    <p class="muted" style="margin-top:.75rem">
+      Detected device prefix: <code>{{ prefix }}</code>
+    </p>
+    {% endif %}
+
+    <div class="control-row" style="margin-top:1.5rem">
+      <a href="{{ ingress_path }}/setup" class="btn btn-secondary">← Start over</a>
+      <button type="submit" class="btn btn-primary">Confirm and continue →</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+
+{# ──────────────────────────────────────────────────────────────────── #}
+
+{# ──────────────────────────────────────────────────────────────────── #}
+{# STEP 4 — Display units                                               #}
+{# ──────────────────────────────────────────────────────────────────── #}
+{% if step == 4 %}
+<section class="setup-card">
+  <h2>Display units</h2>
+  <p class="muted">
+    Choose how pressure and flow are shown throughout the app.
+    {% if ha_detected %}
+    These were auto-detected from your Home Assistant unit system — change
+    them here if you prefer something different.
+    {% endif %}
+  </p>
+
+  <form method="post" action="{{ ingress_path }}/setup/units" class="home-form">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+
+    <div class="form-grid" style="align-items: end">
+      <div class="form-group">
+        <label for="flow_unit">
+          Flow rate &amp; volume
+          <span class="form-hint">flow readings and daily totals</span>
+        </label>
+        <select id="flow_unit" name="flow_unit">
+          {% for key in flow_options %}
+          <option value="{{ key }}"
+            {% if key == flow_key %}selected{% endif %}>
+            {{ flow_option_labels[key] }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label for="pressure_unit">
+          Pressure
+          <span class="form-hint">pressure readings and leak tests</span>
+        </label>
+        <select id="pressure_unit" name="pressure_unit">
+          {% for key in pressure_options %}
+          <option value="{{ key }}"
+            {% if key == pressure_key %}selected{% endif %}>
+            {{ pressure_option_labels[key] }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <p class="form-hint" style="margin-top:1rem">
+      You can change units at any time in Settings → Display Units.
+    </p>
+
+    <div class="control-row" style="margin-top:1.5rem">
+      <button type="submit" class="btn btn-primary">Continue →</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+
+{# STEP 5 — Home details                                                #}
+{# ──────────────────────────────────────────────────────────────────── #}
+{% if step == 5 %}
+<section class="setup-card">
+  <h2>Tell us about your home</h2>
+  <p class="muted">
+    This helps the system suggest a calibration duration and set realistic
+    detection thresholds. You can update these later in Settings.
+  </p>
+
+  <form method="post" action="{{ ingress_path }}/setup/home" class="home-form">
+
+    <fieldset class="form-fieldset">
+      <legend>Bathrooms</legend>
+      <div class="form-grid">
+        <div class="form-group">
+          <label for="bathrooms_full">Full bathrooms
+            <span class="form-hint">with bath or shower</span>
+          </label>
+          <input type="number" id="bathrooms_full" name="bathrooms_full"
+                 min="0" max="20" value="{{ profile.bathrooms_full or 1 }}" required>
+        </div>
+        <div class="form-group">
+          <label for="bathrooms_half">Half bathrooms
+            <span class="form-hint">toilet only</span>
+          </label>
+          <input type="number" id="bathrooms_half" name="bathrooms_half"
+                 min="0" max="10" value="{{ profile.bathrooms_half or 0 }}">
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="form-fieldset">
+      <legend>Property</legend>
+      <div class="form-grid">
+        <div class="form-group">
+          <label for="floors">Floors
+            <span class="form-hint">above ground</span>
+          </label>
+          <input type="number" id="floors" name="floors"
+                 min="1" max="10" value="{{ profile.floors or 1 }}" required>
+        </div>
+        <div class="form-group">
+          <label for="sqft">Home size (sq ft)
+            <span class="form-hint">optional</span>
+          </label>
+          <input type="number" id="sqft" name="sqft"
+                 min="0" max="50000" value="{{ profile.sqft or '' }}"
+                 placeholder="e.g. 2000">
+        </div>
+        <div class="form-group">
+          <label for="build_year">Year built
+            <span class="form-hint">optional</span>
+          </label>
+          <input type="number" id="build_year" name="build_year"
+                 min="1800" max="2030" value="{{ profile.build_year or '' }}"
+                 placeholder="e.g. 1998">
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="form-fieldset">
+      <legend>Household</legend>
+      <div class="form-grid">
+        <div class="form-group">
+          <label for="occupants">Occupants
+            <span class="form-hint">people who live here</span>
+          </label>
+          <input type="number" id="occupants" name="occupants"
+                 min="1" max="20" value="{{ profile.occupants or 2 }}" required>
+        </div>
+        <div class="form-group">
+          <label for="supply_type">Water supply</label>
+          <select id="supply_type" name="supply_type">
+            <option value="mains"
+              {% if (profile.supply_type or 'mains') == 'mains' %}selected{% endif %}>
+              Mains / Municipal
+            </option>
+            <option value="well"
+              {% if profile.supply_type == 'well' %}selected{% endif %}>
+              Private well or pump
+            </option>
+          </select>
+        </div>
+      </div>
+    </fieldset>
+
+    <div class="control-row" style="margin-top:1.5rem">
+      <button type="submit" class="btn btn-primary">Finish setup →</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+
+{# ──────────────────────────────────────────────────────────────────── #}
+{# STEP 6 — Complete                                                    #}
+{# ──────────────────────────────────────────────────────────────────── #}
+{% if step == 6 %}
+<section class="setup-card">
+  <h2>✓ Setup complete</h2>
+  <p>
+    <strong>{{ device_name }}</strong> has been configured and
+    anomaly detection training has started automatically.
+  </p>
+
+  <div class="training-callout">
+    <div class="training-callout-icon">🎓</div>
+    <div class="training-callout-body">
+      <strong>Learning period: {{ cal_days }} days</strong>
+      {% if cal_reason %}<span class="muted"> — {{ cal_reason }}</span>{% endif %}
+      <p>
+        During this period the system observes your household's normal water
+        usage patterns — shower durations, appliance cycles, irrigation runs —
+        and builds a baseline unique to your home.
+      </p>
+      <p>
+        Anomaly detection (burst pipe, unusual flow, trickle alerts) becomes
+        active once training completes. Leak tests run throughout and results
+        are saved to History.
+      </p>
+    </div>
+  </div>
+
+  <div class="circuit-summary">
+    {% for c in circuits %}
+    <div class="circuit-summary-row">
+      <span class="circuit-name">{{ c.display_name }}</span>
+      <div class="circuit-summary-right">
+        <span class="status-pill {% if c.configured %}status-ok{% else %}status-warn{% endif %}">
+          {% if c.configured %}✓ ready{% else %}⚠ incomplete{% endif %}
+        </span>
+        {% if c.training and c.training.state == 'calibrating' %}
+        <span class="status-pill status-training">
+          🎓 Learning ·
+          {% if c.training.days_remaining > 0 %}
+            {{ c.training.days_remaining }}d {{ c.training.hours_remaining }}h left
+          {% else %}
+            {{ c.training.hours_remaining }}h left
+          {% endif %}
+        </span>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <p class="muted" style="margin-top:1rem">
+    You can monitor training progress on the <strong>Dashboard</strong> and
+    adjust settings at any time via <strong>Settings</strong>.
+  </p>
+
+  <div class="control-row" style="margin-top:1.5rem">
+    <a href="{{ ingress_path }}/" class="btn btn-primary">Go to Dashboard →</a>
+    <a href="{{ ingress_path }}/settings" class="btn btn-secondary">Open Settings</a>
+  </div>
+</section>
+{% endif %}
+
+</div>
+{% endblock %}

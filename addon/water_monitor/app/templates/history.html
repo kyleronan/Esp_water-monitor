@@ -1,0 +1,304 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="page-title">History</h1>
+
+{# ── Date range filter ─────────────────────────────────────────────── #}
+<section class="history-filter-section">
+  <form method="get" action="{{ ingress_path }}/history" class="date-range-form">
+    <div class="date-range-row">
+      <div class="date-range-group">
+        <label for="from">From</label>
+        <input type="date" id="from" name="from"
+               value="{{ date_from }}"
+               max="{{ date_to or '' }}">
+      </div>
+      <div class="date-range-group">
+        <label for="to">To</label>
+        <input type="date" id="to" name="to"
+               value="{{ date_to }}"
+               min="{{ date_from or '' }}">
+      </div>
+      <div class="date-range-actions">
+        <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+        {% if using_range %}
+        <a href="{{ ingress_path }}/history" class="btn btn-secondary btn-sm">
+          Clear (show last {{ default_limit }})
+        </a>
+        {% endif %}
+      </div>
+    </div>
+    {% if using_range %}
+    <p class="muted date-range-hint">
+      Showing all events
+      {% if date_from %}from <strong>{{ date_from }}</strong>{% endif %}
+      {% if date_to %}to <strong>{{ date_to }}</strong>{% endif %}
+    </p>
+    {% else %}
+    <p class="muted date-range-hint">
+      Showing the most recent <strong>{{ default_limit }}</strong> events per circuit.
+      Use the date filter to view any stored range.
+    </p>
+    {% endif %}
+  </form>
+</section>
+
+{% for ch in circuit_history %}
+<section class="history-section">
+  <h2>{{ ch.display_name }}</h2>
+
+  {# ── Usage chart from daily summaries ─────────────────────────── #}
+  <div class="summary-chart-card">
+    <div class="summary-chart-header">
+      <span class="summary-chart-title">Daily water usage ({{ vol_unit }})</span>
+      <div class="chart-range-btns">
+        {% for r, label in [('30d','30 days'),('6m','6 months'),('1y','1 year'),('all','All time'),('monthly','This month'),('yearly','This year'),('yoy','Year over year')] %}
+        <a href="{{ ingress_path }}/history?range={{ r }}{% if date_from %}&from={{ date_from }}{% endif %}{% if date_to %}&to={{ date_to }}{% endif %}"
+           class="chart-range-btn {% if chart_range == r %}active{% endif %}">
+          {{ label }}
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% if ch.summaries %}
+    <canvas id="chart-{{ ch.circuit }}" class="usage-chart" height="120"></canvas>
+    {% else %}
+    <p class="muted" style="padding:.75rem 0">
+      No daily summaries yet — check back after the first nightly run.
+    </p>
+    {% endif %}
+  </div>
+
+  <h3>Leak Test History</h3>
+  {% if ch.leak_tests %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Triggered by</th>
+        <th>Result</th>
+        <th>Start ({{ pressure_unit }})</th>
+        <th>End ({{ pressure_unit }})</th>
+        <th>Drop ({{ pressure_unit }})</th>
+        <th>Duration</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in ch.leak_tests %}
+      {% set completed = t.result and ('Passed' in t.result or 'Failed' in t.result) %}
+      <tr class="{% if 'Passed' in (t.result or '') %}row-ok{% elif t.result %}row-warn{% endif %}">
+        <td>{{ (t.run_at or '')[:16] }}</td>
+        <td>{{ t.triggered_by or '—' }}</td>
+        <td>{{ t.result or '—' }}</td>
+        <td>{{ (t.baseline_psi * pressure_factor)|round(pressure_decimals) if completed and t.baseline_psi is not none else "—" }}</td>
+        <td>{{ (t.final_psi * pressure_factor)|round(pressure_decimals)    if completed and t.final_psi    is not none else "—" }}</td>
+        <td>{{ (t.pressure_drop_psi * pressure_factor)|round(pressure_decimals) if completed and t.pressure_drop_psi is not none else "—" }}</td>
+        <td>{{ "%.1f min"|format(t.duration_minutes) if completed and t.duration_minutes else "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No leak tests run yet.</p>
+  {% endif %}
+
+  <h3>Recent Events
+    <span class="muted event-count-label">
+      — {{ ch.event_count }} event{{ 's' if ch.event_count != 1 else '' }}
+      {% if not using_range %}(most recent {{ default_limit }}){% endif %}
+    </span>
+  </h3>
+  {% if ch.events %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Time</th><th>Duration</th><th>Avg flow</th>
+        <th>ΔP ({{ pressure_unit }})</th><th>Shape</th><th>Volume ({{ vol_unit }})</th><th>Composite</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in ch.events %}
+      <tr {% if e.is_composite %}class="row-composite"{% endif %}>
+        <td>{{ (e.start_ts or '')[:16] }}</td>
+        <td>{{ "%.0fs"|format(e.duration_seconds) if e.duration_seconds else "—" }}</td>
+        <td>{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm else "—" }} {{ flow_unit }}</td>
+        <td>{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi else "—" }}</td>
+        <td><span class="shape-badge shape-{{ e.resistance_curve_shape }}">
+          {{ e.resistance_curve_shape or "—" }}</span></td>
+        <td>{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres else "—" }}</td>
+        <td>{% if e.is_composite %}⚡{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No events detected yet. Events appear once training begins.</p>
+  {% endif %}
+
+</section>
+{% endfor %}
+
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+const CHART_RANGE = {{ chart_range|tojson }};
+
+const summaryData = {
+  {% for ch in circuit_history %}
+  {{ ch.circuit|tojson }}: {
+    labels:      [{% for s in ch.summaries %}{{ s.day|tojson }},{% endfor %}],
+    volumes:     [{% for s in ch.summaries %}{{ ((s.total_volume_litres or 0) * vol_factor)|round(vol_decimals) }},{% endfor %}],
+    counts:      [{% for s in ch.summaries %}{{ s.event_count or 0 }},{% endfor %}],
+    anomalies:   [{% for s in ch.summaries %}{{ s.anomaly_count or 0 }},{% endfor %}],
+    priorLabels: [{% for s in ch.prior_summaries %}{{ s.day|tojson }},{% endfor %}],
+    priorVols:   [{% for s in ch.prior_summaries %}{{ ((s.total_volume_litres or 0) * vol_factor)|round(vol_decimals) }},{% endfor %}],
+    hvLabels:    [{% for day in ch.hv_daily.keys() %}{{ day|tojson }},{% endfor %}],
+    hvVolumes:   [{% for vol in ch.hv_daily.values() %}{{ (vol * vol_factor)|round(vol_decimals) }},{% endfor %}],
+  },
+  {% endfor %}
+};
+
+// Aggregate daily data into monthly or yearly buckets
+function aggregate(labels, volumes, counts, period) {
+  const buckets = {};
+  labels.forEach((day, i) => {
+    const key = period === 'monthly'
+      ? day.substring(0, 7)   // YYYY-MM
+      : day.substring(0, 4);  // YYYY
+    if (!buckets[key]) buckets[key] = { vol: 0, cnt: 0 };
+    buckets[key].vol += volumes[i] || 0;
+    buckets[key].cnt += counts[i]  || 0;
+  });
+  return {
+    labels:  Object.keys(buckets).sort(),
+    volumes: Object.keys(buckets).sort().map(k => +buckets[k].vol.toFixed(window.UNITS.vol_decimals)),
+    counts:  Object.keys(buckets).sort().map(k => buckets[k].cnt),
+  };
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  for (const [circuit, data] of Object.entries(summaryData)) {
+    const canvas = document.getElementById('chart-' + circuit);
+    if (!canvas) continue;
+
+    // ── Fallback to hourly_volume when no daily summaries yet ─────────
+    let labels  = data.labels.length  ? data.labels  : data.hvLabels;
+    let volumes = data.volumes.length ? data.volumes : data.hvVolumes;
+    let counts  = data.counts.length  ? data.counts  : volumes.map(() => null);
+    let anomalies = data.anomalies || [];
+
+    if (!labels || !labels.length) continue;
+
+    // ── Aggregate for monthly / yearly views ──────────────────────────
+    let agg = null;
+    if (CHART_RANGE === 'monthly' || CHART_RANGE === 'yearly') {
+      agg = aggregate(labels, volumes, counts,
+                      CHART_RANGE === 'monthly' ? 'monthly' : 'yearly');
+      labels  = agg.labels;
+      volumes = agg.volumes;
+      counts  = agg.counts;
+      anomalies = [];   // no anomaly line for aggregated views
+    }
+
+    // ── Year-over-year: build two datasets aligned by day-of-year ─────
+    const isYoY = CHART_RANGE === 'yoy';
+    let datasets = [];
+
+    if (isYoY) {
+      // Shift prior labels forward by 365 days so they overlay current year
+      const priorMap = {};
+      (data.priorLabels || []).forEach((day, i) => {
+        const d    = new Date(day);
+        d.setFullYear(d.getFullYear() + 1);
+        const key  = d.toISOString().substring(0, 10);
+        priorMap[key] = data.priorVols[i] || 0;
+      });
+      const thisYear  = new Date().getFullYear();
+      const priorYear = thisYear - 1;
+      datasets = [
+        {
+          label:           `This year (${thisYear})`,
+          data:            volumes,
+          backgroundColor: 'rgba(59,130,246,0.55)',
+          borderColor:     'rgba(59,130,246,0.9)',
+          borderWidth:     1,
+        },
+        {
+          label:           `Prior year (${priorYear})`,
+          data:            labels.map(l => priorMap[l] ?? null),
+          backgroundColor: 'rgba(156,163,175,0.35)',
+          borderColor:     'rgba(156,163,175,0.7)',
+          borderWidth:     1,
+          spanGaps:        true,
+        },
+      ];
+    } else {
+      datasets = [
+        {
+          label:           'Volume (L)',
+          data:            volumes,
+          backgroundColor: 'rgba(59,130,246,0.55)',
+          borderColor:     'rgba(59,130,246,0.9)',
+          borderWidth:     1,
+          yAxisID:         'y',
+        },
+        ...(anomalies.some(v => v > 0) ? [{
+          label:           'Anomalies',
+          data:            anomalies,
+          type:            'line',
+          borderColor:     'rgba(239,68,68,0.8)',
+          backgroundColor: 'rgba(239,68,68,0.15)',
+          borderWidth:     1.5,
+          pointRadius:     2,
+          yAxisID:         'y2',
+        }] : []),
+      ];
+    }
+
+    new Chart(canvas, {
+      type: 'bar',
+      data: { labels, datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: true,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { position: 'top',
+                    labels: { boxWidth: 12, font: { size: 11 } } },
+          tooltip: {
+            callbacks: {
+              title: ctx => ctx[0].label,
+              label: ctx => {
+                const idx = ctx.dataIndex;
+                const vol = ctx.parsed.y;
+                if (vol === null || vol === undefined) return null;
+                if (ctx.dataset.label?.startsWith('Anomal'))
+                  return ` ${vol} anomal${vol !== 1 ? 'ies' : 'y'}`;
+                const cnt = counts?.[idx];
+                return cnt != null && !isYoY
+                  ? ` ${vol.toFixed(window.UNITS.vol_decimals)} ${window.UNITS.vol_unit}  (${cnt} event${cnt !== 1 ? 's' : ''})`
+                  : ` ${vol.toFixed(window.UNITS.vol_decimals)} ${window.UNITS.vol_unit}`;
+              },
+            },
+          },
+        },
+        scales: {
+          x: { ticks: { maxTicksLimit: 14, font: { size: 10 } },
+               grid:  { display: false } },
+          y: { position: 'left',
+               title:    { display: true, text: 'Litres', font: { size: 10 } },
+               ticks:    { font: { size: 10 } } },
+          ...(anomalies.some(v => v > 0) && !isYoY ? {
+            y2: { position: 'right',
+                  title:    { display: true, text: 'Anomalies', font: { size: 10 } },
+                  ticks:    { stepSize: 1, font: { size: 10 } },
+                  grid:     { drawOnChartArea: false } },
+          } : {}),
+        },
+      },
+    });
+  }
+});
+</script>
+{% endblock %}
