@@ -337,9 +337,6 @@ async def leaktest_schedule(circuit: str, request: Request):
         week_of_month=int(form.get("week_of_month", 1)),
         run_hour=int(form.get("run_hour", 2)),
         run_minute=int(form.get("run_minute", 0)),
-        quiet_period_minutes=int(form.get("quiet_period_minutes", 30)),
-        retry_delay_minutes=int(form.get("retry_delay_minutes", 15)),
-        retry_count=int(form.get("retry_count", 3)),
         notify_on_pass=form.get("notify_on_pass") == "on",
         notify_on_fail=form.get("notify_on_fail") == "on",
     )
