@@ -290,7 +290,35 @@ details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
   margin-top: .75rem; padding: .75rem;
   background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
 }
-.schedule-form { display: flex; flex-direction: column; gap: .4rem; }
+.schedule-form { display: flex; flex-direction: column; gap: .5rem; }
+
+/* Schedule rows: stacked label-above-field for narrow device cards */
+.schedule-row {
+  display: flex; flex-direction: column; gap: .2rem;
+  font-size: .82rem;
+}
+.schedule-row > label { color: var(--muted); font-size: .78rem; }
+.schedule-row select,
+.schedule-row input[type=number] {
+  padding: .3rem .4rem; border: 1px solid var(--border); border-radius: 4px;
+  font-size: .85rem; width: 100%; box-sizing: border-box;
+}
+
+/* Inline rows for checkboxes — label and toggle on one line */
+.schedule-row-inline {
+  flex-direction: row; align-items: center; justify-content: space-between;
+  padding: .15rem 0;
+}
+.schedule-row-inline > label { font-size: .82rem; }
+
+/* Time row — hour:minute side-by-side */
+.schedule-time {
+  display: flex; align-items: center; gap: .3rem;
+}
+.schedule-time input[type=number] {
+  width: 3.2rem; flex: 0 0 auto; text-align: center;
+}
+.schedule-time span { color: var(--muted); }
 
 /* ── History page ─────────────────────────────────────────────────── */
 .history-section { background: var(--surface); border: 1px solid var(--border);

@@ -399,6 +399,14 @@ def _compute_next_run(schedule: Any) -> Optional[datetime]:
         return candidate.replace(hour=run_hour, minute=run_minute,
                                  second=0, microsecond=0)
 
+    if freq == "daily":
+        # Today at run_hour:run_minute, or tomorrow if that time has already passed
+        candidate = now.replace(hour=run_hour, minute=run_minute,
+                                second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
+
     target_dow = schedule["day_of_week"] or 0   # 0=Monday
     days_ahead = (target_dow - now.weekday()) % 7
     if days_ahead == 0:

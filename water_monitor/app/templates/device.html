@@ -148,20 +148,22 @@
         <form method="post" action="{{ ingress_path }}/device/leaktest/{{ c.circuit }}/schedule"
               class="schedule-form">
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-          <div class="form-row">
+          <div class="schedule-row schedule-row-inline">
             <label>Enabled</label>
             <input type="checkbox" name="enabled"
                    {% if c.schedule.enabled %}checked{% endif %}>
           </div>
-          <div class="form-row">
+          <div class="schedule-row">
             <label>Frequency</label>
             <select name="frequency">
+              <option value="daily" {% if c.schedule.frequency == 'daily' %}selected{% endif %}>Daily</option>
               <option value="weekly" {% if c.schedule.frequency == 'weekly' %}selected{% endif %}>Weekly</option>
               <option value="fortnightly" {% if c.schedule.frequency == 'fortnightly' %}selected{% endif %}>Fortnightly</option>
               <option value="monthly" {% if c.schedule.frequency == 'monthly' %}selected{% endif %}>Monthly</option>
             </select>
           </div>
-          <div class="form-row">
+          {% if c.schedule.frequency != 'daily' %}
+          <div class="schedule-row">
             <label>Day</label>
             <select name="day_of_week">
               {% for i, d in [(0,'Monday'),(1,'Tuesday'),(2,'Wednesday'),(3,'Thursday'),(4,'Friday'),(5,'Saturday'),(6,'Sunday')] %}
@@ -169,19 +171,23 @@
               {% endfor %}
             </select>
           </div>
-          <div class="form-row">
+          {% endif %}
+          <div class="schedule-row">
             <label>Time</label>
-            <input type="number" name="run_hour" min="0" max="23"
-                   value="{{ c.schedule.run_hour or 2 }}" style="width:4rem"> :
-            <input type="number" name="run_minute" min="0" max="59"
-                   value="{{ c.schedule.run_minute or 0 }}" style="width:4rem">
+            <div class="schedule-time">
+              <input type="number" name="run_hour" min="0" max="23"
+                     value="{{ c.schedule.run_hour or 2 }}">
+              <span>:</span>
+              <input type="number" name="run_minute" min="0" max="59"
+                     value="{{ c.schedule.run_minute or 0 }}">
+            </div>
           </div>
-          <div class="form-row">
+          <div class="schedule-row schedule-row-inline">
             <label>Notify on pass</label>
             <input type="checkbox" name="notify_on_pass"
                    {% if c.schedule.notify_on_pass != False %}checked{% endif %}>
           </div>
-          <div class="form-row">
+          <div class="schedule-row schedule-row-inline">
             <label>Notify on fail</label>
             <input type="checkbox" name="notify_on_fail"
                    {% if c.schedule.notify_on_fail != False %}checked{% endif %}>
