@@ -386,8 +386,9 @@ async def away_mode_toggle(request: Request):
     orch = _orch(request)
     form = await request.form()
     enabled = form.get("enabled") == "1"
-    import asyncio
-    asyncio.create_task(orch.set_away_mode(enabled))
+    # Await the call so the database write completes before we redirect
+    # back to /settings — otherwise the rendered page can show stale state.
+    await orch.set_away_mode(enabled)
     return ingress_redirect(request, "/settings")
 
 
