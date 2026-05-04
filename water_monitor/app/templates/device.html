@@ -1,124 +1,155 @@
 {% extends "base.html" %}
 {% block content %}
-<h1 class="page-title">Device</h1>
+
+<h1 class="dev-page-title">Device</h1>
 
 {% for c in circuits %}
-<section class="device-section">
-  <h2>{{ c.display_name }}</h2>
+<section class="dev-circuit-card" data-circuit="{{ c.circuit }}">
 
-  {# Live status strip #}
-  <div class="status-strip">
-    <span class="valve-indicator valve-{{ c.valve_state | lower }}"
-          id="valve-dot-{{ c.circuit }}">⬤ <span id="valve-label-{{ c.circuit }}">{{ c.valve_state | upper }}</span></span>
-    <span>{{ c.pressure }} {{ pressure_unit }}</span>
-    <span>{{ c.flow_rate }} {{ flow_unit }}</span>
-    {% if c.fault_active %}<span class="badge badge-fault">FAULT</span>{% endif %}
+  {# ── Card header — name + valve pill + mono readings ─────────── #}
+  <div class="dev-card-header">
+    <h2 class="dev-card-title">{{ c.display_name }}</h2>
+    <div class="dev-card-readings">
+      <span class="pill {% if c.fault_active %}pill-red{% elif c.valve_state == 'open' %}pill-green{% else %}pill-neutral{% endif %}">
+        <span class="dev-valve-dot dev-valve-{{ c.valve_state | lower }}">⬤</span>
+        <span id="valve-label-{{ c.circuit }}">{{ c.valve_state | upper }}</span>
+      </span>
+      <span class="dev-reading-mono"><span id="pressure-{{ c.circuit }}">{{ c.pressure }}</span> {{ pressure_unit }}</span>
+      <span class="dev-reading-mono"><span id="flow-{{ c.circuit }}">{{ c.flow_rate }}</span> {{ flow_unit }}</span>
+    </div>
   </div>
 
+  {# ── Fault banner — red left-border callout ─────────────────── #}
   {% if c.fault_active %}
-  <div class="fault-reason-banner">
-    <div class="fault-reason-body">
-      <span class="fault-reason-title">⚠ Safety Fault Active</span>
+  <div class="dev-fault-banner">
+    <div class="dev-fault-body">
+      <div class="dev-fault-title">⚠ Safety Fault Active</div>
       {% if c.fault_reason %}
-      <span class="fault-reason-text">{{ c.fault_reason }}</span>
+      <div class="dev-fault-detail">{{ c.fault_reason }}</div>
       {% else %}
-      <span class="fault-reason-text muted">Reason not available — check device log or HA logbook</span>
+      <div class="dev-fault-detail dev-fault-muted">Reason not available — check device log or HA logbook</div>
       {% endif %}
     </div>
-    <button class="btn btn-warning btn-sm" onclick="resetFault('{{ c.circuit }}')">Reset Fault</button>
+    <button class="btn btn-secondary btn-sm" onclick="resetFault('{{ c.circuit }}')">Reset Fault</button>
   </div>
   {% endif %}
 
-  {# Valve controls #}
-  <div class="control-row">
-    <button class="btn btn-primary" onclick="valveOpen('{{ c.circuit }}')">Open</button>
-    <button class="btn btn-danger" onclick="valveClose('{{ c.circuit }}')">Close</button>
+  {# ── Valve control — single contextual button ───────────────── #}
+  <div class="dev-valve-controls" id="valve-controls-{{ c.circuit }}"
+       data-fault="{{ 'true' if c.fault_active else 'false' }}"
+       data-fault-reason="{{ c.fault_reason or '' }}">
+    {% if c.valve_state == 'open' %}
+    <button class="btn btn-danger btn-sm" onclick="valveClose('{{ c.circuit }}')">Close Valve</button>
+    {% elif c.valve_state == 'closed' %}
+      {% if c.fault_active %}
+      <button class="btn btn-secondary btn-sm btn-fault-warn"
+              onclick="valveOpenWithFaultWarning('{{ c.circuit }}', {{ c.fault_reason|tojson if c.fault_reason else '\'\''}})">
+        Open Valve
+      </button>
+      {% else %}
+      <button class="btn btn-primary btn-sm" onclick="valveOpen('{{ c.circuit }}')">Open Valve</button>
+      {% endif %}
+    {% else %}
+    <button class="btn btn-secondary btn-sm" disabled>{{ c.valve_state | title }}</button>
+    {% endif %}
     {% if c.trickle_active %}
-    <button class="btn btn-warning" onclick="resetTrickle('{{ c.circuit }}')">Reset Trickle</button>
+    <button class="btn btn-warning btn-sm" onclick="resetTrickle('{{ c.circuit }}')">Reset Trickle</button>
     {% endif %}
   </div>
 
-  <div class="device-grid">
-
-    {# Micro Leak Test #}
-    <div class="device-card">
-      <h3>Micro Leak Test</h3>
-      <div class="leak-test-status">
-        {% if c.leak_test_running %}
-        <span class="status-pill status-running">🔵 Running…</span>
-        <span class="leak-test-etc"
-              id="etc-{{ c.circuit }}"
-              {% if c.leak_test_started_at %}
-              data-start="{{ c.leak_test_started_at }}"
-              data-duration="{{ c.leak_test_duration_secs }}"
-              data-circuit="{{ c.circuit }}"
-              {% endif %}>
-          {{ c.leak_test_etc or "" }}
-        </span>
+  {# ── Micro Leak Test sub-card on surface-2 ─────────────────── #}
+  <div class="dev-leak-card">
+    <div class="dev-leak-header">
+      <h3 class="dev-leak-title">Micro Leak Test</h3>
+      <div class="dev-leak-status">
+        {% if c.leak_test_active or c.leak_test_running %}
+        <div class="leak-running-indicator"
+             id="etc-{{ c.circuit }}"
+             data-start="{{ c.leak_test_started_at or '' }}"
+             data-duration="{{ c.leak_test_duration_secs or '' }}"
+             data-circuit="{{ c.circuit }}">
+          <span class="leak-running-dot"></span>
+          <span class="leak-running-label">Leak test running</span>
+          <span class="leak-running-etc">{{ c.leak_test_etc or "Running…" }}</span>
+        </div>
         {% elif c.leak_test_result %}
-        <span class="status-pill {% if 'Passed' in c.leak_test_result %}status-ok{% else %}status-warn{% endif %}">
+        <span class="pill {% if 'Passed' in c.leak_test_result %}pill-green{% else %}pill-amber{% endif %}">
           {{ c.leak_test_result }}
         </span>
         {% else %}
-        <span class="status-pill status-neutral">No test run</span>
+        <span class="pill pill-neutral">No test run</span>
         {% endif %}
       </div>
+    </div>
 
-      <div class="control-row">
-        {% if c.leak_test_running %}
-        <button class="btn btn-danger"
-                onclick="abortLeakTest('{{ c.circuit }}')">✕ Abort Test</button>
-        {% else %}
-        <button class="btn btn-primary"
-                onclick="runLeakTest('{{ c.circuit }}')">Run Now</button>
-        {% endif %}
-      </div>
+    <div class="dev-leak-actions">
+      {% if c.leak_test_active or c.leak_test_running %}
+      <button class="btn btn-danger btn-sm"
+              onclick="abortLeakTest('{{ c.circuit }}')">✕ Abort Test</button>
+      {% else %}
+      <button class="btn btn-secondary btn-sm"
+              onclick="runLeakTest('{{ c.circuit }}')">Run Now</button>
+      {% endif %}
+    </div>
 
-      {# Schedule #}
-      <details class="schedule-details">
-        <summary>Schedule</summary>
-        <form method="post" action="{{ ingress_path }}/device/leaktest/{{ c.circuit }}/schedule"
-              class="schedule-form">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-          <div class="schedule-row schedule-row-inline">
-            <label>Enabled</label>
-            <input type="checkbox" name="enabled"
-                   {% if c.schedule.enabled %}checked{% endif %}>
-          </div>
-          <div class="schedule-row schedule-row-inline">
-            <label title="When ON, the addon picks the quietest hour of the day from your usage history. When OFF, the time below is used as-is.">
-              Auto-pick quiet hour
+    {# Schedule settings — collapsed details ─────────────────── #}
+    <details class="dev-schedule-details">
+      <summary class="dev-schedule-summary">Schedule settings</summary>
+
+      <form method="post" action="{{ ingress_path }}/device/leaktest/{{ c.circuit }}/schedule"
+            class="dev-schedule-form">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+
+        <div class="dev-sched-grid">
+          <div class="dev-sched-row">
+            <span class="dev-sched-label">Enabled</span>
+            <label class="dev-toggle">
+              <input type="checkbox" name="enabled"
+                     {% if c.schedule.enabled %}checked{% endif %}>
+              <span class="dev-toggle-track"></span>
             </label>
-            <input type="checkbox" name="auto_learn_hour"
-                   {% if c.schedule.auto_learn_hour != False %}checked{% endif %}>
           </div>
-          <div class="schedule-row">
-            <label>Frequency</label>
-            <select name="frequency">
+
+          <div class="dev-sched-row">
+            <span class="dev-sched-label" title="When ON, the addon picks the quietest hour of the day from your usage history. When OFF, the time below is used as-is.">
+              Auto-pick quiet hour
+            </span>
+            <label class="dev-toggle">
+              <input type="checkbox" name="auto_learn_hour"
+                     {% if c.schedule.auto_learn_hour != False %}checked{% endif %}>
+              <span class="dev-toggle-track"></span>
+            </label>
+          </div>
+
+          <div class="dev-sched-row">
+            <span class="dev-sched-label">Frequency</span>
+            <select class="dev-sched-select" name="frequency">
               <option value="daily" {% if c.schedule.frequency == 'daily' %}selected{% endif %}>Daily</option>
               <option value="weekly" {% if c.schedule.frequency == 'weekly' %}selected{% endif %}>Weekly</option>
               <option value="fortnightly" {% if c.schedule.frequency == 'fortnightly' %}selected{% endif %}>Fortnightly</option>
               <option value="monthly" {% if c.schedule.frequency == 'monthly' %}selected{% endif %}>Monthly</option>
             </select>
           </div>
+
           {% if c.schedule.frequency != 'daily' %}
-          <div class="schedule-row">
-            <label>Day</label>
-            <select name="day_of_week">
+          <div class="dev-sched-row">
+            <span class="dev-sched-label">Day of week</span>
+            <select class="dev-sched-select" name="day_of_week">
               {% for i, d in [(0,'Monday'),(1,'Tuesday'),(2,'Wednesday'),(3,'Thursday'),(4,'Friday'),(5,'Saturday'),(6,'Sunday')] %}
               <option value="{{ i }}" {% if c.schedule.day_of_week == i %}selected{% endif %}>{{ d }}</option>
               {% endfor %}
             </select>
           </div>
           {% endif %}
-          <div class="schedule-row">
-            <label>
+
+          <div class="dev-sched-row">
+            <span class="dev-sched-label">
               Time
               {% if c.schedule.auto_learn_hour != False %}
-              <span class="muted" style="font-weight:normal; font-size:.72rem">(auto-learned)</span>
+              <span class="dev-sched-hint">(auto-learned)</span>
               {% endif %}
-            </label>
-            <div class="schedule-time">
+            </span>
+            <div class="dev-sched-time">
               <input type="number" name="run_hour" min="0" max="23"
                      value="{{ c.schedule.run_hour or 2 }}"
                      {% if c.schedule.auto_learn_hour != False %}disabled{% endif %}>
@@ -128,22 +159,32 @@
                      {% if c.schedule.auto_learn_hour != False %}disabled{% endif %}>
             </div>
           </div>
-          <div class="schedule-row schedule-row-inline">
-            <label>Notify on pass</label>
-            <input type="checkbox" name="notify_on_pass"
-                   {% if c.schedule.notify_on_pass != False %}checked{% endif %}>
-          </div>
-          <div class="schedule-row schedule-row-inline">
-            <label>Notify on fail</label>
-            <input type="checkbox" name="notify_on_fail"
-                   {% if c.schedule.notify_on_fail != False %}checked{% endif %}>
-          </div>
-          <button type="submit" class="btn btn-primary">Save Schedule</button>
-        </form>
-      </details>
-    </div>
 
-  </div>{# end device-grid #}
+          <div class="dev-sched-row">
+            <span class="dev-sched-label">Notify on pass</span>
+            <label class="dev-toggle">
+              <input type="checkbox" name="notify_on_pass"
+                     {% if c.schedule.notify_on_pass != False %}checked{% endif %}>
+              <span class="dev-toggle-track"></span>
+            </label>
+          </div>
+
+          <div class="dev-sched-row">
+            <span class="dev-sched-label">Notify on fail</span>
+            <label class="dev-toggle">
+              <input type="checkbox" name="notify_on_fail"
+                     {% if c.schedule.notify_on_fail != False %}checked{% endif %}>
+              <span class="dev-toggle-track"></span>
+            </label>
+          </div>
+        </div>
+
+        <button type="submit" class="btn btn-primary btn-sm dev-schedule-save">Save Schedule</button>
+      </form>
+    </details>
+  </div>
+
 </section>
 {% endfor %}
+
 {% endblock %}
