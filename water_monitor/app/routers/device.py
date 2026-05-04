@@ -332,6 +332,7 @@ async def leaktest_schedule(circuit: str, request: Request):
     upsert_leak_test_schedule(
         orch.db, circuit,
         enabled=form.get("enabled") == "on",
+        auto_learn_hour=form.get("auto_learn_hour") == "on",
         frequency=form.get("frequency", "monthly"),
         day_of_week=int(form.get("day_of_week", 0)),
         week_of_month=int(form.get("week_of_month", 1)),

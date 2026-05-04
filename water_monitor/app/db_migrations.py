@@ -377,6 +377,39 @@ def _migrate_013(conn: sqlite3.Connection) -> None:
     log.info("Migration 013: Phase 2.1 fixture clustering foundation")
 
 
+def _migrate_014(conn: sqlite3.Connection) -> None:
+    """
+    Cleanup pass — drop dead columns, add leak test auto/manual toggle.
+
+    - home_profile.away_until: never wired up to any UI, redundant with
+      ha_presence_entities. Drop.
+    - leak_test_schedule.custom_interval_days: 'custom' frequency was
+      never exposed in the UI. Drop and remove the dead code path.
+    - leak_test_schedule.auto_learn_hour: NEW — controls whether the
+      scheduler should auto-pick the quietest hour from usage history
+      (default ON, matches previous behaviour) or use the manually
+      configured run_hour/run_minute (when toggled OFF).
+    """
+    # Drop dead columns (idempotent on SQLite < 3.35 — exception swallowed)
+    for table, col in (
+        ("home_profile",        "away_until"),
+        ("leak_test_schedule",  "custom_interval_days"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+        except Exception:
+            pass
+
+    # Add new auto/manual toggle (default 1 = preserve existing behaviour)
+    if not _has_column(conn, "leak_test_schedule", "auto_learn_hour"):
+        conn.execute(
+            "ALTER TABLE leak_test_schedule ADD COLUMN "
+            "auto_learn_hour BOOLEAN DEFAULT 1"
+        )
+
+    log.info("Migration 014: cleaned up dead columns, added auto_learn_hour")
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -391,6 +424,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (11, _migrate_011),
     (12, _migrate_012),
     (13, _migrate_013),
+    (14, _migrate_014),
 ]
 
 

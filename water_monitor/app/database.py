@@ -112,7 +112,6 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- Away / vacation mode
     away_mode       BOOLEAN DEFAULT 0,
     away_since      TIMESTAMP,
-    away_until      TIMESTAMP,
     -- Display unit preferences (keys match units.FLOW_OPTIONS / PRESSURE_OPTIONS)
     flow_unit               TEXT DEFAULT 'L/min',
     pressure_unit           TEXT DEFAULT 'psi',
@@ -448,8 +447,8 @@ CREATE INDEX IF NOT EXISTS idx_daily_summary_circuit_day
 CREATE TABLE IF NOT EXISTS leak_test_schedule (
     circuit                 TEXT PRIMARY KEY,
     enabled                 BOOLEAN DEFAULT 0,
+    auto_learn_hour         BOOLEAN DEFAULT 1,
     frequency               TEXT DEFAULT 'monthly',
-    custom_interval_days    INTEGER,
     day_of_week             INTEGER DEFAULT 0,
     week_of_month           INTEGER DEFAULT 1,
     run_hour                INTEGER DEFAULT 2,
