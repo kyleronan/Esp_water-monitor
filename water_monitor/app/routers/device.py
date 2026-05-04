@@ -31,15 +31,6 @@ async def device_page(request: Request):
     for circuit_cfg in cfg.circuits:
         state = await orch.get_live_state_async(circuit_cfg.circuit)
 
-        # Fetch ESP switch/number states for alert toggles and thresholds
-        esp_entities = await _fetch_esp_device_entities(orch, circuit_cfg)
-        state.update(esp_entities)
-
-        # Alert configs
-        from ..database import get_alert_configs
-        state["alerts"] = [dict(a) for a in
-                           get_alert_configs(orch.db, circuit_cfg.circuit)]
-
         # Leak test schedule
         from ..database import get_leak_test_schedule
         sched = get_leak_test_schedule(orch.db, circuit_cfg.circuit)
@@ -52,46 +43,6 @@ async def device_page(request: Request):
         "circuits": circuit_states,
         "page": "device",
     })
-
-
-async def _fetch_esp_device_entities(orch, circuit_cfg) -> dict:
-    """
-    Fetch current values of ESP threshold and alert entities.
-
-    Entity IDs are constructed using the esp_device_prefix from config.
-    For ESPHome device 'esp-water-shut-off-v3-4', the prefix is
-    'esp_water_shut_off_v3_4_'. If no prefix is configured, entity IDs
-    are used as-is (works if the user has set them up differently).
-    """
-    ha = orch.ha
-    c = circuit_cfg.circuit
-    p = circuit_cfg.esp_device_prefix  # e.g. "esp_water_shut_off_v3_4_"
-
-    name_map = {
-        f"number.{p}burst_pipe_flow_threshold_{c}": "burst_threshold",
-        f"number.{p}pressure_drop_threshold_{c}": "pressure_drop_threshold",
-        f"number.{p}trickle_flow_min_threshold_{c}": "trickle_min",
-        f"number.{p}trickle_flow_max_threshold_{c}": "trickle_max",
-        f"number.{p}trickle_flow_alert_duration_{c}": "trickle_duration",
-        f"number.{p}leak_test_pressure_threshold_{c}": "leak_threshold",
-        f"number.{p}leak_test_duration_{c}": "leak_duration",
-        f"switch.{p}enable_pressure_drop_alert_{c}": "alert_pressure_drop",
-        f"switch.{p}enable_high_flow_alert_{c}": "alert_high_flow",
-        f"switch.{p}enable_leak_test_alert_{c}": "alert_leak_test",
-        f"switch.{p}enable_trickle_alert_{c}": "alert_trickle",
-        f"switch.{p}trickle_flow_auto_shutoff_{c}": "trickle_auto_shutoff",
-    }
-    # Fetch all concurrently
-    entity_ids = list(name_map.keys())
-    states = await asyncio.gather(
-        *[ha.get_state_value(eid, None) for eid in entity_ids],
-        return_exceptions=True,
-    )
-    result = {}
-    for eid, val in zip(entity_ids, states):
-        key = name_map[eid]
-        result[key] = None if isinstance(val, Exception) else val
-    return result
 
 
 # ------------------------------------------------------------------
