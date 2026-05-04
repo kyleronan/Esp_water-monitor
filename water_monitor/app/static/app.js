@@ -297,14 +297,20 @@ document.addEventListener('DOMContentLoaded', startLeakTestCountdowns);
 window.addEventListener("load", () => {
   const el = document.getElementById("conn-status");
   if (!el) return;
+  const labelEl = el.querySelector(".conn-label");
+  const setStatus = (state, label) => {
+    // state: 'ok' | 'reconnecting' | 'offline'
+    el.classList.remove("conn-status-ok", "conn-status-offline", "conn-status-reconnecting");
+    el.classList.add("conn-status-" + state);
+    if (labelEl) labelEl.textContent = label;
+  };
   setInterval(async () => {
     try {
       const r = await fetch(BASE + "/health", { signal: AbortSignal.timeout(5000) });
-      el.textContent = r.ok ? "● Connected" : "● Reconnecting";
-      el.style.color  = r.ok ? "var(--green)" : "var(--amber)";
+      if (r.ok) setStatus("ok", "Connected");
+      else      setStatus("reconnecting", "Reconnecting");
     } catch {
-      el.textContent = "● Offline";
-      el.style.color  = "var(--red)";
+      setStatus("offline", "Offline");
     }
   }, 30000);
 });
