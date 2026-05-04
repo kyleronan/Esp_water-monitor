@@ -150,11 +150,31 @@ async def ingress_middleware(request: Request, call_next):
     # they can only be called from same-origin JS in the HA ingress context.
     # Setup and backup endpoints are exempt (backup import uses multipart
     # without a session token; setup is first-run).
+    #
+    # IMPORTANT: BaseHTTPMiddleware (used by @app.middleware) consumes the
+    # request body when it parses the form. If we don't replay the bytes,
+    # the downstream route handler's own `await request.form()` returns
+    # empty. We read the body once, validate CSRF on a parsed copy, then
+    # rewrite the request._receive callable so the handler sees the
+    # original body intact.
     csrf_exempt = ("/setup", "/backup", "/api/", "/static", "/health")
     if request.method == "POST" and not any(
             request.url.path.startswith(p) for p in csrf_exempt):
         ct = request.headers.get("Content-Type", "")
         if "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
+            # Drain the body once
+            body_bytes = await request.body()
+
+            # Make subsequent reads return the same bytes
+            async def receive_replay():
+                return {
+                    "type": "http.request",
+                    "body": body_bytes,
+                    "more_body": False,
+                }
+            request._receive = receive_replay
+
+            # Parse a copy of the form just for CSRF validation
             form_data = await request.form()
             token = form_data.get("_csrf", "")
             orch = getattr(request.app.state, "orchestrator", None)
@@ -168,6 +188,12 @@ async def ingress_middleware(request: Request, call_next):
                         "<p>Please reload the page and try again.</p>",
                         status_code=403,
                     )
+
+            # Reset the form cache so the handler re-parses from the
+            # replayed body. Starlette caches the parsed form on the
+            # request; clearing the cache forces a fresh parse.
+            if hasattr(request, "_form"):
+                request._form = None
 
     path = request.url.path
     skip_paths = ("/setup", "/static", "/health", "/backup")

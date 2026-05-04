@@ -1,12 +1,16 @@
 """Settings router."""
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from ._helpers import ingress_redirect
 
 from ..config import SENSITIVITY_PRESETS
 from ..database import get_data_retention, update_data_retention, get_home_profile
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/settings")
 
