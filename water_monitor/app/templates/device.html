@@ -147,6 +147,7 @@
         <summary>Schedule</summary>
         <form method="post" action="{{ ingress_path }}/device/leaktest/{{ c.circuit }}/schedule"
               class="schedule-form">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
           <div class="form-row">
             <label>Enabled</label>
             <input type="checkbox" name="enabled"

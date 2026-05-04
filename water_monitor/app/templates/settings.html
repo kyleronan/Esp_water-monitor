@@ -8,6 +8,7 @@
   <p class="muted">Used to suggest calibration duration and initialise thresholds.</p>
 
   <form method="post" action="{{ ingress_path }}/settings/profile/update" class="profile-form">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
     <div class="form-grid">
       <div class="form-group">
         <label>Full bathrooms</label>
@@ -84,6 +85,7 @@
     </p>
     <form method="post" action="{{ ingress_path }}/settings/recalibrate/{{ c.circuit }}"
           class="recal-form">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <div class="form-row">
         <label>Has the number of fixtures changed?</label>
         <select name="fixtures_changed">
@@ -116,6 +118,7 @@
   <div class="settings-card">
     <h3>Learning</h3>
     <form method="post" action="{{ ingress_path }}/settings/learning/{{ c.circuit }}/update">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <div class="radio-group">
         <label class="radio-option">
           <input type="radio" name="learning_mode" value="adaptive"
@@ -145,6 +148,7 @@
     <h3>Sensitivity</h3>
     <form method="post" action="{{ ingress_path }}/settings/sensitivity/{{ c.circuit }}/update"
           id="sens-form-{{ c.circuit }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <input type="hidden" name="mode" id="sens-mode-{{ c.circuit }}" value="simple">
 
       <div class="sensitivity-selector">
@@ -346,6 +350,7 @@
       </div>
       <form method="post"
             action="{{ ingress_path }}/settings/away-mode/toggle">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
         {% if profile.away_mode %}
         <input type="hidden" name="enabled" value="0">
         <button type="submit" class="btn btn-primary btn-sm">
@@ -372,6 +377,7 @@
     </p>
     <form method="post"
           action="{{ ingress_path }}/settings/presence/update">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <div class="form-group">
         <label for="ha_presence_entities">
           Presence entities
@@ -430,6 +436,7 @@
   <div class="settings-card">
     <form method="post"
           action="{{ ingress_path }}/settings/mobile-notify/update">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <div class="form-group">
         <label for="mobile_notify_targets">Notify service name(s)</label>
         <input type="text" id="mobile_notify_targets"
@@ -503,6 +510,7 @@
   <div class="settings-card">
     <form method="post" action="{{ ingress_path }}/settings/retention/update"
           class="retention-form">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <div class="form-grid">
 
         <div class="form-group">
