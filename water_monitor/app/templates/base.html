@@ -34,6 +34,7 @@
   </main>
 
   <script>window.INGRESS_PATH = {{ ingress_path|tojson }};
+  window.CSRF_TOKEN = {{ csrf_token|tojson if csrf_token else '""' }};
   window.UNITS = {
     flow_factor:        {{ flow_factor }},
     flow_unit:          {{ flow_unit|tojson }},

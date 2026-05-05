@@ -31,7 +31,7 @@ async def settings_page(request: Request):
                             get_learning_config, get_alert_configs)
     from ..device_discovery import get_device_config
 
-    profile = dict(get_home_profile(orch.db))
+
 
     # Fetch configurable device entities (number + select) from HA
     device_cfg = get_device_config(orch.db)
@@ -138,12 +138,11 @@ async def settings_page(request: Request):
 
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
-        "profile": profile,
+        "profile": dict(get_home_profile(orch.db) or {}),
         "circuits": circuits,
         "general_entities": entities_by_circuit.get("general", []),
         "presets": SENSITIVITY_PRESETS,
         "retention": get_data_retention(orch.db),
-        "profile": dict(get_home_profile(orch.db) or {}),
         "page": "settings",
     })
 
@@ -287,13 +286,13 @@ async def suggest_days(circuit: str, request: Request):
     from ..database import get_home_profile
     from ..config import compute_suggested_calibration_days
 
-    profile = get_home_profile(orch.db)
+    profile = get_home_profile(orch.db) or {}
     days, tier = compute_suggested_calibration_days(
-        profile["bathrooms_full"] or 1,
-        profile["bathrooms_half"] or 0,
-        profile["floors"] or 1,
-        profile["occupants"] or 2,
-        profile["supply_type"] or "mains",
+        profile.get("bathrooms_full") or 1,
+        profile.get("bathrooms_half") or 0,
+        profile.get("floors") or 1,
+        profile.get("occupants") or 2,
+        profile.get("supply_type") or "mains",
     )
     return JSONResponse({"suggested_days": days, "tier": tier})
 
