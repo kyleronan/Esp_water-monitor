@@ -1,15 +1,16 @@
 """
-Feature extractor — Phase 1.
+Feature extractor — Phase 2.
 
 Consumes RawEvent objects from the detection queue and:
   1. Computes the full feature vector for each event
   2. Stores the event in the SQLite events table
   3. Updates hourly_volume for the chart
   4. Updates the training state event count
+  5. Feeds non-excluded events to ClusterEngine (DBSTREAM) for online
+     cluster matching and sequence context recording
 
-Phase 2 will add DBSCAN clustering and fixture matching on top of
-this stored data. Phase 1 just makes sure we're collecting the right
-features from day one.
+Algorithm: DBSTREAM via river.cluster.DBSTREAM (online, no fixed K).
+DBSCAN batch clustering was considered and rejected — see ADR 003.
 
 Feature vector:
   Temporal:
@@ -74,9 +75,7 @@ from .event_detector import RawEvent
 
 log = logging.getLogger(__name__)
 
-# Maximum gap between consecutive events that counts as a sequence (seconds).
-# Must match cluster_engine.SEQUENCE_GAP_MAX_SECONDS.
-_SEQUENCE_GAP_MAX_S = 300
+from .cluster_engine import SEQUENCE_GAP_MAX_SECONDS as _SEQUENCE_GAP_MAX_S
 
 
 def _safe_float(values: list, default: float = 0.0) -> float:
@@ -334,6 +333,9 @@ class FeatureExtractor:
 
     async def _cluster_event(self, circuit: str, features: dict) -> None:
         """Compute sequence context, run cluster matching, write results back."""
+        if features.get("excluded_from_training"):
+            return
+
         event_id    = features["id"]
         start_ts    = features.get("start_ts")
 
@@ -349,14 +351,12 @@ class FeatureExtractor:
             ).fetchone()
             if prev and prev["end_ts"]:
                 try:
-                    ev_start   = datetime.fromisoformat(start_ts)
-                    prev_end   = datetime.fromisoformat(
+                    ev_start = datetime.fromisoformat(start_ts)
+                    prev_end = datetime.fromisoformat(
                         prev["end_ts"].replace("Z", "+00:00"))
                     if ev_start.tzinfo is None:
-                        from datetime import timezone
                         ev_start = ev_start.replace(tzinfo=timezone.utc)
                     if prev_end.tzinfo is None:
-                        from datetime import timezone
                         prev_end = prev_end.replace(tzinfo=timezone.utc)
                     gap = (ev_start - prev_end).total_seconds()
                     if 0 <= gap < _SEQUENCE_GAP_MAX_S:
@@ -370,7 +370,7 @@ class FeatureExtractor:
                 except (ValueError, TypeError):
                     pass
 
-        # 2. Cluster matching
+        # 2. Cluster matching (sync DB writes dispatched off the event loop)
         cluster_id_result = None
         match_confidence  = None
         match_level       = None
@@ -380,9 +380,19 @@ class FeatureExtractor:
                     "SELECT * FROM events WHERE id = ?", (event_id,)
                 ).fetchone()
                 if event_row:
+                    import functools
+                    loop = asyncio.get_running_loop()
                     cluster_id_result, match_confidence, match_level = \
-                        self.cluster_engine.match_and_learn(
-                            dict(event_row), circuit)
+                        await loop.run_in_executor(
+                            None,
+                            functools.partial(
+                                self.cluster_engine.match_and_learn,
+                                dict(event_row),
+                                circuit,
+                                prev_cluster_id,
+                                seconds_since_prev,
+                            )
+                        )
             except Exception as e:
                 log.error("[%s] cluster matching failed: %s", circuit, e,
                           exc_info=True)
@@ -390,13 +400,27 @@ class FeatureExtractor:
         # 3. Write results back to the event row
         self._db.execute(
             """UPDATE events SET
-                 cluster_id              = ?,
-                 match_confidence        = ?,
-                 match_level             = ?,
+                 cluster_id               = ?,
+                 match_confidence         = ?,
+                 match_level              = ?,
                  seconds_since_prev_event = ?,
-                 prev_cluster_id         = ?
+                 prev_cluster_id          = ?
                WHERE id = ?""",
             (cluster_id_result, match_confidence, match_level,
              seconds_since_prev, prev_cluster_id, event_id)
         )
+
+        # 4. Update fixtures.last_seen_at when this event matched a named fixture
+        if cluster_id_result is not None:
+            fc_row = self._db.execute(
+                """SELECT fixture_id FROM fixture_clusters
+                   WHERE circuit = ? AND id = ? AND fixture_id IS NOT NULL""",
+                (circuit, cluster_id_result)
+            ).fetchone()
+            if fc_row and fc_row["fixture_id"]:
+                self._db.execute(
+                    "UPDATE fixtures SET last_seen_at = ? WHERE id = ?",
+                    (datetime.now(timezone.utc).isoformat(), fc_row["fixture_id"])
+                )
+
         self._db.commit()

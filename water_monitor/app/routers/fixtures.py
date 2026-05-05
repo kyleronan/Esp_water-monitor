@@ -78,10 +78,13 @@ async def retrigger_cluster(request: Request, circuit: str):
         return ingress_redirect(request, "/fixtures?msg=error")
     try:
         import asyncio, functools
-        count = await asyncio.get_event_loop().run_in_executor(
+        loop = asyncio.get_running_loop()
+        count = await loop.run_in_executor(
             None, functools.partial(engine.rebuild_from_db, circuit)
         )
         log.info("[%s] manual rebuild: %d events replayed", circuit, count)
+        if count == 0:
+            return ingress_redirect(request, "/fixtures?msg=too_few_events")
         msg = "reclustered"
     except Exception as e:
         log.error("[%s] re-cluster error: %s", circuit, e, exc_info=True)
@@ -101,10 +104,15 @@ async def confirm_cluster(request: Request, circuit: str, cluster_id: int):
     if not name:
         name = fixture_type.replace("_", " ").title()
 
+    orch = _orch(request)
     from ..database import upsert_fixture_from_cluster
-    upsert_fixture_from_cluster(
-        _orch(request).db, circuit, cluster_id, name, fixture_type, publish
+    fixture_id = upsert_fixture_from_cluster(
+        orch.db, circuit, cluster_id, name, fixture_type, publish
     )
+    if publish and fixture_id:
+        fp = getattr(orch, "_fixture_publisher", None)
+        if fp:
+            fp.publish_fixture(fixture_id)
     return ingress_redirect(request, "/fixtures")
 
 
@@ -112,8 +120,14 @@ async def confirm_cluster(request: Request, circuit: str, cluster_id: int):
 
 @router.post("/{circuit}/cluster/{cluster_id}/delete")
 async def delete_cluster_endpoint(request: Request, circuit: str, cluster_id: int):
-    from ..database import delete_cluster
-    delete_cluster(_orch(request).db, circuit, cluster_id)
+    orch = _orch(request)
+    from ..database import delete_cluster, get_fixture_id_for_cluster
+    fixture_id = get_fixture_id_for_cluster(orch.db, circuit, cluster_id)
+    delete_cluster(orch.db, circuit, cluster_id)
+    if fixture_id:
+        fp = getattr(orch, "_fixture_publisher", None)
+        if fp:
+            fp.retract_fixture(fixture_id)
     return ingress_redirect(request, "/fixtures")
 
 

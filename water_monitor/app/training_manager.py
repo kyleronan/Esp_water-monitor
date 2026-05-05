@@ -44,6 +44,8 @@ class TrainingManager:
         self._db = db
         self._ha = ha
         self._stop = asyncio.Event()
+        # Set by orchestrator after ClusterEngine is initialised
+        self.cluster_engine = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -133,6 +135,24 @@ class TrainingManager:
             completed_at=now.isoformat(),
         )
         await self._publish_status(circuit)
+
+        # Backfill any events that accumulated before the engine was first
+        # instantiated (e.g. installs that upgraded from v0.1.x mid-calibration)
+        if self.cluster_engine is not None:
+            try:
+                import asyncio as _asyncio, functools
+                loop = _asyncio.get_running_loop()
+                backfilled = await loop.run_in_executor(
+                    None,
+                    functools.partial(self.cluster_engine.backfill_unmatched, circuit),
+                )
+                if backfilled:
+                    log.info("[%s] post-calibration backfill: %d events matched",
+                             circuit, backfilled)
+            except Exception as e:
+                log.warning("[%s] post-calibration backfill failed (non-fatal): %s",
+                            circuit, e)
+
         circuit_cfg = self._cfg.get_circuit(circuit)
         if circuit_cfg:
             await self._ha.notify(

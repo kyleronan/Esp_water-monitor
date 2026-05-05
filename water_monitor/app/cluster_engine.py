@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
 from river import cluster, preprocessing
@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 
 # ── Tunable constants ──────────────────────────────────────────────────────────
 SEQUENCE_GAP_MAX_SECONDS      = 300
+# Stage 3: multiply candidate confidence by this when cooccurrence count >= 10
 SEQUENCE_BOOST_WEIGHT         = 1.5
 DBSTREAM_CLUSTERING_THRESHOLD = 1.5
 FADING_FACTOR                 = 0.05
@@ -32,6 +33,14 @@ DTW_DISTANCE_WEIGHT           = 0.4  # Stage 3
 LEVEL_PRELIMINARY_MAX         = 50
 LEVEL_LEARNING_MAX            = 200
 METRICS_WINDOW_HOURS          = 24
+
+# ── Stage 3 hook: DTW transient templates ─────────────────────────────────────
+# dtaidistance is installed (see Dockerfile).  Stage 3 will add:
+#   - transient_template stored per cluster once member_count >= DTW_TEMPLATE_MIN_MEMBERS
+#   - at match time: dtw_dist = dtaidistance.dtw(event_transient, template)
+#   - final confidence = (1 - DTW_DISTANCE_WEIGHT) * feature_conf
+#                       + DTW_DISTANCE_WEIGHT * exp(-dtw_dist / scale)
+# Nothing below touches dtaidistance yet.
 
 FEATURE_KEYS = [
     'avg_flow_lpm', 'peak_flow_lpm', 'duration_seconds',
@@ -131,20 +140,31 @@ class ClusterEngine:
         mapping = self._river_id_map[circuit]
         if river_id not in mapping:
             our_id = self._next_cluster_id[circuit]
-            self._next_cluster_id[circuit] += 1
-            mapping[river_id] = our_id
-            now = datetime.utcnow().isoformat()
-            self._db.execute(
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = self._db.execute(
                 """INSERT OR IGNORE INTO fixture_clusters
                    (circuit, id, member_count, confidence_level, created_at, last_match_at)
                    VALUES (?, ?, 0, 'preliminary', ?, ?)""",
                 (circuit, our_id, now, now)
             )
+            if cursor.rowcount > 0:
+                # INSERT succeeded — claim this ID
+                self._next_cluster_id[circuit] += 1
+                mapping[river_id] = our_id
+            else:
+                # Row already existed (shouldn't normally happen); don't ghost the counter.
+                # Use the existing DB row that matches our_id rather than creating a duplicate.
+                log.warning(
+                    "[%s] _upsert_cluster: INSERT OR IGNORE skipped for id=%d — "
+                    "mapping to existing row",
+                    circuit, our_id,
+                )
+                mapping[river_id] = our_id
         return mapping[river_id]
 
     def _increment_member_count(self, circuit: str, cluster_id: int) -> int:
         """Increment member_count, update confidence_level, return new count."""
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self._db.execute(
             """UPDATE fixture_clusters
                SET member_count  = member_count + 1,
@@ -219,13 +239,46 @@ class ClusterEngine:
         except Exception as e:
             log.warning("[%s] suggest_fixture_type failed: %s", circuit, e)
 
+    def _update_cooccurrence(self, circuit: str, from_id: int, to_id: int,
+                             gap_seconds: float) -> None:
+        """Record a cluster→cluster transition in the cooccurrence table.
+        Uses a running mean for median_gap_seconds (approximation; exact median
+        would require storing all gaps, which is not worth the cost here).
+        Stage 3 will read this table to apply a confidence boost when a
+        candidate cluster frequently follows the previous event's cluster.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            self._db.execute(
+                """INSERT INTO cluster_cooccurrence
+                       (circuit, from_cluster_id, to_cluster_id, count,
+                        median_gap_seconds, last_seen_at)
+                   VALUES (?, ?, ?, 1, ?, ?)
+                   ON CONFLICT (circuit, from_cluster_id, to_cluster_id) DO UPDATE SET
+                       count              = count + 1,
+                       median_gap_seconds = (median_gap_seconds * count + ?) / (count + 1),
+                       last_seen_at       = excluded.last_seen_at""",
+                (circuit, from_id, to_id, gap_seconds, now, gap_seconds)
+            )
+        except Exception as e:
+            log.warning("[%s] cooccurrence update failed: %s", circuit, e)
+
     # ── Core: match and learn ──────────────────────────────────────────────────
 
-    def match_and_learn(self, event: dict,
-                        circuit: str) -> Tuple[Optional[int], float, str]:
+    def match_and_learn(
+        self,
+        event: dict,
+        circuit: str,
+        prev_cluster_id: Optional[int] = None,
+        seconds_since_prev: Optional[float] = None,
+    ) -> Tuple[Optional[int], float, str]:
         """
         Feed one event through DBSTREAM.  Returns (cluster_id, confidence, level).
         cluster_id is None if features are missing or DBSTREAM has no centres yet.
+
+        prev_cluster_id / seconds_since_prev: when provided and the gap is within
+        SEQUENCE_GAP_MAX_SECONDS, the cooccurrence table is updated.
+        Stage 3 will apply a confidence boost from this table.
         """
         features = self._extract_features(event)
         if features is None:
@@ -246,11 +299,22 @@ class ClusterEngine:
             return (None, 0.0, '')
 
         confidence = math.exp(-distance / DBSTREAM_CLUSTERING_THRESHOLD)
+        # Stage 3: multiply confidence by SEQUENCE_BOOST_WEIGHT when
+        # cooccurrence count for (prev_cluster_id → cluster_id) >= 10.
 
         cluster_id   = self._upsert_cluster(circuit, nearest_id)
         member_count = self._increment_member_count(circuit, cluster_id)
         self._update_cluster_centroid(circuit, cluster_id, features, member_count)
         self._run_suggest_type_if_needed(circuit, cluster_id, member_count)
+
+        # Record cooccurrence transition (write path; boost applied in Stage 3)
+        if (prev_cluster_id is not None
+                and seconds_since_prev is not None
+                and seconds_since_prev < SEQUENCE_GAP_MAX_SECONDS):
+            self._update_cooccurrence(
+                circuit, prev_cluster_id, cluster_id, seconds_since_prev
+            )
+
         self._db.commit()
 
         level = self._confidence_level(member_count)
@@ -273,7 +337,7 @@ class ClusterEngine:
         new events continue updating existing clusters rather than creating
         duplicates.
         """
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         rows = self._db.execute(
             """SELECT * FROM events
                WHERE circuit = ? AND end_ts >= ? AND cluster_id IS NOT NULL
@@ -296,6 +360,49 @@ class ClusterEngine:
             self._rebuild_id_map_from_centroids(circuit)
 
         log.info("Restored %d events into circuit '%s' state", count, circuit)
+        return count
+
+    def backfill_unmatched(self, circuit: str) -> int:
+        """
+        Assign cluster_id to events that were collected before the DBSTREAM
+        engine existed (v0.1.x upgrades) or before a full recalibration.
+        Processes cluster_id IS NULL events in chronological order, feeding
+        each through match_and_learn and writing the result back.
+
+        Safe to call multiple times — only processes unmatched rows.
+        Called from orchestrator after rebuild_from_db and from
+        training_manager after calibration completes.
+        """
+        rows = self._db.execute(
+            """SELECT * FROM events
+               WHERE circuit = ? AND cluster_id IS NULL
+                 AND excluded_from_training = 0
+                 AND end_ts IS NOT NULL
+               ORDER BY start_ts ASC""",
+            (circuit,)
+        ).fetchall()
+
+        if not rows:
+            return 0
+
+        count = 0
+        for row in rows:
+            event = dict(row)
+            cluster_id, confidence, level = self.match_and_learn(event, circuit)
+            if cluster_id is None:
+                continue
+            self._db.execute(
+                """UPDATE events
+                   SET cluster_id = ?, match_confidence = ?, match_level = ?
+                   WHERE id = ?""",
+                (cluster_id, confidence, level, event["id"])
+            )
+            count += 1
+
+        if count:
+            self._db.commit()
+            log.info("[%s] backfill_unmatched: assigned cluster_id to %d events",
+                     circuit, count)
         return count
 
     def _rebuild_id_map_from_centroids(self, circuit: str) -> None:
