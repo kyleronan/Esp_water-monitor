@@ -106,12 +106,14 @@ async def settings_page(request: Request):
                 # Pre-convert numeric state to display units
                 if pattern in _FLOW_PATTERNS:
                     e["unit_type"] = "flow"
+                    e["unit"] = _flow_label
                     try:
                         e["state"] = round(float(e["state"]) * _flow_factor, 3)
                     except (TypeError, ValueError):
                         pass
                 elif pattern in _PRESSURE_PATTERNS:
                     e["unit_type"] = "pressure"
+                    e["unit"] = _pressure_label
                     try:
                         e["state"] = round(float(e["state"]) * _pressure_factor, 3)
                     except (TypeError, ValueError):
