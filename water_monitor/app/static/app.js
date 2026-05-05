@@ -12,18 +12,6 @@ async function post(url, body = {}) {
   return { ok: resp.ok, status: resp.status, data };
 }
 
-async function postForm(url, data = {}) {
-  const body = new URLSearchParams(data).toString();
-  const resp = await fetch(BASE + url, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-  let payload = null;
-  try { payload = await resp.json(); } catch {}
-  return { ok: resp.ok, status: resp.status, data: payload };
-}
-
 // ── Live state updater ─────────────────────────────────────────────
 // Always-on poll — reflects valve changes from HA, the ESP firmware
 // (faults, leak tests, bypass switch), or any other source.
@@ -60,20 +48,17 @@ function applyLiveState(circuit, state) {
       }
     }
   }
-  // Pressure + flow readings
+  // Pressure + flow readings.
+  // The API already applies unit conversion server-side — display as-is.
   const p = document.getElementById(`pressure-${circuit}`);
   const f = document.getElementById(`flow-${circuit}`);
   if (p && state.pressure) {
     const v = parseFloat(state.pressure);
-    // state.pressure is raw PSI from HA — multiply by user's pressure factor
-    p.textContent = isNaN(v) ? state.pressure
-      : (v * window.UNITS.pressure_factor).toFixed(window.UNITS.pressure_decimals);
+    p.textContent = isNaN(v) ? state.pressure : v.toFixed(window.UNITS.pressure_decimals);
   }
   if (f && state.flow_rate !== undefined) {
     const v = parseFloat(state.flow_rate);
-    // state.flow_rate is raw L/min from HA — multiply by user's flow factor
-    f.textContent = isNaN(v) ? '0.00'
-      : (v * window.UNITS.flow_factor).toFixed(window.UNITS.flow_decimals);
+    f.textContent = isNaN(v) ? '0.00' : v.toFixed(window.UNITS.flow_decimals);
   }
 
   // Leak test ETC — update data attrs if newly available, then restart countdown
@@ -161,22 +146,6 @@ async function resetFault(circuit) {
 async function resetTrickle(circuit) {
   await post(`/device/trickle/${circuit}/reset`);
   setTimeout(() => location.reload(), 1000);
-}
-
-// ── Threshold update (device page inline inputs) ───────────────────
-async function setThreshold(entityId, value) {
-  const circuit = entityId.split("_").pop();
-  await postForm(`/device/threshold/${circuit}/update`, {
-    entity_id: entityId,
-    value: String(value),
-  });
-}
-
-// ── Alert toggle (device page) ─────────────────────────────────────
-async function toggleAlert(circuit, alertType, enabled) {
-  await postForm(`/device/alert/${circuit}/${alertType}/toggle`, {
-    enabled: enabled ? "true" : "false",
-  });
 }
 
 // ── Leak test ──────────────────────────────────────────────────────
@@ -286,7 +255,7 @@ function startCountdownFor(el) {
 }
 
 function startLeakTestCountdowns() {
-  document.querySelectorAll('.leak-test-etc[data-circuit]').forEach(el => {
+  document.querySelectorAll('.leak-running-indicator[data-circuit]').forEach(el => {
     startCountdownFor(el);
   });
 }

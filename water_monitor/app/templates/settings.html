@@ -666,7 +666,7 @@ async function settingsAlertToggle(alertId, enabled) {
   await fetch(`${window.INGRESS_PATH}/settings/alert/${circuit}/${alertId}/toggle`, {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: `enabled=${enabled}`
+    body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&enabled=${enabled}`
   });
 }
 
@@ -674,7 +674,7 @@ async function updateDeviceEntity(entityId, value) {
   const resp = await fetch(`${window.INGRESS_PATH}/settings/device-entity/update`, {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: `entity_id=${encodeURIComponent(entityId)}&value=${encodeURIComponent(value)}`,
+    body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&entity_id=${encodeURIComponent(entityId)}&value=${encodeURIComponent(value)}`,
   });
   const data = await resp.json().catch(() => ({}));
   if (data.status !== 'ok') {

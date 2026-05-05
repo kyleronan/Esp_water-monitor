@@ -72,7 +72,7 @@
           <span class="leak-running-label">Leak test running</span>
           <span class="leak-running-etc">{{ c.leak_test_etc or "Running…" }}</span>
         </div>
-        {% elif c.leak_test_result %}
+        {% elif c.leak_test_result and c.leak_test_result not in ('No test run', 'unknown', 'unavailable') %}
         <span class="pill {% if 'Passed' in c.leak_test_result %}pill-green{% else %}pill-amber{% endif %}">
           {{ c.leak_test_result }}
         </span>
@@ -123,7 +123,8 @@
 
           <div class="dev-sched-row">
             <span class="dev-sched-label">Frequency</span>
-            <select class="dev-sched-select" name="frequency">
+            <select class="dev-sched-select" name="frequency"
+                    onchange="this.closest('.dev-sched-grid').querySelector('.dev-sched-row-dow').style.display=this.value==='daily'?'none':'flex'">
               <option value="daily" {% if c.schedule.frequency == 'daily' %}selected{% endif %}>Daily</option>
               <option value="weekly" {% if c.schedule.frequency == 'weekly' %}selected{% endif %}>Weekly</option>
               <option value="fortnightly" {% if c.schedule.frequency == 'fortnightly' %}selected{% endif %}>Fortnightly</option>
@@ -131,8 +132,8 @@
             </select>
           </div>
 
-          {% if c.schedule.frequency != 'daily' %}
-          <div class="dev-sched-row">
+          <div class="dev-sched-row dev-sched-row-dow"
+               style="display:{% if c.schedule.frequency == 'daily' or not c.schedule.frequency %}none{% else %}flex{% endif %}">
             <span class="dev-sched-label">Day of week</span>
             <select class="dev-sched-select" name="day_of_week">
               {% for i, d in [(0,'Monday'),(1,'Tuesday'),(2,'Wednesday'),(3,'Thursday'),(4,'Friday'),(5,'Saturday'),(6,'Sunday')] %}
@@ -140,7 +141,6 @@
               {% endfor %}
             </select>
           </div>
-          {% endif %}
 
           <div class="dev-sched-row">
             <span class="dev-sched-label">
