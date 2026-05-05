@@ -410,6 +410,26 @@ def _migrate_014(conn: sqlite3.Connection) -> None:
     log.info("Migration 014: cleaned up dead columns, added auto_learn_hour")
 
 
+def _migrate_015(conn: sqlite3.Connection) -> None:
+    """Remove duplicate events that share (circuit, start_ts).
+
+    Before the uuid5 fix in feature_extractor.py, each re-processing of the
+    same raw event generated a fresh uuid4, so INSERT OR REPLACE never matched
+    the existing row and inserted a duplicate instead.  Keep the row with the
+    lowest rowid (first inserted) and delete the rest.
+    """
+    conn.execute("""
+        DELETE FROM events
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid)
+            FROM events
+            GROUP BY circuit, start_ts
+        )
+    """)
+    deleted = conn.execute("SELECT changes()").fetchone()[0]
+    log.info("Migration 015: removed %d duplicate event row(s)", deleted)
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -425,6 +445,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (12, _migrate_012),
     (13, _migrate_013),
     (14, _migrate_014),
+    (15, _migrate_015),
 ]
 
 
