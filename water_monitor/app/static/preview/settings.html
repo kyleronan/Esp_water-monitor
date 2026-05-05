@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>💧 Settings — Preview</title>
+  <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+
+<header class="app-header">
+  <div class="app-brand">
+    <span class="app-brand-icon">💧</span>
+    <span class="app-brand-text">Water Monitor</span>
+  </div>
+  <div class="conn-status conn-status-ok" id="conn-status">
+    <span class="conn-dot"></span>
+    <span class="conn-label">Connected</span>
+  </div>
+</header>
+
+<nav class="app-nav">
+  <a href="#" class="nav-item">Dashboard</a>
+  <a href="#" class="nav-item">Device</a>
+  <a href="#" class="nav-item">History</a>
+  <a href="#" class="nav-item">Fixtures</a>
+  <a href="#" class="nav-item active">Settings</a>
+  <a href="#" class="nav-item">Backup</a>
+  <a href="#" class="nav-item">Setup</a>
+</nav>
+
+<main class="app-main">
+
+<div class="sett-layout">
+
+  <!-- Sidebar nav -->
+  <nav class="sett-sidebar">
+
+    <button class="sett-nav-btn" id="sett-btn-profile" onclick="settNav('profile')">
+      <span class="sett-nav-icon">🏠</span>
+      <span class="sett-nav-label">Home Profile</span>
+    </button>
+
+    <button class="sett-nav-btn" id="sett-btn-circuit-main" onclick="settNav('circuit-main')">
+      <span class="sett-nav-icon">💧</span>
+      <span class="sett-nav-label">Main Supply</span>
+      <span class="sett-nav-badge badge-live">live</span>
+    </button>
+
+    <button class="sett-nav-btn" id="sett-btn-circuit-irrigation" onclick="settNav('circuit-irrigation')">
+      <span class="sett-nav-icon">💧</span>
+      <span class="sett-nav-label">Irrigation</span>
+      <span class="sett-nav-badge badge-cal">learning</span>
+    </button>
+
+    <button class="sett-nav-btn" id="sett-btn-away" onclick="settNav('away')">
+      <span class="sett-nav-icon">✈️</span>
+      <span class="sett-nav-label">Away Mode</span>
+    </button>
+
+    <button class="sett-nav-btn" id="sett-btn-notifications" onclick="settNav('notifications')">
+      <span class="sett-nav-icon">🔔</span>
+      <span class="sett-nav-label">Notifications</span>
+    </button>
+
+    <button class="sett-nav-btn" id="sett-btn-units" onclick="settNav('units')">
+      <span class="sett-nav-icon">📏</span>
+      <span class="sett-nav-label">Display Units</span>
+    </button>
+
+    <button class="sett-nav-btn" id="sett-btn-retention" onclick="settNav('retention')">
+      <span class="sett-nav-icon">🗄️</span>
+      <span class="sett-nav-label">Data Retention</span>
+    </button>
+
+  </nav>
+
+  <!-- Content pane -->
+  <div class="sett-content">
+
+    <!-- Home Profile -->
+    <div class="sett-section" id="sett-profile">
+      <h2 class="sett-section-title">Home Profile</h2>
+      <p class="sett-section-desc">Used to suggest calibration duration and initialise thresholds.</p>
+      <div class="sett-card">
+        <form method="post" action="#">
+          <div class="sett-form-grid">
+            <div class="sett-form-group">
+              <label>Full bathrooms</label>
+              <input type="number" value="2" min="0" max="20">
+            </div>
+            <div class="sett-form-group">
+              <label>Half bathrooms</label>
+              <input type="number" value="1" min="0" max="10">
+            </div>
+            <div class="sett-form-group">
+              <label>Home size (sq ft)</label>
+              <input type="number" value="2200" min="0" max="50000">
+            </div>
+            <div class="sett-form-group">
+              <label>Floors</label>
+              <input type="number" value="2" min="1" max="10">
+            </div>
+            <div class="sett-form-group">
+              <label>Occupants</label>
+              <input type="number" value="3" min="1" max="20">
+            </div>
+            <div class="sett-form-group">
+              <label>Year built</label>
+              <input type="number" value="2004" min="1800" max="2030">
+            </div>
+            <div class="sett-form-group">
+              <label>Water supply</label>
+              <select>
+                <option selected>Mains / Municipal</option>
+                <option>Private well or pump</option>
+              </select>
+            </div>
+          </div>
+          <button type="button" class="btn btn-primary btn-sm">Save Profile</button>
+        </form>
+      </div>
+    </div>
+
+    <!-- Circuit: Main Supply -->
+    <div class="sett-section" id="sett-circuit-main" style="display:none">
+      <div class="sett-circuit-header">
+        <h2 class="sett-section-title">Main Supply</h2>
+        <span class="pill pill-green">Live</span>
+      </div>
+      <p class="sett-section-desc">Circuit-specific detection and alert settings.</p>
+
+      <!-- Recalibration card -->
+      <div class="sett-card">
+        <h3 class="sett-card-title">Recalibration</h3>
+        <p class="sett-card-desc">Recalibrate if you've renovated, added appliances, or your household has changed significantly.</p>
+        <details class="recal-details">
+          <summary>Start recalibration…</summary>
+          <div style="margin-top:.75rem">
+            <div class="sett-form-grid">
+              <div class="sett-form-group">
+                <label>Have fixtures changed?</label>
+                <select><option>No — plumbing is the same</option><option>Yes — something was added or removed</option></select>
+              </div>
+              <div class="sett-form-group">
+                <label>Have occupants changed?</label>
+                <select><option>No</option><option>Yes — someone moved in or out</option></select>
+              </div>
+              <div class="sett-form-group">
+                <label>Calibration duration</label>
+                <div style="display:flex;gap:.5rem;align-items:center">
+                  <select style="flex:1"><option>14 days</option><option>21 days</option><option>28 days</option></select>
+                  <button type="button" class="btn btn-secondary btn-sm">Suggest</button>
+                </div>
+              </div>
+            </div>
+            <button type="button" class="btn btn-warning btn-sm">Start Recalibration</button>
+          </div>
+        </details>
+      </div>
+
+      <!-- Learning mode card -->
+      <div class="sett-card">
+        <h3 class="sett-card-title">Learning Mode</h3>
+        <label class="sett-radio-card">
+          <input type="radio" name="learning_main" checked>
+          <div>
+            <div class="sett-radio-label">Adaptive <span style="font-weight:400;color:var(--text-3)">(recommended)</span></div>
+            <div class="sett-radio-desc">Usage patterns update automatically as your household evolves. Fixture signatures never change.</div>
+          </div>
+        </label>
+        <label class="sett-radio-card">
+          <input type="radio" name="learning_main">
+          <div>
+            <div class="sett-radio-label">Static</div>
+            <div class="sett-radio-desc">Everything fixed as learned during calibration. Recalibrate manually when needed.</div>
+          </div>
+        </label>
+        <button type="button" class="btn btn-primary btn-sm" style="margin-top:8px">Save</button>
+      </div>
+
+      <!-- Sensitivity card -->
+      <div class="sett-card">
+        <h3 class="sett-card-title">Detection Sensitivity</h3>
+        <div class="sett-sens-grid">
+          <label class="sett-sens-btn">
+            <input type="radio" name="sens_main" value="low"> Low
+          </label>
+          <label class="sett-sens-btn active">
+            <input type="radio" name="sens_main" value="medium" checked> Medium
+          </label>
+          <label class="sett-sens-btn">
+            <input type="radio" name="sens_main" value="high"> High
+          </label>
+        </div>
+        <details class="advanced-details">
+          <summary>Advanced settings</summary>
+          <div class="sett-form-grid" style="margin-top:.75rem">
+            <div class="sett-form-group">
+              <label>Pressure drop to detect event (psi)</label>
+              <input type="number" value="2.0" step="0.5">
+            </div>
+            <div class="sett-form-group">
+              <label>Min event duration (seconds)</label>
+              <input type="number" value="3" step="0.5">
+            </div>
+            <div class="sett-form-group">
+              <label>Anomaly score to alert (0–1)</label>
+              <input type="number" value="0.6" step="0.05">
+            </div>
+            <div class="sett-form-group">
+              <label>Anomaly score to auto-shutoff (0–1)</label>
+              <input type="number" value="0.8" step="0.05">
+            </div>
+          </div>
+        </details>
+        <button type="button" class="btn btn-primary btn-sm" style="margin-top:12px">Save Sensitivity</button>
+      </div>
+
+      <!-- Alerts card -->
+      <div class="sett-card">
+        <h3 class="sett-card-title">Alerts</h3>
+        <p class="sett-card-desc">Toggle which anomaly alerts this add-on generates.</p>
+
+        <div class="sett-toggle-row">
+          <div>
+            <div class="sett-toggle-label">Sustained flow alert</div>
+            <div class="sett-toggle-desc">Alert if flow continues beyond expected duration</div>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="sett-toggle-row">
+          <div>
+            <div class="sett-toggle-label">Burst pipe detection</div>
+            <div class="sett-toggle-desc">Immediate shutoff on extreme flow anomaly</div>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="sett-toggle-row">
+          <div>
+            <div class="sett-toggle-label">Trickle flow alert</div>
+            <div class="sett-toggle-desc">Detect slow continuous drips</div>
+          </div>
+          <label class="toggle">
+            <input type="checkbox">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="sett-toggle-row">
+          <div>
+            <div class="sett-toggle-label">Night-time usage alert</div>
+            <div class="sett-toggle-desc">Flag unexpected flow between 1–5 AM</div>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <!-- Circuit: Irrigation (calibrating) -->
+    <div class="sett-section" id="sett-circuit-irrigation" style="display:none">
+      <div class="sett-circuit-header">
+        <h2 class="sett-section-title">Irrigation</h2>
+        <span class="pill pill-blue">Calibrating</span>
+      </div>
+      <p class="sett-section-desc">Circuit-specific detection and alert settings.</p>
+
+      <div class="sett-card">
+        <h3 class="sett-card-title">Recalibration</h3>
+        <p class="sett-card-desc">Recalibrate if you've renovated, added appliances, or your household has changed significantly.</p>
+        <div style="margin-bottom:.75rem">
+          <span class="muted">14d 3h remaining · 38% complete</span>
+        </div>
+        <details class="recal-details">
+          <summary>Start recalibration…</summary>
+          <div style="margin-top:.75rem">
+            <div class="sett-form-grid">
+              <div class="sett-form-group">
+                <label>Calibration duration</label>
+                <select><option>14 days</option><option selected>21 days</option><option>28 days</option></select>
+              </div>
+            </div>
+            <button type="button" class="btn btn-warning btn-sm">Start Recalibration</button>
+          </div>
+        </details>
+      </div>
+
+      <div class="sett-card">
+        <h3 class="sett-card-title">Detection Sensitivity</h3>
+        <div class="sett-sens-grid">
+          <label class="sett-sens-btn">
+            <input type="radio" name="sens_irr" value="low"> Low
+          </label>
+          <label class="sett-sens-btn">
+            <input type="radio" name="sens_irr" value="medium"> Medium
+          </label>
+          <label class="sett-sens-btn active">
+            <input type="radio" name="sens_irr" value="high" checked> High
+          </label>
+        </div>
+        <button type="button" class="btn btn-primary btn-sm" style="margin-top:12px">Save Sensitivity</button>
+      </div>
+    </div>
+
+    <!-- Away Mode -->
+    <div class="sett-section" id="sett-away" style="display:none">
+      <h2 class="sett-section-title">Away / Vacation Mode</h2>
+      <p class="sett-section-desc">Pauses baseline learning while you're away. Leak tests, valve control, and fault detection continue normally.</p>
+
+      <div class="sett-card">
+        <div class="sett-away-status-row">
+          <div class="sett-away-status-info">
+            <span class="sett-away-icon">🏠</span>
+            <div>
+              <div class="sett-away-status-label">Currently home</div>
+            </div>
+          </div>
+          <button type="button" class="btn btn-secondary btn-sm">Enable away mode</button>
+        </div>
+      </div>
+
+      <div class="sett-card" style="margin-top:.75rem">
+        <h3 class="sett-card-title">Link to Home Assistant presence</h3>
+        <p class="sett-card-desc">Automatically enable away mode when all presence entities report everyone is away.</p>
+        <div class="sett-form-group" style="margin-bottom:12px">
+          <label>Presence entities <span class="form-hint">comma-separated</span></label>
+          <input type="text" placeholder="person.alice, person.bob">
+        </div>
+        <div class="sett-form-grid" style="margin-bottom:12px">
+          <div class="sett-form-group">
+            <label>"Away" state value</label>
+            <input type="text" value="not_home">
+          </div>
+          <div class="sett-form-group">
+            <label>"Home" state value</label>
+            <input type="text" value="home">
+          </div>
+        </div>
+        <button type="button" class="btn btn-primary btn-sm">Save presence settings</button>
+      </div>
+    </div>
+
+    <!-- Notifications -->
+    <div class="sett-section" id="sett-notifications" style="display:none">
+      <h2 class="sett-section-title">Mobile Push Notifications</h2>
+      <p class="sett-section-desc">Send alerts to your phone via the Home Assistant mobile app. Enter the notify service name(s) found in HA under <strong>Developer Tools → Services</strong>.</p>
+      <div class="sett-card">
+        <div class="sett-form-group" style="margin-bottom:12px">
+          <label>Notify service name(s)</label>
+          <input type="text" placeholder="mobile_app_my_iphone, mobile_app_my_android">
+        </div>
+        <button type="button" class="btn btn-primary btn-sm">Save</button>
+      </div>
+    </div>
+
+    <!-- Display Units -->
+    <div class="sett-section" id="sett-units" style="display:none">
+      <h2 class="sett-section-title">Display Units</h2>
+      <p class="sett-section-desc">Choose how pressure and flow are displayed throughout the web UI.</p>
+      <div class="sett-card">
+        <div class="sett-form-grid" style="margin-bottom:14px">
+          <div class="sett-form-group">
+            <label>Flow rate &amp; volume <span class="form-hint">affects flow readings and daily totals</span></label>
+            <select>
+              <option>L/min · Litres</option>
+              <option>GPM · Gallons</option>
+            </select>
+          </div>
+          <div class="sett-form-group">
+            <label>Pressure <span class="form-hint">affects pressure readings and leak test results</span></label>
+            <select>
+              <option>psi</option>
+              <option>bar</option>
+              <option>kPa</option>
+            </select>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+          <button type="button" class="btn btn-primary btn-sm">Save</button>
+          <button type="button" class="btn btn-secondary btn-sm">Re-detect from HA</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Data Retention -->
+    <div class="sett-section" id="sett-retention" style="display:none">
+      <h2 class="sett-section-title">Data Retention</h2>
+      <p class="sett-section-desc">Controls how much historical data is kept. <strong>Training-era data is always protected.</strong></p>
+      <div class="sett-card">
+        <div class="sett-retention-row">
+          <div class="sett-retention-info">
+            <span class="sett-retention-label">Usage events</span>
+            <span class="sett-retention-desc">raw flow/pressure readings — daily summaries kept forever</span>
+            <span class="sett-retention-val" id="events_yr_label">1 yr</span>
+          </div>
+          <input type="range" min="1" max="10" value="1" style="width:100%;accent-color:var(--accent)"
+                 oninput="document.getElementById('events_yr_label').textContent = this.value + ' yr' + (this.value==1?'':'s')">
+        </div>
+        <div class="sett-retention-row">
+          <div class="sett-retention-info">
+            <span class="sett-retention-label">Hourly volume history</span>
+            <span class="sett-retention-desc">used for leak test scheduling</span>
+            <span class="sett-retention-val" id="vol_yr_label">2 yrs</span>
+          </div>
+          <input type="range" min="1" max="10" value="2" style="width:100%;accent-color:var(--accent)"
+                 oninput="document.getElementById('vol_yr_label').textContent = this.value + ' yr' + (this.value==1?'':'s')">
+        </div>
+
+        <div style="display:flex;align-items:center;gap:.5rem;padding-top:4px;margin-bottom:1rem">
+          <label class="toggle">
+            <input type="checkbox" checked>
+            <span class="toggle-slider"></span>
+          </label>
+          <span style="font-size:13px">Enable automatic nightly pruning</span>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--border);margin:.75rem 0">
+        <h3 class="sett-card-title">Automatic Backup</h3>
+        <p class="sett-card-desc">Writes a Quick Restore JSON to the filesystem on a weekly schedule.</p>
+
+        <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.75rem">
+          <label class="toggle">
+            <input type="checkbox">
+            <span class="toggle-slider"></span>
+          </label>
+          <span style="font-size:13px">Enable weekly auto-backup</span>
+        </div>
+
+        <div class="sett-form-grid" style="margin-bottom:.75rem">
+          <div class="sett-form-group">
+            <label>Backup directory</label>
+            <input type="text" value="/share/water_monitor_backups">
+          </div>
+          <div class="sett-form-group">
+            <label>Run on</label>
+            <select><option>Monday</option><option>Sunday</option></select>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap">
+          <button type="button" class="btn btn-primary btn-sm">Save retention settings</button>
+          <button type="button" class="btn btn-secondary btn-sm">Run pruning now</button>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /sett-content -->
+</div><!-- /sett-layout -->
+
+</main>
+
+<script>
+function settNav(id) {
+  document.querySelectorAll('.sett-section').forEach(el => el.style.display = 'none');
+  document.querySelectorAll('.sett-nav-btn').forEach(el => el.classList.remove('active'));
+  const section = document.getElementById('sett-' + id);
+  if (section) section.style.display = '';
+  const btn = document.getElementById('sett-btn-' + id);
+  if (btn) btn.classList.add('active');
+}
+document.addEventListener('DOMContentLoaded', () => {
+  const id = location.hash.slice(1) || 'profile';
+  settNav(id);
+});
+</script>
+
+</body>
+</html>

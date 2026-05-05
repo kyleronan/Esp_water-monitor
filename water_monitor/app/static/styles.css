@@ -1661,6 +1661,7 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .sett-sidebar {
   width: 200px;
   flex-shrink: 0;
+  align-self: flex-start;   /* prevent flex stretch from fighting sticky */
   border-right: 1px solid var(--border);
   background: var(--surface);
   padding: 16px 8px;
