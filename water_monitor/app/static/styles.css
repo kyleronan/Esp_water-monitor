@@ -1702,6 +1702,8 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   padding: 1px 5px; border-radius: 999px;
   flex-shrink: 0;
 }
+.sett-nav-badge.badge-live { background: var(--green-bg);   color: var(--green-text); }
+.sett-nav-badge.badge-cal  { background: var(--accent-bg2); color: var(--accent); }
 /* ── Mobile: sidebar becomes horizontal tab strip ───────────────── */
 @media (max-width: 640px) {
   .sett-layout { flex-direction: column; margin: -20px -24px; }
@@ -1915,3 +1917,25 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .done { /* setup step state, styled via .setup-step.done rule */ }
 .row-optional { opacity: .75; }
 .row-warn { background: var(--amber-bg); }
+
+/* ── Recalibration confirmation modal ────────────────────────────── */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 500;
+  background: oklch(0% 0 0 / .45);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.modal-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  padding: 24px;
+  max-width: 480px; width: 100%;
+}
+.modal-box h3 { font-size: 15px; font-weight: 700; margin-bottom: 10px; }
+.modal-box p  { font-size: 13px; color: var(--text-2); margin-bottom: 8px; line-height: 1.5; }
+.modal-actions {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  margin-top: 16px;
+}
