@@ -1940,3 +1940,144 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   display: flex; gap: 8px; flex-wrap: wrap;
   margin-top: 16px;
 }
+
+/* ── Fixtures page ───────────────────────────────────────────────────── */
+
+/* Flash messages */
+.fx-msg {
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  font-size: 13px; font-weight: 500;
+  margin-bottom: 16px;
+}
+.fx-msg-ok  { background: var(--green-bg);  color: var(--green-text);  border: 1px solid oklch(80% .10 155); }
+.fx-msg-warn{ background: var(--amber-bg);  color: var(--amber-text);  border: 1px solid oklch(82% .12 70);  }
+.fx-msg-err { background: var(--red-bg);    color: var(--red-text);    border: 1px solid oklch(82% .12 25);  }
+
+/* Page header row */
+.fx-header {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 20px; flex-wrap: wrap;
+}
+.fx-header h1 { font-size: 20px; font-weight: 700; letter-spacing: -.02em; color: var(--text); }
+
+/* Unreviewed clusters banner */
+.fx-review-banner {
+  background: var(--amber-bg);
+  border: 1px solid oklch(82% .12 70);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  font-size: 13px; color: var(--amber-text);
+  margin-bottom: 20px;
+}
+
+/* Circuit section heading */
+.fx-circuit-heading {
+  font-size: 16px; font-weight: 700; color: var(--text);
+  margin-bottom: 12px; margin-top: 4px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Empty state */
+.fx-empty {
+  background: var(--surface);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  padding: 28px 20px;
+  text-align: center;
+  margin-bottom: 20px;
+}
+.fx-empty-icon { font-size: 28px; display: block; margin-bottom: 8px; }
+.fx-empty p    { font-size: 13px; color: var(--text-2); }
+
+/* Cluster card grid */
+.fx-cluster-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+  margin-bottom: 24px;
+}
+
+/* Individual cluster card */
+.fx-cluster-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  box-shadow: var(--shadow);
+  display: flex; flex-direction: column; gap: 12px;
+  transition: box-shadow .15s;
+}
+.fx-cluster-card:hover { box-shadow: var(--shadow-md); }
+.fx-cluster-card.needs-review {
+  border-color: oklch(82% .12 70);
+  background: oklch(99% .012 70);
+}
+.fx-cluster-card.confirmed {
+  border-color: oklch(80% .10 155);
+  background: oklch(99% .008 155);
+}
+
+/* Card header: icon + name/count + confidence pill */
+.fx-card-header {
+  display: flex; align-items: flex-start; gap: 10px;
+}
+.fx-card-icon  { font-size: 22px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
+.fx-card-title { font-size: 14px; font-weight: 600; color: var(--text); line-height: 1.3; }
+.fx-card-sub   { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+
+/* Stats row */
+.fx-stats {
+  display: flex; gap: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.fx-stat {
+  flex: 1; text-align: center;
+  padding: 8px 6px;
+  border-right: 1px solid var(--border);
+}
+.fx-stat:last-child { border-right: none; }
+.fx-stat-label { font-size: 10px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: .04em; }
+.fx-stat-value { font-size: 14px; font-weight: 600; color: var(--text); font-family: var(--mono); margin-top: 2px; }
+.fx-stat-value small { font-size: 10px; font-weight: 400; color: var(--text-3); }
+
+/* Confirm / rename form */
+.fx-confirm-form  { display: flex; flex-direction: column; gap: 8px; }
+.fx-confirm-row   { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.fx-name-input {
+  flex: 1; min-width: 0;
+  font-size: 12px; padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font);
+}
+.fx-name-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-bg2);
+}
+.fx-type-select {
+  font-size: 12px; padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font);
+  flex: 1; min-width: 0;
+}
+.fx-type-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-bg2);
+}
+
+/* Responsive: single column on narrow screens */
+@media (max-width: 520px) {
+  .fx-cluster-grid { grid-template-columns: 1fr; }
+  .fx-card { padding: 14px; }
+}
