@@ -936,27 +936,37 @@ def get_recent_events(
     range filter and limit is ignored so the full range is returned.
     Otherwise returns the most recent `limit` rows.
     """
+    _select = """
+        SELECT e.*,
+               fc.suggested_type,
+               fc.suggested_confidence,
+               fc.confidence_level   AS cluster_confidence_level,
+               f.display_name        AS fixture_display_name,
+               f.fixture_type        AS fixture_type_name
+        FROM events e
+        LEFT JOIN fixture_clusters fc
+               ON fc.circuit = e.circuit AND fc.id = e.cluster_id
+        LEFT JOIN fixtures f ON f.id = e.fixture_id
+    """
     if date_from or date_to:
-        conditions = ["circuit = ?"]
+        conditions = ["e.circuit = ?"]
         params: list = [circuit]
         if date_from:
-            conditions.append("start_ts >= ?")
+            conditions.append("e.start_ts >= ?")
             params.append(date_from)
         if date_to:
-            conditions.append("start_ts <= ?")
+            conditions.append("e.start_ts <= ?")
             params.append(date_to + "T23:59:59")
         where = " AND ".join(conditions)
         rows = conn.execute(
-            f"SELECT * FROM events WHERE {where} ORDER BY start_ts DESC",
+            f"{_select} WHERE {where} ORDER BY e.start_ts DESC",
             params,
         ).fetchall()
     else:
-        rows = conn.execute("""
-            SELECT * FROM events
-            WHERE circuit = ?
-            ORDER BY start_ts DESC
-            LIMIT ?
-        """, (circuit, limit)).fetchall()
+        rows = conn.execute(
+            f"{_select} WHERE e.circuit = ? ORDER BY e.start_ts DESC LIMIT ?",
+            (circuit, limit),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -1238,6 +1248,19 @@ def upsert_fixture_from_cluster(
 
     conn.commit()
     return fixture_id
+
+
+def get_fixture_id_for_cluster(
+    conn: sqlite3.Connection,
+    circuit: str,
+    cluster_id: int,
+) -> Optional[str]:
+    """Return the fixture_id linked to a cluster, or None."""
+    row = conn.execute(
+        "SELECT fixture_id FROM fixture_clusters WHERE circuit = ? AND id = ?",
+        (circuit, cluster_id)
+    ).fetchone()
+    return row["fixture_id"] if row and row["fixture_id"] else None
 
 
 def delete_cluster(

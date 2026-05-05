@@ -70,13 +70,14 @@ class DataPruner:
         except Exception:
             count = 0
 
+        now = datetime.now(timezone.utc)
         if count == 0:
             log.info("daily_summary is empty — running startup backfill")
-            self._compute_missing_summaries(datetime.now(timezone.utc),
-                                            full_backfill=True)
+            self._compute_missing_summaries(now, full_backfill=True)
         else:
             # Also catch any days missed since last run (e.g. after an update)
-            self._compute_missing_summaries(datetime.now(timezone.utc))
+            self._compute_missing_summaries(now)
+        self._compute_fixture_daily_summaries(now)
 
     # ── Nightly job ─────────────────────────────────────────────────────────
 
@@ -141,8 +142,10 @@ class DataPruner:
 
         # Step 4: prune auxiliary tables (no training fence needed)
         for tbl, col in [
-            ("zone_flow_history",  "recorded_at"),
-            ("threshold_history",  "recorded_at"),
+            ("zone_flow_history",         "recorded_at"),
+            ("threshold_history",         "recorded_at"),
+            ("cluster_cooccurrence",      "last_seen_at"),   # Phase 2
+            ("fixture_daily_summary",     "day"),            # Phase 2 (F1)
         ]:
             try:
                 cur = self._db.execute(
@@ -151,6 +154,21 @@ class DataPruner:
             except Exception as e:
                 log.error("Pruning %s: %s", tbl, e)
                 deleted[tbl] = 0
+
+        # cluster_metrics_history — hard 90-day retention window
+        metrics_cutoff = (now - timedelta(days=90)).isoformat()
+        try:
+            cur = self._db.execute(
+                "DELETE FROM cluster_metrics_history WHERE measured_at < ?",
+                (metrics_cutoff,)
+            )
+            deleted["cluster_metrics_history"] = cur.rowcount
+        except Exception as e:
+            log.error("Pruning cluster_metrics_history: %s", e)
+            deleted["cluster_metrics_history"] = 0
+
+        # Step 5: compute per-fixture daily summaries for any gaps
+        self._compute_fixture_daily_summaries(now)
 
         self._db.commit()
         update_data_retention(self._db, last_pruned_at=now.isoformat())
@@ -220,6 +238,59 @@ class DataPruner:
             self._db.commit()
             log.info("Daily summaries computed: %d day(s)%s",
                      computed, " (backfill)" if full_backfill else "")
+
+    # ── Fixture daily summaries (F1) ────────────────────────────────────────
+
+    def _compute_fixture_daily_summaries(self, now: datetime) -> None:
+        """
+        Populate fixture_daily_summary for any (circuit, fixture_id, day)
+        triples that have events but no summary row.  Runs nightly and on
+        the startup backfill so analytics are available from day one.
+        """
+        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        try:
+            gaps = self._db.execute("""
+                SELECT e.circuit, e.fixture_id, date(e.start_ts) AS day
+                FROM events e
+                LEFT JOIN fixture_daily_summary fds
+                    ON fds.circuit    = e.circuit
+                    AND fds.fixture_id = e.fixture_id
+                    AND fds.day        = date(e.start_ts)
+                WHERE e.fixture_id IS NOT NULL
+                  AND fds.day IS NULL
+                  AND date(e.start_ts) <= ?
+                GROUP BY e.circuit, e.fixture_id, date(e.start_ts)
+            """, (yesterday,)).fetchall()
+        except Exception as e:
+            log.warning("fixture_daily_summary gap query: %s", e)
+            return
+
+        computed = 0
+        for row in gaps:
+            circuit, fixture_id, day = row["circuit"], row["fixture_id"], row["day"]
+            try:
+                self._db.execute("""
+                    INSERT OR REPLACE INTO fixture_daily_summary
+                        (circuit, fixture_id, day, event_count,
+                         total_volume_litres, avg_flow_lpm, peak_flow_lpm)
+                    SELECT circuit, fixture_id,
+                           date(start_ts)    AS day,
+                           COUNT(*)          AS event_count,
+                           COALESCE(SUM(volume_litres), 0) AS total_volume_litres,
+                           AVG(avg_flow_lpm)               AS avg_flow_lpm,
+                           MAX(peak_flow_lpm)              AS peak_flow_lpm
+                    FROM events
+                    WHERE circuit = ? AND fixture_id = ? AND date(start_ts) = ?
+                    GROUP BY circuit, fixture_id, date(start_ts)
+                """, (circuit, fixture_id, day))
+                computed += 1
+            except Exception as e:
+                log.warning("fixture_daily_summary [%s/%s/%s]: %s",
+                            circuit, fixture_id, day, e)
+
+        if computed:
+            self._db.commit()
+            log.info("Fixture daily summaries computed: %d row(s)", computed)
 
     # ── Auto-backup ─────────────────────────────────────────────────────────
 

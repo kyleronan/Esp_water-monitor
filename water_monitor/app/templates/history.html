@@ -131,6 +131,7 @@
           <th>ΔP ({{ pressure_unit }})</th>
           <th>Shape</th>
           <th>Volume ({{ vol_unit }})</th>
+          <th>Fixture</th>
           {% if ch.events | selectattr('is_composite') | list %}<th>⚡</th>{% endif %}
         </tr>
       </thead>
@@ -147,6 +148,17 @@
             <span class="pill {{ shape_color.get(shape, 'pill-neutral') }}">{{ shape }}</span>
           </td>
           <td class="hist-td hist-td-mono">{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres else "—" }}</td>
+          <td class="hist-td">
+            {% if e.fixture_display_name %}
+              <span class="pill pill-green">{{ e.fixture_display_name }}</span>
+            {% elif e.suggested_type and e.cluster_id is not none %}
+              <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ e.suggested_type | replace('_', ' ') | title }}</span>
+            {% elif e.cluster_id is not none %}
+              <span class="pill pill-neutral">Cluster {{ e.cluster_id }}</span>
+            {% else %}
+              —
+            {% endif %}
+          </td>
           {% if ch.events | selectattr('is_composite') | list %}
           <td class="hist-td">{% if e.is_composite %}⚡{% endif %}</td>
           {% endif %}

@@ -441,6 +441,62 @@ def _migrate_016(conn: sqlite3.Connection) -> None:
     log.info("Migration 016: fixture lookup indexes added")
 
 
+def _migrate_017(conn: sqlite3.Connection) -> None:
+    """Add mqtt_publish_enabled to home_profile for the Integrations settings section."""
+    existing = [row[1] for row in conn.execute("PRAGMA table_info(home_profile)")]
+    if "mqtt_publish_enabled" not in existing:
+        conn.execute(
+            "ALTER TABLE home_profile ADD COLUMN mqtt_publish_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+    log.info("Migration 017: added mqtt_publish_enabled to home_profile")
+
+
+def _migrate_018(conn: sqlite3.Connection) -> None:
+    """Add fixtures.last_seen_at for fixture health scoring and Fixtures page sort."""
+    existing = [row[1] for row in conn.execute("PRAGMA table_info(fixtures)")]
+    if "last_seen_at" not in existing:
+        conn.execute("ALTER TABLE fixtures ADD COLUMN last_seen_at TIMESTAMP")
+    log.info("Migration 018: added fixtures.last_seen_at")
+
+
+def _migrate_019(conn: sqlite3.Connection) -> None:
+    """Create fixture_daily_summary for per-fixture analytics."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fixture_daily_summary (
+            circuit             TEXT    NOT NULL,
+            fixture_id          TEXT    NOT NULL REFERENCES fixtures(id),
+            day                 DATE    NOT NULL,
+            event_count         INTEGER NOT NULL DEFAULT 0,
+            total_volume_litres REAL    NOT NULL DEFAULT 0,
+            avg_flow_lpm        REAL,
+            peak_flow_lpm       REAL,
+            alert_count         INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (circuit, fixture_id, day)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_fixture_daily_circuit_day
+            ON fixture_daily_summary (circuit, day)
+    """)
+    log.info("Migration 019: created fixture_daily_summary table")
+
+
+def _migrate_020(conn: sqlite3.Connection) -> None:
+    """Create fixture_ha_entity_map for MQTT Discovery state tracking."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fixture_ha_entity_map (
+            fixture_id          TEXT NOT NULL REFERENCES fixtures(id),
+            ha_entity_id        TEXT NOT NULL,
+            device_class        TEXT,
+            unit_of_measurement TEXT,
+            last_published_at   TIMESTAMP,
+            retracted_at        TIMESTAMP,
+            PRIMARY KEY (fixture_id, ha_entity_id)
+        )
+    """)
+    log.info("Migration 020: created fixture_ha_entity_map table")
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -458,6 +514,10 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (14, _migrate_014),
     (15, _migrate_015),
     (16, _migrate_016),
+    (17, _migrate_017),
+    (18, _migrate_018),
+    (19, _migrate_019),
+    (20, _migrate_020),
 ]
 
 

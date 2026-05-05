@@ -29,6 +29,8 @@ from .data_pruner import DataPruner
 from .alert_manager import AlertManager
 from .presence_watcher import PresenceWatcher
 from .historical_importer import HistoricalImporter
+from .cluster_metrics import ClusterMetrics
+from .fixture_publisher import FixturePublisher
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +68,8 @@ class Orchestrator:
         self._leak_test_scheduler: Optional[LeakTestScheduler] = None
         self._historical_importer: Optional[HistoricalImporter] = None
         self._cluster_engine = None
+        self._cluster_metrics: Optional[ClusterMetrics] = None
+        self._fixture_publisher: Optional[FixturePublisher] = None
         self._stop = asyncio.Event()
 
     @property
@@ -297,14 +301,24 @@ class Orchestrator:
         # of already-matched events so DBSTREAM + scaler are warm on startup.
         try:
             from .cluster_engine import ClusterEngine
+            loop = asyncio.get_running_loop()
             self._cluster_engine = ClusterEngine(self._db, self._cfg)
             for c in self._cfg.circuits:
-                count = await asyncio.get_event_loop().run_in_executor(
+                count = await loop.run_in_executor(
                     None, self._cluster_engine.rebuild_from_db, c.circuit
                 )
                 log.info("[%s] cluster state rebuilt — %d events replayed",
                          c.circuit, count)
+                # Backfill events that had no cluster_id (e.g. v0.1.x upgrades)
+                backfilled = await loop.run_in_executor(
+                    None, self._cluster_engine.backfill_unmatched, c.circuit
+                )
+                if backfilled:
+                    log.info("[%s] backfilled cluster_id on %d previously unmatched events",
+                             c.circuit, backfilled)
             self._feature_extractor.cluster_engine = self._cluster_engine
+            # Wire to training_manager so complete_calibration can trigger backfill
+            self._training_manager.cluster_engine = self._cluster_engine
             log.info("ClusterEngine initialised and wired to feature extractor")
         except Exception as e:
             log.error("ClusterEngine init failed (non-fatal): %s", e, exc_info=True)
@@ -323,6 +337,16 @@ class Orchestrator:
         except Exception as e:
             log.warning("Unit auto-detection failed (non-fatal): %s", e)
 
+        # Cluster quality metrics — background task writing to cluster_metrics_history
+        self._cluster_metrics = ClusterMetrics(self._db, self._cfg)
+
+        # Fixture publisher — MQTT Discovery for confirmed fixtures
+        self._fixture_publisher = FixturePublisher(self._db, self._cfg, self._ha)
+        try:
+            await self._fixture_publisher.start()
+        except Exception as e:
+            log.warning("FixturePublisher start failed (non-fatal): %s", e)
+
         # Run all background tasks concurrently
         try:
             await asyncio.gather(
@@ -332,6 +356,7 @@ class Orchestrator:
                 self._data_pruner.run(),
                 self._leak_test_scheduler.run(),
                 self._historical_importer.run(),
+                self._cluster_metrics.run(),
             )
         except asyncio.CancelledError:
             pass

@@ -1,642 +1,659 @@
 {% extends "base.html" %}
 {% block content %}
+<h1 class="page-title">Settings</h1>
 
-<div class="sett-layout">
+{# ── Home Profile ─────────────────────────────────────────────────── #}
+<section class="settings-section">
+  <h2>Home Profile</h2>
+  <p class="muted">Used to suggest calibration duration and initialise thresholds.</p>
 
-  {# ── Sidebar nav ──────────────────────────────────────────────────── #}
-  <nav class="sett-sidebar">
-
-    <button class="sett-nav-btn" id="sett-btn-profile"
-            onclick="settNav('profile')">
-      <span class="sett-nav-icon">🏠</span>
-      <span class="sett-nav-label">Home Profile</span>
-    </button>
-
-    {% for c in circuits %}
-    <button class="sett-nav-btn" id="sett-btn-circuit-{{ c.circuit }}"
-            onclick="settNav('circuit-{{ c.circuit }}')">
-      <span class="sett-nav-icon">💧</span>
-      <span class="sett-nav-label">{{ c.display_name }}</span>
-      {% if c.training.state %}
-      <span class="sett-nav-badge
-        {%- if c.training.state == 'live' %} badge-live
-        {%- elif c.training.state == 'calibrating' %} badge-cal
-        {%- endif %}">
-        {{ 'learning' if c.training.state == 'calibrating' else c.training.state }}
-      </span>
-      {% endif %}
-    </button>
-    {% endfor %}
-
-    {% if general_entities %}
-    <button class="sett-nav-btn" id="sett-btn-general"
-            onclick="settNav('general')">
-      <span class="sett-nav-icon">⚙️</span>
-      <span class="sett-nav-label">ESP General</span>
-    </button>
-    {% endif %}
-
-    <button class="sett-nav-btn" id="sett-btn-away"
-            onclick="settNav('away')">
-      <span class="sett-nav-icon">✈️</span>
-      <span class="sett-nav-label">Away Mode</span>
-    </button>
-
-    <button class="sett-nav-btn" id="sett-btn-notifications"
-            onclick="settNav('notifications')">
-      <span class="sett-nav-icon">🔔</span>
-      <span class="sett-nav-label">Notifications</span>
-    </button>
-
-    <button class="sett-nav-btn" id="sett-btn-units"
-            onclick="settNav('units')">
-      <span class="sett-nav-icon">📏</span>
-      <span class="sett-nav-label">Display Units</span>
-    </button>
-
-    <button class="sett-nav-btn" id="sett-btn-retention"
-            onclick="settNav('retention')">
-      <span class="sett-nav-icon">🗄️</span>
-      <span class="sett-nav-label">Data Retention</span>
-    </button>
-
-  </nav>
-
-  {# ── Content pane ─────────────────────────────────────────────────── #}
-  <div class="sett-content">
-
-    {# ── Home Profile ─────────────────────────────────────────────── #}
-    <div class="sett-section" id="sett-profile">
-      <h2 class="sett-section-title">Home Profile</h2>
-      <p class="sett-section-desc">Used to suggest calibration duration and initialise thresholds.</p>
-
-      <div class="sett-card">
-        <form method="post" action="{{ ingress_path }}/settings/profile/update">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-          <div class="sett-form-grid">
-            <div class="sett-form-group">
-              <label>Full bathrooms</label>
-              <input type="number" name="bathrooms_full" min="0" max="20"
-                     value="{{ profile.bathrooms_full or 0 }}">
-            </div>
-            <div class="sett-form-group">
-              <label>Half bathrooms</label>
-              <input type="number" name="bathrooms_half" min="0" max="10"
-                     value="{{ profile.bathrooms_half or 0 }}">
-            </div>
-            <div class="sett-form-group">
-              <label>Home size (sq ft)</label>
-              <input type="number" name="sqft" min="0" max="50000"
-                     value="{{ profile.sqft or 0 }}">
-            </div>
-            <div class="sett-form-group">
-              <label>Floors</label>
-              <input type="number" name="floors" min="1" max="10"
-                     value="{{ profile.floors or 1 }}">
-            </div>
-            <div class="sett-form-group">
-              <label>Occupants</label>
-              <input type="number" name="occupants" min="1" max="20"
-                     value="{{ profile.occupants or 2 }}">
-            </div>
-            <div class="sett-form-group">
-              <label>Year built</label>
-              <input type="number" name="build_year" min="1800" max="2030"
-                     value="{{ profile.build_year or '' }}" placeholder="e.g. 1998">
-            </div>
-            <div class="sett-form-group">
-              <label>Water supply</label>
-              <select name="supply_type">
-                <option value="mains" {% if profile.supply_type == 'mains' %}selected{% endif %}>
-                  Mains / Municipal</option>
-                <option value="well" {% if profile.supply_type == 'well' %}selected{% endif %}>
-                  Private well or pump</option>
-              </select>
-            </div>
-          </div>
-          <button type="submit" class="btn btn-primary btn-sm">Save Profile</button>
-        </form>
+  <form method="post" action="{{ ingress_path }}/settings/profile/update" class="profile-form">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Full bathrooms</label>
+        <input type="number" name="bathrooms_full" min="0" max="20"
+               value="{{ profile.bathrooms_full or 0 }}">
+      </div>
+      <div class="form-group">
+        <label>Half bathrooms</label>
+        <input type="number" name="bathrooms_half" min="0" max="10"
+               value="{{ profile.bathrooms_half or 0 }}">
+      </div>
+      <div class="form-group">
+        <label>Home size (sq ft)</label>
+        <input type="number" name="sqft" min="0" max="50000"
+               value="{{ profile.sqft or 0 }}">
+      </div>
+      <div class="form-group">
+        <label>Floors</label>
+        <input type="number" name="floors" min="1" max="10"
+               value="{{ profile.floors or 1 }}">
+      </div>
+      <div class="form-group">
+        <label>Occupants</label>
+        <input type="number" name="occupants" min="1" max="20"
+               value="{{ profile.occupants or 2 }}">
+      </div>
+      <div class="form-group">
+        <label>Year built</label>
+        <input type="number" name="build_year" min="1800" max="2030"
+               value="{{ profile.build_year or '' }}" placeholder="e.g. 1998">
+      </div>
+      <div class="form-group">
+        <label>Water supply</label>
+        <select name="supply_type">
+          <option value="mains" {% if profile.supply_type == 'mains' %}selected{% endif %}>
+            Mains / Municipal</option>
+          <option value="well" {% if profile.supply_type == 'well' %}selected{% endif %}>
+            Private well or pump</option>
+        </select>
       </div>
     </div>
+    <button type="submit" class="btn btn-primary">Save Profile</button>
+  </form>
+</section>
 
-    {# ── Per-circuit sections ──────────────────────────────────────── #}
-    {% for c in circuits %}
-    <div class="sett-section" id="sett-circuit-{{ c.circuit }}" style="display:none">
+{# ── Per-circuit settings ──────────────────────────────────────────── #}
+{% for c in circuits %}
+<section class="settings-section">
+  <h2>{{ c.display_name }}</h2>
 
-      <div class="sett-circuit-header">
-        <h2 class="sett-section-title">{{ c.display_name }}</h2>
-        <span class="pill
-          {%- if c.training.state == 'live' %} pill-green
-          {%- elif c.training.state == 'calibrating' %} pill-blue
-          {%- else %} pill-neutral
-          {%- endif %}">
-          {{ c.training.state | title }}
-        </span>
+  {# Training status #}
+  <div class="training-status-row">
+    <span class="training-state-badge state-{{ c.training.state }}">
+      {{ c.training.state | title }}
+    </span>
+    {% if c.training.state == 'calibrating' %}
+    <span class="muted">
+      {% if c.training.days_remaining > 0 %}
+        {{ c.training.days_remaining }}d {{ c.training.hours_remaining }}h remaining ·
+      {% else %}
+        {{ c.training.hours_remaining }}h remaining ·
+      {% endif %}
+      {{ c.training.percent_complete }}%
+    </span>
+    {% endif %}
+  </div>
+
+  {# Recalibration #}
+  <details class="recal-details">
+    <summary>Recalibration</summary>
+    <p class="muted">
+      Recalibrate if you've renovated, added appliances, or your household
+      has changed significantly.
+    </p>
+    <form method="post" action="{{ ingress_path }}/settings/recalibrate/{{ c.circuit }}"
+          class="recal-form">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div class="form-row">
+        <label>Has the number of fixtures changed?</label>
+        <select name="fixtures_changed">
+          <option value="no">No — plumbing is the same</option>
+          <option value="yes">Yes — something was added or removed</option>
+        </select>
       </div>
-      <p class="sett-section-desc">Circuit-specific detection and alert settings.</p>
-
-      {# Recalibration #}
-      <div class="sett-card">
-        <h3 class="sett-card-title">Recalibration</h3>
-        <p class="sett-card-desc">
-          Recalibrate if you've renovated, added appliances, or your household
-          has changed significantly.
-        </p>
-        {% if c.training.state == 'calibrating' %}
-        <div style="margin-bottom:.75rem">
-          <span class="muted">
-            {% if c.training.days_remaining > 0 %}
-              {{ c.training.days_remaining }}d {{ c.training.hours_remaining }}h remaining ·
-            {% else %}
-              {{ c.training.hours_remaining }}h remaining ·
-            {% endif %}
-            {{ c.training.percent_complete }}% complete
-          </span>
-        </div>
-        {% endif %}
-        <details class="recal-details">
-          <summary>Start recalibration…</summary>
-          <form method="post" action="{{ ingress_path }}/settings/recalibrate/{{ c.circuit }}"
-                class="recal-form" style="margin-top:.75rem">
-            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-            <div class="sett-form-grid">
-              <div class="sett-form-group">
-                <label>Have fixtures changed?</label>
-                <select name="fixtures_changed">
-                  <option value="no">No — plumbing is the same</option>
-                  <option value="yes">Yes — something was added or removed</option>
-                </select>
-              </div>
-              <div class="sett-form-group">
-                <label>Have occupants changed?</label>
-                <select name="occupants_changed">
-                  <option value="no">No</option>
-                  <option value="yes">Yes — someone moved in or out</option>
-                </select>
-              </div>
-              <div class="sett-form-group">
-                <label>Calibration duration</label>
-                <div style="display:flex;gap:.5rem;align-items:center">
-                  <select name="calibration_days" id="cal-days-{{ c.circuit }}" style="flex:1">
-                    <option value="14">14 days</option>
-                    <option value="21">21 days</option>
-                    <option value="28">28 days</option>
-                  </select>
-                  <button type="button" class="btn btn-secondary btn-sm"
-                          onclick="suggestDays('{{ c.circuit }}')">Suggest</button>
-                </div>
-              </div>
-            </div>
-            <button type="submit" class="btn btn-warning btn-sm">Start Recalibration</button>
-          </form>
-        </details>
+      <div class="form-row">
+        <label>Has the number of people changed?</label>
+        <select name="occupants_changed">
+          <option value="no">No</option>
+          <option value="yes">Yes — someone moved in or out</option>
+        </select>
       </div>
-
-      {# Learning mode #}
-      <div class="sett-card">
-        <h3 class="sett-card-title">Learning Mode</h3>
-        <form method="post" action="{{ ingress_path }}/settings/learning/{{ c.circuit }}/update">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-          <label class="sett-radio-card">
-            <input type="radio" name="learning_mode" value="adaptive"
-                   {% if c.learning.learning_mode != 'static' %}checked{% endif %}>
-            <div>
-              <div class="sett-radio-label">Adaptive <span style="font-weight:400;color:var(--text-3)">(recommended)</span></div>
-              <div class="sett-radio-desc">Usage patterns update automatically as your household evolves. Fixture signatures never change.</div>
-            </div>
-          </label>
-          <label class="sett-radio-card">
-            <input type="radio" name="learning_mode" value="static"
-                   {% if c.learning.learning_mode == 'static' %}checked{% endif %}>
-            <div>
-              <div class="sett-radio-label">Static</div>
-              <div class="sett-radio-desc">Everything fixed as learned during calibration. Recalibrate manually when needed.</div>
-            </div>
-          </label>
-          <button type="submit" class="btn btn-primary btn-sm" style="margin-top:8px">Save</button>
-        </form>
+      <div class="form-row">
+        <label>Calibration duration</label>
+        <select name="calibration_days" id="cal-days-{{ c.circuit }}">
+          <option value="14">14 days</option>
+          <option value="21">21 days</option>
+          <option value="28">28 days</option>
+        </select>
+        <button type="button" class="btn btn-sm"
+                onclick="suggestDays('{{ c.circuit }}')">Suggest</button>
       </div>
+      <button type="submit" class="btn btn-warning">Start Recalibration</button>
+    </form>
+  </details>
 
-      {# Sensitivity #}
-      <div class="sett-card">
-        <h3 class="sett-card-title">Detection Sensitivity</h3>
-        <form method="post" action="{{ ingress_path }}/settings/sensitivity/{{ c.circuit }}/update"
-              id="sens-form-{{ c.circuit }}">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-          <input type="hidden" name="mode" id="sens-mode-{{ c.circuit }}" value="simple">
-
-          <div class="sett-sens-grid">
-            {% for level in ['low', 'medium', 'high'] %}
-            <label class="sett-sens-btn {% if c.sensitivity.simple_level == level %}active{% endif %}">
-              <input type="radio" name="simple_level" value="{{ level }}"
-                     {% if c.sensitivity.simple_level == level %}checked{% endif %}>
-              {{ level | title }}
-            </label>
-            {% endfor %}
-          </div>
-
-          <details class="advanced-details" onToggle="
-              if(this.open) {
-                this.closest('form').querySelector('[name=mode]').value = 'advanced';
-              }">
-            <summary>Advanced settings</summary>
-            <div class="sett-form-grid" style="margin-top:.75rem">
-              <div class="sett-form-group">
-                <label>Pressure drop to detect event ({{ pressure_unit }})</label>
-                <input type="number" name="pressure_drop_event_psi" step="0.5" min="0.5" max="10"
-                       value="{{ c.sensitivity.pressure_drop_event_psi or 2.0 }}">
-              </div>
-              <div class="sett-form-group">
-                <label>Min event duration (seconds)</label>
-                <input type="number" name="min_event_duration_seconds" step="0.5" min="1" max="30"
-                       value="{{ c.sensitivity.min_event_duration_seconds or 3.0 }}">
-              </div>
-              <div class="sett-form-group">
-                <label>Anomaly score to alert (0–1)</label>
-                <input type="number" name="score_alert" step="0.05" min="0.1" max="1"
-                       value="{{ c.sensitivity.score_alert or 0.6 }}">
-              </div>
-              <div class="sett-form-group">
-                <label>Anomaly score to auto-shutoff (0–1)</label>
-                <input type="number" name="score_shutoff" step="0.05" min="0.1" max="1"
-                       value="{{ c.sensitivity.score_shutoff or 0.8 }}">
-              </div>
-              <div class="sett-form-group">
-                <label>Flow tolerance (%)</label>
-                <input type="number" name="flow_tolerance_pct" step="1" min="5" max="80"
-                       value="{{ c.sensitivity.flow_tolerance_pct or 20 }}">
-              </div>
-              <div class="sett-form-group">
-                <label>Alert sustained duration (min)</label>
-                <input type="number" name="sustained_alert_minutes" step="1" min="1" max="60"
-                       value="{{ c.sensitivity.sustained_alert_minutes or 10 }}">
-              </div>
-            </div>
-          </details>
-
-          <button type="submit" class="btn btn-primary btn-sm" style="margin-top:12px">Save Sensitivity</button>
-        </form>
-      </div>
-
-      {# Alerts #}
-      <div class="sett-card">
-        <h3 class="sett-card-title">Alerts</h3>
-        <p class="sett-card-desc">Toggle which anomaly alerts this add-on generates.</p>
-        {% for alert in c.alerts %}
-        <div class="sett-toggle-row">
+  {# Learning mode #}
+  <div class="settings-card">
+    <h3>Learning</h3>
+    <form method="post" action="{{ ingress_path }}/settings/learning/{{ c.circuit }}/update">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div class="radio-group">
+        <label class="radio-option">
+          <input type="radio" name="learning_mode" value="adaptive"
+                 {% if c.learning.learning_mode != 'static' %}checked{% endif %}>
           <div>
-            <div class="sett-toggle-label">{{ alert.label }}</div>
-            <div class="sett-toggle-desc">{{ alert.description }}</div>
+            <strong>Adaptive</strong> (recommended)
+            <p class="muted">Usage patterns update automatically as your
+            household evolves. Fixture signatures never change.</p>
           </div>
-          <label class="toggle">
-            <input type="checkbox" {% if alert.enabled %}checked{% endif %}
-                   onchange="settingsAlertToggle('{{ alert.id }}', this.checked)">
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
+        </label>
+        <label class="radio-option">
+          <input type="radio" name="learning_mode" value="static"
+                 {% if c.learning.learning_mode == 'static' %}checked{% endif %}>
+          <div>
+            <strong>Static</strong>
+            <p class="muted">Everything fixed as learned during calibration.
+            Recalibrate manually when needed.</p>
+          </div>
+        </label>
+      </div>
+      <button type="submit" class="btn btn-primary">Save</button>
+    </form>
+  </div>
+
+  {# Sensitivity #}
+  <div class="settings-card">
+    <h3>Sensitivity</h3>
+    <form method="post" action="{{ ingress_path }}/settings/sensitivity/{{ c.circuit }}/update"
+          id="sens-form-{{ c.circuit }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <input type="hidden" name="mode" id="sens-mode-{{ c.circuit }}" value="simple">
+
+      <div class="sensitivity-selector">
+        {% for level in ['low', 'medium', 'high'] %}
+        <label class="sens-option {% if c.sensitivity.simple_level == level %}active{% endif %}">
+          <input type="radio" name="simple_level" value="{{ level }}"
+                 {% if c.sensitivity.simple_level == level %}checked{% endif %}
+                 onchange="this.closest('.sensitivity-selector')
+                   .querySelectorAll('.sens-option')
+                   .forEach(el => el.classList.remove('active'));
+                   this.parentElement.classList.add('active')">
+          {{ level | title }}
+        </label>
         {% endfor %}
       </div>
 
-      {# ESP device entities for this circuit #}
-      {% if c.device_entities %}
-      <div class="sett-card">
-        <h3 class="sett-card-title">ESP Device Settings</h3>
-        <p class="sett-card-desc">Stored on the ESP device and applied immediately.</p>
-        <div class="device-entity-grid">
-          {% for e in c.device_entities %}
-          <div class="device-entity-row">
-            <div class="device-entity-label-group">
-              <label class="device-entity-label" title="{{ e.entity_id }}">
-                {{ e.short_label or e.friendly_name }}
-              </label>
-              {% if e.description %}
-              <span class="device-entity-desc muted">{{ e.description }}</span>
-              {% endif %}
-            </div>
-            {% if e.domain in ('select', 'input_select') %}
-            <select class="device-entity-input"
-                    onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
-              {% for opt in e.options %}
-              <option value="{{ opt }}" {% if opt == e.state %}selected{% endif %}>{{ opt }}</option>
-              {% endfor %}
-            </select>
-            {% else %}
-            <div class="device-entity-number">
-              <input type="number" class="device-entity-input"
-                     value="{{ e.state }}"
-                     {% if e.min is not none %}min="{{ e.min }}"{% endif %}
-                     {% if e.max is not none %}max="{{ e.max }}"{% endif %}
-                     {% if e.step is not none %}step="{{ e.step }}"{% endif %}
-                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
-              {% if e.unit %}<span class="unit-label">{{ e.unit }}</span>{% endif %}
-            </div>
-            {% endif %}
+      <details class="advanced-details" onToggle="
+          if(this.open) {
+            this.closest('form').querySelector('[name=mode]').value = 'advanced';
+          }">
+        <summary>Advanced settings</summary>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Pressure drop to detect event ({{ pressure_unit }})</label>
+            <input type="number" name="pressure_drop_event_psi" step="0.5" min="0.5" max="10"
+                   value="{{ c.sensitivity.pressure_drop_event_psi or 2.0 }}">
           </div>
-          {% endfor %}
+          <div class="form-group">
+            <label>Min event duration (seconds)</label>
+            <input type="number" name="min_event_duration_seconds" step="0.5" min="1" max="30"
+                   value="{{ c.sensitivity.min_event_duration_seconds or 3.0 }}">
+          </div>
+          <div class="form-group">
+            <label>Anomaly score to alert (0–1)</label>
+            <input type="number" name="score_alert" step="0.05" min="0.1" max="1"
+                   value="{{ c.sensitivity.score_alert or 0.6 }}">
+          </div>
+          <div class="form-group">
+            <label>Anomaly score to auto-shutoff (0–1)</label>
+            <input type="number" name="score_shutoff" step="0.05" min="0.1" max="1"
+                   value="{{ c.sensitivity.score_shutoff or 0.8 }}">
+          </div>
+          <div class="form-group">
+            <label>Flow tolerance (%)</label>
+            <input type="number" name="flow_tolerance_pct" step="1" min="5" max="80"
+                   value="{{ c.sensitivity.flow_tolerance_pct or 20 }}">
+          </div>
+          <div class="form-group">
+            <label>Alert sustained duration (min)</label>
+            <input type="number" name="sustained_alert_minutes" step="1" min="1" max="60"
+                   value="{{ c.sensitivity.sustained_alert_minutes or 10 }}">
+          </div>
         </div>
-      </div>
-      {% endif %}
+      </details>
 
+      <button type="submit" class="btn btn-primary">Save Sensitivity</button>
+    </form>
+  </div>
+
+  {# Addon alert toggles #}
+  <div class="settings-card">
+    <h3>Alerts</h3>
+    <p class="muted">
+      Toggle which anomaly alerts this add-on generates.
+    </p>
+    {% for alert in c.alerts %}
+    <div class="toggle-row">
+      <div>
+        <span class="toggle-label">{{ alert.label }}</span>
+        <span class="toggle-desc muted">{{ alert.description }}</span>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" {% if alert.enabled %}checked{% endif %}
+               onchange="settingsAlertToggle('{{ alert.id }}', this.checked)">
+        <span class="toggle-slider"></span>
+      </label>
     </div>
     {% endfor %}
+  </div>
 
-    {# ── General (non-circuit) device entities ───────────────────── #}
-    {% if general_entities %}
-    <div class="sett-section" id="sett-general" style="display:none">
-      <h2 class="sett-section-title">ESP Device — General Settings</h2>
-      <p class="sett-section-desc">Non-circuit settings stored on the ESP device and applied immediately.</p>
-      <div class="sett-card">
-        <div class="device-entity-grid">
-          {% for e in general_entities %}
-          <div class="device-entity-row">
-            <div class="device-entity-label-group">
-              <label class="device-entity-label" title="{{ e.entity_id }}">
-                {{ e.short_label or e.friendly_name }}
-              </label>
-              {% if e.description %}
-              <span class="device-entity-desc muted">{{ e.description }}</span>
-              {% endif %}
-            </div>
-            {% if e.domain in ('select', 'input_select') %}
-            <select class="device-entity-input"
-                    onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
-              {% for opt in e.options %}
-              <option value="{{ opt }}" {% if opt == e.state %}selected{% endif %}>{{ opt }}</option>
-              {% endfor %}
-            </select>
-            {% else %}
-            <div class="device-entity-number">
-              <input type="number" class="device-entity-input"
-                     value="{{ e.state }}"
-                     {% if e.min is not none %}min="{{ e.min }}"{% endif %}
-                     {% if e.max is not none %}max="{{ e.max }}"{% endif %}
-                     {% if e.step is not none %}step="{{ e.step }}"{% endif %}
-                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
-              {% if e.unit %}<span class="unit-label">{{ e.unit }}</span>{% endif %}
-            </div>
-            {% endif %}
-          </div>
+  {# ESP device configurable entities for this circuit #}
+  {% if c.device_entities %}
+  <div class="settings-card">
+    <h3>ESP Device Settings</h3>
+    <p class="muted">
+      These settings are stored on the ESP device and applied immediately.
+    </p>
+    <div class="device-entity-grid">
+      {% for e in c.device_entities %}
+      <div class="device-entity-row">
+        <div class="device-entity-label-group">
+          <label class="device-entity-label" title="{{ e.entity_id }}">
+            {{ e.short_label or e.friendly_name }}
+          </label>
+          {% if e.description %}
+          <span class="device-entity-desc muted">{{ e.description }}</span>
+          {% endif %}
+        </div>
+        {% if e.domain in ('select', 'input_select') %}
+        <select class="device-entity-input"
+                onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
+          {% for opt in e.options %}
+          <option value="{{ opt }}" {% if opt == e.state %}selected{% endif %}>{{ opt }}</option>
           {% endfor %}
+        </select>
+        {% else %}
+        <div class="device-entity-number">
+          <input type="number"
+                 class="device-entity-input"
+                 value="{{ e.state }}"
+                 {% if e.min is not none %}min="{{ e.min }}"{% endif %}
+                 {% if e.max is not none %}max="{{ e.max }}"{% endif %}
+                 {% if e.step is not none %}step="{{ e.step }}"{% endif %}
+                 onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
+          {% if e.unit %}<span class="unit-label">{{ e.unit }}</span>{% endif %}
         </div>
+        {% endif %}
       </div>
+      {% endfor %}
     </div>
-    {% endif %}
+  </div>
+  {% endif %}
 
-    {# ── Away / Vacation Mode ─────────────────────────────────────── #}
-    <div class="sett-section" id="sett-away" style="display:none">
-      <h2 class="sett-section-title">Away / Vacation Mode</h2>
-      <p class="sett-section-desc">
-        Pauses baseline learning while you're away. Leak tests, valve control, and fault detection continue normally.
-      </p>
+</section>
+{% endfor %}
 
-      <div class="sett-card">
-        <div class="sett-away-status-row">
-          <div class="sett-away-status-info">
-            <span class="sett-away-icon">{% if profile.away_mode %}🏖{% else %}🏠{% endif %}</span>
-            <div>
-              <div class="sett-away-status-label">
-                {% if profile.away_mode %}Away mode active{% else %}Currently home{% endif %}
-              </div>
-              {% if profile.away_mode and profile.away_since %}
-              <div class="sett-away-since">Since {{ profile.away_since[:10] }}</div>
-              {% endif %}
-              {% if profile.ha_presence_entities %}
-              <div class="sett-away-since">(auto-managed by HA presence)</div>
-              {% endif %}
-            </div>
-          </div>
-          <form method="post" action="{{ ingress_path }}/settings/away-mode/toggle" style="margin:0">
-            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-            {% if profile.away_mode %}
-            <input type="hidden" name="enabled" value="0">
-            <button type="submit" class="btn btn-primary btn-sm">I'm back home</button>
-            {% else %}
-            <input type="hidden" name="enabled" value="1">
-            <button type="submit" class="btn btn-secondary btn-sm">Enable away mode</button>
-            {% endif %}
-          </form>
+{# General (non-circuit-specific) device entities #}
+{% if general_entities %}
+<section class="settings-section">
+  <h2>ESP Device — General Settings</h2>
+  <div class="settings-card">
+    <div class="device-entity-grid">
+      {% for e in general_entities %}
+      <div class="device-entity-row">
+        <div class="device-entity-label-group">
+          <label class="device-entity-label" title="{{ e.entity_id }}">
+            {{ e.short_label or e.friendly_name }}
+          </label>
+          {% if e.description %}
+          <span class="device-entity-desc muted">{{ e.description }}</span>
+          {% endif %}
         </div>
+        {% if e.domain in ('select', 'input_select') %}
+        <select class="device-entity-input"
+                onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
+          {% for opt in e.options %}
+          <option value="{{ opt }}" {% if opt == e.state %}selected{% endif %}>{{ opt }}</option>
+          {% endfor %}
+        </select>
+        {% else %}
+        <div class="device-entity-number">
+          <input type="number"
+                 class="device-entity-input"
+                 value="{{ e.state }}"
+                 {% if e.min is not none %}min="{{ e.min }}"{% endif %}
+                 {% if e.max is not none %}max="{{ e.max }}"{% endif %}
+                 {% if e.step is not none %}step="{{ e.step }}"{% endif %}
+                 onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
+          {% if e.unit %}<span class="unit-label">{{ e.unit }}</span>{% endif %}
+        </div>
+        {% endif %}
       </div>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+{% endif %}
 
-      <div class="sett-card" style="margin-top:.75rem">
-        <h3 class="sett-card-title">Link to Home Assistant presence</h3>
-        <p class="sett-card-desc">
-          Automatically enable away mode when all presence entities report everyone is away.
-          Supports <code>person.*</code>, <code>device_tracker.*</code>,
-          <code>input_boolean.*</code>, and <code>alarm_control_panel.*</code>.
+{# ── Away / Vacation Mode ─────────────────────────────────────────────────── #}
+<section class="settings-section">
+  <h2>Away / Vacation Mode</h2>
+  <p class="muted">
+    Pauses baseline learning while you're away so an empty house doesn't
+    skew your usage patterns. Leak tests, valve control, and fault
+    detection continue normally.
+  </p>
+
+  <div class="settings-card">
+    {# Manual toggle #}
+    <div class="away-status-row">
+      <div>
+        <strong>Status:</strong>
+        {% if profile.away_mode %}
+        <span class="status-pill status-warn">🏖 Away mode ON</span>
+        {% if profile.away_since %}
+        <span class="muted" style="font-size:.82rem">
+          since {{ profile.away_since[:10] }}
+        </span>
+        {% endif %}
+        {% else %}
+        <span class="status-pill status-ok">🏠 Home</span>
+        {% endif %}
+        {% if profile.ha_presence_entities %}
+        <span class="muted" style="font-size:.8rem; margin-left:.5rem">
+          (auto-managed by HA presence)
+        </span>
+        {% endif %}
+      </div>
+      <form method="post"
+            action="{{ ingress_path }}/settings/away-mode/toggle">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        {% if profile.away_mode %}
+        <input type="hidden" name="enabled" value="0">
+        <button type="submit" class="btn btn-primary btn-sm">
+          I'm back home
+        </button>
+        {% else %}
+        <input type="hidden" name="enabled" value="1">
+        <button type="submit" class="btn btn-secondary btn-sm">
+          Enable away mode
+        </button>
+        {% endif %}
+      </form>
+    </div>
+  </div>
+
+  {# HA presence linking #}
+  <div class="settings-card" style="margin-top:.75rem">
+    <h3>Link to Home Assistant presence</h3>
+    <p class="muted">
+      Automatically enable away mode when your HA presence entities report
+      everyone is away, and disable it when anyone returns.
+      Supports <code>person.*</code>, <code>device_tracker.*</code>,
+      <code>input_boolean.*</code>, and <code>alarm_control_panel.*</code>.
+    </p>
+    <form method="post"
+          action="{{ ingress_path }}/settings/presence/update">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div class="form-group">
+        <label for="ha_presence_entities">
+          Presence entities
+          <span class="form-hint">comma-separated, leave blank for manual only</span>
+        </label>
+        <input type="text" id="ha_presence_entities"
+               name="ha_presence_entities"
+               value="{{ profile.ha_presence_entities or '' }}"
+               placeholder="person.alice, person.bob">
+        <p class="muted" style="font-size:.78rem; margin-top:.25rem">
+          Away mode enables when <em>all</em> entities are away.
+          It disables when <em>any</em> entity returns home.
         </p>
-        <form method="post" action="{{ ingress_path }}/settings/presence/update">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-          <div class="sett-form-group" style="margin-bottom:12px">
-            <label for="ha_presence_entities">
-              Presence entities
-              <span class="form-hint">comma-separated, leave blank for manual only</span>
-            </label>
-            <input type="text" id="ha_presence_entities" name="ha_presence_entities"
-                   value="{{ profile.ha_presence_entities or '' }}"
-                   placeholder="person.alice, person.bob">
-          </div>
-          <div class="sett-form-grid" style="margin-bottom:12px">
-            <div class="sett-form-group">
-              <label for="ha_away_state">"Away" state value <span class="form-hint">default: not_home</span></label>
-              <input type="text" id="ha_away_state" name="ha_away_state"
-                     value="{{ profile.ha_away_state or 'not_home' }}" placeholder="not_home">
-            </div>
-            <div class="sett-form-group">
-              <label for="ha_home_state">"Home" state value <span class="form-hint">default: home</span></label>
-              <input type="text" id="ha_home_state" name="ha_home_state"
-                     value="{{ profile.ha_home_state or 'home' }}" placeholder="home">
-            </div>
-          </div>
-          <p class="muted" style="font-size:.78rem;margin-bottom:.75rem">
-            Common values: <code>person / device_tracker</code>: away=<code>not_home</code>, home=<code>home</code> ·
-            <code>input_boolean</code>: away=<code>on</code>, home=<code>off</code> ·
-            <code>alarm_control_panel</code>: away=<code>armed_away</code>, home=<code>disarmed</code>
-          </p>
-          <button type="submit" class="btn btn-primary btn-sm">Save presence settings</button>
-        </form>
       </div>
-    </div>
-
-    {# ── Mobile Push Notifications ─────────────────────────────────── #}
-    <div class="sett-section" id="sett-notifications" style="display:none">
-      <h2 class="sett-section-title">Mobile Push Notifications</h2>
-      <p class="sett-section-desc">
-        Send alerts to your phone via the Home Assistant mobile app.
-        Enter the notify service name(s) — found in HA under
-        <strong>Developer Tools → Services</strong>
-        (e.g. <code>mobile_app_my_iphone</code>). Separate multiple with commas.
-      </p>
-      <div class="sett-card">
-        <form method="post" action="{{ ingress_path }}/settings/mobile-notify/update">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-          <div class="sett-form-group" style="margin-bottom:12px">
-            <label for="mobile_notify_targets">Notify service name(s)</label>
-            <input type="text" id="mobile_notify_targets" name="mobile_notify_targets"
-                   value="{{ profile.mobile_notify_targets or '' }}"
-                   placeholder="mobile_app_my_iphone, mobile_app_my_android">
-          </div>
-          <button type="submit" class="btn btn-primary btn-sm">Save</button>
-        </form>
+      <div class="form-grid" style="margin-top:.5rem">
+        <div class="form-group">
+          <label for="ha_away_state">
+            "Away" state value
+            <span class="form-hint">default: not_home</span>
+          </label>
+          <input type="text" id="ha_away_state" name="ha_away_state"
+                 value="{{ profile.ha_away_state or 'not_home' }}"
+                 placeholder="not_home">
+        </div>
+        <div class="form-group">
+          <label for="ha_home_state">
+            "Home" state value
+            <span class="form-hint">default: home</span>
+          </label>
+          <input type="text" id="ha_home_state" name="ha_home_state"
+                 value="{{ profile.ha_home_state or 'home' }}"
+                 placeholder="home">
+        </div>
       </div>
-    </div>
-
-    {# ── Display Units ─────────────────────────────────────────────── #}
-    <div class="sett-section" id="sett-units" style="display:none">
-      <h2 class="sett-section-title">Display Units</h2>
-      <p class="sett-section-desc">
-        Choose how pressure and flow are displayed throughout the web UI.
-        Detected from your HA unit system at first setup — change here to override.
-      </p>
-      <div class="sett-card">
-        <form method="post" action="{{ ingress_path }}/settings/units/update">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-          <div class="sett-form-grid" style="margin-bottom:14px">
-            <div class="sett-form-group">
-              <label for="flow_unit">
-                Flow rate &amp; volume
-                <span class="form-hint">affects flow readings and daily totals</span>
-              </label>
-              <select id="flow_unit" name="flow_unit">
-                {% for key in flow_options %}
-                <option value="{{ key }}" {% if key == flow_key %}selected{% endif %}>
-                  {{ flow_option_labels[key] }}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div class="sett-form-group">
-              <label for="pressure_unit">
-                Pressure
-                <span class="form-hint">affects pressure readings and leak test results</span>
-              </label>
-              <select id="pressure_unit" name="pressure_unit">
-                {% for key in pressure_options %}
-                <option value="{{ key }}" {% if key == pressure_key %}selected{% endif %}>
-                  {{ pressure_option_labels[key] }}</option>
-                {% endfor %}
-              </select>
-            </div>
-          </div>
-          <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
-            <button type="submit" class="btn btn-primary btn-sm">Save</button>
-            <button type="button" class="btn btn-secondary btn-sm"
-                    onclick="autoDetectUnits(this)">Re-detect from HA</button>
-          </div>
-        </form>
+      <div class="muted presence-state-hint">
+        Common values by entity type:
+        <code>person / device_tracker</code>: away=<code>not_home</code>, home=<code>home</code> ·
+        <code>input_boolean</code>: away=<code>on</code>, home=<code>off</code> ·
+        <code>alarm_control_panel</code>: away=<code>armed_away</code>, home=<code>disarmed</code>
       </div>
-    </div>
+      <button type="submit" class="btn btn-primary btn-sm"
+              style="margin-top:.75rem">Save presence settings</button>
+    </form>
+  </div>
+</section>
 
-    {# ── Data Retention ────────────────────────────────────────────── #}
-    <div class="sett-section" id="sett-retention" style="display:none">
-      <h2 class="sett-section-title">Data Retention</h2>
-      <p class="sett-section-desc">
-        Controls how much historical data is kept. The system prunes old records
-        automatically each night. <strong>Training-era data is always protected.</strong>
+{# ── Mobile Push Notifications ────────────────────────────────────────────── #}
+<section class="settings-section">
+  <h2>Mobile Push Notifications</h2>
+  <p class="muted">
+    In addition to the HA sidebar, alerts can be sent to your phone via the
+    Home Assistant mobile app. Enter the notify service name(s) for your
+    device(s) — found in HA under <strong>Developer Tools → Services</strong>
+    (e.g. <code>mobile_app_my_iphone</code>). Separate multiple with commas.
+  </p>
+  <div class="settings-card">
+    <form method="post"
+          action="{{ ingress_path }}/settings/mobile-notify/update">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div class="form-group">
+        <label for="mobile_notify_targets">Notify service name(s)</label>
+        <input type="text" id="mobile_notify_targets"
+               name="mobile_notify_targets"
+               value="{{ profile.mobile_notify_targets or '' }}"
+               placeholder="mobile_app_my_iphone, mobile_app_my_android">
+      </div>
+      <button type="submit" class="btn btn-primary btn-sm"
+              style="margin-top:.75rem">Save</button>
+    </form>
+  </div>
+</section>
+
+
+
+{# ── Display Units ────────────────────────────────────────────────────────── #}
+<section class="settings-section">
+  <h2>Display Units</h2>
+  <p class="muted">
+    Choose how pressure and flow are displayed throughout the web UI.
+    Detected from your HA unit system at first setup — change here to override.
+  </p>
+  <div class="settings-card">
+    <form method="post"
+          action="{{ ingress_path }}/settings/units/update"
+          class="inline-form">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div class="form-grid">
+        <div class="form-group">
+          <label for="flow_unit">
+            Flow rate &amp; volume
+            <span class="form-hint">affects flow readings and daily totals</span>
+          </label>
+          <select id="flow_unit" name="flow_unit">
+            {% for key in flow_options %}
+            <option value="{{ key }}"
+              {% if key == flow_key %}selected{% endif %}>{{ flow_option_labels[key] }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="pressure_unit">
+            Pressure
+            <span class="form-hint">affects pressure readings and leak test results</span>
+          </label>
+          <select id="pressure_unit" name="pressure_unit">
+            {% for key in pressure_options %}
+            <option value="{{ key }}"
+              {% if key == pressure_key %}selected{% endif %}>{{ pressure_option_labels[key] }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:1rem;margin-top:.75rem;flex-wrap:wrap">
+        <button type="submit" class="btn btn-primary btn-sm">Save</button>
+        <button type="button" class="btn btn-secondary btn-sm"
+                onclick="autoDetectUnits(this)">Re-detect from HA</button>
+      </div>
+    </form>
+  </div>
+</section>
+
+{# ── Integrations ─────────────────────────────────────────────────────────── #}
+<section class="settings-section">
+  <h2>Integrations</h2>
+  <p class="muted">
+    Publish confirmed fixtures to Home Assistant as sensors, making them
+    available in the Energy dashboard and automations. Requires Mosquitto broker
+    add-on — discovered automatically from the HA supervisor.
+  </p>
+  <div class="settings-card">
+    <form method="post"
+          action="{{ ingress_path }}/settings/integrations/update">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div class="form-group" style="display:flex;align-items:center;gap:.75rem">
+        <label class="toggle-label" for="mqtt_publish_enabled">
+          <input type="checkbox" id="mqtt_publish_enabled"
+                 name="mqtt_publish_enabled" value="1"
+                 {% if profile.mqtt_publish_enabled %}checked{% endif %}>
+          Publish fixtures to Home Assistant via MQTT
+        </label>
+      </div>
+      <p class="muted" style="margin-top:.5rem">
+        When enabled, each confirmed fixture appears as a sensor in HA with
+        daily count, daily volume (device_class: water), and a running
+        binary sensor. Entities are removed from HA when a fixture is deleted.
       </p>
-      <div class="sett-card">
-        <form method="post" action="{{ ingress_path }}/settings/retention/update">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div style="display:flex;align-items:center;gap:1rem;margin-top:.75rem;flex-wrap:wrap">
+        <button type="submit" class="btn btn-primary btn-sm">Save</button>
+        {% if mqtt_status %}
+        <span class="pill
+          {%- if mqtt_status == 'connected' %} pill-green
+          {%- elif mqtt_status == 'not_configured' %} pill-neutral
+          {%- else %} pill-amber
+          {%- endif %}">
+          MQTT: {{ mqtt_status | replace('_', ' ') | title }}
+        </span>
+        {% endif %}
+      </div>
+    </form>
+  </div>
+</section>
 
-          <div class="sett-retention-row">
-            <div class="sett-retention-info">
-              <span class="sett-retention-label">Usage events</span>
-              <span class="sett-retention-desc">raw flow/pressure readings — daily summaries kept forever</span>
-              <span class="sett-retention-val" id="events_yr_label">
-                {{ retention.events_retain_years or 1 }} yr{{ 's' if (retention.events_retain_years or 1) != 1 else '' }}
-              </span>
-            </div>
+{# ── Data Retention ───────────────────────────────────────────────────────── #}
+<section class="settings-section">
+  <h2>Data Retention</h2>
+  <p class="muted">
+    Controls how much historical data is kept. The system prunes old records
+    automatically each night. <strong>Training-era data is always protected</strong>
+    — these rules only apply to data collected after your initial learning period.
+  </p>
+  <div class="settings-card">
+    <form method="post" action="{{ ingress_path }}/settings/retention/update"
+          class="retention-form">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div class="form-grid">
+
+        <div class="form-group">
+          <label for="events_retain_years">
+            Usage events
+            <span class="form-hint">raw flow/pressure readings — daily summaries kept forever</span>
+          </label>
+          <div class="retain-row">
             <input type="range" id="events_retain_years" name="events_retain_years"
                    min="1" max="10" step="1"
                    value="{{ retention.events_retain_years or 1 }}"
-                   style="width:100%;accent-color:var(--accent)"
                    oninput="document.getElementById('events_yr_label').textContent = this.value + ' yr' + (this.value == 1 ? '' : 's')">
+            <span id="events_yr_label" class="retain-label">
+              {{ retention.events_retain_years or 1 }} yr{{ 's' if (retention.events_retain_years or 1) != 1 else '' }}
+            </span>
           </div>
+        </div>
 
-          <div class="sett-retention-row">
-            <div class="sett-retention-info">
-              <span class="sett-retention-label">Hourly volume history</span>
-              <span class="sett-retention-desc">used for leak test scheduling</span>
-              <span class="sett-retention-val" id="vol_yr_label">
-                {{ retention.hourly_volume_retain_years or 2 }} yr{{ 's' if (retention.hourly_volume_retain_years or 2) != 1 else '' }}
-              </span>
-            </div>
-            <input type="range" id="hourly_volume_retain_years" name="hourly_volume_retain_years"
+        <div class="form-group">
+          <label for="hourly_volume_retain_years">
+            Hourly volume history
+            <span class="form-hint">used for leak test scheduling (learn_best_hour)</span>
+          </label>
+          <div class="retain-row">
+            <input type="range" id="hourly_volume_retain_years"
+                   name="hourly_volume_retain_years"
                    min="1" max="10" step="1"
                    value="{{ retention.hourly_volume_retain_years or 2 }}"
-                   style="width:100%;accent-color:var(--accent)"
                    oninput="document.getElementById('vol_yr_label').textContent = this.value + ' yr' + (this.value == 1 ? '' : 's')">
+            <span id="vol_yr_label" class="retain-label">
+              {{ retention.hourly_volume_retain_years or 2 }} yr{{ 's' if (retention.hourly_volume_retain_years or 2) != 1 else '' }}
+            </span>
           </div>
+        </div>
 
-          <div style="display:flex;align-items:center;gap:.5rem;padding-top:4px;margin-bottom:1rem">
-            <label class="toggle">
-              <input type="checkbox" name="enabled" value="1"
-                     {% if retention.enabled %}checked{% endif %}>
-              <span class="toggle-slider"></span>
-            </label>
-            <span style="font-size:13px">Enable automatic nightly pruning</span>
-          </div>
-
-          <hr style="border:none;border-top:1px solid var(--border);margin:.75rem 0">
-          <h3 class="sett-card-title">Automatic Backup</h3>
-          <p class="sett-card-desc">
-            Writes a Quick Restore JSON to the filesystem on a weekly schedule.
-            Keeps the 4 most recent files. Requires SSH or Samba access to <code>/share/</code>.
-          </p>
-
-          <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.75rem">
-            <label class="toggle">
-              <input type="checkbox" name="auto_backup_enabled" value="1"
-                     {% if retention.auto_backup_enabled %}checked{% endif %}>
-              <span class="toggle-slider"></span>
-            </label>
-            <span style="font-size:13px">Enable weekly auto-backup</span>
-          </div>
-
-          <div class="sett-form-grid" style="margin-bottom:.75rem">
-            <div class="sett-form-group">
-              <label for="auto_backup_path">Backup directory</label>
-              <input type="text" id="auto_backup_path" name="auto_backup_path"
-                     value="{{ retention.auto_backup_path or '/share/water_monitor_backups' }}"
-                     placeholder="/share/water_monitor_backups">
-            </div>
-            <div class="sett-form-group">
-              <label for="auto_backup_day_of_week">Run on</label>
-              <select id="auto_backup_day_of_week" name="auto_backup_day_of_week">
-                {% for i, day in [(0,'Monday'),(1,'Tuesday'),(2,'Wednesday'),
-                                  (3,'Thursday'),(4,'Friday'),(5,'Saturday'),(6,'Sunday')] %}
-                <option value="{{ i }}"
-                  {% if (retention.auto_backup_day_of_week or 0)|int == i %}selected{% endif %}>
-                  {{ day }}
-                </option>
-                {% endfor %}
-              </select>
-            </div>
-          </div>
-
-          {% if retention.last_auto_backup_at %}
-          <p class="muted" style="font-size:.8rem">
-            Last auto-backup: {{ retention.last_auto_backup_at[:16] }}
-          </p>
-          {% endif %}
-          {% if retention.last_pruned_at %}
-          <p class="muted" style="font-size:.8rem">
-            Last pruned: {{ retention.last_pruned_at[:16] }}
-          </p>
-          {% endif %}
-
-          <div style="display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap">
-            <button type="submit" class="btn btn-primary btn-sm">Save retention settings</button>
-            <button type="button" class="btn btn-secondary btn-sm"
-                    onclick="pruneNow()">Run pruning now</button>
-          </div>
-        </form>
       </div>
-    </div>
 
-  </div>{# /sett-content #}
-</div>{# /sett-layout #}
+      <div class="form-group" style="margin-top:.75rem">
+        <label class="toggle-label">
+          <input type="checkbox" name="enabled" value="1"
+                 {% if retention.enabled %}checked{% endif %}>
+          Enable automatic nightly pruning
+        </label>
+      </div>
 
-{# ── Recalibration backup modal (outside layout, absolutely positioned) #}
+      <hr style="border:none;border-top:1px solid var(--border);margin:1rem 0">
+      <h4 style="margin:0 0 .5rem">Automatic Backup</h4>
+      <p class="muted" style="font-size:.83rem;margin-bottom:.75rem">
+        Writes a Quick Restore JSON to the filesystem on a weekly schedule.
+        Keeps the 4 most recent files. Requires SSH or Samba access to
+        <code>/share/</code>.
+      </p>
+
+      <div class="form-group">
+        <label class="toggle-label">
+          <input type="checkbox" name="auto_backup_enabled" value="1"
+                 {% if retention.auto_backup_enabled %}checked{% endif %}>
+          Enable weekly auto-backup
+        </label>
+      </div>
+
+      <div class="form-grid">
+        <div class="form-group">
+          <label for="auto_backup_path">Backup directory</label>
+          <input type="text" id="auto_backup_path" name="auto_backup_path"
+                 value="{{ retention.auto_backup_path or '/share/water_monitor_backups' }}"
+                 placeholder="/share/water_monitor_backups">
+        </div>
+        <div class="form-group">
+          <label for="auto_backup_day_of_week">Run on</label>
+          <select id="auto_backup_day_of_week" name="auto_backup_day_of_week">
+            {% for i, day in [(0,'Monday'),(1,'Tuesday'),(2,'Wednesday'),
+                              (3,'Thursday'),(4,'Friday'),(5,'Saturday'),(6,'Sunday')] %}
+            <option value="{{ i }}"
+              {% if (retention.auto_backup_day_of_week or 0)|int == i %}selected{% endif %}>
+              {{ day }}
+            </option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+
+      {% if retention.last_auto_backup_at %}
+      <p class="muted" style="font-size:.8rem">
+        Last auto-backup: {{ retention.last_auto_backup_at[:16] }}
+      </p>
+      {% endif %}
+      {% if retention.last_pruned_at %}
+      <p class="muted" style="font-size:.8rem">
+        Last pruned: {{ retention.last_pruned_at[:16] }}
+      </p>
+      {% endif %}
+
+      <div class="control-row" style="margin-top:1rem">
+        <button type="submit" class="btn btn-primary btn-sm">Save retention settings</button>
+        <button type="button" class="btn btn-secondary btn-sm"
+                onclick="pruneNow()">Run pruning now</button>
+      </div>
+    </form>
+  </div>
+</section>
+
+{# ── Recalibration backup modal ───────────────────────────────────────────── #}
 <div id="recal-modal" class="modal-overlay" style="display:none"
      onclick="if(event.target===this) closeRecalModal()">
   <div class="modal-box">
@@ -650,8 +667,10 @@
       for circuit <strong id="recal-circuit-name"></strong>.
     </p>
     <div class="modal-actions">
-      <a id="recal-backup-btn" href="{{ ingress_path }}/backup/export"
-         class="btn btn-secondary" target="_blank">
+      <a id="recal-backup-btn"
+         href="{{ ingress_path }}/backup/export"
+         class="btn btn-secondary"
+         target="_blank">
         ⬇ Download backup first
       </a>
       <button class="btn btn-warning" onclick="submitRecalForm()">
@@ -672,34 +691,6 @@
 
 {% block scripts %}
 <script>
-// ── Sidebar navigation ─────────────────────────────────────────────────────
-function settNav(id) {
-  document.querySelectorAll('.sett-section').forEach(el => el.style.display = 'none');
-  document.querySelectorAll('.sett-nav-btn').forEach(el => el.classList.remove('active'));
-  const section = document.getElementById('sett-' + id);
-  if (section) section.style.display = '';
-  const btn = document.getElementById('sett-btn-' + id);
-  if (btn) btn.classList.add('active');
-  history.replaceState(null, '', '#' + id);
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-  const id = location.hash.slice(1) || 'profile';
-  settNav(id);
-
-  // Recalibration modal intercept
-  document.querySelectorAll('.recal-form').forEach(form => {
-    form.addEventListener('submit', e => {
-      e.preventDefault();
-      const section = form.closest('.sett-section');
-      const heading = section ? section.querySelector('.sett-section-title') : null;
-      const name = heading ? heading.textContent.trim() : 'this circuit';
-      showRecalModal(form, name);
-    });
-  });
-});
-
-// ── Settings helpers ────────────────────────────────────────────────────────
 async function suggestDays(circuit) {
   const resp = await fetch(`${window.INGRESS_PATH}/settings/recalibrate/${circuit}/suggest`);
   const data = await resp.json();
@@ -716,7 +707,7 @@ async function settingsAlertToggle(alertId, enabled) {
   await fetch(`${window.INGRESS_PATH}/settings/alert/${circuit}/${alertId}/toggle`, {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&enabled=${enabled}`
+    body: `enabled=${enabled}`
   });
 }
 
@@ -724,7 +715,7 @@ async function updateDeviceEntity(entityId, value) {
   const resp = await fetch(`${window.INGRESS_PATH}/settings/device-entity/update`, {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&entity_id=${encodeURIComponent(entityId)}&value=${encodeURIComponent(value)}`,
+    body: `entity_id=${encodeURIComponent(entityId)}&value=${encodeURIComponent(value)}`,
   });
   const data = await resp.json().catch(() => ({}));
   if (data.status !== 'ok') {
@@ -732,7 +723,7 @@ async function updateDeviceEntity(entityId, value) {
   }
 }
 
-// ── Recalibration modal ─────────────────────────────────────────────────────
+// ── Recalibration backup modal ─────────────────────────────────────────────
 let _recalForm = null;
 
 function showRecalModal(form, circuitDisplayName) {
@@ -751,7 +742,20 @@ function submitRecalForm() {
   if (_recalForm) _recalForm.submit();
 }
 
-// ── Data retention ──────────────────────────────────────────────────────────
+// Intercept all recalibration form submissions
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.recal-form').forEach(form => {
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const section = form.closest('.settings-section, section');
+      const heading = section ? section.querySelector('h2') : null;
+      const name = heading ? heading.textContent.trim() : 'this circuit';
+      showRecalModal(form, name);
+    });
+  });
+});
+
+// ── Data retention ─────────────────────────────────────────────────────────
 async function pruneNow() {
   if (!confirm('Run data pruning now? This will permanently delete old history rows according to the current retention settings.')) return;
   const btn = event.target;
@@ -771,6 +775,11 @@ async function pruneNow() {
     btn.textContent = 'Run pruning now';
   }
 }
+
+// Load page
+window.addEventListener('load', () => {
+  // nothing to auto-load currently
+});
 
 async function autoDetectUnits(btn) {
   btn.disabled = true;

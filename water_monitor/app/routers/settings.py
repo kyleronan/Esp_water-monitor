@@ -171,6 +171,12 @@ async def settings_page(request: Request):
             "device_entities": entities_by_circuit.get(c, []),
         })
 
+    # MQTT status for the Integrations section status pill
+    mqtt_status = None
+    fp = getattr(orch, "_fixture_publisher", None)
+    if fp is not None:
+        mqtt_status = fp.status()
+
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
         "profile": dict(get_home_profile(orch.db) or {}),
@@ -178,6 +184,7 @@ async def settings_page(request: Request):
         "general_entities": entities_by_circuit.get("general", []),
         "presets": SENSITIVITY_PRESETS,
         "retention": get_data_retention(orch.db),
+        "mqtt_status": mqtt_status,
         "page": "settings",
     })
 
@@ -497,6 +504,19 @@ async def units_update(request: Request):
     orch.db.commit()
     from ..units import invalidate_unit_cache
     invalidate_unit_cache()
+    return ingress_redirect(request, "/settings")
+
+
+@router.post("/integrations/update")
+async def integrations_update(request: Request):
+    form = await request.form()
+    enabled = 1 if form.get("mqtt_publish_enabled") else 0
+    orch = _orch(request)
+    orch.db.execute(
+        """UPDATE home_profile SET mqtt_publish_enabled = ? WHERE id = 1""",
+        (enabled,)
+    )
+    orch.db.commit()
     return ingress_redirect(request, "/settings")
 
 
