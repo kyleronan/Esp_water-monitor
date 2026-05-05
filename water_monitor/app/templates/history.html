@@ -144,7 +144,7 @@
           <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi else "—" }}</td>
           <td class="hist-td">
             {% set shape = e.resistance_curve_shape or 'unknown' %}
-            {% set shape_color = {'flat': 'pill-blue', 'rising': 'pill-amber', 'falling': 'pill-green', 'pulsed': 'pill-neutral', 'unknown': 'pill-neutral'} %}
+            {% set shape_color = {'steady': 'pill-blue', 'rising': 'pill-amber', 'falling': 'pill-green', 'pulsed': 'pill-neutral', 'unknown': 'pill-neutral'} %}
             <span class="pill {{ shape_color.get(shape, 'pill-neutral') }}">{{ shape }}</span>
           </td>
           <td class="hist-td hist-td-mono">{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres else "—" }}</td>
