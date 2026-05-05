@@ -65,6 +65,7 @@ class Orchestrator:
         self._presence_watcher: Optional[PresenceWatcher] = None
         self._leak_test_scheduler: Optional[LeakTestScheduler] = None
         self._historical_importer: Optional[HistoricalImporter] = None
+        self._cluster_engine = None
         self._stop = asyncio.Event()
 
     @property
@@ -167,6 +168,10 @@ class Orchestrator:
     @property
     def historical_importer(self) -> Optional[HistoricalImporter]:
         return self._historical_importer
+
+    @property
+    def cluster_engine(self):
+        return self._cluster_engine
 
     @property
     def event_detector(self) -> EventDetector:
@@ -287,6 +292,22 @@ class Orchestrator:
         # Feature extractor
         self._feature_extractor = FeatureExtractor(
             self._event_queue, self._db, self._alert_manager)
+
+        # Cluster engine — instantiate and rebuild state from the last 60 days
+        # of already-matched events so DBSTREAM + scaler are warm on startup.
+        try:
+            from .cluster_engine import ClusterEngine
+            self._cluster_engine = ClusterEngine(self._db, self._cfg)
+            for c in self._cfg.circuits:
+                count = await asyncio.get_event_loop().run_in_executor(
+                    None, self._cluster_engine.rebuild_from_db, c.circuit
+                )
+                log.info("[%s] cluster state rebuilt — %d events replayed",
+                         c.circuit, count)
+            self._feature_extractor.cluster_engine = self._cluster_engine
+            log.info("ClusterEngine initialised and wired to feature extractor")
+        except Exception as e:
+            log.error("ClusterEngine init failed (non-fatal): %s", e, exc_info=True)
 
         # Initialise daily/weekly volume baselines from HA history so that
         # the dashboard shows accurate totals from the first page load.

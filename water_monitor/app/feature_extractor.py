@@ -74,6 +74,10 @@ from .event_detector import RawEvent
 
 log = logging.getLogger(__name__)
 
+# Maximum gap between consecutive events that counts as a sequence (seconds).
+# Must match cluster_engine.SEQUENCE_GAP_MAX_SECONDS.
+_SEQUENCE_GAP_MAX_S = 300
+
 
 def _safe_float(values: list, default: float = 0.0) -> float:
     valid = [v for v in values if v is not None and not math.isnan(v)]
@@ -247,6 +251,8 @@ class FeatureExtractor:
         self._db = db_conn
         self._alert_manager = alert_manager
         self._running = False
+        # Set by orchestrator after ClusterEngine is initialised and rebuilt.
+        self.cluster_engine = None
 
     async def run(self) -> None:
         """Process events from the queue until cancelled."""
@@ -298,6 +304,10 @@ class FeatureExtractor:
                 """, (event.circuit,))
             self._db.commit()
 
+            # ── Phase 2: sequence context + cluster matching ───────────────
+            await self._cluster_event(event.circuit, features)
+            # ──────────────────────────────────────────────────────────────
+
             am = self._alert_manager
             if am and features.get("anomaly_score"):
                 score = float(features["anomaly_score"])
@@ -321,3 +331,72 @@ class FeatureExtractor:
             )
         except Exception as e:
             log.error("[%s] failed to store event: %s", event.circuit, e, exc_info=True)
+
+    async def _cluster_event(self, circuit: str, features: dict) -> None:
+        """Compute sequence context, run cluster matching, write results back."""
+        event_id    = features["id"]
+        start_ts    = features.get("start_ts")
+
+        # 1. Find the previous event on this circuit
+        seconds_since_prev = None
+        prev_cluster_id    = None
+        if start_ts:
+            prev = self._db.execute(
+                """SELECT id, cluster_id, end_ts FROM events
+                   WHERE circuit = ? AND end_ts < ? AND id != ?
+                   ORDER BY end_ts DESC LIMIT 1""",
+                (circuit, start_ts, event_id)
+            ).fetchone()
+            if prev and prev["end_ts"]:
+                try:
+                    ev_start   = datetime.fromisoformat(start_ts)
+                    prev_end   = datetime.fromisoformat(
+                        prev["end_ts"].replace("Z", "+00:00"))
+                    if ev_start.tzinfo is None:
+                        from datetime import timezone
+                        ev_start = ev_start.replace(tzinfo=timezone.utc)
+                    if prev_end.tzinfo is None:
+                        from datetime import timezone
+                        prev_end = prev_end.replace(tzinfo=timezone.utc)
+                    gap = (ev_start - prev_end).total_seconds()
+                    if 0 <= gap < _SEQUENCE_GAP_MAX_S:
+                        seconds_since_prev = gap
+                        prev_cluster_id    = prev["cluster_id"]
+                        # Retroactively fill seconds_to_next_event on previous event
+                        self._db.execute(
+                            "UPDATE events SET seconds_to_next_event = ? WHERE id = ?",
+                            (gap, prev["id"])
+                        )
+                except (ValueError, TypeError):
+                    pass
+
+        # 2. Cluster matching
+        cluster_id_result = None
+        match_confidence  = None
+        match_level       = None
+        if self.cluster_engine:
+            try:
+                event_row = self._db.execute(
+                    "SELECT * FROM events WHERE id = ?", (event_id,)
+                ).fetchone()
+                if event_row:
+                    cluster_id_result, match_confidence, match_level = \
+                        self.cluster_engine.match_and_learn(
+                            dict(event_row), circuit)
+            except Exception as e:
+                log.error("[%s] cluster matching failed: %s", circuit, e,
+                          exc_info=True)
+
+        # 3. Write results back to the event row
+        self._db.execute(
+            """UPDATE events SET
+                 cluster_id              = ?,
+                 match_confidence        = ?,
+                 match_level             = ?,
+                 seconds_since_prev_event = ?,
+                 prev_cluster_id         = ?
+               WHERE id = ?""",
+            (cluster_id_result, match_confidence, match_level,
+             seconds_since_prev, prev_cluster_id, event_id)
+        )
+        self._db.commit()
