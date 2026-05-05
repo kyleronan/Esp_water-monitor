@@ -1,5 +1,52 @@
 # Changelog
 
+## [Unreleased] — 0.2.0-dev
+
+### New Features
+
+#### Phase 2.1 — Fixture Identification (Stages 1–2 complete)
+
+- **Online clustering engine** — `cluster_engine.py` runs per-circuit
+  `river.DBSTREAM` + `StandardScaler` (online, density-based, no fixed K).
+  Every new water event is matched to a cluster immediately as it arrives.
+  Startup replays the last 60 days of matched events to reconstruct
+  in-memory state without pickling (see ADR 008).
+- **9-feature event vectors** — `avg_flow_lpm`, `peak_flow_lpm`,
+  `duration_seconds`, `volume_litres`, `pressure_delta_psi`,
+  `has_pressure_transient`, `flow_variability`, `hour_sin`, `hour_cos`.
+  Time-of-day is sin/cos encoded so midnight and 11 pm are adjacent in
+  feature space.
+- **Sequence context** — each event records `seconds_since_prev_event` and
+  `prev_cluster_id`; the previous event gets `seconds_to_next_event` filled
+  retroactively. Groundwork for Stage 3 cooccurrence boost.
+- **Cluster confidence progression** — three levels persisted on
+  `fixture_clusters.confidence_level`: preliminary (< 50 events), learning
+  (50–200), confirmed (200+ or user-locked). See ADR 009.
+- **Heuristic type suggestion** — `suggest_fixture_type` runs at event 1
+  and every 10 events per cluster, updating `suggested_type` and
+  `suggested_confidence`.
+- **Fixtures page** — shows all clusters grouped by circuit with confidence
+  pills, avg stats (unit-converted), and a confirm/name flow that creates a
+  `fixtures` row and back-fills `events.fixture_id`. "Re-run clustering"
+  rebuilds DBSTREAM state from the last 60 days.
+- **Settings unit conversion for ESP device entities** — flow threshold and
+  pressure threshold entities now display and accept values in the user's
+  chosen units (gal/min, bar, etc.) and convert back to L/min / PSI before
+  sending to HA/ESP.
+- **Duplicate event prevention** — events use a deterministic
+  `uuid5(circuit/start_ts)` ID so the same event can never be inserted twice.
+  Migration 015 removes any existing duplicates on first run.
+- **Migration 016** — adds `idx_events_fixture_id` and `idx_fixtures_circuit`
+  indexes for Phase 2 query paths.
+
+#### Design refresh
+
+- Full visual refresh across all 7 pages (Dashboard, Device, History,
+  Fixtures, Settings, Backup, Setup) — OKLCH colour tokens, consistent
+  card/pill/button components, Settings sidebar navigation.
+
+---
+
 ## [0.1.2] — 2026-05-03
 
 ### Removed
