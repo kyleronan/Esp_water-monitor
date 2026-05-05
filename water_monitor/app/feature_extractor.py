@@ -190,7 +190,8 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
 
     return {
         # Identity
-        "id": str(uuid.uuid4()),
+        "id": str(uuid.uuid5(uuid.NAMESPACE_OID,
+                              f"{event.circuit}/{event.start_ts.isoformat()}")),
         "circuit": event.circuit,
         "start_ts": event.start_ts.isoformat(),
         "end_ts": event.end_ts.isoformat() if event.end_ts else None,
