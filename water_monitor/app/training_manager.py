@@ -80,7 +80,12 @@ class TrainingManager:
                                 calibration_days: int) -> bool:
         """
         Start calibration for a circuit. Returns True if started.
-        Can only start from 'idle' state.
+
+        Only starts a fresh calibration from 'idle'.  If the circuit is
+        already calibrating with a valid ``started_at`` (e.g. the row was
+        just restored from a backup and the setup wizard re-ran), this is
+        a no-op so we don't clobber the existing timer or
+        ``events_collected`` counter.
         """
         state_row = get_training_state(self._db, circuit)
         current = state_row["state"] if state_row else "idle"
@@ -89,6 +94,15 @@ class TrainingManager:
             log.warning("[%s] cannot start calibration from state '%s'",
                         circuit, current)
             return False
+
+        # If calibration is already in progress with a real start time,
+        # preserve it — re-running the setup wizard after a restore must
+        # not reset the timer back to "now" or zero the event counter.
+        if current == "calibrating" and state_row and state_row["started_at"]:
+            log.info("[%s] calibration already in progress — "
+                     "preserving existing timer (started_at=%s)",
+                     circuit, state_row["started_at"])
+            return True
 
         profile = get_home_profile(self._db)
         minimum_events = compute_minimum_events(
