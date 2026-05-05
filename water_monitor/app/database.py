@@ -1142,3 +1142,116 @@ def event_exists_near(
           start_ts, f"-{window_seconds} seconds",
           start_ts, f"+{window_seconds} seconds")).fetchone()
     return row is not None
+
+
+# ── Phase 2: fixture cluster helpers ──────────────────────────────────────────
+
+def get_clusters_with_fixtures(
+    conn: sqlite3.Connection,
+    circuit: str,
+) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT fc.*,
+               f.name,
+               f.display_name,
+               f.fixture_type  AS user_type,
+               f.confirmed,
+               f.user_locked,
+               f.notes,
+               f.publish_to_ha AS fixture_publish_to_ha
+        FROM fixture_clusters fc
+        LEFT JOIN fixtures f ON fc.fixture_id = f.id
+        WHERE fc.circuit = ?
+        ORDER BY fc.member_count DESC
+        """,
+        (circuit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_cluster_stats(
+    conn: sqlite3.Connection,
+    circuit: str,
+    cluster_id: int,
+) -> Dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT COUNT(*)              AS event_count,
+               AVG(volume_litres)   AS avg_volume_litres,
+               AVG(duration_seconds)AS avg_duration_s,
+               AVG(avg_flow_lpm)    AS avg_flow_lpm,
+               MAX(start_ts)        AS last_seen_at
+        FROM events
+        WHERE circuit = ? AND cluster_id = ?
+        """,
+        (circuit, cluster_id),
+    ).fetchone()
+    return dict(row) if row else {}
+
+
+def upsert_fixture_from_cluster(
+    conn: sqlite3.Connection,
+    circuit: str,
+    cluster_id: int,
+    name: str,
+    fixture_type: str,
+    publish_to_ha: int = 1,
+) -> str:
+    """Create or update a fixture linked to a cluster. Returns fixture_id."""
+    import uuid as _uuid
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+
+    row = conn.execute(
+        "SELECT fixture_id FROM fixture_clusters WHERE circuit = ? AND id = ?",
+        (circuit, cluster_id),
+    ).fetchone()
+    fixture_id = row["fixture_id"] if row else None
+
+    if fixture_id:
+        conn.execute(
+            """
+            UPDATE fixtures
+            SET name = ?, fixture_type = ?, confirmed = 1, user_locked = 1,
+                display_name = ?, publish_to_ha = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (name, fixture_type, name, publish_to_ha, now, fixture_id),
+        )
+    else:
+        fixture_id = str(_uuid.uuid4())
+        conn.execute(
+            """
+            INSERT INTO fixtures
+                (id, circuit, name, auto_name, fixture_type, display_name,
+                 confirmed, user_locked, publish_to_ha, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
+            """,
+            (fixture_id, circuit, name, name, fixture_type, name,
+             publish_to_ha, now, now),
+        )
+        conn.execute(
+            "UPDATE fixture_clusters SET fixture_id = ? WHERE circuit = ? AND id = ?",
+            (fixture_id, circuit, cluster_id),
+        )
+
+    conn.commit()
+    return fixture_id
+
+
+def delete_cluster(
+    conn: sqlite3.Connection,
+    circuit: str,
+    cluster_id: int,
+) -> None:
+    """Remove a cluster and null out its cluster_id on linked events."""
+    conn.execute(
+        "UPDATE events SET cluster_id = NULL WHERE circuit = ? AND cluster_id = ?",
+        (circuit, cluster_id),
+    )
+    conn.execute(
+        "DELETE FROM fixture_clusters WHERE circuit = ? AND id = ?",
+        (circuit, cluster_id),
+    )
+    conn.commit()

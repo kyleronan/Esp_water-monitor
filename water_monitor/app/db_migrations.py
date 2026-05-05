@@ -430,6 +430,17 @@ def _migrate_015(conn: sqlite3.Connection) -> None:
     log.info("Migration 015: removed %d duplicate event row(s)", deleted)
 
 
+def _migrate_016(conn: sqlite3.Connection) -> None:
+    """Add fixture lookup indexes for Phase 2 query performance."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_fixture_id ON events (fixture_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fixtures_circuit ON fixtures (circuit)"
+    )
+    log.info("Migration 016: fixture lookup indexes added")
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -446,6 +457,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (13, _migrate_013),
     (14, _migrate_014),
     (15, _migrate_015),
+    (16, _migrate_016),
 ]
 
 

@@ -50,6 +50,20 @@ async def settings_page(request: Request):
                 return c.circuit
         return "general"
 
+    # Load unit context once so descriptions and state values are shown in
+    # the user's chosen units (e.g. gal/min instead of L/min).
+    from ..units import load_unit_context
+    _uc              = load_unit_context(orch.db)
+    _flow_label      = _uc["flow_unit"]       # e.g. "gal/min"
+    _flow_factor     = _uc["flow_factor"]     # multiply L/min → display
+    _pressure_label  = _uc["pressure_unit"]   # e.g. "bar"
+    _pressure_factor = _uc["pressure_factor"] # multiply PSI → display
+
+    # Entity patterns that carry flow or pressure values (internal L/min / PSI).
+    _FLOW_PATTERNS     = {"burst pipe flow threshold", "burst threshold",
+                          "trickle flow max threshold", "trickle flow min threshold"}
+    _PRESSURE_PATTERNS = {"leak test pressure threshold", "pressure drop threshold"}
+
     # Short labels and descriptions for known ESP entity name patterns.
     # Keys are matched against the entity stem (entity_id with prefix and
     # circuit suffix stripped, underscores replaced with spaces, lowercased).
@@ -68,7 +82,7 @@ async def settings_page(request: Request):
     }
 
     def _enrich_entity(e: dict, prefix: str, circuit: str) -> dict:
-        """Add short label and description to a device entity dict."""
+        """Add short label, unit-converted description and state value."""
         eid   = e["entity_id"]
         local = eid.split(".", 1)[1] if "." in eid else eid
         stem  = local[len(prefix):] if local.startswith(prefix) else local
@@ -83,7 +97,27 @@ async def settings_page(request: Request):
             if pattern in stem_readable:
                 e = dict(e)
                 e["short_label"] = f"{label} — {circuit.replace('_', ' ').title()}"
-                e["description"] = desc
+                # Replace hardcoded unit strings in descriptions
+                e["description"] = (desc
+                    .replace("(L/min)", f"({_flow_label})")
+                    .replace("L/min",   _flow_label)
+                    .replace("(PSI)",   f"({_pressure_label})")
+                    .replace("PSI",     _pressure_label))
+                # Pre-convert numeric state to display units
+                if pattern in _FLOW_PATTERNS:
+                    e["unit_type"] = "flow"
+                    try:
+                        e["state"] = round(float(e["state"]) * _flow_factor, 3)
+                    except (TypeError, ValueError):
+                        pass
+                elif pattern in _PRESSURE_PATTERNS:
+                    e["unit_type"] = "pressure"
+                    try:
+                        e["state"] = round(float(e["state"]) * _pressure_factor, 3)
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    e["unit_type"] = None
                 return e
 
         # Fallback: clean up the raw friendly name
@@ -100,6 +134,7 @@ async def settings_page(request: Request):
         e = dict(e)
         e["short_label"] = f"{name.title()} — {circuit.replace('_', ' ').title()}"
         e["description"] = ""
+        e["unit_type"]   = None
         return e
 
     entities_by_circuit: dict = {"general": []}
@@ -330,7 +365,18 @@ async def device_entity_update(request: Request):
 
     if domain in ("number", "input_number"):
         try:
-            ok = await orch.ha.set_number(entity_id, float(value))
+            numeric = float(value)
+            # Convert from display units back to internal units (L/min / PSI)
+            # before sending to HA/ESP.
+            _FLOW_KEYWORDS     = ("flow_threshold", "burst_threshold")
+            _PRESSURE_KEYWORDS = ("pressure_threshold", "pressure_drop")
+            if any(k in entity_id for k in _FLOW_KEYWORDS):
+                from ..units import load_unit_context as _luc
+                numeric = numeric / _luc(orch.db)["flow_factor"]
+            elif any(k in entity_id for k in _PRESSURE_KEYWORDS):
+                from ..units import load_unit_context as _luc
+                numeric = numeric / _luc(orch.db)["pressure_factor"]
+            ok = await orch.ha.set_number(entity_id, round(numeric, 4))
         except ValueError:
             return JSONResponse(
                 {"status": "error", "message": f"Invalid number: {value}"},

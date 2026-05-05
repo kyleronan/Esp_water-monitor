@@ -108,6 +108,26 @@ async def lifespan(app: FastAPI):
         lambda v: _Markup(_json.dumps(v))
     )
 
+    # fixture_icon: maps a cluster dict to an emoji for the fixture type.
+    _FX_ICONS = {
+        "toilet": "🚽", "shower": "🚿", "bath": "🛁",
+        "bathroom_tap": "🪥", "bidet": "🚿",
+        "kitchen_tap": "🍽️", "dishwasher": "🍽️",
+        "washing_machine": "👕", "utility_tap": "🔧",
+        "irrigation_zone": "💧", "hose_bib": "🌿",
+        "outdoor_tap": "🌿", "pool_fill": "🏊",
+        "humidifier": "💨", "water_softener": "🔬",
+        "ice_maker": "🧊", "refrigerator_water": "🧊",
+        "ro_drinking_faucet": "💎", "ro_system_whole_house": "💎",
+        "evaporative_cooler": "❄️", "boiler_makeup": "🔥",
+        "leak_test": "🔍", "other": "❓",
+    }
+    app.state.templates.env.filters["fixture_icon"] = (
+        lambda cl: _FX_ICONS.get(
+            (cl.get("user_type") or cl.get("suggested_type") or "other"), "❓"
+        )
+    )
+
     runner = asyncio.create_task(orch.run())
 
     try:
