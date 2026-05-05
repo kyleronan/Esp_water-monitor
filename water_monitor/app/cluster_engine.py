@@ -199,7 +199,7 @@ class ClusterEngine:
             except (json.JSONDecodeError, TypeError):
                 old_centroid = {}
             new_centroid = {
-                k: (old_centroid.get(k, v) * n_old + v) / member_count
+                k: (old_centroid.get(k, 0.0) * n_old + v) / member_count
                 for k, v in features.items()
             }
         self._db.execute(

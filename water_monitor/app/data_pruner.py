@@ -142,10 +142,9 @@ class DataPruner:
 
         # Step 4: prune auxiliary tables (no training fence needed)
         for tbl, col in [
-            ("zone_flow_history",         "recorded_at"),
-            ("threshold_history",         "recorded_at"),
-            ("cluster_cooccurrence",      "last_seen_at"),   # Phase 2
-            ("fixture_daily_summary",     "day"),            # Phase 2 (F1)
+            ("zone_flow_history",     "recorded_at"),
+            ("threshold_history",     "recorded_at"),
+            ("cluster_cooccurrence",  "last_seen_at"),   # Phase 2
         ]:
             try:
                 cur = self._db.execute(
@@ -154,6 +153,16 @@ class DataPruner:
             except Exception as e:
                 log.error("Pruning %s: %s", tbl, e)
                 deleted[tbl] = 0
+
+        # fixture_daily_summary stores DATE (not TIMESTAMP) — use date() to avoid
+        # string-comparison boundary issue where 'YYYY-MM-DD' < 'YYYY-MM-DDT...'
+        try:
+            cur = self._db.execute(
+                "DELETE FROM fixture_daily_summary WHERE day < date(?)", (events_cutoff,))
+            deleted["fixture_daily_summary"] = cur.rowcount
+        except Exception as e:
+            log.error("Pruning fixture_daily_summary: %s", e)
+            deleted["fixture_daily_summary"] = 0
 
         # cluster_metrics_history — hard 90-day retention window
         metrics_cutoff = (now - timedelta(days=90)).isoformat()
