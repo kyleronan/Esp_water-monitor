@@ -133,53 +133,17 @@ class TrainingManager:
             completed_at=now.isoformat(),
         )
         await self._publish_status(circuit)
-
-        # Run clustering in a thread so the event loop stays free.
-        row = self._db.execute(
-            "SELECT circuit_type FROM circuit_profile WHERE circuit = ?",
-            (circuit,),
-        ).fetchone()
-        circuit_type = row["circuit_type"] if row else "main"
-        await self._run_clustering(circuit, circuit_type)
-
         circuit_cfg = self._cfg.get_circuit(circuit)
         if circuit_cfg:
             await self._ha.notify(
                 title=f"Water Monitor — {circuit_cfg.display_name} training complete",
                 message=(
                     f"The {circuit_cfg.display_name.lower()} circuit has finished "
-                    f"its training period. Visit Fixtures to review detected fixtures."
+                    f"its training period. Visit Fixtures to review detected clusters."
                 ),
                 notification_id=f"water_calibration_complete_{circuit}",
             )
         log.info("[%s] calibration complete — transitioning to live", circuit)
-
-    async def retrigger_clustering(self, circuit: str) -> dict:
-        """Manual re-cluster from the fixtures page. Preserves user_locked fixtures."""
-        row = self._db.execute(
-            "SELECT circuit_type FROM circuit_profile WHERE circuit = ?",
-            (circuit,),
-        ).fetchone()
-        circuit_type = row["circuit_type"] if row else "main"
-        return await self._run_clustering(circuit, circuit_type)
-
-    async def _run_clustering(self, circuit: str, circuit_type: str) -> dict:
-        import functools
-        from .clusterer import run_clustering
-        loop = asyncio.get_event_loop()
-        try:
-            result = await loop.run_in_executor(
-                None,
-                functools.partial(run_clustering, self._db, circuit, circuit_type),
-            )
-            log.info("[%s] clustering complete: %s", circuit, result)
-            return result
-        except ValueError as e:
-            log.info("[%s] clustering skipped: %s", circuit, e)
-            return {}
-        except Exception as e:
-            log.error("[%s] clustering failed: %s", circuit, e, exc_info=True)
-            return {}
 
     async def trigger_full_recalibration(self, circuit: str,
                                          days: int) -> bool:

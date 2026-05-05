@@ -70,15 +70,19 @@ async def fixtures_page(request: Request):
 
 @router.post("/{circuit}/cluster")
 async def retrigger_cluster(request: Request, circuit: str):
-    orch = _orch(request)
-    if not orch.training_manager:
-        return ingress_redirect(request, "/fixtures?msg=no_tm")
+    """Rebuild DBSTREAM state from DB — resets in-memory engine and replays
+    the last 60 days so the fixture_clusters table reflects current history."""
+    orch   = _orch(request)
+    engine = getattr(orch, "cluster_engine", None)
+    if not engine:
+        return ingress_redirect(request, "/fixtures?msg=error")
     try:
-        await orch.training_manager.retrigger_clustering(circuit)
+        import asyncio, functools
+        count = await asyncio.get_event_loop().run_in_executor(
+            None, functools.partial(engine.rebuild_from_db, circuit)
+        )
+        log.info("[%s] manual rebuild: %d events replayed", circuit, count)
         msg = "reclustered"
-    except ValueError as e:
-        log.info("[%s] re-cluster skipped: %s", circuit, e)
-        msg = "too_few_events"
     except Exception as e:
         log.error("[%s] re-cluster error: %s", circuit, e, exc_info=True)
         msg = "error"
