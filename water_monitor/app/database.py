@@ -355,6 +355,14 @@ CREATE TABLE IF NOT EXISTS events (
     other_valve_open            INTEGER,           -- NULL=unknown 0=closed 1=open
     excluded_from_training      BOOLEAN DEFAULT 0,
     cluster_id                  INTEGER,
+    -- Phase 2.1 type-aware match gate: when cluster_id IS NULL, this records
+    -- WHY the event was not matched. Values:
+    --   'no_centers'             — DBSTREAM had no centres yet
+    --   'features_missing'       — extractor returned None
+    --   'type_gate_rejected'     — confirmed cluster's per-type variance gate
+    --   'excluded_from_training' — caller skipped match_and_learn entirely
+    -- NULL when the event matched cleanly.
+    match_rejection_reason      TEXT,
     fixture_id                  TEXT REFERENCES fixtures(id),
     anomaly_score               REAL,
     anomaly_type                TEXT,
@@ -536,7 +544,26 @@ CREATE TABLE IF NOT EXISTS data_retention (
 INSERT OR IGNORE INTO data_retention (id) VALUES (1);
     """)
     conn.commit()
+    _apply_post_create_migrations(conn)
     log.info("Schema created/verified")
+
+
+def _apply_post_create_migrations(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the initial schema for existing DBs.
+
+    Each block uses ``ALTER TABLE … ADD COLUMN`` wrapped in try/except so it
+    is idempotent: on fresh installs the column is already in CREATE TABLE
+    (the ALTER raises ``OperationalError: duplicate column name`` and we
+    swallow it); on upgrade installs the ALTER actually adds the column.
+    """
+    # Phase 2.1 — explain why an event has cluster_id IS NULL.
+    try:
+        conn.execute("ALTER TABLE events ADD COLUMN match_rejection_reason TEXT")
+        conn.commit()
+        log.info("Migration: added events.match_rejection_reason")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            log.warning("ALTER TABLE events.match_rejection_reason: %s", e)
 
 
 # ==========================================================================

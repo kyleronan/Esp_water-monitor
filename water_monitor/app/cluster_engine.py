@@ -61,6 +61,14 @@ class ClusterEngine:
         # In-memory map: circuit -> {river_internal_id -> db_cluster_id}
         # Rebuilt from centroid similarity after each rebuild_from_db().
         self._river_id_map: Dict[str, Dict[int, int]]          = {}
+        # Phase 2.1 — type-aware match gate.
+        # circuit -> {db_cluster_id -> fixture_type}.
+        # Populated at startup from confirmed fixtures (see _init_circuit
+        # and _refresh_type_cache); mutated live by notify_fixture_confirmed
+        # / notify_fixture_removed when the user labels a cluster.
+        # Unconfirmed clusters are intentionally absent — match_and_learn
+        # bypasses the type gate when the lookup returns None.
+        self._type_cache: Dict[str, Dict[int, str]]            = {}
 
         for c in cfg.circuits:
             self._init_circuit(c.circuit)
@@ -74,11 +82,41 @@ class ClusterEngine:
         )
         self._scalers[circuit] = preprocessing.StandardScaler()
         self._river_id_map[circuit] = {}
+        self._type_cache[circuit]   = {}
         row = self._db.execute(
             "SELECT MAX(id) FROM fixture_clusters WHERE circuit = ?",
             (circuit,)
         ).fetchone()
         self._next_cluster_id[circuit] = (row[0] or -1) + 1
+        self._refresh_type_cache(circuit)
+
+    def _refresh_type_cache(self, circuit: str) -> None:
+        """(Re)load the {cluster_id -> fixture_type} map from the DB.
+
+        Called from ``_init_circuit`` at startup and from ``rebuild_from_db``
+        as belt-and-braces protection against drift if a future code path
+        mutates ``fixtures.confirmed`` without going through
+        ``notify_fixture_confirmed`` / ``notify_fixture_removed``.
+        """
+        cache: Dict[int, str] = {}
+        try:
+            rows = self._db.execute(
+                """SELECT fc.id, f.fixture_type
+                   FROM fixture_clusters fc
+                   JOIN fixtures f ON fc.fixture_id = f.id
+                   WHERE fc.circuit = ?
+                     AND f.confirmed = 1
+                     AND f.fixture_type IS NOT NULL""",
+                (circuit,),
+            ).fetchall()
+            for r in rows:
+                cache[int(r["id"])] = r["fixture_type"]
+        except Exception as e:
+            log.warning("[%s] _refresh_type_cache failed: %s", circuit, e)
+        self._type_cache[circuit] = cache
+        if cache:
+            log.debug("[%s] type cache: %d confirmed fixtures",
+                      circuit, len(cache))
 
     # ── Feature extraction ─────────────────────────────────────────────────────
 
@@ -131,6 +169,61 @@ class ClusterEngine:
             if dist < best_dist:
                 best_id, best_dist = cid, dist
         return best_id, best_dist
+
+    # ── Type-aware match gate (Phase 2.1) ──────────────────────────────────────
+
+    def notify_fixture_confirmed(self, circuit: str, cluster_id: int,
+                                 fixture_type: str) -> None:
+        """Cache invalidation hook — called by routers/fixtures.py after a
+        cluster is labelled. Takes effect immediately, no restart required.
+        """
+        self._type_cache.setdefault(circuit, {})[int(cluster_id)] = fixture_type
+        log.info("[%s] type cache: cluster %d → %s",
+                 circuit, cluster_id, fixture_type)
+
+    def notify_fixture_removed(self, circuit: str, cluster_id: int) -> None:
+        """Cache invalidation hook — called when a fixture/cluster is deleted
+        or unconfirmed. The gate falls back to the global threshold for the
+        cluster on the next event.
+        """
+        removed = self._type_cache.get(circuit, {}).pop(int(cluster_id), None)
+        if removed is not None:
+            log.info("[%s] type cache: cluster %d removed (was %s)",
+                     circuit, cluster_id, removed)
+
+    def _build_match_weights(self, fixture_type: str) -> Dict[str, float]:
+        """Per-feature weight vector for a fixture type. Default 1.0.
+
+        Anchor features (volume for toilets, flow/pressure for showers) get
+        amplified. Float features (duration for showers, hour-of-day for ice
+        makers) are zeroed so they don't push the distance over the gate.
+        Forward-looking feature names (e.g. ``resistance_curve_shape``) that
+        are not yet in FEATURE_KEYS are silently ignored.
+        """
+        from .fixtures import get_variance_profile
+        profile = get_variance_profile(fixture_type)
+        weights: Dict[str, float] = {k: 1.0 for k in FEATURE_KEYS}
+        for k, w in profile.get("anchor_weights", {}).items():
+            if k in weights:
+                weights[k] = float(w)
+        for k in profile.get("float_features", set()):
+            if k in weights:
+                weights[k] = 0.0
+        return weights
+
+    @staticmethod
+    def _weighted_distance(a: Dict[str, float], b: Dict[str, float],
+                           weights: Dict[str, float]) -> float:
+        """Weighted Euclidean over FEATURE_KEYS. Default weight 1.0.
+
+        Both ``a`` and ``b`` are expected to be in scaled feature space so
+        the distance is comparable to ``DBSTREAM_CLUSTERING_THRESHOLD`` and
+        the per-type thresholds in ``FIXTURE_MATCH_THRESHOLDS``.
+        """
+        return math.sqrt(sum(
+            weights.get(k, 1.0) * (a.get(k, 0.0) - b.get(k, 0.0)) ** 2
+            for k in FEATURE_KEYS
+        ))
 
     # ── DB helpers ─────────────────────────────────────────────────────────────
 
@@ -271,18 +364,26 @@ class ClusterEngine:
         circuit: str,
         prev_cluster_id: Optional[int] = None,
         seconds_since_prev: Optional[float] = None,
-    ) -> Tuple[Optional[int], float, str]:
+    ) -> Tuple[Optional[int], float, str, Optional[str]]:
         """
-        Feed one event through DBSTREAM.  Returns (cluster_id, confidence, level).
-        cluster_id is None if features are missing or DBSTREAM has no centres yet.
+        Feed one event through DBSTREAM.
 
-        prev_cluster_id / seconds_since_prev: when provided and the gap is within
-        SEQUENCE_GAP_MAX_SECONDS, the cooccurrence table is updated.
+        Returns ``(cluster_id, confidence, level, rejection_reason)``.
+
+        * On success: cluster_id is the DB row id, rejection_reason is None.
+        * On rejection: cluster_id is None and rejection_reason is one of
+          ``'features_missing'``, ``'no_centers'``, ``'type_gate_rejected'``.
+          The caller writes ``rejection_reason`` into
+          ``events.match_rejection_reason`` so the events page can explain
+          why a row has ``cluster_id IS NULL``.
+
+        prev_cluster_id / seconds_since_prev: when provided and the gap is
+        within SEQUENCE_GAP_MAX_SECONDS, the cooccurrence table is updated.
         Stage 3 will apply a confidence boost from this table.
         """
         features = self._extract_features(event)
         if features is None:
-            return (None, 0.0, '')
+            return (None, 0.0, '', 'features_missing')
 
         scaler = self._scalers[circuit]
         scaler.learn_one(features)
@@ -292,11 +393,59 @@ class ClusterEngine:
         stream.learn_one(x)
 
         if not stream.centers:
-            return (None, 0.0, '')
+            return (None, 0.0, '', 'no_centers')
 
         nearest_id, distance = self._nearest_center(stream, x)
         if nearest_id is None:
-            return (None, 0.0, '')
+            return (None, 0.0, '', 'no_centers')
+
+        # ── Type-aware gate (Phase 2.1) ────────────────────────────────────
+        # If the nearest river center already maps to a confirmed fixture,
+        # apply a per-type weighted-distance gate before accepting the match.
+        # Unconfirmed clusters bypass this and use the global threshold path.
+        candidate_id = self._river_id_map.get(circuit, {}).get(nearest_id)
+        fixture_type = (
+            self._type_cache.get(circuit, {}).get(candidate_id)
+            if candidate_id is not None else None
+        )
+        if fixture_type:
+            try:
+                from .fixtures import get_match_threshold
+                row = self._db.execute(
+                    "SELECT centroid FROM fixture_clusters "
+                    "WHERE circuit = ? AND id = ?",
+                    (circuit, candidate_id),
+                ).fetchone()
+                if row and row["centroid"]:
+                    db_orig   = json.loads(row["centroid"])
+                    db_feat   = {k: float(db_orig.get(k, 0)) for k in FEATURE_KEYS}
+                    db_scaled = scaler.transform_one(db_feat)
+                    weights   = self._build_match_weights(fixture_type)
+                    wdist     = self._weighted_distance(x, db_scaled, weights)
+                    threshold = get_match_threshold(fixture_type)
+                    if wdist > threshold:
+                        log.info(
+                            "[%s] event rejected from cluster %d (%s): "
+                            "weighted_dist=%.2f > threshold=%.2f",
+                            circuit, candidate_id, fixture_type,
+                            wdist, threshold,
+                        )
+                        # Leave event unmatched so backfill_unmatched can
+                        # retry it later if a better-fitting cluster appears
+                        # OR the threshold is loosened. Critically we do NOT
+                        # call _increment_member_count / _update_centroid —
+                        # the wrong-fit event must not pollute this fixture's
+                        # learned shape.
+                        return (None, 0.0, '', 'type_gate_rejected')
+            except Exception as e:
+                # Fail open: if the gate itself crashes (corrupt JSON,
+                # missing column, etc.) we'd rather match than lose the
+                # event entirely. The error is logged for follow-up.
+                log.warning(
+                    "[%s] type-aware gate failed for cluster %s "
+                    "(falling through to default match): %s",
+                    circuit, candidate_id, e,
+                )
 
         confidence = math.exp(-distance / DBSTREAM_CLUSTERING_THRESHOLD)
         # Stage 3: multiply confidence by SEQUENCE_BOOST_WEIGHT when
@@ -322,7 +471,7 @@ class ClusterEngine:
             "[%s] matched cluster %d (confidence=%.2f, level=%s, members=%d)",
             circuit, cluster_id, confidence, level, member_count,
         )
-        return (cluster_id, confidence, level)
+        return (cluster_id, confidence, level, None)
 
     # ── Startup rebuild ────────────────────────────────────────────────────────
 
@@ -359,6 +508,11 @@ class ClusterEngine:
         if count > 0:
             self._rebuild_id_map_from_centroids(circuit)
 
+        # Belt-and-braces: re-derive the type cache from the DB after a
+        # rebuild so any drift (e.g. a UI/import path that toggled
+        # fixtures.confirmed without going through the notify hooks) heals.
+        self._refresh_type_cache(circuit)
+
         log.info("Restored %d events into circuit '%s' state", count, circuit)
         return count
 
@@ -388,19 +542,33 @@ class ClusterEngine:
         count = 0
         for row in rows:
             event = dict(row)
-            cluster_id, confidence, level = self.match_and_learn(event, circuit)
+            cluster_id, confidence, level, reason = \
+                self.match_and_learn(event, circuit)
             if cluster_id is None:
+                # Record why the backfill couldn't place this event so the
+                # events page can surface "no_centers" vs.
+                # "type_gate_rejected" vs. "features_missing" without us
+                # having to re-run match_and_learn for the explanation.
+                # Leave cluster_id NULL so a future backfill can retry.
+                self._db.execute(
+                    "UPDATE events SET match_rejection_reason = ? WHERE id = ?",
+                    (reason, event["id"]),
+                )
                 continue
             self._db.execute(
                 """UPDATE events
-                   SET cluster_id = ?, match_confidence = ?, match_level = ?
+                   SET cluster_id = ?,
+                       match_confidence = ?,
+                       match_level = ?,
+                       match_rejection_reason = NULL
                    WHERE id = ?""",
                 (cluster_id, confidence, level, event["id"])
             )
             count += 1
 
-        if count:
+        if count or rows:
             self._db.commit()
+        if count:
             log.info("[%s] backfill_unmatched: assigned cluster_id to %d events",
                      circuit, count)
         return count
@@ -426,6 +594,14 @@ class ClusterEngine:
 
         mapping = self._river_id_map[circuit]
 
+        # Per-type acceptance bound: confirmed fixtures use their per-type
+        # match threshold so a noisy river center can't be re-attached to
+        # (e.g.) a confirmed toilet cluster at scaled distance 2.5 — the
+        # gate would later reject every legitimate toilet event landing on
+        # that mis-mapped river center until DBSTREAM split it.
+        from .fixtures import get_match_threshold
+        type_cache = self._type_cache.get(circuit, {})
+
         for river_id, river_center in stream.centers.items():
             if river_id in mapping:
                 continue
@@ -444,10 +620,20 @@ class ClusterEngine:
                 if dist < best_dist:
                     best_db_id, best_dist = int(db_row["id"]), dist
 
-            # Only accept match if within 2× threshold to avoid false positives
-            if best_db_id is not None and best_dist < DBSTREAM_CLUSTERING_THRESHOLD * 2:
+            if best_db_id is None:
+                continue
+
+            # Confirmed clusters: accept only within the per-type gate.
+            # Unconfirmed clusters: keep the historical 2× threshold so
+            # behaviour is unchanged for the discovery path.
+            ftype = type_cache.get(best_db_id)
+            bound = (get_match_threshold(ftype) if ftype
+                     else DBSTREAM_CLUSTERING_THRESHOLD * 2)
+            if best_dist < bound:
                 mapping[river_id] = best_db_id
                 log.debug(
-                    "[%s] post-rebuild: river cluster %d → DB cluster %d (dist=%.3f)",
-                    circuit, river_id, best_db_id, best_dist,
+                    "[%s] post-rebuild: river cluster %d → DB cluster %d "
+                    "(dist=%.3f, bound=%.2f, type=%s)",
+                    circuit, river_id, best_db_id, best_dist, bound,
+                    ftype or "<unconfirmed>",
                 )
