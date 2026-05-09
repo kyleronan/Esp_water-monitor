@@ -329,7 +329,19 @@ class HistoricalImporter:
             if raw is None:
                 continue
 
-            await self._event_queue.put(raw)
+            # put_nowait raises QueueFull immediately rather than blocking
+            # forever — a blocked await here would stall the entire import
+            # loop (and the event loop) with no log and no way to recover.
+            try:
+                self._event_queue.put_nowait(raw)
+            except asyncio.QueueFull:
+                log.warning(
+                    "[%s] event queue full — historical event dropped "
+                    "(start=%s); will retry on next catch-up cycle",
+                    cfg.circuit,
+                    period_start.strftime("%H:%M:%S"),
+                )
+                continue
             imported += 1
             log.debug(
                 "[%s] queued historical event %s → %s (%.0fs, %.2f L/min avg)",

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re as _re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -46,6 +47,10 @@ async def lifespan(app: FastAPI):
 
     # Initialise DB and run migrations before the orchestrator's async run()
     # so the schema is fully up to date before any component starts.
+    # Close the connection immediately after — orchestrator.run() opens its
+    # own connection (self._db) which is the one used by all components.
+    # Leaving this first connection open leaks a SQLite handle and holds
+    # a shared lock that can interfere with WAL checkpointing.
     from .database import init_db
     from .config import DB_PATH
     _db = init_db(DB_PATH)
@@ -53,6 +58,8 @@ async def lifespan(app: FastAPI):
         run_migrations(_db)
     except Exception as e:
         log.error("DB migration error (non-fatal): %s", e)
+    finally:
+        _db.close()
 
     # Custom Jinja2Templates that automatically injects ingress_path
     # into every template context so nav links and form actions work
@@ -224,7 +231,6 @@ async def ingress_middleware(request: Request, call_next):
             # Sanitise the HA-supplied ingress path before embedding in HTML.
             # Allow only URL-safe path characters; strip anything else to
             # prevent header-injection attacks.
-            import re as _re
             ingress_path = _re.sub(r"[^/a-zA-Z0-9_\-]", "", ingress_path)
             setup_url = f"{ingress_path}/setup"
             return HTMLResponse(

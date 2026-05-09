@@ -137,9 +137,14 @@ class HaClient:
             "type": "subscribe_events",
             "event_type": "state_changed",
         }))
-        # Wait for subscription confirmation
+        # Wait for subscription confirmation — timeout prevents hanging
+        # forever on a network stall during connection setup.
         while True:
-            raw = await ws.recv()
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=15)
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    "Timeout waiting for subscribe_events confirmation")
             msg = json.loads(raw)
             if msg.get("id") == msg_id:
                 if msg.get("type") == "result" and msg.get("success"):
@@ -179,8 +184,13 @@ class HaClient:
                 msg_id = self._next_id()
                 payload = {"id": msg_id, "type": msg_type, **kwargs}
                 await ws.send(json.dumps(payload))
+                # Timeout prevents hanging forever on a network stall.
                 while True:
-                    raw = await ws.recv()
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(
+                            f"Timeout waiting for WS response to '{msg_type}'")
                     msg = json.loads(raw)
                     if msg.get("id") == msg_id:
                         if not msg.get("success"):

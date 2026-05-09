@@ -336,7 +336,8 @@ def save_discovery(
     result: DiscoveryResult,
 ) -> None:
     """Persist a completed discovery result to SQLite."""
-    now = __import__("datetime").datetime.utcnow().isoformat()
+    now = __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc).isoformat()
 
     db.execute("""
         UPDATE device_config SET
@@ -363,7 +364,8 @@ def save_discovery(
 
 
 def mark_setup_complete(db: sqlite3.Connection) -> None:
-    now = __import__("datetime").datetime.utcnow().isoformat()
+    now = __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc).isoformat()
     db.execute("""
         UPDATE device_config SET setup_complete = 1, updated_at = ?
         WHERE id = 1

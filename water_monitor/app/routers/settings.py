@@ -417,15 +417,22 @@ async def device_entity_update(request: Request):
 async def retention_update(request: Request):
     orch = _orch(request)
     form = await request.form()
+
+    def _int(key: str, default: int) -> int:
+        try:
+            return int(form.get(key, default))
+        except (ValueError, TypeError):
+            return default
+
     update_data_retention(
         orch.db,
-        events_retain_years=int(form.get("events_retain_years", 1)),
-        hourly_volume_retain_years=int(form.get("hourly_volume_retain_years", 2)),
+        events_retain_years=_int("events_retain_years", 1),
+        hourly_volume_retain_years=_int("hourly_volume_retain_years", 2),
         enabled=1 if form.get("enabled") == "1" else 0,
         auto_backup_enabled=1 if form.get("auto_backup_enabled") == "1" else 0,
         auto_backup_path=form.get("auto_backup_path",
                                    "/share/water_monitor_backups").strip(),
-        auto_backup_day_of_week=int(form.get("auto_backup_day_of_week", 0)),
+        auto_backup_day_of_week=_int("auto_backup_day_of_week", 0),
     )
     return ingress_redirect(request, "/settings")
 
