@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import sqlite3
 import statistics
 from datetime import datetime, timedelta, timezone
@@ -76,6 +77,20 @@ def _is_numeric(value: Any) -> bool:
         return True
     except (ValueError, TypeError):
         return False
+
+
+def _clamp_flow(v: float) -> float:
+    """Match firmware v3.5 clamping: reject non-finite or out-of-range flow values."""
+    if not math.isfinite(v) or v > 200.0 or (0 < v < 0.01):
+        return 0.0
+    return v
+
+
+def _clamp_pressure(v: float) -> float:
+    """Reject clearly invalid pressure readings (negative or implausibly large)."""
+    if not math.isfinite(v) or v < 0.0 or v > 500.0:
+        return 0.0
+    return v
 
 
 def _parse_ts(ts_value: Any) -> Optional[datetime]:
@@ -100,8 +115,6 @@ class HistoricalImporter:
     CHECK_INTERVAL_MINUTES: int = 30
     MERGE_GAP_SECONDS: int = 15       # bridge flow_pulse_onset gaps shorter than this
     MIN_DURATION_SECONDS: float = 3.0
-    # Max concurrent HA WebSocket history queries — avoids overwhelming HA
-    MAX_CONCURRENT_QUERIES: int = 2
     DUPLICATE_WINDOW_SECONDS: int = 30
     MIN_FLOW_LPM: float = 0.05
     PRE_PRESSURE_WINDOW_SECONDS: int = 30   # look-back for baseline pressure
@@ -119,7 +132,6 @@ class HistoricalImporter:
         self._ha = ha_client
         self._event_queue = event_queue
         self._running = False
-        self._query_sem: Optional[asyncio.Semaphore] = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
@@ -170,7 +182,8 @@ class HistoricalImporter:
         if not cfg or not self._circuit_has_sensors(cfg):
             log.warning("[%s] import_range: circuit not configured", circuit)
             return 0
-        return await self._import_range(cfg, start, end)
+        n, _ = await self._import_range(cfg, start, end)
+        return n
 
     async def import_all_circuits_range(
         self,
@@ -181,7 +194,8 @@ class HistoricalImporter:
         total = 0
         for cfg in self._cfg.circuits:
             if self._circuit_has_sensors(cfg):
-                total += await self._import_range(cfg, start, end)
+                n, _ = await self._import_range(cfg, start, end)
+                total += n
         return total
 
     # ------------------------------------------------------------------ #
@@ -212,7 +226,7 @@ class HistoricalImporter:
 
             log.info("[%s] backfill: importing %s → now",
                      cfg.circuit, start.isoformat())
-            n = await self._import_range(cfg, start, now)
+            n, _ = await self._import_range(cfg, start, now)
             if n:
                 log.info("[%s] backfill: imported %d event(s)", cfg.circuit, n)
 
@@ -235,8 +249,12 @@ class HistoricalImporter:
             else:
                 start = now - timedelta(hours=2)
 
-            n = await self._import_range(cfg, start, now)
-            update_import_state(self._db, cfg.circuit, now.isoformat(), n)
+            n, retry_from = await self._import_range(cfg, start, now)
+            # If any events were dropped due to a full queue, use the earliest
+            # dropped timestamp as the checkpoint so the next catch-up covers
+            # from that point rather than from now - 2 min (which might miss it).
+            checkpoint = retry_from.isoformat() if retry_from else now.isoformat()
+            update_import_state(self._db, cfg.circuit, checkpoint, n)
             if n:
                 log.info("[%s] catch-up: imported %d new event(s)",
                          cfg.circuit, n)
@@ -250,10 +268,12 @@ class HistoricalImporter:
         cfg: CircuitConfig,
         start: datetime,
         end: datetime,
-    ) -> int:
+    ) -> Tuple[int, Optional[datetime]]:
         """
         Fetch HA history for [start, end] and import any missing events.
-        Returns count of events queued for insertion.
+        Returns (count_queued, retry_from) where retry_from is the earliest
+        dropped event start if any events were lost to QueueFull — the caller
+        should use it as the next catch-up checkpoint so those events are retried.
         """
         # Choose the best available pressure sensor for history
         pressure_entity = cfg.pressure_history_sensor or cfg.pressure_avg_sensor
@@ -266,48 +286,36 @@ class HistoricalImporter:
                 cfg.flow_onset_sensor,
                 cfg.flow_sensor,
                 pressure_entity,
+                cfg.volume_sensor,
             ] if e
         ]
         if not cfg.flow_onset_sensor and not cfg.flow_sensor:
             log.warning("[%s] no flow entities — cannot import history",
                         cfg.circuit)
-            return 0
+            return 0, None
 
-        # Fetch all histories concurrently
-        histories: Dict[str, List] = {}
-        # Semaphore limits concurrent HA WebSocket connections
-        if self._query_sem is None:
-            self._query_sem = asyncio.Semaphore(self.MAX_CONCURRENT_QUERIES)
-
-        async def _bounded_fetch(eid: str):
-            async with self._query_sem:
-                return await self._ha.get_history(eid, start, end)
-
-        results = await asyncio.gather(
-            *[_bounded_fetch(eid) for eid in entities_to_fetch],
-            return_exceptions=True,
-        )
-        for eid, result in zip(entities_to_fetch, results):
-            if isinstance(result, Exception):
-                log.warning("[%s] history fetch failed for %s: %s",
-                            cfg.circuit, eid, result)
-                histories[eid] = []
-            else:
-                histories[eid] = result or []
+        # Single WS request/connection for all entities in this window.
+        try:
+            histories = await self._ha.get_history_batch(entities_to_fetch, start, end)
+        except Exception as exc:
+            log.warning("[%s] history batch fetch failed: %s", cfg.circuit, exc)
+            return 0, None
 
         onset_hist     = histories.get(cfg.flow_onset_sensor, [])
         flow_rate_hist = histories.get(cfg.flow_sensor, [])
         pressure_hist  = histories.get(pressure_entity, []) if pressure_entity else []
+        volume_hist    = histories.get(cfg.volume_sensor, []) if cfg.volume_sensor else []
 
         # Detect flow periods
         periods = self._find_flow_periods(onset_hist, flow_rate_hist, query_end=end)
         if not periods:
-            return 0
+            return 0, None
 
         log.debug("[%s] found %d candidate period(s) in history window",
                   cfg.circuit, len(periods))
 
         imported = 0
+        retry_from: Optional[datetime] = None
         for period_start, period_end in periods:
             duration = (period_end - period_start).total_seconds()
             if duration < self.MIN_DURATION_SECONDS:
@@ -323,7 +331,7 @@ class HistoricalImporter:
 
             raw = self._reconstruct_event(
                 cfg.circuit, period_start, period_end,
-                flow_rate_hist, pressure_hist,
+                flow_rate_hist, pressure_hist, volume_hist,
                 using_avg_pressure=(pressure_entity == cfg.pressure_avg_sensor),
             )
             if raw is None:
@@ -335,6 +343,10 @@ class HistoricalImporter:
             try:
                 self._event_queue.put_nowait(raw)
             except asyncio.QueueFull:
+                # Track the earliest dropped start so the next catch-up cycle
+                # can cover from that point, not just now - 2 min.
+                if retry_from is None or period_start < retry_from:
+                    retry_from = period_start
                 log.warning(
                     "[%s] event queue full — historical event dropped "
                     "(start=%s); will retry on next catch-up cycle",
@@ -352,7 +364,7 @@ class HistoricalImporter:
                 sum(raw.flow_readings) / max(len(raw.flow_readings), 1),
             )
 
-        return imported
+        return imported, retry_from
 
     # ------------------------------------------------------------------ #
     # Period detection                                                     #
@@ -444,8 +456,10 @@ class HistoricalImporter:
                 if current_start is None:
                     current_start = ts
             else:
-                if current_start is not None and last_ts is not None:
-                    periods.append((current_start, last_ts))
+                if current_start is not None:
+                    # Use ts (the off-transition) not last_ts, consistent with
+                    # _onset_to_periods which closes at the OFF timestamp.
+                    periods.append((current_start, ts))
                     current_start = None
 
             last_ts = ts
@@ -466,6 +480,7 @@ class HistoricalImporter:
         end: datetime,
         flow_rate_hist: List[Dict],
         pressure_hist: List[Dict],
+        volume_hist: List[Dict],
         using_avg_pressure: bool = False,
     ) -> Optional[RawEvent]:
         """
@@ -474,7 +489,7 @@ class HistoricalImporter:
         """
         # ── Flow readings during the period ───────────────────────────
         flow_readings = [
-            float(e["state"])
+            _clamp_flow(float(e["state"]))
             for e in flow_rate_hist
             if _is_numeric(e.get("state"))
             and start <= (_parse_ts(e.get("last_changed")) or start) <= end
@@ -484,7 +499,7 @@ class HistoricalImporter:
 
         # ── Pressure readings during the period ───────────────────────
         pressure_readings = [
-            float(e["state"])
+            _clamp_pressure(float(e["state"]))
             for e in pressure_hist
             if _is_numeric(e.get("state"))
             and start <= (_parse_ts(e.get("last_changed")) or start) <= end
@@ -493,7 +508,7 @@ class HistoricalImporter:
         # ── Pre-event pressure baseline (look-back window) ────────────
         pre_start = start - timedelta(seconds=self.PRE_PRESSURE_WINDOW_SECONDS)
         pre_readings = [
-            float(e["state"])
+            _clamp_pressure(float(e["state"]))
             for e in pressure_hist
             if _is_numeric(e.get("state"))
             and pre_start <= (_parse_ts(e.get("last_changed")) or pre_start) <= start
@@ -521,6 +536,22 @@ class HistoricalImporter:
             and pressure_delta >= effective_threshold
         )
 
+        # ── Volume from firmware integration sensor ────────────────────
+        # Prefer the cumulative sensor delta over avg_flow × duration to avoid
+        # downsampling errors in long events with fill-pause-fill patterns.
+        volume_litres_measured: Optional[float] = None
+        volume_in_period = [
+            float(e["state"])
+            for e in volume_hist
+            if _is_numeric(e.get("state"))
+            and math.isfinite(float(e["state"]))
+            and start <= (_parse_ts(e.get("last_changed")) or start) <= end
+        ]
+        if len(volume_in_period) >= 2:
+            delta = volume_in_period[-1] - volume_in_period[0]
+            if 0 < delta < 10_000:   # sanity: reject resets and absurd values
+                volume_litres_measured = round(delta, 3)
+
         return RawEvent(
             circuit=circuit,
             start_ts=start,
@@ -535,6 +566,7 @@ class HistoricalImporter:
             flow_onset_ts=start,
             propagation_delay_seconds=0.0,
             flow_readings=flow_readings,
+            volume_litres_measured=volume_litres_measured,
             complete=True,
         )
 
