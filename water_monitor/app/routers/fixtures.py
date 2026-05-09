@@ -46,23 +46,38 @@ async def fixtures_page(request: Request):
             stats = get_cluster_stats(orch.db, c, cl["id"])
             clusters.append({**cl, **stats})
 
+        state = training.get("state", "idle")
         unreviewed = sum(1 for cl in clusters if not cl.get("fixture_id"))
-        total_unreviewed += unreviewed
+        # Only count clusters from circuits whose grid is actually rendered.
+        # Circuits in idle/calibrating states show a "Still calibrating" stub
+        # instead of the cluster grid, so counting their clusters in the
+        # review banner produces a contradiction ("7 need review" with
+        # nothing visible to review below).  Labelling and live circuits
+        # both render the grid and so do contribute to the count.
+        if state not in ("idle", "calibrating"):
+            total_unreviewed += unreviewed
         from ..database import get_active_exclusion_window
         circuits_ctx.append({
             "circuit":          c,
             "display_name":     circ_cfg.display_name,
-            "training_state":   training.get("state", "idle"),
+            "training_state":   state,
             "clusters":         clusters,
             "unreviewed_count": unreviewed,
             "active_exclusion": get_active_exclusion_window(orch.db, c),
         })
+
+    # Differentiates banner copy + CSS treatment so users in the labelling
+    # phase get a clearer call to action ("confirm then activate") than
+    # users in the live phase ("confirm or remove").
+    any_labelling = any(c["training_state"] == "labelling"
+                        for c in circuits_ctx)
 
     return _tmpl(request).TemplateResponse("fixtures.html", {
         "request":               request,
         "page":                  "fixtures",
         "circuits":              circuits_ctx,
         "total_unreviewed":      total_unreviewed,
+        "any_labelling":         any_labelling,
         "fixture_type_labels":   FIXTURE_TYPE_LABELS,
         "user_selectable_types": user_selectable_types(),
     })
@@ -92,6 +107,23 @@ async def retrigger_cluster(request: Request, circuit: str):
         log.error("[%s] re-cluster error: %s", circuit, e, exc_info=True)
         msg = "error"
     return ingress_redirect(request, f"/fixtures?msg={msg}")
+
+
+# ── Activate fixtures (labelling → live) ──────────────────────────────────────
+
+@router.post("/{circuit}/activate")
+async def activate_circuit(request: Request, circuit: str):
+    """Transition labelling → live when the user is satisfied with their
+    cluster labels.  No-op (with error flash) if circuit isn't currently
+    in labelling state — typically a stale browser tab."""
+    orch = _orch(request)
+    tm = orch.training_manager
+    if not tm:
+        return ingress_redirect(request, "/fixtures?msg=error")
+    ok = await tm.activate_fixtures(circuit)
+    if not ok:
+        return ingress_redirect(request, "/fixtures?msg=error")
+    return ingress_redirect(request, "/fixtures?msg=activated")
 
 
 # ── Confirm / save a cluster label ────────────────────────────────────────────

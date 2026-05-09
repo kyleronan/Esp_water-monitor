@@ -169,3 +169,68 @@ def engine_main(db):
 @pytest.fixture
 def engine_two_circuits(db):
     return make_engine(db, ["main", "irrigation"])
+
+
+# ==========================================================================
+# TrainingManager helpers (for test_training_state.py)
+# ==========================================================================
+
+from water_monitor.app.config import AddonConfig, CircuitConfig   # noqa: E402
+
+
+class StubHaClient:
+    """Records notify/set_state calls so tests can assert on them.
+
+    Mirrors the subset of HaClient used by TrainingManager.  No network
+    or async side effects.
+    """
+
+    def __init__(self) -> None:
+        self.notifications: list[dict] = []
+        self.states: list[dict] = []
+
+    async def notify(self, title: str, message: str,
+                     notification_id: Optional[str] = None) -> None:
+        self.notifications.append({
+            "title": title, "message": message,
+            "notification_id": notification_id,
+        })
+
+    async def set_state(self, entity_id: str, state,
+                        attrs: Optional[Dict] = None) -> None:
+        self.states.append({
+            "entity_id": entity_id, "state": state,
+            "attrs": attrs or {},
+        })
+
+
+def make_cfg(circuits: Optional[List[str]] = None) -> AddonConfig:
+    """Build a minimal AddonConfig with the named circuits.
+
+    Default: ['main', 'irrigation'].  Used by test_training_state.py
+    where the circuit lifecycle (start_calibration etc.) needs a real
+    AddonConfig, not the bare _FakeCfg used by cluster_engine tests.
+    """
+    if circuits is None:
+        circuits = ["main", "irrigation"]
+    return AddonConfig(
+        log_level="DEBUG",
+        esp_device_name="test_device",
+        circuits=[
+            CircuitConfig(
+                circuit=c,
+                circuit_type="zone" if c == "irrigation" else "fixture",
+            )
+            for c in circuits
+        ],
+    )
+
+
+@pytest.fixture
+def ha() -> StubHaClient:
+    return StubHaClient()
+
+
+@pytest.fixture
+def cfg() -> AddonConfig:
+    return make_cfg()
