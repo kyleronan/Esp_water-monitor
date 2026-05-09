@@ -175,14 +175,12 @@
           <button type="submit" class="btn btn-primary btn-sm">
             {{ 'Save' if is_confirmed else 'Confirm' }}
           </button>
-          {% if not is_confirmed %}
           <button type="submit"
                   formaction="{{ ingress_path }}/fixtures/{{ circ.circuit }}/cluster/{{ cl.id }}/delete"
                   class="btn btn-ghost btn-sm"
-                  onclick="return confirm('Remove this cluster? The events will be kept but unlinked.')">
+                  onclick="return confirm('{% if is_confirmed %}Remove confirmed fixture \'{{ display_name }}\'? This will unlink all matched events.{% else %}Remove this cluster? Events will be kept but unlinked.{% endif %}')">
             Remove
           </button>
-          {% endif %}
         </div>
       </form>
 
