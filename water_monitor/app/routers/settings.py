@@ -432,10 +432,15 @@ async def retention_update(request: Request):
 
 @router.post("/retention/prune-now")
 async def retention_prune_now(request: Request):
+    import asyncio
     orch = _orch(request)
     if not orch.data_pruner:
         return JSONResponse({"ok": False, "error": "Pruner not available"}, status_code=503)
-    deleted = orch.data_pruner.prune_now()
+    # prune_now() runs synchronous SQLite DELETEs that can block for several
+    # seconds on large tables.  Run it in a thread-pool executor so the
+    # asyncio event loop stays responsive during the operation.
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(None, orch.data_pruner.prune_now)
     return JSONResponse({"ok": True, "deleted": deleted})
 
 

@@ -17,7 +17,8 @@ import sqlite3
 from typing import Any, Dict, Optional
 
 from .config import AddonConfig, SENSITIVITY_PRESETS, DB_PATH
-from .database import (get_sensitivity_config, ensure_circuit_defaults, init_db)
+from .database import (get_sensitivity_config, ensure_circuit_defaults, init_db,
+                       dedup_events)
 from .device_discovery import (load_circuit_entities, is_setup_complete,
                                 get_device_config)
 from .event_detector import EventDetector
@@ -251,6 +252,17 @@ class Orchestrator:
         for circuit_cfg in self._cfg.circuits:
             ensure_circuit_defaults(
                 self._db, circuit_cfg.circuit, circuit_cfg.circuit_type)
+
+        # Startup dedup — cleans up any residual duplicates that slipped through
+        # before migration 021 added the UNIQUE(circuit, start_ts) constraint.
+        # This is a no-op on clean databases; it exists as a safety net for
+        # legacy data that migrated from pre-fix installs.
+        try:
+            _deduped = dedup_events(self._db)
+            if _deduped:
+                log.warning("startup dedup: removed %d duplicate event(s)", _deduped)
+        except Exception as _e:
+            log.warning("startup dedup failed (non-fatal): %s", _e)
 
         # HA client
         self._ha = HaClient()

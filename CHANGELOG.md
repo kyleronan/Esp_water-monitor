@@ -1,5 +1,125 @@
 # Changelog
 
+## [0.2.0-rc2] — 2026-05-08
+
+### Bug Fixes
+
+#### Event-table deduplication (migration 021)
+
+Three independent bugs combined to produce many duplicate event rows in the
+database — visible in Quick Restore backups as 8–9 identical rows per event
+with different `id` values and `created_at` timestamps spanning several days.
+
+**Root causes:**
+
+1. **Pre-fix code generated UUID4 ids.** Before the `uuid5` fix in
+   `feature_extractor.py`, every re-processing of the same raw event produced
+   a fresh random id. `INSERT OR REPLACE` was keyed on `id` (PRIMARY KEY)
+   only — no `UNIQUE` constraint on `(circuit, start_ts)` — so every import
+   created a new row.
+
+2. **`event_exists_near()` was broken.** The historical importer calls this
+   to skip already-imported events. The implementation used SQLite's
+   `datetime()` function which returns `'YYYY-MM-DD HH:MM:SS'` (space
+   separator), while stored `start_ts` values use ISO 8601 `'T'` separator.
+   ASCII `'T'` (84) > `' '` (32), so the upper-bound string comparison
+   always failed and every event was re-imported on every catch-up cycle.
+
+3. **Migration 015 was one-shot.** It deduped correctly but only ran once.
+   Quick Restore used `INSERT OR REPLACE` keyed on `id`, so pre-fix backups
+   re-introduced duplicates on restore, and migration 015 never ran again.
+
+**Fixes in this release:**
+
+- **Migration 021** — normalizes all `events.start_ts` / `end_ts` to UTC
+  ISO 8601 (`+00:00`), recomputes UUID5 `id` values against the new UTC
+  timestamps (prevents future `fixture_id` loss on re-import), clears
+  `cluster_id` on dedup survivors so `backfill_unmatched` re-matches them,
+  removes duplicate rows (keeps `MAX(rowid)` — newest insert), drops the
+  superseded `idx_events_circuit_ts` index, and creates
+  `UNIQUE INDEX idx_events_circuit_start_unique ON events (circuit, start_ts)`.
+  Same UTC normalization applied to `hourly_volume.hour_ts`. Entire migration
+  is wrapped in a transaction for atomicity.
+
+- **`event_exists_near()`** — rewritten to compare in Unix epoch seconds via
+  `CAST(strftime('%s', start_ts) AS INTEGER) BETWEEN lo AND hi`. This is
+  robust against separator mismatch, mixed timezone offsets, and microsecond
+  precision differences. Added `AND start_ts IS NOT NULL` guard.
+
+- **`extract_features()`** — normalizes `event.start_ts` / `end_ts` to UTC
+  before storing and before computing the UUID5 id. Same event expressed
+  in any timezone now always produces the same id and the same stored string.
+
+- **Startup dedup** — `dedup_events()` called in `orchestrator.py` after
+  migrations as a safety net for any legacy data that slipped through. No-op
+  on clean databases.
+
+- **Quick Restore** — after importing events, `normalize_events_utc()` runs
+  first (order matters), then `dedup_events()`. Export query now uses
+  `ORDER BY rowid ASC` so the newest row for each `(circuit, start_ts)` is
+  last in the JSON array and wins on `INSERT OR REPLACE`.
+
+- **Test suite** — 12 new tests in `test_event_dedup.py` covering dedup
+  semantics, UNIQUE constraint, `event_exists_near` correctness (including
+  the regression test that fails on the old code), DST offset mismatch,
+  `normalize_events_utc`, and the migration 021 end-to-end path.
+
+#### Additional bug fixes (codebase audit)
+
+- **`leak_test_scheduler.py` — `dir()` guard always True / missing column**
+  (`BUG-01`): `'schedule' not in dir()` evaluates against the object's
+  *attributes*, not local variables, so it was always `True` — the duration
+  block never ran. `schedule["duration_minutes"]` then caused a `KeyError`
+  because the `leak_test_schedules` table has no such column. Fixed: removed
+  the bogus guard, fetch duration from the HA firmware entity instead, and
+  initialize `result_str = "unknown"` before the poll loop so a timeout log
+  message can't fail with `UnboundLocalError`.
+
+- **`event_detector.py` — silent event loss on full queue** (`BUG-02`):
+  `asyncio.create_task(queue.put(ev))` silently blocks (and leaks a task)
+  when the queue is full, dropping the event with no log. Changed to
+  `queue.put_nowait()` with an explicit `QueueFull` warning log.
+
+- **`presence_watcher.py` — false away-mode at startup** (`BUG-03`):
+  Python's `all([])` returns `True`, so the watcher enabled away mode at
+  startup before HA had delivered any entity states. Added a guard: skip
+  evaluation if no entity states are known yet.
+
+- **`routers/backup.py` — partial restore wipes data permanently** (`BUG-04`):
+  The Quick Restore loop deleted tables then re-inserted rows with only one
+  `db.commit()` at the end. A failure mid-loop left the database in an
+  inconsistent state with no rollback path. Wrapped the entire loop in
+  `with db:` (atomic transaction).
+
+- **`fixture_publisher.py` — SQLite thread-safety violation** (`BUG-05`):
+  paho-mqtt's `_on_connect` callback runs on paho's background thread but
+  called `_publish_all_confirmed_sync()` directly, reading `self._db` from
+  the wrong thread. Moved the call to
+  `loop.call_soon_threadsafe(_publish_all_confirmed_sync)` so it runs on the
+  asyncio event loop thread that owns the connection.
+
+- **`feature_extractor.py` — `hour_ts` format inconsistency** (`BUG-06`):
+  `hour_ts` was stored via `.isoformat()` on a UTC-aware datetime, producing
+  `'2026-05-03T17:00:00+00:00'`. All DB queries use SQLite's
+  `strftime('%Y-%m-%dT%H:00:00', …)` which produces no timezone suffix,
+  causing lexicographic comparisons to fail. Changed storage to
+  `strftime('%Y-%m-%dT%H:00:00')`. Migration 021's `hourly_volume.hour_ts`
+  normalization pass updated to use the same no-suffix format for consistency.
+
+- **`routers/settings.py` — event loop blocked during prune** (`BUG-07`):
+  `orch.data_pruner.prune_now()` runs synchronous SQLite `DELETE` statements
+  that can take several seconds on large tables, blocking the asyncio event
+  loop. Moved to `await loop.run_in_executor(None, prune_now)`.
+
+- **`routers/setup.py` — OOM risk + unatomic restore** (`BUG-08`):
+  `await file.read()` had no size limit — a multi-GB upload would exhaust
+  memory. Added the same 50 MB cap as the main backup restore endpoint.
+  The restore loop was also unprotected (same partial-failure risk as
+  BUG-04). Wrapped in `with db:`. Added `normalize_events_utc()` +
+  `dedup_events()` after events import (same as the main restore path).
+
+---
+
 ## [0.2.0-rc1] — 2026-05-08
 
 ### New Features

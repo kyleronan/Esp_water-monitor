@@ -285,13 +285,20 @@ class LeakTestScheduler:
         log.info("[%s] starting leak test (triggered_by=%s)", circuit, triggered_by)
         await self._ha.turn_on(circuit_cfg.leak_test_switch)
 
-        # Wait for result — firmware takes 60s settle + up to 30min test + 2min buffer.
-        # A hard cap prevents infinite polling if firmware changes result strings.
-        schedule    = get_leak_test_schedule(self._db, circuit) if 'schedule' not in dir() else schedule
-        cfg_duration = (schedule["duration_minutes"] if schedule else 30)
+        # Wait for result — firmware takes 60s settle + up to configured duration + 2min buffer.
+        # Fetch the firmware-configured test duration from the HA sensor entity.
+        # (duration_minutes is NOT a DB column; it lives on the ESP firmware entity.)
+        schedule = get_leak_test_schedule(self._db, circuit)
+        try:
+            dur_str = await self._ha.get_state_value(
+                circuit_cfg.leak_test_duration_entity, "30")
+            cfg_duration = int(float(dur_str)) if dur_str else 30
+        except (ValueError, TypeError):
+            cfg_duration = 30
         max_wait_seconds = 60 + (cfg_duration * 60) + 120
         start_wait   = datetime.now(timezone.utc)
         final_result = "In progress"
+        result_str   = "unknown"   # initialised before loop so timeout log is safe
         timed_out    = False
 
         while (datetime.now(timezone.utc) - start_wait).total_seconds() < max_wait_seconds:
@@ -313,7 +320,7 @@ class LeakTestScheduler:
                 "TERMINAL_RESULTS. Check firmware version or update TERMINAL_RESULTS.",
                 circuit,
                 (datetime.now(timezone.utc) - start_wait).total_seconds(),
-                result_str if 'result_str' in dir() else "unknown",
+                result_str,
             )
             final_result = "Timed out — no terminal result received"
 

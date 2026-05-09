@@ -148,12 +148,16 @@ class PresenceWatcher:
 
         known_states = {eid: self._states.get(eid) for eid in entities}
 
-        all_away = all(
-            s == away_state for s in known_states.values() if s
-        )
-        any_home = any(
-            s == home_state for s in known_states.values() if s
-        )
+        # Don't evaluate until at least one entity state has been delivered.
+        # all([]) is True, which would incorrectly activate away mode at startup
+        # before HA has sent any presence entity state updates.
+        known_non_null = [s for s in known_states.values() if s]
+        if not known_non_null:
+            log.debug("Presence eval: no entity states known yet — skipping")
+            return
+
+        all_away = all(s == away_state for s in known_non_null)
+        any_home = any(s == home_state for s in known_non_null)
 
         log.debug(
             "Presence eval: states=%s all_away=%s any_home=%s current_away=%s",

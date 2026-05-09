@@ -19,6 +19,7 @@ home_profile) no messages are sent, but the broker connection is kept alive.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -69,6 +70,10 @@ class FixturePublisher:
             self._status = "not_configured"
             return
 
+        # Store the running event loop so paho callbacks can safely schedule
+        # work back onto it (paho runs callbacks on its own thread).
+        self._loop = asyncio.get_running_loop()
+
         try:
             client = mqtt.Client(client_id=f"water_monitor_{os.getpid()}")
             if creds.get("username"):
@@ -112,8 +117,17 @@ class FixturePublisher:
             self._connected = True
             self._status = "connected"
             log.info("Fixture publisher connected to MQTT broker")
-            # Re-publish all confirmed fixtures on reconnect
-            self._publish_all_confirmed_sync()
+            # Re-publish all confirmed fixtures on reconnect.
+            # _on_connect runs on paho's background thread — we must NOT read
+            # self._db here (it belongs to the asyncio event loop thread).
+            # call_soon_threadsafe schedules _publish_all_confirmed_sync to run
+            # on the event loop thread, where it is safe to access the DB.
+            loop = getattr(self, "_loop", None)
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(self._publish_all_confirmed_sync)
+            else:
+                log.warning("Fixture publisher: event loop unavailable on connect "
+                            "— deferred re-publish skipped")
         else:
             self._connected = False
             self._status = "broker_error"

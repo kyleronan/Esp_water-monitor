@@ -191,13 +191,30 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     hour_radians = 2 * math.pi * hour / 24
     duration_log = math.log(duration + 1)
 
+    # Normalize timestamps to UTC so the UUID5 id and stored start_ts are
+    # stable regardless of what timezone the incoming RawEvent carries.
+    # This is the single storage point — all paths that write events go
+    # through extract_features(), so enforcing UTC here is sufficient.
+    _start = event.start_ts
+    if _start.tzinfo is None:
+        _start = _start.replace(tzinfo=timezone.utc)
+    start_utc = _start.astimezone(timezone.utc)
+    _end = event.end_ts
+    if _end is not None:
+        if _end.tzinfo is None:
+            _end = _end.replace(tzinfo=timezone.utc)
+        end_utc = _end.astimezone(timezone.utc)
+    else:
+        end_utc = None
+
     return {
-        # Identity
+        # Identity — UUID5 keyed on UTC start_ts so re-imports of the same
+        # event always produce the same id and INSERT OR REPLACE is a no-op.
         "id": str(uuid.uuid5(uuid.NAMESPACE_OID,
-                              f"{event.circuit}/{event.start_ts.isoformat()}")),
+                              f"{event.circuit}/{start_utc.isoformat()}")),
         "circuit": event.circuit,
-        "start_ts": event.start_ts.isoformat(),
-        "end_ts": event.end_ts.isoformat() if event.end_ts else None,
+        "start_ts": start_utc.isoformat(),
+        "end_ts": end_utc.isoformat() if end_utc else None,
 
         # Raw measurements
         "duration_seconds": round(duration, 2),
@@ -305,9 +322,15 @@ class FeatureExtractor:
                 )
 
             if event.start_ts and features.get("volume_litres", 0) > 0:
-                hour_ts = event.start_ts.replace(
-                    minute=0, second=0, microsecond=0
-                ).isoformat()
+                # Normalize to UTC and strip timezone info so hour_ts matches
+                # the format that DB queries use: strftime('%Y-%m-%dT%H:00:00', …)
+                # produces no timezone suffix.  Mixing +00:00 suffixed values
+                # with bare datetime strings breaks lexicographic comparison in
+                # get_daily_volume / get_weekly_volume / data pruner.
+                _hdt = event.start_ts
+                if _hdt.tzinfo is None:
+                    _hdt = _hdt.replace(tzinfo=timezone.utc)
+                hour_ts = _hdt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:00:00')
                 update_hourly_volume(
                     self._db,
                     event.circuit,
