@@ -40,6 +40,18 @@
 
 <h2 class="fx-circuit-heading">{{ circ.display_name }}</h2>
 
+{# Exclusion window status — shown when the user opened a plumbing-flush window #}
+{% if circ.active_exclusion %}
+<div class="fx-msg fx-msg-warn" style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+  <span>⏱ <strong>Exclusion active on {{ circ.display_name }}</strong> —
+    {{ circ.active_exclusion.minutes_remaining }} min remaining.
+    Events during this window are excluded from fixture training.</span>
+  <a href="{{ ingress_path }}/settings#maintenance" class="btn btn-ghost btn-sm">
+    Manage in Settings
+  </a>
+</div>
+{% endif %}
+
 {% if circ.training_state in ('idle', 'calibrating') %}
   <p class="muted" style="margin-bottom:16px">
     Still calibrating — clusters will appear here once training ends.

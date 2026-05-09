@@ -11,7 +11,7 @@ import json
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
@@ -306,6 +306,25 @@ CREATE TABLE IF NOT EXISTS cluster_sequences (
     confidence        REAL DEFAULT 0,
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ==========================================================================
+-- PLUMBING-EVENT EXCLUSION WINDOWS (Phase 2.1)
+-- User-triggered window that prevents events from being used for fixture
+-- clustering during a post-winterization or post-repair flush.  Volume and
+-- leak-detection tracking continue regardless of the window state.
+-- Pruned after 30 days by data_pruner.py.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS circuit_exclusion_windows (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit     TEXT NOT NULL,
+    started_at  TIMESTAMP NOT NULL,
+    ends_at     TIMESTAMP NOT NULL,
+    reason      TEXT,
+    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_excl_circuit_window
+    ON circuit_exclusion_windows (circuit, started_at, ends_at);
 
 -- ==========================================================================
 -- CLUSTER METRICS HISTORY — rolling cluster quality stats
@@ -1305,3 +1324,104 @@ def delete_cluster(
         (circuit, cluster_id),
     )
     conn.commit()
+
+
+# ==========================================================================
+# Plumbing-event exclusion windows
+# ==========================================================================
+
+def create_exclusion_window(
+    conn,
+    circuit: str,
+    minutes: int,
+    reason: str = "plumbing",
+) -> None:
+    """Open a new exclusion window lasting ``minutes`` minutes.
+
+    All timestamps are stored via SQLite datetime() so they share the
+    same 'YYYY-MM-DD HH:MM:SS' format and compare correctly in WHERE clauses.
+    """
+    minutes = max(5, min(60, int(minutes)))
+    modifier = f"+{minutes} minutes"
+    conn.execute(
+        "INSERT INTO circuit_exclusion_windows "
+        "(circuit, started_at, ends_at, reason) "
+        "VALUES (?, datetime('now'), datetime('now', ?), ?)",
+        (circuit, modifier, reason or "plumbing"),
+    )
+    conn.commit()
+
+
+def is_event_in_exclusion_window(
+    conn,
+    circuit: str,
+    event_start_ts: str,
+) -> bool:
+    """Return True if ``event_start_ts`` falls inside any active exclusion
+    window for ``circuit``.
+
+    Normalises the caller timestamp to SQLite 'YYYY-MM-DD HH:MM:SS' format
+    before doing the BETWEEN comparison.
+    """
+    if not event_start_ts:
+        return False
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        dt = _dt.fromisoformat(str(event_start_ts))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(_tz.utc).replace(tzinfo=None)
+        ts = dt.strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        ts = str(event_start_ts)
+    row = conn.execute(
+        "SELECT 1 FROM circuit_exclusion_windows "
+        "WHERE circuit = ? AND ? BETWEEN started_at AND ends_at LIMIT 1",
+        (circuit, ts),
+    ).fetchone()
+    return row is not None
+
+
+def get_active_exclusion_window(
+    conn,
+    circuit: str,
+):
+    """Return the current active exclusion window, or None."""
+    row = conn.execute(
+        "SELECT id, circuit, started_at, ends_at, reason, "
+        "CAST((strftime('%s', ends_at) - strftime('%s', 'now')) / 60 AS INTEGER) "
+        "AS minutes_remaining "
+        "FROM circuit_exclusion_windows "
+        "WHERE circuit = ? AND ends_at > datetime('now') "
+        "ORDER BY ends_at DESC LIMIT 1",
+        (circuit,),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["minutes_remaining"] = max(0, result.get("minutes_remaining") or 0)
+    return result
+
+
+def cancel_exclusion_window(conn, circuit: str) -> None:
+    """End all active exclusion windows for ``circuit`` immediately."""
+    conn.execute(
+        "UPDATE circuit_exclusion_windows "
+        "SET ends_at = datetime('now') "
+        "WHERE circuit = ? AND ends_at > datetime('now')",
+        (circuit,),
+    )
+    conn.commit()
+
+
+def extend_exclusion_window(conn, circuit: str, extra_minutes: int = 15) -> None:
+    """Add ``extra_minutes`` to the active window (capped at 60 min from start)."""
+    modifier = f"+{extra_minutes} minutes"
+    conn.execute(
+        "UPDATE circuit_exclusion_windows "
+        "SET ends_at = MIN(datetime(ends_at, ?), datetime(started_at, '+60 minutes')) "
+        "WHERE circuit = ? AND ends_at > datetime('now')",
+        (modifier, circuit),
+    )
+    conn.commit()
+
+

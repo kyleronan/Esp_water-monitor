@@ -279,8 +279,30 @@ class FeatureExtractor:
         features = extract_features(event)
 
         try:
-            from .database import insert_event, update_hourly_volume
+            from .database import (insert_event, update_hourly_volume,
+                                   is_event_in_exclusion_window)
             insert_event(self._db, features)
+
+            # ── Plumbing-event exclusion window (Phase 2.1) ───────────────
+            # If the user opened an exclusion window (e.g. post-winterization
+            # flush), flag the event so the cluster engine skips it.  Volume
+            # tracking continues — only fixture identification is excluded.
+            start_ts_str = features.get("start_ts")
+            if (start_ts_str
+                    and is_event_in_exclusion_window(
+                        self._db, event.circuit, start_ts_str)):
+                self._db.execute(
+                    """UPDATE events
+                       SET excluded_from_training  = 1,
+                           match_rejection_reason  = 'excluded_from_training'
+                       WHERE id = ?""",
+                    (features["id"],),
+                )
+                features["excluded_from_training"] = 1
+                log.debug(
+                    "[%s] event excluded from training (exclusion window active)",
+                    event.circuit,
+                )
 
             if event.start_ts and features.get("volume_litres", 0) > 0:
                 hour_ts = event.start_ts.replace(

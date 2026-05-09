@@ -343,6 +343,56 @@
       </div>
       {% endif %}
 
+      {# Plumbing exclusion window #}
+      <div class="sett-card" id="maintenance">
+        <h3 class="sett-card-title">Plumbing Events</h3>
+        <p class="sett-card-desc">
+          Exclude events from fixture training while flushing air or sediment
+          after winterization, repairs, or valve work. Volume tracking
+          continues as normal.
+        </p>
+        {% if c.active_exclusion %}
+        <div class="excl-status" style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin-bottom:.75rem">
+          <span class="pill pill-warning">
+            ⏱ Exclusion active — {{ c.active_exclusion.minutes_remaining }} min remaining
+          </span>
+          <form method="post"
+                action="{{ ingress_path }}/settings/circuit/{{ c.circuit }}/exclusion_window/cancel"
+                style="margin:0">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">Cancel</button>
+          </form>
+          <form method="post"
+                action="{{ ingress_path }}/settings/circuit/{{ c.circuit }}/exclusion_window/extend"
+                style="margin:0">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-primary btn-sm">Extend +15 min</button>
+          </form>
+        </div>
+        {% else %}
+        <form method="post"
+              action="{{ ingress_path }}/settings/circuit/{{ c.circuit }}/exclusion_window"
+              class="sett-form-grid" style="align-items:flex-end;gap:.75rem">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <div class="sett-form-group" style="flex:0 0 auto">
+            <label>Duration (minutes)</label>
+            <input type="number" name="minutes" min="5" max="60" value="15"
+                   style="width:80px">
+          </div>
+          <div class="sett-form-group" style="flex:1">
+            <label>Reason <span class="muted">(optional)</span></label>
+            <input type="text" name="reason" placeholder="e.g. winterization, plumbing repair"
+                   maxlength="80">
+          </div>
+          <div class="sett-form-group" style="flex:0 0 auto">
+            <button type="submit" class="btn btn-primary btn-sm">
+              Mark plumbing event
+            </button>
+          </div>
+        </form>
+        {% endif %}
+      </div>
+
     </div>
     {% endfor %}
 
