@@ -436,9 +436,19 @@ class EventDetector:
         self._detectors: Dict[str, CircuitEventDetector] = {}
         # Tracks live valve open/closed state per circuit for cross-circuit feature
         self._valve_open: Dict[str, bool] = {}
+        self._is_configured = False
 
     def setup(self) -> None:
-        """Instantiate detectors and register HA entity subscriptions."""
+        """Instantiate detectors and register HA entity subscriptions.
+
+        Idempotent — safe to call more than once (e.g. after the setup
+        wizard completes on an already-running system).  The second call
+        is a no-op so duplicate HA subscriptions are never registered.
+        """
+        if self._is_configured:
+            log.debug("Event detector already configured — skipping re-setup")
+            return
+        self._is_configured = True
         for cfg in self._circuits:
             sens = self._sensitivity_getter(cfg.circuit)
             detector = CircuitEventDetector(
