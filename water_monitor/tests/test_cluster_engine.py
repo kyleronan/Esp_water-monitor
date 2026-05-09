@@ -486,5 +486,14 @@ def test_multi_circuit_isolation(db):
     assert reason2 != "type_gate_rejected", \
         "irrigation circuit must not apply toilet gate"
 
-    # Caches are strictly separated
-    assert "irrigation" not in engine._type_cache["main"].values()
+    # Type caches are strictly separated: each circuit's dict contains exactly
+    # its own confirmed type and nothing else.  (Both circuits independently
+    # assign cluster id=0 to their first cluster, so the meaningful invariant
+    # is the equality check — not a membership check across the two dicts.)
+    assert engine._type_cache["main"] == {cid_main: "toilet"}, \
+        "main type cache must contain only the toilet cluster"
+    assert engine._type_cache["irrigation"] == {cid_irr: "irrigation_zone"}, \
+        "irrigation type cache must contain only the irrigation_zone cluster"
+    # The two dicts are independent objects — mutating one must not affect the other
+    assert engine._type_cache["main"] is not engine._type_cache["irrigation"], \
+        "circuit type caches must be separate dict objects"
