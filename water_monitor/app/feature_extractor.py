@@ -374,6 +374,7 @@ class FeatureExtractor:
         cluster_id_result = None
         match_confidence  = None
         match_level       = None
+        match_rejection_reason: Optional[str] = None
         if self.cluster_engine:
             try:
                 event_row = self._db.execute(
@@ -382,17 +383,17 @@ class FeatureExtractor:
                 if event_row:
                     import functools
                     loop = asyncio.get_running_loop()
-                    cluster_id_result, match_confidence, match_level = \
-                        await loop.run_in_executor(
-                            None,
-                            functools.partial(
-                                self.cluster_engine.match_and_learn,
-                                dict(event_row),
-                                circuit,
-                                prev_cluster_id,
-                                seconds_since_prev,
-                            )
+                    (cluster_id_result, match_confidence, match_level,
+                     match_rejection_reason) = await loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            self.cluster_engine.match_and_learn,
+                            dict(event_row),
+                            circuit,
+                            prev_cluster_id,
+                            seconds_since_prev,
                         )
+                    )
             except Exception as e:
                 log.error("[%s] cluster matching failed: %s", circuit, e,
                           exc_info=True)
@@ -403,10 +404,12 @@ class FeatureExtractor:
                  cluster_id               = ?,
                  match_confidence         = ?,
                  match_level              = ?,
+                 match_rejection_reason   = ?,
                  seconds_since_prev_event = ?,
                  prev_cluster_id          = ?
                WHERE id = ?""",
             (cluster_id_result, match_confidence, match_level,
+             match_rejection_reason,
              seconds_since_prev, prev_cluster_id, event_id)
         )
 
