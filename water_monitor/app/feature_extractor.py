@@ -167,8 +167,14 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     peak_flow = max(event.flow_readings) if event.flow_readings else 0.0
     flow_variability = _safe_std(event.flow_readings)
 
-    # Volume: avg_flow (L/min) × duration (min)
-    volume_litres = avg_flow * (duration / 60.0) if duration > 0 else 0.0
+    # Volume: prefer the firmware's cumulative integration sensor delta (set by
+    # the historical importer) over the flow-average approximation, which can
+    # overstate volume for long events with fill-pause-fill patterns after
+    # downsampling kicks in at 120 s.
+    if event.volume_litres_measured is not None:
+        volume_litres = event.volume_litres_measured
+    else:
+        volume_litres = avg_flow * (duration / 60.0) if duration > 0 else 0.0
 
     # True hydraulic resistance: ΔP / avg_Q
     # Only meaningful when flow is above noise floor and a pressure
@@ -177,9 +183,28 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     if avg_flow >= 0.05 and event.has_pressure_transient and event.pressure_delta_psi > 0:
         resistance = event.pressure_delta_psi / avg_flow
 
-    # Resistance curve shape — uses corrected ΔP/Q formula
+    # Resistance curve shape — uses corrected ΔP/Q formula.
+    # pressure_readings are at 40 Hz, flow_readings at 1 Hz.  Pair them by
+    # averaging each pressure bin that corresponds to one flow sample so the
+    # resistance values are time-aligned.  Without downsampling, index-pairing
+    # would match the first ~0.75 s of pressure against the full event duration
+    # of flow, making every result meaningless.
+    pressure_for_shape = event.pressure_readings
+    if (event.flow_readings and event.pressure_readings
+            and len(event.pressure_readings) > len(event.flow_readings)):
+        n_flow = len(event.flow_readings)
+        n_pres = len(event.pressure_readings)
+        step = n_pres / n_flow          # fractional step to stay evenly spaced
+        pressure_for_shape = []
+        for i in range(n_flow):
+            lo = int(round(i * step))
+            hi = int(round((i + 1) * step))
+            hi = max(hi, lo + 1)        # guarantee at least one sample per bin
+            bin_samples = event.pressure_readings[lo:hi]
+            pressure_for_shape.append(sum(bin_samples) / len(bin_samples))
+
     shape = _classify_resistance_shape(
-        event.pressure_readings,
+        pressure_for_shape,
         event.flow_readings,
         event.pre_event_pressure_psi,
     )

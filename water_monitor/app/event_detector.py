@@ -78,6 +78,11 @@ class RawEvent:
     # Helps distinguish main-circuit irrigation bleed-through from household demand.
     other_valve_open: Optional[bool] = None
 
+    # Measured volume from the firmware's cumulative integration sensor.
+    # Set by the historical importer when the volume_sensor entity is available.
+    # Preferred over the flow-average approximation in feature extraction.
+    volume_litres_measured: Optional[float] = None
+
     is_composite: bool = False
     complete: bool = False
 
@@ -127,7 +132,7 @@ class CircuitEventDetector:
     # system.  Readings above this are treated as sensor overflow / firmware error
     # values (e.g. 1.58e+36 L/min from ESP ADC overflow) and clamped to 0.0.
     # 1000 L/min ≈ 264 gal/min — well beyond any domestic water supply.
-    MAX_FLOW_LPM: float = 1000.0
+    MAX_FLOW_LPM: float = 200.0   # matches firmware v3.5 ADC overflow clamp ceiling
 
     # Minimum physically meaningful flow rate from this sensor.
     # The pulse counter cannot produce a non-zero value below 1 pulse/second,
@@ -247,6 +252,13 @@ class CircuitEventDetector:
           short within-event baseline so the settled post-drop pressure is
           the reference, not the original pre-event baseline.
         """
+        if state in ("unavailable", "unknown"):
+            # ESP reconnected or went offline — stale buffer readings would mix
+            # with new data and could trigger a false pressure transient.
+            self._pressure_buf.clear()
+            log.debug("[%s] pressure sensor %s — buffer cleared", self.circuit, state)
+            return
+
         try:
             pressure = float(state)
         except (ValueError, TypeError):
@@ -340,10 +352,16 @@ class CircuitEventDetector:
         start_ts = self._flow_sustained_since or now
         self._flow_sustained_since = None
 
-        baseline = (
-            sum(self._pressure_buf) / len(self._pressure_buf)
-            if self._pressure_buf else 0.0
-        )
+        min_samples = self.BASELINE_LOOKBACK_SAMPLES + self.BASELINE_WINDOW_SAMPLES
+        if len(self._pressure_buf) >= min_samples:
+            buf = list(self._pressure_buf)
+            b_end = len(buf) - self.BASELINE_LOOKBACK_SAMPLES
+            b_start = b_end - self.BASELINE_WINDOW_SAMPLES
+            baseline = sum(buf[b_start:b_end]) / self.BASELINE_WINDOW_SAMPLES
+        elif self._pressure_buf:
+            baseline = sum(self._pressure_buf) / len(self._pressure_buf)
+        else:
+            baseline = 0.0
 
         log.info("[%s] event start (FLOW) — %.3f L/min for >= %.1f s",
                  self.circuit, self._current_flow_lpm, self.FLOW_START_SECONDS)
@@ -412,9 +430,12 @@ class CircuitEventDetector:
         ev.end_ts = ts
         # Use `is not None` — pre_event_pressure_psi defaults to 0.0,
         # which is falsy but valid for zero-baseline (unpressurised) systems.
-        if ev.pressure_readings and ev.pre_event_pressure_psi is not None:
+        if ev.pressure_readings:
             ev.min_pressure_psi = min(ev.pressure_readings)
-            ev.pressure_delta_psi = ev.pre_event_pressure_psi - ev.min_pressure_psi
+            # Keep pressure_delta_psi from detection time (initial transient magnitude).
+            # Only set it here as a fallback when it was never captured at detection.
+            if ev.pre_event_pressure_psi is not None and ev.pressure_delta_psi == 0.0:
+                ev.pressure_delta_psi = ev.pre_event_pressure_psi - ev.min_pressure_psi
         ev.complete = True
         self._active_event = None
 

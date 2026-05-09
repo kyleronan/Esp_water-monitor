@@ -957,8 +957,8 @@ sensor:
     source_id: pressure_main
     id: pressure_main_avg
     name: "Water Pressure 1 - Main (Averaged)"
-    # Clear the entity_category inherited from the source (pressure_main is
-    # diagnostic; the averaged copy is the user-facing primary entity).
+    # pressure_main now has entity_category: "" (recorded by HA); explicitly
+    # clear here so this copy does not inherit any future category change.
     entity_category: ""
     device_class: pressure
     state_class: measurement
@@ -1163,7 +1163,7 @@ sensor:
               if (x > 0) {
                 id(valve_seal_fast_elapsed_main) += 1.0f;
                 if (!id(valve_seal_alert_main)
-                    && id(valve_seal_fast_elapsed_main) >= 10.0f) {
+                    && id(valve_seal_fast_elapsed_main) >= 20.0f) {
                   id(valve_seal_alert_main) = true;
                   ESP_LOGW("seal", "MAIN: pulses detected %.0fs after valve closed "
                     "(raw check) — possible valve seal failure",
@@ -1357,7 +1357,7 @@ sensor:
               if (x > 0) {
                 id(valve_seal_fast_elapsed_irr) += 1.0f;
                 if (!id(valve_seal_alert_irr)
-                    && id(valve_seal_fast_elapsed_irr) >= 10.0f) {
+                    && id(valve_seal_fast_elapsed_irr) >= 20.0f) {
                   id(valve_seal_alert_irr) = true;
                   ESP_LOGW("seal", "IRRIGATION: pulses detected %.0fs after valve closed "
                     "(raw check) — possible valve seal failure",
@@ -2663,37 +2663,46 @@ script:
           else:
             - if:
                 condition:
-                  lambda: 'return id(fault_main);'
+                  lambda: 'return !id(open_end_stop_valve1).state && !id(closed_end_stop_valve1).state;'
                 then:
                   - lambda: |-
-                      id(leak_test_result_main) = 7;  // Not run — fault active
-                      ESP_LOGW("leak_test", "MAIN: test not started — safety fault is active. "
-                        "Reset the fault first.");
+                      id(leak_test_result_main) = 6;  // Not run — valve mid-travel
+                      ESP_LOGW("leak_test", "MAIN: test not started — valve is mid-travel "
+                        "(neither end stop active). Wait for travel to complete.");
                 else:
-                  # Pre-checks passed — begin sequence
-                  - lambda: |-
-                      id(leak_test_preparing_main) = true;
-                      id(leak_test_result_main) = 8;  // Preparing
-                      ESP_LOGI("leak_test", "MAIN: closing valve and waiting 60s for pressure to settle...");
-                  - valve.close: main_water_valve
-                  # 60-second settle — allows residual pressure dynamics
-                  # (water hammer, thermal expansion, residual flow) to
-                  # dissipate after the valve closes, so the baseline reading
-                  # captured next is stable and noise-free.
-                  - delay: 60s
-                  # Guard: if cancelled during settle, preparing will be false
-                  - lambda: |-
-                      if (!id(leak_test_preparing_main)) return;
-                      id(leak_test_preparing_main) = false;
-                      id(leak_test_elapsed_main) = 0.0f;
-                      id(leak_test_baseline_main) = id(pressure_main).state;
-                      id(leak_test_active_main) = true;
-                      id(leak_test_result_main) = 1;  // In progress
-                      ESP_LOGI("leak_test", "MAIN: test started. Baseline: %.1f PSI, "
-                        "Threshold: %.1f PSI, Duration: %.0f min",
-                        id(leak_test_baseline_main),
-                        id(leak_threshold_psi_main).state,
-                        id(leak_duration_main).state);
+                  - if:
+                      condition:
+                        lambda: 'return id(fault_main);'
+                      then:
+                        - lambda: |-
+                            id(leak_test_result_main) = 7;  // Not run — fault active
+                            ESP_LOGW("leak_test", "MAIN: test not started — safety fault is active. "
+                              "Reset the fault first.");
+                      else:
+                        # Pre-checks passed — begin sequence
+                        - lambda: |-
+                            id(leak_test_preparing_main) = true;
+                            id(leak_test_result_main) = 8;  // Preparing
+                            ESP_LOGI("leak_test", "MAIN: closing valve and waiting 60s for pressure to settle...");
+                        - valve.close: main_water_valve
+                        # 60-second settle — allows residual pressure dynamics
+                        # (water hammer, thermal expansion, residual flow) to
+                        # dissipate after the valve closes, so the baseline reading
+                        # captured next is stable and noise-free.
+                        - delay: 60s
+                        # Guard: if cancelled during settle, preparing will be false
+                        - lambda: |-
+                            if (!id(leak_test_preparing_main)) return;
+                            id(leak_test_preparing_main) = false;
+                            id(leak_test_elapsed_main) = 0.0f;
+                            id(leak_test_baseline_main) = id(pressure_main).state;
+                            id(leak_test_active_main) = true;
+                            id(leak_test_result_main) = 1;  // In progress
+                            ESP_LOGI("leak_test", "MAIN: test started. Baseline: %.1f PSI, "
+                              "Threshold: %.1f PSI, Duration: %.0f min",
+                              id(leak_test_baseline_main),
+                              id(leak_threshold_psi_main).state,
+                              id(leak_duration_main).state);
 
   # ---------------------------------------------------------------------------
   # LEAK TEST RESTORE — Main circuit
@@ -2730,31 +2739,40 @@ script:
           else:
             - if:
                 condition:
-                  lambda: 'return id(fault_irrigation);'
+                  lambda: 'return !id(open_end_stop_valve2).state && !id(closed_end_stop_valve2).state;'
                 then:
                   - lambda: |-
-                      id(leak_test_result_irr) = 7;  // Not run — fault active
-                      ESP_LOGW("leak_test", "IRRIGATION: test not started — safety fault is active. "
-                        "Reset the fault first.");
+                      id(leak_test_result_irr) = 6;  // Not run — valve mid-travel
+                      ESP_LOGW("leak_test", "IRRIGATION: test not started — valve is mid-travel "
+                        "(neither end stop active). Wait for travel to complete.");
                 else:
-                  - lambda: |-
-                      id(leak_test_preparing_irr) = true;
-                      id(leak_test_result_irr) = 8;  // Preparing
-                      ESP_LOGI("leak_test", "IRRIGATION: closing valve and waiting 60s for pressure to settle...");
-                  - valve.close: irrigation_water_valve
-                  - delay: 60s
-                  - lambda: |-
-                      if (!id(leak_test_preparing_irr)) return;
-                      id(leak_test_preparing_irr) = false;
-                      id(leak_test_elapsed_irr) = 0.0f;
-                      id(leak_test_baseline_irr) = id(pressure_irrigation).state;
-                      id(leak_test_active_irr) = true;
-                      id(leak_test_result_irr) = 1;  // In progress
-                      ESP_LOGI("leak_test", "IRRIGATION: test started. Baseline: %.1f PSI, "
-                        "Threshold: %.1f PSI, Duration: %.0f min",
-                        id(leak_test_baseline_irr),
-                        id(leak_threshold_psi_irr).state,
-                        id(leak_duration_irr).state);
+                  - if:
+                      condition:
+                        lambda: 'return id(fault_irrigation);'
+                      then:
+                        - lambda: |-
+                            id(leak_test_result_irr) = 7;  // Not run — fault active
+                            ESP_LOGW("leak_test", "IRRIGATION: test not started — safety fault is active. "
+                              "Reset the fault first.");
+                      else:
+                        - lambda: |-
+                            id(leak_test_preparing_irr) = true;
+                            id(leak_test_result_irr) = 8;  // Preparing
+                            ESP_LOGI("leak_test", "IRRIGATION: closing valve and waiting 60s for pressure to settle...");
+                        - valve.close: irrigation_water_valve
+                        - delay: 60s
+                        - lambda: |-
+                            if (!id(leak_test_preparing_irr)) return;
+                            id(leak_test_preparing_irr) = false;
+                            id(leak_test_elapsed_irr) = 0.0f;
+                            id(leak_test_baseline_irr) = id(pressure_irrigation).state;
+                            id(leak_test_active_irr) = true;
+                            id(leak_test_result_irr) = 1;  // In progress
+                            ESP_LOGI("leak_test", "IRRIGATION: test started. Baseline: %.1f PSI, "
+                              "Threshold: %.1f PSI, Duration: %.0f min",
+                              id(leak_test_baseline_irr),
+                              id(leak_threshold_psi_irr).state,
+                              id(leak_duration_irr).state);
 
   # ---------------------------------------------------------------------------
   # LEAK TEST RESTORE — Irrigation circuit

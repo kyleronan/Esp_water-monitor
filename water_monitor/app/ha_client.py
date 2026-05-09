@@ -211,6 +211,24 @@ class HaClient:
     # ------------------------------------------------------------------
     # History queries (short-lived WS connections)
     # ------------------------------------------------------------------
+    def _parse_history_entries(
+        self, entries: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Normalise raw HA history entries to [{state, last_changed}]."""
+        out = []
+        for e in entries:
+            state = e.get("s") if "s" in e else e.get("state")
+            ts_field = e.get("lu") if "lu" in e else e.get("last_updated")
+            if ts_field is None:
+                continue
+            if isinstance(ts_field, (int, float)):
+                ts = dt.datetime.fromtimestamp(ts_field, tz=dt.timezone.utc)
+            else:
+                ts = dt.datetime.fromisoformat(
+                    str(ts_field).replace("Z", "+00:00"))
+            out.append({"state": state, "last_changed": ts})
+        return out
+
     async def get_history(
         self,
         entity_id: str,
@@ -226,20 +244,32 @@ class HaClient:
             minimal_response=True,
             no_attributes=True,
         )
-        entries = (result or {}).get(entity_id, [])
-        out = []
-        for e in entries:
-            state = e.get("s") if "s" in e else e.get("state")
-            ts_field = e.get("lu") if "lu" in e else e.get("last_updated")
-            if ts_field is None:
-                continue
-            if isinstance(ts_field, (int, float)):
-                ts = dt.datetime.fromtimestamp(ts_field, tz=dt.timezone.utc)
-            else:
-                ts = dt.datetime.fromisoformat(
-                    str(ts_field).replace("Z", "+00:00"))
-            out.append({"state": state, "last_changed": ts})
-        return out
+        return self._parse_history_entries((result or {}).get(entity_id, []))
+
+    async def get_history_batch(
+        self,
+        entity_ids: List[str],
+        start: dt.datetime,
+        end: dt.datetime,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Fetch history for multiple entities in a single WS request/connection.
+        Returns {entity_id: [{state, last_changed}]}.
+        """
+        if not entity_ids:
+            return {}
+        result = await self.ws_request(
+            "history/history_during_period",
+            start_time=start.isoformat(),
+            end_time=end.isoformat(),
+            entity_ids=entity_ids,
+            minimal_response=True,
+            no_attributes=True,
+        )
+        return {
+            eid: self._parse_history_entries((result or {}).get(eid, []))
+            for eid in entity_ids
+        }
 
     # ------------------------------------------------------------------
     # REST API — state reads
