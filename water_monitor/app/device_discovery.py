@@ -117,7 +117,9 @@ class DiscoveredDevice:
         if not self.sw_version:
             return True   # can't determine — don't block setup
         try:
-            parts = tuple(int(x) for x in self.sw_version.split(".")[:3])
+            # HA appends "(ESPHome x.y.z)" to the project version — strip it
+            version_str = self.sw_version.split("(")[0].strip()
+            parts = tuple(int(x) for x in version_str.split(".")[:3])
             return parts >= MIN_FIRMWARE_VERSION
         except ValueError:
             return True   # non-numeric (e.g. "dev") — warn but don't block
