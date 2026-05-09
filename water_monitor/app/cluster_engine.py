@@ -236,8 +236,9 @@ class ClusterEngine:
             now = datetime.now(timezone.utc).isoformat()
             cursor = self._db.execute(
                 """INSERT OR IGNORE INTO fixture_clusters
-                   (circuit, id, member_count, confidence_level, created_at, last_match_at)
-                   VALUES (?, ?, 0, 'preliminary', ?, ?)""",
+                   (circuit, id, centroid, feature_std,
+                    member_count, confidence_level, created_at, last_match_at)
+                   VALUES (?, ?, '{}', '{}', 0, 'preliminary', ?, ?)""",
                 (circuit, our_id, now, now)
             )
             if cursor.rowcount > 0:

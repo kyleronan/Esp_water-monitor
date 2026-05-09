@@ -1343,6 +1343,14 @@ def create_exclusion_window(
     """
     minutes = max(5, min(60, int(minutes)))
     modifier = f"+{minutes} minutes"
+    # Close any existing active window for this circuit before opening a new one
+    # so we never accumulate multiple overlapping rows.
+    conn.execute(
+        "UPDATE circuit_exclusion_windows "
+        "SET ends_at = datetime('now') "
+        "WHERE circuit = ? AND ends_at > datetime('now')",
+        (circuit,),
+    )
     conn.execute(
         "INSERT INTO circuit_exclusion_windows "
         "(circuit, started_at, ends_at, reason) "
