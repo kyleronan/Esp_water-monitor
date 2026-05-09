@@ -374,6 +374,13 @@ def save_discovery(
 
     db.execute("DELETE FROM circuit_entity_map")
 
+    # Clear fixture data from the previous setup so stale clusters and fixtures
+    # don't bleed through into the new setup's labelling flow.
+    db.execute("DELETE FROM fixture_clusters")
+    db.execute("DELETE FROM fixtures")
+    db.execute("UPDATE events SET cluster_id = NULL, fixture_id = NULL")
+    db.execute("UPDATE training_state SET state = 'idle'")
+
     for circuit, matches in result.circuit_matches.items():
         for m in matches:
             db.execute("""
