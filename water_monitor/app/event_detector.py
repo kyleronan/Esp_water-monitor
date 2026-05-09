@@ -123,6 +123,12 @@ class CircuitEventDetector:
     # Minimum flow rate considered real flow (filters ADC noise)
     MIN_FLOW_LPM: float = 0.05
 
+    # Maximum physically plausible flow rate for any residential/light-commercial
+    # system.  Readings above this are treated as sensor overflow / firmware error
+    # values (e.g. 1.58e36 L/min from ESP ADC overflow) and clamped to 0.0.
+    # 1000 L/min ≈ 264 gal/min — well beyond any domestic water supply.
+    MAX_FLOW_LPM: float = 1000.0
+
     # Seconds of sustained flow required to open a flow-triggered event
     FLOW_START_SECONDS: float = 2.0
 
@@ -176,9 +182,22 @@ class CircuitEventDetector:
         - Resets the timer when flow drops below MIN_FLOW_LPM.
         """
         try:
-            self._current_flow_lpm = float(state)
+            raw_flow = float(state)
         except (ValueError, TypeError):
-            self._current_flow_lpm = 0.0
+            raw_flow = 0.0
+
+        # Guard against ESP firmware overflow / ADC error values (e.g. 1.58e36).
+        # Values above MAX_FLOW_LPM are physically impossible for any domestic
+        # system and indicate a sensor fault — treat them as zero so the event
+        # end condition (flow_rate < MIN_FLOW_LPM) is not permanently blocked.
+        if raw_flow > self.MAX_FLOW_LPM or raw_flow < 0.0:
+            log.warning(
+                "[%s] flow rate sensor returned implausible value %.3g L/min "
+                "— treating as 0.0 (sensor overflow or firmware error)",
+                self.circuit, raw_flow,
+            )
+            raw_flow = 0.0
+        self._current_flow_lpm = raw_flow
 
         now = datetime.now(timezone.utc)
 
