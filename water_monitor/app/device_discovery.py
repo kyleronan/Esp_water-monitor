@@ -27,6 +27,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
+# Minimum firmware version required for full feature support.
+# Checked against the device registry sw_version field (set via project.version
+# in the ESPHome YAML). Non-numeric versions (e.g. "dev") are treated as unknown
+# — setup is not blocked, but a warning is shown.
+MIN_FIRMWARE_VERSION: tuple = (3, 5, 0)
+
 # Roles that are optional — wizard will show them as optional dropdowns
 # and they won't block setup completion if unmatched.
 OPTIONAL_ROLES = {
@@ -92,6 +98,7 @@ class DiscoveredDevice:
     model: Optional[str]
     manufacturer: Optional[str]
     identifiers: List[Any] = field(default_factory=list)
+    sw_version: Optional[str] = None   # project.version from ESPHome YAML
 
     @property
     def display_name(self) -> str:
@@ -103,6 +110,17 @@ class DiscoveredDevice:
             "esphome" in str(ident).lower()
             for ident in self.identifiers
         )
+
+    @property
+    def firmware_ok(self) -> bool:
+        """True if sw_version meets MIN_FIRMWARE_VERSION, or version is unknown."""
+        if not self.sw_version:
+            return True   # can't determine — don't block setup
+        try:
+            parts = tuple(int(x) for x in self.sw_version.split(".")[:3])
+            return parts >= MIN_FIRMWARE_VERSION
+        except ValueError:
+            return True   # non-numeric (e.g. "dev") — warn but don't block
 
 
 @dataclass
@@ -324,6 +342,7 @@ def _to_device(raw: Dict[str, Any]) -> DiscoveredDevice:
         model=raw.get("model"),
         manufacturer=raw.get("manufacturer"),
         identifiers=raw.get("identifiers", []),
+        sw_version=raw.get("sw_version"),
     )
 
 
@@ -344,11 +363,12 @@ def save_discovery(
             ha_device_id = ?,
             ha_device_name = ?,
             esp_device_prefix = ?,
+            fw_version = ?,
             setup_complete = 0,
             updated_at = ?
         WHERE id = 1
     """, (result.device.id, result.device.display_name,
-          result.esp_device_prefix, now))
+          result.esp_device_prefix, result.device.sw_version, now))
 
     db.execute("DELETE FROM circuit_entity_map")
 

@@ -145,6 +145,10 @@
             {% if d.manufacturer %}{{ d.manufacturer }}{% endif %}
             {% if d.model %} · {{ d.model }}{% endif %}
             {% if d.is_esphome %} · ESPHome{% endif %}
+            {% if d.sw_version %} · v{{ d.sw_version }}{% endif %}
+            {% if not d.firmware_ok %}
+            <span class="badge badge-warn" title="Firmware below minimum supported version">Firmware too old</span>
+            {% endif %}
           </div>
         </div>
       </label>
@@ -168,7 +172,14 @@
     Found: <strong>{{ device.name }}</strong>
     {% if device.manufacturer %} · {{ device.manufacturer }}{% endif %}
     {% if device.model %} · {{ device.model }}{% endif %}
+    {% if device.sw_version %} · Firmware v{{ device.sw_version }}{% endif %}
   </p>
+  {% if not device.firmware_ok %}
+  <div class="callout callout-warn" style="margin-bottom:1rem">
+    ⚠ Firmware v{{ device.sw_version }} is below the minimum supported version
+    (v{{ min_fw }}). Some features may not work correctly. Please flash the latest firmware.
+  </div>
+  {% endif %}
 
   <form method="post" action="{{ ingress_path }}/setup/confirm/{{ device.id }}">
 

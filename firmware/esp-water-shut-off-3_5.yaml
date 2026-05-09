@@ -59,8 +59,8 @@ esphome:
     # DIO flash mode required for ESP32-S3
     board_build.flash_mode: dio
   project:
-    name: esphome.web
-    version: dev
+    name: ronan.esp-water-monitor
+    version: "3.5.0"
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
