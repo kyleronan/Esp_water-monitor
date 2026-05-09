@@ -52,7 +52,7 @@
 
 esphome:
   name: esp-water-shut-off-3
-  friendly_name: ESP Water Shut off 3.4
+  friendly_name: ESP Water Shut off 3.5
   min_version: 2024.6.0
   name_add_mac_suffix: false
   platformio_options:

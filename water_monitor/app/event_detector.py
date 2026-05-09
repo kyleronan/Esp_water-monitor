@@ -125,9 +125,16 @@ class CircuitEventDetector:
 
     # Maximum physically plausible flow rate for any residential/light-commercial
     # system.  Readings above this are treated as sensor overflow / firmware error
-    # values (e.g. 1.58e36 L/min from ESP ADC overflow) and clamped to 0.0.
+    # values (e.g. 1.58e+36 L/min from ESP ADC overflow) and clamped to 0.0.
     # 1000 L/min ≈ 264 gal/min — well beyond any domestic water supply.
     MAX_FLOW_LPM: float = 1000.0
+
+    # Minimum physically meaningful flow rate from this sensor.
+    # The pulse counter cannot produce a non-zero value below 1 pulse/second,
+    # which converts to 60 counts/min / 396 ≈ 0.15 L/min.  Values in the
+    # range (0, MIN_NOISE_LPM) are floating-point noise (e.g. 1.58e-36 L/min
+    # from ESPHome ADC underflow) and should be treated as zero.
+    MIN_NOISE_LPM: float = 0.01
 
     # Seconds of sustained flow required to open a flow-triggered event
     FLOW_START_SECONDS: float = 2.0
@@ -186,14 +193,16 @@ class CircuitEventDetector:
         except (ValueError, TypeError):
             raw_flow = 0.0
 
-        # Guard against ESP firmware overflow / ADC error values (e.g. 1.58e36).
-        # Values above MAX_FLOW_LPM are physically impossible for any domestic
-        # system and indicate a sensor fault — treat them as zero so the event
-        # end condition (flow_rate < MIN_FLOW_LPM) is not permanently blocked.
-        if raw_flow > self.MAX_FLOW_LPM or raw_flow < 0.0:
+        # Guard against ESP firmware ADC garbage values. Two failure modes:
+        #   HIGH: overflow produces huge values (e.g. 1.58e+36 L/min).
+        #   LOW:  underflow/noise produces tiny near-zero values (e.g. 1.58e-36)
+        #         that are positive but below the minimum meaningful reading.
+        # Both are treated as zero so event end detection is not blocked.
+        if raw_flow > self.MAX_FLOW_LPM or raw_flow < 0.0 or (
+                0.0 < raw_flow < self.MIN_NOISE_LPM):
             log.warning(
                 "[%s] flow rate sensor returned implausible value %.3g L/min "
-                "— treating as 0.0 (sensor overflow or firmware error)",
+                "— treating as 0.0 (ADC overflow, underflow, or firmware error)",
                 self.circuit, raw_flow,
             )
             raw_flow = 0.0
