@@ -87,7 +87,10 @@ async def setup_new(request: Request):
 async def setup_restore(request: Request):
     import json as _json
     from fastapi import File, UploadFile
-    from ..routers.backup import QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT
+    from ..routers.backup import (
+        QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT, MAX_BACKUP_BYTES,
+    )
+    from ..database import normalize_events_utc, dedup_events
 
     orch = _orch(request)
     form = await request.form()
@@ -100,7 +103,11 @@ async def setup_restore(request: Request):
             "/setup?restore_error=No+file+uploaded")
 
     try:
-        raw = await file.read()
+        # Enforce a 50 MB hard limit to prevent OOM on malformed uploads.
+        raw = await file.read(MAX_BACKUP_BYTES + 1)
+        if len(raw) > MAX_BACKUP_BYTES:
+            return ingress_redirect(request,
+                "/setup?restore_error=File+too+large+(max+50+MB)")
         payload = _json.loads(raw)
     except Exception as e:
         return ingress_redirect(request,
@@ -121,34 +128,49 @@ async def setup_restore(request: Request):
     total  = 0
     db     = orch.db
 
-    for tbl in groups_to_restore:
-        rows = tables.get(tbl)
-        if not rows:
-            continue
-        try:
-            db.execute(f"DELETE FROM {tbl}")
-            # Filter backup columns against live schema so old backups with
-            # removed columns (e.g. monthly_budget_litres) restore cleanly.
-            valid_cols = {r[1] for r in db.execute(
-                f"PRAGMA table_info({tbl})").fetchall()}
-            cols = [c for c in rows[0].keys() if c in valid_cols]
-            if not cols:
-                log.warning("Restore: table %s has no valid columns — skipping", tbl)
-                continue
-            placeholders = ", ".join("?" for _ in cols)
-            col_names    = ", ".join(cols)
-            for row in rows:
-                db.execute(
-                    f"INSERT OR REPLACE INTO {tbl} ({col_names}) "
-                    f"VALUES ({placeholders})",
-                    [row.get(c) for c in cols],
-                )
-            total += len(rows)
-        except Exception as e:
-            log.error("Restore: table %s: %s", tbl, e)
-            errors.append(tbl)
+    # Wrap the entire restore in a single transaction so a partial failure
+    # leaves the database unchanged rather than in a half-restored state.
+    try:
+        with db:
+            for tbl in groups_to_restore:
+                rows = tables.get(tbl)
+                if not rows:
+                    continue
+                db.execute(f"DELETE FROM {tbl}")
+                # Filter backup columns against live schema so old backups with
+                # removed columns (e.g. monthly_budget_litres) restore cleanly.
+                valid_cols = {r[1] for r in db.execute(
+                    f"PRAGMA table_info({tbl})").fetchall()}
+                cols = [c for c in rows[0].keys() if c in valid_cols]
+                if not cols:
+                    log.warning("Restore: table %s has no valid columns — skipping", tbl)
+                    continue
+                placeholders = ", ".join("?" for _ in cols)
+                col_names    = ", ".join(cols)
+                for row in rows:
+                    db.execute(
+                        f"INSERT OR REPLACE INTO {tbl} ({col_names}) "
+                        f"VALUES ({placeholders})",
+                        [row.get(c) for c in cols],
+                    )
+                total += len(rows)
 
-    db.commit()
+            # Normalize and deduplicate events after import so the DB is
+            # consistent even if the backup contained pre-dedup duplicates
+            # or mixed-timezone timestamps.
+            if import_history == "1" and tables.get("events"):
+                normalize_events_utc(db)
+                removed = dedup_events(db)
+                if removed:
+                    log.warning(
+                        "Setup restore: removed %d duplicate event(s) from backup",
+                        removed,
+                    )
+    except Exception as e:
+        log.error("Setup restore failed — transaction rolled back: %s", e)
+        errors.append("(transaction rolled back)")
+        return ingress_redirect(request,
+            f"/setup?restore_error=Restore+failed%3A+{e}")
 
     try:
         orch.reload_circuit_entities()

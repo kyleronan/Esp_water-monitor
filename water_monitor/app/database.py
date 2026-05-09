@@ -1187,17 +1187,138 @@ def event_exists_near(
     start_ts: str,
     window_seconds: int = 30,
 ) -> bool:
-    """True if an event with start_ts within ±window_seconds already exists."""
+    """True if an event with start_ts within ±window_seconds already exists.
+
+    Compares in Unix-epoch seconds so the result is robust against:
+    - 'T' vs space separator mismatch (SQLite datetime() uses space)
+    - mixed timezone offsets in stored data (+00:00 vs -06:00)
+    - microsecond precision differences
+
+    SQLite strftime('%s', …) understands ISO 8601 with both 'T' and space
+    separators and returns integer epoch seconds, making the comparison
+    timezone-absolute.
+    """
+    try:
+        ts = datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return False
+    lo_epoch = int((ts - timedelta(seconds=window_seconds)).timestamp())
+    hi_epoch = int((ts + timedelta(seconds=window_seconds)).timestamp())
     row = conn.execute("""
         SELECT id FROM events
         WHERE circuit = ?
-          AND start_ts >= datetime(?, ?)
-          AND start_ts <= datetime(?, ?)
+          AND start_ts IS NOT NULL
+          AND CAST(strftime('%s', start_ts) AS INTEGER) BETWEEN ? AND ?
         LIMIT 1
-    """, (circuit,
-          start_ts, f"-{window_seconds} seconds",
-          start_ts, f"+{window_seconds} seconds")).fetchone()
+    """, (circuit, lo_epoch, hi_epoch)).fetchone()
     return row is not None
+
+
+def normalize_events_utc(conn: sqlite3.Connection) -> int:
+    """Normalize events.start_ts / end_ts to UTC ISO 8601 in-place.
+
+    Intended to be called before dedup_events() in the Quick Restore path.
+    Does NOT recompute UUID5 ids here — that is done by dedup_events() after
+    duplicates have been removed.  Recomputing ids before dedup would cause
+    a PRIMARY KEY collision when two rows represent the same instant expressed
+    in different offsets (both would map to the same UUID5).
+
+    Returns the number of rows whose timestamps were changed.
+    Idempotent — rows already in UTC format are skipped.
+    """
+    rows = conn.execute(
+        "SELECT id, start_ts, end_ts FROM events WHERE start_ts IS NOT NULL"
+    ).fetchall()
+    updates = []
+    for r in rows:
+        try:
+            s = datetime.fromisoformat(r["start_ts"].replace("Z", "+00:00"))
+            if s.tzinfo is None:
+                s = s.replace(tzinfo=timezone.utc)
+            new_s = s.astimezone(timezone.utc).isoformat()
+            new_e = None
+            if r["end_ts"]:
+                e = datetime.fromisoformat(r["end_ts"].replace("Z", "+00:00"))
+                if e.tzinfo is None:
+                    e = e.replace(tzinfo=timezone.utc)
+                new_e = e.astimezone(timezone.utc).isoformat()
+            if new_s != r["start_ts"] or new_e != r["end_ts"]:
+                updates.append((new_s, new_e, r["id"]))
+        except (ValueError, TypeError):
+            continue
+    if updates:
+        conn.executemany(
+            "UPDATE events SET start_ts = ?, end_ts = ? WHERE id = ?",
+            updates
+        )
+    return len(updates)
+
+
+def dedup_events(conn: sqlite3.Connection) -> int:
+    """Remove duplicate events sharing (circuit, start_ts) and recompute ids.
+
+    Idempotent — safe to call on every startup.  Returns count of rows deleted.
+    Keeps the most recently inserted row (MAX rowid) on the assumption that
+    later inserts have fresher cluster_id / match_confidence.
+
+    Also:
+    - Clears cluster_id / match_confidence on survivors of contested groups so
+      backfill_unmatched re-matches them with the current engine state.
+    - Recomputes UUID5 id = uuid5(NAMESPACE_OID, f"{circuit}/{start_ts}") for
+      all survivors, making ids stable so future INSERT OR REPLACE on
+      UNIQUE(circuit, start_ts) keeps the row (and its fixture_id) intact.
+    """
+    import uuid as _uuid
+
+    # Clear stale cluster_id (and match_confidence if the column exists) on
+    # contested survivors before deleting dupes.  match_confidence was added
+    # by migration 013; older in-memory test databases may not have it.
+    _cols = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+    _extra = ", match_confidence = NULL" if "match_confidence" in _cols else ""
+    conn.execute(f"""
+        UPDATE events SET cluster_id = NULL{_extra}
+        WHERE rowid IN (
+            SELECT MAX(rowid) FROM events
+            WHERE cluster_id IS NOT NULL
+            GROUP BY circuit, start_ts
+            HAVING COUNT(*) > 1
+        )
+    """)
+    cursor = conn.execute("""
+        DELETE FROM events
+        WHERE rowid NOT IN (
+            SELECT MAX(rowid)
+            FROM events
+            GROUP BY circuit, start_ts
+        )
+    """)
+    removed = cursor.rowcount
+
+    # Recompute UUID5 ids for all survivors.  Now that duplicates are gone,
+    # each (circuit, start_ts) is unique so new ids cannot collide.
+    survivors = conn.execute(
+        "SELECT id, circuit, start_ts FROM events WHERE start_ts IS NOT NULL"
+    ).fetchall()
+    id_updates = []
+    for r in survivors:
+        try:
+            new_id = str(_uuid.uuid5(
+                _uuid.NAMESPACE_OID,
+                f"{r['circuit']}/{r['start_ts']}"
+            ))
+            if new_id != r["id"]:
+                id_updates.append((new_id, r["id"]))
+        except (ValueError, TypeError):
+            continue
+    if id_updates:
+        conn.executemany(
+            "UPDATE events SET id = ? WHERE id = ?", id_updates
+        )
+
+    conn.commit()
+    return removed
 
 
 # ── Phase 2: fixture cluster helpers ──────────────────────────────────────────

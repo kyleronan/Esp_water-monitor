@@ -128,8 +128,12 @@ async def export_quick_restore(request: Request):
 
     for tbl, col in [("events", "start_ts"), ("hourly_volume", "hour_ts")]:
         try:
+            # ORDER BY rowid ASC so that on restore the last-inserted (newest)
+            # row appears last in the JSON array.  With INSERT OR REPLACE the
+            # last row for each (circuit, start_ts) wins — which is what we want.
             tables[tbl] = [dict(r) for r in db.execute(
-                f"SELECT * FROM {tbl} WHERE {col} >= ?", (cutoff,)).fetchall()]
+                f"SELECT * FROM {tbl} WHERE {col} >= ? ORDER BY rowid ASC",
+                (cutoff,)).fetchall()]
         except Exception as e:
             log.warning("Quick-restore export %s: %s", tbl, e)
             tables[tbl] = []
@@ -240,7 +244,8 @@ async def export_full(request: Request):
         for tbl, col in [("events", "start_ts"), ("hourly_volume", "hour_ts")]:
             try:
                 qr_tables[tbl] = [dict(r) for r in db.execute(
-                    f"SELECT * FROM {tbl} WHERE {col} >= ?", (cutoff,)).fetchall()]
+                    f"SELECT * FROM {tbl} WHERE {col} >= ?"
+                    f" ORDER BY rowid ASC", (cutoff,)).fetchall()]
             except Exception as e:
                 log.warning("Full export quick-restore %s: %s", tbl, e)
                 qr_tables[tbl] = []
@@ -332,24 +337,42 @@ async def import_quick_restore(
                              "error": "Select at least one group."},
                             status_code=400)
 
-    imported, errors = {}, []
+    imported = {}
     db = orch.db
 
-    for tbl in restore:
-        rows = tables.get(tbl)
-        if rows is None:
-            continue
-        if not rows:
-            imported[tbl] = 0
-            continue
-        try:
-            db.execute(f"DELETE FROM {tbl}")
-            imported[tbl] = _safe_insert(db, tbl, rows)
-        except Exception as e:
-            log.error("Import quick-restore %s: %s", tbl, e)
-            errors.append(f"{tbl}: {e}")
+    # Wrap the entire restore in a single transaction.  If any table's DELETE
+    # or INSERT fails, all prior DELETEs are rolled back — avoiding a state
+    # where some tables are wiped but not restored.
+    try:
+        with db:
+            for tbl in restore:
+                rows = tables.get(tbl)
+                if rows is None:
+                    continue
+                if not rows:
+                    imported[tbl] = 0
+                    continue
+                db.execute(f"DELETE FROM {tbl}")
+                imported[tbl] = _safe_insert(db, tbl, rows)
+    except Exception as e:
+        log.error("Import quick-restore failed: %s", e)
+        return JSONResponse({"ok": False, "error": f"Restore failed: {e}"},
+                            status_code=500)
 
-    db.commit()
+    # After events are imported, normalize timestamps to UTC then dedup.
+    # Order matters: normalize first so rows with the same logical instant
+    # but different offset strings (+00:00 vs -06:00) collapse correctly.
+    if "events" in restore:
+        try:
+            from ..database import normalize_events_utc, dedup_events
+            normalize_events_utc(db)
+            removed = dedup_events(db)
+            if removed:
+                log.warning(
+                    "Quick Restore: removed %d duplicate event(s) from backup",
+                    removed)
+        except Exception as e:
+            log.warning("Quick Restore dedup failed (non-fatal): %s", e)
     try:
         orch.reload_circuit_entities()
     except Exception as e:
@@ -357,9 +380,9 @@ async def import_quick_restore(
 
     total = sum(imported.values())
     return JSONResponse({
-        "ok":      len(errors) == 0,
+        "ok":      True,
         "imported": imported,
-        "errors":  errors,
+        "errors":  [],
         "summary": f"{total} rows restored",
     })
 

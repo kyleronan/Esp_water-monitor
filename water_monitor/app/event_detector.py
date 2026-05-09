@@ -397,7 +397,14 @@ class CircuitEventDetector:
             self.circuit, ev.start_trigger, duration, avg_flow,
             ev.pressure_delta_psi, ev.has_pressure_transient, ev.is_composite,
         )
-        asyncio.create_task(self._event_queue.put(ev))
+        try:
+            self._event_queue.put_nowait(ev)
+        except asyncio.QueueFull:
+            log.warning(
+                "[%s] event queue full — dropping event start_ts=%s "
+                "(consider increasing queue size or reducing event rate)",
+                self.circuit, ev.start_ts,
+            )
 
     def reset(self) -> None:
         """Reset all state — call when valve closes or on explicit reset."""

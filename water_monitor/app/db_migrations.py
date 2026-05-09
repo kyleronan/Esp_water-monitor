@@ -497,6 +497,168 @@ def _migrate_020(conn: sqlite3.Connection) -> None:
     log.info("Migration 020: created fixture_ha_entity_map table")
 
 
+def _migrate_021(conn: sqlite3.Connection) -> None:
+    """Normalize events to UTC, dedup, add UNIQUE(circuit, start_ts) index.
+
+    Fixes three root-cause bugs that produced duplicate event rows:
+
+    1.  Pre-fix code generated UUID4 ids — same event re-imported twice
+        produced two rows because INSERT OR REPLACE matched on PRIMARY KEY
+        (id) only, not on (circuit, start_ts).
+
+    2.  event_exists_near() used SQLite datetime() which returns a space-
+        separated string ('YYYY-MM-DD HH:MM:SS') while stored start_ts uses
+        ISO 8601 'T' separator. ASCII 'T' (84) > ' ' (32) so the upper-
+        bound comparison always failed and every event was re-imported on
+        every historical catch-up cycle.
+
+    3.  Migration 015 removed duplicates once (MIN rowid) but was one-shot;
+        Quick Restore brought pre-dedup data back via INSERT OR REPLACE
+        keyed on id, so migration 015 never ran again on those rows.
+
+    Fix applied here:
+      a. Normalize all events.start_ts / end_ts to UTC ISO 8601 (+00:00)
+         and recompute each row's UUID5 id against the new UTC start_ts so
+         future INSERT OR REPLACE on UNIQUE(circuit, start_ts) keeps the
+         existing row rather than deleting it and losing fixture_id.
+      b. Same UTC normalization for hourly_volume.hour_ts.
+      c. Clear cluster_id / match_confidence on dedup survivors where
+         multiple rows existed, so backfill_unmatched re-matches them with
+         the current engine state.
+      d. Delete duplicate rows (keep MAX rowid — newest insert).
+      e. Drop the old non-unique idx_events_circuit_ts (superseded).
+      f. Create UNIQUE INDEX idx_events_circuit_start_unique — prevents
+         any future duplicate at write time.
+
+    The entire migration runs inside a single transaction; a failure rolls
+    back without leaving the DB in a half-normalized state.
+    """
+    import uuid as _uuid
+    from datetime import datetime, timezone
+
+    with conn:  # one transaction — rolls back on any exception
+        # ── a. Normalize events.start_ts / end_ts to UTC (id unchanged here)
+        #    Separating the id recomputation from the timestamp normalization
+        #    avoids a PRIMARY KEY collision when two rows represent the same
+        #    instant in different offsets and would therefore get the same
+        #    new UUID5 id.  We dedup first (step d) then recompute ids (step e).
+        rows = conn.execute(
+            "SELECT id, circuit, start_ts, end_ts FROM events"
+            " WHERE start_ts IS NOT NULL"
+        ).fetchall()
+        ts_updates = []
+        for r in rows:
+            try:
+                s = datetime.fromisoformat(r["start_ts"].replace("Z", "+00:00"))
+                if s.tzinfo is None:
+                    s = s.replace(tzinfo=timezone.utc)
+                new_s = s.astimezone(timezone.utc).isoformat()
+                new_e = None
+                if r["end_ts"]:
+                    e = datetime.fromisoformat(r["end_ts"].replace("Z", "+00:00"))
+                    if e.tzinfo is None:
+                        e = e.replace(tzinfo=timezone.utc)
+                    new_e = e.astimezone(timezone.utc).isoformat()
+                if new_s != r["start_ts"] or new_e != r["end_ts"]:
+                    ts_updates.append((new_s, new_e, r["id"]))
+            except (ValueError, TypeError):
+                continue
+        conn.executemany(
+            "UPDATE events SET start_ts = ?, end_ts = ? WHERE id = ?",
+            ts_updates
+        )
+        log.info("Migration 021: normalized %d event row(s) to UTC", len(ts_updates))
+
+        # ── b. Normalize hourly_volume ───────────────────────────────────────
+        hv_rows = conn.execute(
+            "SELECT rowid, hour_ts FROM hourly_volume WHERE hour_ts IS NOT NULL"
+        ).fetchall()
+        hv_updates = []
+        for r in hv_rows:
+            try:
+                s = datetime.fromisoformat(r["hour_ts"].replace("Z", "+00:00"))
+                if s.tzinfo is None:
+                    s = s.replace(tzinfo=timezone.utc)
+                # Use strftime format (no timezone suffix) to match the
+                # storage format written by feature_extractor.py and all
+                # DB queries that use SQLite's strftime('%Y-%m-%dT%H:00:00').
+                new_s = s.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:00:00')
+                if new_s != r["hour_ts"]:
+                    hv_updates.append((new_s, r["rowid"]))
+            except (ValueError, TypeError):
+                continue
+        if hv_updates:
+            conn.executemany(
+                "UPDATE hourly_volume SET hour_ts = ? WHERE rowid = ?",
+                hv_updates
+            )
+            log.info("Migration 021: normalized %d hourly_volume row(s) to UTC",
+                     len(hv_updates))
+
+        # ── c. Clear stale cluster_id on contested dedup survivors ───────────
+        _cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(events)").fetchall()}
+        _mc = ", match_confidence = NULL" if "match_confidence" in _cols else ""
+        conn.execute(f"""
+            UPDATE events SET cluster_id = NULL{_mc}
+            WHERE rowid IN (
+                SELECT MAX(rowid) FROM events
+                WHERE cluster_id IS NOT NULL
+                GROUP BY circuit, start_ts
+                HAVING COUNT(*) > 1
+            )
+        """)
+
+        # ── d. Dedup (keep MAX rowid = newest insert) ────────────────────────
+        conn.execute("""
+            DELETE FROM events
+            WHERE rowid NOT IN (
+                SELECT MAX(rowid) FROM events GROUP BY circuit, start_ts
+            )
+        """)
+        deleted = conn.execute("SELECT changes()").fetchone()[0]
+        if deleted:
+            log.info("Migration 021: removed %d duplicate event(s)", deleted)
+
+        # ── e. Recompute UUID5 ids for all survivors ──────────────────────────
+        #    Now that duplicates are gone and start_ts is UTC, each
+        #    (circuit, start_ts) is unique, so new ids cannot collide.
+        #    Recomputation is critical: after normalization the old id
+        #    (keyed on the pre-UTC string) no longer matches what future
+        #    extract_features() generates, so INSERT OR REPLACE on
+        #    UNIQUE(circuit, start_ts) would delete the existing row and
+        #    lose its fixture_id.  Post-recomputation the ids are stable.
+        survivors = conn.execute(
+            "SELECT id, circuit, start_ts FROM events WHERE start_ts IS NOT NULL"
+        ).fetchall()
+        id_updates = []
+        for r in survivors:
+            try:
+                new_id = str(_uuid.uuid5(
+                    _uuid.NAMESPACE_OID,
+                    f"{r['circuit']}/{r['start_ts']}"
+                ))
+                if new_id != r["id"]:
+                    id_updates.append((new_id, r["id"]))
+            except (ValueError, TypeError):
+                continue
+        if id_updates:
+            conn.executemany(
+                "UPDATE events SET id = ? WHERE id = ?", id_updates
+            )
+            log.info("Migration 021: recomputed UUID5 id on %d event(s)", len(id_updates))
+
+        # ── f. Drop superseded index ──────────────────────────────────────────
+        conn.execute("DROP INDEX IF EXISTS idx_events_circuit_ts")
+
+        # ── f. UNIQUE index — prevents future duplicates at write time ───────
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_circuit_start_unique
+                ON events (circuit, start_ts)
+        """)
+    log.info("Migration 021: UNIQUE(circuit, start_ts) index created")
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -518,6 +680,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (18, _migrate_018),
     (19, _migrate_019),
     (20, _migrate_020),
+    (21, _migrate_021),
 ]
 
 
