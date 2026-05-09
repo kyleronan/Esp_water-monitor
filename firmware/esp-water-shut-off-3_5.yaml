@@ -50,6 +50,9 @@
 #     ~1s onset latency (ESPHome 2026.4+ prevents GPIO pin sharing).
 # =============================================================================
 
+substitutions:
+  flow_k_factor: "396.0"   # 6.6 pulses/litre × 60s = 396
+
 esphome:
   name: esp-water-shut-off-3
   friendly_name: ESP Water Shut off 3.5
@@ -60,7 +63,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.5.0"
+    version: "3.5.1"
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -230,6 +233,19 @@ globals:
     restore_value: no
     initial_value: '0.0'
 
+  # Wall-clock start timestamp (millis()) captured when each leak test begins.
+  # Used to compute elapsed = (millis() - start_ms) / 1000 so timing is
+  # accurate under WiFi/scheduling jitter instead of accumulating 0.5s ticks.
+  - id: leak_test_start_ms_main
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: leak_test_start_ms_irr
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
   # True during the 60-second valve-close and EMA settle phase before the
   # test officially starts monitoring. Distinct from leak_test_active so the
   # switch and active indicator show ON throughout, and cancellation during
@@ -326,7 +342,7 @@ globals:
     restore_value: no
     initial_value: '0.0'
 
-  # Separate elapsed timer for the fast seal check (flow_base based, 10s threshold).
+  # Separate elapsed timer for the fast seal check (flow_base based, 20s threshold).
   # Distinct from valve_seal_elapsed_main so the two check paths don't interfere.
   - id: valve_seal_fast_elapsed_main
     type: float
@@ -727,9 +743,8 @@ sensor:
         - lambda: |-
             if (!id(leak_test_active_main)) return;
 
-            // Accumulate elapsed time — sensor fires every 500ms (send_every 100 at 5ms)
-            // so increment by 0.5s per tick to keep elapsed time in seconds.
-            id(leak_test_elapsed_main) += 0.5f;
+            // Elapsed time computed from wall-clock start timestamp to avoid drift.
+            id(leak_test_elapsed_main) = (millis() - id(leak_test_start_ms_main)) / 1000.0f;
 
             float drop = id(leak_test_baseline_main) - x;  // positive = pressure fell, negative = pressure rose
 
@@ -883,8 +898,8 @@ sensor:
         - lambda: |-
             if (!id(leak_test_active_irr)) return;
 
-            // Sensor fires every 500ms (send_every 100 at 5ms) — increment by 0.5s.
-            id(leak_test_elapsed_irr) += 0.5f;
+            // Elapsed time computed from wall-clock start timestamp to avoid drift.
+            id(leak_test_elapsed_irr) = (millis() - id(leak_test_start_ms_irr)) / 1000.0f;
 
             float drop = id(leak_test_baseline_irr) - x;  // positive = pressure fell, negative = pressure rose
 
@@ -1133,7 +1148,7 @@ sensor:
         # Gated by the open end stop so this only fires while the valve is open
         # and the system is in normal operation.
         - lambda: |-
-            float instant_lpm = x / 396.0f;
+            float instant_lpm = x / ${flow_k_factor}f;
             if (!id(fault_main)
                 && id(alert_high_flow_main)
                 && id(open_end_stop_valve1).state
@@ -1154,7 +1169,7 @@ sensor:
 
         # --- Fast valve seal check ---
         # If the closed end stop is active but the raw pulse counter is still
-        # non-zero, the valve has not fully sealed. 10s threshold — tight
+        # non-zero, the valve has not fully sealed. 20s threshold — tight
         # because raw pulse data has no smoothing lag unlike water_usage1.
         # Alert cleared by water_usage1 when flow drops to zero (the smoothed
         # sensor is the right place to confirm sustained zero-flow).
@@ -1195,8 +1210,8 @@ sensor:
       sorting_group_id: group_main_status
       sorting_weight: 4
     filters:
-      # Step 1: Convert raw counts/min to L/min (6.6 pulses/litre × 60s = 396)
-      - lambda: return (x / 396);
+      # Step 1: Convert raw counts/min to L/min (flow_k_factor = 6.6 pulses/litre × 60s = 396)
+      - lambda: return (x / ${flow_k_factor});
       # Step 1b: Clamp — reject garbage values before they corrupt the smoothing
       # windows. Two classes of garbage are possible:
       #   HIGH: ADC float overflow produces values like 1.58e+36 L/min.
@@ -1333,7 +1348,7 @@ sensor:
         # Same logic as flow_base_main — see comments above.
         # Irrigation auto-shutoff fires on the irrigation valve only.
         - lambda: |-
-            float instant_lpm = x / 396.0f;
+            float instant_lpm = x / ${flow_k_factor}f;
             if (!id(fault_irrigation)
                 && id(alert_high_flow_irr)
                 && id(open_end_stop_valve2).state
@@ -1386,7 +1401,7 @@ sensor:
       sorting_group_id: group_irr_status
       sorting_weight: 4
     filters:
-      - lambda: return (x / 396);
+      - lambda: return (x / ${flow_k_factor});
       # Clamp — same guard as water_usage1; see comments there.
       - lambda: |-
           if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
@@ -2695,6 +2710,7 @@ script:
                             if (!id(leak_test_preparing_main)) return;
                             id(leak_test_preparing_main) = false;
                             id(leak_test_elapsed_main) = 0.0f;
+                            id(leak_test_start_ms_main) = millis();
                             id(leak_test_baseline_main) = id(pressure_main).state;
                             id(leak_test_active_main) = true;
                             id(leak_test_result_main) = 1;  // In progress
@@ -2765,6 +2781,7 @@ script:
                             if (!id(leak_test_preparing_irr)) return;
                             id(leak_test_preparing_irr) = false;
                             id(leak_test_elapsed_irr) = 0.0f;
+                            id(leak_test_start_ms_irr) = millis();
                             id(leak_test_baseline_irr) = id(pressure_irrigation).state;
                             id(leak_test_active_irr) = true;
                             id(leak_test_result_irr) = 1;  // In progress

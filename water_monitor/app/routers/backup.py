@@ -489,6 +489,10 @@ async def backup_page(request: Request):
     archive_est = event_rows * 200 + volume_rows * 50   # bytes
     # Full ZIP is roughly the SQLite file size (compressed)
     full_est    = int(db_size_bytes * 0.6)
+    # Quick restore is JSON — more verbose than binary; config rows ~350 B each,
+    # event rows ~500 B each, hourly volume rows ~120 B each.
+    settings_rows = sum(counts.get(t, 0) for t in QUICK_RESTORE_TABLES)
+    quick_est = settings_rows * 350 + event_rows * 500 + volume_rows * 120
 
     def fmt(b):
         if b >= 1_048_576: return f"{b/1_048_576:.1f} MB"
@@ -496,12 +500,13 @@ async def backup_page(request: Request):
         return f"{b} B"
 
     return _tmpl(request).TemplateResponse("backup.html", {
-        "request":          request,
-        "page":             "backup",
-        "counts":           counts,
-        "db_size":          fmt(db_size_bytes),
-        "archive_size_est": fmt(archive_est),
-        "full_size_est":    fmt(full_est),
-        "quick_tables":     QUICK_RESTORE_TABLES + QUICK_RESTORE_RECENT,
-        "history_tables":   HISTORY_ARCHIVE_TABLES,
+        "request":              request,
+        "page":                 "backup",
+        "counts":               counts,
+        "db_size":              fmt(db_size_bytes),
+        "quick_restore_size_est": fmt(quick_est),
+        "archive_size_est":     fmt(archive_est),
+        "full_size_est":        fmt(full_est),
+        "quick_tables":         QUICK_RESTORE_TABLES + QUICK_RESTORE_RECENT,
+        "history_tables":       HISTORY_ARCHIVE_TABLES,
     })

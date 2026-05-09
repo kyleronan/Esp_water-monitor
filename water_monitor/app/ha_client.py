@@ -2,8 +2,8 @@
 Home Assistant client.
 
 Provides:
-  - Persistent WebSocket connection for real-time state_changed events
-    (used by the event detector for pressure/flow monitoring)
+  - Persistent WebSocket connection using subscribe_entities for targeted
+    real-time updates (used by the event detector for pressure/flow monitoring)
   - Short-lived WebSocket connections for history queries
   - REST API for state reads, state publishing, and service calls
 """
@@ -99,24 +99,19 @@ class HaClient:
     async def _connect_and_listen(self) -> None:
         async with websockets.connect(WS_URL, max_size=2**24,
                                       ping_interval=30) as ws:
-            # Auth
             await self._auth(ws)
-            # Subscribe to state_changed for all registered entities
-            await self._subscribe_state_changed(ws)
+            sub_id = await self._subscribe_entity_states(ws)
             log.info("HA WebSocket connected, monitoring %d entities",
                      len(self._subscriptions))
 
-            # Listen loop
             while not self._stop_event.is_set():
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=60)
                 except asyncio.TimeoutError:
                     continue
                 msg = json.loads(raw)
-                if msg.get("type") == "event":
-                    event = msg.get("event", {})
-                    if event.get("event_type") == "state_changed":
-                        self._dispatch_state_changed(event.get("data", {}))
+                if sub_id and msg.get("type") == "event" and msg.get("id") == sub_id:
+                    self._dispatch_entity_change(msg.get("event", {}))
 
     async def _auth(self, ws) -> None:
         hello = json.loads(await ws.recv())
@@ -130,39 +125,52 @@ class HaClient:
         if result.get("type") != "auth_ok":
             raise RuntimeError(f"Auth failed: {result}")
 
-    async def _subscribe_state_changed(self, ws) -> None:
+    async def _subscribe_entity_states(self, ws) -> int:
+        """Subscribe to targeted entity state updates via subscribe_entities.
+
+        Returns the subscription message ID so the recv loop can match
+        incoming events. Returns 0 if there are no registered entity IDs.
+        """
+        entity_ids = list(self._subscriptions.keys())
+        if not entity_ids:
+            return 0
         msg_id = self._next_id()
         await ws.send(json.dumps({
             "id": msg_id,
-            "type": "subscribe_events",
-            "event_type": "state_changed",
+            "type": "subscribe_entities",
+            "entity_ids": entity_ids,
         }))
-        # Wait for subscription confirmation — timeout prevents hanging
-        # forever on a network stall during connection setup.
+        # Wait for subscription confirmation.
         while True:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=15)
             except asyncio.TimeoutError:
                 raise RuntimeError(
-                    "Timeout waiting for subscribe_events confirmation")
+                    "Timeout waiting for subscribe_entities confirmation")
             msg = json.loads(raw)
             if msg.get("id") == msg_id:
                 if msg.get("type") == "result" and msg.get("success"):
-                    return
-                raise RuntimeError(f"Subscribe failed: {msg}")
+                    return msg_id
+                raise RuntimeError(f"subscribe_entities failed: {msg}")
 
-    def _dispatch_state_changed(self, data: dict) -> None:
-        entity_id = data.get("entity_id", "")
-        new_state = data.get("new_state") or {}
-        state = new_state.get("state", "")
-        attributes = new_state.get("attributes", {})
+    def _dispatch_entity_change(self, event: dict) -> None:
+        """Dispatch subscribe_entities change events to registered callbacks.
 
-        callbacks = self._subscriptions.get(entity_id, [])
-        for cb in callbacks:
-            try:
-                cb(entity_id, state, attributes)
-            except Exception as e:
-                log.error("Callback error for %s: %s", entity_id, e)
+        HA sends changes as: {"c": {"entity_id": {"+": {"s": state, "a": attrs}}}}
+        Attributes are partial (only changed keys) — callbacks that need only
+        the state value are unaffected.
+        """
+        for entity_id, diff in event.get("c", {}).items():
+            changes = diff.get("+", {})
+            if not changes:
+                continue
+            state = changes.get("s", "")
+            attributes = changes.get("a", {})
+            for cb in self._subscriptions.get(entity_id, []):
+                try:
+                    cb(entity_id, state, attributes)
+                except Exception as e:
+                    log.error("Callback error for %s: %s", entity_id, e)
 
     def _next_id(self) -> int:
         self._ws_msg_id += 1

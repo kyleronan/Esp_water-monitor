@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # Checked against the device registry sw_version field (set via project.version
 # in the ESPHome YAML). Non-numeric versions (e.g. "dev") are treated as unknown
 # — setup is not blocked, but a warning is shown.
-MIN_FIRMWARE_VERSION: tuple = (3, 5, 0)
+MIN_FIRMWARE_VERSION: tuple = (3, 5, 1)
 
 # Roles that are optional — wizard will show them as optional dropdowns
 # and they won't block setup completion if unmatched.
