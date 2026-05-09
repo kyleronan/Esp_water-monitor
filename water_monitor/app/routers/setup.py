@@ -133,10 +133,14 @@ async def setup_restore(request: Request):
     try:
         with db:
             for tbl in groups_to_restore:
+                # Always clear the table first so the DB reflects the exact
+                # state of the backup — stale rows from a prior restore cannot
+                # bleed through when the backup has an empty array or the table
+                # is absent from the backup entirely.
+                db.execute(f"DELETE FROM {tbl}")
                 rows = tables.get(tbl)
                 if not rows:
                     continue
-                db.execute(f"DELETE FROM {tbl}")
                 # Filter backup columns against live schema so old backups with
                 # removed columns (e.g. monthly_budget_litres) restore cleanly.
                 valid_cols = {r[1] for r in db.execute(
