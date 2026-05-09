@@ -334,6 +334,9 @@ async def setup_discover(device_id: str, request: Request):
             for m in matches
         ]
 
+    from ..device_discovery import MIN_FIRMWARE_VERSION
+    min_fw = ".".join(str(x) for x in MIN_FIRMWARE_VERSION)
+
     return _tmpl(request).TemplateResponse("setup.html", {
         "request": request,
         "step": 3,
@@ -350,6 +353,7 @@ async def setup_discover(device_id: str, request: Request):
         "all_matched": result.all_matched,
         "unmatched_roles": result.unmatched_roles,
         "prefix": prefix,
+        "min_fw": min_fw,
         "page": "setup",
     })
 
@@ -612,6 +616,8 @@ def _device_to_dict(d: DiscoveredDevice) -> Dict[str, Any]:
         "model": d.model or "",
         "manufacturer": d.manufacturer or "",
         "is_esphome": d.is_esphome,
+        "sw_version": d.sw_version or "",
+        "firmware_ok": d.firmware_ok,
     }
 
 

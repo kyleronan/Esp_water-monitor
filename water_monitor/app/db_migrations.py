@@ -659,6 +659,15 @@ def _migrate_021(conn: sqlite3.Connection) -> None:
     log.info("Migration 021: UNIQUE(circuit, start_ts) index created")
 
 
+def _migrate_022(conn: sqlite3.Connection) -> None:
+    """Add fw_version to device_config for firmware version tracking."""
+    try:
+        conn.execute("ALTER TABLE device_config ADD COLUMN fw_version TEXT")
+    except sqlite3.OperationalError:
+        pass   # column already exists (idempotent)
+    log.info("Migration 022: added fw_version to device_config")
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -681,6 +690,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (19, _migrate_019),
     (20, _migrate_020),
     (21, _migrate_021),
+    (22, _migrate_022),
 ]
 
 

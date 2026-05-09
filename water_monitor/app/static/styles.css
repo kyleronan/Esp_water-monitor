@@ -279,6 +279,9 @@ details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
 
 /* ── Badge ────────────────────────────────────────────────────────── */
 .badge { padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: .01em; }
+.badge-warn { background: var(--amber-bg); color: var(--amber-text); margin-left: 4px; }
+.callout { padding: .75rem 1rem; border-radius: 6px; border-left: 3px solid; font-size: .875rem; }
+.callout-warn { background: var(--amber-bg); color: var(--amber-text); border-color: var(--amber); }
 /* ── Misc ─────────────────────────────────────────────────────────── */
 .muted { color: var(--muted); font-size: .8rem; }
 /* ── Setup wizard ─────────────────────────────────────────────────── */
