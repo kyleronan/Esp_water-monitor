@@ -70,7 +70,10 @@ that's great. I'm probably not going to build another one for myself.
   circuits, displayed in the units you choose (L/min · gal/min · ft³/min ·
   m³/min, and PSI · bar · kPa)
 - **Learned baseline** — 14-day calibration period during which the addon
-  watches your normal usage patterns, then uses that to detect anomalies
+  watches your normal usage patterns. When training ends, the Fixtures
+  page lists the clusters that were detected; you confirm or remove them,
+  then activate the circuit to start anomaly detection (or auto-activates
+  after 7 days of no review).
 - **Scheduled micro leak tests** — closes each valve in turn at the
   statistically quietest hour of the day, monitors pressure decay, and notifies
   on failure
