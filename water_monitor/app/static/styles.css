@@ -1703,8 +1703,9 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   padding: 1px 5px; border-radius: 999px;
   flex-shrink: 0;
 }
-.sett-nav-badge.badge-live { background: var(--green-bg);   color: var(--green-text); }
-.sett-nav-badge.badge-cal  { background: var(--accent-bg2); color: var(--accent); }
+.sett-nav-badge.badge-live   { background: var(--green-bg);   color: var(--green-text); }
+.sett-nav-badge.badge-cal    { background: var(--accent-bg2); color: var(--accent); }
+.sett-nav-badge.badge-review { background: var(--amber-bg);   color: var(--amber-text); }
 /* ── Mobile: sidebar becomes horizontal tab strip ───────────────── */
 @media (max-width: 640px) {
   .sett-layout { flex-direction: column; margin: -20px -24px; }
@@ -1970,6 +1971,26 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   font-size: 13px; color: var(--amber-text);
   margin-bottom: 20px;
 }
+/* Stronger emphasis when at least one circuit is in labelling phase —
+   this is a call to action, not a passive review prompt. */
+.fx-review-banner.fx-review-banner--labelling {
+  background: oklch(96% .04 240);
+  border-color: oklch(72% .14 240);
+  color: oklch(35% .14 240);
+}
+
+/* Labelling-phase callout (per-circuit) — "training complete, please review
+   then activate".  Sits between the circuit heading and the cluster grid. */
+.fx-labelling-callout {
+  background: oklch(98% .025 240);
+  border: 1px solid oklch(82% .12 240);
+  border-left: 4px solid oklch(60% .18 240);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  font-size: 13px; color: var(--text);
+}
+.fx-labelling-callout p { color: var(--text); }
 
 /* Circuit section heading */
 .fx-circuit-heading {

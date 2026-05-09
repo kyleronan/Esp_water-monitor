@@ -7,8 +7,10 @@
 <div class="fx-msg fx-msg-ok">Clustering complete — clusters updated below.</div>
 {% elif msg == 'too_few_events' %}
 <div class="fx-msg fx-msg-warn">Not enough events yet (need 150+). Keep collecting data and try again.</div>
+{% elif msg == 'activated' %}
+<div class="fx-msg fx-msg-ok">Fixtures activated — circuit is now live.</div>
 {% elif msg == 'error' %}
-<div class="fx-msg fx-msg-err">Clustering failed — check the addon log for details.</div>
+<div class="fx-msg fx-msg-err">Action failed — check the addon log for details.</div>
 {% endif %}
 
 {# ── Page header ──────────────────────────────────────────────────────── #}
@@ -29,16 +31,47 @@
 
 {# ── Review banner ────────────────────────────────────────────────────── #}
 {% if total_unreviewed > 0 %}
-<div class="fx-review-banner">
+<div class="fx-review-banner{% if any_labelling %} fx-review-banner--labelling{% endif %}">
   ⚠️ <strong>{{ total_unreviewed }} cluster{{ 's' if total_unreviewed != 1 else '' }}</strong>
-  need{{ '' if total_unreviewed != 1 else 's' }} your review — confirm or remove them below.
+  {% if any_labelling %}
+    need{{ '' if total_unreviewed != 1 else 's' }} review — confirm below, then activate the circuit.
+  {% else %}
+    need{{ '' if total_unreviewed != 1 else 's' }} your review — confirm or remove them below.
+  {% endif %}
 </div>
 {% endif %}
 
 {# ── Per-circuit sections ─────────────────────────────────────────────── #}
 {% for circ in circuits %}
 
-<h2 class="fx-circuit-heading">{{ circ.display_name }}</h2>
+<h2 class="fx-circuit-heading">
+  {{ circ.display_name }}
+  {% if circ.training_state == 'labelling' %}
+  <span class="pill pill-amber" style="margin-left:8px;font-size:11px;font-weight:500">
+    awaiting review
+  </span>
+  {% endif %}
+</h2>
+
+{% if circ.training_state == 'labelling' %}
+  <div class="fx-labelling-callout">
+    <p style="margin:0 0 8px 0">
+      <strong>Training complete.</strong> Confirm the fixtures below, then
+      activate this circuit to start anomaly detection.
+    </p>
+    <form method="post"
+          action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/activate"
+          style="display:inline">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button type="submit" class="btn btn-primary btn-sm">
+        Activate fixtures →
+      </button>
+    </form>
+    <span class="muted" style="font-size:11px;margin-left:10px">
+      Auto-activates after 7 days if no review.
+    </span>
+  </div>
+{% endif %}
 
 {# Exclusion window status — shown when the user opened a plumbing-flush window #}
 {% if circ.active_exclusion %}

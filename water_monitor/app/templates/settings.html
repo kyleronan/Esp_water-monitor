@@ -20,9 +20,12 @@
       {% if c.training.state %}
       <span class="sett-nav-badge
         {%- if c.training.state == 'live' %} badge-live
+        {%- elif c.training.state == 'labelling' %} badge-review
         {%- elif c.training.state == 'calibrating' %} badge-cal
         {%- endif %}">
-        {{ 'learning' if c.training.state == 'calibrating' else c.training.state }}
+        {{- 'learning'  if c.training.state == 'calibrating'
+          else 'review' if c.training.state == 'labelling'
+          else c.training.state -}}
       </span>
       {% endif %}
     </button>
@@ -133,10 +136,12 @@
         <h2 class="sett-section-title">{{ c.display_name }}</h2>
         <span class="pill
           {%- if c.training.state == 'live' %} pill-green
+          {%- elif c.training.state == 'labelling' %} pill-amber
           {%- elif c.training.state == 'calibrating' %} pill-blue
           {%- else %} pill-neutral
           {%- endif %}">
-          {{ c.training.state | title }}
+          {{- 'Awaiting Review' if c.training.state == 'labelling'
+              else c.training.state | title -}}
         </span>
       </div>
       <p class="sett-section-desc">Circuit-specific detection and alert settings.</p>

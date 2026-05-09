@@ -118,6 +118,23 @@ class ClusterEngine:
             log.debug("[%s] type cache: %d confirmed fixtures",
                       circuit, len(cache))
 
+    def reset_circuit(self, circuit: str) -> None:
+        """
+        Clear all in-memory state for one circuit and re-seed from DB.
+
+        Called by training_manager.start_calibration() when a new
+        calibration cycle begins, so DBSTREAM and the scaler don't carry
+        over state from the previous run that has just had its
+        unconfirmed clusters wiped.
+
+        Confirmed clusters in fixture_clusters (fixture_id IS NOT NULL)
+        are unaffected — only the in-memory DBSTREAM, scaler,
+        river_id_map and next_cluster_id sequence are reset.  The
+        next_cluster_id is re-derived from MAX(id) across surviving
+        rows so confirmed cluster IDs don't collide.
+        """
+        self._init_circuit(circuit)
+
     # ── Feature extraction ─────────────────────────────────────────────────────
 
     def _extract_features(self, event: dict) -> Optional[Dict[str, float]]:
