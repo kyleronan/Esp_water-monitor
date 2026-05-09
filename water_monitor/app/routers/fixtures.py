@@ -113,6 +113,11 @@ async def confirm_cluster(request: Request, circuit: str, cluster_id: int):
         fp = getattr(orch, "_fixture_publisher", None)
         if fp:
             fp.publish_fixture(fixture_id)
+    # Notify the cluster engine so the type-aware match gate takes effect
+    # immediately — no restart needed.
+    engine = orch.cluster_engine
+    if engine:
+        engine.notify_fixture_confirmed(circuit, cluster_id, fixture_type)
     return ingress_redirect(request, "/fixtures")
 
 
@@ -128,6 +133,11 @@ async def delete_cluster_endpoint(request: Request, circuit: str, cluster_id: in
         fp = getattr(orch, "_fixture_publisher", None)
         if fp:
             fp.retract_fixture(fixture_id)
+    # Drop the cluster from the type cache so the gate no longer applies
+    # to any subsequent river center that re-maps to this slot.
+    engine = orch.cluster_engine
+    if engine:
+        engine.notify_fixture_removed(circuit, cluster_id)
     return ingress_redirect(request, "/fixtures")
 
 
