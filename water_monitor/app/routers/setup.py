@@ -362,13 +362,25 @@ async def setup_confirm(device_id: str, request: Request):
     orch = _orch(request)
     form = await request.form()
 
-    # Update any manually-overridden entity IDs
+    # Update any manually-overridden entity IDs.
+    # Validate circuit and role against the known ROLE_PATTERNS allowlist so
+    # arbitrary form fields cannot inject unrecognised column names or circuits.
+    from ..device_discovery import ROLE_PATTERNS
+    _valid_circuits = set(ROLE_PATTERNS.keys())
+    # Union of all role names across every circuit type
+    _valid_roles = {r for roles in ROLE_PATTERNS.values() for r in roles}
+
     for key, value in form.items():
         # Form fields are named: circuit__role  e.g. main__flow_sensor
         if "__" in key and value:
             parts = key.split("__", 1)
             if len(parts) == 2:
                 circuit, role = parts
+                if circuit not in _valid_circuits or role not in _valid_roles:
+                    log.warning(
+                        "setup_confirm: ignoring unknown circuit/role pair "
+                        "%r/%r", circuit, role)
+                    continue
                 orch.db.execute("""
                     INSERT INTO circuit_entity_map (circuit, role, entity_id, confirmed)
                     VALUES (?, ?, ?, 1)

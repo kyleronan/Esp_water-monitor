@@ -237,7 +237,12 @@ class DataPruner:
                         ON ds.circuit = e.circuit
                         AND ds.day    = date(e.start_ts)
                     WHERE (ds.day IS NULL
-                           OR ds.computed_at < date(e.start_ts, '+1 day'))
+                           -- Wrap computed_at in date() so an ISO timestamp
+                           -- ('2026-05-03T12:00:00+00:00') compares correctly
+                           -- against a plain date string ('2026-05-04').
+                           -- Without date(), 'T' > '-' in ASCII causes the
+                           -- comparison to silently fail for same-day rows.
+                           OR date(ds.computed_at) < date(e.start_ts, '+1 day'))
                       AND date(e.start_ts) BETWEEN ? AND ?
                     GROUP BY e.circuit, date(e.start_ts)
                     ORDER BY e.circuit, day ASC

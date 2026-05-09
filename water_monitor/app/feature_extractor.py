@@ -443,7 +443,24 @@ class FeatureExtractor:
                 log.error("[%s] cluster matching failed: %s", circuit, e,
                           exc_info=True)
 
-        # 3. Write results back to the event row
+        # 3. Derive anomaly_score and store it in features so the alert
+        #    check in _process() can read it.  anomaly_score is intentionally
+        #    NOT stored in the events table — it is ephemeral and recalculated
+        #    by the live match path only; backfill uses match_confidence directly.
+        #    High score = anomalous:
+        #      • no match at all           → 1.0
+        #      • poor confidence match     → 1.0 - confidence
+        #      • good confidence match     → near 0.0
+        if match_confidence is not None:
+            features["anomaly_score"] = round(1.0 - match_confidence, 3)
+        elif cluster_id_result is None and match_rejection_reason not in (
+            "type_gate_rejected", "excluded_from_training"
+        ):
+            # Unmatched event in live state with no explicit rejection reason
+            # — treat as fully anomalous.
+            features["anomaly_score"] = 1.0
+
+        # Write cluster results back to the event row
         self._db.execute(
             """UPDATE events SET
                  cluster_id               = ?,

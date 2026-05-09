@@ -255,12 +255,18 @@ class TrainingManager:
         # Clear all per-circuit data so history charts and volume totals
         # start fresh — daily_summary and import_state are included so the
         # importer re-scans and the chart doesn't show pre-reset data.
+        # fixture_clusters is cleared too: a full recalibration resets the
+        # DBSTREAM engine (via start_calibration → reset_circuit), so any
+        # confirmed cluster centroids left in the DB would be inconsistent
+        # with the empty in-memory model — new events would be type-gate-
+        # rejected instead of matched against the stale centroid rows.
         for table, col in [
-            ("events",          "circuit"),
-            ("hourly_volume",   "circuit"),
-            ("daily_summary",   "circuit"),
-            ("import_state",    "circuit"),
-            ("volume_snapshots","circuit"),
+            ("events",           "circuit"),
+            ("hourly_volume",    "circuit"),
+            ("daily_summary",    "circuit"),
+            ("import_state",     "circuit"),
+            ("volume_snapshots", "circuit"),
+            ("fixture_clusters", "circuit"),  # must come before start_calibration
         ]:
             try:
                 self._db.execute(

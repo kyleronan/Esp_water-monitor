@@ -388,32 +388,23 @@ class Orchestrator:
         level = row["simple_level"] or "medium"
         preset = SENSITIVITY_PRESETS.get(level, SENSITIVITY_PRESETS["medium"])
 
+        # Use `is not None` rather than truthiness — 0.0 is a valid user-set
+        # threshold but is falsy, so `row[x] or preset[x]` would silently
+        # revert a user-set zero back to the preset value.
+        def _eff(key: str):
+            v = row[key]
+            return v if v is not None else preset[key]
+
         return {
-            "pressure_drop_event_psi": (
-                row["pressure_drop_event_psi"]
-                or preset["pressure_drop_event_psi"]
-            ),
-            "min_event_duration_seconds": (
-                row["min_event_duration_seconds"]
-                or preset["min_event_duration_seconds"]
-            ),
-            "score_alert": row["score_alert"] or preset["score_alert"],
-            "score_shutoff": row["score_shutoff"] or preset["score_shutoff"],
-            "flow_tolerance_pct": (
-                row["flow_tolerance_pct"] or preset["flow_tolerance_pct"]
-            ),
-            "duration_tolerance_pct": (
-                row["duration_tolerance_pct"] or preset["duration_tolerance_pct"]
-            ),
-            "schedule_window_minutes": (
-                row["schedule_window_minutes"] or preset["schedule_window_minutes"]
-            ),
-            "sustained_alert_minutes": (
-                row["sustained_alert_minutes"] or preset["sustained_alert_minutes"]
-            ),
-            "max_shutoffs_per_12h": (
-                row["max_shutoffs_per_12h"] or preset["max_shutoffs_per_12h"]
-            ),
+            "pressure_drop_event_psi":    _eff("pressure_drop_event_psi"),
+            "min_event_duration_seconds": _eff("min_event_duration_seconds"),
+            "score_alert":                _eff("score_alert"),
+            "score_shutoff":              _eff("score_shutoff"),
+            "flow_tolerance_pct":         _eff("flow_tolerance_pct"),
+            "duration_tolerance_pct":     _eff("duration_tolerance_pct"),
+            "schedule_window_minutes":    _eff("schedule_window_minutes"),
+            "sustained_alert_minutes":    _eff("sustained_alert_minutes"),
+            "max_shutoffs_per_12h":       _eff("max_shutoffs_per_12h"),
         }
 
     def get_live_state(self, circuit: str) -> Dict[str, Any]:

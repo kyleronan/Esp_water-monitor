@@ -118,6 +118,82 @@ with different `id` values and `created_at` timestamps spanning several days.
   BUG-04). Wrapped in `with db:`. Added `normalize_events_utc()` +
   `dedup_events()` after events import (same as the main restore path).
 
+#### Second-tier bug fixes and suspicious-pattern cleanup
+
+- **`orchestrator.py` — zero sensitivity thresholds silently reset to preset**
+  (`BUG-09`): `_get_sensitivity` used `row[x] or preset[x]` to merge DB
+  values with preset defaults. `0.0` is falsy, so a user-set threshold of
+  `0.0` (valid — disables a trigger) always reverted to the preset. Changed
+  to `value if value is not None else preset[key]`.
+
+- **`event_detector.py` — pressure recalculation skipped for zero-baseline
+  systems** (`BUG-12`): `if ev.pre_event_pressure_psi` is falsy when baseline
+  is 0.0, so min/delta pressure were never recomputed for unpressurised
+  systems. Changed to `is not None`.
+
+- **`main.py` — leaked DB connection after migrations** (`BUG-13`): `lifespan`
+  opens a connection, runs migrations, then discards it without closing. The
+  abandoned handle held a shared lock and prevented WAL checkpointing.
+  Wrapped in `try/finally: _db.close()`.
+
+- **`data_pruner.py` — stale daily summaries never recomputed** (`BUG-14`):
+  `ds.computed_at < date(e.start_ts, '+1 day')` compares a full ISO timestamp
+  string against a plain `YYYY-MM-DD` string. `'T' (84) > '-' (32)` in ASCII,
+  so same-day rows were never considered stale. Wrapped `computed_at` in
+  `date()` for a clean date-vs-date comparison.
+
+- **`ha_client.py` — WebSocket recv loops hang forever on network stall**
+  (`BUG-15`): `_subscribe_state_changed` and `ws_request` used unbounded
+  `while True: await ws.recv()` loops with no timeout. A network stall during
+  connection setup or a one-shot query would block the event loop indefinitely.
+  Added `asyncio.wait_for(ws.recv(), timeout=15/30)` with descriptive
+  `TimeoutError` messages.
+
+- **`historical_importer.py` — import hangs on full event queue** (`BUG-16`):
+  `await self._event_queue.put(raw)` blocks forever when the queue is full
+  (identical pattern to BUG-02). Changed to `put_nowait` with a `QueueFull`
+  warning; dropped events are re-attempted on the next catch-up cycle.
+
+- **`feature_extractor.py` — anomaly alert branch permanently dead code**
+  (`BUG-17`): `features.get("anomaly_score")` was always `None/absent` because
+  nothing set it — the alert check after `_cluster_event` never fired.
+  `_cluster_event` now derives `anomaly_score = 1.0 - match_confidence` from
+  the cluster match result and stores it in `features`. Events rejected by
+  type-gate or excluded from training do not set the score (they are not
+  anomalous — they are simply not yet matched).
+
+- **`training_manager.py` — full recalibration leaves stale confirmed
+  centroids** (`BUG-19`): `trigger_full_recalibration` cleared events and
+  volume data but not `fixture_clusters`. The in-memory DBSTREAM was reset by
+  `start_calibration → reset_circuit`, leaving confirmed centroid rows in the
+  DB with no in-memory counterpart. New events were then type-gate-rejected
+  instead of matched. Added `("fixture_clusters", "circuit")` to the deletion
+  list so the DB and engine state are always consistent after a full reset.
+
+- **`routers/settings.py` — non-numeric retention form input raises 500**
+  (`BUG-20`): bare `int(form.get("events_retain_years", 1))` raises
+  `ValueError` on any non-numeric or empty submission. Added a local `_int()`
+  helper that returns the default on conversion failure.
+
+- **`database.py` — `update_home_profile` SQL injection via unvalidated keys**
+  (`SUSP-02`): column names were interpolated directly into SQL from `kwargs`
+  with no allowlist. Added `_HOME_PROFILE_COLUMNS` frozenset; unknown keys
+  raise `ValueError` before reaching the DB layer.
+
+- **`device_discovery.py` — deprecated `datetime.utcnow()`** (`SUSP-06`):
+  replaced two `datetime.utcnow().isoformat()` calls with timezone-aware
+  `datetime.now(timezone.utc).isoformat()`.
+
+- **`routers/setup.py` — form circuit/role written to DB without validation**
+  (`SUSP-07`): any form field containing `__` was split into `circuit__role`
+  and written directly to `circuit_entity_map`. Added validation against
+  `ROLE_PATTERNS` (the authoritative allowlist from `device_discovery.py`);
+  unknown circuit or role pairs are logged and skipped.
+
+- **`main.py` — `import re` on every request** (`SUSP-09`): `import re`
+  was inside the middleware function body, re-executed on every HTTP request.
+  Moved to module level (`import re as _re`).
+
 ---
 
 ## [0.2.0-rc1] — 2026-05-08

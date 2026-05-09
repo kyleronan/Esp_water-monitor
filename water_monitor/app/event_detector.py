@@ -382,7 +382,9 @@ class CircuitEventDetector:
             return
 
         ev.end_ts = ts
-        if ev.pressure_readings and ev.pre_event_pressure_psi:
+        # Use `is not None` — pre_event_pressure_psi defaults to 0.0,
+        # which is falsy but valid for zero-baseline (unpressurised) systems.
+        if ev.pressure_readings and ev.pre_event_pressure_psi is not None:
             ev.min_pressure_psi = min(ev.pressure_readings)
             ev.pressure_delta_psi = ev.pre_event_pressure_psi - ev.min_pressure_psi
         ev.complete = True
