@@ -162,6 +162,7 @@ async def settings_page(request: Request):
             }
         )
 
+        from ..database import get_active_exclusion_window
         circuits.append({
             "circuit": c,
             "display_name": circuit_cfg.display_name,
@@ -171,6 +172,7 @@ async def settings_page(request: Request):
             "alerts": alerts,
             "training": training,
             "device_entities": entities_by_circuit.get(c, []),
+            "active_exclusion": get_active_exclusion_window(orch.db, c),
         })
 
     # MQTT status for the Integrations section status pill
@@ -520,6 +522,42 @@ async def integrations_update(request: Request):
     )
     orch.db.commit()
     return ingress_redirect(request, "/settings")
+
+
+# ------------------------------------------------------------------
+# Plumbing-event exclusion windows
+# ------------------------------------------------------------------
+
+@router.post("/circuit/{circuit}/exclusion_window")
+async def start_exclusion_window(request: Request, circuit: str):
+    """Open an exclusion window so events during a plumbing flush are not
+    used for fixture training.  Duration: 5–60 min (clamped server-side)."""
+    from ..database import create_exclusion_window
+    form    = await request.form()
+    minutes = int(form.get("minutes") or 15)
+    minutes = max(5, min(60, minutes))
+    reason  = (form.get("reason") or "plumbing").strip() or "plumbing"
+    create_exclusion_window(_orch(request).db, circuit, minutes, reason)
+    log.info("[%s] exclusion window started — %d min (%s)", circuit, minutes, reason)
+    return ingress_redirect(request, "/settings#maintenance")
+
+
+@router.post("/circuit/{circuit}/exclusion_window/cancel")
+async def cancel_exclusion_window_endpoint(request: Request, circuit: str):
+    """End the active exclusion window immediately."""
+    from ..database import cancel_exclusion_window
+    cancel_exclusion_window(_orch(request).db, circuit)
+    log.info("[%s] exclusion window cancelled", circuit)
+    return ingress_redirect(request, "/settings#maintenance")
+
+
+@router.post("/circuit/{circuit}/exclusion_window/extend")
+async def extend_exclusion_window_endpoint(request: Request, circuit: str):
+    """Add 15 minutes to the active exclusion window (capped at 60 min from start)."""
+    from ..database import extend_exclusion_window
+    extend_exclusion_window(_orch(request).db, circuit, extra_minutes=15)
+    log.info("[%s] exclusion window extended +15 min", circuit)
+    return ingress_redirect(request, "/settings#maintenance")
 
 
 @router.get("/units/detect")

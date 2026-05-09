@@ -48,12 +48,14 @@ async def fixtures_page(request: Request):
 
         unreviewed = sum(1 for cl in clusters if not cl.get("fixture_id"))
         total_unreviewed += unreviewed
+        from ..database import get_active_exclusion_window
         circuits_ctx.append({
             "circuit":          c,
             "display_name":     circ_cfg.display_name,
             "training_state":   training.get("state", "idle"),
             "clusters":         clusters,
             "unreviewed_count": unreviewed,
+            "active_exclusion": get_active_exclusion_window(orch.db, c),
         })
 
     return _tmpl(request).TemplateResponse("fixtures.html", {

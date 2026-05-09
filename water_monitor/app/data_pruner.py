@@ -176,6 +176,18 @@ class DataPruner:
             log.error("Pruning cluster_metrics_history: %s", e)
             deleted["cluster_metrics_history"] = 0
 
+        # circuit_exclusion_windows — transient state, keep 30 days
+        excl_cutoff = (now - timedelta(days=30)).isoformat()
+        try:
+            cur = self._db.execute(
+                "DELETE FROM circuit_exclusion_windows WHERE ends_at < ?",
+                (excl_cutoff,)
+            )
+            deleted["circuit_exclusion_windows"] = cur.rowcount
+        except Exception as e:
+            log.error("Pruning circuit_exclusion_windows: %s", e)
+            deleted["circuit_exclusion_windows"] = 0
+
         # Step 5: compute per-fixture daily summaries for any gaps
         self._compute_fixture_daily_summaries(now)
 
