@@ -10,6 +10,7 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import logging
@@ -45,6 +46,7 @@ class HaClient:
         self._subscriptions: Dict[str, List[StateCallback]] = {}
         self._ws_msg_id = 1
         self._ws_lock = asyncio.Lock()
+        self._ws_oneshot: Optional[Any] = None   # persistent connection for ws_request
         self._running = False
         self._stop_event = asyncio.Event()
 
@@ -57,6 +59,9 @@ class HaClient:
 
     async def __aexit__(self, *args) -> None:
         self._stop_event.set()
+        if self._ws_oneshot:
+            with contextlib.suppress(Exception):
+                await self._ws_oneshot.close()
         if self._http:
             await self._http.close()
 
@@ -181,30 +186,36 @@ class HaClient:
     # ------------------------------------------------------------------
     async def ws_request(self, msg_type: str, **kwargs) -> Any:
         """
-        Make a single request/response WebSocket call.
-        Opens a short-lived connection, authenticates, sends the
-        message, waits for the result, then closes.
+        Make a single request/response WebSocket call using a persistent
+        connection. The connection is established lazily on first use and
+        reused for subsequent calls (avoiding a full auth handshake per
+        request). Reconnects transparently on failure.
         Used for registry queries and other one-off requests.
         """
         async with self._ws_lock:
-            async with websockets.connect(WS_URL, max_size=2**24) as ws:
-                await self._auth(ws)
-                msg_id = self._next_id()
-                payload = {"id": msg_id, "type": msg_type, **kwargs}
-                await ws.send(json.dumps(payload))
-                # Timeout prevents hanging forever on a network stall.
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                    except asyncio.TimeoutError:
+            # Lazy connect / reconnect on closed or failed connection
+            if self._ws_oneshot is None or not self._ws_oneshot.open:
+                if self._ws_oneshot is not None:
+                    with contextlib.suppress(Exception):
+                        await self._ws_oneshot.close()
+                self._ws_oneshot = await websockets.connect(WS_URL, max_size=2**24)
+                await self._auth(self._ws_oneshot)
+            ws = self._ws_oneshot
+            msg_id = self._next_id()
+            await ws.send(json.dumps({"id": msg_id, "type": msg_type, **kwargs}))
+            # Timeout prevents hanging forever on a network stall.
+            while True:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"Timeout waiting for WS response to '{msg_type}'")
+                msg = json.loads(raw)
+                if msg.get("id") == msg_id:
+                    if not msg.get("success"):
                         raise RuntimeError(
-                            f"Timeout waiting for WS response to '{msg_type}'")
-                    msg = json.loads(raw)
-                    if msg.get("id") == msg_id:
-                        if not msg.get("success"):
-                            raise RuntimeError(
-                                f"WS request '{msg_type}' failed: {msg}")
-                        return msg.get("result")
+                            f"WS request '{msg_type}' failed: {msg}")
+                    return msg.get("result")
 
     async def get_devices(self) -> List[Dict[str, Any]]:
         """Return all devices from the HA device registry."""

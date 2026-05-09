@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import re as _re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,12 +15,54 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .config import load_config
+from .database import generate_csrf_token
 from .db_migrations import run_migrations
 from .orchestrator import Orchestrator
 from .routers import dashboard, device, history, fixtures, settings, setup, backup
+from .units import build_unit_context, load_unit_context
 
 APP_DIR = Path(__file__).resolve().parent
 log = logging.getLogger(__name__)
+
+
+class IngressTemplates(Jinja2Templates):
+    """Jinja2Templates that auto-injects ingress_path, CSRF token, and unit
+    context into every template response."""
+
+    # Cache one CSRF token per process — rotated every hour
+    _csrf_cache: dict = {"token": None, "expires": 0}
+
+    def TemplateResponse(self, name, context, **kwargs):
+        request = context.get("request")
+        orch_ref = None
+        if request:
+            context.setdefault(
+                "ingress_path",
+                getattr(request.state, "ingress_path", "")
+            )
+            # Return a cached CSRF token — generate a new one only when
+            # the cache is empty or the token has expired (1 hour).
+            # This avoids a DB write on every page render while still
+            # rotating tokens regularly.
+            now = time.time()
+            cache = IngressTemplates._csrf_cache
+            orch_ref = getattr(request.app.state, "orchestrator", None)
+            if not cache["token"] or now > cache["expires"]:
+                if orch_ref:
+                    cache["token"]   = generate_csrf_token(orch_ref.db)
+                    cache["expires"] = now + 3600  # 1 hour
+            context.setdefault("csrf_token", cache["token"] or "")
+        # Inject unit conversion context so every template and the JS
+        # window.UNITS global have the correct factors and labels.
+        if orch_ref and orch_ref.db:
+            uc = load_unit_context(orch_ref.db)
+            for k, v in uc.items():
+                context.setdefault(k, v)
+        else:
+            # Fallback defaults before DB is ready
+            for k, v in build_unit_context("L/min", "psi").items():
+                context.setdefault(k, v)
+        return super().TemplateResponse(name, context, **kwargs)
 
 
 @asynccontextmanager
@@ -60,48 +103,6 @@ async def lifespan(app: FastAPI):
         log.error("DB migration error (non-fatal): %s", e)
     finally:
         _db.close()
-
-    # Custom Jinja2Templates that automatically injects ingress_path
-    # into every template context so nav links and form actions work
-    # correctly behind the HA ingress proxy.
-    class IngressTemplates(Jinja2Templates):
-        # Cache one CSRF token per process — rotated every hour
-        _csrf_cache: dict = {"token": None, "expires": 0}
-
-        def TemplateResponse(self, name, context, **kwargs):
-            request = context.get("request")
-            if request:
-                context.setdefault(
-                    "ingress_path",
-                    getattr(request.state, "ingress_path", "")
-                )
-                # Return a cached CSRF token — generate a new one only when
-                # the cache is empty or the token has expired (1 hour).
-                # This avoids a DB write on every page render while still
-                # rotating tokens regularly.
-                import time
-                now = time.time()
-                cache = IngressTemplates._csrf_cache
-                orch_ref = getattr(request.app.state, "orchestrator", None)
-                if not cache["token"] or now > cache["expires"]:
-                    if orch_ref:
-                        from .database import generate_csrf_token
-                        cache["token"]   = generate_csrf_token(orch_ref.db)
-                        cache["expires"] = now + 3600  # 1 hour
-                context.setdefault("csrf_token", cache["token"] or "")
-            # Inject unit conversion context so every template and the JS
-            # window.UNITS global have the correct factors and labels.
-            if orch_ref and orch_ref.db:
-                from .units import load_unit_context
-                uc = load_unit_context(orch_ref.db)
-                for k, v in uc.items():
-                    context.setdefault(k, v)
-            else:
-                # Fallback defaults before DB is ready
-                from .units import build_unit_context
-                for k, v in build_unit_context("L/min", "psi").items():
-                    context.setdefault(k, v)
-            return super().TemplateResponse(name, context, **kwargs)
 
     app.state.templates = IngressTemplates(
         directory=str(APP_DIR / "templates"))

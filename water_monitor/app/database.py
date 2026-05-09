@@ -762,20 +762,37 @@ def get_training_state(conn: sqlite3.Connection, circuit: str) -> Optional[sqlit
     ).fetchone()
 
 
-def upsert_training_state(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
+def _upsert_by_circuit(
+    conn: sqlite3.Connection, table: str, circuit: str, **kwargs
+) -> None:
+    """Generic upsert helper for single-circuit config tables.
+
+    Table name comes exclusively from internal string literals — never user
+    input — so the f-string interpolation does not introduce injection risk.
+    """
     kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
-    existing = get_training_state(conn, circuit)
-    if existing:
+    exists = conn.execute(
+        f"SELECT 1 FROM {table} WHERE circuit = ?", (circuit,)
+    ).fetchone() is not None
+    if exists:
         sets = ", ".join(f"{k} = ?" for k in kwargs)
-        values = list(kwargs.values()) + [circuit]
-        conn.execute(f"UPDATE training_state SET {sets} WHERE circuit = ?", values)
+        conn.execute(
+            f"UPDATE {table} SET {sets} WHERE circuit = ?",
+            [*kwargs.values(), circuit],
+        )
     else:
         kwargs["circuit"] = circuit
-        cols = ", ".join(kwargs.keys())
-        placeholders = ", ".join("?" for _ in kwargs)
-        conn.execute(f"INSERT INTO training_state ({cols}) VALUES ({placeholders})",
-                     list(kwargs.values()))
+        cols = ", ".join(kwargs)
+        phs = ", ".join("?" * len(kwargs))
+        conn.execute(
+            f"INSERT INTO {table} ({cols}) VALUES ({phs})",
+            list(kwargs.values()),
+        )
     conn.commit()
+
+
+def upsert_training_state(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
+    _upsert_by_circuit(conn, "training_state", circuit, **kwargs)
 
 
 def get_sensitivity_config(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
@@ -785,19 +802,7 @@ def get_sensitivity_config(conn: sqlite3.Connection, circuit: str) -> Optional[s
 
 
 def upsert_sensitivity_config(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
-    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
-    existing = get_sensitivity_config(conn, circuit)
-    if existing:
-        sets = ", ".join(f"{k} = ?" for k in kwargs)
-        values = list(kwargs.values()) + [circuit]
-        conn.execute(f"UPDATE sensitivity_config SET {sets} WHERE circuit = ?", values)
-    else:
-        kwargs["circuit"] = circuit
-        cols = ", ".join(kwargs.keys())
-        placeholders = ", ".join("?" for _ in kwargs)
-        conn.execute(f"INSERT INTO sensitivity_config ({cols}) VALUES ({placeholders})",
-                     list(kwargs.values()))
-    conn.commit()
+    _upsert_by_circuit(conn, "sensitivity_config", circuit, **kwargs)
 
 
 def get_learning_config(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
@@ -807,19 +812,7 @@ def get_learning_config(conn: sqlite3.Connection, circuit: str) -> Optional[sqli
 
 
 def upsert_learning_config(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
-    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
-    existing = get_learning_config(conn, circuit)
-    if existing:
-        sets = ", ".join(f"{k} = ?" for k in kwargs)
-        values = list(kwargs.values()) + [circuit]
-        conn.execute(f"UPDATE learning_config SET {sets} WHERE circuit = ?", values)
-    else:
-        kwargs["circuit"] = circuit
-        cols = ", ".join(kwargs.keys())
-        placeholders = ", ".join("?" for _ in kwargs)
-        conn.execute(f"INSERT INTO learning_config ({cols}) VALUES ({placeholders})",
-                     list(kwargs.values()))
-    conn.commit()
+    _upsert_by_circuit(conn, "learning_config", circuit, **kwargs)
 
 
 def get_alert_configs(conn: sqlite3.Connection, circuit: str) -> List[sqlite3.Row]:
@@ -1036,19 +1029,7 @@ def get_leak_test_schedule(conn: sqlite3.Connection, circuit: str) -> Optional[s
 
 
 def upsert_leak_test_schedule(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
-    kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
-    existing = get_leak_test_schedule(conn, circuit)
-    if existing:
-        sets = ", ".join(f"{k} = ?" for k in kwargs)
-        values = list(kwargs.values()) + [circuit]
-        conn.execute(f"UPDATE leak_test_schedule SET {sets} WHERE circuit = ?", values)
-    else:
-        kwargs["circuit"] = circuit
-        cols = ", ".join(kwargs.keys())
-        placeholders = ", ".join("?" for _ in kwargs)
-        conn.execute(f"INSERT INTO leak_test_schedule ({cols}) VALUES ({placeholders})",
-                     list(kwargs.values()))
-    conn.commit()
+    _upsert_by_circuit(conn, "leak_test_schedule", circuit, **kwargs)
 
 
 def insert_leak_test_history(conn: sqlite3.Connection, **kwargs) -> None:
@@ -1477,7 +1458,7 @@ def delete_cluster(
 ) -> None:
     """Remove a cluster and null out its cluster_id on linked events."""
     conn.execute(
-        "UPDATE events SET cluster_id = NULL WHERE circuit = ? AND cluster_id = ?",
+        "UPDATE events SET cluster_id = NULL, fixture_id = NULL WHERE circuit = ? AND cluster_id = ?",
         (circuit, cluster_id),
     )
     conn.execute(
