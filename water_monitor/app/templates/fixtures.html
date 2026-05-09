@@ -85,7 +85,7 @@
 </div>
 {% endif %}
 
-{% if circ.training_state in ('idle', 'calibrating') %}
+{% if circ.training_state in ('idle', 'calibrating') and not circ.clusters | selectattr('fixture_id') | list %}
   <p class="muted" style="margin-bottom:16px">
     Still calibrating — clusters will appear here once training ends.
   </p>

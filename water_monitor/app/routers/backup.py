@@ -73,7 +73,8 @@ QUICK_RESTORE_TABLES = [
     "circuit_profile", "learning_config", "sensitivity_config",
     "alert_config", "leak_test_schedule", "zone_schedules",
     "data_retention", "training_state", "fixtures",
-    "fixture_signatures", "leak_test_history", "threshold_history",
+    "fixture_signatures", "fixture_clusters", "cluster_cooccurrence",
+    "leak_test_history", "threshold_history",
     "daily_summary",
 ]
 
@@ -343,17 +344,20 @@ async def import_quick_restore(
     # Wrap the entire restore in a single transaction.  If any table's DELETE
     # or INSERT fails, all prior DELETEs are rolled back — avoiding a state
     # where some tables are wiped but not restored.
+    #
+    # Every table in the restore list is cleared unconditionally, even when
+    # the backup has an empty array or the table is absent from the backup
+    # entirely.  This ensures the DB reflects the exact state of the backup
+    # — stale rows from a previous restore cannot bleed through.
     try:
         with db:
             for tbl in restore:
-                rows = tables.get(tbl)
-                if rows is None:
-                    continue
-                if not rows:
-                    imported[tbl] = 0
-                    continue
                 db.execute(f"DELETE FROM {tbl}")
-                imported[tbl] = _safe_insert(db, tbl, rows)
+                rows = tables.get(tbl)
+                if rows:
+                    imported[tbl] = _safe_insert(db, tbl, rows)
+                else:
+                    imported[tbl] = 0
     except Exception as e:
         log.error("Import quick-restore failed: %s", e)
         return JSONResponse({"ok": False, "error": f"Restore failed: {e}"},
@@ -379,6 +383,11 @@ async def import_quick_restore(
         log.warning("Import reload: %s", e)
 
     total = sum(imported.values())
+    log.info(
+        "Quick Restore complete — %d rows imported: %s",
+        total,
+        ", ".join(f"{t}={n}" for t, n in imported.items()),
+    )
     return JSONResponse({
         "ok":      True,
         "imported": imported,
