@@ -486,6 +486,32 @@ async def setup_home_details_save(request: Request):
     mark_setup_complete(orch.db)
     orch.reload_circuit_entities()
 
+    # Activate event detection now that entity IDs are known.
+    # At startup, event_detector.setup() is skipped when setup is not yet
+    # complete.  Calling it here ensures the first real day of monitoring
+    # is not lost — without this, subscriptions stay at 0 until restart.
+    if orch.event_detector:
+        try:
+            orch.event_detector.setup()
+            log.info("Event detection activated after setup wizard completion")
+        except Exception as e:
+            log.warning("Event detector setup failed (non-fatal): %s", e)
+
+    # Fetch midnight volume baselines from HA history so the dashboard
+    # shows accurate daily/weekly totals from the first page load.
+    try:
+        await orch._init_volume_baselines()
+    except Exception as e:
+        log.warning("Volume baseline init after setup failed (non-fatal): %s", e)
+
+    # Sync presence watcher state so away mode is correct immediately
+    # (without this it waits for the next state_changed event from HA).
+    if orch._presence_watcher:
+        try:
+            await orch._presence_watcher.sync_initial_state()
+        except Exception as e:
+            log.warning("Presence watcher sync after setup failed (non-fatal): %s", e)
+
     # Compute calibration duration from the home profile and auto-start
     # training for every circuit.  The user sees the result on step 5.
     cal_days, cal_reason = compute_suggested_calibration_days(
