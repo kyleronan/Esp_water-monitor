@@ -733,29 +733,22 @@ def get_home_profile(conn: sqlite3.Connection) -> sqlite3.Row:
     return conn.execute("SELECT * FROM home_profile WHERE id = 1").fetchone()
 
 
-_HOME_PROFILE_COLUMNS = frozenset({
-    # All writable columns in home_profile (id and updated_at managed here).
-    "bathrooms_full", "bathrooms_half", "floors", "occupants",
-    "supply_type", "build_year", "sqft",
-    "flow_unit", "pressure_unit",
-    "away_mode", "away_since",
-    "ha_presence_entities", "ha_away_state", "ha_home_state",
-    "mqtt_publish_enabled",
-    "calibration_days",
-    "score_alert_threshold", "score_shutoff_threshold",
-    "events_retain_years", "hourly_volume_retain_years",
-    "auto_backup_enabled", "auto_backup_path", "auto_backup_day_of_week",
-    "data_retention_enabled",
-    "updated_at",
-})
-
-
 def update_home_profile(conn: sqlite3.Connection, **kwargs) -> None:
-    # Validate column names against a known-good allowlist to prevent
-    # SQL injection if a caller ever passes user-derived key names.
-    bad = set(kwargs) - _HOME_PROFILE_COLUMNS
+    # Derive the writable column allowlist from the live schema so any
+    # column added by a future migration is automatically permitted without
+    # needing a corresponding change here.  id and created_at are excluded —
+    # they must never be overwritten by callers.  updated_at is managed below.
+    _immutable = {"id", "created_at"}
+    valid_cols = (
+        {r[1] for r in conn.execute("PRAGMA table_info(home_profile)").fetchall()}
+        - _immutable
+    )
+    bad = set(kwargs) - valid_cols
     if bad:
-        raise ValueError(f"update_home_profile: unknown column(s): {bad}")
+        raise ValueError(
+            f"update_home_profile: unknown column(s): {bad}. "
+            f"Valid columns: {sorted(valid_cols)}"
+        )
     kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
     sets = ", ".join(f"{k} = ?" for k in kwargs)
     values = list(kwargs.values()) + [1]
