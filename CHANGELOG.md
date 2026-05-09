@@ -4,6 +4,46 @@
 
 ### New Features
 
+#### Phase 2.1 — Type-aware fixture matching (Commits 1–4 complete)
+
+- **Per-fixture-type variance profiles** — `fixtures.py` gains
+  `FIXTURE_VARIANCE_PROFILES` and `FIXTURE_MATCH_THRESHOLDS` for all 23
+  fixture types. Deterministic fixtures (toilet, ice maker, refrigerator)
+  have tight thresholds (0.5–0.7); user-driven fixtures (shower, taps) use
+  loose thresholds (1.8–2.8) with duration and volume as "float" features
+  that are zeroed from the distance calculation; programme-driven appliances
+  (washing machine, dishwasher) are loosest (2.5–3.0).
+- **Type-aware match gate** — once a cluster is confirmed as a fixture type
+  the engine uses per-type weighted Euclidean distance (anchor features
+  amplified, float features ignored) against the stored centroid. Events that
+  exceed the per-type threshold are rejected with reason
+  ``'type_gate_rejected'`` and their ``cluster_id`` stays NULL so
+  ``backfill_unmatched`` can retry them if the threshold is later relaxed.
+  Unconfirmed clusters keep the existing global-threshold behaviour.
+- **Live cache invalidation** — confirming or deleting a cluster on the
+  Fixtures page immediately updates the in-memory type cache via
+  ``notify_fixture_confirmed`` / ``notify_fixture_removed``. No restart
+  required. The cache is also rebuilt from DB on every ``rebuild_from_db``
+  call as a drift guard.
+- **Rebuild-mapping tightened** — ``_rebuild_id_map_from_centroids`` now
+  uses the per-type threshold (not 2× global) as the acceptance bound when
+  re-attaching a river center to a confirmed DB cluster after a rebuild.
+- **``events.match_rejection_reason``** — new TEXT column recording why an
+  event has ``cluster_id IS NULL``: ``'features_missing'``,
+  ``'no_centers'``, or ``'type_gate_rejected'``. Added via idempotent
+  ``ALTER TABLE`` migration so existing databases are upgraded automatically
+  on first start.
+- **Schema bugfix** — ``fixture_clusters.centroid`` and
+  ``.feature_std`` gained ``DEFAULT '{}'`` so the intermediate INSERT in
+  ``_upsert_cluster`` no longer violates the NOT NULL constraint on fresh
+  databases.
+- **Test suite** — 17 unit tests in ``water_monitor/tests/`` covering the
+  weighted-distance helper, type cache lifecycle, gate acceptance/rejection
+  for toilet and shower, unconfirmed regression guard, schema-drift guard,
+  multi-circuit isolation, and fail-open behaviour on corrupt centroids. Run
+  with ``pytest water_monitor/tests/``. Requires ``pytest`` from
+  ``requirements-dev.txt`` (not installed in the Docker image).
+
 #### Phase 2.1 — Fixture Identification (Stages 1–2 complete)
 
 - **Online clustering engine** — `cluster_engine.py` runs per-circuit

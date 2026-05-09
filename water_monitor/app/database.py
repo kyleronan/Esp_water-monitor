@@ -260,8 +260,8 @@ CREATE TABLE IF NOT EXISTS fixture_signatures (
 CREATE TABLE IF NOT EXISTS fixture_clusters (
     id                    INTEGER NOT NULL,
     circuit               TEXT NOT NULL,
-    centroid              TEXT NOT NULL,        -- JSON dict of feature means
-    feature_std           TEXT NOT NULL,        -- JSON dict of feature stddevs
+    centroid              TEXT NOT NULL DEFAULT '{}',   -- JSON dict of feature means
+    feature_std           TEXT NOT NULL DEFAULT '{}',   -- JSON dict of feature stddevs
     transient_template    TEXT,                 -- JSON list, NULL until enough members
     member_count          INTEGER DEFAULT 0,
     suggested_type        TEXT,                 -- from fixtures.suggest_fixture_type
