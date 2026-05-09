@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ._helpers import ingress_redirect
@@ -21,13 +21,21 @@ def _tmpl(request: Request):
     return request.app.state.templates
 
 
+def _valid_circuit(circuit: str, request: Request) -> str:
+    """FastAPI dependency — validates circuit against configured circuits."""
+    cfg = _orch(request)._cfg
+    if circuit not in {c.circuit for c in cfg.circuits}:
+        raise HTTPException(status_code=404, detail=f"Unknown circuit: {circuit!r}")
+    return circuit
+
+
 # ── Page ──────────────────────────────────────────────────────────────────────
 
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def fixtures_page(request: Request):
     orch = _orch(request)
-    from ..database import get_clusters_with_fixtures, get_cluster_stats
+    from ..database import get_clusters_with_fixtures, get_all_cluster_stats
     from ..fixtures import FIXTURE_TYPE_LABELS, user_selectable_types
 
     circuits_ctx = []
@@ -41,10 +49,8 @@ async def fixtures_page(request: Request):
             else {"state": "idle"}
         )
         clusters_raw = get_clusters_with_fixtures(orch.db, c)
-        clusters = []
-        for cl in clusters_raw:
-            stats = get_cluster_stats(orch.db, c, cl["id"])
-            clusters.append({**cl, **stats})
+        all_stats = get_all_cluster_stats(orch.db, c)
+        clusters = [{**cl, **all_stats.get(cl["id"], {})} for cl in clusters_raw]
 
         state = training.get("state", "idle")
         unreviewed = sum(1 for cl in clusters if not cl.get("fixture_id"))
@@ -86,7 +92,7 @@ async def fixtures_page(request: Request):
 # ── Re-run clustering ─────────────────────────────────────────────────────────
 
 @router.post("/{circuit}/cluster")
-async def retrigger_cluster(request: Request, circuit: str):
+async def retrigger_cluster(request: Request, circuit: str = Depends(_valid_circuit)):
     """Rebuild DBSTREAM state from DB — resets in-memory engine and replays
     the last 60 days so the fixture_clusters table reflects current history."""
     orch   = _orch(request)
@@ -112,7 +118,7 @@ async def retrigger_cluster(request: Request, circuit: str):
 # ── Activate fixtures (labelling → live) ──────────────────────────────────────
 
 @router.post("/{circuit}/activate")
-async def activate_circuit(request: Request, circuit: str):
+async def activate_circuit(request: Request, circuit: str = Depends(_valid_circuit)):
     """Transition labelling → live when the user is satisfied with their
     cluster labels.  No-op (with error flash) if circuit isn't currently
     in labelling state — typically a stale browser tab."""
@@ -129,7 +135,7 @@ async def activate_circuit(request: Request, circuit: str):
 # ── Confirm / save a cluster label ────────────────────────────────────────────
 
 @router.post("/{circuit}/cluster/{cluster_id}/confirm")
-async def confirm_cluster(request: Request, circuit: str, cluster_id: int):
+async def confirm_cluster(request: Request, cluster_id: int, circuit: str = Depends(_valid_circuit)):
     form         = await request.form()
     name         = (form.get("name") or "").strip()
     fixture_type = (form.get("fixture_type") or "other").strip()
@@ -158,7 +164,7 @@ async def confirm_cluster(request: Request, circuit: str, cluster_id: int):
 # ── Delete a cluster ──────────────────────────────────────────────────────────
 
 @router.post("/{circuit}/cluster/{cluster_id}/delete")
-async def delete_cluster_endpoint(request: Request, circuit: str, cluster_id: int):
+async def delete_cluster_endpoint(request: Request, cluster_id: int, circuit: str = Depends(_valid_circuit)):
     orch = _orch(request)
     from ..database import delete_cluster, get_fixture_id_for_cluster
     fixture_id = get_fixture_id_for_cluster(orch.db, circuit, cluster_id)
@@ -178,11 +184,10 @@ async def delete_cluster_endpoint(request: Request, circuit: str, cluster_id: in
 # ── JSON API ──────────────────────────────────────────────────────────────────
 
 @router.get("/api/{circuit}/clusters")
-async def api_clusters(request: Request, circuit: str):
-    from ..database import get_clusters_with_fixtures, get_cluster_stats
+async def api_clusters(request: Request, circuit: str = Depends(_valid_circuit)):
+    from ..database import get_clusters_with_fixtures, get_all_cluster_stats
     db = _orch(request).db
-    clusters = []
-    for cl in get_clusters_with_fixtures(db, circuit):
-        stats = get_cluster_stats(db, circuit, cl["id"])
-        clusters.append({**cl, **stats})
+    all_stats = get_all_cluster_stats(db, circuit)
+    clusters = [{**cl, **all_stats.get(cl["id"], {})}
+                for cl in get_clusters_with_fixtures(db, circuit)]
     return JSONResponse(clusters)

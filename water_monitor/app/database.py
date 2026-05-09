@@ -957,7 +957,6 @@ def compute_ha_daily_volume(
     Daily volume from the authoritative HA cumulative sensor.
     Uses midnight local-time today as the baseline period.
     """
-    from datetime import datetime
     today_midnight = datetime.now().replace(
         hour=0, minute=0, second=0, microsecond=0
     ).isoformat(timespec="seconds")
@@ -974,7 +973,6 @@ def compute_ha_weekly_volume(
     Weekly volume from the authoritative HA cumulative sensor.
     Uses Monday midnight local-time as the baseline period.
     """
-    from datetime import datetime, timedelta
     now = datetime.now()
     monday = now - timedelta(days=now.weekday())
     week_midnight = monday.replace(
@@ -1268,6 +1266,7 @@ def normalize_events_utc(conn: sqlite3.Connection) -> int:
             "UPDATE events SET start_ts = ?, end_ts = ? WHERE id = ?",
             updates
         )
+        conn.commit()
     return len(updates)
 
 
@@ -1380,6 +1379,32 @@ def get_cluster_stats(
         (circuit, cluster_id),
     ).fetchone()
     return dict(row) if row else {}
+
+
+def get_all_cluster_stats(
+    conn: sqlite3.Connection,
+    circuit: str,
+) -> Dict[int, Dict[str, Any]]:
+    """Return stats for all clusters in a circuit in one query.
+
+    Returns {cluster_id: stats_dict} so callers can look up by id instead of
+    issuing one query per cluster (avoids N+1 on the fixtures page).
+    """
+    rows = conn.execute(
+        """
+        SELECT cluster_id,
+               COUNT(*)               AS event_count,
+               AVG(volume_litres)     AS avg_volume_litres,
+               AVG(duration_seconds)  AS avg_duration_s,
+               AVG(avg_flow_lpm)      AS avg_flow_lpm,
+               MAX(start_ts)          AS last_seen_at
+        FROM events
+        WHERE circuit = ? AND cluster_id IS NOT NULL
+        GROUP BY cluster_id
+        """,
+        (circuit,),
+    ).fetchall()
+    return {r["cluster_id"]: dict(r) for r in rows}
 
 
 def upsert_fixture_from_cluster(
