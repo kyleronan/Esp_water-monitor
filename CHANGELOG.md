@@ -1,8 +1,47 @@
 # Changelog
 
-## [Unreleased] — 0.2.0-dev
+## [0.2.0-rc1] — 2026-05-08
 
 ### New Features
+
+#### Phase 2.1 — Labelling state + clean-start guarantee
+
+- **Three-stage training lifecycle** — calibration now ends in a
+  ``labelling`` review window (was: auto-promotion straight to ``live``).
+  After training, the user confirms detected clusters on the Fixtures page,
+  then explicitly clicks **Activate fixtures** to transition to ``live``.
+  This was the missing state from the original training-manager design,
+  deferred from Phase 1 and now reinstated. Anomaly detection is held off
+  until activation so the live phase doesn't run against unconfirmed
+  clusters.
+- **Auto-activation safety net** — if a circuit sits in ``labelling`` for
+  more than 7 days without user review (``LABELLING_AUTO_TIMEOUT_DAYS``),
+  ``_check_progress`` auto-promotes it to ``live`` and sends an HA
+  notification. Prevents the system being stuck waiting for the user to
+  come back.
+- **Clean-start guarantee** — ``start_calibration`` now deletes orphan
+  clusters (``fixture_clusters`` rows with ``fixture_id IS NULL``) from
+  any prior calibration cycle and calls ``cluster_engine.reset_circuit()``
+  to flush the in-memory DBSTREAM and StandardScaler. Confirmed clusters
+  (user-labelled fixtures) survive recalibration.
+- **Recalibrate from labelling** — ``start_calibration`` accepts
+  ``labelling`` as a valid source state, so a user reviewing clusters who
+  doesn't like what they see can trigger recalibration directly without
+  resetting to idle first.
+- **Fixtures page UI** — per-circuit "Awaiting review" pill, a callout
+  card with the **Activate fixtures** button, and adapted banner copy
+  ("confirm below, then activate the circuit") when any circuit is in
+  labelling. Settings page badge/pill render in amber for labelling.
+- **Banner-count fix (carried into this release)** — the unreviewed-clusters
+  banner now only counts clusters whose grid is actually rendered, fixing
+  the contradiction where calibrating circuits with latent clusters showed
+  "*N* clusters need review" with nothing visible to review.
+- **Test suite** — 10 new tests in ``test_training_state.py`` covering
+  orphan clearing, confirmed-cluster preservation, calibrating →
+  labelling → live transitions, no-op activate from wrong states,
+  auto-timeout firing at 8 days and not firing at 6 days,
+  ``percent_complete=100`` for labelling, HA sensor publishing, and
+  recalibrating from labelling. Total suite is now 33 tests.
 
 #### Phase 2.1 — Type-aware fixture matching (Commits 1–4 complete)
 
