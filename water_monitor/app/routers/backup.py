@@ -219,22 +219,16 @@ async def export_full(request: Request):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as _tf:
             snap_path = Path(_tf.name)
         try:
-            src_conn = _sqlite3.connect(str(DB_PATH))
+            src_conn  = _sqlite3.connect(str(DB_PATH))
+            mem_conn  = _sqlite3.connect(":memory:")
+            disk_conn = _sqlite3.connect(str(snap_path))
             try:
-                mem_conn = _sqlite3.connect(":memory:")
-                try:
-                    src_conn.backup(mem_conn)
-                finally:
-                    src_conn.close()
-                disk_conn = _sqlite3.connect(str(snap_path))
-                try:
-                    mem_conn.backup(disk_conn)
-                finally:
-                    mem_conn.close()
-                    disk_conn.close()
-            except Exception:
+                src_conn.backup(mem_conn)
+                mem_conn.backup(disk_conn)
+            finally:
                 src_conn.close()
-                raise
+                mem_conn.close()
+                disk_conn.close()
             zf.write(str(snap_path), "water_monitor.db")
         finally:
             snap_path.unlink(missing_ok=True)
