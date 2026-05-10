@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1-dev] — unreleased
+
+### New Features
+
+- Irrigation system enable/disable toggle — hide the irrigation circuit from
+  the dashboard and device pages without removing it from configuration.
+  Configured during setup (hardware selection step) and adjustable at any
+  time in Settings → Home Profile. Backed by a new `circuit_profile.enabled`
+  per-circuit flag that is forward-compatible with future multi-device setups.
+
+---
+
 ## [0.2.0] — 2026-05-10
 
 ### Changes
