@@ -31,6 +31,11 @@ from .ha_client import HaClient
 
 log = logging.getLogger(__name__)
 
+# Auto-activate a circuit stuck in 'labelling' after this many days of
+# user inaction, so anomaly detection isn't blocked indefinitely waiting
+# for the user to review clusters.
+LABELLING_AUTO_TIMEOUT_DAYS = 7
+
 
 class TrainingManager:
     """
@@ -44,6 +49,8 @@ class TrainingManager:
         self._db = db
         self._ha = ha
         self._stop = asyncio.Event()
+        # Set by orchestrator after ClusterEngine is initialised
+        self.cluster_engine = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -78,15 +85,29 @@ class TrainingManager:
                                 calibration_days: int) -> bool:
         """
         Start calibration for a circuit. Returns True if started.
-        Can only start from 'idle' state.
+
+        Only starts a fresh calibration from 'idle'.  If the circuit is
+        already calibrating with a valid ``started_at`` (e.g. the row was
+        just restored from a backup and the setup wizard re-ran), this is
+        a no-op so we don't clobber the existing timer or
+        ``events_collected`` counter.
         """
         state_row = get_training_state(self._db, circuit)
         current = state_row["state"] if state_row else "idle"
 
-        if current not in ("idle", "calibrating"):
+        if current not in ("idle", "calibrating", "labelling"):
             log.warning("[%s] cannot start calibration from state '%s'",
                         circuit, current)
             return False
+
+        # If calibration is already in progress with a real start time,
+        # preserve it — re-running the setup wizard after a restore must
+        # not reset the timer back to "now" or zero the event counter.
+        if current == "calibrating" and state_row and state_row["started_at"]:
+            log.info("[%s] calibration already in progress — "
+                     "preserving existing timer (started_at=%s)",
+                     circuit, state_row["started_at"])
+            return True
 
         profile = get_home_profile(self._db)
         minimum_events = compute_minimum_events(
@@ -108,6 +129,30 @@ class TrainingManager:
             events_collected=0,
         )
 
+        # Clear unconfirmed clusters from any previous calibration cycle so
+        # stale micro-clusters don't pollute the new run.  Confirmed
+        # clusters (fixture_id IS NOT NULL) are kept — they represent
+        # user-labelled fixtures that should survive recalibration.
+        deleted = self._db.execute(
+            "DELETE FROM fixture_clusters "
+            "WHERE circuit = ? AND fixture_id IS NULL",
+            (circuit,),
+        ).rowcount
+        self._db.commit()
+        if deleted:
+            log.info("[%s] calibration start: cleared %d orphan cluster(s)",
+                     circuit, deleted)
+
+        # Reset in-memory DBSTREAM/scaler so the engine starts fresh
+        # alongside the cleared cluster table.  Confirmed clusters in DB
+        # are re-seeded automatically by _init_circuit's MAX(id) lookup.
+        if self.cluster_engine is not None:
+            try:
+                self.cluster_engine.reset_circuit(circuit)
+            except Exception as e:
+                log.warning("[%s] reset_circuit failed (non-fatal): %s",
+                            circuit, e)
+
         await self._publish_status(circuit)
         log.info("[%s] calibration started — %d days, minimum %d events",
                  circuit, calibration_days, minimum_events)
@@ -125,7 +170,70 @@ class TrainingManager:
         log.info("[%s] calibration cancelled", circuit)
 
     async def complete_calibration(self, circuit: str) -> None:
-        """Transition calibrating → live."""
+        """Transition calibrating → labelling.
+
+        After calibration finishes the circuit enters a review window.
+        The user confirms or removes detected clusters on the Fixtures
+        page, then explicitly activates the circuit (labelling → live).
+        If no review happens within LABELLING_AUTO_TIMEOUT_DAYS, the
+        circuit auto-activates so anomaly detection isn't stuck waiting
+        for the user to come back.
+        """
+        now = datetime.now(timezone.utc)
+        upsert_training_state(
+            self._db, circuit,
+            state="labelling",
+            completed_at=now.isoformat(),
+        )
+        await self._publish_status(circuit)
+
+        # Backfill any events that accumulated before the engine was first
+        # instantiated (e.g. installs that upgraded from v0.1.x mid-calibration)
+        if self.cluster_engine is not None:
+            try:
+                import asyncio as _asyncio, functools
+                loop = _asyncio.get_running_loop()
+                backfilled = await loop.run_in_executor(
+                    None,
+                    functools.partial(self.cluster_engine.backfill_unmatched, circuit),
+                )
+                if backfilled:
+                    log.info("[%s] post-calibration backfill: %d events matched",
+                             circuit, backfilled)
+            except Exception as e:
+                log.warning("[%s] post-calibration backfill failed (non-fatal): %s",
+                            circuit, e)
+
+        circuit_cfg = self._cfg.get_circuit(circuit)
+        if circuit_cfg:
+            await self._ha.notify(
+                title=f"Water Monitor — {circuit_cfg.display_name} training complete",
+                message=(
+                    f"Training complete! Visit Fixtures to confirm what was "
+                    f"detected on the {circuit_cfg.display_name.lower()} circuit, "
+                    f"then tap 'Activate' to go live."
+                ),
+                notification_id=f"water_calibration_complete_{circuit}",
+            )
+        log.info("[%s] calibration complete — transitioning to labelling",
+                 circuit)
+
+    async def activate_fixtures(self, circuit: str) -> bool:
+        """Transition labelling → live.
+
+        Called by the Fixtures router when the user clicks
+        'Activate fixtures' after reviewing detected clusters.  Returns
+        False (no-op) if the circuit is not in labelling state, so a
+        stale browser tab can't accidentally activate.
+        """
+        state_row = get_training_state(self._db, circuit)
+        if not state_row or state_row["state"] != "labelling":
+            log.warning(
+                "[%s] activate_fixtures called from state '%s' — ignored",
+                circuit,
+                state_row["state"] if state_row else "none",
+            )
+            return False
         now = datetime.now(timezone.utc)
         upsert_training_state(
             self._db, circuit,
@@ -133,19 +241,8 @@ class TrainingManager:
             completed_at=now.isoformat(),
         )
         await self._publish_status(circuit)
-
-        circuit_cfg = self._cfg.get_circuit(circuit)
-        if circuit_cfg:
-            await self._ha.notify(
-                title=f"Water Monitor — {circuit_cfg.display_name} training complete",
-                message=(
-                    f"The {circuit_cfg.display_name.lower()} circuit has finished "
-                    f"its training period. Event data is now being collected for "
-                    f"fixture signature analysis."
-                ),
-                notification_id=f"water_calibration_complete_{circuit}",
-            )
-        log.info("[%s] calibration complete — transitioning to live", circuit)
+        log.info("[%s] fixtures activated — now live", circuit)
+        return True
 
     async def trigger_full_recalibration(self, circuit: str,
                                          days: int) -> bool:
@@ -158,12 +255,18 @@ class TrainingManager:
         # Clear all per-circuit data so history charts and volume totals
         # start fresh — daily_summary and import_state are included so the
         # importer re-scans and the chart doesn't show pre-reset data.
+        # fixture_clusters is cleared too: a full recalibration resets the
+        # DBSTREAM engine (via start_calibration → reset_circuit), so any
+        # confirmed cluster centroids left in the DB would be inconsistent
+        # with the empty in-memory model — new events would be type-gate-
+        # rejected instead of matched against the stale centroid rows.
         for table, col in [
-            ("events",          "circuit"),
-            ("hourly_volume",   "circuit"),
-            ("daily_summary",   "circuit"),
-            ("import_state",    "circuit"),
-            ("volume_snapshots","circuit"),
+            ("events",           "circuit"),
+            ("hourly_volume",    "circuit"),
+            ("daily_summary",    "circuit"),
+            ("import_state",     "circuit"),
+            ("volume_snapshots", "circuit"),
+            ("fixture_clusters", "circuit"),  # must come before start_calibration
         ]:
             try:
                 self._db.execute(
@@ -191,14 +294,56 @@ class TrainingManager:
                  circuit)
 
     async def _check_progress(self, circuit: str) -> None:
-        """Check if calibration should complete automatically.
+        """Check if calibration should complete automatically, or whether
+        a labelling-state circuit has been stuck in review long enough to
+        auto-activate.
 
         Pauses the calibration timer while away mode is active — the
         calibration_ends_at timestamp is extended by 1 day for every day
         spent in away mode so the learning period reflects actual occupancy.
         """
         state_row = get_training_state(self._db, circuit)
-        if not state_row or state_row["state"] != "calibrating":
+        if not state_row:
+            return
+
+        # Auto-activate labelling circuits after the timeout window so
+        # anomaly detection isn't blocked indefinitely if the user
+        # never reviews their clusters.
+        if state_row["state"] == "labelling":
+            completed_str = state_row["completed_at"]
+            if completed_str:
+                try:
+                    completed = datetime.fromisoformat(
+                        completed_str.replace("Z", "+00:00"))
+                    if completed.tzinfo is None:
+                        completed = completed.replace(tzinfo=timezone.utc)
+                    age = datetime.now(timezone.utc) - completed
+                    if age.days >= LABELLING_AUTO_TIMEOUT_DAYS:
+                        log.warning(
+                            "[%s] labelling timed out after %d days — "
+                            "auto-activating",
+                            circuit, LABELLING_AUTO_TIMEOUT_DAYS)
+                        await self.activate_fixtures(circuit)
+                        circuit_cfg = self._cfg.get_circuit(circuit)
+                        if circuit_cfg:
+                            await self._ha.notify(
+                                title=(
+                                    f"Water Monitor — "
+                                    f"{circuit_cfg.display_name} auto-activated"
+                                ),
+                                message=(
+                                    f"Fixtures were activated automatically "
+                                    f"after {LABELLING_AUTO_TIMEOUT_DAYS} days "
+                                    f"of no review."
+                                ),
+                                notification_id=f"water_auto_activate_{circuit}",
+                            )
+                except (ValueError, TypeError) as e:
+                    log.warning("[%s] labelling timeout check failed: %s",
+                                circuit, e)
+            return
+
+        if state_row["state"] != "calibrating":
             return
 
         # Check away mode — pause calibration timer while away.
@@ -308,6 +453,14 @@ class TrainingManager:
                 "percent_complete":  pct,
                 "calibration_ends_at": state_row["calibration_ends_at"],
             })
+        elif state in ("labelling", "live"):
+            # Calibration is 100% done; labelling means awaiting user
+            # review, live means anomaly detection is active.
+            attrs.update({
+                "percent_complete":  100,
+                "days_remaining":    0,
+                "hours_remaining":   0,
+            })
 
         entity_id = f"sensor.water_training_status_{circuit}"
         await self._ha.set_state(entity_id, state, attrs)
@@ -350,7 +503,13 @@ class TrainingManager:
             # metric and don't affect the displayed progress.
             result["percent_complete"] = time_pct
         else:
-            result["percent_complete"]  = 100 if state_row["state"] == "live" else 0
+            # 'labelling' is post-calibration review — calibration itself
+            # is 100% done, so the progress bar reads full.  'live' is
+            # also 100%.  'idle' is 0%.
+            if state_row["state"] in ("live", "labelling"):
+                result["percent_complete"] = 100
+            else:
+                result["percent_complete"] = 0
             result["days_remaining"]    = 0
             result["hours_remaining"]   = 0
 

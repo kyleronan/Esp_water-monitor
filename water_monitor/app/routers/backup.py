@@ -73,8 +73,9 @@ QUICK_RESTORE_TABLES = [
     "circuit_profile", "learning_config", "sensitivity_config",
     "alert_config", "leak_test_schedule", "zone_schedules",
     "data_retention", "training_state", "fixtures",
-    "fixture_signatures", "leak_test_history", "threshold_history",
-    "daily_summary",
+    "fixture_signatures", "fixture_clusters", "cluster_cooccurrence",
+    "leak_test_history", "threshold_history",
+    "daily_summary", "fixture_ha_entity_map", "fixture_daily_summary",
 ]
 
 # events + hourly_volume included with 90-day filter in quick-restore
@@ -128,8 +129,12 @@ async def export_quick_restore(request: Request):
 
     for tbl, col in [("events", "start_ts"), ("hourly_volume", "hour_ts")]:
         try:
+            # ORDER BY rowid ASC so that on restore the last-inserted (newest)
+            # row appears last in the JSON array.  With INSERT OR REPLACE the
+            # last row for each (circuit, start_ts) wins — which is what we want.
             tables[tbl] = [dict(r) for r in db.execute(
-                f"SELECT * FROM {tbl} WHERE {col} >= ?", (cutoff,)).fetchall()]
+                f"SELECT * FROM {tbl} WHERE {col} >= ? ORDER BY rowid ASC",
+                (cutoff,)).fetchall()]
         except Exception as e:
             log.warning("Quick-restore export %s: %s", tbl, e)
             tables[tbl] = []
@@ -210,18 +215,20 @@ async def export_full(request: Request):
 
         # Consistent SQLite snapshot using the backup API.
         # This works even while the DB is being written to — no torn reads.
-        import io as _io
         import sqlite3 as _sqlite3
-        snap_path = Path(tempfile.mktemp(suffix=".db"))
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as _tf:
+            snap_path = Path(_tf.name)
         try:
             src_conn  = _sqlite3.connect(str(DB_PATH))
             mem_conn  = _sqlite3.connect(":memory:")
-            src_conn.backup(mem_conn)
-            src_conn.close()
             disk_conn = _sqlite3.connect(str(snap_path))
-            mem_conn.backup(disk_conn)
-            mem_conn.close()
-            disk_conn.close()
+            try:
+                src_conn.backup(mem_conn)
+                mem_conn.backup(disk_conn)
+            finally:
+                src_conn.close()
+                mem_conn.close()
+                disk_conn.close()
             zf.write(str(snap_path), "water_monitor.db")
         finally:
             snap_path.unlink(missing_ok=True)
@@ -240,7 +247,8 @@ async def export_full(request: Request):
         for tbl, col in [("events", "start_ts"), ("hourly_volume", "hour_ts")]:
             try:
                 qr_tables[tbl] = [dict(r) for r in db.execute(
-                    f"SELECT * FROM {tbl} WHERE {col} >= ?", (cutoff,)).fetchall()]
+                    f"SELECT * FROM {tbl} WHERE {col} >= ?"
+                    f" ORDER BY rowid ASC", (cutoff,)).fetchall()]
             except Exception as e:
                 log.warning("Full export quick-restore %s: %s", tbl, e)
                 qr_tables[tbl] = []
@@ -332,34 +340,67 @@ async def import_quick_restore(
                              "error": "Select at least one group."},
                             status_code=400)
 
-    imported, errors = {}, []
+    imported = {}
     db = orch.db
 
-    for tbl in restore:
-        rows = tables.get(tbl)
-        if rows is None:
-            continue
-        if not rows:
-            imported[tbl] = 0
-            continue
-        try:
-            db.execute(f"DELETE FROM {tbl}")
-            imported[tbl] = _safe_insert(db, tbl, rows)
-        except Exception as e:
-            log.error("Import quick-restore %s: %s", tbl, e)
-            errors.append(f"{tbl}: {e}")
+    # PRAGMA foreign_keys must be set outside the transaction — SQLite ignores
+    # it when a transaction is already open.  Disable for the bulk restore so
+    # cross-table FK ordering (e.g. events → fixtures) does not block the
+    # DELETE pass, then re-enable immediately after.
+    db.execute("PRAGMA foreign_keys = OFF")
+    # Wrap the entire restore in a single transaction.  If any table's DELETE
+    # or INSERT fails, all prior DELETEs are rolled back — avoiding a state
+    # where some tables are wiped but not restored.
+    #
+    # Every table in the restore list is cleared unconditionally, even when
+    # the backup has an empty array or the table is absent from the backup
+    # entirely.  This ensures the DB reflects the exact state of the backup
+    # — stale rows from a previous restore cannot bleed through.
+    try:
+        with db:
+            for tbl in restore:
+                db.execute(f"DELETE FROM {tbl}")
+                rows = tables.get(tbl)
+                if rows:
+                    imported[tbl] = _safe_insert(db, tbl, rows)
+                else:
+                    imported[tbl] = 0
+    except Exception as e:
+        log.error("Import quick-restore failed: %s", e)
+        return JSONResponse({"ok": False, "error": f"Restore failed: {e}"},
+                            status_code=500)
+    finally:
+        db.execute("PRAGMA foreign_keys = ON")
 
-    db.commit()
+    # After events are imported, normalize timestamps to UTC then dedup.
+    # Order matters: normalize first so rows with the same logical instant
+    # but different offset strings (+00:00 vs -06:00) collapse correctly.
+    if "events" in restore:
+        try:
+            from ..database import normalize_events_utc, dedup_events
+            normalize_events_utc(db)
+            removed = dedup_events(db)
+            if removed:
+                log.warning(
+                    "Quick Restore: removed %d duplicate event(s) from backup",
+                    removed)
+        except Exception as e:
+            log.warning("Quick Restore dedup failed (non-fatal): %s", e)
     try:
         orch.reload_circuit_entities()
     except Exception as e:
         log.warning("Import reload: %s", e)
 
     total = sum(imported.values())
+    log.info(
+        "Quick Restore complete — %d rows imported: %s",
+        total,
+        ", ".join(f"{t}={n}" for t, n in imported.items()),
+    )
     return JSONResponse({
-        "ok":      len(errors) == 0,
+        "ok":      True,
         "imported": imported,
-        "errors":  errors,
+        "errors":  [],
         "summary": f"{total} rows restored",
     })
 
@@ -384,6 +425,7 @@ async def import_history_archive(
         tmp_path = Path(tmp.name)
 
     imported, errors = {}, []
+    arc = None
 
     try:
         arc = sqlite3.connect(str(tmp_path))
@@ -392,38 +434,45 @@ async def import_history_archive(
         in_archive = {r[0] for r in arc.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 
-        for tbl in HISTORY_ARCHIVE_TABLES:
-            if tbl not in in_archive:
-                continue
-            try:
-                rows = arc.execute(f"SELECT * FROM {tbl}").fetchall()
-                if not rows:
-                    imported[tbl] = 0
-                    continue
-                # Validate columns against live schema (defence in depth —
-                # archive could be from a different schema version)
-                valid_cols = {r[1] for r in orch.db.execute(
-                    f"PRAGMA table_info({tbl})").fetchall()}
-                cols = [c for c in rows[0].keys() if c in valid_cols]
-                if not cols:
-                    log.warning("Import archive %s: no valid columns", tbl)
-                    continue
-                ph = ",".join("?" for _ in cols)
-                cn = ",".join(cols)
-                orch.db.executemany(
-                    f"INSERT OR IGNORE INTO {tbl} ({cn}) VALUES ({ph})",
-                    [[r[c] for c in cols] for r in rows],
-                )
-                imported[tbl] = len(rows)
-            except Exception as e:
-                log.error("Import history-archive %s: %s", tbl, e)
-                errors.append(f"{tbl}: {e}")
+        try:
+            with orch.db:   # single transaction — rolls back all tables on any failure
+                for tbl in HISTORY_ARCHIVE_TABLES:
+                    if tbl not in in_archive:
+                        continue
+                    rows = arc.execute(f"SELECT * FROM {tbl}").fetchall()
+                    if not rows:
+                        imported[tbl] = 0
+                        continue
+                    # Validate columns against live schema (defence in depth —
+                    # archive could be from a different schema version)
+                    valid_cols = {r[1] for r in orch.db.execute(
+                        f"PRAGMA table_info({tbl})").fetchall()}
+                    cols = [c for c in rows[0].keys() if c in valid_cols]
+                    if not cols:
+                        log.warning("Import archive %s: no valid columns", tbl)
+                        continue
+                    ph = ",".join("?" for _ in cols)
+                    cn = ",".join(cols)
+                    # Count before/after to get actual inserted rows — INSERT OR IGNORE
+                    # silently skips duplicates so the count delta is the ground truth.
+                    before = orch.db.execute(
+                        f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    orch.db.executemany(
+                        f"INSERT OR IGNORE INTO {tbl} ({cn}) VALUES ({ph})",
+                        [[r[c] for c in cols] for r in rows],
+                    )
+                    after = orch.db.execute(
+                        f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    imported[tbl] = after - before
+        except Exception as e:
+            log.error("Import history-archive failed (transaction rolled back): %s", e)
+            errors.append(str(e))
 
-        arc.close()
     finally:
+        if arc is not None:
+            arc.close()
         tmp_path.unlink(missing_ok=True)
 
-    orch.db.commit()
     total = sum(imported.values())
 
     return JSONResponse({
@@ -457,6 +506,10 @@ async def backup_page(request: Request):
     archive_est = event_rows * 200 + volume_rows * 50   # bytes
     # Full ZIP is roughly the SQLite file size (compressed)
     full_est    = int(db_size_bytes * 0.6)
+    # Quick restore is JSON — more verbose than binary; config rows ~350 B each,
+    # event rows ~500 B each, hourly volume rows ~120 B each.
+    settings_rows = sum(counts.get(t, 0) for t in QUICK_RESTORE_TABLES)
+    quick_est = settings_rows * 350 + event_rows * 500 + volume_rows * 120
 
     def fmt(b):
         if b >= 1_048_576: return f"{b/1_048_576:.1f} MB"
@@ -464,12 +517,13 @@ async def backup_page(request: Request):
         return f"{b} B"
 
     return _tmpl(request).TemplateResponse("backup.html", {
-        "request":          request,
-        "page":             "backup",
-        "counts":           counts,
-        "db_size":          fmt(db_size_bytes),
-        "archive_size_est": fmt(archive_est),
-        "full_size_est":    fmt(full_est),
-        "quick_tables":     QUICK_RESTORE_TABLES + QUICK_RESTORE_RECENT,
-        "history_tables":   HISTORY_ARCHIVE_TABLES,
+        "request":              request,
+        "page":                 "backup",
+        "counts":               counts,
+        "db_size":              fmt(db_size_bytes),
+        "quick_restore_size_est": fmt(quick_est),
+        "archive_size_est":     fmt(archive_est),
+        "full_size_est":        fmt(full_est),
+        "quick_tables":         QUICK_RESTORE_TABLES + QUICK_RESTORE_RECENT,
+        "history_tables":       HISTORY_ARCHIVE_TABLES,
     })

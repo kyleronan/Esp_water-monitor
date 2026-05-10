@@ -50,17 +50,20 @@
 #     ~1s onset latency (ESPHome 2026.4+ prevents GPIO pin sharing).
 # =============================================================================
 
+substitutions:
+  flow_k_factor: "396.0"   # 6.6 pulses/litre × 60s = 396
+
 esphome:
   name: esp-water-shut-off-3
-  friendly_name: ESP Water Shut off 3.4
+  friendly_name: ESP Water Shut off 3.5
   min_version: 2024.6.0
   name_add_mac_suffix: false
   platformio_options:
     # DIO flash mode required for ESP32-S3
     board_build.flash_mode: dio
   project:
-    name: esphome.web
-    version: dev
+    name: ronan.esp-water-monitor
+    version: "3.5.1"
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -230,6 +233,19 @@ globals:
     restore_value: no
     initial_value: '0.0'
 
+  # Wall-clock start timestamp (millis()) captured when each leak test begins.
+  # Used to compute elapsed = (millis() - start_ms) / 1000 so timing is
+  # accurate under WiFi/scheduling jitter instead of accumulating 0.5s ticks.
+  - id: leak_test_start_ms_main
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: leak_test_start_ms_irr
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
   # True during the 60-second valve-close and EMA settle phase before the
   # test officially starts monitoring. Distinct from leak_test_active so the
   # switch and active indicator show ON throughout, and cancellation during
@@ -326,7 +342,7 @@ globals:
     restore_value: no
     initial_value: '0.0'
 
-  # Separate elapsed timer for the fast seal check (flow_base based, 10s threshold).
+  # Separate elapsed timer for the fast seal check (flow_base based, 20s threshold).
   # Distinct from valve_seal_elapsed_main so the two check paths don't interfere.
   - id: valve_seal_fast_elapsed_main
     type: float
@@ -392,27 +408,46 @@ globals:
     initial_value: 'false'
 
   # ---------------------------------------------------------------------------
+  # OPEN-IN-FLIGHT GUARD GLOBALS
+  #
+  # Mirrors the close_in_flight guard. Set when open_action starts pulsing the
+  # relay; cleared by the open end stop on_press (success) or inside the
+  # motor-fault lambda (failure — so the next open attempt is not silently
+  # ignored after fault reset).
+  # ---------------------------------------------------------------------------
+  - id: open_in_flight_main
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: open_in_flight_irr
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # ---------------------------------------------------------------------------
   # RAPID PRESSURE DROP DETECTION GLOBALS
   #
   # Rapid pressure drop indicates either a burst pipe (during normal operation)
   # or a sudden draw on the system (during a leak test).
   #
-  # A 5-sample circular buffer per circuit holds the last five pressure readings
-  # (one per second from pressure_main / pressure_irrigation). The on_value
-  # lambda compares the current reading against the value 5 seconds ago — if
-  # the drop exceeds the user-set threshold a fault is raised (or, during a
-  # leak test, the test is aborted with code 9 "demand detected").
+  # A 10-sample circular buffer per circuit holds the last ten pressure readings.
+  # pressure_main / pressure_irrigation publish every 500ms (200Hz base ×
+  # send_every:100 = 2Hz), so 10 samples × 500ms = 5-second window.
+  # The on_value lambda compares the current reading against the value 5 seconds
+  # ago — if the drop exceeds the user-set threshold a fault is raised (or,
+  # during a leak test, the test is aborted with code 9 "demand detected").
   #
   # The buffer is invalidated whenever detection should not run — mid-valve-
   # travel, manually closed valve, or leak-test prepare phase. After re-entering
-  # a valid state the buffer takes 5 seconds to refill before detection resumes,
-  # giving a brief blackout that prevents false trips from legitimate transients
-  # such as the controlled close at the start of a leak test.
+  # a valid state the buffer takes 5 seconds (10 samples) to refill before
+  # detection resumes, giving a brief blackout that prevents false trips from
+  # legitimate transients such as the controlled close at the start of a leak test.
   # ---------------------------------------------------------------------------
   - id: pressure_history_main
-    type: float[5]
+    type: float[10]
     restore_value: no
-    initial_value: '{0, 0, 0, 0, 0}'
+    initial_value: '{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}'
 
   - id: pressure_history_main_idx
     type: int
@@ -425,9 +460,9 @@ globals:
     initial_value: 'false'
 
   - id: pressure_history_irr
-    type: float[5]
+    type: float[10]
     restore_value: no
-    initial_value: '{0, 0, 0, 0, 0}'
+    initial_value: '{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}'
 
   - id: pressure_history_irr_idx
     type: int
@@ -627,7 +662,8 @@ sensor:
       then:
         # --- Rapid pressure drop detection (Main) ---
         # 5-second window: compares current pressure against the value held
-        # 5 samples ago in the circular buffer (pressure_main reports every 1s).
+        # 10 samples ago in the circular buffer (pressure_main reports every
+        # 500ms at 2Hz, so 10 samples × 500ms = 5s).
         #
         # Detection is gated to states where a sudden drop is meaningful:
         #   - Valve open during normal operation: a sudden drop indicates a
@@ -713,7 +749,7 @@ sensor:
 
             // Update the circular buffer with the latest sample.
             id(pressure_history_main)[id(pressure_history_main_idx)] = x;
-            id(pressure_history_main_idx) = (id(pressure_history_main_idx) + 1) % 5;
+            id(pressure_history_main_idx) = (id(pressure_history_main_idx) + 1) % 10;
             if (!id(pressure_history_main_filled) && id(pressure_history_main_idx) == 0) {
               id(pressure_history_main_filled) = true;
             }
@@ -727,9 +763,8 @@ sensor:
         - lambda: |-
             if (!id(leak_test_active_main)) return;
 
-            // Accumulate elapsed time — sensor fires every 500ms (send_every 100 at 5ms)
-            // so increment by 0.5s per tick to keep elapsed time in seconds.
-            id(leak_test_elapsed_main) += 0.5f;
+            // Elapsed time computed from wall-clock start timestamp to avoid drift.
+            id(leak_test_elapsed_main) = (millis() - id(leak_test_start_ms_main)) / 1000.0f;
 
             float drop = id(leak_test_baseline_main) - x;  // positive = pressure fell, negative = pressure rose
 
@@ -874,7 +909,7 @@ sensor:
             }
 
             id(pressure_history_irr)[id(pressure_history_irr_idx)] = x;
-            id(pressure_history_irr_idx) = (id(pressure_history_irr_idx) + 1) % 5;
+            id(pressure_history_irr_idx) = (id(pressure_history_irr_idx) + 1) % 10;
             if (!id(pressure_history_irr_filled) && id(pressure_history_irr_idx) == 0) {
               id(pressure_history_irr_filled) = true;
             }
@@ -883,8 +918,8 @@ sensor:
         - lambda: |-
             if (!id(leak_test_active_irr)) return;
 
-            // Sensor fires every 500ms (send_every 100 at 5ms) — increment by 0.5s.
-            id(leak_test_elapsed_irr) += 0.5f;
+            // Elapsed time computed from wall-clock start timestamp to avoid drift.
+            id(leak_test_elapsed_irr) = (millis() - id(leak_test_start_ms_irr)) / 1000.0f;
 
             float drop = id(leak_test_baseline_irr) - x;  // positive = pressure fell, negative = pressure rose
 
@@ -939,15 +974,16 @@ sensor:
   # ---------------------------------------------------------------------------
   # PRESSURE SENSOR 1 (AVERAGED) — Main line
   # Derived from pressure_main via the copy platform — no separate ADC read.
-  # The source publishes every 1 second (already calibrated, clamped, and
-  # smoothed by its 1.25s sliding window); this sensor adds a longer 30-sample
-  # sliding window to average out the upstream solenoid pulses (~30s period).
+  # The source publishes every 500ms at 2Hz (already calibrated, clamped, and
+  # smoothed); this sensor adds a longer 50-sample sliding window to average
+  # out the upstream solenoid pulses (~30s period).
   #
   # Filter chain:
-  #   sliding_window_moving_average: 30 samples × 1s = 30 second window
-  #     send_every: 1 → publishes once per second (inherited from source rate)
-  #   round: 1 → 1 decimal place for display
-  #   Memory: 30 × 4 bytes = 120 bytes (half of the previous 60-sample buffer).
+  #   round: 1 → pre-round before windowing to reduce noise
+  #   sliding_window_moving_average: 50 samples × 500ms = 25-second window
+  #     send_every: 2 → publishes once per second
+  #   round/multiply: nearest 0.5 PSI for clean display
+  #   Memory: 50 × 4 bytes = 200 bytes
   #
   # This sensor is for display and trend monitoring only. All safety checks
   # (burst detection, leak test, rapid pressure drop) use the faster
@@ -957,8 +993,8 @@ sensor:
     source_id: pressure_main
     id: pressure_main_avg
     name: "Water Pressure 1 - Main (Averaged)"
-    # Clear the entity_category inherited from the source (pressure_main is
-    # diagnostic; the averaged copy is the user-facing primary entity).
+    # pressure_main now has entity_category: "" (recorded by HA); explicitly
+    # clear here so this copy does not inherit any future category change.
     entity_category: ""
     device_class: pressure
     state_class: measurement
@@ -1022,7 +1058,7 @@ sensor:
   #     (a proxy for fixture distance from the sensors).
   #
   # All safety logic (burst detection, leak test, rapid drop) remains on the
-  # slower 1Hz pressure_main sensor — this sensor is diagnostic/add-on use only.
+  # slower 2Hz pressure_main sensor — this sensor is diagnostic/add-on use only.
   #
   # entity_category: diagnostic keeps it off the main HA overview.
   # The add-on subscribes to state_changed events for this entity via WebSocket.
@@ -1133,7 +1169,7 @@ sensor:
         # Gated by the open end stop so this only fires while the valve is open
         # and the system is in normal operation.
         - lambda: |-
-            float instant_lpm = x / 396.0f;
+            float instant_lpm = x / ${flow_k_factor}f;
             if (!id(fault_main)
                 && id(alert_high_flow_main)
                 && id(open_end_stop_valve1).state
@@ -1154,7 +1190,7 @@ sensor:
 
         # --- Fast valve seal check ---
         # If the closed end stop is active but the raw pulse counter is still
-        # non-zero, the valve has not fully sealed. 10s threshold — tight
+        # non-zero, the valve has not fully sealed. 20s threshold — tight
         # because raw pulse data has no smoothing lag unlike water_usage1.
         # Alert cleared by water_usage1 when flow drops to zero (the smoothed
         # sensor is the right place to confirm sustained zero-flow).
@@ -1163,7 +1199,7 @@ sensor:
               if (x > 0) {
                 id(valve_seal_fast_elapsed_main) += 1.0f;
                 if (!id(valve_seal_alert_main)
-                    && id(valve_seal_fast_elapsed_main) >= 10.0f) {
+                    && id(valve_seal_fast_elapsed_main) >= 20.0f) {
                   id(valve_seal_alert_main) = true;
                   ESP_LOGW("seal", "MAIN: pulses detected %.0fs after valve closed "
                     "(raw check) — possible valve seal failure",
@@ -1195,8 +1231,20 @@ sensor:
       sorting_group_id: group_main_status
       sorting_weight: 4
     filters:
-      # Step 1: Convert raw counts/min to L/min (6.6 pulses/litre × 60s = 396)
-      - lambda: return (x / 396);
+      # Step 1: Convert raw counts/min to L/min (flow_k_factor = 6.6 pulses/litre × 60s = 396)
+      - lambda: return (x / ${flow_k_factor});
+      # Step 1b: Clamp — reject garbage values before they corrupt the smoothing
+      # windows. Two classes of garbage are possible:
+      #   HIGH: ADC float overflow produces values like 1.58e+36 L/min.
+      #   LOW:  ADC/ESPHome floating-point noise produces tiny non-zero
+      #         values like 1.58e-36 that should be zero. The minimum
+      #         physically meaningful reading is 1 pulse/s = 60 counts/min
+      #         / 396 ≈ 0.15 L/min, so anything below 0.01 is garbage.
+      # Returning 0.0 keeps the smoothed output well-behaved and prevents
+      # open-forever event detection bugs in the companion addon.
+      - lambda: |-
+          if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
+          return x;
       # Step 2: 30-second sliding window. At 0.5 L/min a pulse arrives every
       # ~18s — a 30s window captures 1-2 pulses for a stable non-zero reading.
       - sliding_window_moving_average:
@@ -1321,7 +1369,7 @@ sensor:
         # Same logic as flow_base_main — see comments above.
         # Irrigation auto-shutoff fires on the irrigation valve only.
         - lambda: |-
-            float instant_lpm = x / 396.0f;
+            float instant_lpm = x / ${flow_k_factor}f;
             if (!id(fault_irrigation)
                 && id(alert_high_flow_irr)
                 && id(open_end_stop_valve2).state
@@ -1345,7 +1393,7 @@ sensor:
               if (x > 0) {
                 id(valve_seal_fast_elapsed_irr) += 1.0f;
                 if (!id(valve_seal_alert_irr)
-                    && id(valve_seal_fast_elapsed_irr) >= 10.0f) {
+                    && id(valve_seal_fast_elapsed_irr) >= 20.0f) {
                   id(valve_seal_alert_irr) = true;
                   ESP_LOGW("seal", "IRRIGATION: pulses detected %.0fs after valve closed "
                     "(raw check) — possible valve seal failure",
@@ -1374,7 +1422,11 @@ sensor:
       sorting_group_id: group_irr_status
       sorting_weight: 4
     filters:
-      - lambda: return (x / 396);
+      - lambda: return (x / ${flow_k_factor});
+      # Clamp — same guard as water_usage1; see comments there.
+      - lambda: |-
+          if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
+          return x;
       - sliding_window_moving_average:
           window_size: 30
           send_every: 1
@@ -1800,10 +1852,12 @@ binary_sensor:
         - valve.template.publish:
             id: main_water_valve
             state: OPEN
-        # Valve has reached the open position — any prior close-in-flight is
-        # moot. Clear the guard so future closes can proceed normally even if
-        # a previous close failed and left the guard set.
-        - lambda: 'id(close_in_flight_main) = false;'
+        # Valve has reached the open position — clear both in-flight guards.
+        # close_in_flight: any prior failed close is resolved; future closes proceed.
+        # open_in_flight: open sequence completed successfully.
+        - lambda: |-
+            id(close_in_flight_main) = false;
+            id(open_in_flight_main) = false;
 
   - platform: gpio
     pin:
@@ -1851,7 +1905,9 @@ binary_sensor:
         - valve.template.publish:
             id: irrigation_water_valve
             state: OPEN
-        - lambda: 'id(close_in_flight_irr) = false;'
+        - lambda: |-
+            id(close_in_flight_irr) = false;
+            id(open_in_flight_irr) = false;
 
   - platform: gpio
     pin:
@@ -2647,37 +2703,47 @@ script:
           else:
             - if:
                 condition:
-                  lambda: 'return id(fault_main);'
+                  lambda: 'return !id(open_end_stop_valve1).state && !id(closed_end_stop_valve1).state;'
                 then:
                   - lambda: |-
-                      id(leak_test_result_main) = 7;  // Not run — fault active
-                      ESP_LOGW("leak_test", "MAIN: test not started — safety fault is active. "
-                        "Reset the fault first.");
+                      id(leak_test_result_main) = 6;  // Not run — valve mid-travel
+                      ESP_LOGW("leak_test", "MAIN: test not started — valve is mid-travel "
+                        "(neither end stop active). Wait for travel to complete.");
                 else:
-                  # Pre-checks passed — begin sequence
-                  - lambda: |-
-                      id(leak_test_preparing_main) = true;
-                      id(leak_test_result_main) = 8;  // Preparing
-                      ESP_LOGI("leak_test", "MAIN: closing valve and waiting 60s for pressure to settle...");
-                  - valve.close: main_water_valve
-                  # 60-second settle — allows residual pressure dynamics
-                  # (water hammer, thermal expansion, residual flow) to
-                  # dissipate after the valve closes, so the baseline reading
-                  # captured next is stable and noise-free.
-                  - delay: 60s
-                  # Guard: if cancelled during settle, preparing will be false
-                  - lambda: |-
-                      if (!id(leak_test_preparing_main)) return;
-                      id(leak_test_preparing_main) = false;
-                      id(leak_test_elapsed_main) = 0.0f;
-                      id(leak_test_baseline_main) = id(pressure_main).state;
-                      id(leak_test_active_main) = true;
-                      id(leak_test_result_main) = 1;  // In progress
-                      ESP_LOGI("leak_test", "MAIN: test started. Baseline: %.1f PSI, "
-                        "Threshold: %.1f PSI, Duration: %.0f min",
-                        id(leak_test_baseline_main),
-                        id(leak_threshold_psi_main).state,
-                        id(leak_duration_main).state);
+                  - if:
+                      condition:
+                        lambda: 'return id(fault_main);'
+                      then:
+                        - lambda: |-
+                            id(leak_test_result_main) = 7;  // Not run — fault active
+                            ESP_LOGW("leak_test", "MAIN: test not started — safety fault is active. "
+                              "Reset the fault first.");
+                      else:
+                        # Pre-checks passed — begin sequence
+                        - lambda: |-
+                            id(leak_test_preparing_main) = true;
+                            id(leak_test_result_main) = 8;  // Preparing
+                            ESP_LOGI("leak_test", "MAIN: closing valve and waiting 60s for pressure to settle...");
+                        - valve.close: main_water_valve
+                        # 60-second settle — allows residual pressure dynamics
+                        # (water hammer, thermal expansion, residual flow) to
+                        # dissipate after the valve closes, so the baseline reading
+                        # captured next is stable and noise-free.
+                        - delay: 60s
+                        # Guard: if cancelled during settle, preparing will be false
+                        - lambda: |-
+                            if (!id(leak_test_preparing_main)) return;
+                            id(leak_test_preparing_main) = false;
+                            id(leak_test_elapsed_main) = 0.0f;
+                            id(leak_test_start_ms_main) = millis();
+                            id(leak_test_baseline_main) = id(pressure_main).state;
+                            id(leak_test_active_main) = true;
+                            id(leak_test_result_main) = 1;  // In progress
+                            ESP_LOGI("leak_test", "MAIN: test started. Baseline: %.1f PSI, "
+                              "Threshold: %.1f PSI, Duration: %.0f min",
+                              id(leak_test_baseline_main),
+                              id(leak_threshold_psi_main).state,
+                              id(leak_duration_main).state);
 
   # ---------------------------------------------------------------------------
   # LEAK TEST RESTORE — Main circuit
@@ -2714,31 +2780,41 @@ script:
           else:
             - if:
                 condition:
-                  lambda: 'return id(fault_irrigation);'
+                  lambda: 'return !id(open_end_stop_valve2).state && !id(closed_end_stop_valve2).state;'
                 then:
                   - lambda: |-
-                      id(leak_test_result_irr) = 7;  // Not run — fault active
-                      ESP_LOGW("leak_test", "IRRIGATION: test not started — safety fault is active. "
-                        "Reset the fault first.");
+                      id(leak_test_result_irr) = 6;  // Not run — valve mid-travel
+                      ESP_LOGW("leak_test", "IRRIGATION: test not started — valve is mid-travel "
+                        "(neither end stop active). Wait for travel to complete.");
                 else:
-                  - lambda: |-
-                      id(leak_test_preparing_irr) = true;
-                      id(leak_test_result_irr) = 8;  // Preparing
-                      ESP_LOGI("leak_test", "IRRIGATION: closing valve and waiting 60s for pressure to settle...");
-                  - valve.close: irrigation_water_valve
-                  - delay: 60s
-                  - lambda: |-
-                      if (!id(leak_test_preparing_irr)) return;
-                      id(leak_test_preparing_irr) = false;
-                      id(leak_test_elapsed_irr) = 0.0f;
-                      id(leak_test_baseline_irr) = id(pressure_irrigation).state;
-                      id(leak_test_active_irr) = true;
-                      id(leak_test_result_irr) = 1;  // In progress
-                      ESP_LOGI("leak_test", "IRRIGATION: test started. Baseline: %.1f PSI, "
-                        "Threshold: %.1f PSI, Duration: %.0f min",
-                        id(leak_test_baseline_irr),
-                        id(leak_threshold_psi_irr).state,
-                        id(leak_duration_irr).state);
+                  - if:
+                      condition:
+                        lambda: 'return id(fault_irrigation);'
+                      then:
+                        - lambda: |-
+                            id(leak_test_result_irr) = 7;  // Not run — fault active
+                            ESP_LOGW("leak_test", "IRRIGATION: test not started — safety fault is active. "
+                              "Reset the fault first.");
+                      else:
+                        - lambda: |-
+                            id(leak_test_preparing_irr) = true;
+                            id(leak_test_result_irr) = 8;  // Preparing
+                            ESP_LOGI("leak_test", "IRRIGATION: closing valve and waiting 60s for pressure to settle...");
+                        - valve.close: irrigation_water_valve
+                        - delay: 60s
+                        - lambda: |-
+                            if (!id(leak_test_preparing_irr)) return;
+                            id(leak_test_preparing_irr) = false;
+                            id(leak_test_elapsed_irr) = 0.0f;
+                            id(leak_test_start_ms_irr) = millis();
+                            id(leak_test_baseline_irr) = id(pressure_irrigation).state;
+                            id(leak_test_active_irr) = true;
+                            id(leak_test_result_irr) = 1;  // In progress
+                            ESP_LOGI("leak_test", "IRRIGATION: test started. Baseline: %.1f PSI, "
+                              "Threshold: %.1f PSI, Duration: %.0f min",
+                              id(leak_test_baseline_irr),
+                              id(leak_threshold_psi_irr).state,
+                              id(leak_duration_irr).state);
 
   # ---------------------------------------------------------------------------
   # LEAK TEST RESTORE — Irrigation circuit
@@ -2803,24 +2879,35 @@ valve:
                 level: WARN
                 format: "Main valve open blocked — safety fault active. Reset fault first."
           else:
-            - switch.turn_off: relay_closed_valve1
-            - delay: 20ms
-            - switch.turn_on: relay_open_valve1
-            - delay: 15ms
-            - switch.turn_off: relay_open_valve1
-            - delay: 15000ms
             - if:
                 condition:
-                  binary_sensor.is_off: open_end_stop_valve1
+                  lambda: 'return id(open_in_flight_main);'
                 then:
-                  - lambda: |-
-                      id(fault_main) = true;
-                      id(fault_reason_main_str) = "Motor fault — open end stop not reached";
-                      id(fault_reason_main).publish_state(id(fault_reason_main_str));
-                      ESP_LOGE("valve", "MAIN: open end stop not reached after 15000ms — motor/wiring fault");
-                  - valve.template.publish:
-                      id: main_water_valve
-                      state: CLOSED
+                  - logger.log:
+                      level: DEBUG
+                      tag: valve
+                      format: "MAIN: open already in flight — ignoring duplicate request"
+                else:
+                  - lambda: 'id(open_in_flight_main) = true;'
+                  - switch.turn_off: relay_closed_valve1
+                  - delay: 20ms
+                  - switch.turn_on: relay_open_valve1
+                  - delay: 15ms
+                  - switch.turn_off: relay_open_valve1
+                  - delay: 15000ms
+                  - if:
+                      condition:
+                        # Check both: guard still set (open truly in flight) AND end stop not reached.
+                        # Without the guard check, a close that completes during the 15s travel window
+                        # deactivates the end stop — triggering a false motor fault.
+                        lambda: 'return id(open_in_flight_main) && !id(open_end_stop_valve1).state;'
+                      then:
+                        - lambda: |-
+                            id(fault_main) = true;
+                            id(fault_reason_main_str) = "Motor fault — open end stop not reached";
+                            id(fault_reason_main).publish_state(id(fault_reason_main_str));
+                            id(open_in_flight_main) = false;
+                            ESP_LOGE("valve", "MAIN: open end stop not reached after 15000ms — motor/wiring fault");
     close_action:
       # Guard against repeated valve.close calls while a close is already
       # in flight. The guard is set on first entry, cleared when the open
@@ -2831,10 +2918,13 @@ valve:
           condition:
             lambda: 'return id(close_in_flight_main);'
           then:
-            - logger.log:
-                level: DEBUG
-                tag: valve
-                format: "MAIN: close already in flight — ignoring duplicate request"
+            - lambda: |-
+                if (id(fault_main)) {
+                  ESP_LOGW("valve", "MAIN: fault-triggered close requested but close-in-flight guard is set "
+                    "— valve may be mid-travel or in recovery after a failed close. Close will execute once the open end stop fires.");
+                } else {
+                  ESP_LOGD("valve", "MAIN: close already in flight — ignoring duplicate request");
+                }
           else:
             - lambda: 'id(close_in_flight_main) = true;'
             - switch.turn_off: relay_open_valve1
@@ -2873,34 +2963,46 @@ valve:
                 level: WARN
                 format: "Irrigation valve open blocked — safety fault active. Reset fault first."
           else:
-            - switch.turn_off: relay_closed_valve2
-            - delay: 20ms
-            - switch.turn_on: relay_open_valve2
-            - delay: 15ms
-            - switch.turn_off: relay_open_valve2
-            - delay: 15000ms
             - if:
                 condition:
-                  binary_sensor.is_off: open_end_stop_valve2
+                  lambda: 'return id(open_in_flight_irr);'
                 then:
-                  - lambda: |-
-                      id(fault_irrigation) = true;
-                      id(fault_reason_irr_str) = "Motor fault — open end stop not reached";
-                      id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
-                      ESP_LOGE("valve", "IRRIGATION: open end stop not reached after 15000ms — motor/wiring fault");
-                  - valve.template.publish:
-                      id: irrigation_water_valve
-                      state: CLOSED
+                  - logger.log:
+                      level: DEBUG
+                      tag: valve
+                      format: "IRRIGATION: open already in flight — ignoring duplicate request"
+                else:
+                  - lambda: 'id(open_in_flight_irr) = true;'
+                  - switch.turn_off: relay_closed_valve2
+                  - delay: 20ms
+                  - switch.turn_on: relay_open_valve2
+                  - delay: 15ms
+                  - switch.turn_off: relay_open_valve2
+                  - delay: 15000ms
+                  - if:
+                      condition:
+                        # Same guard-check pattern as main valve — see main open_action comment.
+                        lambda: 'return id(open_in_flight_irr) && !id(open_end_stop_valve2).state;'
+                      then:
+                        - lambda: |-
+                            id(fault_irrigation) = true;
+                            id(fault_reason_irr_str) = "Motor fault — open end stop not reached";
+                            id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+                            id(open_in_flight_irr) = false;
+                            ESP_LOGE("valve", "IRRIGATION: open end stop not reached after 15000ms — motor/wiring fault");
     close_action:
       # See main valve close_action for explanation of the close-in-flight guard.
       - if:
           condition:
             lambda: 'return id(close_in_flight_irr);'
           then:
-            - logger.log:
-                level: DEBUG
-                tag: valve
-                format: "IRRIGATION: close already in flight — ignoring duplicate request"
+            - lambda: |-
+                if (id(fault_irrigation)) {
+                  ESP_LOGW("valve", "IRRIGATION: fault-triggered close requested but close-in-flight guard is set "
+                    "— valve may be mid-travel or in recovery after a failed close. Close will execute once the open end stop fires.");
+                } else {
+                  ESP_LOGD("valve", "IRRIGATION: close already in flight — ignoring duplicate request");
+                }
           else:
             - lambda: 'id(close_in_flight_irr) = true;'
             - switch.turn_off: relay_open_valve2

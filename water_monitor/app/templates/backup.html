@@ -1,66 +1,68 @@
 {% extends "base.html" %}
 {% block content %}
-<h1 class="page-title">Backup &amp; Restore</h1>
 
-<p class="muted page-intro">
-  Database size: <strong>{{ db_size }}</strong>
-</p>
+{# ── Title row with DB size on the right ─────────────────────────── #}
+<div class="bk-title-row">
+  <h1 class="bk-title">Backup &amp; Restore</h1>
+  <span class="bk-db-size">Database size: <strong>{{ db_size }}</strong></span>
+</div>
 
-{# ── 1. Quick Restore ────────────────────────────────────────────────────── #}
-<section class="settings-section">
-  <div class="backup-tier-header">
-    <span class="backup-tier-icon">⚡</span>
+{# ── Tier 1: Quick Restore ───────────────────────────────────────── #}
+<div class="bk-tier bk-tier-accent">
+  <div class="bk-tier-header">
+    <span class="bk-tier-icon">⚡</span>
     <div>
-      <h2>Quick Restore</h2>
-      <p class="muted">
+      <h2 class="bk-tier-title">Quick Restore</h2>
+      <p class="bk-tier-desc">
         The go-to backup for reinstalls. Settings, training baseline, and the
         last <strong>90 days</strong> of events and usage data.
         Small enough to email or store in cloud.
-        <strong>JSON format</strong> — can be restored from the setup wizard.
+        <strong>JSON format</strong> — restore from the setup wizard.
       </p>
     </div>
   </div>
-  <div class="backup-card">
-    <div class="backup-table-list">
-      {% for t in quick_tables %}
-      <span class="backup-table-chip">{{ t }}&nbsp;<em>({{ counts.get(t, 0) }})</em></span>
-      {% endfor %}
-    </div>
-    <div class="backup-actions">
-      <a href="{{ ingress_path }}/backup/export/quick-restore"
-         class="btn btn-primary">⬇ Download Quick Restore</a>
-    </div>
+
+  <div class="bk-chips">
+    {% for t in quick_tables %}
+    <span class="bk-chip">{{ t }} <em>({{ counts.get(t, 0) }})</em></span>
+    {% endfor %}
   </div>
-  <details class="backup-import-details">
-    <summary>Restore from Quick Restore file…</summary>
-    <div class="backup-card" style="margin-top:.75rem">
+
+  <div class="bk-actions">
+    <a href="{{ ingress_path }}/backup/export/quick-restore"
+       class="btn btn-primary btn-sm">⬇ Download Quick Restore</a>
+    <span class="bk-size-est">~{{ quick_restore_size_est }} estimated</span>
+  </div>
+
+  <details class="bk-restore-details">
+    <summary class="bk-restore-summary">Restore from backup file…</summary>
+    <div class="bk-restore-body">
       <form onsubmit="return false">
-        <div class="import-file-row">
-          <label class="btn btn-secondary btn-sm" for="qr-file">📂 Choose .json…</label>
+        <div class="bk-file-row">
+          <label class="btn btn-ghost btn-sm" for="qr-file">📂 Choose file…</label>
           <input type="file" id="qr-file" accept=".json" style="display:none"
                  onchange="document.getElementById('qr-fname').textContent=this.files[0]?.name||''">
-          <span id="qr-fname" class="muted">No file chosen</span>
+          <span id="qr-fname" class="bk-fname">No file chosen</span>
         </div>
-        <div class="import-groups">
-          <label class="import-check"><input type="checkbox" id="qr-settings" checked> Settings &amp; training baseline</label>
-          <label class="import-check"><input type="checkbox" id="qr-history"  checked> Recent events &amp; usage</label>
+        <div class="bk-check-row">
+          <label class="bk-check"><input type="checkbox" id="qr-settings" checked> Settings &amp; training baseline</label>
+          <label class="bk-check"><input type="checkbox" id="qr-history"  checked> Recent events &amp; usage</label>
         </div>
-        <div class="import-warn muted">⚠ Existing data in selected groups will be replaced.</div>
-        <button class="btn btn-warning btn-sm"
-                onclick="doQuickRestore()">⬆ Restore</button>
-        <div id="qr-result" class="import-result" style="display:none"></div>
+        <p class="bk-warn">⚠ Existing data in selected groups will be replaced.</p>
+        <button class="btn btn-warning btn-sm" onclick="doQuickRestore()">⬆ Restore</button>
+        <div id="qr-result" class="bk-result" style="display:none"></div>
       </form>
     </div>
   </details>
-</section>
+</div>
 
-{# ── 2. History Archive ──────────────────────────────────────────────────── #}
-<section class="settings-section">
-  <div class="backup-tier-header">
-    <span class="backup-tier-icon">📊</span>
+{# ── Tier 2: History Archive ─────────────────────────────────────── #}
+<div class="bk-tier bk-tier-muted">
+  <div class="bk-tier-header">
+    <span class="bk-tier-icon">📊</span>
     <div>
-      <h2>History Archive</h2>
-      <p class="muted">
+      <h2 class="bk-tier-title">History Archive</h2>
+      <p class="bk-tier-desc">
         All usage events and hourly volumes — potentially years of data.
         Exported as a compact <strong>SQLite file (.db)</strong>, far smaller
         than JSON for large datasets. Import this <em>after</em> a Quick
@@ -68,65 +70,63 @@
       </p>
     </div>
   </div>
-  <div class="backup-card">
-    <div class="backup-table-list">
-      {% for t in history_tables %}
-      <span class="backup-table-chip">{{ t }}&nbsp;<em>({{ counts.get(t, 0) }})</em></span>
-      {% endfor %}
-    </div>
-    <div class="backup-actions">
-      <a href="{{ ingress_path }}/backup/export/history-archive"
-         class="btn btn-secondary">⬇ Download History Archive (.db)</a>
-      <span class="muted backup-size-est">~{{ archive_size_est }} estimated</span>
-    </div>
+
+  <div class="bk-chips">
+    {% for t in history_tables %}
+    <span class="bk-chip">{{ t }} <em>({{ counts.get(t, 0) }})</em></span>
+    {% endfor %}
   </div>
-  <details class="backup-import-details">
-    <summary>Import history archive…</summary>
-    <div class="backup-card" style="margin-top:.75rem">
-      <p class="muted">
+
+  <div class="bk-actions">
+    <a href="{{ ingress_path }}/backup/export/history-archive"
+       class="btn btn-secondary btn-sm">⬇ Download History Archive (.db)</a>
+    <span class="bk-size-est">~{{ archive_size_est }} estimated</span>
+  </div>
+
+  <details class="bk-restore-details">
+    <summary class="bk-restore-summary">Import history archive…</summary>
+    <div class="bk-restore-body">
+      <p class="bk-restore-note">
         Merges rows into the live database. Existing rows are kept — nothing
         is overwritten. Do this after a Quick Restore to get full history back.
       </p>
       <form onsubmit="return false">
-        <div class="import-file-row">
-          <label class="btn btn-secondary btn-sm" for="ha-file">📂 Choose .db…</label>
+        <div class="bk-file-row">
+          <label class="btn btn-ghost btn-sm" for="ha-file">📂 Choose file…</label>
           <input type="file" id="ha-file" accept=".db" style="display:none"
                  onchange="document.getElementById('ha-fname').textContent=this.files[0]?.name||''">
-          <span id="ha-fname" class="muted">No file chosen</span>
+          <span id="ha-fname" class="bk-fname">No file chosen</span>
         </div>
-        <button class="btn btn-warning btn-sm"
-                onclick="doHistoryImport()">⬆ Import History</button>
-        <div id="ha-result" class="import-result" style="display:none"></div>
+        <button class="btn btn-warning btn-sm" onclick="doHistoryImport()">⬆ Import History</button>
+        <div id="ha-result" class="bk-result" style="display:none"></div>
       </form>
     </div>
   </details>
-</section>
+</div>
 
-{# ── 3. Full Export ──────────────────────────────────────────────────────── #}
-<section class="settings-section">
-  <div class="backup-tier-header">
-    <span class="backup-tier-icon">💾</span>
+{# ── Tier 3: Full Export ─────────────────────────────────────────── #}
+<div class="bk-tier bk-tier-muted">
+  <div class="bk-tier-header">
+    <span class="bk-tier-icon">💾</span>
     <div>
-      <h2>Full Export</h2>
-      <p class="muted">
+      <h2 class="bk-tier-title">Full Export</h2>
+      <p class="bk-tier-desc">
         Complete data archive as a <strong>ZIP</strong> — the raw SQLite
         database, a <strong>Quick Restore JSON</strong> for easy reinstall via
         the setup wizard, and a human-readable settings summary.
-        See README inside for restore instructions.
       </p>
     </div>
   </div>
-  <div class="backup-card">
-    <div class="backup-actions">
-      <a href="{{ ingress_path }}/backup/export/full"
-         class="btn btn-secondary">⬇ Download Full Export (.zip)</a>
-      <span class="muted backup-size-est">~{{ full_size_est }} estimated</span>
-    </div>
-    <p class="muted" style="margin-top:.6rem;font-size:.8rem">
-      ⚠ May be large on long-running installs. Use Quick Restore for regular backups.
-    </p>
+
+  <div class="bk-actions">
+    <a href="{{ ingress_path }}/backup/export/full"
+       class="btn btn-secondary btn-sm">⬇ Download Full Export (.zip)</a>
+    <span class="bk-size-est">~{{ full_size_est }} estimated</span>
   </div>
-</section>
+  <p class="bk-footnote">
+    ⚠ May be large on long-running installs. Use Quick Restore for regular backups.
+  </p>
+</div>
 
 {% endblock %}
 
@@ -137,35 +137,31 @@ async function doQuickRestore() {
   const resultEl = document.getElementById('qr-result');
   const wantSett = document.getElementById('qr-settings').checked;
   const wantHist = document.getElementById('qr-history').checked;
-
-  if (!fileEl.files.length)      { alert('Choose a file first.'); return; }
-  if (!wantSett && !wantHist)    { alert('Select at least one group.'); return; }
+  if (!fileEl.files.length)   { alert('Choose a file first.'); return; }
+  if (!wantSett && !wantHist) { alert('Select at least one group.'); return; }
   if (!confirm('This will replace existing data in the selected groups. Continue?')) return;
-
   const form = new FormData();
   form.append('file', fileEl.files[0]);
   form.append('import_settings', wantSett ? '1' : '');
   form.append('import_history',  wantHist ? '1' : '');
-
   resultEl.style.display = '';
-  resultEl.className = 'import-result import-result-info';
+  resultEl.className = 'bk-result bk-result-info';
   resultEl.textContent = 'Restoring… please wait.';
-
   try {
     const resp = await fetch(`${window.INGRESS_PATH}/backup/import/quick-restore`,
                              { method: 'POST', body: form });
     const data = await resp.json();
     if (data.ok) {
-      resultEl.className = 'import-result import-result-ok';
-      resultEl.innerHTML = `✓ Restored<br><span class="muted">${data.summary}</span>`;
+      resultEl.className = 'bk-result bk-result-ok';
+      resultEl.innerHTML = `✓ Restored<br><span class="bk-result-detail">${data.summary}</span>`;
       setTimeout(() => location.reload(), 2500);
     } else {
-      resultEl.className = 'import-result import-result-err';
+      resultEl.className = 'bk-result bk-result-err';
       resultEl.innerHTML = `✗ ${data.error||'Failed'}<br>
-        <span class="muted">${(data.errors||[]).join('<br>')}</span>`;
+        <span class="bk-result-detail">${(data.errors||[]).join('<br>')}</span>`;
     }
   } catch (e) {
-    resultEl.className = 'import-result import-result-err';
+    resultEl.className = 'bk-result bk-result-err';
     resultEl.textContent = `✗ Network error: ${e.message}`;
   }
 }
@@ -173,32 +169,28 @@ async function doQuickRestore() {
 async function doHistoryImport() {
   const fileEl   = document.getElementById('ha-file');
   const resultEl = document.getElementById('ha-result');
-
   if (!fileEl.files.length) { alert('Choose a .db file first.'); return; }
   if (!confirm('Merge history from this archive? Existing rows will be kept.')) return;
-
   const form = new FormData();
   form.append('file', fileEl.files[0]);
-
   resultEl.style.display = '';
-  resultEl.className = 'import-result import-result-info';
+  resultEl.className = 'bk-result bk-result-info';
   resultEl.textContent = 'Importing… this may take a moment for large archives.';
-
   try {
     const resp = await fetch(`${window.INGRESS_PATH}/backup/import/history-archive`,
                              { method: 'POST', body: form });
     const data = await resp.json();
     if (data.ok) {
-      resultEl.className = 'import-result import-result-ok';
+      resultEl.className = 'bk-result bk-result-ok';
       resultEl.innerHTML = `✓ ${data.summary}<br>
-        <span class="muted">Existing rows kept; archive rows merged in.</span>`;
+        <span class="bk-result-detail">Existing rows kept; archive rows merged in.</span>`;
     } else {
-      resultEl.className = 'import-result import-result-err';
+      resultEl.className = 'bk-result bk-result-err';
       resultEl.innerHTML = `✗ ${data.error||'Failed'}<br>
-        <span class="muted">${(data.errors||[]).join('<br>')}</span>`;
+        <span class="bk-result-detail">${(data.errors||[]).join('<br>')}</span>`;
     }
   } catch (e) {
-    resultEl.className = 'import-result import-result-err';
+    resultEl.className = 'bk-result bk-result-err';
     resultEl.textContent = `✗ Network error: ${e.message}`;
   }
 }

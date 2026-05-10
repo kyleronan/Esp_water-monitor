@@ -17,7 +17,8 @@ import sqlite3
 from typing import Any, Dict, Optional
 
 from .config import AddonConfig, SENSITIVITY_PRESETS, DB_PATH
-from .database import (get_sensitivity_config, ensure_circuit_defaults, init_db)
+from .database import (get_sensitivity_config, ensure_circuit_defaults, init_db,
+                       dedup_events)
 from .device_discovery import (load_circuit_entities, is_setup_complete,
                                 get_device_config)
 from .event_detector import EventDetector
@@ -29,6 +30,8 @@ from .data_pruner import DataPruner
 from .alert_manager import AlertManager
 from .presence_watcher import PresenceWatcher
 from .historical_importer import HistoricalImporter
+from .cluster_metrics import ClusterMetrics
+from .fixture_publisher import FixturePublisher
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +68,11 @@ class Orchestrator:
         self._presence_watcher: Optional[PresenceWatcher] = None
         self._leak_test_scheduler: Optional[LeakTestScheduler] = None
         self._historical_importer: Optional[HistoricalImporter] = None
+        self._cluster_engine = None
+        self._cluster_metrics: Optional[ClusterMetrics] = None
+        self._fixture_publisher: Optional[FixturePublisher] = None
         self._stop = asyncio.Event()
+        self._live_state_cache: Dict[str, Any] = {}
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -167,6 +174,10 @@ class Orchestrator:
     @property
     def historical_importer(self) -> Optional[HistoricalImporter]:
         return self._historical_importer
+
+    @property
+    def cluster_engine(self):
+        return self._cluster_engine
 
     @property
     def event_detector(self) -> EventDetector:
@@ -288,6 +299,32 @@ class Orchestrator:
         self._feature_extractor = FeatureExtractor(
             self._event_queue, self._db, self._alert_manager)
 
+        # Cluster engine — instantiate and rebuild state from the last 60 days
+        # of already-matched events so DBSTREAM + scaler are warm on startup.
+        try:
+            from .cluster_engine import ClusterEngine
+            loop = asyncio.get_running_loop()
+            self._cluster_engine = ClusterEngine(self._db, self._cfg)
+            for c in self._cfg.circuits:
+                count = await loop.run_in_executor(
+                    None, self._cluster_engine.rebuild_from_db, c.circuit
+                )
+                log.info("[%s] cluster state rebuilt — %d events replayed",
+                         c.circuit, count)
+                # Backfill events that had no cluster_id (e.g. v0.1.x upgrades)
+                backfilled = await loop.run_in_executor(
+                    None, self._cluster_engine.backfill_unmatched, c.circuit
+                )
+                if backfilled:
+                    log.info("[%s] backfilled cluster_id on %d previously unmatched events",
+                             c.circuit, backfilled)
+            self._feature_extractor.cluster_engine = self._cluster_engine
+            # Wire to training_manager so complete_calibration can trigger backfill
+            self._training_manager.cluster_engine = self._cluster_engine
+            log.info("ClusterEngine initialised and wired to feature extractor")
+        except Exception as e:
+            log.error("ClusterEngine init failed (non-fatal): %s", e, exc_info=True)
+
         # Initialise daily/weekly volume baselines from HA history so that
         # the dashboard shows accurate totals from the first page load.
         try:
@@ -302,6 +339,16 @@ class Orchestrator:
         except Exception as e:
             log.warning("Unit auto-detection failed (non-fatal): %s", e)
 
+        # Cluster quality metrics — background task writing to cluster_metrics_history
+        self._cluster_metrics = ClusterMetrics(self._db, self._cfg)
+
+        # Fixture publisher — MQTT Discovery for confirmed fixtures
+        self._fixture_publisher = FixturePublisher(self._db, self._cfg, self._ha)
+        try:
+            await self._fixture_publisher.start()
+        except Exception as e:
+            log.warning("FixturePublisher start failed (non-fatal): %s", e)
+
         # Run all background tasks concurrently
         try:
             await asyncio.gather(
@@ -311,6 +358,7 @@ class Orchestrator:
                 self._data_pruner.run(),
                 self._leak_test_scheduler.run(),
                 self._historical_importer.run(),
+                self._cluster_metrics.run(),
             )
         except asyncio.CancelledError:
             pass
@@ -330,32 +378,23 @@ class Orchestrator:
         level = row["simple_level"] or "medium"
         preset = SENSITIVITY_PRESETS.get(level, SENSITIVITY_PRESETS["medium"])
 
+        # Use `is not None` rather than truthiness — 0.0 is a valid user-set
+        # threshold but is falsy, so `row[x] or preset[x]` would silently
+        # revert a user-set zero back to the preset value.
+        def _eff(key: str):
+            v = row[key]
+            return v if v is not None else preset[key]
+
         return {
-            "pressure_drop_event_psi": (
-                row["pressure_drop_event_psi"]
-                or preset["pressure_drop_event_psi"]
-            ),
-            "min_event_duration_seconds": (
-                row["min_event_duration_seconds"]
-                or preset["min_event_duration_seconds"]
-            ),
-            "score_alert": row["score_alert"] or preset["score_alert"],
-            "score_shutoff": row["score_shutoff"] or preset["score_shutoff"],
-            "flow_tolerance_pct": (
-                row["flow_tolerance_pct"] or preset["flow_tolerance_pct"]
-            ),
-            "duration_tolerance_pct": (
-                row["duration_tolerance_pct"] or preset["duration_tolerance_pct"]
-            ),
-            "schedule_window_minutes": (
-                row["schedule_window_minutes"] or preset["schedule_window_minutes"]
-            ),
-            "sustained_alert_minutes": (
-                row["sustained_alert_minutes"] or preset["sustained_alert_minutes"]
-            ),
-            "max_shutoffs_per_12h": (
-                row["max_shutoffs_per_12h"] or preset["max_shutoffs_per_12h"]
-            ),
+            "pressure_drop_event_psi":    _eff("pressure_drop_event_psi"),
+            "min_event_duration_seconds": _eff("min_event_duration_seconds"),
+            "score_alert":                _eff("score_alert"),
+            "score_shutoff":              _eff("score_shutoff"),
+            "flow_tolerance_pct":         _eff("flow_tolerance_pct"),
+            "duration_tolerance_pct":     _eff("duration_tolerance_pct"),
+            "schedule_window_minutes":    _eff("schedule_window_minutes"),
+            "sustained_alert_minutes":    _eff("sustained_alert_minutes"),
+            "max_shutoffs_per_12h":       _eff("max_shutoffs_per_12h"),
         }
 
     def get_live_state(self, circuit: str) -> Dict[str, Any]:
@@ -374,14 +413,13 @@ class Orchestrator:
         now_ts = time.monotonic()
 
         # Return cached result if it's fresh enough (3 second window)
-        cache_key = f"_live_state_{circuit}"
-        cached = getattr(self, cache_key, None)
+        cached = self._live_state_cache.get(circuit)
         if cached and now_ts - cached.get("_fetched_at", 0) < 3.0:
             return cached
 
         result = await self._fetch_live_state(circuit)
         result["_fetched_at"] = now_ts
-        setattr(self, cache_key, result)
+        self._live_state_cache[circuit] = result
         return result
 
     async def _init_display_units(self) -> None:
@@ -427,24 +465,16 @@ class Orchestrator:
 
         Without this, _get_volume_baseline() uses 0.0 as a placeholder on
         the first call, which causes the dashboard to show the full cumulative
-        sensor total rather than just today's volume.  This method overwrites
-        the placeholder with the real midnight reading from HA history.
+        sensor total rather than just today's volume.
 
-        period_ts keys MUST use local-time midnight (no tzinfo) to match the
-        keys produced by compute_ha_daily_volume / compute_ha_weekly_volume in
-        database.py.  HA history queries use UTC datetimes separately.
+        period_ts keys are naive UTC ISO strings (no +00:00 suffix) to match
+        the keys produced by compute_ha_daily_volume / compute_ha_weekly_volume.
         """
         from datetime import datetime, timezone, timedelta
 
-        # Local midnight — matches compute_ha_daily_volume key format
-        now_local       = datetime.now()
-        today_midnight  = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_monday     = today_midnight - timedelta(days=today_midnight.weekday())
-
-        # UTC equivalents for HA history queries
-        now_utc              = datetime.now(timezone.utc)
-        today_midnight_utc   = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_monday_utc      = today_midnight_utc - timedelta(days=today_midnight_utc.weekday())
+        now_utc         = datetime.now(timezone.utc)
+        today_midnight  = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        seven_days_ago  = today_midnight - timedelta(days=7)
 
         for cfg in self._cfg.circuits:
             if not cfg.volume_sensor:
@@ -452,11 +482,12 @@ class Orchestrator:
 
             circuit = cfg.circuit
 
-            for period_start_local, period_start_utc, label in [
-                (today_midnight,  today_midnight_utc,  "today"),
-                (week_monday,     week_monday_utc,     "this week"),
+            for period_start, label in [
+                (today_midnight, "today"),
+                (seven_days_ago, "past 7 days"),
             ]:
-                period_ts = period_start_local.isoformat(timespec="seconds")
+                # Naive UTC string — matches DB lookup keys in database.py
+                period_ts = period_start.replace(tzinfo=None).isoformat(timespec="seconds")
 
                 # Only fix baselines that are still at the 0.0 placeholder
                 row = self._db.execute(
@@ -472,8 +503,8 @@ class Orchestrator:
                 try:
                     hist = await self._ha.get_history(
                         cfg.volume_sensor,
-                        period_start_utc,
-                        period_start_utc + timedelta(hours=2),
+                        period_start,
+                        period_start + timedelta(hours=2),
                     )
                     if hist:
                         midnight_val = float(hist[0]["state"])
@@ -581,6 +612,13 @@ class Orchestrator:
         from .units import load_unit_context
         uc = load_unit_context(self._db)
 
+        _vt_raw = states.get(circuit_cfg.volume_sensor, "")
+        try:
+            _vt = f"{float(_vt_raw) * uc['vol_factor']:.{uc['vol_decimals']}f}" \
+                  if _vt_raw not in ("", "unknown", "unavailable") else "—"
+        except (ValueError, TypeError):
+            _vt = "—"
+
         return {
             "circuit": circuit,
             "circuit_type": circuit_cfg.circuit_type,
@@ -607,7 +645,7 @@ class Orchestrator:
             "leak_test_duration_secs": leak_test_duration_secs,  # float for JS
             "leak_test_result": states.get(
                 circuit_cfg.leak_test_result_sensor, "No test run"),
-            "volume_total": states.get(circuit_cfg.volume_sensor, "0"),
+            "volume_total": _vt,
             "volume_daily":  f"{volume_daily  * uc['vol_factor']:.{uc['vol_decimals']}f}",
             "volume_weekly": f"{volume_weekly * uc['vol_factor']:.{uc['vol_decimals']}f}",
             "leak_test_running": self._leak_test_scheduler.is_running(circuit)
