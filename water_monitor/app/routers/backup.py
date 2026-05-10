@@ -341,6 +341,11 @@ async def import_quick_restore(
     imported = {}
     db = orch.db
 
+    # PRAGMA foreign_keys must be set outside the transaction — SQLite ignores
+    # it when a transaction is already open.  Disable for the bulk restore so
+    # cross-table FK ordering (e.g. events → fixtures) does not block the
+    # DELETE pass, then re-enable immediately after.
+    db.execute("PRAGMA foreign_keys = OFF")
     # Wrap the entire restore in a single transaction.  If any table's DELETE
     # or INSERT fails, all prior DELETEs are rolled back — avoiding a state
     # where some tables are wiped but not restored.
@@ -362,6 +367,8 @@ async def import_quick_restore(
         log.error("Import quick-restore failed: %s", e)
         return JSONResponse({"ok": False, "error": f"Restore failed: {e}"},
                             status_code=500)
+    finally:
+        db.execute("PRAGMA foreign_keys = ON")
 
     # After events are imported, normalize timestamps to UTC then dedup.
     # Order matters: normalize first so rows with the same logical instant

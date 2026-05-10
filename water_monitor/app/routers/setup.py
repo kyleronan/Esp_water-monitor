@@ -128,6 +128,11 @@ async def setup_restore(request: Request):
     total  = 0
     db     = orch.db
 
+    # PRAGMA foreign_keys must be set outside the transaction — SQLite ignores
+    # it when a transaction is already open.  We disable it for the bulk
+    # restore so that cross-table FK ordering (e.g. events → fixtures) does
+    # not block the DELETE pass, then re-enable immediately after.
+    db.execute("PRAGMA foreign_keys = OFF")
     # Wrap the entire restore in a single transaction so a partial failure
     # leaves the database unchanged rather than in a half-restored state.
     try:
@@ -175,6 +180,8 @@ async def setup_restore(request: Request):
         errors.append("(transaction rolled back)")
         return ingress_redirect(request,
             f"/setup?restore_error=Restore+failed%3A+{e}")
+    finally:
+        db.execute("PRAGMA foreign_keys = ON")
 
     try:
         orch.reload_circuit_entities()
