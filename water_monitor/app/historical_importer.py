@@ -389,7 +389,7 @@ class HistoricalImporter:
         into a unified, gap-filled, deduplicated list.
         """
         onset_periods = self._onset_to_periods(onset_hist, query_end=query_end)
-        rate_periods  = self._rate_to_periods(flow_rate_hist)
+        rate_periods  = self._rate_to_periods(flow_rate_hist, query_end=query_end)
 
         all_periods = onset_periods + rate_periods
         if not all_periods:
@@ -442,7 +442,8 @@ class HistoricalImporter:
         return periods
 
     def _rate_to_periods(
-        self, history: List[Dict]
+        self, history: List[Dict],
+        query_end: Optional[datetime] = None,
     ) -> List[Tuple[datetime, datetime]]:
         """
         Extract periods where flow_rate >= MIN_FLOW_LPM from 1Hz history.
@@ -472,8 +473,10 @@ class HistoricalImporter:
 
             last_ts = ts
 
-        if current_start is not None and last_ts is not None:
-            periods.append((current_start, last_ts))
+        if current_start is not None:
+            close_ts = query_end if query_end is not None else last_ts
+            if close_ts is not None and close_ts > current_start:
+                periods.append((current_start, close_ts))
 
         return periods
 

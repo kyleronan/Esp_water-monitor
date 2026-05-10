@@ -253,17 +253,6 @@ class Orchestrator:
             ensure_circuit_defaults(
                 self._db, circuit_cfg.circuit, circuit_cfg.circuit_type)
 
-        # Startup dedup — cleans up any residual duplicates that slipped through
-        # before migration 021 added the UNIQUE(circuit, start_ts) constraint.
-        # This is a no-op on clean databases; it exists as a safety net for
-        # legacy data that migrated from pre-fix installs.
-        try:
-            _deduped = dedup_events(self._db)
-            if _deduped:
-                log.warning("startup dedup: removed %d duplicate event(s)", _deduped)
-        except Exception as _e:
-            log.warning("startup dedup failed (non-fatal): %s", _e)
-
         # HA client
         self._ha = HaClient()
         await self._ha.__aenter__()
@@ -630,6 +619,13 @@ class Orchestrator:
         from .units import load_unit_context
         uc = load_unit_context(self._db)
 
+        _vt_raw = states.get(circuit_cfg.volume_sensor, "")
+        try:
+            _vt = f"{float(_vt_raw) * uc['vol_factor']:.{uc['vol_decimals']}f}" \
+                  if _vt_raw not in ("", "unknown", "unavailable") else "—"
+        except (ValueError, TypeError):
+            _vt = "—"
+
         return {
             "circuit": circuit,
             "circuit_type": circuit_cfg.circuit_type,
@@ -656,7 +652,7 @@ class Orchestrator:
             "leak_test_duration_secs": leak_test_duration_secs,  # float for JS
             "leak_test_result": states.get(
                 circuit_cfg.leak_test_result_sensor, "No test run"),
-            "volume_total": states.get(circuit_cfg.volume_sensor, "0"),
+            "volume_total": _vt,
             "volume_daily":  f"{volume_daily  * uc['vol_factor']:.{uc['vol_decimals']}f}",
             "volume_weekly": f"{volume_weekly * uc['vol_factor']:.{uc['vol_decimals']}f}",
             "leak_test_running": self._leak_test_scheduler.is_running(circuit)

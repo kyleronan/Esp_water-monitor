@@ -86,6 +86,7 @@ async def setup_new(request: Request):
 @router.post("/restore")
 async def setup_restore(request: Request):
     import json as _json
+    from urllib.parse import quote_plus as _qp
     from fastapi import File, UploadFile
     from ..routers.backup import (
         QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT, MAX_BACKUP_BYTES,
@@ -111,7 +112,7 @@ async def setup_restore(request: Request):
         payload = _json.loads(raw)
     except Exception as e:
         return ingress_redirect(request,
-            f"/setup?restore_error=Invalid+JSON%3A+{e}")
+            f"/setup?restore_error={_qp(str(e))}")
 
     tables = payload.get("tables", {})
     if not tables:
@@ -123,6 +124,10 @@ async def setup_restore(request: Request):
         groups_to_restore += QUICK_RESTORE_TABLES
     if import_history == "1":
         groups_to_restore += QUICK_RESTORE_RECENT
+
+    if not groups_to_restore:
+        return ingress_redirect(request,
+            "/setup?restore_error=No+import+options+selected")
 
     errors = []
     total  = 0
@@ -179,7 +184,7 @@ async def setup_restore(request: Request):
         log.error("Setup restore failed — transaction rolled back: %s", e)
         errors.append("(transaction rolled back)")
         return ingress_redirect(request,
-            f"/setup?restore_error=Restore+failed%3A+{e}")
+            f"/setup?restore_error={_qp(str(e))}")
     finally:
         db.execute("PRAGMA foreign_keys = ON")
 
@@ -203,7 +208,7 @@ async def setup_restore(request: Request):
 
     if errors:
         return ingress_redirect(request,
-            f"/setup?restore_error=Some+tables+failed%3A+{','.join(errors)}")
+            f"/setup?restore_error={_qp('Some tables failed: ' + ', '.join(errors))}")
 
     log.info("Backup restored — %d rows across %d tables", total,
              len(groups_to_restore))
@@ -459,7 +464,7 @@ async def setup_units_save(request: Request):
 async def setup_home_details(request: Request):
     orch = _orch(request)
     from ..database import get_home_profile
-    profile = dict(get_home_profile(orch.db))
+    profile = dict(get_home_profile(orch.db) or {})
     return _tmpl(request).TemplateResponse("setup.html", {
         "request": request,
         "step": 5,

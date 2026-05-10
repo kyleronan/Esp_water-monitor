@@ -185,7 +185,13 @@ async def ingress_middleware(request: Request, call_next):
     # empty. We read the body once, validate CSRF on a parsed copy, then
     # rewrite the request._receive callable so the handler sees the
     # original body intact.
-    csrf_exempt = ("/setup", "/backup", "/api/", "/static", "/health")
+    csrf_exempt = (
+        "/setup",    # first-run wizard — no session token exists yet; writes validated server-side against ROLE_PATTERNS
+        "/backup",   # multipart import has no session cookie
+        "/api/",
+        "/static",
+        "/health",
+    )
     if request.method == "POST" and not any(
             request.url.path.startswith(p) for p in csrf_exempt):
         ct = request.headers.get("Content-Type", "")

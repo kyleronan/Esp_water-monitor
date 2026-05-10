@@ -75,7 +75,7 @@ QUICK_RESTORE_TABLES = [
     "data_retention", "training_state", "fixtures",
     "fixture_signatures", "fixture_clusters", "cluster_cooccurrence",
     "leak_test_history", "threshold_history",
-    "daily_summary",
+    "daily_summary", "fixture_ha_entity_map", "fixture_daily_summary",
 ]
 
 # events + hourly_volume included with 90-day filter in quick-restore
@@ -215,18 +215,26 @@ async def export_full(request: Request):
 
         # Consistent SQLite snapshot using the backup API.
         # This works even while the DB is being written to — no torn reads.
-        import io as _io
         import sqlite3 as _sqlite3
-        snap_path = Path(tempfile.mktemp(suffix=".db"))
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as _tf:
+            snap_path = Path(_tf.name)
         try:
-            src_conn  = _sqlite3.connect(str(DB_PATH))
-            mem_conn  = _sqlite3.connect(":memory:")
-            src_conn.backup(mem_conn)
-            src_conn.close()
-            disk_conn = _sqlite3.connect(str(snap_path))
-            mem_conn.backup(disk_conn)
-            mem_conn.close()
-            disk_conn.close()
+            src_conn = _sqlite3.connect(str(DB_PATH))
+            try:
+                mem_conn = _sqlite3.connect(":memory:")
+                try:
+                    src_conn.backup(mem_conn)
+                finally:
+                    src_conn.close()
+                disk_conn = _sqlite3.connect(str(snap_path))
+                try:
+                    mem_conn.backup(disk_conn)
+                finally:
+                    mem_conn.close()
+                    disk_conn.close()
+            except Exception:
+                src_conn.close()
+                raise
             zf.write(str(snap_path), "water_monitor.db")
         finally:
             snap_path.unlink(missing_ok=True)
@@ -423,6 +431,7 @@ async def import_history_archive(
         tmp_path = Path(tmp.name)
 
     imported, errors = {}, []
+    arc = None
 
     try:
         arc = sqlite3.connect(str(tmp_path))
@@ -431,38 +440,45 @@ async def import_history_archive(
         in_archive = {r[0] for r in arc.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 
-        for tbl in HISTORY_ARCHIVE_TABLES:
-            if tbl not in in_archive:
-                continue
-            try:
-                rows = arc.execute(f"SELECT * FROM {tbl}").fetchall()
-                if not rows:
-                    imported[tbl] = 0
-                    continue
-                # Validate columns against live schema (defence in depth —
-                # archive could be from a different schema version)
-                valid_cols = {r[1] for r in orch.db.execute(
-                    f"PRAGMA table_info({tbl})").fetchall()}
-                cols = [c for c in rows[0].keys() if c in valid_cols]
-                if not cols:
-                    log.warning("Import archive %s: no valid columns", tbl)
-                    continue
-                ph = ",".join("?" for _ in cols)
-                cn = ",".join(cols)
-                orch.db.executemany(
-                    f"INSERT OR IGNORE INTO {tbl} ({cn}) VALUES ({ph})",
-                    [[r[c] for c in cols] for r in rows],
-                )
-                imported[tbl] = len(rows)
-            except Exception as e:
-                log.error("Import history-archive %s: %s", tbl, e)
-                errors.append(f"{tbl}: {e}")
+        try:
+            with orch.db:   # single transaction — rolls back all tables on any failure
+                for tbl in HISTORY_ARCHIVE_TABLES:
+                    if tbl not in in_archive:
+                        continue
+                    rows = arc.execute(f"SELECT * FROM {tbl}").fetchall()
+                    if not rows:
+                        imported[tbl] = 0
+                        continue
+                    # Validate columns against live schema (defence in depth —
+                    # archive could be from a different schema version)
+                    valid_cols = {r[1] for r in orch.db.execute(
+                        f"PRAGMA table_info({tbl})").fetchall()}
+                    cols = [c for c in rows[0].keys() if c in valid_cols]
+                    if not cols:
+                        log.warning("Import archive %s: no valid columns", tbl)
+                        continue
+                    ph = ",".join("?" for _ in cols)
+                    cn = ",".join(cols)
+                    # Count before/after to get actual inserted rows — INSERT OR IGNORE
+                    # silently skips duplicates so the count delta is the ground truth.
+                    before = orch.db.execute(
+                        f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    orch.db.executemany(
+                        f"INSERT OR IGNORE INTO {tbl} ({cn}) VALUES ({ph})",
+                        [[r[c] for c in cols] for r in rows],
+                    )
+                    after = orch.db.execute(
+                        f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    imported[tbl] = after - before
+        except Exception as e:
+            log.error("Import history-archive failed (transaction rolled back): %s", e)
+            errors.append(str(e))
 
-        arc.close()
     finally:
+        if arc is not None:
+            arc.close()
         tmp_path.unlink(missing_ok=True)
 
-    orch.db.commit()
     total = sum(imported.values())
 
     return JSONResponse({

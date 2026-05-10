@@ -526,7 +526,7 @@ async def units_update(request: Request):
 @router.post("/integrations/update")
 async def integrations_update(request: Request):
     form = await request.form()
-    enabled = 1 if form.get("mqtt_publish_enabled") else 0
+    enabled = 1 if form.get("mqtt_publish_enabled") == "1" else 0
     orch = _orch(request)
     orch.db.execute(
         """UPDATE home_profile SET mqtt_publish_enabled = ? WHERE id = 1""",

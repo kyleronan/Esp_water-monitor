@@ -408,27 +408,46 @@ globals:
     initial_value: 'false'
 
   # ---------------------------------------------------------------------------
+  # OPEN-IN-FLIGHT GUARD GLOBALS
+  #
+  # Mirrors the close_in_flight guard. Set when open_action starts pulsing the
+  # relay; cleared by the open end stop on_press (success) or inside the
+  # motor-fault lambda (failure — so the next open attempt is not silently
+  # ignored after fault reset).
+  # ---------------------------------------------------------------------------
+  - id: open_in_flight_main
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: open_in_flight_irr
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # ---------------------------------------------------------------------------
   # RAPID PRESSURE DROP DETECTION GLOBALS
   #
   # Rapid pressure drop indicates either a burst pipe (during normal operation)
   # or a sudden draw on the system (during a leak test).
   #
-  # A 5-sample circular buffer per circuit holds the last five pressure readings
-  # (one per second from pressure_main / pressure_irrigation). The on_value
-  # lambda compares the current reading against the value 5 seconds ago — if
-  # the drop exceeds the user-set threshold a fault is raised (or, during a
-  # leak test, the test is aborted with code 9 "demand detected").
+  # A 10-sample circular buffer per circuit holds the last ten pressure readings.
+  # pressure_main / pressure_irrigation publish every 500ms (200Hz base ×
+  # send_every:100 = 2Hz), so 10 samples × 500ms = 5-second window.
+  # The on_value lambda compares the current reading against the value 5 seconds
+  # ago — if the drop exceeds the user-set threshold a fault is raised (or,
+  # during a leak test, the test is aborted with code 9 "demand detected").
   #
   # The buffer is invalidated whenever detection should not run — mid-valve-
   # travel, manually closed valve, or leak-test prepare phase. After re-entering
-  # a valid state the buffer takes 5 seconds to refill before detection resumes,
-  # giving a brief blackout that prevents false trips from legitimate transients
-  # such as the controlled close at the start of a leak test.
+  # a valid state the buffer takes 5 seconds (10 samples) to refill before
+  # detection resumes, giving a brief blackout that prevents false trips from
+  # legitimate transients such as the controlled close at the start of a leak test.
   # ---------------------------------------------------------------------------
   - id: pressure_history_main
-    type: float[5]
+    type: float[10]
     restore_value: no
-    initial_value: '{0, 0, 0, 0, 0}'
+    initial_value: '{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}'
 
   - id: pressure_history_main_idx
     type: int
@@ -441,9 +460,9 @@ globals:
     initial_value: 'false'
 
   - id: pressure_history_irr
-    type: float[5]
+    type: float[10]
     restore_value: no
-    initial_value: '{0, 0, 0, 0, 0}'
+    initial_value: '{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}'
 
   - id: pressure_history_irr_idx
     type: int
@@ -643,7 +662,8 @@ sensor:
       then:
         # --- Rapid pressure drop detection (Main) ---
         # 5-second window: compares current pressure against the value held
-        # 5 samples ago in the circular buffer (pressure_main reports every 1s).
+        # 10 samples ago in the circular buffer (pressure_main reports every
+        # 500ms at 2Hz, so 10 samples × 500ms = 5s).
         #
         # Detection is gated to states where a sudden drop is meaningful:
         #   - Valve open during normal operation: a sudden drop indicates a
@@ -729,7 +749,7 @@ sensor:
 
             // Update the circular buffer with the latest sample.
             id(pressure_history_main)[id(pressure_history_main_idx)] = x;
-            id(pressure_history_main_idx) = (id(pressure_history_main_idx) + 1) % 5;
+            id(pressure_history_main_idx) = (id(pressure_history_main_idx) + 1) % 10;
             if (!id(pressure_history_main_filled) && id(pressure_history_main_idx) == 0) {
               id(pressure_history_main_filled) = true;
             }
@@ -889,7 +909,7 @@ sensor:
             }
 
             id(pressure_history_irr)[id(pressure_history_irr_idx)] = x;
-            id(pressure_history_irr_idx) = (id(pressure_history_irr_idx) + 1) % 5;
+            id(pressure_history_irr_idx) = (id(pressure_history_irr_idx) + 1) % 10;
             if (!id(pressure_history_irr_filled) && id(pressure_history_irr_idx) == 0) {
               id(pressure_history_irr_filled) = true;
             }
@@ -954,15 +974,16 @@ sensor:
   # ---------------------------------------------------------------------------
   # PRESSURE SENSOR 1 (AVERAGED) — Main line
   # Derived from pressure_main via the copy platform — no separate ADC read.
-  # The source publishes every 1 second (already calibrated, clamped, and
-  # smoothed by its 1.25s sliding window); this sensor adds a longer 30-sample
-  # sliding window to average out the upstream solenoid pulses (~30s period).
+  # The source publishes every 500ms at 2Hz (already calibrated, clamped, and
+  # smoothed); this sensor adds a longer 50-sample sliding window to average
+  # out the upstream solenoid pulses (~30s period).
   #
   # Filter chain:
-  #   sliding_window_moving_average: 30 samples × 1s = 30 second window
-  #     send_every: 1 → publishes once per second (inherited from source rate)
-  #   round: 1 → 1 decimal place for display
-  #   Memory: 30 × 4 bytes = 120 bytes (half of the previous 60-sample buffer).
+  #   round: 1 → pre-round before windowing to reduce noise
+  #   sliding_window_moving_average: 50 samples × 500ms = 25-second window
+  #     send_every: 2 → publishes once per second
+  #   round/multiply: nearest 0.5 PSI for clean display
+  #   Memory: 50 × 4 bytes = 200 bytes
   #
   # This sensor is for display and trend monitoring only. All safety checks
   # (burst detection, leak test, rapid pressure drop) use the faster
@@ -1037,7 +1058,7 @@ sensor:
   #     (a proxy for fixture distance from the sensors).
   #
   # All safety logic (burst detection, leak test, rapid drop) remains on the
-  # slower 1Hz pressure_main sensor — this sensor is diagnostic/add-on use only.
+  # slower 2Hz pressure_main sensor — this sensor is diagnostic/add-on use only.
   #
   # entity_category: diagnostic keeps it off the main HA overview.
   # The add-on subscribes to state_changed events for this entity via WebSocket.
@@ -1831,10 +1852,12 @@ binary_sensor:
         - valve.template.publish:
             id: main_water_valve
             state: OPEN
-        # Valve has reached the open position — any prior close-in-flight is
-        # moot. Clear the guard so future closes can proceed normally even if
-        # a previous close failed and left the guard set.
-        - lambda: 'id(close_in_flight_main) = false;'
+        # Valve has reached the open position — clear both in-flight guards.
+        # close_in_flight: any prior failed close is resolved; future closes proceed.
+        # open_in_flight: open sequence completed successfully.
+        - lambda: |-
+            id(close_in_flight_main) = false;
+            id(open_in_flight_main) = false;
 
   - platform: gpio
     pin:
@@ -1882,7 +1905,9 @@ binary_sensor:
         - valve.template.publish:
             id: irrigation_water_valve
             state: OPEN
-        - lambda: 'id(close_in_flight_irr) = false;'
+        - lambda: |-
+            id(close_in_flight_irr) = false;
+            id(open_in_flight_irr) = false;
 
   - platform: gpio
     pin:
@@ -2854,24 +2879,35 @@ valve:
                 level: WARN
                 format: "Main valve open blocked — safety fault active. Reset fault first."
           else:
-            - switch.turn_off: relay_closed_valve1
-            - delay: 20ms
-            - switch.turn_on: relay_open_valve1
-            - delay: 15ms
-            - switch.turn_off: relay_open_valve1
-            - delay: 15000ms
             - if:
                 condition:
-                  binary_sensor.is_off: open_end_stop_valve1
+                  lambda: 'return id(open_in_flight_main);'
                 then:
-                  - lambda: |-
-                      id(fault_main) = true;
-                      id(fault_reason_main_str) = "Motor fault — open end stop not reached";
-                      id(fault_reason_main).publish_state(id(fault_reason_main_str));
-                      ESP_LOGE("valve", "MAIN: open end stop not reached after 15000ms — motor/wiring fault");
-                  - valve.template.publish:
-                      id: main_water_valve
-                      state: CLOSED
+                  - logger.log:
+                      level: DEBUG
+                      tag: valve
+                      format: "MAIN: open already in flight — ignoring duplicate request"
+                else:
+                  - lambda: 'id(open_in_flight_main) = true;'
+                  - switch.turn_off: relay_closed_valve1
+                  - delay: 20ms
+                  - switch.turn_on: relay_open_valve1
+                  - delay: 15ms
+                  - switch.turn_off: relay_open_valve1
+                  - delay: 15000ms
+                  - if:
+                      condition:
+                        # Check both: guard still set (open truly in flight) AND end stop not reached.
+                        # Without the guard check, a close that completes during the 15s travel window
+                        # deactivates the end stop — triggering a false motor fault.
+                        lambda: 'return id(open_in_flight_main) && !id(open_end_stop_valve1).state;'
+                      then:
+                        - lambda: |-
+                            id(fault_main) = true;
+                            id(fault_reason_main_str) = "Motor fault — open end stop not reached";
+                            id(fault_reason_main).publish_state(id(fault_reason_main_str));
+                            id(open_in_flight_main) = false;
+                            ESP_LOGE("valve", "MAIN: open end stop not reached after 15000ms — motor/wiring fault");
     close_action:
       # Guard against repeated valve.close calls while a close is already
       # in flight. The guard is set on first entry, cleared when the open
@@ -2882,10 +2918,13 @@ valve:
           condition:
             lambda: 'return id(close_in_flight_main);'
           then:
-            - logger.log:
-                level: DEBUG
-                tag: valve
-                format: "MAIN: close already in flight — ignoring duplicate request"
+            - lambda: |-
+                if (id(fault_main)) {
+                  ESP_LOGW("valve", "MAIN: fault-triggered close requested but close-in-flight guard is set "
+                    "— valve may be mid-travel or in recovery after a failed close. Close will execute once the open end stop fires.");
+                } else {
+                  ESP_LOGD("valve", "MAIN: close already in flight — ignoring duplicate request");
+                }
           else:
             - lambda: 'id(close_in_flight_main) = true;'
             - switch.turn_off: relay_open_valve1
@@ -2924,34 +2963,46 @@ valve:
                 level: WARN
                 format: "Irrigation valve open blocked — safety fault active. Reset fault first."
           else:
-            - switch.turn_off: relay_closed_valve2
-            - delay: 20ms
-            - switch.turn_on: relay_open_valve2
-            - delay: 15ms
-            - switch.turn_off: relay_open_valve2
-            - delay: 15000ms
             - if:
                 condition:
-                  binary_sensor.is_off: open_end_stop_valve2
+                  lambda: 'return id(open_in_flight_irr);'
                 then:
-                  - lambda: |-
-                      id(fault_irrigation) = true;
-                      id(fault_reason_irr_str) = "Motor fault — open end stop not reached";
-                      id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
-                      ESP_LOGE("valve", "IRRIGATION: open end stop not reached after 15000ms — motor/wiring fault");
-                  - valve.template.publish:
-                      id: irrigation_water_valve
-                      state: CLOSED
+                  - logger.log:
+                      level: DEBUG
+                      tag: valve
+                      format: "IRRIGATION: open already in flight — ignoring duplicate request"
+                else:
+                  - lambda: 'id(open_in_flight_irr) = true;'
+                  - switch.turn_off: relay_closed_valve2
+                  - delay: 20ms
+                  - switch.turn_on: relay_open_valve2
+                  - delay: 15ms
+                  - switch.turn_off: relay_open_valve2
+                  - delay: 15000ms
+                  - if:
+                      condition:
+                        # Same guard-check pattern as main valve — see main open_action comment.
+                        lambda: 'return id(open_in_flight_irr) && !id(open_end_stop_valve2).state;'
+                      then:
+                        - lambda: |-
+                            id(fault_irrigation) = true;
+                            id(fault_reason_irr_str) = "Motor fault — open end stop not reached";
+                            id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+                            id(open_in_flight_irr) = false;
+                            ESP_LOGE("valve", "IRRIGATION: open end stop not reached after 15000ms — motor/wiring fault");
     close_action:
       # See main valve close_action for explanation of the close-in-flight guard.
       - if:
           condition:
             lambda: 'return id(close_in_flight_irr);'
           then:
-            - logger.log:
-                level: DEBUG
-                tag: valve
-                format: "IRRIGATION: close already in flight — ignoring duplicate request"
+            - lambda: |-
+                if (id(fault_irrigation)) {
+                  ESP_LOGW("valve", "IRRIGATION: fault-triggered close requested but close-in-flight guard is set "
+                    "— valve may be mid-travel or in recovery after a failed close. Close will execute once the open end stop fires.");
+                } else {
+                  ESP_LOGD("valve", "IRRIGATION: close already in flight — ignoring duplicate request");
+                }
           else:
             - lambda: 'id(close_in_flight_irr) = true;'
             - switch.turn_off: relay_open_valve2
