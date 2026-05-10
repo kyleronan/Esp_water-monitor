@@ -465,24 +465,16 @@ class Orchestrator:
 
         Without this, _get_volume_baseline() uses 0.0 as a placeholder on
         the first call, which causes the dashboard to show the full cumulative
-        sensor total rather than just today's volume.  This method overwrites
-        the placeholder with the real midnight reading from HA history.
+        sensor total rather than just today's volume.
 
-        period_ts keys MUST use local-time midnight (no tzinfo) to match the
-        keys produced by compute_ha_daily_volume / compute_ha_weekly_volume in
-        database.py.  HA history queries use UTC datetimes separately.
+        period_ts keys are naive UTC ISO strings (no +00:00 suffix) to match
+        the keys produced by compute_ha_daily_volume / compute_ha_weekly_volume.
         """
         from datetime import datetime, timezone, timedelta
 
-        # Local midnight — matches compute_ha_daily_volume key format
-        now_local       = datetime.now()
-        today_midnight  = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_monday     = today_midnight - timedelta(days=today_midnight.weekday())
-
-        # UTC equivalents for HA history queries
-        now_utc              = datetime.now(timezone.utc)
-        today_midnight_utc   = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_monday_utc      = today_midnight_utc - timedelta(days=today_midnight_utc.weekday())
+        now_utc         = datetime.now(timezone.utc)
+        today_midnight  = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        seven_days_ago  = today_midnight - timedelta(days=7)
 
         for cfg in self._cfg.circuits:
             if not cfg.volume_sensor:
@@ -490,11 +482,12 @@ class Orchestrator:
 
             circuit = cfg.circuit
 
-            for period_start_local, period_start_utc, label in [
-                (today_midnight,  today_midnight_utc,  "today"),
-                (week_monday,     week_monday_utc,     "this week"),
+            for period_start, label in [
+                (today_midnight, "today"),
+                (seven_days_ago, "past 7 days"),
             ]:
-                period_ts = period_start_local.isoformat(timespec="seconds")
+                # Naive UTC string — matches DB lookup keys in database.py
+                period_ts = period_start.replace(tzinfo=None).isoformat(timespec="seconds")
 
                 # Only fix baselines that are still at the 0.0 placeholder
                 row = self._db.execute(
@@ -510,8 +503,8 @@ class Orchestrator:
                 try:
                     hist = await self._ha.get_history(
                         cfg.volume_sensor,
-                        period_start_utc,
-                        period_start_utc + timedelta(hours=2),
+                        period_start,
+                        period_start + timedelta(hours=2),
                     )
                     if hist:
                         midnight_val = float(hist[0]["state"])

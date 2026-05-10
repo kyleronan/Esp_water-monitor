@@ -867,17 +867,14 @@ def get_daily_volume(conn: sqlite3.Connection, circuit: str) -> float:
 
 def get_weekly_volume(conn: sqlite3.Connection, circuit: str) -> float:
     """
-    Total volume since the most recent Monday midnight UTC.
+    Total volume over the rolling past 7 days (midnight UTC 7 days ago → now).
     Computed from the internal hourly_volume table.
     """
-    # Compute days since Monday: strftime('%w') = 0(Sun)…6(Sat).
-    # (w + 6) % 7 maps Mon→0, Tue→1, …, Sun→6 — subtract from 'now' to get this Monday.
     row = conn.execute("""
         SELECT COALESCE(SUM(volume_litres), 0)
         FROM hourly_volume
         WHERE circuit = ?
-          AND hour_ts >= strftime('%Y-%m-%dT00:00:00',
-                         date('now', '-' || ((CAST(strftime('%w', 'now') AS INTEGER) + 6) % 7) || ' days'))
+          AND hour_ts >= strftime('%Y-%m-%dT00:00:00', datetime('now', '-7 days'))
     """, (circuit,)).fetchone()
     return round(row[0], 1) if row else 0.0
 
@@ -962,10 +959,11 @@ def compute_ha_daily_volume(
 ) -> float:
     """
     Daily volume from the authoritative HA cumulative sensor.
-    Uses midnight UTC today as the baseline period — matches SQLite 'now'.
+    Baseline key is midnight UTC today stored as a naive ISO string — matches
+    both SQLite 'now' and the key written by _init_volume_baselines.
     """
     today_midnight = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
     ).isoformat(timespec="seconds")
     baseline = _get_volume_baseline(conn, circuit, today_midnight, current_ha_value)
     return round(max(0.0, current_ha_value - baseline), 1)
@@ -977,15 +975,13 @@ def compute_ha_weekly_volume(
     current_ha_value: float,
 ) -> float:
     """
-    Weekly volume from the authoritative HA cumulative sensor.
-    Uses Monday midnight UTC as the baseline period — matches SQLite 'now'.
+    Rolling 7-day volume from the authoritative HA cumulative sensor.
+    Baseline key is midnight UTC 7 days ago stored as a naive ISO string.
     """
-    now = datetime.now(timezone.utc)
-    monday = now - timedelta(days=now.weekday())
-    week_midnight = monday.replace(
-        hour=0, minute=0, second=0, microsecond=0
+    seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
     ).isoformat(timespec="seconds")
-    baseline = _get_volume_baseline(conn, circuit, week_midnight, current_ha_value)
+    baseline = _get_volume_baseline(conn, circuit, seven_days_ago, current_ha_value)
     return round(max(0.0, current_ha_value - baseline), 1)
 
 
