@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS device_config (
     ha_device_id        TEXT,       -- HA device registry ID
     ha_device_name      TEXT,       -- HA device display name
     esp_device_prefix   TEXT,       -- derived entity ID prefix
+    fw_version          TEXT,       -- ESPHome project.version from device registry
     setup_complete      BOOLEAN DEFAULT 0,
     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -129,6 +130,8 @@ CREATE TABLE IF NOT EXISTS home_profile (
     ha_presence_entities    TEXT DEFAULT '',
     ha_away_state           TEXT DEFAULT 'not_home',
     ha_home_state           TEXT DEFAULT 'home',
+    -- MQTT publishing toggle (Phase 2.1)
+    mqtt_publish_enabled    INTEGER NOT NULL DEFAULT 0,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -857,13 +860,14 @@ def get_weekly_volume(conn: sqlite3.Connection, circuit: str) -> float:
     Total volume since the most recent Monday midnight UTC.
     Computed from the internal hourly_volume table.
     """
-    # SQLite: 'weekday 1' = Monday; subtract 6 days to get Monday of this week
+    # Compute days since Monday: strftime('%w') = 0(Sun)…6(Sat).
+    # (w + 6) % 7 maps Mon→0, Tue→1, …, Sun→6 — subtract from 'now' to get this Monday.
     row = conn.execute("""
         SELECT COALESCE(SUM(volume_litres), 0)
         FROM hourly_volume
         WHERE circuit = ?
           AND hour_ts >= strftime('%Y-%m-%dT00:00:00',
-                         date('now', 'weekday 1', '-6 days'))
+                         date('now', '-' || ((CAST(strftime('%w', 'now') AS INTEGER) + 6) % 7) || ' days'))
     """, (circuit,)).fetchone()
     return round(row[0], 1) if row else 0.0
 
@@ -1254,7 +1258,12 @@ def normalize_events_utc(conn: sqlite3.Connection) -> int:
 def dedup_events(conn: sqlite3.Connection) -> int:
     """Remove duplicate events sharing (circuit, start_ts) and recompute ids.
 
-    Idempotent — safe to call on every startup.  Returns count of rows deleted.
+    Called after Quick Restore to clean any pre-dedup data from old backups.
+    Migration 021 (one-time) deduped all existing rows and added a
+    UNIQUE(circuit, start_ts) index that prevents write-time duplicates going
+    forward — this function is now only needed in the Quick Restore path.
+
+    Idempotent — safe to call multiple times.  Returns count of rows deleted.
     Keeps the most recently inserted row (MAX rowid) on the assumption that
     later inserts have fresher cluster_id / match_confidence.
 
