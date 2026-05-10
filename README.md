@@ -79,8 +79,7 @@ that's great. I'm probably not going to build another one for myself.
   on failure
 - **Fixture identification** — clusters water events by their pressure and
   flow signatures to identify individual fixtures (toilets, showers, taps,
-  appliances). The online clustering engine is live in v0.2.x-dev; the
-  user-facing naming UI is complete.
+  appliances). Live in v0.2.0; the user-facing naming UI is complete.
 - **Anomaly detection** — flags events that don't match learned patterns,
   catches running toilets, slow leaks, and unusual usage. Planned for v0.3.x.
 - **Away mode** — pauses learning while unoccupied, automatically toggled
@@ -101,6 +100,8 @@ documentation, and (eventually) a companion native HA integration.
 ├── water_monitor/       # The addon itself (HA expects this at the root)
 │   ├── config.yaml
 │   ├── Dockerfile
+│   ├── icon.png         # Addon icon (128 × 128) — shown on HA addon card
+│   ├── logo.png         # Addon logo (250 × 100) — shown on HA store detail page
 │   ├── app/
 │   ├── README.md
 │   └── CHANGELOG.md
@@ -146,7 +147,7 @@ take eight months will probably apply here too.
 
 ### Firmware
 
-1. Flash `firmware/esp-water-shut-off-3_4.yaml` to your ESP32-S3-WROOM-1
+1. Flash `firmware/esp-water-shut-off-3_5.yaml` (v3.5.1) to your ESP32-S3-WROOM-1
    using ESPHome
 2. Make sure the device is added to Home Assistant before installing the addon
 3. The setup wizard will discover the device automatically
@@ -156,7 +157,7 @@ take eight months will probably apply here too.
 | Phase | Scope | Status |
 |---|---|---|
 | **0.1.x** | Core monitoring, leak detection, calibration, display units | Shipped |
-| **0.2.x** | Fixture identification — clustering engine live, UI complete, refinement (DTW + cooccurrence) in progress | In development |
+| **0.2.x** | Fixture identification — clustering engine live, UI complete, refinement (DTW + cooccurrence) in progress | Shipped |
 | **0.3.x+** | Anomaly detection, native HA integration | Planned? |
 
 See `CHANGELOG.md` for detailed release notes.
