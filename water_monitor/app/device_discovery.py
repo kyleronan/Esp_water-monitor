@@ -27,6 +27,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
+# Minimum firmware version required for full feature support.
+# Checked against the device registry sw_version field (set via project.version
+# in the ESPHome YAML). Non-numeric versions (e.g. "dev") are treated as unknown
+# — setup is not blocked, but a warning is shown.
+MIN_FIRMWARE_VERSION: tuple = (3, 5, 1)
+
 # Roles that are optional — wizard will show them as optional dropdowns
 # and they won't block setup completion if unmatched.
 OPTIONAL_ROLES = {
@@ -52,6 +58,8 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "flow_sensor":             (r"water flow rate.*main",         "sensor"),
         "pressure_fast_sensor":    (r"water pressure.*main.*fast",    "sensor"),
         "pressure_avg_sensor":     (r"water pressure.*main.*averaged","sensor"),
+        # NOTE: assumes "Water Pressure Main" naming (circuit suffix last, qualifier mid).
+        # Would fail for "Water Pressure (Fast) Main" — update regex if firmware changes.
         "pressure_history_sensor": (r"water pressure.*main(?!\s*\((?:fast|averaged))", "sensor"),
         "flow_onset_sensor":       (r"flow pulse onset.*main",        "binary_sensor"),
         "valve_entity":            (r"main water valve",              "valve"),
@@ -68,6 +76,7 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "flow_sensor":             (r"water flow rate.*irrigation",         "sensor"),
         "pressure_fast_sensor":    (r"water pressure.*irrigation.*fast",    "sensor"),
         "pressure_avg_sensor":     (r"water pressure.*irrigation.*averaged","sensor"),
+        # Same naming assumption as main circuit — see comment above.
         "pressure_history_sensor": (r"water pressure.*irrigation(?!\s*\((?:fast|averaged))", "sensor"),
         "flow_onset_sensor":       (r"flow pulse onset.*irrigation",        "binary_sensor"),
         "valve_entity":            (r"irrigation water valve",              "valve"),
@@ -92,6 +101,7 @@ class DiscoveredDevice:
     model: Optional[str]
     manufacturer: Optional[str]
     identifiers: List[Any] = field(default_factory=list)
+    sw_version: Optional[str] = None   # project.version from ESPHome YAML
 
     @property
     def display_name(self) -> str:
@@ -103,6 +113,19 @@ class DiscoveredDevice:
             "esphome" in str(ident).lower()
             for ident in self.identifiers
         )
+
+    @property
+    def firmware_ok(self) -> bool:
+        """True if sw_version meets MIN_FIRMWARE_VERSION, or version is unknown."""
+        if not self.sw_version:
+            return True   # can't determine — don't block setup
+        try:
+            # HA appends "(ESPHome x.y.z)" to the project version — strip it
+            version_str = self.sw_version.split("(")[0].strip()
+            parts = tuple(int(x) for x in version_str.split(".")[:3])
+            return parts >= MIN_FIRMWARE_VERSION
+        except ValueError:
+            return True   # non-numeric (e.g. "dev") — warn but don't block
 
 
 @dataclass
@@ -164,7 +187,7 @@ def find_matching_devices(
     exact = next(
         (d for d in all_devices
          if d.name.lower() == search_lower
-         or d.name_by_user.lower() == search_lower),
+         or (d.name_by_user and d.name_by_user.lower() == search_lower)),
         None,
     )
     if exact:
@@ -275,10 +298,9 @@ def _find_entity_for_role(
         return candidates[0]
 
     # Multiple candidates — prefer one where original_name matches over entity_id
-    compiled_name = re.compile(pattern, re.IGNORECASE)
     name_matches = [
         e for e in candidates
-        if compiled_name.search(e.get("original_name") or "")
+        if compiled.search(e.get("original_name") or "")
     ]
     return name_matches[0] if name_matches else candidates[0]
 
@@ -290,7 +312,9 @@ def _derive_prefix(entities: List[Dict[str, Any]]) -> str:
     e.g. from 'sensor.esp_water_shut_off_3_water_flow_rate_main'
     extracts 'esp_water_shut_off_3_'
     """
-    # Common known entity name suffixes from the firmware
+    # Known suffixes used to strip the device prefix from entity IDs.
+    # If the firmware adds new entity types, extend this list or switch to
+    # a longest-common-prefix approach across all device entity IDs.
     known_suffixes = [
         "water_flow_rate_main",
         "water_flow_rate_irrigation",
@@ -324,6 +348,7 @@ def _to_device(raw: Dict[str, Any]) -> DiscoveredDevice:
         model=raw.get("model"),
         manufacturer=raw.get("manufacturer"),
         identifiers=raw.get("identifiers", []),
+        sw_version=raw.get("sw_version"),
     )
 
 
@@ -336,34 +361,49 @@ def save_discovery(
     result: DiscoveryResult,
 ) -> None:
     """Persist a completed discovery result to SQLite."""
-    now = __import__("datetime").datetime.utcnow().isoformat()
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
 
-    db.execute("""
-        UPDATE device_config SET
-            ha_device_id = ?,
-            ha_device_name = ?,
-            esp_device_prefix = ?,
-            setup_complete = 0,
-            updated_at = ?
-        WHERE id = 1
-    """, (result.device.id, result.device.display_name,
-          result.esp_device_prefix, now))
+    with db:
+        db.execute("""
+            UPDATE device_config SET
+                ha_device_id = ?,
+                ha_device_name = ?,
+                esp_device_prefix = ?,
+                fw_version = ?,
+                setup_complete = 0,
+                updated_at = ?
+            WHERE id = 1
+        """, (result.device.id, result.device.display_name,
+              result.esp_device_prefix, result.device.sw_version, now))
 
-    db.execute("DELETE FROM circuit_entity_map")
+        db.execute("DELETE FROM circuit_entity_map")
 
-    for circuit, matches in result.circuit_matches.items():
-        for m in matches:
-            db.execute("""
-                INSERT INTO circuit_entity_map
-                    (circuit, role, entity_id, entity_name, confirmed)
-                VALUES (?, ?, ?, ?, 0)
-            """, (circuit, m.role, m.entity_id, m.original_name))
+        # Clear fixture data from the previous setup so stale clusters and fixtures
+        # don't bleed through into the new setup's labelling flow.
+        db.execute("DELETE FROM fixture_clusters")
+        # fixture_ha_entity_map and fixture_daily_summary reference fixtures(id)
+        # without ON DELETE CASCADE, so they must be cleared before deleting fixtures.
+        # NOTE: MQTT Discovery entities already published to HA are not retracted here
+        # — the setup wizard does not perform HA teardown on reset.
+        db.execute("DELETE FROM fixture_ha_entity_map")
+        db.execute("DELETE FROM fixture_daily_summary")
+        db.execute("DELETE FROM fixtures")
+        db.execute("UPDATE events SET cluster_id = NULL, fixture_id = NULL")
+        db.execute("UPDATE training_state SET state = 'idle'")
 
-    db.commit()
+        for circuit, matches in result.circuit_matches.items():
+            for m in matches:
+                db.execute("""
+                    INSERT INTO circuit_entity_map
+                        (circuit, role, entity_id, entity_name, confirmed)
+                    VALUES (?, ?, ?, ?, 0)
+                """, (circuit, m.role, m.entity_id, m.original_name))
 
 
 def mark_setup_complete(db: sqlite3.Connection) -> None:
-    now = __import__("datetime").datetime.utcnow().isoformat()
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
     db.execute("""
         UPDATE device_config SET setup_complete = 1, updated_at = ?
         WHERE id = 1

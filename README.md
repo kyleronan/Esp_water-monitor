@@ -70,13 +70,17 @@ that's great. I'm probably not going to build another one for myself.
   circuits, displayed in the units you choose (L/min · gal/min · ft³/min ·
   m³/min, and PSI · bar · kPa)
 - **Learned baseline** — 14-day calibration period during which the addon
-  watches your normal usage patterns, then uses that to detect anomalies
+  watches your normal usage patterns. When training ends, the Fixtures
+  page lists the clusters that were detected; you confirm or remove them,
+  then activate the circuit to start anomaly detection (or auto-activates
+  after 7 days of no review).
 - **Scheduled micro leak tests** — closes each valve in turn at the
   statistically quietest hour of the day, monitors pressure decay, and notifies
   on failure
 - **Fixture identification** — clusters water events by their pressure and
   flow signatures to identify individual fixtures (toilets, showers, taps,
-  appliances). In active development for v0.2.x.
+  appliances). The online clustering engine is live in v0.2.x-dev; the
+  user-facing naming UI is complete.
 - **Anomaly detection** — flags events that don't match learned patterns,
   catches running toilets, slow leaks, and unusual usage. Planned for v0.3.x.
 - **Away mode** — pauses learning while unoccupied, automatically toggled
@@ -127,6 +131,14 @@ repository, the HA addon store will offer the update.
 You'll need the ESP32-S3-WROOM-1 board (custom PCB), motorised ball valves
 with end-stop signalling, pressure transducers, and pulse-output flow meters.
 
+> **If your home has a pressure boosting pump or well pump system**, install
+> the addon's flow and pressure sensors *downstream* of the pump (between the
+> pump output and the house plumbing). Sensors placed upstream see pump cycling
+> artifacts that mask individual fixture pressure signatures, making the
+> fixture identification feature in v0.2.x unreliable. Downstream placement is
+> also what every reasonable installation diagram recommends regardless of
+> monitoring.
+
 I'm planning to add the PCB design files (KiCad source + Gerbers), a bill of
 materials with digikey links, and a quarter-assed build guide (I am legally required to not do half-assed or full-assed work) to `docs/`
 at some point. No promises on timing — same ADHD that made the addon code
@@ -144,10 +156,10 @@ take eight months will probably apply here too.
 | Phase | Scope | Status |
 |---|---|---|
 | **0.1.x** | Core monitoring, leak detection, calibration, display units | Shipped |
-| **0.2.x** | Fixture identification (clustering + matching) | In development |
+| **0.2.x** | Fixture identification — clustering engine live, UI complete, refinement (DTW + cooccurrence) in progress | In development |
 | **0.3.x+** | Anomaly detection, native HA integration | Planned? |
 
-See `water_monitor/CHANGELOG.md` for detailed release notes.
+See `CHANGELOG.md` for detailed release notes.
 
 ## License
 

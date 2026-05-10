@@ -9,8 +9,14 @@
 </head>
 <body>
   <header class="app-header">
-    <div class="app-title">💧 Water Monitor</div>
-    <div class="conn-status" id="conn-status">● Connected</div>
+    <div class="app-brand">
+      <span class="app-brand-icon">💧</span>
+      <span class="app-brand-text">Water Monitor</span>
+    </div>
+    <div class="conn-status conn-status-ok" id="conn-status">
+      <span class="conn-dot"></span>
+      <span class="conn-label">Connected</span>
+    </div>
   </header>
 
   <nav class="app-nav">
@@ -20,6 +26,7 @@
     <a href="{{ ingress_path }}/fixtures" class="nav-item {% if page == 'fixtures' %}active{% endif %}">Fixtures</a>
     <a href="{{ ingress_path }}/settings" class="nav-item {% if page == 'settings' %}active{% endif %}">Settings</a>
     <a href="{{ ingress_path }}/backup"   class="nav-item {% if page == 'backup'   %}active{% endif %}">Backup</a>
+    <a href="{{ ingress_path }}/setup"    class="nav-item {% if page == 'setup'    %}active{% endif %}">Setup</a>
   </nav>
 
   <main class="app-main">
@@ -27,6 +34,7 @@
   </main>
 
   <script>window.INGRESS_PATH = {{ ingress_path|tojson }};
+  window.CSRF_TOKEN = {{ csrf_token|tojson if csrf_token else '""' }};
   window.UNITS = {
     flow_factor:        {{ flow_factor }},
     flow_unit:          {{ flow_unit|tojson }},

@@ -86,8 +86,12 @@ async def setup_new(request: Request):
 @router.post("/restore")
 async def setup_restore(request: Request):
     import json as _json
+    from urllib.parse import quote_plus as _qp
     from fastapi import File, UploadFile
-    from ..routers.backup import QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT
+    from ..routers.backup import (
+        QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT, MAX_BACKUP_BYTES,
+    )
+    from ..database import normalize_events_utc, dedup_events
 
     orch = _orch(request)
     form = await request.form()
@@ -100,11 +104,15 @@ async def setup_restore(request: Request):
             "/setup?restore_error=No+file+uploaded")
 
     try:
-        raw = await file.read()
+        # Enforce a 50 MB hard limit to prevent OOM on malformed uploads.
+        raw = await file.read(MAX_BACKUP_BYTES + 1)
+        if len(raw) > MAX_BACKUP_BYTES:
+            return ingress_redirect(request,
+                "/setup?restore_error=File+too+large+(max+50+MB)")
         payload = _json.loads(raw)
     except Exception as e:
         return ingress_redirect(request,
-            f"/setup?restore_error=Invalid+JSON%3A+{e}")
+            f"/setup?restore_error={_qp(str(e))}")
 
     tables = payload.get("tables", {})
     if not tables:
@@ -117,38 +125,68 @@ async def setup_restore(request: Request):
     if import_history == "1":
         groups_to_restore += QUICK_RESTORE_RECENT
 
+    if not groups_to_restore:
+        return ingress_redirect(request,
+            "/setup?restore_error=No+import+options+selected")
+
     errors = []
     total  = 0
     db     = orch.db
 
-    for tbl in groups_to_restore:
-        rows = tables.get(tbl)
-        if not rows:
-            continue
-        try:
-            db.execute(f"DELETE FROM {tbl}")
-            # Filter backup columns against live schema so old backups with
-            # removed columns (e.g. monthly_budget_litres) restore cleanly.
-            valid_cols = {r[1] for r in db.execute(
-                f"PRAGMA table_info({tbl})").fetchall()}
-            cols = [c for c in rows[0].keys() if c in valid_cols]
-            if not cols:
-                log.warning("Restore: table %s has no valid columns — skipping", tbl)
-                continue
-            placeholders = ", ".join("?" for _ in cols)
-            col_names    = ", ".join(cols)
-            for row in rows:
-                db.execute(
-                    f"INSERT OR REPLACE INTO {tbl} ({col_names}) "
-                    f"VALUES ({placeholders})",
-                    [row.get(c) for c in cols],
-                )
-            total += len(rows)
-        except Exception as e:
-            log.error("Restore: table %s: %s", tbl, e)
-            errors.append(tbl)
+    # PRAGMA foreign_keys must be set outside the transaction — SQLite ignores
+    # it when a transaction is already open.  We disable it for the bulk
+    # restore so that cross-table FK ordering (e.g. events → fixtures) does
+    # not block the DELETE pass, then re-enable immediately after.
+    db.execute("PRAGMA foreign_keys = OFF")
+    # Wrap the entire restore in a single transaction so a partial failure
+    # leaves the database unchanged rather than in a half-restored state.
+    try:
+        with db:
+            for tbl in groups_to_restore:
+                # Always clear the table first so the DB reflects the exact
+                # state of the backup — stale rows from a prior restore cannot
+                # bleed through when the backup has an empty array or the table
+                # is absent from the backup entirely.
+                db.execute(f"DELETE FROM {tbl}")
+                rows = tables.get(tbl)
+                if not rows:
+                    continue
+                # Filter backup columns against live schema so old backups with
+                # removed columns (e.g. monthly_budget_litres) restore cleanly.
+                valid_cols = {r[1] for r in db.execute(
+                    f"PRAGMA table_info({tbl})").fetchall()}
+                cols = [c for c in rows[0].keys() if c in valid_cols]
+                if not cols:
+                    log.warning("Restore: table %s has no valid columns — skipping", tbl)
+                    continue
+                placeholders = ", ".join("?" for _ in cols)
+                col_names    = ", ".join(cols)
+                for row in rows:
+                    db.execute(
+                        f"INSERT OR REPLACE INTO {tbl} ({col_names}) "
+                        f"VALUES ({placeholders})",
+                        [row.get(c) for c in cols],
+                    )
+                total += len(rows)
 
-    db.commit()
+            # Normalize and deduplicate events after import so the DB is
+            # consistent even if the backup contained pre-dedup duplicates
+            # or mixed-timezone timestamps.
+            if import_history == "1" and tables.get("events"):
+                normalize_events_utc(db)
+                removed = dedup_events(db)
+                if removed:
+                    log.warning(
+                        "Setup restore: removed %d duplicate event(s) from backup",
+                        removed,
+                    )
+    except Exception as e:
+        log.error("Setup restore failed — transaction rolled back: %s", e)
+        errors.append("(transaction rolled back)")
+        return ingress_redirect(request,
+            f"/setup?restore_error={_qp(str(e))}")
+    finally:
+        db.execute("PRAGMA foreign_keys = ON")
 
     try:
         orch.reload_circuit_entities()
@@ -170,7 +208,7 @@ async def setup_restore(request: Request):
 
     if errors:
         return ingress_redirect(request,
-            f"/setup?restore_error=Some+tables+failed%3A+{','.join(errors)}")
+            f"/setup?restore_error={_qp('Some tables failed: ' + ', '.join(errors))}")
 
     log.info("Backup restored — %d rows across %d tables", total,
              len(groups_to_restore))
@@ -312,6 +350,9 @@ async def setup_discover(device_id: str, request: Request):
             for m in matches
         ]
 
+    from ..device_discovery import MIN_FIRMWARE_VERSION
+    min_fw = ".".join(str(x) for x in MIN_FIRMWARE_VERSION)
+
     return _tmpl(request).TemplateResponse("setup.html", {
         "request": request,
         "step": 3,
@@ -328,6 +369,7 @@ async def setup_discover(device_id: str, request: Request):
         "all_matched": result.all_matched,
         "unmatched_roles": result.unmatched_roles,
         "prefix": prefix,
+        "min_fw": min_fw,
         "page": "setup",
     })
 
@@ -340,13 +382,25 @@ async def setup_confirm(device_id: str, request: Request):
     orch = _orch(request)
     form = await request.form()
 
-    # Update any manually-overridden entity IDs
+    # Update any manually-overridden entity IDs.
+    # Validate circuit and role against the known ROLE_PATTERNS allowlist so
+    # arbitrary form fields cannot inject unrecognised column names or circuits.
+    from ..device_discovery import ROLE_PATTERNS
+    _valid_circuits = set(ROLE_PATTERNS.keys())
+    # Union of all role names across every circuit type
+    _valid_roles = {r for roles in ROLE_PATTERNS.values() for r in roles}
+
     for key, value in form.items():
         # Form fields are named: circuit__role  e.g. main__flow_sensor
         if "__" in key and value:
             parts = key.split("__", 1)
             if len(parts) == 2:
                 circuit, role = parts
+                if circuit not in _valid_circuits or role not in _valid_roles:
+                    log.warning(
+                        "setup_confirm: ignoring unknown circuit/role pair "
+                        "%r/%r", circuit, role)
+                    continue
                 orch.db.execute("""
                     INSERT INTO circuit_entity_map (circuit, role, entity_id, confirmed)
                     VALUES (?, ?, ?, 1)
@@ -410,7 +464,7 @@ async def setup_units_save(request: Request):
 async def setup_home_details(request: Request):
     orch = _orch(request)
     from ..database import get_home_profile
-    profile = dict(get_home_profile(orch.db))
+    profile = dict(get_home_profile(orch.db) or {})
     return _tmpl(request).TemplateResponse("setup.html", {
         "request": request,
         "step": 5,
@@ -451,6 +505,32 @@ async def setup_home_details_save(request: Request):
     # Mark setup complete and reload entity IDs into live circuit configs
     mark_setup_complete(orch.db)
     orch.reload_circuit_entities()
+
+    # Activate event detection now that entity IDs are known.
+    # At startup, event_detector.setup() is skipped when setup is not yet
+    # complete.  Calling it here ensures the first real day of monitoring
+    # is not lost — without this, subscriptions stay at 0 until restart.
+    if orch.event_detector:
+        try:
+            orch.event_detector.setup()
+            log.info("Event detection activated after setup wizard completion")
+        except Exception as e:
+            log.warning("Event detector setup failed (non-fatal): %s", e)
+
+    # Fetch midnight volume baselines from HA history so the dashboard
+    # shows accurate daily/weekly totals from the first page load.
+    try:
+        await orch._init_volume_baselines()
+    except Exception as e:
+        log.warning("Volume baseline init after setup failed (non-fatal): %s", e)
+
+    # Sync presence watcher state so away mode is correct immediately
+    # (without this it waits for the next state_changed event from HA).
+    if orch._presence_watcher:
+        try:
+            await orch._presence_watcher.sync_initial_state()
+        except Exception as e:
+            log.warning("Presence watcher sync after setup failed (non-fatal): %s", e)
 
     # Compute calibration duration from the home profile and auto-start
     # training for every circuit.  The user sees the result on step 5.
@@ -514,7 +594,7 @@ async def setup_complete(request: Request):
             }
             for c in orch._cfg.circuits
         ],
-        "cal_days":   int(cal_days) if cal_days else 14,
+        "cal_days":   (int(cal_days) if str(cal_days).isdigit() else 14) if cal_days else 14,
         "cal_reason": cal_reason,
         "page":       "setup",
     })
@@ -552,6 +632,8 @@ def _device_to_dict(d: DiscoveredDevice) -> Dict[str, Any]:
         "model": d.model or "",
         "manufacturer": d.manufacturer or "",
         "is_esphome": d.is_esphome,
+        "sw_version": d.sw_version or "",
+        "firmware_ok": d.firmware_ok,
     }
 
 

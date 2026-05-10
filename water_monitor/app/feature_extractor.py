@@ -1,15 +1,16 @@
 """
-Feature extractor — Phase 1.
+Feature extractor — Phase 2.
 
 Consumes RawEvent objects from the detection queue and:
   1. Computes the full feature vector for each event
   2. Stores the event in the SQLite events table
   3. Updates hourly_volume for the chart
   4. Updates the training state event count
+  5. Feeds non-excluded events to ClusterEngine (DBSTREAM) for online
+     cluster matching and sequence context recording
 
-Phase 2 will add DBSCAN clustering and fixture matching on top of
-this stored data. Phase 1 just makes sure we're collecting the right
-features from day one.
+Algorithm: DBSTREAM via river.cluster.DBSTREAM (online, no fixed K).
+DBSCAN batch clustering was considered and rejected — see ADR 003.
 
 Feature vector:
   Temporal:
@@ -73,6 +74,8 @@ from typing import Any, Dict, List, Optional
 from .event_detector import RawEvent
 
 log = logging.getLogger(__name__)
+
+from .cluster_engine import SEQUENCE_GAP_MAX_SECONDS as _SEQUENCE_GAP_MAX_S
 
 
 def _safe_float(values: list, default: float = 0.0) -> float:
@@ -164,8 +167,14 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     peak_flow = max(event.flow_readings) if event.flow_readings else 0.0
     flow_variability = _safe_std(event.flow_readings)
 
-    # Volume: avg_flow (L/min) × duration (min)
-    volume_litres = avg_flow * (duration / 60.0) if duration > 0 else 0.0
+    # Volume: prefer the firmware's cumulative integration sensor delta (set by
+    # the historical importer) over the flow-average approximation, which can
+    # overstate volume for long events with fill-pause-fill patterns after
+    # downsampling kicks in at 120 s.
+    if event.volume_litres_measured is not None:
+        volume_litres = event.volume_litres_measured
+    else:
+        volume_litres = avg_flow * (duration / 60.0) if duration > 0 else 0.0
 
     # True hydraulic resistance: ΔP / avg_Q
     # Only meaningful when flow is above noise floor and a pressure
@@ -174,9 +183,28 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     if avg_flow >= 0.05 and event.has_pressure_transient and event.pressure_delta_psi > 0:
         resistance = event.pressure_delta_psi / avg_flow
 
-    # Resistance curve shape — uses corrected ΔP/Q formula
+    # Resistance curve shape — uses corrected ΔP/Q formula.
+    # pressure_readings are at 40 Hz, flow_readings at 1 Hz.  Pair them by
+    # averaging each pressure bin that corresponds to one flow sample so the
+    # resistance values are time-aligned.  Without downsampling, index-pairing
+    # would match the first ~0.75 s of pressure against the full event duration
+    # of flow, making every result meaningless.
+    pressure_for_shape = event.pressure_readings
+    if (event.flow_readings and event.pressure_readings
+            and len(event.pressure_readings) > len(event.flow_readings)):
+        n_flow = len(event.flow_readings)
+        n_pres = len(event.pressure_readings)
+        step = n_pres / n_flow          # fractional step to stay evenly spaced
+        pressure_for_shape = []
+        for i in range(n_flow):
+            lo = int(round(i * step))
+            hi = int(round((i + 1) * step))
+            hi = max(hi, lo + 1)        # guarantee at least one sample per bin
+            bin_samples = event.pressure_readings[lo:hi]
+            pressure_for_shape.append(sum(bin_samples) / len(bin_samples))
+
     shape = _classify_resistance_shape(
-        event.pressure_readings,
+        pressure_for_shape,
         event.flow_readings,
         event.pre_event_pressure_psi,
     )
@@ -188,12 +216,30 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     hour_radians = 2 * math.pi * hour / 24
     duration_log = math.log(duration + 1)
 
+    # Normalize timestamps to UTC so the UUID5 id and stored start_ts are
+    # stable regardless of what timezone the incoming RawEvent carries.
+    # This is the single storage point — all paths that write events go
+    # through extract_features(), so enforcing UTC here is sufficient.
+    _start = event.start_ts
+    if _start.tzinfo is None:
+        _start = _start.replace(tzinfo=timezone.utc)
+    start_utc = _start.astimezone(timezone.utc)
+    _end = event.end_ts
+    if _end is not None:
+        if _end.tzinfo is None:
+            _end = _end.replace(tzinfo=timezone.utc)
+        end_utc = _end.astimezone(timezone.utc)
+    else:
+        end_utc = None
+
     return {
-        # Identity
-        "id": str(uuid.uuid4()),
+        # Identity — UUID5 keyed on UTC start_ts so re-imports of the same
+        # event always produce the same id and INSERT OR REPLACE is a no-op.
+        "id": str(uuid.uuid5(uuid.NAMESPACE_OID,
+                              f"{event.circuit}/{start_utc.isoformat()}")),
         "circuit": event.circuit,
-        "start_ts": event.start_ts.isoformat(),
-        "end_ts": event.end_ts.isoformat() if event.end_ts else None,
+        "start_ts": start_utc.isoformat(),
+        "end_ts": end_utc.isoformat() if end_utc else None,
 
         # Raw measurements
         "duration_seconds": round(duration, 2),
@@ -246,6 +292,8 @@ class FeatureExtractor:
         self._db = db_conn
         self._alert_manager = alert_manager
         self._running = False
+        # Set by orchestrator after ClusterEngine is initialised and rebuilt.
+        self.cluster_engine = None
 
     async def run(self) -> None:
         """Process events from the queue until cancelled."""
@@ -273,13 +321,41 @@ class FeatureExtractor:
         features = extract_features(event)
 
         try:
-            from .database import insert_event, update_hourly_volume
+            from .database import (insert_event, update_hourly_volume,
+                                   is_event_in_exclusion_window)
             insert_event(self._db, features)
 
+            # ── Plumbing-event exclusion window (Phase 2.1) ───────────────
+            # If the user opened an exclusion window (e.g. post-winterization
+            # flush), flag the event so the cluster engine skips it.  Volume
+            # tracking continues — only fixture identification is excluded.
+            start_ts_str = features.get("start_ts")
+            if (start_ts_str
+                    and is_event_in_exclusion_window(
+                        self._db, event.circuit, start_ts_str)):
+                self._db.execute(
+                    """UPDATE events
+                       SET excluded_from_training  = 1,
+                           match_rejection_reason  = 'excluded_from_training'
+                       WHERE id = ?""",
+                    (features["id"],),
+                )
+                features["excluded_from_training"] = 1
+                log.debug(
+                    "[%s] event excluded from training (exclusion window active)",
+                    event.circuit,
+                )
+
             if event.start_ts and features.get("volume_litres", 0) > 0:
-                hour_ts = event.start_ts.replace(
-                    minute=0, second=0, microsecond=0
-                ).isoformat()
+                # Normalize to UTC and strip timezone info so hour_ts matches
+                # the format that DB queries use: strftime('%Y-%m-%dT%H:00:00', …)
+                # produces no timezone suffix.  Mixing +00:00 suffixed values
+                # with bare datetime strings breaks lexicographic comparison in
+                # get_daily_volume / get_weekly_volume / data pruner.
+                _hdt = event.start_ts
+                if _hdt.tzinfo is None:
+                    _hdt = _hdt.replace(tzinfo=timezone.utc)
+                hour_ts = _hdt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:00:00')
                 update_hourly_volume(
                     self._db,
                     event.circuit,
@@ -296,6 +372,10 @@ class FeatureExtractor:
                       AND state = 'calibrating'
                 """, (event.circuit,))
             self._db.commit()
+
+            # ── Phase 2: sequence context + cluster matching ───────────────
+            await self._cluster_event(event.circuit, features)
+            # ──────────────────────────────────────────────────────────────
 
             am = self._alert_manager
             if am and features.get("anomaly_score"):
@@ -320,3 +400,117 @@ class FeatureExtractor:
             )
         except Exception as e:
             log.error("[%s] failed to store event: %s", event.circuit, e, exc_info=True)
+
+    async def _cluster_event(self, circuit: str, features: dict) -> None:
+        """Compute sequence context, run cluster matching, write results back."""
+        if features.get("excluded_from_training"):
+            return
+
+        event_id    = features["id"]
+        start_ts    = features.get("start_ts")
+
+        # 1. Find the previous event on this circuit
+        seconds_since_prev = None
+        prev_cluster_id    = None
+        if start_ts:
+            prev = self._db.execute(
+                """SELECT id, cluster_id, end_ts FROM events
+                   WHERE circuit = ? AND end_ts < ? AND id != ?
+                   ORDER BY end_ts DESC LIMIT 1""",
+                (circuit, start_ts, event_id)
+            ).fetchone()
+            if prev and prev["end_ts"]:
+                try:
+                    ev_start = datetime.fromisoformat(start_ts)
+                    prev_end = datetime.fromisoformat(
+                        prev["end_ts"].replace("Z", "+00:00"))
+                    if ev_start.tzinfo is None:
+                        ev_start = ev_start.replace(tzinfo=timezone.utc)
+                    if prev_end.tzinfo is None:
+                        prev_end = prev_end.replace(tzinfo=timezone.utc)
+                    gap = (ev_start - prev_end).total_seconds()
+                    if 0 <= gap < _SEQUENCE_GAP_MAX_S:
+                        seconds_since_prev = gap
+                        prev_cluster_id    = prev["cluster_id"]
+                        # Retroactively fill seconds_to_next_event on previous event
+                        self._db.execute(
+                            "UPDATE events SET seconds_to_next_event = ? WHERE id = ?",
+                            (gap, prev["id"])
+                        )
+                except (ValueError, TypeError):
+                    pass
+
+        # 2. Cluster matching (sync DB writes dispatched off the event loop)
+        cluster_id_result = None
+        match_confidence  = None
+        match_level       = None
+        match_rejection_reason: Optional[str] = None
+        if self.cluster_engine:
+            try:
+                event_row = self._db.execute(
+                    "SELECT * FROM events WHERE id = ?", (event_id,)
+                ).fetchone()
+                if event_row:
+                    import functools
+                    loop = asyncio.get_running_loop()
+                    (cluster_id_result, match_confidence, match_level,
+                     match_rejection_reason) = await loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            self.cluster_engine.match_and_learn,
+                            dict(event_row),
+                            circuit,
+                            prev_cluster_id,
+                            seconds_since_prev,
+                        )
+                    )
+            except Exception as e:
+                log.error("[%s] cluster matching failed: %s", circuit, e,
+                          exc_info=True)
+
+        # 3. Derive anomaly_score and store it in features so the alert
+        #    check in _process() can read it.  anomaly_score is intentionally
+        #    NOT stored in the events table — it is ephemeral and recalculated
+        #    by the live match path only; backfill uses match_confidence directly.
+        #    High score = anomalous:
+        #      • no match at all           → 1.0
+        #      • poor confidence match     → 1.0 - confidence
+        #      • good confidence match     → near 0.0
+        if match_confidence is not None:
+            features["anomaly_score"] = round(1.0 - match_confidence, 3)
+        elif cluster_id_result is None and match_rejection_reason not in (
+            "type_gate_rejected", "excluded_from_training"
+        ):
+            # Unmatched event in live state with no explicit rejection reason
+            # — treat as fully anomalous.
+            features["anomaly_score"] = 1.0
+
+        # Write cluster results back to the event row
+        self._db.execute(
+            """UPDATE events SET
+                 cluster_id               = ?,
+                 match_confidence         = ?,
+                 match_level              = ?,
+                 match_rejection_reason   = ?,
+                 seconds_since_prev_event = ?,
+                 prev_cluster_id          = ?
+               WHERE id = ?""",
+            (cluster_id_result, match_confidence, match_level,
+             match_rejection_reason,
+             seconds_since_prev, prev_cluster_id, event_id)
+        )
+
+        # 4. Update fixtures.last_seen_at when this event matched a named fixture
+        if cluster_id_result is not None:
+            fc_row = self._db.execute(
+                """SELECT fixture_id FROM fixture_clusters
+                   WHERE circuit = ? AND id = ? AND fixture_id IS NOT NULL""",
+                (circuit, cluster_id_result)
+            ).fetchone()
+            if fc_row and fc_row["fixture_id"]:
+                self._db.execute(
+                    "UPDATE fixtures SET last_seen_at = ? WHERE id = ?",
+                    (datetime.now(timezone.utc).isoformat(), fc_row["fixture_id"])
+                )
+
+        self._db.commit()

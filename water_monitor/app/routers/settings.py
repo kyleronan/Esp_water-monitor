@@ -1,12 +1,16 @@
 """Settings router."""
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from ._helpers import ingress_redirect
 
 from ..config import SENSITIVITY_PRESETS
 from ..database import get_data_retention, update_data_retention, get_home_profile
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/settings")
 
@@ -27,7 +31,7 @@ async def settings_page(request: Request):
                             get_learning_config, get_alert_configs)
     from ..device_discovery import get_device_config
 
-    profile = dict(get_home_profile(orch.db))
+
 
     # Fetch configurable device entities (number + select) from HA
     device_cfg = get_device_config(orch.db)
@@ -45,6 +49,20 @@ async def settings_page(request: Request):
             if stem.endswith(f"_{c.circuit}") or stem.endswith(f"_{c.circuit.replace('_', '')}"):
                 return c.circuit
         return "general"
+
+    # Load unit context once so descriptions and state values are shown in
+    # the user's chosen units (e.g. gal/min instead of L/min).
+    from ..units import load_unit_context
+    _uc              = load_unit_context(orch.db)
+    _flow_label      = _uc["flow_unit"]       # e.g. "gal/min"
+    _flow_factor     = _uc["flow_factor"]     # multiply L/min → display
+    _pressure_label  = _uc["pressure_unit"]   # e.g. "bar"
+    _pressure_factor = _uc["pressure_factor"] # multiply PSI → display
+
+    # Entity patterns that carry flow or pressure values (internal L/min / PSI).
+    _FLOW_PATTERNS     = {"burst pipe flow threshold", "burst threshold",
+                          "trickle flow max threshold", "trickle flow min threshold"}
+    _PRESSURE_PATTERNS = {"leak test pressure threshold", "pressure drop threshold"}
 
     # Short labels and descriptions for known ESP entity name patterns.
     # Keys are matched against the entity stem (entity_id with prefix and
@@ -64,7 +82,7 @@ async def settings_page(request: Request):
     }
 
     def _enrich_entity(e: dict, prefix: str, circuit: str) -> dict:
-        """Add short label and description to a device entity dict."""
+        """Add short label, unit-converted description and state value."""
         eid   = e["entity_id"]
         local = eid.split(".", 1)[1] if "." in eid else eid
         stem  = local[len(prefix):] if local.startswith(prefix) else local
@@ -79,7 +97,29 @@ async def settings_page(request: Request):
             if pattern in stem_readable:
                 e = dict(e)
                 e["short_label"] = f"{label} — {circuit.replace('_', ' ').title()}"
-                e["description"] = desc
+                # Replace hardcoded unit strings in descriptions
+                e["description"] = (desc
+                    .replace("(L/min)", f"({_flow_label})")
+                    .replace("L/min",   _flow_label)
+                    .replace("(PSI)",   f"({_pressure_label})")
+                    .replace("PSI",     _pressure_label))
+                # Pre-convert numeric state to display units
+                if pattern in _FLOW_PATTERNS:
+                    e["unit_type"] = "flow"
+                    e["unit"] = _flow_label
+                    try:
+                        e["state"] = round(float(e["state"]) * _flow_factor, 3)
+                    except (TypeError, ValueError):
+                        pass
+                elif pattern in _PRESSURE_PATTERNS:
+                    e["unit_type"] = "pressure"
+                    e["unit"] = _pressure_label
+                    try:
+                        e["state"] = round(float(e["state"]) * _pressure_factor, 3)
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    e["unit_type"] = None
                 return e
 
         # Fallback: clean up the raw friendly name
@@ -96,6 +136,7 @@ async def settings_page(request: Request):
         e = dict(e)
         e["short_label"] = f"{name.title()} — {circuit.replace('_', ' ').title()}"
         e["description"] = ""
+        e["unit_type"]   = None
         return e
 
     entities_by_circuit: dict = {"general": []}
@@ -121,6 +162,7 @@ async def settings_page(request: Request):
             }
         )
 
+        from ..database import get_active_exclusion_window
         circuits.append({
             "circuit": c,
             "display_name": circuit_cfg.display_name,
@@ -130,16 +172,23 @@ async def settings_page(request: Request):
             "alerts": alerts,
             "training": training,
             "device_entities": entities_by_circuit.get(c, []),
+            "active_exclusion": get_active_exclusion_window(orch.db, c),
         })
+
+    # MQTT status for the Integrations section status pill
+    mqtt_status = None
+    fp = getattr(orch, "_fixture_publisher", None)
+    if fp is not None:
+        mqtt_status = fp.status()
 
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
-        "profile": profile,
+        "profile": dict(get_home_profile(orch.db) or {}),
         "circuits": circuits,
         "general_entities": entities_by_circuit.get("general", []),
         "presets": SENSITIVITY_PRESETS,
         "retention": get_data_retention(orch.db),
-        "profile": dict(get_home_profile(orch.db) or {}),
+        "mqtt_status": mqtt_status,
         "page": "settings",
     })
 
@@ -169,7 +218,7 @@ async def profile_update(request: Request):
         supply_type=form.get("supply_type", "mains"),
         setup_complete=1,
     )
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#profile")
 
 
 # ------------------------------------------------------------------
@@ -220,7 +269,7 @@ async def sensitivity_update(circuit: str, request: Request):
     if orch.event_detector:
         orch.event_detector.update_thresholds()
 
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
 # ------------------------------------------------------------------
@@ -236,7 +285,7 @@ async def learning_update(circuit: str, request: Request):
         orch.db, circuit,
         learning_mode=form.get("learning_mode", "adaptive"),
     )
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
 # ------------------------------------------------------------------
@@ -249,7 +298,10 @@ async def recalibrate(circuit: str, request: Request):
 
     fixtures_changed = form.get("fixtures_changed") == "yes"
     occupants_changed = form.get("occupants_changed") == "yes"
-    calibration_days = int(form.get("calibration_days", 14))
+    try:
+        calibration_days = int(form.get("calibration_days", 14))
+    except (ValueError, TypeError):
+        calibration_days = 14
 
     if not orch.training_manager:
         return JSONResponse(
@@ -273,7 +325,7 @@ async def recalibrate(circuit: str, request: Request):
             await orch.training_manager.start_calibration(
                 circuit, calibration_days)
 
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
 @router.get("/recalibrate/{circuit}/suggest")
@@ -283,13 +335,13 @@ async def suggest_days(circuit: str, request: Request):
     from ..database import get_home_profile
     from ..config import compute_suggested_calibration_days
 
-    profile = get_home_profile(orch.db)
+    profile = get_home_profile(orch.db) or {}
     days, tier = compute_suggested_calibration_days(
-        profile["bathrooms_full"] or 1,
-        profile["bathrooms_half"] or 0,
-        profile["floors"] or 1,
-        profile["occupants"] or 2,
-        profile["supply_type"] or "mains",
+        profile.get("bathrooms_full") or 1,
+        profile.get("bathrooms_half") or 0,
+        profile.get("floors") or 1,
+        profile.get("occupants") or 2,
+        profile.get("supply_type") or "mains",
     )
     return JSONResponse({"suggested_days": days, "tier": tier})
 
@@ -327,7 +379,18 @@ async def device_entity_update(request: Request):
 
     if domain in ("number", "input_number"):
         try:
-            ok = await orch.ha.set_number(entity_id, float(value))
+            numeric = float(value)
+            # Convert from display units back to internal units (L/min / PSI)
+            # before sending to HA/ESP.
+            _FLOW_KEYWORDS     = ("flow_threshold", "burst_threshold")
+            _PRESSURE_KEYWORDS = ("pressure_threshold", "pressure_drop")
+            if any(k in entity_id for k in _FLOW_KEYWORDS):
+                from ..units import load_unit_context as _luc
+                numeric = numeric / _luc(orch.db)["flow_factor"]
+            elif any(k in entity_id for k in _PRESSURE_KEYWORDS):
+                from ..units import load_unit_context as _luc
+                numeric = numeric / _luc(orch.db)["pressure_factor"]
+            ok = await orch.ha.set_number(entity_id, round(numeric, 4))
         except ValueError:
             return JSONResponse(
                 {"status": "error", "message": f"Invalid number: {value}"},
@@ -357,25 +420,37 @@ async def device_entity_update(request: Request):
 async def retention_update(request: Request):
     orch = _orch(request)
     form = await request.form()
+
+    def _int(key: str, default: int) -> int:
+        try:
+            return int(form.get(key, default))
+        except (ValueError, TypeError):
+            return default
+
     update_data_retention(
         orch.db,
-        events_retain_years=int(form.get("events_retain_years", 1)),
-        hourly_volume_retain_years=int(form.get("hourly_volume_retain_years", 2)),
+        events_retain_years=_int("events_retain_years", 1),
+        hourly_volume_retain_years=_int("hourly_volume_retain_years", 2),
         enabled=1 if form.get("enabled") == "1" else 0,
         auto_backup_enabled=1 if form.get("auto_backup_enabled") == "1" else 0,
         auto_backup_path=form.get("auto_backup_path",
                                    "/share/water_monitor_backups").strip(),
-        auto_backup_day_of_week=int(form.get("auto_backup_day_of_week", 0)),
+        auto_backup_day_of_week=_int("auto_backup_day_of_week", 0),
     )
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#retention")
 
 
 @router.post("/retention/prune-now")
 async def retention_prune_now(request: Request):
+    import asyncio
     orch = _orch(request)
     if not orch.data_pruner:
         return JSONResponse({"ok": False, "error": "Pruner not available"}, status_code=503)
-    deleted = orch.data_pruner.prune_now()
+    # prune_now() runs synchronous SQLite DELETEs that can block for several
+    # seconds on large tables.  Run it in a thread-pool executor so the
+    # asyncio event loop stays responsive during the operation.
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(None, orch.data_pruner.prune_now)
     return JSONResponse({"ok": True, "deleted": deleted})
 
 
@@ -386,9 +461,10 @@ async def away_mode_toggle(request: Request):
     orch = _orch(request)
     form = await request.form()
     enabled = form.get("enabled") == "1"
-    import asyncio
-    asyncio.create_task(orch.set_away_mode(enabled))
-    return ingress_redirect(request, "/settings")
+    # Await the call so the database write completes before we redirect
+    # back to /settings — otherwise the rendered page can show stale state.
+    await orch.set_away_mode(enabled)
+    return ingress_redirect(request, "/settings#away")
 
 
 # ── Mobile notify targets ──────────────────────────────────────────────────
@@ -402,7 +478,7 @@ async def mobile_notify_update(request: Request):
         "UPDATE home_profile SET mobile_notify_targets = ?, updated_at = datetime('now') WHERE id = 1",
         (targets,))
     orch.db.commit()
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#notifications")
 
 
 # ── HA Presence tracking ────────────────────────────────────────────────────
@@ -424,7 +500,7 @@ async def presence_update(request: Request):
     """, (entities, away_state, home_state))
     orch.db.commit()
     orch.reload_presence_watcher()
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#away")
 
 # ── Display units ─────────────────────────────────────────────────────────────
 
@@ -447,7 +523,56 @@ async def units_update(request: Request):
     orch.db.commit()
     from ..units import invalidate_unit_cache
     invalidate_unit_cache()
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#units")
+
+
+@router.post("/integrations/update")
+async def integrations_update(request: Request):
+    form = await request.form()
+    enabled = 1 if form.get("mqtt_publish_enabled") == "1" else 0
+    orch = _orch(request)
+    orch.db.execute(
+        """UPDATE home_profile SET mqtt_publish_enabled = ? WHERE id = 1""",
+        (enabled,)
+    )
+    orch.db.commit()
+    return ingress_redirect(request, "/settings#integrations")
+
+
+# ------------------------------------------------------------------
+# Plumbing-event exclusion windows
+# ------------------------------------------------------------------
+
+@router.post("/circuit/{circuit}/exclusion_window")
+async def start_exclusion_window(request: Request, circuit: str):
+    """Open an exclusion window so events during a plumbing flush are not
+    used for fixture training.  Duration: 5–60 min (clamped server-side)."""
+    from ..database import create_exclusion_window
+    form    = await request.form()
+    minutes = int(form.get("minutes") or 15)
+    minutes = max(5, min(60, minutes))
+    reason  = (form.get("reason") or "plumbing").strip() or "plumbing"
+    create_exclusion_window(_orch(request).db, circuit, minutes, reason)
+    log.info("[%s] exclusion window started — %d min (%s)", circuit, minutes, reason)
+    return ingress_redirect(request, "/settings#maintenance")
+
+
+@router.post("/circuit/{circuit}/exclusion_window/cancel")
+async def cancel_exclusion_window_endpoint(request: Request, circuit: str):
+    """End the active exclusion window immediately."""
+    from ..database import cancel_exclusion_window
+    cancel_exclusion_window(_orch(request).db, circuit)
+    log.info("[%s] exclusion window cancelled", circuit)
+    return ingress_redirect(request, "/settings#maintenance")
+
+
+@router.post("/circuit/{circuit}/exclusion_window/extend")
+async def extend_exclusion_window_endpoint(request: Request, circuit: str):
+    """Add 15 minutes to the active exclusion window (capped at 60 min from start)."""
+    from ..database import extend_exclusion_window
+    extend_exclusion_window(_orch(request).db, circuit, extra_minutes=15)
+    log.info("[%s] exclusion window extended +15 min", circuit)
+    return ingress_redirect(request, "/settings#maintenance")
 
 
 @router.get("/units/detect")

@@ -203,17 +203,34 @@ class LeakTestScheduler:
     async def _update_next_run(self, circuit: str, schedule: Any) -> None:
         """
         Compute and store the next run timestamp.
-        Re-learns the best quiet hour from usage history before scheduling.
+
+        If auto_learn_hour is enabled (default), re-learn the best quiet
+        hour from usage history before scheduling.  If disabled, respect
+        the manually configured run_hour as-is.
         """
-        best_hour = self.learn_best_hour(circuit)
-        if best_hour is not None:
-            current_hour = schedule.get("run_hour") or 2
-            if best_hour != current_hour:
-                log.info("[%s] updating run_hour %02d→%02d from usage history",
-                         circuit, current_hour, best_hour)
-                upsert_leak_test_schedule(self._db, circuit, run_hour=best_hour)
-                schedule = dict(schedule)
-                schedule["run_hour"] = best_hour
+        # Pull the flag from the schedule (defaults to True for backward compat)
+        # SQLite Row supports .get-equivalent via try/except; dicts have .get()
+        try:
+            auto_learn = schedule["auto_learn_hour"]
+            if auto_learn is None:
+                auto_learn = True
+            else:
+                auto_learn = bool(auto_learn)
+        except (KeyError, IndexError):
+            auto_learn = True
+
+        if auto_learn:
+            best_hour = self.learn_best_hour(circuit)
+            if best_hour is not None:
+                current_hour = schedule.get("run_hour") if isinstance(schedule, dict) \
+                    else schedule["run_hour"]
+                current_hour = current_hour or 2
+                if best_hour != current_hour:
+                    log.info("[%s] auto-learn updating run_hour %02d→%02d from usage history",
+                             circuit, current_hour, best_hour)
+                    upsert_leak_test_schedule(self._db, circuit, run_hour=best_hour)
+                    schedule = dict(schedule)
+                    schedule["run_hour"] = best_hour
 
         next_run = _compute_next_run(schedule)
         if next_run:
@@ -268,13 +285,20 @@ class LeakTestScheduler:
         log.info("[%s] starting leak test (triggered_by=%s)", circuit, triggered_by)
         await self._ha.turn_on(circuit_cfg.leak_test_switch)
 
-        # Wait for result — firmware takes 60s settle + up to 30min test + 2min buffer.
-        # A hard cap prevents infinite polling if firmware changes result strings.
-        schedule    = get_leak_test_schedule(self._db, circuit) if 'schedule' not in dir() else schedule
-        cfg_duration = (schedule["duration_minutes"] if schedule else 30)
+        # Wait for result — firmware takes 60s settle + up to configured duration + 2min buffer.
+        # Fetch the firmware-configured test duration from the HA sensor entity.
+        # (duration_minutes is NOT a DB column; it lives on the ESP firmware entity.)
+        schedule = get_leak_test_schedule(self._db, circuit)
+        try:
+            dur_str = await self._ha.get_state_value(
+                circuit_cfg.leak_test_duration_entity, "30")
+            cfg_duration = int(float(dur_str)) if dur_str else 30
+        except (ValueError, TypeError):
+            cfg_duration = 30
         max_wait_seconds = 60 + (cfg_duration * 60) + 120
         start_wait   = datetime.now(timezone.utc)
         final_result = "In progress"
+        result_str   = "unknown"   # initialised before loop so timeout log is safe
         timed_out    = False
 
         while (datetime.now(timezone.utc) - start_wait).total_seconds() < max_wait_seconds:
@@ -296,7 +320,7 @@ class LeakTestScheduler:
                 "TERMINAL_RESULTS. Check firmware version or update TERMINAL_RESULTS.",
                 circuit,
                 (datetime.now(timezone.utc) - start_wait).total_seconds(),
-                result_str if 'result_str' in dir() else "unknown",
+                result_str,
             )
             final_result = "Timed out — no terminal result received"
 
@@ -387,17 +411,13 @@ def _compute_next_run(schedule: Any) -> Optional[datetime]:
     run_hour   = schedule["run_hour"]   or 2
     run_minute = schedule["run_minute"] or 0
 
-    if freq == "custom" and schedule["custom_interval_days"]:
-        last = schedule["last_run_at"]
-        if last:
-            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-            candidate = last_dt + timedelta(days=schedule["custom_interval_days"])
-        else:
-            candidate = now + timedelta(days=schedule["custom_interval_days"])
-        return candidate.replace(hour=run_hour, minute=run_minute,
-                                 second=0, microsecond=0)
+    if freq == "daily":
+        # Today at run_hour:run_minute, or tomorrow if that time has already passed
+        candidate = now.replace(hour=run_hour, minute=run_minute,
+                                second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
 
     target_dow = schedule["day_of_week"] or 0   # 0=Monday
     days_ahead = (target_dow - now.weekday()) % 7
