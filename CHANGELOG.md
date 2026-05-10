@@ -1,5 +1,162 @@
 # Changelog
 
+## [0.2.0] — 2026-05-10
+
+### Changes
+
+- **Dashboard — "Past 7 days" volume** replaces the previous calendar-week
+  (Monday-reset) total. The figure now reflects a rolling 7-day window,
+  which is more useful day-to-day and avoids the sharp Monday drop to zero.
+  Affects both the hourly-volume fallback path (SQL cutoff changed to
+  `datetime('now', '-7 days')`) and the HA cumulative-sensor path (baseline
+  key updated to midnight UTC 7 days ago). The volume baseline seeder in
+  `_init_volume_baselines` was refactored to use a single naive-UTC key
+  format throughout, fixing a key-format mismatch that would have silently
+  broken daily totals on non-UTC servers.
+
+- **Addon icon and logo** — `water_monitor/icon.png` (128 × 128) and
+  `water_monitor/logo.png` (250 × 100) added. The generic puzzle-piece
+  placeholder on the HA addon card and store detail page is now replaced by
+  a proper branded icon.
+
+- **Web UI favicon** — `favicon.ico` and `icon_32x32.png` added to the
+  static assets folder. `base.html` now includes `<link rel="icon">` tags so
+  the browser tab shows the addon icon instead of a blank page icon.
+
+### Bug Fixes
+
+#### Addon — robustness and correctness (second-pass audit)
+
+- **`device_discovery.py` — `name_by_user` None crash in device search**:
+  the exact-match path called `.lower()` on `name_by_user` without a None
+  guard; the partial-match path already had one. Added `d.name_by_user and`
+  guard for consistency.
+
+- **`device_discovery.py` — `save_discovery` not transactional**: multiple
+  `db.execute` calls (including FK-ordered deletes and circuit-entity inserts)
+  were not wrapped in an explicit transaction. A mid-write failure left the
+  DB in a partially-cleared state. Wrapped the entire function body in
+  `with db:`.
+
+- **`backup.py` — `tempfile.mktemp()` deprecated + connection leak**: the
+  SQLite backup snapshot used the deprecated `mktemp()` (TOCTOU race
+  possible). Replaced with `NamedTemporaryFile(delete=False)`. All three
+  SQLite connections (`src_conn`, `mem_conn`, `disk_conn`) are now opened
+  before a single `try/finally` block so none can leak if `backup()` raises.
+
+- **`backup.py` — `QUICK_RESTORE_TABLES` missing two tables**:
+  `fixture_ha_entity_map` and `fixture_daily_summary` were omitted, so
+  HA entity mappings and daily fixture summaries were lost on a Quick Restore
+  cycle. Both tables added to the list.
+
+- **`database.py` — volume baselines used local time instead of UTC**:
+  `compute_ha_daily_volume` and `compute_ha_weekly_volume` called
+  `datetime.now()` (local) to compute the baseline `period_ts` key; SQLite's
+  `'now'` is always UTC. On servers not in UTC this caused the key to miss
+  the row seeded by `_init_volume_baselines`, falling back to a 0.0 baseline
+  and showing the full cumulative sensor total as the daily/weekly figure.
+  All baseline functions now use `datetime.now(timezone.utc)` with the
+  `tzinfo` stripped before `isoformat()` to produce consistent naive-UTC
+  keys throughout.
+
+- **`database.py` — `update_data_retention` SQL column injection**:
+  column names were interpolated from `**kwargs` without an allowlist. Added
+  `_DATA_RETENTION_COLUMNS` frozenset; unknown keys raise `ValueError` before
+  reaching the DB layer (mirrors the existing `_HOME_PROFILE_COLUMNS` pattern).
+
+- **`settings.py` — `int(calibration_days)` raises 500 on bad input**:
+  bare `int()` on a form value raises `ValueError` if the submission is
+  non-numeric or empty. Added `try/except (ValueError, TypeError)` with
+  fallback to 14 days.
+
+- **`setup.py` — `int(cal_days)` raises 500 on non-numeric query param**:
+  the setup-complete page renders `int(cal_days)` from a query parameter;
+  a stale cache hit or crafted URL could pass a non-numeric string. Added
+  `.isdigit()` guard with fallback to 14.
+
+- **`main.py` — DB migration failure non-fatal**: a migration error was
+  caught, logged at ERROR, and swallowed — the server started with a
+  potentially broken schema. Now logs at CRITICAL and re-raises so the
+  addon fails fast rather than running in a degraded state.
+
+- **`orchestrator.py` — live-state cache used `setattr`**: per-circuit
+  state was cached via `setattr(self, f"_live_state_{circuit}", ...)`.
+  A circuit name colliding with an existing `Orchestrator` attribute would
+  silently corrupt instance state. Replaced with a dedicated
+  `_live_state_cache: Dict[str, Any] = {}`.
+
+#### Addon — code quality (18-issue audit)
+
+- **`device_discovery.py`** — removed duplicate `re.compile` call in
+  `_find_entity_for_role`; replaced `__import__("datetime")` anti-pattern
+  in `save_discovery` and `mark_setup_complete` with normal imports; added
+  FK-safe delete ordering before `DELETE FROM fixtures` to prevent constraint
+  violations on re-setup; added comments on regex fragility and suffix-list
+  limitations.
+
+- **`backup.py`** — wrapped `import_history_archive` multi-table writes in
+  `with orch.db:` for atomicity; replaced `len(rows)` count (which included
+  skipped duplicates) with before/after `COUNT(*)` for accurate inserted-row
+  reporting; moved `arc.close()` to `finally`; removed dead `import io as _io`.
+
+- **`settings.py`** — fixed `form.get("mqtt_publish_enabled")` truthy check:
+  any non-empty string (including `"0"`) evaluated as `True`; changed to
+  explicit `== "1"` comparison.
+
+- **`setup.py`** — added `get_home_profile(orch.db) or {}` guard against
+  `None` return before `dict()`; applied `quote_plus()` to all exception
+  messages embedded in redirect URLs; added early-return guard when no
+  restore options are selected.
+
+- **`database.py`** — fixed `get_weekly_volume` SQL date expression that
+  gave wrong results on Sunday and Monday (wrong `weekday 1` modifier);
+  updated `_create_schema` `CREATE TABLE` statements to include columns
+  added by migrations (self-documenting, fresh installs see full schema);
+  added docstring to `dedup_events` explaining its post-restore role.
+
+- **`orchestrator.py`** — unit-converted `volume_total` in the live-state
+  dict using the same `vol_factor`/`vol_decimals` pattern as
+  `volume_daily`/`volume_weekly`; removed startup `dedup_events()` call
+  (migration 021's `UNIQUE` index prevents new duplicates at write time).
+
+- **`historical_importer.py`** — `_rate_to_periods` now accepts an optional
+  `query_end` parameter; an open flow period at the end of the query window
+  is now closed at `query_end` rather than at the last reading timestamp,
+  matching the `_onset_to_periods` behaviour.
+
+- **`main.py`** — added inline comment explaining the `/setup` CSRF
+  exemption trade-off.
+
+#### Firmware — `esp-water-shut-off-3_5.yaml` (v3.5.1)
+
+- **Spurious motor fault on concurrent close** (🔴): after `open_action`
+  fires the relay and waits 15 s, it checks whether the open end-stop is
+  inactive to detect a motor fault. If a `close_action` completed during
+  that 15 s window the end-stop is naturally inactive — triggering a false
+  fault. Fixed: the post-wait condition now checks
+  `id(open_in_flight_*) && !id(open_end_stop_*).state` so a false fault
+  can only fire if the open sequence is still genuinely in flight.
+
+- **Pressure history buffer too small** (🔴): `pressure_history_main/irr`
+  globals were 5-element `float[5]` arrays. `pressure_main` publishes at
+  2 Hz (500 ms per sample), so the buffer held only 2.5 s of history, not
+  the intended 5 s. Increased to `float[10]` (10 × 500 ms = 5 s); modulo
+  index and initial value updated accordingly.
+
+- **Close guard log message misleading** (🟡): fault-triggered close log
+  said "valve is mid-travel opening" — incorrect when the guard is set after
+  a failed close. Updated to "valve may be mid-travel or in recovery after a
+  failed close".
+
+- **Stale comments in `pressure_main_avg` and `pressure_main_fast`** (🟡/🔵):
+  `pressure_main_avg` header comment still said "every 1 second", "1.25 s
+  sliding window", "30-sample", "120 bytes" — all wrong after the 2 Hz
+  refactor. Corrected to 500 ms / 50-sample / 25 s / 200 bytes.
+  `pressure_main_fast` comment said "slower 1 Hz pressure_main" — corrected
+  to 2 Hz.
+
+---
+
 ## [0.2.0-rc2] — 2026-05-08
 
 ### Bug Fixes
