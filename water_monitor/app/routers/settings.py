@@ -218,7 +218,7 @@ async def profile_update(request: Request):
         supply_type=form.get("supply_type", "mains"),
         setup_complete=1,
     )
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#profile")
 
 
 # ------------------------------------------------------------------
@@ -269,7 +269,7 @@ async def sensitivity_update(circuit: str, request: Request):
     if orch.event_detector:
         orch.event_detector.update_thresholds()
 
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
 # ------------------------------------------------------------------
@@ -285,7 +285,7 @@ async def learning_update(circuit: str, request: Request):
         orch.db, circuit,
         learning_mode=form.get("learning_mode", "adaptive"),
     )
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
 # ------------------------------------------------------------------
@@ -322,7 +322,7 @@ async def recalibrate(circuit: str, request: Request):
             await orch.training_manager.start_calibration(
                 circuit, calibration_days)
 
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
 @router.get("/recalibrate/{circuit}/suggest")
@@ -434,7 +434,7 @@ async def retention_update(request: Request):
                                    "/share/water_monitor_backups").strip(),
         auto_backup_day_of_week=_int("auto_backup_day_of_week", 0),
     )
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#retention")
 
 
 @router.post("/retention/prune-now")
@@ -461,7 +461,7 @@ async def away_mode_toggle(request: Request):
     # Await the call so the database write completes before we redirect
     # back to /settings — otherwise the rendered page can show stale state.
     await orch.set_away_mode(enabled)
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#away")
 
 
 # ── Mobile notify targets ──────────────────────────────────────────────────
@@ -475,7 +475,7 @@ async def mobile_notify_update(request: Request):
         "UPDATE home_profile SET mobile_notify_targets = ?, updated_at = datetime('now') WHERE id = 1",
         (targets,))
     orch.db.commit()
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#notifications")
 
 
 # ── HA Presence tracking ────────────────────────────────────────────────────
@@ -497,7 +497,7 @@ async def presence_update(request: Request):
     """, (entities, away_state, home_state))
     orch.db.commit()
     orch.reload_presence_watcher()
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#away")
 
 # ── Display units ─────────────────────────────────────────────────────────────
 
@@ -520,7 +520,7 @@ async def units_update(request: Request):
     orch.db.commit()
     from ..units import invalidate_unit_cache
     invalidate_unit_cache()
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#units")
 
 
 @router.post("/integrations/update")
@@ -533,7 +533,7 @@ async def integrations_update(request: Request):
         (enabled,)
     )
     orch.db.commit()
-    return ingress_redirect(request, "/settings")
+    return ingress_redirect(request, "/settings#integrations")
 
 
 # ------------------------------------------------------------------

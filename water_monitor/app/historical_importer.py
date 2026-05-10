@@ -226,9 +226,17 @@ class HistoricalImporter:
 
             log.info("[%s] backfill: importing %s → now",
                      cfg.circuit, start.isoformat())
-            n, _ = await self._import_range(cfg, start, now)
-            if n:
-                log.info("[%s] backfill: imported %d event(s)", cfg.circuit, n)
+            # Chunk into 1-day windows so each WS response stays small enough
+            # to fit within the WebSocket max_size limit.
+            total = 0
+            window_start = start
+            while window_start < now:
+                window_end = min(window_start + timedelta(days=1), now)
+                n, _ = await self._import_range(cfg, window_start, window_end)
+                total += n
+                window_start = window_end
+            if total:
+                log.info("[%s] backfill: imported %d event(s)", cfg.circuit, total)
 
     async def _catch_up(self) -> None:
         """
