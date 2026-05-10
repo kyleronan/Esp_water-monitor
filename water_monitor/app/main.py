@@ -100,7 +100,8 @@ async def lifespan(app: FastAPI):
     try:
         run_migrations(_db)
     except Exception as e:
-        log.error("DB migration error (non-fatal): %s", e)
+        log.critical("DB migration failed — cannot start: %s", e)
+        raise
     finally:
         _db.close()
 

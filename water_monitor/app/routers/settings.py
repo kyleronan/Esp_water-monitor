@@ -298,7 +298,10 @@ async def recalibrate(circuit: str, request: Request):
 
     fixtures_changed = form.get("fixtures_changed") == "yes"
     occupants_changed = form.get("occupants_changed") == "yes"
-    calibration_days = int(form.get("calibration_days", 14))
+    try:
+        calibration_days = int(form.get("calibration_days", 14))
+    except (ValueError, TypeError):
+        calibration_days = 14
 
     if not orch.training_manager:
         return JSONResponse(

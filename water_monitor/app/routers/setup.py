@@ -594,7 +594,7 @@ async def setup_complete(request: Request):
             }
             for c in orch._cfg.circuits
         ],
-        "cal_days":   int(cal_days) if cal_days else 14,
+        "cal_days":   (int(cal_days) if str(cal_days).isdigit() else 14) if cal_days else 14,
         "cal_reason": cal_reason,
         "page":       "setup",
     })

@@ -699,7 +699,17 @@ def get_data_retention(conn: sqlite3.Connection) -> dict:
     }
 
 
+_DATA_RETENTION_COLUMNS = frozenset({
+    "events_retain_years", "hourly_volume_retain_years", "enabled",
+    "last_pruned_at", "auto_backup_enabled", "auto_backup_path",
+    "auto_backup_day_of_week", "last_auto_backup_at", "updated_at",
+})
+
+
 def update_data_retention(conn: sqlite3.Connection, **kwargs) -> None:
+    unknown = set(kwargs) - _DATA_RETENTION_COLUMNS
+    if unknown:
+        raise ValueError(f"Unknown data_retention columns: {unknown}")
     kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
     sets = ", ".join(f"{k} = ?" for k in kwargs)
     conn.execute(
@@ -952,9 +962,9 @@ def compute_ha_daily_volume(
 ) -> float:
     """
     Daily volume from the authoritative HA cumulative sensor.
-    Uses midnight local-time today as the baseline period.
+    Uses midnight UTC today as the baseline period — matches SQLite 'now'.
     """
-    today_midnight = datetime.now().replace(
+    today_midnight = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     ).isoformat(timespec="seconds")
     baseline = _get_volume_baseline(conn, circuit, today_midnight, current_ha_value)
@@ -968,9 +978,9 @@ def compute_ha_weekly_volume(
 ) -> float:
     """
     Weekly volume from the authoritative HA cumulative sensor.
-    Uses Monday midnight local-time as the baseline period.
+    Uses Monday midnight UTC as the baseline period — matches SQLite 'now'.
     """
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     monday = now - timedelta(days=now.weekday())
     week_midnight = monday.replace(
         hour=0, minute=0, second=0, microsecond=0

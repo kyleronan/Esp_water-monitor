@@ -72,6 +72,7 @@ class Orchestrator:
         self._cluster_metrics: Optional[ClusterMetrics] = None
         self._fixture_publisher: Optional[FixturePublisher] = None
         self._stop = asyncio.Event()
+        self._live_state_cache: Dict[str, Any] = {}
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -412,14 +413,13 @@ class Orchestrator:
         now_ts = time.monotonic()
 
         # Return cached result if it's fresh enough (3 second window)
-        cache_key = f"_live_state_{circuit}"
-        cached = getattr(self, cache_key, None)
+        cached = self._live_state_cache.get(circuit)
         if cached and now_ts - cached.get("_fetched_at", 0) < 3.0:
             return cached
 
         result = await self._fetch_live_state(circuit)
         result["_fetched_at"] = now_ts
-        setattr(self, cache_key, result)
+        self._live_state_cache[circuit] = result
         return result
 
     async def _init_display_units(self) -> None:
