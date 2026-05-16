@@ -60,7 +60,11 @@
     {% elif c.trickle_active %}
     <div class="dash-status-line dash-status-alert" id="status-line-{{ c.circuit }}" aria-live="polite">
       <span class="dash-status-icon" aria-hidden="true">●</span>
-      <span class="dash-status-text">Attention needed · Trickle flow detected · Valve closed</span>
+      <span class="dash-status-text">Attention needed · Trickle flow detected ·
+        {% if c.valve_state == 'closed' %}Valve closed
+        {% elif c.valve_state == 'open' %}Valve open
+        {% else %}Valve {{ c.valve_state }}{% endif %}
+      </span>
     </div>
     {% elif c.valve_state != 'open' %}
     <div class="dash-status-line dash-status-closed" id="status-line-{{ c.circuit }}" aria-live="polite">
@@ -134,7 +138,7 @@
          data-fault-reason="{{ c.fault_reason or '' }}"
          data-display-name="{{ c.display_name }}">
       {% if c.valve_state == 'open' %}
-      <button class="btn btn-danger btn-sm" onclick="valveClose('{{ c.circuit }}')">Close Valve</button>
+      <button class="btn btn-danger btn-sm" onclick="valveCloseModal('{{ c.circuit }}', this)">Close Valve</button>
       {% elif c.valve_state == 'closed' %}
         {% if c.fault_active %}
         <button class="btn btn-secondary btn-sm btn-fault-warn"
