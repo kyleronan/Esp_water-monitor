@@ -32,7 +32,7 @@
     {% endfor %}
 
     {% if general_entities %}
-    <button class="sett-nav-btn" id="sett-btn-general"
+    <button class="sett-nav-btn sett-nav-adv" id="sett-btn-general"
             onclick="settNav('general')">
       <span class="sett-nav-icon">⚙️</span>
       <span class="sett-nav-label">ESP General</span>
@@ -57,17 +57,23 @@
       <span class="sett-nav-label">Display Units</span>
     </button>
 
-    <button class="sett-nav-btn" id="sett-btn-integrations"
+    <button class="sett-nav-btn sett-nav-adv" id="sett-btn-integrations"
             onclick="settNav('integrations')">
       <span class="sett-nav-icon">🔗</span>
       <span class="sett-nav-label">Integrations</span>
     </button>
 
-    <button class="sett-nav-btn" id="sett-btn-retention"
+    <button class="sett-nav-btn sett-nav-adv" id="sett-btn-retention"
             onclick="settNav('retention')">
       <span class="sett-nav-icon">🗄️</span>
       <span class="sett-nav-label">Data Retention</span>
     </button>
+
+    <div class="sett-mode-divider">
+      <button class="sett-mode-btn" id="sett-mode-btn" onclick="toggleSettMode()">
+        ⚙ Show Advanced
+      </button>
+    </div>
 
   </nav>
 
@@ -172,9 +178,18 @@
         </form>
       </div>
 
+      {# Installer settings divider — only visible in advanced mode #}
+      <div class="sett-adv-banner sett-adv-card">
+        <span>⚙</span>
+        <div class="sett-adv-banner-inner">
+          <strong>Installer settings</strong>
+          Changes below affect leak detection and automatic shutoff.
+        </div>
+      </div>
+
       {# Recalibration #}
-      <div class="sett-card">
-        <h3 class="sett-card-title">Recalibration</h3>
+      <div class="sett-card sett-adv-card">
+        <h3 class="sett-card-title">Recalibration <span class="sett-installer-badge">⚠ Installer</span></h3>
         <p class="sett-card-desc">
           Recalibrate if you've renovated, added appliances, or your household
           has changed significantly.
@@ -227,10 +242,11 @@
             <button type="submit" class="btn btn-warning btn-sm">Start Recalibration</button>
           </form>
         </details>
+        <p class="sett-cal-warning">⚠ Incorrect calibration values may cause false shutoffs or missed leaks.</p>
       </div>
 
       {# Learning mode #}
-      <div class="sett-card">
+      <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Learning Mode</h3>
         <form method="post" action="{{ ingress_path }}/settings/learning/{{ c.circuit }}/update">
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -255,7 +271,7 @@
       </div>
 
       {# Sensitivity #}
-      <div class="sett-card">
+      <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Detection Sensitivity</h3>
         <form method="post" action="{{ ingress_path }}/settings/sensitivity/{{ c.circuit }}/update"
               id="sens-form-{{ c.circuit }}">
@@ -336,7 +352,7 @@
 
       {# ESP device entities for this circuit #}
       {% if c.device_entities %}
-      <div class="sett-card">
+      <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">ESP Device Settings</h3>
         <p class="sett-card-desc">Stored on the ESP device and applied immediately.</p>
         <div class="device-entity-grid">
@@ -371,6 +387,11 @@
           </div>
           {% endfor %}
         </div>
+      </div>
+      {% else %}
+      <div class="sett-card sett-adv-card">
+        <h3 class="sett-card-title">ESP Device Settings</h3>
+        <p class="sett-card-desc">Calibration controls are not available — no calibration entities were found during setup.</p>
       </div>
       {% endif %}
 
@@ -429,7 +450,14 @@
 
     {# ── General (non-circuit) device entities ───────────────────── #}
     {% if general_entities %}
-    <div class="sett-section" id="sett-general" style="display:none">
+    <div class="sett-section sett-adv-section" id="sett-general" style="display:none">
+      <div class="sett-adv-banner">
+        <span>⚙</span>
+        <div class="sett-adv-banner-inner">
+          <strong>Installer settings</strong>
+          Changes here affect device behaviour and are applied immediately.
+        </div>
+      </div>
       <h2 class="sett-section-title">ESP Device — General Settings</h2>
       <p class="sett-section-desc">Non-circuit settings stored on the ESP device and applied immediately.</p>
       <div class="sett-card">
@@ -614,7 +642,14 @@
     </div>
 
     {# ── Integrations ──────────────────────────────────────────────── #}
-    <div class="sett-section" id="sett-integrations" style="display:none">
+    <div class="sett-section sett-adv-section" id="sett-integrations" style="display:none">
+      <div class="sett-adv-banner">
+        <span>⚙</span>
+        <div class="sett-adv-banner-inner">
+          <strong>Installer settings</strong>
+          Changes here affect leak detection and automatic shutoff.
+        </div>
+      </div>
       <h2 class="sett-section-title">Integrations</h2>
       <p class="sett-section-desc">
         Publish confirmed fixtures to Home Assistant via MQTT Discovery.
@@ -660,7 +695,14 @@
     </div>
 
     {# ── Data Retention ────────────────────────────────────────────── #}
-    <div class="sett-section" id="sett-retention" style="display:none">
+    <div class="sett-section sett-adv-section" id="sett-retention" style="display:none">
+      <div class="sett-adv-banner">
+        <span>⚙</span>
+        <div class="sett-adv-banner-inner">
+          <strong>Installer settings</strong>
+          Changes here affect how much historical data is stored and when it is pruned.
+        </div>
+      </div>
       <h2 class="sett-section-title">Data Retention</h2>
       <p class="sett-section-desc">
         Controls how much historical data is kept. The system prunes old records
@@ -816,7 +858,31 @@ function settNav(id) {
   history.replaceState(null, '', '#' + id);
 }
 
+// ── Basic / Advanced mode ───────────────────────────────────────────────────
+function _applySettMode(mode) {
+  const layout = document.querySelector('.sett-layout');
+  if (!layout) return;
+  layout.dataset.settMode = mode;
+  localStorage.setItem('wm_settings_mode', mode);
+  const btn = document.getElementById('sett-mode-btn');
+  if (btn) btn.textContent = mode === 'basic' ? '⚙ Show Advanced' : '⚙ Hide Advanced';
+  if (mode === 'basic') {
+    const advSections = ['general', 'integrations', 'retention'];
+    const current = location.hash.slice(1);
+    if (advSections.includes(current)) settNav('profile');
+  }
+}
+
+function toggleSettMode() {
+  const layout = document.querySelector('.sett-layout');
+  const current = layout ? (layout.dataset.settMode || 'basic') : 'basic';
+  _applySettMode(current === 'basic' ? 'advanced' : 'basic');
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  const savedMode = localStorage.getItem('wm_settings_mode') || 'basic';
+  _applySettMode(savedMode);
+
   const id = location.hash.slice(1) || 'profile';
   settNav(id);
 
@@ -839,7 +905,7 @@ async function suggestDays(circuit) {
   const sel = document.getElementById(`cal-days-${circuit}`);
   if (sel) {
     sel.value = String(data.suggested_days);
-    alert(`Suggested: ${data.suggested_days} days for a ${data.tier} home`);
+    toast(`Suggested: ${data.suggested_days} days — ${data.tier} home.`, 'info');
   }
 }
 
@@ -861,7 +927,7 @@ async function updateDeviceEntity(entityId, value) {
   });
   const data = await resp.json().catch(() => ({}));
   if (data.status !== 'ok') {
-    alert('Failed to update: ' + (data.message || 'unknown error'));
+    toast('Failed to update: ' + (data.message || 'unknown error'), 'error');
   }
 }
 
@@ -896,9 +962,9 @@ async function pruneNow() {
     });
     const data = await resp.json();
     const total = Object.values(data.deleted || {}).reduce((a, b) => a + b, 0);
-    alert(`Pruning complete — ${total} rows deleted.`);
+    toast(`Pruning complete — ${total} rows deleted.`, 'success');
   } catch (e) {
-    alert('Pruning failed: ' + e.message);
+    toast('Pruning failed: ' + e.message, 'error');
   } finally {
     btn.disabled = false;
     btn.textContent = 'Run pruning now';
