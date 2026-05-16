@@ -166,7 +166,8 @@
                  placeholder="Name this fixture"
                  value="{{ cl.name or cl.display_name or '' }}">
           <select class="fx-type-select" name="fixture_type">
-            {% for t in user_selectable_types %}
+            {% set types_for_circuit = circuit_type_selectable.get(circ.circuit, user_selectable_types) %}
+            {% for t in types_for_circuit %}
             <option value="{{ t }}"
               {% if t == active_type %}selected{% endif %}>
               {{ fixture_type_labels.get(t, t | replace('_',' ') | title) }}

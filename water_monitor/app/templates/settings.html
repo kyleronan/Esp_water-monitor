@@ -178,6 +178,33 @@
         </form>
       </div>
 
+      {# Circuit type #}
+      <div class="sett-card">
+        <h3 class="sett-card-title">Circuit type</h3>
+        <p class="sett-card-desc">
+          Controls which fixture types are suggested and which alert categories
+          are available for this circuit. This does not rename the valve or
+          change any entity mappings. After changing type, you may want to
+          recalibrate for best results.
+        </p>
+        {% for t in circuit_types %}
+        <label style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem;cursor:pointer">
+          <input type="radio"
+                 name="circuit_type_{{ c.circuit }}"
+                 value="{{ t }}"
+                 {% if t == c.circuit_type %}checked{% endif %}
+                 onchange="settingsCircuitTypeUpdate('{{ c.circuit }}', '{{ t }}')"
+                 style="margin-top:3px;flex-shrink:0">
+          <span>
+            <strong>{{ circuit_type_labels[t] }}</strong>
+            <span class="muted" style="font-size:.8125rem;display:block">{{ circuit_type_help[t] }}</span>
+          </span>
+        </label>
+        {% endfor %}
+        <p class="sett-card-desc" id="circuit-type-saving-{{ c.circuit }}"
+           style="display:none;color:var(--color-warn);margin-top:.5rem">Saving…</p>
+      </div>
+
       {# Installer settings divider — only visible in advanced mode #}
       <div class="sett-adv-banner sett-adv-card">
         <span>⚙</span>
@@ -336,6 +363,7 @@
         <h3 class="sett-card-title">Alerts</h3>
         <p class="sett-card-desc">Toggle which anomaly alerts this add-on generates.</p>
         {% for alert in c.alerts %}
+        {% if alert.alert_type not in zone_only_alert_types or c.circuit_type == "zone" %}
         <div class="sett-toggle-row">
           <div>
             <div class="sett-toggle-label">{{ alert.label }}</div>
@@ -347,6 +375,7 @@
             <span class="toggle-slider"></span>
           </label>
         </div>
+        {% endif %}
         {% endfor %}
       </div>
 
@@ -906,6 +935,26 @@ async function suggestDays(circuit) {
   if (sel) {
     sel.value = String(data.suggested_days);
     toast(`Suggested: ${data.suggested_days} days — ${data.tier} home.`, 'info');
+  }
+}
+
+async function settingsCircuitTypeUpdate(circuit, circuitType) {
+  const note = document.getElementById(`circuit-type-saving-${circuit}`);
+  if (note) note.style.display = 'block';
+  try {
+    const resp = await fetch(`${window.INGRESS_PATH}/settings/circuit/${circuit}/type`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&circuit_type=${encodeURIComponent(circuitType)}`,
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (data.status !== 'updated') {
+      toast('Could not update circuit type: ' + (data.message || 'unknown error'), 'error');
+      document.querySelectorAll(`input[name="circuit_type_${circuit}"]`)
+        .forEach(r => { r.checked = (r.value !== circuitType); });
+    }
+  } finally {
+    if (note) note.style.display = 'none';
   }
 }
 

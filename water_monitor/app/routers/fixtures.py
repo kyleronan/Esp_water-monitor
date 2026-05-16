@@ -38,10 +38,12 @@ def _valid_circuit(circuit: str, request: Request) -> str:
 async def fixtures_page(request: Request):
     orch = _orch(request)
     from ..database import get_clusters_with_fixtures, get_all_cluster_stats
-    from ..fixtures import FIXTURE_TYPE_LABELS, user_selectable_types
+    from ..fixtures import (FIXTURE_TYPE_LABELS, user_selectable_types,
+                            zone_user_selectable_types, fixture_user_selectable_types)
 
     circuits_ctx = []
     total_unreviewed = 0
+    circuit_type_selectable = {}
 
     for circ_cfg in orch._cfg.circuits:
         c = circ_cfg.circuit
@@ -74,6 +76,11 @@ async def fixtures_page(request: Request):
             "active_exclusion": get_active_exclusion_window(orch.db, c),
         })
 
+        if circ_cfg.circuit_type == "zone":
+            circuit_type_selectable[c] = zone_user_selectable_types()
+        else:
+            circuit_type_selectable[c] = fixture_user_selectable_types()
+
     # Differentiates banner copy + CSS treatment so users in the labelling
     # phase get a clearer call to action ("confirm then activate") than
     # users in the live phase ("confirm or remove").
@@ -81,13 +88,14 @@ async def fixtures_page(request: Request):
                         for c in circuits_ctx)
 
     return _tmpl(request).TemplateResponse("fixtures.html", {
-        "request":               request,
-        "page":                  "fixtures",
-        "circuits":              circuits_ctx,
-        "total_unreviewed":      total_unreviewed,
-        "any_labelling":         any_labelling,
-        "fixture_type_labels":   FIXTURE_TYPE_LABELS,
-        "user_selectable_types": user_selectable_types(),
+        "request":                 request,
+        "page":                    "fixtures",
+        "circuits":                circuits_ctx,
+        "total_unreviewed":        total_unreviewed,
+        "any_labelling":           any_labelling,
+        "fixture_type_labels":     FIXTURE_TYPE_LABELS,
+        "user_selectable_types":   user_selectable_types(),
+        "circuit_type_selectable": circuit_type_selectable,
     })
 
 

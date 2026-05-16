@@ -294,11 +294,11 @@
 {# ──────────────────────────────────────────────────────────────────── #}
 {% if step == "3b" %}
 <section class="setup-card">
-  <h2>Name your circuits</h2>
+  <h2>Name and classify your circuits</h2>
   <p class="muted">
-    Give each circuit a name that makes sense for your home — for example
-    "Main", "Garden", "Unit A", or "Irrigation". These names appear
-    throughout the dashboard. You can change them later in Settings.
+    Give each circuit a name and choose how it is used. These settings
+    appear throughout the dashboard and control which fixture types are
+    learned. You can change them later in Settings.
   </p>
 
   {% if errors %}
@@ -309,7 +309,7 @@
 
   <form method="post" action="{{ ingress_path }}/setup/circuit-names">
     {% for c in circuits %}
-    <div class="form-group">
+    <div class="form-group" style="margin-bottom:1.5rem;padding-bottom:1.5rem;border-bottom:1px solid var(--color-border)">
       <label for="label_{{ c.circuit }}">
         {{ c.display_name or (c.circuit | replace('_', ' ') | title) }}
         <span class="setup-circuit-id">Internal ID: {{ c.circuit }}</span>
@@ -322,7 +322,25 @@
         maxlength="40"
         placeholder="e.g. Main, Garden, Unit A"
         class="form-control"
+        style="margin-bottom:1rem"
       >
+
+      <fieldset style="border:none;padding:0;margin:0">
+        <legend style="font-weight:600;font-size:.875rem;margin-bottom:.5rem">Circuit type</legend>
+        {% for t in circuit_types %}
+        <label style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem;cursor:pointer">
+          <input type="radio"
+                 name="type_{{ c.circuit }}"
+                 value="{{ t }}"
+                 {% if t == c.circuit_type %}checked{% endif %}
+                 style="margin-top:3px;flex-shrink:0">
+          <span>
+            <strong>{{ circuit_type_labels[t] }}</strong>
+            <span class="muted" style="font-size:.8125rem;display:block">{{ circuit_type_help[t] }}</span>
+          </span>
+        </label>
+        {% endfor %}
+      </fieldset>
     </div>
     {% endfor %}
 
