@@ -253,11 +253,9 @@ async def leaktest_abort(circuit: str, request: Request):
     if orch.leak_test_scheduler:
         orch.leak_test_scheduler.cancel(circuit)
 
-    # Re-open the valve (firmware also does this, belt-and-braces)
-    if cfg.valve_entity:
-        ok = await orch.ha.open_valve(cfg.valve_entity)
-        if not ok:
-            errors.append(f"Could not re-open valve ({cfg.valve_entity})")
+    # Firmware owns the valve restore decision — leak_test_restore_main checks
+    # !fault_main before reopening, so a concurrent safety fault keeps the valve
+    # closed correctly. Sending an unconditional open here would bypass that guard.
 
     if errors:
         return JSONResponse({

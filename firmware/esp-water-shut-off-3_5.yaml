@@ -2898,6 +2898,12 @@ valve:
       sorting_weight: 1
     id: main_water_valve
     lambda: |-
+      if (id(open_end_stop_valve1).state && id(closed_end_stop_valve1).state) {
+        // Both end stops active simultaneously — wiring fault (shorted or stuck switch).
+        // Return unknown so HA doesn't silently report VALVE_OPEN.
+        ESP_LOGE("valve", "MAIN: both end stops active simultaneously — wiring fault");
+        return {};
+      }
       if (id(open_end_stop_valve1).state) return VALVE_OPEN;
       if (id(closed_end_stop_valve1).state) return VALVE_CLOSED;
       return {};
@@ -2982,6 +2988,10 @@ valve:
       sorting_weight: 1
     id: irrigation_water_valve
     lambda: |-
+      if (id(open_end_stop_valve2).state && id(closed_end_stop_valve2).state) {
+        ESP_LOGE("valve", "IRRIGATION: both end stops active simultaneously — wiring fault");
+        return {};
+      }
       if (id(open_end_stop_valve2).state) return VALVE_OPEN;
       if (id(closed_end_stop_valve2).state) return VALVE_CLOSED;
       return {};

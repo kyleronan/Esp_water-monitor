@@ -511,9 +511,12 @@ class EventDetector:
             )
             self._detectors[cfg.circuit] = detector
 
-            self._ha.subscribe_entity(cfg.flow_sensor,          detector.on_flow_rate)
-            self._ha.subscribe_entity(cfg.pressure_fast_sensor, detector.on_pressure_fast)
-            self._ha.subscribe_entity(cfg.flow_onset_sensor,    detector.on_flow_onset)
+            if cfg.flow_sensor:
+                self._ha.subscribe_entity(cfg.flow_sensor,          detector.on_flow_rate)
+            if cfg.pressure_fast_sensor:
+                self._ha.subscribe_entity(cfg.pressure_fast_sensor, detector.on_pressure_fast)
+            if cfg.flow_onset_sensor:
+                self._ha.subscribe_entity(cfg.flow_onset_sensor,    detector.on_flow_onset)
             # Track valve states so we can record other-circuit valve open at event start
             if cfg.valve_entity:
                 self._ha.subscribe_entity(
