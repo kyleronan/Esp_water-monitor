@@ -51,6 +51,34 @@
       </span>
     </div>
 
+    {# Primary status line — always visible, updated by applyLiveState() #}
+    {% if c.fault_active %}
+    <div class="dash-status-line dash-status-fault" id="status-line-{{ c.circuit }}" aria-live="polite">
+      <span class="dash-status-icon" aria-hidden="true">●</span>
+      <span class="dash-status-text">Fault · Valve closed · Manual reset required</span>
+    </div>
+    {% elif c.trickle_active %}
+    <div class="dash-status-line dash-status-alert" id="status-line-{{ c.circuit }}" aria-live="polite">
+      <span class="dash-status-icon" aria-hidden="true">●</span>
+      <span class="dash-status-text">Attention needed · Trickle flow detected · Valve closed</span>
+    </div>
+    {% elif c.valve_state != 'open' %}
+    <div class="dash-status-line dash-status-closed" id="status-line-{{ c.circuit }}" aria-live="polite">
+      <span class="dash-status-icon" aria-hidden="true">○</span>
+      <span class="dash-status-text">Valve closed · No active alerts</span>
+    </div>
+    {% elif c.training.state == 'calibrating' %}
+    <div class="dash-status-line dash-status-learning" id="status-line-{{ c.circuit }}" aria-live="polite">
+      <span class="dash-status-icon" aria-hidden="true">●</span>
+      <span class="dash-status-text">Learning · Valve open · Monitoring active</span>
+    </div>
+    {% else %}
+    <div class="dash-status-line dash-status-normal" id="status-line-{{ c.circuit }}" aria-live="polite">
+      <span class="dash-status-icon" aria-hidden="true">●</span>
+      <span class="dash-status-text">Normal · Valve open · No active alerts</span>
+    </div>
+    {% endif %}
+
     {# Alert banner — fault or trickle, when active #}
     {% if c.fault_active %}
     <div class="dash-alert dash-alert-fault">

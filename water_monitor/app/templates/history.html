@@ -41,6 +41,44 @@
   </form>
 </div>
 
+{# ── Summary strip ────────────────────────────────────────────────── #}
+{% set ns = namespace(total_vol=0, total_events=0, tests_pass=0, tests_fail=0, total_alerts=0) %}
+{% for ch in circuit_history %}
+  {% for s in ch.summaries %}
+    {% set ns.total_vol = ns.total_vol + ((s.total_volume_litres or 0) * vol_factor) %}
+    {% set ns.total_alerts = ns.total_alerts + (s.alert_count or 0) %}
+  {% endfor %}
+  {% set ns.total_events = ns.total_events + (ch.event_count or 0) %}
+  {% for t in ch.leak_tests %}
+    {% if 'Passed' in (t.result or '') %}{% set ns.tests_pass = ns.tests_pass + 1 %}
+    {% elif t.result %}{% set ns.tests_fail = ns.tests_fail + 1 %}{% endif %}
+  {% endfor %}
+{% endfor %}
+<div class="hist-summary-strip">
+  <div class="hist-summary-item">
+    <span class="hist-summary-label">Total volume</span>
+    <span class="hist-summary-value">{{ ns.total_vol | round(vol_decimals) }} {{ vol_unit or 'L' }}</span>
+  </div>
+  <div class="hist-summary-item">
+    <span class="hist-summary-label">Events</span>
+    <span class="hist-summary-value">{{ ns.total_events }}</span>
+  </div>
+  <div class="hist-summary-item">
+    <span class="hist-summary-label">Leak tests</span>
+    <span class="hist-summary-value">
+      {% if ns.tests_pass + ns.tests_fail == 0 %}—
+      {% else %}
+        <span class="hist-summary-pass">{{ ns.tests_pass }} passed</span>
+        {% if ns.tests_fail %} · <span class="hist-summary-fail">{{ ns.tests_fail }} failed</span>{% endif %}
+      {% endif %}
+    </span>
+  </div>
+  <div class="hist-summary-item">
+    <span class="hist-summary-label">Alerts</span>
+    <span class="hist-summary-value">{{ ns.total_alerts if ns.total_alerts else '—' }}</span>
+  </div>
+</div>
+
 {% for ch in circuit_history %}
 
 {# ── Usage chart card ────────────────────────────────────────────── #}
