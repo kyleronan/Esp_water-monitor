@@ -147,7 +147,7 @@ take eight months will probably apply here too.
 
 ### Firmware
 
-1. Flash `firmware/esp-water-shut-off-3_5.yaml` (v3.5.1) to your ESP32-S3-WROOM-1
+1. Flash `firmware/esp-water-shut-off-3_6.yaml` (v3.6.0) to your ESP32-S3-WROOM-1
    using ESPHome
 2. Make sure the device is added to Home Assistant before installing the addon
 3. The setup wizard will discover the device automatically

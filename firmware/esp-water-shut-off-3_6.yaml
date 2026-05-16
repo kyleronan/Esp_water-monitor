@@ -65,7 +65,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.5.1"
+    version: "3.6.0"
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE

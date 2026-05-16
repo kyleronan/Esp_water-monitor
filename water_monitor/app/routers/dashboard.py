@@ -87,6 +87,8 @@ async def dashboard_live(request: Request):
 @router.get("/api/chart/{circuit}")
 async def chart_data(circuit: str, request: Request):
     """Return hourly volume data for chart refresh."""
+    from ..circuit_compat import resolve_circuit
+    circuit = resolve_circuit(circuit)
     orch = _get_orchestrator(request)
     data = _build_chart_data(orch.db, circuit)
     return JSONResponse(data)

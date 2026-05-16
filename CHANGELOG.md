@@ -139,7 +139,7 @@
 - **`main.py`** — added inline comment explaining the `/setup` CSRF
   exemption trade-off.
 
-#### Firmware — `esp-water-shut-off-3_5.yaml` (v3.5.1)
+#### Firmware — `esp-water-shut-off-3_6.yaml` (v3.6.0)
 
 - **Spurious motor fault on concurrent close** (🔴): after `open_action`
   fires the relay and waits 15 s, it checks whether the open end-stop is
