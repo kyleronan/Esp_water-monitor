@@ -37,6 +37,10 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # Wait up to 5s before raising OperationalError on a locked DB.
+    # Prevents immediate failures when cluster engine executor threads and
+    # async coroutines briefly contend for the same connection.
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
