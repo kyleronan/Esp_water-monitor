@@ -12,6 +12,34 @@ async function post(url, body = {}) {
   return { ok: resp.ok, status: resp.status, data };
 }
 
+// ── Toast notifications ────────────────────────────────────────────
+function toast(message, type = 'info') {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+  const el = document.createElement('div');
+  el.className = `toast toast-${type}`;
+  el.setAttribute('role', 'status');
+  el.innerHTML =
+    `<span class="toast-body">${message}</span>` +
+    `<button class="toast-close" aria-label="Dismiss notification">×</button>`;
+  const dismiss = () => {
+    if (el._dismissed) return;
+    el._dismissed = true;
+    const reduced = !window.matchMedia('(prefers-reduced-motion: no-preference)').matches;
+    if (!reduced) {
+      el.classList.add('toast-out');
+      setTimeout(() => el.remove(), 200);
+    } else {
+      el.remove();
+    }
+  };
+  el.querySelector('.toast-close').addEventListener('click', dismiss);
+  container.appendChild(el);
+  if (type === 'success' || type === 'info') {
+    setTimeout(dismiss, 4000);
+  }
+}
+
 // ── Live state updater ─────────────────────────────────────────────
 // Always-on poll — reflects valve changes from HA, the ESP firmware
 // (faults, leak tests, bypass switch), or any other source.
@@ -107,7 +135,7 @@ async function valveOpen(circuit) {
   if (!confirm(`Open ${circuit} valve?`)) return;
   const r = await post(`/device/valve/${circuit}/open`);
   if (r.data && r.data.status === "error") {
-    alert("Could not open valve: " + (r.data.message || "unknown error"));
+    toast("Could not open valve: " + (r.data.message || "unknown error"), 'error');
     return;
   }
   // Poll faster until the state settles
@@ -124,7 +152,7 @@ async function valveClose(circuit) {
   if (!confirm(`Close ${circuit} valve?`)) return;
   const r = await post(`/device/valve/${circuit}/close`);
   if (r.data && r.data.status === "error") {
-    alert("Could not close valve: " + (r.data.message || "unknown error"));
+    toast("Could not close valve: " + (r.data.message || "unknown error"), 'error');
     return;
   }
   let attempts = 0;
@@ -158,7 +186,7 @@ async function runLeakTest(circuit) {
   const r = await post(`/device/leaktest/${circuit}/run`);
   const msg    = r.data && r.data.message ? r.data.message : "Leak test started.";
   const status = r.data && r.data.status  ? r.data.status  : "started";
-  alert(msg);
+  toast(msg, status === 'error' ? 'error' : 'info');
   if (status === "started") {
     // Reload once HA confirms the test is actually active (avoids stale render)
     _pollThenReload(circuit, s => s.leak_test_active || s.leak_test_running, 20);
@@ -172,7 +200,7 @@ async function abortLeakTest(circuit) {
   )) return;
   const r = await post(`/device/leaktest/${circuit}/abort`);
   const msg = r.data && r.data.message ? r.data.message : "Leak test aborted.";
-  alert(msg);
+  toast(msg, r.ok ? 'info' : 'error');
   // Reload once HA confirms the test is no longer active
   _pollThenReload(circuit, s => !s.leak_test_active && !s.leak_test_running, 20);
 }
