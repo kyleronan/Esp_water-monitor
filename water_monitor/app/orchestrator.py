@@ -349,21 +349,38 @@ class Orchestrator:
         except Exception as e:
             log.warning("FixturePublisher start failed (non-fatal): %s", e)
 
-        # Run all background tasks concurrently
+        # Run all background tasks concurrently, each under its own supervisor
+        # so a crash in one subsystem restarts only that subsystem instead of
+        # taking down the entire orchestrator.
         try:
             await asyncio.gather(
-                self._ha.run_event_loop(),
-                self._feature_extractor.run(),
-                self._training_manager.run(),
-                self._data_pruner.run(),
-                self._leak_test_scheduler.run(),
-                self._historical_importer.run(),
-                self._cluster_metrics.run(),
+                self._supervise("ha_event_loop",       self._ha.run_event_loop),
+                self._supervise("feature_extractor",   self._feature_extractor.run),
+                self._supervise("training_manager",    self._training_manager.run),
+                self._supervise("data_pruner",         self._data_pruner.run),
+                self._supervise("leak_test_scheduler", self._leak_test_scheduler.run),
+                self._supervise("historical_importer", self._historical_importer.run),
+                self._supervise("cluster_metrics",     self._cluster_metrics.run),
             )
         except asyncio.CancelledError:
             pass
         finally:
             await self._ha.__aexit__(None, None, None)
+
+    async def _supervise(self, name: str, coro_fn) -> None:
+        """Run coro_fn() in a restart loop. A crash restarts after 5s."""
+        while not self._stop.is_set():
+            try:
+                await coro_fn()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("%s crashed — restarting in 5s", name)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=5)
+                    return
+                except asyncio.TimeoutError:
+                    pass
 
     def _get_sensitivity(self, circuit: str) -> dict:
         """Return effective sensitivity settings for a circuit."""

@@ -51,6 +51,7 @@ class LeakTestScheduler:
         self._alert_manager = alert_manager
         self._stop = asyncio.Event()
         self._running_tests: Dict[str, bool] = {}
+        self._tasks: Dict[str, Optional[asyncio.Task]] = {}
 
     def stop(self) -> None:
         self._stop.set()
@@ -95,16 +96,20 @@ class LeakTestScheduler:
         notify_fail = schedule["notify_on_fail"] if schedule else True
 
         self._running_tests[circuit] = True
-        result = {}
+        task = asyncio.create_task(self._execute_test(
+            circuit_cfg,
+            notify_pass=notify_pass,
+            notify_fail=notify_fail,
+            triggered_by=triggered_by,
+        ))
+        self._tasks[circuit] = task
         try:
-            result = await self._execute_test(
-                circuit_cfg,
-                notify_pass=notify_pass,
-                notify_fail=notify_fail,
-                triggered_by=triggered_by,
-            )
+            result = await task
+        except asyncio.CancelledError:
+            result = {"result": "cancelled"}
         finally:
             self._running_tests[circuit] = False
+            self._tasks.pop(circuit, None)
 
         return result
 
@@ -153,12 +158,15 @@ class LeakTestScheduler:
 
     def cancel(self, circuit: str) -> None:
         """
-        Mark a circuit's test as no longer running.
-        Called by the abort endpoint so is_running() returns False immediately,
-        letting the live-state poll reflect the abort without delay.
-        The background _execute_test task still finishes cleanly (stores the
-        'Stopped manually' result from the firmware) but the UI won't wait for it.
+        Cancel a running leak test.  Cancels the asyncio task so _execute_test
+        stops polling immediately; is_running() returns False right away so the
+        UI reflects the abort without waiting for the next firmware poll cycle.
+        The firmware has already received the stop command from the abort route
+        before this method is called.
         """
+        task = self._tasks.get(circuit)
+        if task and not task.done():
+            task.cancel()
         self._running_tests[circuit] = False
         log.info("[%s] leak test cancelled via abort", circuit)
 

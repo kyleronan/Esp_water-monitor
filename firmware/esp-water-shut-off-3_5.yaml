@@ -1878,9 +1878,14 @@ binary_sensor:
         - valve.template.publish:
             id: main_water_valve
             state: CLOSED
-        # Valve has reached the closed position — clear the close-in-flight
-        # guard so future closes can be requested again if needed.
-        - lambda: 'id(close_in_flight_main) = false;'
+        # Valve has reached the closed position — clear both in-flight guards.
+        # close_in_flight: close sequence completed successfully.
+        # open_in_flight: clears any open that was interrupted mid-travel by
+        # this close (e.g. safety-fault auto-close arriving during the 15s
+        # open-action delay), preventing a spurious motor fault at timeout.
+        - lambda: |-
+            id(close_in_flight_main) = false;
+            id(open_in_flight_main) = false;
 
   # ---------------------------------------------------------------------------
   # END STOP SWITCHES — Valve 2 (Irrigation)
@@ -1928,7 +1933,11 @@ binary_sensor:
         - valve.template.publish:
             id: irrigation_water_valve
             state: CLOSED
-        - lambda: 'id(close_in_flight_irr) = false;'
+        # Mirror the main-circuit closed end-stop: clear both guards.
+        # See closed_end_stop_valve1.on_press comment for rationale.
+        - lambda: |-
+            id(close_in_flight_irr) = false;
+            id(open_in_flight_irr) = false;
 
 # =============================================================================
 # OUTPUTS — Panel indicator LEDs
@@ -2730,13 +2739,26 @@ script:
                         # dissipate after the valve closes, so the baseline reading
                         # captured next is stable and noise-free.
                         - delay: 60s
-                        # Guard: if cancelled during settle, preparing will be false
+                        # Guard: if cancelled during settle, preparing will be false.
+                        # Also validates the baseline reading is a sane pressure value —
+                        # the ADC-backed EMA sensor can return NaN or 0.0 on cold boot
+                        # before the first valid sample arrives, which would make the
+                        # leak threshold comparison undefined or always-pass.
                         - lambda: |-
                             if (!id(leak_test_preparing_main)) return;
+                            float baseline = id(pressure_main).state;
+                            if (isnan(baseline) || baseline < 1.0f) {
+                              id(leak_test_result_main) = 6;  // Not run — sensor not ready
+                              id(leak_test_preparing_main) = false;
+                              id(leak_test_active_main) = false;
+                              ESP_LOGW("leak_test", "MAIN: baseline invalid (%.1f PSI) — "
+                                "ADC not settled after close, aborting test", baseline);
+                              return;
+                            }
                             id(leak_test_preparing_main) = false;
                             id(leak_test_elapsed_main) = 0.0f;
                             id(leak_test_start_ms_main) = millis();
-                            id(leak_test_baseline_main) = id(pressure_main).state;
+                            id(leak_test_baseline_main) = baseline;
                             id(leak_test_active_main) = true;
                             id(leak_test_result_main) = 1;  // In progress
                             ESP_LOGI("leak_test", "MAIN: test started. Baseline: %.1f PSI, "
@@ -2804,10 +2826,19 @@ script:
                         - delay: 60s
                         - lambda: |-
                             if (!id(leak_test_preparing_irr)) return;
+                            float baseline = id(pressure_irrigation).state;
+                            if (isnan(baseline) || baseline < 1.0f) {
+                              id(leak_test_result_irr) = 6;  // Not run — sensor not ready
+                              id(leak_test_preparing_irr) = false;
+                              id(leak_test_active_irr) = false;
+                              ESP_LOGW("leak_test", "IRRIGATION: baseline invalid (%.1f PSI) — "
+                                "ADC not settled after close, aborting test", baseline);
+                              return;
+                            }
                             id(leak_test_preparing_irr) = false;
                             id(leak_test_elapsed_irr) = 0.0f;
                             id(leak_test_start_ms_irr) = millis();
-                            id(leak_test_baseline_irr) = id(pressure_irrigation).state;
+                            id(leak_test_baseline_irr) = baseline;
                             id(leak_test_active_irr) = true;
                             id(leak_test_result_irr) = 1;  // In progress
                             ESP_LOGI("leak_test", "IRRIGATION: test started. Baseline: %.1f PSI, "
