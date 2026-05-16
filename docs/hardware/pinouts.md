@@ -38,12 +38,16 @@ For both `J10` and `J12`:
 | `Flow1` | Red / + supply / `/3v3` | Yellow / pulse / `GPIO39` | Black / GND / `Earth` |
 | `Flow2` | Red / + supply / `/3v3` | Yellow / pulse / `GPIO38` | Black / GND / `Earth` |
 
+Because the flow sensor is powered from 3.3 V, the yellow pulse output can connect directly to the ESP32 GPIO input without a voltage divider or other signal conditioning.
+
 ## Pressure sensor connectors
 
 | Connector | Pin 1 | Pin 2 | Pin 3 |
 | --- | --- | --- | --- |
 | `Pressure1` | Red / + supply / `/5V` | Black / GND / `Earth` | Green / sense, through divider to `GPIO1` |
 | `Pressure2` | Red / + supply / `/5V` | Black / GND / `Earth` | Green / sense, through divider to `GPIO2` |
+
+The pressure sensor output is 0.5 to 4.5 V. The PCB resistor divider scales the signal for ESP32 ADC input.
 
 ## Pressure sense scaling
 
