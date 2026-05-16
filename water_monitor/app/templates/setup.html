@@ -4,9 +4,10 @@
 
 {# ── Step progress indicator ──────────────────────────────────────── #}
 <div class="setup-steps">
+  {% set step_num = (step | string)[0] | int %}
   {% for i, label in [(1,'Find Device'),(2,'Select'),(3,'Entities'),(4,'Units'),(5,'Your Home'),(6,'Done')] %}
-  <div class="setup-step {% if step == i %}active{% elif step > i %}done{% endif %}">
-    <span class="step-num">{% if step > i %}✓{% else %}{{ i }}{% endif %}</span>
+  <div class="setup-step {% if step_num == i %}active{% elif step_num > i %}done{% endif %}">
+    <span class="step-num">{% if step_num > i %}✓{% else %}{{ i }}{% endif %}</span>
     <span class="step-label">{{ label }}</span>
   </div>
   {% if not loop.last %}<div class="step-connector"></div>{% endif %}
