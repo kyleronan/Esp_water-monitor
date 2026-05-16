@@ -92,6 +92,7 @@ async def setup_restore(request: Request):
         QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT, MAX_BACKUP_BYTES,
     )
     from ..database import normalize_events_utc, dedup_events
+    from ..restore_utils import safe_insert_rows, restore_circuit_labels
 
     orch = _orch(request)
     form = await request.form()
@@ -151,23 +152,7 @@ async def setup_restore(request: Request):
                 rows = tables.get(tbl)
                 if not rows:
                     continue
-                # Filter backup columns against live schema so old backups with
-                # removed columns (e.g. monthly_budget_litres) restore cleanly.
-                valid_cols = {r[1] for r in db.execute(
-                    f"PRAGMA table_info({tbl})").fetchall()}
-                cols = [c for c in rows[0].keys() if c in valid_cols]
-                if not cols:
-                    log.warning("Restore: table %s has no valid columns — skipping", tbl)
-                    continue
-                placeholders = ", ".join("?" for _ in cols)
-                col_names    = ", ".join(cols)
-                for row in rows:
-                    db.execute(
-                        f"INSERT OR REPLACE INTO {tbl} ({col_names}) "
-                        f"VALUES ({placeholders})",
-                        [row.get(c) for c in cols],
-                    )
-                total += len(rows)
+                total += safe_insert_rows(db, tbl, rows)
 
             # Normalize and deduplicate events after import so the DB is
             # consistent even if the backup contained pre-dedup duplicates
@@ -180,6 +165,9 @@ async def setup_restore(request: Request):
                         "Setup restore: removed %d duplicate event(s) from backup",
                         removed,
                     )
+
+            # Restore circuit display labels atomically with the table data.
+            restore_circuit_labels(db, payload)
     except Exception as e:
         log.error("Setup restore failed — transaction rolled back: %s", e)
         errors.append("(transaction rolled back)")

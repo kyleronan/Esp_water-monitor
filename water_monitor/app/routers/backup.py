@@ -37,58 +37,16 @@ from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from ._helpers import ingress_redirect
-from ..circuit_compat import resolve_circuit
 from ..config import DB_PATH
+from ..restore_utils import (
+    normalize_restore_row as _normalize_row,
+    safe_insert_rows as _safe_insert,
+    CIRCUIT_TABLES as _CIRCUIT_TABLES,
+)
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/backup")
 MAX_BACKUP_BYTES = 50 * 1024 * 1024  # 50 MB hard limit
-
-# Tables that contain a 'circuit' column and require normalization on restore.
-# Used by _normalize_row() to map legacy 'main'/'irrigation' values.
-_CIRCUIT_TABLES = frozenset({
-    "events", "circuit_entity_map", "circuit_profile", "training_state",
-    "learning_config", "sensitivity_config", "alert_config", "leak_test_schedule",
-    "circuit_exclusion_windows", "hourly_volume", "daily_summary",
-    "fixtures", "fixture_clusters", "fixture_daily_summary", "leak_test_history",
-    "volume_snapshots", "cluster_cooccurrence", "cluster_metrics_history",
-    "import_state",
-})
-
-def _normalize_row(row: dict, table: str) -> dict:
-    """
-    Normalize the 'circuit' field of a restored row to the stable circuit ID format.
-    Maps legacy values ('main' → 'circuit_1', 'irrigation' → 'circuit_2').
-    Must be applied to every row in every restored table that has a 'circuit' column.
-    """
-    if table in _CIRCUIT_TABLES and "circuit" in row:
-        row = dict(row)
-        row["circuit"] = resolve_circuit(row["circuit"])
-    return row
-
-
-def _safe_insert(db, tbl: str, rows: list) -> int:
-    """
-    Insert rows into tbl, validating column names against the live schema
-    to prevent SQL injection via crafted backup files.
-    Normalizes circuit values on every row before insert.
-    Returns count of rows inserted.
-    """
-    if not rows:
-        return 0
-    # Fetch the actual columns that exist in this table
-    valid_cols = {r[1] for r in db.execute(f"PRAGMA table_info({tbl})").fetchall()}
-    # Filter to only columns that exist in both the payload and the table
-    cols = [c for c in rows[0].keys() if c in valid_cols]
-    if not cols:
-        raise ValueError(f"No valid columns found for table {tbl}")
-    ph = ",".join("?" for _ in cols)
-    cn = ",".join(cols)
-    sql = f"INSERT OR REPLACE INTO {tbl} ({cn}) VALUES ({ph})"
-    for row in rows:
-        row = _normalize_row(row, tbl)
-        db.execute(sql, [row.get(c) for c in cols])
-    return len(rows)
 
 
 # ── Table groups ─────────────────────────────────────────────────────────────
@@ -287,11 +245,17 @@ async def export_full(request: Request):
                 log.warning("Full export quick-restore %s: %s", tbl, e)
                 qr_tables[tbl] = []
 
+        from ..database import load_circuit_labels as _load_labels
+        _circuit_labels = _load_labels(db)
         qr_payload = {
             "backup_type":  "quick_restore",
             "version":      3,
             "exported_at":  datetime.now(timezone.utc).isoformat(),
             "history_days": QUICK_RESTORE_DAYS,
+            "circuits": [
+                {"circuit_id": cid, "display_name": lbl}
+                for cid, lbl in _circuit_labels.items()
+            ],
             "tables":       qr_tables,
         }
         zf.writestr("quick_restore.json",
