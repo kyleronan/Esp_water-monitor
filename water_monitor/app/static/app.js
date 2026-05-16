@@ -16,28 +16,33 @@ async function post(url, body = {}) {
 function toast(message, type = 'info') {
   const container = document.getElementById('toast-container');
   if (!container) return;
+
   const el = document.createElement('div');
   el.className = `toast toast-${type}`;
-  el.setAttribute('role', 'status');
-  el.innerHTML =
-    `<span class="toast-body">${message}</span>` +
-    `<button class="toast-close" aria-label="Dismiss notification">×</button>`;
+  el.setAttribute('role', type === 'error' ? 'alert' : 'status');
+
+  const body = document.createElement('span');
+  body.className = 'toast-body';
+  body.textContent = String(message);
+
+  const close = document.createElement('button');
+  close.className = 'toast-close';
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Dismiss notification');
+  close.textContent = '×';
+
+  el.append(body, close);
+
   const dismiss = () => {
     if (el._dismissed) return;
     el._dismissed = true;
     const reduced = !window.matchMedia('(prefers-reduced-motion: no-preference)').matches;
-    if (!reduced) {
-      el.classList.add('toast-out');
-      setTimeout(() => el.remove(), 200);
-    } else {
-      el.remove();
-    }
+    if (!reduced) { el.classList.add('toast-out'); setTimeout(() => el.remove(), 200); }
+    else { el.remove(); }
   };
-  el.querySelector('.toast-close').addEventListener('click', dismiss);
+  close.addEventListener('click', dismiss);
   container.appendChild(el);
-  if (type === 'success' || type === 'info') {
-    setTimeout(dismiss, 4000);
-  }
+  if (type === 'success' || type === 'info') setTimeout(dismiss, 4000);
 }
 
 // ── Live state updater ─────────────────────────────────────────────
@@ -63,15 +68,15 @@ function applyLiveState(circuit, state) {
       ctrl.dataset.faultReason = faultReason;
 
       if (vs === 'open') {
-        ctrl.innerHTML = `<button class="btn btn-danger" onclick="valveClose('${circuit}')">Close Valve</button>`;
+        ctrl.innerHTML = `<button class="btn btn-danger btn-sm" onclick="valveCloseModal('${circuit}', this)">Close Valve</button>`;
       } else if (vs === 'closed') {
         if (faultActive) {
-          ctrl.innerHTML = `<button class="btn btn-secondary btn-fault-warn" onclick="valveOpenWithFaultWarning('${circuit}', this)">Open Valve</button>`;
+          ctrl.innerHTML = `<button class="btn btn-secondary btn-sm btn-fault-warn" onclick="valveOpenWithFaultWarning('${circuit}', this)">Open Valve</button>`;
         } else {
-          ctrl.innerHTML = `<button class="btn btn-primary" onclick="valveOpenModal('${circuit}', this)">Open Valve</button>`;
+          ctrl.innerHTML = `<button class="btn btn-primary btn-sm" onclick="valveOpenModal('${circuit}', this)">Open Valve</button>`;
         }
       } else {
-        ctrl.innerHTML = `<button class="btn btn-secondary" disabled>${state.valve_state}</button>`;
+        ctrl.innerHTML = `<button class="btn btn-secondary btn-sm" disabled>${state.valve_state}</button>`;
       }
     }
   }
@@ -101,7 +106,10 @@ function applyLiveState(circuit, state) {
     } else if (state.trickle_active) {
       statusClass = 'dash-status-alert';
       iconText    = '●';
-      statusText  = 'Attention needed · Trickle flow detected · Valve closed';
+      const valvePhrase = vs === 'closed' ? 'Valve closed'
+                        : vs === 'open'   ? 'Valve open'
+                        : `Valve ${state.valve_state || 'unknown'}`;
+      statusText  = `Attention needed · Trickle flow detected · ${valvePhrase}`;
     } else if (vs !== 'open') {
       statusClass = 'dash-status-closed';
       iconText    = '○';
@@ -196,7 +204,7 @@ window.addEventListener('DOMContentLoaded', () => {
 let _valveModalTrigger   = null;
 let _valveModalOnConfirm = null;
 
-function _openValveModal(titleText, bodyText, faultText) {
+function _openValveModal(titleText, bodyText, faultText, confirmLabel = 'Confirm', confirmClass = 'btn-warning') {
   document.getElementById('valve-modal-title').textContent = titleText;
   document.getElementById('valve-modal-body').textContent  = bodyText;
   const faultEl = document.getElementById('valve-modal-fault');
@@ -206,6 +214,9 @@ function _openValveModal(titleText, bodyText, faultText) {
   } else {
     faultEl.style.display = 'none';
   }
+  const confirmBtn = document.getElementById('valve-modal-confirm');
+  confirmBtn.textContent = confirmLabel;
+  confirmBtn.className   = `btn ${confirmClass}`;
   document.getElementById('valve-modal').style.display = '';
   document.getElementById('valve-modal-cancel').focus();
 }
@@ -252,7 +263,9 @@ function valveOpenModal(circuit, triggerEl) {
   _openValveModal(
     `Open ${displayName} valve?`,
     'This may restore water flow. Confirm the leak condition has been resolved before opening.',
-    null
+    null,
+    'Open Valve',
+    'btn-warning'
   );
 }
 
@@ -268,20 +281,36 @@ function valveOpenWithFaultWarning(circuit, triggerEl) {
   _openValveModal(
     `Open ${displayName} valve?`,
     'This may restore water flow. Confirm the leak condition has been resolved before opening.',
-    faultLine
+    faultLine,
+    'Open Valve',
+    'btn-warning'
+  );
+}
+
+function valveCloseModal(circuit, triggerEl) {
+  _valveModalTrigger   = triggerEl || null;
+  const displayName    = _getDisplayName(circuit);
+  _valveModalOnConfirm = () => valveClose(circuit);
+  _openValveModal(
+    `Close ${displayName} valve?`,
+    'This will immediately stop water flow to the circuit.',
+    null,
+    'Close Valve',
+    'btn-danger'
   );
 }
 
 async function valveOpen(circuit) {
   const displayName = _getDisplayName(circuit);
   _setValveBtnsLoading(circuit, 'Opening…');
+  toast(`Open command sent for ${displayName} valve.`, 'info');
   const r = await post(`/device/valve/${circuit}/open`);
-  if (r.data && r.data.status === "error") {
-    toast(`Could not open ${displayName} valve: ` + (r.data.message || "unknown error"), 'error');
+  if (!r.ok || !r.data || r.data.status !== 'ok') {
+    toast(`Could not open ${displayName} valve: ${r.data?.message || 'request failed'}`, 'error');
     _restoreValveBtns(circuit);
     return;
   }
-  toast(`Open command sent for ${displayName} valve.`, 'success');
+  toast(`Open command accepted for ${displayName} valve. Waiting for live state confirmation.`, 'success');
   let attempts = 0;
   const iv = setInterval(async () => {
     await fetchLiveState();
@@ -293,15 +322,15 @@ async function valveOpen(circuit) {
 
 async function valveClose(circuit) {
   const displayName = _getDisplayName(circuit);
-  toast(`Close command sent for ${displayName} valve.`, 'info');
   _setValveBtnsLoading(circuit, 'Closing…');
+  toast(`Close command sent for ${displayName} valve.`, 'info');
   const r = await post(`/device/valve/${circuit}/close`);
-  if (r.data && r.data.status === "error") {
-    toast(`Could not close ${displayName} valve: ` + (r.data.message || "unknown error"), 'error');
+  if (!r.ok || !r.data || r.data.status !== 'ok') {
+    toast(`Could not close ${displayName} valve: ${r.data?.message || 'request failed'}`, 'error');
     _restoreValveBtns(circuit);
     return;
   }
-  toast(`${displayName} valve closed.`, 'success');
+  toast(`Close command accepted for ${displayName} valve. Waiting for live state confirmation.`, 'success');
   let attempts = 0;
   const iv = setInterval(async () => {
     await fetchLiveState();

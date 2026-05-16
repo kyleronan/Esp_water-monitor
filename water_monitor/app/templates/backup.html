@@ -10,7 +10,10 @@
 {# ── Last automatic backup status ────────────────────────────────── #}
 <p class="bk-last-backup">
   {% if retention.last_auto_backup_at %}
-  Last automatic backup: <strong>{{ retention.last_auto_backup_at[:16] }}</strong>
+  Last automatic backup:
+  <strong>
+    <time datetime="{{ retention.last_auto_backup_at }}">{{ retention.last_auto_backup_at[:16] }} UTC</time>
+  </strong>
   {% else %}
   No automatic backup recorded.
   {% endif %}

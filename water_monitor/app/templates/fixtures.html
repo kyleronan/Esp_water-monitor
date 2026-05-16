@@ -110,17 +110,17 @@
     {% set active_type   = cl.user_type or cl.suggested_type or 'other' %}
     {% set display_name  = cl.name or cl.display_name or (active_type | replace('_',' ') | title) %}
 
-    <div class="fx-cluster-card{% if needs_review %} needs-review{% elif is_confirmed %} confirmed{% endif %}">
+    <div class="fx-cluster-card{% if not_enough %}{% elif needs_review %} needs-review{% elif is_confirmed %} confirmed{% endif %}">
 
       {# Header: icon + name + confidence pill #}
       <div class="fx-card-header">
         <span class="fx-card-icon">{{ cl | fixture_icon }}</span>
         <div style="flex:1;min-width:0">
           <div class="fx-card-title">{{ display_name }}</div>
-          {% if needs_review %}
-          <div class="fx-card-sub fx-needs-review-label">Needs review</div>
-          {% elif not_enough %}
+          {% if not_enough %}
           <div class="fx-card-sub fx-not-enough-label">Not enough data to classify automatically</div>
+          {% elif needs_review %}
+          <div class="fx-card-sub fx-needs-review-label">Needs review</div>
           {% else %}
           <div class="fx-card-sub">{{ cl.member_count }} events</div>
           {% endif %}

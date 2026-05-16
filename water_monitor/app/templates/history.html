@@ -56,15 +56,15 @@
 {% endfor %}
 <div class="hist-summary-strip">
   <div class="hist-summary-item">
-    <span class="hist-summary-label">Total volume</span>
+    <span class="hist-summary-label">Volume (chart range)</span>
     <span class="hist-summary-value">{{ ns.total_vol | round(vol_decimals) }} {{ vol_unit or 'L' }}</span>
   </div>
   <div class="hist-summary-item">
-    <span class="hist-summary-label">Events</span>
+    <span class="hist-summary-label">Events ({% if using_range %}filtered{% else %}recent {{ default_limit }}{% endif %})</span>
     <span class="hist-summary-value">{{ ns.total_events }}</span>
   </div>
   <div class="hist-summary-item">
-    <span class="hist-summary-label">Leak tests</span>
+    <span class="hist-summary-label">Leak tests (last 20)</span>
     <span class="hist-summary-value">
       {% if ns.tests_pass + ns.tests_fail == 0 %}—
       {% else %}
@@ -74,7 +74,7 @@
     </span>
   </div>
   <div class="hist-summary-item">
-    <span class="hist-summary-label">Alerts</span>
+    <span class="hist-summary-label">Alerts (chart range)</span>
     <span class="hist-summary-value">{{ ns.total_alerts if ns.total_alerts else '—' }}</span>
   </div>
 </div>
