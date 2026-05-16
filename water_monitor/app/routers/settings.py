@@ -42,12 +42,24 @@ async def settings_page(request: Request):
     except Exception:
         device_entities = []
 
-    # Group by circuit using the prefix — strip prefix then check suffix
+    # Legacy entity_id suffixes per stable circuit ID.
+    # Firmware entity_ids still end with _main / _irrigation / _irr even after
+    # the Python stable IDs were renamed to circuit_1 / circuit_2.
+    _LEGACY_SUFFIXES: dict = {
+        "circuit_1": ("main",),
+        "circuit_2": ("irrigation", "irr"),
+    }
+
+    # Group by circuit using the prefix — strip prefix then check suffix.
+    # Checks canonical suffixes (_circuit_1, _circuit1) and legacy aliases
+    # (_main, _irrigation, _irr) so firmware entities are grouped correctly.
     def circuit_of(entity_id: str) -> str:
         local = entity_id.split(".", 1)[1] if "." in entity_id else entity_id
         stem = local[len(prefix):] if local.startswith(prefix) else local
         for c in orch._cfg.circuits:
-            if stem.endswith(f"_{c.circuit}") or stem.endswith(f"_{c.circuit.replace('_', '')}"):
+            canonical = (f"_{c.circuit}", f"_{c.circuit.replace('_', '')}")
+            legacy = tuple(f"_{s}" for s in _LEGACY_SUFFIXES.get(c.circuit, ()))
+            if any(stem.endswith(sfx) for sfx in canonical + legacy):
                 return c.circuit
         return "general"
 
@@ -87,8 +99,12 @@ async def settings_page(request: Request):
         eid   = e["entity_id"]
         local = eid.split(".", 1)[1] if "." in eid else eid
         stem  = local[len(prefix):] if local.startswith(prefix) else local
-        # Strip circuit suffix
-        for suffix in (f"_{circuit}", f"_{circuit.replace('_', '')}"):
+        # Strip circuit suffix — check canonical names and legacy firmware aliases
+        _strip_candidates = (
+            (f"_{circuit}", f"_{circuit.replace('_', '')}")
+            + tuple(f"_{s}" for s in _LEGACY_SUFFIXES.get(circuit, ()))
+        )
+        for suffix in _strip_candidates:
             if stem.endswith(suffix):
                 stem = stem[: -len(suffix)]
                 break
@@ -140,10 +156,18 @@ async def settings_page(request: Request):
         e["unit_type"]   = None
         return e
 
+    # Only render number.* entities — select.* support requires explicit mutable
+    # select roles and a separate hardened endpoint; exclude them here so the
+    # template never calls the number-only device-entity/update with a select.
+    number_entities = [
+        e for e in device_entities
+        if (e.get("entity_id") or "").split(".")[0] == "number"
+    ]
+
     entities_by_circuit: dict = {"general": []}
     for c in orch._cfg.circuits:
         entities_by_circuit[c.circuit] = []
-    for e in device_entities:
+    for e in number_entities:
         circ = circuit_of(e["entity_id"])
         enriched = _enrich_entity(e, prefix, circ)
         entities_by_circuit.setdefault(circ, []).append(enriched)
@@ -365,12 +389,31 @@ async def alert_toggle(circuit: str, alert_id: str, request: Request):
     return JSONResponse({"status": "updated", "enabled": enabled})
 
 
+# Roles whose discovered entity_ids may be written via /settings/device-entity/update.
+# Only ESPHome number.* entities — select.* support requires a separate endpoint.
+# Keep in sync with _THRESHOLD_ROLES in device.py.
+_SETTINGS_MUTABLE_ROLES: frozenset[str] = frozenset({
+    "burst_threshold",
+    "pressure_drop_threshold",
+    "leak_pressure_threshold",
+    "trickle_min_flow",
+    "trickle_max_flow",
+    "trickle_duration",
+    "leak_test_duration_number",   # preferred name (firmware v3.6+)
+    "leak_test_duration_sensor",   # compat alias — remove after one release
+})
+
+
 # ------------------------------------------------------------------
-# Device entity updates (number and select entities on the ESP)
+# Device entity updates (number entities on the ESP)
 # ------------------------------------------------------------------
 @router.post("/device-entity/update")
 async def device_entity_update(request: Request):
-    """Update a number or select entity value on the ESP via HA."""
+    """Update a number entity value on the ESP via HA.
+
+    Only ESPHome number.* entities that belong to an explicitly mutable
+    role are accepted.  input_number, select, and input_select are rejected.
+    """
     form = await request.form()
     orch = _orch(request)
     entity_id = form.get("entity_id", "").strip()
@@ -383,31 +426,42 @@ async def device_entity_update(request: Request):
             status_code=400,
         )
 
-    if domain in ("number", "input_number"):
-        try:
-            numeric = float(value)
-            # Convert from display units back to internal units (L/min / PSI)
-            # before sending to HA/ESP.
-            _FLOW_KEYWORDS     = ("flow_threshold", "burst_threshold")
-            _PRESSURE_KEYWORDS = ("pressure_threshold", "pressure_drop")
-            if any(k in entity_id for k in _FLOW_KEYWORDS):
-                from ..units import load_unit_context as _luc
-                numeric = numeric / _luc(orch.db)["flow_factor"]
-            elif any(k in entity_id for k in _PRESSURE_KEYWORDS):
-                from ..units import load_unit_context as _luc
-                numeric = numeric / _luc(orch.db)["pressure_factor"]
-            ok = await orch.ha.set_number(entity_id, round(numeric, 4))
-        except ValueError:
-            return JSONResponse(
-                {"status": "error", "message": f"Invalid number: {value}"},
-                status_code=400,
-            )
-    elif domain in ("select", "input_select"):
-        ok = await orch.ha.set_select(entity_id, value)
-    else:
+    if domain != "number":
         return JSONResponse(
             {"status": "error",
-             "message": f"Unsupported entity domain: {domain}"},
+             "message": "Only ESPHome number.* entities are accepted"},
+            status_code=403,
+        )
+
+    # Build the allowlist from discovered entities in mutable roles only.
+    from ..device_discovery import load_circuit_entities
+    allowed: set[str] = set()
+    for c in orch._cfg.circuits:
+        ents = load_circuit_entities(orch.db, c.circuit)
+        allowed.update(v for k, v in ents.items() if k in _SETTINGS_MUTABLE_ROLES and v)
+
+    if entity_id not in allowed:
+        return JSONResponse(
+            {"status": "error", "message": "Entity not in allowed set for this device"},
+            status_code=403,
+        )
+
+    try:
+        numeric = float(value)
+        # Convert from display units back to internal units (L/min / PSI)
+        # before sending to HA/ESP.
+        _FLOW_KEYWORDS     = ("flow_threshold", "burst_threshold")
+        _PRESSURE_KEYWORDS = ("pressure_threshold", "pressure_drop")
+        if any(k in entity_id for k in _FLOW_KEYWORDS):
+            from ..units import load_unit_context as _luc
+            numeric = numeric / _luc(orch.db)["flow_factor"]
+        elif any(k in entity_id for k in _PRESSURE_KEYWORDS):
+            from ..units import load_unit_context as _luc
+            numeric = numeric / _luc(orch.db)["pressure_factor"]
+        ok = await orch.ha.set_number(entity_id, round(numeric, 4))
+    except ValueError:
+        return JSONResponse(
+            {"status": "error", "message": f"Invalid number: {value}"},
             status_code=400,
         )
 
