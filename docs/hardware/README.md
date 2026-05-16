@@ -55,6 +55,7 @@ These photos document the prototype, assembly, enclosure wiring, plumbing test, 
 | [Inside of enclosure](images/inside-enclosure.jpg) | Internal enclosure layout with mounted electronics and wiring. |
 | [Breakaway switch board wiring](images/breakaway-switch-board-bypass-wiring-enclosure-door.jpg) | Breakaway switch/control board bypass wiring mounted on the enclosure door. |
 | [Outside of enclosure with LEDs](images/outside-enclosure-leds-wip.jpg) | Front of the enclosure showing panel LEDs. Work in progress; final labels still needed. |
+| [ESP32-S3 WROOM-1 pinout](images/esp32s3_wroom1_pinout.png) | Pin reference diagram for the ESP32-S3 WROOM-1 module used in this build. |
 
 ### Gallery
 
@@ -105,5 +106,8 @@ Breakaway switch/control board bypass wiring mounted on the enclosure door.
 
 Front of the enclosure showing panel LEDs. Work in progress; final labels still needed.
 
+#### ESP32-S3 WROOM-1 pinout
 
+![ESP32-S3 WROOM-1 pinout](images/esp32s3_wroom1_pinout.png)
 
+Pin reference diagram for the ESP32-S3 WROOM-1 module used in this build.
