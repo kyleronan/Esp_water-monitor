@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re as _re
 import time
 from contextlib import asynccontextmanager

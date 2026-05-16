@@ -173,6 +173,8 @@ class CircuitEventDetector:
         # Prevents 290k-sample lists for 2-hour irrigation events.
         self._DOWNSAMPLE_AFTER_SECONDS: float = 120.0
         self._DOWNSAMPLE_KEEP_EVERY: int = 5
+        self._flow_sample_count: int = 0
+        self._pressure_sample_count: int = 0
 
     # ------------------------------------------------------------------ #
     # Public                                                               #
@@ -217,8 +219,8 @@ class CircuitEventDetector:
 
         if self._active_event is not None:
             elapsed = (now - self._active_event.start_ts).total_seconds()
-            n = len(self._active_event.flow_readings)
-            if elapsed < self._DOWNSAMPLE_AFTER_SECONDS or n % self._DOWNSAMPLE_KEEP_EVERY == 0:
+            self._flow_sample_count += 1
+            if elapsed < self._DOWNSAMPLE_AFTER_SECONDS or self._flow_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.flow_readings.append(self._current_flow_lpm)
             self._flow_sustained_since = None
             return
@@ -289,8 +291,8 @@ class CircuitEventDetector:
                 self._start_pressure_event(now, baseline, pressure)
         else:
             elapsed_p = (now - self._active_event.start_ts).total_seconds()
-            np = len(self._active_event.pressure_readings)
-            if elapsed_p < self._DOWNSAMPLE_AFTER_SECONDS or np % self._DOWNSAMPLE_KEEP_EVERY == 0:
+            self._pressure_sample_count += 1
+            if elapsed_p < self._DOWNSAMPLE_AFTER_SECONDS or self._pressure_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.pressure_readings.append(pressure)
 
             if not self._active_event.has_pressure_transient:
@@ -366,6 +368,8 @@ class CircuitEventDetector:
         log.info("[%s] event start (FLOW) — %.3f L/min for >= %.1f s",
                  self.circuit, self._current_flow_lpm, self.FLOW_START_SECONDS)
 
+        self._flow_sample_count = 0
+        self._pressure_sample_count = 0
         self._active_event = RawEvent(
             circuit=self.circuit,
             start_ts=start_ts,
@@ -384,6 +388,8 @@ class CircuitEventDetector:
         log.info("[%s] event start (PRESSURE) — %.1f PSI drop (%.1f -> %.1f PSI)",
                  self.circuit, drop, baseline, current_pressure)
 
+        self._flow_sample_count = 0
+        self._pressure_sample_count = 0
         self._active_event = RawEvent(
             circuit=self.circuit,
             start_ts=now,
@@ -425,6 +431,8 @@ class CircuitEventDetector:
             log.debug("[%s] discarding short event (%.1f s < %.1f s)",
                       self.circuit, duration, self.min_event_duration)
             self._active_event = None
+            self._flow_sample_count = 0
+            self._pressure_sample_count = 0
             return
 
         ev.end_ts = ts
@@ -438,6 +446,8 @@ class CircuitEventDetector:
                 ev.pressure_delta_psi = ev.pre_event_pressure_psi - ev.min_pressure_psi
         ev.complete = True
         self._active_event = None
+        self._flow_sample_count = 0
+        self._pressure_sample_count = 0
 
         avg_flow = (
             sum(ev.flow_readings) / len(ev.flow_readings) if ev.flow_readings else 0.0
@@ -460,6 +470,8 @@ class CircuitEventDetector:
     def reset(self) -> None:
         """Reset all state — call when valve closes or on explicit reset."""
         self._active_event = None
+        self._flow_sample_count = 0
+        self._pressure_sample_count = 0
         self._pressure_buf.clear()
         self._current_flow_lpm = 0.0
         self._flow_sustained_since = None

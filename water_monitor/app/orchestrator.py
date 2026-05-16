@@ -17,8 +17,7 @@ import sqlite3
 from typing import Any, Dict, Optional
 
 from .config import AddonConfig, SENSITIVITY_PRESETS, DB_PATH
-from .database import (get_sensitivity_config, ensure_circuit_defaults, init_db,
-                       dedup_events)
+from .database import (get_sensitivity_config, ensure_circuit_defaults, init_db)
 from .device_discovery import (load_circuit_entities, is_setup_complete,
                                 get_device_config)
 from .event_detector import EventDetector

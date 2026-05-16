@@ -102,9 +102,7 @@ documentation, and (eventually) a companion native HA integration.
 │   ├── Dockerfile
 │   ├── icon.png         # Addon icon (128 × 128) — shown on HA addon card
 │   ├── logo.png         # Addon logo (250 × 100) — shown on HA store detail page
-│   ├── app/
-│   ├── README.md
-│   └── CHANGELOG.md
+│   └── app/
 ├── firmware/            # ESPHome firmware for the ESP32-S3-WROOM-1
 ├── integration/         # Native HA integration (planned for v0.4)
 └── docs/                # Hardware build notes, pinouts, parts list
@@ -140,10 +138,7 @@ with end-stop signalling, pressure transducers, and pulse-output flow meters.
 > also what every reasonable installation diagram recommends regardless of
 > monitoring.
 
-I'm planning to add the PCB design files (KiCad source + Gerbers), a bill of
-materials with digikey links, and a quarter-assed build guide (I am legally required to not do half-assed or full-assed work) to `docs/`
-at some point. No promises on timing — same ADHD that made the addon code
-take eight months will probably apply here too.
+PCB design files (KiCad + Gerbers), bill of materials, build guide, and bring-up checklist are in [`docs/hardware/`](docs/hardware/).
 
 ### Firmware
 

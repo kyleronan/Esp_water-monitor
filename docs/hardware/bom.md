@@ -95,8 +95,8 @@ The flow sensor pulse output connects directly to the ESP32 GPIO input. No volta
 
 ### Valve
 
-- Ball valve item: AliExpress `3256803975349392`https://www.aliexpress.us/item/3256803975349392.html
-- Valve motor item: AliExpress `3256804718502721`https://www.aliexpress.us/item/3256804718502721.html
+- Ball valve item: AliExpress `3256803975349392` https://www.aliexpress.us/item/3256803975349392.html
+- Valve motor item: AliExpress `3256804718502721` https://www.aliexpress.us/item/3256804718502721.html
 - Size: 3/4 inch
 - Control type: CR5 01 / CR501
 - Voltage: 12 V DC
