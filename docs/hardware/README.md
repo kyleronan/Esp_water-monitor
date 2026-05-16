@@ -13,19 +13,15 @@ Software may allow custom names later, but the hardware build guide uses the phy
 
 - `bom.md` - simplified builder-facing BOM
 - `pinouts.md` - board connector pinouts
-- `valve-wiring.md` - CR501 valve motor and feedback wiring
-- `sensor-wiring.md` - flow and pressure sensor wiring
-- `panel-led-wiring.md` - external panel LED wiring
 - `breakaway-front-panel-controls.md` - optional manual/auto front-panel control board
-- `enclosure-wiring.md` - enclosure wiring notes and DIN terminal blocks
 - `bring-up-checklist.md` - first power-up and test checklist
 
 
-# Hardware Build Guide
+## Hardware Build Guide
 
 This is a high-level build guide for the ESP32 Water Valve Controller hardware.
 
-## Build order
+### Build order
 
 1. Inspect the bare PCB.
 2. Assemble the PCB.
@@ -44,10 +40,70 @@ This is a high-level build guide for the ESP32 Water Valve Controller hardware.
 
 ## Build photos
 
-The build photo gallery is in:
+These photos document the prototype, assembly, enclosure wiring, plumbing test, pressure calibration, front panel, and breakaway switch wiring.
 
-```text
-docs/hardware/build-photos.md
-```
+
+### Photo index
+
+| Photo | Description |
+| --- | --- |
+| [Early prototyping](images/early-prototyping.jpg) | Early hardware prototyping before the final enclosure layout. |
+| [Soldering complete](images/soldering-complete.jpg) | Assembled PCB after soldering. |
+| [First enclosure wiring and testing](images/first-enclosure-wiring-and-testing.jpg) | Initial wiring inside the enclosure during testing. |
+| [First plumbing test](images/first-plumbing-test-hose-floor-drain.jpg) | Initial plumbing test using a hose and floor drain. |
+| [Pressure sensor calibration](images/pressure-sensor-calibration-analog-gauge.jpg) | Pressure sensor calibration using an analog pressure gauge. |
+| [Inside of enclosure](images/inside-enclosure.jpg) | Internal enclosure layout with mounted electronics and wiring. |
+| [Breakaway switch board wiring](images/breakaway-switch-board-bypass-wiring-enclosure-door.jpg) | Breakaway switch/control board bypass wiring mounted on the enclosure door. |
+| [Outside of enclosure with LEDs](images/outside-enclosure-leds-wip.jpg) | Front of the enclosure showing panel LEDs. Work in progress; final labels still needed. |
+
+### Gallery
+
+#### Early prototyping
+
+![Early prototyping](images/early-prototyping.jpg)
+
+Early hardware prototyping before the final enclosure layout.
+
+#### Soldering complete
+
+![Soldering complete](images/soldering-complete.jpg)
+
+Assembled PCB after soldering.
+
+#### First enclosure wiring and testing
+
+![First enclosure wiring and testing](images/first-enclosure-wiring-and-testing.jpg)
+
+Initial wiring inside the enclosure during testing.
+
+#### First plumbing test
+
+![First plumbing test](images/first-plumbing-test-hose-floor-drain.jpg)
+
+Initial plumbing test using a hose and floor drain.
+#### Pressure sensor calibration
+
+![Pressure sensor calibration](images/pressure-sensor-calibration-analog-gauge.jpg)
+
+Pressure sensor calibration using an analog pressure gauge.
+
+#### Inside of enclosure
+
+![Inside of enclosure](images/inside-enclosure.jpg)
+
+Internal enclosure layout with mounted electronics and wiring.
+
+#### Breakaway switch board wiring
+
+![Breakaway switch board wiring](images/breakaway-switch-board-bypass-wiring-enclosure-door.jpg)
+
+Breakaway switch/control board bypass wiring mounted on the enclosure door.
+
+#### Outside of enclosure with LEDs
+
+![Outside of enclosure with LEDs](images/outside-enclosure-leds-wip.jpg)
+
+Front of the enclosure showing panel LEDs. Work in progress; final labels still needed.
+
 
 
