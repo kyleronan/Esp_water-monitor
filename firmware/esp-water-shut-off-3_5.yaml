@@ -1157,6 +1157,7 @@ sensor:
       mode:
         input: true
         pulldown: true    # pulldown prevents floating input causing false counts
+    internal_filter: 13us  # debounce — suppresses RF noise from valve motor inductance
     id: flow_base_main
     internal: true
     update_interval: 1s
@@ -1360,6 +1361,7 @@ sensor:
       mode:
         input: true
         pulldown: true
+    internal_filter: 13us  # debounce — suppresses RF noise from valve motor inductance
     id: flow_base_irr
     internal: true
     update_interval: 1s
