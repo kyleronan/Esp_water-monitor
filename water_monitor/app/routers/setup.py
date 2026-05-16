@@ -11,7 +11,7 @@ Handles the first-run configuration flow:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -23,7 +23,6 @@ from ..device_discovery import (
     _resolve_labels_from_diagnostics,
     save_discovery,
     mark_setup_complete,
-    load_circuit_entities,
     get_device_config,
     DiscoveryResult,
     DiscoveredDevice,

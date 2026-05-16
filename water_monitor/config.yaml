@@ -5,7 +5,7 @@ description: >-
   Intelligent water monitoring with fixture signature recognition,
   anomaly detection, and scheduled leak testing. Learns your home's
   normal water usage patterns and alerts on unusual events.
-url: "https://github.com/local/water-monitor-addons"
+url: "https://github.com/kyleronan/Esp_water-monitor"
 arch:
   - aarch64
   - amd64

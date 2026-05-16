@@ -7,9 +7,9 @@ Use this checklist before connecting the system to permanent plumbing.
 - [ ] Inspect PCB for solder bridges.
 - [ ] Check orientation of ESP32 module, USB-C connector, diodes, LEDs, relays, and regulators.
 - [ ] Verify terminal blocks are installed correctly.
-- [ ] Verify valve wiring matches `valve-wiring.md`.
-- [ ] Verify panel LED wiring matches `panel-led-wiring.md`.
-- [ ] Verify sensor wiring matches `sensor-wiring.md`.
+- [ ] Verify valve wiring matches `pinouts.md`.
+- [ ] Verify panel LED wiring matches `breakaway-front-panel-controls.md`.
+- [ ] Verify sensor wiring matches `pinouts.md`.
 
 ## First power
 

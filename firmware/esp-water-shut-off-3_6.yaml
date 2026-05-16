@@ -635,8 +635,8 @@ sensor:
   # ---------------------------------------------------------------------------
   # PRESSURE SENSOR 1 — Main line (GPIO01)
   # Reads raw ADC voltage and converts to PSI using a linear calibration.
-  # Sampled at 10ms, averaged with exponential moving average, reported
-  # to HA every 100 samples (~1s). Clamped to valid sensor range (0-104 PSI).
+  # Sampled at 5ms, averaged with exponential moving average, reported
+  # to HA every 100 samples (~500ms). Clamped to valid sensor range (0-104 PSI).
   #
   # Safety checks on every reported value:
   #   1. Rapid pressure drop — indicates a burst pipe or sudden large leak
