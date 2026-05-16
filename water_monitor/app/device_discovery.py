@@ -41,6 +41,22 @@ OPTIONAL_ROLES = {
     "leak_test_result_sensor",
     "leak_test_duration_sensor",
     "pressure_history_sensor",   # present only after firmware change removing diagnostic
+    # Reset buttons (added v3.6)
+    "fault_reset_button",
+    "trickle_reset_button",
+    # Alert enable/disable switches (added v3.6)
+    "alert_high_flow_switch",
+    "alert_pressure_drop_switch",
+    "alert_trickle_switch",
+    "alert_leak_test_switch",
+    # Threshold number entities (added v3.6)
+    "burst_threshold",
+    "pressure_drop_threshold",
+    "leak_pressure_threshold",
+    "trickle_min_flow",
+    "trickle_max_flow",
+    "trickle_duration",
+    "leak_test_duration_number",  # preferred name; leak_test_duration_sensor is the compat alias
 }
 
 
@@ -86,8 +102,24 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "leak_test_sensor":        (r"leak test active.*main",                          "binary_sensor"),
         "leak_test_switch":        (r"micro leak test.*main",                           "switch"),
         "leak_test_result_sensor": (r"leak test result.*main",                          "sensor"),
-        "leak_test_duration_sensor": (r"leak test duration.*main",                      "number"),
+        "leak_test_duration_sensor": (r"leak test duration.*main",                      "number"),   # compat alias
         "volume_sensor":           (r"water volume total.*main",                        "sensor"),
+        # Reset buttons (firmware v3.6+)
+        "fault_reset_button":         (r"reset safety fault.*main",                    "button"),
+        "trickle_reset_button":       (r"reset trickle alert.*main",                   "button"),
+        # Alert enable/disable switches (firmware v3.6+)
+        "alert_high_flow_switch":     (r"enable high flow alert.*main",                "switch"),
+        "alert_pressure_drop_switch": (r"enable pressure drop alert.*main",            "switch"),
+        "alert_trickle_switch":       (r"enable trickle alert.*main",                  "switch"),
+        "alert_leak_test_switch":     (r"enable leak test alert.*main",                "switch"),
+        # Writable threshold number entities (firmware v3.6+)
+        "burst_threshold":            (r"burst pipe flow threshold.*main",             "number"),
+        "pressure_drop_threshold":    (r"pressure drop threshold.*main",               "number"),
+        "leak_pressure_threshold":    (r"leak test pressure threshold.*main",          "number"),
+        "trickle_min_flow":           (r"trickle flow min threshold.*main",            "number"),
+        "trickle_max_flow":           (r"trickle flow max threshold.*main",            "number"),
+        "trickle_duration":           (r"trickle flow alert duration.*main",           "number"),
+        "leak_test_duration_number":  (r"leak test duration.*main",                    "number"),
     },
     "circuit_2": {   # was "irrigation" — regex patterns match default firmware names
         "flow_sensor":             (r"water flow rate.*irrigation",                           "sensor"),
@@ -102,8 +134,26 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "leak_test_sensor":        (r"leak test active.*irrigation",                          "binary_sensor"),
         "leak_test_switch":        (r"micro leak test.*irrigation",                           "switch"),
         "leak_test_result_sensor": (r"leak test result.*irrigation",                          "sensor"),
-        "leak_test_duration_sensor": (r"leak test duration.*irrigation",                      "number"),
+        "leak_test_duration_sensor": (r"leak test duration.*irrigation|leak_duration_irr\b",  "number"),   # compat alias
         "volume_sensor":           (r"water volume total.*irrigation",                        "sensor"),
+        # Reset buttons (firmware v3.6+)
+        # Display names use ${circuit_2_name} → "Irrigation"; entity_id suffix fallback uses _irr\b
+        # (_irr appears in ESPHome internal IDs; \b prevents matching "irrigation" display names)
+        "fault_reset_button":         (r"reset safety fault.*irrigation|reset safety fault.*_irr\b",           "button"),
+        "trickle_reset_button":       (r"reset trickle alert.*irrigation|reset trickle alert.*_irr\b",         "button"),
+        # Alert enable/disable switches (firmware v3.6+)
+        "alert_high_flow_switch":     (r"enable high flow alert.*irrigation|enable_high_flow_irr\b",           "switch"),
+        "alert_pressure_drop_switch": (r"enable pressure drop alert.*irrigation|enable_pressure_drop_irr\b",   "switch"),
+        "alert_trickle_switch":       (r"enable trickle alert.*irrigation|enable_trickle_irr\b",               "switch"),
+        "alert_leak_test_switch":     (r"enable leak test alert.*irrigation|enable_leak_test_irr\b",           "switch"),
+        # Writable threshold number entities (firmware v3.6+)
+        "burst_threshold":            (r"burst pipe flow threshold.*irrigation|burst_threshold_irr\b",         "number"),
+        "pressure_drop_threshold":    (r"pressure drop threshold.*irrigation|pressure_drop_threshold_irr\b",   "number"),
+        "leak_pressure_threshold":    (r"leak test pressure threshold.*irrigation|leak_threshold_psi_irr\b",   "number"),
+        "trickle_min_flow":           (r"trickle flow min threshold.*irrigation|trickle_min_flow_irr\b",       "number"),
+        "trickle_max_flow":           (r"trickle flow max threshold.*irrigation|trickle_max_flow_irr\b",       "number"),
+        "trickle_duration":           (r"trickle flow alert duration.*irrigation|trickle_duration_irr\b",      "number"),
+        "leak_test_duration_number":  (r"leak test duration.*irrigation|leak_duration_irr\b",                  "number"),
     },
 }
 

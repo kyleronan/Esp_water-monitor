@@ -20,14 +20,17 @@ VALID_ALERT_TYPES: frozenset[str] = frozenset({
 })
 
 # Only ESPHome number.* roles that carry writable threshold values.
+# Names must match keys in ROLE_PATTERNS so load_circuit_entities() returns them.
 # Sensors, valves, switches, binary_sensors, and input_number helpers are excluded.
-# If input_number.* helper support is added in future it must be explicit + tested.
 _THRESHOLD_ROLES: frozenset[str] = frozenset({
-    "leak_test_duration_entity",
-    "high_flow_threshold",
-    "trickle_threshold",
+    "leak_test_duration_number",   # preferred name (firmware v3.6+)
+    "leak_test_duration_sensor",   # compat alias — remove after one release
     "burst_threshold",
+    "pressure_drop_threshold",
+    "leak_pressure_threshold",
     "trickle_min_flow",
+    "trickle_max_flow",
+    "trickle_duration",
 })
 
 
