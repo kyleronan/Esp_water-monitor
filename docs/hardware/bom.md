@@ -2,19 +2,13 @@
 
 This is the simplified builder-facing BOM for the PCB and related hardware.
 
-The official editable BOM files are in:
-
-```text
-hardware/esp32-water-valve-controller/bom/
-```
 
 ## Important BOM notes
 
-- The external MCP3208 ADC is not used on the final PCB. It was planned and purchased earlier, but the ESP32 ADC was sufficient.
 - The KiCad source files included in this package use `470R` for the installed resistor value.
 - For 4-position terminal groups, the build uses two Phoenix Contact `1935161` 2-position terminal blocks.
 - The confirmed quantity for Phoenix Contact `1935161` terminal blocks is 9 per build.
-- Purchase-history files are not the official BOM. They include alternate, prototype, spare, and not-used items.
+- Majority of PCB components were purchased from Digikey
 
 ## PCB BOM
 
@@ -60,8 +54,81 @@ hardware/esp32-water-valve-controller/bom/
 
 ## Enclosure and field hardware
 
-See `field-hardware.md` and:
+# Field Hardware
 
-```text
-hardware/esp32-water-valve-controller/bom/field-hardware-bom.csv
-```
+This page documents non-PCB hardware used in the system build.
+
+## Pressure sensor
+
+- Supplier: Amazon
+- ASIN: `B0CFJ7BN3L` https://www.amazon.com/dp/B0CFJ7BN3L
+- Type: 100 PSI pressure transducer
+- Thread: 1/8"-27 NPT
+- Supply: 5 to 16 V DC
+- Output: 0.5 to 4.5 V analog
+- Material: 316 stainless steel
+- Listed waterproof rating: IP65
+
+### Pressure sensor wiring
+
+| Wire color | Function |
+| --- | --- |
+| Red | Supply + |
+| Black | Ground |
+| Green | Analog sense output |
+
+Pressure sensors are powered from 5 V. The sense output is scaled by a resistor divider before reaching the ESP32 ADC input.
+
+## Flow sensor
+
+- Supplier: AliExpress
+- Item: `3256804293371927` https://www.aliexpress.us/item/3256804293371927.html
+- Selected version: 5 V version
+- Used from the PCB 3.3 V supply because the sensor works down to 3.3 V
+
+### Flow sensor wiring
+
+| Wire color | Function |
+| --- | --- |
+| Red | Supply + |
+| Black | Ground |
+| Yellow | Pulse output |
+
+The flow sensor pulse output connects directly to the ESP32 GPIO input. No voltage divider or extra signal conditioning is needed because the sensor is powered from 3.3 V.
+
+## Valve
+
+- Ball valve item: AliExpress `3256803975349392`https://www.aliexpress.us/item/3256803975349392.html
+- Valve motor item: AliExpress `3256804718502721`https://www.aliexpress.us/item/3256804718502721.html
+- Size: 3/4 inch
+- Control type: CR5 01 / CR501
+- Voltage: 12 V DC
+- Thread type: NPT
+- Material: 304 stainless steel
+- Pressure rating: 600 WOG
+
+Verify local plumbing requirements and potable-water suitability before installation.
+
+## Enclosure
+
+- Supplier: Amazon
+- ASIN: `B0CSJXTLGZ` https://www.amazon.com/dp/B0CSJXTLGZ
+- Style: lockable outdoor weatherproof enclosure
+- Size selected: 11.4 in x 7.5 in x 5.5 in
+- DIN terminal blocks: Dinkle DK2.5N, 12 to 22 AWG, various colors
+- Cable glands: TE Connectivity ENTRELEC `1SNG601161R0000`
+- 12 V DIN rail power supply: Ideal Power `56YSD60S-1204500`
+
+## Panel accessories
+
+| Qty | Part | Description |
+| ---: | --- | --- |
+| 2 | McMaster-Carr `2779K111` | Green 12 V DC quick-disconnect panel LED, 5/16 inch panel cutout |
+| 2 | McMaster-Carr `2779K113` | Red 12 V DC quick-disconnect panel LED, 5/16 inch panel cutout |
+
+Quick-disconnect terminals are used for the external panel LED wiring.
+
+## DIN rail power supply
+
+The build uses an Ideal Power `56YSD60S-1204500` 12 V DIN rail power supply.
+
