@@ -139,8 +139,8 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         # Reset buttons (firmware v3.6+)
         # Display names use ${circuit_2_name} → "Irrigation"; entity_id suffix fallback uses _irr\b
         # (_irr appears in ESPHome internal IDs; \b prevents matching "irrigation" display names)
-        "fault_reset_button":         (r"reset safety fault.*irrigation|reset safety fault.*_irr\b",           "button"),
-        "trickle_reset_button":       (r"reset trickle alert.*irrigation|reset trickle alert.*_irr\b",         "button"),
+        "fault_reset_button":         (r"reset safety fault.*irrigation|reset_safety_fault.*_irr\b",           "button"),
+        "trickle_reset_button":       (r"reset trickle alert.*irrigation|reset_trickle_alert.*_irr\b",         "button"),
         # Alert enable/disable switches (firmware v3.6+)
         "alert_high_flow_switch":     (r"enable high flow alert.*irrigation|enable_high_flow_irr\b",           "switch"),
         "alert_pressure_drop_switch": (r"enable pressure drop alert.*irrigation|enable_pressure_drop_irr\b",   "switch"),
