@@ -55,39 +55,38 @@ OPTIONAL_ROLES = {
 # Domain narrows the match when multiple entities share a similar name.
 ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
     "main": {
-        "flow_sensor":             (r"water flow rate.*main",         "sensor"),
-        "pressure_fast_sensor":    (r"water pressure.*main.*fast",    "sensor"),
-        "pressure_avg_sensor":     (r"water pressure.*main.*averaged","sensor"),
-        # NOTE: assumes "Water Pressure Main" naming (circuit suffix last, qualifier mid).
-        # Would fail for "Water Pressure (Fast) Main" — update regex if firmware changes.
-        "pressure_history_sensor": (r"water pressure.*main(?!\s*\((?:fast|averaged))", "sensor"),
-        "flow_onset_sensor":       (r"flow pulse onset.*main",        "binary_sensor"),
-        "valve_entity":            (r"main water valve",              "valve"),
-        "fault_sensor":            (r"safety fault.*main",            "binary_sensor"),
-        "fault_reason_sensor":     (r"fault reason.*main|safety fault.*reason.*main", "sensor"),
-        "trickle_sensor":          (r"trickle.*alert.*main",          "binary_sensor"),
-        "leak_test_sensor":        (r"leak test active.*main",        "binary_sensor"),
-        "leak_test_switch":        (r"micro leak test.*main",         "switch"),
-        "leak_test_result_sensor": (r"leak test result.*main",        "sensor"),
-        "leak_test_duration_sensor": (r"leak test duration.*main",    "number"),
-        "volume_sensor":           (r"water volume total.*main",      "sensor"),
+        "flow_sensor":             (r"water flow rate.*main",                           "sensor"),
+        # Lookahead patterns — order-insensitive so "Water Pressure (Fast) Main" and
+        # "Water Pressure Main (Fast)" both match without needing a regex update.
+        "pressure_fast_sensor":    (r"water pressure(?=.*main)(?=.*fast)",              "sensor"),
+        "pressure_avg_sensor":     (r"water pressure(?=.*main)(?=.*averaged)",          "sensor"),
+        "pressure_history_sensor": (r"water pressure(?=.*main)(?!.*fast)(?!.*averaged)","sensor"),
+        "flow_onset_sensor":       (r"flow pulse onset.*main",                          "binary_sensor"),
+        "valve_entity":            (r"main water valve",                                "valve"),
+        "fault_sensor":            (r"safety fault.*main",                              "binary_sensor"),
+        "fault_reason_sensor":     (r"fault reason.*main|safety fault.*reason.*main",   "sensor"),
+        "trickle_sensor":          (r"trickle.*alert.*main",                            "binary_sensor"),
+        "leak_test_sensor":        (r"leak test active.*main",                          "binary_sensor"),
+        "leak_test_switch":        (r"micro leak test.*main",                           "switch"),
+        "leak_test_result_sensor": (r"leak test result.*main",                          "sensor"),
+        "leak_test_duration_sensor": (r"leak test duration.*main",                      "number"),
+        "volume_sensor":           (r"water volume total.*main",                        "sensor"),
     },
     "irrigation": {
-        "flow_sensor":             (r"water flow rate.*irrigation",         "sensor"),
-        "pressure_fast_sensor":    (r"water pressure.*irrigation.*fast",    "sensor"),
-        "pressure_avg_sensor":     (r"water pressure.*irrigation.*averaged","sensor"),
-        # Same naming assumption as main circuit — see comment above.
-        "pressure_history_sensor": (r"water pressure.*irrigation(?!\s*\((?:fast|averaged))", "sensor"),
-        "flow_onset_sensor":       (r"flow pulse onset.*irrigation",        "binary_sensor"),
-        "valve_entity":            (r"irrigation water valve",              "valve"),
-        "fault_sensor":            (r"safety fault.*irrigation",            "binary_sensor"),
+        "flow_sensor":             (r"water flow rate.*irrigation",                           "sensor"),
+        "pressure_fast_sensor":    (r"water pressure(?=.*irrigation)(?=.*fast)",              "sensor"),
+        "pressure_avg_sensor":     (r"water pressure(?=.*irrigation)(?=.*averaged)",          "sensor"),
+        "pressure_history_sensor": (r"water pressure(?=.*irrigation)(?!.*fast)(?!.*averaged)","sensor"),
+        "flow_onset_sensor":       (r"flow pulse onset.*irrigation",                          "binary_sensor"),
+        "valve_entity":            (r"irrigation water valve",                                "valve"),
+        "fault_sensor":            (r"safety fault.*irrigation",                              "binary_sensor"),
         "fault_reason_sensor":     (r"fault reason.*irrigation|safety fault.*reason.*irrigation", "sensor"),
-        "trickle_sensor":          (r"trickle.*alert.*irrigation",          "binary_sensor"),
-        "leak_test_sensor":        (r"leak test active.*irrigation",        "binary_sensor"),
-        "leak_test_switch":        (r"micro leak test.*irrigation",         "switch"),
-        "leak_test_result_sensor": (r"leak test result.*irrigation",        "sensor"),
-        "leak_test_duration_sensor": (r"leak test duration.*irrigation",    "number"),
-        "volume_sensor":           (r"water volume total.*irrigation",      "sensor"),
+        "trickle_sensor":          (r"trickle.*alert.*irrigation",                            "binary_sensor"),
+        "leak_test_sensor":        (r"leak test active.*irrigation",                          "binary_sensor"),
+        "leak_test_switch":        (r"micro leak test.*irrigation",                           "switch"),
+        "leak_test_result_sensor": (r"leak test result.*irrigation",                          "sensor"),
+        "leak_test_duration_sensor": (r"leak test duration.*irrigation",                      "number"),
+        "volume_sensor":           (r"water volume total.*irrigation",                        "sensor"),
     },
 }
 
@@ -125,7 +124,13 @@ class DiscoveredDevice:
             parts = tuple(int(x) for x in version_str.split(".")[:3])
             return parts >= MIN_FIRMWARE_VERSION
         except ValueError:
-            return True   # non-numeric (e.g. "dev") — warn but don't block
+            log.warning(
+                "Firmware version %r is non-numeric — cannot verify compatibility "
+                "(minimum required: %s). Proceeding, but some features may not work.",
+                self.sw_version,
+                ".".join(str(x) for x in MIN_FIRMWARE_VERSION),
+            )
+            return True   # non-numeric (e.g. "dev") — don't block setup
 
 
 @dataclass
