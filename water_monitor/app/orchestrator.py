@@ -246,6 +246,23 @@ class Orchestrator:
             log.debug("[%s] display_name loaded: %r",
                       circuit_cfg.circuit, circuit_cfg.display_name)
 
+    def reload_circuit_profiles(self) -> None:
+        """Re-read circuit_type from circuit_profile into the live CircuitConfig objects.
+
+        Called after startup seeding, the setup wizard circuit-names step,
+        and the settings circuit-type endpoint. Falls back to the value already
+        on CircuitConfig (originally from options.json) if no DB row exists.
+        """
+        if not self._db:
+            return
+        from .database import get_circuit_type
+        for circuit_cfg in self._cfg.circuits:
+            circuit_cfg.circuit_type = get_circuit_type(
+                self._db,
+                circuit_cfg.circuit,
+                default=circuit_cfg.circuit_type,
+            )
+
     def stop(self) -> None:
         self._stop.set()
         if self._feature_extractor:
@@ -273,9 +290,10 @@ class Orchestrator:
         self._ha = HaClient()
         await self._ha.__aenter__()
 
-        # Load entity IDs and display labels from DB into circuit configs
+        # Load entity IDs, display labels, and circuit types from DB into circuit configs
         self.reload_circuit_entities()
         self.reload_circuit_labels()
+        self.reload_circuit_profiles()
 
         # Event queue
         self._event_queue = asyncio.Queue(maxsize=1000)

@@ -206,6 +206,7 @@ async def settings_page(request: Request):
     if fp is not None:
         mqtt_status = fp.status()
 
+    from ..fixtures import CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP, ZONE_ONLY_ALERT_TYPES
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
         "profile": dict(get_home_profile(orch.db) or {}),
@@ -214,6 +215,10 @@ async def settings_page(request: Request):
         "presets": SENSITIVITY_PRESETS,
         "retention": get_data_retention(orch.db),
         "mqtt_status": mqtt_status,
+        "circuit_types": CIRCUIT_TYPES,
+        "circuit_type_labels": CIRCUIT_TYPE_LABELS,
+        "circuit_type_help": CIRCUIT_TYPE_HELP,
+        "zone_only_alert_types": ZONE_ONLY_ALERT_TYPES,
         "page": "settings",
     })
 
@@ -629,6 +634,53 @@ async def circuit_rename(circuit: str, request: Request):
     orch.reload_circuit_labels()
 
     return JSONResponse({"status": "renamed", "circuit": circuit, "display_name": display_name})
+
+
+@router.post("/circuit/{circuit}/type")
+async def circuit_type_update(circuit: str, request: Request):
+    """Update the circuit_type for a circuit.
+
+    Zone alert rows are seeded automatically when switching to 'zone'.
+    They are never deleted when switching back to 'fixture' — the UI
+    simply hides them via the zone_only_alert_types template filter.
+    """
+    from ..circuit_compat import resolve_circuit
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+
+    if not orch._cfg.get_circuit(circuit):
+        return JSONResponse(
+            {"status": "error", "message": f"Unknown circuit: {circuit}"},
+            status_code=400,
+        )
+
+    form = await request.form()
+    from ..fixtures import normalize_circuit_type, CIRCUIT_TYPES
+    from ..database import set_circuit_type
+
+    raw_type = form.get("circuit_type", "").strip()
+    circuit_type = normalize_circuit_type(raw_type)
+    if circuit_type not in CIRCUIT_TYPES:
+        return JSONResponse(
+            {"status": "error",
+             "message": f"Invalid circuit_type {raw_type!r}. Must be one of: {', '.join(sorted(CIRCUIT_TYPES))}"},
+            status_code=400,
+        )
+
+    try:
+        set_circuit_type(orch.db, circuit, circuit_type)
+    except Exception as exc:
+        log.error("[%s] set_circuit_type failed: %s", circuit, exc)
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+    orch.reload_circuit_profiles()
+    log.info("[%s] circuit_type changed to %r", circuit, circuit_type)
+
+    return JSONResponse({
+        "status": "updated",
+        "circuit": circuit,
+        "circuit_type": circuit_type,
+    })
 
 
 # ------------------------------------------------------------------

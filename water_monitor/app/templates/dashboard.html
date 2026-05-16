@@ -44,7 +44,7 @@
     <div class="dash-card-header">
       <div>
         <h2 class="dash-card-title">{{ c.display_name }}</h2>
-        <span class="dash-card-type">{{ c.circuit_type }}</span>
+        <span class="dash-card-type">{{ circuit_type_labels.get(c.circuit_type, c.circuit_type | title) }}</span>
       </div>
       <span class="pill {% if c.valve_state == 'open' %}pill-green{% else %}pill-neutral{% endif %}">
         {% if c.valve_state == 'open' %}Open{% elif c.valve_state == 'closed' %}Closed{% else %}{{ c.valve_state | title }}{% endif %}

@@ -839,6 +839,78 @@ def get_alert_configs(conn: sqlite3.Connection, circuit: str) -> List[sqlite3.Ro
     ).fetchall()
 
 
+VALID_CIRCUIT_TYPES = frozenset({"fixture", "zone"})
+
+
+def get_circuit_type(
+    conn: sqlite3.Connection,
+    circuit: str,
+    default: str = "fixture",
+) -> str:
+    """Return the circuit_type for a circuit, normalised to a canonical value.
+
+    Falls back to `default` if no circuit_profile row exists yet.
+    Normalises legacy "irrigation" values to "zone" transparently.
+    """
+    from .fixtures import normalize_circuit_type
+    row = conn.execute(
+        "SELECT circuit_type FROM circuit_profile WHERE circuit = ?",
+        (circuit,)
+    ).fetchone()
+    raw = row["circuit_type"] if row else default
+    return normalize_circuit_type(raw)
+
+
+def _seed_zone_alerts_only(conn: sqlite3.Connection, circuit: str) -> None:
+    """INSERT OR IGNORE zone-only alert rows — never overwrites user toggle state."""
+    zone_only_alerts = [
+        ("pre_solenoid_leak", "Pre-Solenoid Leak",
+         "Alert when flow detected with no zone commanded open"),
+        ("solenoid_weeping", "Solenoid Weeping",
+         "Alert when flow persists after zone commanded closed"),
+        ("zone_flow_deviation_high", "Zone Flow High",
+         "Alert when zone flow exceeds learned range"),
+        ("zone_flow_deviation_low", "Zone Flow Low",
+         "Alert when zone flow is below learned range — possible blocked head"),
+        ("zone_duration_overrun", "Zone Duration Overrun",
+         "Alert when zone runs significantly longer than expected"),
+    ]
+    for alert_type, label, description in zone_only_alerts:
+        alert_id = f"{alert_type}_{circuit}"
+        conn.execute("""
+            INSERT OR IGNORE INTO alert_config
+                (id, circuit, alert_type, label, description, enabled)
+            VALUES (?, ?, ?, ?, ?, 1)
+        """, (alert_id, circuit, alert_type, label, description))
+
+
+def set_circuit_type(
+    conn: sqlite3.Connection,
+    circuit: str,
+    circuit_type: str,
+) -> None:
+    """Persist circuit_type to circuit_profile.
+
+    UPSERTs the row so it is safe to call before ensure_circuit_defaults().
+    When switching to "zone", seeds any missing zone-only alert rows via
+    INSERT OR IGNORE so existing user toggle state is preserved.
+    Zone alerts are never deleted when switching back to "fixture" — they are
+    simply hidden in the UI by the template filter.
+    """
+    from .fixtures import normalize_circuit_type
+    circuit_type = normalize_circuit_type(circuit_type)
+    if circuit_type not in VALID_CIRCUIT_TYPES:
+        raise ValueError(f"Invalid circuit_type {circuit_type!r}; must be 'fixture' or 'zone'")
+    conn.execute("""
+        INSERT INTO circuit_profile (circuit, circuit_type)
+        VALUES (?, ?)
+        ON CONFLICT(circuit) DO UPDATE SET circuit_type = excluded.circuit_type
+    """, (circuit, circuit_type))
+    if circuit_type == "zone":
+        _seed_zone_alerts_only(conn, circuit)
+    conn.commit()
+
+
 def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) -> None:
     conn.execute(
         "UPDATE alert_config SET enabled = ?, updated_at = ? WHERE id = ?",
@@ -1125,30 +1197,16 @@ def _seed_alert_configs(conn: sqlite3.Connection, circuit: str,
          "Alert when flow occurs outside expected time patterns"),
     ]
 
-    zone_only_alerts = [
-        ("pre_solenoid_leak", "Pre-Solenoid Leak",
-         "Alert when flow detected with no zone commanded open"),
-        ("solenoid_weeping", "Solenoid Weeping",
-         "Alert when flow persists after zone commanded closed"),
-        ("zone_flow_deviation_high", "Zone Flow High",
-         "Alert when zone flow exceeds learned range"),
-        ("zone_flow_deviation_low", "Zone Flow Low",
-         "Alert when zone flow is below learned range — possible blocked head"),
-        ("zone_duration_overrun", "Zone Duration Overrun",
-         "Alert when zone runs significantly longer than expected"),
-    ]
-
-    alerts = base_alerts
-    if circuit_type == "zone":
-        alerts = alerts + zone_only_alerts
-
-    for alert_type, label, description in alerts:
+    for alert_type, label, description in base_alerts:
         alert_id = f"{alert_type}_{circuit}"
         conn.execute("""
             INSERT OR IGNORE INTO alert_config
                 (id, circuit, alert_type, label, description, enabled)
             VALUES (?, ?, ?, ?, ?, 1)
         """, (alert_id, circuit, alert_type, label, description))
+
+    if circuit_type == "zone":
+        _seed_zone_alerts_only(conn, circuit)
 
 
 def get_import_state(conn: sqlite3.Connection, circuit: str) -> dict:

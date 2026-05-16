@@ -53,13 +53,15 @@ async def dashboard(request: Request):
     from ..database import get_home_profile
     profile = dict(get_home_profile(orch.db) or {})
 
+    from ..fixtures import CIRCUIT_TYPE_LABELS
     return templates.TemplateResponse("dashboard.html", {
-        "request":          request,
-        "circuits":         circuit_states,
-        "chart_data_json":  json.dumps(chart_data),
-        "page":             "dashboard",
-        "profile":          profile,
-        "away_mode":        profile.get("away_mode", False),
+        "request":             request,
+        "circuits":            circuit_states,
+        "chart_data_json":     json.dumps(chart_data),
+        "page":                "dashboard",
+        "profile":             profile,
+        "away_mode":           profile.get("away_mode", False),
+        "circuit_type_labels": CIRCUIT_TYPE_LABELS,
     })
 
 

@@ -418,37 +418,44 @@ async def setup_confirm(device_id: str, request: Request):
 
 @router.get("/circuit-names", response_class=HTMLResponse)
 async def setup_circuit_names(request: Request):
-    """Step 3b — let the user name their circuits before configuring home details."""
+    """Step 3b — let the user name and classify their circuits."""
     orch = _orch(request)
-    from ..device_discovery import CIRCUIT_DISPLAY_DEFAULTS
+    from ..database import get_circuit_type
+    from ..fixtures import CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP
     circuits = [
         {
             "circuit":      c.circuit,
             "display_name": c.label,
+            "circuit_type": get_circuit_type(orch.db, c.circuit, default=c.circuit_type),
         }
         for c in orch._cfg.circuits
     ]
     return _tmpl(request).TemplateResponse("setup.html", {
-        "request":  request,
-        "step":     "3b",
-        "circuits": circuits,
-        "page":     "setup",
+        "request":             request,
+        "step":                "3b",
+        "circuits":            circuits,
+        "circuit_types":       CIRCUIT_TYPES,
+        "circuit_type_labels": CIRCUIT_TYPE_LABELS,
+        "circuit_type_help":   CIRCUIT_TYPE_HELP,
+        "page":                "setup",
     })
 
 
 @router.post("/circuit-names")
 async def setup_circuit_names_save(request: Request):
-    """Save circuit display names and advance to unit selection."""
+    """Save circuit display names and types, then advance to unit selection."""
     from ..circuit_compat import validate_display_name
-    from ..database import upsert_circuit_label
+    from ..database import upsert_circuit_label, set_circuit_type, get_circuit_type
+    from ..fixtures import normalize_circuit_type, CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP
     orch = _orch(request)
     form = await request.form()
 
     errors = []
+
+    # Save display names
     for c in orch._cfg.circuits:
         raw = form.get(f"label_{c.circuit}", "").strip()
         if not raw:
-            # Keep existing label if input was blank
             continue
         try:
             display_name = validate_display_name(raw)
@@ -457,21 +464,43 @@ async def setup_circuit_names_save(request: Request):
             continue
         upsert_circuit_label(orch.db, c.circuit, display_name)
 
+    # Save circuit types
+    for c in orch._cfg.circuits:
+        raw_type = form.get(f"type_{c.circuit}", "").strip()
+        if not raw_type:
+            continue
+        normalised = normalize_circuit_type(raw_type)
+        if normalised not in CIRCUIT_TYPES:
+            errors.append(f"{c.circuit}: invalid circuit type {raw_type!r}")
+            continue
+        try:
+            set_circuit_type(orch.db, c.circuit, normalised)
+        except Exception as exc:
+            errors.append(f"{c.circuit}: could not save circuit type: {exc}")
+
     if errors:
         circuits = [
-            {"circuit": c.circuit, "display_name": c.label}
+            {
+                "circuit":      c.circuit,
+                "display_name": c.label,
+                "circuit_type": get_circuit_type(orch.db, c.circuit, default=c.circuit_type),
+            }
             for c in orch._cfg.circuits
         ]
         return _tmpl(request).TemplateResponse("setup.html", {
-            "request":  request,
-            "step":     "3b",
-            "circuits": circuits,
-            "errors":   errors,
-            "page":     "setup",
+            "request":             request,
+            "step":                "3b",
+            "circuits":            circuits,
+            "errors":              errors,
+            "circuit_types":       CIRCUIT_TYPES,
+            "circuit_type_labels": CIRCUIT_TYPE_LABELS,
+            "circuit_type_help":   CIRCUIT_TYPE_HELP,
+            "page":                "setup",
         })
 
     orch.reload_circuit_labels()
-    log.info("Setup: circuit names saved")
+    orch.reload_circuit_profiles()
+    log.info("Setup: circuit names and types saved")
     return ingress_redirect(request, "/setup/units")
 
 
