@@ -38,6 +38,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from ._helpers import ingress_redirect
 from ..config import DB_PATH
+from ..database import get_data_retention
 from ..restore_utils import (
     normalize_restore_row as _normalize_row,
     safe_insert_rows as _safe_insert,
@@ -546,6 +547,11 @@ async def backup_page(request: Request):
         if b >= 1024:       return f"{b/1024:.1f} KB"
         return f"{b} B"
 
+    try:
+        retention = get_data_retention(db)
+    except Exception:
+        retention = {}
+
     return _tmpl(request).TemplateResponse("backup.html", {
         "request":              request,
         "page":                 "backup",
@@ -556,4 +562,5 @@ async def backup_page(request: Request):
         "full_size_est":        fmt(full_est),
         "quick_tables":         QUICK_RESTORE_TABLES + QUICK_RESTORE_RECENT,
         "history_tables":       HISTORY_ARCHIVE_TABLES,
+        "retention":            retention,
     })
