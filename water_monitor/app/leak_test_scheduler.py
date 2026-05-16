@@ -259,7 +259,7 @@ class LeakTestScheduler:
         no flow-based gating here — just valve/fault pre-checks then start.
         """
         circuit = circuit_cfg.circuit
-        name    = circuit_cfg.display_name
+        name    = circuit_cfg.label
         run_at  = datetime.now(timezone.utc)
 
         # --- Pre-check: valve open ---

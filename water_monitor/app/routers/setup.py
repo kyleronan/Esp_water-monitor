@@ -410,7 +410,70 @@ async def setup_confirm(device_id: str, request: Request):
                 """, (circuit, role, value.strip()))
 
     orch.db.commit()
-    log.info("Entity mapping confirmed for device %s — proceeding to home details", device_id)
+    log.info("Entity mapping confirmed for device %s — proceeding to circuit names", device_id)
+    return ingress_redirect(request, "/setup/circuit-names")
+
+
+# ------------------------------------------------------------------
+# Step 3b — circuit display names
+# ------------------------------------------------------------------
+
+@router.get("/circuit-names", response_class=HTMLResponse)
+async def setup_circuit_names(request: Request):
+    """Step 3b — let the user name their circuits before configuring home details."""
+    orch = _orch(request)
+    from ..device_discovery import CIRCUIT_DISPLAY_DEFAULTS
+    circuits = [
+        {
+            "circuit":      c.circuit,
+            "display_name": c.label,
+        }
+        for c in orch._cfg.circuits
+    ]
+    return _tmpl(request).TemplateResponse("setup.html", {
+        "request":  request,
+        "step":     "3b",
+        "circuits": circuits,
+        "page":     "setup",
+    })
+
+
+@router.post("/circuit-names")
+async def setup_circuit_names_save(request: Request):
+    """Save circuit display names and advance to unit selection."""
+    from ..circuit_compat import validate_display_name
+    from ..database import upsert_circuit_label
+    orch = _orch(request)
+    form = await request.form()
+
+    errors = []
+    for c in orch._cfg.circuits:
+        raw = form.get(f"label_{c.circuit}", "").strip()
+        if not raw:
+            # Keep existing label if input was blank
+            continue
+        try:
+            display_name = validate_display_name(raw)
+        except ValueError as exc:
+            errors.append(f"{c.circuit}: {exc}")
+            continue
+        upsert_circuit_label(orch.db, c.circuit, display_name)
+
+    if errors:
+        circuits = [
+            {"circuit": c.circuit, "display_name": c.label}
+            for c in orch._cfg.circuits
+        ]
+        return _tmpl(request).TemplateResponse("setup.html", {
+            "request":  request,
+            "step":     "3b",
+            "circuits": circuits,
+            "errors":   errors,
+            "page":     "setup",
+        })
+
+    orch.reload_circuit_labels()
+    log.info("Setup: circuit names saved")
     return ingress_redirect(request, "/setup/units")
 
 
@@ -588,7 +651,7 @@ async def setup_complete(request: Request):
         "circuits": [
             {
                 "circuit":      c.circuit,
-                "display_name": c.display_name,
+                "display_name": c.label,
                 "configured":   c.is_fully_configured,
                 "training":     training_info.get(c.circuit, {}),
             }
@@ -605,6 +668,8 @@ async def setup_complete(request: Request):
 # ------------------------------------------------------------------
 @router.post("/api/rediscover/{device_id}/{circuit}")
 async def rediscover_circuit(device_id: str, circuit: str, request: Request):
+    from ..circuit_compat import resolve_circuit
+    circuit = resolve_circuit(circuit)
     orch = _orch(request)
     try:
         entities = await orch.ha.get_entity_registry()

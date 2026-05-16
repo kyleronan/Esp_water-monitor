@@ -7,10 +7,28 @@ import logging
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from ._helpers import ingress_redirect
+from ..circuit_compat import resolve_circuit
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/device")
+
+# Immutable set of alert types accepted by the firmware — rejects arbitrary strings
+# that would be silently interpolated into entity IDs sent to HA.
+VALID_ALERT_TYPES: frozenset[str] = frozenset({
+    "high_flow", "trickle", "pressure_drop", "leak_test",
+})
+
+# Only ESPHome number.* roles that carry writable threshold values.
+# Sensors, valves, switches, binary_sensors, and input_number helpers are excluded.
+# If input_number.* helper support is added in future it must be explicit + tested.
+_THRESHOLD_ROLES: frozenset[str] = frozenset({
+    "leak_test_duration_entity",
+    "high_flow_threshold",
+    "trickle_threshold",
+    "burst_threshold",
+    "trickle_min_flow",
+})
 
 
 def _orch(request: Request):
@@ -50,6 +68,7 @@ async def device_page(request: Request):
 # ------------------------------------------------------------------
 @router.post("/valve/{circuit}/open")
 async def valve_open(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     log.info(">>> valve_open called for circuit=%s", circuit)
     orch = _orch(request)
     cfg = orch._cfg.get_circuit(circuit)
@@ -72,6 +91,7 @@ async def valve_open(circuit: str, request: Request):
 
 @router.post("/valve/{circuit}/close")
 async def valve_close(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     log.info(">>> valve_close called for circuit=%s", circuit)
     orch = _orch(request)
     cfg = orch._cfg.get_circuit(circuit)
@@ -97,6 +117,7 @@ async def valve_close(circuit: str, request: Request):
 # ------------------------------------------------------------------
 @router.post("/fault/{circuit}/reset")
 async def fault_reset(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     log.info(">>> fault_reset called for circuit=%s", circuit)
     orch = _orch(request)
     circuit_cfg = orch._cfg.get_circuit(circuit)
@@ -110,6 +131,7 @@ async def fault_reset(circuit: str, request: Request):
 
 @router.post("/trickle/{circuit}/reset")
 async def trickle_reset(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     log.info(">>> trickle_reset called for circuit=%s", circuit)
     orch = _orch(request)
     circuit_cfg = orch._cfg.get_circuit(circuit)
@@ -131,7 +153,34 @@ async def threshold_update(
     entity_id: str = Form(...),
     value: float = Form(...),
 ):
+    circuit = resolve_circuit(circuit)
     orch = _orch(request)
+    circuit_cfg = orch._cfg.get_circuit(circuit)
+    if not circuit_cfg:
+        return JSONResponse(
+            {"status": "error", "message": f"Unknown circuit: {circuit}"},
+            status_code=400,
+        )
+
+    # Build allowlist from only the writable threshold roles for this circuit
+    from ..device_discovery import load_circuit_entities
+    entities = load_circuit_entities(orch.db, circuit)
+    allowed = {v for k, v in entities.items() if k in _THRESHOLD_ROLES and v}
+    if entity_id not in allowed:
+        return JSONResponse(
+            {"status": "error", "message": "Entity not in allowed set for this circuit"},
+            status_code=403,
+        )
+
+    # Runtime domain guard — only ESPHome number.* entities are accepted.
+    # input_number.* helpers are NOT allowed in safety-critical firmware paths.
+    if not entity_id.startswith("number."):
+        return JSONResponse(
+            {"status": "error",
+             "message": "Only ESPHome number.* entities are accepted for threshold updates"},
+            status_code=403,
+        )
+
     await orch.ha.set_number_value(entity_id, value)
     return JSONResponse({"status": "updated", "entity_id": entity_id, "value": value})
 
@@ -144,8 +193,19 @@ async def alert_toggle(
     circuit: str, alert_type: str, request: Request,
     enabled: bool = Form(...),
 ):
+    circuit = resolve_circuit(circuit)
+    if alert_type not in VALID_ALERT_TYPES:
+        return JSONResponse(
+            {"status": "error", "message": f"Unknown alert type: {alert_type!r}"},
+            status_code=400,
+        )
     orch = _orch(request)
     circuit_cfg = orch._cfg.get_circuit(circuit)
+    if not circuit_cfg:
+        return JSONResponse(
+            {"status": "error", "message": f"Unknown circuit: {circuit}"},
+            status_code=400,
+        )
     p = circuit_cfg.esp_device_prefix if circuit_cfg else ""
     entity_id = f"switch.{p}enable_{alert_type}_alert_{circuit}"
     if enabled:
@@ -165,6 +225,7 @@ async def alert_toggle(
 # ------------------------------------------------------------------
 @router.post("/leaktest/{circuit}/run")
 async def leaktest_run(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     log.info(">>> leaktest_run called for circuit=%s", circuit)
     orch = _orch(request)
     cfg = orch._cfg.get_circuit(circuit)
@@ -228,6 +289,7 @@ async def leaktest_run(circuit: str, request: Request):
 # ------------------------------------------------------------------
 @router.post("/leaktest/{circuit}/abort")
 async def leaktest_abort(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     log.info(">>> leaktest_abort called for circuit=%s", circuit)
     orch = _orch(request)
     cfg = orch._cfg.get_circuit(circuit)
@@ -274,6 +336,7 @@ async def leaktest_abort(circuit: str, request: Request):
 # ------------------------------------------------------------------
 @router.post("/leaktest/{circuit}/schedule")
 async def leaktest_schedule(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
 

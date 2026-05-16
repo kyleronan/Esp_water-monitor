@@ -50,11 +50,28 @@ OPTIONAL_ROLES = {
 # the entity's original_name from the HA entity registry.
 # ------------------------------------------------------------------
 
+# Default display names for each circuit ID (used in setup wizard).
+CIRCUIT_DISPLAY_DEFAULTS: Dict[str, str] = {
+    "circuit_1": "Main",
+    "circuit_2": "Irrigation",
+}
+
 # Role → (name pattern, domain)
 # Pattern is matched against original_name (case-insensitive).
 # Domain narrows the match when multiple entities share a similar name.
+#
+# Keys are now stable circuit IDs (circuit_1 / circuit_2).
+# Regex patterns still search for "main" and "irrigation" because those are
+# the keywords in the DEFAULT firmware entity names (e.g. "Main Water Valve",
+# "Water Flow Rate - Irrigation"). For firmware with non-default label
+# substitutions (e.g. duplex installs), these patterns will not match and
+# the setup wizard's manual entity assignment UI must be used instead.
+#
+# Discovery priority: diagnostic Circuit ID/Label text sensors (added in
+# firmware v3.6+) are checked first; these regex patterns are the fallback
+# for older firmware without those sensors.
 ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
-    "main": {
+    "circuit_1": {   # was "main" — regex patterns match default firmware names
         "flow_sensor":             (r"water flow rate.*main",                           "sensor"),
         # Lookahead patterns — order-insensitive so "Water Pressure (Fast) Main" and
         # "Water Pressure Main (Fast)" both match without needing a regex update.
@@ -72,7 +89,7 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "leak_test_duration_sensor": (r"leak test duration.*main",                      "number"),
         "volume_sensor":           (r"water volume total.*main",                        "sensor"),
     },
-    "irrigation": {
+    "circuit_2": {   # was "irrigation" — regex patterns match default firmware names
         "flow_sensor":             (r"water flow rate.*irrigation",                           "sensor"),
         "pressure_fast_sensor":    (r"water pressure(?=.*irrigation)(?=.*fast)",              "sensor"),
         "pressure_avg_sensor":     (r"water pressure(?=.*irrigation)(?=.*averaged)",          "sensor"),

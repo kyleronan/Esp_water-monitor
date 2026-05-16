@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ._helpers import ingress_redirect
+from ..circuit_compat import resolve_circuit
 
 log = logging.getLogger(__name__)
 
@@ -22,7 +23,8 @@ def _tmpl(request: Request):
 
 
 def _valid_circuit(circuit: str, request: Request) -> str:
-    """FastAPI dependency — validates circuit against configured circuits."""
+    """FastAPI dependency — normalises legacy aliases then validates against configured circuits."""
+    circuit = resolve_circuit(circuit)
     cfg = _orch(request)._cfg
     if circuit not in {c.circuit for c in cfg.circuits}:
         raise HTTPException(status_code=404, detail=f"Unknown circuit: {circuit!r}")
@@ -65,7 +67,7 @@ async def fixtures_page(request: Request):
         from ..database import get_active_exclusion_window
         circuits_ctx.append({
             "circuit":          c,
-            "display_name":     circ_cfg.display_name,
+            "display_name":     circ_cfg.label,
             "training_state":   state,
             "clusters":         clusters,
             "unreviewed_count": unreviewed,

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from ..circuit_compat import resolve_circuit
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/history")
@@ -98,7 +99,7 @@ async def _history_page(request: Request):
 
         circuit_history.append({
             "circuit":         circuit_cfg.circuit,
-            "display_name":    circuit_cfg.display_name,
+            "display_name":    circuit_cfg.label,
             "events":          events,
             "leak_tests":      leak_tests,
             "event_count":     len(events),
@@ -127,6 +128,7 @@ async def events_api(
     date_from: str = "",
     date_to: str = "",
 ):
+    circuit = resolve_circuit(circuit)
     orch = _orch(request)
     from ..database import get_recent_events
     events = get_recent_events(

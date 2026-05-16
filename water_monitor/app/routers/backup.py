@@ -37,16 +37,41 @@ from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from ._helpers import ingress_redirect
+from ..circuit_compat import resolve_circuit
 from ..config import DB_PATH
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/backup")
 MAX_BACKUP_BYTES = 50 * 1024 * 1024  # 50 MB hard limit
 
+# Tables that contain a 'circuit' column and require normalization on restore.
+# Used by _normalize_row() to map legacy 'main'/'irrigation' values.
+_CIRCUIT_TABLES = frozenset({
+    "events", "circuit_entity_map", "circuit_profile", "training_state",
+    "learning_config", "sensitivity_config", "alert_config", "leak_test_schedule",
+    "circuit_exclusion_windows", "hourly_volume", "daily_summary",
+    "fixtures", "fixture_clusters", "fixture_daily_summary", "leak_test_history",
+    "volume_snapshots", "cluster_cooccurrence", "cluster_metrics_history",
+    "import_state",
+})
+
+def _normalize_row(row: dict, table: str) -> dict:
+    """
+    Normalize the 'circuit' field of a restored row to the stable circuit ID format.
+    Maps legacy values ('main' → 'circuit_1', 'irrigation' → 'circuit_2').
+    Must be applied to every row in every restored table that has a 'circuit' column.
+    """
+    if table in _CIRCUIT_TABLES and "circuit" in row:
+        row = dict(row)
+        row["circuit"] = resolve_circuit(row["circuit"])
+    return row
+
+
 def _safe_insert(db, tbl: str, rows: list) -> int:
     """
     Insert rows into tbl, validating column names against the live schema
     to prevent SQL injection via crafted backup files.
+    Normalizes circuit values on every row before insert.
     Returns count of rows inserted.
     """
     if not rows:
@@ -61,6 +86,7 @@ def _safe_insert(db, tbl: str, rows: list) -> int:
     cn = ",".join(cols)
     sql = f"INSERT OR REPLACE INTO {tbl} ({cn}) VALUES ({ph})"
     for row in rows:
+        row = _normalize_row(row, tbl)
         db.execute(sql, [row.get(c) for c in cols])
     return len(rows)
 
@@ -139,11 +165,19 @@ async def export_quick_restore(request: Request):
             log.warning("Quick-restore export %s: %s", tbl, e)
             tables[tbl] = []
 
+    # Include circuit labels so custom display names survive a restore
+    from ..database import load_circuit_labels
+    circuit_labels = load_circuit_labels(db)
+
     payload = {
         "backup_type":  "quick_restore",
         "version":      3,
         "exported_at":  datetime.now(timezone.utc).isoformat(),
         "history_days": QUICK_RESTORE_DAYS,
+        "circuits": [
+            {"circuit_id": cid, "display_name": label}
+            for cid, label in circuit_labels.items()
+        ],
         "tables":       tables,
     }
     return _download(
@@ -386,10 +420,38 @@ async def import_quick_restore(
                     removed)
         except Exception as e:
             log.warning("Quick Restore dedup failed (non-fatal): %s", e)
+
+    # Restore circuit display labels from backup, or seed defaults for old backups
+    try:
+        from ..database import load_circuit_labels, upsert_circuit_label
+        circuit_entries = payload.get("circuits", [])
+        if circuit_entries:
+            for entry in circuit_entries:
+                cid   = entry.get("circuit_id", "")
+                label = entry.get("display_name", "")
+                if cid and label:
+                    upsert_circuit_label(db, cid, label)
+            log.info("Quick Restore: restored %d circuit label(s)", len(circuit_entries))
+        else:
+            # Old backup without circuit metadata — seed defaults if table is empty
+            existing = load_circuit_labels(db)
+            if not existing:
+                upsert_circuit_label(db, "circuit_1", "Main")
+                upsert_circuit_label(db, "circuit_2", "Irrigation")
+                log.info("Quick Restore: seeded default circuit labels (legacy backup)")
+    except Exception as e:
+        log.warning("Quick Restore: circuit label restore failed (non-fatal): %s", e)
+
     try:
         orch.reload_circuit_entities()
     except Exception as e:
         log.warning("Import reload: %s", e)
+
+    # Reload circuit labels into the in-memory config
+    try:
+        orch.reload_circuit_labels()
+    except Exception as e:
+        log.warning("Import reload labels: %s", e)
 
     total = sum(imported.values())
     log.info(
@@ -459,7 +521,11 @@ async def import_history_archive(
                         f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
                     orch.db.executemany(
                         f"INSERT OR IGNORE INTO {tbl} ({cn}) VALUES ({ph})",
-                        [[r[c] for c in cols] for r in rows],
+                        [
+                            [_normalize_row(dict(zip(cols, [r[c] for c in cols])), tbl).get(c)
+                             for c in cols]
+                            for r in rows
+                        ],
                     )
                     after = orch.db.execute(
                         f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]

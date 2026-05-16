@@ -7,6 +7,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from ._helpers import ingress_redirect
 
+from ..circuit_compat import resolve_circuit
 from ..config import SENSITIVITY_PRESETS
 from ..database import get_data_retention, update_data_retention, get_home_profile
 
@@ -165,7 +166,7 @@ async def settings_page(request: Request):
         from ..database import get_active_exclusion_window
         circuits.append({
             "circuit": c,
-            "display_name": circuit_cfg.display_name,
+            "display_name": circuit_cfg.label,
             "circuit_type": circuit_cfg.circuit_type,
             "sensitivity": dict(sens) if sens else {},
             "learning": dict(learn) if learn else {},
@@ -226,6 +227,7 @@ async def profile_update(request: Request):
 # ------------------------------------------------------------------
 @router.post("/sensitivity/{circuit}/update")
 async def sensitivity_update(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
     from ..database import upsert_sensitivity_config
@@ -277,6 +279,7 @@ async def sensitivity_update(circuit: str, request: Request):
 # ------------------------------------------------------------------
 @router.post("/learning/{circuit}/update")
 async def learning_update(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
     from ..database import upsert_learning_config
@@ -293,6 +296,7 @@ async def learning_update(circuit: str, request: Request):
 # ------------------------------------------------------------------
 @router.post("/recalibrate/{circuit}")
 async def recalibrate(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
 
@@ -331,6 +335,7 @@ async def recalibrate(circuit: str, request: Request):
 @router.get("/recalibrate/{circuit}/suggest")
 async def suggest_days(circuit: str, request: Request):
     """Return suggested calibration days based on home profile."""
+    circuit = resolve_circuit(circuit)
     orch = _orch(request)
     from ..database import get_home_profile
     from ..config import compute_suggested_calibration_days
@@ -351,6 +356,7 @@ async def suggest_days(circuit: str, request: Request):
 # ------------------------------------------------------------------
 @router.post("/alert/{circuit}/{alert_id}/toggle")
 async def alert_toggle(circuit: str, alert_id: str, request: Request):
+    circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
     enabled = form.get("enabled") == "true"
@@ -540,6 +546,38 @@ async def integrations_update(request: Request):
 
 
 # ------------------------------------------------------------------
+# Circuit display name rename
+# ------------------------------------------------------------------
+
+@router.post("/circuit/{circuit}/rename")
+async def circuit_rename(circuit: str, request: Request):
+    """Update the human-readable display name for a circuit."""
+    circuit = resolve_circuit(circuit)
+    form = await request.form()
+    orch = _orch(request)
+
+    # Validate circuit exists
+    circuit_cfg = orch._cfg.get_circuit(circuit)
+    if not circuit_cfg:
+        return JSONResponse(
+            {"status": "error", "message": f"Unknown circuit: {circuit}"},
+            status_code=400,
+        )
+
+    from ..circuit_compat import validate_display_name
+    try:
+        display_name = validate_display_name(form.get("display_name", ""))
+    except ValueError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+
+    from ..database import upsert_circuit_label
+    upsert_circuit_label(orch.db, circuit, display_name)
+    orch.reload_circuit_labels()
+
+    return JSONResponse({"status": "renamed", "circuit": circuit, "display_name": display_name})
+
+
+# ------------------------------------------------------------------
 # Plumbing-event exclusion windows
 # ------------------------------------------------------------------
 
@@ -547,6 +585,7 @@ async def integrations_update(request: Request):
 async def start_exclusion_window(request: Request, circuit: str):
     """Open an exclusion window so events during a plumbing flush are not
     used for fixture training.  Duration: 5–60 min (clamped server-side)."""
+    circuit = resolve_circuit(circuit)
     from ..database import create_exclusion_window
     form    = await request.form()
     minutes = int(form.get("minutes") or 15)
@@ -560,6 +599,7 @@ async def start_exclusion_window(request: Request, circuit: str):
 @router.post("/circuit/{circuit}/exclusion_window/cancel")
 async def cancel_exclusion_window_endpoint(request: Request, circuit: str):
     """End the active exclusion window immediately."""
+    circuit = resolve_circuit(circuit)
     from ..database import cancel_exclusion_window
     cancel_exclusion_window(_orch(request).db, circuit)
     log.info("[%s] exclusion window cancelled", circuit)
@@ -569,6 +609,7 @@ async def cancel_exclusion_window_endpoint(request: Request, circuit: str):
 @router.post("/circuit/{circuit}/exclusion_window/extend")
 async def extend_exclusion_window_endpoint(request: Request, circuit: str):
     """Add 15 minutes to the active exclusion window (capped at 60 min from start)."""
+    circuit = resolve_circuit(circuit)
     from ..database import extend_exclusion_window
     extend_exclusion_window(_orch(request).db, circuit, extra_minutes=15)
     log.info("[%s] exclusion window extended +15 min", circuit)

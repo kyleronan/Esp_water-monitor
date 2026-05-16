@@ -289,6 +289,48 @@
 {% endif %}
 
 {# ──────────────────────────────────────────────────────────────────── #}
+{# STEP 3b — Circuit display names                                      #}
+{# ──────────────────────────────────────────────────────────────────── #}
+{% if step == "3b" %}
+<section class="setup-card">
+  <h2>Name your circuits</h2>
+  <p class="muted">
+    Give each circuit a name that makes sense for your home — for example
+    "Main", "Garden", "Unit A", or "Irrigation". These names appear
+    throughout the dashboard. You can change them later in Settings.
+  </p>
+
+  {% if errors %}
+  <div class="alert alert-error">
+    {% for e in errors %}<p>{{ e }}</p>{% endfor %}
+  </div>
+  {% endif %}
+
+  <form method="post" action="{{ ingress_path }}/setup/circuit-names">
+    {% for c in circuits %}
+    <div class="form-group">
+      <label for="label_{{ c.circuit }}">{{ c.circuit.replace('_', ' ').title() }} display name</label>
+      <input
+        type="text"
+        id="label_{{ c.circuit }}"
+        name="label_{{ c.circuit }}"
+        value="{{ c.display_name }}"
+        maxlength="40"
+        placeholder="e.g. Main, Garden, Unit A"
+        class="form-control"
+      >
+    </div>
+    {% endfor %}
+
+    <div class="setup-step-actions">
+      <a href="{{ ingress_path }}/setup" class="btn btn-ghost btn-sm">← Back</a>
+      <button type="submit" class="btn btn-primary btn-sm">Continue →</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+
+{# ──────────────────────────────────────────────────────────────────── #}
 {# STEP 4 — Display units                                               #}
 {# ──────────────────────────────────────────────────────────────────── #}
 {% if step == 4 %}
