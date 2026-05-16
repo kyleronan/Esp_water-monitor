@@ -66,10 +66,9 @@ function applyLiveState(circuit, state) {
         ctrl.innerHTML = `<button class="btn btn-danger" onclick="valveClose('${circuit}')">Close Valve</button>`;
       } else if (vs === 'closed') {
         if (faultActive) {
-          const escapedReason = faultReason.replace(/'/g, "\\'");
-          ctrl.innerHTML = `<button class="btn btn-secondary btn-fault-warn" onclick="valveOpenWithFaultWarning('${circuit}', '${escapedReason}')">Open Valve</button>`;
+          ctrl.innerHTML = `<button class="btn btn-secondary btn-fault-warn" onclick="valveOpenWithFaultWarning('${circuit}', this)">Open Valve</button>`;
         } else {
-          ctrl.innerHTML = `<button class="btn btn-primary" onclick="valveOpen('${circuit}')">Open Valve</button>`;
+          ctrl.innerHTML = `<button class="btn btn-primary" onclick="valveOpenModal('${circuit}', this)">Open Valve</button>`;
         }
       } else {
         ctrl.innerHTML = `<button class="btn btn-secondary" disabled>${state.valve_state}</button>`;
@@ -117,28 +116,138 @@ window.addEventListener('DOMContentLoaded', () => {
   setInterval(fetchLiveState, 5000);  // then every 5 seconds
 });
 
+// Modal event wiring (only runs if the modal scaffold is present in base.html)
+window.addEventListener('DOMContentLoaded', () => {
+  const overlay = document.getElementById('valve-modal');
+  if (!overlay) return;
+
+  document.getElementById('valve-modal-cancel').addEventListener('click', _closeValveModal);
+
+  document.getElementById('valve-modal-confirm').addEventListener('click', () => {
+    if (_valveModalOnConfirm) {
+      const fn = _valveModalOnConfirm;
+      _closeValveModal();
+      fn();
+    }
+  });
+
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) _closeValveModal();
+  });
+
+  document.addEventListener('keydown', e => {
+    if (overlay.style.display === 'none') return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      _closeValveModal();
+      return;
+    }
+    if (e.key === 'Tab') {
+      const focusable = [
+        document.getElementById('valve-modal-cancel'),
+        document.getElementById('valve-modal-confirm'),
+      ];
+      const first = focusable[0];
+      const last  = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault(); last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault(); first.focus();
+      }
+    }
+  });
+});
+
+// ── Valve modal ────────────────────────────────────────────────────
+let _valveModalTrigger   = null;
+let _valveModalOnConfirm = null;
+
+function _openValveModal(titleText, bodyText, faultText) {
+  document.getElementById('valve-modal-title').textContent = titleText;
+  document.getElementById('valve-modal-body').textContent  = bodyText;
+  const faultEl = document.getElementById('valve-modal-fault');
+  if (faultText) {
+    faultEl.textContent   = faultText;
+    faultEl.style.display = '';
+  } else {
+    faultEl.style.display = 'none';
+  }
+  document.getElementById('valve-modal').style.display = '';
+  document.getElementById('valve-modal-cancel').focus();
+}
+
+function _closeValveModal() {
+  document.getElementById('valve-modal').style.display = 'none';
+  _valveModalOnConfirm = null;
+  if (_valveModalTrigger) {
+    _valveModalTrigger.focus();
+    _valveModalTrigger = null;
+  }
+}
+
+function _getDisplayName(circuit) {
+  const ctrl = document.getElementById(`valve-controls-${circuit}`);
+  return (ctrl && ctrl.dataset.displayName) ? ctrl.dataset.displayName : circuit;
+}
+
+function _setValveBtnsLoading(circuit, loadingText) {
+  const ctrl = document.getElementById(`valve-controls-${circuit}`);
+  if (!ctrl) return;
+  ctrl.querySelectorAll('button').forEach(b => {
+    b.disabled = true;
+    if (b.textContent.trim() === 'Open Valve' || b.textContent.trim() === 'Close Valve')
+      b.textContent = loadingText;
+  });
+}
+
+function _restoreValveBtns(circuit) {
+  const ctrl = document.getElementById(`valve-controls-${circuit}`);
+  if (!ctrl) return;
+  ctrl.querySelectorAll('button').forEach(b => {
+    b.disabled = false;
+    if (b.textContent.trim() === 'Opening…') b.textContent = 'Open Valve';
+    if (b.textContent.trim() === 'Closing…') b.textContent = 'Close Valve';
+  });
+}
+
 // ── Valve control ──────────────────────────────────────────────────
-async function valveOpenWithFaultWarning(circuit, faultReason) {
-  const reasonLine = faultReason
-    ? `\n\nFault reason: "${faultReason}"`
-    : '';
-  const confirmed = confirm(
-    `⚠ Safety fault is active on this circuit.${reasonLine}\n\n` +
-    `Opening the valve before resolving the fault may be unsafe.\n\n` +
-    `Reset the fault first, then open the valve — or confirm below to override.`
+function valveOpenModal(circuit, triggerEl) {
+  _valveModalTrigger   = triggerEl || null;
+  const displayName    = _getDisplayName(circuit);
+  _valveModalOnConfirm = () => valveOpen(circuit);
+  _openValveModal(
+    `Open ${displayName} valve?`,
+    'This may restore water flow. Confirm the leak condition has been resolved before opening.',
+    null
   );
-  if (!confirmed) return;
-  await valveOpen(circuit);
+}
+
+function valveOpenWithFaultWarning(circuit, triggerEl) {
+  _valveModalTrigger  = triggerEl || null;
+  const displayName   = _getDisplayName(circuit);
+  const ctrl          = document.getElementById(`valve-controls-${circuit}`);
+  const faultReason   = ctrl ? (ctrl.dataset.faultReason || '') : '';
+  const faultLine     = faultReason
+    ? `⚠ Fault reason: "${faultReason}". Opening before resolving the fault may be unsafe. Reset the fault first, or confirm to override.`
+    : '⚠ Safety fault is active. Opening before resolving it may be unsafe. Reset the fault first, or confirm to override.';
+  _valveModalOnConfirm = () => valveOpen(circuit);
+  _openValveModal(
+    `Open ${displayName} valve?`,
+    'This may restore water flow. Confirm the leak condition has been resolved before opening.',
+    faultLine
+  );
 }
 
 async function valveOpen(circuit) {
-  if (!confirm(`Open ${circuit} valve?`)) return;
+  const displayName = _getDisplayName(circuit);
+  _setValveBtnsLoading(circuit, 'Opening…');
   const r = await post(`/device/valve/${circuit}/open`);
   if (r.data && r.data.status === "error") {
-    toast("Could not open valve: " + (r.data.message || "unknown error"), 'error');
+    toast(`Could not open ${displayName} valve: ` + (r.data.message || "unknown error"), 'error');
+    _restoreValveBtns(circuit);
     return;
   }
-  // Poll faster until the state settles
+  toast(`Open command sent for ${displayName} valve.`, 'success');
   let attempts = 0;
   const iv = setInterval(async () => {
     await fetchLiveState();
@@ -149,12 +258,16 @@ async function valveOpen(circuit) {
 }
 
 async function valveClose(circuit) {
-  if (!confirm(`Close ${circuit} valve?`)) return;
+  const displayName = _getDisplayName(circuit);
+  toast(`Close command sent for ${displayName} valve.`, 'info');
+  _setValveBtnsLoading(circuit, 'Closing…');
   const r = await post(`/device/valve/${circuit}/close`);
   if (r.data && r.data.status === "error") {
-    toast("Could not close valve: " + (r.data.message || "unknown error"), 'error');
+    toast(`Could not close ${displayName} valve: ` + (r.data.message || "unknown error"), 'error');
+    _restoreValveBtns(circuit);
     return;
   }
+  toast(`${displayName} valve closed.`, 'success');
   let attempts = 0;
   const iv = setInterval(async () => {
     await fetchLiveState();

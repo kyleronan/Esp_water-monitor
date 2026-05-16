@@ -103,17 +103,18 @@
     {# Valve control — single button that flips by current state #}
     <div class="dash-valve-controls" id="valve-controls-{{ c.circuit }}"
          data-fault="{{ 'true' if c.fault_active else 'false' }}"
-         data-fault-reason="{{ c.fault_reason or '' }}">
+         data-fault-reason="{{ c.fault_reason or '' }}"
+         data-display-name="{{ c.display_name }}">
       {% if c.valve_state == 'open' %}
       <button class="btn btn-danger btn-sm" onclick="valveClose('{{ c.circuit }}')">Close Valve</button>
       {% elif c.valve_state == 'closed' %}
         {% if c.fault_active %}
         <button class="btn btn-secondary btn-sm btn-fault-warn"
-                onclick="valveOpenWithFaultWarning('{{ c.circuit }}', {{ c.fault_reason|tojson if c.fault_reason else '\'\''}})">
+                onclick="valveOpenWithFaultWarning('{{ c.circuit }}', this)">
           Open Valve
         </button>
         {% else %}
-        <button class="btn btn-primary btn-sm" onclick="valveOpen('{{ c.circuit }}')">Open Valve</button>
+        <button class="btn btn-primary btn-sm" onclick="valveOpenModal('{{ c.circuit }}', this)">Open Valve</button>
         {% endif %}
       {% else %}
       <button class="btn btn-secondary btn-sm" disabled>{{ c.valve_state | title }}</button>

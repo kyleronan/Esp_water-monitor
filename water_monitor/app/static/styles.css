@@ -1940,6 +1940,15 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 }
 .modal-box h3 { font-size: 15px; font-weight: 700; margin-bottom: 10px; }
 .modal-box p  { font-size: 13px; color: var(--text-2); margin-bottom: 8px; line-height: 1.5; }
+.valve-modal-fault-text {
+  font-size: 13px; line-height: 1.5;
+  background: var(--amber-bg);
+  border: 1px solid oklch(82% .12 70);
+  border-radius: var(--radius-sm);
+  color: var(--amber-text);
+  padding: 8px 10px;
+  margin-top: 8px;
+}
 .modal-actions {
   display: flex; gap: 8px; flex-wrap: wrap;
   margin-top: 16px;
