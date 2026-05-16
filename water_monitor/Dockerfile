@@ -18,7 +18,6 @@ RUN apk add --no-cache python3 py3-pip \
         paho-mqtt==2.1.0
 
 COPY app /opt/water_monitor/app
-COPY firmware /opt/water_monitor/firmware
 COPY rootfs /
 
 LABEL \
