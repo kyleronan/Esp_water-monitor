@@ -20,6 +20,7 @@ from ._helpers import ingress_redirect
 from ..device_discovery import (
     find_matching_devices,
     match_entities_to_roles,
+    _resolve_labels_from_diagnostics,
     save_discovery,
     mark_setup_complete,
     load_circuit_entities,
@@ -305,8 +306,17 @@ async def setup_discover(device_id: str, request: Request):
     from ..device_discovery import _to_device
     device = _to_device(device_raw)
 
+    # Resolve display labels from v3.6+ diagnostic sensors before regex matching
+    # so non-default circuit names (e.g. "Zone A") are recognised in tier 1.
+    diag_labels = await _resolve_labels_from_diagnostics(orch.ha, entities)
+    if diag_labels:
+        from ..database import upsert_circuit_label
+        for cid, lbl in diag_labels.items():
+            upsert_circuit_label(orch.db, cid, lbl)
+        orch.reload_circuit_labels()
+
     circuit_matches, prefix = match_entities_to_roles(
-        device_id, entities, circuits)
+        device_id, entities, circuits, labels=diag_labels)
 
     # Get all device entities for fallback dropdowns
     device_entity_list = [
@@ -661,8 +671,9 @@ async def rediscover_circuit(device_id: str, circuit: str, request: Request):
     orch = _orch(request)
     try:
         entities = await orch.ha.get_entity_registry()
+        diag_labels = await _resolve_labels_from_diagnostics(orch.ha, entities)
         circuit_matches, _ = match_entities_to_roles(
-            device_id, entities, [circuit])
+            device_id, entities, [circuit], labels=diag_labels)
         matches = circuit_matches.get(circuit, [])
         return JSONResponse({
             "matches": [
