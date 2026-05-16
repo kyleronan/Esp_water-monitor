@@ -123,12 +123,17 @@ async def fault_reset(circuit: str, request: Request):
     circuit = resolve_circuit(circuit)
     log.info(">>> fault_reset called for circuit=%s", circuit)
     orch = _orch(request)
-    circuit_cfg = orch._cfg.get_circuit(circuit)
-    p = circuit_cfg.esp_device_prefix if circuit_cfg else ""
-    await orch.ha.call_service(
-        "button", "press",
-        {"entity_id": f"button.{p}reset_safety_fault_{circuit}"}
-    )
+    from ..device_discovery import load_circuit_entities
+    entities = load_circuit_entities(orch.db, circuit)
+    entity_id = entities.get("fault_reset_button")
+    if not entity_id:
+        return JSONResponse(
+            {"status": "error",
+             "message": "Fault reset button not found for this circuit. "
+                        "Re-run device discovery to map the entity."},
+            status_code=400,
+        )
+    await orch.ha.call_service("button", "press", {"entity_id": entity_id})
     return JSONResponse({"status": "reset"})
 
 
@@ -137,12 +142,17 @@ async def trickle_reset(circuit: str, request: Request):
     circuit = resolve_circuit(circuit)
     log.info(">>> trickle_reset called for circuit=%s", circuit)
     orch = _orch(request)
-    circuit_cfg = orch._cfg.get_circuit(circuit)
-    p = circuit_cfg.esp_device_prefix if circuit_cfg else ""
-    await orch.ha.call_service(
-        "button", "press",
-        {"entity_id": f"button.{p}reset_trickle_alert_{circuit}"}
-    )
+    from ..device_discovery import load_circuit_entities
+    entities = load_circuit_entities(orch.db, circuit)
+    entity_id = entities.get("trickle_reset_button")
+    if not entity_id:
+        return JSONResponse(
+            {"status": "error",
+             "message": "Trickle reset button not found for this circuit. "
+                        "Re-run device discovery to map the entity."},
+            status_code=400,
+        )
+    await orch.ha.call_service("button", "press", {"entity_id": entity_id})
     return JSONResponse({"status": "reset"})
 
 
@@ -209,8 +219,17 @@ async def alert_toggle(
             {"status": "error", "message": f"Unknown circuit: {circuit}"},
             status_code=400,
         )
-    p = circuit_cfg.esp_device_prefix if circuit_cfg else ""
-    entity_id = f"switch.{p}enable_{alert_type}_alert_{circuit}"
+    from ..device_discovery import load_circuit_entities
+    entities = load_circuit_entities(orch.db, circuit)
+    role = f"alert_{alert_type}_switch"
+    entity_id = entities.get(role)
+    if not entity_id:
+        return JSONResponse(
+            {"status": "error",
+             "message": f"Alert switch for '{alert_type}' not found for this circuit. "
+                        "Re-run device discovery to map the entity."},
+            status_code=400,
+        )
     if enabled:
         await orch.ha.turn_on(entity_id)
     else:
