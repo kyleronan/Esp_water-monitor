@@ -98,7 +98,7 @@ async def lifespan(app: FastAPI):
     from .config import DB_PATH
     _db = init_db(DB_PATH)
     try:
-        run_migrations(_db)
+        run_migrations(_db, db_path=DB_PATH)
     except Exception as e:
         log.critical("DB migration failed — cannot start: %s", e)
         raise

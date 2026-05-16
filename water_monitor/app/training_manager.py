@@ -207,10 +207,10 @@ class TrainingManager:
         circuit_cfg = self._cfg.get_circuit(circuit)
         if circuit_cfg:
             await self._ha.notify(
-                title=f"Water Monitor — {circuit_cfg.display_name} training complete",
+                title=f"Water Monitor — {circuit_cfg.label} training complete",
                 message=(
                     f"Training complete! Visit Fixtures to confirm what was "
-                    f"detected on the {circuit_cfg.display_name.lower()} circuit, "
+                    f"detected on the {circuit_cfg.label.lower()} circuit, "
                     f"then tap 'Activate' to go live."
                 ),
                 notification_id=f"water_calibration_complete_{circuit}",
@@ -329,7 +329,7 @@ class TrainingManager:
                             await self._ha.notify(
                                 title=(
                                     f"Water Monitor — "
-                                    f"{circuit_cfg.display_name} auto-activated"
+                                    f"{circuit_cfg.label} auto-activated"
                                 ),
                                 message=(
                                     f"Fixtures were activated automatically "
@@ -392,7 +392,7 @@ class TrainingManager:
                 await self._ha.notify(
                     title=f"Water Monitor — Training extended",
                     message=(
-                        f"{circuit_cfg.display_name}: training period elapsed but only "
+                        f"{circuit_cfg.label}: training period elapsed but only "
                         f"{state_row['events_collected']} of "
                         f"{state_row['minimum_events']} events collected. "
                         f"Training continues automatically."

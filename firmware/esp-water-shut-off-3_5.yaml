@@ -52,6 +52,8 @@
 
 substitutions:
   flow_k_factor: "396.0"   # 6.6 pulses/litre × 60s = 396
+  circuit_1_name: "Main"        # Display name for circuit 1 — change to suit your install
+  circuit_2_name: "Irrigation"  # Display name for circuit 2 — change to suit your install
 
 esphome:
   name: esp-water-shut-off-3
@@ -158,16 +160,16 @@ web_server:
   # Each entity is assigned to a group via its web_server: sorting_group_id.
   sorting_groups:
     - id: group_main_status
-      name: "Main Valve — Status & Controls"
+      name: "${circuit_1_name} Valve — Status & Controls"
       sorting_weight: 10
     - id: group_main_settings
-      name: "Main Valve — Settings"
+      name: "${circuit_1_name} Valve — Settings"
       sorting_weight: 30
     - id: group_irr_status
-      name: "Irrigation Valve — Status & Controls"
+      name: "${circuit_2_name} Valve — Status & Controls"
       sorting_weight: 20
     - id: group_irr_settings
-      name: "Irrigation Valve — Settings"
+      name: "${circuit_2_name} Valve — Settings"
       sorting_weight: 40
     - id: group_system
       name: "System"
@@ -285,7 +287,7 @@ globals:
   # ---------------------------------------------------------------------------
 
   # True when the trickle alert has fired on the main circuit.
-  # Cleared by the "Reset Trickle Alert - Main" button.
+  # Cleared by the "Reset Trickle Alert - ${circuit_1_name}" button.
   - id: trickle_alert_main
     type: bool
     restore_value: no
@@ -643,7 +645,7 @@ sensor:
   - platform: copy
     source_id: pressure_main_base
     id: pressure_main
-    name: "Water Pressure 1 - Main"
+    name: "Water Pressure 1 - ${circuit_1_name}"
     entity_category: ""        # recorded by HA — used for historical event import
     device_class: pressure
     web_server:
@@ -833,7 +835,7 @@ sensor:
   - platform: copy
     source_id: pressure_irrigation_base
     id: pressure_irrigation
-    name: "Water Pressure 2 - Irrigation"
+    name: "Water Pressure 2 - ${circuit_2_name}"
     entity_category: ""        # recorded by HA — used for historical event import
     device_class: pressure
     web_server:
@@ -992,7 +994,7 @@ sensor:
   - platform: copy
     source_id: pressure_main
     id: pressure_main_avg
-    name: "Water Pressure 1 - Main (Averaged)"
+    name: "Water Pressure 1 - ${circuit_1_name} (Averaged)"
     # pressure_main now has entity_category: "" (recorded by HA); explicitly
     # clear here so this copy does not inherit any future category change.
     entity_category: ""
@@ -1026,7 +1028,7 @@ sensor:
   - platform: copy
     source_id: pressure_irrigation
     id: pressure_irrigation_avg
-    name: "Water Pressure 2 - Irrigation (Averaged)"
+    name: "Water Pressure 2 - ${circuit_2_name} (Averaged)"
     # See pressure_main_avg above.
     entity_category: ""
     device_class: pressure
@@ -1066,7 +1068,7 @@ sensor:
   - platform: copy
     source_id: pressure_main_base
     id: pressure_main_fast
-    name: "Water Pressure 1 - Main (Fast)"
+    name: "Water Pressure 1 - ${circuit_1_name} (Fast)"
     entity_category: diagnostic
     device_class: pressure
     web_server:
@@ -1089,7 +1091,7 @@ sensor:
   - platform: copy
     source_id: pressure_irrigation_base
     id: pressure_irrigation_fast
-    name: "Water Pressure 2 - Irrigation (Fast)"
+    name: "Water Pressure 2 - ${circuit_2_name} (Fast)"
     entity_category: diagnostic
     device_class: pressure
     web_server:
@@ -1225,7 +1227,7 @@ sensor:
     unit_of_measurement: 'L/min'
     accuracy_decimals: 2
     id: water_usage1
-    name: "Water Flow Rate - Main"
+    name: "Water Flow Rate - ${circuit_1_name}"
     device_class: volume_flow_rate
     state_class: measurement
     web_server:
@@ -1417,7 +1419,7 @@ sensor:
     unit_of_measurement: 'L/min'
     accuracy_decimals: 2
     id: water_usage2
-    name: "Water Flow Rate - Irrigation"
+    name: "Water Flow Rate - ${circuit_2_name}"
     device_class: volume_flow_rate
     state_class: measurement
     web_server:
@@ -1532,7 +1534,7 @@ sensor:
 # totals that survive recorder purge cycles).
 # =============================================================================
   - platform: integration
-    name: "Water Volume Total - Main"
+    name: "Water Volume Total - ${circuit_1_name}"
     id: water_volume_total_main
     sensor: water_usage1
     time_unit: min
@@ -1546,7 +1548,7 @@ sensor:
       sorting_weight: 49
 
   - platform: integration
-    name: "Water Volume Total - Irrigation"
+    name: "Water Volume Total - ${circuit_2_name}"
     id: water_volume_total_irr
     sensor: water_usage2
     time_unit: min
@@ -1569,7 +1571,7 @@ sensor:
 # =============================================================================
 text_sensor:
   - platform: template
-    name: "Leak Test Result - Main"
+    name: "Leak Test Result - ${circuit_1_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_main_status
@@ -1592,7 +1594,7 @@ text_sensor:
       }
 
   - platform: template
-    name: "Leak Test Result - Irrigation"
+    name: "Leak Test Result - ${circuit_2_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_irr_status
@@ -1634,7 +1636,7 @@ text_sensor:
   # Matched by the water signature add-on via pattern "fault reason.*main".
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Fault Reason - Main"
+    name: "Fault Reason - ${circuit_1_name}"
     id: fault_reason_main
     entity_category: diagnostic
     icon: mdi:alert-circle-outline
@@ -1645,7 +1647,7 @@ text_sensor:
     lambda: 'return {id(fault_reason_main_str)};'
 
   - platform: template
-    name: "Fault Reason - Irrigation"
+    name: "Fault Reason - ${circuit_2_name}"
     id: fault_reason_irr
     entity_category: diagnostic
     icon: mdi:alert-circle-outline
@@ -1654,6 +1656,45 @@ text_sensor:
       sorting_weight: 5.5
     update_interval: 5s
     lambda: 'return {id(fault_reason_irr_str)};'
+
+  # ---------------------------------------------------------------------------
+  # Diagnostic circuit identity sensors
+  # These allow the water monitor add-on to map circuit IDs to display labels
+  # without relying on entity name pattern matching — enabling label-independent
+  # device discovery (critical for non-default firmware labels, duplex installs).
+  # entity_category: diagnostic keeps them off the main HA overview.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Circuit 1 ID"
+    id: circuit_1_id_sensor
+    entity_category: diagnostic
+    icon: mdi:identifier
+    update_interval: 60s
+    lambda: return {"circuit_1"};
+
+  - platform: template
+    name: "Circuit 1 Label"
+    id: circuit_1_label_sensor
+    entity_category: diagnostic
+    icon: mdi:label-outline
+    update_interval: 60s
+    lambda: return {"${circuit_1_name}"};
+
+  - platform: template
+    name: "Circuit 2 ID"
+    id: circuit_2_id_sensor
+    entity_category: diagnostic
+    icon: mdi:identifier
+    update_interval: 60s
+    lambda: return {"circuit_2"};
+
+  - platform: template
+    name: "Circuit 2 Label"
+    id: circuit_2_label_sensor
+    entity_category: diagnostic
+    icon: mdi:label-outline
+    update_interval: 60s
+    lambda: return {"${circuit_2_name}"};
 
 # =============================================================================
 # BINARY SENSORS
@@ -1685,7 +1726,7 @@ binary_sensor:
   # ---------------------------------------------------------------------------
   - platform: template
     id: flow_pulse_onset_main
-    name: "Flow Pulse Onset - Main"
+    name: "Flow Pulse Onset - ${circuit_1_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_main_status
@@ -1700,7 +1741,7 @@ binary_sensor:
 
   - platform: template
     id: flow_pulse_onset_irr
-    name: "Flow Pulse Onset - Irrigation"
+    name: "Flow Pulse Onset - ${circuit_2_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_irr_status
@@ -1725,7 +1766,7 @@ binary_sensor:
   # ---------------------------------------------------------------------------
   - platform: template
     id: flow_indicator1
-    name: "Water Flowing - Main"
+    name: "Water Flowing - ${circuit_1_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_main_status
@@ -1734,7 +1775,7 @@ binary_sensor:
 
   - platform: template
     id: flow_indicator2
-    name: "Water Flowing - Irrigation"
+    name: "Water Flowing - ${circuit_2_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_irr_status
@@ -1747,7 +1788,7 @@ binary_sensor:
   # mobile push notifications.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Safety Fault - Main"
+    name: "Safety Fault - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 5
@@ -1755,7 +1796,7 @@ binary_sensor:
     device_class: problem
 
   - platform: template
-    name: "Safety Fault - Irrigation"
+    name: "Safety Fault - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 5
@@ -1764,7 +1805,7 @@ binary_sensor:
 
   # Indicates whether leak test mode is active on each circuit
   - platform: template
-    name: "Leak Test Active - Main"
+    name: "Leak Test Active - ${circuit_1_name}"
     entity_category: diagnostic
     device_class: running
     web_server:
@@ -1773,7 +1814,7 @@ binary_sensor:
     lambda: 'return id(leak_test_active_main) || id(leak_test_preparing_main);'
 
   - platform: template
-    name: "Leak Test Active - Irrigation"
+    name: "Leak Test Active - ${circuit_2_name}"
     entity_category: diagnostic
     device_class: running
     web_server:
@@ -1791,7 +1832,7 @@ binary_sensor:
   #   "Shut off"    — presses "Reset Trickle Alert" then calls valve.close
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Trickle Flow Alert - Main"
+    name: "Trickle Flow Alert - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 6
@@ -1799,7 +1840,7 @@ binary_sensor:
     device_class: problem
 
   - platform: template
-    name: "Trickle Flow Alert - Irrigation"
+    name: "Trickle Flow Alert - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 6
@@ -1814,7 +1855,7 @@ binary_sensor:
   # can drive mobile push notifications.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Valve Seal Alert - Main"
+    name: "Valve Seal Alert - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 85
@@ -1822,7 +1863,7 @@ binary_sensor:
     device_class: problem
 
   - platform: template
-    name: "Valve Seal Alert - Irrigation"
+    name: "Valve Seal Alert - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 85
@@ -1842,7 +1883,7 @@ binary_sensor:
         input: true
         pullup: true
     id: open_end_stop_valve1
-    name: "Open End Stop - Main"
+    name: "Open End Stop - ${circuit_1_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_main_status
@@ -1868,7 +1909,7 @@ binary_sensor:
         input: true
         pullup: true
     id: closed_end_stop_valve1
-    name: "Closed End Stop - Main"
+    name: "Closed End Stop - ${circuit_1_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_main_status
@@ -1900,7 +1941,7 @@ binary_sensor:
         input: true
         pullup: true
     id: open_end_stop_valve2
-    name: "Open End Stop - Irrigation"
+    name: "Open End Stop - ${circuit_2_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_irr_status
@@ -1923,7 +1964,7 @@ binary_sensor:
         input: true
         pullup: true
     id: closed_end_stop_valve2
-    name: "Closed End Stop - Irrigation"
+    name: "Closed End Stop - ${circuit_2_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_irr_status
@@ -1970,7 +2011,7 @@ number:
   # BURST PIPE HIGH FLOW THRESHOLD
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Burst Pipe Flow Threshold - Main"
+    name: "Burst Pipe Flow Threshold - ${circuit_1_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -1991,7 +2032,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Burst Pipe Flow Threshold - Irrigation"
+    name: "Burst Pipe Flow Threshold - ${circuit_2_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -2029,7 +2070,7 @@ number:
   #     normal demand events.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Pressure Drop Threshold - Main"
+    name: "Pressure Drop Threshold - ${circuit_1_name}"
     entity_category: config
     device_class: pressure
     web_server:
@@ -2050,7 +2091,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Pressure Drop Threshold - Irrigation"
+    name: "Pressure Drop Threshold - ${circuit_2_name}"
     entity_category: config
     device_class: pressure
     web_server:
@@ -2074,7 +2115,7 @@ number:
   # LEAK TEST PRESSURE THRESHOLD AND DURATION
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Leak Test Pressure Threshold - Main"
+    name: "Leak Test Pressure Threshold - ${circuit_1_name}"
     entity_category: config
     device_class: pressure
     web_server:
@@ -2095,7 +2136,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Leak Test Pressure Threshold - Irrigation"
+    name: "Leak Test Pressure Threshold - ${circuit_2_name}"
     entity_category: config
     device_class: pressure
     web_server:
@@ -2116,7 +2157,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Leak Test Duration - Main"
+    name: "Leak Test Duration - ${circuit_1_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_main_settings
@@ -2136,7 +2177,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Leak Test Duration - Irrigation"
+    name: "Leak Test Duration - ${circuit_2_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_irr_settings
@@ -2182,7 +2223,7 @@ number:
   #   Toilet cistern refilling:       ~0.5–2.0 L/min for 1–2 minutes then stops
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Trickle Flow Min Threshold - Main"
+    name: "Trickle Flow Min Threshold - ${circuit_1_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -2203,7 +2244,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Trickle Flow Max Threshold - Main"
+    name: "Trickle Flow Max Threshold - ${circuit_1_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -2224,7 +2265,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Trickle Flow Alert Duration - Main"
+    name: "Trickle Flow Alert Duration - ${circuit_1_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_main_settings
@@ -2255,7 +2296,7 @@ number:
   # above 0.1 L/min, raise this threshold above the observed bleed rate.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Trickle Flow Min Threshold - Irrigation"
+    name: "Trickle Flow Min Threshold - ${circuit_2_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -2276,7 +2317,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Trickle Flow Max Threshold - Irrigation"
+    name: "Trickle Flow Max Threshold - ${circuit_2_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -2297,7 +2338,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Trickle Flow Alert Duration - Irrigation"
+    name: "Trickle Flow Alert Duration - ${circuit_2_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_irr_settings
@@ -2389,7 +2430,7 @@ switch:
   # The lambda shows ON during both the prepare and active phases.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Micro Leak Test - Main"
+    name: "Micro Leak Test - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 13
@@ -2414,7 +2455,7 @@ switch:
   # Same as main — see main comments above for full usage instructions.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Micro Leak Test - Irrigation"
+    name: "Micro Leak Test - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 13
@@ -2442,7 +2483,7 @@ switch:
   # context. All default to ON. State persists across reboots.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Enable Pressure Drop Alert - Main"
+    name: "Enable Pressure Drop Alert - ${circuit_1_name}"
     entity_category: config
     id: enable_pressure_drop_main
     icon: mdi:gauge-low
@@ -2456,7 +2497,7 @@ switch:
       - lambda: 'id(alert_pressure_drop_main) = false;'
 
   - platform: template
-    name: "Enable High Flow Alert - Main"
+    name: "Enable High Flow Alert - ${circuit_1_name}"
     entity_category: config
     id: enable_high_flow_main
     icon: mdi:water-alert
@@ -2470,7 +2511,7 @@ switch:
       - lambda: 'id(alert_high_flow_main) = false;'
 
   - platform: template
-    name: "Enable Leak Test Alert - Main"
+    name: "Enable Leak Test Alert - ${circuit_1_name}"
     entity_category: config
     id: enable_leak_test_main
     icon: mdi:water-check
@@ -2484,7 +2525,7 @@ switch:
       - lambda: 'id(alert_leak_test_main) = false;'
 
   - platform: template
-    name: "Enable Trickle Alert - Main"
+    name: "Enable Trickle Alert - ${circuit_1_name}"
     entity_category: config
     id: enable_trickle_main
     icon: mdi:water-minus
@@ -2498,7 +2539,7 @@ switch:
       - lambda: 'id(alert_trickle_main) = false;'
 
   - platform: template
-    name: "Enable Pressure Drop Alert - Irrigation"
+    name: "Enable Pressure Drop Alert - ${circuit_2_name}"
     entity_category: config
     id: enable_pressure_drop_irr
     icon: mdi:gauge-low
@@ -2512,7 +2553,7 @@ switch:
       - lambda: 'id(alert_pressure_drop_irr) = false;'
 
   - platform: template
-    name: "Enable High Flow Alert - Irrigation"
+    name: "Enable High Flow Alert - ${circuit_2_name}"
     entity_category: config
     id: enable_high_flow_irr
     icon: mdi:water-alert
@@ -2526,7 +2567,7 @@ switch:
       - lambda: 'id(alert_high_flow_irr) = false;'
 
   - platform: template
-    name: "Enable Leak Test Alert - Irrigation"
+    name: "Enable Leak Test Alert - ${circuit_2_name}"
     entity_category: config
     id: enable_leak_test_irr
     icon: mdi:water-check
@@ -2540,7 +2581,7 @@ switch:
       - lambda: 'id(alert_leak_test_irr) = false;'
 
   - platform: template
-    name: "Enable Trickle Alert - Irrigation"
+    name: "Enable Trickle Alert - ${circuit_2_name}"
     entity_category: config
     id: enable_trickle_irr
     icon: mdi:water-minus
@@ -2568,7 +2609,7 @@ switch:
   # reboots — set it once and it is remembered.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Trickle Flow Auto-Shutoff - Main"
+    name: "Trickle Flow Auto-Shutoff - ${circuit_1_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_main_settings
@@ -2593,7 +2634,7 @@ switch:
   # above your normal irrigation zone flow rates to avoid false shutoffs.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Trickle Flow Auto-Shutoff - Irrigation"
+    name: "Trickle Flow Auto-Shutoff - ${circuit_2_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_irr_settings
@@ -2633,7 +2674,7 @@ switch:
 # =============================================================================
 button:
   - platform: template
-    name: "Reset Safety Fault - Main"
+    name: "Reset Safety Fault - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 11
@@ -2646,7 +2687,7 @@ button:
       - logger.log: "Main safety fault manually reset"
 
   - platform: template
-    name: "Reset Safety Fault - Irrigation"
+    name: "Reset Safety Fault - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 11
@@ -2659,7 +2700,7 @@ button:
       - logger.log: "Irrigation safety fault manually reset"
 
   - platform: template
-    name: "Reset Trickle Alert - Main"
+    name: "Reset Trickle Alert - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 12
@@ -2671,7 +2712,7 @@ button:
           ESP_LOGI("trickle", "Main trickle flow alert manually reset");
 
   - platform: template
-    name: "Reset Trickle Alert - Irrigation"
+    name: "Reset Trickle Alert - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 12
@@ -2893,7 +2934,7 @@ script:
 # =============================================================================
 valve:
   - platform: template
-    name: "Main Water Valve"
+    name: "${circuit_1_name} Water Valve"
     device_class: water
     web_server:
       sorting_group_id: group_main_status
@@ -2983,7 +3024,7 @@ valve:
                       ESP_LOGE("valve", "MAIN: closed end stop not reached after 15000ms — motor/wiring fault");
 
   - platform: template
-    name: "Irrigation Water Valve"
+    name: "${circuit_2_name} Water Valve"
     device_class: water
     web_server:
       sorting_group_id: group_irr_status

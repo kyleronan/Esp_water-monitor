@@ -15,8 +15,10 @@ The current schema version is stored in a simple key-value table.
 from __future__ import annotations
 
 import logging
+import shutil
 import sqlite3
-from typing import Callable, List, Tuple
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -668,6 +670,136 @@ def _migrate_022(conn: sqlite3.Connection) -> None:
     log.info("Migration 022: added fw_version to device_config")
 
 
+def _backup_before_migration_023(db_path: Optional[Path]) -> None:
+    """
+    Copy the database before the destructive circuit rename migration.
+    Uses a timestamped filename so existing backups are never overwritten.
+    Raises RuntimeError (and aborts the migration) if the copy fails,
+    except when db_path is None (in-memory / test databases).
+    """
+    if db_path is None:
+        return   # in-memory / test DB — skip backup
+
+    from datetime import datetime
+    ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    dest = db_path.parent / f"{db_path.stem}.pre_circuit_refactor_{ts}.db"
+
+    if dest.exists():
+        log.warning("Migration 023: backup already exists at %s — skipping copy", dest)
+        return
+
+    try:
+        shutil.copy2(db_path, dest)
+        log.info("Migration 023: pre-migration DB backed up to %s", dest)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Migration 023: could not create pre-migration backup at {dest}: {exc}. "
+            "Resolve the disk/permissions issue and restart the addon."
+        ) from exc
+
+
+def _migrate_023(conn: sqlite3.Connection) -> None:
+    """
+    Circuit ID refactor — rename 'main'/'irrigation' to 'circuit_1'/'circuit_2'.
+
+    Creates:
+      circuit_labels (circuit_id, display_name) — user-facing display names per circuit
+
+    Renames circuit values in all tables that store them, including both active
+    config/mapping tables and historical data tables.
+
+    All UPDATE statements are idempotent: WHERE circuit IN ('main','irrigation')
+    is a no-op on rows that are already renamed.
+
+    Optional tables (may not exist in all installs) are guarded with _has_table().
+    """
+    # Create the labels table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS circuit_labels (
+            circuit_id   TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "INSERT OR IGNORE INTO circuit_labels (circuit_id, display_name) VALUES (?, ?)",
+        ("circuit_1", "Main"),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO circuit_labels (circuit_id, display_name) VALUES (?, ?)",
+        ("circuit_2", "Irrigation"),
+    )
+
+    # ── Active config / mapping tables ──────────────────────────────────────
+    for tbl in (
+        "circuit_entity_map",
+        "circuit_profile",
+        "training_state",
+        "learning_config",
+        "sensitivity_config",
+        "alert_config",
+        "leak_test_schedule",
+        "circuit_exclusion_windows",
+    ):
+        conn.execute(f"UPDATE {tbl} SET circuit = 'circuit_1' WHERE circuit = 'main'")
+        conn.execute(f"UPDATE {tbl} SET circuit = 'circuit_2' WHERE circuit = 'irrigation'")
+
+    # ── Historical tables ────────────────────────────────────────────────────
+    for tbl in (
+        "events",
+        "hourly_volume",
+        "daily_summary",
+        "fixtures",
+        "fixture_clusters",
+        "fixture_daily_summary",
+        "volume_snapshots",
+        "cluster_cooccurrence",
+        "cluster_metrics_history",
+        "import_state",
+    ):
+        if _has_table(conn, tbl):
+            conn.execute(f"UPDATE {tbl} SET circuit = 'circuit_1' WHERE circuit = 'main'")
+            conn.execute(f"UPDATE {tbl} SET circuit = 'circuit_2' WHERE circuit = 'irrigation'")
+
+    # ── Optional / version-dependent tables ─────────────────────────────────
+    for tbl in ("leak_test_history", "zone_schedules_v2"):
+        if _has_table(conn, tbl):
+            conn.execute(f"UPDATE {tbl} SET circuit = 'circuit_1' WHERE circuit = 'main'")
+            conn.execute(f"UPDATE {tbl} SET circuit = 'circuit_2' WHERE circuit = 'irrigation'")
+
+    log.info("Migration 023: renamed 'main'→'circuit_1', 'irrigation'→'circuit_2' in all tables")
+
+
+def _verify_migration_023(conn: sqlite3.Connection) -> None:
+    """
+    Post-migration sanity check for migration 023.
+    Logs errors (but does not raise) for any stale legacy values remaining
+    in active config tables, or if circuit_labels is not fully seeded.
+    """
+    active_tables = [
+        "circuit_entity_map", "circuit_profile", "training_state",
+        "learning_config", "sensitivity_config", "alert_config",
+        "leak_test_schedule", "circuit_exclusion_windows",
+    ]
+    for tbl in active_tables:
+        if not _has_table(conn, tbl):
+            continue
+        count = conn.execute(
+            f"SELECT COUNT(*) FROM {tbl} WHERE circuit IN ('main', 'irrigation')"
+        ).fetchone()[0]
+        if count > 0:
+            log.error(
+                "Migration 023 sanity: %d stale legacy circuit row(s) remain in %s",
+                count, tbl,
+            )
+
+    label_count = conn.execute("SELECT COUNT(*) FROM circuit_labels").fetchone()[0]
+    if label_count < 2:
+        log.error(
+            "Migration 023 sanity: circuit_labels has only %d row(s); expected 2",
+            label_count,
+        )
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -691,12 +823,19 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (20, _migrate_020),
     (21, _migrate_021),
     (22, _migrate_022),
+    (23, _migrate_023),
 ]
 
 
-def run_migrations(conn: sqlite3.Connection) -> None:
+def run_migrations(
+    conn: sqlite3.Connection,
+    db_path: Optional[Path] = None,
+) -> None:
     """
     Apply all pending migrations in order. Called once at startup.
+
+    db_path is used for the pre-migration-023 backup. Pass None for
+    in-memory / test databases (backup is silently skipped).
     """
     current = _get_version(conn)
     pending  = [(v, fn) for v, fn in MIGRATIONS if v > current]
@@ -709,11 +848,19 @@ def run_migrations(conn: sqlite3.Connection) -> None:
              len(pending), current)
 
     for version, fn in pending:
+        # Backup the database before the destructive circuit rename migration
+        if version == 23:
+            _backup_before_migration_023(db_path)
+
         try:
             fn(conn)
             conn.commit()
             _set_version(conn, version)
             log.info("Migration %03d applied", version)
+
+            # Post-migration sanity check for 023
+            if version == 23:
+                _verify_migration_023(conn)
         except Exception as e:
             log.error("Migration %03d failed: %s", version, e, exc_info=True)
             raise

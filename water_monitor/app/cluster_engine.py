@@ -337,7 +337,7 @@ class ClusterEngine:
             "SELECT circuit_type FROM circuit_profile WHERE circuit = ?",
             (circuit,)
         ).fetchone()
-        circuit_type = ct_row["circuit_type"] if ct_row else "main"
+        circuit_type = ct_row["circuit_type"] if ct_row else "fixture"
         try:
             from .fixtures import suggest_fixture_type
             suggested_type, confidence = suggest_fixture_type(centroid, circuit_type)

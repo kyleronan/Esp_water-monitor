@@ -20,6 +20,10 @@ class CircuitConfig:
     circuit: str
     circuit_type: str   # 'fixture' or 'zone'
 
+    # User-facing display label — loaded at runtime from circuit_labels table.
+    # Empty string means not yet loaded; use .label property to read safely.
+    display_name: str = ""
+
     # Entity IDs — populated at runtime from device_discovery / circuit_entity_map.
     # Empty string means not yet discovered.
     flow_sensor: str = ""
@@ -43,8 +47,14 @@ class CircuitConfig:
         return self.circuit_type == "zone"
 
     @property
-    def display_name(self) -> str:
-        return self.circuit.replace("_", " ").title()
+    def label(self) -> str:
+        """Human-readable name — stored display_name value, or fallback from circuit ID."""
+        return self.display_name or self.circuit.replace("_", " ").title()
+
+    @property
+    def display_label(self) -> str:
+        """Temporary compat alias for label — remove after one release."""
+        return self.label
 
     @property
     def is_fully_configured(self) -> bool:
@@ -84,8 +94,8 @@ def load_config() -> AddonConfig:
     # Default circuits if none configured
     if not circuits:
         circuits = [
-            CircuitConfig(circuit="main", circuit_type="fixture"),
-            CircuitConfig(circuit="irrigation", circuit_type="zone"),
+            CircuitConfig(circuit="circuit_1", circuit_type="fixture"),
+            CircuitConfig(circuit="circuit_2", circuit_type="zone"),
         ]
 
     return AddonConfig(

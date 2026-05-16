@@ -1594,3 +1594,36 @@ def extend_exclusion_window(conn, circuit: str, extra_minutes: int = 15) -> None
     conn.commit()
 
 
+# ------------------------------------------------------------------
+# Circuit label helpers (circuit_1 / circuit_2 display names)
+# ------------------------------------------------------------------
+
+def load_circuit_labels(db: sqlite3.Connection) -> Dict[str, str]:
+    """Return {circuit_id: display_name} for all configured circuits."""
+    try:
+        rows = db.execute(
+            "SELECT circuit_id, display_name FROM circuit_labels"
+        ).fetchall()
+        return {row["circuit_id"]: row["display_name"] for row in rows}
+    except sqlite3.OperationalError:
+        # Table does not exist yet (pre-migration-023 DB); return empty dict.
+        log.debug("circuit_labels table not found — migration 023 not yet applied")
+        return {}
+
+
+def upsert_circuit_label(
+    db: sqlite3.Connection,
+    circuit_id: str,
+    display_name: str,
+) -> None:
+    """Insert or update the display name for a circuit ID."""
+    with db:
+        db.execute(
+            """
+            INSERT INTO circuit_labels (circuit_id, display_name) VALUES (?, ?)
+            ON CONFLICT(circuit_id) DO UPDATE SET display_name = excluded.display_name
+            """,
+            (circuit_id, display_name.strip()),
+        )
+
+

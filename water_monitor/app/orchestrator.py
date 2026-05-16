@@ -231,6 +231,21 @@ class Orchestrator:
             log.debug("[%s] entity IDs loaded from DB — fully_configured=%s",
                       circuit_cfg.circuit, circuit_cfg.is_fully_configured)
 
+    def reload_circuit_labels(self) -> None:
+        """
+        Re-load circuit display names from circuit_labels into the live
+        CircuitConfig objects. Called on startup, after setup wizard
+        naming step, after settings rename, and after backup restore.
+        """
+        if not self._db:
+            return
+        from .database import load_circuit_labels
+        labels = load_circuit_labels(self._db)
+        for circuit_cfg in self._cfg.circuits:
+            circuit_cfg.display_name = labels.get(circuit_cfg.circuit, "")
+            log.debug("[%s] display_name loaded: %r",
+                      circuit_cfg.circuit, circuit_cfg.display_name)
+
     def stop(self) -> None:
         self._stop.set()
         if self._feature_extractor:
@@ -258,8 +273,9 @@ class Orchestrator:
         self._ha = HaClient()
         await self._ha.__aenter__()
 
-        # Load entity IDs from DB into circuit configs
+        # Load entity IDs and display labels from DB into circuit configs
         self.reload_circuit_entities()
+        self.reload_circuit_labels()
 
         # Event queue
         self._event_queue = asyncio.Queue(maxsize=1000)
@@ -639,7 +655,7 @@ class Orchestrator:
         return {
             "circuit": circuit,
             "circuit_type": circuit_cfg.circuit_type,
-            "display_name": circuit_cfg.display_name,
+            "display_name": circuit_cfg.label,
             "valve_state": states.get(circuit_cfg.valve_entity, "unknown"),
             "pressure": _fmt_sensor(
                 states.get(circuit_cfg.pressure_history_sensor)

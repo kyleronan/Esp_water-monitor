@@ -146,6 +146,32 @@
       </div>
       <p class="sett-section-desc">Circuit-specific detection and alert settings.</p>
 
+      {# Circuit rename #}
+      <div class="sett-card">
+        <h3 class="sett-card-title">Circuit name</h3>
+        <p class="sett-card-desc">
+          Change the display name shown in the dashboard for this circuit.
+          Internal ID (<code>{{ c.circuit }}</code>) is never changed.
+        </p>
+        <form method="post"
+              action="{{ ingress_path }}/settings/circuit/{{ c.circuit }}/rename"
+              class="sett-form-inline">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <div class="sett-form-group" style="flex:1">
+            <label for="rename_{{ c.circuit }}">Display name</label>
+            <input type="text"
+                   id="rename_{{ c.circuit }}"
+                   name="display_name"
+                   value="{{ c.display_name }}"
+                   maxlength="40"
+                   class="form-control">
+          </div>
+          <button type="submit" class="btn btn-secondary btn-sm" style="align-self:flex-end">
+            Rename
+          </button>
+        </form>
+      </div>
+
       {# Recalibration #}
       <div class="sett-card">
         <h3 class="sett-card-title">Recalibration</h3>
