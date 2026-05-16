@@ -1171,6 +1171,38 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   margin-bottom: 20px; color: var(--text);
 }
 
+/* Summary strip */
+.hist-summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.hist-summary-item {
+  flex: 1 1 120px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  box-shadow: var(--shadow);
+}
+.hist-summary-label {
+  display: block;
+  font-size: .72rem;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--text-muted, oklch(62% .014 240));
+  margin-bottom: 4px;
+}
+.hist-summary-value {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--text);
+}
+.hist-summary-pass { color: var(--green, oklch(55% .18 145)); }
+.hist-summary-fail { color: var(--red,   oklch(55% .22 25)); }
+
 /* Shared card shell for all history sections */
 .hist-card {
   background: var(--surface);
@@ -1647,6 +1679,14 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .setup-step-actions {
   display: flex; gap: 8px; margin-top: 16px;
 }
+.setup-circuit-id {
+  display: block;
+  font-size: .75rem;
+  font-weight: 400;
+  color: var(--text-muted, oklch(62% .014 240));
+  font-family: var(--font-mono, "JetBrains Mono", monospace);
+  margin-top: 2px;
+}
 
 /* ============================================================
    SETTINGS PAGE — design refresh page 7/7
@@ -2059,6 +2099,8 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .fx-card-icon  { font-size: 22px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
 .fx-card-title { font-size: 14px; font-weight: 600; color: var(--text); line-height: 1.3; }
 .fx-card-sub   { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.fx-needs-review-label { color: var(--amber, oklch(72% .18 80)); font-weight: 600; }
+.fx-not-enough-label   { color: var(--text-muted, oklch(62% .014 240)); font-style: italic; }
 
 /* Stats row */
 .fx-stats {
@@ -2172,6 +2214,23 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
     to   { opacity: 0; transform: translateX(20px); }
   }
 }
+
+/* ── Dashboard circuit status line ───────────────────────────── */
+.dash-status-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 6px 0 2px;
+}
+.dash-status-icon { font-size: 9px; flex-shrink: 0; line-height: 1; }
+
+.dash-status-fault    { color: var(--red-text);          }
+.dash-status-alert    { color: var(--amber-text);        }
+.dash-status-closed   { color: var(--text-3);            }
+.dash-status-learning { color: oklch(35% .14 240);       }
+.dash-status-normal   { color: var(--green-text);        }
 
 /* ── Settings Basic/Advanced mode ─────────────────────────────── */
 .sett-layout[data-sett-mode="basic"] .sett-nav-adv     { display: none !important; }

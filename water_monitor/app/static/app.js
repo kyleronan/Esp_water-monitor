@@ -88,6 +88,40 @@ function applyLiveState(circuit, state) {
     f.textContent = isNaN(v) ? '0.00' : v.toFixed(window.UNITS.flow_decimals);
   }
 
+  // Primary status line — derives from live state priority order
+  const statusEl = document.getElementById(`status-line-${circuit}`);
+  if (statusEl) {
+    const training = state.training || {};
+    const vs = (state.valve_state || '').toLowerCase();
+    let statusClass, iconText, statusText;
+    if (state.fault_active) {
+      statusClass = 'dash-status-fault';
+      iconText    = '●';
+      statusText  = 'Fault · Valve closed · Manual reset required';
+    } else if (state.trickle_active) {
+      statusClass = 'dash-status-alert';
+      iconText    = '●';
+      statusText  = 'Attention needed · Trickle flow detected · Valve closed';
+    } else if (vs !== 'open') {
+      statusClass = 'dash-status-closed';
+      iconText    = '○';
+      statusText  = 'Valve closed · No active alerts';
+    } else if (training.state === 'calibrating') {
+      statusClass = 'dash-status-learning';
+      iconText    = '●';
+      statusText  = 'Learning · Valve open · Monitoring active';
+    } else {
+      statusClass = 'dash-status-normal';
+      iconText    = '●';
+      statusText  = 'Normal · Valve open · No active alerts';
+    }
+    statusEl.className = `dash-status-line ${statusClass}`;
+    const icon = statusEl.querySelector('.dash-status-icon');
+    const text = statusEl.querySelector('.dash-status-text');
+    if (icon) icon.textContent = iconText;
+    if (text) text.textContent = statusText;
+  }
+
   // Leak test ETC — update data attrs if newly available, then restart countdown
   const etc = document.getElementById(`etc-${circuit}`);
   if (etc && state.leak_test_active && state.leak_test_started_at) {

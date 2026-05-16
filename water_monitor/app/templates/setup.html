@@ -309,7 +309,10 @@
   <form method="post" action="{{ ingress_path }}/setup/circuit-names">
     {% for c in circuits %}
     <div class="form-group">
-      <label for="label_{{ c.circuit }}">{{ c.circuit.replace('_', ' ').title() }} display name</label>
+      <label for="label_{{ c.circuit }}">
+        {{ c.display_name or (c.circuit | replace('_', ' ') | title) }}
+        <span class="setup-circuit-id">Internal ID: {{ c.circuit }}</span>
+      </label>
       <input
         type="text"
         id="label_{{ c.circuit }}"
