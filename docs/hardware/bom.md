@@ -54,11 +54,8 @@ This is the simplified builder-facing BOM for the PCB and related hardware.
 
 ## Enclosure and field hardware
 
-# Field Hardware
 
-This page documents non-PCB hardware used in the system build.
-
-## Pressure sensor
+### Pressure sensor
 
 - Supplier: Amazon
 - ASIN: `B0CFJ7BN3L` https://www.amazon.com/dp/B0CFJ7BN3L
@@ -69,7 +66,7 @@ This page documents non-PCB hardware used in the system build.
 - Material: 316 stainless steel
 - Listed waterproof rating: IP65
 
-### Pressure sensor wiring
+#### Pressure sensor wiring
 
 | Wire color | Function |
 | --- | --- |
@@ -79,14 +76,14 @@ This page documents non-PCB hardware used in the system build.
 
 Pressure sensors are powered from 5 V. The sense output is scaled by a resistor divider before reaching the ESP32 ADC input.
 
-## Flow sensor
+### Flow sensor
 
 - Supplier: AliExpress
 - Item: `3256804293371927` https://www.aliexpress.us/item/3256804293371927.html
 - Selected version: 5 V version
 - Used from the PCB 3.3 V supply because the sensor works down to 3.3 V
 
-### Flow sensor wiring
+#### Flow sensor wiring
 
 | Wire color | Function |
 | --- | --- |
@@ -96,7 +93,7 @@ Pressure sensors are powered from 5 V. The sense output is scaled by a resistor 
 
 The flow sensor pulse output connects directly to the ESP32 GPIO input. No voltage divider or extra signal conditioning is needed because the sensor is powered from 3.3 V.
 
-## Valve
+### Valve
 
 - Ball valve item: AliExpress `3256803975349392`https://www.aliexpress.us/item/3256803975349392.html
 - Valve motor item: AliExpress `3256804718502721`https://www.aliexpress.us/item/3256804718502721.html
@@ -109,7 +106,7 @@ The flow sensor pulse output connects directly to the ESP32 GPIO input. No volta
 
 Verify local plumbing requirements and potable-water suitability before installation.
 
-## Enclosure
+### Enclosure
 
 - Supplier: Amazon
 - ASIN: `B0CSJXTLGZ` https://www.amazon.com/dp/B0CSJXTLGZ
@@ -119,7 +116,7 @@ Verify local plumbing requirements and potable-water suitability before installa
 - Cable glands: TE Connectivity ENTRELEC `1SNG601161R0000`
 - 12 V DIN rail power supply: Ideal Power `56YSD60S-1204500`
 
-## Panel accessories
+### Panel accessories
 
 | Qty | Part | Description |
 | ---: | --- | --- |
@@ -128,7 +125,7 @@ Verify local plumbing requirements and potable-water suitability before installa
 
 Quick-disconnect terminals are used for the external panel LED wiring.
 
-## DIN rail power supply
+### DIN rail power supply
 
 The build uses an Ideal Power `56YSD60S-1204500` 12 V DIN rail power supply.
 
