@@ -84,10 +84,11 @@ def load_config() -> AddonConfig:
         with OPTIONS_PATH.open() as f:
             raw = json.load(f)
 
+    from .circuit_compat import resolve_circuit
     circuits = []
     for c in raw.get("circuits", []):
         circuits.append(CircuitConfig(
-            circuit=c["circuit"],
+            circuit=resolve_circuit(c["circuit"]),
             circuit_type=c.get("circuit_type", "fixture"),
         ))
 
