@@ -820,11 +820,13 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--accent);
   flex-shrink: 0;
-  animation: leak-pulse 1.6s ease-in-out infinite;
 }
-@keyframes leak-pulse {
-  0%, 100% { box-shadow: 0 0 0 3px var(--accent-bg2); }
-  50%      { box-shadow: 0 0 0 5px var(--accent-bg); }
+@media (prefers-reduced-motion: no-preference) {
+  .leak-running-dot { animation: leak-pulse 1.6s ease-in-out infinite; }
+  @keyframes leak-pulse {
+    0%, 100% { box-shadow: 0 0 0 3px var(--accent-bg2); }
+    50%      { box-shadow: 0 0 0 5px var(--accent-bg); }
+  }
 }
 .leak-running-label {
   font-size: 12px; font-weight: 600;
@@ -862,7 +864,9 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   height: 100%;
   background: var(--accent);
   border-radius: 999px;
-  transition: width .4s ease;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .dash-training-fill { transition: width .4s ease; }
 }
 
 /* 24-hour bar chart card ────────────────────────────────────────── */
@@ -1367,6 +1371,11 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   font-size: 12.5px; color: var(--text-3);
 }
 .bk-db-size strong { color: var(--text-2); }
+.bk-last-backup {
+  font-size: 12.5px; color: var(--text-3);
+  margin-bottom: 16px;
+}
+.bk-last-backup strong { color: var(--text-2); }
 
 /* Tier card — shared base */
 .bk-tier {
