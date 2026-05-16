@@ -800,6 +800,61 @@ def _verify_migration_023(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_024(conn: sqlite3.Connection) -> None:
+    """
+    Sync /data/options.json circuit IDs to match the DB rename from migration 023.
+
+    Migration 023 renamed DB records 'main'→'circuit_1', 'irrigation'→'circuit_2'
+    but did not update /data/options.json.  The orchestrator reads its circuit IDs
+    from that file on every startup, so it was still loading 'main'/'irrigation'
+    while resolve_circuit() was translating them to 'circuit_1'/'circuit_2',
+    causing an "Unknown circuit" error on every device action.
+
+    Idempotent: circuits already using 'circuit_1'/'circuit_2' are left unchanged.
+    Graceful: a missing or unreadable options file is logged but does not fail.
+    """
+    import json
+    from .config import OPTIONS_PATH
+
+    _RENAMES = {"main": "circuit_1", "irrigation": "circuit_2"}
+
+    if not OPTIONS_PATH.exists():
+        log.info("Migration 024: %s not found — skipping options patch", OPTIONS_PATH)
+        return
+
+    try:
+        with OPTIONS_PATH.open() as f:
+            options = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("Migration 024: could not read %s: %s — skipping", OPTIONS_PATH, exc)
+        return
+
+    circuits = options.get("circuits", [])
+    changed = 0
+    for c in circuits:
+        new_id = _RENAMES.get(c.get("circuit", ""))
+        if new_id:
+            c["circuit"] = new_id
+            changed += 1
+
+    if changed == 0:
+        log.info("Migration 024: options.json circuit IDs already up to date")
+        return
+
+    try:
+        tmp = OPTIONS_PATH.with_suffix(".json.tmp")
+        with tmp.open("w") as f:
+            json.dump(options, f, indent=2)
+        tmp.replace(OPTIONS_PATH)
+        log.info("Migration 024: patched %d circuit ID(s) in %s", changed, OPTIONS_PATH)
+    except OSError as exc:
+        log.warning(
+            "Migration 024: could not write %s: %s — "
+            "circuit IDs may still be stale; restart after resolving disk/permission issue",
+            OPTIONS_PATH, exc,
+        )
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -824,6 +879,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (21, _migrate_021),
     (22, _migrate_022),
     (23, _migrate_023),
+    (24, _migrate_024),
 ]
 
 
