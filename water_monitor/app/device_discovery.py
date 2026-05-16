@@ -280,19 +280,72 @@ def find_matching_devices(
     return None, suggestions
 
 
+async def _resolve_labels_from_diagnostics(
+    ha,
+    entity_registry_entities: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Fetch live circuit display labels from v3.6+ diagnostic text sensors.
+
+    Looks up "Circuit N Label" sensors by original_name in the entity registry
+    (metadata-first — never guesses entity_ids), then fetches their live state
+    from HA.  Returns {circuit_id: label_string}, e.g. {"circuit_1": "Zone A"}.
+    Returns an empty dict when no diagnostic sensors are present (older firmware).
+    """
+    labels: Dict[str, str] = {}
+    for entity in entity_registry_entities:
+        name = (entity.get("original_name") or "").lower()
+        if not re.search(r"circuit [12] label", name):
+            continue
+        state = await ha.get_state_value(entity["entity_id"], None)
+        if not state:
+            continue
+        n = re.search(r"circuit (\d+)", name)
+        if n:
+            labels[f"circuit_{n.group(1)}"] = state
+    if labels:
+        log.info("Diagnostic circuit labels resolved: %s", labels)
+    return labels
+
+
+def _make_label_pattern(base_pattern: str, circuit: str, label: str) -> Optional[str]:
+    """Return a variant of *base_pattern* with the default firmware keyword
+    replaced by *re.escape(label)*, or None if the keyword is not in the pattern.
+
+    circuit_1 patterns contain "main"; circuit_2 patterns contain "irrigation".
+    The _irr\\b entity-id suffix alternatives in circuit_2 patterns are left
+    unchanged so entity_id fallback matching still works.
+    """
+    keyword = "main" if circuit == "circuit_1" else "irrigation"
+    if keyword not in base_pattern:
+        return None
+    escaped = re.escape(label)
+    return base_pattern.replace(f".*{keyword}", f".*{escaped}").replace(keyword, escaped)
+
+
 def match_entities_to_roles(
     device_id: str,
     entities: List[Dict[str, Any]],
     circuits: List[str],
+    labels: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, List[EntityMatch]], str]:
-    """
-    Match entities belonging to device_id to circuit roles.
+    """Match entities belonging to device_id to circuit roles.
+
+    *labels* — optional dict of {circuit_id: display_label} from
+    :func:`_resolve_labels_from_diagnostics`.  When provided, matching uses
+    three ordered tiers per role:
+
+    1. Escaped diagnostic label against ``original_name`` (handles user-renamed
+       circuits — ``re.escape`` is applied because labels are user-controlled).
+    2. Hardcoded display-name terms ("main" / "irrigation") in ``original_name``.
+    3. Entity object_id / entity_id suffix fallback (``_main`` / ``_irr\\b``).
+
+    Tiers 2 and 3 are already encoded in the ROLE_PATTERNS regexes; tier 1 is
+    attempted first by substituting the escaped label into the pattern.
 
     Returns:
         (circuit_matches, esp_device_prefix)
-        circuit_matches: dict of circuit → list of EntityMatch
-        esp_device_prefix: the common prefix derived from entity IDs
     """
+    labels = labels or {}
     # Filter to entities belonging to this device
     device_entities = [e for e in entities if e.get("device_id") == device_id]
 
@@ -308,11 +361,22 @@ def match_entities_to_roles(
 
     for circuit in circuits:
         patterns = ROLE_PATTERNS.get(circuit, {})
+        circuit_label = labels.get(circuit)
         matches = []
 
         for role, (pattern, expected_domain) in patterns.items():
-            match = _find_entity_for_role(
-                device_entities, pattern, expected_domain)
+            match = None
+
+            # Tier 1: escaped diagnostic label (non-default firmware names)
+            if circuit_label:
+                lp = _make_label_pattern(pattern, circuit, circuit_label)
+                if lp:
+                    match = _find_entity_for_role(device_entities, lp, expected_domain)
+
+            # Tiers 2+3: hardcoded "main"/"irrigation" display term + _irr\b suffix
+            if not match:
+                match = _find_entity_for_role(device_entities, pattern, expected_domain)
+
             if match:
                 entity_id = match["entity_id"]
                 name = match.get("original_name") or match.get("name") or ""
