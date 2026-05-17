@@ -148,9 +148,7 @@ esp32:
 
 logger:      # Enable serial logging for debugging
 
-api:
-  encryption:
-    key: !secret api_encryption_key   # Generate: python3 -c "import base64,os; print(base64.b64encode(os.urandom(32)).decode())"
+api:         # Encryption disabled for now — re-add an `encryption:` block before release
 
 ota:         # Enable over-the-air firmware updates
   - platform: esphome
