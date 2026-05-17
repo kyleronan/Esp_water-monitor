@@ -105,6 +105,22 @@ esphome:
       # Note: if neither end stop is active on boot, state stays unknown
       # in HA until the next valve movement completes.
 
+      # --- Publish persisted fault state ---
+      # fault_main/fault_irrigation survive reboots (restore_value: yes).
+      # fault_reason strings cannot be restored; publish a generic message
+      # so HA shows the fault is active and why a reset is required.
+      - lambda: |-
+          if (id(fault_main)) {
+            if (id(fault_reason_main_str).empty())
+              id(fault_reason_main_str) = "Fault persisted across reboot — manual reset required";
+            id(fault_reason_main).publish_state(id(fault_reason_main_str));
+          }
+          if (id(fault_irrigation)) {
+            if (id(fault_reason_irr_str).empty())
+              id(fault_reason_irr_str) = "Fault persisted across reboot — manual reset required";
+            id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+          }
+
       # --- Valve 2 (Irrigation) ---
       - if:
           condition:
@@ -132,22 +148,27 @@ esp32:
 
 logger:      # Enable serial logging for debugging
 
-api:         # Enable Home Assistant native API integration
+api:
+  encryption:
+    key: !secret api_encryption_key   # Generate: python3 -c "import base64,os; print(base64.b64encode(os.urandom(32)).decode())"
 
 ota:         # Enable over-the-air firmware updates
   - platform: esphome
+    password: !secret ota_password
 
 improv_serial:   # Allows Wi-Fi provisioning via USB serial on first setup
 
 wifi:
-  ap: {}     # Create a fallback Wi-Fi access point if no credentials are stored
-             # Used with captive_portal below to provision Wi-Fi credentials
+  ap:
+    password: !secret fallback_ap_password   # Fallback hotspot — set in firmware/secrets.yaml
 
 captive_portal:  # Serves a Wi-Fi setup page when connected to the fallback AP
 
 dashboard_import:
-  # Allows this device to appear in the ESPHome dashboard for adoption
-  package_import_url: github://esphome/firmware/esphome-web/esp32s3.yaml@main
+  # Allows this device to appear in the ESPHome dashboard for adoption.
+  # RELEASE BLOCKER: replace @main with an immutable version tag before publishing
+  #   e.g.  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_6.yaml@v3.6.0
+  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_6.yaml@main
   import_full_config: true
 
 esp32_improv:
@@ -156,6 +177,9 @@ esp32_improv:
 
 web_server:
   version: 3  # Required for sorting_groups support
+  auth:
+    username: !secret web_username
+    password: !secret web_password
   # Organises the built-in web UI into collapsible sections per valve.
   # Each entity is assigned to a group via its web_server: sorting_group_id.
   sorting_groups:
@@ -178,21 +202,22 @@ web_server:
 # =============================================================================
 # GLOBALS
 # Runtime variables that persist across automations within a session.
-# restore_value: no means faults always start cleared on boot. A fault that
-# existed before a power cycle should be reviewed, not silently carried forward.
+# fault_main / fault_irrigation use restore_value: yes so a safety fault
+# survives a power cycle and requires explicit manual reset — matching the
+# intended "latching" safety behaviour. All other globals reset on boot.
 # =============================================================================
 globals:
   # True when a safety condition has triggered on the main valve circuit.
   # Blocks valve open_action until manually reset from Home Assistant.
   - id: fault_main
     type: bool
-    restore_value: no
+    restore_value: yes   # Fault must survive power-cycle — manual reset required
     initial_value: 'false'
 
   # Same fault flag for the irrigation valve circuit.
   - id: fault_irrigation
     type: bool
-    restore_value: no
+    restore_value: yes   # Fault must survive power-cycle — manual reset required
     initial_value: 'false'
 
   # True while leak test mode is active on the main valve circuit.

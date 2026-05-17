@@ -13,8 +13,15 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+import os as _os
+
 from .config import load_config
 from .database import generate_csrf_token
+
+# Ingress IP guard — only accept requests from the HA supervisor ingress proxy.
+# Override via env vars for non-standard deployments and local/pytest runs.
+_INGRESS_IP  = _os.environ.get("INGRESS_ALLOWED_IP", "172.30.32.2")
+_DEV_MODE    = _os.environ.get("DEV_MODE", "false").lower() in ("true", "1", "yes")
 from .db_migrations import run_migrations
 from .orchestrator import Orchestrator
 from .routers import dashboard, device, history, fixtures, settings, setup, backup
@@ -169,68 +176,84 @@ async def ingress_middleware(request: Request, call_next):
     ingress_path = request.headers.get("X-Ingress-Path", "").rstrip("/")
     request.state.ingress_path = ingress_path
 
+    # Reject requests that did not arrive through the HA ingress proxy.
+    # /health is exempt so Docker and HA health probes (which come directly,
+    # not through ingress) continue to work.
+    # Disabled when DEV_MODE=true or INGRESS_ALLOWED_IP="" for local dev/tests.
+    if (not _DEV_MODE and _INGRESS_IP
+            and not request.url.path.startswith("/health")):
+        client_ip = request.client.host if request.client else ""
+        if client_ip != _INGRESS_IP:
+            log.warning("Rejected request from non-ingress IP %s on %s",
+                        client_ip, request.url.path)
+            from fastapi.responses import Response as _Resp
+            return _Resp(status_code=403, content=b"Forbidden")
+
     # Log every POST so we can see what's reaching the addon
     if request.method == "POST":
         log.info("POST %s (ingress=%r)", request.url.path, ingress_path)
 
-    # CSRF protection for state-changing form POSTs.
-    # JSON API endpoints (Content-Type: application/json) are exempt —
-    # they can only be called from same-origin JS in the HA ingress context.
-    # Setup and backup endpoints are exempt (backup import uses multipart
-    # without a session token; setup is first-run).
+    # CSRF protection for all state-changing POSTs.
     #
-    # IMPORTANT: BaseHTTPMiddleware (used by @app.middleware) consumes the
-    # request body when it parses the form. If we don't replay the bytes,
-    # the downstream route handler's own `await request.form()` returns
-    # empty. We read the body once, validate CSRF on a parsed copy, then
-    # rewrite the request._receive callable so the handler sees the
-    # original body intact.
+    # Token lookup order (first match wins):
+    #   1. X-CSRF-Token request header   — used by all fetch()/post() calls
+    #   2. _csrf field in form/multipart body — used by traditional HTML forms
+    #      and backup imports that send multipart FormData
+    #
+    # /setup is exempt — no session token exists on first run.
+    # /static and /health are never POST targets; exempt for safety.
+    #
+    # IMPORTANT: reading the form body consumes the ASGI receive stream.
+    # We drain the body once, replay it via request._receive, then clear
+    # Starlette's form cache so the downstream route handler re-parses
+    # the same bytes correctly.
     csrf_exempt = (
-        "/setup",    # first-run wizard — no session token exists yet; writes validated server-side against ROLE_PATTERNS
-        "/backup",   # multipart import has no session cookie
-        "/api/",
+        "/setup",    # first-run wizard — no session token yet
         "/static",
         "/health",
     )
     if request.method == "POST" and not any(
             request.url.path.startswith(p) for p in csrf_exempt):
-        ct = request.headers.get("Content-Type", "")
-        if "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
-            # Drain the body once
-            body_bytes = await request.body()
+        # 1. Check header first (covers JSON, no-body, and all fetch POSTs)
+        token = request.headers.get("X-CSRF-Token", "")
 
-            # Make subsequent reads return the same bytes
-            async def receive_replay():
-                return {
-                    "type": "http.request",
-                    "body": body_bytes,
-                    "more_body": False,
-                }
-            request._receive = receive_replay
+        # 2. Fall back to form/multipart body (HTML forms and backup imports)
+        if not token:
+            ct = request.headers.get("Content-Type", "")
+            if "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
+                # Drain the body once, then replay it for downstream handlers
+                body_bytes = await request.body()
 
-            # Parse a copy of the form just for CSRF validation
-            form_data = await request.form()
-            token = form_data.get("_csrf", "")
-            orch = getattr(request.app.state, "orchestrator", None)
-            if orch:
-                from .database import validate_csrf_token
-                if not validate_csrf_token(orch.db, token):
-                    log.warning("CSRF token invalid on POST %s",
-                                request.url.path)
-                    return HTMLResponse(
-                        "<h1>403 — Invalid or missing security token</h1>"
-                        "<p>Please reload the page and try again.</p>",
-                        status_code=403,
-                    )
+                async def receive_replay():
+                    return {
+                        "type": "http.request",
+                        "body": body_bytes,
+                        "more_body": False,
+                    }
+                request._receive = receive_replay
 
-            # Reset the form cache so the handler re-parses from the
-            # replayed body. Starlette caches the parsed form on the
-            # request; clearing the cache forces a fresh parse.
-            if hasattr(request, "_form"):
-                request._form = None
+                form_data = await request.form()
+                token = form_data.get("_csrf", "")
+
+                # Clear Starlette's form cache so the route handler re-parses
+                # from the replayed body rather than the already-consumed one.
+                if hasattr(request, "_form"):
+                    request._form = None
+
+        orch = getattr(request.app.state, "orchestrator", None)
+        if orch:
+            from .database import validate_csrf_token
+            if not validate_csrf_token(orch.db, token):
+                log.warning("CSRF token invalid on POST %s",
+                            request.url.path)
+                return HTMLResponse(
+                    "<h1>403 — Invalid or missing security token</h1>"
+                    "<p>Please reload the page and try again.</p>",
+                    status_code=403,
+                )
 
     path = request.url.path
-    skip_paths = ("/setup", "/static", "/health", "/backup")
+    skip_paths = ("/setup", "/static", "/health")
     if not any(path.startswith(p) for p in skip_paths):
         orch = getattr(request.app.state, "orchestrator", None)
         if orch and not orch.setup_complete:
