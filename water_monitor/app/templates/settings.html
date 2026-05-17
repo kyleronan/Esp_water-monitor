@@ -152,6 +152,35 @@
       </div>
       <p class="sett-section-desc">Circuit-specific detection and alert settings.</p>
 
+      {# Sub-tab strip — use loop.index as a safe DOM key #}
+      {% set circ_idx = loop.index %}
+      <div class="sett-subtab-strip" role="tablist">
+        <button type="button"
+                class="sett-subtab-btn active"
+                id="sttab-btn-{{ circ_idx }}-config"
+                role="tab" aria-selected="true"
+                onclick="settSubNav({{ circ_idx }}, 'config')">
+          Config
+        </button>
+        <button type="button"
+                class="sett-subtab-btn"
+                id="sttab-btn-{{ circ_idx }}-detection"
+                role="tab" aria-selected="false"
+                onclick="settSubNav({{ circ_idx }}, 'detection')">
+          Detection
+        </button>
+        <button type="button"
+                class="sett-subtab-btn sett-adv-card"
+                id="sttab-btn-{{ circ_idx }}-advanced"
+                role="tab" aria-selected="false"
+                onclick="settSubNav({{ circ_idx }}, 'advanced')">
+          Advanced
+        </button>
+      </div>
+
+      {# ── Config tab: name + circuit type ──────────────────────────── #}
+      <div class="sett-subtab-panel" id="sttab-{{ circ_idx }}-config" role="tabpanel">
+
       {# Circuit rename #}
       <div class="sett-card">
         <h3 class="sett-card-title">Circuit name</h3>
@@ -205,14 +234,11 @@
            style="display:none;color:var(--color-warn);margin-top:.5rem">Saving…</p>
       </div>
 
-      {# Installer settings divider — only visible in advanced mode #}
-      <div class="sett-adv-banner sett-adv-card">
-        <span>⚙</span>
-        <div class="sett-adv-banner-inner">
-          <strong>Installer settings</strong>
-          Changes below affect leak detection and automatic shutoff.
-        </div>
-      </div>
+      </div>{# /Config panel #}
+
+      {# ── Advanced tab: recal + learning + sensitivity + ESP device ── #}
+      <div class="sett-subtab-panel" id="sttab-{{ circ_idx }}-advanced"
+           style="display:none" role="tabpanel">
 
       {# Recalibration #}
       <div class="sett-card sett-adv-card">
@@ -358,27 +384,6 @@
         </form>
       </div>
 
-      {# Alerts #}
-      <div class="sett-card">
-        <h3 class="sett-card-title">Alerts</h3>
-        <p class="sett-card-desc">Toggle which anomaly alerts this add-on generates.</p>
-        {% for alert in c.alerts %}
-        {% if alert.alert_type not in zone_only_alert_types or c.circuit_type == "zone" %}
-        <div class="sett-toggle-row">
-          <div>
-            <div class="sett-toggle-label">{{ alert.label }}</div>
-            <div class="sett-toggle-desc">{{ alert.description }}</div>
-          </div>
-          <label class="toggle">
-            <input type="checkbox" {% if alert.enabled %}checked{% endif %}
-                   onchange="settingsAlertToggle('{{ alert.id }}', this.checked)">
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
-        {% endif %}
-        {% endfor %}
-      </div>
-
       {# ESP device entities for this circuit #}
       {% if c.device_entities %}
       <div class="sett-card sett-adv-card">
@@ -423,6 +428,33 @@
         <p class="sett-card-desc">Calibration controls are not available — no calibration entities were found during setup.</p>
       </div>
       {% endif %}
+
+      </div>{# /Advanced panel #}
+
+      {# ── Detection tab: alerts + plumbing events ───────────────────── #}
+      <div class="sett-subtab-panel" id="sttab-{{ circ_idx }}-detection"
+           style="display:none" role="tabpanel">
+
+      {# Alerts #}
+      <div class="sett-card">
+        <h3 class="sett-card-title">Alerts</h3>
+        <p class="sett-card-desc">Toggle which anomaly alerts this add-on generates.</p>
+        {% for alert in c.alerts %}
+        {% if alert.alert_type not in zone_only_alert_types or c.circuit_type == "zone" %}
+        <div class="sett-toggle-row">
+          <div>
+            <div class="sett-toggle-label">{{ alert.label }}</div>
+            <div class="sett-toggle-desc">{{ alert.description }}</div>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" {% if alert.enabled %}checked{% endif %}
+                   onchange="settingsAlertToggle('{{ alert.id }}', this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        {% endif %}
+        {% endfor %}
+      </div>
 
       {# Plumbing exclusion window #}
       <div class="sett-card" id="maintenance">
@@ -473,6 +505,8 @@
         </form>
         {% endif %}
       </div>
+
+      </div>{# /Detection panel #}
 
     </div>
     {% endfor %}
@@ -876,6 +910,19 @@
 
 {% block scripts %}
 <script>
+// ── Circuit sub-tab navigation ─────────────────────────────────────────────
+function settSubNav(circIdx, tab) {
+  ['config', 'detection', 'advanced'].forEach(t => {
+    const panel = document.getElementById('sttab-' + circIdx + '-' + t);
+    const btn   = document.getElementById('sttab-btn-' + circIdx + '-' + t);
+    if (panel) panel.style.display = t === tab ? '' : 'none';
+    if (btn) {
+      btn.classList.toggle('active', t === tab);
+      btn.setAttribute('aria-selected', t === tab ? 'true' : 'false');
+    }
+  });
+}
+
 // ── Sidebar navigation ─────────────────────────────────────────────────────
 function settNav(id) {
   document.querySelectorAll('.sett-section').forEach(el => el.style.display = 'none');
@@ -914,6 +961,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const id = location.hash.slice(1) || 'profile';
   settNav(id);
+
+  // Initialize all circuit sub-tabs to Config
+  document.querySelectorAll('.sett-subtab-strip').forEach(strip => {
+    const circIdx = strip.querySelector('[id^="sttab-btn-"]')
+      ?.id.split('-')[2];
+    if (circIdx) settSubNav(Number(circIdx), 'config');
+  });
+
+  // #maintenance → open first circuit section + Detection sub-tab
+  if (location.hash === '#maintenance') {
+    const firstStrip = document.querySelector('.sett-subtab-strip');
+    if (firstStrip) {
+      const circIdx = firstStrip.querySelector('[id^="sttab-btn-"]')
+        ?.id.split('-')[2];
+      if (circIdx) settSubNav(Number(circIdx), 'detection');
+    }
+  }
 
   // Recalibration modal intercept
   document.querySelectorAll('.recal-form').forEach(form => {
