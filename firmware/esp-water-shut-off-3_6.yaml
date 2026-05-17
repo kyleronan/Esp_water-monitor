@@ -152,13 +152,12 @@ api:         # Encryption disabled for now — re-add an `encryption:` block bef
 
 ota:         # Enable over-the-air firmware updates
   - platform: esphome
-    password: !secret ota_password
+    # OTA password disabled for now — re-add `password:` before release
 
 improv_serial:   # Allows Wi-Fi provisioning via USB serial on first setup
 
 wifi:
-  ap:
-    password: !secret fallback_ap_password   # Fallback hotspot — set in firmware/secrets.yaml
+  ap:   # Fallback hotspot — open network for now; re-add `password:` before release
 
 captive_portal:  # Serves a Wi-Fi setup page when connected to the fallback AP
 
@@ -175,9 +174,7 @@ esp32_improv:
 
 web_server:
   version: 3  # Required for sorting_groups support
-  auth:
-    username: !secret web_username
-    password: !secret web_password
+  # Web UI auth disabled for now — re-add an `auth:` block before release
   # Organises the built-in web UI into collapsible sections per valve.
   # Each entity is assigned to a group via its web_server: sorting_group_id.
   sorting_groups:
