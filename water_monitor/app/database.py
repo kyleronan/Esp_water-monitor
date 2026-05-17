@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -1543,6 +1544,185 @@ def delete_cluster(
         (circuit, cluster_id),
     )
     conn.commit()
+
+
+def merge_clusters(
+    conn: sqlite3.Connection,
+    circuit: str,
+    survivor_id: int,
+    selected_cluster_ids: List[int],
+) -> Dict[str, int]:
+    """Merge several clusters into one survivor cluster.
+
+    Every event from the non-survivor clusters is relinked to ``survivor_id``;
+    the survivor's centroid, feature_std, member_count and confidence_level are
+    recomputed; the non-survivor cluster rows and any confirmed fixture rows
+    they own are deleted.  The survivor's own fixture row is left untouched.
+
+    Returns ``{"events_relinked", "fixtures_removed", "survivor_member_count"}``.
+    Raises ``ValueError`` on any validation failure, having written nothing.
+    All writes run in a single transaction — rolled back on any exception.
+    """
+    # ── Validation — everything before any write ───────────────────────
+    ids = list(dict.fromkeys(int(i) for i in selected_cluster_ids))
+    if len(ids) < 2:
+        raise ValueError("merge_clusters needs at least 2 distinct cluster IDs")
+    survivor_id = int(survivor_id)
+    if survivor_id not in ids:
+        raise ValueError(
+            f"survivor_id {survivor_id} not in selected cluster IDs {ids}"
+        )
+
+    id_ph = ",".join(["?"] * len(ids))
+    rows = conn.execute(
+        f"""SELECT id, centroid, feature_std, member_count
+            FROM fixture_clusters
+            WHERE circuit = ? AND id IN ({id_ph})""",
+        (circuit, *ids),
+    ).fetchall()
+    found = {int(r["id"]): r for r in rows}
+    missing = [i for i in ids if i not in found]
+    if missing:
+        raise ValueError(
+            f"clusters not found in circuit {circuit!r}: {missing}"
+        )
+
+    centroids: Dict[int, dict] = {}
+    feature_stds: Dict[int, dict] = {}
+    counts: Dict[int, int] = {}
+    for i in ids:
+        r = found[i]
+        try:
+            cen = json.loads(r["centroid"]) if r["centroid"] else {}
+            std = json.loads(r["feature_std"]) if r["feature_std"] else {}
+        except (json.JSONDecodeError, TypeError) as e:
+            raise ValueError(f"cluster {i} has malformed JSON: {e}")
+        if not isinstance(cen, dict) or not isinstance(std, dict):
+            raise ValueError(
+                f"cluster {i} centroid/feature_std is not a JSON object"
+            )
+        centroids[i] = cen
+        feature_stds[i] = std
+        counts[i] = int(r["member_count"] or 0)
+
+    total_n = sum(counts.values())
+    if total_n <= 0:
+        raise ValueError(
+            "total member_count across selected clusters is 0 — nothing to merge"
+        )
+
+    # ── Merged centroid: member-count weighted mean over the key union ──
+    centroid_keys: set = set()
+    for cen in centroids.values():
+        centroid_keys.update(cen.keys())
+    merged_centroid = {
+        k: sum(counts[i] * float(centroids[i].get(k, 0.0)) for i in ids) / total_n
+        for k in centroid_keys
+    }
+
+    # ── Merged feature_std: pooled standard deviation ──────────────────
+    # Pooled variance needs each cluster's per-feature mean (its centroid
+    # value) and std.  When a cluster lacks a std for a feature we fall back
+    # to a member-count weighted average of the available stds — feature_std
+    # is a forward-looking column, empty ('{}') in practice, so the fallback
+    # is normally what runs and the result is just {}.
+    std_keys: set = set()
+    for std in feature_stds.values():
+        std_keys.update(std.keys())
+    merged_std = {}
+    for k in std_keys:
+        full = all(k in feature_stds[i] and k in centroids[i] for i in ids)
+        if full:
+            combined_var = sum(
+                counts[i] * (
+                    float(feature_stds[i][k]) ** 2
+                    + (float(centroids[i][k]) - merged_centroid.get(k, 0.0)) ** 2
+                )
+                for i in ids
+            ) / total_n
+            merged_std[k] = math.sqrt(max(combined_var, 0.0))
+        else:
+            contributors = [i for i in ids if k in feature_stds[i]]
+            weight = sum(counts[i] for i in contributors) or 1
+            merged_std[k] = sum(
+                counts[i] * float(feature_stds[i][k]) for i in contributors
+            ) / weight
+
+    # ── confidence_level — kept in sync with cluster_engine thresholds ──
+    from .cluster_engine import LEVEL_PRELIMINARY_MAX, LEVEL_LEARNING_MAX
+    if total_n < LEVEL_PRELIMINARY_MAX:
+        level = "preliminary"
+    elif total_n < LEVEL_LEARNING_MAX:
+        level = "learning"
+    else:
+        level = "confirmed"
+
+    deleted_ids = [i for i in ids if i != survivor_id]
+    del_ph = ",".join(["?"] * len(deleted_ids))
+
+    # ── Non-survivor fixture IDs to delete (deduped, survivor excluded) ─
+    survivor_row = conn.execute(
+        "SELECT fixture_id FROM fixture_clusters WHERE circuit = ? AND id = ?",
+        (circuit, survivor_id),
+    ).fetchone()
+    survivor_fixture_id = survivor_row["fixture_id"] if survivor_row else None
+
+    fx_rows = conn.execute(
+        f"""SELECT DISTINCT fixture_id FROM fixture_clusters
+            WHERE circuit = ? AND id IN ({del_ph}) AND fixture_id IS NOT NULL""",
+        (circuit, *deleted_ids),
+    ).fetchall()
+    fixture_ids = [
+        r["fixture_id"] for r in fx_rows
+        if r["fixture_id"] != survivor_fixture_id
+    ]
+
+    # ── Writes — single transaction, rollback on any failure ───────────
+    try:
+        # Relink events to the survivor cluster.  fixture_id is also repointed
+        # to the survivor's fixture (or NULL): the non-survivor fixture rows
+        # are about to be deleted, and events.fixture_id REFERENCES fixtures(id)
+        # would otherwise either dangle or block the DELETE.
+        relink = conn.execute(
+            f"""UPDATE events SET cluster_id = ?, fixture_id = ?
+                WHERE circuit = ? AND cluster_id IN ({del_ph})""",
+            (survivor_id, survivor_fixture_id, circuit, *deleted_ids),
+        )
+        events_relinked = relink.rowcount
+
+        conn.execute(
+            """UPDATE fixture_clusters
+               SET centroid = ?, feature_std = ?, member_count = ?,
+                   confidence_level = ?
+               WHERE circuit = ? AND id = ?""",
+            (json.dumps(merged_centroid), json.dumps(merged_std),
+             total_n, level, circuit, survivor_id),
+        )
+
+        # Delete cluster rows before fixture rows — fixture_clusters.fixture_id
+        # references fixtures(id), so this avoids relying on ON DELETE SET NULL.
+        conn.execute(
+            f"DELETE FROM fixture_clusters WHERE circuit = ? AND id IN ({del_ph})",
+            (circuit, *deleted_ids),
+        )
+
+        if fixture_ids:
+            fx_ph = ",".join(["?"] * len(fixture_ids))
+            conn.execute(
+                f"DELETE FROM fixtures WHERE id IN ({fx_ph})",
+                tuple(fixture_ids),
+            )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return {
+        "events_relinked": events_relinked,
+        "fixtures_removed": len(fixture_ids),
+        "survivor_member_count": total_n,
+    }
 
 
 # ==========================================================================
