@@ -1145,7 +1145,6 @@ sensor:
   #     2. sliding_window_moving_average (window 30s) — averages the last 30
   #        one-second readings. At low flow (<1 L/min) pulses are sparse and
   #        irregular; a 30s window captures several pulses for a stable average.
-  #     3. exponential_moving_average (alpha 0.2) — further smooths step changes.
   #
   # Safety checks on every reported value:
   #   1. Burst pipe — high flow above threshold triggers safety fault
@@ -1277,10 +1276,6 @@ sensor:
       # ~18s — a 30s window captures 1-2 pulses for a stable non-zero reading.
       - sliding_window_moving_average:
           window_size: 30
-          send_every: 1
-      # Step 3: EMA further smooths step changes from the sliding window output.
-      - exponential_moving_average:
-          alpha: 0.2
           send_every: 1
     on_value:
       then:
@@ -1458,9 +1453,6 @@ sensor:
           return x;
       - sliding_window_moving_average:
           window_size: 30
-          send_every: 1
-      - exponential_moving_average:
-          alpha: 0.2
           send_every: 1
     on_value:
       then:
