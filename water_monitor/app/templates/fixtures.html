@@ -9,6 +9,10 @@
 <div class="fx-msg fx-msg-warn">Not enough events yet (need 150+). Keep collecting data and try again.</div>
 {% elif msg == 'activated' %}
 <div class="fx-msg fx-msg-ok">Fixtures activated — circuit is now live.</div>
+{% elif msg == 'merged' %}
+<div class="fx-msg fx-msg-ok">Clusters merged successfully.</div>
+{% elif msg == 'merge_failed' %}
+<div class="fx-msg fx-msg-err">Could not merge clusters — the selected clusters may have changed. Refresh and try again.</div>
 {% elif msg == 'error' %}
 <div class="fx-msg fx-msg-err">Action failed — check the addon log for details.</div>
 {% endif %}
@@ -100,6 +104,23 @@
   </div>
 
 {% else %}
+  {# Merge action bar — shown by JS when ≥2 boxes in this circuit are checked #}
+  {% set circ_idx = loop.index %}
+  <div class="fx-merge-bar" id="fx-merge-bar-{{ circ_idx }}"
+       data-circuit="{{ circ.circuit }}" style="display:none">
+    <span class="fx-merge-bar-info">
+      <strong class="fx-merge-count">0</strong> clusters selected
+    </span>
+    <button type="button" class="btn btn-primary btn-sm fx-merge-btn"
+            data-circuit="{{ circ.circuit }}" data-circ-idx="{{ circ_idx }}">
+      Merge selected
+    </button>
+    <button type="button" class="btn btn-ghost btn-sm fx-merge-clear"
+            data-circ-idx="{{ circ_idx }}">
+      Clear
+    </button>
+  </div>
+
   <div class="fx-cluster-grid">
   {% for cl in circ.clusters %}
     {% set is_confirmed  = cl.fixture_id is not none %}
@@ -114,6 +135,16 @@
 
       {# Header: icon + name + confidence pill #}
       <div class="fx-card-header">
+        {% if not not_enough %}
+        <label class="fx-card-check" title="Select to merge">
+          <input type="checkbox"
+                 class="fx-cluster-select"
+                 data-circuit="{{ circ.circuit }}"
+                 data-circ-idx="{{ circ_idx }}"
+                 value="{{ cl.id }}"
+                 aria-label="Select {{ display_name }} to merge">
+        </label>
+        {% endif %}
         <span class="fx-card-icon">{{ cl | fixture_icon }}</span>
         <div style="flex:1;min-width:0">
           <div class="fx-card-title">{{ display_name }}</div>
@@ -220,6 +251,49 @@ document.querySelectorAll('.fx-type-select').forEach(sel => {
       inp.value = sel.options[sel.selectedIndex].text;
       inp.dataset.autofilled = '1';
     }
+  });
+});
+
+// ── Merge cluster selection ────────────────────────────────────────────────
+function _updateMergeBar(circIdx) {
+  const boxes = document.querySelectorAll(
+    `.fx-cluster-select[data-circ-idx="${circIdx}"]`
+  );
+  const checked = Array.from(boxes).filter(b => b.checked);
+  const bar = document.getElementById('fx-merge-bar-' + circIdx);
+  if (!bar) return;
+  bar.style.display = checked.length >= 2 ? '' : 'none';
+  const countEl = bar.querySelector('.fx-merge-count');
+  if (countEl) countEl.textContent = checked.length;
+  const btn = bar.querySelector('.fx-merge-btn');
+  if (btn) btn.textContent = `Merge ${checked.length} selected`;
+}
+
+document.querySelectorAll('.fx-cluster-select').forEach(box => {
+  box.addEventListener('change', () => _updateMergeBar(box.dataset.circIdx));
+});
+
+document.querySelectorAll('.fx-merge-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const circIdx = btn.dataset.circIdx;
+    const circuit = btn.dataset.circuit;
+    const checked = Array.from(document.querySelectorAll(
+      `.fx-cluster-select[data-circ-idx="${circIdx}"]:checked`
+    ));
+    const ids = checked.map(b => encodeURIComponent(b.value)).join(',');
+    const base = (window.INGRESS_PATH || '') +
+      '/fixtures/' + encodeURIComponent(circuit) + '/merge';
+    window.location.href = base + '?ids=' + ids;
+  });
+});
+
+document.querySelectorAll('.fx-merge-clear').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const circIdx = btn.dataset.circIdx;
+    document.querySelectorAll(
+      `.fx-cluster-select[data-circ-idx="${circIdx}"]`
+    ).forEach(b => { b.checked = false; });
+    _updateMergeBar(circIdx);
   });
 });
 </script>
