@@ -87,7 +87,7 @@ class ClusterEngine:
             "SELECT MAX(id) FROM fixture_clusters WHERE circuit = ?",
             (circuit,)
         ).fetchone()
-        self._next_cluster_id[circuit] = (row[0] or -1) + 1
+        self._next_cluster_id[circuit] = (row[0] if row[0] is not None else -1) + 1
         self._refresh_type_cache(circuit)
 
     def _refresh_type_cache(self, circuit: str) -> None:

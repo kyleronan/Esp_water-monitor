@@ -865,7 +865,7 @@
           <div style="display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap">
             <button type="submit" class="btn btn-primary btn-sm">Save retention settings</button>
             <button type="button" class="btn btn-secondary btn-sm"
-                    onclick="pruneNow()">Run pruning now</button>
+                    onclick="pruneNow(event)">Run pruning now</button>
           </div>
         </form>
       </div>
@@ -1015,7 +1015,7 @@ async function settingsCircuitTypeUpdate(circuit, circuitType) {
     if (data.status !== 'updated') {
       toast('Could not update circuit type: ' + (data.message || 'unknown error'), 'error');
       document.querySelectorAll(`input[name="circuit_type_${circuit}"]`)
-        .forEach(r => { r.checked = (r.value !== circuitType); });
+        .forEach(r => { r.checked = false; });
     }
   } finally {
     if (note) note.style.display = 'none';
@@ -1064,9 +1064,9 @@ function submitRecalForm() {
 }
 
 // ── Data retention ──────────────────────────────────────────────────────────
-async function pruneNow() {
+async function pruneNow(evt) {
   if (!confirm('Run data pruning now? This will permanently delete old history rows according to the current retention settings.')) return;
-  const btn = event.target;
+  const btn = evt.target;
   btn.disabled = true;
   btn.textContent = 'Pruning…';
   try {
