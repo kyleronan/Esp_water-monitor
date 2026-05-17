@@ -1137,21 +1137,19 @@ sensor:
   #     shortest practical window that still gives accurate readings at low flow.
   #   Filter chain (applied in order):
   #     1. lambda — converts raw counts/min to L/min
-  #     2. sliding_window_moving_average (window 30s) — averages the last 30
-  #        one-second readings. At low flow (<1 L/min) pulses are sparse and
-  #        irregular; a 30s window captures several pulses for a stable average.
+  #     2. sliding_window_moving_average (window 2s) — averages the last 2
+  #        one-second readings to smooth single-second pulse noise while adding
+  #        only ~2s of lag on flow-stop.
   #
   # Safety checks on every reported value:
   #   1. Burst pipe — high flow above threshold triggers safety fault
   #   2. Trickle flow — low but sustained flow triggers trickle alert
   #
-  # Note on trickle detection and the 30s sliding window:
-  #   The window means flow must enter the trickle band and stay there long
-  #   enough for the average to stabilise before the elapsed timer accumulates
-  #   meaningfully. In practice this adds ~30s of natural lag before the timer
-  #   counts reliably — desirable, as it prevents brief spikes from starting
-  #   the timer. The alert duration should be several minutes or more so this
-  #   is insignificant relative to the total detection time.
+  # Note on trickle detection and the 2s sliding window:
+  #   The window averages two 1s readings, reducing single-pulse noise while
+  #   adding only ~2s of lag. Trickle detection is reliable for flows above
+  #   ~0.15 L/min (1 pulse/s); below that, readings are noisier but the timer
+  #   still accumulates correctly over the multi-minute alert duration.
   # ---------------------------------------------------------------------------
   # FLOW SENSOR 1 BASE — Main line (GPIO39)
   # Single pulse_counter on this GPIO — the only component on GPIO39.
@@ -1159,17 +1157,17 @@ sensor:
   # Derived sensors below convert to L/min and detect flow onset.
   #
   # on_value runs two safety checks that benefit from the raw 1s pulse count
-  # rather than the 30s-smoothed water_usage1:
+  # rather than the 2s-smoothed water_usage1:
   #
   #   1. INSTANT BURST — catches a burst pipe within 1-2 seconds rather than
-  #      waiting ~30s for the smoothing window to fill. Uses 1.5× the
-  #      configured burst threshold to tolerate 1s window variability while
-  #      still catching genuinely large bursts immediately.
+  #      waiting for the smoothing window to fill. Uses 1.5× the configured
+  #      burst threshold to tolerate 1s window variability while still catching
+  #      genuinely large bursts immediately.
   #
   #   2. FAST VALVE SEAL — detects flow pulses within 10s of the closed end
   #      stop activating. The existing slow seal check (water_usage1, 90s)
-  #      was padded to tolerate the 30s smoothing window draining. With raw
-  #      pulse data, 10s is enough to be confident the valve hasn't seated.
+  #      was originally padded for the old 30s window; the 2s window now drains
+  #      quickly but the raw check remains the fastest signal.
   #      Clearing the alert is handled by water_usage1 when flow stops.
   # ---------------------------------------------------------------------------
   - platform: pulse_counter
@@ -1267,10 +1265,12 @@ sensor:
       - lambda: |-
           if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
           return x;
-      # Step 2: 30-second sliding window. At 0.5 L/min a pulse arrives every
-      # ~18s — a 30s window captures 1-2 pulses for a stable non-zero reading.
+      # Step 2: 2-second sliding window. Smooths single-second pulse noise while
+      # adding only ~2s of lag on flow-stop. Trickle detection is reliable for
+      # flows above ~0.15 L/min (1 pulse/s). Below that, readings are noisier
+      # but still accumulate correctly over the trickle timer duration.
       - sliding_window_moving_average:
-          window_size: 30
+          window_size: 2
           send_every: 1
     on_value:
       then:
@@ -1447,7 +1447,7 @@ sensor:
           if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
           return x;
       - sliding_window_moving_average:
-          window_size: 30
+          window_size: 2
           send_every: 1
     on_value:
       then:
@@ -1764,16 +1764,15 @@ binary_sensor:
 
   # ---------------------------------------------------------------------------
   # FLOW INDICATORS
-  # Boolean "is water flowing right now?" view, derived from the smoothed
-  # pulse counter — no separate GPIO sensor, no shared pin.
+  # Boolean "is water flowing right now?" — derived from the raw pulse counter
+  # (same source as flow_pulse_onset) rather than the smoothed water_usage
+  # sensor. This gives a near-instant OFF response (~1s) when flow stops,
+  # independent of the 2s smoothing window on the flow-rate sensor.
   #
-  # Threshold 0.02 L/min is below any real flow but above floating-point zero.
-  # The 30s sliding window upstream means the indicator stays ON for ~30s
-  # after flow physically stops, replicating the original delayed_off: 25s
-  # behaviour without needing the binary sensor's debounce.
+  # delayed_off: 2s debounces brief zero-pulse gaps at very low flow rates
+  # (< 1 pulse/s) without adding meaningful latency on flow stop.
   #
-  # entity_category: diagnostic — kept for HA automations that need an
-  # immediate boolean signal, but tucked away from default dashboards because
+  # entity_category: diagnostic — tucked away from default dashboards because
   # the flow rate sensor already conveys the same information numerically.
   # ---------------------------------------------------------------------------
   - platform: template
@@ -1783,7 +1782,9 @@ binary_sensor:
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 45
-    lambda: 'return id(water_usage1).state > 0.02;'
+    lambda: 'return id(flow_base_main).state > 0;'
+    filters:
+      - delayed_off: 2s
 
   - platform: template
     id: flow_indicator2
@@ -1792,7 +1793,9 @@ binary_sensor:
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 45
-    lambda: 'return id(water_usage2).state > 0.02;'
+    lambda: 'return id(flow_base_irr).state > 0;'
+    filters:
+      - delayed_off: 2s
 
   # ---------------------------------------------------------------------------
   # FAULT STATUS SENSORS
