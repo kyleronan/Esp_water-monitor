@@ -1,6 +1,6 @@
 # Firmware — ESP Water Monitor
 
-ESPHome firmware for the ESP32 water shut-off controller.
+ESPHome firmware for the ESP32 water shut-off controller. 
 
 ## First-time setup
 
