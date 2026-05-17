@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+{% block content %}
+
+{# ── Pre-compute survivor defaults for the preview summary ─────────────── #}
+{% set survivor_cluster = clusters | selectattr('id', 'equalto', default_survivor) | first %}
+{% set survivor_name = survivor_cluster.name or survivor_cluster.display_name or 'Unnamed cluster' %}
+{% set fixtures_removed_default = clusters
+     | rejectattr('id', 'equalto', default_survivor)
+     | selectattr('fixture_id')
+     | list | length %}
+
+<div class="fx-header">
+  <h1 class="page-title" style="margin:0">Merge Clusters</h1>
+  <a href="{{ ingress_path }}/fixtures" class="btn btn-ghost btn-sm">Cancel</a>
+</div>
+
+{# ── Warning when multiple confirmed fixtures are involved ──────────────── #}
+{% if confirmed_count >= 2 %}
+<div class="fx-msg fx-msg-warn">
+  <strong>Multiple confirmed fixtures selected.</strong>
+  Only the survivor fixture will remain — the others will be removed from
+  Home Assistant when you confirm.
+</div>
+{% endif %}
+
+{# ── Preview summary ────────────────────────────────────────────────────── #}
+<div class="fx-merge-summary">
+  <h2 class="fx-merge-summary-title">What will happen</h2>
+  <ul class="fx-merge-summary-list">
+    <li><strong>{{ clusters | length }}</strong> clusters merged into one</li>
+    <li><strong>{{ total_events }}</strong> events preserved and relinked to the survivor</li>
+    <li>Survivor member count after merge: <strong>{{ total_members }}</strong></li>
+    {% if fixtures_removed_default > 0 %}
+    <li id="fx-summary-retract">
+      <strong>{{ fixtures_removed_default }}</strong>
+      confirmed fixture {{ 'entity' if fixtures_removed_default == 1 else 'entities' }}
+      removed from Home Assistant (updates when you change the survivor below)
+    </li>
+    {% else %}
+    <li id="fx-summary-retract">No Home Assistant fixture entities will be removed</li>
+    {% endif %}
+    {% if survivor_cluster.fixture_id %}
+    <li id="fx-summary-kept">Survivor fixture kept: <strong>{{ survivor_name }}</strong></li>
+    {% else %}
+    <li id="fx-summary-kept">No confirmed fixture on the survivor (none kept)</li>
+    {% endif %}
+  </ul>
+  <p class="muted" style="font-size:12px;margin-top:8px">
+    All event history is preserved. Only the non-survivor cluster records and
+    their Home Assistant fixture entities are removed.
+  </p>
+</div>
+
+{# ── Cluster cards with survivor radio buttons ──────────────────────────── #}
+<form method="post"
+      action="{{ ingress_path }}/fixtures/{{ circuit }}/merge"
+      id="fx-merge-form">
+  <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+
+  {# Hidden ids inputs — one per selected cluster #}
+  {% for cl in clusters %}
+  <input type="hidden" name="ids" value="{{ cl.id }}">
+  {% endfor %}
+
+  <p class="muted" style="margin-bottom:16px;font-size:13px">
+    Select which cluster becomes the survivor. Its name and fixture type are kept;
+    all events from the others are relinked to it.
+  </p>
+
+  <div class="fx-cluster-grid fx-merge-grid">
+  {% for cl in clusters %}
+    {% set is_confirmed  = cl.fixture_id is not none %}
+    {% set confidence    = cl.suggested_confidence or 0 %}
+    {% set conf_pct      = confidence if confidence > 1 else (confidence * 100) %}
+    {% set active_type   = cl.user_type or cl.suggested_type or 'other' %}
+    {% set display_name  = cl.name or cl.display_name or (active_type | replace('_',' ') | title) %}
+
+    <label class="fx-cluster-card fx-merge-card{% if cl.id == default_survivor %} fx-merge-card--selected{% endif %}"
+           id="fx-merge-label-{{ cl.id }}">
+
+      {# Survivor radio #}
+      <div class="fx-merge-radio-row">
+        <input type="radio" name="survivor_id" value="{{ cl.id }}"
+               {% if cl.id == default_survivor %}checked{% endif %}
+               onchange="fxMergePickSurvivor({{ cl.id }})">
+        <span class="fx-merge-radio-label">
+          {% if cl.id == default_survivor %}Survivor (default — largest){% else %}Make survivor{% endif %}
+        </span>
+      </div>
+
+      {# Header #}
+      <div class="fx-card-header" style="margin-top:8px">
+        <span class="fx-card-icon">{{ cl | fixture_icon }}</span>
+        <div style="flex:1;min-width:0">
+          <div class="fx-card-title">{{ display_name }}</div>
+          <div class="fx-card-sub">{{ cl.member_count }} events</div>
+        </div>
+        {% if is_confirmed %}
+        <span class="pill pill-green" style="font-size:10px">confirmed</span>
+        {% elif conf_pct > 0 %}
+        <span class="pill {% if conf_pct >= 85 %}pill-green{% elif conf_pct >= 65 %}pill-amber{% else %}pill-red{% endif %}">
+          {{ conf_pct | int }}%
+        </span>
+        {% endif %}
+      </div>
+
+      {# Stats #}
+      <div class="fx-stats">
+        <div class="fx-stat">
+          <div class="fx-stat-label">Avg vol</div>
+          <div class="fx-stat-value">
+            {{ ((cl.avg_volume_litres or 0) * vol_factor) | round(vol_decimals) }}
+            <small>{{ vol_unit }}</small>
+          </div>
+        </div>
+        <div class="fx-stat">
+          <div class="fx-stat-label">Avg dur</div>
+          <div class="fx-stat-value">{{ (cl.avg_duration_s or 0) | int }}<small>s</small></div>
+        </div>
+        <div class="fx-stat">
+          <div class="fx-stat-label">Avg flow</div>
+          <div class="fx-stat-value">
+            {{ ((cl.avg_flow_lpm or 0) * flow_factor) | round(flow_decimals) }}
+            <small>{{ flow_unit }}</small>
+          </div>
+        </div>
+      </div>
+
+      {% if is_confirmed %}
+      <div class="fx-merge-fixture-note">
+        {% if cl.id == default_survivor %}
+        ✓ Fixture "<strong>{{ cl.name }}</strong>" will be kept
+        {% else %}
+        ✗ Fixture "<strong>{{ cl.name }}</strong>" will be removed from Home Assistant
+        {% endif %}
+      </div>
+      {% endif %}
+
+    </label>
+  {% endfor %}
+  </div>
+
+  <div class="fx-merge-actions">
+    <button type="submit" class="btn btn-primary">
+      Confirm merge
+    </button>
+    <a href="{{ ingress_path }}/fixtures" class="btn btn-ghost">Cancel</a>
+  </div>
+</form>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Build a lookup so the radio-change handler can update the summary live.
+const _mergeClusterData = [
+  {% for cl in clusters %}
+  {
+    id:        {{ cl.id }},
+    name:      {{ (cl.name or cl.display_name or '') | tojson }},
+    fixtureId: {{ cl.fixture_id | tojson }},
+  },
+  {% endfor %}
+];
+
+function fxMergePickSurvivor(survivorId) {
+  // Update card highlight and fixture-note text.
+  _mergeClusterData.forEach(c => {
+    const label = document.getElementById('fx-merge-label-' + c.id);
+    if (!label) return;
+    const isSurvivor = c.id === survivorId;
+    label.classList.toggle('fx-merge-card--selected', isSurvivor);
+    const radioLabel = label.querySelector('.fx-merge-radio-label');
+    if (radioLabel) {
+      radioLabel.textContent = isSurvivor
+        ? 'Survivor (selected)' : 'Make survivor';
+    }
+    const note = label.querySelector('.fx-merge-fixture-note');
+    if (note && c.fixtureId) {
+      note.innerHTML = isSurvivor
+        ? `✓ Fixture "<strong>${c.name}</strong>" will be kept`
+        : `✗ Fixture "<strong>${c.name}</strong>" will be removed from Home Assistant`;
+    }
+  });
+
+  // Update summary.
+  const survivor = _mergeClusterData.find(c => c.id === survivorId);
+  const retractCount = _mergeClusterData.filter(
+    c => c.id !== survivorId && c.fixtureId
+  ).length;
+  const retractEl = document.getElementById('fx-summary-retract');
+  const keptEl    = document.getElementById('fx-summary-kept');
+  if (retractEl) {
+    retractEl.innerHTML = retractCount > 0
+      ? `<strong>${retractCount}</strong> confirmed fixture ${retractCount === 1 ? 'entity' : 'entities'} removed from Home Assistant`
+      : 'No Home Assistant fixture entities will be removed';
+  }
+  if (keptEl && survivor) {
+    keptEl.innerHTML = survivor.fixtureId
+      ? `Survivor fixture kept: <strong>${survivor.name || 'unnamed'}</strong>`
+      : 'No confirmed fixture on the survivor (none kept)';
+  }
+}
+</script>
+{% endblock %}

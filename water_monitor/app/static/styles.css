@@ -2166,6 +2166,104 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   .fx-card { padding: 14px; }
 }
 
+/* ── Merge cluster selection ────────────────────────────────────── */
+.fx-card-check {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  margin-right: 4px;
+  cursor: pointer;
+}
+.fx-card-check input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.fx-merge-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--accent-bg2, oklch(93% .05 260));
+  border: 1px solid var(--accent, oklch(58% .2 260));
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  position: sticky;
+  top: 56px;
+  z-index: 10;
+}
+.fx-merge-bar-info { font-size: 13px; flex: 1; }
+.fx-merge-count    { font-weight: 700; }
+
+/* ── Merge confirmation page ────────────────────────────────────── */
+.fx-merge-summary {
+  background: var(--surface-2, oklch(96% .005 240));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 20px;
+  margin-bottom: 20px;
+}
+.fx-merge-summary-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  margin: 0 0 10px 0;
+}
+.fx-merge-summary-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.8;
+}
+
+.fx-merge-grid { margin-top: 8px; }
+
+.fx-merge-card {
+  display: block;
+  cursor: pointer;
+  user-select: none;
+  border: 2px solid transparent;
+  transition: border-color .15s;
+}
+.fx-merge-card--selected {
+  border-color: var(--accent, oklch(58% .2 260));
+  background: var(--accent-bg2, oklch(96% .04 260));
+}
+
+.fx-merge-radio-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.fx-merge-radio-row input[type="radio"] {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+}
+.fx-merge-radio-label { color: var(--text-2); }
+.fx-merge-card--selected .fx-merge-radio-label { color: var(--accent); }
+
+.fx-merge-fixture-note {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--text-3);
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.fx-merge-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+
 /* ── Toast notification system ────────────────────────────────── */
 #toast-container {
   position: fixed;
