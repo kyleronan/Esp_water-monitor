@@ -133,7 +133,12 @@ async def fault_reset(circuit: str, request: Request):
                         "Re-run device discovery to map the entity."},
             status_code=400,
         )
-    await orch.ha.call_service("button", "press", {"entity_id": entity_id})
+    ok = await orch.ha.call_service("button", "press", {"entity_id": entity_id})
+    if not ok:
+        return JSONResponse(
+            {"status": "error", "message": "HA button press failed — check device connectivity"},
+            status_code=502,
+        )
     return JSONResponse({"status": "reset"})
 
 
@@ -152,7 +157,12 @@ async def trickle_reset(circuit: str, request: Request):
                         "Re-run device discovery to map the entity."},
             status_code=400,
         )
-    await orch.ha.call_service("button", "press", {"entity_id": entity_id})
+    ok = await orch.ha.call_service("button", "press", {"entity_id": entity_id})
+    if not ok:
+        return JSONResponse(
+            {"status": "error", "message": "HA button press failed — check device connectivity"},
+            status_code=502,
+        )
     return JSONResponse({"status": "reset"})
 
 
@@ -194,7 +204,12 @@ async def threshold_update(
             status_code=403,
         )
 
-    await orch.ha.set_number_value(entity_id, value)
+    ok = await orch.ha.set_number_value(entity_id, value)
+    if not ok:
+        return JSONResponse(
+            {"status": "error", "message": "HA number update failed — check device connectivity"},
+            status_code=502,
+        )
     return JSONResponse({"status": "updated", "entity_id": entity_id, "value": value})
 
 
@@ -230,12 +245,14 @@ async def alert_toggle(
                         "Re-run device discovery to map the entity."},
             status_code=400,
         )
-    if enabled:
-        await orch.ha.turn_on(entity_id)
-    else:
-        await orch.ha.turn_off(entity_id)
+    ok = await orch.ha.turn_on(entity_id) if enabled else await orch.ha.turn_off(entity_id)
+    if not ok:
+        return JSONResponse(
+            {"status": "error", "message": "HA alert switch update failed — check device connectivity"},
+            status_code=502,
+        )
 
-    # Also update local alert_config
+    # Update local alert_config only after HA confirms
     from ..database import set_alert_enabled
     set_alert_enabled(orch.db, f"{alert_type}_{circuit}", enabled)
 

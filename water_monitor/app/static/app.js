@@ -4,7 +4,10 @@ const BASE = window.INGRESS_PATH || "";
 async function post(url, body = {}) {
   const resp = await fetch(BASE + url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-CSRF-Token": window.CSRF_TOKEN || "",
+    },
     body: JSON.stringify(body),
   });
   let data = null;
@@ -67,17 +70,29 @@ function applyLiveState(circuit, state) {
       ctrl.dataset.fault       = faultActive ? 'true' : 'false';
       ctrl.dataset.faultReason = faultReason;
 
+      ctrl.replaceChildren();
+      const vBtn = document.createElement('button');
+      vBtn.className = 'btn btn-sm';
       if (vs === 'open') {
-        ctrl.innerHTML = `<button class="btn btn-danger btn-sm" onclick="valveCloseModal('${circuit}', this)">Close Valve</button>`;
+        vBtn.className += ' btn-danger';
+        vBtn.textContent = 'Close Valve';
+        vBtn.onclick = function() { valveCloseModal(circuit, this); };
       } else if (vs === 'closed') {
         if (faultActive) {
-          ctrl.innerHTML = `<button class="btn btn-secondary btn-sm btn-fault-warn" onclick="valveOpenWithFaultWarning('${circuit}', this)">Open Valve</button>`;
+          vBtn.className += ' btn-secondary btn-fault-warn';
+          vBtn.textContent = 'Open Valve';
+          vBtn.onclick = function() { valveOpenWithFaultWarning(circuit, this); };
         } else {
-          ctrl.innerHTML = `<button class="btn btn-primary btn-sm" onclick="valveOpenModal('${circuit}', this)">Open Valve</button>`;
+          vBtn.className += ' btn-primary';
+          vBtn.textContent = 'Open Valve';
+          vBtn.onclick = function() { valveOpenModal(circuit, this); };
         }
       } else {
-        ctrl.innerHTML = `<button class="btn btn-secondary btn-sm" disabled>${state.valve_state}</button>`;
+        vBtn.className += ' btn-secondary';
+        vBtn.disabled = true;
+        vBtn.textContent = state.valve_state || 'Unknown';
       }
+      ctrl.appendChild(vBtn);
     }
   }
   // Pressure + flow readings.
@@ -315,8 +330,14 @@ async function valveOpen(circuit) {
   const iv = setInterval(async () => {
     await fetchLiveState();
     const dot = document.getElementById(`valve-dot-${circuit}`);
-    if (!dot || dot.classList.contains('valve-open') || ++attempts >= 15)
+    if (dot && dot.classList.contains('valve-open')) {
       clearInterval(iv);
+      _restoreValveBtns(circuit);
+    } else if (++attempts >= 15) {
+      clearInterval(iv);
+      _restoreValveBtns(circuit);
+      toast(`Open command sent but valve position not confirmed — check the device.`, 'warning');
+    }
   }, 2000);
 }
 
@@ -335,8 +356,14 @@ async function valveClose(circuit) {
   const iv = setInterval(async () => {
     await fetchLiveState();
     const dot = document.getElementById(`valve-dot-${circuit}`);
-    if (!dot || dot.classList.contains('valve-closed') || ++attempts >= 15)
+    if (dot && dot.classList.contains('valve-closed')) {
       clearInterval(iv);
+      _restoreValveBtns(circuit);
+    } else if (++attempts >= 15) {
+      clearInterval(iv);
+      _restoreValveBtns(circuit);
+      toast(`Close command sent but valve position not confirmed — check the device.`, 'warning');
+    }
   }, 2000);
 }
 

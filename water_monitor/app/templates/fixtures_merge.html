@@ -177,9 +177,14 @@ function fxMergePickSurvivor(survivorId) {
     }
     const note = label.querySelector('.fx-merge-fixture-note');
     if (note && c.fixtureId) {
-      note.innerHTML = isSurvivor
-        ? `✓ Fixture "<strong>${c.name}</strong>" will be kept`
-        : `✗ Fixture "<strong>${c.name}</strong>" will be removed from Home Assistant`;
+      note.replaceChildren();
+      const prefix = document.createTextNode(isSurvivor ? '✓ Fixture "' : '✗ Fixture "');
+      const nameEl = document.createElement('strong');
+      nameEl.textContent = c.name;
+      const suffix = document.createTextNode(
+        isSurvivor ? '" will be kept' : '" will be removed from Home Assistant'
+      );
+      note.append(prefix, nameEl, suffix);
     }
   });
 
@@ -191,14 +196,27 @@ function fxMergePickSurvivor(survivorId) {
   const retractEl = document.getElementById('fx-summary-retract');
   const keptEl    = document.getElementById('fx-summary-kept');
   if (retractEl) {
-    retractEl.innerHTML = retractCount > 0
-      ? `<strong>${retractCount}</strong> confirmed fixture ${retractCount === 1 ? 'entity' : 'entities'} removed from Home Assistant`
-      : 'No Home Assistant fixture entities will be removed';
+    retractEl.replaceChildren();
+    if (retractCount > 0) {
+      const bold = document.createElement('strong');
+      bold.textContent = String(retractCount);
+      const noun = retractCount === 1 ? ' entity' : ' entities';
+      retractEl.append(bold, document.createTextNode(
+        ` confirmed fixture ${noun} removed from Home Assistant`
+      ));
+    } else {
+      retractEl.textContent = 'No Home Assistant fixture entities will be removed';
+    }
   }
   if (keptEl && survivor) {
-    keptEl.innerHTML = survivor.fixtureId
-      ? `Survivor fixture kept: <strong>${survivor.name || 'unnamed'}</strong>`
-      : 'No confirmed fixture on the survivor (none kept)';
+    keptEl.replaceChildren();
+    if (survivor.fixtureId) {
+      const bold = document.createElement('strong');
+      bold.textContent = survivor.name || 'unnamed';
+      keptEl.append(document.createTextNode('Survivor fixture kept: '), bold);
+    } else {
+      keptEl.textContent = 'No confirmed fixture on the survivor (none kept)';
+    }
   }
 }
 </script>

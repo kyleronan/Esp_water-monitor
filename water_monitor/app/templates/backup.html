@@ -144,6 +144,19 @@
 
 {% block scripts %}
 <script>
+// Build a two-line result safely without innerHTML (XSS-safe).
+function _setResult(el, headline, detail) {
+  el.replaceChildren();
+  el.appendChild(document.createTextNode(headline));
+  if (detail) {
+    el.appendChild(document.createElement('br'));
+    const span = document.createElement('span');
+    span.className = 'bk-result-detail';
+    span.textContent = detail;
+    el.appendChild(span);
+  }
+}
+
 async function doQuickRestore() {
   const fileEl   = document.getElementById('qr-file');
   const resultEl = document.getElementById('qr-result');
@@ -156,6 +169,7 @@ async function doQuickRestore() {
   form.append('file', fileEl.files[0]);
   form.append('import_settings', wantSett ? '1' : '');
   form.append('import_history',  wantHist ? '1' : '');
+  form.append('_csrf', window.CSRF_TOKEN || '');
   resultEl.style.display = '';
   resultEl.className = 'bk-result bk-result-info';
   resultEl.textContent = 'Restoring… please wait.';
@@ -165,12 +179,11 @@ async function doQuickRestore() {
     const data = await resp.json();
     if (data.ok) {
       resultEl.className = 'bk-result bk-result-ok';
-      resultEl.innerHTML = `✓ Restored<br><span class="bk-result-detail">${data.summary}</span>`;
+      _setResult(resultEl, '✓ Restored', data.summary);
       setTimeout(() => location.reload(), 2500);
     } else {
       resultEl.className = 'bk-result bk-result-err';
-      resultEl.innerHTML = `✗ ${data.error||'Failed'}<br>
-        <span class="bk-result-detail">${(data.errors||[]).join('<br>')}</span>`;
+      _setResult(resultEl, `✗ ${data.error || 'Failed'}`, (data.errors || []).join('\n'));
     }
   } catch (e) {
     resultEl.className = 'bk-result bk-result-err';
@@ -185,6 +198,7 @@ async function doHistoryImport() {
   if (!confirm('Merge history from this archive? Existing rows will be kept.')) return;
   const form = new FormData();
   form.append('file', fileEl.files[0]);
+  form.append('_csrf', window.CSRF_TOKEN || '');
   resultEl.style.display = '';
   resultEl.className = 'bk-result bk-result-info';
   resultEl.textContent = 'Importing… this may take a moment for large archives.';
@@ -194,12 +208,10 @@ async function doHistoryImport() {
     const data = await resp.json();
     if (data.ok) {
       resultEl.className = 'bk-result bk-result-ok';
-      resultEl.innerHTML = `✓ ${data.summary}<br>
-        <span class="bk-result-detail">Existing rows kept; archive rows merged in.</span>`;
+      _setResult(resultEl, `✓ ${data.summary}`, 'Existing rows kept; archive rows merged in.');
     } else {
       resultEl.className = 'bk-result bk-result-err';
-      resultEl.innerHTML = `✗ ${data.error||'Failed'}<br>
-        <span class="bk-result-detail">${(data.errors||[]).join('<br>')}</span>`;
+      _setResult(resultEl, `✗ ${data.error || 'Failed'}`, (data.errors || []).join('\n'));
     }
   } catch (e) {
     resultEl.className = 'bk-result bk-result-err';
