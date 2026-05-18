@@ -411,10 +411,11 @@
             <div class="device-entity-number">
               <input type="number" class="device-entity-input"
                      value="{{ e.state }}"
+                     data-native-step="{{ e.native_step or '' }}"
                      {% if e.min is not none %}min="{{ e.min }}"{% endif %}
                      {% if e.max is not none %}max="{{ e.max }}"{% endif %}
                      {% if e.step is not none %}step="{{ e.step }}"{% endif %}
-                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
+                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value, this.dataset.nativeStep)">
               {% if e.unit %}<span class="unit-label">{{ e.unit }}</span>{% endif %}
             </div>
             {% endif %}
@@ -546,10 +547,11 @@
             <div class="device-entity-number">
               <input type="number" class="device-entity-input"
                      value="{{ e.state }}"
+                     data-native-step="{{ e.native_step or '' }}"
                      {% if e.min is not none %}min="{{ e.min }}"{% endif %}
                      {% if e.max is not none %}max="{{ e.max }}"{% endif %}
                      {% if e.step is not none %}step="{{ e.step }}"{% endif %}
-                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
+                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value, this.dataset.nativeStep)">
               {% if e.unit %}<span class="unit-label">{{ e.unit }}</span>{% endif %}
             </div>
             {% endif %}
@@ -1032,11 +1034,14 @@ async function settingsAlertToggle(alertId, enabled) {
   });
 }
 
-async function updateDeviceEntity(entityId, value) {
+async function updateDeviceEntity(entityId, value, nativeStep) {
   const resp = await fetch(`${window.INGRESS_PATH}/settings/device-entity/update`, {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&entity_id=${encodeURIComponent(entityId)}&value=${encodeURIComponent(value)}`,
+    body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}`
+        + `&entity_id=${encodeURIComponent(entityId)}`
+        + `&value=${encodeURIComponent(value)}`
+        + `&native_step=${encodeURIComponent(nativeStep || '')}`,
   });
   const data = await resp.json().catch(() => ({}));
   if (data.status !== 'ok') {
