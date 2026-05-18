@@ -120,7 +120,7 @@ def _classify_resistance_shape(
     # Compute true ΔP/Q resistance at each steady-state point.
     # Skip readings where flow is below noise floor to avoid division
     # by near-zero inflating variance.
-    MIN_FLOW = 0.05   # L/min noise floor
+    MIN_FLOW = 0.15   # L/min noise floor (matches event_detector.MIN_FLOW_LPM)
     resistance = []
     for p, f in zip(p_mid, f_mid):
         if f >= MIN_FLOW:
@@ -383,7 +383,7 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     # Only meaningful when flow is above noise floor and a pressure
     # transient was actually captured.
     resistance: Optional[float] = None
-    if avg_flow >= 0.05 and event.has_pressure_transient and event.pressure_delta_psi > 0:
+    if avg_flow >= 0.15 and event.has_pressure_transient and event.pressure_delta_psi > 0:
         resistance = event.pressure_delta_psi / avg_flow
 
     # Resistance curve shape — uses corrected ΔP/Q formula.

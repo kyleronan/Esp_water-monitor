@@ -1268,12 +1268,12 @@ sensor:
       - lambda: |-
           if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
           return x;
-      # Step 2: 1-second sliding window (40 samples × 25ms = 1s). send_every: 2
-      # throttles HA updates to 20/s (every 50ms) while internal smoothing
-      # runs at the full 40Hz rate.
+      # Step 2: 0.5-second sliding window (20 samples × 25ms = 500ms). send_every: 1
+      # publishes at 40Hz (every 25ms). Shorter window reduces the stepped
+      # appearance in the HA history graph while keeping the same average volume.
       - sliding_window_moving_average:
-          window_size: 40
-          send_every: 2
+          window_size: 20
+          send_every: 1
     on_value:
       then:
         # --- Check 1: Burst pipe high flow fault ---
@@ -1448,9 +1448,10 @@ sensor:
       - lambda: |-
           if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
           return x;
+      # 0.5-second sliding window — matches water_usage1; see comments there.
       - sliding_window_moving_average:
-          window_size: 40
-          send_every: 2
+          window_size: 20
+          send_every: 1
     on_value:
       then:
         # --- Check 1: Burst pipe high flow fault ---

@@ -129,7 +129,7 @@ class CircuitEventDetector:
     BASELINE_WINDOW_SAMPLES: int = 80       # 2 s averaging window
 
     # Minimum flow rate considered real flow (filters ADC noise)
-    MIN_FLOW_LPM: float = 0.05
+    MIN_FLOW_LPM: float = 0.15
 
     # Maximum physically plausible flow rate for any residential/light-commercial
     # system.  Readings above this are treated as sensor overflow / firmware error
@@ -142,13 +142,24 @@ class CircuitEventDetector:
     # which converts to 60 counts/min / 396 ≈ 0.15 L/min.  Values in the
     # range (0, MIN_NOISE_LPM) are floating-point noise (e.g. 1.58e-36 L/min
     # from ESPHome ADC underflow) and should be treated as zero.
-    MIN_NOISE_LPM: float = 0.01
+    MIN_NOISE_LPM: float = 0.05
 
     # Seconds of sustained flow required to open a flow-triggered event
     FLOW_START_SECONDS: float = 2.0
 
     # Composite: second transient must be >= this multiple of primary threshold
     COMPOSITE_TRANSIENT_MULTIPLIER: float = 1.5
+
+    # Minimum seconds the settled baseline must be stable before a pressure
+    # drop can open an event.  Prevents oscillation peaks (rising→flat→falling)
+    # from being mistaken for a fixture open — real house pressure is stable for
+    # minutes before any tap is turned on.
+    PRESSURE_STABLE_DURATION_S: float = 10.0
+
+    # Minimum event volume.  Events whose computed volume (avg_flow × duration)
+    # is below this threshold are discarded as noise.  1 mL is a sanity floor —
+    # no real water-use event produces less than 1 mL.
+    MIN_EVENT_VOLUME_L: float = 0.001
 
     # Gate for updating the settled-pressure baseline.
     # Only accept a sample as "resting" when historical vs. current pressure
@@ -180,6 +191,7 @@ class CircuitEventDetector:
 
         self._pressure_buf: Deque[float] = deque(maxlen=self.PRESSURE_BUFFER_SIZE)
         self._settled_pressure_psi: Optional[float] = None
+        self._settled_pressure_since: Optional[datetime] = None
         self._active_event: Optional[RawEvent] = None
         self._current_flow_lpm: float = 0.0
         self._flow_sustained_since: Optional[datetime] = None
@@ -304,9 +316,23 @@ class CircuitEventDetector:
 
         if self._active_event is None:
             if abs(drop) < self.SETTLED_STABILITY_PSI:
+                if (self._settled_pressure_psi is None
+                        or abs(baseline - self._settled_pressure_psi) >= 0.1):
+                    self._settled_pressure_since = now
                 self._settled_pressure_psi = baseline
             if drop >= self.pressure_drop_threshold:
-                self._start_pressure_event(now, baseline, pressure)
+                stable_secs = (
+                    0.0 if self._settled_pressure_since is None
+                    else (now - self._settled_pressure_since).total_seconds()
+                )
+                if stable_secs < self.PRESSURE_STABLE_DURATION_S:
+                    log.debug(
+                        "[%s] pressure drop %.1f PSI suppressed — baseline not yet stable "
+                        "(%.1fs < %.1fs required)",
+                        self.circuit, drop, stable_secs, self.PRESSURE_STABLE_DURATION_S,
+                    )
+                else:
+                    self._start_pressure_event(now, baseline, pressure)
         else:
             elapsed_p = (now - self._active_event.start_ts).total_seconds()
             self._pressure_sample_count += 1
@@ -493,6 +519,14 @@ class CircuitEventDetector:
         avg_flow = (
             sum(ev.flow_readings) / len(ev.flow_readings) if ev.flow_readings else 0.0
         )
+        volume_l = avg_flow * duration / 60.0
+        if volume_l < self.MIN_EVENT_VOLUME_L:
+            log.debug(
+                "[%s] discarding near-zero-volume event (%.5f L < %.3f L)",
+                self.circuit, volume_l, self.MIN_EVENT_VOLUME_L,
+            )
+            return
+
         log.info(
             "[%s] event complete — trigger=%s duration=%.1f s avg_flow=%.3f L/min "
             "pressure_drop=%.1f PSI has_transient=%s composite=%s",
@@ -516,6 +550,8 @@ class CircuitEventDetector:
         self._pressure_buf.clear()
         self._current_flow_lpm = 0.0
         self._flow_sustained_since = None
+        self._settled_pressure_psi = None
+        self._settled_pressure_since = None
 
 
 class EventDetector:
