@@ -155,6 +155,9 @@ class CircuitEventDetector:
     # is within this margin — blocks updates during post-event recovery where
     # the historical baseline still lags below the rising actual pressure.
     SETTLED_STABILITY_PSI: float = 0.3
+    # Minimum pressure drop (PSI below baseline) that marks the onset of a
+    # pressure event when scanning the buffer to compute propagation delay.
+    PROPAGATION_ONSET_PSI: float = 0.2
 
     def __init__(
         self,
@@ -382,8 +385,23 @@ class CircuitEventDetector:
         else:
             baseline = 0.0
 
-        log.info("[%s] event start (FLOW) — %.3f L/min for >= %.1f s",
-                 self.circuit, self._current_flow_lpm, self.FLOW_START_SECONDS)
+        # Compute propagation delay from the 40Hz pressure buffer.
+        # Count consecutive samples (newest-first) that are already below
+        # baseline by PROPAGATION_ONSET_PSI — each sample = 25ms.
+        propagation_delay_ms = 0.0
+        if self._pressure_buf:
+            buf_baseline = self._settled_pressure_psi if self._settled_pressure_psi is not None else baseline
+            onset_threshold = buf_baseline - self.PROPAGATION_ONSET_PSI
+            samples_below = 0
+            for p in reversed(self._pressure_buf):
+                if p < onset_threshold:
+                    samples_below += 1
+                else:
+                    break
+            propagation_delay_ms = round(samples_below * 25.0, 1)
+
+        log.info("[%s] event start (FLOW) — %.3f L/min for >= %.1f s propagation_delay=%.0f ms",
+                 self.circuit, self._current_flow_lpm, self.FLOW_START_SECONDS, propagation_delay_ms)
 
         self._flow_sample_count = 0
         self._pressure_sample_count = 0
@@ -392,7 +410,7 @@ class CircuitEventDetector:
             start_ts=start_ts,
             start_trigger="flow",
             flow_onset_ts=start_ts,
-            propagation_delay_ms=0.0,
+            propagation_delay_ms=propagation_delay_ms,
             flow_onset_entity=self._flow_onset_entity,
             pre_event_pressure_psi=baseline,
             min_pressure_psi=baseline,
