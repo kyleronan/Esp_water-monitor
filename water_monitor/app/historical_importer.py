@@ -116,7 +116,7 @@ class HistoricalImporter:
     MERGE_GAP_SECONDS: int = 15       # bridge flow_pulse_onset gaps shorter than this
     MIN_DURATION_SECONDS: float = 3.0
     DUPLICATE_WINDOW_SECONDS: int = 30
-    MIN_FLOW_LPM: float = 0.05
+    MIN_FLOW_LPM: float = 0.15
     PRE_PRESSURE_WINDOW_SECONDS: int = 30   # look-back for baseline pressure
     MIN_PRESSURE_DROP_PSI: float = 0.8      # min drop to flag has_pressure_transient
 
