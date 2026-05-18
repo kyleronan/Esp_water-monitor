@@ -2015,6 +2015,16 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .fx-msg-ok  { background: var(--green-bg);  color: var(--green-text);  border: 1px solid oklch(80% .10 155); }
 .fx-msg-warn{ background: var(--amber-bg);  color: var(--amber-text);  border: 1px solid oklch(82% .12 70);  }
 .fx-msg-err { background: var(--red-bg);    color: var(--red-text);    border: 1px solid oklch(82% .12 25);  }
+.fx-preview-banner {
+  background: var(--amber-bg);
+  color: var(--amber-text);
+  border: 1px solid oklch(82% .12 70);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 16px;
+}
 
 /* Page header row */
 .fx-header {

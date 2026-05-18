@@ -89,9 +89,12 @@
 </div>
 {% endif %}
 
-{% if circ.training_state in ('idle', 'calibrating') and not circ.clusters | selectattr('fixture_id') | list %}
+{% if circ.training_state in ('idle', 'calibrating') and not circ.clusters | selectattr('fixture_id') | list and not (preview and circ.clusters) %}
   <p class="muted" style="margin-bottom:16px">
     Still calibrating — clusters will appear here once training ends.
+    {% if circ.clusters %}
+      <a href="?preview=1" style="margin-left:8px">Show {{ circ.clusters | length }} detected cluster{{ 's' if circ.clusters | length != 1 }} (preview)</a>
+    {% endif %}
   </p>
 
 {% elif not circ.clusters %}
@@ -104,6 +107,12 @@
   </div>
 
 {% else %}
+  {% if preview and circ.training_state in ('idle', 'calibrating') %}
+  <div class="fx-preview-banner">
+    ⚠ Preview — still calibrating. These clusters may shift or merge as more events are collected.
+    <a href="{{ ingress_path }}/fixtures" style="margin-left:8px">Hide preview</a>
+  </div>
+  {% endif %}
   {# Merge action bar — shown by JS when ≥2 boxes in this circuit are checked #}
   {% set circ_idx = loop.index %}
   <div class="fx-merge-bar" id="fx-merge-bar-{{ circ_idx }}"

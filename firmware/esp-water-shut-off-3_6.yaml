@@ -1133,22 +1133,22 @@ sensor:
   #   where 6.6 is the sensor pulse factor (pulses per litre).
   #
   # Timing strategy:
-  #   update_interval: 1s — counts pulses over a 1 second window. This is the
-  #     shortest practical window that still gives accurate readings at low flow.
+  #   update_interval: 50ms — counts pulses over a 50ms window at 20Hz internally.
+  #     Improves propagation-delay resolution to ±50ms so the clustering engine
+  #     can better distinguish fixtures at different hydraulic distances.
   #   Filter chain (applied in order):
   #     1. lambda — converts raw counts/min to L/min
-  #     2. sliding_window_moving_average (window 2s) — averages the last 2
-  #        one-second readings to smooth single-second pulse noise while adding
-  #        only ~2s of lag on flow-stop.
+  #     2. sliding_window_moving_average (window_size 20 × 50ms = 1s, send_every 2)
+  #        — 1s smoothing window; sends every 2nd result → 10 HA updates/second.
   #
   # Safety checks on every reported value:
   #   1. Burst pipe — high flow above threshold triggers safety fault
   #   2. Trickle flow — low but sustained flow triggers trickle alert
   #
-  # Note on trickle detection and the 2s sliding window:
-  #   The window averages two 1s readings, reducing single-pulse noise while
-  #   adding only ~2s of lag. Trickle detection is reliable for flows above
-  #   ~0.15 L/min (1 pulse/s); below that, readings are noisier but the timer
+  # Note on trickle detection and the 1s sliding window:
+  #   The window averages twenty 50ms readings (= 1s), reducing pulse noise while
+  #   adding only ~1s of lag. Trickle detection is reliable for flows above
+  #   ~0.15 L/min (~1 pulse/s); below that, readings are noisier but the timer
   #   still accumulates correctly over the multi-minute alert duration.
   # ---------------------------------------------------------------------------
   # FLOW SENSOR 1 BASE — Main line (GPIO39)
@@ -1179,7 +1179,7 @@ sensor:
     internal_filter: 13us  # debounce — suppresses RF noise from valve motor inductance
     id: flow_base_main
     internal: true
-    update_interval: 1s
+    update_interval: 50ms
     on_value:
       then:
         # --- Instant burst detection ---
@@ -1265,13 +1265,12 @@ sensor:
       - lambda: |-
           if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
           return x;
-      # Step 2: 2-second sliding window. Smooths single-second pulse noise while
-      # adding only ~2s of lag on flow-stop. Trickle detection is reliable for
-      # flows above ~0.15 L/min (1 pulse/s). Below that, readings are noisier
-      # but still accumulate correctly over the trickle timer duration.
+      # Step 2: 1-second sliding window (20 samples × 50ms = 1s). send_every: 2
+      # throttles HA updates to 10/s (every 100ms) while internal smoothing
+      # runs at the full 20Hz rate.
       - sliding_window_moving_average:
-          window_size: 2
-          send_every: 1
+          window_size: 20
+          send_every: 2
     on_value:
       then:
         # --- Check 1: Burst pipe high flow fault ---
@@ -1381,7 +1380,7 @@ sensor:
     internal_filter: 13us  # debounce — suppresses RF noise from valve motor inductance
     id: flow_base_irr
     internal: true
-    update_interval: 1s
+    update_interval: 50ms
     on_value:
       then:
         # --- Instant burst detection (Irrigation) ---
@@ -1447,8 +1446,8 @@ sensor:
           if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
           return x;
       - sliding_window_moving_average:
-          window_size: 2
-          send_every: 1
+          window_size: 20
+          send_every: 2
     on_value:
       then:
         # --- Check 1: Burst pipe high flow fault ---
