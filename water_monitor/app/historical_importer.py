@@ -314,6 +314,16 @@ class HistoricalImporter:
         pressure_hist  = histories.get(pressure_entity, []) if pressure_entity else []
         volume_hist    = histories.get(cfg.volume_sensor, []) if cfg.volume_sensor else []
 
+        # Resolve volume sensor unit from live state — history is fetched with
+        # no_attributes=True so attributes are stripped from volume_hist entries.
+        vol_unit = ""
+        if cfg.volume_sensor:
+            try:
+                vs = await self._ha.get_state(cfg.volume_sensor)
+                vol_unit = (vs.get("attributes") or {}).get("unit_of_measurement", "") if vs else ""
+            except Exception:
+                pass
+
         # Detect flow periods
         periods = self._find_flow_periods(onset_hist, flow_rate_hist, query_end=end)
         if not periods:
@@ -341,6 +351,7 @@ class HistoricalImporter:
                 cfg.circuit, period_start, period_end,
                 flow_rate_hist, pressure_hist, volume_hist,
                 using_avg_pressure=(pressure_entity == cfg.pressure_avg_sensor),
+                vol_unit=vol_unit,
             )
             if raw is None:
                 continue
@@ -493,6 +504,7 @@ class HistoricalImporter:
         pressure_hist: List[Dict],
         volume_hist: List[Dict],
         using_avg_pressure: bool = False,
+        vol_unit: str = "",
     ) -> Optional[RawEvent]:
         """
         Build a RawEvent from slices of history data.
@@ -562,7 +574,6 @@ class HistoricalImporter:
             delta = volume_in_period[-1] - volume_in_period[0]
             if 0 < delta < 10_000:   # sanity: reject resets and absurd values
                 from .ha_client import vol_to_litres as _v2l
-                vol_unit = (volume_hist[0].get("attributes") or {}).get("unit_of_measurement", "")
                 volume_litres_measured = round(_v2l(delta, vol_unit), 3)
 
         return RawEvent(
