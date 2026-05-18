@@ -557,7 +557,11 @@ class Orchestrator:
                         period_start + timedelta(hours=2),
                     )
                     if hist:
-                        midnight_val = float(hist[0]["state"])
+                        from .ha_client import vol_to_litres as _v2l
+                        first = hist[0]
+                        midnight_val = float(first["state"])
+                        mid_unit = (first.get("attributes") or {}).get("unit_of_measurement", "")
+                        midnight_val = _v2l(midnight_val, mid_unit)
                     else:
                         midnight_val = 0.0
                 except Exception as e:
@@ -618,7 +622,14 @@ class Orchestrator:
                                compute_ha_daily_volume, compute_ha_weekly_volume)
         ha_volume_raw = states.get(circuit_cfg.volume_sensor, "")
         try:
-            ha_volume_total = float(ha_volume_raw) if ha_volume_raw not in ("", "unknown", None) else None
+            if ha_volume_raw not in ("", "unknown", None):
+                from .ha_client import vol_to_litres as _v2l
+                raw_f    = float(ha_volume_raw)
+                vol_attrs = (full_states.get(circuit_cfg.volume_sensor) or {}).get("attributes") or {}
+                vol_unit  = vol_attrs.get("unit_of_measurement", "")
+                ha_volume_total = _v2l(raw_f, vol_unit)
+            else:
+                ha_volume_total = None
         except (ValueError, TypeError):
             ha_volume_total = None
 

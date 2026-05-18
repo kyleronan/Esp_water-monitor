@@ -561,7 +561,9 @@ class HistoricalImporter:
         if len(volume_in_period) >= 2:
             delta = volume_in_period[-1] - volume_in_period[0]
             if 0 < delta < 10_000:   # sanity: reject resets and absurd values
-                volume_litres_measured = round(delta, 3)
+                from .ha_client import vol_to_litres as _v2l
+                vol_unit = (volume_hist[0].get("attributes") or {}).get("unit_of_measurement", "")
+                volume_litres_measured = round(_v2l(delta, vol_unit), 3)
 
         return RawEvent(
             circuit=circuit,

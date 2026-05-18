@@ -120,23 +120,40 @@ async def settings_page(request: Request):
                     .replace("L/min",   _flow_label)
                     .replace("(PSI)",   f"({_pressure_label})")
                     .replace("PSI",     _pressure_label))
-                # Pre-convert numeric state to display units
+                # Pre-convert numeric state to display units; also convert
+                # min/max/step so the HTML input constraints match display units.
+                # native_step is preserved so the POST handler can round to it.
                 if pattern in _FLOW_PATTERNS:
-                    e["unit_type"] = "flow"
-                    e["unit"] = _flow_label
+                    e["unit_type"]   = "flow"
+                    e["unit"]        = _flow_label
+                    e["native_step"] = e.get("step")
                     try:
                         e["state"] = round(float(e["state"]) * _flow_factor, 3)
                     except (TypeError, ValueError):
                         pass
+                    for attr in ("min", "max", "step"):
+                        if e.get(attr) is not None:
+                            try:
+                                e[attr] = round(float(e[attr]) * _flow_factor, 3)
+                            except (TypeError, ValueError):
+                                pass
                 elif pattern in _PRESSURE_PATTERNS:
-                    e["unit_type"] = "pressure"
-                    e["unit"] = _pressure_label
+                    e["unit_type"]   = "pressure"
+                    e["unit"]        = _pressure_label
+                    e["native_step"] = e.get("step")
                     try:
                         e["state"] = round(float(e["state"]) * _pressure_factor, 3)
                     except (TypeError, ValueError):
                         pass
+                    for attr in ("min", "max", "step"):
+                        if e.get(attr) is not None:
+                            try:
+                                e[attr] = round(float(e[attr]) * _pressure_factor, 3)
+                            except (TypeError, ValueError):
+                                pass
                 else:
-                    e["unit_type"] = None
+                    e["unit_type"]   = None
+                    e["native_step"] = e.get("step")
                 return e
 
         # Fallback: clean up the raw friendly name
@@ -154,6 +171,7 @@ async def settings_page(request: Request):
         e["short_label"] = f"{name.title()} — {circuit.replace('_', ' ').title()}"
         e["description"] = ""
         e["unit_type"]   = None
+        e["native_step"] = e.get("step")
         return e
 
     # Only render number.* entities — select.* support requires explicit mutable
@@ -451,6 +469,7 @@ async def device_entity_update(request: Request):
             status_code=403,
         )
 
+    native_step = form.get("native_step", "").strip()
     try:
         numeric = float(value)
         # Convert from display units back to internal units (L/min / PSI)
@@ -463,7 +482,17 @@ async def device_entity_update(request: Request):
         elif any(k in entity_id for k in _PRESSURE_KEYWORDS):
             from ..units import load_unit_context as _luc
             numeric = numeric / _luc(orch.db)["pressure_factor"]
-        ok = await orch.ha.set_number(entity_id, round(numeric, 4))
+        # Round to the entity's native step to satisfy HA validation
+        if native_step:
+            try:
+                ns = float(native_step)
+                if ns > 0:
+                    numeric = round(round(numeric / ns) * ns, 6)
+            except ValueError:
+                numeric = round(numeric, 4)
+        else:
+            numeric = round(numeric, 4)
+        ok = await orch.ha.set_number(entity_id, numeric)
     except ValueError:
         return JSONResponse(
             {"status": "error", "message": f"Invalid number: {value}"},

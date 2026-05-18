@@ -882,6 +882,18 @@ def _migrate_025(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_026(conn: sqlite3.Connection) -> None:
+    """Clear volume_snapshots so baselines are re-initialised with correct unit conversion.
+
+    Prior to this migration, HA volume sensor states were read without checking
+    unit_of_measurement, so US-customary installs stored gallon values as if they
+    were litres.  Clearing the table forces _init_volume_baselines() to refetch
+    the correct midnight values (now converted to litres) on the next startup.
+    """
+    conn.execute("DELETE FROM volume_snapshots")
+    log.info("Migration 026: cleared volume_snapshots — baselines will be rebuilt at startup")
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -908,6 +920,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (23, _migrate_023),
     (24, _migrate_024),
     (25, _migrate_025),
+    (26, _migrate_026),
 ]
 
 

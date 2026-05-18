@@ -26,6 +26,15 @@ log = logging.getLogger(__name__)
 WS_URL = "ws://supervisor/core/websocket"
 REST_URL = "http://supervisor/core/api"
 
+_GAL_UNITS = {"gal", "us gal", "gallon", "gallons", "us gallon", "us liquid gallon"}
+
+
+def vol_to_litres(value: float, unit: str) -> float:
+    """Convert a volume value to litres; pass-through if already in L or unknown."""
+    if (unit or "").strip().lower() in _GAL_UNITS:
+        return value * 3.785411784
+    return value
+
 # Type for state-changed callbacks: (entity_id, new_state, attributes) -> None
 StateCallback = Callable[[str, str, dict], None]
 
