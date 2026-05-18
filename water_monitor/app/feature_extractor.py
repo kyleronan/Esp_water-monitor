@@ -479,7 +479,7 @@ class FeatureExtractor:
         try:
             from .database import (insert_event, update_hourly_volume,
                                    is_event_in_exclusion_window)
-            insert_event(self._db, features)
+            is_new_event = insert_event(self._db, features)
 
             # ── Plumbing-event exclusion window (Phase 2.1) ───────────────
             # If the user opened an exclusion window (e.g. post-winterization
@@ -502,7 +502,11 @@ class FeatureExtractor:
                     event.circuit,
                 )
 
-            if event.start_ts and features.get("volume_litres", 0) > 0:
+            # Only accumulate volume and training counts for genuinely new events.
+            # Re-imports (INSERT OR REPLACE replacing an existing row) must not
+            # add to these totals again — that would inflate the hourly chart and
+            # the training progress bar on every addon restart.
+            if is_new_event and event.start_ts and features.get("volume_litres", 0) > 0:
                 # Normalize to UTC and strip timezone info so hour_ts matches
                 # the format that DB queries use: strftime('%Y-%m-%dT%H:00:00', …)
                 # produces no timezone suffix.  Mixing +00:00 suffixed values
@@ -519,7 +523,7 @@ class FeatureExtractor:
                     features["volume_litres"],
                 )
 
-            if not features.get("excluded_from_training"):
+            if is_new_event and not features.get("excluded_from_training"):
                 self._db.execute("""
                     UPDATE training_state
                     SET events_collected = events_collected + 1,
