@@ -535,9 +535,9 @@ class Orchestrator:
 
         Uses the cached HA timezone from _init_ha_timezone(); falls back to UTC.
         """
-        from datetime import timezone as _tz, timedelta as _td
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
         ha_tz = getattr(self, "_ha_tz", _tz.utc)
-        now_local = datetime.now(ha_tz)
+        now_local = _dt.now(ha_tz)
         midnight_local = now_local.replace(
             hour=0, minute=0, second=0, microsecond=0
         ) - _td(days=days_ago)
