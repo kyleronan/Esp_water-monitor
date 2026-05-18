@@ -369,6 +369,7 @@ CREATE TABLE IF NOT EXISTS events (
     hydraulic_resistance        REAL,
     resistance_curve_shape      TEXT,
     propagation_delay_seconds   REAL,
+    propagation_delay_ms        REAL DEFAULT 0,
     flow_onset_delay_seconds    REAL,
     start_trigger               TEXT DEFAULT 'unknown',
     has_pressure_transient      BOOLEAN DEFAULT 0,
@@ -413,7 +414,11 @@ CREATE TABLE IF NOT EXISTS events (
     steady_state_fraction            REAL DEFAULT 0,
     -- Pressure transient features (migration 025)
     pressure_transient_energy        REAL DEFAULT 0,
-    pressure_transient_duration_ms   REAL DEFAULT 0
+    pressure_transient_duration_ms   REAL DEFAULT 0,
+    -- Pressure transient shape features (migration 026)
+    pressure_onset_ms                REAL DEFAULT 0,
+    recovery_overshoot_psi           REAL DEFAULT 0,
+    pressure_oscillation_count       INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_circuit_ts
@@ -607,6 +612,31 @@ def _apply_post_create_migrations(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e).lower():
             log.warning("ALTER TABLE events.match_rejection_reason: %s", e)
+
+    # Migration 026 — propagation_delay in ms + pressure transient shape features.
+    try:
+        conn.execute("ALTER TABLE events ADD COLUMN propagation_delay_ms REAL DEFAULT 0")
+        conn.execute(
+            "UPDATE events SET propagation_delay_ms = propagation_delay_seconds * 1000 "
+            "WHERE propagation_delay_seconds IS NOT NULL")
+        conn.commit()
+        log.info("Migration: added events.propagation_delay_ms (backfilled from seconds column)")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            log.warning("ALTER TABLE events.propagation_delay_ms: %s", e)
+
+    for col, definition in [
+        ("pressure_onset_ms",          "REAL DEFAULT 0"),
+        ("recovery_overshoot_psi",     "REAL DEFAULT 0"),
+        ("pressure_oscillation_count", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
+            conn.commit()
+            log.info("Migration: added events.%s", col)
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                log.warning("ALTER TABLE events.%s: %s", col, e)
 
 
 # ==========================================================================

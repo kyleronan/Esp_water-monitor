@@ -1133,20 +1133,22 @@ sensor:
   #   where 6.6 is the sensor pulse factor (pulses per litre).
   #
   # Timing strategy:
-  #   update_interval: 50ms — counts pulses over a 50ms window at 20Hz internally.
-  #     Improves propagation-delay resolution to ±50ms so the clustering engine
-  #     can better distinguish fixtures at different hydraulic distances.
+  #   update_interval: 25ms — counts pulses over a 25ms window at 40Hz internally.
+  #     Matches the fast pressure sensor sample rate so flow_pulse_onset fires
+  #     within ~41ms of the first pulse (25ms window + ~16ms ESP loop).
+  #     HA history records the server-side last_changed timestamp for accurate
+  #     propagation delay calculation via the HA history API.
   #   Filter chain (applied in order):
   #     1. lambda — converts raw counts/min to L/min
-  #     2. sliding_window_moving_average (window_size 20 × 50ms = 1s, send_every 2)
-  #        — 1s smoothing window; sends every 2nd result → 10 HA updates/second.
+  #     2. sliding_window_moving_average (window_size 40 × 25ms = 1s, send_every 2)
+  #        — 1s smoothing window; sends every 2nd result → 20 HA updates/second.
   #
   # Safety checks on every reported value:
   #   1. Burst pipe — high flow above threshold triggers safety fault
   #   2. Trickle flow — low but sustained flow triggers trickle alert
   #
   # Note on trickle detection and the 1s sliding window:
-  #   The window averages twenty 50ms readings (= 1s), reducing pulse noise while
+  #   The window averages forty 25ms readings (= 1s), reducing pulse noise while
   #   adding only ~1s of lag. Trickle detection is reliable for flows above
   #   ~0.15 L/min (~1 pulse/s); below that, readings are noisier but the timer
   #   still accumulates correctly over the multi-minute alert duration.
@@ -1179,7 +1181,7 @@ sensor:
     internal_filter: 13us  # debounce — suppresses RF noise from valve motor inductance
     id: flow_base_main
     internal: true
-    update_interval: 50ms
+    update_interval: 25ms
     on_value:
       then:
         # --- Instant burst detection ---
@@ -1265,11 +1267,11 @@ sensor:
       - lambda: |-
           if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
           return x;
-      # Step 2: 1-second sliding window (20 samples × 50ms = 1s). send_every: 2
-      # throttles HA updates to 10/s (every 100ms) while internal smoothing
-      # runs at the full 20Hz rate.
+      # Step 2: 1-second sliding window (40 samples × 25ms = 1s). send_every: 2
+      # throttles HA updates to 20/s (every 50ms) while internal smoothing
+      # runs at the full 40Hz rate.
       - sliding_window_moving_average:
-          window_size: 20
+          window_size: 40
           send_every: 2
     on_value:
       then:
@@ -1380,7 +1382,7 @@ sensor:
     internal_filter: 13us  # debounce — suppresses RF noise from valve motor inductance
     id: flow_base_irr
     internal: true
-    update_interval: 50ms
+    update_interval: 25ms
     on_value:
       then:
         # --- Instant burst detection (Irrigation) ---
@@ -1446,7 +1448,7 @@ sensor:
           if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
           return x;
       - sliding_window_moving_average:
-          window_size: 20
+          window_size: 40
           send_every: 2
     on_value:
       then:
@@ -1724,16 +1726,11 @@ binary_sensor:
   # These transition ON when the flow rate exceeds the noise floor (0.02 L/min)
   # and stay ON for 8 seconds after the last above-threshold reading.
   #
-  # Timing note: these sensors update every 1 second (the pulse counter rate).
-  # Flow onset detection now has up to ~1s latency rather than the near-
-  # instantaneous first-pulse response of the previous GPIO approach. In
-  # practice this is acceptable because HA WebSocket event timestamps already
-  # carry 1-2s delivery jitter, so sub-second propagation delay measurement
-  # via the HA event stream was not achievable anyway.
-  #
-  # The water signature add-on uses these to detect event start/end and
-  # pair with pressure_main_fast state_changed events for propagation delay
-  # estimation at ~1s resolution.
+  # Timing note: flow_pulse_onset fires within ~41ms of the first pulse —
+  # the template lambda evaluates on each ESP main loop cycle (~16ms) against
+  # flow_base_main/irr which updates every 25ms. HA records the server-side
+  # last_changed timestamp; the app queries this via the HA history API after
+  # each pressure-triggered event to compute propagation_delay_ms accurately.
   # ---------------------------------------------------------------------------
   - platform: template
     id: flow_pulse_onset_main

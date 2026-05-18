@@ -69,7 +69,10 @@ class RawEvent:
 
     # Flow onset relative to event start (only meaningful for pressure-started events)
     flow_onset_ts: Optional[datetime] = None
-    propagation_delay_seconds: Optional[float] = None
+    propagation_delay_ms: Optional[float] = None
+    # Entity ID of the flow_pulse_onset sensor — used by FeatureExtractorWorker
+    # to fetch the precise HA-history timestamp after the event closes.
+    flow_onset_entity: Optional[str] = None
 
     # 1Hz flow readings collected during the event
     flow_readings: List[float] = field(default_factory=list)
@@ -160,11 +163,13 @@ class CircuitEventDetector:
         min_event_duration_seconds: float,
         event_queue: asyncio.Queue,
         get_other_valve_open: Optional[Callable[[], Optional[bool]]] = None,
+        flow_onset_entity: Optional[str] = None,
     ) -> None:
         self.circuit = circuit
         self.pressure_drop_threshold = pressure_drop_threshold_psi
         self.min_event_duration = min_event_duration_seconds
         self._event_queue = event_queue
+        self._flow_onset_entity: Optional[str] = flow_onset_entity
         # Callable provided by parent EventDetector to read other-circuit valve states
         self._get_other_valve_open: Callable[[], Optional[bool]] = (
             get_other_valve_open or (lambda: None)
@@ -341,10 +346,10 @@ class CircuitEventDetector:
             if (self._active_event is not None
                     and self._active_event.flow_onset_ts is None):
                 self._active_event.flow_onset_ts = now
-                delay = (now - self._active_event.start_ts).total_seconds()
-                self._active_event.propagation_delay_seconds = delay
-                log.debug("[%s] flow onset — propagation delay %.2f s",
-                          self.circuit, delay)
+                delay_ms = (now - self._active_event.start_ts).total_seconds() * 1000.0
+                self._active_event.propagation_delay_ms = delay_ms
+                log.debug("[%s] flow onset — propagation delay %.0f ms",
+                          self.circuit, delay_ms)
         else:
             if self._active_event is not None:
                 if self._current_flow_lpm < self.MIN_FLOW_LPM:
@@ -387,7 +392,8 @@ class CircuitEventDetector:
             start_ts=start_ts,
             start_trigger="flow",
             flow_onset_ts=start_ts,
-            propagation_delay_seconds=0.0,
+            propagation_delay_ms=0.0,
+            flow_onset_entity=self._flow_onset_entity,
             pre_event_pressure_psi=baseline,
             min_pressure_psi=baseline,
             flow_readings=[self._current_flow_lpm],
@@ -413,6 +419,7 @@ class CircuitEventDetector:
             min_pressure_psi=current_pressure,
             pressure_delta_psi=drop,
             pressure_readings=[current_pressure],
+            flow_onset_entity=self._flow_onset_entity,
             other_valve_open=self._get_other_valve_open(),
         )
         self._flow_sustained_since = None
@@ -536,6 +543,7 @@ class EventDetector:
                 get_other_valve_open=(
                     lambda c=cfg.circuit: self._get_other_valve_open(c)
                 ),
+                flow_onset_entity=cfg.flow_onset_sensor,
             )
             self._detectors[cfg.circuit] = detector
 

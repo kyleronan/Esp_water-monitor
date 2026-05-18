@@ -47,7 +47,7 @@ FEATURE_KEYS = [
     'avg_flow_lpm', 'peak_flow_lpm', 'duration_seconds',
     'volume_litres', 'pressure_delta_psi', 'has_pressure_transient',
     'flow_variability', 'hour_sin', 'hour_cos',
-    'propagation_delay_seconds',
+    'propagation_delay_ms',
     # Flow shape — 32-point normalized signature
     'flow_sig_00', 'flow_sig_01', 'flow_sig_02', 'flow_sig_03',
     'flow_sig_04', 'flow_sig_05', 'flow_sig_06', 'flow_sig_07',
@@ -71,6 +71,8 @@ FEATURE_KEYS = [
     # Pressure scalars (pre_event/min/resistance already stored; energy/duration new)
     'pre_event_pressure_psi', 'min_pressure_psi', 'hydraulic_resistance',
     'pressure_transient_energy', 'pressure_transient_duration_ms',
+    # Pressure transient shape features
+    'pressure_onset_ms', 'recovery_overshoot_psi', 'pressure_oscillation_count',
 ]
 
 
@@ -192,7 +194,7 @@ class ClusterEngine:
             'flow_variability':       variability,
             'hour_sin':               hour_sin,
             'hour_cos':               hour_cos,
-            'propagation_delay_seconds': float(event.get('propagation_delay_seconds') or 0),
+            'propagation_delay_ms':      float(event.get('propagation_delay_ms')      or 0),
             # Edge complexity
             'flow_edge_count':        float(event.get('flow_edge_count')        or 0),
             # Open/close dynamics
@@ -217,6 +219,9 @@ class ClusterEngine:
             'hydraulic_resistance':   float(event.get('hydraulic_resistance')   or 0),
             'pressure_transient_energy':     float(event.get('pressure_transient_energy')     or 0),
             'pressure_transient_duration_ms': float(event.get('pressure_transient_duration_ms') or 0),
+            'pressure_onset_ms':             float(event.get('pressure_onset_ms')             or 0),
+            'recovery_overshoot_psi':        float(event.get('recovery_overshoot_psi')        or 0),
+            'pressure_oscillation_count':    float(event.get('pressure_oscillation_count')    or 0),
         }
 
         # Expand JSON signature → flow_sig_00 … flow_sig_31

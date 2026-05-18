@@ -603,7 +603,7 @@ class HistoricalImporter:
             pressure_delta_psi=round(pressure_delta, 2),
             pressure_readings=pressure_readings,
             flow_onset_ts=start,
-            propagation_delay_seconds=0.0,
+            propagation_delay_ms=0.0,
             flow_readings=flow_readings,
             volume_litres_measured=volume_litres_measured,
             complete=True,
