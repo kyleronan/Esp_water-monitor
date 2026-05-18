@@ -46,6 +46,7 @@ FEATURE_KEYS = [
     'avg_flow_lpm', 'peak_flow_lpm', 'duration_seconds',
     'volume_litres', 'pressure_delta_psi', 'has_pressure_transient',
     'flow_variability', 'hour_sin', 'hour_cos',
+    'propagation_delay_seconds',   # pipe-distance heuristic — distinguishes fixtures at different hydraulic distances
 ]
 
 
