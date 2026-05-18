@@ -570,14 +570,15 @@ async def setup_home_details_save(request: Request):
     from ..database import update_home_profile
     from ..config import compute_suggested_calibration_days
 
-    bathrooms_full = int(form.get("bathrooms_full", 1) or 1)
-    bathrooms_half = int(form.get("bathrooms_half", 0) or 0)
-    floors         = int(form.get("floors", 1) or 1)
-    occupants      = int(form.get("occupants", 2) or 2)
-    supply_type    = form.get("supply_type", "mains")
-    build_year_raw = form.get("build_year", "")
-    build_year     = int(build_year_raw) if build_year_raw.strip().isdigit() else None
-    sqft           = int(form.get("sqft", 0) or 0)
+    bathrooms_full             = int(form.get("bathrooms_full", 1) or 1)
+    bathrooms_half             = int(form.get("bathrooms_half", 0) or 0)
+    floors                     = int(form.get("floors", 1) or 1)
+    occupants                  = int(form.get("occupants", 2) or 2)
+    supply_type                = form.get("supply_type", "mains")
+    build_year_raw             = form.get("build_year", "")
+    build_year                 = int(build_year_raw) if build_year_raw.strip().isdigit() else None
+    sqft                       = int(form.get("sqft", 0) or 0)
+    historical_import_enabled  = form.get("historical_import_enabled") == "1"
 
     update_home_profile(
         orch.db,
@@ -594,6 +595,17 @@ async def setup_home_details_save(request: Request):
     # Mark setup complete and reload entity IDs into live circuit configs
     mark_setup_complete(orch.db)
     orch.reload_circuit_entities()
+
+    # If the user opted out of historical import, stamp import_state to NOW
+    # for every circuit.  _backfill() and _catch_up() both clamp to this
+    # checkpoint, so no events before the setup moment will ever be imported.
+    if not historical_import_enabled:
+        from datetime import datetime, timezone as _tz
+        from ..database import update_import_state
+        now_ts = datetime.now(_tz.utc).isoformat()
+        for _circuit_cfg in orch._cfg.circuits:
+            update_import_state(orch.db, _circuit_cfg.circuit, now_ts, 0)
+        log.info("Historical import disabled — import_state stamped to %s for all circuits", now_ts)
 
     # Activate event detection now that entity IDs are known.
     # At startup, event_detector.setup() is skipped when setup is not yet

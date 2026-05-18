@@ -224,6 +224,21 @@ class HistoricalImporter:
             else:
                 start = now - timedelta(days=self.MAX_BACKFILL_DAYS)
 
+            # Respect any import_state checkpoint — e.g. stamped at setup time
+            # when the user chose to skip historical import.  Clamp so we never
+            # reach before that cutoff, even across restarts.
+            state = get_import_state(self._db, cfg.circuit)
+            cutoff_ts = state.get("last_check_ts") if state else None
+            if cutoff_ts:
+                try:
+                    cutoff = datetime.fromisoformat(cutoff_ts.replace("Z", "+00:00"))
+                    if start < cutoff:
+                        log.info("[%s] backfill clamped to import_state checkpoint %s",
+                                 cfg.circuit, cutoff_ts)
+                        start = cutoff
+                except ValueError:
+                    pass
+
             log.info("[%s] backfill: importing %s → now",
                      cfg.circuit, start.isoformat())
             # Chunk into 1-day windows so each WS response stays small enough

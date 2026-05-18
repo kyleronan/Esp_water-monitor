@@ -499,6 +499,20 @@
       </div>
     </fieldset>
 
+    <fieldset class="form-section" style="margin-top:1.5rem">
+      <legend>Historical data</legend>
+      <div class="form-group form-group--checkbox">
+        <label class="checkbox-label">
+          <input type="checkbox" name="historical_import_enabled" value="1" checked>
+          <span>Import historical events</span>
+        </label>
+        <p class="form-hint" style="margin-left:1.6rem">
+          Import up to 10 days of past water usage from Home Assistant.
+          Uncheck to start fresh — only new events will be recorded.
+        </p>
+      </div>
+    </fieldset>
+
     <div class="control-row" style="margin-top:1.5rem">
       <button type="submit" class="btn btn-primary">Finish setup →</button>
     </div>
