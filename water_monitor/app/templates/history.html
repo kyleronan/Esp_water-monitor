@@ -118,14 +118,15 @@
           <th>Start ({{ pressure_unit }})</th>
           <th>End ({{ pressure_unit }})</th>
           <th>Drop</th>
+          <th>Drop rate</th>
           <th>Duration</th>
         </tr>
       </thead>
       <tbody>
         {% for t in ch.leak_tests %}
-        {% set completed = t.result and ('Passed' in t.result or 'Failed' in t.result) %}
+        {% set drop_rate = (t.pressure_drop_psi / t.duration_minutes) if (t.pressure_drop_psi is not none and t.duration_minutes) else none %}
         <tr class="{% if 'Passed' in (t.result or '') %}hist-row-pass{% elif t.result %}hist-row-fail{% endif %}">
-          <td class="hist-td hist-td-mono">{{ (t.run_at or '')[:16] }}</td>
+          <td class="hist-td hist-td-mono"><time data-ts="{{ t.run_at or '' }}">{{ (t.run_at or '')[:16] }}</time></td>
           <td class="hist-td">{{ t.triggered_by or '—' }}</td>
           <td class="hist-td">
             {% if 'Passed' in (t.result or '') %}
@@ -135,10 +136,11 @@
             {% else %}—
             {% endif %}
           </td>
-          <td class="hist-td hist-td-mono">{{ (t.baseline_psi * pressure_factor)|round(pressure_decimals) if completed and t.baseline_psi is not none else "—" }}</td>
-          <td class="hist-td hist-td-mono">{{ (t.final_psi * pressure_factor)|round(pressure_decimals) if completed and t.final_psi is not none else "—" }}</td>
-          <td class="hist-td hist-td-mono">{{ (t.pressure_drop_psi * pressure_factor)|round(pressure_decimals) if completed and t.pressure_drop_psi is not none else "—" }}</td>
-          <td class="hist-td">{{ "%.1f min"|format(t.duration_minutes) if completed and t.duration_minutes else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ (t.baseline_psi * pressure_factor)|round(pressure_decimals) if t.baseline_psi is not none else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ (t.final_psi * pressure_factor)|round(pressure_decimals) if t.final_psi is not none else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ (t.pressure_drop_psi * pressure_factor)|round(pressure_decimals) if t.pressure_drop_psi is not none else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ "%.4f %s/min"|format(drop_rate * pressure_factor, pressure_unit) if drop_rate is not none else "—" }}</td>
+          <td class="hist-td">{{ "%.1f min"|format(t.duration_minutes) if t.duration_minutes else "—" }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -176,7 +178,7 @@
       <tbody>
         {% for e in ch.events %}
         <tr class="hist-event-row{% if e.is_composite %} hist-row-composite{% endif %}">
-          <td class="hist-td hist-td-mono hist-td-time">{{ (e.start_ts or '')[:16] }}</td>
+          <td class="hist-td hist-td-mono hist-td-time"><time data-ts="{{ e.start_ts or '' }}">{{ (e.start_ts or '')[:16] }}</time></td>
           <td class="hist-td">{{ "%.0fs"|format(e.duration_seconds) if e.duration_seconds else "—" }}</td>
           <td class="hist-td hist-td-mono">{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm else "—" }} {{ flow_unit }}</td>
           <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi else "—" }}</td>
@@ -373,6 +375,16 @@ document.addEventListener('DOMContentLoaded', () => {
       },
     });
   }
+});
+
+// Convert UTC timestamps to browser local time
+document.querySelectorAll('time[data-ts]').forEach(el => {
+  const ts = el.dataset.ts;
+  if (!ts) return;
+  const d = new Date(ts);
+  if (isNaN(d)) return;
+  const pad = n => String(n).padStart(2, '0');
+  el.textContent = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 });
 </script>
 {% endblock %}
