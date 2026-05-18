@@ -147,6 +147,12 @@ class CircuitEventDetector:
     # Composite: second transient must be >= this multiple of primary threshold
     COMPOSITE_TRANSIENT_MULTIPLIER: float = 1.5
 
+    # Gate for updating the settled-pressure baseline.
+    # Only accept a sample as "resting" when historical vs. current pressure
+    # is within this margin — blocks updates during post-event recovery where
+    # the historical baseline still lags below the rising actual pressure.
+    SETTLED_STABILITY_PSI: float = 0.3
+
     def __init__(
         self,
         circuit: str,
@@ -165,6 +171,7 @@ class CircuitEventDetector:
         )
 
         self._pressure_buf: Deque[float] = deque(maxlen=self.PRESSURE_BUFFER_SIZE)
+        self._settled_pressure_psi: Optional[float] = None
         self._active_event: Optional[RawEvent] = None
         self._current_flow_lpm: float = 0.0
         self._flow_sustained_since: Optional[datetime] = None
@@ -258,6 +265,7 @@ class CircuitEventDetector:
             # ESP reconnected or went offline — stale buffer readings would mix
             # with new data and could trigger a false pressure transient.
             self._pressure_buf.clear()
+            self._settled_pressure_psi = None
             log.debug("[%s] pressure sensor %s — buffer cleared", self.circuit, state)
             return
 
@@ -287,6 +295,8 @@ class CircuitEventDetector:
         drop = baseline - pressure   # positive = pressure has fallen
 
         if self._active_event is None:
+            if abs(drop) < self.SETTLED_STABILITY_PSI:
+                self._settled_pressure_psi = baseline
             if drop >= self.pressure_drop_threshold:
                 self._start_pressure_event(now, baseline, pressure)
         else:
@@ -355,7 +365,9 @@ class CircuitEventDetector:
         self._flow_sustained_since = None
 
         min_samples = self.BASELINE_LOOKBACK_SAMPLES + self.BASELINE_WINDOW_SAMPLES
-        if len(self._pressure_buf) >= min_samples:
+        if self._settled_pressure_psi is not None:
+            baseline = self._settled_pressure_psi
+        elif len(self._pressure_buf) >= min_samples:
             buf = list(self._pressure_buf)
             b_end = len(buf) - self.BASELINE_LOOKBACK_SAMPLES
             b_start = b_end - self.BASELINE_WINDOW_SAMPLES
@@ -384,6 +396,8 @@ class CircuitEventDetector:
 
     def _start_pressure_event(self, now: datetime, baseline: float,
                               current_pressure: float) -> None:
+        if self._settled_pressure_psi is not None:
+            baseline = self._settled_pressure_psi
         drop = baseline - current_pressure
         log.info("[%s] event start (PRESSURE) — %.1f PSI drop (%.1f -> %.1f PSI)",
                  self.circuit, drop, baseline, current_pressure)
@@ -410,6 +424,8 @@ class CircuitEventDetector:
         if ev is None:
             return
 
+        if self._settled_pressure_psi is not None:
+            baseline = self._settled_pressure_psi
         drop = baseline - current_pressure
         ev.has_pressure_transient = True
         ev.start_trigger = "pressure+flow"
