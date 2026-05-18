@@ -62,7 +62,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import AddonConfig, CircuitConfig
-from .event_detector import RawEvent
+from .event_detector import RawEvent, CircuitEventDetector as _CED
 from .database import (
     get_import_state, update_import_state,
     get_last_event_ts, event_exists_near,
@@ -116,7 +116,8 @@ class HistoricalImporter:
     MERGE_GAP_SECONDS: int = 15       # bridge flow_pulse_onset gaps shorter than this
     MIN_DURATION_SECONDS: float = 3.0
     DUPLICATE_WINDOW_SECONDS: int = 30
-    MIN_FLOW_LPM: float = 0.15
+    MIN_FLOW_LPM: float = _CED.MIN_FLOW_LPM
+    MIN_EVENT_VOLUME_L: float = _CED.MIN_EVENT_VOLUME_L
     PRE_PRESSURE_WINDOW_SECONDS: int = 30   # look-back for baseline pressure
     MIN_PRESSURE_DROP_PSI: float = 0.8      # min drop to flag has_pressure_transient
 
@@ -526,13 +527,32 @@ class HistoricalImporter:
         Returns None if there is insufficient flow data.
         """
         # ── Flow readings during the period ───────────────────────────
-        flow_readings = [
-            _clamp_flow(float(e["state"]))
+        # Build timestamped entries so we can compute a time-weighted average.
+        # HA records state *changes* only — a single 0.5s pulse at 0.30 L/min
+        # produces one entry; max() would pass it, but the time-weighted average
+        # (0.30 × 0.5s / 8s event = 0.019 L/min) correctly rejects it.
+        flow_entries = [
+            (_parse_ts(e.get("last_changed")), _clamp_flow(float(e["state"])))
             for e in flow_rate_hist
             if _is_numeric(e.get("state"))
+            and _parse_ts(e.get("last_changed")) is not None
             and start <= (_parse_ts(e.get("last_changed")) or start) <= end
         ]
+        flow_entries.sort(key=lambda x: x[0])
+        flow_readings = [r for _, r in flow_entries]
+
         if not flow_readings or max(flow_readings) < self.MIN_FLOW_LPM:
+            return None
+
+        # Time-weighted average: each reading is a step function valid until
+        # the next entry or event end.
+        total_vol = 0.0
+        for i, (ts, rate) in enumerate(flow_entries):
+            next_ts = flow_entries[i + 1][0] if i + 1 < len(flow_entries) else end
+            seg_min = max(0.0, (min(next_ts, end) - ts).total_seconds()) / 60.0
+            total_vol += rate * seg_min
+        event_min = (end - start).total_seconds() / 60.0
+        if event_min <= 0 or (total_vol / event_min) < self.MIN_FLOW_LPM:
             return None
 
         # ── Pressure readings during the period ───────────────────────
@@ -590,6 +610,12 @@ class HistoricalImporter:
             if 0 < delta < 10_000:   # sanity: reject resets and absurd values
                 from .ha_client import vol_to_litres as _v2l
                 volume_litres_measured = round(_v2l(delta, vol_unit), 3)
+
+        # Volume floor — mirrors CircuitEventDetector._end_event
+        avg_flow = sum(flow_readings) / len(flow_readings) if flow_readings else 0.0
+        volume_l = avg_flow * (end - start).total_seconds() / 60.0
+        if volume_l < self.MIN_EVENT_VOLUME_L:
+            return None
 
         return RawEvent(
             circuit=circuit,
