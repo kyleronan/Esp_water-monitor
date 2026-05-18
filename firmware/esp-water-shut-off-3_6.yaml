@@ -147,6 +147,7 @@ esp32:
     type: arduino
 
 logger:      # Enable serial logging for debugging
+  level: INFO
 
 api:         # Encryption disabled for now — re-add an `encryption:` block before release
 
