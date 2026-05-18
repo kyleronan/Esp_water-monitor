@@ -175,22 +175,42 @@ def _flow_signature(flow_readings: list, peak: float, n: int = 32) -> list:
 
 
 def _flow_edges(flow_readings: list, peak: float) -> tuple:
-    """Count significant rising/falling step changes after 3-point smoothing."""
+    """Count significant direction reversals using zigzag (WaterSense model).
+
+    Prepends 0.0 so the valve-open onset step is visible.
+    Fires an edge when cumulative displacement from the last extreme exceeds
+    the threshold, so gradual ramps count the same as abrupt steps.
+    """
     if len(flow_readings) < 3:
         return 0, 0
     threshold = max(0.3, 0.15 * peak)
+    padded = [0.0] + list(flow_readings)
+    n = len(padded)
     smoothed = [
-        sum(flow_readings[max(0, i - 1): min(len(flow_readings), i + 2)])
-        / len(flow_readings[max(0, i - 1): min(len(flow_readings), i + 2)])
-        for i in range(len(flow_readings))
+        sum(padded[max(0, i - 1): min(n, i + 2)])
+        / len(padded[max(0, i - 1): min(n, i + 2)])
+        for i in range(n)
     ]
     pos = neg = 0
-    for i in range(1, len(smoothed)):
-        d = smoothed[i] - smoothed[i - 1]
-        if d >= threshold:
-            pos += 1
-        elif d <= -threshold:
-            neg += 1
+    last_extreme = smoothed[0]
+    direction = None
+    for val in smoothed[1:]:
+        change = val - last_extreme
+        if change >= threshold:
+            if direction != 'up':
+                pos += 1
+                direction = 'up'
+            last_extreme = val
+        elif change <= -threshold:
+            if direction != 'down':
+                neg += 1
+                direction = 'down'
+            last_extreme = val
+        else:
+            if direction == 'up' and val > last_extreme:
+                last_extreme = val
+            elif direction == 'down' and val < last_extreme:
+                last_extreme = val
     return pos, neg
 
 
