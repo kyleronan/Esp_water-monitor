@@ -251,6 +251,42 @@ def _pressure_transient_stats(
     }
 
 
+def _pressure_shape_features(
+    pressure_readings: list, pre_event_psi: float, pressure_delta_psi: float
+) -> dict:
+    """Transient shape features from the 40 Hz pressure curve.
+
+    pressure_onset_ms        — index of minimum * 25 ms (time to peak drop)
+    recovery_overshoot_psi   — max pressure above baseline after the minimum
+    pressure_oscillation_count — zero-crossings of (p - pre_event_psi) post-min
+    """
+    zero = {
+        'pressure_onset_ms': 0.0,
+        'recovery_overshoot_psi': 0.0,
+        'pressure_oscillation_count': 0,
+    }
+    if not pressure_readings or pressure_delta_psi <= 0:
+        return zero
+
+    min_idx = min(range(len(pressure_readings)), key=lambda i: pressure_readings[i])
+    onset_ms = round(min_idx * 25.0, 1)
+
+    post_min = pressure_readings[min_idx:]
+    overshoot = round(max(0.0, max(post_min) - pre_event_psi), 3)
+
+    deviations = [p - pre_event_psi for p in post_min]
+    crossings = sum(
+        1 for i in range(1, len(deviations))
+        if deviations[i - 1] * deviations[i] < 0
+    )
+
+    return {
+        'pressure_onset_ms':          onset_ms,
+        'recovery_overshoot_psi':     overshoot,
+        'pressure_oscillation_count': crossings,
+    }
+
+
 def _flow_dynamics(flow_readings: list, peak: float) -> dict:
     """Rise/fall rates, opening/closing step magnitudes, and 90% ramp times.
 
@@ -308,6 +344,9 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     mid_drop     = _mid_event_flow_drop(event.flow_readings, peak_flow)
     steady       = _flow_steady_state(event.flow_readings)
     p_stats      = _pressure_transient_stats(
+        event.pressure_readings, event.pre_event_pressure_psi, event.pressure_delta_psi
+    )
+    p_shape      = _pressure_shape_features(
         event.pressure_readings, event.pre_event_pressure_psi, event.pressure_delta_psi
     )
 
@@ -400,9 +439,9 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         # Detection provenance — tells Phase 2 how reliable pressure data is
         "start_trigger": event.start_trigger,
         "has_pressure_transient": 1 if event.has_pressure_transient else 0,
-        "propagation_delay_seconds": (
-            round(event.propagation_delay_seconds, 2)
-            if event.propagation_delay_seconds is not None else None
+        "propagation_delay_ms": (
+            round(event.propagation_delay_ms, 1)
+            if event.propagation_delay_ms is not None else None
         ),
 
         # Derived features for ML clustering
@@ -433,6 +472,11 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
 
         # Pressure transient features
         **p_stats,
+
+        # Pressure transient shape features
+        "pressure_onset_ms":          p_shape['pressure_onset_ms'],
+        "recovery_overshoot_psi":     p_shape['recovery_overshoot_psi'],
+        "pressure_oscillation_count": p_shape['pressure_oscillation_count'],
     }
 
 
@@ -443,10 +487,12 @@ class FeatureExtractor:
     """
 
     def __init__(self, event_queue: asyncio.Queue,
-                 db_conn: sqlite3.Connection, alert_manager=None):
+                 db_conn: sqlite3.Connection, alert_manager=None,
+                 ha_client=None):
         self._queue = event_queue
         self._db = db_conn
         self._alert_manager = alert_manager
+        self._ha = ha_client
         self._running = False
         # Set by orchestrator after ClusterEngine is initialised and rebuilt.
         self.cluster_engine = None
@@ -470,9 +516,37 @@ class FeatureExtractor:
     def stop(self) -> None:
         self._running = False
 
+    async def _enrich_propagation_delay(self, event: RawEvent) -> None:
+        """Replace the jittery WebSocket-callback propagation_delay_ms with the
+        precise server-side last_changed timestamp from HA history."""
+        from datetime import timedelta
+        window_start = event.start_ts - timedelta(seconds=5)
+        window_end   = (event.end_ts or event.start_ts) + timedelta(seconds=15)
+        try:
+            history = await self._ha.get_history(
+                event.flow_onset_entity, window_start, window_end)
+            onset = next(
+                (h for h in history
+                 if h["state"].lower() in ("on", "true", "1")
+                 and h["last_changed"] >= event.start_ts),
+                None,
+            )
+            if onset:
+                event.propagation_delay_ms = round(
+                    (onset["last_changed"] - event.start_ts).total_seconds() * 1000, 1)
+                log.debug("[%s] propagation delay enriched from HA history: %.0f ms",
+                          event.circuit, event.propagation_delay_ms)
+        except Exception as e:
+            log.debug("[%s] propagation delay HA enrichment failed: %s",
+                      event.circuit, e)
+
     async def _process(self, event: RawEvent) -> None:
         if not event.complete:
             return
+
+        if (self._ha and event.flow_onset_entity
+                and event.start_trigger in ("pressure", "pressure+flow")):
+            await self._enrich_propagation_delay(event)
 
         features = extract_features(event)
 

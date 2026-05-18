@@ -190,11 +190,14 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     # ── Deterministic ────────────────────────────────────────────────────
     "toilet": {
         "anchor_weights": {
-            "volume_litres":          3.0,
-            "duration_seconds":       3.0,
-            "avg_flow_lpm":           2.0,
-            "has_pressure_transient": 2.0,
-            "resistance_curve_shape": 2.0,   # forward-looking
+            "volume_litres":              3.0,
+            "duration_seconds":           3.0,
+            "avg_flow_lpm":               2.0,
+            "has_pressure_transient":     2.0,
+            "resistance_curve_shape":     2.0,   # forward-looking
+            "recovery_overshoot_psi":     1.5,   # water hammer on cistern snap-shut
+            "pressure_oscillation_count": 1.5,
+            "pressure_onset_ms":          1.0,
         },
         "float_features": {"hour_sin", "hour_cos", "day_of_week", "is_weekend"},
         "expected_cv": {"volume_litres": 0.08, "duration_seconds": 0.10},
@@ -246,6 +249,8 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
             "pressure_delta_psi":     2.0,
             "flow_variability":       1.5,
             "hydraulic_resistance":   2.0,   # forward-looking
+            "recovery_overshoot_psi": 1.0,
+            "pressure_onset_ms":      1.0,
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.45, "volume_litres": 0.45},
@@ -262,8 +267,10 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     },
     "bathroom_tap": {
         "anchor_weights": {
-            "avg_flow_lpm":       2.5,
-            "pressure_delta_psi": 1.5,
+            "avg_flow_lpm":           2.5,
+            "pressure_delta_psi":     1.5,
+            "recovery_overshoot_psi": 1.0,
+            "pressure_onset_ms":      1.0,
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.60, "volume_litres": 0.60},
@@ -271,8 +278,10 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     },
     "kitchen_tap": {
         "anchor_weights": {
-            "avg_flow_lpm":       2.5,
-            "pressure_delta_psi": 1.5,
+            "avg_flow_lpm":           2.5,
+            "pressure_delta_psi":     1.5,
+            "recovery_overshoot_psi": 1.0,
+            "pressure_onset_ms":      1.0,
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.55, "volume_litres": 0.55},
@@ -310,6 +319,8 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
             "pressure_delta_psi":     1.5,
             "flow_variability":       1.5,
             "resistance_curve_shape": 2.0,   # forward-looking
+            "pressure_onset_ms":      1.5,   # solenoid valve = fast onset
+            "recovery_overshoot_psi": 1.0,
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.50, "volume_litres": 0.50},
@@ -320,6 +331,8 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
             "avg_flow_lpm":           2.0,
             "flow_variability":       1.5,
             "resistance_curve_shape": 2.0,   # forward-looking
+            "pressure_onset_ms":      1.5,   # solenoid valve = fast onset
+            "recovery_overshoot_psi": 1.0,
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.40, "volume_litres": 0.40},
@@ -339,8 +352,10 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     # ── Outdoor / programme-ish ──────────────────────────────────────────
     "irrigation_zone": {
         "anchor_weights": {
-            "avg_flow_lpm":       2.5,
-            "pressure_delta_psi": 1.5,
+            "avg_flow_lpm":           2.5,
+            "pressure_delta_psi":     1.5,
+            "pressure_onset_ms":      1.5,   # solenoid valve = fast onset
+            "recovery_overshoot_psi": 1.0,
         },
         "float_features": {"duration_seconds", "volume_litres"},
         "expected_cv": {"duration_seconds": 0.25, "volume_litres": 0.25},
