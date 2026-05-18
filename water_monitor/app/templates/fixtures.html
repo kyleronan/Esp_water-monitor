@@ -21,7 +21,7 @@
 <div class="fx-header">
   <h1 class="page-title" style="margin:0">Fixtures</h1>
   {% for circ in circuits %}
-  {% if circ.training_state == 'live' %}
+  {% if circ.training_state in ('live', 'labelling') %}
   <form method="post" action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/cluster"
         style="display:inline">
     <input type="hidden" name="_csrf" value="{{ csrf_token }}">

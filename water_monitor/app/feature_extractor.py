@@ -63,6 +63,7 @@ so ramp-up and ramp-down transients don't corrupt the trend analysis.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import sqlite3
@@ -157,6 +158,140 @@ def _classify_resistance_shape(
     return "steady"
 
 
+def _flow_signature(flow_readings: list, peak: float, n: int = 32) -> list:
+    """Resample flow_readings to n points, normalize by peak (0–1)."""
+    if not flow_readings or peak <= 0:
+        return [0.0] * n
+    src = flow_readings
+    if len(src) == 1:
+        return [min(src[0] / peak, 1.0)] * n
+    result = []
+    for i in range(n):
+        pos = i * (len(src) - 1) / (n - 1)
+        lo, hi = int(pos), min(int(pos) + 1, len(src) - 1)
+        v = src[lo] * (1 - (pos - lo)) + src[hi] * (pos - lo)
+        result.append(round(min(v / peak, 1.0), 4))
+    return result
+
+
+def _flow_edges(flow_readings: list, peak: float) -> tuple:
+    """Count significant rising/falling step changes after 3-point smoothing."""
+    if len(flow_readings) < 3:
+        return 0, 0
+    threshold = max(0.3, 0.15 * peak)
+    smoothed = [
+        sum(flow_readings[max(0, i - 1): min(len(flow_readings), i + 2)])
+        / len(flow_readings[max(0, i - 1): min(len(flow_readings), i + 2)])
+        for i in range(len(flow_readings))
+    ]
+    pos = neg = 0
+    for i in range(1, len(smoothed)):
+        d = smoothed[i] - smoothed[i - 1]
+        if d >= threshold:
+            pos += 1
+        elif d <= -threshold:
+            neg += 1
+    return pos, neg
+
+
+def _mid_event_flow_drop(flow_readings: list, peak: float) -> float:
+    """Largest flow drop that does not terminate the event.
+
+    A 'non-terminal' drop is one where flow remains above 20% of peak after
+    the drop — signalling one fixture turning off while another keeps running.
+    Returns 0.0 for single-fixture events.
+    """
+    n = len(flow_readings)
+    if n < 3 or peak <= 0:
+        return 0.0
+    floor = 0.20 * peak
+    max_drop = 0.0
+    for i in range(1, n):
+        drop = flow_readings[i - 1] - flow_readings[i]
+        if drop > 0 and flow_readings[i] >= floor:
+            max_drop = max(max_drop, drop)
+    return round(max_drop, 4)
+
+
+def _flow_steady_state(flow_readings: list) -> float:
+    """Fraction of event time within ±20% of the median flow (0.0–1.0).
+
+    High for steady showers; low for toilet fill curves and pulsed appliances.
+    """
+    n = len(flow_readings)
+    if n < 3:
+        return 0.0
+    sorted_vals = sorted(flow_readings)
+    median = sorted_vals[n // 2]
+    if median <= 0:
+        return 0.0
+    threshold = 0.20 * median
+    steady = sum(1 for v in flow_readings if abs(v - median) <= threshold)
+    return round(steady / n, 4)
+
+
+def _pressure_transient_stats(
+    pressure_readings: list, pre_event_psi: float, pressure_delta_psi: float
+) -> dict:
+    """Compute energy and duration of the opening pressure transient.
+
+    pressure_readings is at 40 Hz (25 ms/sample). Returns zeros for
+    flow-only events where pressure_readings is empty or no transient occurred.
+    """
+    if not pressure_readings or pressure_delta_psi <= 0:
+        return {'pressure_transient_energy': 0.0, 'pressure_transient_duration_ms': 0.0}
+    threshold = 0.10 * pressure_delta_psi
+    energy = sum((p - pre_event_psi) ** 2 for p in pressure_readings)
+    duration_samples = sum(
+        1 for p in pressure_readings if abs(p - pre_event_psi) >= threshold
+    )
+    return {
+        'pressure_transient_energy':     round(energy, 4),
+        'pressure_transient_duration_ms': round(duration_samples * 25.0, 1),
+    }
+
+
+def _flow_dynamics(flow_readings: list, peak: float) -> dict:
+    """Rise/fall rates, opening/closing step magnitudes, and 90% ramp times.
+
+    Assumes uniform 1 Hz sampling (1 index = 1 second). For events > 120s the
+    event_detector downsamples to 0.2 Hz so timing values are approximate for
+    long irrigation runs — acceptable since those are identified by volume/duration.
+    """
+    zero = {
+        'flow_rise_rate_lpm_s': 0.0, 'flow_fall_rate_lpm_s': 0.0,
+        'opening_step_lpm': 0.0,     'closing_step_lpm': 0.0,
+        'time_to_90pct_flow_seconds': 0.0,
+        'time_from_90pct_to_zero_seconds': 0.0,
+    }
+    n = len(flow_readings)
+    if n < 2 or peak <= 0:
+        return zero
+
+    peak_idx = max(range(n), key=lambda i: flow_readings[i])
+    rise_rate = peak / max(peak_idx, 1)
+    fall_rate = peak / max(n - 1 - peak_idx, 1)
+
+    deltas = [flow_readings[i] - flow_readings[i - 1] for i in range(1, n)]
+    opening_step = max((d for d in deltas if d > 0), default=0.0)
+    closing_step = max((-d for d in deltas if d < 0), default=0.0)
+
+    threshold_90 = 0.9 * peak
+    t_rise = next((i for i, v in enumerate(flow_readings) if v >= threshold_90), n - 1)
+    t_fall_rev = next(
+        (i for i, v in enumerate(reversed(flow_readings)) if v >= threshold_90), 0
+    )
+
+    return {
+        'flow_rise_rate_lpm_s':            round(rise_rate, 4),
+        'flow_fall_rate_lpm_s':            round(fall_rate, 4),
+        'opening_step_lpm':                round(opening_step, 4),
+        'closing_step_lpm':                round(closing_step, 4),
+        'time_to_90pct_flow_seconds':      float(t_rise),
+        'time_from_90pct_to_zero_seconds': float(t_fall_rev),
+    }
+
+
 def extract_features(event: RawEvent) -> Dict[str, Any]:
     """Compute the full feature vector from a RawEvent."""
     duration = 0.0
@@ -166,6 +301,15 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     avg_flow = _safe_float(event.flow_readings)
     peak_flow = max(event.flow_readings) if event.flow_readings else 0.0
     flow_variability = _safe_std(event.flow_readings)
+
+    sig          = _flow_signature(event.flow_readings, peak_flow)
+    pos_edges, neg_edges = _flow_edges(event.flow_readings, peak_flow)
+    dynamics     = _flow_dynamics(event.flow_readings, peak_flow)
+    mid_drop     = _mid_event_flow_drop(event.flow_readings, peak_flow)
+    steady       = _flow_steady_state(event.flow_readings)
+    p_stats      = _pressure_transient_stats(
+        event.pressure_readings, event.pre_event_pressure_psi, event.pressure_delta_psi
+    )
 
     # Volume: prefer the firmware's cumulative integration sensor delta (set by
     # the historical importer) over the flow-average approximation, which can
@@ -277,6 +421,18 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
             else None
         ),
         "excluded_from_training": 1 if event.is_composite else 0,
+
+        # Flow shape features
+        "flow_signature_json":    json.dumps(sig),
+        "positive_edge_count":    pos_edges,
+        "negative_edge_count":    neg_edges,
+        "flow_edge_count":        pos_edges + neg_edges,
+        **dynamics,
+        "mid_event_flow_drop_lpm": mid_drop,
+        "steady_state_fraction":  steady,
+
+        # Pressure transient features
+        **p_stats,
     }
 
 

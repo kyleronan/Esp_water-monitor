@@ -397,7 +397,23 @@ CREATE TABLE IF NOT EXISTS events (
     user_reviewed               BOOLEAN DEFAULT 0,
     triggered_alert             BOOLEAN DEFAULT 0,
     volume_litres               REAL DEFAULT 0,
-    created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- Flow shape features (migration 025)
+    flow_signature_json              TEXT,
+    positive_edge_count              INTEGER DEFAULT 0,
+    negative_edge_count              INTEGER DEFAULT 0,
+    flow_edge_count                  INTEGER DEFAULT 0,
+    flow_rise_rate_lpm_s             REAL DEFAULT 0,
+    flow_fall_rate_lpm_s             REAL DEFAULT 0,
+    opening_step_lpm                 REAL DEFAULT 0,
+    closing_step_lpm                 REAL DEFAULT 0,
+    time_to_90pct_flow_seconds       REAL DEFAULT 0,
+    time_from_90pct_to_zero_seconds  REAL DEFAULT 0,
+    mid_event_flow_drop_lpm          REAL DEFAULT 0,
+    steady_state_fraction            REAL DEFAULT 0,
+    -- Pressure transient features (migration 025)
+    pressure_transient_energy        REAL DEFAULT 0,
+    pressure_transient_duration_ms   REAL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_circuit_ts
