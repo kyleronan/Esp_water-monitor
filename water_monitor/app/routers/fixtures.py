@@ -35,7 +35,7 @@ def _valid_circuit(circuit: str, request: Request) -> str:
 
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
-async def fixtures_page(request: Request):
+async def fixtures_page(request: Request, preview: bool = False):
     orch = _orch(request)
     from ..database import get_clusters_with_fixtures, get_all_cluster_stats
     from ..fixtures import (FIXTURE_TYPE_LABELS, user_selectable_types,
@@ -96,6 +96,7 @@ async def fixtures_page(request: Request):
         "fixture_type_labels":     FIXTURE_TYPE_LABELS,
         "user_selectable_types":   user_selectable_types(),
         "circuit_type_selectable": circuit_type_selectable,
+        "preview":                 preview,
     })
 
 
