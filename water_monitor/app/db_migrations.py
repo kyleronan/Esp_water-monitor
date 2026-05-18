@@ -883,15 +883,30 @@ def _migrate_025(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_026(conn: sqlite3.Connection) -> None:
-    """Clear volume_snapshots so baselines are re-initialised with correct unit conversion.
+    """Fix volume accounting after unit-conversion bug.
 
-    Prior to this migration, HA volume sensor states were read without checking
-    unit_of_measurement, so US-customary installs stored gallon values as if they
-    were litres.  Clearing the table forces _init_volume_baselines() to refetch
-    the correct midnight values (now converted to litres) on the next startup.
+    Two problems addressed:
+    a. volume_snapshots stored gallon values as if litres (unit_of_measurement
+       was not checked).  Clear it so _init_volume_baselines() refetches with
+       the corrected conversion.
+    b. hourly_volume accumulated double-counts: each addon restart re-imported
+       recent HA history and called update_hourly_volume() again for events that
+       were already stored.  Rebuild from events table to get the true totals.
     """
     conn.execute("DELETE FROM volume_snapshots")
-    log.info("Migration 026: cleared volume_snapshots — baselines will be rebuilt at startup")
+    conn.execute("DELETE FROM hourly_volume")
+    conn.execute("""
+        INSERT INTO hourly_volume (circuit, hour_ts, volume_litres)
+        SELECT
+            circuit,
+            strftime('%Y-%m-%dT%H:00:00', start_ts) AS hour_ts,
+            SUM(volume_litres)
+        FROM events
+        WHERE volume_litres > 0
+          AND start_ts IS NOT NULL
+        GROUP BY circuit, strftime('%Y-%m-%dT%H:00:00', start_ts)
+    """)
+    log.info("Migration 026: cleared volume_snapshots + rebuilt hourly_volume from events")
 
 
 MIGRATIONS: List[Tuple[int, Callable]] = [

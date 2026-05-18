@@ -358,6 +358,12 @@ class Orchestrator:
         except Exception as e:
             log.error("ClusterEngine init failed (non-fatal): %s", e, exc_info=True)
 
+        # Fetch the HA instance timezone so "Today" is anchored to local midnight.
+        try:
+            await self._init_ha_timezone()
+        except Exception as e:
+            log.warning("HA timezone fetch failed (using UTC): %s", e)
+
         # Initialise daily/weekly volume baselines from HA history so that
         # the dashboard shows accurate totals from the first page load.
         try:
@@ -508,6 +514,36 @@ class Orchestrator:
         log.info("Display units auto-detected from HA: flow=%s pressure=%s",
                  flow_key, pressure_key)
 
+    async def _init_ha_timezone(self) -> None:
+        """Fetch the HA instance's configured timezone and cache it for volume queries."""
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+        try:
+            ha_cfg = await self._ha.get_ha_config()
+            tz_name = ha_cfg.get("time_zone") or "UTC"
+            self._ha_tz = ZoneInfo(tz_name)
+            log.info("HA timezone: %s", tz_name)
+        except Exception as e:
+            from datetime import timezone as _tz
+            self._ha_tz = _tz.utc
+            log.warning("Could not determine HA timezone (%s) — using UTC", e)
+
+    def _local_midnight_utc(self, days_ago: int = 0) -> str:
+        """Return the UTC equivalent of local midnight (or N days ago) as a naive ISO string.
+
+        Uses the cached HA timezone from _init_ha_timezone(); falls back to UTC.
+        """
+        from datetime import timezone as _tz, timedelta as _td
+        ha_tz = getattr(self, "_ha_tz", _tz.utc)
+        now_local = datetime.now(ha_tz)
+        midnight_local = now_local.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) - _td(days=days_ago)
+        midnight_utc = midnight_local.astimezone(_tz.utc).replace(tzinfo=None)
+        return midnight_utc.isoformat(timespec="seconds")
+
     async def _init_volume_baselines(self) -> None:
         """
         Query HA history to set accurate midnight baselines for daily/weekly
@@ -517,14 +553,18 @@ class Orchestrator:
         the first call, which causes the dashboard to show the full cumulative
         sensor total rather than just today's volume.
 
-        period_ts keys are naive UTC ISO strings (no +00:00 suffix) to match
-        the keys produced by compute_ha_daily_volume / compute_ha_weekly_volume.
+        period_ts keys are the UTC equivalent of local midnight, stored as naive
+        ISO strings, matching the keys produced by compute_ha_daily/weekly_volume.
         """
         from datetime import datetime, timezone, timedelta
 
-        now_utc         = datetime.now(timezone.utc)
-        today_midnight  = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-        seven_days_ago  = today_midnight - timedelta(days=7)
+        today_midnight_ts   = self._local_midnight_utc(days_ago=0)
+        seven_days_ago_ts   = self._local_midnight_utc(days_ago=7)
+
+        # Reconstruct aware UTC datetimes for the get_history() call window
+        _utc = timezone.utc
+        today_midnight_dt   = datetime.fromisoformat(today_midnight_ts).replace(tzinfo=_utc)
+        seven_days_ago_dt   = datetime.fromisoformat(seven_days_ago_ts).replace(tzinfo=_utc)
 
         for cfg in self._cfg.circuits:
             if not cfg.volume_sensor:
@@ -532,12 +572,10 @@ class Orchestrator:
 
             circuit = cfg.circuit
 
-            for period_start, label in [
-                (today_midnight, "today"),
-                (seven_days_ago, "past 7 days"),
+            for period_start, period_ts, label in [
+                (today_midnight_dt,  today_midnight_ts,  "today"),
+                (seven_days_ago_dt,  seven_days_ago_ts,  "past 7 days"),
             ]:
-                # Naive UTC string — matches DB lookup keys in database.py
-                period_ts = period_start.replace(tzinfo=None).isoformat(timespec="seconds")
 
                 # Only fix baselines that are still at the 0.0 placeholder
                 row = self._db.execute(
@@ -633,12 +671,15 @@ class Orchestrator:
         except (ValueError, TypeError):
             ha_volume_total = None
 
+        today_ts = self._local_midnight_utc(days_ago=0)
+        week_ts  = self._local_midnight_utc(days_ago=7)
+
         if ha_volume_total is not None and ha_volume_total >= 0:
-            volume_daily  = compute_ha_daily_volume(self._db, circuit, ha_volume_total)
-            volume_weekly = compute_ha_weekly_volume(self._db, circuit, ha_volume_total)
+            volume_daily  = compute_ha_daily_volume(self._db, circuit, ha_volume_total, period_ts=today_ts)
+            volume_weekly = compute_ha_weekly_volume(self._db, circuit, ha_volume_total, period_ts=week_ts)
         else:
-            volume_daily  = get_daily_volume(self._db, circuit)
-            volume_weekly = get_weekly_volume(self._db, circuit)
+            volume_daily  = get_daily_volume(self._db, circuit, since_utc=today_ts)
+            volume_weekly = get_weekly_volume(self._db, circuit, since_utc=week_ts)
 
         fault_active = states.get(circuit_cfg.fault_sensor) == "on"
 

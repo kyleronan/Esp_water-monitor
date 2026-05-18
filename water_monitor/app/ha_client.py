@@ -339,6 +339,19 @@ class HaClient:
             for eid, r in zip(entity_ids, results)
         }
 
+    async def get_ha_config(self) -> Dict[str, Any]:
+        """GET /api/config — returns HA instance config including time_zone."""
+        if not self._http:
+            return {}
+        try:
+            async with self._http.get(f"{REST_URL}/config") as resp:
+                if resp.status != 200:
+                    return {}
+                return await resp.json()
+        except Exception as e:
+            log.warning("get_ha_config failed: %s", e)
+            return {}
+
     async def get_all_states(self) -> List[Dict[str, Any]]:
         """GET /api/states — returns all entity states."""
         if not self._http:

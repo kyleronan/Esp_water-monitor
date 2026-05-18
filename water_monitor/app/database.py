@@ -936,39 +936,58 @@ def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) ->
     conn.commit()
 
 
-def insert_event(conn: sqlite3.Connection, event: dict) -> None:
+def insert_event(conn: sqlite3.Connection, event: dict) -> bool:
+    """Insert event row; returns True if genuinely new, False if it replaced an existing row.
+
+    INSERT OR REPLACE fires DELETE + INSERT when replacing, incrementing
+    total_changes by 2.  A brand-new insert increments by 1.  Use this to
+    avoid double-counting volume in hourly_volume when the historical importer
+    re-processes an event that is already stored.
+    """
     cols = ", ".join(event.keys())
     placeholders = ", ".join("?" for _ in event)
+    before = conn.total_changes
     conn.execute(f"INSERT OR REPLACE INTO events ({cols}) VALUES ({placeholders})",
                  list(event.values()))
     conn.commit()
+    return (conn.total_changes - before) == 1
 
 
-def get_daily_volume(conn: sqlite3.Connection, circuit: str) -> float:
+def get_daily_volume(conn: sqlite3.Connection, circuit: str,
+                     since_utc: str = "") -> float:
+    """Total volume since local midnight (expressed as a UTC ISO string).
+
+    Pass since_utc as the UTC equivalent of the HA instance's local midnight
+    (e.g. '2026-05-17T05:00:00' for UTC-5).  Falls back to UTC midnight when
+    since_utc is not provided.
     """
-    Total volume since midnight UTC today.
-    Computed from the internal hourly_volume table.
-    """
+    cutoff = since_utc or datetime.now(timezone.utc).strftime('%Y-%m-%dT00:00:00')
     row = conn.execute("""
         SELECT COALESCE(SUM(volume_litres), 0)
         FROM hourly_volume
         WHERE circuit = ?
-          AND hour_ts >= strftime('%Y-%m-%dT00:00:00', 'now')
-    """, (circuit,)).fetchone()
+          AND hour_ts >= ?
+    """, (circuit, cutoff)).fetchone()
     return round(row[0], 1) if row else 0.0
 
 
-def get_weekly_volume(conn: sqlite3.Connection, circuit: str) -> float:
+def get_weekly_volume(conn: sqlite3.Connection, circuit: str,
+                      since_utc: str = "") -> float:
+    """Total volume since local midnight 7 days ago (expressed as a UTC ISO string).
+
+    Pass since_utc as the UTC equivalent of local midnight 7 days ago.
+    Falls back to UTC midnight 7 days ago when since_utc is not provided.
     """
-    Total volume over the rolling past 7 days (midnight UTC 7 days ago → now).
-    Computed from the internal hourly_volume table.
-    """
+    if since_utc:
+        cutoff = since_utc
+    else:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime('%Y-%m-%dT00:00:00')
     row = conn.execute("""
         SELECT COALESCE(SUM(volume_litres), 0)
         FROM hourly_volume
         WHERE circuit = ?
-          AND hour_ts >= strftime('%Y-%m-%dT00:00:00', datetime('now', '-7 days'))
-    """, (circuit,)).fetchone()
+          AND hour_ts >= ?
+    """, (circuit, cutoff)).fetchone()
     return round(row[0], 1) if row else 0.0
 
 
@@ -1049,16 +1068,19 @@ def compute_ha_daily_volume(
     conn: sqlite3.Connection,
     circuit: str,
     current_ha_value: float,
+    period_ts: str = "",
 ) -> float:
+    """Daily volume from the authoritative HA cumulative sensor.
+
+    period_ts is the UTC equivalent of local midnight, as a naive ISO string
+    (e.g. '2026-05-17T05:00:00').  Falls back to UTC midnight when not provided.
+    Must match the key written by _init_volume_baselines().
     """
-    Daily volume from the authoritative HA cumulative sensor.
-    Baseline key is midnight UTC today stored as a naive ISO string — matches
-    both SQLite 'now' and the key written by _init_volume_baselines.
-    """
-    today_midnight = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-    ).isoformat(timespec="seconds")
-    baseline = _get_volume_baseline(conn, circuit, today_midnight, current_ha_value)
+    if not period_ts:
+        period_ts = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+        ).isoformat(timespec="seconds")
+    baseline = _get_volume_baseline(conn, circuit, period_ts, current_ha_value)
     return round(max(0.0, current_ha_value - baseline), 1)
 
 
@@ -1066,15 +1088,18 @@ def compute_ha_weekly_volume(
     conn: sqlite3.Connection,
     circuit: str,
     current_ha_value: float,
+    period_ts: str = "",
 ) -> float:
+    """Rolling 7-day volume from the authoritative HA cumulative sensor.
+
+    period_ts is the UTC equivalent of local midnight 7 days ago, as a naive
+    ISO string.  Falls back to UTC midnight 7 days ago when not provided.
     """
-    Rolling 7-day volume from the authoritative HA cumulative sensor.
-    Baseline key is midnight UTC 7 days ago stored as a naive ISO string.
-    """
-    seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).replace(
-        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-    ).isoformat(timespec="seconds")
-    baseline = _get_volume_baseline(conn, circuit, seven_days_ago, current_ha_value)
+    if not period_ts:
+        period_ts = (datetime.now(timezone.utc) - timedelta(days=7)).replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+        ).isoformat(timespec="seconds")
+    baseline = _get_volume_baseline(conn, circuit, period_ts, current_ha_value)
     return round(max(0.0, current_ha_value - baseline), 1)
 
 
