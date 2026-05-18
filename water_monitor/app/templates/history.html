@@ -1,5 +1,10 @@
 {% extends "base.html" %}
 {% block content %}
+<style>
+.hist-td-shape { white-space: nowrap; }
+.shape-cell    { display: flex; align-items: center; gap: 6px; }
+.shape-spark   { display: block; flex-shrink: 0; opacity: .85; }
+</style>
 
 <h1 class="hist-page-title">History</h1>
 
@@ -182,10 +187,20 @@
           <td class="hist-td">{{ "%.0fs"|format(e.duration_seconds) if e.duration_seconds else "—" }}</td>
           <td class="hist-td hist-td-mono">{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm else "—" }} {{ flow_unit }}</td>
           <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi else "—" }}</td>
-          <td class="hist-td">
+          <td class="hist-td hist-td-shape">
             {% set shape = e.resistance_curve_shape or 'unknown' %}
-            {% set shape_color = {'steady': 'pill-blue', 'rising': 'pill-amber', 'falling': 'pill-green', 'pulsed': 'pill-neutral', 'unknown': 'pill-neutral'} %}
-            <span class="pill {{ shape_color.get(shape, 'pill-neutral') }}">{{ shape }}</span>
+            {% set shape_color  = {'steady': 'pill-blue', 'rising': 'pill-amber', 'falling': 'pill-green', 'pulsed': 'pill-neutral', 'unknown': 'pill-neutral'} %}
+            {% set spark_stroke = {'steady': 'oklch(55% .18 240/.85)', 'rising': 'oklch(65% .18 80/.85)', 'falling': 'oklch(50% .18 145/.85)', 'pulsed': 'oklch(55% .05 240/.85)'} %}
+            {% set spark_fill   = {'steady': 'oklch(55% .18 240/.12)', 'rising': 'oklch(65% .18 80/.12)', 'falling': 'oklch(50% .18 145/.12)', 'pulsed': 'oklch(55% .05 240/.10)'} %}
+            <div class="shape-cell">
+              <span class="pill {{ shape_color.get(shape, 'pill-neutral') }}">{{ shape }}</span>
+              {% if e.flow_signature_json and e.flow_signature_json not in ('null', 'None', '') %}
+              <canvas class="shape-spark" width="48" height="16"
+                      data-sig="{{ e.flow_signature_json }}"
+                      data-stroke="{{ spark_stroke.get(shape, 'oklch(55% .05 240/.55)') }}"
+                      data-fill="{{ spark_fill.get(shape,   'oklch(55% .05 240/.08)') }}"></canvas>
+              {% endif %}
+            </div>
           </td>
           <td class="hist-td hist-td-mono">{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres else "—" }}</td>
           <td class="hist-td">
@@ -385,6 +400,34 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   if (isNaN(d)) return;
   const pad = n => String(n).padStart(2, '0');
   el.textContent = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+});
+
+// Shape sparklines
+document.querySelectorAll('canvas.shape-spark').forEach(canvas => {
+  let sig;
+  try { sig = JSON.parse(canvas.dataset.sig || '[]'); } catch { return; }
+  if (!sig.length) return;
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d');
+  const max = Math.max(...sig, 0.001);
+  const pts = sig.map((v, i) => ({
+    x: (i / (sig.length - 1)) * w,
+    y: h - (v / max) * (h - 2) - 1,
+  }));
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, h);
+  ctx.lineTo(pts[0].x, pts[0].y);
+  pts.forEach(p => ctx.lineTo(p.x, p.y));
+  ctx.lineTo(pts[pts.length - 1].x, h);
+  ctx.closePath();
+  ctx.fillStyle = canvas.dataset.fill;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  pts.forEach(p => ctx.lineTo(p.x, p.y));
+  ctx.strokeStyle = canvas.dataset.stroke;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
 });
 </script>
 {% endblock %}
