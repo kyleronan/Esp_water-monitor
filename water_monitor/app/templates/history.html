@@ -229,9 +229,9 @@
             {% if e.user_fixture_type %}
               <span class="pill pill-green" title="You assigned this">★ {{ fixture_type_labels.get(e.user_fixture_type, e.user_fixture_type | replace('_',' ') | title) }}</span>
             {% elif e.fixture_display_name %}
-              <span class="pill pill-green">{{ e.fixture_display_name }}</span>
+              <span class="pill pill-green">{{ e.fixture_display_name }}{% if e.cluster_id is not none %} · {{ e.cluster_id }}{% endif %}</span>
             {% elif e.suggested_type and e.cluster_id is not none %}
-              <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }}</span>
+              <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }} · {{ e.cluster_id }}</span>
             {% elif e.cluster_id is not none %}
               <span class="pill pill-neutral">Cluster {{ e.cluster_id }}</span>
             {% else %}
@@ -254,7 +254,7 @@
 {% endfor %}
 
 {# ── Event detail modal ──────────────────────────────────────────── #}
-<div id="evt-modal" class="evt-modal-backdrop" hidden aria-modal="true" role="dialog" aria-labelledby="evt-modal-title">
+<div id="evt-modal" class="evt-modal-backdrop" aria-modal="true" role="dialog" aria-labelledby="evt-modal-title">
   <div class="evt-modal">
     <div class="evt-modal-header">
       <h3 class="evt-modal-title" id="evt-modal-title">Event detail</h3>
@@ -474,23 +474,24 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
 
 // ── Event detail modal ──────────────────────────────────────────────────────
 (function () {
-  const INGRESS  = {{ (ingress_path or '') | tojson }};
+  const INGRESS   = {{ (ingress_path or '') | tojson }};
   const FX_LABELS = {{ fixture_type_labels | tojson }};
 
-  const modal    = document.getElementById('evt-modal');
-  const selFix   = document.getElementById('emd-fixture-select');
-  const ignBtn   = document.getElementById('emd-ignore-btn');
-  const saveBtn  = document.getElementById('emd-save-btn');
-  const errBox   = document.getElementById('emd-error');
-  let activeRow  = null;
+  const modal   = document.getElementById('evt-modal');
+  const selFix  = document.getElementById('emd-fixture-select');
+  const ignBtn  = document.getElementById('emd-ignore-btn');
+  const saveBtn = document.getElementById('emd-save-btn');
+  const errBox  = document.getElementById('emd-error');
 
-  function fmtTs(iso) {
-    if (!iso) return '—';
-    const d = new Date(iso);
-    if (isNaN(d)) return iso;
-    const p = n => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  // Startup diagnostic
+  const rows = document.querySelectorAll('.hist-event-row');
+  console.debug('[evt-modal] init — rows:', rows.length, { modal, selFix, ignBtn, saveBtn, errBox });
+  if (!modal || !selFix || !ignBtn || !saveBtn || !errBox) {
+    console.error('[evt-modal] one or more required elements not found — modal will not work', { modal, selFix, ignBtn, saveBtn, errBox });
+    return;
   }
+
+  let activeRow = null;
 
   function openModal(row) {
     activeRow = row;
@@ -503,7 +504,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     document.getElementById('emd-shape').textContent    = d.shape;
     document.getElementById('emd-cluster').textContent  = d.cluster;
     const fixLabel = d.userLabel || (d.userType ? FX_LABELS[d.userType] || d.userType : null);
-    document.getElementById('emd-fixture').textContent  = fixLabel || d.fixtureLabel || '—';
+    document.getElementById('emd-fixture').textContent  = fixLabel || '—';
     selFix.value   = d.userType || '';
     ignBtn.textContent = d.excluded === '1' ? 'Restore event' : 'Ignore event';
 
@@ -533,17 +534,25 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     document.getElementById('emd-other-valve').textContent =
       ov === '1' ? 'Yes (open)' : ov === '0' ? 'No' : '—';
 
-    errBox.hidden  = true;
+    errBox.hidden = true;
     errBox.textContent = '';
-    modal.hidden   = false;
+    modal.classList.add('is-open');
     modal.focus();
   }
 
-  function closeModal() { modal.hidden = true; activeRow = null; }
+  function closeModal() { modal.classList.remove('is-open'); activeRow = null; }
+
+  function fmtTs(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
 
   // Open on row click or Enter/Space keypress
-  document.querySelectorAll('.hist-event-row').forEach(row => {
-    row.addEventListener('click', () => openModal(row));
+  rows.forEach(row => {
+    row.addEventListener('click', () => { console.debug('[evt-modal] row clicked', row.dataset.eventId); openModal(row); });
     row.addEventListener('keydown', e => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openModal(row); }
     });
@@ -551,7 +560,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
 
   document.getElementById('evt-modal-close').addEventListener('click', closeModal);
   modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
-  document.addEventListener('keydown', e => { if (e.key === 'Escape' && !modal.hidden) closeModal(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && modal.classList.contains('is-open')) closeModal(); });
 
   async function patchEvent(payload) {
     const { eventId, circuit } = activeRow.dataset;
