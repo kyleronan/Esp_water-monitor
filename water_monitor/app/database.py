@@ -396,6 +396,7 @@ CREATE TABLE IF NOT EXISTS events (
     anomaly_type                TEXT,
     flagged                     BOOLEAN DEFAULT 0,
     user_reviewed               BOOLEAN DEFAULT 0,
+    user_fixture_type           TEXT,              -- user-assigned fixture type (overrides clustering)
     triggered_alert             BOOLEAN DEFAULT 0,
     volume_litres               REAL DEFAULT 0,
     created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -629,6 +630,7 @@ def _apply_post_create_migrations(conn: sqlite3.Connection) -> None:
         ("pressure_onset_ms",          "REAL DEFAULT 0"),
         ("recovery_overshoot_psi",     "REAL DEFAULT 0"),
         ("pressure_oscillation_count", "INTEGER DEFAULT 0"),
+        ("user_fixture_type",          "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
@@ -1178,6 +1180,42 @@ def get_recent_events(
             (circuit, limit),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+_PATCH_UNSET = object()
+
+
+def patch_event(
+    conn: sqlite3.Connection,
+    event_id: str,
+    circuit: str,
+    *,
+    user_fixture_type=_PATCH_UNSET,
+    excluded_from_training=_PATCH_UNSET,
+) -> bool:
+    """Update user-editable fields on a single event.
+
+    Pass a value (including None) to update that field; omit a kwarg entirely
+    to leave the field unchanged.  Returns False if no matching row exists.
+    """
+    row = conn.execute(
+        "SELECT id FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if row is None:
+        return False
+    if user_fixture_type is not _PATCH_UNSET:
+        conn.execute(
+            "UPDATE events SET user_fixture_type = ? WHERE id = ? AND circuit = ?",
+            (user_fixture_type, event_id, circuit),
+        )
+    if excluded_from_training is not _PATCH_UNSET:
+        conn.execute(
+            "UPDATE events SET excluded_from_training = ? WHERE id = ? AND circuit = ?",
+            (1 if excluded_from_training else 0, event_id, circuit),
+        )
+    conn.commit()
+    return True
 
 
 def get_leak_test_schedule(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:

@@ -182,11 +182,33 @@
       </thead>
       <tbody>
         {% for e in ch.events %}
-        <tr class="hist-event-row{% if e.is_composite %} hist-row-composite{% endif %}">
+        {% set _fix_label = fixture_type_labels.get(e.user_fixture_type, '') if e.user_fixture_type else '' %}
+        <tr class="hist-event-row{% if e.is_composite %} hist-row-composite{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}"
+            tabindex="0" role="button" aria-label="Event detail"
+            data-event-id="{{ e.id }}"
+            data-circuit="{{ ch.circuit }}"
+            data-start="{{ e.start_ts or '' }}"
+            data-duration="{{ '%.0fs'|format(e.duration_seconds) if e.duration_seconds else '—' }}"
+            data-flow="{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else '—' }} {{ flow_unit }}"
+            data-pressure="{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else '—' }}"
+            data-volume="{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else '—' }} {{ vol_unit }}"
+            data-shape="{{ e.resistance_curve_shape or 'unknown' }}"
+            data-cluster="{{ e.cluster_id if e.cluster_id is not none else '—' }}"
+            data-user-type="{{ e.user_fixture_type or '' }}"
+            data-user-label="{{ _fix_label }}"
+            data-excluded="{{ '1' if e.excluded_from_training else '0' }}"
+            data-trigger="{{ e.start_trigger or 'unknown' }}"
+            data-peak-flow="{{ (e.peak_flow_lpm * flow_factor)|round(flow_decimals) if e.peak_flow_lpm is not none else '' }}"
+            data-pre-pressure="{{ (e.pre_event_pressure_psi * pressure_factor)|round(pressure_decimals) if e.pre_event_pressure_psi is not none else '' }}"
+            data-prop-ms="{{ e.propagation_delay_ms | int if e.propagation_delay_ms else '0' }}"
+            data-anomaly-score="{{ (e.anomaly_score * 100)|round(1) if e.anomaly_score is not none else '' }}"
+            data-anomaly-type="{{ e.anomaly_type or '' }}"
+            data-composite="{{ '1' if e.is_composite else '0' }}"
+            data-other-valve="{{ e.other_valve_open if e.other_valve_open is not none else '' }}">
           <td class="hist-td hist-td-mono hist-td-time"><time data-ts="{{ e.start_ts or '' }}">{{ (e.start_ts or '')[:16] }}</time></td>
           <td class="hist-td">{{ "%.0fs"|format(e.duration_seconds) if e.duration_seconds else "—" }}</td>
-          <td class="hist-td hist-td-mono">{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm else "—" }} {{ flow_unit }}</td>
-          <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else "—" }} {{ flow_unit }}</td>
+          <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else "—" }}</td>
           <td class="hist-td hist-td-shape">
             {% set shape = e.resistance_curve_shape or 'unknown' %}
             {% set shape_color  = {'steady': 'pill-blue', 'rising': 'pill-amber', 'falling': 'pill-green', 'pulsed': 'pill-neutral', 'unknown': 'pill-neutral'} %}
@@ -202,12 +224,14 @@
               {% endif %}
             </div>
           </td>
-          <td class="hist-td hist-td-mono">{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else "—" }} {{ vol_unit if e.volume_litres is not none else '' }}</td>
           <td class="hist-td">
-            {% if e.fixture_display_name %}
+            {% if e.user_fixture_type %}
+              <span class="pill pill-green" title="You assigned this">★ {{ fixture_type_labels.get(e.user_fixture_type, e.user_fixture_type | replace('_',' ') | title) }}</span>
+            {% elif e.fixture_display_name %}
               <span class="pill pill-green">{{ e.fixture_display_name }}</span>
             {% elif e.suggested_type and e.cluster_id is not none %}
-              <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ e.suggested_type | replace('_', ' ') | title }}</span>
+              <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }}</span>
             {% elif e.cluster_id is not none %}
               <span class="pill pill-neutral">Cluster {{ e.cluster_id }}</span>
             {% else %}
@@ -228,6 +252,52 @@
 </div>
 
 {% endfor %}
+
+{# ── Event detail modal ──────────────────────────────────────────── #}
+<div id="evt-modal" class="evt-modal-backdrop" hidden aria-modal="true" role="dialog" aria-labelledby="evt-modal-title">
+  <div class="evt-modal">
+    <div class="evt-modal-header">
+      <h3 class="evt-modal-title" id="evt-modal-title">Event detail</h3>
+      <button id="evt-modal-close" class="icon-btn" aria-label="Close">✕</button>
+    </div>
+    <dl class="evt-modal-dl">
+      <dt>Time</dt>       <dd id="emd-start"></dd>
+      <dt>Duration</dt>   <dd id="emd-duration"></dd>
+      <dt>Avg flow</dt>   <dd id="emd-flow"></dd>
+      <dt>ΔP</dt>         <dd id="emd-pressure"></dd>
+      <dt>Volume</dt>     <dd id="emd-volume"></dd>
+      <dt>Shape</dt>      <dd id="emd-shape"></dd>
+      <dt>Cluster</dt>    <dd id="emd-cluster"></dd>
+      <dt>Fixture</dt>    <dd id="emd-fixture"></dd>
+    </dl>
+    <details class="evt-modal-details">
+      <summary class="evt-modal-summary">Technical details</summary>
+      <dl class="evt-modal-dl evt-modal-dl-extra">
+        <dt>Start trigger</dt> <dd id="emd-trigger"></dd>
+        <dt>Peak flow</dt>     <dd id="emd-peak-flow"></dd>
+        <dt>Pre-event P</dt>   <dd id="emd-pre-pressure"></dd>
+        <dt>Prop. delay</dt>   <dd id="emd-prop-delay"></dd>
+        <dt>Anomaly</dt>       <dd id="emd-anomaly"></dd>
+        <dt>Other valve</dt>   <dd id="emd-other-valve"></dd>
+      </dl>
+    </details>
+    <hr class="evt-modal-hr">
+    <div class="evt-modal-section">
+      <label class="evt-modal-label" for="emd-fixture-select">Assign fixture type</label>
+      <select id="emd-fixture-select" class="evt-modal-select">
+        <option value="">— no assignment —</option>
+        {% for ft in fixture_type_options %}
+        <option value="{{ ft.value }}">{{ ft.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div id="emd-error" class="evt-modal-error" hidden></div>
+    <div class="evt-modal-btns">
+      <button id="emd-ignore-btn" class="btn btn-secondary btn-sm">Ignore event</button>
+      <button id="emd-save-btn"   class="btn btn-primary btn-sm">Save</button>
+    </div>
+  </div>
+</div>
 
 {% endblock %}
 
@@ -401,6 +471,129 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   const pad = n => String(n).padStart(2, '0');
   el.textContent = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 });
+
+// ── Event detail modal ──────────────────────────────────────────────────────
+(function () {
+  const INGRESS  = {{ (ingress_path or '') | tojson }};
+  const FX_LABELS = {{ fixture_type_labels | tojson }};
+
+  const modal    = document.getElementById('evt-modal');
+  const selFix   = document.getElementById('emd-fixture-select');
+  const ignBtn   = document.getElementById('emd-ignore-btn');
+  const saveBtn  = document.getElementById('emd-save-btn');
+  const errBox   = document.getElementById('emd-error');
+  let activeRow  = null;
+
+  function fmtTs(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  function openModal(row) {
+    activeRow = row;
+    const d = row.dataset;
+    document.getElementById('emd-start').textContent    = fmtTs(d.start);
+    document.getElementById('emd-duration').textContent = d.duration;
+    document.getElementById('emd-flow').textContent     = d.flow;
+    document.getElementById('emd-pressure').textContent = d.pressure;
+    document.getElementById('emd-volume').textContent   = d.volume;
+    document.getElementById('emd-shape').textContent    = d.shape;
+    document.getElementById('emd-cluster').textContent  = d.cluster;
+    const fixLabel = d.userLabel || (d.userType ? FX_LABELS[d.userType] || d.userType : null);
+    document.getElementById('emd-fixture').textContent  = fixLabel || d.fixtureLabel || '—';
+    selFix.value   = d.userType || '';
+    ignBtn.textContent = d.excluded === '1' ? 'Restore event' : 'Ignore event';
+
+    // Technical details
+    const TRIGGER_LABELS = { flow: 'Flow (sustained)', pressure: 'Pressure drop', 'pressure+flow': 'Pressure + flow' };
+    document.getElementById('emd-trigger').textContent =
+      TRIGGER_LABELS[d.trigger] || (d.trigger || '—');
+
+    const flowUnit = {{ (flow_unit | tojson) }};
+    document.getElementById('emd-peak-flow').textContent =
+      d.peakFlow ? `${d.peakFlow} ${flowUnit}` : '—';
+
+    const pressUnit = {{ (pressure_unit | tojson) }};
+    document.getElementById('emd-pre-pressure').textContent =
+      d.prePressure ? `${d.prePressure} ${pressUnit}` : '—';
+
+    const propMs = parseInt(d.propMs || '0', 10);
+    document.getElementById('emd-prop-delay').textContent =
+      (propMs > 0) ? `${propMs} ms` : (d.trigger === 'flow' ? 'N/A (flow-triggered)' : '—');
+
+    const aScore = d.anomalyScore;
+    const aType  = d.anomalyType;
+    document.getElementById('emd-anomaly').textContent =
+      aScore ? `${aScore}%${aType ? ' · ' + aType.replace(/_/g, ' ') : ''}` : '—';
+
+    const ov = d.otherValve;
+    document.getElementById('emd-other-valve').textContent =
+      ov === '1' ? 'Yes (open)' : ov === '0' ? 'No' : '—';
+
+    errBox.hidden  = true;
+    errBox.textContent = '';
+    modal.hidden   = false;
+    modal.focus();
+  }
+
+  function closeModal() { modal.hidden = true; activeRow = null; }
+
+  // Open on row click or Enter/Space keypress
+  document.querySelectorAll('.hist-event-row').forEach(row => {
+    row.addEventListener('click', () => openModal(row));
+    row.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openModal(row); }
+    });
+  });
+
+  document.getElementById('evt-modal-close').addEventListener('click', closeModal);
+  modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && !modal.hidden) closeModal(); });
+
+  async function patchEvent(payload) {
+    const { eventId, circuit } = activeRow.dataset;
+    errBox.hidden = true;
+    saveBtn.disabled = true;
+    ignBtn.disabled  = true;
+    try {
+      const resp = await fetch(`${INGRESS}/history/api/events/${circuit}/${eventId}`, {
+        method:  'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload),
+      });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        errBox.textContent = data.error || `Error ${resp.status}`;
+        errBox.hidden = false;
+        return false;
+      }
+      return true;
+    } catch (err) {
+      errBox.textContent = 'Network error — please try again.';
+      errBox.hidden = false;
+      return false;
+    } finally {
+      saveBtn.disabled = false;
+      ignBtn.disabled  = false;
+    }
+  }
+
+  saveBtn.addEventListener('click', async () => {
+    if (!activeRow) return;
+    const ok = await patchEvent({ user_fixture_type: selFix.value || null });
+    if (ok) location.reload();
+  });
+
+  ignBtn.addEventListener('click', async () => {
+    if (!activeRow) return;
+    const excluded = activeRow.dataset.excluded !== '1';
+    const ok = await patchEvent({ excluded_from_training: excluded });
+    if (ok) location.reload();
+  });
+})();
 
 // Shape sparklines
 document.querySelectorAll('canvas.shape-spark').forEach(canvas => {
