@@ -1358,12 +1358,13 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 
 /* ── Event detail modal ──────────────────────────────────────────── */
 .evt-modal-backdrop {
+  display: none;
   position: fixed; inset: 0;
   background: rgba(0,0,0,.45);
-  display: flex; align-items: center; justify-content: center;
+  align-items: center; justify-content: center;
   z-index: 500;
 }
-.evt-modal-backdrop[hidden] { display: none; }
+.evt-modal-backdrop.is-open { display: flex; }
 .evt-modal {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 10px; padding: 24px; width: 380px; max-width: 95vw;
