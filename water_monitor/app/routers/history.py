@@ -7,6 +7,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from ..circuit_compat import resolve_circuit
+from ..fixtures import FIXTURE_TYPE_LABELS, user_selectable_types
+from ..database import patch_event as _patch_event
+
+_VALID_USER_FIXTURE_TYPES: frozenset = frozenset(user_selectable_types())
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/history")
@@ -108,15 +112,22 @@ async def _history_page(request: Request):
             "hv_daily":        hv_daily,
         })
 
+    fixture_type_options = [
+        {"value": k, "label": FIXTURE_TYPE_LABELS.get(k, k.replace("_", " ").title())}
+        for k in user_selectable_types()
+    ]
+
     return _tmpl(request).TemplateResponse("history.html", {
-        "request":         request,
-        "circuit_history": circuit_history,
-        "page":            "history",
-        "date_from":       date_from,
-        "date_to":         date_to,
-        "using_range":     using_range,
-        "default_limit":   DEFAULT_EVENT_LIMIT,
-        "chart_range":     chart_range,
+        "request":              request,
+        "circuit_history":      circuit_history,
+        "page":                 "history",
+        "date_from":            date_from,
+        "date_to":              date_to,
+        "using_range":          using_range,
+        "default_limit":        DEFAULT_EVENT_LIMIT,
+        "chart_range":          chart_range,
+        "fixture_type_options": fixture_type_options,
+        "fixture_type_labels":  FIXTURE_TYPE_LABELS,
     })
 
 
@@ -138,3 +149,35 @@ async def events_api(
         date_to=date_to or None,
     )
     return JSONResponse(events)
+
+
+@router.patch("/api/events/{circuit}/{event_id}")
+async def patch_event_api(circuit: str, event_id: str, request: Request):
+    """Update user-editable fields on a single event.
+
+    Accepted payload keys (all optional):
+      user_fixture_type (str | null) — assign or clear a fixture type label.
+      excluded_from_training (bool)  — ignore / restore the event.
+    """
+    payload = await request.json()
+    db = _orch(request).db
+
+    # Validate fixture type before touching the DB
+    if "user_fixture_type" in payload:
+        ftype = payload["user_fixture_type"] or None
+        if ftype is not None and ftype not in _VALID_USER_FIXTURE_TYPES:
+            return JSONResponse(
+                {"error": f"Invalid fixture type: {ftype!r}"},
+                status_code=400,
+            )
+
+    kwargs: dict = {}
+    if "user_fixture_type" in payload:
+        kwargs["user_fixture_type"] = payload["user_fixture_type"] or None
+    if "excluded_from_training" in payload:
+        kwargs["excluded_from_training"] = bool(payload["excluded_from_training"])
+
+    found = _patch_event(db, event_id, circuit, **kwargs)
+    if not found:
+        return JSONResponse({"error": "Event not found"}, status_code=404)
+    return JSONResponse({"ok": True})

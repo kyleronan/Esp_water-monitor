@@ -156,7 +156,7 @@
         {% endif %}
         <span class="fx-card-icon">{{ cl | fixture_icon }}</span>
         <div style="flex:1;min-width:0">
-          <div class="fx-card-title">{{ display_name }}</div>
+          <div class="fx-card-title">{{ display_name }} <small class="fx-cluster-id">· Cluster {{ cl.id }}</small></div>
           {% if not_enough %}
           <div class="fx-card-sub fx-not-enough-label">Not enough data to classify automatically</div>
           {% elif needs_review %}
