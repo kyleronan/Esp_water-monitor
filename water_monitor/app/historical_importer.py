@@ -65,7 +65,7 @@ from .config import AddonConfig, CircuitConfig
 from .event_detector import RawEvent, CircuitEventDetector as _CED
 from .database import (
     get_import_state, update_import_state,
-    get_last_event_ts, event_exists_near,
+    get_last_event_ts, event_exists_near, find_overlapping_event,
 )
 
 log = logging.getLogger(__name__)
@@ -355,12 +355,32 @@ class HistoricalImporter:
             if duration < self.MIN_DURATION_SECONDS:
                 continue
 
-            # Skip if already in DB
-            if event_exists_near(
+            # Skip if a meaningfully-overlapping event already exists.
+            # Meaningful = overlap >= 30 s OR >= 50% of the shorter event.
+            # This catches importer catch-up duplicates whose start_ts drifted
+            # by minutes — well beyond the old ±30 s point-match.
+            existing = find_overlapping_event(
                 self._db, cfg.circuit,
                 period_start.isoformat(),
-                self.DUPLICATE_WINDOW_SECONDS,
-            ):
+                period_end.isoformat(),
+            )
+            if existing is not None:
+                suffix = ""
+                if existing.get("user_fixture_type"):
+                    suffix = f" (user-labeled '{existing['user_fixture_type']}')"
+                elif existing.get("fixture_id") and existing.get("user_locked"):
+                    suffix = f" (user-locked fixture id={existing['fixture_id']})"
+                log.info(
+                    "[%s] skipping reconstruction %s..%s: overlaps existing "
+                    "event id=%s %s..%s%s",
+                    cfg.circuit,
+                    period_start.strftime("%H:%M:%S"),
+                    period_end.strftime("%H:%M:%S"),
+                    existing["id"],
+                    existing["start_ts"],
+                    existing["end_ts"],
+                    suffix,
+                )
                 continue
 
             raw = self._reconstruct_event(

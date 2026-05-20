@@ -1357,6 +1357,82 @@ def get_last_event_ts(conn: sqlite3.Connection, circuit: str) -> Optional[str]:
     return row[0] if row and row[0] else None
 
 
+def find_overlapping_event(
+    conn: sqlite3.Connection,
+    circuit: str,
+    start_ts: str,
+    end_ts: str,
+    exclude_event_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Return an existing event row that meaningfully overlaps [start_ts, end_ts].
+
+    'Meaningful' means:
+      overlap >= 30 seconds, OR
+      overlap / shorter_event_duration >= 0.5
+
+    This distinguishes genuine duplicates (same physical event reconstructed
+    twice with drifted timestamps) from adjacent events that happen to touch.
+
+    Returns None when no meaningful overlap exists.  When a row is found it is
+    returned as a dict so callers can log which event blocked the insert.
+    """
+    try:
+        start = datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
+        end   = datetime.fromisoformat(end_ts.replace("Z", "+00:00"))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+    start_epoch = int(start.timestamp())
+    end_epoch   = int(end.timestamp())
+    new_dur     = end_epoch - start_epoch
+
+    excl = "AND e.id != ?" if exclude_event_id is not None else ""
+    params: list = [circuit, start_epoch, end_epoch]
+    if exclude_event_id is not None:
+        params.append(exclude_event_id)
+
+    rows = conn.execute(f"""
+        SELECT e.id,
+               e.start_ts,
+               e.end_ts,
+               e.duration_seconds,
+               e.fixture_id,
+               e.user_fixture_type,
+               f.user_locked,
+               CAST(strftime('%s', e.start_ts) AS INTEGER) AS ex_start_epoch,
+               CAST(strftime('%s', e.end_ts)   AS INTEGER) AS ex_end_epoch
+          FROM events e
+          LEFT JOIN fixtures f ON f.id = e.fixture_id
+         WHERE e.circuit = ?
+           AND e.start_ts IS NOT NULL
+           AND e.end_ts IS NOT NULL
+           AND CAST(strftime('%s', e.end_ts)   AS INTEGER) > ?
+           AND CAST(strftime('%s', e.start_ts) AS INTEGER) < ?
+               {excl}
+    """, params).fetchall()
+
+    for row in rows:
+        ex_start = row["ex_start_epoch"]
+        ex_end   = row["ex_end_epoch"]
+        if ex_start is None or ex_end is None:
+            continue
+        overlap = min(ex_end, end_epoch) - max(ex_start, start_epoch)
+        if overlap <= 0:
+            continue
+        ex_dur  = ex_end - ex_start
+        shorter = min(ex_dur, new_dur)
+        if shorter <= 0:
+            continue
+        if overlap >= 30 or (overlap / shorter) >= 0.5:
+            return dict(row)
+
+    return None
+
+
 def event_exists_near(
     conn: sqlite3.Connection,
     circuit: str,
