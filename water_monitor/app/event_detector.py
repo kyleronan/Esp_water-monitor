@@ -591,7 +591,7 @@ class EventDetector:
             sens = self._sensitivity_getter(cfg.circuit)
             detector = CircuitEventDetector(
                 circuit=cfg.circuit,
-                pressure_drop_threshold_psi=sens.get("pressure_drop_event_psi", 2.0),
+                pressure_drop_threshold_psi=sens.get("pressure_drop_event_psi", 1.2),
                 min_event_duration_seconds=sens.get("min_event_duration_seconds", 3.0),
                 event_queue=self._queue,
                 get_other_valve_open=(
@@ -621,14 +621,14 @@ class EventDetector:
                 cfg.circuit,
                 detector.MIN_FLOW_LPM,
                 detector.FLOW_START_SECONDS,
-                sens.get("pressure_drop_event_psi", 2.0),
+                sens.get("pressure_drop_event_psi", 1.2),
             )
 
     def update_thresholds(self) -> None:
         """Reload thresholds from config after sensitivity settings change."""
         for circuit, detector in self._detectors.items():
             sens = self._sensitivity_getter(circuit)
-            detector.update_threshold(sens.get("pressure_drop_event_psi", 2.0))
+            detector.update_threshold(sens.get("pressure_drop_event_psi", 1.2))
             detector.min_event_duration = sens.get("min_event_duration_seconds", 3.0)
 
     def _on_valve_state(self, circuit: str, state: str) -> None:
