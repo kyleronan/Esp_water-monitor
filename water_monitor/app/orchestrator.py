@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from datetime import timezone
 from typing import Any, Dict, Optional
 
 from .config import AddonConfig, SENSITIVITY_PRESETS, DB_PATH
@@ -72,6 +73,7 @@ class Orchestrator:
         self._fixture_publisher: Optional[FixturePublisher] = None
         self._stop = asyncio.Event()
         self._live_state_cache: Dict[str, Any] = {}
+        self._ha_tz = timezone.utc
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -307,9 +309,17 @@ class Orchestrator:
         self._presence_watcher.setup()
         await self._presence_watcher.sync_initial_state()
 
+        # Fetch the HA instance timezone so the leak-test scheduler and "Today"
+        # calculations use local time rather than UTC.
+        try:
+            await self._init_ha_timezone()
+        except Exception as e:
+            log.warning("HA timezone fetch failed (using UTC): %s", e)
+
         # Leak test scheduler
         self._leak_test_scheduler = LeakTestScheduler(
-            self._cfg, self._db, self._ha, self._alert_manager)
+            self._cfg, self._db, self._ha, self._alert_manager,
+            ha_tz=self._ha_tz)
 
         # Historical importer — backfills missed events and runs periodic catch-up
         self._historical_importer = HistoricalImporter(
@@ -358,12 +368,6 @@ class Orchestrator:
             log.info("ClusterEngine initialised and wired to feature extractor")
         except Exception as e:
             log.error("ClusterEngine init failed (non-fatal): %s", e, exc_info=True)
-
-        # Fetch the HA instance timezone so "Today" is anchored to local midnight.
-        try:
-            await self._init_ha_timezone()
-        except Exception as e:
-            log.warning("HA timezone fetch failed (using UTC): %s", e)
 
         # Initialise daily/weekly volume baselines from HA history so that
         # the dashboard shows accurate totals from the first page load.
