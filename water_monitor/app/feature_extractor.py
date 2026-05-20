@@ -572,7 +572,38 @@ class FeatureExtractor:
 
         try:
             from .database import (insert_event, update_hourly_volume,
-                                   is_event_in_exclusion_window)
+                                   is_event_in_exclusion_window,
+                                   find_overlapping_event)
+
+            # Writer-boundary duplicate guard: two importer catch-up runs can
+            # both queue a reconstruction before either has written to the DB,
+            # so the importer-side check alone cannot prevent the race.  Check
+            # here too, as close to the INSERT as the architecture allows.
+            if event.end_ts is not None:
+                blocking = find_overlapping_event(
+                    self._db, event.circuit,
+                    event.start_ts.isoformat(),
+                    event.end_ts.isoformat(),
+                )
+                if blocking is not None:
+                    suffix = ""
+                    if blocking.get("user_fixture_type"):
+                        suffix = f" (user-labeled '{blocking['user_fixture_type']}')"
+                    elif blocking.get("fixture_id") and blocking.get("user_locked"):
+                        suffix = f" (user-locked fixture id={blocking['fixture_id']})"
+                    log.info(
+                        "[%s] dropping queued event %s..%s: overlaps existing "
+                        "event id=%s %s..%s%s",
+                        event.circuit,
+                        event.start_ts.strftime("%H:%M:%S"),
+                        event.end_ts.strftime("%H:%M:%S"),
+                        blocking["id"],
+                        blocking["start_ts"],
+                        blocking["end_ts"],
+                        suffix,
+                    )
+                    return
+
             is_new_event = insert_event(self._db, features)
 
             # ── Plumbing-event exclusion window (Phase 2.1) ───────────────
