@@ -623,14 +623,19 @@ class HistoricalImporter:
             if state == STATE_IDLE:
                 cutoff = ts - timedelta(seconds=self.PRESSURE_DIP_BASELINE_WINDOW_S)
                 idle_window = [(t, v) for t, v in idle_window if t >= cutoff]
+                # Compute baseline from the PREVIOUS window (before this sample) so
+                # a dip at exactly the threshold still triggers rather than diluting
+                # the baseline and causing a missed detection.
+                if idle_window:
+                    baseline = sum(v for _, v in idle_window) / len(idle_window)
+                    if psi <= baseline - effective_thr:
+                        # Freeze baseline and start the candidate clock;
+                        # do NOT add the dip sample to the idle window.
+                        frozen_baseline = baseline
+                        candidate_start = ts
+                        state = STATE_CANDIDATE
+                        continue
                 idle_window.append((ts, psi))
-                baseline = sum(v for _, v in idle_window) / len(idle_window)
-
-                if psi <= baseline - effective_thr:
-                    # Freeze baseline and start the candidate clock
-                    frozen_baseline = baseline
-                    candidate_start = ts
-                    state = STATE_CANDIDATE
 
             # ── CANDIDATE: check sustain (do NOT update idle_window) ─────
             elif state == STATE_CANDIDATE:
