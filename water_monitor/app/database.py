@@ -1368,10 +1368,14 @@ def find_overlapping_event(
 
     'Meaningful' means:
       overlap >= 30 seconds, OR
-      overlap / shorter_event_duration >= 0.5
+      overlap >= 10 seconds AND overlap / shorter_event_duration >= 0.8
 
-    This distinguishes genuine duplicates (same physical event reconstructed
-    twice with drifted timestamps) from adjacent events that happen to touch.
+    Short independent events (< 10 s absolute overlap) are never blocked
+    regardless of ratio — this preserves fridge-fill / toilet events that
+    happen to start near the end of a longer shower.
+
+    When multiple rows overlap, returns the most-protected one first:
+    user-labeled rows → user-locked rows → longest event.
 
     Returns None when no meaningful overlap exists.  When a row is found it is
     returned as a dict so callers can log which event blocked the insert.
@@ -1413,6 +1417,11 @@ def find_overlapping_event(
            AND CAST(strftime('%s', e.end_ts)   AS INTEGER) > ?
            AND CAST(strftime('%s', e.start_ts) AS INTEGER) < ?
                {excl}
+         ORDER BY
+               CASE WHEN e.user_fixture_type IS NOT NULL THEN 0 ELSE 1 END,
+               CASE WHEN f.user_locked = 1               THEN 0 ELSE 1 END,
+               (CAST(strftime('%s', e.end_ts)   AS INTEGER) -
+                CAST(strftime('%s', e.start_ts) AS INTEGER)) DESC
     """, params).fetchall()
 
     for row in rows:
@@ -1427,7 +1436,7 @@ def find_overlapping_event(
         shorter = min(ex_dur, new_dur)
         if shorter <= 0:
             continue
-        if overlap >= 30 or (overlap / shorter) >= 0.5:
+        if overlap >= 30 or (overlap >= 10 and (overlap / shorter) >= 0.8):
             return dict(row)
 
     return None

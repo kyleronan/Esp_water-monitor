@@ -882,18 +882,12 @@ def _migrate_025(conn: sqlite3.Connection) -> None:
     )
 
 
-def _migrate_026(conn: sqlite3.Connection) -> None:
-    """Fix volume accounting after unit-conversion bug.
+def _rebuild_hourly_volume(conn: sqlite3.Connection) -> None:
+    """Rebuild hourly_volume from scratch using the current events table.
 
-    Two problems addressed:
-    a. volume_snapshots stored gallon values as if litres (unit_of_measurement
-       was not checked).  Clear it so _init_volume_baselines() refetches with
-       the corrected conversion.
-    b. hourly_volume accumulated double-counts: each addon restart re-imported
-       recent HA history and called update_hourly_volume() again for events that
-       were already stored.  Rebuild from events table to get the true totals.
+    Called by migrations that add or remove event rows so that chart totals
+    stay consistent with the events table after the migration completes.
     """
-    conn.execute("DELETE FROM volume_snapshots")
     conn.execute("DELETE FROM hourly_volume")
     conn.execute("""
         INSERT INTO hourly_volume (circuit, hour_ts, volume_litres)
@@ -906,6 +900,21 @@ def _migrate_026(conn: sqlite3.Connection) -> None:
           AND start_ts IS NOT NULL
         GROUP BY circuit, strftime('%Y-%m-%dT%H:00:00', start_ts)
     """)
+
+
+def _migrate_026(conn: sqlite3.Connection) -> None:
+    """Fix volume accounting after unit-conversion bug.
+
+    Two problems addressed:
+    a. volume_snapshots stored gallon values as if litres (unit_of_measurement
+       was not checked).  Clear it so _init_volume_baselines() refetches with
+       the corrected conversion.
+    b. hourly_volume accumulated double-counts: each addon restart re-imported
+       recent HA history and called update_hourly_volume() again for events that
+       were already stored.  Rebuild from events table to get the true totals.
+    """
+    conn.execute("DELETE FROM volume_snapshots")
+    _rebuild_hourly_volume(conn)
     log.info("Migration 026: cleared volume_snapshots + rebuilt hourly_volume from events")
 
 
@@ -927,21 +936,24 @@ def _migrate_027(conn: sqlite3.Connection) -> None:
 def _migrate_028(conn: sqlite3.Connection) -> None:
     """Collapse duplicate overlapping event rows created by importer catch-up races.
 
-    Background: before overlap-based duplicate detection landed (migration 027+
-    code change), each importer catch-up cycle could reconstruct the same physical
-    event with a slightly different start_ts, producing N overlapping rows for the
-    same real event. This one-time sweep removes the duplicates.
+    Background: before overlap-based duplicate detection landed, each importer
+    catch-up cycle could reconstruct the same physical event with a slightly
+    different start_ts, producing N overlapping rows for the same real event.
+    This one-time sweep removes the duplicates.
 
     Algorithm (per circuit):
       1. Sort events by start_ts.
-      2. Build overlap clusters: extend the current cluster while
-         next.start_ts < cluster.max(end_ts)  AND the pair has meaningful overlap
-         (overlap >= 30 s OR overlap/shorter_duration >= 0.5).
+      2. Build overlap clusters: a new row joins the current cluster if it has
+         meaningful overlap with ANY existing cluster member (not just the last
+         one — this handles transitive cases like A–B–C where C overlaps A but
+         not B).  Meaningful = overlap >= 30 s OR (overlap >= 10 s AND
+         overlap/shorter_duration >= 0.8).
       3. Per cluster: skip entirely if any row has a user-locked fixture OR a
          user_fixture_type (user intent — do not touch).
       4. Otherwise: keep the row with the longest (end_ts - start_ts) duration
          exactly as-is.  Delete the rest.  Do NOT sum volume_litres, expand end_ts,
          or recompute any derived fields — partial data would corrupt the row.
+      5. After all deletions, rebuild hourly_volume from the surviving events.
 
     Wrapped in a single transaction; the migration framework rolls back on exception.
     """
@@ -960,19 +972,17 @@ def _migrate_028(conn: sqlite3.Connection) -> None:
         log.info("Migration 028: no events to process")
         return
 
-    # Group into per-circuit lists
     from collections import defaultdict
     by_circuit: dict = defaultdict(list)
     for r in rows:
         by_circuit[r["circuit"]].append(r)
 
-    clusters_found         = 0
-    rows_deleted           = 0
+    clusters_found            = 0
+    rows_deleted              = 0
     clusters_skipped_locked   = 0
     clusters_skipped_labeled  = 0
 
     def _epoch(ts_str: str) -> int:
-        """Parse an ISO timestamp string to integer epoch seconds."""
         try:
             from datetime import datetime, timezone
             s = ts_str.replace("Z", "+00:00")
@@ -983,8 +993,23 @@ def _migrate_028(conn: sqlite3.Connection) -> None:
         except (ValueError, AttributeError):
             return 0
 
+    def _meaningful_overlap_with_cluster(
+        row_start: int, row_end: int, row_dur: int, cluster: list,
+    ) -> bool:
+        """Return True if the row has meaningful overlap with any cluster member."""
+        for member in cluster:
+            m_start = _epoch(member["start_ts"])
+            m_end   = _epoch(member["end_ts"])
+            m_dur   = m_end - m_start
+            pair_ov = min(row_end, m_end) - max(row_start, m_start)
+            shorter = min(m_dur, row_dur) if min(m_dur, row_dur) > 0 else 1
+            if pair_ov > 0 and (
+                pair_ov >= 30 or (pair_ov >= 10 and (pair_ov / shorter) >= 0.8)
+            ):
+                return True
+        return False
+
     for circuit, circuit_rows in by_circuit.items():
-        # Build overlap clusters using a sweep
         clusters: list = []
         current_cluster: list = []
         cluster_max_end: int = 0
@@ -992,30 +1017,16 @@ def _migrate_028(conn: sqlite3.Connection) -> None:
         for row in circuit_rows:
             row_start = _epoch(row["start_ts"])
             row_end   = _epoch(row["end_ts"])
+            row_dur   = row_end - row_start
 
             if not current_cluster:
                 current_cluster = [row]
                 cluster_max_end = row_end
                 continue
 
-            # Check for meaningful overlap with the current cluster window
-            overlap  = min(row_end, cluster_max_end) - max(row_start, _epoch(current_cluster[0]["start_ts"]))
-            # Use pairwise check against the closest member (last added)
-            prev     = current_cluster[-1]
-            prev_start = _epoch(prev["start_ts"])
-            prev_end   = _epoch(prev["end_ts"])
-            pair_overlap = min(row_end, prev_end) - max(row_start, prev_start)
-            prev_dur = prev_end - prev_start
-            row_dur  = row_end - row_start
-            shorter  = min(prev_dur, row_dur) if min(prev_dur, row_dur) > 0 else 1
-
-            meaningful = (
-                row_start < cluster_max_end  # windows touch at all
-                and pair_overlap > 0
-                and (pair_overlap >= 30 or (pair_overlap / shorter) >= 0.5)
-            )
-
-            if meaningful:
+            if (row_start < cluster_max_end
+                    and _meaningful_overlap_with_cluster(
+                        row_start, row_end, row_dur, current_cluster)):
                 current_cluster.append(row)
                 cluster_max_end = max(cluster_max_end, row_end)
             else:
@@ -1028,11 +1039,10 @@ def _migrate_028(conn: sqlite3.Connection) -> None:
 
         for cluster in clusters:
             if len(cluster) == 1:
-                continue  # nothing to collapse
+                continue
 
             clusters_found += 1
 
-            # Check for user intent — skip entire cluster
             has_locked  = False
             has_labeled = False
             for row in cluster:
@@ -1066,7 +1076,6 @@ def _migrate_028(conn: sqlite3.Connection) -> None:
                 )
                 continue
 
-            # Pick survivor: longest duration
             survivor = max(cluster, key=lambda r: r["duration_s"] or 0)
             to_delete = [r["id"] for r in cluster if r["id"] != survivor["id"]]
 
@@ -1081,11 +1090,17 @@ def _migrate_028(conn: sqlite3.Connection) -> None:
                 survivor["start_ts"], len(to_delete),
             )
 
+    hourly_volume_rebuilt = rows_deleted > 0
+    if hourly_volume_rebuilt:
+        _rebuild_hourly_volume(conn)
+
     log.info(
         "Migration 028: done — clusters_found=%d rows_deleted=%d "
-        "clusters_skipped_user_locked=%d clusters_skipped_user_labeled=%d",
+        "clusters_skipped_user_locked=%d clusters_skipped_user_labeled=%d "
+        "hourly_volume_rebuilt=%s",
         clusters_found, rows_deleted,
         clusters_skipped_locked, clusters_skipped_labeled,
+        hourly_volume_rebuilt,
     )
 
 
