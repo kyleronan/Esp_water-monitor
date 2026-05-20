@@ -455,29 +455,32 @@ class CircuitEventDetector:
             baseline = 0.0
 
         # Compute propagation delay from the 40Hz pressure buffer.
-        # Scan newest→oldest; tolerate up to MAX_BLIPS consecutive above-threshold
-        # samples (raw 40 Hz is noisy). oldest_below tracks how many samples from
-        # the buffer end the pressure onset was.
+        # Apply a 1-second (40-sample) rolling average first so that both
+        # high-frequency noise spikes and slow transition ramps produce a
+        # clean monotonic signal for the threshold scan.
         # Buffer end is ~FLOW_START_SECONDS past start_ts; subtract that offset.
         propagation_delay_ms = 0.0
         if self._pressure_buf:
             buf_baseline = self._settled_pressure_psi if self._settled_pressure_psi is not None else baseline
             onset_threshold = buf_baseline - self.PROPAGATION_ONSET_PSI
-            MAX_BLIPS = 3
+            MA_WINDOW = 40      # 1-second rolling average at 40 Hz
             MIN_BELOW = 3
-            blips = 0
+            buf = list(self._pressure_buf)
+            smoothed: list[float] = []
+            running_sum = 0.0
+            for i, p in enumerate(buf):
+                running_sum += p
+                if i >= MA_WINDOW:
+                    running_sum -= buf[i - MA_WINDOW]
+                smoothed.append(running_sum / min(i + 1, MA_WINDOW))
             below_count = 0
-            pos = 0
             oldest_below = 0
-            for p in reversed(self._pressure_buf):
-                pos += 1
+            for pos, p in enumerate(reversed(smoothed), start=1):
                 if p < onset_threshold:
                     below_count += 1
                     oldest_below = pos
-                    blips = 0
                 else:
-                    blips += 1
-                    if blips > MAX_BLIPS:
+                    if below_count >= MIN_BELOW:
                         break
             if below_count >= MIN_BELOW:
                 delay_ms = oldest_below * 25.0 - self.FLOW_START_SECONDS * 1000.0
