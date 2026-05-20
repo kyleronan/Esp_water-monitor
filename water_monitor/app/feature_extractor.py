@@ -387,21 +387,26 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     peak_flow = max(event.flow_readings) if event.flow_readings else 0.0
     flow_variability = _safe_std(event.flow_readings)
 
+    # Clamp pressure_delta_psi ≥ 0: negative values (pressure rose during event)
+    # are surge artefacts; the live detector now rejects them, but historical
+    # importer events may still arrive with negative delta.
+    pressure_delta_psi = max(0.0, float(event.pressure_delta_psi or 0))
+
     sig          = _flow_signature(event.flow_readings, peak_flow)
     p_sig        = _pressure_signature(
         event.pressure_readings or [],
         float(event.pre_event_pressure_psi or 0),
-        float(event.pressure_delta_psi or 0),
+        pressure_delta_psi,
     )
     pos_edges, neg_edges = _flow_edges(event.flow_readings, peak_flow)
     dynamics     = _flow_dynamics(event.flow_readings, peak_flow)
     mid_drop     = _mid_event_flow_drop(event.flow_readings, peak_flow)
     steady       = _flow_steady_state(event.flow_readings)
     p_stats      = _pressure_transient_stats(
-        event.pressure_readings, event.pre_event_pressure_psi, event.pressure_delta_psi
+        event.pressure_readings, event.pre_event_pressure_psi, pressure_delta_psi
     )
     p_shape      = _pressure_shape_features(
-        event.pressure_readings, event.pre_event_pressure_psi, event.pressure_delta_psi
+        event.pressure_readings, event.pre_event_pressure_psi, pressure_delta_psi
     )
 
     # Volume: prefer the firmware's cumulative integration sensor delta (set by
@@ -483,7 +488,7 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         "avg_flow_lpm": round(avg_flow, 3),
         "peak_flow_lpm": round(peak_flow, 3),
         "flow_variability": round(flow_variability, 4),
-        "pressure_delta_psi": round(event.pressure_delta_psi, 2),
+        "pressure_delta_psi": round(pressure_delta_psi, 2),
         "pre_event_pressure_psi": round(event.pre_event_pressure_psi, 2),
         "min_pressure_psi": round(event.min_pressure_psi, 2),
         "hydraulic_resistance": round(resistance, 3) if resistance is not None else None,

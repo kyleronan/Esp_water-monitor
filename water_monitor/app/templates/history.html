@@ -1,5 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
+{%- macro fmt_duration(s) -%}
+  {%- if s is none or s == 0 -%}—
+  {%- elif s < 60 -%}{{ "%.0f"|format(s) }}s
+  {%- else -%}{{ (s // 60)|int }}m {{ (s % 60)|int }}s
+  {%- endif -%}
+{%- endmacro -%}
 <style>
 .hist-td-shape { white-space: nowrap; }
 .shape-cell    { display: flex; align-items: center; gap: 6px; }
@@ -188,7 +194,7 @@
             data-event-id="{{ e.id }}"
             data-circuit="{{ ch.circuit }}"
             data-start="{{ e.start_ts or '' }}"
-            data-duration="{{ '%.0fs'|format(e.duration_seconds) if e.duration_seconds else '—' }}"
+            data-duration="{{ fmt_duration(e.duration_seconds) }}"
             data-flow="{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else '—' }} {{ flow_unit }}"
             data-pressure="{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else '—' }}"
             data-volume="{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else '—' }} {{ vol_unit }}"
@@ -206,7 +212,7 @@
             data-composite="{{ '1' if e.is_composite else '0' }}"
             data-other-valve="{{ e.other_valve_open if e.other_valve_open is not none else '' }}">
           <td class="hist-td hist-td-mono hist-td-time"><time data-ts="{{ e.start_ts or '' }}">{{ (e.start_ts or '')[:16] }}</time></td>
-          <td class="hist-td">{{ "%.0fs"|format(e.duration_seconds) if e.duration_seconds else "—" }}</td>
+          <td class="hist-td">{{ fmt_duration(e.duration_seconds) }}</td>
           <td class="hist-td hist-td-mono">{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else "—" }} {{ flow_unit }}</td>
           <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else "—" }}</td>
           <td class="hist-td hist-td-shape">
