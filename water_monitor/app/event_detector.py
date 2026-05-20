@@ -455,19 +455,33 @@ class CircuitEventDetector:
             baseline = 0.0
 
         # Compute propagation delay from the 40Hz pressure buffer.
-        # Count consecutive samples (newest-first) that are already below
-        # baseline by PROPAGATION_ONSET_PSI — each sample = 25ms.
+        # Scan newest→oldest; tolerate up to MAX_BLIPS consecutive above-threshold
+        # samples (raw 40 Hz is noisy). oldest_below tracks how many samples from
+        # the buffer end the pressure onset was.
+        # Buffer end is ~FLOW_START_SECONDS past start_ts; subtract that offset.
         propagation_delay_ms = 0.0
         if self._pressure_buf:
             buf_baseline = self._settled_pressure_psi if self._settled_pressure_psi is not None else baseline
             onset_threshold = buf_baseline - self.PROPAGATION_ONSET_PSI
-            samples_below = 0
+            MAX_BLIPS = 3
+            MIN_BELOW = 3
+            blips = 0
+            below_count = 0
+            pos = 0
+            oldest_below = 0
             for p in reversed(self._pressure_buf):
+                pos += 1
                 if p < onset_threshold:
-                    samples_below += 1
+                    below_count += 1
+                    oldest_below = pos
+                    blips = 0
                 else:
-                    break
-            propagation_delay_ms = round(samples_below * 25.0, 1)
+                    blips += 1
+                    if blips > MAX_BLIPS:
+                        break
+            if below_count >= MIN_BELOW:
+                delay_ms = oldest_below * 25.0 - self.FLOW_START_SECONDS * 1000.0
+                propagation_delay_ms = round(max(0.0, delay_ms), 1)
 
         log.info("[%s] event start (FLOW) — %.3f L/min for >= %.1f s propagation_delay=%.0f ms",
                  self.circuit, self._current_flow_lpm, self.FLOW_START_SECONDS, propagation_delay_ms)
