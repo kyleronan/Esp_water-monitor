@@ -130,6 +130,11 @@ class HistoricalImporter:
     PRESSURE_DIP_BASELINE_WINDOW_S: float = 30.0  # idle look-back for rolling baseline
     PRESSURE_DIP_AVG_MIN_THRESHOLD_PSI: float = 0.5   # floor when using avg sensor
     PRESSURE_DIP_AVG_OPEN_DURATION_S: float = 10.0    # longer sustain for avg sensor
+    # Minimum idle history required before an IDLE→CANDIDATE transition is allowed.
+    # Guards against a manual import that starts mid-dip computing the baseline
+    # from only one or two pre-dip samples and triggering a spurious period.
+    PRESSURE_DIP_MIN_BASELINE_SAMPLES: int = 3
+    PRESSURE_DIP_MIN_BASELINE_SPAN_S: float = 5.0
 
     def __init__(
         self,
@@ -627,7 +632,15 @@ class HistoricalImporter:
                 # the baseline and causing a missed detection.
                 if idle_window:
                     baseline = sum(v for _, v in idle_window) / len(idle_window)
-                    if psi <= baseline - effective_thr:
+                    span_s = (
+                        (idle_window[-1][0] - idle_window[0][0]).total_seconds()
+                        if len(idle_window) > 1 else 0.0
+                    )
+                    if (
+                        len(idle_window) >= self.PRESSURE_DIP_MIN_BASELINE_SAMPLES
+                        and span_s >= self.PRESSURE_DIP_MIN_BASELINE_SPAN_S
+                        and psi <= baseline - effective_thr
+                    ):
                         # Freeze baseline and start the candidate clock;
                         # do NOT add the dip sample to the idle window.
                         frozen_baseline = baseline
@@ -674,14 +687,15 @@ class HistoricalImporter:
                     recovery_start  = None
                     frozen_baseline = 0.0
 
-        # End-of-history flush
-        if state in (STATE_OPEN, STATE_RECOVERING) and candidate_start is not None:
-            close_ts = recovery_start if state == STATE_RECOVERING else last_ts
+        # End-of-history flush — only flush STATE_RECOVERING, NOT STATE_OPEN.
+        # If the dip is still open at query_end the event is likely still in
+        # progress; emitting it now would insert a partial event that blocks
+        # the full one when the importer runs again after the event ends.
+        if state == STATE_RECOVERING and candidate_start is not None:
+            close_ts = recovery_start or last_ts
             if query_end is not None:
-                close_ts = min(close_ts or query_end, query_end)
-            else:
-                close_ts = close_ts or last_ts
-            if close_ts and close_ts > candidate_start:
+                close_ts = min(close_ts, query_end)
+            if close_ts > candidate_start:
                 periods.append((candidate_start, close_ts))
 
         return periods
@@ -706,25 +720,30 @@ class HistoricalImporter:
         Returns None if there is insufficient flow data.
         """
         # ── Flow readings during the period ───────────────────────────
-        # Build timestamped entries so we can compute a time-weighted average.
-        # HA records state *changes* only — a single 0.5s pulse at 0.30 L/min
-        # produces one entry; max() would pass it, but the time-weighted average
-        # (0.30 × 0.5s / 8s event = 0.019 L/min) correctly rejects it.
-        flow_entries = [
-            (_parse_ts(e.get("last_changed")), _clamp_flow(float(e["state"])))
-            for e in flow_rate_hist
-            if _is_numeric(e.get("state"))
-            and _parse_ts(e.get("last_changed")) is not None
-            and start <= (_parse_ts(e.get("last_changed")) or start) <= end
-        ]
-        flow_entries.sort(key=lambda x: x[0])
-        flow_readings = [r for _, r in flow_entries]
+        # Build all raw flow entries (sorted) then resample to 1 Hz so that
+        # FeatureExtractor sees a uniform time series rather than sparse
+        # HA state-change events.  Last known rate before start is used as
+        # the default so inter-sample gaps are correctly forward-filled.
+        all_flow_entries = sorted(
+            (
+                (_parse_ts(e.get("last_changed")), _clamp_flow(float(e["state"])))
+                for e in flow_rate_hist
+                if _is_numeric(e.get("state"))
+                and _parse_ts(e.get("last_changed")) is not None
+            ),
+            key=lambda x: x[0],
+        )
+        # Last known rate before start (forward-fill default)
+        flow_before = [v for t, v in all_flow_entries if t < start]
+        flow_default = flow_before[-1] if flow_before else 0.0
 
-        if not flow_readings or max(flow_readings) < self.MIN_FLOW_LPM:
+        # Entries within [start, end] for the time-weighted volume check
+        flow_entries = [(t, v) for t, v in all_flow_entries if start <= t <= end]
+
+        if not flow_entries or max(v for _, v in flow_entries) < self.MIN_FLOW_LPM:
             return None
 
-        # Time-weighted average: each reading is a step function valid until
-        # the next entry or event end.
+        # Time-weighted average for volume and reject-by-avg gate.
         total_vol = 0.0
         for i, (ts, rate) in enumerate(flow_entries):
             next_ts = flow_entries[i + 1][0] if i + 1 < len(flow_entries) else end
@@ -734,13 +753,29 @@ class HistoricalImporter:
         if event_min <= 0 or (total_vol / event_min) < self.MIN_FLOW_LPM:
             return None
 
+        # 1 Hz resampled flow readings (uniform time base for FeatureExtractor)
+        flow_readings = _resample_step_function_1hz(
+            [(t, v) for t, v in all_flow_entries],
+            start, end, default=flow_default,
+        )
+
         # ── Pressure readings during the period ───────────────────────
-        pressure_readings = [
-            _clamp_pressure(float(e["state"]))
-            for e in pressure_hist
-            if _is_numeric(e.get("state"))
-            and start <= (_parse_ts(e.get("last_changed")) or start) <= end
-        ]
+        # Resample pressure to the same 1 Hz grid so pressure_signature_json
+        # is generated from a time-correct series, not sparse HA change events.
+        all_pres_entries = sorted(
+            (
+                (_parse_ts(e.get("last_changed")), _clamp_pressure(float(e["state"])))
+                for e in pressure_hist
+                if _is_numeric(e.get("state"))
+                and _parse_ts(e.get("last_changed")) is not None
+            ),
+            key=lambda x: x[0],
+        )
+        pres_before = [v for t, v in all_pres_entries if t < start]
+        pres_default = pres_before[-1] if pres_before else 0.0
+        pressure_readings = _resample_step_function_1hz(
+            all_pres_entries, start, end, default=pres_default,
+        )
 
         # ── Pre-event pressure baseline (look-back window) ────────────
         pre_start = start - timedelta(seconds=self.PRE_PRESSURE_WINDOW_SECONDS)
@@ -846,6 +881,45 @@ class HistoricalImporter:
     def _circuit_has_sensors(cfg: CircuitConfig) -> bool:
         """True if the circuit has at least flow sensors configured."""
         return bool(cfg.flow_onset_sensor or cfg.flow_sensor)
+
+
+def _resample_step_function_1hz(
+    samples: List[Tuple[datetime, float]],
+    start: datetime,
+    end: datetime,
+    default: float = 0.0,
+) -> List[float]:
+    """Resample a step-function history to 1 Hz over [start, end] (inclusive).
+
+    HA records state-change events only, not a regular time series.  This
+    function forward-fills the last known value at each integer second so
+    that FeatureExtractor sees a uniform time series rather than sparse
+    change-event indices.
+
+    ``samples`` must be sorted by timestamp.  ``default`` is used before the
+    first sample (e.g. the last known value before ``start``).
+
+    Output length = int((end - start).total_seconds()) + 1.
+    Returns [default] when end <= start.
+    """
+    total_s = int((end - start).total_seconds())
+    if total_s <= 0:
+        return [default]
+
+    length = total_s + 1
+    out: List[float] = []
+    si = 0
+    current = default
+
+    for tick in range(length):
+        t = start + timedelta(seconds=tick)
+        # Advance through samples whose timestamp <= t (last one wins)
+        while si < len(samples) and samples[si][0] <= t:
+            current = samples[si][1]
+            si += 1
+        out.append(current)
+
+    return out
 
 
 def _merge_periods(
