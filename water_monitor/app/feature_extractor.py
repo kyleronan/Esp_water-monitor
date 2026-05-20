@@ -584,6 +584,7 @@ class FeatureExtractor:
                     self._db, event.circuit,
                     event.start_ts.isoformat(),
                     event.end_ts.isoformat(),
+                    exclude_event_id=features["id"],
                 )
                 if blocking is not None:
                     suffix = ""

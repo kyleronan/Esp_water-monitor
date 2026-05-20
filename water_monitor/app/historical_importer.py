@@ -35,9 +35,9 @@ accurate and suitable for volume accounting and coarse clustering.
 
 Duplicate prevention
 --------------------
-Before queuing any reconstructed event, checks whether an event with
-start_ts within ±DUPLICATE_WINDOW_SECONDS already exists. Safe to run
-multiple times over the same window.
+Before queuing any reconstructed event, checks whether a meaningfully
+overlapping event already exists (overlap >= 30 s, or >= 10 s and >= 80 %
+of the shorter event). Safe to run multiple times over the same window.
 
 Scheduling
 ----------
@@ -65,7 +65,7 @@ from .config import AddonConfig, CircuitConfig
 from .event_detector import RawEvent, CircuitEventDetector as _CED
 from .database import (
     get_import_state, update_import_state,
-    get_last_event_ts, event_exists_near, find_overlapping_event,
+    get_last_event_ts, find_overlapping_event,
 )
 
 log = logging.getLogger(__name__)
@@ -115,7 +115,6 @@ class HistoricalImporter:
     CHECK_INTERVAL_MINUTES: int = 30
     MERGE_GAP_SECONDS: int = 15       # bridge flow_pulse_onset gaps shorter than this
     MIN_DURATION_SECONDS: float = 3.0
-    DUPLICATE_WINDOW_SECONDS: int = 30
     MIN_FLOW_LPM: float = _CED.MIN_FLOW_LPM
     MIN_EVENT_VOLUME_L: float = _CED.MIN_EVENT_VOLUME_L
     PRE_PRESSURE_WINDOW_SECONDS: int = 30   # look-back for baseline pressure
