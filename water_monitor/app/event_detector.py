@@ -64,6 +64,7 @@ class RawEvent:
     has_pressure_transient: bool = False
     pre_event_pressure_psi: float = 0.0
     min_pressure_psi: float = 0.0
+    max_pressure_psi: float = 0.0
     pressure_delta_psi: float = 0.0
     pressure_readings: List[float] = field(default_factory=list)
 
@@ -166,6 +167,12 @@ class CircuitEventDetector:
     # is below this threshold are discarded as noise.  1 mL is a sanity floor —
     # no real water-use event produces less than 1 mL.
     MIN_EVENT_VOLUME_L: float = 0.001
+
+    # Pressure-surge phantom rejection.  If the maximum pressure seen during an
+    # event is more than this amount ABOVE the pre-event baseline AND no net
+    # pressure drop occurred (pressure_delta_psi <= 0), the event is a turbine
+    # artefact caused by a surge (pump, water hammer) rather than real flow.
+    PRESSURE_SURGE_PHANTOM_PSI: float = 0.5
 
     # Gate for updating the settled-pressure baseline.
     # Only accept a sample as "resting" when historical vs. current pressure
@@ -343,6 +350,8 @@ class CircuitEventDetector:
         else:
             elapsed_p = (now - self._active_event.start_ts).total_seconds()
             self._pressure_sample_count += 1
+            # Track max on every sample (before downsample gate).
+            self._active_event.max_pressure_psi = max(self._active_event.max_pressure_psi, pressure)
             if elapsed_p < self._DOWNSAMPLE_AFTER_SECONDS or self._pressure_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.pressure_readings.append(pressure)
 
@@ -474,6 +483,7 @@ class CircuitEventDetector:
             flow_onset_entity=self._flow_onset_entity,
             pre_event_pressure_psi=baseline,
             min_pressure_psi=baseline,
+            max_pressure_psi=baseline,
             flow_readings=[self._current_flow_lpm],
             other_valve_open=self._get_other_valve_open(),
         )
@@ -496,6 +506,7 @@ class CircuitEventDetector:
             has_pressure_transient=True,
             pre_event_pressure_psi=baseline,
             min_pressure_psi=current_pressure,
+            max_pressure_psi=current_pressure,
             pressure_delta_psi=drop,
             pressure_readings=[current_pressure],
             flow_onset_entity=self._flow_onset_entity,
@@ -562,6 +573,24 @@ class CircuitEventDetector:
                 self.circuit, volume_l, self.MIN_EVENT_VOLUME_L,
             )
             return
+
+        # Reject pressure-surge phantoms: turbine artefacts from pump surges or
+        # water hammer where pressure rose above baseline and never dropped.
+        if (
+            ev.pressure_readings
+            and ev.pre_event_pressure_psi > 0
+            and ev.max_pressure_psi > 0
+        ):
+            pressure_rise = ev.max_pressure_psi - ev.pre_event_pressure_psi
+            if pressure_rise > self.PRESSURE_SURGE_PHANTOM_PSI and ev.pressure_delta_psi <= 0:
+                log.info(
+                    "[%s] rejecting pressure-surge phantom: rose %.2f PSI "
+                    "(max=%.1f baseline=%.1f delta=%.2f) duration=%.1f s",
+                    self.circuit, pressure_rise, ev.max_pressure_psi,
+                    ev.pre_event_pressure_psi, ev.pressure_delta_psi, duration,
+                )
+                self._pressure_recovered_since = None
+                return
 
         log.info(
             "[%s] event complete — trigger=%s duration=%.1f s avg_flow=%.3f L/min "
