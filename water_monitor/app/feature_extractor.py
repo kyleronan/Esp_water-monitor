@@ -174,6 +174,35 @@ def _flow_signature(flow_readings: list, peak: float, n: int = 32) -> list:
     return result
 
 
+def _pressure_signature(
+    pressure_readings: list,
+    pre_event_pressure_psi: float,
+    pressure_delta_psi: float,
+    n: int = 32,
+) -> list:
+    """32-point normalized pressure drop (0 = no drop, 1 = full drop at delta_psi)."""
+    if pressure_delta_psi <= 0:
+        return [0.0] * n
+    drops = []
+    for p in pressure_readings:
+        try:
+            v = float(p)
+        except (TypeError, ValueError):
+            continue
+        drops.append(max(0.0, min(1.0, (pre_event_pressure_psi - v) / pressure_delta_psi)))
+    if not drops:
+        return [0.0] * n
+    if len(drops) == 1:
+        return [drops[0]] * n
+    result = []
+    for i in range(n):
+        pos = i * (len(drops) - 1) / (n - 1)
+        lo, hi = int(pos), min(int(pos) + 1, len(drops) - 1)
+        v = drops[lo] * (1 - (pos - lo)) + drops[hi] * (pos - lo)
+        result.append(round(v, 4))
+    return result
+
+
 def _flow_edges(flow_readings: list, peak: float) -> tuple:
     """Count significant direction reversals using zigzag (WaterSense model).
 
@@ -359,6 +388,11 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     flow_variability = _safe_std(event.flow_readings)
 
     sig          = _flow_signature(event.flow_readings, peak_flow)
+    p_sig        = _pressure_signature(
+        event.pressure_readings or [],
+        float(event.pre_event_pressure_psi or 0),
+        float(event.pressure_delta_psi or 0),
+    )
     pos_edges, neg_edges = _flow_edges(event.flow_readings, peak_flow)
     dynamics     = _flow_dynamics(event.flow_readings, peak_flow)
     mid_drop     = _mid_event_flow_drop(event.flow_readings, peak_flow)
@@ -483,6 +517,7 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
 
         # Flow shape features
         "flow_signature_json":    json.dumps(sig),
+        "pressure_signature_json": json.dumps(p_sig),
         "positive_edge_count":    pos_edges,
         "negative_edge_count":    neg_edges,
         "flow_edge_count":        pos_edges + neg_edges,

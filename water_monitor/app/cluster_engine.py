@@ -73,7 +73,25 @@ FEATURE_KEYS = [
     'pressure_transient_energy', 'pressure_transient_duration_ms',
     # Pressure transient shape features
     'pressure_onset_ms', 'recovery_overshoot_psi', 'pressure_oscillation_count',
+    # Pressure drop signature — 32-point normalized drop curve
+    'pressure_sig_00', 'pressure_sig_01', 'pressure_sig_02', 'pressure_sig_03',
+    'pressure_sig_04', 'pressure_sig_05', 'pressure_sig_06', 'pressure_sig_07',
+    'pressure_sig_08', 'pressure_sig_09', 'pressure_sig_10', 'pressure_sig_11',
+    'pressure_sig_12', 'pressure_sig_13', 'pressure_sig_14', 'pressure_sig_15',
+    'pressure_sig_16', 'pressure_sig_17', 'pressure_sig_18', 'pressure_sig_19',
+    'pressure_sig_20', 'pressure_sig_21', 'pressure_sig_22', 'pressure_sig_23',
+    'pressure_sig_24', 'pressure_sig_25', 'pressure_sig_26', 'pressure_sig_27',
+    'pressure_sig_28', 'pressure_sig_29', 'pressure_sig_30', 'pressure_sig_31',
 ]
+
+# Per-dimension weights for weighted Euclidean distance.
+# Pressure shape (0.8) > flow shape (0.4); scalars default 1.0; hour sinusoids 0.2.
+BASE_FEATURE_WEIGHTS: Dict[str, float] = {k: 1.0 for k in FEATURE_KEYS}
+for _i in range(32):
+    BASE_FEATURE_WEIGHTS[f'flow_sig_{_i:02d}']     = 0.4
+    BASE_FEATURE_WEIGHTS[f'pressure_sig_{_i:02d}'] = 0.8
+BASE_FEATURE_WEIGHTS['hour_sin'] = 0.2
+BASE_FEATURE_WEIGHTS['hour_cos'] = 0.2
 
 
 class ClusterEngine:
@@ -236,6 +254,18 @@ class ClusterEngine:
         for i in range(32):
             features.setdefault(f'flow_sig_{i:02d}', 0.0)
 
+        # Expand pressure signature → pressure_sig_00 … pressure_sig_31
+        p_sig_json = event.get('pressure_signature_json')
+        if p_sig_json:
+            try:
+                p_sig = json.loads(p_sig_json)
+                for i, v in enumerate(p_sig[:32]):
+                    features[f'pressure_sig_{i:02d}'] = float(v)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        for i in range(32):
+            features.setdefault(f'pressure_sig_{i:02d}', 0.0)
+
         return features
 
     # ── Cluster confidence ─────────────────────────────────────────────────────
@@ -294,7 +324,7 @@ class ClusterEngine:
         """
         from .fixtures import get_variance_profile
         profile = get_variance_profile(fixture_type)
-        weights: Dict[str, float] = {k: 1.0 for k in FEATURE_KEYS}
+        weights: Dict[str, float] = dict(BASE_FEATURE_WEIGHTS)
         for k, w in profile.get("anchor_weights", {}).items():
             if k in weights:
                 weights[k] = float(w)

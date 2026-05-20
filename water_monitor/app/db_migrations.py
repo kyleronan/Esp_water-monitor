@@ -1104,6 +1104,19 @@ def _migrate_028(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_029(conn: sqlite3.Connection) -> None:
+    """Add pressure_signature_json column to events (idempotent)."""
+    if not _has_column(conn, "events", "pressure_signature_json"):
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN pressure_signature_json TEXT"
+        )
+        conn.commit()
+    log.info(
+        "Migration 029: pressure_signature_json present=%s",
+        _has_column(conn, "events", "pressure_signature_json"),
+    )
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -1133,6 +1146,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (26, _migrate_026),
     (27, _migrate_027),
     (28, _migrate_028),
+    (29, _migrate_029),
 ]
 
 
