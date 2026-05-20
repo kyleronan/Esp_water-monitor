@@ -618,6 +618,17 @@ async def setup_home_details_save(request: Request):
         except Exception as e:
             log.warning("Event detector setup failed (non-fatal): %s", e)
 
+    # The HA WebSocket was already connected before setup completed (monitoring 0
+    # entities).  subscribe_entity() adds to the dict but cannot update the live
+    # WebSocket subscription.  Reconnect so HA starts sending state changes for
+    # the newly registered circuit entities.
+    if orch.ha:
+        try:
+            orch.ha.request_reconnect()
+            log.info("HA WebSocket reconnect requested — circuit entity subscriptions now active")
+        except Exception as e:
+            log.warning("HA WebSocket reconnect request failed (non-fatal): %s", e)
+
     # Fetch midnight volume baselines from HA history so the dashboard
     # shows accurate daily/weekly totals from the first page load.
     try:

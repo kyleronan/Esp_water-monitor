@@ -58,6 +58,7 @@ class HaClient:
         self._ws_oneshot: Optional[Any] = None   # persistent connection for ws_request
         self._running = False
         self._stop_event = asyncio.Event()
+        self._reconnect_event = asyncio.Event()
 
     async def __aenter__(self) -> "HaClient":
         self._http = aiohttp.ClientSession(
@@ -76,6 +77,14 @@ class HaClient:
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def request_reconnect(self) -> None:
+        """Signal the listen loop to reconnect, re-subscribing with the current entity list.
+
+        Call this after adding new subscriptions on an already-running connection
+        (e.g. after the setup wizard completes and adds circuit entity subscriptions).
+        """
+        self._reconnect_event.set()
 
     def subscribe_entity(self, entity_id: str, callback: StateCallback) -> None:
         """Register a callback for state_changed events on entity_id."""
@@ -111,6 +120,7 @@ class HaClient:
                     pass
 
     async def _connect_and_listen(self) -> None:
+        self._reconnect_event.clear()
         async with websockets.connect(WS_URL, max_size=2**24,
                                       ping_interval=30) as ws:
             await self._auth(ws)
@@ -118,7 +128,7 @@ class HaClient:
             log.info("HA WebSocket connected, monitoring %d entities",
                      len(self._subscriptions))
 
-            while not self._stop_event.is_set():
+            while not self._stop_event.is_set() and not self._reconnect_event.is_set():
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=60)
                 except asyncio.TimeoutError:
@@ -126,6 +136,10 @@ class HaClient:
                 msg = json.loads(raw)
                 if sub_id and msg.get("type") == "event" and msg.get("id") == sub_id:
                     self._dispatch_entity_change(msg.get("event", {}))
+
+            if self._reconnect_event.is_set():
+                log.info("HA WebSocket reconnecting to pick up %d updated entity subscriptions",
+                         len(self._subscriptions))
 
     async def _auth(self, ws) -> None:
         hello = json.loads(await ws.recv())
