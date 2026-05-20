@@ -523,7 +523,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
 
     const propMs = parseInt(d.propMs || '0', 10);
     document.getElementById('emd-prop-delay').textContent =
-      (propMs > 0) ? `${propMs} ms` : (d.trigger === 'flow' ? 'N/A (flow-triggered)' : '—');
+      (propMs > 0) ? `${propMs} ms` : '—';
 
     const aScore = d.anomalyScore;
     const aType  = d.anomalyType;
