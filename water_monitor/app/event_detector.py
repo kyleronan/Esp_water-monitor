@@ -156,6 +156,12 @@ class CircuitEventDetector:
     # minutes before any tap is turned on.
     PRESSURE_STABLE_DURATION_S: float = 10.0
 
+    # Pressure-recovery END for pressure-triggered events.
+    # A pulsed-flow event stays open while the dip persists; it closes once the
+    # dip has recovered to ≤ FRACTION of its starting magnitude for this many seconds.
+    PRESSURE_RECOVERY_FRACTION: float = 0.5
+    PRESSURE_RECOVERY_DURATION_S: float = 10.0
+
     # Minimum event volume.  Events whose computed volume (avg_flow × duration)
     # is below this threshold are discarded as noise.  1 mL is a sanity floor —
     # no real water-use event produces less than 1 mL.
@@ -195,6 +201,7 @@ class CircuitEventDetector:
         self._active_event: Optional[RawEvent] = None
         self._current_flow_lpm: float = 0.0
         self._flow_sustained_since: Optional[datetime] = None
+        self._pressure_recovered_since: Optional[datetime] = None
 
         # Downsampling: keep all readings for the first N seconds, then every Kth.
         # Prevents 290k-sample lists for 2-hour irrigation events.
@@ -339,6 +346,32 @@ class CircuitEventDetector:
             if elapsed_p < self._DOWNSAMPLE_AFTER_SECONDS or self._pressure_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.pressure_readings.append(pressure)
 
+            ev = self._active_event
+            if ev.has_pressure_transient and ev.pressure_delta_psi > 0:
+                recovery_line = (
+                    ev.pre_event_pressure_psi
+                    - ev.pressure_delta_psi * self.PRESSURE_RECOVERY_FRACTION
+                )
+                if pressure >= recovery_line:
+                    if self._pressure_recovered_since is None:
+                        self._pressure_recovered_since = now
+                    elif (
+                        (now - self._pressure_recovered_since).total_seconds()
+                        >= self.PRESSURE_RECOVERY_DURATION_S
+                        and self._current_flow_lpm < self.MIN_FLOW_LPM
+                    ):
+                        log.debug(
+                            "[%s] pressure recovered (>= %.2f PSI for %.1f s, flow=%.3f) "
+                            "— ending pressure-triggered event",
+                            self.circuit, recovery_line,
+                            (now - self._pressure_recovered_since).total_seconds(),
+                            self._current_flow_lpm,
+                        )
+                        self._end_event(now)
+                        return
+                else:
+                    self._pressure_recovered_since = None
+
             if not self._active_event.has_pressure_transient:
                 # First transient seen during this event — enrich the record.
                 # Use the same historical baseline so the delta is accurate.
@@ -397,6 +430,7 @@ class CircuitEventDetector:
     def _start_flow_event(self, now: datetime) -> None:
         start_ts = self._flow_sustained_since or now
         self._flow_sustained_since = None
+        self._pressure_recovered_since = None
 
         min_samples = self.BASELINE_LOOKBACK_SAMPLES + self.BASELINE_WINDOW_SAMPLES
         if self._settled_pressure_psi is not None:
@@ -446,6 +480,7 @@ class CircuitEventDetector:
 
     def _start_pressure_event(self, now: datetime, baseline: float,
                               current_pressure: float) -> None:
+        self._pressure_recovered_since = None
         if self._settled_pressure_psi is not None:
             baseline = self._settled_pressure_psi
         drop = baseline - current_pressure
@@ -491,6 +526,7 @@ class CircuitEventDetector:
         ev = self._active_event
         if ev is None:
             return
+        self._pressure_recovered_since = None
 
         duration = (ts - ev.start_ts).total_seconds()
 
@@ -550,6 +586,7 @@ class CircuitEventDetector:
         self._pressure_buf.clear()
         self._current_flow_lpm = 0.0
         self._flow_sustained_since = None
+        self._pressure_recovered_since = None
         self._settled_pressure_psi = None
         self._settled_pressure_since = None
 
