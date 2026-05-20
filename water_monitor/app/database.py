@@ -402,6 +402,8 @@ CREATE TABLE IF NOT EXISTS events (
     created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     -- Flow shape features (migration 025)
     flow_signature_json              TEXT,
+    -- Pressure drop signature (migration 029)
+    pressure_signature_json          TEXT,
     positive_edge_count              INTEGER DEFAULT 0,
     negative_edge_count              INTEGER DEFAULT 0,
     flow_edge_count                  INTEGER DEFAULT 0,
