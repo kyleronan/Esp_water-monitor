@@ -349,8 +349,8 @@
             <div class="sett-form-grid" style="margin-top:.75rem">
               <div class="sett-form-group">
                 <label>Pressure drop to detect event ({{ pressure_unit }})</label>
-                <input type="number" name="pressure_drop_event_psi" step="0.5" min="0.5" max="10"
-                       value="{{ c.sensitivity.pressure_drop_event_psi or 2.0 }}">
+                <input type="number" name="pressure_drop_event_psi" step="0.1" min="0.5" max="10"
+                       value="{{ c.sensitivity.pressure_drop_event_psi or 1.2 }}">
               </div>
               <div class="sett-form-group">
                 <label>Min event duration (seconds)</label>

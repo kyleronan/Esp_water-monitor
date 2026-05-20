@@ -197,7 +197,7 @@ CREATE TABLE IF NOT EXISTS sensitivity_config (
     mode                        TEXT DEFAULT 'simple',
     simple_level                TEXT DEFAULT 'medium',
     -- Event detection
-    pressure_drop_event_psi     REAL DEFAULT 2.0,
+    pressure_drop_event_psi     REAL DEFAULT 1.2,
     min_event_duration_seconds  REAL DEFAULT 3.0,
     -- Anomaly thresholds
     score_alert                 REAL DEFAULT 0.60,

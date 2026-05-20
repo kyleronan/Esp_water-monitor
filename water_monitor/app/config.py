@@ -124,7 +124,7 @@ SENSITIVITY_PRESETS = {
         "max_shutoffs_per_12h": 1,
     },
     "medium": {
-        "pressure_drop_event_psi": 2.0,
+        "pressure_drop_event_psi": 1.2,
         "min_event_duration_seconds": 3.0,
         "score_alert": 0.60,
         "score_shutoff": 0.80,

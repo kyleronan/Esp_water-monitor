@@ -909,6 +909,21 @@ def _migrate_026(conn: sqlite3.Connection) -> None:
     log.info("Migration 026: cleared volume_snapshots + rebuilt hourly_volume from events")
 
 
+def _migrate_027(conn: sqlite3.Connection) -> None:
+    """Lower medium-preset pressure_drop_event_psi default from 2.0 to 1.2.
+
+    Only updates rows that are still on the old medium-preset default — avoids
+    overwriting user-customized thresholds.
+    """
+    conn.execute("""
+        UPDATE sensitivity_config
+           SET pressure_drop_event_psi = 1.2
+         WHERE pressure_drop_event_psi = 2.0
+           AND simple_level = 'medium'
+    """)
+    log.info("Migration 027: lowered medium-preset pressure_drop_event_psi 2.0 → 1.2")
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -936,6 +951,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (24, _migrate_024),
     (25, _migrate_025),
     (26, _migrate_026),
+    (27, _migrate_027),
 ]
 
 
