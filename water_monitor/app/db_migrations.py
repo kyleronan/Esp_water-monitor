@@ -1043,11 +1043,17 @@ def _migrate_028(conn: sqlite3.Connection) -> None:
 
             clusters_found += 1
 
-            has_locked  = False
-            has_labeled = False
-            for row in cluster:
+            survivor = max(cluster, key=lambda r: r["duration_s"] or 0)
+            non_survivors = [r for r in cluster if r["id"] != survivor["id"]]
+
+            # Only skip if a NON-SURVIVOR row carries user intent.  If the
+            # survivor itself is user-labeled or user-locked, we can safely
+            # delete the unlabeled duplicates while keeping the labeled row.
+            skip_locked  = False
+            skip_labeled = False
+            for row in non_survivors:
                 if row["user_fixture_type"] is not None:
-                    has_labeled = True
+                    skip_labeled = True
                     break
                 if row["fixture_id"] is not None:
                     locked = conn.execute(
@@ -1055,29 +1061,28 @@ def _migrate_028(conn: sqlite3.Connection) -> None:
                         (row["fixture_id"],)
                     ).fetchone()
                     if locked and locked["user_locked"]:
-                        has_locked = True
+                        skip_locked = True
                         break
 
-            if has_labeled:
+            if skip_labeled:
                 clusters_skipped_labeled += 1
                 log.warning(
                     "Migration 028: [%s] skipping cluster of %d rows starting %s "
-                    "— contains user-labeled row (user_fixture_type set)",
+                    "— non-survivor row has user_fixture_type set",
                     circuit, len(cluster), cluster[0]["start_ts"],
                 )
                 continue
 
-            if has_locked:
+            if skip_locked:
                 clusters_skipped_locked += 1
                 log.warning(
                     "Migration 028: [%s] skipping cluster of %d rows starting %s "
-                    "— contains row with user-locked fixture",
+                    "— non-survivor row has user-locked fixture",
                     circuit, len(cluster), cluster[0]["start_ts"],
                 )
                 continue
 
-            survivor = max(cluster, key=lambda r: r["duration_s"] or 0)
-            to_delete = [r["id"] for r in cluster if r["id"] != survivor["id"]]
+            to_delete = [r["id"] for r in non_survivors]
 
             for del_id in to_delete:
                 conn.execute("DELETE FROM events WHERE id = ?", (del_id,))
@@ -1102,6 +1107,18 @@ def _migrate_028(conn: sqlite3.Connection) -> None:
         clusters_skipped_locked, clusters_skipped_labeled,
         hourly_volume_rebuilt,
     )
+
+
+def _migrate_030(conn: sqlite3.Connection) -> None:
+    """Re-run the migration-028 cluster sweep with the corrected skip rule.
+
+    Migration 028 skipped clusters where ANY row was user-labeled, including
+    clusters where the survivor (longest row) was the labeled one.  Those
+    clusters are safe to clean up: keep the labeled survivor, delete the
+    unlabeled duplicates.  This migration applies the corrected rule to finish
+    the job.
+    """
+    _migrate_028(conn)
 
 
 def _migrate_029(conn: sqlite3.Connection) -> None:
@@ -1147,6 +1164,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (27, _migrate_027),
     (28, _migrate_028),
     (29, _migrate_029),
+    (30, _migrate_030),
 ]
 
 
