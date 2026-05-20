@@ -792,6 +792,30 @@ class HistoricalImporter:
         if volume_l < self.MIN_EVENT_VOLUME_L:
             return None
 
+        # ── Propagation delay ─────────────────────────────────────────
+        # Scan pressure samples strictly within [start, end] for the first
+        # sample that crosses baseline - PROPAGATION_ONSET_PSI.  Return None
+        # (rendered as "—" in the UI) when:
+        #   • pressure history is absent
+        #   • using_avg_pressure (25 s smoothing makes ms-precision meaningless)
+        #   • no sample within the window crosses the threshold
+        propagation_delay_ms: Optional[float] = None
+        if pressure_hist and not using_avg_pressure and pre_event_pressure > 0:
+            onset_threshold = pre_event_pressure - _CED.PROPAGATION_ONSET_PSI
+            for entry in pressure_hist:
+                ts = _parse_ts(entry.get("last_changed"))
+                if ts is None or not (start <= ts <= end):
+                    continue
+                try:
+                    psi = float(entry["state"])
+                except (ValueError, TypeError, KeyError):
+                    continue
+                if psi <= onset_threshold:
+                    propagation_delay_ms = round(
+                        (ts - start).total_seconds() * 1000.0, 1
+                    )
+                    break
+
         return RawEvent(
             circuit=circuit,
             start_ts=start,
@@ -804,7 +828,7 @@ class HistoricalImporter:
             pressure_delta_psi=round(pressure_delta, 2),
             pressure_readings=pressure_readings,
             flow_onset_ts=start,
-            propagation_delay_ms=0.0,
+            propagation_delay_ms=propagation_delay_ms,
             flow_readings=flow_readings,
             volume_litres_measured=volume_litres_measured,
             complete=True,
