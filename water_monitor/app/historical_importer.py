@@ -121,6 +121,17 @@ class HistoricalImporter:
     PRE_PRESSURE_WINDOW_SECONDS: int = 30   # look-back for baseline pressure
     MIN_PRESSURE_DROP_PSI: float = 0.8      # min drop to flag has_pressure_transient
 
+    # Pressure-dip-as-period-source constants.
+    # The state machine below emits a (start, end) period for each contiguous
+    # sustained dip — these are merged with flow periods by _merge_periods so
+    # pulsed-flow events that produce a clean pressure envelope still register.
+    PRESSURE_DIP_PERIOD_PSI: float = 1.0          # threshold for exact-pressure sensor
+    PRESSURE_DIP_OPEN_DURATION_S: float = 5.0     # sustain before opening a period
+    PRESSURE_DIP_CLOSE_DURATION_S: float = 5.0    # sustain before closing a period
+    PRESSURE_DIP_BASELINE_WINDOW_S: float = 30.0  # idle look-back for rolling baseline
+    PRESSURE_DIP_AVG_MIN_THRESHOLD_PSI: float = 0.5   # floor when using avg sensor
+    PRESSURE_DIP_AVG_OPEN_DURATION_S: float = 10.0    # longer sustain for avg sensor
+
     def __init__(
         self,
         cfg: AddonConfig,
@@ -340,8 +351,15 @@ class HistoricalImporter:
             except Exception:
                 pass
 
-        # Detect flow periods
-        periods = self._find_flow_periods(onset_hist, flow_rate_hist, query_end=end)
+        # Detect flow periods — pressure_hist is passed so the state machine can
+        # emit a dip-envelope period that bridges pulsed-flow bursts too far apart
+        # for MERGE_GAP_SECONDS (e.g. fridge dispenser with ~40 s inter-burst gap).
+        using_avg_pressure = (pressure_entity == cfg.pressure_avg_sensor)
+        periods = self._find_flow_periods(
+            onset_hist, flow_rate_hist, query_end=end,
+            pressure_hist=pressure_hist,
+            using_avg_pressure=using_avg_pressure,
+        )
         if not periods:
             return 0, None
 
@@ -386,7 +404,7 @@ class HistoricalImporter:
             raw = self._reconstruct_event(
                 cfg.circuit, period_start, period_end,
                 flow_rate_hist, pressure_hist, volume_hist,
-                using_avg_pressure=(pressure_entity == cfg.pressure_avg_sensor),
+                using_avg_pressure=using_avg_pressure,
                 vol_unit=vol_unit,
             )
             if raw is None:
@@ -430,15 +448,26 @@ class HistoricalImporter:
         onset_hist: List[Dict],
         flow_rate_hist: List[Dict],
         query_end: Optional[datetime] = None,
+        pressure_hist: Optional[List[Dict]] = None,
+        using_avg_pressure: bool = False,
     ) -> List[Tuple[datetime, datetime]]:
         """
-        Merge flow_pulse_onset ON periods and flow_rate > threshold periods
-        into a unified, gap-filled, deduplicated list.
-        """
-        onset_periods = self._onset_to_periods(onset_hist, query_end=query_end)
-        rate_periods  = self._rate_to_periods(flow_rate_hist, query_end=query_end)
+        Merge flow_pulse_onset ON periods, flow_rate > threshold periods, and
+        (optionally) sustained pressure-dip periods into a unified, gap-filled,
+        deduplicated list.
 
-        all_periods = onset_periods + rate_periods
+        The pressure-dip source bridges pulsed-flow events whose bursts are too
+        far apart for MERGE_GAP_SECONDS — the continuous dip envelope covers the
+        full event window and _merge_periods fuses it with the flow fragments.
+        """
+        onset_periods    = self._onset_to_periods(onset_hist, query_end=query_end)
+        rate_periods     = self._rate_to_periods(flow_rate_hist, query_end=query_end)
+        pressure_periods = self._pressure_to_periods(
+            pressure_hist or [], query_end=query_end,
+            using_avg_pressure=using_avg_pressure,
+        )
+
+        all_periods = onset_periods + rate_periods + pressure_periods
         if not all_periods:
             return []
 
@@ -524,6 +553,132 @@ class HistoricalImporter:
             close_ts = query_end if query_end is not None else last_ts
             if close_ts is not None and close_ts > current_start:
                 periods.append((current_start, close_ts))
+
+        return periods
+
+    def _pressure_to_periods(
+        self,
+        history: List[Dict],
+        query_end: Optional[datetime] = None,
+        using_avg_pressure: bool = False,
+    ) -> List[Tuple[datetime, datetime]]:
+        """Emit (start, end) periods for each sustained pressure dip.
+
+        State machine over time-ordered pressure samples:
+          IDLE      — rolling baseline from the last PRESSURE_DIP_BASELINE_WINDOW_S
+          CANDIDATE — freeze baseline; require sustained dip before opening
+          OPEN      — period active; watch for recovery
+          RECOVERING — sustained recovery required before closing
+
+        The frozen-baseline design prevents the baseline from drifting downward
+        inside a real dip, which would cause the dip to look smaller than it is.
+        """
+        if not history:
+            return []
+
+        # Effective threshold and open-sustain depend on sensor quality.
+        if using_avg_pressure:
+            effective_thr  = max(self.PRESSURE_DIP_AVG_MIN_THRESHOLD_PSI,
+                                 self.PRESSURE_DIP_PERIOD_PSI * 0.3)
+            open_duration  = self.PRESSURE_DIP_AVG_OPEN_DURATION_S
+        else:
+            effective_thr  = self.PRESSURE_DIP_PERIOD_PSI
+            open_duration  = self.PRESSURE_DIP_OPEN_DURATION_S
+        close_duration = self.PRESSURE_DIP_CLOSE_DURATION_S
+
+        # State
+        STATE_IDLE       = 0
+        STATE_CANDIDATE  = 1
+        STATE_OPEN       = 2
+        STATE_RECOVERING = 3
+
+        state           = STATE_IDLE
+        idle_window: List[Tuple[datetime, float]] = []  # (ts, psi) for rolling mean
+        frozen_baseline : float = 0.0
+        candidate_start : Optional[datetime] = None
+        recovery_start  : Optional[datetime] = None
+        periods: List[Tuple[datetime, datetime]] = []
+
+        samples = []
+        for entry in history:
+            ts = _parse_ts(entry.get("last_changed"))
+            if ts is None:
+                continue
+            try:
+                psi = float(entry["state"])
+            except (ValueError, TypeError, KeyError):
+                continue
+            if not math.isfinite(psi):
+                continue
+            samples.append((ts, psi))
+
+        if not samples:
+            return []
+
+        last_ts = samples[-1][0]
+
+        for ts, psi in samples:
+
+            # ── IDLE: maintain rolling baseline ──────────────────────────
+            if state == STATE_IDLE:
+                cutoff = ts - timedelta(seconds=self.PRESSURE_DIP_BASELINE_WINDOW_S)
+                idle_window = [(t, v) for t, v in idle_window if t >= cutoff]
+                idle_window.append((ts, psi))
+                baseline = sum(v for _, v in idle_window) / len(idle_window)
+
+                if psi <= baseline - effective_thr:
+                    # Freeze baseline and start the candidate clock
+                    frozen_baseline = baseline
+                    candidate_start = ts
+                    state = STATE_CANDIDATE
+
+            # ── CANDIDATE: check sustain (do NOT update idle_window) ─────
+            elif state == STATE_CANDIDATE:
+                assert candidate_start is not None
+                if psi > frozen_baseline - effective_thr:
+                    # Cancelled before sustained — return to IDLE
+                    # Re-feed this sample into the idle window
+                    cutoff = ts - timedelta(seconds=self.PRESSURE_DIP_BASELINE_WINDOW_S)
+                    idle_window = [(t, v) for t, v in idle_window if t >= cutoff]
+                    idle_window.append((ts, psi))
+                    state = STATE_IDLE
+                elif (ts - candidate_start).total_seconds() >= open_duration:
+                    state = STATE_OPEN
+
+            # ── OPEN: watch for start of recovery ────────────────────────
+            elif state == STATE_OPEN:
+                recovery_line = frozen_baseline - effective_thr * 0.5
+                if psi >= recovery_line:
+                    recovery_start = ts
+                    state = STATE_RECOVERING
+
+            # ── RECOVERING: require sustained recovery before closing ─────
+            elif state == STATE_RECOVERING:
+                assert recovery_start is not None
+                assert candidate_start is not None
+                recovery_line = frozen_baseline - effective_thr * 0.5
+                if psi < recovery_line:
+                    # Pressure dipped again — cancel recovery, stay OPEN
+                    recovery_start = None
+                    state = STATE_OPEN
+                elif (ts - recovery_start).total_seconds() >= close_duration:
+                    periods.append((candidate_start, recovery_start))
+                    # Reset to IDLE; re-feed this sample as start of idle window
+                    idle_window = [(ts, psi)]
+                    state = STATE_IDLE
+                    candidate_start = None
+                    recovery_start  = None
+                    frozen_baseline = 0.0
+
+        # End-of-history flush
+        if state in (STATE_OPEN, STATE_RECOVERING) and candidate_start is not None:
+            close_ts = recovery_start if state == STATE_RECOVERING else last_ts
+            if query_end is not None:
+                close_ts = min(close_ts or query_end, query_end)
+            else:
+                close_ts = close_ts or last_ts
+            if close_ts and close_ts > candidate_start:
+                periods.append((candidate_start, close_ts))
 
         return periods
 
