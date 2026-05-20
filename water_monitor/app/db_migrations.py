@@ -924,6 +924,171 @@ def _migrate_027(conn: sqlite3.Connection) -> None:
     log.info("Migration 027: lowered medium-preset pressure_drop_event_psi 2.0 → 1.2")
 
 
+def _migrate_028(conn: sqlite3.Connection) -> None:
+    """Collapse duplicate overlapping event rows created by importer catch-up races.
+
+    Background: before overlap-based duplicate detection landed (migration 027+
+    code change), each importer catch-up cycle could reconstruct the same physical
+    event with a slightly different start_ts, producing N overlapping rows for the
+    same real event. This one-time sweep removes the duplicates.
+
+    Algorithm (per circuit):
+      1. Sort events by start_ts.
+      2. Build overlap clusters: extend the current cluster while
+         next.start_ts < cluster.max(end_ts)  AND the pair has meaningful overlap
+         (overlap >= 30 s OR overlap/shorter_duration >= 0.5).
+      3. Per cluster: skip entirely if any row has a user-locked fixture OR a
+         user_fixture_type (user intent — do not touch).
+      4. Otherwise: keep the row with the longest (end_ts - start_ts) duration
+         exactly as-is.  Delete the rest.  Do NOT sum volume_litres, expand end_ts,
+         or recompute any derived fields — partial data would corrupt the row.
+
+    Wrapped in a single transaction; the migration framework rolls back on exception.
+    """
+    rows = conn.execute("""
+        SELECT id, circuit, start_ts, end_ts,
+               CAST(strftime('%s', end_ts)   AS INTEGER) -
+               CAST(strftime('%s', start_ts) AS INTEGER) AS duration_s,
+               fixture_id, user_fixture_type
+          FROM events
+         WHERE start_ts IS NOT NULL
+           AND end_ts   IS NOT NULL
+         ORDER BY circuit, start_ts
+    """).fetchall()
+
+    if not rows:
+        log.info("Migration 028: no events to process")
+        return
+
+    # Group into per-circuit lists
+    from collections import defaultdict
+    by_circuit: dict = defaultdict(list)
+    for r in rows:
+        by_circuit[r["circuit"]].append(r)
+
+    clusters_found         = 0
+    rows_deleted           = 0
+    clusters_skipped_locked   = 0
+    clusters_skipped_labeled  = 0
+
+    def _epoch(ts_str: str) -> int:
+        """Parse an ISO timestamp string to integer epoch seconds."""
+        try:
+            from datetime import datetime, timezone
+            s = ts_str.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except (ValueError, AttributeError):
+            return 0
+
+    for circuit, circuit_rows in by_circuit.items():
+        # Build overlap clusters using a sweep
+        clusters: list = []
+        current_cluster: list = []
+        cluster_max_end: int = 0
+
+        for row in circuit_rows:
+            row_start = _epoch(row["start_ts"])
+            row_end   = _epoch(row["end_ts"])
+
+            if not current_cluster:
+                current_cluster = [row]
+                cluster_max_end = row_end
+                continue
+
+            # Check for meaningful overlap with the current cluster window
+            overlap  = min(row_end, cluster_max_end) - max(row_start, _epoch(current_cluster[0]["start_ts"]))
+            # Use pairwise check against the closest member (last added)
+            prev     = current_cluster[-1]
+            prev_start = _epoch(prev["start_ts"])
+            prev_end   = _epoch(prev["end_ts"])
+            pair_overlap = min(row_end, prev_end) - max(row_start, prev_start)
+            prev_dur = prev_end - prev_start
+            row_dur  = row_end - row_start
+            shorter  = min(prev_dur, row_dur) if min(prev_dur, row_dur) > 0 else 1
+
+            meaningful = (
+                row_start < cluster_max_end  # windows touch at all
+                and pair_overlap > 0
+                and (pair_overlap >= 30 or (pair_overlap / shorter) >= 0.5)
+            )
+
+            if meaningful:
+                current_cluster.append(row)
+                cluster_max_end = max(cluster_max_end, row_end)
+            else:
+                clusters.append(current_cluster)
+                current_cluster = [row]
+                cluster_max_end = row_end
+
+        if current_cluster:
+            clusters.append(current_cluster)
+
+        for cluster in clusters:
+            if len(cluster) == 1:
+                continue  # nothing to collapse
+
+            clusters_found += 1
+
+            # Check for user intent — skip entire cluster
+            has_locked  = False
+            has_labeled = False
+            for row in cluster:
+                if row["user_fixture_type"] is not None:
+                    has_labeled = True
+                    break
+                if row["fixture_id"] is not None:
+                    locked = conn.execute(
+                        "SELECT user_locked FROM fixtures WHERE id = ?",
+                        (row["fixture_id"],)
+                    ).fetchone()
+                    if locked and locked["user_locked"]:
+                        has_locked = True
+                        break
+
+            if has_labeled:
+                clusters_skipped_labeled += 1
+                log.warning(
+                    "Migration 028: [%s] skipping cluster of %d rows starting %s "
+                    "— contains user-labeled row (user_fixture_type set)",
+                    circuit, len(cluster), cluster[0]["start_ts"],
+                )
+                continue
+
+            if has_locked:
+                clusters_skipped_locked += 1
+                log.warning(
+                    "Migration 028: [%s] skipping cluster of %d rows starting %s "
+                    "— contains row with user-locked fixture",
+                    circuit, len(cluster), cluster[0]["start_ts"],
+                )
+                continue
+
+            # Pick survivor: longest duration
+            survivor = max(cluster, key=lambda r: r["duration_s"] or 0)
+            to_delete = [r["id"] for r in cluster if r["id"] != survivor["id"]]
+
+            for del_id in to_delete:
+                conn.execute("DELETE FROM events WHERE id = ?", (del_id,))
+            rows_deleted += len(to_delete)
+
+            log.info(
+                "Migration 028: [%s] collapsed %d-row cluster → survivor id=%s "
+                "start=%s (deleted %d row(s))",
+                circuit, len(cluster), survivor["id"],
+                survivor["start_ts"], len(to_delete),
+            )
+
+    log.info(
+        "Migration 028: done — clusters_found=%d rows_deleted=%d "
+        "clusters_skipped_user_locked=%d clusters_skipped_user_labeled=%d",
+        clusters_found, rows_deleted,
+        clusters_skipped_locked, clusters_skipped_labeled,
+    )
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -952,6 +1117,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (25, _migrate_025),
     (26, _migrate_026),
     (27, _migrate_027),
+    (28, _migrate_028),
 ]
 
 
