@@ -331,6 +331,7 @@ class Orchestrator:
             ha_client=self._ha,
             event_queue=self._event_queue,
             sensitivity_getter=self._get_sensitivity,
+            debug_capture_propagation=self._cfg.debug_capture_propagation,
         )
         if self.setup_complete:
             self._event_detector.setup()

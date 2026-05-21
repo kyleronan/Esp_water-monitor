@@ -85,13 +85,18 @@ FEATURE_KEYS = [
 ]
 
 # Per-dimension weights for weighted Euclidean distance.
-# Pressure shape (0.8) > flow shape (0.4); scalars default 1.0; hour sinusoids 0.2.
+# Pressure shape (0.8) > flow shape (0.4); scalars default 1.0; hour sinusoids
+# and propagation delay 0.2 (weak / noisy contextual signals).
 BASE_FEATURE_WEIGHTS: Dict[str, float] = {k: 1.0 for k in FEATURE_KEYS}
 for _i in range(32):
     BASE_FEATURE_WEIGHTS[f'flow_sig_{_i:02d}']     = 0.4
     BASE_FEATURE_WEIGHTS[f'pressure_sig_{_i:02d}'] = 0.8
 BASE_FEATURE_WEIGHTS['hour_sin'] = 0.2
 BASE_FEATURE_WEIGHTS['hour_cos'] = 0.2
+# propagation_delay_ms swings widely with supply conditions and valve dynamics
+# (one toilet measured 1.6-3.6 s across five flushes) and largely co-varies with
+# features already weighted here — keep it as a weak contextual signal only.
+BASE_FEATURE_WEIGHTS['propagation_delay_ms'] = 0.2
 
 
 class ClusterEngine:

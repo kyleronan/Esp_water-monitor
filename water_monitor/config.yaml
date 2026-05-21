@@ -31,6 +31,7 @@ ports_description:
 options:
   log_level: "info"
   esp_device_name: "ESP Water Shut off"
+  debug_capture_propagation: false
   circuits:
     - circuit: "main"
       circuit_type: "fixture"
@@ -39,6 +40,7 @@ options:
 schema:
   log_level: "list(trace|debug|info|warning|error|fatal)"
   esp_device_name: "str"
+  debug_capture_propagation: "bool"
   circuits:
     - circuit: "str"
       circuit_type: "list(fixture|zone)"
