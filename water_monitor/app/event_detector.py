@@ -470,8 +470,6 @@ class CircuitEventDetector:
         # Buffer end is ~FLOW_START_SECONDS past start_ts; subtract that offset.
         propagation_delay_ms = 0.0
         if self._pressure_buf:
-            buf_baseline = self._settled_pressure_psi if self._settled_pressure_psi is not None else baseline
-            onset_threshold = buf_baseline - self.PROPAGATION_ONSET_PSI
             MA_WINDOW  = 40    # 1-second rolling average at 40 Hz
             MIN_BELOW  = 3
             SLOPE_WIN  = int(self.FLOW_START_SECONDS * 40)   # = 80 samples (2 s)
@@ -484,6 +482,10 @@ class CircuitEventDetector:
                 if i >= MA_WINDOW:
                     running_sum -= buf[i - MA_WINDOW]
                 smoothed.append(running_sum / min(i + 1, MA_WINDOW))
+            # Use the buffer peak as baseline — immune to stale _settled_pressure_psi
+            # that may have been set during a prior event's pressure recovery phase.
+            buf_baseline = max(smoothed)
+            onset_threshold = buf_baseline - self.PROPAGATION_ONSET_PSI
 
             # --- Mode 1: trendline when pressure is still actively dropping ---
             if len(smoothed) >= SLOPE_WIN + 1:
