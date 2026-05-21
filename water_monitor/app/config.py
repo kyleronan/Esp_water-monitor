@@ -73,6 +73,10 @@ class AddonConfig:
     esp_device_name: str
     circuits: List[CircuitConfig]
 
+    # When true, the event detector emits a full JSON capture blob per flow
+    # event so the propagation scan can be replayed offline. Off by default.
+    debug_capture_propagation: bool = False
+
     def get_circuit(self, name: str) -> Optional[CircuitConfig]:
         return next((c for c in self.circuits if c.circuit == name), None)
 
@@ -103,6 +107,7 @@ def load_config() -> AddonConfig:
         log_level=raw.get("log_level", "info"),
         esp_device_name=raw.get("esp_device_name", ""),
         circuits=circuits,
+        debug_capture_propagation=bool(raw.get("debug_capture_propagation", False)),
     )
 
 

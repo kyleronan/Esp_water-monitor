@@ -39,10 +39,12 @@ so the feature extractor can weight pressure data appropriately.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, Deque, List, Literal, Optional
 
 log = logging.getLogger(__name__)
@@ -61,8 +63,10 @@ class RawEvent:
 
     # Pressure transient fields — populated only when a transient is detected.
     # May be absent for flow-only events.
+    # pre_event_pressure_psi is None when the baseline was not trustworthy
+    # (e.g. cold start before a settled baseline exists) — see _start_flow_event.
     has_pressure_transient: bool = False
-    pre_event_pressure_psi: float = 0.0
+    pre_event_pressure_psi: Optional[float] = 0.0
     min_pressure_psi: float = 0.0
     max_pressure_psi: float = 0.0
     pressure_delta_psi: float = 0.0
@@ -89,6 +93,193 @@ class RawEvent:
 
     is_composite: bool = False
     complete: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Propagation-delay scan — shared by live detection and the offline replay tool
+# --------------------------------------------------------------------------- #
+
+def _read_addon_version() -> Optional[str]:
+    """Best-effort add-on version from config.yaml — None if unavailable."""
+    try:
+        cfg = Path(__file__).resolve().parents[1] / "config.yaml"
+        for line in cfg.read_text(encoding="utf-8").splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return None
+
+
+def _read_git_commit() -> Optional[str]:
+    """Best-effort git short commit — None when not in a git checkout."""
+    try:
+        git_dir = Path(__file__).resolve().parents[2] / ".git"
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = head.split(":", 1)[1].strip()
+            return (git_dir / ref).read_text(encoding="utf-8").strip()[:12]
+        return head[:12]
+    except Exception:
+        return None
+
+
+_ADDON_VERSION = _read_addon_version()
+_GIT_COMMIT = _read_git_commit()
+
+# Propagation scan parameters.  The fast-pressure sensor is event-driven
+# (publishes on change), so the buffer is variable-rate — all timing is done
+# from real per-sample timestamps, never a sample-count assumption.
+_PROP_MAX_LOOKBACK_S = 12.0      # only search this far back from flow onset
+_PROP_BASELINE_GUARD_S = 5.0     # samples older than (flow_onset - this) form the baseline
+_PROP_MA_HALF_S = 0.5            # centered moving-average half-width (-> 1 s window)
+_PROP_NOISE_BAND = 0.10          # PSI below the local baseline that marks transient onset
+_PROP_ABOVE_RUN = 5              # consecutive at-baseline samples confirming pre-drop
+_PROP_MIN_BASELINE_SAMPLES = 5   # minimum samples required in the baseline-guard region
+
+
+def _median(values: List[float]) -> float:
+    s = sorted(values)
+    k = len(s)
+    mid = k // 2
+    return s[mid] if k % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+@dataclass
+class PropagationScanResult:
+    """Outcome of scan_propagation_delay — the delay plus the diagnostics
+    needed to see *why* the scan produced it, in logs or offline replay."""
+    delay_ms: Optional[float]           # value to store; None when undetermined
+    status: str                         # "valid" | "clamped" | "unknown"
+    stop_reason: str                    # no_timestamps|window_too_short|no_baseline|
+                                        # gate_failed|no_onset|above_run|window_start
+    sample_count: int
+    buffer_span_s: Optional[float]
+    baseline_psi: Optional[float]       # local resting baseline (median of guard region)
+    min_pressure_psi: Optional[float]
+    min_smoothed_psi: Optional[float]
+    magnitude_gate_passed: bool
+    onset_index: Optional[int]          # samples back from the newest sample
+    onset_ts: Optional[datetime]
+    raw_delay_ms: Optional[float]       # before the >= 0 clamp
+    final_delay_ms: Optional[float]     # after clamp; mirrors delay_ms
+
+
+def scan_propagation_delay(
+    pressure: List[float],
+    timestamps: Optional[List[datetime]],
+    flow_onset_ts: Optional[datetime],
+    propagation_onset_psi: float,
+) -> PropagationScanResult:
+    """Find the pressure-transient onset and derive the propagation delay
+    (flow onset minus transient onset, in ms).
+
+    This is the single scan implementation used by both live detection
+    (CircuitEventDetector._start_flow_event) and the offline replay harness —
+    never duplicate it.
+
+    The fast-pressure buffer is event-driven and variable-rate, so the scan is
+    fully timestamp-based — there is no samples-per-second assumption:
+
+      1. Restrict to a recent window (_PROP_MAX_LOOKBACK_S before flow onset)
+         so the search cannot wander back across earlier events.
+      2. Centered 1-second time-windowed moving average to reject noise.
+      3. Local resting baseline = median of the smoothed samples older than
+         _PROP_BASELINE_GUARD_S before flow onset (guaranteed pre-drop for
+         realistic 1-3 s delays) — NOT the global max, which sits above the
+         noisy / incompletely-recovered resting level.
+      4. Walk newest->oldest to the transient onset (last sample at the local
+         baseline); delay = flow_onset_ts - onset_ts from the real timestamps.
+    """
+    n = len(pressure)
+    ts_ok = bool(timestamps) and len(timestamps) == n and n > 0
+    span = (timestamps[-1] - timestamps[0]).total_seconds() if ts_ok else None
+
+    def _result(**kw) -> PropagationScanResult:
+        base = dict(
+            delay_ms=None, status="unknown", stop_reason="unknown",
+            sample_count=n, buffer_span_s=span, baseline_psi=None,
+            min_pressure_psi=None, min_smoothed_psi=None,
+            magnitude_gate_passed=False, onset_index=None, onset_ts=None,
+            raw_delay_ms=None, final_delay_ms=None,
+        )
+        base.update(kw)
+        return PropagationScanResult(**base)
+
+    if not ts_ok:
+        return _result(stop_reason="no_timestamps")
+    if flow_onset_ts is None:
+        return _result(stop_reason="no_flow_onset")
+
+    # 1. Bound to a recent window before flow onset.
+    win_start = flow_onset_ts - timedelta(seconds=_PROP_MAX_LOOKBACK_S)
+    win = [(t, p) for t, p in zip(timestamps, pressure) if t >= win_start]
+    if len(win) < _PROP_ABOVE_RUN + _PROP_MIN_BASELINE_SAMPLES:
+        return _result(stop_reason="window_too_short")
+    win_ts = [t for t, _ in win]
+    win_p = [p for _, p in win]
+    m = len(win)
+
+    # 2. Centered 1-second time-windowed moving average.
+    smoothed: List[float] = []
+    for i in range(m):
+        lo = win_ts[i] - timedelta(seconds=_PROP_MA_HALF_S)
+        hi = win_ts[i] + timedelta(seconds=_PROP_MA_HALF_S)
+        seg = [win_p[j] for j in range(m) if lo <= win_ts[j] <= hi]
+        smoothed.append(sum(seg) / len(seg))
+
+    min_smoothed = min(smoothed)
+    min_pressure = min(win_p)
+
+    # 3. Local resting baseline — median of the pre-drop guard region.
+    guard_cut = flow_onset_ts - timedelta(seconds=_PROP_BASELINE_GUARD_S)
+    guard = [smoothed[i] for i in range(m) if win_ts[i] <= guard_cut]
+    if len(guard) < _PROP_MIN_BASELINE_SAMPLES:
+        return _result(stop_reason="no_baseline", min_pressure_psi=min_pressure,
+                       min_smoothed_psi=min_smoothed)
+    baseline = _median(guard)
+
+    # Magnitude gate: a real transient must fall >= onset PSI below baseline.
+    if baseline - min_smoothed < propagation_onset_psi:
+        return _result(stop_reason="gate_failed", baseline_psi=baseline,
+                       min_pressure_psi=min_pressure, min_smoothed_psi=min_smoothed)
+
+    # 4. Walk newest->oldest to the transient onset.
+    onset_threshold = baseline - _PROP_NOISE_BAND
+    above_run = 0
+    onset_i: Optional[int] = None
+    stop_reason = "window_start"
+    for i in range(m - 1, -1, -1):
+        if smoothed[i] >= onset_threshold:
+            above_run += 1
+            if above_run >= _PROP_ABOVE_RUN:
+                stop_reason = "above_run"
+                break
+        else:
+            above_run = 0
+            onset_i = i
+
+    if onset_i is None:
+        return _result(stop_reason="no_onset", baseline_psi=baseline,
+                       min_pressure_psi=min_pressure, min_smoothed_psi=min_smoothed,
+                       magnitude_gate_passed=True)
+
+    onset_ts = win_ts[onset_i]
+    raw_delay_ms = (flow_onset_ts - onset_ts).total_seconds() * 1000.0
+    if raw_delay_ms > 0:
+        final_delay_ms = round(raw_delay_ms, 1)
+        status = "valid"
+    else:
+        final_delay_ms = 0.0
+        status = "clamped"
+
+    return _result(
+        delay_ms=final_delay_ms, status=status, stop_reason=stop_reason,
+        baseline_psi=baseline, min_pressure_psi=min_pressure,
+        min_smoothed_psi=min_smoothed, magnitude_gate_passed=True,
+        onset_index=m - 1 - onset_i, onset_ts=onset_ts,
+        raw_delay_ms=round(raw_delay_ms, 1), final_delay_ms=final_delay_ms,
+    )
 
 
 class CircuitEventDetector:
@@ -191,6 +382,7 @@ class CircuitEventDetector:
         event_queue: asyncio.Queue,
         get_other_valve_open: Optional[Callable[[], Optional[bool]]] = None,
         flow_onset_entity: Optional[str] = None,
+        debug_capture_propagation: bool = False,
     ) -> None:
         self.circuit = circuit
         self.pressure_drop_threshold = pressure_drop_threshold_psi
@@ -202,7 +394,12 @@ class CircuitEventDetector:
             get_other_valve_open or (lambda: None)
         )
 
+        self._debug_capture_propagation: bool = debug_capture_propagation
+
         self._pressure_buf: Deque[float] = deque(maxlen=self.PRESSURE_BUFFER_SIZE)
+        # Per-sample arrival timestamps, kept exactly parallel to _pressure_buf
+        # (same maxlen, appended/cleared together) — diagnostic use only.
+        self._pressure_ts_buf: Deque[datetime] = deque(maxlen=self.PRESSURE_BUFFER_SIZE)
         self._settled_pressure_psi: Optional[float] = None
         self._settled_pressure_since: Optional[datetime] = None
         self._active_event: Optional[RawEvent] = None
@@ -299,6 +496,7 @@ class CircuitEventDetector:
             # ESP reconnected or went offline — stale buffer readings would mix
             # with new data and could trigger a false pressure transient.
             self._pressure_buf.clear()
+            self._pressure_ts_buf.clear()
             self._settled_pressure_psi = None
             log.debug("[%s] pressure sensor %s — buffer cleared", self.circuit, state)
             return
@@ -310,6 +508,7 @@ class CircuitEventDetector:
 
         now = datetime.now(timezone.utc)
         self._pressure_buf.append(pressure)
+        self._pressure_ts_buf.append(now)
 
         # Need LOOKBACK + WINDOW samples before baseline is meaningful.
         # At 40 Hz this is ~5 seconds — well inside the firmware grace period.
@@ -414,13 +613,24 @@ class CircuitEventDetector:
         flow_on = state.lower() in ("on", "true", "1")
 
         if flow_on:
-            if (self._active_event is not None
-                    and self._active_event.flow_onset_ts is None):
-                self._active_event.flow_onset_ts = now
-                delay_ms = (now - self._active_event.start_ts).total_seconds() * 1000.0
-                self._active_event.propagation_delay_ms = delay_ms
-                log.debug("[%s] flow onset — propagation delay %.0f ms",
-                          self.circuit, delay_ms)
+            ev = self._active_event
+            if ev is not None and ev.flow_onset_ts is None:
+                # Pressure-triggered event: flow is only being detected now.
+                # Scan the buffer for the TRUE transient onset (earlier than
+                # the threshold crossing that opened the event) so the delay
+                # is measured the same way as for flow-triggered events.
+                ev.flow_onset_ts = now
+                scan = self._run_propagation_scan(
+                    ev.start_trigger, ev.start_ts, now)
+                if scan.delay_ms is not None:
+                    ev.propagation_delay_ms = scan.delay_ms
+                else:
+                    # Scan could not locate an onset — fall back to the
+                    # threshold-crossing delay so the field is still set.
+                    ev.propagation_delay_ms = round(
+                        max(0.0, (now - ev.start_ts).total_seconds() * 1000.0), 1)
+                log.debug("[%s] flow onset — propagation_delay=%.0f ms",
+                          self.circuit, ev.propagation_delay_ms)
         else:
             if self._active_event is not None:
                 if self._current_flow_lpm < self.MIN_FLOW_LPM:
@@ -436,78 +646,68 @@ class CircuitEventDetector:
     # Internal lifecycle                                                   #
     # ------------------------------------------------------------------ #
 
+    def _run_propagation_scan(
+        self, trigger: str, event_start_ts: datetime, flow_onset_ts: datetime,
+    ) -> PropagationScanResult:
+        """Scan the pressure buffer for the transient onset, emit the DEBUG
+        instrumentation line, and (when enabled) a capture blob.
+
+        Shared by flow-triggered (_start_flow_event, at event start) and
+        pressure-triggered (on_flow_onset, when flow is finally detected)
+        events.  The caller stores the resulting delay on the event.
+        """
+        pressure_samples = list(self._pressure_buf)
+        pressure_ts = list(self._pressure_ts_buf)
+        scan = scan_propagation_delay(
+            pressure_samples, pressure_ts, flow_onset_ts,
+            self.PROPAGATION_ONSET_PSI,
+        )
+        self._log_propagation_scan(trigger, flow_onset_ts, scan)
+        if self._debug_capture_propagation:
+            self._emit_propagation_capture(
+                trigger, event_start_ts, flow_onset_ts,
+                pressure_samples, pressure_ts, scan)
+        return scan
+
     def _start_flow_event(self, now: datetime) -> None:
         start_ts = self._flow_sustained_since or now
         self._flow_sustained_since = None
         self._pressure_recovered_since = None
 
-        min_samples = self.BASELINE_LOOKBACK_SAMPLES + self.BASELINE_WINDOW_SAMPLES
-        if self._settled_pressure_psi is not None:
-            baseline = self._settled_pressure_psi
-        elif len(self._pressure_buf) >= min_samples:
-            buf = list(self._pressure_buf)
-            b_end = len(buf) - self.BASELINE_LOOKBACK_SAMPLES
-            b_start = b_end - self.BASELINE_WINDOW_SAMPLES
-            baseline = sum(buf[b_start:b_end]) / self.BASELINE_WINDOW_SAMPLES
-        elif self._pressure_buf:
-            baseline = sum(self._pressure_buf) / len(self._pressure_buf)
+        # Warmup gate — pressure-derived fields are only trustworthy once a
+        # settled baseline has been established.  Shortly after an addon
+        # restart (or a sensor-unavailable buffer clear) there is no clean
+        # pre-event reference, so any computed drop/delay would be fabricated.
+        # In that case the event is still recorded as a real flow event, but
+        # its pressure fields are left as honest unknowns.
+        trustworthy = self._settled_pressure_psi is not None
+
+        if trustworthy:
+            baseline: Optional[float] = self._settled_pressure_psi
+            # For a flow-triggered event, start_ts IS the flow onset.
+            scan = self._run_propagation_scan("flow", start_ts, start_ts)
+            propagation_delay_ms = scan.delay_ms
         else:
-            baseline = 0.0
+            baseline = None
+            propagation_delay_ms = None
+            log.debug(
+                "[%s] propagation scan skipped — pressure baseline not "
+                "trustworthy (no settled pressure / buffer not warm)",
+                self.circuit,
+            )
+            self._log_propagation_scan("flow", start_ts, None)
+            if self._debug_capture_propagation:
+                self._emit_propagation_capture(
+                    "flow", start_ts, start_ts,
+                    list(self._pressure_buf), list(self._pressure_ts_buf), None)
 
-        # Compute propagation delay from the 40Hz pressure buffer.
-        #
-        # A centered moving average rejects noise without the ~500-1000 ms lag
-        # a trailing average would introduce.  The transient ONSET is then found
-        # by scanning newest→oldest for the point where pressure last sat within
-        # NOISE_BAND of baseline — the true start of the drop, not the point
-        # where it had already fallen PROPAGATION_ONSET_PSI.  That threshold is
-        # used only as a magnitude gate: it decides whether a real transient
-        # exists, not when it began (a gradual/knee-shaped drop can take 0.5-1 s
-        # to fall the full 0.2 PSI, which previously truncated the delay badly).
-        #
-        # onset_pos counts samples back from the buffer end (~now).  Flow onset
-        # is FLOW_START_SECONDS before now, so that offset is subtracted.
-        propagation_delay_ms = 0.0
-        if self._pressure_buf:
-            MA_WINDOW  = 40      # 1-second average at 40 Hz
-            HALF_WIN   = MA_WINDOW // 2
-            NOISE_BAND = 0.04    # PSI; departure from baseline that marks onset
-            ABOVE_RUN  = 5       # consecutive at-baseline samples confirming pre-drop
-            buf = list(self._pressure_buf)
-            n = len(buf)
-
-            # Centered moving average — symmetric window, no systematic lag.
-            smoothed: list[float] = []
-            for i in range(n):
-                lo = max(0, i - HALF_WIN)
-                hi = min(n, i + HALF_WIN + 1)
-                smoothed.append(sum(buf[lo:hi]) / (hi - lo))
-
-            # Buffer peak as baseline — immune to stale _settled_pressure_psi
-            # left from a prior event's pressure recovery phase.
-            buf_baseline = max(smoothed)
-
-            # Magnitude gate: only measure a delay if a real transient exists.
-            if buf_baseline - min(smoothed) >= self.PROPAGATION_ONSET_PSI:
-                onset_threshold = buf_baseline - NOISE_BAND
-                above_run = 0
-                onset_pos = 0
-                for pos, p in enumerate(reversed(smoothed), start=1):
-                    if p >= onset_threshold:
-                        # A sustained run back at baseline confirms the
-                        # pre-drop state; brief noise blips are ignored.
-                        above_run += 1
-                        if above_run >= ABOVE_RUN:
-                            break
-                    else:
-                        above_run = 0
-                        onset_pos = pos
-                if onset_pos > 0:
-                    delay_ms = onset_pos * 25.0 - self.FLOW_START_SECONDS * 1000.0
-                    propagation_delay_ms = round(max(0.0, delay_ms), 1)
-
-        log.info("[%s] event start (FLOW) — %.3f L/min for >= %.1f s propagation_delay=%.0f ms",
-                 self.circuit, self._current_flow_lpm, self.FLOW_START_SECONDS, propagation_delay_ms)
+        delay_str = ("unknown" if propagation_delay_ms is None
+                     else f"{propagation_delay_ms:.0f} ms")
+        log.info(
+            "[%s] event start (FLOW) — %.3f L/min for >= %.1f s "
+            "propagation_delay=%s", self.circuit, self._current_flow_lpm,
+            self.FLOW_START_SECONDS, delay_str,
+        )
 
         self._flow_sample_count = 0
         self._pressure_sample_count = 0
@@ -519,11 +719,104 @@ class CircuitEventDetector:
             propagation_delay_ms=propagation_delay_ms,
             flow_onset_entity=self._flow_onset_entity,
             pre_event_pressure_psi=baseline,
-            min_pressure_psi=baseline,
-            max_pressure_psi=baseline,
+            min_pressure_psi=baseline if baseline is not None else 0.0,
+            max_pressure_psi=baseline if baseline is not None else 0.0,
             flow_readings=[self._current_flow_lpm],
             other_valve_open=self._get_other_valve_open(),
         )
+
+    def _log_propagation_scan(
+        self, trigger: str, flow_onset_ts: datetime,
+        scan: Optional[PropagationScanResult],
+    ) -> None:
+        """Emit one compact DEBUG line describing the propagation scan."""
+        if scan is None:
+            log.debug("[%s] propagation scan (%s) — skipped "
+                      "(baseline untrustworthy)", self.circuit, trigger)
+            return
+
+        def _f(v: Optional[float], fmt: str) -> str:
+            return fmt % v if v is not None else "n/a"
+
+        onset_ts = (scan.onset_ts.strftime("%H:%M:%S.%f")[:-3]
+                    if scan.onset_ts is not None else "n/a")
+        log.debug(
+            "[%s] propagation scan (%s) — samples=%d span=%s flow_onset=%s "
+            "baseline=%s min_p=%s min_sm=%s gate=%s onset_idx=%s onset_ts=%s "
+            "stop=%s raw_delay=%s final=%s status=%s",
+            self.circuit, trigger, scan.sample_count,
+            _f(scan.buffer_span_s, "%.1fs"),
+            flow_onset_ts.strftime("%H:%M:%S.%f")[:-3],
+            _f(scan.baseline_psi, "%.2f"), _f(scan.min_pressure_psi, "%.2f"),
+            _f(scan.min_smoothed_psi, "%.2f"),
+            "pass" if scan.magnitude_gate_passed else "fail",
+            scan.onset_index if scan.onset_index is not None else "n/a",
+            onset_ts, scan.stop_reason,
+            _f(scan.raw_delay_ms, "%.0fms"), _f(scan.final_delay_ms, "%.0fms"),
+            scan.status,
+        )
+
+    def _emit_propagation_capture(
+        self, trigger: str, event_start_ts: datetime, flow_onset_ts: datetime,
+        pressure_samples: List[float], pressure_ts: List[datetime],
+        scan: Optional[PropagationScanResult],
+    ) -> None:
+        """Emit one compact JSON capture blob (debug_capture_propagation only)
+        so a real event can be replayed offline against scan_propagation_delay.
+
+        event_start_ts is when the event opened (flow-confirm time, or the
+        pressure threshold crossing); flow_onset_ts is what the scan measures
+        against — for pressure-triggered events the two differ.
+        """
+        try:
+            n = len(pressure_samples)
+            ts_ok = len(pressure_ts) == n and n > 0
+            t0 = pressure_ts[0] if ts_ok else None
+            downsample = 2 if n > 600 else 1
+            samples = []
+            for i in range(0, n, downsample):
+                off = (round((pressure_ts[i] - t0).total_seconds() * 1000, 1)
+                       if t0 is not None else None)
+                samples.append([off, round(pressure_samples[i], 4)])
+            blob = {
+                "capture": "propagation_delay",
+                "meta": {
+                    "version": _ADDON_VERSION,
+                    "git": _GIT_COMMIT,
+                    "circuit": self.circuit,
+                    "start_trigger": trigger,
+                    "pressure_drop_threshold_psi": self.pressure_drop_threshold,
+                    "flow_start_seconds": self.FLOW_START_SECONDS,
+                    "propagation_onset_psi": self.PROPAGATION_ONSET_PSI,
+                    "ma_half_s": _PROP_MA_HALF_S,
+                    "sample_count": n,
+                    "buffer_span_s": scan.buffer_span_s if scan else None,
+                    "downsample": downsample,
+                    "trustworthy_baseline": scan is not None,
+                },
+                "samples_t0": t0.isoformat() if t0 is not None else None,
+                "start_ts": event_start_ts.isoformat(),
+                "flow_onset_ts": flow_onset_ts.isoformat(),
+                "samples": samples,
+                "result": None if scan is None else {
+                    "delay_ms": scan.delay_ms,
+                    "status": scan.status,
+                    "stop_reason": scan.stop_reason,
+                    "baseline_psi": scan.baseline_psi,
+                    "min_pressure_psi": scan.min_pressure_psi,
+                    "min_smoothed_psi": scan.min_smoothed_psi,
+                    "magnitude_gate_passed": scan.magnitude_gate_passed,
+                    "onset_index": scan.onset_index,
+                    "onset_ts": (scan.onset_ts.isoformat()
+                                 if scan.onset_ts is not None else None),
+                    "raw_delay_ms": scan.raw_delay_ms,
+                    "final_delay_ms": scan.final_delay_ms,
+                },
+            }
+            log.debug("[%s] PROPAGATION_CAPTURE %s", self.circuit,
+                      json.dumps(blob, separators=(",", ":")))
+        except Exception as e:   # never let diagnostics break detection
+            log.debug("[%s] propagation capture failed: %s", self.circuit, e)
 
     def _start_pressure_event(self, now: datetime, baseline: float,
                               current_pressure: float) -> None:
@@ -615,6 +908,7 @@ class CircuitEventDetector:
         # water hammer where pressure rose above baseline and never dropped.
         if (
             ev.pressure_readings
+            and ev.pre_event_pressure_psi is not None
             and ev.pre_event_pressure_psi > 0
             and ev.max_pressure_psi > 0
         ):
@@ -650,6 +944,7 @@ class CircuitEventDetector:
         self._flow_sample_count = 0
         self._pressure_sample_count = 0
         self._pressure_buf.clear()
+        self._pressure_ts_buf.clear()
         self._current_flow_lpm = 0.0
         self._flow_sustained_since = None
         self._pressure_recovered_since = None
@@ -669,11 +964,13 @@ class EventDetector:
         ha_client: Any,
         event_queue: asyncio.Queue,
         sensitivity_getter: Callable[[str], dict],
+        debug_capture_propagation: bool = False,
     ) -> None:
         self._circuits = circuits
         self._ha = ha_client
         self._queue = event_queue
         self._sensitivity_getter = sensitivity_getter
+        self._debug_capture_propagation = debug_capture_propagation
         self._detectors: Dict[str, CircuitEventDetector] = {}
         # Tracks live valve open/closed state per circuit for cross-circuit feature
         self._valve_open: Dict[str, bool] = {}
@@ -701,6 +998,7 @@ class EventDetector:
                     lambda c=cfg.circuit: self._get_other_valve_open(c)
                 ),
                 flow_onset_entity=cfg.flow_onset_sensor,
+                debug_capture_propagation=self._debug_capture_propagation,
             )
             self._detectors[cfg.circuit] = detector
 
@@ -726,6 +1024,12 @@ class EventDetector:
                 detector.FLOW_START_SECONDS,
                 sens.get("pressure_drop_event_psi", 1.2),
             )
+
+        log.info(
+            "propagation-delay capture: %s",
+            "ENABLED — flow events emit PROPAGATION_CAPTURE blobs"
+            if self._debug_capture_propagation else "disabled",
+        )
 
     def update_thresholds(self) -> None:
         """Reload thresholds from config after sensitivity settings change."""

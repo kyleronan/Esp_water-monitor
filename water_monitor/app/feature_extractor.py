@@ -391,11 +391,15 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     # are surge artefacts; the live detector now rejects them, but historical
     # importer events may still arrive with negative delta.
     pressure_delta_psi = max(0.0, float(event.pressure_delta_psi or 0))
+    # pre_event_pressure_psi is None for cold-start flow events with no
+    # trustworthy baseline — coerce to 0 so pressure-derived features (all
+    # gated on a positive pressure_delta_psi) degrade gracefully.
+    pre_event_pressure = float(event.pre_event_pressure_psi or 0)
 
     sig          = _flow_signature(event.flow_readings, peak_flow)
     p_sig        = _pressure_signature(
         event.pressure_readings or [],
-        float(event.pre_event_pressure_psi or 0),
+        pre_event_pressure,
         pressure_delta_psi,
     )
     pos_edges, neg_edges = _flow_edges(event.flow_readings, peak_flow)
@@ -403,10 +407,10 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     mid_drop     = _mid_event_flow_drop(event.flow_readings, peak_flow)
     steady       = _flow_steady_state(event.flow_readings)
     p_stats      = _pressure_transient_stats(
-        event.pressure_readings, event.pre_event_pressure_psi, pressure_delta_psi
+        event.pressure_readings, pre_event_pressure, pressure_delta_psi
     )
     p_shape      = _pressure_shape_features(
-        event.pressure_readings, event.pre_event_pressure_psi, pressure_delta_psi
+        event.pressure_readings, pre_event_pressure, pressure_delta_psi
     )
 
     # Volume: prefer the firmware's cumulative integration sensor delta (set by
@@ -448,7 +452,7 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     shape = _classify_resistance_shape(
         pressure_for_shape,
         event.flow_readings,
-        event.pre_event_pressure_psi,
+        pre_event_pressure,
     )
 
     # Time features
@@ -489,7 +493,7 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         "peak_flow_lpm": round(peak_flow, 3),
         "flow_variability": round(flow_variability, 4),
         "pressure_delta_psi": round(pressure_delta_psi, 2),
-        "pre_event_pressure_psi": round(event.pre_event_pressure_psi, 2),
+        "pre_event_pressure_psi": round(pre_event_pressure, 2),
         "min_pressure_psi": round(event.min_pressure_psi, 2),
         "hydraulic_resistance": round(resistance, 3) if resistance is not None else None,
         "resistance_curve_shape": shape,
@@ -580,24 +584,27 @@ class FeatureExtractor:
         """Refine propagation_delay_ms with the precise server-side last_changed
         timestamp of the flow-onset entity from HA history.
 
-        propagation_delay = flow_onset − pressure_transient_onset, applied to
-        every trigger type:
-          - 'pressure'               start_ts IS the pressure onset.
-          - 'flow' / 'pressure+flow' start_ts is the flow onset; the pressure
-            onset is recovered by subtracting the buffer-scan delay already
-            stored in propagation_delay_ms.  HA's recorder does not retain the
-            40 Hz pressure sensor at full resolution, so the buffer scan stays
-            authoritative for the pressure side; only the flow-onset timestamp
-            is sharpened here, replacing the jittery callback time.
+        propagation_delay_ms is, for every trigger type, the buffer-scan delay
+        flow_onset − true_transient_onset.  The true onset is recovered here and
+        the flow-onset side is sharpened with the precise HA-history timestamp.
+        HA's recorder does not retain the 40 Hz pressure sensor at full
+        resolution, so the buffer scan stays authoritative for the pressure side.
+
+          - 'flow' / 'pressure+flow' start_ts IS the flow onset.
+          - 'pressure'               flow_onset_ts is the flow onset (start_ts
+            is the threshold crossing, not the true transient onset).
         """
         from datetime import timedelta
 
+        if not event.propagation_delay_ms:
+            # No measured transient delay — nothing to refine.
+            return
         if event.start_trigger == "pressure":
-            pressure_onset = event.start_ts
-        else:
-            if not event.propagation_delay_ms:
-                # No transient preceded the flow — nothing to refine.
+            if event.flow_onset_ts is None:
                 return
+            pressure_onset = event.flow_onset_ts - timedelta(
+                milliseconds=event.propagation_delay_ms)
+        else:
             pressure_onset = event.start_ts - timedelta(
                 milliseconds=event.propagation_delay_ms)
 
