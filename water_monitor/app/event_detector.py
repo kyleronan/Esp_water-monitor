@@ -455,16 +455,27 @@ class CircuitEventDetector:
             baseline = 0.0
 
         # Compute propagation delay from the 40Hz pressure buffer.
-        # Apply a 1-second (40-sample) rolling average first so that both
-        # high-frequency noise spikes and slow transition ramps produce a
-        # clean monotonic signal for the threshold scan.
+        # Apply a 1-second (40-sample) rolling average to reject noise, then
+        # attempt two methods in order:
+        #
+        # Mode 1 — Trendline: measure the pressure drop rate over the 2-second
+        # flow-confirmation window and extrapolate linearly back from start_ts
+        # to the baseline crossing.  Handles slow/gradual drops still in
+        # progress when flow is confirmed.  Three safety gates prevent false
+        # positives from tiny drift or near-zero slopes.
+        #
+        # Mode 2 — MA threshold scan: scan newest→oldest for the farthest-back
+        # smoothed sample below (baseline − PROPAGATION_ONSET_PSI).  Handles
+        # sharp drops that have fully stabilised before flow is confirmed.
         # Buffer end is ~FLOW_START_SECONDS past start_ts; subtract that offset.
         propagation_delay_ms = 0.0
         if self._pressure_buf:
             buf_baseline = self._settled_pressure_psi if self._settled_pressure_psi is not None else baseline
             onset_threshold = buf_baseline - self.PROPAGATION_ONSET_PSI
-            MA_WINDOW = 40      # 1-second rolling average at 40 Hz
-            MIN_BELOW = 3
+            MA_WINDOW  = 40    # 1-second rolling average at 40 Hz
+            MIN_BELOW  = 3
+            SLOPE_WIN  = int(self.FLOW_START_SECONDS * 40)   # = 80 samples (2 s)
+            MIN_SLOPE  = 0.001 # PSI/sample minimum to trust the trendline
             buf = list(self._pressure_buf)
             smoothed: list[float] = []
             running_sum = 0.0
@@ -473,18 +484,33 @@ class CircuitEventDetector:
                 if i >= MA_WINDOW:
                     running_sum -= buf[i - MA_WINDOW]
                 smoothed.append(running_sum / min(i + 1, MA_WINDOW))
-            below_count = 0
-            oldest_below = 0
-            for pos, p in enumerate(reversed(smoothed), start=1):
-                if p < onset_threshold:
-                    below_count += 1
-                    oldest_below = pos
-                else:
-                    if below_count >= MIN_BELOW:
-                        break
-            if below_count >= MIN_BELOW:
-                delay_ms = oldest_below * 25.0 - self.FLOW_START_SECONDS * 1000.0
-                propagation_delay_ms = round(max(0.0, delay_ms), 1)
+
+            # --- Mode 1: trendline when pressure is still actively dropping ---
+            if len(smoothed) >= SLOPE_WIN + 1:
+                slope = (smoothed[-1] - smoothed[-SLOPE_WIN]) / (SLOPE_WIN - 1)
+                total_drop = smoothed[-SLOPE_WIN] - smoothed[-1]  # +ve when dropping
+                if (slope < -MIN_SLOPE
+                        and total_drop >= self.PROPAGATION_ONSET_PSI * 0.5):
+                    p_at_start = smoothed[-SLOPE_WIN]
+                    t_samples = (p_at_start - buf_baseline) / slope   # both −ve → +ve
+                    max_delay_ms = max(0.0, (len(smoothed) - SLOPE_WIN) * 25.0)
+                    delay_ms = min(t_samples * 25.0, max_delay_ms)
+                    propagation_delay_ms = round(max(0.0, delay_ms), 1)
+
+            # --- Mode 2: MA threshold scan when sharp drop is already complete ---
+            if propagation_delay_ms == 0.0:
+                below_count = 0
+                oldest_below = 0
+                for pos, p in enumerate(reversed(smoothed), start=1):
+                    if p < onset_threshold:
+                        below_count += 1
+                        oldest_below = pos
+                    else:
+                        if below_count >= MIN_BELOW:
+                            break
+                if below_count >= MIN_BELOW:
+                    delay_ms = oldest_below * 25.0 - self.FLOW_START_SECONDS * 1000.0
+                    propagation_delay_ms = round(max(0.0, delay_ms), 1)
 
         log.info("[%s] event start (FLOW) — %.3f L/min for >= %.1f s propagation_delay=%.0f ms",
                  self.circuit, self._current_flow_lpm, self.FLOW_START_SECONDS, propagation_delay_ms)
