@@ -605,7 +605,7 @@ class FeatureExtractor:
             return
 
         if (self._ha and event.flow_onset_entity
-                and event.start_trigger in ("pressure", "pressure+flow")):
+                and event.start_trigger == "pressure"):
             await self._enrich_propagation_delay(event)
 
         features = extract_features(event)
