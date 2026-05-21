@@ -455,63 +455,55 @@ class CircuitEventDetector:
             baseline = 0.0
 
         # Compute propagation delay from the 40Hz pressure buffer.
-        # Apply a 1-second (40-sample) rolling average to reject noise, then
-        # attempt two methods in order:
         #
-        # Mode 1 — Trendline: measure the pressure drop rate over the 2-second
-        # flow-confirmation window and extrapolate linearly back from start_ts
-        # to the baseline crossing.  Handles slow/gradual drops still in
-        # progress when flow is confirmed.  Three safety gates prevent false
-        # positives from tiny drift or near-zero slopes.
+        # A centered moving average rejects noise without the ~500-1000 ms lag
+        # a trailing average would introduce.  The transient ONSET is then found
+        # by scanning newest→oldest for the point where pressure last sat within
+        # NOISE_BAND of baseline — the true start of the drop, not the point
+        # where it had already fallen PROPAGATION_ONSET_PSI.  That threshold is
+        # used only as a magnitude gate: it decides whether a real transient
+        # exists, not when it began (a gradual/knee-shaped drop can take 0.5-1 s
+        # to fall the full 0.2 PSI, which previously truncated the delay badly).
         #
-        # Mode 2 — MA threshold scan: scan newest→oldest for the farthest-back
-        # smoothed sample below (baseline − PROPAGATION_ONSET_PSI).  Handles
-        # sharp drops that have fully stabilised before flow is confirmed.
-        # Buffer end is ~FLOW_START_SECONDS past start_ts; subtract that offset.
+        # onset_pos counts samples back from the buffer end (~now).  Flow onset
+        # is FLOW_START_SECONDS before now, so that offset is subtracted.
         propagation_delay_ms = 0.0
         if self._pressure_buf:
-            MA_WINDOW  = 40    # 1-second rolling average at 40 Hz
-            MIN_BELOW  = 3
-            SLOPE_WIN  = int(self.FLOW_START_SECONDS * 40)   # = 80 samples (2 s)
-            MIN_SLOPE  = 0.001 # PSI/sample minimum to trust the trendline
+            MA_WINDOW  = 40      # 1-second average at 40 Hz
+            HALF_WIN   = MA_WINDOW // 2
+            NOISE_BAND = 0.04    # PSI; departure from baseline that marks onset
+            ABOVE_RUN  = 5       # consecutive at-baseline samples confirming pre-drop
             buf = list(self._pressure_buf)
+            n = len(buf)
+
+            # Centered moving average — symmetric window, no systematic lag.
             smoothed: list[float] = []
-            running_sum = 0.0
-            for i, p in enumerate(buf):
-                running_sum += p
-                if i >= MA_WINDOW:
-                    running_sum -= buf[i - MA_WINDOW]
-                smoothed.append(running_sum / min(i + 1, MA_WINDOW))
-            # Use the buffer peak as baseline — immune to stale _settled_pressure_psi
-            # that may have been set during a prior event's pressure recovery phase.
+            for i in range(n):
+                lo = max(0, i - HALF_WIN)
+                hi = min(n, i + HALF_WIN + 1)
+                smoothed.append(sum(buf[lo:hi]) / (hi - lo))
+
+            # Buffer peak as baseline — immune to stale _settled_pressure_psi
+            # left from a prior event's pressure recovery phase.
             buf_baseline = max(smoothed)
-            onset_threshold = buf_baseline - self.PROPAGATION_ONSET_PSI
 
-            # --- Mode 1: trendline when pressure is still actively dropping ---
-            if len(smoothed) >= SLOPE_WIN + 1:
-                slope = (smoothed[-1] - smoothed[-SLOPE_WIN]) / (SLOPE_WIN - 1)
-                total_drop = smoothed[-SLOPE_WIN] - smoothed[-1]  # +ve when dropping
-                if (slope < -MIN_SLOPE
-                        and total_drop >= self.PROPAGATION_ONSET_PSI * 0.5):
-                    p_at_start = smoothed[-SLOPE_WIN]
-                    t_samples = (p_at_start - buf_baseline) / slope   # both −ve → +ve
-                    max_delay_ms = max(0.0, (len(smoothed) - SLOPE_WIN) * 25.0)
-                    delay_ms = min(t_samples * 25.0, max_delay_ms)
-                    propagation_delay_ms = round(max(0.0, delay_ms), 1)
-
-            # --- Mode 2: MA threshold scan when sharp drop is already complete ---
-            if propagation_delay_ms == 0.0:
-                below_count = 0
-                oldest_below = 0
+            # Magnitude gate: only measure a delay if a real transient exists.
+            if buf_baseline - min(smoothed) >= self.PROPAGATION_ONSET_PSI:
+                onset_threshold = buf_baseline - NOISE_BAND
+                above_run = 0
+                onset_pos = 0
                 for pos, p in enumerate(reversed(smoothed), start=1):
-                    if p < onset_threshold:
-                        below_count += 1
-                        oldest_below = pos
-                    else:
-                        if below_count >= MIN_BELOW:
+                    if p >= onset_threshold:
+                        # A sustained run back at baseline confirms the
+                        # pre-drop state; brief noise blips are ignored.
+                        above_run += 1
+                        if above_run >= ABOVE_RUN:
                             break
-                if below_count >= MIN_BELOW:
-                    delay_ms = oldest_below * 25.0 - self.FLOW_START_SECONDS * 1000.0
+                    else:
+                        above_run = 0
+                        onset_pos = pos
+                if onset_pos > 0:
+                    delay_ms = onset_pos * 25.0 - self.FLOW_START_SECONDS * 1000.0
                     propagation_delay_ms = round(max(0.0, delay_ms), 1)
 
         log.info("[%s] event start (FLOW) — %.3f L/min for >= %.1f s propagation_delay=%.0f ms",
