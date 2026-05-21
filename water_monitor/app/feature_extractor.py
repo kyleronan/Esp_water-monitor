@@ -577,10 +577,31 @@ class FeatureExtractor:
         self._running = False
 
     async def _enrich_propagation_delay(self, event: RawEvent) -> None:
-        """Replace the jittery WebSocket-callback propagation_delay_ms with the
-        precise server-side last_changed timestamp from HA history."""
+        """Refine propagation_delay_ms with the precise server-side last_changed
+        timestamp of the flow-onset entity from HA history.
+
+        propagation_delay = flow_onset − pressure_transient_onset, applied to
+        every trigger type:
+          - 'pressure'               start_ts IS the pressure onset.
+          - 'flow' / 'pressure+flow' start_ts is the flow onset; the pressure
+            onset is recovered by subtracting the buffer-scan delay already
+            stored in propagation_delay_ms.  HA's recorder does not retain the
+            40 Hz pressure sensor at full resolution, so the buffer scan stays
+            authoritative for the pressure side; only the flow-onset timestamp
+            is sharpened here, replacing the jittery callback time.
+        """
         from datetime import timedelta
-        window_start = event.start_ts - timedelta(seconds=5)
+
+        if event.start_trigger == "pressure":
+            pressure_onset = event.start_ts
+        else:
+            if not event.propagation_delay_ms:
+                # No transient preceded the flow — nothing to refine.
+                return
+            pressure_onset = event.start_ts - timedelta(
+                milliseconds=event.propagation_delay_ms)
+
+        window_start = pressure_onset - timedelta(seconds=5)
         window_end   = (event.end_ts or event.start_ts) + timedelta(seconds=15)
         try:
             history = await self._ha.get_history(
@@ -588,12 +609,13 @@ class FeatureExtractor:
             onset = next(
                 (h for h in history
                  if h["state"].lower() in ("on", "true", "1")
-                 and h["last_changed"] >= event.start_ts),
+                 and h["last_changed"] >= pressure_onset),
                 None,
             )
             if onset:
                 event.propagation_delay_ms = round(
-                    (onset["last_changed"] - event.start_ts).total_seconds() * 1000, 1)
+                    max(0.0, (onset["last_changed"] - pressure_onset)
+                        .total_seconds() * 1000), 1)
                 log.debug("[%s] propagation delay enriched from HA history: %.0f ms",
                           event.circuit, event.propagation_delay_ms)
         except Exception as e:
@@ -604,8 +626,7 @@ class FeatureExtractor:
         if not event.complete:
             return
 
-        if (self._ha and event.flow_onset_entity
-                and event.start_trigger == "pressure"):
+        if self._ha and event.flow_onset_entity:
             await self._enrich_propagation_delay(event)
 
         features = extract_features(event)
