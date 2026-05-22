@@ -17,6 +17,7 @@ from typing import Dict
 import pytest
 
 from water_monitor.app.cluster_engine import (
+    BASE_FEATURE_WEIGHTS,
     DBSTREAM_CLUSTERING_THRESHOLD,
     FEATURE_KEYS,
     ClusterEngine,
@@ -90,9 +91,9 @@ def test_build_match_weights_for_toilet(engine_main):
     assert weights["hour_sin"] == 0.0
     assert weights["hour_cos"] == 0.0
 
-    # Unmodified features stay at 1.0
-    assert weights["peak_flow_lpm"] == 1.0
-    assert weights["pressure_delta_psi"] == 1.0
+    # Features not in the toilet profile pass through at their base weight
+    assert weights["peak_flow_lpm"] == BASE_FEATURE_WEIGHTS["peak_flow_lpm"]
+    assert weights["pressure_delta_psi"] == BASE_FEATURE_WEIGHTS["pressure_delta_psi"]
 
 
 # ==========================================================================
