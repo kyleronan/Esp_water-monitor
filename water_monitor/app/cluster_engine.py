@@ -85,18 +85,24 @@ FEATURE_KEYS = [
 ]
 
 # Per-dimension weights for weighted Euclidean distance.
-# Pressure shape (0.8) > flow shape (0.4); scalars default 1.0; hour sinusoids
-# and propagation delay 0.2 (weak / noisy contextual signals).
+# Pressure shape (0.8) > flow shape (0.4); scalars default 1.0; hour sinusoids 0.2.
 BASE_FEATURE_WEIGHTS: Dict[str, float] = {k: 1.0 for k in FEATURE_KEYS}
 for _i in range(32):
     BASE_FEATURE_WEIGHTS[f'flow_sig_{_i:02d}']     = 0.4
     BASE_FEATURE_WEIGHTS[f'pressure_sig_{_i:02d}'] = 0.8
 BASE_FEATURE_WEIGHTS['hour_sin'] = 0.2
 BASE_FEATURE_WEIGHTS['hour_cos'] = 0.2
-# propagation_delay_ms swings widely with supply conditions and valve dynamics
-# (one toilet measured 1.6-3.6 s across five flushes) and largely co-varies with
-# features already weighted here — keep it as a weak contextual signal only.
-BASE_FEATURE_WEIGHTS['propagation_delay_ms'] = 0.2
+
+# Discrimination tuning — derived from a labelled-event analysis (18 events,
+# 6 fixtures, 3 types). Flow rate was by far the strongest type discriminator
+# (F-ratio ~55-66); time-to-peak-flow and flow edge count were the next tier
+# (~8-9); propagation delay was the weakest feature measured (F-ratio ~0.2 —
+# effectively noise, swinging 1.6-3.6 s across flushes of one toilet).
+BASE_FEATURE_WEIGHTS['avg_flow_lpm']               = 2.0
+BASE_FEATURE_WEIGHTS['peak_flow_lpm']              = 2.0
+BASE_FEATURE_WEIGHTS['time_to_90pct_flow_seconds'] = 1.5
+BASE_FEATURE_WEIGHTS['flow_edge_count']            = 1.5
+BASE_FEATURE_WEIGHTS['propagation_delay_ms']       = 0.1
 
 
 class ClusterEngine:
