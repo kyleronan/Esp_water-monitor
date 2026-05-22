@@ -421,7 +421,12 @@ CREATE TABLE IF NOT EXISTS events (
     -- Pressure transient shape features (migration 026)
     pressure_onset_ms                REAL DEFAULT 0,
     recovery_overshoot_psi           REAL DEFAULT 0,
-    pressure_oscillation_count       INTEGER DEFAULT 0
+    pressure_oscillation_count       INTEGER DEFAULT 0,
+    -- ESP waveform A/B fields (migration 031)
+    esp_waveform_used                INTEGER,
+    waveform_event_id                INTEGER,
+    waveform_quality                 INTEGER,
+    waveform_overlap_score           REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_circuit_ts
