@@ -1134,6 +1134,31 @@ def _migrate_029(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_031(conn: sqlite3.Connection) -> None:
+    """Add per-event ESP waveform A/B columns (idempotent).
+
+    esp_waveform_used     — 1 when waveform features were used for this event
+    waveform_event_id     — firmware waveform_event_id (monotonic per boot)
+    waveform_quality      — resolved quality enum (0 ok, 1 incomplete, 2+ rejected)
+    waveform_overlap_score — duration-overlap score used for correlation (0.0–1.0)
+    """
+    new_cols = [
+        ("esp_waveform_used",     "INTEGER"),
+        ("waveform_event_id",     "INTEGER"),
+        ("waveform_quality",      "INTEGER"),
+        ("waveform_overlap_score", "REAL"),
+    ]
+    added = []
+    for col, coltype in new_cols:
+        if not _has_column(conn, "events", col):
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {coltype}")
+            added.append(col)
+    if added:
+        conn.commit()
+    log.info("Migration 031: waveform A/B columns — added=%s already_present=%s",
+             added, [c for c, _ in new_cols if c not in added])
+
+
 MIGRATIONS: List[Tuple[int, Callable]] = [
     (1, _migrate_001),
     (2, _migrate_002),
@@ -1165,6 +1190,7 @@ MIGRATIONS: List[Tuple[int, Callable]] = [
     (28, _migrate_028),
     (29, _migrate_029),
     (30, _migrate_030),
+    (31, _migrate_031),
 ]
 
 

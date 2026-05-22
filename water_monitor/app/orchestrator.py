@@ -350,7 +350,8 @@ class Orchestrator:
         # Feature extractor
         self._feature_extractor = FeatureExtractor(
             self._event_queue, self._db, self._alert_manager,
-            ha_client=self._ha)
+            ha_client=self._ha,
+            event_detector=self._event_detector)
 
         # Cluster engine — instantiate and rebuild state from the last 60 days
         # of already-matched events so DBSTREAM + scaler are warm on startup.

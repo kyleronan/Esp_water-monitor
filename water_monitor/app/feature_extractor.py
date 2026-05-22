@@ -72,7 +72,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from .event_detector import RawEvent
+from .event_detector import RawEvent, WaveformRecord
 
 log = logging.getLogger(__name__)
 
@@ -377,6 +377,186 @@ def _flow_dynamics(flow_readings: list, peak: float) -> dict:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────── #
+# ESP waveform enrichment (firmware 3.7.0+) — per-group feature routing       #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+# Minimum correlation overlap score required to treat a WaveformRecord as
+# matching a given RawEvent. Duration-match below this threshold → legacy path.
+_WF_MATCH_MIN_SCORE: float = 0.70
+
+# Maximum seconds between the waveform record's assembled timestamp and the
+# current processing moment. Guards against stale records from a previous event.
+_WF_MATCH_WINDOW_S: float = 90.0
+
+# Waveform flag bits (must match firmware wire format).
+_WF_FL_START_COMPLETE: int = 0x01
+_WF_FL_FULL_COMPLETE:  int = 0x02
+
+
+def _wf_millis_sub(a: int, b: int) -> int:
+    """Wrap-safe uint32 millis subtraction: (a - b) mod 2**32."""
+    return int((a - b) & 0xFFFFFFFF)
+
+
+def _wf_resample(points: List[float], n: int) -> List[float]:
+    """Linearly resample ``points`` to exactly ``n`` output points."""
+    src = points
+    m = len(src)
+    if m == 0:
+        return [0.0] * n
+    if m == 1:
+        return [src[0]] * n
+    result = []
+    for i in range(n):
+        pos = i * (m - 1) / (n - 1)
+        lo, hi = int(pos), min(int(pos) + 1, m - 1)
+        frac = pos - lo
+        result.append(src[lo] * (1.0 - frac) + src[hi] * frac)
+    return result
+
+
+def _wf_overlap_score(event: RawEvent, record: WaveformRecord) -> float:
+    """
+    Duration-based overlap score for correlating a RawEvent to a WaveformRecord.
+
+    Returns a value in [0, 1]: 1.0 = exact duration match, 0.0 = no overlap.
+    Uses wrap-safe millis arithmetic for the firmware-side duration.
+    """
+    if event.end_ts is None or event.start_ts is None:
+        return 0.0
+    event_dur_ms = max(0.0, (event.end_ts - event.start_ts).total_seconds() * 1000)
+    meta = record.metadata
+    fw_dur_ms = float(_wf_millis_sub(meta.end_ms, meta.start_ms))
+    denom = max(event_dur_ms, fw_dur_ms)
+    if denom <= 0:
+        return 0.0
+    return max(0.0, min(1.0, 1.0 - abs(event_dur_ms - fw_dur_ms) / denom))
+
+
+def _enrich_from_waveform(
+    features: Dict[str, Any],
+    record: WaveformRecord,
+    overlap_score: float,
+) -> None:
+    """
+    Selectively override features in ``features`` with ESP waveform data.
+
+    Each feature group is routed independently — a missing or low-quality
+    window falls back to the already-computed legacy value; no all-or-nothing.
+
+    Mutates ``features`` in place and sets the four waveform A/B fields.
+    """
+    import time as _time
+
+    meta = record.metadata
+    fl   = meta.flags
+    any_wf_used = False
+
+    # ── 1. Metadata-sourced features (always, no flag guard needed) ────────
+    # The metadata is always valid when we reach this point; replace features
+    # that are better measured at 200 Hz / by the firmware's accumulator.
+    if meta.peak_flow > 0:
+        features["peak_flow_lpm"] = round(meta.peak_flow, 3)
+        any_wf_used = True
+    if meta.pressure_delta >= 0:
+        features["pressure_delta_psi"] = round(meta.pressure_delta, 2)
+        any_wf_used = True
+    # Propagation delay — firmware measures at ~50 Hz (ISR resolution);
+    # -1 means the firmware did not detect a clear onset, keep legacy value.
+    if meta.propagation_delay_ms >= 0:
+        features["propagation_delay_ms"] = float(meta.propagation_delay_ms)
+        any_wf_used = True
+
+    # ── 2. Start-window features (flag bit 0x01 — start_waveform_complete) ─
+    if fl & _WF_FL_START_COMPLETE:
+        sn = meta.start_points
+        dt_start_s = (meta.pre_ms + meta.post_ms) / 1000.0 / sn  # seconds/sample
+
+        # 2a. Start-flow waveform → opening dynamics
+        sf = record.start_flow   # L/min, sn points
+        if sf and max(sf) > 0:
+            peak_wf = max(sf)
+            # Onset index: approximately where the pre-roll ends
+            onset_idx = round(meta.pre_ms / 1000.0 / dt_start_s)
+            onset_idx = min(onset_idx, sn - 1)
+            ramp = sf[onset_idx:]
+            if ramp:
+                # Rise rate from onset to peak
+                peak_idx_ramp = max(range(len(ramp)), key=lambda i: ramp[i])
+                if peak_idx_ramp > 0:
+                    features["flow_rise_rate_lpm_s"] = round(
+                        peak_wf / (peak_idx_ramp * dt_start_s), 4)
+                # Time to 90% of peak
+                t90 = next((i for i, v in enumerate(ramp) if v >= 0.9 * peak_wf), None)
+                if t90 is not None:
+                    features["time_to_90pct_flow_seconds"] = round(t90 * dt_start_s, 2)
+                # Opening step — largest single-sample rise in the ramp
+                if len(ramp) >= 2:
+                    features["opening_step_lpm"] = round(
+                        max((ramp[i] - ramp[i - 1]
+                             for i in range(1, len(ramp))
+                             if ramp[i] > ramp[i - 1]),
+                            default=0.0), 4)
+            any_wf_used = True
+
+        # 2b. Start-pressure waveform → onset timing (time from window start to min)
+        sp = record.start_pressure   # PSI, sn points
+        if sp:
+            min_idx = min(range(len(sp)), key=lambda i: sp[i])
+            # Onset relative to the start of the window (which begins pre_ms before onset)
+            # So the true pressure_onset_ms is time from onset = (min_idx * dt - pre_ms/1000) * 1000
+            onset_ms_wf = round((min_idx * dt_start_s * 1000) - meta.pre_ms, 1)
+            # Keep non-negative (a negative value means the onset is before the window pre-roll)
+            features["pressure_onset_ms"] = max(0.0, onset_ms_wf)
+            any_wf_used = True
+
+    # ── 3. Full-window features (flag bit 0x02 — full_waveform_complete) ───
+    if fl & _WF_FL_FULL_COMPLETE:
+        fw_span_ms = float(_wf_millis_sub(meta.end_ms, meta.start_ms)) + meta.tail_ms
+        dt_full_s  = fw_span_ms / 1000.0 / meta.full_points  # seconds/sample
+
+        # 3a. Full-flow waveform → steady-state fraction and variability
+        ff = record.full_flow   # L/min, fn points
+        if ff:
+            n_full = len(ff)
+            # Exclude tail samples from steady-state calculation
+            tail_pts = round(meta.tail_ms / 1000.0 / dt_full_s) if dt_full_s > 0 else 0
+            body = ff[:max(1, n_full - tail_pts)]
+            if len(body) >= 3:
+                sorted_body = sorted(body)
+                med = sorted_body[len(body) // 2]
+                if med > 0:
+                    thr = 0.20 * med
+                    features["steady_state_fraction"] = round(
+                        sum(1 for v in body if abs(v - med) <= thr) / len(body), 4)
+            if len(ff) >= 2:
+                features["flow_variability"] = round(_safe_std(ff), 4)
+            any_wf_used = True
+
+        # 3b. Full-pressure waveform → recovery overshoot (from the tail)
+        fp = record.full_pressure   # PSI, fn points
+        if fp and meta.full_points > 0:
+            # Tail starts at the event-end sample
+            tail_pts = round(meta.tail_ms / 1000.0 / dt_full_s) if dt_full_s > 0 else 0
+            n_full = len(fp)
+            body_pts = n_full - tail_pts
+            if tail_pts > 0 and body_pts > 0:
+                body_press = fp[:body_pts]
+                tail_press = fp[body_pts:]
+                if body_press and tail_press:
+                    baseline = sum(body_press) / len(body_press)
+                    overshoot = max(0.0, max(tail_press) - baseline)
+                    features["recovery_overshoot_psi"] = round(overshoot, 3)
+            any_wf_used = True
+
+    # ── 4. Set A/B tracking fields ─────────────────────────────────────────
+    features["esp_waveform_used"]     = 1 if any_wf_used else 0
+    features["waveform_event_id"]     = meta.event_id
+    features["waveform_quality"]      = meta.quality
+    features["waveform_overlap_score"] = round(overlap_score, 4)
+
+
 def extract_features(event: RawEvent) -> Dict[str, Any]:
     """Compute the full feature vector from a RawEvent."""
     duration = 0.0
@@ -541,6 +721,13 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         "pressure_onset_ms":          p_shape['pressure_onset_ms'],
         "recovery_overshoot_psi":     p_shape['recovery_overshoot_psi'],
         "pressure_oscillation_count": p_shape['pressure_oscillation_count'],
+
+        # ESP waveform A/B fields — overridden by _enrich_from_waveform when
+        # firmware 3.7.0+ waveform data is available and correlated.
+        "esp_waveform_used":      0,
+        "waveform_event_id":      None,
+        "waveform_quality":       None,
+        "waveform_overlap_score": None,
     }
 
 
@@ -552,11 +739,14 @@ class FeatureExtractor:
 
     def __init__(self, event_queue: asyncio.Queue,
                  db_conn: sqlite3.Connection, alert_manager=None,
-                 ha_client=None):
+                 ha_client=None, event_detector=None):
         self._queue = event_queue
         self._db = db_conn
         self._alert_manager = alert_manager
         self._ha = ha_client
+        # Optional EventDetector — provides WaveformAssembler access (firmware 3.7.0+).
+        # None when running in test / historical-import contexts.
+        self._event_detector = event_detector
         self._running = False
         # Set by orchestrator after ClusterEngine is initialised and rebuilt.
         self.cluster_engine = None
@@ -629,6 +819,35 @@ class FeatureExtractor:
             log.debug("[%s] propagation delay HA enrichment failed: %s",
                       event.circuit, e)
 
+    def _find_waveform(self, event: RawEvent) -> "Optional[WaveformRecord]":
+        """
+        Look up the most-recently assembled WaveformRecord for this circuit and
+        check whether it correlates with the given RawEvent.
+
+        Returns the record when both the duration-overlap score exceeds
+        _WF_MATCH_MIN_SCORE and the record was assembled within
+        _WF_MATCH_WINDOW_S seconds of now; otherwise None.
+        """
+        import time as _time
+
+        if self._event_detector is None:
+            return None
+        try:
+            record = self._event_detector.get_latest_waveform(event.circuit)
+        except Exception:
+            return None
+        if record is None:
+            return None
+        # Recency guard: if the record was assembled too long ago it belongs to
+        # a previous event, not this one.
+        age_s = _time.monotonic() - record.received_at
+        if age_s > _WF_MATCH_WINDOW_S:
+            return None
+        # Duration overlap guard.
+        if _wf_overlap_score(event, record) < _WF_MATCH_MIN_SCORE:
+            return None
+        return record
+
     async def _process(self, event: RawEvent) -> None:
         if not event.complete:
             return
@@ -637,6 +856,23 @@ class FeatureExtractor:
             await self._enrich_propagation_delay(event)
 
         features = extract_features(event)
+
+        # Attempt to enrich features from ESP waveform capture (firmware 3.7.0+).
+        # Per-group routing: each group falls back to the legacy value independently.
+        wf_record = self._find_waveform(event)
+        if wf_record is not None:
+            score = _wf_overlap_score(event, wf_record)
+            _enrich_from_waveform(features, wf_record, score)
+            log.debug(
+                "[%s] waveform enriched — event_id=%d boot_id=%d "
+                "overlap=%.2f q=%d fl=0x%02x",
+                event.circuit,
+                wf_record.metadata.event_id,
+                wf_record.metadata.boot_id,
+                score,
+                wf_record.metadata.quality,
+                wf_record.metadata.flags,
+            )
 
         try:
             from .database import (insert_event, update_hourly_volume,
