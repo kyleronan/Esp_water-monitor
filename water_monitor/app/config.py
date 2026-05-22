@@ -40,6 +40,14 @@ class CircuitConfig:
     leak_test_switch: str = ""
     leak_test_result_sensor: str = ""
     volume_sensor: str = ""
+    # Per-event waveform capture entity IDs (firmware 3.7.0+, circuit_1 only).
+    # Empty string when the firmware version pre-dates waveform capture.
+    wf_start_flow_sensor: str = ""
+    wf_start_pressure_sensor: str = ""
+    wf_full_flow_sensor: str = ""
+    wf_full_pressure_sensor: str = ""
+    wf_metadata_sensor: str = ""
+    wf_overflow_count_sensor: str = ""
     esp_device_prefix: str = ""
 
     @property

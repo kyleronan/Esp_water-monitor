@@ -39,13 +39,16 @@ so the feature extractor can weight pressure data appropriately.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import struct
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Deque, List, Literal, Optional
+from typing import Any, Callable, Dict, Deque, List, Literal, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -952,6 +955,387 @@ class CircuitEventDetector:
         self._settled_pressure_since = None
 
 
+# ------------------------------------------------------------------------------- #
+# Per-event waveform capture (firmware 3.7.0+) — assembler and wire-format helpers
+# ------------------------------------------------------------------------------- #
+
+# Wire-format constants — must match firmware build-time contract.
+_WF_START_POINTS_MAX: int = 88      # hard cap on start-window point count
+_WF_FULL_POINTS_MAX: int = 64       # hard cap on full-window point count
+_WF_PART_TTL_S: float = 60.0        # maximum age for a cached waveform part
+_WF_INITIAL_GRACE_S: float = 3.0    # reject parts received within this many
+                                    # seconds of subscription (likely retained HA state)
+_WF_META_MAX_AGE_S: float = 5.0     # reject metadata whose publish millis is more
+                                    # than this many seconds before we received it
+_WF_MAX_RECORDS: int = 30           # maximum assembled records to keep per circuit
+_WF_ROLES: Tuple[str, ...] = (      # the four waveform parts, in publish order
+    "start_flow", "start_pressure", "full_flow", "full_pressure",
+)
+_WF_FLAG_VALID_MASK: int = 0x7F     # bits 0-6 only; bit 7 must be 0
+_WF_SUPPORTED_VERSIONS = {1}        # set of wire-format versions we handle
+
+
+@dataclass
+class WaveformMetadata:
+    """Decoded and validated event_metadata JSON."""
+    event_id: int           # id — monotonic per-boot waveform event counter
+    boot_id: int            # b  — ESP session id
+    version: int            # v  — wire-format version
+    start_ms: int           # s  — event start millis()
+    end_ms: int             # e  — event end millis()
+    publish_ms: int         # p  — publish millis()
+    start_points: int       # sn — resampled points in each start window
+    full_points: int        # fn — resampled points in each full window
+    pre_ms: int             # pre — start-window pre-event portion (ms)
+    post_ms: int            # post — start-window post-event portion (ms)
+    tail_ms: int            # tl — full-window post-event tail (ms)
+    flow_scale: int         # fs — int16 → L/min divisor
+    pressure_scale: int     # ps — int16 → PSI divisor
+    peak_flow: float        # pk — peak flow (×100 in wire, /100 here)
+    pressure_delta: float   # dp — pressure delta (×100 in wire, /100 here)
+    propagation_delay_ms: int   # pd — onset propagation delay (ms; -1 = not detected)
+    quality: int            # q  — 0 ok, 1 incomplete, firmware never publishes 2-6
+    flags: int              # fl — bitfield (see plan)
+
+
+@dataclass
+class WaveformRecord:
+    """Fully assembled and decoded per-event waveform — ready for feature extraction."""
+    circuit: str
+    boot_id: int
+    event_id: int
+    metadata: WaveformMetadata
+    # Each list has exactly metadata.start_points or metadata.full_points float values.
+    start_flow: List[float]       # L/min
+    start_pressure: List[float]   # PSI
+    full_flow: List[float]        # L/min
+    full_pressure: List[float]    # PSI
+    received_at: float            # time.monotonic() when the record was assembled
+
+
+@dataclass
+class _WfPart:
+    """One cached waveform text_sensor state, pending metadata commit."""
+    role: str           # one of _WF_ROLES
+    boot_id: int
+    event_id: int
+    b64_payload: str    # the raw base64 segment from the wire state
+    received_at: float  # time.monotonic()
+    initial: bool       # True when received within _WF_INITIAL_GRACE_S of subscription
+
+
+def _parse_b36(s: str) -> Optional[int]:
+    """Decode a base36 string to a non-negative integer, or None on error."""
+    try:
+        v = int(s, 36)
+        return v if v >= 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_metadata(state: str) -> Optional[WaveformMetadata]:
+    """
+    Parse and validate event_metadata JSON.
+    Returns None (with a DEBUG log) on any validation failure.
+    """
+    try:
+        d = json.loads(state)
+    except (json.JSONDecodeError, ValueError):
+        log.debug("waveform: metadata JSON decode failed: %.80r", state)
+        return None
+
+    required_int = ("id", "b", "v", "s", "e", "p", "sn", "fn",
+                    "pre", "post", "tl", "fs", "ps", "pk", "dp", "pd", "q", "fl")
+    for key in required_int:
+        if key not in d or not isinstance(d[key], int):
+            log.debug("waveform: metadata missing/non-integer field %r in %.80r", key, state)
+            return None
+
+    # Field-range validation
+    ev   = d["id"];  b = d["b"];   v = d["v"]
+    sn   = d["sn"];  fn = d["fn"]
+    fs   = d["fs"];  ps = d["ps"]
+    q    = d["q"];   fl = d["fl"]
+
+    if ev < 0 or b < 0:
+        log.debug("waveform: metadata negative id/boot_id")
+        return None
+    if v not in _WF_SUPPORTED_VERSIONS:
+        log.debug("waveform: metadata unsupported version %d", v)
+        return None
+    if sn <= 0 or sn > _WF_START_POINTS_MAX:
+        log.debug("waveform: metadata sn=%d out of range", sn)
+        return None
+    if fn <= 0 or fn > _WF_FULL_POINTS_MAX:
+        log.debug("waveform: metadata fn=%d out of range", fn)
+        return None
+    if fs <= 0 or ps <= 0:
+        log.debug("waveform: metadata fs/ps must be positive")
+        return None
+    if not (0 <= q <= 6):
+        log.debug("waveform: metadata q=%d out of range", q)
+        return None
+    if fl & ~_WF_FLAG_VALID_MASK:
+        log.debug("waveform: metadata fl=%d has invalid high bits", fl)
+        return None
+
+    return WaveformMetadata(
+        event_id=ev,
+        boot_id=b,
+        version=v,
+        start_ms=d["s"],
+        end_ms=d["e"],
+        publish_ms=d["p"],
+        start_points=sn,
+        full_points=fn,
+        pre_ms=d["pre"],
+        post_ms=d["post"],
+        tail_ms=d["tl"],
+        flow_scale=fs,
+        pressure_scale=ps,
+        peak_flow=d["pk"] / 100.0,
+        pressure_delta=d["dp"] / 100.0,
+        propagation_delay_ms=d["pd"],
+        quality=q,
+        flags=fl,
+    )
+
+
+def _decode_waveform(
+    b64_payload: str,
+    expected_pts: int,
+    scale: int,
+) -> Optional[List[float]]:
+    """
+    Decode a base64-encoded little-endian int16 waveform payload.
+
+    Returns a list of ``expected_pts`` float values (int16 ÷ scale), or None
+    when the payload is empty, malformed, or not exactly the expected byte length.
+    """
+    if not b64_payload:
+        log.debug("waveform: empty base64 payload")
+        return None
+    try:
+        raw = base64.b64decode(b64_payload, validate=True)
+    except Exception:
+        log.debug("waveform: base64 decode error for payload %.40r", b64_payload)
+        return None
+    expected_bytes = expected_pts * 2
+    if len(raw) != expected_bytes:
+        log.debug(
+            "waveform: payload length %d != expected %d bytes (%d pts × 2)",
+            len(raw), expected_bytes, expected_pts,
+        )
+        return None
+    values: List[float] = []
+    for i in range(expected_pts):
+        (v,) = struct.unpack_from("<h", raw, i * 2)
+        values.append(v / scale)
+    return values
+
+
+class WaveformAssembler:
+    """
+    Per-circuit assembler for the five waveform entities (firmware 3.7.0+).
+
+    Lifecycle
+    ---------
+    - ``on_waveform_part`` is called for each of the four waveform text_sensors.
+    - ``on_metadata`` is called when event_metadata arrives (the commit signal).
+    - A ``WaveformRecord`` is stored only when all four parts are fresh, non-stale,
+      non-initial, agree on boot_id + event_id, and the metadata validates.
+
+    Stale/retained-state rejection
+    --------------------------------
+    Parts received within ``_WF_INITIAL_GRACE_S`` of subscription are flagged
+    ``initial=True`` and are never used — they may be retained HA states replayed
+    on subscription.  The metadata commit itself is also rejected if it arrives
+    in this window.
+
+    Boot-session guard
+    ------------------
+    When ``boot_id`` changes, the part cache is flushed — the ESP rebooted and
+    the ``event_id`` counter has reset, so pre-reboot parts are invalid.
+    """
+
+    def __init__(self, circuit: str) -> None:
+        self._circuit = circuit
+        self._subscribed_at: float = time.monotonic()
+        self._known_boot_id: Optional[int] = None
+        # Part cache: (boot_id, event_id, role) → _WfPart
+        self._parts: Dict[Tuple[int, int, str], _WfPart] = {}
+        # Assembled records, newest last.
+        self._records: List[WaveformRecord] = []
+
+    # ------------------------------------------------------------------
+    # Public callbacks (called by EventDetector from HA subscriptions)
+    # ------------------------------------------------------------------
+
+    def on_waveform_part(self, role: str, entity_id: str, state: str) -> None:
+        """Cache one waveform part state, applying stale/format guards."""
+        now = time.monotonic()
+        initial = (now - self._subscribed_at) < _WF_INITIAL_GRACE_S
+
+        # Wire format: "<boot_id_b36>:<event_id_b36>:<base64>"
+        parts = state.split(":", 2)
+        if len(parts) != 3:
+            log.debug("waveform[%s]: malformed part state for %s: %.60r",
+                      self._circuit, role, state)
+            return
+        boot_id = _parse_b36(parts[0])
+        event_id = _parse_b36(parts[1])
+        b64_payload = parts[2]
+        if boot_id is None or event_id is None:
+            log.debug("waveform[%s]: bad b36 ids in %s state %.40r",
+                      self._circuit, role, state)
+            return
+
+        # Boot-session guard — flush cache on new session.
+        if self._known_boot_id is not None and boot_id != self._known_boot_id:
+            log.debug("waveform[%s]: boot_id changed %d→%d, flushing part cache",
+                      self._circuit, self._known_boot_id, boot_id)
+            self._parts.clear()
+        self._known_boot_id = boot_id
+
+        # Evict TTL-expired parts before inserting.
+        self._evict_stale(now)
+
+        key = (boot_id, event_id, role)
+        self._parts[key] = _WfPart(
+            role=role,
+            boot_id=boot_id,
+            event_id=event_id,
+            b64_payload=b64_payload,
+            received_at=now,
+            initial=initial,
+        )
+
+    def on_metadata(self, entity_id: str, state: str) -> None:
+        """
+        Attempt to assemble a WaveformRecord from the cached parts.
+        Called when event_metadata arrives (the commit signal, always last).
+        """
+        now = time.monotonic()
+
+        # Reject if we are still in the initial grace window (likely retained state).
+        if (now - self._subscribed_at) < _WF_INITIAL_GRACE_S:
+            log.debug("waveform[%s]: metadata in initial grace window — skipped",
+                      self._circuit)
+            return
+
+        meta = _parse_metadata(state)
+        if meta is None:
+            return  # _parse_metadata already logged
+
+        # Boot-session guard for metadata itself.
+        if self._known_boot_id is not None and meta.boot_id != self._known_boot_id:
+            log.debug(
+                "waveform[%s]: metadata boot_id %d != known %d — flushing and skipping",
+                self._circuit, meta.boot_id, self._known_boot_id,
+            )
+            self._parts.clear()
+            self._known_boot_id = meta.boot_id
+            return
+        self._known_boot_id = meta.boot_id
+
+        # Evict stale parts before trying to assemble.
+        self._evict_stale(now)
+
+        # Collect the four required parts for this (boot_id, event_id).
+        collected: Dict[str, _WfPart] = {}
+        for role in _WF_ROLES:
+            key = (meta.boot_id, meta.event_id, role)
+            part = self._parts.get(key)
+            if part is None:
+                log.debug(
+                    "waveform[%s]: missing part %r for event %d — skipping assembly",
+                    self._circuit, role, meta.event_id,
+                )
+                return
+            if part.initial:
+                log.debug(
+                    "waveform[%s]: part %r is initial/retained — skipping assembly",
+                    self._circuit, role,
+                )
+                return
+            collected[role] = part
+
+        # Decode each waveform window.
+        # start window → meta.start_points pts; full window → meta.full_points pts.
+        def _decode(role: str, expected_pts: int, scale: int) -> Optional[List[float]]:
+            result = _decode_waveform(collected[role].b64_payload, expected_pts, scale)
+            if result is None:
+                log.debug("waveform[%s]: decode failed for role %r event %d",
+                          self._circuit, role, meta.event_id)
+            return result
+
+        start_flow     = _decode("start_flow",     meta.start_points, meta.flow_scale)
+        start_pressure = _decode("start_pressure", meta.start_points, meta.pressure_scale)
+        full_flow      = _decode("full_flow",      meta.full_points,  meta.flow_scale)
+        full_pressure  = _decode("full_pressure",  meta.full_points,  meta.pressure_scale)
+
+        if any(w is None for w in (start_flow, start_pressure, full_flow, full_pressure)):
+            return  # decode error already logged above
+
+        record = WaveformRecord(
+            circuit=self._circuit,
+            boot_id=meta.boot_id,
+            event_id=meta.event_id,
+            metadata=meta,
+            start_flow=start_flow,       # type: ignore[arg-type]
+            start_pressure=start_pressure,
+            full_flow=full_flow,
+            full_pressure=full_pressure,
+            received_at=now,
+        )
+        self._records.append(record)
+        # Trim record list to a bounded size.
+        if len(self._records) > _WF_MAX_RECORDS:
+            self._records = self._records[-_WF_MAX_RECORDS:]
+
+        # Remove consumed parts so they don't accumulate.
+        for role in _WF_ROLES:
+            self._parts.pop((meta.boot_id, meta.event_id, role), None)
+
+        log.debug(
+            "waveform[%s]: assembled event %d (boot=%d q=%d fl=0x%02x "
+            "sn=%d fn=%d pk=%.2f dp=%.2f pd=%dms)",
+            self._circuit, meta.event_id, meta.boot_id,
+            meta.quality, meta.flags,
+            meta.start_points, meta.full_points,
+            meta.peak_flow, meta.pressure_delta, meta.propagation_delay_ms,
+        )
+
+    def get_record(self, boot_id: int, event_id: int) -> Optional[WaveformRecord]:
+        """Return the assembled record for a given (boot_id, event_id), or None."""
+        for rec in reversed(self._records):
+            if rec.boot_id == boot_id and rec.event_id == event_id:
+                return rec
+        return None
+
+    def latest_record(self) -> Optional[WaveformRecord]:
+        """Return the most-recently assembled record, or None."""
+        return self._records[-1] if self._records else None
+
+    def pop_record(self, boot_id: int, event_id: int) -> Optional[WaveformRecord]:
+        """Remove and return the record for (boot_id, event_id), or None."""
+        for i in range(len(self._records) - 1, -1, -1):
+            if self._records[i].boot_id == boot_id and self._records[i].event_id == event_id:
+                return self._records.pop(i)
+        return None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _evict_stale(self, now: float) -> None:
+        """Remove parts older than _WF_PART_TTL_S."""
+        stale = [k for k, p in self._parts.items()
+                 if (now - p.received_at) > _WF_PART_TTL_S]
+        for k in stale:
+            del self._parts[k]
+
+
 class EventDetector:
     """
     Top-level coordinator. Owns one CircuitEventDetector per circuit
@@ -974,6 +1358,8 @@ class EventDetector:
         self._detectors: Dict[str, CircuitEventDetector] = {}
         # Tracks live valve open/closed state per circuit for cross-circuit feature
         self._valve_open: Dict[str, bool] = {}
+        # One WaveformAssembler per circuit — populated in setup().
+        self._assemblers: Dict[str, WaveformAssembler] = {}
         self._is_configured = False
 
     def setup(self) -> None:
@@ -1014,6 +1400,37 @@ class EventDetector:
                     cfg.valve_entity,
                     lambda eid, state, attrs, c=cfg.circuit: self._on_valve_state(c, state),
                 )
+
+            # Waveform capture entities (firmware 3.7.0+, circuit_1 only).
+            # Subscribe only when the entity IDs have been discovered; if the
+            # firmware pre-dates 3.7.0 all six fields are empty and we skip silently.
+            assembler = WaveformAssembler(cfg.circuit)
+            self._assemblers[cfg.circuit] = assembler
+            wf_subscriptions = [
+                (cfg.wf_start_flow_sensor,     "start_flow"),
+                (cfg.wf_start_pressure_sensor, "start_pressure"),
+                (cfg.wf_full_flow_sensor,      "full_flow"),
+                (cfg.wf_full_pressure_sensor,  "full_pressure"),
+            ]
+            wf_count = 0
+            for entity_id, role in wf_subscriptions:
+                if entity_id:
+                    self._ha.subscribe_entity(
+                        entity_id,
+                        lambda eid, state, attrs, r=role, a=assembler:
+                            a.on_waveform_part(r, eid, state),
+                    )
+                    wf_count += 1
+            if cfg.wf_metadata_sensor:
+                self._ha.subscribe_entity(
+                    cfg.wf_metadata_sensor,
+                    lambda eid, state, attrs, a=assembler:
+                        a.on_metadata(eid, state),
+                )
+                wf_count += 1
+            if wf_count:
+                log.info("[%s] waveform assembler ready (%d entities subscribed)",
+                         cfg.circuit, wf_count)
 
             log.info(
                 "[%s] event detector ready — triggers: "
@@ -1058,3 +1475,28 @@ class EventDetector:
     def get_active_event(self, circuit: str) -> Optional[RawEvent]:
         detector = self._detectors.get(circuit)
         return detector._active_event if detector else None
+
+    def get_waveform_record(
+        self,
+        circuit: str,
+        boot_id: int,
+        event_id: int,
+    ) -> Optional[WaveformRecord]:
+        """Return the assembled WaveformRecord for (boot_id, event_id) on a circuit, or None."""
+        assembler = self._assemblers.get(circuit)
+        return assembler.get_record(boot_id, event_id) if assembler else None
+
+    def get_latest_waveform(self, circuit: str) -> Optional[WaveformRecord]:
+        """Return the most-recently assembled WaveformRecord for a circuit, or None."""
+        assembler = self._assemblers.get(circuit)
+        return assembler.latest_record() if assembler else None
+
+    def pop_waveform_record(
+        self,
+        circuit: str,
+        boot_id: int,
+        event_id: int,
+    ) -> Optional[WaveformRecord]:
+        """Remove and return the WaveformRecord for (boot_id, event_id), or None."""
+        assembler = self._assemblers.get(circuit)
+        return assembler.pop_record(boot_id, event_id) if assembler else None
