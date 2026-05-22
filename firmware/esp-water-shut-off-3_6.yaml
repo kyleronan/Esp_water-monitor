@@ -65,7 +65,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.6.0"
+    version: "3.7.0"
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -590,6 +590,142 @@ globals:
     type: std::string
     restore_value: no
     initial_value: '""'
+
+  # ---------------------------------------------------------------------------
+  # WAVEFORM CAPTURE GLOBALS — Main circuit (circuit_1) — firmware 3.7.0+
+  #
+  # Per-event flow + pressure waveform capture for the water-signature add-on.
+  # STRICTLY ADDITIVE: no safety, ADC, valve, or leak-test path reads or writes
+  # any global below. All capture work runs in the dedicated `waveform_capture`
+  # interval (~50 Hz) — never in the 200 Hz ADC loop, the pulse-counter ISR, or
+  # any safety lambda. Storage is fully preallocated (no runtime allocation).
+  #
+  # int16 wire scaling:  flow = L/min x 100,  pressure = PSI x 100.
+  #
+  # A continuous pre-roll ring buffer always holds the last ~2 s. On a flow
+  # onset the pre-roll is copied into one of two double-buffered event slots;
+  # the slot keeps capturing through the event and a post-event tail, then is
+  # resampled into a fixed start window + full window and published. Two slots
+  # let a second event capture while the first publishes — events are never
+  # mixed. If both slots are busy the event is dropped and a diagnostic counter
+  # increments (the add-on then falls back to legacy feature extraction).
+  # Circuit 2 (irrigation) capture is intentionally out of scope for this
+  # phase; the wire format carries a circuit field so it can be added later.
+  # ---------------------------------------------------------------------------
+
+  # Pre-roll ring buffer — 100 samples @ ~50 Hz = ~2.0 s of flow + pressure.
+  # Arrays have no initial_value — static storage zero-initialises them.
+  - id: wf_ring_flow
+    type: int16_t[100]
+    restore_value: no
+  - id: wf_ring_press
+    type: int16_t[100]
+    restore_value: no
+  - id: wf_ring_idx
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ring_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # Event capture slots — double-buffered. 480 samples @ ~50 Hz = ~9.6 s before
+  # in-place 2x decimation extends the captured span at coarser resolution.
+  - id: wf_slot0_flow
+    type: int16_t[480]
+    restore_value: no
+  - id: wf_slot0_press
+    type: int16_t[480]
+    restore_value: no
+  - id: wf_slot1_flow
+    type: int16_t[480]
+    restore_value: no
+  - id: wf_slot1_press
+    type: int16_t[480]
+    restore_value: no
+
+  # Per-slot capture state — index 0/1 selects the slot.
+  #   wf_slot_phase: 0 free, 1 capturing, 2 waiting-for-zero (tail),
+  #                  3 ready-to-publish, 4+ publishing steps.
+  - id: wf_slot_phase
+    type: int[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_slot_len               # samples written into the slot
+    type: int[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_slot_onset_idx         # slot index of the flow-onset sample
+    type: int[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_slot_press_onset_idx   # slot index of pressure transient, -1 = none
+    type: int[2]
+    restore_value: no
+    initial_value: '{-1, -1}'
+  - id: wf_slot_decim             # in-place decimation factor (1, 2, 4, ...)
+    type: int[2]
+    restore_value: no
+    initial_value: '{1, 1}'
+  - id: wf_slot_pub_step          # publisher progress, 0..5
+    type: int[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_slot_flags             # completeness/quality flag bitfield
+    type: int[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_slot_event_id
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_slot_start_ms
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_slot_end_ms
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_slot_zero_ms           # millis() when flow last dropped below gate
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+
+  # Engine-wide capture state.
+  - id: wf_active_slot            # slot currently capturing, -1 = none
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: wf_tick                   # free-running ~50 Hz interval tick counter
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_event_counter          # monotonic event id, resets only on reboot
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_boot_id                # random per-boot session id (0 = uninit)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_overflow_count         # events dropped because both slots busy
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wf_dropped_active         # guards one overflow count per dropped event
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: wf_press_baseline         # slow pressure baseline for transient onset
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: wf_press_baseline_valid
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 # =============================================================================
 # SENSORS
@@ -1576,6 +1712,29 @@ sensor:
       sorting_group_id: group_irr_status
       sorting_weight: 49
 
+  # ---------------------------------------------------------------------------
+  # WAVEFORM OVERFLOW DROPPED COUNT — Main circuit — diagnostic (firmware 3.7.0+)
+  #
+  # Increments once per water event that could not be captured because both
+  # double-buffered waveform slots were still busy publishing. A climbing value
+  # means events are arriving faster than they can be encoded/published; the
+  # add-on simply falls back to legacy feature extraction for those events.
+  # Published immediately on change by the waveform_capture interval, and also
+  # polled every 60 s so HA has the value after a reconnect.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Waveform Overflow Dropped Count - ${circuit_1_name}"
+    id: waveform_overflow_dropped_count
+    entity_category: diagnostic
+    icon: mdi:waveform
+    accuracy_decimals: 0
+    state_class: total_increasing
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 47
+    update_interval: 60s
+    lambda: 'return (float) id(wf_overflow_count);'
+
 # =============================================================================
 # TEXT SENSORS — Leak test results
 # Persists the last result of each leak test as a human-readable string.
@@ -1710,6 +1869,84 @@ text_sensor:
     icon: mdi:label-outline
     update_interval: 60s
     lambda: return {"${circuit_2_name}"};
+
+  # ---------------------------------------------------------------------------
+  # WAVEFORM CAPTURE TEXT SENSORS — Main circuit (firmware 3.7.0+)
+  #
+  # Five entities published per captured water event by the waveform_capture
+  # interval. The four waveform sensors are published FIRST; event_metadata is
+  # published LAST and is the add-on's commit signal — the add-on assembles a
+  # record only once metadata arrives referencing waveform parts it has already
+  # cached from earlier state-change events.
+  #
+  # Waveform state format:  <boot_id>:<event_id>:<base64>
+  #   boot_id, event_id : base36-encoded uint32 (compact — keeps the state
+  #                       under HA's 255-char limit even at the point caps).
+  #   base64            : little-endian signed int16 array. 80 points for the
+  #                       start windows, 64 for the full windows.
+  #   real value        : int16 / scale  (fs for flow, ps for pressure — both
+  #                       100, carried in event_metadata).
+  #
+  # event_metadata state: compact JSON, no spaces, < 255 chars. Keys:
+  #   id  event id            b   boot/session id      v  format version
+  #   s/e/p  start/end/publish millis()                sn/fn  point counts
+  #   pre/post  start-window pre/post span (ms)        tl  full-window tail ms
+  #   fs/ps  flow/pressure int16 scale                 pk  peak flow x100
+  #   dp  pressure delta x100  pd  propagation delay ms (-1 = unknown)
+  #   q   quality (0 ok, 1 incomplete)                 fl  flags bitfield
+  #
+  # update_interval: never — these never self-poll; state is published
+  # imperatively. They hold no meaningful value until the first event.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Event Start Flow Waveform - ${circuit_1_name}"
+    id: event_start_flow_waveform
+    entity_category: diagnostic
+    icon: mdi:waveform
+    update_interval: never
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 50
+
+  - platform: template
+    name: "Event Start Pressure Waveform - ${circuit_1_name}"
+    id: event_start_pressure_waveform
+    entity_category: diagnostic
+    icon: mdi:waveform
+    update_interval: never
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 51
+
+  - platform: template
+    name: "Event Full Flow Waveform - ${circuit_1_name}"
+    id: event_full_flow_waveform
+    entity_category: diagnostic
+    icon: mdi:waveform
+    update_interval: never
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 52
+
+  - platform: template
+    name: "Event Full Pressure Waveform - ${circuit_1_name}"
+    id: event_full_pressure_waveform
+    entity_category: diagnostic
+    icon: mdi:waveform
+    update_interval: never
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 53
+
+  - platform: template
+    name: "Event Metadata - ${circuit_1_name}"
+    id: event_metadata
+    entity_category: diagnostic
+    icon: mdi:code-json
+    update_interval: never
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 54
 
 # =============================================================================
 # BINARY SENSORS
@@ -2735,6 +2972,321 @@ button:
           id(trickle_alert_irr) = false;
           id(trickle_elapsed_irr) = 0.0f;
           ESP_LOGI("trickle", "Irrigation trickle flow alert manually reset");
+
+# =============================================================================
+# INTERVALS — Per-event waveform capture (firmware 3.7.0+)
+#
+# A single ~50 Hz interval drives the whole waveform-capture engine for the
+# main circuit. STRICTLY ADDITIVE — it only READS already-published sensor
+# states (water_usage1, pressure_main_fast) and writes its own wf_* globals.
+# It never touches the 200 Hz ADC loop, the pulse-counter ISR, the safety
+# lambdas, or any valve action, so it cannot regress the shut-off device.
+#
+# Per tick the lambda: (1) appends one flow+pressure sample to the continuous
+# pre-roll ring; (2) runs the capture state machine — on a flow onset it copies
+# the pre-roll into a free double-buffered slot and captures the event plus a
+# 3 s post-event tail, decimating the slot 2x in place if it fills; (3) runs
+# the publisher — one entity per tick, the four waveforms first and
+# event_metadata last (the add-on's commit signal).
+#
+# Encoding/JSON/publish work runs only in the publishing steps (5 ticks per
+# event), never in the sampling path. A build-time static_assert guarantees
+# the worst-case waveform state stays under HA's 255-char limit.
+#
+# Note: the 200 Hz pressure-onset / Hall edge-interrupt propagation timing
+# described in the design is a later refinement — this phase measures the
+# propagation delay at the ~50 Hz capture resolution (pd, low-weight in the
+# add-on; -1 when the transient is not seen in the pre-roll).
+# =============================================================================
+interval:
+  - interval: 20ms
+    then:
+      - lambda: |-
+          /* WAVEFORM CAPTURE ENGINE — main circuit. Strictly additive. */
+
+          // Build-time guard: worst-case waveform text_sensor state must fit
+          // HA's 255-char limit. Point cap 88 -> 176 bytes -> base64 length
+          // ((176+2)/3)*4 = 236, plus two 7-char base36 ids and two ':'.
+          static_assert(((176 + 2) / 3) * 4 + 7 + 7 + 2 <= 255,
+            "waveform text_sensor state could exceed the HA 255-char limit");
+
+          // ---- one-time per-boot init ----
+          if (id(wf_boot_id) == 0) {
+            uint32_t r = esphome::random_uint32();
+            id(wf_boot_id) = (r == 0) ? 1u : r;
+          }
+          id(wf_tick) = id(wf_tick) + 1;
+
+          // ---- helpers (stack-only lambdas, no heap allocation) ----
+          auto slot_flow = [](int s) -> int16_t* {
+            return (s == 0) ? &id(wf_slot0_flow)[0] : &id(wf_slot1_flow)[0];
+          };
+          auto slot_press = [](int s) -> int16_t* {
+            return (s == 0) ? &id(wf_slot0_press)[0] : &id(wf_slot1_press)[0];
+          };
+          auto to_i16 = [](float v) -> int16_t {
+            float s = v * 100.0f;
+            if (s > 32767.0f) s = 32767.0f;
+            if (s < -32768.0f) s = -32768.0f;
+            return (int16_t) lroundf(s);
+          };
+          auto resample = [](const int16_t *src, int rlo, int rhi,
+                             int16_t *out, int npts) {
+            int span = rhi - rlo;
+            if (span <= 0) { for (int i = 0; i < npts; i++) out[i] = 0; return; }
+            for (int i = 0; i < npts; i++) {
+              int a = rlo + (int) ((long long) i * span / npts);
+              int b = rlo + (int) ((long long) (i + 1) * span / npts);
+              if (b <= a) b = a + 1;
+              if (b > rhi) b = rhi;
+              long acc = 0; int cnt = 0;
+              for (int k = a; k < b; k++) { acc += src[k]; cnt++; }
+              out[i] = (cnt > 0) ? (int16_t) (acc / cnt) : 0;
+            }
+          };
+          auto b36 = [](uint32_t v) -> std::string {
+            static const char *D = "0123456789abcdefghijklmnopqrstuvwxyz";
+            if (v == 0) return std::string("0");
+            char tmp[8]; int n = 0;
+            while (v > 0 && n < 8) { tmp[n++] = D[v % 36]; v /= 36; }
+            std::string out;
+            for (int i = n - 1; i >= 0; i--) out += tmp[i];
+            return out;
+          };
+          auto b64 = [](const uint8_t *d, int len) -> std::string {
+            static const char *T =
+              "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string out;
+            out.reserve(((len + 2) / 3) * 4);
+            int i = 0;
+            while (i + 3 <= len) {
+              uint32_t n = ((uint32_t) d[i] << 16) |
+                           ((uint32_t) d[i + 1] << 8) | d[i + 2];
+              out += T[(n >> 18) & 63]; out += T[(n >> 12) & 63];
+              out += T[(n >> 6) & 63];  out += T[n & 63];
+              i += 3;
+            }
+            int rem = len - i;
+            if (rem == 1) {
+              uint32_t n = (uint32_t) d[i] << 16;
+              out += T[(n >> 18) & 63]; out += T[(n >> 12) & 63];
+              out += '='; out += '=';
+            } else if (rem == 2) {
+              uint32_t n = ((uint32_t) d[i] << 16) | ((uint32_t) d[i + 1] << 8);
+              out += T[(n >> 18) & 63]; out += T[(n >> 12) & 63];
+              out += T[(n >> 6) & 63];  out += '=';
+            }
+            return out;
+          };
+
+          // ---- 1. sample the continuous pre-roll ring ----
+          float flow_lpm = id(water_usage1).state;
+          float press_psi = id(pressure_main_fast).state;
+          bool clamped = false;
+          if (!std::isfinite(flow_lpm))  { flow_lpm = 0.0f;  clamped = true; }
+          if (!std::isfinite(press_psi)) { press_psi = 0.0f; clamped = true; }
+          if (flow_lpm < 0.0f)  flow_lpm = 0.0f;
+          if (press_psi < 0.0f) press_psi = 0.0f;
+          int16_t fi = to_i16(flow_lpm);
+          int16_t pi = to_i16(press_psi);
+          id(wf_ring_flow)[id(wf_ring_idx)] = fi;
+          id(wf_ring_press)[id(wf_ring_idx)] = pi;
+          id(wf_ring_idx) = (id(wf_ring_idx) + 1) % 100;
+          if (id(wf_ring_count) < 100) id(wf_ring_count) = id(wf_ring_count) + 1;
+
+          // ---- 2. slow pressure baseline (frozen while an event is active) ----
+          if (!id(wf_press_baseline_valid)) {
+            id(wf_press_baseline) = press_psi;
+            id(wf_press_baseline_valid) = true;
+          } else if (id(wf_active_slot) < 0) {
+            id(wf_press_baseline) =
+              id(wf_press_baseline) + 0.02f * (press_psi - id(wf_press_baseline));
+          }
+
+          uint32_t now = millis();
+          bool flow_on = flow_lpm > 0.10f;
+
+          // ---- 3. capture state machine ----
+          if (id(wf_active_slot) < 0) {
+            // IDLE — watch for a flow onset.
+            if (flow_on) {
+              int slot = (id(wf_slot_phase)[0] == 0) ? 0
+                       : (id(wf_slot_phase)[1] == 0) ? 1 : -1;
+              if (slot >= 0) {
+                int n = id(wf_ring_count);
+                int ri = id(wf_ring_idx);
+                int start = (ri - n + 100) % 100;
+                int16_t *sf = slot_flow(slot);
+                int16_t *sp = slot_press(slot);
+                for (int k = 0; k < n; k++) {
+                  int src = (start + k) % 100;
+                  sf[k] = id(wf_ring_flow)[src];
+                  sp[k] = id(wf_ring_press)[src];
+                }
+                int onset = (n > 0) ? (n - 1) : 0;
+                id(wf_slot_len)[slot] = n;
+                id(wf_slot_onset_idx)[slot] = onset;
+                id(wf_slot_decim)[slot] = 1;
+                id(wf_slot_event_id)[slot] = id(wf_event_counter) + 1;
+                id(wf_event_counter) = id(wf_event_counter) + 1;
+                id(wf_slot_start_ms)[slot] = now;
+                id(wf_slot_end_ms)[slot] = now;
+                id(wf_slot_zero_ms)[slot] = now;
+                id(wf_slot_pub_step)[slot] = 0;
+                // flags: bit0 = pre-roll covers the full start-window pre span
+                // (>= 1.5 s = 75 samples); bit6 = a clamped/error sample.
+                int fl = 0;
+                if (n >= 75) fl |= 0x01;
+                if (clamped) fl |= 0x40;
+                id(wf_slot_flags)[slot] = fl;
+                // propagation: earliest pre-roll sample already above the
+                // pressure transient threshold (baseline + 0.5 PSI).
+                int po = -1;
+                float thr = (id(wf_press_baseline) + 0.5f) * 100.0f;
+                for (int k = 0; k <= onset; k++) {
+                  if ((float) sp[k] >= thr) { po = k; break; }
+                }
+                id(wf_slot_press_onset_idx)[slot] = po;
+                id(wf_slot_phase)[slot] = 1;
+                id(wf_active_slot) = slot;
+                id(wf_dropped_active) = false;
+              } else if (!id(wf_dropped_active)) {
+                // Both slots busy — drop this event, count it exactly once.
+                id(wf_dropped_active) = true;
+                id(wf_overflow_count) = id(wf_overflow_count) + 1;
+                id(waveform_overflow_dropped_count).publish_state(
+                  (float) id(wf_overflow_count));
+              }
+            } else {
+              id(wf_dropped_active) = false;
+            }
+          } else {
+            // CAPTURING / WAITING-FOR-ZERO — append to the active slot.
+            int as = id(wf_active_slot);
+            int phase = id(wf_slot_phase)[as];
+            // Append once per `decim` ticks (in-place decimation cadence).
+            if (id(wf_tick) % (uint32_t) id(wf_slot_decim)[as] == 0) {
+              int len = id(wf_slot_len)[as];
+              if (len >= 480) {
+                // Capture buffer full — decimate 2x in place; span preserved.
+                int16_t *sf = slot_flow(as);
+                int16_t *sp = slot_press(as);
+                for (int k = 0; k < 240; k++) {
+                  sf[k] = sf[2 * k]; sp[k] = sp[2 * k];
+                }
+                len = 240;
+                id(wf_slot_len)[as] = len;
+                id(wf_slot_onset_idx)[as] = id(wf_slot_onset_idx)[as] / 2;
+                if (id(wf_slot_press_onset_idx)[as] >= 0)
+                  id(wf_slot_press_onset_idx)[as] =
+                    id(wf_slot_press_onset_idx)[as] / 2;
+                id(wf_slot_decim)[as] = id(wf_slot_decim)[as] * 2;
+                id(wf_slot_flags)[as] |= 0x04;  // resolution_reduced
+              }
+              int16_t *sf = slot_flow(as);
+              int16_t *sp = slot_press(as);
+              sf[len] = fi;
+              sp[len] = pi;
+              id(wf_slot_len)[as] = len + 1;
+              if (clamped) id(wf_slot_flags)[as] |= 0x40;
+            }
+            // Phase transitions.
+            if (flow_on) {
+              id(wf_slot_zero_ms)[as] = now;
+              if (phase == 2) id(wf_slot_phase)[as] = 1;
+            } else {
+              if (phase == 1) {
+                id(wf_slot_phase)[as] = 2;
+                id(wf_slot_end_ms)[as] = now;
+              }
+              if ((uint32_t) (now - id(wf_slot_zero_ms)[as]) >= 3000u) {
+                // FINALIZE — slot is ready for the publisher.
+                uint32_t dur = (uint32_t) (id(wf_slot_end_ms)[as] -
+                                           id(wf_slot_start_ms)[as]);
+                int fl = id(wf_slot_flags)[as] | 0x02;  // full_waveform_complete
+                if (dur < 1000u) fl |= 0x10;            // event_too_short
+                if (id(wf_slot_decim)[as] >= 4) fl |= 0x20;  // event_too_long
+                id(wf_slot_flags)[as] = fl;
+                id(wf_slot_phase)[as] = 3;
+                id(wf_slot_pub_step)[as] = 0;
+                id(wf_active_slot) = -1;
+              }
+            }
+          }
+
+          // ---- 4. publisher — one entity per tick, metadata published last ----
+          for (int s = 0; s < 2; s++) {
+            if (id(wf_slot_phase)[s] < 3) continue;
+            int step = id(wf_slot_pub_step)[s];
+            int decim = id(wf_slot_decim)[s];
+            int dt = 20 * decim;
+            int len = id(wf_slot_len)[s];
+            int onset = id(wf_slot_onset_idx)[s];
+            int pre_n = 1500 / dt;
+            if (pre_n > onset) pre_n = onset;
+            int lo = onset - pre_n;
+            if (lo < 0) lo = 0;
+            int hi = onset + 3500 / dt;
+            if (hi > len) hi = len;
+
+            if (step <= 3) {
+              bool is_start = (step <= 1);
+              bool is_flow = (step == 0) || (step == 2);
+              const int16_t *src = is_flow ? slot_flow(s) : slot_press(s);
+              int rlo = is_start ? lo : 0;
+              int rhi = is_start ? hi : len;
+              int npts = is_start ? 80 : 64;
+              int16_t pts[88];
+              resample(src, rlo, rhi, pts, npts);
+              uint8_t bytes[176];
+              for (int i = 0; i < npts; i++) {
+                uint16_t u = (uint16_t) pts[i];
+                bytes[2 * i] = (uint8_t) (u & 0xFF);
+                bytes[2 * i + 1] = (uint8_t) ((u >> 8) & 0xFF);
+              }
+              std::string payload = b36(id(wf_boot_id)) + ":" +
+                b36(id(wf_slot_event_id)[s]) + ":" + b64(bytes, npts * 2);
+              esphome::text_sensor::TextSensor *ent =
+                  (step == 0) ? &id(event_start_flow_waveform)
+                : (step == 1) ? &id(event_start_pressure_waveform)
+                : (step == 2) ? &id(event_full_flow_waveform)
+                              : &id(event_full_pressure_waveform);
+              ent->publish_state(payload);
+            } else {
+              // event_metadata — published LAST as the add-on's commit signal.
+              const int16_t *sf = slot_flow(s);
+              const int16_t *sp = slot_press(s);
+              int pk = 0, pmin = 32767, pmax = -32768;
+              for (int k = 0; k < len; k++) {
+                if (sf[k] > pk) pk = sf[k];
+                if (sp[k] < pmin) pmin = sp[k];
+                if (sp[k] > pmax) pmax = sp[k];
+              }
+              int dp = (len > 0 && pmax >= pmin) ? (pmax - pmin) : 0;
+              int pd = -1;
+              int po = id(wf_slot_press_onset_idx)[s];
+              if (po >= 0 && po <= onset) pd = (onset - po) * dt;
+              int pre_ms = (onset - lo) * dt;
+              int post_ms = (hi - onset) * dt;
+              int fl = id(wf_slot_flags)[s];
+              int q = (fl & 0x01) ? 0 : 1;
+              char buf[256];
+              snprintf(buf, sizeof(buf),
+                "{\"id\":%u,\"b\":%u,\"v\":1,\"s\":%u,\"e\":%u,\"p\":%u,"
+                "\"sn\":80,\"fn\":64,\"pre\":%d,\"post\":%d,\"tl\":3000,"
+                "\"fs\":100,\"ps\":100,\"pk\":%d,\"dp\":%d,\"pd\":%d,"
+                "\"q\":%d,\"fl\":%d}",
+                (unsigned) id(wf_slot_event_id)[s], (unsigned) id(wf_boot_id),
+                (unsigned) id(wf_slot_start_ms)[s],
+                (unsigned) id(wf_slot_end_ms)[s], (unsigned) now,
+                pre_ms, post_ms, pk, dp, pd, q, fl);
+              id(event_metadata).publish_state(std::string(buf));
+            }
+
+            id(wf_slot_pub_step)[s] = step + 1;
+            if (step >= 4) id(wf_slot_phase)[s] = 0;  // slot free
+            break;  // at most one entity published per tick
+          }
 
 # =============================================================================
 # SCRIPTS — Leak test sequences
