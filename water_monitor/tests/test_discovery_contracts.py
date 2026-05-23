@@ -23,13 +23,16 @@ from water_monitor.app.device_discovery import (
     match_entities_to_roles,
 )
 
-# Waveform roles that are ESPHome text_sensor: entities (domain = "text_sensor")
-_WF_TEXT_SENSOR_ROLES = frozenset({
+# All six waveform roles — ESPHome text_sensor: and sensor: components both
+# appear as "sensor" domain in HA (the HA ESPHome integration maps text_sensor
+# to sensor.* entity IDs).
+_WF_ALL_ROLES = frozenset({
     "wf_start_flow_sensor",
     "wf_start_pressure_sensor",
     "wf_full_flow_sensor",
     "wf_full_pressure_sensor",
     "wf_metadata_sensor",
+    "wf_overflow_count_sensor",
 })
 
 
@@ -326,96 +329,68 @@ def test_regex_fallback_used_when_no_labels():
 
 
 # =============================================================================
-# 13. Waveform role domains — ESPHome text_sensor: entities must be "text_sensor"
+# 13. Waveform role domains — all 6 wf_* roles must use "sensor" domain
 # =============================================================================
 
-def test_waveform_text_sensor_roles_have_text_sensor_domain():
-    """The 5 waveform window/metadata roles must declare domain 'text_sensor',
-    not 'sensor', so that match_entities_to_roles() finds them in the HA registry."""
+def test_all_waveform_roles_have_sensor_domain():
+    """All 6 wf_* roles must declare domain 'sensor'.
+
+    ESPHome text_sensor: components are exposed as sensor.* entities in HA
+    (the HA ESPHome integration maps text_sensor to the sensor platform).
+    A wrong domain would cause match_entities_to_roles() to skip every
+    matching entity and leave all wf_* rows empty after rescan.
+    """
     patterns = ROLE_PATTERNS["circuit_1"]
-    for role in _WF_TEXT_SENSOR_ROLES:
+    for role in _WF_ALL_ROLES:
         assert role in patterns, f"Role '{role}' missing from ROLE_PATTERNS['circuit_1']"
         _, domain = patterns[role]
-        assert domain == "text_sensor", (
+        assert domain == "sensor", (
             f"ROLE_PATTERNS['circuit_1']['{role}'] has domain {domain!r}; "
-            f"expected 'text_sensor' (ESPHome text_sensor: entities are never "
-            f"exposed under the 'sensor' domain in HA)."
+            f"expected 'sensor' — the HA ESPHome integration exposes all "
+            f"text_sensor: entities under the sensor.* domain."
         )
 
 
-def test_wf_overflow_count_sensor_has_sensor_domain():
-    """The overflow counter is a numeric sensor: entity — domain must stay 'sensor'."""
-    _, domain = ROLE_PATTERNS["circuit_1"]["wf_overflow_count_sensor"]
-    assert domain == "sensor", (
-        f"wf_overflow_count_sensor domain is {domain!r}; expected 'sensor'."
-    )
-
-
-def test_waveform_text_sensor_roles_match_correct_domain_entities():
-    """match_entities_to_roles() finds waveform text_sensor entities when domain='text_sensor'."""
+def test_waveform_roles_match_sensor_domain_entities():
+    """match_entities_to_roles() finds all 6 wf_* entities when they use sensor.* domain."""
     device_id = "dev_123"
     pfx = "esp_water_shut_off_3_"
-    # Provide one entity per wf text_sensor role in the correct domain
     entities = [
         {
             "device_id": device_id,
-            "entity_id": f"text_sensor.{pfx}event_start_flow_waveform_main",
-            "original_name": "Event Start Flow Waveform Main",
+            "entity_id": f"sensor.{pfx}event_start_flow_waveform_main",
+            "original_name": "Event Start Flow Waveform - Main",
         },
         {
             "device_id": device_id,
-            "entity_id": f"text_sensor.{pfx}event_start_pressure_waveform_main",
-            "original_name": "Event Start Pressure Waveform Main",
+            "entity_id": f"sensor.{pfx}event_start_pressure_waveform_main",
+            "original_name": "Event Start Pressure Waveform - Main",
         },
         {
             "device_id": device_id,
-            "entity_id": f"text_sensor.{pfx}event_full_flow_waveform_main",
-            "original_name": "Event Full Flow Waveform Main",
+            "entity_id": f"sensor.{pfx}event_full_flow_waveform_main",
+            "original_name": "Event Full Flow Waveform - Main",
         },
         {
             "device_id": device_id,
-            "entity_id": f"text_sensor.{pfx}event_full_pressure_waveform_main",
-            "original_name": "Event Full Pressure Waveform Main",
+            "entity_id": f"sensor.{pfx}event_full_pressure_waveform_main",
+            "original_name": "Event Full Pressure Waveform - Main",
         },
         {
             "device_id": device_id,
-            "entity_id": f"text_sensor.{pfx}event_metadata_main",
-            "original_name": "Event Metadata Main",
+            "entity_id": f"sensor.{pfx}event_metadata_main",
+            "original_name": "Event Metadata - Main",
         },
         {
             "device_id": device_id,
             "entity_id": f"sensor.{pfx}waveform_overflow_dropped_count_main",
-            "original_name": "Waveform Overflow Dropped Count Main",
+            "original_name": "Waveform Overflow Dropped Count - Main",
         },
     ]
     matches, _ = match_entities_to_roles(device_id, entities, ["circuit_1"])
-    for role in _WF_TEXT_SENSOR_ROLES:
+    for role in _WF_ALL_ROLES:
         m = next(x for x in matches["circuit_1"] if x.role == role)
-        assert m.matched, f"{role} should match a text_sensor entity"
-        assert m.entity_id.startswith("text_sensor."), (
-            f"{role} matched {m.entity_id!r}; expected a text_sensor entity"
+        assert m.matched, f"{role} should match a sensor.* entity"
+        assert m.entity_id.startswith("sensor."), (
+            f"{role} matched {m.entity_id!r}; expected a sensor.* entity"
         )
-
-    overflow = next(x for x in matches["circuit_1"] if x.role == "wf_overflow_count_sensor")
-    assert overflow.matched
-    assert overflow.entity_id.startswith("sensor.")
-
-
-def test_waveform_sensor_entities_not_matched_to_text_sensor_roles():
-    """Entities with domain 'sensor' must NOT match text_sensor waveform roles."""
-    device_id = "dev_123"
-    pfx = "esp_water_shut_off_3_"
-    # Provide entities in the WRONG domain (sensor instead of text_sensor)
-    wrong_domain_entities = [
-        {
-            "device_id": device_id,
-            "entity_id": f"sensor.{pfx}event_metadata_main",
-            "original_name": "Event Metadata Main",
-        },
-    ]
-    matches, _ = match_entities_to_roles(device_id, wrong_domain_entities, ["circuit_1"])
-    meta = next(x for x in matches["circuit_1"] if x.role == "wf_metadata_sensor")
-    assert not meta.matched, (
-        "wf_metadata_sensor must NOT match a 'sensor' domain entity — "
-        "it should only match 'text_sensor' domain entities."
-    )
