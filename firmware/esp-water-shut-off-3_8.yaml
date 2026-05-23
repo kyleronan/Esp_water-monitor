@@ -1045,11 +1045,14 @@ sensor:
             }
 
         # --- Fault response: close the main valve ---
-        # Guarded by the closed end stop so valve.close is only called once —
-        # not repeatedly on every sensor tick while the valve is already shut.
+        # Gated on close_in_flight_main so valve.close is requested exactly
+        # once per fault event — not on every sensor tick during the 15s
+        # travel window (or while waiting for an end stop after a failed
+        # close). The closed end stop alone is not sufficient: it stays off
+        # for the full travel time and indefinitely after a motor fault.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state;'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
             then:
               - valve.close: main_water_valve
 
@@ -1190,11 +1193,14 @@ sensor:
               ESP_LOGI("leak_test", "IRRIGATION: leak test complete — no leak detected after %.0f minutes",
                 id(leak_duration_irr).state);
             }
-        # Guarded by the closed end stop so valve.close is only called once —
-        # not repeatedly on every sensor tick while the valve is already shut.
+        # Gated on close_in_flight_irr so valve.close is requested exactly
+        # once per fault event — not on every sensor tick during the 15s
+        # travel window (or while waiting for an end stop after a failed
+        # close). The closed end stop alone is not sufficient: it stays off
+        # for the full travel time and indefinitely after a motor fault.
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state;'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
             then:
               - valve.close: irrigation_water_valve
 
@@ -1410,9 +1416,10 @@ sensor:
                 instant_lpm, id(burst_threshold_main).state);
             }
         # Fault response — close valve if not already closing.
+        # close_in_flight_main is the one-shot; see leak-test handler above.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state;'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
             then:
               - valve.close: main_water_valve
 
@@ -1494,10 +1501,10 @@ sensor:
                 ESP_LOGD("safety", "MAIN: high flow detected (%.2f L/min) — alert disabled", x);
               }
             }
-        # Guarded by the closed end stop so valve.close is only called once.
+        # Gated on close_in_flight_main so valve.close fires once per fault.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state;'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
             then:
               - valve.close: main_water_valve
 
@@ -1540,7 +1547,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(trickle_alert_main) && id(trickle_shutoff_main) && !id(closed_end_stop_valve1).state;'
+              lambda: 'return id(trickle_alert_main) && id(trickle_shutoff_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
             then:
               - valve.close: main_water_valve
 
@@ -1609,7 +1616,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state;'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
             then:
               - valve.close: irrigation_water_valve
 
@@ -1672,10 +1679,10 @@ sensor:
                 ESP_LOGD("safety", "IRRIGATION: high flow detected (%.2f L/min) — alert disabled", x);
               }
             }
-        # Guarded by the closed end stop so valve.close is only called once.
+        # Gated on close_in_flight_irr so valve.close fires once per fault.
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state;'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
             then:
               - valve.close: irrigation_water_valve
 
@@ -1703,7 +1710,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(trickle_alert_irr) && id(trickle_shutoff_irr) && !id(closed_end_stop_valve2).state;'
+              lambda: 'return id(trickle_alert_irr) && id(trickle_shutoff_irr) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
             then:
               - valve.close: irrigation_water_valve
 
