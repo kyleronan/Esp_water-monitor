@@ -426,7 +426,10 @@ CREATE TABLE IF NOT EXISTS events (
     esp_waveform_used                INTEGER,
     waveform_event_id                INTEGER,
     waveform_quality                 INTEGER,
-    waveform_overlap_score           REAL
+    waveform_overlap_score           REAL,
+    -- Signature provenance — which source generated the shape signatures.
+    -- 'software' (default) | 'esp_full_flow' | 'esp_full_pressure' | 'esp_full_flow_pressure'
+    signature_source                 TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_circuit_ts
