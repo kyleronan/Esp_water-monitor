@@ -130,13 +130,14 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "leak_test_duration_number":  (r"leak test duration.*main",                    "number"),
         # Per-event waveform capture (firmware 3.7.0+) — circuit_1 only in Phase 1.
         # All marked optional; absent on older firmware → graceful legacy fallback.
-        # The four waveform windows and metadata are ESPHome text_sensor: entities → domain "text_sensor".
-        # Only the overflow diagnostic counter is a numeric sensor: entity → domain "sensor".
-        "wf_start_flow_sensor":       (r"event start flow waveform.*main",             "text_sensor"),
-        "wf_start_pressure_sensor":   (r"event start pressure waveform.*main",         "text_sensor"),
-        "wf_full_flow_sensor":        (r"event full flow waveform.*main",              "text_sensor"),
-        "wf_full_pressure_sensor":    (r"event full pressure waveform.*main",          "text_sensor"),
-        "wf_metadata_sensor":         (r"event metadata.*main",                        "text_sensor"),
+        # ESPHome text_sensor: components are exposed as "sensor" domain in HA
+        # (the HA ESPHome integration maps all text_sensor entities to sensor.*).
+        # All six wf_* entities therefore use domain "sensor".
+        "wf_start_flow_sensor":       (r"event start flow waveform.*main",             "sensor"),
+        "wf_start_pressure_sensor":   (r"event start pressure waveform.*main",         "sensor"),
+        "wf_full_flow_sensor":        (r"event full flow waveform.*main",              "sensor"),
+        "wf_full_pressure_sensor":    (r"event full pressure waveform.*main",          "sensor"),
+        "wf_metadata_sensor":         (r"event metadata.*main",                        "sensor"),
         "wf_overflow_count_sensor":   (r"waveform overflow dropped count.*main",       "sensor"),
     },
     "circuit_2": {   # was "irrigation" — regex patterns match default firmware names
