@@ -14,7 +14,7 @@ import pytest
 
 from water_monitor.app.device_discovery import ROLE_PATTERNS
 
-_FIRMWARE_YAML = Path(__file__).parent.parent.parent / "firmware" / "esp-water-shut-off-3_6.yaml"
+_FIRMWARE_YAML = Path(__file__).parent.parent.parent / "firmware" / "esp-water-shut-off-3_7.yaml"
 
 
 def _firmware_text() -> str:
