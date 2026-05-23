@@ -1486,6 +1486,11 @@ sensor:
       - sliding_window_moving_average:
           window_size: 20
           send_every: 1
+      # Throttle to 4Hz for downstream consumers (HA recorder, web dashboard,
+      # add-on event_detector — which is documented as 1Hz). Avoids flooding
+      # the web_server SSE stream and HA. on_value safety checks below run at
+      # the throttled rate; the fast burst path is on flow_base_main at 25ms.
+      - throttle: 250ms
     on_value:
       then:
         # --- Check 1: Burst pipe high flow fault ---
@@ -1664,6 +1669,8 @@ sensor:
       - sliding_window_moving_average:
           window_size: 20
           send_every: 1
+      # Throttle to 4Hz — see water_usage1 comment.
+      - throttle: 250ms
     on_value:
       then:
         # --- Check 1: Burst pipe high flow fault ---
