@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 from .config import AddonConfig, SENSITIVITY_PRESETS, DB_PATH
 from .database import (get_sensitivity_config, ensure_circuit_defaults, init_db)
 from .device_discovery import (load_circuit_entities, is_setup_complete,
-                                get_device_config)
+                                get_device_config, rescan_optional_roles)
 from .event_detector import EventDetector
 from .feature_extractor import FeatureExtractor
 from .ha_client import HaClient
@@ -303,6 +303,27 @@ class Orchestrator:
         self.reload_circuit_entities()
         self.reload_circuit_labels()
         self.reload_circuit_profiles()
+
+        # On already-configured systems, scan for optional roles that may have appeared
+        # after a firmware upgrade (e.g. waveform entities added in 3.7.0).
+        # This runs before EventDetector is constructed so that CircuitConfig waveform
+        # fields are populated before setup() subscribes entities.
+        # Never calls save_discovery() — never clears existing mappings.
+        if self.setup_complete:
+            try:
+                _rescan = await rescan_optional_roles(
+                    self._ha,
+                    self._db,
+                    [c.circuit for c in self._cfg.circuits],
+                )
+                if _rescan.total_changed:
+                    log.info(
+                        "Optional-role rescan: %d new entity mapping(s) added — reloading",
+                        _rescan.total_changed,
+                    )
+                    self.reload_circuit_entities()
+            except Exception as _e:
+                log.warning("Optional-role rescan failed (non-fatal): %s", _e)
 
         # Event queue
         self._event_queue = asyncio.Queue(maxsize=1000)

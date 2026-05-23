@@ -130,11 +130,13 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "leak_test_duration_number":  (r"leak test duration.*main",                    "number"),
         # Per-event waveform capture (firmware 3.7.0+) — circuit_1 only in Phase 1.
         # All marked optional; absent on older firmware → graceful legacy fallback.
-        "wf_start_flow_sensor":       (r"event start flow waveform.*main",             "sensor"),
-        "wf_start_pressure_sensor":   (r"event start pressure waveform.*main",         "sensor"),
-        "wf_full_flow_sensor":        (r"event full flow waveform.*main",              "sensor"),
-        "wf_full_pressure_sensor":    (r"event full pressure waveform.*main",          "sensor"),
-        "wf_metadata_sensor":         (r"event metadata.*main",                        "sensor"),
+        # The four waveform windows and metadata are ESPHome text_sensor: entities → domain "text_sensor".
+        # Only the overflow diagnostic counter is a numeric sensor: entity → domain "sensor".
+        "wf_start_flow_sensor":       (r"event start flow waveform.*main",             "text_sensor"),
+        "wf_start_pressure_sensor":   (r"event start pressure waveform.*main",         "text_sensor"),
+        "wf_full_flow_sensor":        (r"event full flow waveform.*main",              "text_sensor"),
+        "wf_full_pressure_sensor":    (r"event full pressure waveform.*main",          "text_sensor"),
+        "wf_metadata_sensor":         (r"event metadata.*main",                        "text_sensor"),
         "wf_overflow_count_sensor":   (r"waveform overflow dropped count.*main",       "sensor"),
     },
     "circuit_2": {   # was "irrigation" — regex patterns match default firmware names
@@ -599,3 +601,186 @@ def get_device_config(db: sqlite3.Connection) -> Optional[Dict[str, Any]]:
         "SELECT * FROM device_config WHERE id = 1"
     ).fetchone()
     return dict(row) if row else None
+
+
+# ------------------------------------------------------------------
+# Optional-role re-discovery after firmware upgrades
+# ------------------------------------------------------------------
+
+# sw_version values that must never be written to fw_version.
+# Checked case-insensitively after stripping whitespace.
+_UNTRUSTWORTHY_FW = {"", "unknown", "unavailable", "none", "null"}
+
+
+def merge_optional_roles(
+    db: sqlite3.Connection,
+    circuit: str,
+    matches: List[EntityMatch],
+) -> int:
+    """Insert or update optional-role rows in circuit_entity_map without
+    overwriting user-confirmed or already-mapped entries.
+
+    Rules (applied in order per match):
+    1. Skip if ``not m.matched``, ``not m.entity_id``, or
+       ``m.role not in OPTIONAL_ROLES``.
+    2. Row missing → INSERT with confirmed=0.
+    3. Row exists, entity_id NULL/empty, confirmed=0 → UPDATE entity_id and entity_name.
+    4. Row exists, entity_id non-empty → do NOT overwrite.
+    5. Row exists, confirmed=1 → do NOT overwrite (even if entity_id is empty).
+
+    Returns the number of rows inserted or updated.  Idempotent: a second run
+    with the same data returns 0.  Commits only when at least one row changed.
+    """
+    changed = 0
+    cursor = db.cursor()
+
+    for m in matches:
+        if not m.matched or not m.entity_id or m.role not in OPTIONAL_ROLES:
+            continue
+
+        row = cursor.execute(
+            "SELECT entity_id, confirmed FROM circuit_entity_map WHERE circuit=? AND role=?",
+            (circuit, m.role),
+        ).fetchone()
+
+        if row is None:
+            # Rule 2: row missing → INSERT
+            cursor.execute(
+                """INSERT INTO circuit_entity_map (circuit, role, entity_id, entity_name, confirmed)
+                   VALUES (?, ?, ?, ?, 0)""",
+                (circuit, m.role, m.entity_id, m.original_name),
+            )
+            changed += cursor.rowcount
+        else:
+            existing_id = row[0] or ""
+            confirmed = row[1] or 0
+            if existing_id or confirmed:
+                # Rule 4 or 5: non-empty entity_id OR confirmed=1 → do NOT overwrite
+                continue
+            # Rule 3: entity_id NULL/empty and confirmed=0 → UPDATE
+            cursor.execute(
+                """UPDATE circuit_entity_map
+                   SET entity_id=?, entity_name=?
+                   WHERE circuit=? AND role=?
+                     AND (entity_id IS NULL OR entity_id='')
+                     AND confirmed=0""",
+                (m.entity_id, m.original_name, circuit, m.role),
+            )
+            changed += cursor.rowcount
+
+    if changed:
+        db.commit()
+
+    return changed
+
+
+@dataclass
+class OptionalRoleRescanResult:
+    """Result of :func:`rescan_optional_roles`."""
+    total_changed: int
+    per_circuit: Dict[str, int]
+    fw_version_updated: bool = False
+    fw_version: Optional[str] = None
+
+
+async def rescan_optional_roles(
+    ha,
+    db: sqlite3.Connection,
+    circuits: List[str],
+) -> OptionalRoleRescanResult:
+    """Scan the HA entity registry for optional roles not yet in circuit_entity_map.
+
+    Safe to call on an already-configured system — never invokes
+    :func:`save_discovery`, never overwrites confirmed or non-empty mappings.
+    Idempotent: a second run against a fully-populated DB returns 0 changed rows.
+
+    Returns an :class:`OptionalRoleRescanResult` describing what changed.
+    """
+    zero = OptionalRoleRescanResult(
+        total_changed=0,
+        per_circuit={c: 0 for c in circuits},
+    )
+
+    cfg = get_device_config(db)
+    if not cfg or not cfg.get("setup_complete") or not cfg.get("ha_device_id"):
+        log.debug("rescan_optional_roles: setup not complete or ha_device_id missing — skipping")
+        return zero
+
+    ha_device_id: str = cfg["ha_device_id"]
+
+    try:
+        devices = await ha.get_devices()
+        entity_registry = await ha.get_entity_registry()
+    except Exception as exc:  # pragma: no cover
+        log.warning("rescan_optional_roles: failed to query HA — %s", exc)
+        return zero
+
+    # Find the target DiscoveredDevice
+    target_device: Optional[DiscoveredDevice] = None
+    for raw in devices:
+        d = _to_device(raw)
+        if d.id == ha_device_id:
+            target_device = d
+            break
+
+    if target_device is None:
+        log.warning(
+            "rescan_optional_roles: device %s not found in HA device registry",
+            ha_device_id,
+        )
+        return zero
+
+    # Filter entity registry to this device only (prevent cross-device contamination)
+    device_entities = [e for e in entity_registry if e.get("device_id") == ha_device_id]
+
+    # Resolve diagnostic circuit labels scoped to this device's entities
+    try:
+        diag_labels = await _resolve_labels_from_diagnostics(ha, device_entities)
+    except Exception as exc:  # pragma: no cover
+        log.warning("rescan_optional_roles: label resolution failed — %s", exc)
+        diag_labels = {}
+
+    # Match entities to roles (uses device-scoped entity list)
+    circuit_matches, _prefix = match_entities_to_roles(
+        ha_device_id, device_entities, circuits, labels=diag_labels
+    )
+
+    # Merge optional roles per circuit, counting new rows
+    per_circuit: Dict[str, int] = {}
+    total_changed = 0
+    for circuit in circuits:
+        n = merge_optional_roles(db, circuit, circuit_matches.get(circuit, []))
+        per_circuit[circuit] = n
+        if n:
+            log.info("[%s] %d new optional entities discovered", circuit, n)
+        total_changed += n
+
+    # Update stored fw_version if the reported version is trustworthy and different.
+    # Never overwrite with empty / sentinel strings.
+    fw_version_updated = False
+    new_fw: Optional[str] = None
+    raw_sw = (target_device.sw_version or "").strip()
+    if raw_sw and raw_sw.lower() not in _UNTRUSTWORTHY_FW:
+        # Strip HA suffix: "3.7.0 (ESPHome 2024.11.0)" → "3.7.0"
+        fw_str = raw_sw.split("(")[0].strip()
+        if fw_str:
+            stored_fw = (cfg.get("fw_version") or "").strip()
+            if fw_str != stored_fw:
+                db.execute(
+                    "UPDATE device_config SET fw_version=? WHERE id=1",
+                    (fw_str,),
+                )
+                db.commit()
+                fw_version_updated = True
+                new_fw = fw_str
+                log.info(
+                    "rescan_optional_roles: fw_version updated %r → %r",
+                    stored_fw, fw_str,
+                )
+
+    return OptionalRoleRescanResult(
+        total_changed=total_changed,
+        per_circuit=per_circuit,
+        fw_version_updated=fw_version_updated,
+        fw_version=new_fw,
+    )
