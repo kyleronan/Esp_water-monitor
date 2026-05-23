@@ -3154,7 +3154,7 @@ interval:
                 // Both slots busy — drop this event, count it exactly once.
                 id(wf_dropped_active) = true;
                 id(wf_overflow_count) = id(wf_overflow_count) + 1;
-                id(waveform_overflow_dropped_count).publish_state(
+                id(waveform_overflow_dropped_count)->publish_state(
                   (float) id(wf_overflow_count));
               }
             } else {
@@ -3246,12 +3246,10 @@ interval:
               }
               std::string payload = b36(id(wf_boot_id)) + ":" +
                 b36(id(wf_slot_event_id)[s]) + ":" + b64(bytes, npts * 2);
-              esphome::text_sensor::TextSensor *ent =
-                  (step == 0) ? &id(event_start_flow_waveform)
-                : (step == 1) ? &id(event_start_pressure_waveform)
-                : (step == 2) ? &id(event_full_flow_waveform)
-                              : &id(event_full_pressure_waveform);
-              ent->publish_state(payload);
+              if      (step == 0) id(event_start_flow_waveform)->publish_state(payload);
+              else if (step == 1) id(event_start_pressure_waveform)->publish_state(payload);
+              else if (step == 2) id(event_full_flow_waveform)->publish_state(payload);
+              else                id(event_full_pressure_waveform)->publish_state(payload);
             } else {
               // event_metadata — published LAST as the add-on's commit signal.
               const int16_t *sf = slot_flow(s);
@@ -3280,7 +3278,7 @@ interval:
                 (unsigned) id(wf_slot_start_ms)[s],
                 (unsigned) id(wf_slot_end_ms)[s], (unsigned) now,
                 pre_ms, post_ms, pk, dp, pd, q, fl);
-              id(event_metadata).publish_state(std::string(buf));
+              id(event_metadata)->publish_state(std::string(buf));
             }
 
             id(wf_slot_pub_step)[s] = step + 1;
