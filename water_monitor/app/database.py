@@ -391,6 +391,13 @@ CREATE TABLE IF NOT EXISTS events (
     --   'excluded_from_training' — caller skipped match_and_learn entirely
     -- NULL when the event matched cleanly.
     match_rejection_reason      TEXT,
+    -- Cluster match quality (written by _cluster_event after insert)
+    match_confidence            REAL,    -- 0.0–1.0; NULL = unmatched
+    match_level                 TEXT,    -- 'preliminary'|'confirmed'|NULL
+    -- Inter-event sequence context (written by _cluster_event)
+    seconds_since_prev_event    REAL,    -- gap from previous event end → this start
+    seconds_to_next_event       REAL,    -- retroactively filled when next event arrives
+    prev_cluster_id             INTEGER, -- cluster_id of the preceding event
     fixture_id                  TEXT REFERENCES fixtures(id),
     anomaly_score               REAL,
     anomaly_type                TEXT,
@@ -601,6 +608,44 @@ CREATE TABLE IF NOT EXISTS data_retention (
 );
 
 INSERT OR IGNORE INTO data_retention (id) VALUES (1);
+
+-- ==========================================================================
+-- CIRCUIT DISPLAY LABELS (added migration 023)
+-- Maps circuit_id → user-visible display name (e.g. "Main", "Irrigation").
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS circuit_labels (
+    circuit_id   TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL
+);
+
+-- ==========================================================================
+-- FIXTURE HA ENTITY MAP (added migration 025)
+-- Tracks MQTT Discovery entities published to HA for each fixture.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS fixture_ha_entity_map (
+    fixture_id          TEXT REFERENCES fixtures(id),
+    ha_entity_id        TEXT NOT NULL,
+    device_class        TEXT,
+    unit_of_measurement TEXT,
+    last_published_at   TIMESTAMP,
+    retracted_at        TIMESTAMP,
+    PRIMARY KEY (fixture_id, ha_entity_id)
+);
+
+-- ==========================================================================
+-- FIXTURE DAILY SUMMARY (added migration 027)
+-- Aggregated per-fixture daily stats used for analytics and MQTT publishing.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS fixture_daily_summary (
+    circuit              TEXT NOT NULL,
+    fixture_id           TEXT NOT NULL REFERENCES fixtures(id),
+    day                  DATE NOT NULL,
+    event_count          INTEGER,
+    total_volume_litres  REAL,
+    avg_flow_lpm         REAL,
+    peak_flow_lpm        REAL,
+    PRIMARY KEY (circuit, fixture_id, day)
+);
     """)
     conn.commit()
     _apply_post_create_migrations(conn)
