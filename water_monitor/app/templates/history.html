@@ -210,7 +210,9 @@
             data-anomaly-score="{{ (e.anomaly_score * 100)|round(1) if e.anomaly_score is not none else '' }}"
             data-anomaly-type="{{ e.anomaly_type or '' }}"
             data-composite="{{ '1' if e.is_composite else '0' }}"
-            data-other-valve="{{ e.other_valve_open if e.other_valve_open is not none else '' }}">
+            data-other-valve="{{ e.other_valve_open if e.other_valve_open is not none else '' }}"
+            data-pressure-sig="{{ e.pressure_signature_json or '' }}"
+            data-waveform-used="{{ e.esp_waveform_used or 0 }}">
           <td class="hist-td hist-td-mono hist-td-time"><time data-ts="{{ e.start_ts or '' }}">{{ (e.start_ts or '')[:16] }}</time></td>
           <td class="hist-td">{{ fmt_duration(e.duration_seconds) }}</td>
           <td class="hist-td hist-td-mono">{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else "—" }} {{ flow_unit }}</td>
@@ -287,6 +289,19 @@
         <dt>Other valve</dt>   <dd id="emd-other-valve"></dd>
       </dl>
     </details>
+    <div id="emd-wf-section" class="evt-modal-wf" hidden>
+      <div class="evt-modal-wf-hdr">
+        <span class="evt-modal-wf-label">Waveform shape</span>
+        <span id="emd-esp-badge" class="wf-esp-badge" hidden
+              title="Waveform captured directly by ESP firmware"
+              aria-label="Waveform captured directly by ESP firmware">ESP</span>
+      </div>
+      <div class="evt-modal-wf-wrap">
+        <canvas id="emd-wf-chart" role="img"
+                aria-label="Normalized flow and pressure waveform chart"></canvas>
+      </div>
+      <div id="emd-wf-meta" class="evt-modal-wf-meta"></div>
+    </div>
     <hr class="evt-modal-hr">
     <div class="evt-modal-section">
       <label class="evt-modal-label" for="emd-fixture-select">Assign fixture type</label>
@@ -498,6 +513,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   }
 
   let activeRow = null;
+  let wfChart   = null;
 
   function openModal(row) {
     activeRow = row;
@@ -544,9 +560,106 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     errBox.textContent = '';
     modal.classList.add('is-open');
     modal.focus();
+
+    // ── Waveform chart ────────────────────────────────────────────────────────
+    const wfSection   = document.getElementById('emd-wf-section');
+    const espBadge    = document.getElementById('emd-esp-badge');
+    const wfMeta      = document.getElementById('emd-wf-meta');
+    const chartCanvas = document.getElementById('emd-wf-chart');
+    const flowSig     = row.querySelector('.shape-spark')?.dataset.sig || '';
+    const pressSig    = row.dataset.pressureSig || '';
+    const wfUsed      = row.dataset.waveformUsed === '1';
+
+    if (wfChart) { wfChart.destroy(); wfChart = null; }
+
+    if (!window.Chart) {
+      console.warn('[evt-modal] Chart.js unavailable; waveform chart skipped');
+      wfSection.hidden = true;
+      espBadge.hidden  = true;
+      wfMeta.textContent = '';
+    } else {
+      let flowPts = [], pressPts = [];
+      try { flowPts  = flowSig  ? JSON.parse(flowSig)  : []; }
+      catch (err) { console.warn('[evt-modal] invalid flow signature JSON', err); }
+      try { pressPts = pressSig ? JSON.parse(pressSig) : []; }
+      catch (err) { console.warn('[evt-modal] invalid pressure signature JSON', err); }
+
+      const pressHasData = pressPts.some(v => Math.abs(Number(v) || 0) > 0.01);
+      const hasFlow = flowPts.length > 0;
+
+      wfSection.hidden = !hasFlow;
+      espBadge.hidden  = !wfUsed;
+
+      if (hasFlow) {
+        const labels = flowPts.map((_, i) => i);
+        const datasets = [{
+          label: 'Flow',
+          data: flowPts,
+          borderColor: 'oklch(55% .18 240)',
+          backgroundColor: 'oklch(55% .18 240 / .12)',
+          fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
+        }];
+        if (pressHasData) {
+          datasets.push({
+            label: 'Pressure',
+            data: pressPts,
+            borderColor: 'oklch(55% .18 30)',
+            backgroundColor: 'transparent',
+            fill: false, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
+          });
+        }
+
+        wfChart = new Chart(chartCanvas, {
+          type: 'line',
+          data: { labels, datasets },
+          options: {
+            animation: false,
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: {
+                display: pressHasData,
+                labels: { boxWidth: 12, font: { size: 11 } },
+              },
+            },
+            scales: {
+              x: { display: false },
+              y: { display: false, min: 0, max: 1 },
+            },
+          },
+        });
+
+        const channels = pressHasData ? 'flow + pressure' : 'flow only';
+        chartCanvas.setAttribute(
+          'aria-label',
+          `Normalized ${channels} waveform, ${flowPts.length} samples`
+        );
+
+        const source  = wfUsed ? 'ESP captured' : 'event computed';
+        const pkText  = d.peakFlow ? ` · peak ${d.peakFlow} ${flowUnit}` : '';
+        const pressureNum = Number.parseFloat(d.pressure);
+        const dpText  = Number.isFinite(pressureNum) && Math.abs(pressureNum) > 0.01
+          ? ` · drop ${d.pressure} ${pressUnit}`
+          : '';
+        wfMeta.textContent =
+          `${source} · ${flowPts.length} samples · ${channels}${pkText}${dpText}`;
+        const note = document.createElement('span');
+        note.textContent = 'Values show shape only, not actual flow or pressure units.';
+        wfMeta.appendChild(document.createElement('br'));
+        wfMeta.appendChild(note);
+      } else {
+        wfMeta.textContent = '';
+      }
+    }
   }
 
-  function closeModal() { modal.classList.remove('is-open'); activeRow = null; }
+  function closeModal() {
+    modal.classList.remove('is-open');
+    activeRow = null;
+    if (wfChart) { wfChart.destroy(); wfChart = null; }
+    document.getElementById('emd-wf-meta').textContent = '';
+    document.getElementById('emd-wf-section').hidden   = true;
+  }
 
   function fmtTs(iso) {
     if (!iso) return '—';
@@ -618,8 +731,9 @@ document.querySelectorAll('canvas.shape-spark').forEach(canvas => {
   const w = canvas.width, h = canvas.height;
   const ctx = canvas.getContext('2d');
   const max = Math.max(...sig, 0.001);
+  const px = 1; // inset prevents 1.5 px stroke from clipping at canvas edges
   const pts = sig.map((v, i) => ({
-    x: (i / (sig.length - 1)) * w,
+    x: px + (i / (sig.length - 1)) * (w - 2 * px),
     y: h - (v / max) * (h - 2) - 1,
   }));
   ctx.beginPath();
