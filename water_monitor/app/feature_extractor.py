@@ -390,9 +390,12 @@ _WF_MATCH_MIN_SCORE: float = 0.55
 _WF_MATCH_WINDOW_S: float = 90.0
 
 # Waveform flag bits (must match firmware wire format).
-_WF_FL_START_COMPLETE:     int = 0x01
-_WF_FL_FULL_COMPLETE:      int = 0x02
+_WF_FL_START_COMPLETE:     int = 0x01  # pre-roll covers full start-window span
+_WF_FL_FULL_COMPLETE:      int = 0x02  # full-window capture is complete
 _WF_FL_RESOLUTION_REDUCED: int = 0x04  # buffer decimated; lower sample rate
+_WF_FL_EVENT_TOO_SHORT:    int = 0x10  # firmware duration < 1 s
+_WF_FL_EVENT_TOO_LONG:     int = 0x20  # decimation factor >= 4×
+_WF_FL_CLAMPED_SAMPLE:     int = 0x40  # at least one sample hit ADC rail
 
 
 def _wf_millis_sub(a: int, b: int) -> int:
