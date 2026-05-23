@@ -383,15 +383,16 @@ def _flow_dynamics(flow_readings: list, peak: float) -> dict:
 
 # Minimum correlation overlap score required to treat a WaveformRecord as
 # matching a given RawEvent. Duration-match below this threshold → legacy path.
-_WF_MATCH_MIN_SCORE: float = 0.70
+_WF_MATCH_MIN_SCORE: float = 0.55
 
 # Maximum seconds between the waveform record's assembled timestamp and the
 # current processing moment. Guards against stale records from a previous event.
 _WF_MATCH_WINDOW_S: float = 90.0
 
 # Waveform flag bits (must match firmware wire format).
-_WF_FL_START_COMPLETE: int = 0x01
-_WF_FL_FULL_COMPLETE:  int = 0x02
+_WF_FL_START_COMPLETE:     int = 0x01
+_WF_FL_FULL_COMPLETE:      int = 0x02
+_WF_FL_RESOLUTION_REDUCED: int = 0x04  # buffer decimated; lower sample rate
 
 
 def _wf_millis_sub(a: int, b: int) -> int:
@@ -427,7 +428,11 @@ def _wf_overlap_score(event: RawEvent, record: WaveformRecord) -> float:
         return 0.0
     event_dur_ms = max(0.0, (event.end_ts - event.start_ts).total_seconds() * 1000)
     meta = record.metadata
-    fw_dur_ms = float(_wf_millis_sub(meta.end_ms, meta.start_ms))
+    # Include the tail window: end_ms marks when flow first drops (phase 1→2),
+    # after which the firmware waits tail_ms before finalising.  The software
+    # event end_ts includes a similar debounce, so comparing full spans is more
+    # accurate than using end_ms - start_ms alone.
+    fw_dur_ms = float(_wf_millis_sub(meta.end_ms, meta.start_ms)) + meta.tail_ms
     denom = max(event_dur_ms, fw_dur_ms)
     if denom <= 0:
         return 0.0
@@ -842,9 +847,24 @@ class FeatureExtractor:
         # a previous event, not this one.
         age_s = _time.monotonic() - record.received_at
         if age_s > _WF_MATCH_WINDOW_S:
+            log.debug(
+                "[%s] waveform skip — event_id=%d stale (age=%.1fs > %.0fs)",
+                event.circuit, record.metadata.event_id, age_s, _WF_MATCH_WINDOW_S,
+            )
             return None
         # Duration overlap guard.
-        if _wf_overlap_score(event, record) < _WF_MATCH_MIN_SCORE:
+        score = _wf_overlap_score(event, record)
+        if score < _WF_MATCH_MIN_SCORE:
+            log.debug(
+                "[%s] waveform skip — event_id=%d overlap=%.2f < %.2f "
+                "(event=%.1fs fw=%.1fs)",
+                event.circuit, record.metadata.event_id, score, _WF_MATCH_MIN_SCORE,
+                (event.end_ts - event.start_ts).total_seconds() if event.end_ts else 0.0,
+                (
+                    _wf_millis_sub(record.metadata.end_ms, record.metadata.start_ms)
+                    + record.metadata.tail_ms
+                ) / 1000.0,
+            )
             return None
         return record
 
