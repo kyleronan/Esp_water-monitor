@@ -1033,23 +1033,41 @@ def _parse_b36(s: str) -> Optional[int]:
         return None
 
 
-def _parse_metadata(state: str) -> Optional[WaveformMetadata]:
+def _parse_metadata(source) -> Optional[WaveformMetadata]:
     """
-    Parse and validate event_metadata JSON.
+    Parse and validate waveform metadata.
+
+    Accepts either a JSON string (text-sensor path) or a pre-parsed dict
+    (HA event path where values may be strings or native JSON numbers).
     Returns None (with a DEBUG log) on any validation failure.
     """
-    try:
-        d = json.loads(state)
-    except (json.JSONDecodeError, ValueError):
-        log.debug("waveform: metadata JSON decode failed: %.80r", state)
-        return None
+    if isinstance(source, str):
+        try:
+            d = json.loads(source)
+        except (json.JSONDecodeError, ValueError):
+            log.debug("waveform: metadata JSON decode failed: %.80r", source)
+            return None
+    else:
+        d = source
 
     required_int = ("id", "b", "v", "s", "e", "p", "sn", "fn",
                     "pre", "post", "tl", "fs", "ps", "pk", "dp", "pd", "q", "fl")
+    normalized: dict = {}
     for key in required_int:
-        if key not in d or not isinstance(d[key], int):
-            log.debug("waveform: metadata missing/non-integer field %r in %.80r", key, state)
+        raw = d.get(key)
+        if raw is None:
+            log.debug("waveform: metadata missing field %r", key)
             return None
+        # Reject bool — Python bool is an int subclass, so must check explicitly.
+        if isinstance(raw, bool):
+            log.debug("waveform: metadata field %r has unexpected bool value", key)
+            return None
+        try:
+            normalized[key] = int(raw)
+        except (TypeError, ValueError):
+            log.debug("waveform: metadata field %r not castable to int: %.40r", key, raw)
+            return None
+    d = normalized
 
     # Field-range validation
     ev   = d["id"];  b = d["b"];   v = d["v"]
@@ -1336,6 +1354,135 @@ class WaveformAssembler:
             del self._parts[k]
 
 
+def _normalize_node_name(name: str) -> str:
+    """Normalize an ESPHome node name for identity comparison.
+
+    App.get_name() may use hyphens; HA entity prefixes use underscores.
+    Both sides of the comparison must be normalized the same way.
+    """
+    return name.strip().lower().replace("-", "_")
+
+
+class WaveformEventHandler:
+    """
+    Per-circuit handler for single HA-event waveform transport (firmware 3.8.0+).
+
+    One ``esphome.water_monitor_waveform`` event carries all four waveform
+    payloads and metadata in a single atomic delivery, replacing the five
+    text-sensor state-change sequence used by WaveformAssembler.
+
+    Key differences from WaveformAssembler:
+    - No initial grace window — HA events are ephemeral bus events, never
+      restored HA state.  Stale delivery is prevented by schema/identity
+      validation instead.
+    - All scalar values arrive as strings (or native JSON numbers); both are
+      accepted and normalized to int.
+    - Validation failures log at DEBUG so hardware testing is debuggable
+      without INFO spam.
+
+    Exposes the same get_record / latest_record / pop_record interface as
+    WaveformAssembler so feature_extractor.py is untouched.
+    """
+
+    def __init__(self, circuit: str, expected_node: str) -> None:
+        self._circuit = circuit
+        # Normalize once so every comparison is cheap.
+        self._expected_node = _normalize_node_name(expected_node)
+        self._known_boot_id: Optional[int] = None
+        self._records: List[WaveformRecord] = []
+
+    def on_waveform_event(self, data: dict) -> None:
+        """Process a single esphome.water_monitor_waveform event payload."""
+        # Schema fingerprint guard.
+        if data.get("schema") != "esp_water_monitor_waveform":
+            log.debug("waveform[%s]: event rejected — unexpected schema %r",
+                      self._circuit, data.get("schema"))
+            return
+
+        if data.get("transport_version") != "1":
+            log.debug("waveform[%s]: event rejected — unsupported transport_version %r",
+                      self._circuit, data.get("transport_version"))
+            return
+
+        # Device identity guard (normalized comparison).
+        node = _normalize_node_name(data.get("node", ""))
+        if self._expected_node and node != self._expected_node:
+            log.debug("waveform[%s]: event rejected — node %r != expected %r",
+                      self._circuit, node, self._expected_node)
+            return
+
+        # Circuit routing — wrong circuit is quietly ignored (normal when a
+        # second ESP device fires on the same HA bus).
+        if data.get("circuit") != self._circuit:
+            return
+
+        # Parse and validate metadata (shared with the text-sensor path).
+        meta = _parse_metadata(data)
+        if meta is None:
+            # _parse_metadata already logged the rejection reason.
+            return
+
+        # Decode the four waveform payloads.
+        start_flow = _decode_waveform(
+            data.get("sf", ""), meta.start_points, meta.flow_scale)
+        start_pressure = _decode_waveform(
+            data.get("sp", ""), meta.start_points, meta.pressure_scale)
+        full_flow = _decode_waveform(
+            data.get("ff", ""), meta.full_points, meta.flow_scale)
+        full_pressure = _decode_waveform(
+            data.get("fp", ""), meta.full_points, meta.pressure_scale)
+
+        if any(w is None for w in (start_flow, start_pressure, full_flow, full_pressure)):
+            log.debug("waveform[%s]: event %d rejected — waveform decode failed",
+                      self._circuit, meta.event_id)
+            return
+
+        # Boot-session guard.
+        if self._known_boot_id is not None and meta.boot_id != self._known_boot_id:
+            log.debug("waveform[%s]: boot_id changed %d→%d",
+                      self._circuit, self._known_boot_id, meta.boot_id)
+        self._known_boot_id = meta.boot_id
+
+        record = WaveformRecord(
+            circuit=self._circuit,
+            boot_id=meta.boot_id,
+            event_id=meta.event_id,
+            metadata=meta,
+            start_flow=start_flow,
+            start_pressure=start_pressure,
+            full_flow=full_flow,
+            full_pressure=full_pressure,
+            received_at=time.monotonic(),
+        )
+        self._records.append(record)
+        if len(self._records) > _WF_MAX_RECORDS:
+            self._records = self._records[-_WF_MAX_RECORDS:]
+
+        log.debug(
+            "waveform[%s]: assembled event %d via HA event (boot=%d q=%d fl=0x%02x "
+            "sn=%d fn=%d pk=%.2f dp=%.2f pd=%dms)",
+            self._circuit, meta.event_id, meta.boot_id,
+            meta.quality, meta.flags,
+            meta.start_points, meta.full_points,
+            meta.peak_flow, meta.pressure_delta, meta.propagation_delay_ms,
+        )
+
+    def get_record(self, boot_id: int, event_id: int) -> Optional[WaveformRecord]:
+        for rec in reversed(self._records):
+            if rec.boot_id == boot_id and rec.event_id == event_id:
+                return rec
+        return None
+
+    def latest_record(self) -> Optional[WaveformRecord]:
+        return self._records[-1] if self._records else None
+
+    def pop_record(self, boot_id: int, event_id: int) -> Optional[WaveformRecord]:
+        for i in range(len(self._records) - 1, -1, -1):
+            if self._records[i].boot_id == boot_id and self._records[i].event_id == event_id:
+                return self._records.pop(i)
+        return None
+
+
 class EventDetector:
     """
     Top-level coordinator. Owns one CircuitEventDetector per circuit
@@ -1358,8 +1505,11 @@ class EventDetector:
         self._detectors: Dict[str, CircuitEventDetector] = {}
         # Tracks live valve open/closed state per circuit for cross-circuit feature
         self._valve_open: Dict[str, bool] = {}
-        # One WaveformAssembler per circuit — populated in setup().
+        # Text-sensor waveform assemblers (firmware 3.7.x, fallback).
         self._assemblers: Dict[str, WaveformAssembler] = {}
+        # HA-event waveform handlers (firmware 3.8.0+, preferred).
+        self._event_handlers: Dict[str, WaveformEventHandler] = {}
+        self._wf_event_subscribed: bool = False
         self._is_configured = False
 
     def setup(self) -> None:
@@ -1432,6 +1582,23 @@ class EventDetector:
                 log.info("[%s] waveform assembler ready (%d entities subscribed)",
                          cfg.circuit, wf_count)
 
+            # HA-event waveform handler (firmware 3.8.0+).
+            # esp_device_prefix is e.g. "esp_water_main_"; strip the trailing
+            # underscore to get the normalized node name for identity comparison.
+            expected_node = cfg.esp_device_prefix.rstrip("_")
+            handler = WaveformEventHandler(cfg.circuit, expected_node=expected_node)
+            self._event_handlers[cfg.circuit] = handler
+
+            # Register the HA event subscription once (shared across all circuits).
+            # Must not be guarded by wf_metadata_sensor or any text-sensor entity ID
+            # so it works even when zero wf_* rows exist in circuit_entity_map.
+            if not self._wf_event_subscribed:
+                self._ha.subscribe_event(
+                    "esphome.water_monitor_waveform",
+                    self._on_waveform_event,
+                )
+                self._wf_event_subscribed = True
+
             log.info(
                 "[%s] event detector ready — triggers: "
                 "flow (>= %.2f L/min for %.1f s) | "
@@ -1454,6 +1621,14 @@ class EventDetector:
             sens = self._sensitivity_getter(circuit)
             detector.update_threshold(sens.get("pressure_drop_event_psi", 1.2))
             detector.min_event_duration = sens.get("min_event_duration_seconds", 3.0)
+
+    def _on_waveform_event(self, data: dict) -> None:
+        """Route an esphome.water_monitor_waveform event to the correct circuit handler."""
+        circuit = data.get("circuit", "")
+        handler = self._event_handlers.get(circuit)
+        if handler is not None:
+            handler.on_waveform_event(data)
+        # Wrong or missing circuit is handled silently by the handler itself.
 
     def _on_valve_state(self, circuit: str, state: str) -> None:
         """Update tracked valve state for cross-circuit feature."""
@@ -1482,14 +1657,29 @@ class EventDetector:
         boot_id: int,
         event_id: int,
     ) -> Optional[WaveformRecord]:
-        """Return the assembled WaveformRecord for (boot_id, event_id) on a circuit, or None."""
-        assembler = self._assemblers.get(circuit)
-        return assembler.get_record(boot_id, event_id) if assembler else None
+        """Return the assembled WaveformRecord for (boot_id, event_id) on a circuit, or None.
+
+        HA-event handler (firmware 3.8.0+) is checked first; falls back to the
+        text-sensor assembler (firmware 3.7.x) when no HA-event record exists.
+        """
+        handler = self._event_handlers.get(circuit)
+        record = handler.get_record(boot_id, event_id) if handler else None
+        if record is None:
+            assembler = self._assemblers.get(circuit)
+            record = assembler.get_record(boot_id, event_id) if assembler else None
+        return record
 
     def get_latest_waveform(self, circuit: str) -> Optional[WaveformRecord]:
-        """Return the most-recently assembled WaveformRecord for a circuit, or None."""
-        assembler = self._assemblers.get(circuit)
-        return assembler.latest_record() if assembler else None
+        """Return the most-recently assembled WaveformRecord for a circuit, or None.
+
+        HA-event handler is preferred; falls back to text-sensor assembler.
+        """
+        handler = self._event_handlers.get(circuit)
+        record = handler.latest_record() if handler else None
+        if record is None:
+            assembler = self._assemblers.get(circuit)
+            record = assembler.latest_record() if assembler else None
+        return record
 
     def pop_waveform_record(
         self,
@@ -1497,6 +1687,13 @@ class EventDetector:
         boot_id: int,
         event_id: int,
     ) -> Optional[WaveformRecord]:
-        """Remove and return the WaveformRecord for (boot_id, event_id), or None."""
-        assembler = self._assemblers.get(circuit)
-        return assembler.pop_record(boot_id, event_id) if assembler else None
+        """Remove and return the WaveformRecord for (boot_id, event_id), or None.
+
+        HA-event handler is checked first; falls back to text-sensor assembler.
+        """
+        handler = self._event_handlers.get(circuit)
+        record = handler.pop_record(boot_id, event_id) if handler else None
+        if record is None:
+            assembler = self._assemblers.get(circuit)
+            record = assembler.pop_record(boot_id, event_id) if assembler else None
+        return record

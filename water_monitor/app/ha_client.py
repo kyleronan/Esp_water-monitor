@@ -38,6 +38,9 @@ def vol_to_litres(value: float, unit: str) -> float:
 # Type for state-changed callbacks: (entity_id, new_state, attributes) -> None
 StateCallback = Callable[[str, str, dict], None]
 
+# Type for HA event callbacks: (event_data_dict) -> None
+EventCallback = Callable[[dict], None]
+
 
 class HaClient:
     """
@@ -53,6 +56,8 @@ class HaClient:
         self._token = supervisor_token()
         self._http: Optional[aiohttp.ClientSession] = None
         self._subscriptions: Dict[str, List[StateCallback]] = {}
+        self._event_subscriptions: Dict[str, List[EventCallback]] = {}
+        self._event_sub_ids: Dict[int, str] = {}  # ws msg_id → event_type
         self._ws_msg_id = 1
         self._ws_lock = asyncio.Lock()
         self._ws_oneshot: Optional[Any] = None   # persistent connection for ws_request
@@ -97,6 +102,17 @@ class HaClient:
         for eid in entity_ids:
             self.subscribe_entity(eid, callback)
 
+    def subscribe_event(self, event_type: str, callback: EventCallback) -> None:
+        """Register a callback for HA bus events of event_type.
+
+        Idempotent — the same (event_type, callback) pair is never registered twice.
+        Triggers a WebSocket reconnect so the new subscription is picked up.
+        """
+        callbacks = self._event_subscriptions.setdefault(event_type, [])
+        if callback not in callbacks:
+            callbacks.append(callback)
+            self._reconnect_event.set()
+
     # ------------------------------------------------------------------
     # Persistent event subscription loop
     # ------------------------------------------------------------------
@@ -125,8 +141,11 @@ class HaClient:
                                       ping_interval=30) as ws:
             await self._auth(ws)
             sub_id = await self._subscribe_entity_states(ws)
-            log.info("HA WebSocket connected, monitoring %d entities",
-                     len(self._subscriptions))
+            self._event_sub_ids = await self._subscribe_ha_events(ws)
+            log.info(
+                "HA WebSocket connected, monitoring %d entities, %d event types",
+                len(self._subscriptions), len(self._event_sub_ids),
+            )
 
             while not self._stop_event.is_set() and not self._reconnect_event.is_set():
                 try:
@@ -134,8 +153,13 @@ class HaClient:
                 except asyncio.TimeoutError:
                     continue
                 msg = json.loads(raw)
-                if sub_id and msg.get("type") == "event" and msg.get("id") == sub_id:
+                if msg.get("type") != "event":
+                    continue
+                msg_id = msg.get("id")
+                if sub_id and msg_id == sub_id:
                     self._dispatch_entity_change(msg.get("event", {}))
+                elif msg_id in self._event_sub_ids:
+                    self._dispatch_ha_event(msg.get("event", {}))
 
             if self._reconnect_event.is_set():
                 log.info("HA WebSocket reconnecting to pick up %d updated entity subscriptions",
@@ -199,6 +223,44 @@ class HaClient:
                     cb(entity_id, state, attributes)
                 except Exception as e:
                     log.error("Callback error for %s: %s", entity_id, e)
+
+    async def _subscribe_ha_events(self, ws) -> Dict[int, str]:
+        """Subscribe to each registered HA event type.
+
+        Returns {msg_id: event_type} so the recv loop can match incoming messages.
+        """
+        id_to_type: Dict[int, str] = {}
+        for event_type in self._event_subscriptions:
+            msg_id = self._next_id()
+            await ws.send(json.dumps({
+                "id": msg_id,
+                "type": "subscribe_events",
+                "event_type": event_type,
+            }))
+            while True:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"Timeout waiting for subscribe_events({event_type!r}) confirmation")
+                resp = json.loads(raw)
+                if resp.get("id") == msg_id:
+                    if resp.get("type") == "result" and resp.get("success"):
+                        id_to_type[msg_id] = event_type
+                        break
+                    raise RuntimeError(
+                        f"subscribe_events({event_type!r}) failed: {resp}")
+        return id_to_type
+
+    def _dispatch_ha_event(self, event: dict) -> None:
+        """Dispatch a subscribed HA bus event to registered callbacks."""
+        event_type = event.get("event_type", "")
+        data = event.get("data", {})
+        for cb in self._event_subscriptions.get(event_type, []):
+            try:
+                cb(data)
+            except Exception as e:
+                log.error("HA event callback error for %s: %s", event_type, e)
 
     def _next_id(self) -> int:
         self._ws_msg_id += 1
