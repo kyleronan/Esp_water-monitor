@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # Checked against the device registry sw_version field (set via project.version
 # in the ESPHome YAML). Non-numeric versions (e.g. "dev") are treated as unknown
 # — setup is not blocked, but a warning is shown.
-MIN_FIRMWARE_VERSION: tuple = (3, 5, 1)
+MIN_FIRMWARE_VERSION: tuple = (3, 8, 0)
 
 # Roles that are optional — wizard will show them as optional dropdowns
 # and they won't block setup completion if unmatched.
@@ -57,13 +57,8 @@ OPTIONAL_ROLES = {
     "trickle_max_flow",
     "trickle_duration",
     "leak_test_duration_number",  # preferred name; leak_test_duration_sensor is the compat alias
-    # Per-event waveform capture (firmware 3.7.0+, circuit_1 only in Phase 1).
-    # Absent on firmware < 3.7.0 — the add-on falls back to legacy features silently.
-    "wf_start_flow_sensor",
-    "wf_start_pressure_sensor",
-    "wf_full_flow_sensor",
-    "wf_full_pressure_sensor",
-    "wf_metadata_sensor",
+    # Waveform overflow diagnostic counter (firmware 3.7.0+, circuit_1 only).
+    # The 5 chunked text sensors were replaced by an HA event in firmware 3.8.0.
     "wf_overflow_count_sensor",
 }
 
@@ -128,16 +123,8 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "trickle_max_flow":           (r"trickle flow max threshold.*main",            "number"),
         "trickle_duration":           (r"trickle flow alert duration.*main",           "number"),
         "leak_test_duration_number":  (r"leak test duration.*main",                    "number"),
-        # Per-event waveform capture (firmware 3.7.0+) — circuit_1 only in Phase 1.
-        # All marked optional; absent on older firmware → graceful legacy fallback.
-        # ESPHome text_sensor: components are exposed as "sensor" domain in HA
-        # (the HA ESPHome integration maps all text_sensor entities to sensor.*).
-        # All six wf_* entities therefore use domain "sensor".
-        "wf_start_flow_sensor":       (r"event start flow waveform.*main",             "sensor"),
-        "wf_start_pressure_sensor":   (r"event start pressure waveform.*main",         "sensor"),
-        "wf_full_flow_sensor":        (r"event full flow waveform.*main",              "sensor"),
-        "wf_full_pressure_sensor":    (r"event full pressure waveform.*main",          "sensor"),
-        "wf_metadata_sensor":         (r"event metadata.*main",                        "sensor"),
+        # Waveform overflow diagnostic counter (firmware 3.7.0+, circuit_1 only).
+        # The 5 chunked text sensors were replaced by an HA event in firmware 3.8.0.
         "wf_overflow_count_sensor":   (r"waveform overflow dropped count.*main",       "sensor"),
     },
     "circuit_2": {   # was "irrigation" — regex patterns match default firmware names

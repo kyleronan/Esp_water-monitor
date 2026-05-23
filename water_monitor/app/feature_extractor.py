@@ -825,7 +825,7 @@ class FeatureExtractor:
         self._db = db_conn
         self._alert_manager = alert_manager
         self._ha = ha_client
-        # Optional EventDetector — provides WaveformAssembler access (firmware 3.7.0+).
+        # Optional EventDetector — provides WaveformEventHandler access (firmware 3.8.0+).
         # None when running in test / historical-import contexts.
         self._event_detector = event_detector
         self._running = False

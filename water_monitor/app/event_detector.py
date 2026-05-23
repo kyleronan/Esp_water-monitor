@@ -956,21 +956,13 @@ class CircuitEventDetector:
 
 
 # ------------------------------------------------------------------------------- #
-# Per-event waveform capture (firmware 3.7.0+) — assembler and wire-format helpers
+# Per-event waveform capture (firmware 3.8.0+) — HA-event handler and wire-format
 # ------------------------------------------------------------------------------- #
 
 # Wire-format constants — must match firmware build-time contract.
 _WF_START_POINTS_MAX: int = 88      # hard cap on start-window point count
 _WF_FULL_POINTS_MAX: int = 64       # hard cap on full-window point count
-_WF_PART_TTL_S: float = 60.0        # maximum age for a cached waveform part
-_WF_INITIAL_GRACE_S: float = 3.0    # reject parts received within this many
-                                    # seconds of subscription (likely retained HA state)
-_WF_META_MAX_AGE_S: float = 5.0     # reject metadata whose publish millis is more
-                                    # than this many seconds before we received it
 _WF_MAX_RECORDS: int = 30           # maximum assembled records to keep per circuit
-_WF_ROLES: Tuple[str, ...] = (      # the four waveform parts, in publish order
-    "start_flow", "start_pressure", "full_flow", "full_pressure",
-)
 _WF_FLAG_VALID_MASK: int = 0x7F     # bits 0-6 only; bit 7 must be 0
 _WF_SUPPORTED_VERSIONS = {1}        # set of wire-format versions we handle
 
@@ -1011,26 +1003,6 @@ class WaveformRecord:
     full_flow: List[float]        # L/min
     full_pressure: List[float]    # PSI
     received_at: float            # time.monotonic() when the record was assembled
-
-
-@dataclass
-class _WfPart:
-    """One cached waveform text_sensor state, pending metadata commit."""
-    role: str           # one of _WF_ROLES
-    boot_id: int
-    event_id: int
-    b64_payload: str    # the raw base64 segment from the wire state
-    received_at: float  # time.monotonic()
-    initial: bool       # True when received within _WF_INITIAL_GRACE_S of subscription
-
-
-def _parse_b36(s: str) -> Optional[int]:
-    """Decode a base36 string to a non-negative integer, or None on error."""
-    try:
-        v = int(s, 36)
-        return v if v >= 0 else None
-    except (ValueError, TypeError):
-        return None
 
 
 def _parse_metadata(source) -> Optional[WaveformMetadata]:
@@ -1152,208 +1124,6 @@ def _decode_waveform(
     return values
 
 
-class WaveformAssembler:
-    """
-    Per-circuit assembler for the five waveform entities (firmware 3.7.0+).
-
-    Lifecycle
-    ---------
-    - ``on_waveform_part`` is called for each of the four waveform text_sensors.
-    - ``on_metadata`` is called when event_metadata arrives (the commit signal).
-    - A ``WaveformRecord`` is stored only when all four parts are fresh, non-stale,
-      non-initial, agree on boot_id + event_id, and the metadata validates.
-
-    Stale/retained-state rejection
-    --------------------------------
-    Parts received within ``_WF_INITIAL_GRACE_S`` of subscription are flagged
-    ``initial=True`` and are never used — they may be retained HA states replayed
-    on subscription.  The metadata commit itself is also rejected if it arrives
-    in this window.
-
-    Boot-session guard
-    ------------------
-    When ``boot_id`` changes, the part cache is flushed — the ESP rebooted and
-    the ``event_id`` counter has reset, so pre-reboot parts are invalid.
-    """
-
-    def __init__(self, circuit: str) -> None:
-        self._circuit = circuit
-        self._subscribed_at: float = time.monotonic()
-        self._known_boot_id: Optional[int] = None
-        # Part cache: (boot_id, event_id, role) → _WfPart
-        self._parts: Dict[Tuple[int, int, str], _WfPart] = {}
-        # Assembled records, newest last.
-        self._records: List[WaveformRecord] = []
-
-    # ------------------------------------------------------------------
-    # Public callbacks (called by EventDetector from HA subscriptions)
-    # ------------------------------------------------------------------
-
-    def on_waveform_part(self, role: str, entity_id: str, state: str) -> None:
-        """Cache one waveform part state, applying stale/format guards."""
-        now = time.monotonic()
-        initial = (now - self._subscribed_at) < _WF_INITIAL_GRACE_S
-
-        # Wire format: "<boot_id_b36>:<event_id_b36>:<base64>"
-        parts = state.split(":", 2)
-        if len(parts) != 3:
-            log.debug("waveform[%s]: malformed part state for %s: %.60r",
-                      self._circuit, role, state)
-            return
-        boot_id = _parse_b36(parts[0])
-        event_id = _parse_b36(parts[1])
-        b64_payload = parts[2]
-        if boot_id is None or event_id is None:
-            log.debug("waveform[%s]: bad b36 ids in %s state %.40r",
-                      self._circuit, role, state)
-            return
-
-        # Boot-session guard — flush cache on new session.
-        if self._known_boot_id is not None and boot_id != self._known_boot_id:
-            log.debug("waveform[%s]: boot_id changed %d→%d, flushing part cache",
-                      self._circuit, self._known_boot_id, boot_id)
-            self._parts.clear()
-        self._known_boot_id = boot_id
-
-        # Evict TTL-expired parts before inserting.
-        self._evict_stale(now)
-
-        key = (boot_id, event_id, role)
-        self._parts[key] = _WfPart(
-            role=role,
-            boot_id=boot_id,
-            event_id=event_id,
-            b64_payload=b64_payload,
-            received_at=now,
-            initial=initial,
-        )
-
-    def on_metadata(self, entity_id: str, state: str) -> None:
-        """
-        Attempt to assemble a WaveformRecord from the cached parts.
-        Called when event_metadata arrives (the commit signal, always last).
-        """
-        now = time.monotonic()
-
-        # Reject if we are still in the initial grace window (likely retained state).
-        if (now - self._subscribed_at) < _WF_INITIAL_GRACE_S:
-            log.debug("waveform[%s]: metadata in initial grace window — skipped",
-                      self._circuit)
-            return
-
-        meta = _parse_metadata(state)
-        if meta is None:
-            return  # _parse_metadata already logged
-
-        # Boot-session guard for metadata itself.
-        if self._known_boot_id is not None and meta.boot_id != self._known_boot_id:
-            log.debug(
-                "waveform[%s]: metadata boot_id %d != known %d — flushing and skipping",
-                self._circuit, meta.boot_id, self._known_boot_id,
-            )
-            self._parts.clear()
-            self._known_boot_id = meta.boot_id
-            return
-        self._known_boot_id = meta.boot_id
-
-        # Evict stale parts before trying to assemble.
-        self._evict_stale(now)
-
-        # Collect the four required parts for this (boot_id, event_id).
-        collected: Dict[str, _WfPart] = {}
-        for role in _WF_ROLES:
-            key = (meta.boot_id, meta.event_id, role)
-            part = self._parts.get(key)
-            if part is None:
-                log.debug(
-                    "waveform[%s]: missing part %r for event %d — skipping assembly",
-                    self._circuit, role, meta.event_id,
-                )
-                return
-            if part.initial:
-                log.debug(
-                    "waveform[%s]: part %r is initial/retained — skipping assembly",
-                    self._circuit, role,
-                )
-                return
-            collected[role] = part
-
-        # Decode each waveform window.
-        # start window → meta.start_points pts; full window → meta.full_points pts.
-        def _decode(role: str, expected_pts: int, scale: int) -> Optional[List[float]]:
-            result = _decode_waveform(collected[role].b64_payload, expected_pts, scale)
-            if result is None:
-                log.debug("waveform[%s]: decode failed for role %r event %d",
-                          self._circuit, role, meta.event_id)
-            return result
-
-        start_flow     = _decode("start_flow",     meta.start_points, meta.flow_scale)
-        start_pressure = _decode("start_pressure", meta.start_points, meta.pressure_scale)
-        full_flow      = _decode("full_flow",      meta.full_points,  meta.flow_scale)
-        full_pressure  = _decode("full_pressure",  meta.full_points,  meta.pressure_scale)
-
-        if any(w is None for w in (start_flow, start_pressure, full_flow, full_pressure)):
-            return  # decode error already logged above
-
-        record = WaveformRecord(
-            circuit=self._circuit,
-            boot_id=meta.boot_id,
-            event_id=meta.event_id,
-            metadata=meta,
-            start_flow=start_flow,       # type: ignore[arg-type]
-            start_pressure=start_pressure,
-            full_flow=full_flow,
-            full_pressure=full_pressure,
-            received_at=now,
-        )
-        self._records.append(record)
-        # Trim record list to a bounded size.
-        if len(self._records) > _WF_MAX_RECORDS:
-            self._records = self._records[-_WF_MAX_RECORDS:]
-
-        # Remove consumed parts so they don't accumulate.
-        for role in _WF_ROLES:
-            self._parts.pop((meta.boot_id, meta.event_id, role), None)
-
-        log.debug(
-            "waveform[%s]: assembled event %d (boot=%d q=%d fl=0x%02x "
-            "sn=%d fn=%d pk=%.2f dp=%.2f pd=%dms)",
-            self._circuit, meta.event_id, meta.boot_id,
-            meta.quality, meta.flags,
-            meta.start_points, meta.full_points,
-            meta.peak_flow, meta.pressure_delta, meta.propagation_delay_ms,
-        )
-
-    def get_record(self, boot_id: int, event_id: int) -> Optional[WaveformRecord]:
-        """Return the assembled record for a given (boot_id, event_id), or None."""
-        for rec in reversed(self._records):
-            if rec.boot_id == boot_id and rec.event_id == event_id:
-                return rec
-        return None
-
-    def latest_record(self) -> Optional[WaveformRecord]:
-        """Return the most-recently assembled record, or None."""
-        return self._records[-1] if self._records else None
-
-    def pop_record(self, boot_id: int, event_id: int) -> Optional[WaveformRecord]:
-        """Remove and return the record for (boot_id, event_id), or None."""
-        for i in range(len(self._records) - 1, -1, -1):
-            if self._records[i].boot_id == boot_id and self._records[i].event_id == event_id:
-                return self._records.pop(i)
-        return None
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _evict_stale(self, now: float) -> None:
-        """Remove parts older than _WF_PART_TTL_S."""
-        stale = [k for k, p in self._parts.items()
-                 if (now - p.received_at) > _WF_PART_TTL_S]
-        for k in stale:
-            del self._parts[k]
-
-
 def _normalize_node_name(name: str) -> str:
     """Normalize an ESPHome node name for identity comparison.
 
@@ -1365,13 +1135,12 @@ def _normalize_node_name(name: str) -> str:
 
 class WaveformEventHandler:
     """
-    Per-circuit handler for single HA-event waveform transport (firmware 3.8.0+).
+    Per-circuit handler for waveform delivery via HA event (firmware 3.8.0+).
 
-    One ``esphome.water_monitor_waveform`` event carries all four waveform
-    payloads and metadata in a single atomic delivery, replacing the five
-    text-sensor state-change sequence used by WaveformAssembler.
+    A single ``esphome.water_monitor_waveform`` event carries all four
+    waveform payloads and the metadata in one atomic delivery — there are no
+    chunks to reassemble.  Replaced the five-text-sensor transport in 3.8.0.
 
-    Key differences from WaveformAssembler:
     - No initial grace window — HA events are ephemeral bus events, never
       restored HA state.  Stale delivery is prevented by schema/identity
       validation instead.
@@ -1379,9 +1148,6 @@ class WaveformEventHandler:
       accepted and normalized to int.
     - Validation failures log at DEBUG so hardware testing is debuggable
       without INFO spam.
-
-    Exposes the same get_record / latest_record / pop_record interface as
-    WaveformAssembler so feature_extractor.py is untouched.
     """
 
     def __init__(self, circuit: str, expected_node: str) -> None:
@@ -1506,9 +1272,7 @@ class EventDetector:
         self._detectors: Dict[str, CircuitEventDetector] = {}
         # Tracks live valve open/closed state per circuit for cross-circuit feature
         self._valve_open: Dict[str, bool] = {}
-        # Text-sensor waveform assemblers (firmware 3.7.x, fallback).
-        self._assemblers: Dict[str, WaveformAssembler] = {}
-        # HA-event waveform handlers (firmware 3.8.0+, preferred).
+        # HA-event waveform handlers (firmware 3.8.0+) — sole transport.
         self._event_handlers: Dict[str, WaveformEventHandler] = {}
         self._wf_event_subscribed: bool = False
         self._is_configured = False
@@ -1552,38 +1316,7 @@ class EventDetector:
                     lambda eid, state, attrs, c=cfg.circuit: self._on_valve_state(c, state),
                 )
 
-            # Waveform capture entities (firmware 3.7.0+, circuit_1 only).
-            # Subscribe only when the entity IDs have been discovered; if the
-            # firmware pre-dates 3.7.0 all six fields are empty and we skip silently.
-            assembler = WaveformAssembler(cfg.circuit)
-            self._assemblers[cfg.circuit] = assembler
-            wf_subscriptions = [
-                (cfg.wf_start_flow_sensor,     "start_flow"),
-                (cfg.wf_start_pressure_sensor, "start_pressure"),
-                (cfg.wf_full_flow_sensor,      "full_flow"),
-                (cfg.wf_full_pressure_sensor,  "full_pressure"),
-            ]
-            wf_count = 0
-            for entity_id, role in wf_subscriptions:
-                if entity_id:
-                    self._ha.subscribe_entity(
-                        entity_id,
-                        lambda eid, state, attrs, r=role, a=assembler:
-                            a.on_waveform_part(r, eid, state),
-                    )
-                    wf_count += 1
-            if cfg.wf_metadata_sensor:
-                self._ha.subscribe_entity(
-                    cfg.wf_metadata_sensor,
-                    lambda eid, state, attrs, a=assembler:
-                        a.on_metadata(eid, state),
-                )
-                wf_count += 1
-            if wf_count:
-                log.info("[%s] waveform assembler ready (%d entities subscribed)",
-                         cfg.circuit, wf_count)
-
-            # HA-event waveform handler (firmware 3.8.0+).
+            # Per-event waveform capture (firmware 3.8.0+, circuit_1 only).
             # esp_device_prefix is e.g. "esp_water_main_"; strip the trailing
             # underscore to get the normalized node name for identity comparison.
             expected_node = cfg.esp_device_prefix.rstrip("_")
@@ -1591,8 +1324,6 @@ class EventDetector:
             self._event_handlers[cfg.circuit] = handler
 
             # Register the HA event subscription once (shared across all circuits).
-            # Must not be guarded by wf_metadata_sensor or any text-sensor entity ID
-            # so it works even when zero wf_* rows exist in circuit_entity_map.
             if not self._wf_event_subscribed:
                 self._ha.subscribe_event(
                     "esphome.water_monitor_waveform",
@@ -1658,29 +1389,14 @@ class EventDetector:
         boot_id: int,
         event_id: int,
     ) -> Optional[WaveformRecord]:
-        """Return the assembled WaveformRecord for (boot_id, event_id) on a circuit, or None.
-
-        HA-event handler (firmware 3.8.0+) is checked first; falls back to the
-        text-sensor assembler (firmware 3.7.x) when no HA-event record exists.
-        """
+        """Return the assembled WaveformRecord for (boot_id, event_id), or None."""
         handler = self._event_handlers.get(circuit)
-        record = handler.get_record(boot_id, event_id) if handler else None
-        if record is None:
-            assembler = self._assemblers.get(circuit)
-            record = assembler.get_record(boot_id, event_id) if assembler else None
-        return record
+        return handler.get_record(boot_id, event_id) if handler else None
 
     def get_latest_waveform(self, circuit: str) -> Optional[WaveformRecord]:
-        """Return the most-recently assembled WaveformRecord for a circuit, or None.
-
-        HA-event handler is preferred; falls back to text-sensor assembler.
-        """
+        """Return the most-recently assembled WaveformRecord for a circuit, or None."""
         handler = self._event_handlers.get(circuit)
-        record = handler.latest_record() if handler else None
-        if record is None:
-            assembler = self._assemblers.get(circuit)
-            record = assembler.latest_record() if assembler else None
-        return record
+        return handler.latest_record() if handler else None
 
     def pop_waveform_record(
         self,
@@ -1688,13 +1404,6 @@ class EventDetector:
         boot_id: int,
         event_id: int,
     ) -> Optional[WaveformRecord]:
-        """Remove and return the WaveformRecord for (boot_id, event_id), or None.
-
-        HA-event handler is checked first; falls back to text-sensor assembler.
-        """
+        """Remove and return the WaveformRecord for (boot_id, event_id), or None."""
         handler = self._event_handlers.get(circuit)
-        record = handler.pop_record(boot_id, event_id) if handler else None
-        if record is None:
-            assembler = self._assemblers.get(circuit)
-            record = assembler.pop_record(boot_id, event_id) if assembler else None
-        return record
+        return handler.pop_record(boot_id, event_id) if handler else None

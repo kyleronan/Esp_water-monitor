@@ -227,13 +227,8 @@ class Orchestrator:
             circuit_cfg.leak_test_result_sensor = entities.get(
                 "leak_test_result_sensor", "")
             circuit_cfg.volume_sensor = entities.get("volume_sensor", "")
-            # Waveform capture entities (firmware 3.7.0+, circuit_1 only).
-            # Empty string when not yet discovered or firmware pre-dates waveform capture.
-            circuit_cfg.wf_start_flow_sensor = entities.get("wf_start_flow_sensor", "")
-            circuit_cfg.wf_start_pressure_sensor = entities.get("wf_start_pressure_sensor", "")
-            circuit_cfg.wf_full_flow_sensor = entities.get("wf_full_flow_sensor", "")
-            circuit_cfg.wf_full_pressure_sensor = entities.get("wf_full_pressure_sensor", "")
-            circuit_cfg.wf_metadata_sensor = entities.get("wf_metadata_sensor", "")
+            # Waveforms now arrive via HA event (firmware 3.8.0+); only the
+            # diagnostic overflow counter remains as a discoverable entity.
             circuit_cfg.wf_overflow_count_sensor = entities.get("wf_overflow_count_sensor", "")
             circuit_cfg.esp_device_prefix = prefix
 

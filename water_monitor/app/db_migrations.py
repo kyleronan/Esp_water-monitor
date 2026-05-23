@@ -20,6 +20,31 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 _BASELINE_VERSION: int = 20260523
+_CURRENT_VERSION: int = 20260524   # bumped when text-sensor waveform roles were retired
+
+# Roles removed when the firmware switched waveform delivery from 5 chunked
+# text sensors to a single HA event (firmware 3.8.0). Old DBs may still carry
+# circuit_entity_map rows for these — the migration deletes them so the
+# discovery wizard doesn't display stale entries.
+_RETIRED_WF_ROLES: tuple = (
+    "wf_start_flow_sensor",
+    "wf_start_pressure_sensor",
+    "wf_full_flow_sensor",
+    "wf_full_pressure_sensor",
+    "wf_metadata_sensor",
+)
+
+
+def _drop_retired_wf_entity_map_rows(conn: sqlite3.Connection) -> None:
+    placeholders = ",".join("?" * len(_RETIRED_WF_ROLES))
+    cur = conn.execute(
+        f"DELETE FROM circuit_entity_map WHERE role IN ({placeholders})",
+        _RETIRED_WF_ROLES,
+    )
+    conn.commit()
+    if cur.rowcount:
+        log.info("Removed %d stale waveform text-sensor row(s) from circuit_entity_map",
+                 cur.rowcount)
 
 
 def _get_version(conn: sqlite3.Connection) -> int:
@@ -82,9 +107,19 @@ def run_migrations(
     version = _get_version(conn)
     _db_hint = f" DB file: {db_path}" if db_path else ""
 
+    if version == _CURRENT_VERSION:
+        missing = _missing_baseline_columns(conn)
+        if missing:
+            raise RuntimeError(
+                "Database claims current schema version but is missing required "
+                f"columns: {', '.join(sorted(missing))}. "
+                f"Delete the database file and restart the add-on.{_db_hint}"
+            )
+        log.debug("Database at schema version %d", _CURRENT_VERSION)
+        return
+
     if version == _BASELINE_VERSION:
-        # Sanity check — guard against a partially created/corrupt DB that
-        # somehow carries the correct version but is missing required columns.
+        # Forward step: drop retired text-sensor waveform roles, stamp new version.
         missing = _missing_baseline_columns(conn)
         if missing:
             raise RuntimeError(
@@ -92,7 +127,9 @@ def run_migrations(
                 f"columns: {', '.join(sorted(missing))}. "
                 f"Delete the database file and restart the add-on.{_db_hint}"
             )
-        log.debug("Database at baseline schema version %d", _BASELINE_VERSION)
+        _drop_retired_wf_entity_map_rows(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
 
     if version == 0:
@@ -106,15 +143,14 @@ def run_migrations(
                 f"{', '.join(sorted(missing))}. "
                 f"Delete the database file and restart the add-on.{_db_hint}"
             )
-        # Fresh DB: all baseline columns confirmed present → stamp version.
-        _set_version(conn, _BASELINE_VERSION)
-        log.info("New database — baseline schema version %d applied",
-                 _BASELINE_VERSION)
+        # Fresh DB: no retired rows could exist; stamp directly at current.
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return
 
     # Any version 1–31: old incremental migration DB.
     raise RuntimeError(
         f"Database schema version {version} is a pre-squash version. "
         f"Delete the database file and restart the add-on to create a fresh "
-        f"schema. (Expected {_BASELINE_VERSION}, found {version}.){_db_hint}"
+        f"schema. (Expected {_CURRENT_VERSION}, found {version}.){_db_hint}"
     )
