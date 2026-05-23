@@ -212,7 +212,8 @@
             data-composite="{{ '1' if e.is_composite else '0' }}"
             data-other-valve="{{ e.other_valve_open if e.other_valve_open is not none else '' }}"
             data-pressure-sig="{{ e.pressure_signature_json or '' }}"
-            data-waveform-used="{{ e.esp_waveform_used or 0 }}">
+            data-waveform-used="{{ e.esp_waveform_used or 0 }}"
+            data-sig-source="{{ e.signature_source or 'software' }}">
           <td class="hist-td hist-td-mono hist-td-time"><time data-ts="{{ e.start_ts or '' }}">{{ (e.start_ts or '')[:16] }}</time></td>
           <td class="hist-td">{{ fmt_duration(e.duration_seconds) }}</td>
           <td class="hist-td hist-td-mono">{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else "—" }} {{ flow_unit }}</td>
@@ -287,6 +288,7 @@
         <dt>Prop. delay</dt>   <dd id="emd-prop-delay"></dd>
         <dt>Anomaly</dt>       <dd id="emd-anomaly"></dd>
         <dt>Other valve</dt>   <dd id="emd-other-valve"></dd>
+        <dt>Sig. source</dt>   <dd id="emd-sig-source"></dd>
       </dl>
     </details>
     <div id="emd-wf-section" class="evt-modal-wf" hidden>
@@ -555,6 +557,8 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const ov = d.otherValve;
     document.getElementById('emd-other-valve').textContent =
       ov === '1' ? 'Yes (open)' : ov === '0' ? 'No' : '—';
+
+    document.getElementById('emd-sig-source').textContent = d.sigSource || 'software';
 
     errBox.hidden = true;
     errBox.textContent = '';

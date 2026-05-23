@@ -397,6 +397,9 @@ _WF_FL_EVENT_TOO_SHORT:    int = 0x10  # firmware duration < 1 s
 _WF_FL_EVENT_TOO_LONG:     int = 0x20  # decimation factor >= 4×
 _WF_FL_CLAMPED_SAMPLE:     int = 0x40  # at least one sample hit ADC rail
 
+_WF_FLOW_SIG_MIN_PEAK_LPM:   float = 0.05   # ignore near-zero / noisy full_flow arrays
+_WF_PRESS_SIG_MIN_DELTA_PSI:  float = 0.15   # ignore pressure noise below this drop
+
 
 def _wf_millis_sub(a: int, b: int) -> int:
     """Wrap-safe uint32 millis subtraction: (a - b) mod 2**32."""
@@ -557,6 +560,72 @@ def _enrich_from_waveform(
                     overshoot = max(0.0, max(tail_press) - baseline)
                     features["recovery_overshoot_psi"] = round(overshoot, 3)
             any_wf_used = True
+
+    # ── 3b. Shape signatures — firmware arrays are time-aligned, flow starts near zero ──
+    # Use separate flags so signature_source reflects exactly what was overridden.
+    _flow_sig_overridden  = False
+    _press_sig_overridden = False
+
+    # Flow: full_flow is in L/min; guard against zero/noise arrays before overriding.
+    if record.full_flow:
+        peak_fw = max(record.full_flow)
+        if peak_fw >= _WF_FLOW_SIG_MIN_PEAK_LPM:
+            features["flow_signature_json"] = json.dumps(
+                _flow_signature(record.full_flow, peak_fw)
+            )
+            _flow_sig_overridden = True
+            any_wf_used = True
+
+    # Pressure: derive baseline from pre-roll samples (pressure before flow onset).
+    # record.start_pressure and record.full_pressure both use meta.pressure_scale
+    # and belong to the same WaveformRecord — units are identical (PSI).
+    if record.full_pressure:
+        baseline_psi: Optional[float] = None
+
+        # Priority 1: median of pre-roll samples from start_pressure (most accurate —
+        # firmware ISR-level capture before flow onset).
+        if (fl & _WF_FL_START_COMPLETE) and record.start_pressure \
+                and meta.start_points > 0 \
+                and (meta.pre_ms + meta.post_ms) > 0 \
+                and meta.pre_ms > 0:
+            onset_idx = round(
+                meta.pre_ms * meta.start_points / (meta.pre_ms + meta.post_ms)
+            )
+            onset_idx = max(0, min(onset_idx, len(record.start_pressure) - 1))
+            pre_roll = record.start_pressure[:onset_idx]
+            if len(pre_roll) >= 3:
+                sorted_pr = sorted(pre_roll)
+                baseline_psi = sorted_pr[len(pre_roll) // 2]  # median
+
+        # Priority 2: median of first few full_pressure samples (still firmware data,
+        # but may already include partial onset drop).
+        if baseline_psi is None and len(record.full_pressure) >= 3:
+            pre_fp = record.full_pressure[:min(5, len(record.full_pressure))]
+            sorted_fp = sorted(pre_fp)
+            baseline_psi = sorted_fp[len(pre_fp) // 2]
+
+        # Priority 3: software-measured pre-event baseline (different time base,
+        # but better than nothing).
+        if baseline_psi is None:
+            baseline_psi = float(features.get("pre_event_pressure_psi") or 0.0)
+
+        if baseline_psi > 0:
+            delta_psi = baseline_psi - min(record.full_pressure)
+            if delta_psi >= _WF_PRESS_SIG_MIN_DELTA_PSI:
+                features["pressure_signature_json"] = json.dumps(
+                    _pressure_signature(record.full_pressure, baseline_psi, delta_psi)
+                )
+                _press_sig_overridden = True
+                any_wf_used = True
+
+    # Set granular signature_source — reflects exactly what was overridden.
+    if _flow_sig_overridden and _press_sig_overridden:
+        features["signature_source"] = "esp_full_flow_pressure"
+    elif _flow_sig_overridden:
+        features["signature_source"] = "esp_full_flow"
+    elif _press_sig_overridden:
+        features["signature_source"] = "esp_full_pressure"
+    # else: stays "software" (set in extract_features default)
 
     # ── 4. Set A/B tracking fields ─────────────────────────────────────────
     features["esp_waveform_used"]     = 1 if any_wf_used else 0
@@ -736,6 +805,10 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         "waveform_event_id":      None,
         "waveform_quality":       None,
         "waveform_overlap_score": None,
+
+        # Signature provenance — overridden to "esp_full_*" by _enrich_from_waveform
+        # when ESP full_flow / full_pressure arrays are used as canonical signatures.
+        "signature_source":       "software",
     }
 
 
