@@ -1399,7 +1399,8 @@ class WaveformEventHandler:
                       self._circuit, data.get("schema"))
             return
 
-        if data.get("transport_version") != "1":
+        # HA may coerce numeric template strings back to int — accept either.
+        if str(data.get("transport_version", "")) != "1":
             log.debug("waveform[%s]: event rejected — unsupported transport_version %r",
                       self._circuit, data.get("transport_version"))
             return
