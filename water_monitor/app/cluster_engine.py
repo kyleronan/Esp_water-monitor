@@ -18,7 +18,19 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
-from river import cluster, preprocessing
+# `river` is a runtime dependency of ClusterEngine but not of the rest of
+# the package. Import it lazily so test modules that pull in
+# feature_extractor / event_detector still collect in environments where
+# river isn't installed (e.g. local test runs without the add-on's full
+# Dockerfile pip set). ClusterEngine.__init__ raises a clear error if river
+# is actually needed at runtime.
+try:                                   # pragma: no cover - import guard
+    from river import cluster, preprocessing
+    _RIVER_IMPORT_ERROR: Optional[BaseException] = None
+except ImportError as _exc:            # pragma: no cover - import guard
+    cluster = None                     # type: ignore[assignment]
+    preprocessing = None               # type: ignore[assignment]
+    _RIVER_IMPORT_ERROR = _exc
 
 log = logging.getLogger(__name__)
 
@@ -109,6 +121,13 @@ class ClusterEngine:
     """Per-circuit DBSTREAM clustering engine."""
 
     def __init__(self, db, cfg):
+        if _RIVER_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "ClusterEngine requires the 'river' package, which is not "
+                "installed in this environment. Install it (it is part of "
+                "the add-on Dockerfile's pip set) before constructing the "
+                f"engine. Original ImportError: {_RIVER_IMPORT_ERROR}"
+            )
         self._db  = db
         self._cfg = cfg
         self._streams: Dict[str, cluster.DBSTREAM]             = {}

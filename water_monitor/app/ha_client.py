@@ -137,15 +137,24 @@ class HaClient:
 
     async def _connect_and_listen(self) -> None:
         self._reconnect_event.clear()
+        # Buffer for messages that arrive mid-handshake — flushed via the
+        # normal dispatch path once subscriptions are confirmed so that
+        # state_changed / HA bus events fired during setup are not lost.
+        deferred: List[dict] = []
         async with websockets.connect(WS_URL, max_size=2**24,
                                       ping_interval=30) as ws:
             await self._auth(ws)
-            sub_id = await self._subscribe_entity_states(ws)
-            self._event_sub_ids = await self._subscribe_ha_events(ws)
+            sub_id = await self._subscribe_entity_states(ws, deferred)
+            self._event_sub_ids = await self._subscribe_ha_events(
+                ws, sub_id, deferred)
             log.info(
                 "HA WebSocket connected, monitoring %d entities, %d event types",
                 len(self._subscriptions), len(self._event_sub_ids),
             )
+            # Flush any events received during the subscription handshake.
+            for msg in deferred:
+                self._route_event_msg(msg, sub_id, self._event_sub_ids)
+            deferred.clear()
 
             while not self._stop_event.is_set() and not self._reconnect_event.is_set():
                 try:
@@ -153,13 +162,7 @@ class HaClient:
                 except asyncio.TimeoutError:
                     continue
                 msg = json.loads(raw)
-                if msg.get("type") != "event":
-                    continue
-                msg_id = msg.get("id")
-                if sub_id and msg_id == sub_id:
-                    self._dispatch_entity_change(msg.get("event", {}))
-                elif msg_id in self._event_sub_ids:
-                    self._dispatch_ha_event(msg.get("event", {}))
+                self._route_event_msg(msg, sub_id, self._event_sub_ids)
 
             if self._reconnect_event.is_set():
                 log.info("HA WebSocket reconnecting to pick up %d updated entity subscriptions",
@@ -177,11 +180,15 @@ class HaClient:
         if result.get("type") != "auth_ok":
             raise RuntimeError(f"Auth failed: {result}")
 
-    async def _subscribe_entity_states(self, ws) -> int:
+    async def _subscribe_entity_states(self, ws, deferred: List[dict]) -> int:
         """Subscribe to targeted entity state updates via subscribe_entities.
 
         Returns the subscription message ID so the recv loop can match
         incoming events. Returns 0 if there are no registered entity IDs.
+
+        ``deferred`` collects any non-matching messages received while
+        waiting for the result so they can be dispatched after the
+        handshake — otherwise they would be silently dropped.
         """
         entity_ids = list(self._subscriptions.keys())
         if not entity_ids:
@@ -192,7 +199,7 @@ class HaClient:
             "type": "subscribe_entities",
             "entity_ids": entity_ids,
         }))
-        # Wait for subscription confirmation.
+        # Wait for subscription confirmation; buffer everything else.
         while True:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=15)
@@ -204,6 +211,9 @@ class HaClient:
                 if msg.get("type") == "result" and msg.get("success"):
                     return msg_id
                 raise RuntimeError(f"subscribe_entities failed: {msg}")
+            # Not our result — defer for the post-handshake flush.
+            if msg.get("type") == "event":
+                deferred.append(msg)
 
     def _dispatch_entity_change(self, event: dict) -> None:
         """Dispatch subscribe_entities change events to registered callbacks.
@@ -224,10 +234,20 @@ class HaClient:
                 except Exception as e:
                     log.error("Callback error for %s: %s", entity_id, e)
 
-    async def _subscribe_ha_events(self, ws) -> Dict[int, str]:
+    async def _subscribe_ha_events(
+        self, ws, entity_sub_id: int, deferred: List[dict],
+    ) -> Dict[int, str]:
         """Subscribe to each registered HA event type.
 
-        Returns {msg_id: event_type} so the recv loop can match incoming messages.
+        Returns {msg_id: event_type} so the recv loop can match incoming
+        messages.
+
+        ``entity_sub_id`` is the already-confirmed subscribe_entities id;
+        ``deferred`` collects any event messages received while we are
+        waiting for subscribe_events results so they can be dispatched
+        after the handshake — otherwise state_changed messages on the
+        entity subscription (already streaming by this point) would be
+        silently dropped.
         """
         id_to_type: Dict[int, str] = {}
         for event_type in self._event_subscriptions:
@@ -250,7 +270,28 @@ class HaClient:
                         break
                     raise RuntimeError(
                         f"subscribe_events({event_type!r}) failed: {resp}")
+                # Not our result — defer event messages for the post-handshake
+                # flush. (entity_sub_id and prior id_to_type entries may already
+                # be streaming events at this point.)
+                if resp.get("type") == "event":
+                    deferred.append(resp)
         return id_to_type
+
+    def _route_event_msg(
+        self, msg: dict, sub_id: int, event_sub_ids: Dict[int, str],
+    ) -> None:
+        """Dispatch a single incoming WS message to the right callback path.
+
+        Centralises the routing logic so the recv loop and the post-handshake
+        deferred-flush use identical behaviour.
+        """
+        if msg.get("type") != "event":
+            return
+        msg_id = msg.get("id")
+        if sub_id and msg_id == sub_id:
+            self._dispatch_entity_change(msg.get("event", {}))
+        elif msg_id in event_sub_ids:
+            self._dispatch_ha_event(msg.get("event", {}))
 
     def _dispatch_ha_event(self, event: dict) -> None:
         """Dispatch a subscribed HA bus event to registered callbacks."""
