@@ -20,7 +20,14 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 _BASELINE_VERSION: int = 20260523
-_CURRENT_VERSION: int = 20260524   # bumped when text-sensor waveform roles were retired
+# Version bumps:
+#   20260524 — retired text-sensor waveform roles
+#   20260525 — added UNIQUE(circuit, start_ts) on events (dedup first)
+_CURRENT_VERSION: int = 20260525
+# Intermediate stepping-stone version for the dedup-then-unique-index
+# migration. Existing DBs at this version have had their wf rows dropped
+# but still need the unique index applied.
+_VERSION_PRE_UNIQUE_INDEX: int = 20260524
 
 # Roles removed when the firmware switched waveform delivery from 5 chunked
 # text sensors to a single HA event (firmware 3.8.0). Old DBs may still carry
@@ -45,6 +52,36 @@ def _drop_retired_wf_entity_map_rows(conn: sqlite3.Connection) -> None:
     if cur.rowcount:
         log.info("Removed %d stale waveform text-sensor row(s) from circuit_entity_map",
                  cur.rowcount)
+
+
+def _apply_unique_events_index(conn: sqlite3.Connection) -> None:
+    """Add UNIQUE(circuit, start_ts) on events after deduping any historical
+    duplicates left behind by older code paths.
+
+    The dedup pass runs first because a CREATE UNIQUE INDEX would fail with
+    IntegrityError if the existing data has duplicate (circuit, start_ts)
+    pairs. dedup_events keeps the most recently inserted row (MAX rowid),
+    clears stale cluster_id on contested groups, and recomputes UUID5 ids.
+    Idempotent on its own.
+
+    The non-unique idx_events_circuit_ts is also dropped — its sole purpose
+    was the index range scan that the new unique index now serves.
+    """
+    # Import here so the module remains importable without database.py side
+    # effects during test collection.
+    from .database import dedup_events
+    removed = dedup_events(conn, commit=False)
+    if removed:
+        log.info(
+            "Migration: dedup_events removed %d duplicate row(s) before "
+            "applying UNIQUE(circuit, start_ts)", removed,
+        )
+    conn.execute("DROP INDEX IF EXISTS idx_events_circuit_ts")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_circuit_start_unique "
+        "ON events (circuit, start_ts)"
+    )
+    conn.commit()
 
 
 def _get_version(conn: sqlite3.Connection) -> int:
@@ -119,7 +156,7 @@ def run_migrations(
         return
 
     if version == _BASELINE_VERSION:
-        # Forward step: drop retired text-sensor waveform roles, stamp new version.
+        # Forward step 1: drop retired text-sensor waveform roles.
         missing = _missing_baseline_columns(conn)
         if missing:
             raise RuntimeError(
@@ -128,8 +165,19 @@ def run_migrations(
                 f"Delete the database file and restart the add-on.{_db_hint}"
             )
         _drop_retired_wf_entity_map_rows(conn)
+        # Forward step 2: dedup events and apply the unique index.
+        _apply_unique_events_index(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
+        return
+
+    if version == _VERSION_PRE_UNIQUE_INDEX:
+        # User upgraded between the wf-role-drop and the unique-index
+        # versions — just apply the unique index step.
+        _apply_unique_events_index(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded %d → %d",
+                 _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
         return
 
     if version == 0:

@@ -179,10 +179,12 @@ async def setup_restore(request: Request):
 
             # Normalize and deduplicate events after import so the DB is
             # consistent even if the backup contained pre-dedup duplicates
-            # or mixed-timezone timestamps.
+            # or mixed-timezone timestamps. commit=False keeps everything
+            # inside the outer transaction so a failure here rolls the
+            # whole restore back instead of leaving a half-imported DB.
             if import_history == "1" and tables.get("events"):
-                normalize_events_utc(db)
-                removed = dedup_events(db)
+                normalize_events_utc(db, commit=False)
+                removed = dedup_events(db, commit=False)
                 if removed:
                     log.warning(
                         "Setup restore: removed %d duplicate event(s) from backup",
@@ -190,7 +192,7 @@ async def setup_restore(request: Request):
                     )
 
             # Restore circuit display labels atomically with the table data.
-            restore_circuit_labels(db, payload)
+            restore_circuit_labels(db, payload, commit=False)
     except Exception as e:
         log.error("Setup restore failed — transaction rolled back: %s", e)
         errors.append("(transaction rolled back)")

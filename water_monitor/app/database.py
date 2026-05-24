@@ -439,7 +439,13 @@ CREATE TABLE IF NOT EXISTS events (
     signature_source                 TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_circuit_ts
+-- UNIQUE(circuit, start_ts) — enforces the contract the importer / dedup
+-- helpers have always assumed (see comments in dedup_events). Replaces the
+-- earlier non-unique idx_events_circuit_ts. Fresh DBs get the unique index
+-- directly; upgrades from baseline (20260524) run dedup_events first via
+-- migration 20260525 before this index is created so the unique constraint
+-- doesn't fail on historical duplicates.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_circuit_start_unique
     ON events (circuit, start_ts);
 CREATE INDEX IF NOT EXISTS idx_events_start_ts
     ON events (start_ts);
@@ -1023,21 +1029,75 @@ def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) ->
     conn.commit()
 
 
-def insert_event(conn: sqlite3.Connection, event: dict) -> bool:
-    """Insert event row; returns True if genuinely new, False if it replaced an existing row.
+#: Columns on `events` that capture user intent — never overwritten by an
+#: importer re-insert or any other automated path. The historical importer
+#: re-imports past events when fresh history becomes available, and the
+#: live detector can re-stage the same id on retry; both must preserve any
+#: label or ignore-flag the user already set.
+_EVENT_USER_COLUMNS: frozenset[str] = frozenset({
+    "user_fixture_type",
+    "user_reviewed",
+    "excluded_from_training",
+})
 
-    INSERT OR REPLACE fires DELETE + INSERT when replacing, incrementing
-    total_changes by 2.  A brand-new insert increments by 1.  Use this to
-    avoid double-counting volume in hourly_volume when the historical importer
-    re-processes an event that is already stored.
+
+def insert_event(conn: sqlite3.Connection, event: dict) -> bool:
+    """Insert event row; returns True if genuinely new, False on conflict.
+
+    Replaces an older INSERT OR REPLACE implementation that delete-then-
+    inserted on conflict. REPLACE had three bad side-effects:
+      (1) it fired ON DELETE CASCADE against tables that reference
+          events(id) — e.g. fixture_ha_entity_map — silently dropping
+          dependent rows;
+      (2) it changed the rowid of the conflicting row, breaking any
+          rowid-based bookkeeping a long-running reader held;
+      (3) it wiped user-editable columns (user_fixture_type,
+          user_reviewed, excluded_from_training) on every same-id
+          re-insert, undoing manual labels the next time the importer
+          ran.
+
+    The new behaviour is an UPSERT via ON CONFLICT(id) DO UPDATE that
+    refreshes every measurement / system column from the incoming row but
+    deliberately omits the user-controlled columns listed in
+    _EVENT_USER_COLUMNS. Conflicts no longer fire cascades or change rowids.
+
+    "is genuinely new" is now decided by a pre-check rather than by
+    interpreting total_changes (REPLACE's old +2-on-replace trick is no
+    longer applicable). Callers use the return value to decide whether to
+    add the event's volume to hourly_volume.
     """
-    cols = ", ".join(event.keys())
-    placeholders = ", ".join("?" for _ in event)
-    before = conn.total_changes
-    conn.execute(f"INSERT OR REPLACE INTO events ({cols}) VALUES ({placeholders})",
-                 list(event.values()))
+    cols = list(event.keys())
+    if "id" not in cols:
+        # Defensive — without an id we can't detect conflicts; let SQLite
+        # raise on the missing PK rather than silently insert a NULL.
+        raise ValueError("insert_event: event dict missing 'id'")
+
+    exists = conn.execute(
+        "SELECT 1 FROM events WHERE id = ?", (event["id"],),
+    ).fetchone() is not None
+
+    col_list     = ", ".join(cols)
+    placeholders = ", ".join("?" for _ in cols)
+    # Build the DO UPDATE SET clause: refresh measurement/system columns,
+    # leave id and the user-intent columns alone.
+    set_cols = [c for c in cols
+                if c != "id" and c not in _EVENT_USER_COLUMNS]
+    if set_cols:
+        set_clause = ", ".join(f"{c}=excluded.{c}" for c in set_cols)
+        sql = (
+            f"INSERT INTO events ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT(id) DO UPDATE SET {set_clause}"
+        )
+    else:
+        # The incoming dict had nothing to update beyond id / user fields —
+        # treat the existing row as authoritative.
+        sql = (
+            f"INSERT INTO events ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT(id) DO NOTHING"
+        )
+    conn.execute(sql, list(event.values()))
     conn.commit()
-    return (conn.total_changes - before) == 1
+    return not exists
 
 
 def get_daily_volume(conn: sqlite3.Connection, circuit: str,
@@ -1548,7 +1608,7 @@ def event_exists_near(
     return row is not None
 
 
-def normalize_events_utc(conn: sqlite3.Connection) -> int:
+def normalize_events_utc(conn: sqlite3.Connection, commit: bool = True) -> int:
     """Normalize events.start_ts / end_ts to UTC ISO 8601 in-place.
 
     Intended to be called before dedup_events() in the Quick Restore path.
@@ -1556,6 +1616,11 @@ def normalize_events_utc(conn: sqlite3.Connection) -> int:
     duplicates have been removed.  Recomputing ids before dedup would cause
     a PRIMARY KEY collision when two rows represent the same instant expressed
     in different offsets (both would map to the same UUID5).
+
+    When ``commit`` is False the caller owns the transaction (e.g. a restore
+    handler running multiple helpers under one outer ``with db:`` block).
+    This prevents the inner commit from making the multi-step restore
+    partially durable on later failure.
 
     Returns the number of rows whose timestamps were changed.
     Idempotent — rows already in UTC format are skipped.
@@ -1585,17 +1650,24 @@ def normalize_events_utc(conn: sqlite3.Connection) -> int:
             "UPDATE events SET start_ts = ?, end_ts = ? WHERE id = ?",
             updates
         )
-        conn.commit()
+        if commit:
+            conn.commit()
     return len(updates)
 
 
-def dedup_events(conn: sqlite3.Connection) -> int:
+def dedup_events(conn: sqlite3.Connection, commit: bool = True) -> int:
     """Remove duplicate events sharing (circuit, start_ts) and recompute ids.
 
     Called after Quick Restore to clean any pre-dedup data from old backups.
-    Migration 021 (one-time) deduped all existing rows and added a
-    UNIQUE(circuit, start_ts) index that prevents write-time duplicates going
-    forward — this function is now only needed in the Quick Restore path.
+    Migration 021 (one-time) deduped all existing rows; the matching
+    UNIQUE(circuit, start_ts) index lands in migration 032 (this commit).
+    Dedup must run before the index creation when restoring older backups,
+    or the unique constraint will fire on the historical duplicates.
+
+    When ``commit`` is False the caller owns the transaction (see
+    ``normalize_events_utc`` for the same pattern). Required by the
+    setup-wizard restore handler so the full multi-step restore commits or
+    rolls back as one unit.
 
     Idempotent — safe to call multiple times.  Returns count of rows deleted.
     Keeps the most recently inserted row (MAX rowid) on the assumption that
@@ -1605,8 +1677,10 @@ def dedup_events(conn: sqlite3.Connection) -> int:
     - Clears cluster_id / match_confidence on survivors of contested groups so
       backfill_unmatched re-matches them with the current engine state.
     - Recomputes UUID5 id = uuid5(NAMESPACE_OID, f"{circuit}/{start_ts}") for
-      all survivors, making ids stable so future INSERT OR REPLACE on
-      UNIQUE(circuit, start_ts) keeps the row (and its fixture_id) intact.
+      all survivors, making ids stable so future inserts against the
+      UNIQUE(circuit, start_ts) index (migration 20260525) collide on the
+      same UUID5 and the ON CONFLICT(id) DO UPDATE upsert in insert_event
+      refreshes the existing row rather than triggering a duplicate.
     """
     import uuid as _uuid
 
@@ -1655,7 +1729,8 @@ def dedup_events(conn: sqlite3.Connection) -> int:
             "UPDATE events SET id = ? WHERE id = ?", id_updates
         )
 
-    conn.commit()
+    if commit:
+        conn.commit()
     return removed
 
 
@@ -2118,15 +2193,23 @@ def upsert_circuit_label(
     db: sqlite3.Connection,
     circuit_id: str,
     display_name: str,
+    commit: bool = True,
 ) -> None:
-    """Insert or update the display name for a circuit ID."""
-    with db:
-        db.execute(
-            """
-            INSERT INTO circuit_labels (circuit_id, display_name) VALUES (?, ?)
-            ON CONFLICT(circuit_id) DO UPDATE SET display_name = excluded.display_name
-            """,
-            (circuit_id, display_name.strip()),
-        )
+    """Insert or update the display name for a circuit ID.
+
+    When ``commit`` is True (default) this runs in its own transaction via
+    ``with db:``. When False the caller owns the transaction — required by
+    multi-step paths like the restore handler so a failure later in the
+    sequence rolls back this label change too.
+    """
+    sql = (
+        "INSERT INTO circuit_labels (circuit_id, display_name) VALUES (?, ?) "
+        "ON CONFLICT(circuit_id) DO UPDATE SET display_name = excluded.display_name"
+    )
+    if commit:
+        with db:
+            db.execute(sql, (circuit_id, display_name.strip()))
+    else:
+        db.execute(sql, (circuit_id, display_name.strip()))
 
 
