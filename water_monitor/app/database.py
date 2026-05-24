@@ -1492,6 +1492,22 @@ def find_overlapping_event(
         if shorter <= 0:
             continue
         if overlap >= 30 or (overlap >= 10 and (overlap / shorter) >= 0.8):
+            # "Longer wins over short unlabeled stub" — when the incoming event
+            # is ≥ 3× the existing one (the importer-partial signature) and the
+            # existing row has no user label / user-locked fixture, allow the
+            # insert. The orphan stub stays in the DB; the caller is expected
+            # to log it. This auto-heals the C0 historical_importer truncation
+            # case where the partial was stored before the live event closed.
+            user_locked = bool(row["user_locked"]) if "user_locked" in row.keys() else False
+            if (new_dur >= ex_dur * 3
+                    and row["user_fixture_type"] is None
+                    and not user_locked):
+                log.info(
+                    "[overlap] not blocking %d s event by %d s unlabeled stub %s "
+                    "— allowing the longer event to insert",
+                    new_dur, ex_dur, row["id"],
+                )
+                continue
             return dict(row)
 
     return None

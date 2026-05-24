@@ -346,9 +346,12 @@ class Orchestrator:
             self._cfg, self._db, self._ha, self._alert_manager,
             ha_tz=self._ha_tz)
 
-        # Historical importer — backfills missed events and runs periodic catch-up
+        # Historical importer — backfills missed events and runs periodic catch-up.
+        # Pass `self` so the importer can consult the live EventDetector and skip
+        # candidate periods that overlap a currently-active event (C0 guard).
         self._historical_importer = HistoricalImporter(
-            self._cfg, self._db, self._ha, self._event_queue)
+            self._cfg, self._db, self._ha, self._event_queue,
+            orchestrator=self)
 
         # Event detector — only if setup is complete and entities are loaded
         self._event_detector = EventDetector(

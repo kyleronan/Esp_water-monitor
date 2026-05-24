@@ -142,11 +142,17 @@ class HistoricalImporter:
         db: sqlite3.Connection,
         ha_client: Any,
         event_queue: asyncio.Queue,
+        orchestrator: Any = None,
     ) -> None:
         self._cfg = cfg
         self._db = db
         self._ha = ha_client
         self._event_queue = event_queue
+        # Optional back-reference to the orchestrator so _import_range can
+        # consult the live EventDetector and skip periods that overlap a
+        # currently-active event (which would otherwise be reconstructed as
+        # a partial stub and then block the real event via overlap rules).
+        self._orch = orchestrator
         self._running = False
 
     # ------------------------------------------------------------------ #
@@ -367,6 +373,29 @@ class HistoricalImporter:
         if not periods:
             return 0, None
 
+        # Belt-and-braces guard: if the live EventDetector currently has an
+        # active event on this circuit, drop any candidate period that overlaps
+        # it. Fix 1 (drop trailing still-active emissions in _onset/_rate) is
+        # the primary defence; this catches the rare race where the sensor
+        # briefly flickered OFF mid-event and the helper closed a period
+        # honestly inside the event window.
+        ev_detector = self._orch.event_detector if self._orch is not None else None
+        active = ev_detector.get_active_event(cfg.circuit) if ev_detector else None
+        if active is not None and active.start_ts is not None:
+            active_start = active.start_ts
+            active_end = datetime.now(timezone.utc)
+            before = len(periods)
+            periods = [(s, e) for (s, e) in periods
+                       if e <= active_start or s >= active_end]
+            if len(periods) < before:
+                log.info(
+                    "[%s] importer: dropped %d candidate period(s) overlapping "
+                    "live event (start=%s)",
+                    cfg.circuit, before - len(periods), active_start.isoformat(),
+                )
+            if not periods:
+                return 0, None
+
         log.debug("[%s] found %d candidate period(s) in history window",
                   cfg.circuit, len(periods))
 
@@ -510,14 +539,19 @@ class HistoricalImporter:
                     periods.append((current_start, ts))
                     current_start = None
 
-        # Still ON at end of window — close at query_end (most accurate) or
-        # the last history entry if query_end wasn't provided.
+        # Still ON at end of window — DO NOT flush. Emitting a period here
+        # would insert a partial event that then blocks the real event from
+        # being stored when the live detector finishes it (overlap rule fires
+        # at ratio = 1.0 since the partial is fully contained). The next
+        # importer run will see the full closed period and import it
+        # correctly, or the live detector will store the complete event.
         if current_start is not None:
-            close_ts = query_end
-            if close_ts is None and history:
-                close_ts = _parse_ts(history[-1].get("last_changed"))
-            if close_ts and close_ts > current_start:
-                periods.append((current_start, close_ts))
+            log.info(
+                "[importer] skipping still-active onset period "
+                "(start=%s, query_end=%s) — deferring to next run / live detector",
+                current_start.isoformat(),
+                query_end.isoformat() if query_end is not None else "?",
+            )
 
         return periods
 
@@ -553,10 +587,16 @@ class HistoricalImporter:
 
             last_ts = ts
 
+        # Same rationale as _onset_to_periods: do NOT flush still-active
+        # flow-rate periods at query_end. The live detector / next importer
+        # run will handle them once flow actually drops.
         if current_start is not None:
-            close_ts = query_end if query_end is not None else last_ts
-            if close_ts is not None and close_ts > current_start:
-                periods.append((current_start, close_ts))
+            log.info(
+                "[importer] skipping still-active flow-rate period "
+                "(start=%s, query_end=%s) — deferring to next run / live detector",
+                current_start.isoformat(),
+                query_end.isoformat() if query_end is not None else "?",
+            )
 
         return periods
 
