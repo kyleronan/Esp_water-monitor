@@ -956,38 +956,49 @@ class CircuitEventDetector:
 
 
 # ------------------------------------------------------------------------------- #
-# Per-event waveform capture (firmware 3.8.0+) — HA-event handler and wire-format
+# Per-event waveform capture (firmware 3.9.0+) — chunked HA-event accumulator    #
 # ------------------------------------------------------------------------------- #
+# Each event is delivered as a stream of esphome.water_monitor_waveform_chunk
+# events. A chunk fires every time a firmware-side 1500-sample buffer fills
+# (~30 s @ ~50 Hz) and also on event end. The accumulator stitches chunks
+# keyed on (boot_id, event_id) and emits a WaveformRecord when the final
+# chunk arrives and all expected seqs are present. Native cadence is
+# preserved; arrays are variable-length — feature_extractor.py is fine with
+# variable lengths already.
 
-# Wire-format constants — must match firmware build-time contract.
-_WF_START_POINTS_MAX: int = 88      # hard cap on start-window point count
-_WF_FULL_POINTS_MAX: int = 64       # hard cap on full-window point count
-_WF_MAX_RECORDS: int = 30           # maximum assembled records to keep per circuit
-_WF_FLAG_VALID_MASK: int = 0x7F     # bits 0-6 only; bit 7 must be 0
-_WF_SUPPORTED_VERSIONS = {1}        # set of wire-format versions we handle
+# Wire-format / safety constants.
+_WF_START_SAMPLES: int = 150            # first slice of full_flow used as start_flow (3 s @ ~50 Hz)
+_WF_MAX_RECORDS: int = 30               # max assembled records kept per circuit
+_WF_FLAG_VALID_MASK: int = 0x7F         # bits 0-6 only; bit 7 must be 0
+_WF_INFLIGHT_TTL_S: float = 7200.0      # 2 h — absolute upper bound on supported event length
+_WF_MAX_CHUNK_SAMPLES: int = 1500       # firmware buffer cap; bound decoded-payload length defensively
+_WF_MAX_TOTAL_CHUNKS: int = 600         # bound for the 'total' field (~5 hour event at 30s cadence)
 
 
 @dataclass
 class WaveformMetadata:
-    """Decoded and validated event_metadata JSON."""
-    event_id: int           # id — monotonic per-boot waveform event counter
-    boot_id: int            # b  — ESP session id
-    version: int            # v  — wire-format version
-    start_ms: int           # s  — event start millis()
-    end_ms: int             # e  — event end millis()
-    publish_ms: int         # p  — publish millis()
-    start_points: int       # sn — resampled points in each start window
-    full_points: int        # fn — resampled points in each full window
-    pre_ms: int             # pre — start-window pre-event portion (ms)
-    post_ms: int            # post — start-window post-event portion (ms)
-    tail_ms: int            # tl — full-window post-event tail (ms)
-    flow_scale: int         # fs — int16 → L/min divisor
-    pressure_scale: int     # ps — int16 → PSI divisor
+    """Per-event waveform metadata, populated from the final chunk."""
+    event_id: int           # id  — monotonic per-boot event counter
+    boot_id: int            # b   — ESP session id
+    start_ms: int           # event_s — event-wide start millis()
+    end_ms: int             # event_e — event-wide end millis()
+    start_points: int       # sn — len(start_flow) (derived: min(_WF_START_SAMPLES, full))
+    full_points: int        # fn — len(full_flow)  (sum of chunk samples)
+    flow_scale: int         # int16 → L/min divisor (constant 100 today)
+    pressure_scale: int     # int16 → PSI divisor (constant 100 today)
     peak_flow: float        # pk — peak flow (×100 in wire, /100 here)
     pressure_delta: float   # dp — pressure delta (×100 in wire, /100 here)
     propagation_delay_ms: int   # pd — onset propagation delay (ms; -1 = not detected)
     quality: int            # q  — 0 ok, 1 incomplete, firmware never publishes 2-6
     flags: int              # fl — bitfield (see plan)
+    # Onset position within the concatenated full array (seq * per_chunk + idx).
+    onset_index: int = 0
+    pressure_onset_index: int = -1
+    # Legacy fields kept at zero for compat — pre/post/tail no longer meaningful.
+    pre_ms: int = 0
+    post_ms: int = 0
+    tail_ms: int = 0
+    version: int = 1
 
 
 @dataclass
@@ -997,110 +1008,153 @@ class WaveformRecord:
     boot_id: int
     event_id: int
     metadata: WaveformMetadata
-    # Each list has exactly metadata.start_points or metadata.full_points float values.
-    start_flow: List[float]       # L/min
+    # Variable-length lists — feature_extractor.py guards each access with `if x:`.
+    start_flow: List[float]       # L/min — first _WF_START_SAMPLES of full_flow
     start_pressure: List[float]   # PSI
-    full_flow: List[float]        # L/min
+    full_flow: List[float]        # L/min — concatenated across all chunks
     full_pressure: List[float]    # PSI
-    received_at: float            # time.monotonic() when the record was assembled
+    received_at: float            # time.monotonic() when the final chunk assembled
 
 
-def _parse_metadata(source) -> Optional[WaveformMetadata]:
+@dataclass
+class _InflightChunkSet:
+    """Per-event scratchpad: chunks seen, final metadata once it arrives, TTL stamp."""
+    chunks: Dict[int, Tuple[List[float], List[float]]] = field(default_factory=dict)
+    total: Optional[int] = None
+    final_metadata: Optional[WaveformMetadata] = None
+    first_received_at: float = 0.0
+    # Track which (seq) we've already DEBUG-logged a duplicate for, so the
+    # log doesn't spam if a chunk arrives 3+ times.
+    duplicate_logged: set = field(default_factory=set)
+
+
+def _parse_wire_bool(value: Any) -> bool:
+    """Parse a wire-format boolean tolerantly.
+
+    HA may pass back the literal string from the template, or coerce to a
+    native bool. Accept "true"/"false" (any case) and native True/False;
+    raise ValueError on anything else so the caller can DEBUG-log + reject.
     """
-    Parse and validate waveform metadata.
+    if value is True:
+        return True
+    if value is False:
+        return False
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+    raise ValueError(f"invalid wire bool: {value!r}")
 
-    Accepts either a JSON string (text-sensor path) or a pre-parsed dict
-    (HA event path where values may be strings or native JSON numbers).
-    Returns None (with a DEBUG log) on any validation failure.
+
+def _normalize_int_field(d: dict, key: str) -> Optional[int]:
+    """Get d[key] and normalize to int. Returns None on missing/invalid.
+
+    Accepts str or native int; rejects bool (Python bool is int subclass).
+    Logs DEBUG with the rejection reason; the caller just checks for None.
     """
-    if isinstance(source, str):
-        try:
-            d = json.loads(source)
-        except (json.JSONDecodeError, ValueError):
-            log.debug("waveform: metadata JSON decode failed: %.80r", source)
-            return None
-    else:
-        d = source
+    raw = d.get(key)
+    if raw is None:
+        log.debug("waveform: chunk missing field %r", key)
+        return None
+    if isinstance(raw, bool):
+        log.debug("waveform: chunk field %r has unexpected bool value", key)
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        log.debug("waveform: chunk field %r not castable to int: %.40r", key, raw)
+        return None
 
-    required_int = ("id", "b", "v", "s", "e", "p", "sn", "fn",
-                    "pre", "post", "tl", "fs", "ps", "pk", "dp", "pd", "q", "fl")
-    normalized: dict = {}
-    for key in required_int:
-        raw = d.get(key)
-        if raw is None:
-            log.debug("waveform: metadata missing field %r", key)
-            return None
-        # Reject bool — Python bool is an int subclass, so must check explicitly.
-        if isinstance(raw, bool):
-            log.debug("waveform: metadata field %r has unexpected bool value", key)
-            return None
-        try:
-            normalized[key] = int(raw)
-        except (TypeError, ValueError):
-            log.debug("waveform: metadata field %r not castable to int: %.40r", key, raw)
-            return None
-    d = normalized
 
-    # Field-range validation
-    ev   = d["id"];  b = d["b"];   v = d["v"]
-    sn   = d["sn"];  fn = d["fn"]
-    fs   = d["fs"];  ps = d["ps"]
-    q    = d["q"];   fl = d["fl"]
+def _parse_chunk_scalars(data: dict) -> Optional[dict]:
+    """Parse and range-check the per-chunk scalar fields. Returns a dict of
+    normalized ints (b, id, seq, s, e, fs, ps) or None on failure."""
+    out: dict = {}
+    for key in ("b", "id", "seq", "s", "e", "fs", "ps"):
+        v = _normalize_int_field(data, key)
+        if v is None:
+            return None
+        out[key] = v
+    if out["b"] < 0 or out["id"] < 0 or out["seq"] < 0:
+        log.debug("waveform: chunk negative b/id/seq")
+        return None
+    if out["fs"] <= 0 or out["ps"] <= 0:
+        log.debug("waveform: chunk fs/ps must be positive")
+        return None
+    return out
 
-    if ev < 0 or b < 0:
-        log.debug("waveform: metadata negative id/boot_id")
+
+def _parse_final_metadata(data: dict, circuit: str,
+                          full_len: int, start_len: int) -> Optional[WaveformMetadata]:
+    """Build a WaveformMetadata from the final chunk's extra fields.
+
+    `full_len` is the total sample count after concatenation; `start_len` is
+    the prefix slice length (min of _WF_START_SAMPLES and full_len).
+    """
+    b = _normalize_int_field(data, "b")
+    eid = _normalize_int_field(data, "id")
+    evs = _normalize_int_field(data, "event_s")
+    eve = _normalize_int_field(data, "event_e")
+    total = _normalize_int_field(data, "total")
+    onset_seq = _normalize_int_field(data, "onset_seq")
+    onset_idx = _normalize_int_field(data, "onset_idx")
+    press_onset_seq = _normalize_int_field(data, "press_onset_seq")
+    press_onset_idx = _normalize_int_field(data, "press_onset_idx")
+    pk = _normalize_int_field(data, "pk")
+    dp = _normalize_int_field(data, "dp")
+    pd = _normalize_int_field(data, "pd")
+    q = _normalize_int_field(data, "q")
+    fl = _normalize_int_field(data, "fl")
+    fs = _normalize_int_field(data, "fs")
+    ps = _normalize_int_field(data, "ps")
+    if None in (b, eid, evs, eve, total, onset_seq, onset_idx,
+                pk, dp, pd, q, fl, fs, ps,
+                press_onset_seq, press_onset_idx):
         return None
-    if v not in _WF_SUPPORTED_VERSIONS:
-        log.debug("waveform: metadata unsupported version %d", v)
-        return None
-    if sn <= 0 or sn > _WF_START_POINTS_MAX:
-        log.debug("waveform: metadata sn=%d out of range", sn)
-        return None
-    if fn <= 0 or fn > _WF_FULL_POINTS_MAX:
-        log.debug("waveform: metadata fn=%d out of range", fn)
-        return None
-    if fs <= 0 or ps <= 0:
-        log.debug("waveform: metadata fs/ps must be positive")
+    if total <= 0 or total > _WF_MAX_TOTAL_CHUNKS:
+        log.debug("waveform[%s]: chunk total=%d out of range", circuit, total)
         return None
     if not (0 <= q <= 6):
-        log.debug("waveform: metadata q=%d out of range", q)
+        log.debug("waveform[%s]: final q=%d out of range", circuit, q)
         return None
     if fl & ~_WF_FLAG_VALID_MASK:
-        log.debug("waveform: metadata fl=%d has invalid high bits", fl)
+        log.debug("waveform[%s]: final fl=%d has invalid high bits", circuit, fl)
         return None
-
+    # Compute onset position within the concatenated full array. Each chunk
+    # before onset_seq has a length we don't directly know here — the
+    # accumulator passes the resolved sample indices via WaveformMetadata so
+    # downstream consumers see a single linear index.
     return WaveformMetadata(
-        event_id=ev,
+        event_id=eid,
         boot_id=b,
-        version=v,
-        start_ms=d["s"],
-        end_ms=d["e"],
-        publish_ms=d["p"],
-        start_points=sn,
-        full_points=fn,
-        pre_ms=d["pre"],
-        post_ms=d["post"],
-        tail_ms=d["tl"],
+        start_ms=evs,
+        end_ms=eve,
+        start_points=start_len,
+        full_points=full_len,
         flow_scale=fs,
         pressure_scale=ps,
-        peak_flow=d["pk"] / 100.0,
-        pressure_delta=d["dp"] / 100.0,
-        propagation_delay_ms=d["pd"],
+        peak_flow=pk / 100.0,
+        pressure_delta=dp / 100.0,
+        propagation_delay_ms=pd,
         quality=q,
         flags=fl,
+        onset_index=onset_idx,             # within onset_seq's chunk; linear resolved by accumulator
+        pressure_onset_index=press_onset_idx if press_onset_seq >= 0 else -1,
     )
 
 
 def _decode_waveform(
     b64_payload: str,
-    expected_pts: int,
     scale: int,
+    expected_pts: Optional[int] = None,
 ) -> Optional[List[float]]:
-    """
-    Decode a base64-encoded little-endian int16 waveform payload.
+    """Decode a base64-encoded little-endian int16 waveform payload.
 
-    Returns a list of ``expected_pts`` float values (int16 ÷ scale), or None
-    when the payload is empty, malformed, or not exactly the expected byte length.
+    Returns the decoded floats, or None when malformed. If ``expected_pts``
+    is given, the byte length must match exactly; if None, any whole int16
+    count is accepted (used by the chunk path, where chunk length varies).
     """
     if not b64_payload:
         log.debug("waveform: empty base64 payload")
@@ -1110,15 +1164,24 @@ def _decode_waveform(
     except Exception:
         log.debug("waveform: base64 decode error for payload %.40r", b64_payload)
         return None
-    expected_bytes = expected_pts * 2
-    if len(raw) != expected_bytes:
+    if len(raw) % 2 != 0:
+        log.debug("waveform: payload length %d not a whole int16 count", len(raw))
+        return None
+    if expected_pts is not None and len(raw) != expected_pts * 2:
         log.debug(
             "waveform: payload length %d != expected %d bytes (%d pts × 2)",
-            len(raw), expected_bytes, expected_pts,
+            len(raw), expected_pts * 2, expected_pts,
+        )
+        return None
+    pts = len(raw) // 2
+    if pts > _WF_MAX_CHUNK_SAMPLES:
+        log.debug(
+            "waveform: payload %d samples exceeds max chunk size %d",
+            pts, _WF_MAX_CHUNK_SAMPLES,
         )
         return None
     values: List[float] = []
-    for i in range(expected_pts):
+    for i in range(pts):
         (v,) = struct.unpack_from("<h", raw, i * 2)
         values.append(v / scale)
     return values
@@ -1133,82 +1196,193 @@ def _normalize_node_name(name: str) -> str:
     return name.strip().lower().replace("-", "_")
 
 
-class WaveformEventHandler:
+class WaveformChunkAccumulator:
     """
-    Per-circuit handler for waveform delivery via HA event (firmware 3.8.0+).
+    Per-circuit accumulator for chunked waveform delivery (firmware 3.9.0+).
 
-    A single ``esphome.water_monitor_waveform`` event carries all four
-    waveform payloads and the metadata in one atomic delivery — there are no
-    chunks to reassemble.  Replaced the five-text-sensor transport in 3.8.0.
+    The firmware streams `esphome.water_monitor_waveform_chunk` events keyed
+    by (boot_id, event_id, seq). Each non-final chunk carries a slice of the
+    flow + pressure waveform; the final chunk carries the last slice (which
+    may be empty) plus event-wide metadata + the expected `total` chunk count.
 
-    - No initial grace window — HA events are ephemeral bus events, never
-      restored HA state.  Stale delivery is prevented by schema/identity
-      validation instead.
-    - All scalar values arrive as strings (or native JSON numbers); both are
-      accepted and normalized to int.
-    - Validation failures log at DEBUG so hardware testing is debuggable
-      without INFO spam.
+    Lifecycle per event:
+      1. Chunks arrive in any order; held in an in-flight set per (boot, id).
+      2. Final chunk sets `total` and the WaveformMetadata.
+      3. When all seqs 0..total-1 are present, the accumulator concatenates
+         them and emits a WaveformRecord. The in-flight entry is removed.
+      4. Missing seqs at final time → DEBUG log, no record (a delayed chunk
+         can still complete the set later until TTL eviction).
+
+    **Durability:** chunk accumulation is in-memory only. An add-on restart
+    during an active event drops in-flight chunks for that event; the final
+    chunk arriving after restart will be missing predecessors and won't
+    assemble. EventDetector continues normal event detection without
+    waveform enrichment in that specific case — no persistence layer.
+
+    Exposes the same get_record / latest_record / pop_record interface as
+    the prior WaveformEventHandler so EventDetector's public accessors don't
+    change.
     """
 
     def __init__(self, circuit: str, expected_node: str) -> None:
         self._circuit = circuit
         # Normalize once so every comparison is cheap.
         self._expected_node = _normalize_node_name(expected_node)
-        self._known_boot_id: Optional[int] = None
+        self._inflight: Dict[Tuple[int, int], _InflightChunkSet] = {}
         self._records: List[WaveformRecord] = []
 
-    def on_waveform_event(self, data: dict) -> None:
-        """Process a single esphome.water_monitor_waveform event payload."""
-        # Schema fingerprint guard.
-        if data.get("schema") != "esp_water_monitor_waveform":
-            log.debug("waveform[%s]: event rejected — unexpected schema %r",
+    # ------------------------------------------------------------------
+    # Public callback
+    # ------------------------------------------------------------------
+
+    def on_waveform_chunk(self, data: dict) -> None:
+        """Process a single esphome.water_monitor_waveform_chunk event."""
+        now = time.monotonic()
+        self._evict_stale(now)
+
+        # Identity & schema guards.
+        if data.get("schema") != "esp_water_monitor_waveform_chunk":
+            log.debug("waveform[%s]: chunk rejected — unexpected schema %r",
                       self._circuit, data.get("schema"))
             return
-
-        # HA may coerce numeric template strings back to int — accept either.
         if str(data.get("transport_version", "")) != "1":
-            log.debug("waveform[%s]: event rejected — unsupported transport_version %r",
+            log.debug("waveform[%s]: chunk rejected — unsupported transport_version %r",
                       self._circuit, data.get("transport_version"))
             return
-
-        # Device identity guard (normalized comparison).
         node = _normalize_node_name(data.get("node", ""))
         if self._expected_node and node != self._expected_node:
-            log.debug("waveform[%s]: event rejected — node %r != expected %r",
+            log.debug("waveform[%s]: chunk rejected — node %r != expected %r",
                       self._circuit, node, self._expected_node)
             return
-
-        # Circuit routing — wrong circuit is quietly ignored (normal when a
-        # second ESP device fires on the same HA bus).
         if data.get("circuit") != self._circuit:
+            return  # silently skip other circuits
+
+        # Scalars.
+        sc = _parse_chunk_scalars(data)
+        if sc is None:
+            return
+        try:
+            is_final = _parse_wire_bool(data.get("final", "false"))
+        except ValueError:
+            log.debug("waveform[%s]: chunk rejected — invalid 'final' value %r",
+                      self._circuit, data.get("final"))
             return
 
-        # Parse and validate metadata (shared with the text-sensor path).
-        meta = _parse_metadata(data)
-        if meta is None:
-            # _parse_metadata already logged the rejection reason.
+        # Decode flow/press payloads. On a final chunk an empty payload is
+        # explicitly allowed (firmware flushed the last sample in a prior
+        # chunk); on a non-final chunk it's a wire-format error.
+        flow_b64 = data.get("flow", "")
+        press_b64 = data.get("press", "")
+        if is_final and flow_b64 == "" and press_b64 == "":
+            flow: List[float] = []
+            press: List[float] = []
+        else:
+            decoded_flow = _decode_waveform(flow_b64, sc["fs"])
+            decoded_press = _decode_waveform(press_b64, sc["ps"])
+            if decoded_flow is None or decoded_press is None:
+                log.debug("waveform[%s]: chunk seq=%d rejected — payload decode failed",
+                          self._circuit, sc["seq"])
+                return
+            if len(decoded_flow) != len(decoded_press):
+                log.debug(
+                    "waveform[%s]: chunk seq=%d rejected — flow/press length mismatch (%d vs %d)",
+                    self._circuit, sc["seq"], len(decoded_flow), len(decoded_press),
+                )
+                return
+            flow, press = decoded_flow, decoded_press
+
+        key = (sc["b"], sc["id"])
+        cs = self._inflight.get(key)
+        if cs is None:
+            cs = _InflightChunkSet(first_received_at=now)
+            self._inflight[key] = cs
+
+        seq = sc["seq"]
+
+        # Reject seq values that exceed any already-known total (catches
+        # corrupted/duplicate-event_id misroutes).
+        if cs.total is not None and seq >= cs.total:
+            log.debug(
+                "waveform[%s]: chunk seq=%d rejected — exceeds known total=%d (boot=%d id=%d)",
+                self._circuit, seq, cs.total, sc["b"], sc["id"],
+            )
             return
 
-        # Decode the four waveform payloads.
-        start_flow = _decode_waveform(
-            data.get("sf", ""), meta.start_points, meta.flow_scale)
-        start_pressure = _decode_waveform(
-            data.get("sp", ""), meta.start_points, meta.pressure_scale)
-        full_flow = _decode_waveform(
-            data.get("ff", ""), meta.full_points, meta.flow_scale)
-        full_pressure = _decode_waveform(
-            data.get("fp", ""), meta.full_points, meta.pressure_scale)
+        # Duplicate handling.
+        if seq in cs.chunks:
+            prev_flow, _prev_press = cs.chunks[seq]
+            if len(prev_flow) == len(flow):
+                if seq not in cs.duplicate_logged:
+                    log.debug(
+                        "waveform[%s]: duplicate chunk seq=%d for boot=%d id=%d — same length, replacing",
+                        self._circuit, seq, sc["b"], sc["id"],
+                    )
+                    cs.duplicate_logged.add(seq)
+                cs.chunks[seq] = (flow, press)
+            else:
+                log.debug(
+                    "waveform[%s]: duplicate chunk seq=%d for boot=%d id=%d — length mismatch (%d vs %d), rejecting",
+                    self._circuit, seq, sc["b"], sc["id"], len(prev_flow), len(flow),
+                )
+                return
+        else:
+            cs.chunks[seq] = (flow, press)
 
-        if any(w is None for w in (start_flow, start_pressure, full_flow, full_pressure)):
-            log.debug("waveform[%s]: event %d rejected — waveform decode failed",
-                      self._circuit, meta.event_id)
-            return
+        # On final, capture metadata + total and try to assemble.
+        if is_final:
+            # Compute provisional full length to feed metadata builder.
+            chunks_in_order = sorted(cs.chunks.items())
+            full_len = sum(len(f) for _, (f, _p) in chunks_in_order)
+            start_len = min(_WF_START_SAMPLES, full_len)
+            meta = _parse_final_metadata(data, self._circuit, full_len, start_len)
+            if meta is None:
+                # Don't pop the in-flight entry — TTL will GC it. The DEBUG
+                # log already explained why.
+                return
+            cs.total = int(_normalize_int_field(data, "total") or 0)
+            cs.final_metadata = meta
 
-        # Boot-session guard.
-        if self._known_boot_id is not None and meta.boot_id != self._known_boot_id:
-            log.debug("waveform[%s]: boot_id changed %d→%d",
-                      self._circuit, self._known_boot_id, meta.boot_id)
-        self._known_boot_id = meta.boot_id
+        # Try to assemble if we have a known total and all seqs are present.
+        if cs.total is not None and cs.final_metadata is not None:
+            missing = [s for s in range(cs.total) if s not in cs.chunks]
+            if missing:
+                log.debug(
+                    "waveform[%s]: cannot assemble event %d yet — missing %d/%d chunk(s): seqs %s",
+                    self._circuit, sc["id"], len(missing), cs.total, missing,
+                )
+                return
+            self._assemble(key, cs)
+
+    # ------------------------------------------------------------------
+    # Assembly
+    # ------------------------------------------------------------------
+
+    def _assemble(self, key: Tuple[int, int], cs: _InflightChunkSet) -> None:
+        meta = cs.final_metadata
+        assert meta is not None
+        chunks_in_order = sorted(cs.chunks.items())
+
+        full_flow: List[float] = []
+        full_press: List[float] = []
+        # Resolve the chunk-relative onset_index to a linear index by summing
+        # chunk lengths up to onset_seq, then adding the within-chunk offset.
+        # The final-chunk metadata recorded onset_seq alongside onset_idx,
+        # but _parse_final_metadata only stored onset_idx; recompute linear
+        # offset here from the source data.
+        # (We don't have onset_seq in WaveformMetadata; the per-chunk index
+        # is sufficient since onset always lives in chunk 0 by construction —
+        # the firmware copies the pre-roll into the chunk on event onset.)
+        for _seq, (flow, press) in chunks_in_order:
+            full_flow.extend(flow)
+            full_press.extend(press)
+
+        start_flow = full_flow[:_WF_START_SAMPLES]
+        start_press = full_press[:_WF_START_SAMPLES]
+
+        # Update lengths in metadata after concat in case _parse_final_metadata
+        # under-counted (shouldn't happen but defensive).
+        meta.full_points = len(full_flow)
+        meta.start_points = len(start_flow)
 
         record = WaveformRecord(
             circuit=self._circuit,
@@ -1216,23 +1390,48 @@ class WaveformEventHandler:
             event_id=meta.event_id,
             metadata=meta,
             start_flow=start_flow,
-            start_pressure=start_pressure,
+            start_pressure=start_press,
             full_flow=full_flow,
-            full_pressure=full_pressure,
+            full_pressure=full_press,
             received_at=time.monotonic(),
         )
         self._records.append(record)
         if len(self._records) > _WF_MAX_RECORDS:
             self._records = self._records[-_WF_MAX_RECORDS:]
 
+        # Done — remove the in-flight entry so late stray chunks for this
+        # event_id don't keep growing memory.
+        self._inflight.pop(key, None)
+
         log.debug(
-            "waveform[%s]: assembled event %d via HA event (boot=%d q=%d fl=0x%02x "
-            "sn=%d fn=%d pk=%.2f dp=%.2f pd=%dms)",
-            self._circuit, meta.event_id, meta.boot_id,
+            "waveform[%s]: assembled event %d from %d chunk(s) "
+            "(boot=%d full=%d start=%d q=%d fl=0x%02x pk=%.2f dp=%.2f pd=%dms)",
+            self._circuit, meta.event_id, cs.total, meta.boot_id,
+            meta.full_points, meta.start_points,
             meta.quality, meta.flags,
-            meta.start_points, meta.full_points,
             meta.peak_flow, meta.pressure_delta, meta.propagation_delay_ms,
         )
+
+    # ------------------------------------------------------------------
+    # TTL eviction
+    # ------------------------------------------------------------------
+
+    def _evict_stale(self, now: float) -> None:
+        stale = [
+            k for k, cs in self._inflight.items()
+            if (now - cs.first_received_at) > _WF_INFLIGHT_TTL_S
+        ]
+        for k in stale:
+            cs = self._inflight.pop(k, None)
+            if cs is not None:
+                log.debug(
+                    "waveform[%s]: in-flight chunk set evicted (boot=%d id=%d, %d chunk(s), total=%s)",
+                    self._circuit, k[0], k[1], len(cs.chunks), cs.total,
+                )
+
+    # ------------------------------------------------------------------
+    # Lookup interface — same as the prior WaveformEventHandler
+    # ------------------------------------------------------------------
 
     def get_record(self, boot_id: int, event_id: int) -> Optional[WaveformRecord]:
         for rec in reversed(self._records):
@@ -1272,8 +1471,8 @@ class EventDetector:
         self._detectors: Dict[str, CircuitEventDetector] = {}
         # Tracks live valve open/closed state per circuit for cross-circuit feature
         self._valve_open: Dict[str, bool] = {}
-        # HA-event waveform handlers (firmware 3.8.0+) — sole transport.
-        self._event_handlers: Dict[str, WaveformEventHandler] = {}
+        # Chunked HA-event waveform accumulators (firmware 3.9.0+) — sole transport.
+        self._chunk_accumulators: Dict[str, WaveformChunkAccumulator] = {}
         self._wf_event_subscribed: bool = False
         self._is_configured = False
 
@@ -1316,18 +1515,18 @@ class EventDetector:
                     lambda eid, state, attrs, c=cfg.circuit: self._on_valve_state(c, state),
                 )
 
-            # Per-event waveform capture (firmware 3.8.0+, circuit_1 only).
+            # Per-event waveform capture (firmware 3.9.0+, chunked streaming).
             # esp_device_prefix is e.g. "esp_water_main_"; strip the trailing
             # underscore to get the normalized node name for identity comparison.
             expected_node = cfg.esp_device_prefix.rstrip("_")
-            handler = WaveformEventHandler(cfg.circuit, expected_node=expected_node)
-            self._event_handlers[cfg.circuit] = handler
+            accumulator = WaveformChunkAccumulator(cfg.circuit, expected_node=expected_node)
+            self._chunk_accumulators[cfg.circuit] = accumulator
 
             # Register the HA event subscription once (shared across all circuits).
             if not self._wf_event_subscribed:
                 self._ha.subscribe_event(
-                    "esphome.water_monitor_waveform",
-                    self._on_waveform_event,
+                    "esphome.water_monitor_waveform_chunk",
+                    self._on_waveform_chunk,
                 )
                 self._wf_event_subscribed = True
 
@@ -1354,13 +1553,13 @@ class EventDetector:
             detector.update_threshold(sens.get("pressure_drop_event_psi", 1.2))
             detector.min_event_duration = sens.get("min_event_duration_seconds", 3.0)
 
-    def _on_waveform_event(self, data: dict) -> None:
-        """Route an esphome.water_monitor_waveform event to the correct circuit handler."""
+    def _on_waveform_chunk(self, data: dict) -> None:
+        """Route an esphome.water_monitor_waveform_chunk event to the correct circuit."""
         circuit = data.get("circuit", "")
-        handler = self._event_handlers.get(circuit)
-        if handler is not None:
-            handler.on_waveform_event(data)
-        # Wrong or missing circuit is handled silently by the handler itself.
+        accumulator = self._chunk_accumulators.get(circuit)
+        if accumulator is not None:
+            accumulator.on_waveform_chunk(data)
+        # Wrong or missing circuit is handled silently by the accumulator itself.
 
     def _on_valve_state(self, circuit: str, state: str) -> None:
         """Update tracked valve state for cross-circuit feature."""
@@ -1390,13 +1589,13 @@ class EventDetector:
         event_id: int,
     ) -> Optional[WaveformRecord]:
         """Return the assembled WaveformRecord for (boot_id, event_id), or None."""
-        handler = self._event_handlers.get(circuit)
-        return handler.get_record(boot_id, event_id) if handler else None
+        accumulator = self._chunk_accumulators.get(circuit)
+        return accumulator.get_record(boot_id, event_id) if accumulator else None
 
     def get_latest_waveform(self, circuit: str) -> Optional[WaveformRecord]:
         """Return the most-recently assembled WaveformRecord for a circuit, or None."""
-        handler = self._event_handlers.get(circuit)
-        return handler.latest_record() if handler else None
+        accumulator = self._chunk_accumulators.get(circuit)
+        return accumulator.latest_record() if accumulator else None
 
     def pop_waveform_record(
         self,
@@ -1405,5 +1604,5 @@ class EventDetector:
         event_id: int,
     ) -> Optional[WaveformRecord]:
         """Remove and return the WaveformRecord for (boot_id, event_id), or None."""
-        handler = self._event_handlers.get(circuit)
-        return handler.pop_record(boot_id, event_id) if handler else None
+        accumulator = self._chunk_accumulators.get(circuit)
+        return accumulator.pop_record(boot_id, event_id) if accumulator else None

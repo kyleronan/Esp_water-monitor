@@ -40,9 +40,11 @@ class CircuitConfig:
     leak_test_switch: str = ""
     leak_test_result_sensor: str = ""
     volume_sensor: str = ""
-    # Waveform overflow diagnostic counter — only remaining wf_* entity after
-    # the 3.8.0 HA-event transport migration replaced the 5 chunked text sensors.
+    # Waveform diagnostic counters — the only wf_* entities after the 3.8.0
+    # HA-event transport migration removed the 5 chunked text sensors.
+    # Chunk drop count was added in 3.9.0 with chunked streaming.
     wf_overflow_count_sensor: str = ""
+    wf_chunk_drop_count_sensor: str = ""
     esp_device_prefix: str = ""
 
     @property
