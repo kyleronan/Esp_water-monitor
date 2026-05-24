@@ -51,12 +51,14 @@ def normalize_restore_row(row: dict, table: str) -> dict:
     return row
 
 
-def restore_circuit_labels(db, payload: dict) -> None:
+def restore_circuit_labels(db, payload: dict, commit: bool = True) -> None:
     """Write circuit display labels from a backup payload into the DB.
 
-    Must be called inside the caller's transaction so the full restore is
-    atomic.  If the payload has no 'circuits' key (legacy backup format),
-    seeds default labels only when the circuit_labels table is empty.
+    Pass ``commit=False`` when calling from inside an outer transaction
+    (e.g. the setup-wizard restore handler's ``with db:`` block) so the
+    individual label upserts don't end the outer transaction mid-restore.
+    If the payload has no 'circuits' key (legacy backup format), seeds
+    default labels only when the circuit_labels table is empty.
     """
     from .database import load_circuit_labels, upsert_circuit_label
     circuit_entries = payload.get("circuits", [])
@@ -65,13 +67,13 @@ def restore_circuit_labels(db, payload: dict) -> None:
             cid   = entry.get("circuit_id", "")
             label = entry.get("display_name", "")
             if cid and label:
-                upsert_circuit_label(db, cid, label)
+                upsert_circuit_label(db, cid, label, commit=commit)
         log.info("Restore: restored %d circuit label(s)", len(circuit_entries))
     else:
         existing = load_circuit_labels(db)
         if not existing:
-            upsert_circuit_label(db, "circuit_1", "Main")
-            upsert_circuit_label(db, "circuit_2", "Irrigation")
+            upsert_circuit_label(db, "circuit_1", "Main", commit=commit)
+            upsert_circuit_label(db, "circuit_2", "Irrigation", commit=commit)
             log.info("Restore: seeded default circuit labels (legacy backup)")
 
 
