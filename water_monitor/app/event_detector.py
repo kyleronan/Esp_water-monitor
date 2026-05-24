@@ -995,9 +995,16 @@ class WaveformMetadata:
     # and within-chunk sample index as reported by firmware; ``onset_index``
     # is the linear index into the concatenated full_flow/full_pressure and
     # is resolved by the accumulator once chunk lengths are known.
-    onset_seq: int = 0
-    onset_idx: int = 0
-    onset_index: int = 0
+    #
+    # Default to -1 (not 0) so a record constructed without onset fields —
+    # malformed parse, future schema change, hand-built test fixture —
+    # cannot silently look like "onset at sample 0" and have downstream
+    # feature_extractor treat the pre-roll as the post-onset ramp. _assemble
+    # also validates that (onset_seq, onset_idx) is in bounds for the
+    # received chunks and writes -1 if not.
+    onset_seq: int = -1
+    onset_idx: int = -1
+    onset_index: int = -1
     pressure_onset_seq: int = -1
     pressure_onset_idx: int = -1
     pressure_onset_index: int = -1
@@ -1388,25 +1395,40 @@ class WaveformChunkAccumulator:
         # firmware that extends the pre-roll across multiple chunks or fires
         # an event without flow pre-roll.
         prefix_len: Dict[int, int] = {}
+        chunk_lengths: Dict[int, int] = {}
         running = 0
         for seq, (flow, press) in chunks_in_order:
             prefix_len[seq] = running
+            chunk_lengths[seq] = len(flow)
             full_flow.extend(flow)
             full_press.extend(press)
             running += len(flow)
 
         def _linear(seq: int, idx: int) -> int:
-            base = prefix_len.get(seq, 0)
-            return base + max(0, idx)
+            """Resolve (seq, idx) to a linear index into full_flow/full_press.
 
-        meta.onset_index = (
-            _linear(meta.onset_seq, meta.onset_idx)
-            if meta.onset_seq >= 0 else 0
-        )
-        meta.pressure_onset_index = (
-            _linear(meta.pressure_onset_seq, meta.pressure_onset_idx)
-            if meta.pressure_onset_seq >= 0 else -1
-        )
+            Returns -1 when:
+              - seq < 0 (firmware reported "no onset")
+              - seq isn't among the received chunks (corrupt metadata)
+              - idx isn't a valid position inside that chunk
+
+            Downstream feature_extractor treats -1 as "use legacy onset
+            detection from the waveform itself" rather than trusting a
+            silently-clamped value (the old behaviour clamped any negative
+            idx to 0, which made a missing-onset record look like onset
+            lived at sample 0 — wrong for any event with a pre-roll).
+            """
+            if seq < 0:
+                return -1
+            if seq not in chunk_lengths:
+                return -1
+            if not (0 <= idx < chunk_lengths[seq]):
+                return -1
+            return prefix_len[seq] + idx
+
+        meta.onset_index = _linear(meta.onset_seq, meta.onset_idx)
+        meta.pressure_onset_index = _linear(
+            meta.pressure_onset_seq, meta.pressure_onset_idx)
 
         start_flow = full_flow[:_WF_START_SAMPLES]
         start_press = full_press[:_WF_START_SAMPLES]
@@ -1430,7 +1452,10 @@ class WaveformChunkAccumulator:
                 meta.pre_ms = onset_in_start * _SAMPLE_MS
                 meta.post_ms = (meta.start_points - onset_in_start) * _SAMPLE_MS
             else:
-                # Onset is outside the start window — describe the window only.
+                # Onset is either unknown (onset_index == -1 after the
+                # bounds-check above) or lies outside the start window.
+                # Describe the window's full extent only; feature_extractor
+                # falls back to detecting onset from the waveform itself.
                 meta.pre_ms = 0
                 meta.post_ms = meta.start_points * _SAMPLE_MS
         # tail_ms = 0: chunked records do not capture a post-event recovery
