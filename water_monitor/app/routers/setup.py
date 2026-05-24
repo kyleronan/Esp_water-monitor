@@ -40,6 +40,26 @@ def _tmpl(r: Request):
     return r.app.state.templates
 
 
+def _block_if_setup_complete(request: Request):
+    """Return an ingress redirect to '/' when setup is already complete.
+
+    The setup wizard is intentionally CSRF-exempt (main.py:210) because no
+    session token exists on first run. That carve-out is safe ONLY while
+    setup_complete=0; once setup is done these endpoints must refuse to
+    mutate so a stray POST to /setup/restore (which calls DELETE FROM …
+    before re-inserting) can't wipe the live DB. Call this at the top of
+    every state-mutating /setup/* handler and return its value if not None.
+    """
+    orch = _orch(request)
+    if orch and getattr(orch, "setup_complete", False):
+        log.warning(
+            "setup_complete=1 — refusing mutation on %s (path=%s)",
+            request.method, request.url.path,
+        )
+        return ingress_redirect(request, "/")
+    return None
+
+
 # ------------------------------------------------------------------
 # Step 1 — landing page (search box)
 # ------------------------------------------------------------------
@@ -85,6 +105,9 @@ async def setup_new(request: Request):
 # ------------------------------------------------------------------
 @router.post("/restore")
 async def setup_restore(request: Request):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     import json as _json
     from urllib.parse import quote_plus as _qp
     from fastapi import File, UploadFile
@@ -225,6 +248,9 @@ async def setup_search(
     request: Request,
     device_name: str = Form(...),
 ):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     orch = _orch(request)
 
     # Persist the searched name
@@ -279,6 +305,9 @@ async def setup_select(
     request: Request,
     device_id: str = Form(...),
 ):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     return ingress_redirect(request, f"/setup/discover/{device_id}")
 
 
@@ -376,6 +405,9 @@ async def setup_discover(device_id: str, request: Request):
 # ------------------------------------------------------------------
 @router.post("/confirm/{device_id}")
 async def setup_confirm(device_id: str, request: Request):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     orch = _orch(request)
     form = await request.form()
 
@@ -443,6 +475,9 @@ async def setup_circuit_names(request: Request):
 @router.post("/circuit-names")
 async def setup_circuit_names_save(request: Request):
     """Save circuit display names and types, then advance to unit selection."""
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     from ..circuit_compat import validate_display_name
     from ..database import upsert_circuit_label, set_circuit_type, get_circuit_type
     from ..fixtures import normalize_circuit_type, CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP
@@ -533,6 +568,9 @@ async def setup_units(request: Request):
 @router.post("/units")
 async def setup_units_save(request: Request):
     """Save display unit preferences and advance to home details."""
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     from ..units import FLOW_OPTIONS, PRESSURE_OPTIONS, invalidate_unit_cache
     orch = _orch(request)
     form = await request.form()
@@ -564,6 +602,9 @@ async def setup_home_details(request: Request):
 
 @router.post("/home")
 async def setup_home_details_save(request: Request):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     orch = _orch(request)
     form = await request.form()
 
@@ -717,6 +758,10 @@ async def setup_complete(request: Request):
 # ------------------------------------------------------------------
 @router.post("/api/rediscover/{device_id}/{circuit}")
 async def rediscover_circuit(device_id: str, circuit: str, request: Request):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        # Same JSON shape as the error branch below — keep the client happy.
+        return JSONResponse({"error": "setup already complete"}, status_code=403)
     from ..circuit_compat import resolve_circuit
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
