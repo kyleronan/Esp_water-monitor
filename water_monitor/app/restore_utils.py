@@ -83,8 +83,17 @@ def safe_insert_rows(db, tbl: str, rows: list) -> int:
     - *tbl* must be in RESTORABLE_TABLES — raises ValueError otherwise.
     - Column names are validated against the live schema via PRAGMA table_info;
       only columns present in both the payload and the live schema are written.
+      The column set is the union of keys across all rows so heterogeneous
+      payloads don't silently drop fields that appear only in later rows.
     - If zero columns survive schema filtering a clear ValueError is raised —
       silent skips can make a restore appear successful while dropping data.
+    - Conflicting rows are upserted via ``ON CONFLICT(<pk>) DO UPDATE``.
+      ``INSERT OR REPLACE`` deletes-then-inserts, which fires
+      ``ON DELETE CASCADE`` on dependent tables and changes rowids — for
+      ``fixtures`` that would drop fixture_signatures / fixture_clusters and
+      for ``events`` it would drop fixture_ha_entity_map rows. Upsert avoids
+      both. Tables without a PRIMARY KEY fall back to INSERT OR REPLACE (no
+      restorable tables hit this today).
     - Does NOT commit; must be called inside the caller's transaction so the
       full restore remains atomic.
 
@@ -94,17 +103,49 @@ def safe_insert_rows(db, tbl: str, rows: list) -> int:
         return 0
     if tbl not in RESTORABLE_TABLES:
         raise ValueError(f"Table {tbl!r} is not in the restore allowlist")
-    valid_cols = {r[1] for r in db.execute(f"PRAGMA table_info({tbl})").fetchall()}
-    cols = [c for c in rows[0].keys() if c in valid_cols]
+    info = db.execute(f"PRAGMA table_info({tbl})").fetchall()
+    valid_cols = {r[1] for r in info}
+    # PRAGMA table_info: r[5] (pk) is 0 for non-PK, 1..n for ordered PK columns.
+    pk_cols = [r[1] for r in sorted(info, key=lambda r: r[5]) if r[5] > 0]
+
+    # Union of keys across all rows — late rows with extra columns are honored.
+    payload_keys: set = set()
+    for r in rows:
+        payload_keys.update(r.keys())
+    cols = [c for c in payload_keys if c in valid_cols]
     if not cols:
         raise ValueError(
             f"Restore error: table '{tbl}' has no valid columns after schema "
-            f"filtering — payload columns {list(rows[0].keys())} do not match "
+            f"filtering — payload columns {sorted(payload_keys)} do not match "
             f"the live schema.  The backup may be from an incompatible version."
         )
-    ph  = ",".join("?" for _ in cols)
-    cn  = ",".join(cols)
-    sql = f"INSERT OR REPLACE INTO {tbl} ({cn}) VALUES ({ph})"
+    # Stable column order so generated SQL is deterministic (helps tests / logs).
+    cols = sorted(cols)
+
+    ph = ",".join("?" for _ in cols)
+    cn = ",".join(cols)
+
+    if pk_cols and all(c in cols for c in pk_cols):
+        non_pk = [c for c in cols if c not in pk_cols]
+        if non_pk:
+            set_clause = ", ".join(f"{c}=excluded.{c}" for c in non_pk)
+            conflict = ",".join(pk_cols)
+            sql = (
+                f"INSERT INTO {tbl} ({cn}) VALUES ({ph}) "
+                f"ON CONFLICT({conflict}) DO UPDATE SET {set_clause}"
+            )
+        else:
+            # All payload columns are PK columns — nothing to update on conflict.
+            conflict = ",".join(pk_cols)
+            sql = (
+                f"INSERT INTO {tbl} ({cn}) VALUES ({ph}) "
+                f"ON CONFLICT({conflict}) DO NOTHING"
+            )
+    else:
+        # No declared PK (or payload missing PK cols) — fall back to the legacy
+        # REPLACE path. None of the current RESTORABLE_TABLES hit this branch.
+        sql = f"INSERT OR REPLACE INTO {tbl} ({cn}) VALUES ({ph})"
+
     for row in rows:
         row = normalize_restore_row(row, tbl)
         db.execute(sql, [row.get(c) for c in cols])

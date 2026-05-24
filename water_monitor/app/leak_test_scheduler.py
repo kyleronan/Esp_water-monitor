@@ -144,22 +144,34 @@ class LeakTestScheduler:
             except (ValueError, AttributeError, TypeError):
                 continue
 
-        best_hr  = None
-        best_avg = None
+        # Two-pass selection: (1) find the global-minimum average, then
+        # (2) prefer any 0–5 AM hour that is within 5 % of that minimum.
+        # The previous single-pass tie-break re-anchored best_avg to the
+        # in-range hour, which let successive 0–5 hours monotonically drift
+        # upward (e.g. 7→2→3→5 with averages 1.00, 1.04, 1.09, 1.14 all
+        # passed the gate and ended at hour 5).
+        averages: Dict[int, float] = {}
         for hr in sorted(hour_vols.keys()):
             vols = hour_vols[hr]
             if len(vols) < 7:
                 continue
-            avg_vol = sum(vols) / len(vols)
-            if best_avg is None or avg_vol < best_avg * 0.95:
-                best_hr  = hr
-                best_avg = avg_vol
-            elif avg_vol < best_avg * 1.05 and 0 <= hr <= 5:
-                best_hr  = hr
-                best_avg = avg_vol
+            averages[hr] = sum(vols) / len(vols)
 
-        if best_hr is None:
+        if not averages:
             return None
+
+        global_min_hr  = min(averages, key=lambda h: averages[h])
+        global_min_avg = averages[global_min_hr]
+        ceiling        = global_min_avg * 1.05
+
+        # Prefer the earliest 0–5 hour within 5 % of the global minimum.
+        best_hr  = global_min_hr
+        best_avg = global_min_avg
+        for hr in range(0, 6):
+            if hr in averages and averages[hr] <= ceiling:
+                best_hr  = hr
+                best_avg = averages[hr]
+                break
 
         log.info("[%s] learned best test hour: %02d:00 local (avg %.3f L/h)",
                  circuit, best_hr, best_avg)
@@ -430,13 +442,19 @@ class LeakTestScheduler:
 
         target_dow = schedule["day_of_week"] or 0   # 0=Monday
         days_ahead = (target_dow - now_local.weekday()) % 7
-        if days_ahead == 0:
-            days_ahead = 7
-        if freq == "fortnightly":
-            days_ahead += 7
-
+        # If today is the target weekday, only push to next week if today's
+        # run_hour has already passed — otherwise today at run_hour is the
+        # correct next run (mirroring the daily branch's same-day handling).
         candidate = (now_local + timedelta(days=days_ahead)).replace(
             hour=run_hour, minute=run_minute, second=0, microsecond=0)
+        if days_ahead == 0 and candidate <= now_local:
+            days_ahead = 7
+            candidate = (now_local + timedelta(days=days_ahead)).replace(
+                hour=run_hour, minute=run_minute, second=0, microsecond=0)
+        if freq == "fortnightly" and days_ahead != 0:
+            # Fortnightly = same weekday two weeks out, unless we already
+            # picked "today" (no extra week needed in that case).
+            candidate += timedelta(days=7)
 
         if freq == "monthly":
             week_of_month = schedule["week_of_month"] or 1

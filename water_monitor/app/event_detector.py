@@ -991,8 +991,15 @@ class WaveformMetadata:
     propagation_delay_ms: int   # pd — onset propagation delay (ms; -1 = not detected)
     quality: int            # q  — 0 ok, 1 incomplete, firmware never publishes 2-6
     flags: int              # fl — bitfield (see plan)
-    # Onset position within the concatenated full array (seq * per_chunk + idx).
+    # Onset position. ``onset_seq`` and ``onset_idx`` are the source chunk
+    # and within-chunk sample index as reported by firmware; ``onset_index``
+    # is the linear index into the concatenated full_flow/full_pressure and
+    # is resolved by the accumulator once chunk lengths are known.
+    onset_seq: int = 0
+    onset_idx: int = 0
     onset_index: int = 0
+    pressure_onset_seq: int = -1
+    pressure_onset_idx: int = -1
     pressure_onset_index: int = -1
     # Legacy fields kept at zero for compat — pre/post/tail no longer meaningful.
     pre_ms: int = 0
@@ -1086,12 +1093,17 @@ def _parse_chunk_scalars(data: dict) -> Optional[dict]:
     return out
 
 
-def _parse_final_metadata(data: dict, circuit: str,
-                          full_len: int, start_len: int) -> Optional[WaveformMetadata]:
+def _parse_final_metadata(
+    data: dict, circuit: str, full_len: int, start_len: int,
+) -> Optional[Tuple[WaveformMetadata, int]]:
     """Build a WaveformMetadata from the final chunk's extra fields.
 
     `full_len` is the total sample count after concatenation; `start_len` is
     the prefix slice length (min of _WF_START_SAMPLES and full_len).
+
+    Returns ``(metadata, total)`` so the caller does not re-parse ``total``
+    (a defensive re-parse risks silently substituting 0 and assembling an
+    incomplete record).
     """
     b = _normalize_int_field(data, "b")
     eid = _normalize_int_field(data, "id")
@@ -1122,11 +1134,10 @@ def _parse_final_metadata(data: dict, circuit: str,
     if fl & ~_WF_FLAG_VALID_MASK:
         log.debug("waveform[%s]: final fl=%d has invalid high bits", circuit, fl)
         return None
-    # Compute onset position within the concatenated full array. Each chunk
-    # before onset_seq has a length we don't directly know here — the
-    # accumulator passes the resolved sample indices via WaveformMetadata so
-    # downstream consumers see a single linear index.
-    return WaveformMetadata(
+    # Onset position is reported here in (seq, idx) form; the linear index
+    # into the concatenated full array is resolved by the accumulator once
+    # all chunk lengths are known (`_assemble`).
+    meta = WaveformMetadata(
         event_id=eid,
         boot_id=b,
         start_ms=evs,
@@ -1140,9 +1151,12 @@ def _parse_final_metadata(data: dict, circuit: str,
         propagation_delay_ms=pd,
         quality=q,
         flags=fl,
-        onset_index=onset_idx,             # within onset_seq's chunk; linear resolved by accumulator
-        pressure_onset_index=press_onset_idx if press_onset_seq >= 0 else -1,
+        onset_seq=onset_seq,
+        onset_idx=onset_idx,
+        pressure_onset_seq=press_onset_seq,
+        pressure_onset_idx=press_onset_idx if press_onset_seq >= 0 else -1,
     )
+    return meta, total
 
 
 def _decode_waveform(
@@ -1334,12 +1348,16 @@ class WaveformChunkAccumulator:
             chunks_in_order = sorted(cs.chunks.items())
             full_len = sum(len(f) for _, (f, _p) in chunks_in_order)
             start_len = min(_WF_START_SAMPLES, full_len)
-            meta = _parse_final_metadata(data, self._circuit, full_len, start_len)
-            if meta is None:
+            parsed = _parse_final_metadata(data, self._circuit, full_len, start_len)
+            if parsed is None:
                 # Don't pop the in-flight entry — TTL will GC it. The DEBUG
                 # log already explained why.
                 return
-            cs.total = int(_normalize_int_field(data, "total") or 0)
+            meta, total = parsed
+            # Use the already-validated total from _parse_final_metadata
+            # rather than re-parsing the wire field (a re-parse failure
+            # would silently substitute 0 and assemble an empty record).
+            cs.total = total
             cs.final_metadata = meta
 
         # Try to assemble if we have a known total and all seqs are present.
@@ -1364,17 +1382,31 @@ class WaveformChunkAccumulator:
 
         full_flow: List[float] = []
         full_press: List[float] = []
-        # Resolve the chunk-relative onset_index to a linear index by summing
-        # chunk lengths up to onset_seq, then adding the within-chunk offset.
-        # The final-chunk metadata recorded onset_seq alongside onset_idx,
-        # but _parse_final_metadata only stored onset_idx; recompute linear
-        # offset here from the source data.
-        # (We don't have onset_seq in WaveformMetadata; the per-chunk index
-        # is sufficient since onset always lives in chunk 0 by construction —
-        # the firmware copies the pre-roll into the chunk on event onset.)
-        for _seq, (flow, press) in chunks_in_order:
+        # Resolve the (onset_seq, onset_idx) pair to a linear index into the
+        # concatenated full_flow / full_pressure arrays by summing the lengths
+        # of all chunks strictly before onset_seq. This is robust to a future
+        # firmware that extends the pre-roll across multiple chunks or fires
+        # an event without flow pre-roll.
+        prefix_len: Dict[int, int] = {}
+        running = 0
+        for seq, (flow, press) in chunks_in_order:
+            prefix_len[seq] = running
             full_flow.extend(flow)
             full_press.extend(press)
+            running += len(flow)
+
+        def _linear(seq: int, idx: int) -> int:
+            base = prefix_len.get(seq, 0)
+            return base + max(0, idx)
+
+        meta.onset_index = (
+            _linear(meta.onset_seq, meta.onset_idx)
+            if meta.onset_seq >= 0 else 0
+        )
+        meta.pressure_onset_index = (
+            _linear(meta.pressure_onset_seq, meta.pressure_onset_idx)
+            if meta.pressure_onset_seq >= 0 else -1
+        )
 
         start_flow = full_flow[:_WF_START_SAMPLES]
         start_press = full_press[:_WF_START_SAMPLES]
@@ -1387,18 +1419,28 @@ class WaveformChunkAccumulator:
         # feature_extractor derives per-sample dt from (pre_ms + post_ms) /
         # start_points. The firmware streams at native ~50 Hz cadence (20 ms
         # per sample); populate pre_ms / post_ms so dt resolves to 0.020 s
-        # and the onset position is recoverable. Onset always lives in the
-        # first chunk (the pre-roll), so meta.onset_index maps directly into
-        # the start_flow slice.
+        # and the onset position is recoverable. When the resolved onset lies
+        # within the start window we expose it via pre_ms/post_ms; otherwise
+        # we just describe the start window's full extent and downstream code
+        # falls back to legacy onset detection from the waveform itself.
         _SAMPLE_MS = 20
         if meta.start_points > 0:
-            onset_in_start = max(0, min(meta.onset_index, meta.start_points - 1))
-            meta.pre_ms = onset_in_start * _SAMPLE_MS
-            meta.post_ms = (meta.start_points - onset_in_start) * _SAMPLE_MS
-        # tail_ms reflects native-cadence span of full_pressure minus the
-        # start window — kept for compatibility with legacy consumers that
-        # treat it as "post-event sample budget".
-        meta.tail_ms = max(0, meta.full_points - meta.start_points) * _SAMPLE_MS
+            if 0 <= meta.onset_index < meta.start_points:
+                onset_in_start = meta.onset_index
+                meta.pre_ms = onset_in_start * _SAMPLE_MS
+                meta.post_ms = (meta.start_points - onset_in_start) * _SAMPLE_MS
+            else:
+                # Onset is outside the start window — describe the window only.
+                meta.pre_ms = 0
+                meta.post_ms = meta.start_points * _SAMPLE_MS
+        # tail_ms = 0: chunked records do not capture a post-event recovery
+        # tail. The full waveform spans onset → event end only. Setting this
+        # to anything else feeds the wrong "tail" into feature_extractor's
+        # recovery_overshoot_psi / steady_state_fraction full-window math.
+        # When tail_ms is 0, those blocks fall through and the legacy
+        # _pressure_shape_features value survives (which is correct — it
+        # measures over the full pressure_readings window).
+        meta.tail_ms = 0
 
         record = WaveformRecord(
             circuit=self._circuit,
