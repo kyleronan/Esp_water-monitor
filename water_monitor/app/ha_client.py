@@ -141,12 +141,30 @@ class HaClient:
         # normal dispatch path once subscriptions are confirmed so that
         # state_changed / HA bus events fired during setup are not lost.
         deferred: List[dict] = []
+        sub_id: int = 0
         async with websockets.connect(WS_URL, max_size=2**24,
                                       ping_interval=30) as ws:
             await self._auth(ws)
-            sub_id = await self._subscribe_entity_states(ws, deferred)
-            self._event_sub_ids = await self._subscribe_ha_events(
-                ws, sub_id, deferred)
+            try:
+                sub_id = await self._subscribe_entity_states(ws, deferred)
+                self._event_sub_ids = await self._subscribe_ha_events(
+                    ws, sub_id, deferred)
+            except Exception:
+                # Subscribe timed out or HA rejected the subscription. Flush
+                # whatever we already buffered before propagating: the outer
+                # run_event_loop will reconnect with a fresh `deferred` list,
+                # so anything left here is lost forever otherwise. Routing
+                # uses the latest `self._event_sub_ids` (possibly stale by one
+                # connection) plus the partial sub_id — _route_event_msg's
+                # `if msg.get("type") != "event"` and id-matching guards make
+                # mis-routes safe (the message is simply not dispatched).
+                if deferred:
+                    log.warning(
+                        "HA subscribe failed; flushing %d buffered event(s) "
+                        "before reconnect", len(deferred))
+                for msg in deferred:
+                    self._route_event_msg(msg, sub_id, self._event_sub_ids)
+                raise
             log.info(
                 "HA WebSocket connected, monitoring %d entities, %d event types",
                 len(self._subscriptions), len(self._event_sub_ids),
