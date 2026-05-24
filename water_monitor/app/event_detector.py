@@ -1384,6 +1384,22 @@ class WaveformChunkAccumulator:
         meta.full_points = len(full_flow)
         meta.start_points = len(start_flow)
 
+        # feature_extractor derives per-sample dt from (pre_ms + post_ms) /
+        # start_points. The firmware streams at native ~50 Hz cadence (20 ms
+        # per sample); populate pre_ms / post_ms so dt resolves to 0.020 s
+        # and the onset position is recoverable. Onset always lives in the
+        # first chunk (the pre-roll), so meta.onset_index maps directly into
+        # the start_flow slice.
+        _SAMPLE_MS = 20
+        if meta.start_points > 0:
+            onset_in_start = max(0, min(meta.onset_index, meta.start_points - 1))
+            meta.pre_ms = onset_in_start * _SAMPLE_MS
+            meta.post_ms = (meta.start_points - onset_in_start) * _SAMPLE_MS
+        # tail_ms reflects native-cadence span of full_pressure minus the
+        # start window — kept for compatibility with legacy consumers that
+        # treat it as "post-event sample budget".
+        meta.tail_ms = max(0, meta.full_points - meta.start_points) * _SAMPLE_MS
+
         record = WaveformRecord(
             circuit=self._circuit,
             boot_id=meta.boot_id,
