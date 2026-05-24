@@ -212,7 +212,11 @@ async def ingress_middleware(request: Request, call_next):
         "/static",
         "/health",
     )
-    if request.method == "POST" and not any(
+    # Cover every state-mutating method — the History UI uses PATCH for
+    # event-label edits, and future settings endpoints may use PUT/DELETE.
+    # Previously only POST was guarded, leaving PATCH routes such as
+    # /api/events/{circuit}/{event_id} unprotected.
+    if request.method in ("POST", "PUT", "PATCH", "DELETE") and not any(
             request.url.path.startswith(p) for p in csrf_exempt):
         # 1. Check header first (covers JSON, no-body, and all fetch POSTs)
         token = request.headers.get("X-CSRF-Token", "")

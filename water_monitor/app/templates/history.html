@@ -691,9 +691,15 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     saveBtn.disabled = true;
     ignBtn.disabled  = true;
     try {
+      // X-CSRF-Token required since the middleware now gates PATCH the
+      // same as POST. window.CSRF_TOKEN is injected by IngressTemplates
+      // (main.py) into every page render.
       const resp = await fetch(`${INGRESS}/history/api/events/${circuit}/${eventId}`, {
         method:  'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': window.CSRF_TOKEN || '',
+        },
         body:    JSON.stringify(payload),
       });
       if (!resp.ok) {
