@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # Checked against the device registry sw_version field (set via project.version
 # in the ESPHome YAML). Non-numeric versions (e.g. "dev") are treated as unknown
 # — setup is not blocked, but a warning is shown.
-MIN_FIRMWARE_VERSION: tuple = (3, 8, 0)
+MIN_FIRMWARE_VERSION: tuple = (3, 9, 0)
 
 # Roles that are optional — wizard will show them as optional dropdowns
 # and they won't block setup completion if unmatched.
@@ -57,9 +57,12 @@ OPTIONAL_ROLES = {
     "trickle_max_flow",
     "trickle_duration",
     "leak_test_duration_number",  # preferred name; leak_test_duration_sensor is the compat alias
-    # Waveform overflow diagnostic counter (firmware 3.7.0+, circuit_1 only).
+    # Waveform diagnostic counters (firmware 3.7.0+ / 3.9.0+, circuit_1 only).
     # The 5 chunked text sensors were replaced by an HA event in firmware 3.8.0.
+    # Chunk drop count was added in 3.9.0 when chunked streaming replaced the
+    # single-event transport.
     "wf_overflow_count_sensor",
+    "wf_chunk_drop_count_sensor",
 }
 
 
@@ -123,9 +126,11 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "trickle_max_flow":           (r"trickle flow max threshold.*main",            "number"),
         "trickle_duration":           (r"trickle flow alert duration.*main",           "number"),
         "leak_test_duration_number":  (r"leak test duration.*main",                    "number"),
-        # Waveform overflow diagnostic counter (firmware 3.7.0+, circuit_1 only).
-        # The 5 chunked text sensors were replaced by an HA event in firmware 3.8.0.
+        # Waveform diagnostic counters (firmware 3.7.0+ / 3.9.0+, circuit_1 only).
+        # The 5 chunked text sensors were replaced by an HA event in firmware 3.8.0;
+        # chunk drop count was added in 3.9.0 alongside the chunked streaming transport.
         "wf_overflow_count_sensor":   (r"waveform overflow dropped count.*main",       "sensor"),
+        "wf_chunk_drop_count_sensor": (r"waveform chunk drop count.*main",             "sensor"),
     },
     "circuit_2": {   # was "irrigation" — regex patterns match default firmware names
         "flow_sensor":             (r"water flow rate.*irrigation",                           "sensor"),

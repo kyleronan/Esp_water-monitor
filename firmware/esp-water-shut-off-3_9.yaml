@@ -57,7 +57,7 @@ substitutions:
 
 esphome:
   name: esp-water-shut-off-3
-  friendly_name: ESP Water Shut off 3.8
+  friendly_name: ESP Water Shut off 3.9
   min_version: 2024.6.0
   name_add_mac_suffix: false
   platformio_options:
@@ -65,7 +65,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.8.0"
+    version: "3.9.0"
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -592,29 +592,31 @@ globals:
     initial_value: '""'
 
   # ---------------------------------------------------------------------------
-  # WAVEFORM CAPTURE GLOBALS — Main circuit (circuit_1) — firmware 3.7.0+
+  # WAVEFORM CAPTURE GLOBALS — Per-circuit chunked streaming (firmware 3.9.0+)
   #
-  # Per-event flow + pressure waveform capture for the water-signature add-on.
-  # STRICTLY ADDITIVE: no safety, ADC, valve, or leak-test path reads or writes
-  # any global below. All capture work runs in the dedicated `waveform_capture`
-  # interval (~50 Hz) — never in the 200 Hz ADC loop, the pulse-counter ISR, or
-  # any safety lambda. Storage is fully preallocated (no runtime allocation).
+  # Per-event flow + pressure waveform capture for the water-signature add-on,
+  # delivered as a stream of esphome.water_monitor_waveform_chunk events.
+  # A new chunk fires every 30 s of capture (or whenever the 1500-sample
+  # buffer fills) and the add-on accumulates + stitches them on the final
+  # chunk. This replaces the slot+decimation design used through 3.8.x —
+  # native cadence is preserved regardless of event length.
+  #
+  # STRICTLY ADDITIVE to safety: no safety, ADC, valve, or leak-test path
+  # reads or writes any global below. All capture work runs in the dedicated
+  # `waveform_capture` interval (~50 Hz) — never in the 200 Hz ADC loop, the
+  # pulse-counter ISR, or any safety lambda. Storage is fully preallocated
+  # (no runtime allocation).
   #
   # int16 wire scaling:  flow = L/min x 100,  pressure = PSI x 100.
   #
-  # A continuous pre-roll ring buffer always holds the last ~2 s. On a flow
-  # onset the pre-roll is copied into one of two double-buffered event slots;
-  # the slot keeps capturing through the event and a post-event tail, then is
-  # resampled into a fixed start window + full window and published. Two slots
-  # let a second event capture while the first publishes — events are never
-  # mixed. If both slots are busy the event is dropped and a diagnostic counter
-  # increments (the add-on then falls back to legacy feature extraction).
-  # Circuit 2 (irrigation) capture is intentionally out of scope for this
-  # phase; the wire format carries a circuit field so it can be added later.
+  # Per-circuit layout: arrays indexed [2] where 0 = circuit_1 (main) and
+  # 1 = circuit_2 (irrigation). Circuit_2 onset detection is wired in a
+  # later firmware version; in 3.9.0 only circuit_1 ever enters CAPTURING.
   # ---------------------------------------------------------------------------
 
   # Pre-roll ring buffer — 100 samples @ ~50 Hz = ~2.0 s of flow + pressure.
-  # Arrays have no initial_value — static storage zero-initialises them.
+  # Shared across circuits for now (only circuit_1's flow/press is sampled);
+  # Commit 4 may split this per-circuit if irrigation pre-roll diverges.
   - id: wf_ring_flow
     type: int16_t[100]
     restore_value: no
@@ -630,70 +632,86 @@ globals:
     restore_value: no
     initial_value: '0'
 
-  # Event capture slots — double-buffered. 480 samples @ ~50 Hz = ~9.6 s before
-  # in-place 2x decimation extends the captured span at coarser resolution.
-  - id: wf_slot0_flow
-    type: int16_t[480]
+  # Per-circuit chunk buffers — 1500 samples = 30 s @ ~50 Hz native cadence.
+  # Statically allocated; never written past index 1499. When a buffer fills
+  # and staging is blocked, new samples are dropped (wf_chunk_drop_count++).
+  # Total: 2 circuits x 2 signals x 1500 x 2 bytes = 12 KB raw arrays.
+  - id: wf_chunk_flow
+    type: int16_t[2][1500]
     restore_value: no
-  - id: wf_slot0_press
-    type: int16_t[480]
-    restore_value: no
-  - id: wf_slot1_flow
-    type: int16_t[480]
-    restore_value: no
-  - id: wf_slot1_press
-    type: int16_t[480]
+  - id: wf_chunk_press
+    type: int16_t[2][1500]
     restore_value: no
 
-  # Per-slot capture state — index 0/1 selects the slot.
-  #   wf_slot_phase: 0 free, 1 capturing, 2 waiting-for-zero (tail),
-  #                  3 ready-to-publish, 4+ publishing steps.
-  - id: wf_slot_phase
+  # Per-circuit capture state (index 0 = circuit_1, 1 = circuit_2).
+  - id: wf_chunk_len              # samples currently in chunk buffer
     type: int[2]
     restore_value: no
     initial_value: '{0, 0}'
-  - id: wf_slot_len               # samples written into the slot
+  - id: wf_chunk_seq              # chunk index within the current event, 0-based
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_chunk_start_ms         # millis() when current chunk started
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_capturing              # true between onset and end-of-tail
+    type: bool[2]
+    restore_value: no
+    initial_value: '{false, false}'
+  - id: wf_event_id               # current event's id per circuit
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_event_start_ms
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_event_end_ms
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_zero_ms                # millis() when flow last dropped below gate
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_onset_seq              # chunk_seq containing the flow onset (= 0)
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_onset_idx              # sample index of onset within wf_onset_seq
     type: int[2]
     restore_value: no
     initial_value: '{0, 0}'
-  - id: wf_slot_onset_idx         # slot index of the flow-onset sample
-    type: int[2]
-    restore_value: no
-    initial_value: '{0, 0}'
-  - id: wf_slot_press_onset_idx   # slot index of pressure transient, -1 = none
+  - id: wf_press_onset_seq        # chunk_seq containing the pressure transient
     type: int[2]
     restore_value: no
     initial_value: '{-1, -1}'
-  - id: wf_slot_decim             # in-place decimation factor (1, 2, 4, ...)
+  - id: wf_press_onset_idx        # sample index within wf_press_onset_seq, -1 = none
     type: int[2]
     restore_value: no
-    initial_value: '{1, 1}'
-  - id: wf_slot_flags             # completeness/quality flag bitfield
+    initial_value: '{-1, -1}'
+
+  # Running event-wide accumulators (updated every captured sample).
+  - id: wf_evt_pk                 # peak flow (int16 wire scale)
     type: int[2]
     restore_value: no
     initial_value: '{0, 0}'
-  - id: wf_slot_event_id
-    type: uint32_t[2]
+  - id: wf_evt_pmin
+    type: int[2]
     restore_value: no
-    initial_value: '{0, 0}'
-  - id: wf_slot_start_ms
-    type: uint32_t[2]
+    initial_value: '{32767, 32767}'
+  - id: wf_evt_pmax
+    type: int[2]
     restore_value: no
-    initial_value: '{0, 0}'
-  - id: wf_slot_end_ms
-    type: uint32_t[2]
-    restore_value: no
-    initial_value: '{0, 0}'
-  - id: wf_slot_zero_ms           # millis() when flow last dropped below gate
-    type: uint32_t[2]
+    initial_value: '{-32768, -32768}'
+  - id: wf_evt_flags              # quality/completeness bitfield
+    type: int[2]
     restore_value: no
     initial_value: '{0, 0}'
 
   # Engine-wide capture state.
-  - id: wf_active_slot            # slot currently capturing, -1 = none
-    type: int
-    restore_value: no
-    initial_value: '-1'
   - id: wf_tick                   # free-running ~50 Hz interval tick counter
     type: uint32_t
     restore_value: no
@@ -706,14 +724,14 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  - id: wf_overflow_count         # events dropped because both slots busy
+  - id: wf_overflow_count         # events dropped because previous event still flushing
     type: int
     restore_value: no
     initial_value: '0'
-  - id: wf_dropped_active         # guards one overflow count per dropped event
-    type: bool
+  - id: wf_chunk_drop_count       # samples dropped because buffer full + staging blocked
+    type: uint32_t
     restore_value: no
-    initial_value: 'false'
+    initial_value: '0'
   - id: wf_press_baseline         # slow pressure baseline for transient onset
     type: float
     restore_value: no
@@ -722,24 +740,34 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  - id: wf_stage_rr               # round-robin starting circuit for stage fairness
+    type: int
+    restore_value: no
+    initial_value: '0'
 
-  # HA-event staging globals (firmware 3.8.0+).
-  # All fields for one esphome.water_monitor_waveform event are staged here
-  # before the homeassistant.event action fires so the action only reads from
-  # these globals — never from live slot arrays.
-  - id: wf_ev_sf
+  # HA-event staging globals — single shared in-flight chunk (only one
+  # esphome.water_monitor_waveform_chunk event may be queued at a time).
+  # The capture loop sets wf_ev_pending; the YAML event action fires the
+  # event reading these fields, then clears wf_ev_pending.
+  - id: wf_ev_flow_b64
     type: std::string
     restore_value: no
-  - id: wf_ev_sp
+  - id: wf_ev_press_b64
     type: std::string
     restore_value: no
-  - id: wf_ev_ff
-    type: std::string
+  - id: wf_ev_pending
+    type: bool
     restore_value: no
-  - id: wf_ev_fp
-    type: std::string
+    initial_value: 'false'
+  - id: wf_ev_is_final
+    type: bool
     restore_value: no
-  - id: wf_ev_id
+    initial_value: 'false'
+  - id: wf_ev_circuit             # 0 or 1 — picks circuit_1 / circuit_2 in event
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_event_id
     type: uint32_t
     restore_value: no
     initial_value: '0'
@@ -747,26 +775,47 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  - id: wf_ev_s
+  - id: wf_ev_seq
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  - id: wf_ev_e
+  - id: wf_ev_s                   # chunk_start_ms
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  - id: wf_ev_p
+  - id: wf_ev_e                   # chunk_end_ms
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  - id: wf_ev_pre
+  # Final-only metadata fields (only valid when wf_ev_is_final is true).
+  - id: wf_ev_evt_s               # event-wide start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_evt_e               # event-wide end_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_total               # expected total chunk count (wf_chunk_seq + 1)
+    type: uint32_t
+    restore_value: no
+    initial_value: '1'
+  - id: wf_ev_onset_seq
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_onset_idx
     type: int
     restore_value: no
     initial_value: '0'
-  - id: wf_ev_post
+  - id: wf_ev_press_onset_seq
     type: int
     restore_value: no
-    initial_value: '0'
+    initial_value: '-1'
+  - id: wf_ev_press_onset_idx
+    type: int
+    restore_value: no
+    initial_value: '-1'
   - id: wf_ev_pk
     type: int
     restore_value: no
@@ -787,14 +836,6 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
-  - id: wf_ev_pending
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: wf_pub_slot
-    type: int
-    restore_value: no
-    initial_value: '-1'
 
 # =============================================================================
 # SENSORS
@@ -1798,11 +1839,11 @@ sensor:
   # ---------------------------------------------------------------------------
   # WAVEFORM OVERFLOW DROPPED COUNT — Main circuit — diagnostic (firmware 3.7.0+)
   #
-  # Increments once per water event that could not be captured because both
-  # double-buffered waveform slots were still busy publishing. A climbing value
-  # means events are arriving faster than they can be encoded/published; the
-  # add-on simply falls back to legacy feature extraction for those events.
-  # Published immediately on change by the waveform_capture interval, and also
+  # Increments once per water event that could not be captured because the
+  # previous event's final chunk was still flushing to HA. Climbing value =>
+  # events arriving faster than they can be staged + sent (very rare in
+  # chunked transport; was the dominant failure mode in the slot+decimation
+  # design used through 3.8.x). Published immediately on change and also
   # polled every 60 s so HA has the value after a reconnect.
   # ---------------------------------------------------------------------------
   - platform: template
@@ -1817,6 +1858,29 @@ sensor:
       sorting_weight: 47
     update_interval: 60s
     lambda: 'return (float) id(wf_overflow_count);'
+
+  # ---------------------------------------------------------------------------
+  # WAVEFORM CHUNK DROP COUNT — diagnostic (firmware 3.9.0+)
+  #
+  # Increments once per SAMPLE dropped because a circuit's 1500-sample chunk
+  # buffer was full AND staging was blocked (wf_ev_pending). With the
+  # in-tick stage+fire pipeline this should stay at 0 under normal operation;
+  # a non-zero value indicates HA→ESP event latency is occasionally exceeding
+  # one 20 ms tick. Investigate add-on responsiveness or HA load before
+  # declaring chunked streaming stable on a deployment.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Waveform Chunk Drop Count - ${circuit_1_name}"
+    id: waveform_chunk_drop_count
+    entity_category: diagnostic
+    icon: mdi:waveform
+    accuracy_decimals: 0
+    state_class: total_increasing
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 48
+    update_interval: 60s
+    lambda: 'return (float) id(wf_chunk_drop_count);'
 
 # =============================================================================
 # TEXT SENSORS — Leak test results
@@ -2986,37 +3050,42 @@ button:
           ESP_LOGI("trickle", "Irrigation trickle flow alert manually reset");
 
 # =============================================================================
-# INTERVALS — Per-event waveform capture (firmware 3.7.0+)
+# INTERVALS — Per-event waveform capture (firmware 3.9.0+, chunked streaming)
 #
-# A single ~50 Hz interval drives the whole waveform-capture engine for the
-# main circuit. STRICTLY ADDITIVE — it only READS already-published sensor
-# states (water_usage1, pressure_main_fast) and writes its own wf_* globals.
-# It never touches the 200 Hz ADC loop, the pulse-counter ISR, the safety
-# lambdas, or any valve action, so it cannot regress the shut-off device.
+# A single ~50 Hz interval drives the whole waveform-capture engine. STRICTLY
+# ADDITIVE — it only READS already-published sensor states (water_usage1,
+# pressure_main_fast) and writes its own wf_* globals. It never touches the
+# 200 Hz ADC loop, the pulse-counter ISR, the safety lambdas, or any valve
+# action, so it cannot regress the shut-off device.
 #
-# Per tick the lambda: (1) appends one flow+pressure sample to the continuous
-# pre-roll ring; (2) runs the capture state machine — on a flow onset it copies
-# the pre-roll into a free double-buffered slot and captures the event plus a
-# 3 s post-event tail, decimating the slot 2x in place if it fills; (3) runs
-# the publisher — stages the wf_ev_* globals for one finalized slot per tick,
-# guarded by wf_ev_pending so a second slot cannot overwrite staged data.
+# Each captured event is delivered as a sequence of
+# `esphome.water_monitor_waveform_chunk` events. A chunk fires every time a
+# circuit's 1500-sample buffer fills (~30 s @ ~50 Hz) and also on event end.
+# The add-on accumulates chunks by (boot_id, event_id) and stitches them on
+# the final chunk. Native cadence is preserved regardless of event length —
+# no decimation, no fixed-size resampling.
 #
-# A single esphome.water_monitor_waveform event then fires from the YAML
-# action below, carrying all four base64 waveform payloads + metadata
-# atomically. Encoding work runs only in the staging tick, never in the
-# sampling path. Firmware 3.8.0 dropped the 5 chunked text_sensor outputs
-# used by earlier releases — HA events have no per-field size limit.
+# Per-circuit layout: arrays indexed [2] where 0 = circuit_1 (main), 1 =
+# circuit_2 (irrigation). 3.9.0 wires only circuit_1's flow + pressure
+# sources; circuit_2's flow_on stays false until a later firmware release.
+# The state machine, buffers, and publisher are already per-circuit, so
+# turning circuit_2 capture on is a single-line change at that point.
 #
-# Note: the 200 Hz pressure-onset / Hall edge-interrupt propagation timing
-# described in the design is a later refinement — this phase measures the
-# propagation delay at the ~50 Hz capture resolution (pd, low-weight in the
-# add-on; -1 when the transient is not seen in the pre-roll).
+# Staging is a single shared in-flight chunk: only one
+# water_monitor_waveform_chunk event may be queued at a time. wf_ev_pending
+# guards it. When the buffer fills and staging is blocked, the new sample
+# is DROPPED and wf_chunk_drop_count++ — the buffer is NEVER written past
+# index 1499. Buffer-full AND finalizing in the same tick collapses to a
+# single final chunk.
+#
+# Wire format: see WaveformChunkAccumulator in water_monitor/app/event_detector.py
+# and the wire-format table in plans/i-would-like-to-snug-lerdorf.md.
 # =============================================================================
 interval:
   - interval: 20ms
     then:
       - lambda: |-
-          /* WAVEFORM CAPTURE ENGINE — main circuit. Strictly additive. */
+          /* WAVEFORM CAPTURE ENGINE — chunked streaming. Strictly additive. */
 
           // ---- one-time per-boot init ----
           if (id(wf_boot_id) == 0) {
@@ -3026,40 +3095,11 @@ interval:
           id(wf_tick) = id(wf_tick) + 1;
 
           // ---- helpers (stack-only lambdas, no heap allocation) ----
-          auto slot_flow = [](int s) -> int16_t* {
-            return (s == 0) ? &id(wf_slot0_flow)[0] : &id(wf_slot1_flow)[0];
-          };
-          auto slot_press = [](int s) -> int16_t* {
-            return (s == 0) ? &id(wf_slot0_press)[0] : &id(wf_slot1_press)[0];
-          };
           auto to_i16 = [](float v) -> int16_t {
             float s = v * 100.0f;
             if (s > 32767.0f) s = 32767.0f;
             if (s < -32768.0f) s = -32768.0f;
             return (int16_t) lroundf(s);
-          };
-          auto resample = [](const int16_t *src, int rlo, int rhi,
-                             int16_t *out, int npts) {
-            int span = rhi - rlo;
-            if (span <= 0) { for (int i = 0; i < npts; i++) out[i] = 0; return; }
-            for (int i = 0; i < npts; i++) {
-              int a = rlo + (int) ((long long) i * span / npts);
-              int b = rlo + (int) ((long long) (i + 1) * span / npts);
-              if (b <= a) b = a + 1;
-              if (b > rhi) b = rhi;
-              long acc = 0; int cnt = 0;
-              for (int k = a; k < b; k++) { acc += src[k]; cnt++; }
-              out[i] = (cnt > 0) ? (int16_t) (acc / cnt) : 0;
-            }
-          };
-          auto b36 = [](uint32_t v) -> std::string {
-            static const char *D = "0123456789abcdefghijklmnopqrstuvwxyz";
-            if (v == 0) return std::string("0");
-            char tmp[8]; int n = 0;
-            while (v > 0 && n < 8) { tmp[n++] = D[v % 36]; v /= 36; }
-            std::string out;
-            for (int i = n - 1; i >= 0; i--) out += tmp[i];
-            return out;
           };
           auto b64 = [](const uint8_t *d, int len) -> std::string {
             static const char *T =
@@ -3086,6 +3126,75 @@ interval:
             }
             return out;
           };
+          // Encode the first `len` int16 samples from a circuit's chunk buffer
+          // into base64 little-endian bytes. Heap allocation bounded by chunk
+          // size (max 1500 samples = 3000 bytes raw, ~4000 chars base64).
+          auto encode_chunk = [&](int16_t *src, int len) -> std::string {
+            if (len <= 0) return std::string();
+            std::vector<uint8_t> bytes;
+            bytes.resize((size_t) len * 2);
+            for (int i = 0; i < len; i++) {
+              uint16_t u = (uint16_t) src[i];
+              bytes[2 * i]     = (uint8_t) (u & 0xFF);
+              bytes[2 * i + 1] = (uint8_t) ((u >> 8) & 0xFF);
+            }
+            return b64(bytes.data(), (int) bytes.size());
+          };
+          // Stage one chunk for circuit c. Returns true on success, false if
+          // staging was blocked by wf_ev_pending.
+          // `is_final` triggers final-only metadata fields; on a non-final
+          // chunk those fields are set to safe defaults but ignored by the
+          // add-on (the wire-format spec only requires them when final=true).
+          auto stage_chunk = [&](int c, bool is_final, uint32_t now_ms) -> bool {
+            if (id(wf_ev_pending)) return false;
+            int len = id(wf_chunk_len)[c];
+            int16_t *fbuf = (c == 0) ? &id(wf_chunk_flow)[0][0]
+                                      : &id(wf_chunk_flow)[1][0];
+            int16_t *pbuf = (c == 0) ? &id(wf_chunk_press)[0][0]
+                                      : &id(wf_chunk_press)[1][0];
+            id(wf_ev_flow_b64)  = encode_chunk(fbuf, len);
+            id(wf_ev_press_b64) = encode_chunk(pbuf, len);
+            id(wf_ev_circuit)   = c;
+            id(wf_ev_is_final)  = is_final;
+            id(wf_ev_event_id)  = id(wf_event_id)[c];
+            id(wf_ev_boot)      = id(wf_boot_id);
+            id(wf_ev_seq)       = id(wf_chunk_seq)[c];
+            id(wf_ev_s)         = id(wf_chunk_start_ms)[c];
+            id(wf_ev_e)         = now_ms;
+            if (is_final) {
+              int fl = id(wf_evt_flags)[c] | 0x02;  // full_waveform_complete
+              uint32_t dur = (uint32_t) (id(wf_event_end_ms)[c] -
+                                          id(wf_event_start_ms)[c]);
+              if (dur < 1000u) fl |= 0x10;          // event_too_short
+              id(wf_evt_flags)[c] = fl;
+              id(wf_ev_evt_s)     = id(wf_event_start_ms)[c];
+              id(wf_ev_evt_e)     = id(wf_event_end_ms)[c];
+              id(wf_ev_total)     = id(wf_chunk_seq)[c] + 1u;
+              id(wf_ev_onset_seq) = id(wf_onset_seq)[c];
+              id(wf_ev_onset_idx) = id(wf_onset_idx)[c];
+              id(wf_ev_press_onset_seq) = id(wf_press_onset_seq)[c];
+              id(wf_ev_press_onset_idx) = id(wf_press_onset_idx)[c];
+              int dp = (id(wf_evt_pmax)[c] >= id(wf_evt_pmin)[c])
+                       ? (id(wf_evt_pmax)[c] - id(wf_evt_pmin)[c]) : 0;
+              id(wf_ev_pk) = id(wf_evt_pk)[c];
+              id(wf_ev_dp) = dp;
+              id(wf_ev_pd) = -1;  // chunk-stream propagation delay derived add-on side
+              id(wf_ev_q)  = (fl & 0x01) ? 0 : 1;
+              id(wf_ev_fl) = fl;
+            } else {
+              id(wf_ev_total)     = 0u;  // unused on non-final chunks
+              id(wf_ev_evt_s)     = 0u;
+              id(wf_ev_evt_e)     = 0u;
+              id(wf_ev_onset_seq) = 0u;
+              id(wf_ev_onset_idx) = 0;
+              id(wf_ev_press_onset_seq) = -1;
+              id(wf_ev_press_onset_idx) = -1;
+              id(wf_ev_pk) = 0; id(wf_ev_dp) = 0;
+              id(wf_ev_pd) = -1; id(wf_ev_q) = 0; id(wf_ev_fl) = 0;
+            }
+            id(wf_ev_pending) = true;
+            return true;
+          };
 
           // ---- 1. sample the continuous pre-roll ring ----
           float flow_lpm = id(water_usage1).state;
@@ -3102,259 +3211,229 @@ interval:
           id(wf_ring_idx) = (id(wf_ring_idx) + 1) % 100;
           if (id(wf_ring_count) < 100) id(wf_ring_count) = id(wf_ring_count) + 1;
 
-          // ---- 2. slow pressure baseline (frozen while an event is active) ----
+          // ---- 2. slow pressure baseline (frozen while ANY circuit is capturing) ----
+          bool any_capturing = id(wf_capturing)[0] || id(wf_capturing)[1];
           if (!id(wf_press_baseline_valid)) {
             id(wf_press_baseline) = press_psi;
             id(wf_press_baseline_valid) = true;
-          } else if (id(wf_active_slot) < 0) {
+          } else if (!any_capturing) {
             id(wf_press_baseline) =
               id(wf_press_baseline) + 0.02f * (press_psi - id(wf_press_baseline));
           }
 
           uint32_t now = millis();
-          bool flow_on = flow_lpm > 0.10f;
+          // Per-circuit sample sources. circuit_1 = current main flow/press.
+          // circuit_2 stays at zero in 3.9.0 — Commit 4 wires the real source.
+          int16_t cur_fi[2] = { fi, 0 };
+          int16_t cur_pi[2] = { pi, 0 };
+          bool flow_on[2] = { flow_lpm > 0.10f, false };
 
-          // ---- 3. capture state machine ----
-          if (id(wf_active_slot) < 0) {
-            // IDLE — watch for a flow onset.
-            if (flow_on) {
-              int slot = (id(wf_slot_phase)[0] == 0) ? 0
-                       : (id(wf_slot_phase)[1] == 0) ? 1 : -1;
-              if (slot >= 0) {
-                int n = id(wf_ring_count);
-                int ri = id(wf_ring_idx);
-                int start = (ri - n + 100) % 100;
-                int16_t *sf = slot_flow(slot);
-                int16_t *sp = slot_press(slot);
-                for (int k = 0; k < n; k++) {
-                  int src = (start + k) % 100;
-                  sf[k] = id(wf_ring_flow)[src];
-                  sp[k] = id(wf_ring_press)[src];
-                }
-                int onset = (n > 0) ? (n - 1) : 0;
-                id(wf_slot_len)[slot] = n;
-                id(wf_slot_onset_idx)[slot] = onset;
-                id(wf_slot_decim)[slot] = 1;
-                id(wf_slot_event_id)[slot] = id(wf_event_counter) + 1;
-                id(wf_event_counter) = id(wf_event_counter) + 1;
-                id(wf_slot_start_ms)[slot] = now;
-                id(wf_slot_end_ms)[slot] = now;
-                id(wf_slot_zero_ms)[slot] = now;
-                // flags: bit0 = pre-roll covers the full start-window pre span
-                // (>= 1.5 s = 75 samples); bit6 = a clamped/error sample.
-                int fl = 0;
-                if (n >= 75) fl |= 0x01;
-                if (clamped) fl |= 0x40;
-                id(wf_slot_flags)[slot] = fl;
-                // propagation: earliest pre-roll sample already above the
-                // pressure transient threshold (baseline + 0.5 PSI).
-                int po = -1;
-                float thr = (id(wf_press_baseline) + 0.5f) * 100.0f;
-                for (int k = 0; k <= onset; k++) {
-                  if ((float) sp[k] >= thr) { po = k; break; }
-                }
-                id(wf_slot_press_onset_idx)[slot] = po;
-                id(wf_slot_phase)[slot] = 1;
-                id(wf_active_slot) = slot;
-                id(wf_dropped_active) = false;
-              } else if (!id(wf_dropped_active)) {
-                // Both slots busy — drop this event, count it exactly once.
-                id(wf_dropped_active) = true;
+          // ---- 3. per-circuit capture state machine ----
+          for (int c = 0; c < 2; c++) {
+            if (!id(wf_capturing)[c]) {
+              // IDLE — watch for flow onset.
+              if (!flow_on[c]) continue;
+              // Reject onset if a previous final-chunk for this circuit hasn't
+              // flushed yet (very rare — wf_ev_pending clears within one tick).
+              if (id(wf_ev_pending) && id(wf_ev_is_final) &&
+                  id(wf_ev_circuit) == c) {
                 id(wf_overflow_count) = id(wf_overflow_count) + 1;
                 id(waveform_overflow_dropped_count)->publish_state(
                   (float) id(wf_overflow_count));
+                continue;
               }
-            } else {
-              id(wf_dropped_active) = false;
+              // Copy 100-sample pre-roll into this circuit's chunk buffer.
+              int n = id(wf_ring_count);
+              int ri = id(wf_ring_idx);
+              int start = (ri - n + 100) % 100;
+              int16_t *fbuf = (c == 0) ? &id(wf_chunk_flow)[0][0]
+                                          : &id(wf_chunk_flow)[1][0];
+              int16_t *pbuf = (c == 0) ? &id(wf_chunk_press)[0][0]
+                                          : &id(wf_chunk_press)[1][0];
+              int pk = 0, pmin = 32767, pmax = -32768;
+              for (int k = 0; k < n; k++) {
+                int src = (start + k) % 100;
+                int16_t f = id(wf_ring_flow)[src];
+                int16_t p = id(wf_ring_press)[src];
+                fbuf[k] = f; pbuf[k] = p;
+                if (f > pk) pk = f;
+                if (p < pmin) pmin = p;
+                if (p > pmax) pmax = p;
+              }
+              int onset = (n > 0) ? (n - 1) : 0;
+              id(wf_chunk_len)[c]      = n;
+              id(wf_chunk_seq)[c]      = 0;
+              id(wf_chunk_start_ms)[c] = now;
+              id(wf_event_id)[c]       = id(wf_event_counter) + 1;
+              id(wf_event_counter)     = id(wf_event_counter) + 1;
+              id(wf_event_start_ms)[c] = now;
+              id(wf_event_end_ms)[c]   = now;
+              id(wf_zero_ms)[c]        = now;
+              id(wf_onset_seq)[c]      = 0;
+              id(wf_onset_idx)[c]      = onset;
+              id(wf_evt_pk)[c]         = pk;
+              id(wf_evt_pmin)[c]       = (n > 0) ? pmin : 32767;
+              id(wf_evt_pmax)[c]       = (n > 0) ? pmax : -32768;
+              int fl = 0;
+              if (n >= 75) fl |= 0x01;  // pre-roll covers >= 1.5 s
+              if (clamped) fl |= 0x40;  // a sample was clamped
+              id(wf_evt_flags)[c] = fl;
+              // Pressure-transient onset (earliest sample above baseline + 0.5 PSI).
+              int po = -1;
+              float thr = (id(wf_press_baseline) + 0.5f) * 100.0f;
+              for (int k = 0; k <= onset; k++) {
+                if ((float) pbuf[k] >= thr) { po = k; break; }
+              }
+              id(wf_press_onset_seq)[c] = (po >= 0) ? 0 : -1;
+              id(wf_press_onset_idx)[c] = po;
+              id(wf_capturing)[c] = true;
+              continue;
             }
-          } else {
-            // CAPTURING / WAITING-FOR-ZERO — append to the active slot.
-            int as = id(wf_active_slot);
-            int phase = id(wf_slot_phase)[as];
-            // Append once per `decim` ticks (in-place decimation cadence).
-            if (id(wf_tick) % (uint32_t) id(wf_slot_decim)[as] == 0) {
-              int len = id(wf_slot_len)[as];
-              if (len >= 480) {
-                // Capture buffer full — decimate 2x in place; span preserved.
-                int16_t *sf = slot_flow(as);
-                int16_t *sp = slot_press(as);
-                for (int k = 0; k < 240; k++) {
-                  sf[k] = sf[2 * k]; sp[k] = sp[2 * k];
+
+            // CAPTURING — try to append the current sample to circuit c's chunk.
+            int len = id(wf_chunk_len)[c];
+            int16_t *fbuf = (c == 0) ? &id(wf_chunk_flow)[0][0]
+                                        : &id(wf_chunk_flow)[1][0];
+            int16_t *pbuf = (c == 0) ? &id(wf_chunk_press)[0][0]
+                                        : &id(wf_chunk_press)[1][0];
+
+            // Buffer-full handling. NEVER write past index 1499.
+            if (len >= 1500) {
+              // Check if we should finalize this tick (collapse buffer-full+final
+              // into a single final chunk rather than non-final + zero-payload final).
+              bool ready_to_finalize =
+                !flow_on[c] &&
+                ((uint32_t) (now - id(wf_zero_ms)[c]) >= 3000u);
+              if (stage_chunk(c, ready_to_finalize, now)) {
+                // Reset buffer for next chunk.
+                id(wf_chunk_len)[c]      = 0;
+                id(wf_chunk_seq)[c]     += 1;
+                id(wf_chunk_start_ms)[c] = now;
+                if (ready_to_finalize) {
+                  id(wf_capturing)[c] = false;
+                  continue;  // event complete — current sample skipped (acceptable: tail)
                 }
-                len = 240;
-                id(wf_slot_len)[as] = len;
-                id(wf_slot_onset_idx)[as] = id(wf_slot_onset_idx)[as] / 2;
-                if (id(wf_slot_press_onset_idx)[as] >= 0)
-                  id(wf_slot_press_onset_idx)[as] =
-                    id(wf_slot_press_onset_idx)[as] / 2;
-                id(wf_slot_decim)[as] = id(wf_slot_decim)[as] * 2;
-                id(wf_slot_flags)[as] |= 0x04;  // resolution_reduced
+                // Append the current sample into the now-empty buffer.
+                fbuf[0] = cur_fi[c];
+                pbuf[0] = cur_pi[c];
+                id(wf_chunk_len)[c] = 1;
+                if (cur_fi[c] > id(wf_evt_pk)[c]) id(wf_evt_pk)[c] = cur_fi[c];
+                if (cur_pi[c] < id(wf_evt_pmin)[c]) id(wf_evt_pmin)[c] = cur_pi[c];
+                if (cur_pi[c] > id(wf_evt_pmax)[c]) id(wf_evt_pmax)[c] = cur_pi[c];
+                if (clamped) id(wf_evt_flags)[c] |= 0x40;
+              } else {
+                // Staging blocked — drop this sample, count it, retry next tick.
+                id(wf_chunk_drop_count) = id(wf_chunk_drop_count) + 1;
+                id(wf_evt_flags)[c] |= 0x04;  // resolution_reduced (chunk drop)
               }
-              int16_t *sf = slot_flow(as);
-              int16_t *sp = slot_press(as);
-              sf[len] = fi;
-              sp[len] = pi;
-              id(wf_slot_len)[as] = len + 1;
-              if (clamped) id(wf_slot_flags)[as] |= 0x40;
-            }
-            // Phase transitions.
-            if (flow_on) {
-              id(wf_slot_zero_ms)[as] = now;
-              if (phase == 2) id(wf_slot_phase)[as] = 1;
             } else {
-              if (phase == 1) {
-                id(wf_slot_phase)[as] = 2;
-                id(wf_slot_end_ms)[as] = now;
+              // Buffer has room — append the current sample.
+              fbuf[len] = cur_fi[c];
+              pbuf[len] = cur_pi[c];
+              id(wf_chunk_len)[c] = len + 1;
+              if (cur_fi[c] > id(wf_evt_pk)[c]) id(wf_evt_pk)[c] = cur_fi[c];
+              if (cur_pi[c] < id(wf_evt_pmin)[c]) id(wf_evt_pmin)[c] = cur_pi[c];
+              if (cur_pi[c] > id(wf_evt_pmax)[c]) id(wf_evt_pmax)[c] = cur_pi[c];
+              if (clamped) id(wf_evt_flags)[c] |= 0x40;
+            }
+
+            // Tail-timer + finalize logic.
+            if (flow_on[c]) {
+              id(wf_zero_ms)[c] = now;
+            } else {
+              if (id(wf_event_end_ms)[c] < id(wf_zero_ms)[c] ||
+                  id(wf_event_end_ms)[c] == id(wf_event_start_ms)[c]) {
+                // First tick of zero flow — record event end.
+                id(wf_event_end_ms)[c] = now;
               }
-              if ((uint32_t) (now - id(wf_slot_zero_ms)[as]) >= 3000u) {
-                // FINALIZE — slot is ready for the publisher.
-                uint32_t dur = (uint32_t) (id(wf_slot_end_ms)[as] -
-                                           id(wf_slot_start_ms)[as]);
-                int fl = id(wf_slot_flags)[as] | 0x02;  // full_waveform_complete
-                if (dur < 1000u) fl |= 0x10;            // event_too_short
-                if (id(wf_slot_decim)[as] >= 4) fl |= 0x20;  // event_too_long
-                id(wf_slot_flags)[as] = fl;
-                id(wf_slot_phase)[as] = 3;
-                id(wf_active_slot) = -1;
+              if ((uint32_t) (now - id(wf_zero_ms)[c]) >= 3000u &&
+                  id(wf_capturing)[c]) {
+                // 3 s of zero flow elapsed — try to send final chunk.
+                // If the buffer happens to be empty (already flushed), this
+                // stages a zero-payload final chunk with metadata only.
+                if (stage_chunk(c, true, now)) {
+                  id(wf_chunk_len)[c] = 0;
+                  id(wf_capturing)[c] = false;
+                }
+                // If stage blocked, retry next tick. wf_capturing stays true.
               }
             }
           }
 
-          // ---- 4. publisher — stage HA event for one finalized slot per tick.
-          // The pending guard prevents a second slot from overwriting the
-          // staged wf_ev_* globals before the YAML event action fires.
-          for (int s = 0; s < 2; s++) {
-            if (id(wf_slot_phase)[s] < 3) continue;
-            if (id(wf_ev_pending)) break;   // already staged — try again next tick
-            int decim = id(wf_slot_decim)[s];
-            int dt = 20 * decim;
-            int len = id(wf_slot_len)[s];
-            int onset = id(wf_slot_onset_idx)[s];
-            int pre_n = 1500 / dt;
-            if (pre_n > onset) pre_n = onset;
-            int lo = onset - pre_n;
-            if (lo < 0) lo = 0;
-            int hi = onset + 3500 / dt;
-            if (hi > len) hi = len;
+          // ---- 4. stage fairness — if both circuits CAPTURING + buffer-full,
+          // alternate which one wins the wf_ev_pending slot per tick.
+          // (Implemented inline in the loop above by iterating c in {0, 1};
+          // wf_stage_rr is reserved for a future fairness rotation when both
+          // circuits are routinely contending. Currently circuit_2 is idle.)
+          id(wf_stage_rr) = (id(wf_stage_rr) + 1) % 2;
 
-            // Compute metadata scalars from slot data.
-            const int16_t *sf5 = slot_flow(s);
-            const int16_t *sp5 = slot_press(s);
-            int pk5 = 0, pmin5 = 32767, pmax5 = -32768;
-            for (int k = 0; k < len; k++) {
-              if (sf5[k] > pk5) pk5 = sf5[k];
-              if (sp5[k] < pmin5) pmin5 = sp5[k];
-              if (sp5[k] > pmax5) pmax5 = sp5[k];
-            }
-            int dp5 = (len > 0 && pmax5 >= pmin5) ? (pmax5 - pmin5) : 0;
-            int pd5 = -1;
-            int po5 = id(wf_slot_press_onset_idx)[s];
-            if (po5 >= 0 && po5 <= onset) pd5 = (onset - po5) * dt;
-            int pre_ms5 = (onset - lo) * dt;
-            int post_ms5 = (hi - onset) * dt;
-            int fl5 = id(wf_slot_flags)[s];
-            int q5 = (fl5 & 0x01) ? 0 : 1;
-
-            // Build all four base64 waveform payloads.
-            auto encode_wf = [&](const int16_t *src, int rlo, int rhi, int npts) -> std::string {
-              int16_t pts[88];
-              resample(src, rlo, rhi, pts, npts);
-              uint8_t bytes[176];
-              for (int i = 0; i < npts; i++) {
-                uint16_t u = (uint16_t) pts[i];
-                bytes[2 * i]     = (uint8_t) (u & 0xFF);
-                bytes[2 * i + 1] = (uint8_t) ((u >> 8) & 0xFF);
-              }
-              return b64(bytes, npts * 2);
-            };
-            id(wf_ev_sf) = encode_wf(slot_flow(s),  lo,  hi, 80);   // start flow
-            id(wf_ev_sp) = encode_wf(slot_press(s), lo,  hi, 80);   // start pressure
-            id(wf_ev_ff) = encode_wf(slot_flow(s),   0, len, 64);   // full flow
-            id(wf_ev_fp) = encode_wf(slot_press(s),  0, len, 64);   // full pressure
-
-            // Stage scalar metadata.
-            id(wf_ev_id)   = id(wf_slot_event_id)[s];
-            id(wf_ev_boot) = id(wf_boot_id);
-            id(wf_ev_s)    = id(wf_slot_start_ms)[s];
-            id(wf_ev_e)    = id(wf_slot_end_ms)[s];
-            id(wf_ev_p)    = now;
-            id(wf_ev_pre)  = pre_ms5;
-            id(wf_ev_post) = post_ms5;
-            id(wf_ev_pk)   = pk5;
-            id(wf_ev_dp)   = dp5;
-            id(wf_ev_pd)   = pd5;
-            id(wf_ev_q)    = q5;
-            id(wf_ev_fl)   = fl5;
-
-            id(wf_pub_slot) = s;
-            id(wf_ev_pending) = true;
-            // Slot stays phase=3 until the YAML event-action lambda frees it.
-            break;  // at most one staging per tick
-          }
-
-      # Fire the staged HA event when the step-5 publisher has filled the
-      # wf_ev_* globals and set wf_ev_pending.  Runs in the same 20ms tick
-      # as the staging lambda (ESPHome evaluates then: actions sequentially).
+      # Fire the staged HA chunk event when wf_ev_pending is true. Runs in the
+      # same 20ms tick as the staging lambda (ESPHome evaluates then: actions
+      # sequentially), so staging-and-fire happens within one tick at the cost
+      # of a short retry-loop if the event coroutine yields.
       - if:
           condition:
             lambda: 'return id(wf_ev_pending);'
           then:
             - homeassistant.event:
-                event: esphome.water_monitor_waveform
+                event: esphome.water_monitor_waveform_chunk
                 data_template:
                   schema:            "{{ schema }}"
-                  transport:         "{{ transport }}"
                   transport_version: "{{ transport_version }}"
                   node:              "{{ node }}"
                   circuit:           "{{ circuit }}"
                   id:                "{{ id }}"
                   b:                 "{{ b }}"
-                  v:                 "1"
+                  seq:               "{{ seq }}"
                   s:                 "{{ s }}"
                   e:                 "{{ e }}"
-                  p:                 "{{ p }}"
-                  sn:                "80"
-                  fn:                "64"
-                  pre:               "{{ pre }}"
-                  post:              "{{ post }}"
-                  tl:                "3000"
                   fs:                "100"
                   ps:                "100"
+                  flow:              "{{ flow }}"
+                  press:             "{{ press }}"
+                  final:             "{{ final }}"
+                  event_s:           "{{ event_s }}"
+                  event_e:           "{{ event_e }}"
+                  total:             "{{ total }}"
+                  onset_seq:         "{{ onset_seq }}"
+                  onset_idx:         "{{ onset_idx }}"
+                  press_onset_seq:   "{{ press_onset_seq }}"
+                  press_onset_idx:   "{{ press_onset_idx }}"
                   pk:                "{{ pk }}"
                   dp:                "{{ dp }}"
                   pd:                "{{ pd }}"
                   q:                 "{{ q }}"
                   fl:                "{{ fl }}"
-                  sf:                "{{ sf }}"
-                  sp:                "{{ sp }}"
-                  ff:                "{{ ff }}"
-                  fp:                "{{ fp }}"
                 variables:
-                  schema:            !lambda 'return std::string("esp_water_monitor_waveform");'
-                  transport:         !lambda 'return std::string("ha_event");'
+                  schema:            !lambda 'return std::string("esp_water_monitor_waveform_chunk");'
                   transport_version: !lambda 'return std::string("1");'
                   node:              !lambda 'return App.get_name();'
-                  circuit:           !lambda 'return std::string("circuit_1");'
-                  id:                !lambda 'return std::to_string(id(wf_ev_id));'
+                  circuit:           !lambda 'return std::string(id(wf_ev_circuit) == 0 ? "circuit_1" : "circuit_2");'
+                  id:                !lambda 'return std::to_string(id(wf_ev_event_id));'
                   b:                 !lambda 'return std::to_string(id(wf_ev_boot));'
+                  seq:               !lambda 'return std::to_string(id(wf_ev_seq));'
                   s:                 !lambda 'return std::to_string(id(wf_ev_s));'
                   e:                 !lambda 'return std::to_string(id(wf_ev_e));'
-                  p:                 !lambda 'return std::to_string(id(wf_ev_p));'
-                  pre:               !lambda 'return std::to_string(id(wf_ev_pre));'
-                  post:              !lambda 'return std::to_string(id(wf_ev_post));'
+                  flow:              !lambda 'return id(wf_ev_flow_b64);'
+                  press:             !lambda 'return id(wf_ev_press_b64);'
+                  final:             !lambda 'return std::string(id(wf_ev_is_final) ? "true" : "false");'
+                  event_s:           !lambda 'return std::to_string(id(wf_ev_evt_s));'
+                  event_e:           !lambda 'return std::to_string(id(wf_ev_evt_e));'
+                  total:             !lambda 'return std::to_string(id(wf_ev_total));'
+                  onset_seq:         !lambda 'return std::to_string(id(wf_ev_onset_seq));'
+                  onset_idx:         !lambda 'return std::to_string(id(wf_ev_onset_idx));'
+                  press_onset_seq:   !lambda 'return std::to_string(id(wf_ev_press_onset_seq));'
+                  press_onset_idx:   !lambda 'return std::to_string(id(wf_ev_press_onset_idx));'
                   pk:                !lambda 'return std::to_string(id(wf_ev_pk));'
                   dp:                !lambda 'return std::to_string(id(wf_ev_dp));'
                   pd:                !lambda 'return std::to_string(id(wf_ev_pd));'
                   q:                 !lambda 'return std::to_string(id(wf_ev_q));'
                   fl:                !lambda 'return std::to_string(id(wf_ev_fl));'
-                  sf:                !lambda 'return id(wf_ev_sf);'
-                  sp:                !lambda 'return id(wf_ev_sp);'
-                  ff:                !lambda 'return id(wf_ev_ff);'
-                  fp:                !lambda 'return id(wf_ev_fp);'
             - lambda: |-
                 id(wf_ev_pending) = false;
-                // Slot freed only after event fires.
-                id(wf_slot_phase)[id(wf_pub_slot)] = 0;
+                // Drop large staging strings to free heap promptly.
+                id(wf_ev_flow_b64).clear();
+                id(wf_ev_press_b64).clear();
 
 # =============================================================================
 # SCRIPTS — Leak test sequences

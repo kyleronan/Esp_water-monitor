@@ -227,9 +227,10 @@ class Orchestrator:
             circuit_cfg.leak_test_result_sensor = entities.get(
                 "leak_test_result_sensor", "")
             circuit_cfg.volume_sensor = entities.get("volume_sensor", "")
-            # Waveforms now arrive via HA event (firmware 3.8.0+); only the
-            # diagnostic overflow counter remains as a discoverable entity.
+            # Waveforms now arrive via chunked HA events (firmware 3.9.0+).
+            # Only diagnostic counters remain as discoverable entities.
             circuit_cfg.wf_overflow_count_sensor = entities.get("wf_overflow_count_sensor", "")
+            circuit_cfg.wf_chunk_drop_count_sensor = entities.get("wf_chunk_drop_count_sensor", "")
             circuit_cfg.esp_device_prefix = prefix
 
             log.debug("[%s] entity IDs loaded from DB — fully_configured=%s",
