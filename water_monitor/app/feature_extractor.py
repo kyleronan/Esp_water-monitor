@@ -825,12 +825,34 @@ class FeatureExtractor:
         self._db = db_conn
         self._alert_manager = alert_manager
         self._ha = ha_client
-        # Optional EventDetector — provides WaveformEventHandler access (firmware 3.8.0+).
-        # None when running in test / historical-import contexts.
+        # Optional EventDetector — provides WaveformChunkAccumulator access
+        # (firmware 3.9.0+). None when running in test / historical-import
+        # contexts; _find_waveform handles the missing-detector case.
         self._event_detector = event_detector
         self._running = False
+        # Strong references for fire-and-forget tasks (anomaly alerts).
+        # Without this, the only ref to the task is whatever
+        # asyncio.create_task returns — Python may GC the task before it
+        # completes, silently dropping the alert. add_done_callback also
+        # gives us a place to observe and log exceptions instead of the
+        # default "Task exception was never retrieved" warning.
+        self._pending_alert_tasks: set[asyncio.Task] = set()
         # Set by orchestrator after ClusterEngine is initialised and rebuilt.
         self.cluster_engine = None
+
+    def _spawn_alert_task(self, coro) -> None:
+        """Fire a background alert and keep a strong ref until it completes."""
+        t = asyncio.create_task(coro)
+        self._pending_alert_tasks.add(t)
+        t.add_done_callback(self._pending_alert_tasks.discard)
+        # Also log any unobserved exception so a failed alert isn't silent.
+        def _log_exc(task: asyncio.Task) -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                log.error("Anomaly alert task raised: %s", exc, exc_info=exc)
+        t.add_done_callback(_log_exc)
 
     async def run(self) -> None:
         """Process events from the queue until cancelled."""
@@ -1071,7 +1093,10 @@ class FeatureExtractor:
                     (event.circuit,)).fetchone()
                 if ts_row and ts_row["state"] == "live" and score >= 0.60:
                     circuit_name = event.circuit.replace("_", " ").title()
-                    asyncio.create_task(
+                    # Use _spawn_alert_task instead of bare asyncio.create_task
+                    # so Python doesn't garbage-collect the task before the
+                    # alert is sent (loose-reference antipattern).
+                    self._spawn_alert_task(
                         am.alert_flow_anomaly(event.circuit, score, circuit_name))
 
             log.debug(

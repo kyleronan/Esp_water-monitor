@@ -59,7 +59,9 @@ function applyLiveState(circuit, state) {
   const label = document.getElementById(`valve-label-${circuit}`);
   if (dot && state.valve_state) {
     const vs = state.valve_state.toLowerCase();
-    dot.className = dot.className.replace(/\bvalve-\S+/g, '').trim() + ` valve-${vs}`;
+    // Strip only known valve-state classes; `valve-\S+` would also strip
+    // unrelated tokens like a future `valve-icon` or `valve-controls-…`.
+    dot.className = dot.className.replace(/\bvalve-(open|closed|opening|closing|unknown)\b/g, '').replace(/\s+/g, ' ').trim() + ` valve-${vs}`;
     if (label) label.textContent = vs.toUpperCase();
 
     // Keep the valve control button in sync
@@ -250,10 +252,25 @@ function _getDisplayName(circuit) {
   return (ctrl && ctrl.dataset.displayName) ? ctrl.dataset.displayName : circuit;
 }
 
-function _setValveBtnsLoading(circuit, loadingText) {
+// Touch only valve-action buttons — any other button the controls container
+// may host in the future (fault reset, leak-test trigger, …) shouldn't be
+// disabled by an in-flight valve command. Buttons opt in by carrying the
+// data-valve-action attribute; fall back to text-content matching for
+// templates that haven't been migrated yet.
+function _valveActionBtns(circuit) {
   const ctrl = document.getElementById(`valve-controls-${circuit}`);
-  if (!ctrl) return;
-  ctrl.querySelectorAll('button').forEach(b => {
+  if (!ctrl) return [];
+  const tagged = ctrl.querySelectorAll('[data-valve-action]');
+  if (tagged.length) return Array.from(tagged);
+  return Array.from(ctrl.querySelectorAll('button')).filter(b => {
+    const t = b.textContent.trim();
+    return t === 'Open Valve' || t === 'Close Valve'
+        || t === 'Opening…' || t === 'Closing…';
+  });
+}
+
+function _setValveBtnsLoading(circuit, loadingText) {
+  _valveActionBtns(circuit).forEach(b => {
     b.disabled = true;
     if (b.textContent.trim() === 'Open Valve' || b.textContent.trim() === 'Close Valve')
       b.textContent = loadingText;
@@ -261,9 +278,7 @@ function _setValveBtnsLoading(circuit, loadingText) {
 }
 
 function _restoreValveBtns(circuit) {
-  const ctrl = document.getElementById(`valve-controls-${circuit}`);
-  if (!ctrl) return;
-  ctrl.querySelectorAll('button').forEach(b => {
+  _valveActionBtns(circuit).forEach(b => {
     b.disabled = false;
     if (b.textContent.trim() === 'Opening…') b.textContent = 'Open Valve';
     if (b.textContent.trim() === 'Closing…') b.textContent = 'Close Valve';
@@ -410,8 +425,14 @@ async function abortLeakTest(circuit) {
 
 // Poll /api/dashboard/live for one circuit until predicate(state) is true,
 // then reload. Gives up after maxAttempts × 2s.
+//
+// On timeout, only reload when the most recent observed state did NOT
+// satisfy the predicate — otherwise the UI is already in the expected
+// state and a reload would just flicker. We remember the last observed
+// result so a passing predicate near the timeout boundary is honoured.
 function _pollThenReload(circuit, predicate, maxAttempts) {
   let attempts = 0;
+  let lastPredicateTrue = false;
   const iv = setInterval(async () => {
     attempts++;
     try {
@@ -419,16 +440,21 @@ function _pollThenReload(circuit, predicate, maxAttempts) {
       if (resp.ok) {
         const data = await resp.json();
         const state = data[circuit];
-        if (state && predicate(state)) {
-          clearInterval(iv);
-          location.reload();
-          return;
+        if (state) {
+          lastPredicateTrue = !!predicate(state);
+          if (lastPredicateTrue) {
+            clearInterval(iv);
+            location.reload();
+            return;
+          }
         }
       }
     } catch (_) {}
     if (attempts >= maxAttempts) {
       clearInterval(iv);
-      location.reload();
+      // Only reload when we never observed the target state — otherwise
+      // the UI's already correct and reloading just flickers.
+      if (!lastPredicateTrue) location.reload();
     }
   }, 2000);
 }
