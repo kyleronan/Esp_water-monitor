@@ -57,7 +57,7 @@ substitutions:
 
 esphome:
   name: esp-water-shut-off-3
-  friendly_name: ESP Water Shut off 3.9
+  friendly_name: ESP Water Shut off 3.10
   min_version: 2024.6.0
   name_add_mac_suffix: false
   platformio_options:
@@ -65,7 +65,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.9.0"
+    version: "3.10.0"
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -592,7 +592,7 @@ globals:
     initial_value: '""'
 
   # ---------------------------------------------------------------------------
-  # WAVEFORM CAPTURE GLOBALS — Per-circuit chunked streaming (firmware 3.9.0+)
+  # WAVEFORM CAPTURE GLOBALS — Per-circuit chunked streaming (firmware 3.10.0+)
   #
   # Per-event flow + pressure waveform capture for the water-signature add-on,
   # delivered as a stream of esphome.water_monitor_waveform_chunk events.
@@ -611,26 +611,28 @@ globals:
   #
   # Per-circuit layout: arrays indexed [2] where 0 = circuit_1 (main) and
   # 1 = circuit_2 (irrigation). Circuit_2 onset detection is wired in a
-  # later firmware version; in 3.9.0 only circuit_1 ever enters CAPTURING.
+  # 3.10.0 wires both circuits' flow + pressure sources into the state machine,
+  # so circuit_2 (irrigation) waveforms are captured and streamed alongside
+  # circuit_1 (main). Per-circuit pre-roll rings keep their signatures isolated.
   # ---------------------------------------------------------------------------
 
-  # Pre-roll ring buffer — 100 samples @ ~50 Hz = ~2.0 s of flow + pressure.
-  # Shared across circuits for now (only circuit_1's flow/press is sampled);
-  # Commit 4 may split this per-circuit if irrigation pre-roll diverges.
+  # Pre-roll ring buffer — 100 samples @ ~50 Hz = ~2.0 s of flow + pressure
+  # per circuit. Each circuit captures its own pre-roll so its chunk_0 holds
+  # the genuine pre-event signature, not a sibling circuit's data.
   - id: wf_ring_flow
-    type: int16_t[100]
+    type: int16_t[2][100]
     restore_value: no
   - id: wf_ring_press
-    type: int16_t[100]
+    type: int16_t[2][100]
     restore_value: no
   - id: wf_ring_idx
-    type: int
+    type: int[2]
     restore_value: no
-    initial_value: '0'
+    initial_value: '{0, 0}'
   - id: wf_ring_count
-    type: int
+    type: int[2]
     restore_value: no
-    initial_value: '0'
+    initial_value: '{0, 0}'
 
   # Per-circuit chunk buffers — 1500 samples = 30 s @ ~50 Hz native cadence.
   # Statically allocated; never written past index 1499. When a buffer fills
@@ -732,14 +734,14 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  - id: wf_press_baseline         # slow pressure baseline for transient onset
-    type: float
+  - id: wf_press_baseline         # slow per-circuit pressure baseline for transient onset
+    type: float[2]
     restore_value: no
-    initial_value: '0.0'
+    initial_value: '{0.0, 0.0}'
   - id: wf_press_baseline_valid
-    type: bool
+    type: bool[2]
     restore_value: no
-    initial_value: 'false'
+    initial_value: '{false, false}'
   - id: wf_stage_rr               # round-robin starting circuit for stage fairness
     type: int
     restore_value: no
@@ -1860,7 +1862,7 @@ sensor:
     lambda: 'return (float) id(wf_overflow_count);'
 
   # ---------------------------------------------------------------------------
-  # WAVEFORM CHUNK DROP COUNT — diagnostic (firmware 3.9.0+)
+  # WAVEFORM CHUNK DROP COUNT — diagnostic (firmware 3.9.0+, circuit_1 only)
   #
   # Increments once per SAMPLE dropped because a circuit's 1500-sample chunk
   # buffer was full AND staging was blocked (wf_ev_pending). With the
@@ -3050,7 +3052,7 @@ button:
           ESP_LOGI("trickle", "Irrigation trickle flow alert manually reset");
 
 # =============================================================================
-# INTERVALS — Per-event waveform capture (firmware 3.9.0+, chunked streaming)
+# INTERVALS — Per-event waveform capture (firmware 3.10.0+, dual-circuit chunked streaming)
 #
 # A single ~50 Hz interval drives the whole waveform-capture engine. STRICTLY
 # ADDITIVE — it only READS already-published sensor states (water_usage1,
@@ -3066,10 +3068,11 @@ button:
 # no decimation, no fixed-size resampling.
 #
 # Per-circuit layout: arrays indexed [2] where 0 = circuit_1 (main), 1 =
-# circuit_2 (irrigation). 3.9.0 wires only circuit_1's flow + pressure
-# sources; circuit_2's flow_on stays false until a later firmware release.
-# The state machine, buffers, and publisher are already per-circuit, so
-# turning circuit_2 capture on is a single-line change at that point.
+# circuit_2 (irrigation). 3.10.0 wires both circuits' flow + pressure
+# sources into the state machine — circuit_2 captures alongside circuit_1.
+# Per-circuit pre-roll rings keep each event's signature isolated. The
+# single staging slot (wf_ev_pending) serialises HA event emission across
+# circuits; with stage-fire under one tick this rarely contends.
 #
 # Staging is a single shared in-flight chunk: only one
 # water_monitor_waveform_chunk event may be queued at a time. wf_ev_pending
@@ -3196,37 +3199,55 @@ interval:
             return true;
           };
 
-          // ---- 1. sample the continuous pre-roll ring ----
-          float flow_lpm = id(water_usage1).state;
-          float press_psi = id(pressure_main_fast).state;
+          // ---- 1. sample both circuits into their per-circuit pre-roll rings ----
+          // Source IDs: water_usage1 / pressure_main_fast = circuit_1 (main),
+          //             water_usage2 / pressure_irrigation_fast = circuit_2 (irrigation).
+          float src_flow[2] = {
+            id(water_usage1).state,
+            id(water_usage2).state,
+          };
+          float src_press[2] = {
+            id(pressure_main_fast).state,
+            id(pressure_irrigation_fast).state,
+          };
           bool clamped = false;
-          if (!std::isfinite(flow_lpm))  { flow_lpm = 0.0f;  clamped = true; }
-          if (!std::isfinite(press_psi)) { press_psi = 0.0f; clamped = true; }
-          if (flow_lpm < 0.0f)  flow_lpm = 0.0f;
-          if (press_psi < 0.0f) press_psi = 0.0f;
-          int16_t fi = to_i16(flow_lpm);
-          int16_t pi = to_i16(press_psi);
-          id(wf_ring_flow)[id(wf_ring_idx)] = fi;
-          id(wf_ring_press)[id(wf_ring_idx)] = pi;
-          id(wf_ring_idx) = (id(wf_ring_idx) + 1) % 100;
-          if (id(wf_ring_count) < 100) id(wf_ring_count) = id(wf_ring_count) + 1;
+          int16_t cur_fi[2];
+          int16_t cur_pi[2];
+          bool flow_on[2];
+          for (int c = 0; c < 2; c++) {
+            float f = src_flow[c];
+            float p = src_press[c];
+            if (!std::isfinite(f)) { f = 0.0f; clamped = true; }
+            if (!std::isfinite(p)) { p = 0.0f; clamped = true; }
+            if (f < 0.0f) f = 0.0f;
+            if (p < 0.0f) p = 0.0f;
+            int16_t fi = to_i16(f);
+            int16_t pi = to_i16(p);
+            cur_fi[c] = fi;
+            cur_pi[c] = pi;
+            flow_on[c] = (f > 0.10f);
+            int ri = id(wf_ring_idx)[c];
+            id(wf_ring_flow)[c][ri] = fi;
+            id(wf_ring_press)[c][ri] = pi;
+            id(wf_ring_idx)[c] = (ri + 1) % 100;
+            if (id(wf_ring_count)[c] < 100)
+              id(wf_ring_count)[c] = id(wf_ring_count)[c] + 1;
+          }
 
-          // ---- 2. slow pressure baseline (frozen while ANY circuit is capturing) ----
-          bool any_capturing = id(wf_capturing)[0] || id(wf_capturing)[1];
-          if (!id(wf_press_baseline_valid)) {
-            id(wf_press_baseline) = press_psi;
-            id(wf_press_baseline_valid) = true;
-          } else if (!any_capturing) {
-            id(wf_press_baseline) =
-              id(wf_press_baseline) + 0.02f * (press_psi - id(wf_press_baseline));
+          // ---- 2. slow per-circuit pressure baseline (frozen while CAPTURING) ----
+          for (int c = 0; c < 2; c++) {
+            float p = src_press[c];
+            if (!std::isfinite(p) || p < 0.0f) p = 0.0f;
+            if (!id(wf_press_baseline_valid)[c]) {
+              id(wf_press_baseline)[c] = p;
+              id(wf_press_baseline_valid)[c] = true;
+            } else if (!id(wf_capturing)[c]) {
+              id(wf_press_baseline)[c] =
+                id(wf_press_baseline)[c] + 0.02f * (p - id(wf_press_baseline)[c]);
+            }
           }
 
           uint32_t now = millis();
-          // Per-circuit sample sources. circuit_1 = current main flow/press.
-          // circuit_2 stays at zero in 3.9.0 — Commit 4 wires the real source.
-          int16_t cur_fi[2] = { fi, 0 };
-          int16_t cur_pi[2] = { pi, 0 };
-          bool flow_on[2] = { flow_lpm > 0.10f, false };
 
           // ---- 3. per-circuit capture state machine ----
           for (int c = 0; c < 2; c++) {
@@ -3242,9 +3263,9 @@ interval:
                   (float) id(wf_overflow_count));
                 continue;
               }
-              // Copy 100-sample pre-roll into this circuit's chunk buffer.
-              int n = id(wf_ring_count);
-              int ri = id(wf_ring_idx);
+              // Copy this circuit's 100-sample pre-roll into its chunk buffer.
+              int n = id(wf_ring_count)[c];
+              int ri = id(wf_ring_idx)[c];
               int start = (ri - n + 100) % 100;
               int16_t *fbuf = (c == 0) ? &id(wf_chunk_flow)[0][0]
                                           : &id(wf_chunk_flow)[1][0];
@@ -3253,8 +3274,8 @@ interval:
               int pk = 0, pmin = 32767, pmax = -32768;
               for (int k = 0; k < n; k++) {
                 int src = (start + k) % 100;
-                int16_t f = id(wf_ring_flow)[src];
-                int16_t p = id(wf_ring_press)[src];
+                int16_t f = id(wf_ring_flow)[c][src];
+                int16_t p = id(wf_ring_press)[c][src];
                 fbuf[k] = f; pbuf[k] = p;
                 if (f > pk) pk = f;
                 if (p < pmin) pmin = p;
@@ -3280,7 +3301,7 @@ interval:
               id(wf_evt_flags)[c] = fl;
               // Pressure-transient onset (earliest sample above baseline + 0.5 PSI).
               int po = -1;
-              float thr = (id(wf_press_baseline) + 0.5f) * 100.0f;
+              float thr = (id(wf_press_baseline)[c] + 0.5f) * 100.0f;
               for (int k = 0; k <= onset; k++) {
                 if ((float) pbuf[k] >= thr) { po = k; break; }
               }
