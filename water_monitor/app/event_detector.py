@@ -1240,9 +1240,8 @@ class WaveformChunkAccumulator:
     assemble. EventDetector continues normal event detection without
     waveform enrichment in that specific case — no persistence layer.
 
-    Exposes the same get_record / latest_record / pop_record interface as
-    the prior WaveformEventHandler so EventDetector's public accessors don't
-    change.
+    Exposes get_record / latest_record / pop_record so EventDetector's
+    public accessors are a thin pass-through (see EventDetector below).
     """
 
     def __init__(self, circuit: str, expected_node: str) -> None:
@@ -1513,7 +1512,7 @@ class WaveformChunkAccumulator:
                 )
 
     # ------------------------------------------------------------------
-    # Lookup interface — same as the prior WaveformEventHandler
+    # Lookup interface
     # ------------------------------------------------------------------
 
     def get_record(self, boot_id: int, event_id: int) -> Optional[WaveformRecord]:
@@ -1601,7 +1600,10 @@ class EventDetector:
             # Per-event waveform capture (firmware 3.9.0+, chunked streaming).
             # esp_device_prefix is e.g. "esp_water_main_"; strip the trailing
             # underscore to get the normalized node name for identity comparison.
-            expected_node = cfg.esp_device_prefix.rstrip("_")
+            # removesuffix("_") strips exactly one trailing underscore;
+            # rstrip("_") was over-eager and would strip multiple if a
+            # prefix were ever configured with a double-underscore tail.
+            expected_node = cfg.esp_device_prefix.removesuffix("_")
             accumulator = WaveformChunkAccumulator(cfg.circuit, expected_node=expected_node)
             self._chunk_accumulators[cfg.circuit] = accumulator
 

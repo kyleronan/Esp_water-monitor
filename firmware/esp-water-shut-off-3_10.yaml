@@ -2021,9 +2021,11 @@ text_sensor:
 
   # ---------------------------------------------------------------------------
   # WAVEFORM CAPTURE — Main circuit
-  # As of firmware 3.8.0 waveform data is delivered via a single
-  # `esphome.water_monitor_waveform` HA event (see the publisher interval
-  # below). The previous 5 chunked text_sensors were removed in this version.
+  # As of firmware 3.9.0 waveform data is delivered as a stream of
+  # `esphome.water_monitor_waveform_chunk` HA events — one per ~1500-sample
+  # buffer fill plus one final chunk on event end. The add-on accumulator
+  # stitches by (boot_id, event_id). The earlier 3.8.x single-event
+  # transport (and the 3.7.x 5-text-sensor transport) are both gone.
   # ---------------------------------------------------------------------------
 
 # =============================================================================

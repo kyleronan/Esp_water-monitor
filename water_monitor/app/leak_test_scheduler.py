@@ -56,6 +56,10 @@ class LeakTestScheduler:
         self._stop = asyncio.Event()
         self._running_tests: Dict[str, bool] = {}
         self._tasks: Dict[str, Optional[asyncio.Task]] = {}
+        # Strong refs for fire-and-forget guarded-run tasks so the GC can't
+        # drop them mid-flight. _check_schedule spawns one per due test; the
+        # task removes itself from the set when done.
+        self._pending_scheduled: set[asyncio.Task] = set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -229,7 +233,12 @@ class LeakTestScheduler:
                     log.error("[%s] scheduled leak test error: %s",
                               circuit, e, exc_info=True)
 
-            asyncio.create_task(_run_guarded())
+            # Keep a strong reference so the GC can't drop the task before
+            # run_now completes — bare asyncio.create_task() is a known
+            # antipattern.
+            t = asyncio.create_task(_run_guarded())
+            self._pending_scheduled.add(t)
+            t.add_done_callback(self._pending_scheduled.discard)
             await self._update_next_run(circuit, schedule)
 
     async def _update_next_run(self, circuit: str, schedule: Any) -> None:
