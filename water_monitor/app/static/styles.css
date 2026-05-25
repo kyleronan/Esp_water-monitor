@@ -25,16 +25,24 @@
   --accent-dark:    oklch(45% 0.20 240);     /* legacy alias */
   --blue:           var(--accent);            /* legacy alias */
 
-  /* Status colors with bg + text variants */
+  /* Status colors with bg + text + border variants */
   --green:          oklch(58% 0.18 155);
   --green-bg:       oklch(95% 0.05 155);
   --green-text:     oklch(32% 0.12 155);
+  --green-border:   oklch(80% 0.10 155);
   --amber:          oklch(68% 0.18 70);
   --amber-bg:       oklch(96% 0.06 70);
   --amber-text:     oklch(38% 0.14 70);
+  --amber-border:   oklch(82% 0.12 70);
   --red:            oklch(55% 0.22 25);
   --red-bg:         oklch(96% 0.05 25);
   --red-text:       oklch(35% 0.16 25);
+  --red-border:     oklch(82% 0.12 25);
+  --accent-border:  oklch(82% 0.10 240);
+  --accent-text:    oklch(35% 0.14 240);
+
+  /* Surface-alt — used for callouts / subtle highlight surfaces */
+  --surface-alt:    oklch(96% 0.03 240);
 
   /* Radius / shadow / typography */
   --radius:         10px;
@@ -43,6 +51,56 @@
   --shadow-md:      0 4px 12px oklch(0% 0 0 / .08), 0 2px 4px oklch(0% 0 0 / .05);
   --font:           'DM Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   --mono:           'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+}
+
+/* ============================================================
+   Dark mode — auto-applied from OS / browser preference.
+   Inverts OKLCH lightness; preserves chroma/hue so brand
+   identity stays consistent across themes.
+   ============================================================ */
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Surfaces */
+    --bg:             oklch(16% 0.008 240);
+    --surface:        oklch(20% 0.008 240);
+    --surface-2:      oklch(24% 0.008 240);
+    --surface-alt:    oklch(26% 0.020 240);
+    --border:         oklch(32% 0.010 240);
+    --border-strong:  oklch(42% 0.014 240);
+
+    /* Text */
+    --text:           oklch(94% 0.012 240);
+    --text-2:         oklch(75% 0.014 240);
+    --text-3:         oklch(58% 0.014 240);
+    --muted:          oklch(58% 0.014 240);
+
+    /* Accent (blue) — brighten foreground, dim tinted bg layers */
+    --accent:         oklch(68% 0.18 240);
+    --accent-hover:   oklch(74% 0.19 240);
+    --accent-bg:      oklch(26% 0.06 240);
+    --accent-bg2:     oklch(32% 0.08 240);
+    --accent-dark:    oklch(60% 0.20 240);
+    --accent-border:  oklch(45% 0.14 240);
+    --accent-text:    oklch(85% 0.14 240);
+
+    /* Status colors */
+    --green:          oklch(70% 0.18 155);
+    --green-bg:       oklch(26% 0.07 155);
+    --green-text:     oklch(82% 0.14 155);
+    --green-border:   oklch(40% 0.10 155);
+    --amber:          oklch(78% 0.18 70);
+    --amber-bg:       oklch(28% 0.08 70);
+    --amber-text:     oklch(85% 0.14 70);
+    --amber-border:   oklch(45% 0.12 70);
+    --red:            oklch(68% 0.22 25);
+    --red-bg:         oklch(28% 0.08 25);
+    --red-text:       oklch(85% 0.16 25);
+    --red-border:     oklch(45% 0.14 25);
+
+    /* Shadows — stronger blacks read better on dark surfaces */
+    --shadow:    0 1px 3px oklch(0% 0 0 / .35), 0 1px 2px oklch(0% 0 0 / .25);
+    --shadow-md: 0 4px 12px oklch(0% 0 0 / .45), 0 2px 4px oklch(0% 0 0 / .30);
+  }
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -230,7 +288,7 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 }
 .toggle-slider:before {
   content: ""; position: absolute; height: 14px; width: 14px;
-  left: 3px; bottom: 3px; background: white; border-radius: 50%;
+  left: 3px; bottom: 3px; background: var(--surface); border-radius: 50%;
   transition: .2s;
 }
 input:checked + .toggle-slider { background: var(--accent); }
@@ -406,8 +464,8 @@ details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
 .training-callout {
   display: flex;
   gap: 1rem;
-  background: var(--surface-alt, #f0f7ff);
-  border: 1px solid var(--accent, #3b82f6);
+  background: var(--surface-alt);
+  border: 1px solid var(--accent);
   border-radius: var(--radius);
   padding: 1rem 1.25rem;
   margin: 1.25rem 0;
@@ -453,7 +511,7 @@ details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
 .restore-groups    { display: flex; gap: 1.5rem; margin-bottom: .5rem; }
 .alert-ok {
   background: var(--green-bg); color: var(--green-text);
-  border: 1px solid oklch(85% 0.10 155);
+  border: 1px solid var(--green-border);
   border-radius: var(--radius);
   padding: .6rem .9rem;
   margin-bottom: 1rem;
@@ -468,7 +526,7 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
 /* ── Away mode banner ───────────────────────────────────────────────── */
 .away-banner {
   background: var(--amber-bg); color: var(--amber-text);
-  border: 1px solid oklch(88% 0.12 70);
+  border: 1px solid var(--amber-border);
   border-radius: var(--radius);
   padding: .65rem 1rem; margin-bottom: 1rem;
   font-size: .88rem; display: flex;
@@ -495,9 +553,9 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
 
 /* ── Fault-state valve button ───────────────────────────────────────── */
 .btn-fault-warn {
-  background: var(--surface-alt, #e5e7eb);
-  color: var(--muted, #6b7280);
-  border: 1px solid var(--border, #d1d5db);
+  background: var(--surface-alt);
+  color: var(--muted);
+  border: 1px solid var(--border);
   cursor: pointer;
   position: relative;
 }
@@ -1154,7 +1212,7 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   position: absolute;
   width: 14px; height: 14px;
   left: 2.5px; top: 2.5px;
-  background: #fff;
+  background: var(--surface);
   border-radius: 50%;
   box-shadow: 0 1px 3px rgba(0,0,0,.2);
   transition: left .15s;
@@ -1196,7 +1254,7 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   font-weight: 600;
   letter-spacing: .04em;
   text-transform: uppercase;
-  color: var(--text-muted, oklch(62% .014 240));
+  color: var(--muted);
   margin-bottom: 4px;
 }
 .hist-summary-value {
@@ -1428,9 +1486,9 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   font-weight: 700;
   padding: 1px 5px;
   border-radius: 4px;
-  background: oklch(55% .18 165 / .15);
-  color: oklch(40% .18 165);
-  border: 1px solid oklch(55% .18 165 / .35);
+  background: var(--green-bg);
+  color: var(--green-text);
+  border: 1px solid var(--green-border);
   letter-spacing: .05em;
   cursor: default;
 }
@@ -1789,7 +1847,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   display: block;
   font-size: .75rem;
   font-weight: 400;
-  color: var(--text-muted, oklch(62% .014 240));
+  color: var(--muted);
   font-family: var(--font-mono, "JetBrains Mono", monospace);
   margin-top: 2px;
 }
@@ -2089,7 +2147,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 .valve-modal-fault-text {
   font-size: 13px; line-height: 1.5;
   background: var(--amber-bg);
-  border: 1px solid oklch(82% .12 70);
+  border: 1px solid var(--amber-border);
   border-radius: var(--radius-sm);
   color: var(--amber-text);
   padding: 8px 10px;
@@ -2109,13 +2167,13 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   font-size: 13px; font-weight: 500;
   margin-bottom: 16px;
 }
-.fx-msg-ok  { background: var(--green-bg);  color: var(--green-text);  border: 1px solid oklch(80% .10 155); }
-.fx-msg-warn{ background: var(--amber-bg);  color: var(--amber-text);  border: 1px solid oklch(82% .12 70);  }
-.fx-msg-err { background: var(--red-bg);    color: var(--red-text);    border: 1px solid oklch(82% .12 25);  }
+.fx-msg-ok  { background: var(--green-bg);  color: var(--green-text);  border: 1px solid var(--green-border); }
+.fx-msg-warn{ background: var(--amber-bg);  color: var(--amber-text);  border: 1px solid var(--amber-border); }
+.fx-msg-err { background: var(--red-bg);    color: var(--red-text);    border: 1px solid var(--red-border);   }
 .fx-preview-banner {
   background: var(--amber-bg);
   color: var(--amber-text);
-  border: 1px solid oklch(82% .12 70);
+  border: 1px solid var(--amber-border);
   border-radius: var(--radius-sm);
   padding: 10px 14px;
   font-size: 13px;
@@ -2133,7 +2191,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 /* Unreviewed clusters banner */
 .fx-review-banner {
   background: var(--amber-bg);
-  border: 1px solid oklch(82% .12 70);
+  border: 1px solid var(--amber-border);
   border-radius: var(--radius-sm);
   padding: 10px 14px;
   font-size: 13px; color: var(--amber-text);
@@ -2142,17 +2200,17 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 /* Stronger emphasis when at least one circuit is in labelling phase —
    this is a call to action, not a passive review prompt. */
 .fx-review-banner.fx-review-banner--labelling {
-  background: oklch(96% .04 240);
-  border-color: oklch(72% .14 240);
-  color: oklch(35% .14 240);
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: var(--accent-text);
 }
 
 /* Labelling-phase callout (per-circuit) — "training complete, please review
    then activate".  Sits between the circuit heading and the cluster grid. */
 .fx-labelling-callout {
-  background: oklch(98% .025 240);
-  border: 1px solid oklch(82% .12 240);
-  border-left: 4px solid oklch(60% .18 240);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-left: 4px solid var(--accent);
   border-radius: var(--radius-sm);
   padding: 12px 14px;
   margin-bottom: 16px;
@@ -2200,12 +2258,12 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 }
 .fx-cluster-card:hover { box-shadow: var(--shadow-md); }
 .fx-cluster-card.needs-review {
-  border-color: oklch(82% .12 70);
-  background: oklch(99% .012 70);
+  border-color: var(--amber-border);
+  background: var(--amber-bg);
 }
 .fx-cluster-card.confirmed {
-  border-color: oklch(80% .10 155);
-  background: oklch(99% .008 155);
+  border-color: var(--green-border);
+  background: var(--green-bg);
 }
 
 /* Card header: icon + name/count + confidence pill */
@@ -2217,7 +2275,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 .fx-cluster-id { font-size: 11px; font-weight: 400; color: var(--text-3); }
 .fx-card-sub   { font-size: 11px; color: var(--text-3); margin-top: 2px; }
 .fx-needs-review-label { color: var(--amber, oklch(72% .18 80)); font-weight: 600; }
-.fx-not-enough-label   { color: var(--text-muted, oklch(62% .014 240)); font-style: italic; }
+.fx-not-enough-label   { color: var(--muted); font-style: italic; }
 
 /* Stats row */
 .fx-stats {
@@ -2294,8 +2352,8 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--accent-bg2, oklch(93% .05 260));
-  border: 1px solid var(--accent, oklch(58% .2 260));
+  background: var(--accent-bg2);
+  border: 1px solid var(--accent);
   border-radius: 8px;
   padding: 10px 14px;
   margin-bottom: 12px;
@@ -2308,7 +2366,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 
 /* ── Merge confirmation page ────────────────────────────────────── */
 .fx-merge-summary {
-  background: var(--surface-2, oklch(96% .005 240));
+  background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 16px 20px;
@@ -2338,8 +2396,8 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   transition: border-color .15s;
 }
 .fx-merge-card--selected {
-  border-color: var(--accent, oklch(58% .2 260));
-  background: var(--accent-bg2, oklch(96% .04 260));
+  border-color: var(--accent);
+  background: var(--accent-bg2);
 }
 
 .fx-merge-radio-row {
@@ -2412,10 +2470,10 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 }
 .toast-close:hover { opacity: 1; }
 
-.toast-success { background: var(--green-bg);  border-color: oklch(80% .10 155); color: var(--green-text); }
-.toast-error   { background: var(--red-bg);    border-color: oklch(82% .12 25);  color: var(--red-text);   }
-.toast-warning { background: var(--amber-bg);  border-color: oklch(82% .12 70);  color: var(--amber-text); }
-.toast-info    { background: var(--accent-bg); border-color: oklch(82% .10 240); color: oklch(35% .14 240); }
+.toast-success { background: var(--green-bg);  border-color: var(--green-border); color: var(--green-text); }
+.toast-error   { background: var(--red-bg);    border-color: var(--red-border);   color: var(--red-text);   }
+.toast-warning { background: var(--amber-bg);  border-color: var(--amber-border); color: var(--amber-text); }
+.toast-info    { background: var(--accent-bg); border-color: var(--accent-border); color: var(--accent-text); }
 
 @media (prefers-reduced-motion: no-preference) {
   .toast             { animation: toast-in  200ms ease forwards; }
@@ -2444,7 +2502,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 .dash-status-fault    { color: var(--red-text);          }
 .dash-status-alert    { color: var(--amber-text);        }
 .dash-status-closed   { color: var(--text-3);            }
-.dash-status-learning { color: oklch(35% .14 240);       }
+.dash-status-learning { color: var(--accent-text);       }
 .dash-status-normal   { color: var(--green-text);        }
 
 /* ── Settings Basic/Advanced mode ─────────────────────────────── */
@@ -2509,8 +2567,8 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   align-items: flex-start;
   gap: 8px;
   padding: 10px 14px;
-  background: oklch(97% .04 70);
-  border: 1px solid oklch(85% .10 70);
+  background: var(--amber-bg);
+  border: 1px solid var(--amber-border);
   border-radius: var(--radius-sm);
   font-size: 12.5px;
   color: var(--amber-text);
@@ -2534,7 +2592,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   font-size: 12px;
   color: var(--red-text);
   background: var(--red-bg);
-  border: 1px solid oklch(82% .12 25);
+  border: 1px solid var(--red-border);
   border-radius: var(--radius-sm);
   padding: 7px 10px;
   margin-top: 10px;
