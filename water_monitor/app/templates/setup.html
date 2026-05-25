@@ -19,6 +19,18 @@
 {# ──────────────────────────────────────────────────────────────────── #}
 {% if step == 0 %}
 <section class="setup-card">
+  {% if setup_locked %}
+  <div class="alert-banner alert-fault" role="alert">
+    <strong>⚠ Setup is locked.</strong>
+    This installation has already completed initial setup, so the wizard
+    will not modify the configuration. To re-run setup — for example after
+    swapping hardware — open
+    <a href="{{ ingress_path }}/settings#resetup">Settings → Re-run Setup</a>
+    and use <strong>Re-run setup wizard</strong>. The system will prompt you
+    to download a backup first.
+  </div>
+  {% endif %}
+
   <h2>Welcome to Water Monitor</h2>
   <p class="muted">
     Is this a fresh installation or are you restoring from a previous backup?
