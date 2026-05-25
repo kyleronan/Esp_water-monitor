@@ -38,6 +38,6 @@ Paste the output into `secrets.yaml` as the value for `api_encryption_key`.
 ## Releasing
 
 `dashboard_import.package_import_url` currently points to `@main`. Before any
-public release, replace `@main` with an immutable version tag (e.g. `@v3.6.0`)
+public release, replace `@main` with an immutable version tag (e.g. `@v3.10.0`)
 so adopters always get a known-good version. This is marked as a
 `# RELEASE BLOCKER` comment in the YAML.

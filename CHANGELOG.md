@@ -1,14 +1,143 @@
 # Changelog
 
-## [0.2.1-dev] — unreleased
+## [0.2.1] — 2026-05-24
+
+A refinement release of the 0.2.x fixture-identification line. Headlines:
+ESP-side waveform capture replaces software-only signatures, the event
+detail modal makes individual events inspectable and re-labellable, auto
+dark mode follows the OS, and the hardware documentation tree is now
+complete (KiCad, BOM, bring-up checklist, build photos). Plus a long tail
+of correctness work on the historical importer, propagation-delay scan,
+clustering features, persistence, and CSRF coverage.
 
 ### New Features
 
-- Irrigation system enable/disable toggle — hide the irrigation circuit from
-  the dashboard and device pages without removing it from configuration.
-  Configured during setup (hardware selection step) and adjustable at any
-  time in Settings → Home Profile. Backed by a new `circuit_profile.enabled`
-  per-circuit flag that is forward-compatible with future multi-device setups.
+- **Auto dark mode** — UI follows `prefers-color-scheme` automatically;
+  no toggle, no setup. All pages, modals, toasts, status pills, and
+  Chart.js charts switch live with the OS theme. The dark palette is
+  derived from the existing OKLCH light tokens by lightness inversion,
+  so brand identity is preserved.
+- **ESP-side waveform capture and feature enrichment** — firmware 3.7.0+
+  captures per-event flow and pressure waveforms on-device and streams
+  them to the addon over a chunked HA event channel. The feature
+  extractor uses them when overlap and quality are good enough, and
+  falls back to the legacy software-derived values otherwise. Per-group
+  fallback (metadata, start window, full window) so partial waveforms
+  still help. Migration 031 adds four A/B tracking columns.
+- **Event detail modal** on the History page — fixture re-assignment,
+  ignore/restore, technical details (trigger type, peak flow, propagation
+  delay, anomaly score), and an embedded waveform chart when ESP-side
+  capture is available.
+- **Merge clusters UI** on the Fixtures page — checkboxes on each
+  cluster card plus a confirm page for combining fixtures the engine
+  split apart.
+- **Basic / Advanced split** in Settings — sidebar groups Advanced-only
+  destinations behind a "Show Advanced" toggle persisted in localStorage.
+  Per-circuit sub-tabs (Config / Detection / Advanced) replace the long
+  scroll.
+- **Re-run setup wizard** — Settings → Advanced → Re-run Setup
+  unlocks the wizard after initial setup (e.g. for new hardware) and
+  prompts to download a backup first. Setup re-locks automatically when
+  the wizard completes.
+- **Toast notification system** replacing inline status text.
+- **Accessible valve confirm modal** replacing `window.confirm()` for
+  open/close actions.
+- **History page summary strip** showing event counts, pass/fail and
+  totals at the top of the page.
+- **Last automatic backup date** surfaced on the Backup page.
+- **Irrigation enable/disable** toggle — hide the irrigation circuit
+  from Dashboard and Device pages without removing it from
+  configuration. Configured during setup (hardware selection step) and
+  adjustable at any time in Settings → Home Profile. Backed by a new
+  `circuit_profile.enabled` per-circuit flag that is forward-compatible
+  with future multi-device setups.
+- **Historical-import option** in the setup wizard — backfill events
+  from HA history when first connecting to an existing device.
+
+### Changes
+
+- **Firmware bumped to v3.7+**. Per-event waveform capture; chunked
+  streaming at native cadence; flow-rate publishes throttled to 4 Hz;
+  valve-close re-trigger storm on fault fixed (main + irrigation);
+  default logger level set to INFO.
+- **Clustering**: 32-point pressure signature added to the feature
+  vector (60 dims total). Feature weights retuned from F-ratio analysis
+  on labelled events.
+- **Event detection**: settled resting pressure now drives the event
+  baseline; new pressure-transient shape features; zigzag algorithm for
+  flow edges; medium sensitivity preset `pressure_drop_event_psi` default
+  lowered 2.0 → 1.2 PSI (migration 027). Added pressure-recovery END
+  for pulsed pressure-triggered events (e.g. fridge dispenser) so
+  flow-pulse-onset flicker no longer fragments a single event.
+- **Propagation-delay scan** reworked to be timestamp-based and
+  observable in logs; under-estimation on gradual pressure drops fixed;
+  pressure+flow composites now enriched with a real delay.
+- **Leak test scheduling** now uses the local timezone instead of UTC,
+  so the configured run hour matches your wall clock.
+- **Flow-stop detection lag** reduced — EMA filter removed; sliding
+  window dropped from 5 s to 2 s.
+
+### Bug Fixes
+
+- **Persistence**: `insert_event` is now an upsert, restore is atomic
+  inside a single transaction, `UNIQUE (circuit, start_ts)` enforced.
+  The historical importer no longer truncates active events on its
+  next run (could lose multi-minute fixture activity). Migration 028
+  collapses duplicate overlapping event rows left over from older
+  builds.
+- **Phantom events**: pressure-surge phantoms now rejected by both the
+  live detector and the importer. Overnight pressure-oscillation
+  phantoms eliminated via baseline-history requirements.
+- **Security**: CSRF coverage tightened across all mutating methods
+  (PATCH/PUT/DELETE, not just POST); `/setup` mutations locked
+  post-setup so a stray `/setup/restore` can no longer wipe the live
+  DB. Settings endpoint inputs hardened against malformed values.
+- **Setup wizard could not be re-run** after initial setup — every
+  `/setup/*` POST was silently redirected to the dashboard. Now shows
+  a clear error banner pointing to Settings → Advanced → Re-run Setup,
+  which deliberately re-opens the wizard after a confirmation step.
+- **Reliability**: fire-and-forget tasks now tracked so failures
+  surface; HA WebSocket reconnect is more robust (waveform onset bounds
+  hardened, reconnect after setup wizard so new entity subscriptions
+  activate immediately).
+- **UI / UX**: setup progress bar `TypeError` on the "3b" sub-step
+  fixed; dashboard chart legacy alias restored; XSS-via-fixture-label,
+  valve modal race conditions, toast-timing edge cases and trickle
+  status display all addressed (9 merge-readiness fixes).
+- **Discovery**: circuit ID normalisation now survives Supervisor
+  restarts (migration 024 patches stale `options.json`); reset-button,
+  alert-switch and threshold roles added to role discovery; waveform
+  role domains corrected (ESPHome text-sensor entities live in the
+  `sensor.*` domain).
+- **Database**: volume baselines now consistently UTC (fixes wrong
+  daily / weekly totals on non-UTC servers); `update_data_retention`
+  column allowlist prevents SQL injection via `**kwargs`.
+
+### Hardware & Docs
+
+- **PCB v1.2a** — design refresh with a new board image. KiCad project,
+  Gerbers and BOM published under `docs/hardware/`.
+- **Hardware build guide** now complete — overview, build order,
+  pinout, bring-up checklist, and an 11-photo build gallery.
+- **ESP32-S3-WROOM-1 pinout** diagram added to the hardware index.
+- **Stylesheet cache-bust** — the `<link>` to `styles.css` now carries
+  a `?v=0.2.1` query string so the UI picks up new CSS on upgrade
+  without requiring a hard refresh.
+
+### Internal
+
+- Refactor: hardcoded circuit role names (`main`, `irrigation`)
+  replaced with generic stable IDs (`circuit_1`, `circuit_2`) plus
+  user-configurable display names. Migrations 023 / 024 carry existing
+  installs across the rename.
+- Shared restore logic extracted to `restore_utils.py` (used by both
+  the setup-wizard restore and the Backup page).
+- Migrations: 023 (circuit-ID rename), 024 (`options.json` patch),
+  027 (sensitivity preset bump), 028 (overlap dedup), 031 (waveform
+  A/B columns).
+- Test suite expanded to 422 tests covering waveform enrichment,
+  importer state-machine and 1 Hz resampling, propagation-delay
+  scans, pressure-period detection, and discovery contracts.
 
 ---
 
