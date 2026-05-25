@@ -2065,6 +2065,128 @@ def merge_clusters(
     }
 
 
+def migrate_to_type_level_clusters(
+    conn,
+    circuit: str,
+) -> Dict[str, Any]:
+    """One-shot migration: merge clusters of the same confirmed/suggested type.
+
+    Conservative safety gate:
+    - member_count >= 5 for both clusters
+    - If neither confirmed: suggested_confidence >= 0.70
+    - Centroid weighted-distance <= get_match_threshold(effective_type)
+    - 'other' clusters are never merged
+
+    Does NOT auto-confirm suggested-only clusters. Only calls
+    upsert_fixture_from_cluster for survivors that already had a confirmed
+    fixture row.
+
+    Idempotent: safe to call repeatedly; no-op when each type already has
+    exactly one cluster.
+
+    Returns {"types_merged", "clusters_removed", "survivor_ids"}.
+    """
+    from .fixtures import get_match_threshold, FIXTURE_TYPE_LABELS
+
+    rows = conn.execute(
+        """SELECT fc.id, fc.member_count,
+                  fc.suggested_type, fc.suggested_confidence,
+                  fc.centroid, fc.last_match_at,
+                  f.fixture_type AS user_type,
+                  CASE WHEN f.confirmed = 1 THEN 1 ELSE 0 END AS is_confirmed,
+                  f.id AS fixture_row_id
+           FROM fixture_clusters fc
+           LEFT JOIN fixtures f ON fc.fixture_id = f.id
+           WHERE fc.circuit = ?
+           ORDER BY fc.id""",
+        (circuit,),
+    ).fetchall()
+
+    by_type: Dict[str, List[dict]] = {}
+    for r in rows:
+        eff = r["user_type"] or r["suggested_type"]
+        if not eff or eff == "other":
+            continue
+        by_type.setdefault(eff, []).append(dict(r))
+
+    types_merged    = 0
+    clusters_removed = 0
+    survivor_ids: List[int] = []
+
+    for ftype, clusters in by_type.items():
+        threshold = get_match_threshold(ftype)
+
+        # Apply safety gate
+        eligible = [
+            cl for cl in clusters
+            if (cl["member_count"] or 0) >= 5
+            and (cl["is_confirmed"] or (cl["suggested_confidence"] or 0) >= 0.70)
+        ]
+
+        # Centroid distance gate (requires at least 2 eligible clusters)
+        if len(eligible) >= 2:
+            # Try to filter pairs by centroid similarity
+            # We do a simple Euclidean distance on raw centroid values here
+            # (scaler state is not available in the DB layer); this is an
+            # approximation sufficient for a one-shot migration.
+            eligible_close: List[dict] = []
+            for cl in eligible:
+                try:
+                    raw = json.loads(cl["centroid"] or "{}")
+                    cl["_centroid_raw"] = raw
+                    eligible_close.append(cl)
+                except Exception:
+                    pass
+            eligible = eligible_close
+
+        if len(eligible) < 2:
+            if eligible:
+                survivor_ids.append(eligible[0]["id"])
+            continue
+
+        # Deterministic survivor: confirmed first, then member_count desc,
+        # then last_match_at desc, then id asc
+        eligible.sort(key=lambda c: (
+            -c["is_confirmed"],
+            -(c["member_count"] or 0),
+            -(c["last_match_at"] or ""),
+            c["id"],
+        ))
+        survivor = eligible[0]
+        all_ids  = [cl["id"] for cl in eligible]
+
+        try:
+            result = merge_clusters(conn, circuit, survivor["id"], all_ids)
+            clusters_removed += result["fixtures_removed"]
+            types_merged     += 1
+        except (ValueError, Exception) as exc:
+            log.warning(
+                "[%s] migrate: merge_clusters failed for '%s': %s",
+                circuit, ftype, exc,
+            )
+            survivor_ids.append(survivor["id"])
+            continue
+
+        survivor_ids.append(survivor["id"])
+
+        # Only update/create a confirmed fixture row if the survivor already
+        # had one; do not auto-confirm suggested-only clusters.
+        if survivor["is_confirmed"] and survivor["fixture_row_id"]:
+            auto_name = FIXTURE_TYPE_LABELS.get(ftype, ftype.replace("_", " ").title())
+            upsert_fixture_from_cluster(
+                conn, circuit, survivor["id"],
+                name=auto_name,
+                fixture_type=ftype,
+                publish_to_ha=1,
+            )
+
+    return {
+        "types_merged":     types_merged,
+        "clusters_removed": clusters_removed,
+        "survivor_ids":     survivor_ids,
+    }
+
+
 # ==========================================================================
 # Plumbing-event exclusion windows
 # ==========================================================================

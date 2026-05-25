@@ -11,6 +11,8 @@
 <div class="fx-msg fx-msg-ok">Fixtures activated — circuit is now live.</div>
 {% elif msg == 'merged' %}
 <div class="fx-msg fx-msg-ok">Clusters merged successfully.</div>
+{% elif msg == 'migrated' %}
+<div class="fx-msg fx-msg-ok">Clusters merged by fixture type.</div>
 {% elif msg == 'merge_failed' %}
 <div class="fx-msg fx-msg-err">Could not merge clusters — the selected clusters may have changed. Refresh and try again.</div>
 {% elif msg == 'error' %}
@@ -36,7 +38,7 @@
 {# ── Review banner ────────────────────────────────────────────────────── #}
 {% if total_unreviewed > 0 %}
 <div class="fx-review-banner{% if any_labelling %} fx-review-banner--labelling{% endif %}">
-  ⚠️ <strong>{{ total_unreviewed }} cluster{{ 's' if total_unreviewed != 1 else '' }}</strong>
+  ⚠️ <strong>{{ total_unreviewed }} fixture type{{ 's' if total_unreviewed != 1 else '' }}</strong>
   {% if any_labelling %}
     need{{ '' if total_unreviewed != 1 else 's' }} review — confirm below, then activate the circuit.
   {% else %}
@@ -60,7 +62,7 @@
 {% if circ.training_state == 'labelling' %}
   <div class="fx-labelling-callout">
     <p style="margin:0 0 8px 0">
-      <strong>Training complete.</strong> Confirm the fixtures below, then
+      <strong>Training complete.</strong> Confirm the fixture types below, then
       activate this circuit to start anomaly detection.
     </p>
     <form method="post"
@@ -69,6 +71,15 @@
       <input type="hidden" name="_csrf" value="{{ csrf_token }}">
       <button type="submit" class="btn btn-primary btn-sm">
         Activate fixtures →
+      </button>
+    </form>
+    <form method="post"
+          action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/migrate"
+          style="display:inline;margin-left:8px">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <button type="submit" class="btn btn-ghost btn-sm"
+              onclick="return confirm('Merge all clusters of the same fixture type? This cannot be undone.')">
+        Merge by type
       </button>
     </form>
     <span class="muted" style="font-size:11px;margin-left:10px">
@@ -202,9 +213,9 @@
             action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/cluster/{{ cl.id }}/confirm">
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
         <div class="fx-confirm-row">
-          <input class="fx-name-input" type="text" name="name"
-                 placeholder="Name this fixture"
-                 value="{{ cl.name or cl.display_name or '' }}">
+          {# Name is derived from the selected type; hidden so the endpoint still receives it #}
+          <input type="hidden" class="fx-name-input" name="name"
+                 value="{{ cl.name or cl.display_name or (active_type | replace('_',' ') | title) }}">
           <select class="fx-type-select" name="fixture_type">
             {% set types_for_circuit = circuit_type_selectable.get(circ.circuit, user_selectable_types) %}
             {% for t in types_for_circuit %}
@@ -222,7 +233,7 @@
             Publish to Home Assistant
           </label>
           <button type="submit" class="btn btn-primary btn-sm">
-            {{ 'Save' if is_confirmed else 'Confirm' }}
+            {{ 'Save' if is_confirmed else 'Confirm type' }}
           </button>
           <button type="submit"
                   formaction="{{ ingress_path }}/fixtures/{{ circ.circuit }}/cluster/{{ cl.id }}/delete"
@@ -252,13 +263,12 @@ document.querySelectorAll('.fx-recluster-btn').forEach(btn =>
   })
 );
 
-// Auto-fill name from type dropdown if user hasn't manually typed
+// Update hidden name field when type selection changes
 document.querySelectorAll('.fx-type-select').forEach(sel => {
   sel.addEventListener('change', () => {
     const inp = sel.closest('form').querySelector('.fx-name-input');
-    if (!inp.value || inp.dataset.autofilled === '1') {
+    if (inp && !inp.dataset.usernamed) {
       inp.value = sel.options[sel.selectedIndex].text;
-      inp.dataset.autofilled = '1';
     }
   });
 });

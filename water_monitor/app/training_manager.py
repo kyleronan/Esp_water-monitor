@@ -204,6 +204,21 @@ class TrainingManager:
                 log.warning("[%s] post-calibration backfill failed (non-fatal): %s",
                             circuit, e)
 
+        # Merge same-type clusters so the labelling page shows one card per type
+        if self.cluster_engine is not None:
+            try:
+                import asyncio as _asyncio, functools
+                loop = _asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        self.cluster_engine.auto_merge_same_type_clusters, circuit
+                    ),
+                )
+            except Exception as e:
+                log.warning("[%s] post-calibration type-merge failed (non-fatal): %s",
+                            circuit, e)
+
         circuit_cfg = self._cfg.get_circuit(circuit)
         if circuit_cfg:
             await self._ha.notify(

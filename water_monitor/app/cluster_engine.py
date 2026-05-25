@@ -15,8 +15,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # `river` is a runtime dependency of ClusterEngine but not of the rest of
 # the package. Import it lazily so test modules that pull in
@@ -38,7 +39,7 @@ log = logging.getLogger(__name__)
 SEQUENCE_GAP_MAX_SECONDS      = 300
 # Stage 3: multiply candidate confidence by this when cooccurrence count >= 10
 SEQUENCE_BOOST_WEIGHT         = 1.5
-DBSTREAM_CLUSTERING_THRESHOLD = 1.5
+DBSTREAM_CLUSTERING_THRESHOLD = 2.0
 FADING_FACTOR                 = 0.05
 DTW_TEMPLATE_MIN_MEMBERS      = 10   # Stage 3
 DTW_DISTANCE_WEIGHT           = 0.4  # Stage 3
@@ -144,6 +145,9 @@ class ClusterEngine:
         # Unconfirmed clusters are intentionally absent — match_and_learn
         # bypasses the type gate when the lookup returns None.
         self._type_cache: Dict[str, Dict[int, str]]            = {}
+        # Protects merge + rebuild sequences so concurrent executor threads
+        # cannot read stale river→DB ID maps while a merge is in progress.
+        self._merge_lock = threading.Lock()
 
         for c in cfg.circuits:
             self._init_circuit(c.circuit)
@@ -455,11 +459,16 @@ class ClusterEngine:
 
     def _run_suggest_type_if_needed(self, circuit: str, cluster_id: int,
                                     member_count: int) -> None:
-        """Call suggest_fixture_type on the centroid at event 1 and every 10 events."""
+        """Call suggest_fixture_type on the centroid at event 1 and every 10 events.
+
+        If the suggested type changes to a non-None value, schedules an
+        auto-merge pass so sibling clusters of the same type are consolidated.
+        """
         if member_count != 1 and member_count % 10 != 0:
             return
         row = self._db.execute(
-            "SELECT centroid FROM fixture_clusters WHERE circuit = ? AND id = ?",
+            "SELECT centroid, suggested_type FROM fixture_clusters "
+            "WHERE circuit = ? AND id = ?",
             (circuit, cluster_id)
         ).fetchone()
         if not row or not row["centroid"]:
@@ -475,6 +484,7 @@ class ClusterEngine:
         circuit_type = ct_row["circuit_type"] if ct_row else "fixture"
         try:
             from .fixtures import suggest_fixture_type
+            old_type = row["suggested_type"]
             suggested_type, confidence = suggest_fixture_type(centroid, circuit_type)
             self._db.execute(
                 """UPDATE fixture_clusters
@@ -482,6 +492,15 @@ class ClusterEngine:
                    WHERE circuit = ? AND id = ?""",
                 (suggested_type, confidence, circuit, cluster_id)
             )
+            # If the type is newly assigned, try to merge sibling clusters.
+            if suggested_type and suggested_type != old_type:
+                try:
+                    self.auto_merge_same_type_clusters(circuit)
+                except Exception as merge_exc:
+                    log.warning(
+                        "[%s] auto_merge after type suggestion failed (non-fatal): %s",
+                        circuit, merge_exc,
+                    )
         except Exception as e:
             log.warning("[%s] suggest_fixture_type failed: %s", circuit, e)
 
@@ -725,6 +744,137 @@ class ClusterEngine:
             log.info("[%s] backfill_unmatched: assigned cluster_id to %d events",
                      circuit, count)
         return count
+
+    # ── Type-level auto-merge ──────────────────────────────────────────────────
+
+    def auto_merge_same_type_clusters(self, circuit: str) -> int:
+        """Merge clusters that have converged to the same fixture type.
+
+        Conservative safety gate — all conditions must hold before merging:
+        - Effective type is not None and not 'other'
+        - Both clusters have member_count >= 5
+        - If neither is confirmed: suggested_confidence >= 0.75 for both
+        - Centroid weighted-distance <= get_match_threshold(effective_type)
+
+        Survivor selection is deterministic: confirmed fixture row first,
+        then highest member_count, then most recent last_match_at, then
+        lowest cluster_id.
+
+        Returns the number of merge operations executed.  Protected by
+        _merge_lock so concurrent executor threads see consistent state.
+        """
+        from .database import merge_clusters
+        from .fixtures import get_match_threshold, get_variance_profile
+
+        with self._merge_lock:
+            rows = self._db.execute(
+                """SELECT fc.id, fc.member_count,
+                          fc.suggested_type, fc.suggested_confidence,
+                          fc.centroid, fc.last_match_at,
+                          f.fixture_type AS user_type,
+                          CASE WHEN f.confirmed = 1 THEN 1 ELSE 0 END AS is_confirmed
+                   FROM fixture_clusters fc
+                   LEFT JOIN fixtures f ON fc.fixture_id = f.id
+                   WHERE fc.circuit = ?
+                   ORDER BY fc.id""",
+                (circuit,),
+            ).fetchall()
+
+            # Group by effective type
+            by_type: Dict[str, List[dict]] = {}
+            for r in rows:
+                eff = r["user_type"] or r["suggested_type"]
+                if not eff or eff == "other":
+                    continue
+                by_type.setdefault(eff, []).append(dict(r))
+
+            scaler = self._scalers.get(circuit)
+            merges = 0
+
+            for ftype, clusters in by_type.items():
+                if len(clusters) < 2:
+                    continue
+
+                # Apply safety gate to each cluster; collect eligible ones
+                threshold = get_match_threshold(ftype)
+                weights   = self._build_match_weights(ftype)
+                eligible: List[dict] = []
+                for cl in clusters:
+                    if (cl["member_count"] or 0) < 5:
+                        continue
+                    if not cl["is_confirmed"] and (cl["suggested_confidence"] or 0) < 0.75:
+                        continue
+                    eligible.append(cl)
+
+                if len(eligible) < 2:
+                    continue
+
+                # Check centroid distance between all pairs; only proceed if
+                # at least one pair is close enough to merge.
+                if scaler:
+                    centroids_scaled = {}
+                    for cl in eligible:
+                        try:
+                            raw = json.loads(cl["centroid"] or "{}")
+                            feat = {k: float(raw.get(k, 0)) for k in FEATURE_KEYS}
+                            centroids_scaled[cl["id"]] = scaler.transform_one(feat)
+                        except Exception:
+                            pass
+
+                    any_close = False
+                    ids = [cl["id"] for cl in eligible]
+                    for i, id_a in enumerate(ids):
+                        for id_b in ids[i + 1:]:
+                            if id_a not in centroids_scaled or id_b not in centroids_scaled:
+                                continue
+                            dist = self._weighted_distance(
+                                centroids_scaled[id_a], centroids_scaled[id_b], weights
+                            )
+                            if dist <= threshold:
+                                any_close = True
+                                break
+                        if any_close:
+                            break
+                    if not any_close:
+                        log.debug(
+                            "[%s] auto_merge: skipping '%s' — no pair within "
+                            "threshold %.2f", circuit, ftype, threshold,
+                        )
+                        continue
+
+                # Pick survivor deterministically
+                def _survivor_key(c: dict):
+                    return (
+                        -c["is_confirmed"],
+                        -(c["member_count"] or 0),
+                        -(c["last_match_at"] or ""),
+                        c["id"],
+                    )
+
+                eligible.sort(key=_survivor_key)
+                survivor_id = eligible[0]["id"]
+                all_ids = [cl["id"] for cl in eligible]
+
+                log.info(
+                    "[%s] auto_merge: merging %d '%s' clusters → survivor=%d",
+                    circuit, len(all_ids), ftype, survivor_id,
+                )
+                try:
+                    merge_clusters(self._db, circuit, survivor_id, all_ids)
+                    merges += 1
+                except (ValueError, Exception) as exc:
+                    log.warning(
+                        "[%s] auto_merge: merge_clusters failed for '%s': %s",
+                        circuit, ftype, exc,
+                    )
+
+            if merges > 0:
+                self._db.commit()
+                self.rebuild_from_db(circuit)
+                log.info("[%s] auto_merge: %d merge(s) completed, engine rebuilt",
+                         circuit, merges)
+
+            return merges
 
     def _rebuild_id_map_from_centroids(self, circuit: str) -> None:
         """

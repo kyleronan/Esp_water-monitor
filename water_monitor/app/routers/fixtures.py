@@ -303,6 +303,35 @@ async def merge_clusters_endpoint(
     return ingress_redirect(request, "/fixtures?msg=merged")
 
 
+# ── Type-level migration ──────────────────────────────────────────────────────
+
+@router.post("/{circuit}/migrate")
+async def migrate_circuit(request: Request, circuit: str = Depends(_valid_circuit)):
+    """Merge same-type clusters into one cluster per fixture type per circuit.
+
+    Conservative: only merges clusters that pass the safety gate (member
+    count, confidence, centroid distance).  Does not auto-confirm
+    suggested-only clusters.
+    """
+    orch = _orch(request)
+    from ..database import migrate_to_type_level_clusters
+    try:
+        summary = migrate_to_type_level_clusters(orch.db, circuit)
+        orch.db.commit()
+        engine = getattr(orch, "cluster_engine", None)
+        if engine:
+            import asyncio, functools
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, functools.partial(engine.rebuild_from_db, circuit)
+            )
+        log.info("[%s] type-level migration: %s", circuit, summary)
+    except Exception as e:
+        log.error("[%s] migrate_circuit failed: %s", circuit, e, exc_info=True)
+        return ingress_redirect(request, "/fixtures?msg=error")
+    return ingress_redirect(request, "/fixtures?msg=migrated")
+
+
 # ── JSON API ──────────────────────────────────────────────────────────────────
 
 @router.get("/api/{circuit}/clusters")

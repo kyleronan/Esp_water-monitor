@@ -1,21 +1,20 @@
 """
 Fixture publisher — Phase 2 (Gap 6).
 
-Publishes confirmed fixtures to Home Assistant via MQTT Discovery so they
-appear as native HA entities (Energy panel, automations, dashboards).
+Publishes water fixture activity to Home Assistant via MQTT Discovery using
+broad categories rather than individual fixture names.  Per circuit the
+publisher creates up to six HA entity sets (one per broad category present):
 
-Per fixture the publisher creates three HA entities:
-  sensor.water_monitor_{slug}_count_today        — daily event count (integer)
-  sensor.water_monitor_{slug}_volume_today       — daily volume (device_class: water)
-  binary_sensor.water_monitor_{slug}_running     — water currently running
+  sensor.water_monitor_{circuit}_{category}_count_today
+  sensor.water_monitor_{circuit}_{category}_volume_today
+  binary_sensor.water_monitor_{circuit}_{category}_running
+
+Categories: toilet, shower_tub, tap, appliance, irrigation, other.
 
 Broker credentials are fetched from the HA supervisor at startup:
   GET http://supervisor/services/mqtt  (requires SUPERVISOR_TOKEN env var)
 
-State updates run every 60 seconds for all published fixtures.
-Fixtures with publish_to_ha = 0 are silently skipped.
-When MQTT publishing is disabled globally (mqtt_publish_enabled = 0 in
-home_profile) no messages are sent, but the broker connection is kept alive.
+State updates run every 60 seconds for all published circuits.
 """
 from __future__ import annotations
 
@@ -26,7 +25,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Dict, Optional, Set
 
 log = logging.getLogger(__name__)
 
@@ -35,20 +34,25 @@ _NODE_ID          = "water_monitor"
 
 
 def _slugify(name: str) -> str:
-    """Convert a fixture display name to a safe HA entity slug."""
+    """Convert a name to a safe HA entity slug."""
     slug = name.lower().strip()
     slug = re.sub(r"[^a-z0-9]+", "_", slug)
     return slug.strip("_") or "fixture"
 
 
+def _category_slug(circuit: str, category: str) -> str:
+    """Return the HA entity slug for a circuit + category."""
+    return f"{_slugify(circuit)}_{category}"
+
+
 class FixturePublisher:
-    """Publishes confirmed fixtures to HA via MQTT Discovery."""
+    """Publishes fixture category states to HA via MQTT Discovery."""
 
     def __init__(self, db: sqlite3.Connection, cfg, ha_client):
         self._db  = db
         self._cfg = cfg
         self._ha  = ha_client
-        self._client = None      # paho MQTT client
+        self._client = None
         self._connected = False
         self._status = "not_configured"
 
@@ -70,8 +74,6 @@ class FixturePublisher:
             self._status = "not_configured"
             return
 
-        # Store the running event loop so paho callbacks can safely schedule
-        # work back onto it (paho runs callbacks on its own thread).
         self._loop = asyncio.get_running_loop()
 
         try:
@@ -117,11 +119,6 @@ class FixturePublisher:
             self._connected = True
             self._status = "connected"
             log.info("Fixture publisher connected to MQTT broker")
-            # Re-publish all confirmed fixtures on reconnect.
-            # _on_connect runs on paho's background thread — we must NOT read
-            # self._db here (it belongs to the asyncio event loop thread).
-            # call_soon_threadsafe schedules _publish_all_confirmed_sync to run
-            # on the event loop thread, where it is safe to access the DB.
             loop = getattr(self, "_loop", None)
             if loop and loop.is_running():
                 loop.call_soon_threadsafe(self._publish_all_confirmed_sync)
@@ -148,57 +145,56 @@ class FixturePublisher:
         except Exception:
             return False
 
-    def publish_fixture(self, fixture_id: str) -> None:
-        """Publish HA Discovery config for all entities of one fixture."""
-        if not self._connected or not self._is_publishing_enabled():
-            return
-        row = self._db.execute(
-            "SELECT * FROM fixtures WHERE id = ? AND publish_to_ha = 1",
-            (fixture_id,)
-        ).fetchone()
-        if not row:
-            return
-        self._publish_discovery(dict(row))
+    # ── Category helpers ────────────────────────────────────────────────────────
 
-    def retract_fixture(self, fixture_id: str) -> None:
-        """Publish empty payload to remove a fixture's HA entities."""
-        if not self._connected:
-            return
-        row = self._db.execute(
-            "SELECT * FROM fixtures WHERE id = ?", (fixture_id,)
-        ).fetchone()
-        if not row:
-            return
-        slug = _slugify(row["display_name"] or row["name"] or fixture_id)
-        for component, object_id in [
-            ("sensor",        f"{_NODE_ID}_{slug}_count_today"),
-            ("sensor",        f"{_NODE_ID}_{slug}_volume_today"),
-            ("binary_sensor", f"{_NODE_ID}_{slug}_running"),
-        ]:
-            topic = f"{_DISCOVERY_PREFIX}/{component}/{object_id}/config"
-            self._client.publish(topic, "", retain=True)
-        # Mark as retracted in the entity map
-        now = datetime.now(timezone.utc).isoformat()
-        self._db.execute(
-            """UPDATE fixture_ha_entity_map SET retracted_at = ?
-               WHERE fixture_id = ?""",
-            (now, fixture_id)
-        )
-        self._db.commit()
-        log.info("Retracted HA entities for fixture %s", fixture_id)
+    def _categories_for_circuit(self, circuit: str) -> Dict[str, dict]:
+        """Return {category: {label, circuit_label}} for categories that have
+        at least one confirmed publish_to_ha=1 fixture on this circuit.
 
-    def _publish_discovery(self, fixture: dict) -> None:
-        """Publish MQTT Discovery payloads for count, volume, and running sensors."""
-        slug = _slugify(fixture.get("display_name") or fixture.get("name") or fixture["id"])
-        name = fixture.get("display_name") or fixture.get("name") or slug
-        fid  = fixture["id"]
-        now  = datetime.now(timezone.utc).isoformat()
+        Also includes categories inferred from suggested_type on unconfirmed
+        clusters so that the publisher tracks all active usage, not just
+        user-confirmed fixtures.
+        """
+        from .fixtures import get_fixture_category, FIXTURE_CATEGORY_LABELS
+
+        circ_label = circuit
+        for c in self._cfg.circuits:
+            if c.circuit == circuit:
+                circ_label = getattr(c, "label", circuit)
+                break
+
+        rows = self._db.execute(
+            """SELECT COALESCE(f.fixture_type, fc.suggested_type) AS ftype
+               FROM fixture_clusters fc
+               LEFT JOIN fixtures f ON fc.fixture_id = f.id
+               WHERE fc.circuit = ?
+                 AND (f.publish_to_ha = 1 OR (f.publish_to_ha IS NULL AND fc.suggested_type IS NOT NULL))
+                 AND fc.member_count >= 5""",
+            (circuit,),
+        ).fetchall()
+
+        cats: Dict[str, dict] = {}
+        for r in rows:
+            cat = get_fixture_category(r["ftype"])
+            if cat and cat not in cats:
+                cats[cat] = {
+                    "label":         FIXTURE_CATEGORY_LABELS.get(cat, cat.replace("_", " ").title()),
+                    "circuit_label": circ_label,
+                }
+        return cats
+
+    def _publish_category_discovery(self, circuit: str, category: str,
+                                    cat_label: str) -> None:
+        """Publish MQTT Discovery payloads for one circuit+category."""
+        slug  = _category_slug(circuit, category)
+        name  = cat_label
+        now   = datetime.now(timezone.utc).isoformat()
 
         device = {
-            "identifiers":    [f"{_NODE_ID}_{fid}"],
-            "name":           f"Water Monitor — {name}",
-            "manufacturer":   "Water Monitor",
-            "model":          fixture.get("fixture_type", "fixture"),
+            "identifiers":  [f"{_NODE_ID}_{_slugify(circuit)}"],
+            "name":         f"Water Monitor — {getattr(self._cfg, 'home_name', 'Home')}",
+            "manufacturer": "Water Monitor",
+            "model":        "Water Usage Monitor",
         }
 
         configs = [
@@ -207,37 +203,31 @@ class FixturePublisher:
                 f"{_NODE_ID}_{slug}_count_today",
                 f"{name} — uses today",
                 f"{_DISCOVERY_PREFIX}/sensor/{_NODE_ID}_{slug}_count_today/state",
-                None,        # no device_class for event count
-                None,
-                "mdi:counter",
+                None, None, "mdi:counter",
             ),
             (
                 "sensor",
                 f"{_NODE_ID}_{slug}_volume_today",
                 f"{name} — volume today",
                 f"{_DISCOVERY_PREFIX}/sensor/{_NODE_ID}_{slug}_volume_today/state",
-                "water",
-                "L",
-                "mdi:water",
+                "water", "L", "mdi:water",
             ),
             (
                 "binary_sensor",
                 f"{_NODE_ID}_{slug}_running",
                 f"{name} — running",
                 f"{_DISCOVERY_PREFIX}/binary_sensor/{_NODE_ID}_{slug}_running/state",
-                None,
-                None,
-                "mdi:water-pump",
+                None, None, "mdi:water-pump",
             ),
         ]
 
         for component, object_id, friendly_name, state_topic, device_class, unit, icon in configs:
             payload: dict = {
-                "name":         friendly_name,
-                "unique_id":    f"{_NODE_ID}_{object_id}",
-                "state_topic":  state_topic,
-                "device":       device,
-                "icon":         icon,
+                "name":        friendly_name,
+                "unique_id":   f"{_NODE_ID}_{object_id}",
+                "state_topic": state_topic,
+                "device":      device,
+                "icon":        icon,
             }
             if device_class:
                 payload["device_class"] = device_class
@@ -248,74 +238,143 @@ class FixturePublisher:
             topic = f"{_DISCOVERY_PREFIX}/{component}/{object_id}/config"
             self._client.publish(topic, json.dumps(payload), retain=True)
 
-            # Record in entity map
-            try:
-                self._db.execute(
-                    """INSERT INTO fixture_ha_entity_map
-                           (fixture_id, ha_entity_id, device_class,
-                            unit_of_measurement, last_published_at, retracted_at)
-                       VALUES (?, ?, ?, ?, ?, NULL)
-                       ON CONFLICT (fixture_id, ha_entity_id) DO UPDATE SET
-                           last_published_at = excluded.last_published_at,
-                           retracted_at      = NULL""",
-                    (fid, f"{component}.{object_id}", device_class, unit, now)
-                )
-            except Exception as e:
-                log.warning("fixture_ha_entity_map write failed: %s", e)
+        log.debug("Published Discovery for %s/%s (%s)", circuit, category, slug)
 
-        self._db.commit()
-        log.debug("Published Discovery for fixture %s (%s)", fid, name)
+    def _retract_category_entity(self, circuit: str, category: str) -> None:
+        """Send empty-payload retract for a category's three HA entities."""
+        slug = _category_slug(circuit, category)
+        for component, suffix in [
+            ("sensor",        "count_today"),
+            ("sensor",        "volume_today"),
+            ("binary_sensor", "running"),
+        ]:
+            object_id = f"{_NODE_ID}_{slug}_{suffix}"
+            topic = f"{_DISCOVERY_PREFIX}/{component}/{object_id}/config"
+            self._client.publish(topic, "", retain=True)
+        log.info("Retracted HA entities for %s/%s", circuit, category)
+
+    # ── Public API ──────────────────────────────────────────────────────────────
+
+    def publish_fixture(self, fixture_id: str) -> None:
+        """Publish/update HA Discovery for the category this fixture belongs to."""
+        if not self._connected or not self._is_publishing_enabled():
+            return
+        row = self._db.execute(
+            "SELECT * FROM fixtures WHERE id = ? AND publish_to_ha = 1",
+            (fixture_id,),
+        ).fetchone()
+        if not row:
+            return
+        from .fixtures import get_fixture_category, FIXTURE_CATEGORY_LABELS
+        category = get_fixture_category(row["fixture_type"])
+        if not category:
+            return
+        cat_label = FIXTURE_CATEGORY_LABELS.get(category, category.replace("_", " ").title())
+        self._publish_category_discovery(row["circuit"], category, cat_label)
+
+    def retract_fixture(self, fixture_id: str) -> None:
+        """Retract the category HA entity only if no other fixtures remain in it."""
+        if not self._connected:
+            return
+        row = self._db.execute(
+            "SELECT * FROM fixtures WHERE id = ?", (fixture_id,)
+        ).fetchone()
+        if not row:
+            return
+        from .fixtures import get_fixture_category
+        category = get_fixture_category(row["fixture_type"])
+        if not category:
+            return
+        circuit = row["circuit"]
+
+        # Check if any other publish_to_ha=1 fixture in the same category remains
+        remaining_rows = self._db.execute(
+            """SELECT f.fixture_type FROM fixtures f
+               WHERE f.circuit = ? AND f.publish_to_ha = 1 AND f.id != ?""",
+            (circuit, fixture_id),
+        ).fetchall()
+        remaining_categories: Set[str] = {
+            get_fixture_category(r["fixture_type"])
+            for r in remaining_rows
+            if get_fixture_category(r["fixture_type"])
+        }
+        if category not in remaining_categories:
+            self._retract_category_entity(circuit, category)
 
     def _publish_all_confirmed_sync(self) -> None:
-        """Re-publish Discovery configs for all publish_to_ha fixtures."""
+        """Re-publish Discovery configs for all circuits and their active categories."""
         if not self._is_publishing_enabled():
             return
         try:
-            rows = self._db.execute(
-                "SELECT * FROM fixtures WHERE publish_to_ha = 1"
-            ).fetchall()
-            for row in rows:
-                self._publish_discovery(dict(row))
-            if rows:
-                log.info("Re-published Discovery for %d fixture(s)", len(rows))
+            circuits = [c.circuit for c in self._cfg.circuits]
+            for circuit in circuits:
+                cats = self._categories_for_circuit(circuit)
+                for category, info in cats.items():
+                    self._publish_category_discovery(circuit, category, info["label"])
+            if any(self._categories_for_circuit(c) for c in circuits):
+                log.info("Re-published Discovery for %d circuit(s)", len(circuits))
         except Exception as e:
             log.error("publish_all_confirmed failed: %s", e)
 
     async def update_state(self, circuit: str) -> None:
-        """Push current state for all confirmed fixtures on this circuit."""
+        """Push current aggregated state for all categories on this circuit."""
         if not self._connected or not self._is_publishing_enabled():
             return
+
+        from .fixtures import get_fixture_category
+
         try:
             rows = self._db.execute(
-                """SELECT f.*, fds.event_count, fds.total_volume_litres
-                   FROM fixtures f
+                """SELECT f.fixture_type, fc.suggested_type,
+                          COALESCE(fds.event_count, 0)          AS event_count,
+                          COALESCE(fds.total_volume_litres, 0.0) AS total_volume,
+                          f.id AS fixture_id
+                   FROM fixture_clusters fc
+                   LEFT JOIN fixtures f ON fc.fixture_id = f.id
                    LEFT JOIN fixture_daily_summary fds
-                       ON fds.fixture_id = f.id
-                       AND fds.day = date('now')
-                   WHERE f.circuit = ? AND f.publish_to_ha = 1""",
-                (circuit,)
+                       ON fds.fixture_id = f.id AND fds.day = date('now')
+                   WHERE fc.circuit = ?
+                     AND (f.publish_to_ha = 1
+                          OR (f.publish_to_ha IS NULL AND fc.suggested_type IS NOT NULL))
+                     AND fc.member_count >= 5""",
+                (circuit,),
             ).fetchall()
         except Exception as e:
             log.warning("[%s] fixture state update failed: %s", circuit, e)
             return
 
-        for row in rows:
-            slug   = _slugify(row["display_name"] or row["name"] or row["id"])
-            count  = row["event_count"] or 0
-            volume = round(row["total_volume_litres"] or 0.0, 2)
+        # Aggregate per category
+        cat_counts:  Dict[str, int]   = {}
+        cat_volumes: Dict[str, float] = {}
+        cat_running: Dict[str, bool]  = {}
 
-            # Determine if currently running — check for active event on this circuit
-            running = False
-            try:
-                active = self._db.execute(
-                    """SELECT 1 FROM events
-                       WHERE circuit = ? AND fixture_id = ?
-                         AND end_ts IS NULL LIMIT 1""",
-                    (circuit, row["id"])
-                ).fetchone()
-                running = active is not None
-            except Exception:
-                pass
+        for row in rows:
+            ftype = row["fixture_type"] or row["suggested_type"]
+            cat   = get_fixture_category(ftype)
+            if not cat:
+                continue
+            cat_counts[cat]  = cat_counts.get(cat, 0)  + (row["event_count"] or 0)
+            cat_volumes[cat] = cat_volumes.get(cat, 0.0) + (row["total_volume"] or 0.0)
+
+            # Check if currently running
+            if row["fixture_id"] and not cat_running.get(cat):
+                try:
+                    active = self._db.execute(
+                        """SELECT 1 FROM events
+                           WHERE circuit = ? AND fixture_id = ?
+                             AND end_ts IS NULL LIMIT 1""",
+                        (circuit, row["fixture_id"]),
+                    ).fetchone()
+                    if active:
+                        cat_running[cat] = True
+                except Exception:
+                    pass
+
+        for cat in cat_counts:
+            slug   = _category_slug(circuit, cat)
+            count  = cat_counts[cat]
+            volume = round(cat_volumes.get(cat, 0.0), 2)
+            running = cat_running.get(cat, False)
 
             self._client.publish(
                 f"{_DISCOVERY_PREFIX}/sensor/{_NODE_ID}_{slug}_count_today/state",

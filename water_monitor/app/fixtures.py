@@ -91,6 +91,56 @@ FIXTURE_TYPE_LABELS: Dict[str, str] = {
 # they never show up as a real fixture for clustering or HA publishing.
 INTERNAL_FIXTURE_TYPES: List[str] = ["leak_test"]
 
+# Broad HA publishing categories. DB clusters remain at granular type level;
+# these categories are used only in fixture_publisher to produce one HA
+# entity per category per circuit (e.g., "Tap" covers bathroom_tap +
+# kitchen_tap + utility_tap). Never stored in the database.
+FIXTURE_CATEGORIES: Dict[str, Optional[str]] = {
+    "toilet":                "toilet",
+    "bidet":                 "toilet",
+    "shower":                "shower_tub",
+    "bath":                  "shower_tub",
+    "bathroom_tap":          "tap",
+    "kitchen_tap":           "tap",
+    "utility_tap":           "tap",
+    "washing_machine":       "appliance",
+    "dishwasher":            "appliance",
+    "water_softener":        "appliance",
+    "boiler_makeup":         "appliance",
+    "ro_system_whole_house": "appliance",
+    "irrigation_zone":       "irrigation",
+    "hose_bib":              "other",
+    "outdoor_tap":           "other",
+    "pool_fill":             "other",
+    "humidifier":            "other",
+    "ice_maker":             "other",
+    "refrigerator_water":    "other",
+    "ro_drinking_faucet":    "other",
+    "evaporative_cooler":    "other",
+    "other":                 "other",
+    "leak_test":             None,    # never publish
+}
+
+FIXTURE_CATEGORY_LABELS: Dict[str, str] = {
+    "toilet":     "Toilet",
+    "shower_tub": "Shower/Tub",
+    "tap":        "Tap",
+    "appliance":  "Appliance",
+    "irrigation": "Irrigation",
+    "other":      "Other",
+}
+
+
+def get_fixture_category(fixture_type: Optional[str]) -> Optional[str]:
+    """Return the broad HA publishing category for a granular fixture type.
+
+    Returns None for leak_test (never published) and for unknown types.
+    Returns 'other' for None or any type not in FIXTURE_CATEGORIES.
+    """
+    if fixture_type is None:
+        return "other"
+    return FIXTURE_CATEGORIES.get(fixture_type, "other")
+
 
 def is_valid_fixture_type(name: Optional[str]) -> bool:
     """True if `name` is a recognised fixture type (or None)."""
@@ -189,10 +239,14 @@ def fixture_user_selectable_types() -> List[str]:
 FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     # ── Deterministic ────────────────────────────────────────────────────
     "toilet": {
+        # Type-level weights: lowered volume/duration/flow from 3.0/3.0/2.0 to
+        # 1.5 each so that two cisterns with slightly different flush sizes both
+        # match the type centroid. Pressure-transient anchors are unchanged —
+        # these remain the sharpest cross-type discriminators.
         "anchor_weights": {
-            "volume_litres":              3.0,
-            "duration_seconds":           3.0,
-            "avg_flow_lpm":               2.0,
+            "volume_litres":              1.5,
+            "duration_seconds":           1.5,
+            "avg_flow_lpm":               1.5,
             "has_pressure_transient":     2.0,
             "resistance_curve_shape":     2.0,   # forward-looking
             "recovery_overshoot_psi":     1.5,   # water hammer on cistern snap-shut
@@ -200,7 +254,7 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
             "pressure_onset_ms":          1.0,
         },
         "float_features": {"hour_sin", "hour_cos", "day_of_week", "is_weekend"},
-        "expected_cv": {"volume_litres": 0.08, "duration_seconds": 0.10},
+        "expected_cv": {"volume_litres": 0.20, "duration_seconds": 0.25},
         "multimodal": False,
     },
     "ice_maker": {
@@ -429,47 +483,35 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
 }
 
 
-# Per-fixture-type match thresholds (scaled-feature space, comparable to
-# DBSTREAM_CLUSTERING_THRESHOLD = 1.5). Lower = tighter gate.
-#
-# Tuned categorically:
-#   < 1.0  deterministic — toilets, ice makers, refrigerators
-#   1.0–2.0 mostly-deterministic — humidifiers, taps, RO
-#   2.0–3.0 user-driven — showers, baths, hose bibs, irrigation
-#   3.0+   multimodal — washing machines / dishwashers (loosest)
+# Per-fixture-type match thresholds (scaled-feature space).
+# Raised from individual-fixture values to type-level values so that two
+# fixtures of the same type (e.g., two different cisterns) both match a
+# single type centroid rather than splitting into separate clusters.
+# "other" is unchanged — it is a catch-all, not a named type.
 FIXTURE_MATCH_THRESHOLDS: Dict[str, float] = {
-    # Deterministic
-    "toilet":              0.6,
-    "ice_maker":           0.5,
-    "refrigerator_water":  0.7,
-    "humidifier":          1.0,
-    "boiler_makeup":       1.0,
-
-    # User-driven
-    "shower":              2.5,
-    "bath":                2.8,
-    "bathroom_tap":        1.8,
-    "kitchen_tap":         1.8,
-    "utility_tap":         2.0,
-    "bidet":               1.6,
-    "ro_drinking_faucet":  1.5,
-
-    # Programme-driven (multimodal — loosest)
-    "washing_machine":     3.0,
-    "dishwasher":          2.8,
-    "water_softener":      2.5,
-
-    # Outdoor / programme-ish
-    "irrigation_zone":     2.2,
-    "pool_fill":           1.8,
-    "hose_bib":            2.5,
-    "outdoor_tap":         2.5,
-    "evaporative_cooler":  1.8,
-    "ro_system_whole_house": 2.0,
-
-    # Special
+    "toilet":              3.0,
+    "ice_maker":           1.2,
+    "refrigerator_water":  1.5,
+    "humidifier":          2.0,
+    "boiler_makeup":       2.0,
+    "shower":              4.0,
+    "bath":                4.5,
+    "bathroom_tap":        3.5,
+    "kitchen_tap":         3.5,
+    "utility_tap":         3.5,
+    "bidet":               3.0,
+    "ro_drinking_faucet":  2.5,
+    "washing_machine":     4.5,
+    "dishwasher":          4.5,
+    "water_softener":      4.0,
+    "irrigation_zone":     3.5,
+    "pool_fill":           2.5,
+    "hose_bib":            4.0,
+    "outdoor_tap":         4.0,
+    "evaporative_cooler":  2.5,
+    "ro_system_whole_house": 3.5,
     "leak_test":           0.8,
-    "other":               1.5,   # = current DBSTREAM_CLUSTERING_THRESHOLD
+    "other":               1.5,
 }
 
 
@@ -624,29 +666,6 @@ def _rule_irrigation_zone(centroid: Dict, circuit_type: str) -> Optional[Tuple[s
     return None
 
 
-def _rule_ice_maker(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Ice maker: tiny intermittent fills, 50-300 mL, 3-15 s."""
-    if circuit_type == "zone":
-        return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
-    if _between(vol, 0.05, 0.4) and _between(dur, 3, 15):
-        return ("ice_maker", 0.65)
-    return None
-
-
-def _rule_humidifier(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Whole-house humidifier: small slow fills, 0.5-3 L, 30-180 s."""
-    if circuit_type == "zone":
-        return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
-    flow = _safe(centroid, "avg_flow_lpm")
-    if _between(vol, 0.5, 3) and _between(dur, 30, 180) and _between(flow, 0.3, 1.5):
-        return ("humidifier", 0.55)
-    return None
-
-
 def _rule_water_softener(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Water softener regen: long sustained flow, 150-300 L, 30-90 minutes, scheduled."""
     if circuit_type == "zone":
@@ -669,11 +688,10 @@ _RULES = [
     _rule_shower,
     _rule_washing_machine,
     _rule_dishwasher,
-    _rule_humidifier,
     _rule_toilet,            # very characteristic, but check after high-vol rules
     _rule_bathroom_tap,      # before kitchen_tap because bathroom_tap has lower vol bound
     _rule_kitchen_tap,
-    _rule_ice_maker,
+    # ice_maker and humidifier removed: too ambiguous at type level, route to other
 ]
 
 
