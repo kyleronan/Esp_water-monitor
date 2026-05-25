@@ -58,6 +58,14 @@ class IngressTemplates(Jinja2Templates):
                     cache["token"]   = generate_csrf_token(orch_ref.db)
                     cache["expires"] = now + 3600  # 1 hour
             context.setdefault("csrf_token", cache["token"] or "")
+            # Hide the top-level Setup tab once initial setup is complete;
+            # the wizard is locked anyway, so the tab would be a dead-end.
+            # Re-runs go through Settings → Re-run Setup, which flips this
+            # back to 0 and the tab reappears.
+            context.setdefault(
+                "setup_complete",
+                bool(getattr(orch_ref, "setup_complete", False)),
+            )
         # Inject unit conversion context so every template and the JS
         # window.UNITS global have the correct factors and labels.
         if orch_ref and orch_ref.db:
