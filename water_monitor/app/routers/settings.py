@@ -548,6 +548,23 @@ async def retention_prune_now(request: Request):
     return JSONResponse({"ok": True, "deleted": deleted})
 
 
+# ── Re-run setup wizard ────────────────────────────────────────────────────
+# Flips home_profile.setup_complete back to 0 so the setup wizard's
+# state-mutating endpoints (guarded by _block_if_setup_complete()) accept
+# POSTs again. The wizard's final step (/setup/home) sets it back to 1 on
+# completion, re-locking the mutators. The route lives in the CSRF-covered
+# settings router (only /setup/* is CSRF-exempted in main.py), so a stray
+# cross-origin POST cannot trigger this.
+
+@router.post("/setup/unlock")
+async def setup_unlock(request: Request):
+    from ..database import update_home_profile
+    orch = _orch(request)
+    update_home_profile(orch.db, setup_complete=0)
+    log.warning("Setup wizard unlocked via Settings → Advanced — /setup/* mutators are open until the wizard completes again")
+    return ingress_redirect(request, "/setup")
+
+
 # ── Away mode ──────────────────────────────────────────────────────────────
 
 @router.post("/away-mode/toggle")

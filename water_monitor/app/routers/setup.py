@@ -41,7 +41,7 @@ def _tmpl(r: Request):
 
 
 def _block_if_setup_complete(request: Request):
-    """Return an ingress redirect to '/' when setup is already complete.
+    """Return a rendered setup-locked error page when setup is already complete.
 
     The setup wizard is intentionally CSRF-exempt (main.py:210) because no
     session token exists on first run. That carve-out is safe ONLY while
@@ -49,6 +49,11 @@ def _block_if_setup_complete(request: Request):
     mutate so a stray POST to /setup/restore (which calls DELETE FROM …
     before re-inserting) can't wipe the live DB. Call this at the top of
     every state-mutating /setup/* handler and return its value if not None.
+
+    Returns the setup landing page (step 0) with `setup_locked=True` so the
+    template can show an error banner pointing the user at Settings →
+    Advanced → "Re-run setup wizard". A silent redirect would leave the
+    user stranded on the dashboard with no idea why their POST disappeared.
     """
     orch = _orch(request)
     if orch and getattr(orch, "setup_complete", False):
@@ -56,7 +61,17 @@ def _block_if_setup_complete(request: Request):
             "setup_complete=1 — refusing mutation on %s (path=%s)",
             request.method, request.url.path,
         )
-        return ingress_redirect(request, "/")
+        device_cfg = get_device_config(orch.db) if orch.db else {}
+        initial_name = (
+            device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
+        )
+        return _tmpl(request).TemplateResponse("setup.html", {
+            "request": request,
+            "step": 0,
+            "initial_name": initial_name,
+            "setup_locked": True,
+            "page": "setup",
+        }, status_code=403)
     return None
 
 
