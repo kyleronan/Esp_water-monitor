@@ -328,6 +328,12 @@
 <script>
 const CHART_RANGE = {{ chart_range|tojson }};
 
+// Read a CSS custom property from :root so Chart.js picks up the live theme
+// (light or dark, switched by prefers-color-scheme). Returns a trimmed string.
+const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+// color-mix wrapper for alpha — Chart.js accepts color-mix() as a CSS color
+const mix = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparent)`;
+
 const summaryData = {
   {% for ch in circuit_history %}
   {{ ch.circuit|tojson }}: {
@@ -381,6 +387,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const isYoY = CHART_RANGE === 'yoy';
+    const ACCENT = cssVar('--accent');
+    const MUTED  = cssVar('--muted');
+    const RED    = cssVar('--red');
+    const TEXT_3 = cssVar('--text-3');
+    const BORDER = cssVar('--border');
+    const SURFACE_2 = cssVar('--surface-2');
+    const TEXT      = cssVar('--text');
     let datasets = [];
 
     if (isYoY) {
@@ -396,15 +409,15 @@ document.addEventListener('DOMContentLoaded', () => {
         {
           label: `This year (${thisYear})`,
           data: volumes,
-          backgroundColor: 'oklch(55% .18 240 / .35)',
-          borderColor:     'oklch(55% .18 240 / .85)',
+          backgroundColor: mix(ACCENT, 35),
+          borderColor:     mix(ACCENT, 85),
           borderWidth: 1, borderRadius: 2,
         },
         {
           label: `Prior year (${priorYear})`,
           data: labels.map(l => priorMap[l] ?? null),
-          backgroundColor: 'oklch(62% .014 240 / .3)',
-          borderColor:     'oklch(62% .014 240 / .6)',
+          backgroundColor: mix(MUTED, 30),
+          borderColor:     mix(MUTED, 60),
           borderWidth: 1, borderRadius: 2, spanGaps: true,
         },
       ];
@@ -413,8 +426,8 @@ document.addEventListener('DOMContentLoaded', () => {
         {
           label: 'Volume',
           data: volumes,
-          backgroundColor: 'oklch(55% .18 240 / .35)',
-          borderColor:     'oklch(55% .18 240 / .85)',
+          backgroundColor: mix(ACCENT, 35),
+          borderColor:     mix(ACCENT, 85),
           borderWidth: 1, borderRadius: 2,
           yAxisID: 'y',
         },
@@ -422,8 +435,8 @@ document.addEventListener('DOMContentLoaded', () => {
           label: 'Anomalies',
           data: anomalies,
           type: 'line',
-          borderColor: 'oklch(55% .22 25 / .8)',
-          backgroundColor: 'oklch(55% .22 25 / .12)',
+          borderColor:     mix(RED, 80),
+          backgroundColor: mix(RED, 12),
           borderWidth: 1.5, pointRadius: 2,
           yAxisID: 'y2',
         }] : []),
@@ -444,7 +457,11 @@ document.addEventListener('DOMContentLoaded', () => {
             labels: { boxWidth: 12, font: { family: 'DM Sans', size: 11 } },
           },
           tooltip: {
-            backgroundColor: 'oklch(18% .02 240)',
+            backgroundColor: SURFACE_2,
+            titleColor: TEXT,
+            bodyColor:  TEXT,
+            borderColor: BORDER,
+            borderWidth: 1,
             titleFont:  { family: 'DM Sans', size: 11 },
             bodyFont:   { family: 'JetBrains Mono', size: 12 },
             padding: 8, cornerRadius: 6,
@@ -465,17 +482,17 @@ document.addEventListener('DOMContentLoaded', () => {
         scales: {
           x: {
             grid:  { display: false },
-            ticks: { font: { family: 'DM Sans', size: 10 }, color: 'oklch(62% .014 240)', maxTicksLimit: 14, maxRotation: 0 },
+            ticks: { font: { family: 'DM Sans', size: 10 }, color: TEXT_3, maxTicksLimit: 14, maxRotation: 0 },
           },
           y: {
             position: 'left',
-            grid: { color: 'oklch(89% .008 240)' },
-            ticks: { font: { family: 'DM Sans', size: 10 }, color: 'oklch(62% .014 240)' },
+            grid: { color: BORDER },
+            ticks: { font: { family: 'DM Sans', size: 10 }, color: TEXT_3 },
           },
           ...(anomalies.some(v => v > 0) && !isYoY ? {
             y2: {
               position: 'right',
-              ticks: { stepSize: 1, font: { family: 'DM Sans', size: 10 }, color: 'oklch(62% .014 240)' },
+              ticks: { stepSize: 1, font: { family: 'DM Sans', size: 10 }, color: TEXT_3 },
               grid: { drawOnChartArea: false },
             },
           } : {}),
@@ -599,15 +616,15 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         const datasets = [{
           label: 'Flow',
           data: flowPts,
-          borderColor: 'oklch(55% .18 240)',
-          backgroundColor: 'oklch(55% .18 240 / .12)',
+          borderColor: cssVar('--accent'),
+          backgroundColor: mix(cssVar('--accent'), 12),
           fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
         }];
         if (pressHasData) {
           datasets.push({
             label: 'Pressure',
             data: pressPts,
-            borderColor: 'oklch(55% .18 30)',
+            borderColor: cssVar('--red'),
             backgroundColor: 'transparent',
             fill: false, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
           });
