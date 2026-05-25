@@ -322,6 +322,10 @@ def run_migrations(
                 f"{', '.join(sorted(missing_deg))}. "
                 f"Schema definition is out of sync.{_db_hint}"
             )
+        # The degraded-supply partial index isn't in _create_schema (would
+        # fail on existing-DB upgrades — see comment there). Apply the full
+        # migration step here too; idempotent and a no-op on empty tables.
+        _apply_degraded_supply_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

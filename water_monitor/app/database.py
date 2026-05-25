@@ -453,9 +453,17 @@ CREATE TABLE IF NOT EXISTS events (
     degraded_diagnostic_json         TEXT
 );
 
--- Partial index for fast dashboard "are any degraded events active?" lookups.
-CREATE INDEX IF NOT EXISTS idx_events_degraded
-    ON events (circuit, start_ts) WHERE degraded_supply = 1;
+-- NOTE: the partial index on (circuit, start_ts) WHERE degraded_supply = 1
+-- is created by db_migrations._apply_degraded_supply_columns() rather than
+-- inline here. Putting it in _create_schema would fail on an upgrade-from-
+-- baseline DB: CREATE TABLE IF NOT EXISTS is a no-op on existing tables,
+-- so the existing events table doesn't get the degraded_supply column
+-- added by this DDL (ALTER TABLE in the migration is what does that), but
+-- the partial-index statement would still execute and reference a column
+-- that doesn't exist yet. Order is:
+--   1. database.init_db() -> _create_schema() — must succeed on existing DB
+--   2. db_migrations.run_migrations() — adds columns AND the partial index
+-- Fresh DBs hit the same migration via the version==0 path.
 
 -- UNIQUE(circuit, start_ts) — enforces the contract the importer / dedup
 -- helpers have always assumed (see comments in dedup_events). Replaces the
