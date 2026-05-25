@@ -23,11 +23,16 @@ _BASELINE_VERSION: int = 20260523
 # Version bumps:
 #   20260524 — retired text-sensor waveform roles
 #   20260525 — added UNIQUE(circuit, start_ts) on events (dedup first)
-_CURRENT_VERSION: int = 20260525
+#   20260526 — degraded-supply guard: new event columns, event_waveforms
+#              table, rebuild hourly_volume from events
+_CURRENT_VERSION: int = 20260526
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
 _VERSION_PRE_UNIQUE_INDEX: int = 20260524
+# Intermediate stepping-stone for the degraded-supply migration. Existing
+# DBs at this version have the unique index but lack the degraded columns.
+_VERSION_PRE_DEGRADED: int = 20260525
 
 # Roles removed when the firmware switched waveform delivery from 5 chunked
 # text sensors to a single HA event (firmware 3.8.0). Old DBs may still carry
@@ -84,6 +89,99 @@ def _apply_unique_events_index(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _apply_degraded_supply_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260526.
+
+    Adds 7 new columns on events, creates idx_events_degraded, creates the
+    event_waveforms table + index, backfills volume_litres_effective and
+    hourly_volume_applied_* for existing rows, then REBUILDS hourly_volume
+    from events as source of truth.
+
+    Rebuild filter is INTENTIONALLY broad — every event with a positive
+    volume contributes, including those with excluded_from_training=1.
+    Clustering exclusion is NOT the same as volume exclusion; degraded
+    events still count toward water-usage totals (with their estimated
+    value).
+
+    Idempotent on its own (column adds are guarded by _has_column; the
+    backfill UPDATEs only touch rows with NULL/0 in the new fields).
+    """
+    new_cols = (
+        ("degraded_supply",               "BOOLEAN DEFAULT 0"),
+        ("volume_litres_estimated",       "REAL"),
+        ("volume_litres_effective",       "REAL"),
+        ("volume_estimation_method",      "TEXT DEFAULT 'raw'"),
+        ("hourly_volume_applied_litres",  "REAL DEFAULT 0"),
+        ("hourly_volume_applied_bucket",  "TEXT"),
+        ("degraded_diagnostic_json",      "TEXT"),
+    )
+    for col, decl in new_cols:
+        if not _has_column(conn, "events", col):
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
+            log.info("Added events.%s", col)
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_degraded "
+        "ON events (circuit, start_ts) WHERE degraded_supply = 1"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS event_waveforms (
+            event_id              TEXT PRIMARY KEY
+                                  REFERENCES events(id) ON DELETE CASCADE,
+            flow_min_json         TEXT NOT NULL,
+            flow_max_json         TEXT NOT NULL,
+            pressure_min_json     TEXT NOT NULL,
+            pressure_max_json     TEXT NOT NULL,
+            duration_seconds      REAL NOT NULL,
+            created_at            TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_event_waveforms_created "
+        "ON event_waveforms (created_at)"
+    )
+    conn.commit()
+
+    # Backfill effective volume + method for existing rows BEFORE the
+    # rebuild reads from this column.
+    conn.execute(
+        "UPDATE events "
+        "SET volume_litres_effective = COALESCE(volume_litres, 0), "
+        "    volume_estimation_method = 'raw' "
+        "WHERE volume_litres_effective IS NULL"
+    )
+
+    # Backfill applied bookkeeping so future re-imports subtract correctly.
+    # hour_ts format must match _hour_bucket_for() in database.py:
+    # '%Y-%m-%dT%H:00:00' UTC, no tz suffix.
+    conn.execute(
+        "UPDATE events "
+        "SET hourly_volume_applied_litres = "
+        "      COALESCE(volume_litres_effective, volume_litres, 0), "
+        "    hourly_volume_applied_bucket = "
+        "      strftime('%Y-%m-%dT%H:00:00', start_ts) "
+        "WHERE hourly_volume_applied_bucket IS NULL"
+    )
+    conn.commit()
+
+    # Rebuild hourly_volume from events as the source of truth.
+    # CRITICAL: no excluded_from_training filter — degraded events still
+    # count toward volume totals.
+    conn.execute("DELETE FROM hourly_volume")
+    conn.execute(
+        "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+        "SELECT circuit, "
+        "       strftime('%Y-%m-%dT%H:00:00', start_ts) AS hour_ts, "
+        "       SUM(COALESCE(volume_litres_effective, volume_litres, 0)) "
+        "FROM events "
+        "WHERE start_ts IS NOT NULL "
+        "GROUP BY circuit, strftime('%Y-%m-%dT%H:00:00', start_ts)"
+    )
+    conn.commit()
+    log.info("Migration 20260526: rebuilt hourly_volume from events; "
+             "added 7 degraded-supply columns + event_waveforms table")
+
+
 def _get_version(conn: sqlite3.Connection) -> int:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _schema_version (
@@ -119,6 +217,22 @@ _BASELINE_EVENT_COLUMNS: frozenset = frozenset({
     "waveform_overlap_score",  # added in migration 031
 })
 
+# Columns added by the 20260526 degraded-supply migration. Used to verify the
+# migration has actually run on a DB claiming version 20260526 (catches the
+# case where _schema_version was stamped without the migration applying).
+_DEGRADED_EVENT_COLUMNS: frozenset = frozenset({
+    "degraded_supply",
+    "volume_litres_effective",
+    "hourly_volume_applied_bucket",
+})
+
+
+def _missing_degraded_columns(conn: sqlite3.Connection) -> set[str]:
+    return {
+        col for col in _DEGRADED_EVENT_COLUMNS
+        if not _has_column(conn, "events", col)
+    }
+
 
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
@@ -145,7 +259,7 @@ def run_migrations(
     _db_hint = f" DB file: {db_path}" if db_path else ""
 
     if version == _CURRENT_VERSION:
-        missing = _missing_baseline_columns(conn)
+        missing = _missing_baseline_columns(conn) | _missing_degraded_columns(conn)
         if missing:
             raise RuntimeError(
                 "Database claims current schema version but is missing required "
@@ -167,23 +281,30 @@ def run_migrations(
         _drop_retired_wf_entity_map_rows(conn)
         # Forward step 2: dedup events and apply the unique index.
         _apply_unique_events_index(conn)
+        # Forward step 3: degraded-supply columns + waveform table + rebuild.
+        _apply_degraded_supply_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
 
     if version == _VERSION_PRE_UNIQUE_INDEX:
-        # User upgraded between the wf-role-drop and the unique-index
-        # versions — just apply the unique index step.
         _apply_unique_events_index(conn)
+        _apply_degraded_supply_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
         return
 
+    if version == _VERSION_PRE_DEGRADED:
+        # DB has the unique index but lacks the degraded-supply columns.
+        _apply_degraded_supply_columns(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded %d → %d",
+                 _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
+        return
+
     if version == 0:
         # Distinguish fresh DB from pre-squash DB via baseline columns.
-        # CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so an old
-        # events table keeps its old schema — missing columns reveal the old DB.
         missing = _missing_baseline_columns(conn)
         if missing:
             raise RuntimeError(
@@ -191,7 +312,16 @@ def run_migrations(
                 f"{', '.join(sorted(missing))}. "
                 f"Delete the database file and restart the add-on.{_db_hint}"
             )
-        # Fresh DB: no retired rows could exist; stamp directly at current.
+        # Fresh DB created by current _create_schema() — has all current
+        # columns including the degraded-supply additions. Stamp at current.
+        # Defensively verify the degraded columns are present too.
+        missing_deg = _missing_degraded_columns(conn)
+        if missing_deg:
+            raise RuntimeError(
+                "Fresh DB missing expected degraded-supply columns: "
+                f"{', '.join(sorted(missing_deg))}. "
+                f"Schema definition is out of sync.{_db_hint}"
+            )
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

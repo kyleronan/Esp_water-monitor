@@ -154,6 +154,39 @@ class AlertManager:
                      "Review the History page for details."),
         )
 
+    async def alert_pulsing_supply(self, circuit: str,
+                                    circuit_name: str,
+                                    event_count_30min: int) -> None:
+        """Notify the user that recent events were captured during pulsing
+        supply conditions and are flagged as degraded.
+
+        Tone is intentionally neutral about cause — the same symptom can
+        come from supply-side pulsation OR sensor-reversal artifacts. The
+        message lists both with a quick diagnostic at the pre-PRV gauge.
+        """
+        await self.fire(
+            circuit, "pulsing_supply",
+            title=f"⚠ Degraded supply — {circuit_name}",
+            message=(
+                f"{event_count_30min} water events in the past 30 minutes "
+                "were captured with chaotic pressure/flow readings — "
+                "pattern is consistent with supply pulsation or sensor "
+                "reversal artifacts. Volume totals for those events are "
+                "estimated.\n\n"
+                "Possible causes:\n"
+                "• PRV (pressure-reducing valve) failure or chatter\n"
+                "• Well pump short-cycling\n"
+                "• Booster pump oscillation\n"
+                "• Municipal supply pulsation\n"
+                "• Flow sensor wiring noise or reversal artifacts\n\n"
+                "Diagnostic: listen at the pre-PRV gauge — a steady hiss "
+                "is normal; rhythmic ticking (period 1–6 s) indicates "
+                "supply-side pulsation. If the gauge is steady but the "
+                "addon still detects pulsing, suspect sensor or wiring."
+            ),
+            notification_id=f"water_pulsing_supply_{circuit}",
+        )
+
     async def alert_leak_test_failed(self, circuit: str,
                                       pressure_drop_psi: float,
                                       circuit_name: str) -> None:

@@ -14,6 +14,14 @@
 
 <h1 class="hist-page-title">History</h1>
 
+{% if filter_param == 'degraded' %}
+{# Filter banner — explains why the list is restricted and offers a way out. #}
+<div class="hist-filter-banner" role="status" aria-live="polite">
+  <span><strong>Filtered:</strong> showing only events flagged as degraded (pulsing supply detected). Volume totals for these events are estimated.</span>
+  <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history">Clear filter</a>
+</div>
+{% endif %}
+
 {# ── Date range filter card ────────────────────────────────────────── #}
 <div class="hist-filter-card">
   <form method="get" action="{{ ingress_path }}/history">
@@ -183,13 +191,14 @@
           <th>Shape</th>
           <th>Volume ({{ vol_unit }})</th>
           <th>Fixture</th>
-          {% if ch.events | selectattr('is_composite') | list %}<th>⚡</th>{% endif %}
+          {% if ch.events | selectattr('is_composite') | list %}<th title="Composite event">⚡</th>{% endif %}
+          {% if ch.events | selectattr('degraded_supply') | list %}<th title="Degraded supply detected — volume estimated">〰</th>{% endif %}
         </tr>
       </thead>
       <tbody>
         {% for e in ch.events %}
         {% set _fix_label = fixture_type_labels.get(e.user_fixture_type, '') if e.user_fixture_type else '' %}
-        <tr class="hist-event-row{% if e.is_composite %} hist-row-composite{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}"
+        <tr class="hist-event-row{% if e.is_composite %} hist-row-composite{% endif %}{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}"
             tabindex="0" role="button" aria-label="Event detail"
             data-event-id="{{ e.id }}"
             data-circuit="{{ ch.circuit }}"
@@ -210,6 +219,10 @@
             data-anomaly-score="{{ (e.anomaly_score * 100)|round(1) if e.anomaly_score is not none else '' }}"
             data-anomaly-type="{{ e.anomaly_type or '' }}"
             data-composite="{{ '1' if e.is_composite else '0' }}"
+            data-degraded="{{ '1' if e.degraded_supply else '0' }}"
+            data-volume-effective="{{ (e.volume_litres_effective * vol_factor)|round(vol_decimals) if e.volume_litres_effective is not none else '' }}"
+            data-volume-method="{{ e.volume_estimation_method or 'raw' }}"
+            data-degraded-diag="{{ e.degraded_diagnostic_json or '' }}"
             data-other-valve="{{ e.other_valve_open if e.other_valve_open is not none else '' }}"
             data-pressure-sig="{{ e.pressure_signature_json or '' }}"
             data-waveform-used="{{ e.esp_waveform_used or 0 }}"
@@ -248,7 +261,10 @@
             {% endif %}
           </td>
           {% if ch.events | selectattr('is_composite') | list %}
-          <td class="hist-td">{% if e.is_composite %}⚡{% endif %}</td>
+          <td class="hist-td">{% if e.is_composite %}<span title="Composite event" aria-label="Composite event">⚡</span>{% endif %}</td>
+          {% endif %}
+          {% if ch.events | selectattr('degraded_supply') | list %}
+          <td class="hist-td">{% if e.degraded_supply %}<span title="Degraded supply detected — volume estimated" aria-label="Degraded supply event">〰</span>{% endif %}</td>
           {% endif %}
         </tr>
         {% endfor %}

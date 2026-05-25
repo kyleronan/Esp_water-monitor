@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from .config import AddonConfig, SENSITIVITY_PRESETS, DB_PATH
@@ -435,6 +435,7 @@ class Orchestrator:
                 self._supervise("leak_test_scheduler", self._leak_test_scheduler.run),
                 self._supervise("historical_importer", self._historical_importer.run),
                 self._supervise("cluster_metrics",     self._cluster_metrics.run),
+                self._supervise("waveform_purger",     self._run_waveform_purger),
             )
         except asyncio.CancelledError:
             pass
@@ -788,7 +789,66 @@ class Orchestrator:
             "leak_test_running": self._leak_test_scheduler.is_running(circuit)
             if self._leak_test_scheduler else False,
             "setup_complete": self.setup_complete,
+            # Degraded-supply guard status. Python-computed UTC ISO cutoffs
+            # so the comparison format matches stored start_ts exactly.
+            **self._degraded_state_for(circuit),
         }
+
+    def _degraded_state_for(self, circuit: str) -> Dict[str, Any]:
+        """Return {degraded_active, degraded_events_24h} for the dashboard."""
+        try:
+            now = datetime.now(timezone.utc)
+            cutoff_30min = (now - timedelta(minutes=30)).isoformat()
+            cutoff_24h   = (now - timedelta(hours=24)).isoformat()
+            active = self._db.execute(
+                "SELECT 1 FROM events WHERE circuit = ? "
+                "AND degraded_supply = 1 AND start_ts >= ? LIMIT 1",
+                (circuit, cutoff_30min),
+            ).fetchone()
+            day_row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM events WHERE circuit = ? "
+                "AND degraded_supply = 1 AND start_ts >= ?",
+                (circuit, cutoff_24h),
+            ).fetchone()
+            return {
+                "degraded_active":     bool(active),
+                "degraded_events_24h": int(day_row["n"] or 0) if day_row else 0,
+            }
+        except Exception as e:
+            log.warning("[%s] degraded-state query failed: %s", circuit, e)
+            return {"degraded_active": False, "degraded_events_24h": 0}
+
+    async def _run_waveform_purger(self) -> None:
+        """Daily housekeeping: drop event_waveforms rows older than 60 days.
+
+        The full-resolution flow/pressure waveforms are kept for the event
+        detail modal but cost ~28 KB/event. Retention bounds storage. The
+        underlying event row is untouched (cascade is from event to waveform,
+        not the other way).
+        """
+        WAVEFORM_RETENTION_DAYS = 60
+        # Wait ~30s after startup so the rest of the boot sequence finishes
+        # before the first purge runs.
+        await asyncio.sleep(30)
+        while not self._stop.is_set():
+            try:
+                cutoff = (datetime.now(timezone.utc)
+                          - timedelta(days=WAVEFORM_RETENTION_DAYS)).isoformat()
+                cur = self._db.execute(
+                    "DELETE FROM event_waveforms WHERE created_at < ?",
+                    (cutoff,),
+                )
+                self._db.commit()
+                if cur.rowcount:
+                    log.info("Purged %d waveform row(s) older than %d days",
+                             cur.rowcount, WAVEFORM_RETENTION_DAYS)
+            except Exception as e:
+                log.warning("Waveform purge failed (non-fatal): %s", e)
+            # Sleep 24h, exiting promptly if stop is signaled.
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=24 * 3600)
+            except asyncio.TimeoutError:
+                pass
 
     async def _compute_leak_test_etc(
         self,

@@ -43,6 +43,11 @@ async def _history_page(request: Request):
     date_from   = request.query_params.get("from", "").strip()
     date_to     = request.query_params.get("to",   "").strip()
     chart_range = request.query_params.get("range", "30d")
+    # Optional filters surfaced by the Dashboard "Degraded supply" banner
+    # link. `filter=degraded` restricts the per-circuit events list to
+    # degraded-supply rows; `circuit=...` further scopes to one circuit.
+    filter_param  = request.query_params.get("filter",  "").strip().lower()
+    filter_circuit = resolve_circuit(request.query_params.get("circuit", "").strip())
     # 30d | 6m | 1y | all | monthly | yearly | yoy
     using_range = bool(date_from or date_to)
 
@@ -61,6 +66,9 @@ async def _history_page(request: Request):
 
     circuit_history = []
     for circuit_cfg in cfg.circuits:
+        # If a specific circuit filter is set, skip rendering the other ones.
+        if filter_circuit and circuit_cfg.circuit != filter_circuit:
+            continue
         from ..database import (get_recent_events, get_leak_test_history,
                                 get_daily_summaries)
         events = get_recent_events(
@@ -69,6 +77,12 @@ async def _history_page(request: Request):
             date_from=date_from or None,
             date_to=date_to or None,
         )
+        # Filter to only degraded events when the page is opened from the
+        # dashboard "Degraded supply" View link. Post-filter rather than a
+        # dedicated SQL path because the rendering machinery is already in
+        # place to handle a filtered list; this avoids touching the DB layer.
+        if filter_param == "degraded":
+            events = [e for e in events if dict(e).get("degraded_supply")]
         leak_tests = get_leak_test_history(orch.db, circuit_cfg.circuit, limit=20)
         summaries  = get_daily_summaries(
             orch.db, circuit_cfg.circuit,
@@ -128,7 +142,48 @@ async def _history_page(request: Request):
         "chart_range":          chart_range,
         "fixture_type_options": fixture_type_options,
         "fixture_type_labels":  FIXTURE_TYPE_LABELS,
+        "filter_param":         filter_param,
+        "filter_circuit":       filter_circuit,
     })
+
+
+@router.get("/api/event/{event_id}/waveform")
+async def event_waveform(event_id: str, request: Request):
+    """Return the high-resolution min/max waveform for one event.
+
+    Source: the `event_waveforms` table, populated by feature_extractor's
+    `_persist_waveform` after each new event is processed. Historical events
+    captured before this migration won't have a waveform row — clients get
+    a 404 and should fall back to the existing 32-point signature display.
+    """
+    import json as _json
+    orch = _orch(request)
+    row = orch.db.execute(
+        """SELECT w.flow_min_json, w.flow_max_json,
+                  w.pressure_min_json, w.pressure_max_json,
+                  w.duration_seconds,
+                  e.start_ts, e.degraded_supply
+           FROM event_waveforms w
+           JOIN events e ON w.event_id = e.id
+           WHERE w.event_id = ?""",
+        (event_id,),
+    ).fetchone()
+    if not row:
+        return JSONResponse({"error": "waveform not found"}, status_code=404)
+    try:
+        return JSONResponse({
+            "event_id":         event_id,
+            "start_ts":         row["start_ts"],
+            "duration_seconds": row["duration_seconds"],
+            "degraded_supply":  bool(row["degraded_supply"]),
+            "flow_min":         _json.loads(row["flow_min_json"]),
+            "flow_max":         _json.loads(row["flow_max_json"]),
+            "pressure_min":     _json.loads(row["pressure_min_json"]),
+            "pressure_max":     _json.loads(row["pressure_max_json"]),
+        })
+    except (ValueError, TypeError) as e:
+        log.warning("Waveform JSON decode failed for %s: %s", event_id, e)
+        return JSONResponse({"error": "waveform corrupted"}, status_code=500)
 
 
 @router.get("/api/events/{circuit}")

@@ -101,6 +101,23 @@
     </div>
     {% endif %}
 
+    {# Degraded-supply banner — orthogonal to fault/trickle. Shown when at
+       least one event in the past 30 min was captured during pulsing
+       supply conditions and flagged as degraded by the guard. Click View
+       opens the history page filtered to degraded events. #}
+    {% if c.degraded_active %}
+    <div class="dash-alert dash-alert-degraded" aria-live="polite">
+      <div class="dash-alert-body">
+        <span class="dash-alert-title">⚠ Degraded supply</span>
+        <span class="dash-alert-detail">
+          {{ c.degraded_events_24h }} affected event{% if c.degraded_events_24h != 1 %}s{% endif %} in past 24h — volume totals are estimated.
+        </span>
+      </div>
+      <a class="btn btn-secondary btn-sm"
+         href="{{ ingress_path }}/history?filter=degraded&circuit={{ c.circuit }}">View</a>
+    </div>
+    {% endif %}
+
     {# Live readings — pressure & flow on surface-2 inset cards #}
     <div class="dash-readings">
       <div class="dash-reading">

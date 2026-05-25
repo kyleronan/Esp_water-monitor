@@ -436,8 +436,26 @@ CREATE TABLE IF NOT EXISTS events (
     waveform_overlap_score           REAL,
     -- Signature provenance — which source generated the shape signatures.
     -- 'software' (default) | 'esp_full_flow' | 'esp_full_pressure' | 'esp_full_flow_pressure'
-    signature_source                 TEXT
+    signature_source                 TEXT,
+    -- Degraded-supply guard (migration 20260526). When degraded_supply=1 the
+    -- event was captured during pulsing-supply conditions; flow data is
+    -- unreliable. volume_litres_effective is the value actually applied to
+    -- hourly_volume (raw for healthy events, envelope-smoothed for degraded).
+    -- hourly_volume_applied_litres/_bucket track exact prior contribution so
+    -- re-imports correctly subtract-then-add.
+    -- match_rejection_reason additionally accepts 'pulsing_supply'.
+    degraded_supply                  BOOLEAN DEFAULT 0,
+    volume_litres_estimated          REAL,
+    volume_litres_effective          REAL,
+    volume_estimation_method         TEXT DEFAULT 'raw',
+    hourly_volume_applied_litres     REAL DEFAULT 0,
+    hourly_volume_applied_bucket     TEXT,
+    degraded_diagnostic_json         TEXT
 );
+
+-- Partial index for fast dashboard "are any degraded events active?" lookups.
+CREATE INDEX IF NOT EXISTS idx_events_degraded
+    ON events (circuit, start_ts) WHERE degraded_supply = 1;
 
 -- UNIQUE(circuit, start_ts) — enforces the contract the importer / dedup
 -- helpers have always assumed (see comments in dedup_events). Replaces the
@@ -462,6 +480,28 @@ CREATE TABLE IF NOT EXISTS hourly_volume (
 
 CREATE INDEX IF NOT EXISTS idx_hourly_volume_circuit_ts
     ON hourly_volume (circuit, hour_ts);
+
+-- ==========================================================================
+-- EVENT WAVEFORMS — high-resolution min/max envelopes for the event detail
+-- modal (added 20260526). The 32-point pressure_signature_json/_flow_*
+-- columns in events stay for clustering; these min/max bins are higher
+-- resolution and preserve oscillation envelopes that bin-mean would hide.
+-- Retention: WAVEFORM_RETENTION_DAYS (60 by default), purged daily by
+-- orchestrator._purge_old_waveforms. FK cascade deletes when an event is
+-- removed (foreign_keys pragma is enabled on every connection).
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS event_waveforms (
+    event_id              TEXT PRIMARY KEY
+                          REFERENCES events(id) ON DELETE CASCADE,
+    flow_min_json         TEXT NOT NULL,
+    flow_max_json         TEXT NOT NULL,
+    pressure_min_json     TEXT NOT NULL,
+    pressure_max_json     TEXT NOT NULL,
+    duration_seconds      REAL NOT NULL,
+    created_at            TEXT NOT NULL          -- ISO-8601 UTC, Python-written
+);
+CREATE INDEX IF NOT EXISTS idx_event_waveforms_created
+    ON event_waveforms (created_at);
 
 -- ==========================================================================
 -- VOLUME SNAPSHOTS (HA sensor baselines for accurate daily / weekly totals)
@@ -1040,6 +1080,38 @@ _EVENT_USER_COLUMNS: frozenset[str] = frozenset({
     "excluded_from_training",
 })
 
+# Columns whose values must NOT be overwritten by an event-row upsert.
+# These track the exact prior contribution applied to hourly_volume so future
+# reprocessing (re-imports etc.) can correctly subtract before re-adding.
+# Maintained ONLY by upsert_event_and_apply_hourly_volume() — never by the
+# event-feature upsert path.
+_EVENT_APPLIED_BOOKKEEPING_COLUMNS: frozenset[str] = frozenset({
+    "hourly_volume_applied_litres",
+    "hourly_volume_applied_bucket",
+})
+
+
+def _hour_bucket_for(start_ts) -> str:
+    """Return the hour_ts string in the canonical format used by
+    update_hourly_volume(): UTC-normalised '%Y-%m-%dT%H:00:00' (no tz suffix).
+    Mirrors the production format from feature_extractor.py line ~1066 so
+    aggregate queries (get_daily_volume / get_weekly_volume) keep working.
+    """
+    if start_ts is None:
+        return ""
+    if isinstance(start_ts, str):
+        try:
+            dt = datetime.fromisoformat(start_ts)
+        except ValueError:
+            return ""
+    elif isinstance(start_ts, datetime):
+        dt = start_ts
+    else:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:00:00')
+
 
 def insert_event(conn: sqlite3.Connection, event: dict) -> bool:
     """Insert event row; returns True if genuinely new, False on conflict.
@@ -1066,22 +1138,41 @@ def insert_event(conn: sqlite3.Connection, event: dict) -> bool:
     longer applicable). Callers use the return value to decide whether to
     add the event's volume to hourly_volume.
     """
-    cols = list(event.keys())
-    if "id" not in cols:
-        # Defensive — without an id we can't detect conflicts; let SQLite
-        # raise on the missing PK rather than silently insert a NULL.
+    if "id" not in event:
         raise ValueError("insert_event: event dict missing 'id'")
-
     exists = conn.execute(
         "SELECT 1 FROM events WHERE id = ?", (event["id"],),
     ).fetchone() is not None
+    _do_event_upsert(conn, event)
+    conn.commit()
+    return not exists
+
+
+def _do_event_upsert(conn: sqlite3.Connection, event: dict) -> None:
+    """Run the INSERT ... ON CONFLICT(id) DO UPDATE for an event row.
+
+    The DO UPDATE SET clause refreshes measurement/system columns but
+    explicitly excludes:
+      • 'id' (the conflict target)
+      • _EVENT_USER_COLUMNS (preserve user labels/flags across re-imports)
+      • _EVENT_APPLIED_BOOKKEEPING_COLUMNS (preserve exact prior
+        hourly_volume contribution so upsert_event_and_apply_hourly_volume
+        can subtract it correctly on reprocess)
+
+    Does NOT commit; the caller controls the transaction boundary.
+    """
+    cols = list(event.keys())
+    if "id" not in cols:
+        raise ValueError("_do_event_upsert: event dict missing 'id'")
 
     col_list     = ", ".join(cols)
     placeholders = ", ".join("?" for _ in cols)
-    # Build the DO UPDATE SET clause: refresh measurement/system columns,
-    # leave id and the user-intent columns alone.
-    set_cols = [c for c in cols
-                if c != "id" and c not in _EVENT_USER_COLUMNS]
+    set_cols = [
+        c for c in cols
+        if c != "id"
+        and c not in _EVENT_USER_COLUMNS
+        and c not in _EVENT_APPLIED_BOOKKEEPING_COLUMNS
+    ]
     if set_cols:
         set_clause = ", ".join(f"{c}=excluded.{c}" for c in set_cols)
         sql = (
@@ -1089,15 +1180,89 @@ def insert_event(conn: sqlite3.Connection, event: dict) -> bool:
             f"ON CONFLICT(id) DO UPDATE SET {set_clause}"
         )
     else:
-        # The incoming dict had nothing to update beyond id / user fields —
-        # treat the existing row as authoritative.
         sql = (
             f"INSERT INTO events ({col_list}) VALUES ({placeholders}) "
             f"ON CONFLICT(id) DO NOTHING"
         )
     conn.execute(sql, list(event.values()))
-    conn.commit()
-    return not exists
+
+
+def upsert_event_and_apply_hourly_volume(
+    conn: sqlite3.Connection,
+    event: dict,
+    new_effective_volume: float,
+) -> bool:
+    """Atomically upsert an event row AND keep hourly_volume in sync.
+
+    Replaces the previous two-step pattern (insert_event then update_hourly_volume)
+    which made it easy to lose idempotency on reprocessing. All work happens
+    inside a single transaction:
+
+      1. Read prior (litres, bucket) from the existing event row, if any.
+      2. UPSERT the event (preserving _EVENT_APPLIED_BOOKKEEPING_COLUMNS).
+      3. If a prior bucket existed: subtract the prior contribution from it.
+      4. Add new_effective_volume to the new bucket (derived from start_ts).
+      5. Update the event's applied-bookkeeping columns to (new_amount, new_bucket).
+
+    Returns True if the event was genuinely new (not a reprocess); the caller
+    can use this to decide whether to bump training_state counters.
+
+    `event` must contain 'id' and 'start_ts'. circuit is read from event['circuit'].
+    """
+    if "id" not in event or "start_ts" not in event or "circuit" not in event:
+        raise ValueError(
+            "upsert_event_and_apply_hourly_volume: event missing "
+            "id/start_ts/circuit"
+        )
+
+    event_id = event["id"]
+    circuit = event["circuit"]
+    new_bucket = _hour_bucket_for(event["start_ts"])
+
+    with transaction(conn):
+        # (1) Read prior applied state.
+        prev = conn.execute(
+            "SELECT hourly_volume_applied_litres, hourly_volume_applied_bucket "
+            "FROM events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        prev_litres = float(prev["hourly_volume_applied_litres"] or 0) if prev else 0.0
+        prev_bucket = prev["hourly_volume_applied_bucket"] if prev else None
+        is_new = prev is None
+
+        # (2) UPSERT the event (preserves applied bookkeeping columns).
+        _do_event_upsert(conn, event)
+
+        # (3) Reverse prior contribution if any.
+        if prev_bucket and prev_litres != 0:
+            conn.execute(
+                "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (circuit, hour_ts) "
+                "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
+                (circuit, prev_bucket, -prev_litres),
+            )
+
+        # (4) Apply new contribution (skip if zero — keeps hourly_volume clean).
+        if new_bucket and new_effective_volume:
+            conn.execute(
+                "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (circuit, hour_ts) "
+                "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
+                (circuit, new_bucket, new_effective_volume),
+            )
+
+        # (5) Record new applied state on the event row.
+        conn.execute(
+            "UPDATE events "
+            "SET hourly_volume_applied_litres = ?, "
+            "    hourly_volume_applied_bucket = ? "
+            "WHERE id = ?",
+            (new_effective_volume, new_bucket, event_id),
+        )
+
+    return is_new
 
 
 def get_daily_volume(conn: sqlite3.Connection, circuit: str,

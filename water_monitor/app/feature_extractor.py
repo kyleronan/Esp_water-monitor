@@ -69,7 +69,7 @@ import math
 import sqlite3
 import statistics
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .event_detector import RawEvent, WaveformRecord
@@ -156,6 +156,423 @@ def _classify_resistance_shape(
     if change_ratio < -0.15:
         return "falling"
     return "steady"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Degraded-supply guard (added 2026-05-26)
+#
+# Detects when an event was captured during supply-pulsation conditions, in
+# which case the paddlewheel flow sensor produces chaotic readings (forward
+# and reverse pulses both count as positive; brief zero-velocity transitions
+# register as 0 L/min). See plan: zany-yawning-church.md for full design.
+#
+# Constants below are site-tunable. Defaults calibrated against the
+# 2026-05-25 diagnostic session where pulse period was ~4 s; the range
+# permits per-installation variation.
+# ─────────────────────────────────────────────────────────────────────────────
+SUPPLY_PULSE_PERIOD_MIN_S    = 1.0
+SUPPLY_PULSE_PERIOD_MAX_S    = 6.0
+MIN_CYCLES_FOR_DETECTION     = 2.0
+MID_PRESSURE_STD_PULSING_PSI = 0.30    # clean events 0.05-0.12; pulsing ≥ 0.45
+PRESSURE_AUTOCORR_THRESHOLD  = 0.5
+FLOW_TROUGH_LPM              = 0.20
+MIN_TROUGH_EPISODE_RATE_HZ   = 0.15
+APPLIANCE_FLOW_PRESSURE_RATIO = 30.0
+VOLUME_ENVELOPE_PERCENTILE   = 0.95
+VOLUME_ENVELOPE_WINDOW_S     = 5.0
+FIXTURE_CYCLE_PERIOD_MAX_S   = 30.0
+MAX_WAVEFORM_BINS            = 1000
+
+
+def _finite_float_series(values) -> List[float]:
+    """Strip None/NaN/inf; coerce to float at full precision.
+
+    For detection math (detrending, std-dev, autocorrelation). Do NOT use
+    the rounded storage variant — accumulated 3-dp rounding error can
+    suppress small but real periodic signals.
+    """
+    out = []
+    for v in values or []:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f):
+            out.append(f)
+    return out
+
+
+def _clean_numeric_series(values) -> List[float]:
+    """Storage variant: sanitize and round to 3 dp for JSON serialization.
+
+    Use ONLY for waveform persistence; never for detection math.
+    """
+    return [round(v, 3) for v in _finite_float_series(values)]
+
+
+def _detrend_linear(values: List[float]) -> List[float]:
+    """Subtract the first-to-last linear trend from `values`.
+
+    Removes slow recovery drift so autocorrelation finds true periodicity
+    rather than a slope-induced false peak.
+    """
+    n = len(values)
+    if n < 2:
+        return list(values)
+    slope = (values[-1] - values[0]) / (n - 1)
+    return [v - slope * i for i, v in enumerate(values)]
+
+
+def _autocorr_at_lag(values: List[float], lag: int) -> float:
+    """Normalized autocorrelation of `values` at the given sample lag.
+
+    Returns a value in approximately [-1, 1]; returns 0 when undefined.
+    """
+    n = len(values) - lag
+    if n <= 1:
+        return 0.0
+    mean = sum(values) / len(values)
+    centered = [v - mean for v in values]
+    var = sum(c * c for c in centered) / len(centered)
+    if var < 1e-9:
+        return 0.0
+    cov = sum(centered[i] * centered[i + lag] for i in range(n)) / n
+    return cov / var
+
+
+def _dominant_period_s(
+    values: List[float],
+    sample_rate_hz: float,
+    min_period_s: float,
+    max_period_s: float,
+):
+    """Find the dominant period in `values` by autocorrelation peak search.
+
+    Returns ``(period_s, score)``. ``period_s`` is None when no peak in the
+    search band exceeds PRESSURE_AUTOCORR_THRESHOLD; ``score`` is the best
+    autocorrelation value seen regardless (useful for diagnostics).
+
+    Complexity: O(N · num_lags) — fine for our event sample sizes (10² to
+    10⁴ samples, search band ≤ a few hundred lags).
+    """
+    if not values or sample_rate_hz <= 0:
+        return None, 0.0
+    min_lag = max(2, int(round(min_period_s * sample_rate_hz)))
+    max_lag = int(round(max_period_s * sample_rate_hz))
+    if max_lag >= len(values) // 2:
+        max_lag = len(values) // 2 - 1
+    if max_lag <= min_lag:
+        return None, 0.0
+    best_lag, best_score = None, 0.0
+    for lag in range(min_lag, max_lag + 1):
+        score = _autocorr_at_lag(values, lag)
+        if score > best_score:
+            best_score, best_lag = score, lag
+    if best_lag is None or best_score < PRESSURE_AUTOCORR_THRESHOLD:
+        return None, best_score
+    return best_lag / sample_rate_hz, best_score
+
+
+def _count_trough_episodes(flow_readings: List[float], threshold: float) -> int:
+    """Count contiguous below-threshold runs in flow_readings.
+
+    Each run is ONE episode regardless of length. This counts the number of
+    "the flow sensor briefly read zero" events during an otherwise active
+    event — a signature of paddlewheel direction reversal during supply
+    pulsation.
+    """
+    count = 0
+    in_trough = False
+    for f in flow_readings:
+        below = f is not None and f < threshold
+        if below and not in_trough:
+            count += 1
+            in_trough = True
+        elif not below:
+            in_trough = False
+    return count
+
+
+def _detect_degraded_supply(
+    pressure_readings: List[float],
+    flow_readings: List[float],
+    pre_event_pressure_psi: float,
+    resistance_shape: str,
+    duration_s: float,
+):
+    """Detect supply-driven pulsation in a captured event.
+
+    Sample-rate aware. Adapts the search range to event duration so short
+    events with fast pulses can still be detected.
+
+    Returns ``(is_degraded: bool, diagnostic: dict)``. The diagnostic dict
+    always contains a ``reason`` key whose value is one of the canonical
+    reason strings; degraded events have ``reason == "pulsing_supply_confirmed"``.
+    """
+    diag = {}
+
+    # Full-precision sanitize at entry. The detector does autocorrelation
+    # and std-dev on these; 3-dp rounding would suppress small periodic
+    # signals.
+    pressure_readings = _finite_float_series(pressure_readings)
+    flow_readings = _finite_float_series(flow_readings)
+
+    # (A) Minimum duration: ≥ 2 cycles of the FASTEST detectable pulse.
+    if duration_s < 2 * SUPPLY_PULSE_PERIOD_MIN_S:
+        return False, {"reason": "too_short", "duration_s": duration_s}
+    if not pressure_readings or pre_event_pressure_psi <= 0:
+        return False, {"reason": "no_pressure_baseline"}
+
+    # (B) Adapt searchable max period to event duration. A 6 s pulse can't
+    # be detected in an 8 s event (< 2 cycles), but a 2 s pulse can be.
+    search_max_period_s = min(
+        SUPPLY_PULSE_PERIOD_MAX_S,
+        duration_s / MIN_CYCLES_FOR_DETECTION,
+    )
+    if search_max_period_s < SUPPLY_PULSE_PERIOD_MIN_S:
+        return False, {
+            "reason": "too_short_for_period_search",
+            "duration_s": duration_s,
+        }
+
+    pressure_rate_hz = len(pressure_readings) / duration_s
+    diag["pressure_rate_hz"] = round(pressure_rate_hz, 2)
+
+    # (C) Middle 70% slice — drop ramp-up and recovery.
+    lo = int(len(pressure_readings) * 0.15)
+    hi = int(len(pressure_readings) * 0.85)
+    mid = pressure_readings[lo:hi]
+    # Refine search_max to what the mid slice can actually support.
+    # _dominant_period_s caps lag at len(values)//2 - 1; that means the
+    # largest detectable period from `mid` is (len(mid)//2) / pressure_rate_hz.
+    mid_max_period_s = (len(mid) // 2 - 1) / pressure_rate_hz if pressure_rate_hz > 0 else 0
+    search_max_period_s = min(search_max_period_s, mid_max_period_s)
+    diag["search_max_period_s"] = round(search_max_period_s, 2)
+    if search_max_period_s < SUPPLY_PULSE_PERIOD_MIN_S or len(mid) < 8:
+        return False, {
+            "reason": "mid_slice_too_short",
+            "mid_samples": len(mid),
+            "search_max_period_s": round(search_max_period_s, 2),
+        }
+
+    # Detrend BEFORE std and autocorrelation — kills slow recovery drift
+    # that would otherwise inflate variance and create false periodicity
+    # at long lags.
+    mid = _detrend_linear(mid)
+    mid_std = statistics.pstdev(mid)
+    diag["mid_pressure_std_psi"] = round(mid_std, 3)
+
+    # (D) Primary gate — pressure must actually be moving.
+    if mid_std < MID_PRESSURE_STD_PULSING_PSI:
+        diag["reason"] = "pressure_steady"
+        return False, diag
+
+    # (E) Dominant pressure period in the supply-pulse band.
+    pressure_period_s, pressure_score = _dominant_period_s(
+        mid, pressure_rate_hz,
+        min_period_s=SUPPLY_PULSE_PERIOD_MIN_S,
+        max_period_s=search_max_period_s,
+    )
+    diag["pressure_dominant_period_s"] = (
+        round(pressure_period_s, 2) if pressure_period_s else None
+    )
+    diag["pressure_autocorr_score"] = round(pressure_score, 3)
+    if not pressure_period_s:
+        diag["reason"] = "no_periodic_pressure_in_supply_band"
+        return False, diag
+
+    # (F) Flow period match — flow's dominant period must match pressure's
+    # (within ±25%, or at the 1:2 / 2:1 harmonic that arises from
+    # paddlewheel rectification doubling apparent flow frequency).
+    period_matched = False
+    flow_period_s = None
+    flow_score = 0.0
+    if flow_readings and len(flow_readings) >= 8:
+        flow_rate_hz = len(flow_readings) / duration_s
+        flow_period_s, flow_score = _dominant_period_s(
+            _detrend_linear(flow_readings), flow_rate_hz,
+            min_period_s=SUPPLY_PULSE_PERIOD_MIN_S,
+            max_period_s=FIXTURE_CYCLE_PERIOD_MAX_S,
+        )
+        diag["flow_dominant_period_s"] = (
+            round(flow_period_s, 2) if flow_period_s else None
+        )
+        diag["flow_autocorr_score"] = round(flow_score, 3)
+        if flow_period_s:
+            ratio = flow_period_s / pressure_period_s
+            diag["period_match_ratio"] = round(ratio, 2)
+            if 0.75 <= ratio <= 1.33:
+                period_matched = True
+                diag["harmonic"] = "1:1"
+            elif 0.45 <= ratio <= 0.55:
+                period_matched = True
+                diag["harmonic"] = "1:2"   # flow at half pressure period
+            elif 1.8 <= ratio <= 2.2:
+                period_matched = True
+                diag["harmonic"] = "2:1"   # flow at double pressure period
+            else:
+                diag["reason"] = "frequency_mismatch_fixture_cycling"
+                return False, diag
+        # If flow has no clean dominant period, fall through; the pressure
+        # band already showed periodicity. period_matched stays False so
+        # the appliance fallback can run.
+
+    # (G) Appliance fallback discriminator — runs ONLY when period match
+    # was inconclusive. Real degraded events have very high
+    # flow_rel_std / pressure_rel_std ratios, so this MUST NOT run after
+    # a confirmed period match.
+    if not period_matched:
+        avg_flow = (sum(flow_readings) / len(flow_readings)
+                    if flow_readings else 0)
+        if avg_flow > 0.5 and len(flow_readings) >= 4:
+            flow_std_full = statistics.pstdev(flow_readings)
+            flow_rel = flow_std_full / avg_flow
+            pressure_rel = mid_std / pre_event_pressure_psi
+            if pressure_rel > 0 and (flow_rel / pressure_rel) > APPLIANCE_FLOW_PRESSURE_RATIO:
+                diag["reason"] = "appliance_cycling"
+                diag["flow_rel_std"] = round(flow_rel, 3)
+                diag["pressure_rel_std"] = round(pressure_rel, 4)
+                return False, diag
+
+    # (H) Confirmatory signals.
+    # When periods matched, require a meaningful flow autocorr score (the
+    # match means flow has its own significant periodicity, not just a
+    # noise-driven coincidence). When inconclusive, require trough/resistance.
+    trough_count = _count_trough_episodes(flow_readings, FLOW_TROUGH_LPM)
+    trough_rate = trough_count / duration_s if duration_s > 0 else 0
+    diag["flow_trough_episode_count"] = trough_count
+    diag["flow_trough_episode_rate_hz"] = round(trough_rate, 3)
+    diag["resistance_shape"] = resistance_shape
+
+    if period_matched:
+        if flow_score < PRESSURE_AUTOCORR_THRESHOLD:
+            diag["reason"] = "no_confirmatory_signal"
+            return False, diag
+    else:
+        confirmed = (
+            trough_rate >= MIN_TROUGH_EPISODE_RATE_HZ
+            or resistance_shape == "pulsed"
+        )
+        if not confirmed:
+            diag["reason"] = "no_confirmatory_signal"
+            return False, diag
+
+    diag["reason"] = "pulsing_supply_confirmed"
+    diag["period_matched"] = period_matched
+    return True, diag
+
+
+def _estimate_volume_smoothed(
+    flow_readings: List[float],
+    duration_s: float,
+) -> float:
+    """Spike-resistant smoothed volume estimate for degraded events.
+
+    Strategy: cap a rolling-max envelope at the 95th percentile of positive
+    samples (rejects single-sample spikes), then take the MEDIAN across
+    windows (rejects sub-event high outliers). The result is a "typical
+    sustained flow" estimate that's robust to both the artefact zero-troughs
+    AND any phantom-pulse spikes that paddlewheel rectification might
+    introduce.
+
+    For very short events with too few samples to envelope-smooth, fall
+    back to a plain mean times duration.
+    """
+    if not flow_readings or duration_s <= 0:
+        return 0.0
+    cleaned = [f for f in _finite_float_series(flow_readings) if f >= 0]
+    if not cleaned:
+        return 0.0
+    if len(cleaned) < 5 or duration_s < 5:
+        avg = sum(cleaned) / len(cleaned)
+        return max(0.0, avg * (duration_s / 60.0))
+
+    positive = sorted(f for f in cleaned if f > FLOW_TROUGH_LPM)
+    if not positive:
+        return 0.0
+    cap_idx = max(0, int(len(positive) * VOLUME_ENVELOPE_PERCENTILE) - 1)
+    cap = positive[cap_idx]
+
+    sample_rate_hz = len(cleaned) / duration_s
+    win = max(2, int(round(VOLUME_ENVELOPE_WINDOW_S * sample_rate_hz)))
+    windowed = []
+    for i in range(0, len(cleaned), win):
+        chunk = cleaned[i:i + win]
+        if chunk:
+            windowed.append(min(max(chunk), cap))
+    if not windowed:
+        return 0.0
+    windowed.sort()
+    effective_flow = windowed[len(windowed) // 2]   # median of window-maxes
+    return max(0.0, effective_flow * (duration_s / 60.0))
+
+
+def _bin_min_max(values: list, n_bins: int):
+    """Bin `values` into up to n_bins, returning (mins, maxs) per bin.
+
+    Each output bin contains the MIN and MAX of its slice — preserves
+    oscillation envelopes that bin-mean would hide. Bin slicing uses
+    round-of-fraction indexing so the output length is bounded by n_bins
+    (never exceeds, no integer-division off-by-one).
+    """
+    cleaned = _clean_numeric_series(values)
+    if not cleaned:
+        return [], []
+    if len(cleaned) <= n_bins:
+        return list(cleaned), list(cleaned)
+    mins, maxs = [], []
+    L = len(cleaned)
+    for b in range(n_bins):
+        start = round(b * L / n_bins)
+        end   = round((b + 1) * L / n_bins)
+        if end <= start:
+            end = start + 1
+        chunk = cleaned[start:end]
+        if chunk:
+            mins.append(round(min(chunk), 3))
+            maxs.append(round(max(chunk), 3))
+    assert len(mins) <= n_bins and len(maxs) <= n_bins
+    return mins, maxs
+
+
+def _persist_waveform(
+    db,
+    event_id: str,
+    flow_readings: list,
+    pressure_readings: list,
+    duration_s: float,
+) -> None:
+    """Write a min/max-binned waveform to event_waveforms.
+
+    Used for the high-resolution waveform display in the event detail modal.
+    The 32-point pressure_signature_json / flow_signature_json on the events
+    row stays for clustering — these min/max envelopes are display-only.
+    Skips silently if both reading lists are empty (historical events).
+    """
+    flow_min, flow_max = _bin_min_max(flow_readings, MAX_WAVEFORM_BINS)
+    pres_min, pres_max = _bin_min_max(pressure_readings, MAX_WAVEFORM_BINS)
+    if not flow_min and not pres_min:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        db.execute(
+            "INSERT OR REPLACE INTO event_waveforms "
+            "(event_id, flow_min_json, flow_max_json, "
+            " pressure_min_json, pressure_max_json, "
+            " duration_seconds, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                json.dumps(flow_min, allow_nan=False),
+                json.dumps(flow_max, allow_nan=False),
+                json.dumps(pres_min, allow_nan=False),
+                json.dumps(pres_max, allow_nan=False),
+                float(duration_s),
+                now_iso,
+            ),
+        )
+    except Exception as e:
+        log.warning("event_waveforms insert failed for %s: %s", event_id, e)
 
 
 def _flow_signature(flow_readings: list, peak: float, n: int = 32) -> list:
@@ -712,6 +1129,29 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         pre_event_pressure,
     )
 
+    # ── Degraded-supply guard ─────────────────────────────────────────────
+    # Detect supply-pulsation during this event. When detected, substitute
+    # an envelope-smoothed volume estimate so daily totals stay sane, and
+    # mark the event excluded from clustering (centroid would otherwise be
+    # corrupted by the chaotic flow readings). Always compute the smoothed
+    # estimate — useful diagnostically even for healthy events.
+    volume_litres_estimated = _estimate_volume_smoothed(
+        event.flow_readings, duration
+    )
+    is_degraded, deg_diag = _detect_degraded_supply(
+        event.pressure_readings,
+        event.flow_readings,
+        pre_event_pressure,
+        shape,
+        duration,
+    )
+    if is_degraded:
+        volume_litres_effective = volume_litres_estimated
+        volume_estimation_method = "pulsing_supply_envelope"
+    else:
+        volume_litres_effective = volume_litres
+        volume_estimation_method = "raw"
+
     # Time features
     ts = event.start_ts
     hour = ts.hour
@@ -779,7 +1219,29 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
             else 0 if event.other_valve_open is False
             else None
         ),
-        "excluded_from_training": 1 if event.is_composite else 0,
+        # Excluded from cluster training when:
+        #   - composite event (multiple fixtures concurrent), OR
+        #   - degraded by supply pulsation (chaotic flow readings)
+        # Note: clustering exclusion is NOT the same as volume exclusion;
+        # the volume_litres_effective field still contributes to daily totals.
+        "excluded_from_training": 1 if (event.is_composite or is_degraded) else 0,
+        # match_rejection_reason: 'pulsing_supply' on degraded events, BUT
+        # only if no other exclusion reason was set first (composite events
+        # keep their authoritative reason). The cluster-engine reason values
+        # ('no_centers', 'features_missing', etc.) are written separately by
+        # match_and_learn; this field carries the *upstream* reason set by
+        # feature extraction.
+        "match_rejection_reason": (
+            "pulsing_supply" if (is_degraded and not event.is_composite)
+            else None
+        ),
+
+        # Degraded-supply guard
+        "degraded_supply":             1 if is_degraded else 0,
+        "volume_litres_estimated":     round(volume_litres_estimated, 3),
+        "volume_litres_effective":     round(volume_litres_effective, 3),
+        "volume_estimation_method":    volume_estimation_method,
+        "degraded_diagnostic_json":    json.dumps(deg_diag, allow_nan=False),
 
         # Flow shape features
         "flow_signature_json":    json.dumps(sig),
@@ -837,6 +1299,12 @@ class FeatureExtractor:
         # gives us a place to observe and log exceptions instead of the
         # default "Task exception was never retrieved" warning.
         self._pending_alert_tasks: set[asyncio.Task] = set()
+        # Per-circuit cooldown timestamps for the pulsing-supply alert.
+        # In-memory only — resets on addon restart. That's acceptable for now:
+        # if a real pulsing episode persists across a restart the user will
+        # be re-alerted (mildly annoying, not dangerous). Persist to DB
+        # later if it becomes a problem.
+        self._last_pulsing_alert_at: dict[str, datetime] = {}
         # Set by orchestrator after ClusterEngine is initialised and rebuilt.
         self.cluster_engine = None
 
@@ -993,7 +1461,7 @@ class FeatureExtractor:
             )
 
         try:
-            from .database import (insert_event, update_hourly_volume,
+            from .database import (upsert_event_and_apply_hourly_volume,
                                    is_event_in_exclusion_window,
                                    find_overlapping_event)
 
@@ -1027,49 +1495,53 @@ class FeatureExtractor:
                     )
                     return
 
-            is_new_event = insert_event(self._db, features)
+            # Atomic upsert + hourly_volume update. Uses
+            # volume_litres_effective (which is volume_litres for healthy
+            # events, or the envelope-smoothed estimate for degraded ones).
+            # Idempotent: re-imports subtract the prior contribution before
+            # adding the new value, so no double-counting.
+            effective_volume = float(features.get("volume_litres_effective") or 0)
+            is_new_event = upsert_event_and_apply_hourly_volume(
+                self._db, features, effective_volume,
+            )
 
             # ── Plumbing-event exclusion window (Phase 2.1) ───────────────
             # If the user opened an exclusion window (e.g. post-winterization
             # flush), flag the event so the cluster engine skips it.  Volume
             # tracking continues — only fixture identification is excluded.
+            # Preserves any upstream match_rejection_reason already set by
+            # feature extraction (e.g. 'pulsing_supply') — only stamps
+            # 'excluded_from_training' when no reason was set.
             start_ts_str = features.get("start_ts")
             if (start_ts_str
                     and is_event_in_exclusion_window(
                         self._db, event.circuit, start_ts_str)):
+                existing_reason = features.get("match_rejection_reason")
+                new_reason = existing_reason or "excluded_from_training"
                 self._db.execute(
                     """UPDATE events
                        SET excluded_from_training  = 1,
-                           match_rejection_reason  = 'excluded_from_training'
+                           match_rejection_reason  = ?
                        WHERE id = ?""",
-                    (features["id"],),
+                    (new_reason, features["id"]),
                 )
                 features["excluded_from_training"] = 1
+                features["match_rejection_reason"] = new_reason
                 log.debug(
                     "[%s] event excluded from training (exclusion window active)",
                     event.circuit,
                 )
 
-            # Only accumulate volume and training counts for genuinely new events.
-            # Re-imports (INSERT OR REPLACE replacing an existing row) must not
-            # add to these totals again — that would inflate the hourly chart and
-            # the training progress bar on every addon restart.
-            if is_new_event and event.start_ts and features.get("volume_litres", 0) > 0:
-                # Normalize to UTC and strip timezone info so hour_ts matches
-                # the format that DB queries use: strftime('%Y-%m-%dT%H:00:00', …)
-                # produces no timezone suffix.  Mixing +00:00 suffixed values
-                # with bare datetime strings breaks lexicographic comparison in
-                # get_daily_volume / get_weekly_volume / data pruner.
-                _hdt = event.start_ts
-                if _hdt.tzinfo is None:
-                    _hdt = _hdt.replace(tzinfo=timezone.utc)
-                hour_ts = _hdt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:00:00')
-                update_hourly_volume(
-                    self._db,
-                    event.circuit,
-                    hour_ts,
-                    features["volume_litres"],
-                )
+            # Persist the hi-res waveform for the event-detail modal. Always
+            # called, even for healthy events — useful diagnostic data. Skips
+            # silently when readings lists are empty (historical events).
+            _persist_waveform(
+                self._db,
+                features["id"],
+                event.flow_readings,
+                event.pressure_readings,
+                float(features.get("duration_seconds") or 0),
+            )
 
             if is_new_event and not features.get("excluded_from_training"):
                 self._db.execute("""
@@ -1098,6 +1570,38 @@ class FeatureExtractor:
                     # alert is sent (loose-reference antipattern).
                     self._spawn_alert_task(
                         am.alert_flow_anomaly(event.circuit, score, circuit_name))
+
+            # ── Pulsing-supply alert (rate-limited) ────────────────────────
+            # Fire at most once per hour per circuit, and only when at least
+            # 3 degraded events occurred in the past 30 minutes. Uses
+            # Python-computed UTC ISO timestamps for the SQL cutoff so the
+            # comparison format matches stored start_ts exactly.
+            if am and features.get("degraded_supply"):
+                now = datetime.now(timezone.utc)
+                cutoff_30min = (now - timedelta(minutes=30)).isoformat()
+                try:
+                    row = self._db.execute(
+                        "SELECT COUNT(*) FROM events "
+                        "WHERE circuit = ? AND degraded_supply = 1 "
+                        "AND start_ts >= ?",
+                        (event.circuit, cutoff_30min),
+                    ).fetchone()
+                    count = int(row[0]) if row else 0
+                except Exception as e:
+                    log.warning("[%s] pulsing-supply count query failed: %s",
+                                event.circuit, e)
+                    count = 0
+                last = self._last_pulsing_alert_at.get(event.circuit)
+                if count >= 3 and (
+                    last is None or now - last >= timedelta(hours=1)
+                ):
+                    circuit_name = event.circuit.replace("_", " ").title()
+                    self._spawn_alert_task(
+                        am.alert_pulsing_supply(
+                            event.circuit, circuit_name, count
+                        )
+                    )
+                    self._last_pulsing_alert_at[event.circuit] = now
 
             log.debug(
                 "[%s] event stored — duration=%.1fs shape=%s trigger=%s "
