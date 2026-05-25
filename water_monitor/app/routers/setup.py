@@ -11,7 +11,7 @@ Handles the first-run configuration flow:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -20,9 +20,9 @@ from ._helpers import ingress_redirect
 from ..device_discovery import (
     find_matching_devices,
     match_entities_to_roles,
+    _resolve_labels_from_diagnostics,
     save_discovery,
     mark_setup_complete,
-    load_circuit_entities,
     get_device_config,
     DiscoveryResult,
     DiscoveredDevice,
@@ -38,6 +38,41 @@ def _orch(r: Request):
 
 def _tmpl(r: Request):
     return r.app.state.templates
+
+
+def _block_if_setup_complete(request: Request):
+    """Return a rendered setup-locked error page when setup is already complete.
+
+    The setup wizard is intentionally CSRF-exempt (main.py:210) because no
+    session token exists on first run. That carve-out is safe ONLY while
+    setup_complete=0; once setup is done these endpoints must refuse to
+    mutate so a stray POST to /setup/restore (which calls DELETE FROM …
+    before re-inserting) can't wipe the live DB. Call this at the top of
+    every state-mutating /setup/* handler and return its value if not None.
+
+    Returns the setup landing page (step 0) with `setup_locked=True` so the
+    template can show an error banner pointing the user at Settings →
+    Advanced → "Re-run setup wizard". A silent redirect would leave the
+    user stranded on the dashboard with no idea why their POST disappeared.
+    """
+    orch = _orch(request)
+    if orch and getattr(orch, "setup_complete", False):
+        log.warning(
+            "setup_complete=1 — refusing mutation on %s (path=%s)",
+            request.method, request.url.path,
+        )
+        device_cfg = get_device_config(orch.db) if orch.db else {}
+        initial_name = (
+            device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
+        )
+        return _tmpl(request).TemplateResponse("setup.html", {
+            "request": request,
+            "step": 0,
+            "initial_name": initial_name,
+            "setup_locked": True,
+            "page": "setup",
+        }, status_code=403)
+    return None
 
 
 # ------------------------------------------------------------------
@@ -85,6 +120,9 @@ async def setup_new(request: Request):
 # ------------------------------------------------------------------
 @router.post("/restore")
 async def setup_restore(request: Request):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     import json as _json
     from urllib.parse import quote_plus as _qp
     from fastapi import File, UploadFile
@@ -92,6 +130,7 @@ async def setup_restore(request: Request):
         QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT, MAX_BACKUP_BYTES,
     )
     from ..database import normalize_events_utc, dedup_events
+    from ..restore_utils import safe_insert_rows, restore_circuit_labels
 
     orch = _orch(request)
     form = await request.form()
@@ -151,35 +190,24 @@ async def setup_restore(request: Request):
                 rows = tables.get(tbl)
                 if not rows:
                     continue
-                # Filter backup columns against live schema so old backups with
-                # removed columns (e.g. monthly_budget_litres) restore cleanly.
-                valid_cols = {r[1] for r in db.execute(
-                    f"PRAGMA table_info({tbl})").fetchall()}
-                cols = [c for c in rows[0].keys() if c in valid_cols]
-                if not cols:
-                    log.warning("Restore: table %s has no valid columns — skipping", tbl)
-                    continue
-                placeholders = ", ".join("?" for _ in cols)
-                col_names    = ", ".join(cols)
-                for row in rows:
-                    db.execute(
-                        f"INSERT OR REPLACE INTO {tbl} ({col_names}) "
-                        f"VALUES ({placeholders})",
-                        [row.get(c) for c in cols],
-                    )
-                total += len(rows)
+                total += safe_insert_rows(db, tbl, rows)
 
             # Normalize and deduplicate events after import so the DB is
             # consistent even if the backup contained pre-dedup duplicates
-            # or mixed-timezone timestamps.
+            # or mixed-timezone timestamps. commit=False keeps everything
+            # inside the outer transaction so a failure here rolls the
+            # whole restore back instead of leaving a half-imported DB.
             if import_history == "1" and tables.get("events"):
-                normalize_events_utc(db)
-                removed = dedup_events(db)
+                normalize_events_utc(db, commit=False)
+                removed = dedup_events(db, commit=False)
                 if removed:
                     log.warning(
                         "Setup restore: removed %d duplicate event(s) from backup",
                         removed,
                     )
+
+            # Restore circuit display labels atomically with the table data.
+            restore_circuit_labels(db, payload, commit=False)
     except Exception as e:
         log.error("Setup restore failed — transaction rolled back: %s", e)
         errors.append("(transaction rolled back)")
@@ -237,6 +265,9 @@ async def setup_search(
     request: Request,
     device_name: str = Form(...),
 ):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     orch = _orch(request)
 
     # Persist the searched name
@@ -291,6 +322,9 @@ async def setup_select(
     request: Request,
     device_id: str = Form(...),
 ):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     return ingress_redirect(request, f"/setup/discover/{device_id}")
 
 
@@ -317,8 +351,17 @@ async def setup_discover(device_id: str, request: Request):
     from ..device_discovery import _to_device
     device = _to_device(device_raw)
 
+    # Resolve display labels from v3.6+ diagnostic sensors before regex matching
+    # so non-default circuit names (e.g. "Zone A") are recognised in tier 1.
+    diag_labels = await _resolve_labels_from_diagnostics(orch.ha, entities)
+    if diag_labels:
+        from ..database import upsert_circuit_label
+        for cid, lbl in diag_labels.items():
+            upsert_circuit_label(orch.db, cid, lbl)
+        orch.reload_circuit_labels()
+
     circuit_matches, prefix = match_entities_to_roles(
-        device_id, entities, circuits)
+        device_id, entities, circuits, labels=diag_labels)
 
     # Get all device entities for fallback dropdowns
     device_entity_list = [
@@ -379,6 +422,9 @@ async def setup_discover(device_id: str, request: Request):
 # ------------------------------------------------------------------
 @router.post("/confirm/{device_id}")
 async def setup_confirm(device_id: str, request: Request):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     orch = _orch(request)
     form = await request.form()
 
@@ -410,7 +456,102 @@ async def setup_confirm(device_id: str, request: Request):
                 """, (circuit, role, value.strip()))
 
     orch.db.commit()
-    log.info("Entity mapping confirmed for device %s — proceeding to home details", device_id)
+    log.info("Entity mapping confirmed for device %s — proceeding to circuit names", device_id)
+    return ingress_redirect(request, "/setup/circuit-names")
+
+
+# ------------------------------------------------------------------
+# Step 3b — circuit display names
+# ------------------------------------------------------------------
+
+@router.get("/circuit-names", response_class=HTMLResponse)
+async def setup_circuit_names(request: Request):
+    """Step 3b — let the user name and classify their circuits."""
+    orch = _orch(request)
+    from ..database import get_circuit_type
+    from ..fixtures import CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP
+    circuits = [
+        {
+            "circuit":      c.circuit,
+            "display_name": c.label,
+            "circuit_type": get_circuit_type(orch.db, c.circuit, default=c.circuit_type),
+        }
+        for c in orch._cfg.circuits
+    ]
+    return _tmpl(request).TemplateResponse("setup.html", {
+        "request":             request,
+        "step":                "3b",
+        "circuits":            circuits,
+        "circuit_types":       CIRCUIT_TYPES,
+        "circuit_type_labels": CIRCUIT_TYPE_LABELS,
+        "circuit_type_help":   CIRCUIT_TYPE_HELP,
+        "page":                "setup",
+    })
+
+
+@router.post("/circuit-names")
+async def setup_circuit_names_save(request: Request):
+    """Save circuit display names and types, then advance to unit selection."""
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
+    from ..circuit_compat import validate_display_name
+    from ..database import upsert_circuit_label, set_circuit_type, get_circuit_type
+    from ..fixtures import normalize_circuit_type, CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP
+    orch = _orch(request)
+    form = await request.form()
+
+    errors = []
+
+    # Save display names
+    for c in orch._cfg.circuits:
+        raw = form.get(f"label_{c.circuit}", "").strip()
+        if not raw:
+            continue
+        try:
+            display_name = validate_display_name(raw)
+        except ValueError as exc:
+            errors.append(f"{c.circuit}: {exc}")
+            continue
+        upsert_circuit_label(orch.db, c.circuit, display_name)
+
+    # Save circuit types
+    for c in orch._cfg.circuits:
+        raw_type = form.get(f"type_{c.circuit}", "").strip()
+        if not raw_type:
+            continue
+        normalised = normalize_circuit_type(raw_type)
+        if normalised not in CIRCUIT_TYPES:
+            errors.append(f"{c.circuit}: invalid circuit type {raw_type!r}")
+            continue
+        try:
+            set_circuit_type(orch.db, c.circuit, normalised)
+        except Exception as exc:
+            errors.append(f"{c.circuit}: could not save circuit type: {exc}")
+
+    if errors:
+        circuits = [
+            {
+                "circuit":      c.circuit,
+                "display_name": c.label,
+                "circuit_type": get_circuit_type(orch.db, c.circuit, default=c.circuit_type),
+            }
+            for c in orch._cfg.circuits
+        ]
+        return _tmpl(request).TemplateResponse("setup.html", {
+            "request":             request,
+            "step":                "3b",
+            "circuits":            circuits,
+            "errors":              errors,
+            "circuit_types":       CIRCUIT_TYPES,
+            "circuit_type_labels": CIRCUIT_TYPE_LABELS,
+            "circuit_type_help":   CIRCUIT_TYPE_HELP,
+            "page":                "setup",
+        })
+
+    orch.reload_circuit_labels()
+    orch.reload_circuit_profiles()
+    log.info("Setup: circuit names and types saved")
     return ingress_redirect(request, "/setup/units")
 
 
@@ -444,6 +585,9 @@ async def setup_units(request: Request):
 @router.post("/units")
 async def setup_units_save(request: Request):
     """Save display unit preferences and advance to home details."""
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     from ..units import FLOW_OPTIONS, PRESSURE_OPTIONS, invalidate_unit_cache
     orch = _orch(request)
     form = await request.form()
@@ -475,20 +619,24 @@ async def setup_home_details(request: Request):
 
 @router.post("/home")
 async def setup_home_details_save(request: Request):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        return blocked
     orch = _orch(request)
     form = await request.form()
 
     from ..database import update_home_profile
     from ..config import compute_suggested_calibration_days
 
-    bathrooms_full = int(form.get("bathrooms_full", 1) or 1)
-    bathrooms_half = int(form.get("bathrooms_half", 0) or 0)
-    floors         = int(form.get("floors", 1) or 1)
-    occupants      = int(form.get("occupants", 2) or 2)
-    supply_type    = form.get("supply_type", "mains")
-    build_year_raw = form.get("build_year", "")
-    build_year     = int(build_year_raw) if build_year_raw.strip().isdigit() else None
-    sqft           = int(form.get("sqft", 0) or 0)
+    bathrooms_full             = int(form.get("bathrooms_full", 1) or 1)
+    bathrooms_half             = int(form.get("bathrooms_half", 0) or 0)
+    floors                     = int(form.get("floors", 1) or 1)
+    occupants                  = int(form.get("occupants", 2) or 2)
+    supply_type                = form.get("supply_type", "mains")
+    build_year_raw             = form.get("build_year", "")
+    build_year                 = int(build_year_raw) if build_year_raw.strip().isdigit() else None
+    sqft                       = int(form.get("sqft", 0) or 0)
+    historical_import_enabled  = form.get("historical_import_enabled") == "1"
 
     update_home_profile(
         orch.db,
@@ -506,6 +654,17 @@ async def setup_home_details_save(request: Request):
     mark_setup_complete(orch.db)
     orch.reload_circuit_entities()
 
+    # If the user opted out of historical import, stamp import_state to NOW
+    # for every circuit.  _backfill() and _catch_up() both clamp to this
+    # checkpoint, so no events before the setup moment will ever be imported.
+    if not historical_import_enabled:
+        from datetime import datetime, timezone as _tz
+        from ..database import update_import_state
+        now_ts = datetime.now(_tz.utc).isoformat()
+        for _circuit_cfg in orch._cfg.circuits:
+            update_import_state(orch.db, _circuit_cfg.circuit, now_ts, 0)
+        log.info("Historical import disabled — import_state stamped to %s for all circuits", now_ts)
+
     # Activate event detection now that entity IDs are known.
     # At startup, event_detector.setup() is skipped when setup is not yet
     # complete.  Calling it here ensures the first real day of monitoring
@@ -516,6 +675,17 @@ async def setup_home_details_save(request: Request):
             log.info("Event detection activated after setup wizard completion")
         except Exception as e:
             log.warning("Event detector setup failed (non-fatal): %s", e)
+
+    # The HA WebSocket was already connected before setup completed (monitoring 0
+    # entities).  subscribe_entity() adds to the dict but cannot update the live
+    # WebSocket subscription.  Reconnect so HA starts sending state changes for
+    # the newly registered circuit entities.
+    if orch.ha:
+        try:
+            orch.ha.request_reconnect()
+            log.info("HA WebSocket reconnect requested — circuit entity subscriptions now active")
+        except Exception as e:
+            log.warning("HA WebSocket reconnect request failed (non-fatal): %s", e)
 
     # Fetch midnight volume baselines from HA history so the dashboard
     # shows accurate daily/weekly totals from the first page load.
@@ -588,7 +758,7 @@ async def setup_complete(request: Request):
         "circuits": [
             {
                 "circuit":      c.circuit,
-                "display_name": c.display_name,
+                "display_name": c.label,
                 "configured":   c.is_fully_configured,
                 "training":     training_info.get(c.circuit, {}),
             }
@@ -605,11 +775,18 @@ async def setup_complete(request: Request):
 # ------------------------------------------------------------------
 @router.post("/api/rediscover/{device_id}/{circuit}")
 async def rediscover_circuit(device_id: str, circuit: str, request: Request):
+    blocked = _block_if_setup_complete(request)
+    if blocked is not None:
+        # Same JSON shape as the error branch below — keep the client happy.
+        return JSONResponse({"error": "setup already complete"}, status_code=403)
+    from ..circuit_compat import resolve_circuit
+    circuit = resolve_circuit(circuit)
     orch = _orch(request)
     try:
         entities = await orch.ha.get_entity_registry()
+        diag_labels = await _resolve_labels_from_diagnostics(orch.ha, entities)
         circuit_matches, _ = match_entities_to_roles(
-            device_id, entities, [circuit])
+            device_id, entities, [circuit], labels=diag_labels)
         matches = circuit_matches.get(circuit, [])
         return JSONResponse({
             "matches": [

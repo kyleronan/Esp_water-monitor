@@ -63,6 +63,7 @@ so ramp-up and ramp-down transients don't corrupt the trend analysis.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import sqlite3
@@ -71,7 +72,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from .event_detector import RawEvent
+from .event_detector import RawEvent, WaveformRecord
 
 log = logging.getLogger(__name__)
 
@@ -119,7 +120,7 @@ def _classify_resistance_shape(
     # Compute true ΔP/Q resistance at each steady-state point.
     # Skip readings where flow is below noise floor to avoid division
     # by near-zero inflating variance.
-    MIN_FLOW = 0.05   # L/min noise floor
+    MIN_FLOW = 0.15   # L/min noise floor (matches event_detector.MIN_FLOW_LPM)
     resistance = []
     for p, f in zip(p_mid, f_mid):
         if f >= MIN_FLOW:
@@ -157,6 +158,482 @@ def _classify_resistance_shape(
     return "steady"
 
 
+def _flow_signature(flow_readings: list, peak: float, n: int = 32) -> list:
+    """Resample flow_readings to n points, normalize by peak (0–1)."""
+    if not flow_readings or peak <= 0:
+        return [0.0] * n
+    src = flow_readings
+    if len(src) == 1:
+        return [min(src[0] / peak, 1.0)] * n
+    result = []
+    for i in range(n):
+        pos = i * (len(src) - 1) / (n - 1)
+        lo, hi = int(pos), min(int(pos) + 1, len(src) - 1)
+        v = src[lo] * (1 - (pos - lo)) + src[hi] * (pos - lo)
+        result.append(round(min(v / peak, 1.0), 4))
+    return result
+
+
+def _pressure_signature(
+    pressure_readings: list,
+    pre_event_pressure_psi: float,
+    pressure_delta_psi: float,
+    n: int = 32,
+) -> list:
+    """32-point normalized pressure drop (0 = no drop, 1 = full drop at delta_psi)."""
+    if pressure_delta_psi <= 0:
+        return [0.0] * n
+    drops = []
+    for p in pressure_readings:
+        try:
+            v = float(p)
+        except (TypeError, ValueError):
+            continue
+        drops.append(max(0.0, min(1.0, (pre_event_pressure_psi - v) / pressure_delta_psi)))
+    if not drops:
+        return [0.0] * n
+    if len(drops) == 1:
+        return [drops[0]] * n
+    result = []
+    for i in range(n):
+        pos = i * (len(drops) - 1) / (n - 1)
+        lo, hi = int(pos), min(int(pos) + 1, len(drops) - 1)
+        v = drops[lo] * (1 - (pos - lo)) + drops[hi] * (pos - lo)
+        result.append(round(v, 4))
+    return result
+
+
+def _flow_edges(flow_readings: list, peak: float) -> tuple:
+    """Count significant direction reversals using zigzag (WaterSense model).
+
+    Prepends 0.0 so the valve-open onset step is visible.
+    Fires an edge when cumulative displacement from the last extreme exceeds
+    the threshold, so gradual ramps count the same as abrupt steps.
+    """
+    if len(flow_readings) < 3:
+        return 0, 0
+    threshold = max(0.3, 0.15 * peak)
+    padded = [0.0] + list(flow_readings)
+    n = len(padded)
+    smoothed = [
+        sum(padded[max(0, i - 1): min(n, i + 2)])
+        / len(padded[max(0, i - 1): min(n, i + 2)])
+        for i in range(n)
+    ]
+    pos = neg = 0
+    last_extreme = smoothed[0]
+    direction = None
+    for val in smoothed[1:]:
+        change = val - last_extreme
+        if change >= threshold:
+            if direction != 'up':
+                pos += 1
+                direction = 'up'
+            last_extreme = val
+        elif change <= -threshold:
+            if direction != 'down':
+                neg += 1
+                direction = 'down'
+            last_extreme = val
+        else:
+            if direction == 'up' and val > last_extreme:
+                last_extreme = val
+            elif direction == 'down' and val < last_extreme:
+                last_extreme = val
+    return pos, neg
+
+
+def _mid_event_flow_drop(flow_readings: list, peak: float) -> float:
+    """Largest flow drop that does not terminate the event.
+
+    A 'non-terminal' drop is one where flow remains above 20% of peak after
+    the drop — signalling one fixture turning off while another keeps running.
+    Returns 0.0 for single-fixture events.
+    """
+    n = len(flow_readings)
+    if n < 3 or peak <= 0:
+        return 0.0
+    floor = 0.20 * peak
+    max_drop = 0.0
+    for i in range(1, n):
+        drop = flow_readings[i - 1] - flow_readings[i]
+        if drop > 0 and flow_readings[i] >= floor:
+            max_drop = max(max_drop, drop)
+    return round(max_drop, 4)
+
+
+def _flow_steady_state(flow_readings: list) -> float:
+    """Fraction of event time within ±20% of the median flow (0.0–1.0).
+
+    High for steady showers; low for toilet fill curves and pulsed appliances.
+    """
+    n = len(flow_readings)
+    if n < 3:
+        return 0.0
+    sorted_vals = sorted(flow_readings)
+    median = sorted_vals[n // 2]
+    if median <= 0:
+        return 0.0
+    threshold = 0.20 * median
+    steady = sum(1 for v in flow_readings if abs(v - median) <= threshold)
+    return round(steady / n, 4)
+
+
+def _pressure_transient_stats(
+    pressure_readings: list, pre_event_psi: float, pressure_delta_psi: float
+) -> dict:
+    """Compute energy and duration of the opening pressure transient.
+
+    pressure_readings is at 40 Hz (25 ms/sample). Returns zeros for
+    flow-only events where pressure_readings is empty or no transient occurred.
+    """
+    if not pressure_readings or pressure_delta_psi <= 0:
+        return {'pressure_transient_energy': 0.0, 'pressure_transient_duration_ms': 0.0}
+    threshold = 0.10 * pressure_delta_psi
+    energy = sum((p - pre_event_psi) ** 2 for p in pressure_readings)
+    duration_samples = sum(
+        1 for p in pressure_readings if abs(p - pre_event_psi) >= threshold
+    )
+    return {
+        'pressure_transient_energy':     round(energy, 4),
+        'pressure_transient_duration_ms': round(duration_samples * 25.0, 1),
+    }
+
+
+def _pressure_shape_features(
+    pressure_readings: list, pre_event_psi: float, pressure_delta_psi: float
+) -> dict:
+    """Transient shape features from the 40 Hz pressure curve.
+
+    pressure_onset_ms        — index of minimum * 25 ms (time to peak drop)
+    recovery_overshoot_psi   — max pressure above baseline after the minimum
+    pressure_oscillation_count — zero-crossings of (p - pre_event_psi) post-min
+    """
+    zero = {
+        'pressure_onset_ms': 0.0,
+        'recovery_overshoot_psi': 0.0,
+        'pressure_oscillation_count': 0,
+    }
+    if not pressure_readings or pressure_delta_psi <= 0:
+        return zero
+
+    min_idx = min(range(len(pressure_readings)), key=lambda i: pressure_readings[i])
+    onset_ms = round(min_idx * 25.0, 1)
+
+    post_min = pressure_readings[min_idx:]
+    overshoot = round(max(0.0, max(post_min) - pre_event_psi), 3)
+
+    deviations = [p - pre_event_psi for p in post_min]
+    crossings = sum(
+        1 for i in range(1, len(deviations))
+        if deviations[i - 1] * deviations[i] < 0
+    )
+
+    return {
+        'pressure_onset_ms':          onset_ms,
+        'recovery_overshoot_psi':     overshoot,
+        'pressure_oscillation_count': crossings,
+    }
+
+
+def _flow_dynamics(flow_readings: list, peak: float) -> dict:
+    """Rise/fall rates, opening/closing step magnitudes, and 90% ramp times.
+
+    Assumes uniform 1 Hz sampling (1 index = 1 second). For events > 120s the
+    event_detector downsamples to 0.2 Hz so timing values are approximate for
+    long irrigation runs — acceptable since those are identified by volume/duration.
+    """
+    zero = {
+        'flow_rise_rate_lpm_s': 0.0, 'flow_fall_rate_lpm_s': 0.0,
+        'opening_step_lpm': 0.0,     'closing_step_lpm': 0.0,
+        'time_to_90pct_flow_seconds': 0.0,
+        'time_from_90pct_to_zero_seconds': 0.0,
+    }
+    n = len(flow_readings)
+    if n < 2 or peak <= 0:
+        return zero
+
+    peak_idx = max(range(n), key=lambda i: flow_readings[i])
+    rise_rate = peak / max(peak_idx, 1)
+    fall_rate = peak / max(n - 1 - peak_idx, 1)
+
+    deltas = [flow_readings[i] - flow_readings[i - 1] for i in range(1, n)]
+    opening_step = max((d for d in deltas if d > 0), default=0.0)
+    closing_step = max((-d for d in deltas if d < 0), default=0.0)
+
+    threshold_90 = 0.9 * peak
+    t_rise = next((i for i, v in enumerate(flow_readings) if v >= threshold_90), n - 1)
+    t_fall_rev = next(
+        (i for i, v in enumerate(reversed(flow_readings)) if v >= threshold_90), 0
+    )
+
+    return {
+        'flow_rise_rate_lpm_s':            round(rise_rate, 4),
+        'flow_fall_rate_lpm_s':            round(fall_rate, 4),
+        'opening_step_lpm':                round(opening_step, 4),
+        'closing_step_lpm':                round(closing_step, 4),
+        'time_to_90pct_flow_seconds':      float(t_rise),
+        'time_from_90pct_to_zero_seconds': float(t_fall_rev),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# ESP waveform enrichment (firmware 3.7.0+) — per-group feature routing       #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+# Minimum correlation overlap score required to treat a WaveformRecord as
+# matching a given RawEvent. Duration-match below this threshold → legacy path.
+_WF_MATCH_MIN_SCORE: float = 0.55
+
+# Maximum seconds between the waveform record's assembled timestamp and the
+# current processing moment. Guards against stale records from a previous event.
+_WF_MATCH_WINDOW_S: float = 90.0
+
+# Waveform flag bits (must match firmware wire format).
+_WF_FL_START_COMPLETE:     int = 0x01  # pre-roll covers full start-window span
+_WF_FL_FULL_COMPLETE:      int = 0x02  # full-window capture is complete
+_WF_FL_RESOLUTION_REDUCED: int = 0x04  # buffer decimated; lower sample rate
+_WF_FL_EVENT_TOO_SHORT:    int = 0x10  # firmware duration < 1 s
+_WF_FL_EVENT_TOO_LONG:     int = 0x20  # decimation factor >= 4×
+_WF_FL_CLAMPED_SAMPLE:     int = 0x40  # at least one sample hit ADC rail
+
+_WF_FLOW_SIG_MIN_PEAK_LPM:   float = 0.05   # ignore near-zero / noisy full_flow arrays
+_WF_PRESS_SIG_MIN_DELTA_PSI:  float = 0.15   # ignore pressure noise below this drop
+
+
+def _wf_millis_sub(a: int, b: int) -> int:
+    """Wrap-safe uint32 millis subtraction: (a - b) mod 2**32."""
+    return int((a - b) & 0xFFFFFFFF)
+
+
+def _wf_resample(points: List[float], n: int) -> List[float]:
+    """Linearly resample ``points`` to exactly ``n`` output points."""
+    src = points
+    m = len(src)
+    if m == 0:
+        return [0.0] * n
+    if m == 1:
+        return [src[0]] * n
+    result = []
+    for i in range(n):
+        pos = i * (m - 1) / (n - 1)
+        lo, hi = int(pos), min(int(pos) + 1, m - 1)
+        frac = pos - lo
+        result.append(src[lo] * (1.0 - frac) + src[hi] * frac)
+    return result
+
+
+def _wf_overlap_score(event: RawEvent, record: WaveformRecord) -> float:
+    """
+    Duration-based overlap score for correlating a RawEvent to a WaveformRecord.
+
+    Returns a value in [0, 1]: 1.0 = exact duration match, 0.0 = no overlap.
+    Uses wrap-safe millis arithmetic for the firmware-side duration.
+    """
+    if event.end_ts is None or event.start_ts is None:
+        return 0.0
+    event_dur_ms = max(0.0, (event.end_ts - event.start_ts).total_seconds() * 1000)
+    meta = record.metadata
+    # Include the tail window: end_ms marks when flow first drops (phase 1→2),
+    # after which the firmware waits tail_ms before finalising.  The software
+    # event end_ts includes a similar debounce, so comparing full spans is more
+    # accurate than using end_ms - start_ms alone.
+    fw_dur_ms = float(_wf_millis_sub(meta.end_ms, meta.start_ms)) + meta.tail_ms
+    denom = max(event_dur_ms, fw_dur_ms)
+    if denom <= 0:
+        return 0.0
+    return max(0.0, min(1.0, 1.0 - abs(event_dur_ms - fw_dur_ms) / denom))
+
+
+def _enrich_from_waveform(
+    features: Dict[str, Any],
+    record: WaveformRecord,
+    overlap_score: float,
+) -> None:
+    """
+    Selectively override features in ``features`` with ESP waveform data.
+
+    Each feature group is routed independently — a missing or low-quality
+    window falls back to the already-computed legacy value; no all-or-nothing.
+
+    Mutates ``features`` in place and sets the four waveform A/B fields.
+    """
+    import time as _time
+
+    meta = record.metadata
+    fl   = meta.flags
+    any_wf_used = False
+
+    # ── 1. Metadata-sourced features (always, no flag guard needed) ────────
+    # The metadata is always valid when we reach this point; replace features
+    # that are better measured at 200 Hz / by the firmware's accumulator.
+    if meta.peak_flow > 0:
+        features["peak_flow_lpm"] = round(meta.peak_flow, 3)
+        any_wf_used = True
+    if meta.pressure_delta >= 0:
+        features["pressure_delta_psi"] = round(meta.pressure_delta, 2)
+        any_wf_used = True
+    # Propagation delay — firmware measures at ~50 Hz (ISR resolution);
+    # -1 means the firmware did not detect a clear onset, keep legacy value.
+    if meta.propagation_delay_ms >= 0:
+        features["propagation_delay_ms"] = float(meta.propagation_delay_ms)
+        any_wf_used = True
+
+    # ── 2. Start-window features (flag bit 0x01 — start_waveform_complete) ─
+    if fl & _WF_FL_START_COMPLETE:
+        sn = meta.start_points
+        dt_start_s = (meta.pre_ms + meta.post_ms) / 1000.0 / sn  # seconds/sample
+
+        # 2a. Start-flow waveform → opening dynamics
+        sf = record.start_flow   # L/min, sn points
+        if sf and max(sf) > 0:
+            peak_wf = max(sf)
+            # Onset index: approximately where the pre-roll ends
+            onset_idx = round(meta.pre_ms / 1000.0 / dt_start_s)
+            onset_idx = min(onset_idx, sn - 1)
+            ramp = sf[onset_idx:]
+            if ramp:
+                # Rise rate from onset to peak
+                peak_idx_ramp = max(range(len(ramp)), key=lambda i: ramp[i])
+                if peak_idx_ramp > 0:
+                    features["flow_rise_rate_lpm_s"] = round(
+                        peak_wf / (peak_idx_ramp * dt_start_s), 4)
+                # Time to 90% of peak
+                t90 = next((i for i, v in enumerate(ramp) if v >= 0.9 * peak_wf), None)
+                if t90 is not None:
+                    features["time_to_90pct_flow_seconds"] = round(t90 * dt_start_s, 2)
+                # Opening step — largest single-sample rise in the ramp
+                if len(ramp) >= 2:
+                    features["opening_step_lpm"] = round(
+                        max((ramp[i] - ramp[i - 1]
+                             for i in range(1, len(ramp))
+                             if ramp[i] > ramp[i - 1]),
+                            default=0.0), 4)
+            any_wf_used = True
+
+        # 2b. Start-pressure waveform → onset timing (time from window start to min)
+        sp = record.start_pressure   # PSI, sn points
+        if sp:
+            min_idx = min(range(len(sp)), key=lambda i: sp[i])
+            # Onset relative to the start of the window (which begins pre_ms before onset)
+            # So the true pressure_onset_ms is time from onset = (min_idx * dt - pre_ms/1000) * 1000
+            onset_ms_wf = round((min_idx * dt_start_s * 1000) - meta.pre_ms, 1)
+            # Keep non-negative (a negative value means the onset is before the window pre-roll)
+            features["pressure_onset_ms"] = max(0.0, onset_ms_wf)
+            any_wf_used = True
+
+    # ── 3. Full-window features (flag bit 0x02 — full_waveform_complete) ───
+    if fl & _WF_FL_FULL_COMPLETE:
+        fw_span_ms = float(_wf_millis_sub(meta.end_ms, meta.start_ms)) + meta.tail_ms
+        dt_full_s  = fw_span_ms / 1000.0 / meta.full_points  # seconds/sample
+
+        # 3a. Full-flow waveform → steady-state fraction and variability
+        ff = record.full_flow   # L/min, fn points
+        if ff:
+            n_full = len(ff)
+            # Exclude tail samples from steady-state calculation
+            tail_pts = round(meta.tail_ms / 1000.0 / dt_full_s) if dt_full_s > 0 else 0
+            body = ff[:max(1, n_full - tail_pts)]
+            if len(body) >= 3:
+                sorted_body = sorted(body)
+                med = sorted_body[len(body) // 2]
+                if med > 0:
+                    thr = 0.20 * med
+                    features["steady_state_fraction"] = round(
+                        sum(1 for v in body if abs(v - med) <= thr) / len(body), 4)
+            if len(ff) >= 2:
+                features["flow_variability"] = round(_safe_std(ff), 4)
+            any_wf_used = True
+
+        # 3b. Full-pressure waveform → recovery overshoot (from the tail)
+        fp = record.full_pressure   # PSI, fn points
+        if fp and meta.full_points > 0:
+            # Tail starts at the event-end sample
+            tail_pts = round(meta.tail_ms / 1000.0 / dt_full_s) if dt_full_s > 0 else 0
+            n_full = len(fp)
+            body_pts = n_full - tail_pts
+            if tail_pts > 0 and body_pts > 0:
+                body_press = fp[:body_pts]
+                tail_press = fp[body_pts:]
+                if body_press and tail_press:
+                    baseline = sum(body_press) / len(body_press)
+                    overshoot = max(0.0, max(tail_press) - baseline)
+                    features["recovery_overshoot_psi"] = round(overshoot, 3)
+            any_wf_used = True
+
+    # ── 3b. Shape signatures — firmware arrays are time-aligned, flow starts near zero ──
+    # Use separate flags so signature_source reflects exactly what was overridden.
+    _flow_sig_overridden  = False
+    _press_sig_overridden = False
+
+    # Flow: full_flow is in L/min; guard against zero/noise arrays before overriding.
+    if record.full_flow:
+        peak_fw = max(record.full_flow)
+        if peak_fw >= _WF_FLOW_SIG_MIN_PEAK_LPM:
+            features["flow_signature_json"] = json.dumps(
+                _flow_signature(record.full_flow, peak_fw)
+            )
+            _flow_sig_overridden = True
+            any_wf_used = True
+
+    # Pressure: derive baseline from pre-roll samples (pressure before flow onset).
+    # record.start_pressure and record.full_pressure both use meta.pressure_scale
+    # and belong to the same WaveformRecord — units are identical (PSI).
+    if record.full_pressure:
+        baseline_psi: Optional[float] = None
+
+        # Priority 1: median of pre-roll samples from start_pressure (most accurate —
+        # firmware ISR-level capture before flow onset).
+        if (fl & _WF_FL_START_COMPLETE) and record.start_pressure \
+                and meta.start_points > 0 \
+                and (meta.pre_ms + meta.post_ms) > 0 \
+                and meta.pre_ms > 0:
+            onset_idx = round(
+                meta.pre_ms * meta.start_points / (meta.pre_ms + meta.post_ms)
+            )
+            onset_idx = max(0, min(onset_idx, len(record.start_pressure) - 1))
+            pre_roll = record.start_pressure[:onset_idx]
+            if len(pre_roll) >= 3:
+                sorted_pr = sorted(pre_roll)
+                baseline_psi = sorted_pr[len(pre_roll) // 2]  # median
+
+        # Priority 2: median of first few full_pressure samples (still firmware data,
+        # but may already include partial onset drop).
+        if baseline_psi is None and len(record.full_pressure) >= 3:
+            pre_fp = record.full_pressure[:min(5, len(record.full_pressure))]
+            sorted_fp = sorted(pre_fp)
+            baseline_psi = sorted_fp[len(pre_fp) // 2]
+
+        # Priority 3: software-measured pre-event baseline (different time base,
+        # but better than nothing).
+        if baseline_psi is None:
+            baseline_psi = float(features.get("pre_event_pressure_psi") or 0.0)
+
+        if baseline_psi > 0:
+            delta_psi = baseline_psi - min(record.full_pressure)
+            if delta_psi >= _WF_PRESS_SIG_MIN_DELTA_PSI:
+                features["pressure_signature_json"] = json.dumps(
+                    _pressure_signature(record.full_pressure, baseline_psi, delta_psi)
+                )
+                _press_sig_overridden = True
+                any_wf_used = True
+
+    # Set granular signature_source — reflects exactly what was overridden.
+    if _flow_sig_overridden and _press_sig_overridden:
+        features["signature_source"] = "esp_full_flow_pressure"
+    elif _flow_sig_overridden:
+        features["signature_source"] = "esp_full_flow"
+    elif _press_sig_overridden:
+        features["signature_source"] = "esp_full_pressure"
+    # else: stays "software" (set in extract_features default)
+
+    # ── 4. Set A/B tracking fields ─────────────────────────────────────────
+    features["esp_waveform_used"]     = 1 if any_wf_used else 0
+    features["waveform_event_id"]     = meta.event_id
+    features["waveform_quality"]      = meta.quality
+    features["waveform_overlap_score"] = round(overlap_score, 4)
+
+
 def extract_features(event: RawEvent) -> Dict[str, Any]:
     """Compute the full feature vector from a RawEvent."""
     duration = 0.0
@@ -166,6 +643,32 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     avg_flow = _safe_float(event.flow_readings)
     peak_flow = max(event.flow_readings) if event.flow_readings else 0.0
     flow_variability = _safe_std(event.flow_readings)
+
+    # Clamp pressure_delta_psi ≥ 0: negative values (pressure rose during event)
+    # are surge artefacts; the live detector now rejects them, but historical
+    # importer events may still arrive with negative delta.
+    pressure_delta_psi = max(0.0, float(event.pressure_delta_psi or 0))
+    # pre_event_pressure_psi is None for cold-start flow events with no
+    # trustworthy baseline — coerce to 0 so pressure-derived features (all
+    # gated on a positive pressure_delta_psi) degrade gracefully.
+    pre_event_pressure = float(event.pre_event_pressure_psi or 0)
+
+    sig          = _flow_signature(event.flow_readings, peak_flow)
+    p_sig        = _pressure_signature(
+        event.pressure_readings or [],
+        pre_event_pressure,
+        pressure_delta_psi,
+    )
+    pos_edges, neg_edges = _flow_edges(event.flow_readings, peak_flow)
+    dynamics     = _flow_dynamics(event.flow_readings, peak_flow)
+    mid_drop     = _mid_event_flow_drop(event.flow_readings, peak_flow)
+    steady       = _flow_steady_state(event.flow_readings)
+    p_stats      = _pressure_transient_stats(
+        event.pressure_readings, pre_event_pressure, pressure_delta_psi
+    )
+    p_shape      = _pressure_shape_features(
+        event.pressure_readings, pre_event_pressure, pressure_delta_psi
+    )
 
     # Volume: prefer the firmware's cumulative integration sensor delta (set by
     # the historical importer) over the flow-average approximation, which can
@@ -180,7 +683,7 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     # Only meaningful when flow is above noise floor and a pressure
     # transient was actually captured.
     resistance: Optional[float] = None
-    if avg_flow >= 0.05 and event.has_pressure_transient and event.pressure_delta_psi > 0:
+    if avg_flow >= 0.15 and event.has_pressure_transient and event.pressure_delta_psi > 0:
         resistance = event.pressure_delta_psi / avg_flow
 
     # Resistance curve shape — uses corrected ΔP/Q formula.
@@ -206,7 +709,7 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     shape = _classify_resistance_shape(
         pressure_for_shape,
         event.flow_readings,
-        event.pre_event_pressure_psi,
+        pre_event_pressure,
     )
 
     # Time features
@@ -246,8 +749,8 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         "avg_flow_lpm": round(avg_flow, 3),
         "peak_flow_lpm": round(peak_flow, 3),
         "flow_variability": round(flow_variability, 4),
-        "pressure_delta_psi": round(event.pressure_delta_psi, 2),
-        "pre_event_pressure_psi": round(event.pre_event_pressure_psi, 2),
+        "pressure_delta_psi": round(pressure_delta_psi, 2),
+        "pre_event_pressure_psi": round(pre_event_pressure, 2),
         "min_pressure_psi": round(event.min_pressure_psi, 2),
         "hydraulic_resistance": round(resistance, 3) if resistance is not None else None,
         "resistance_curve_shape": shape,
@@ -256,9 +759,9 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         # Detection provenance — tells Phase 2 how reliable pressure data is
         "start_trigger": event.start_trigger,
         "has_pressure_transient": 1 if event.has_pressure_transient else 0,
-        "propagation_delay_seconds": (
-            round(event.propagation_delay_seconds, 2)
-            if event.propagation_delay_seconds is not None else None
+        "propagation_delay_ms": (
+            round(event.propagation_delay_ms, 1)
+            if event.propagation_delay_ms is not None else None
         ),
 
         # Derived features for ML clustering
@@ -277,6 +780,35 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
             else None
         ),
         "excluded_from_training": 1 if event.is_composite else 0,
+
+        # Flow shape features
+        "flow_signature_json":    json.dumps(sig),
+        "pressure_signature_json": json.dumps(p_sig),
+        "positive_edge_count":    pos_edges,
+        "negative_edge_count":    neg_edges,
+        "flow_edge_count":        pos_edges + neg_edges,
+        **dynamics,
+        "mid_event_flow_drop_lpm": mid_drop,
+        "steady_state_fraction":  steady,
+
+        # Pressure transient features
+        **p_stats,
+
+        # Pressure transient shape features
+        "pressure_onset_ms":          p_shape['pressure_onset_ms'],
+        "recovery_overshoot_psi":     p_shape['recovery_overshoot_psi'],
+        "pressure_oscillation_count": p_shape['pressure_oscillation_count'],
+
+        # ESP waveform A/B fields — overridden by _enrich_from_waveform when
+        # firmware 3.7.0+ waveform data is available and correlated.
+        "esp_waveform_used":      0,
+        "waveform_event_id":      None,
+        "waveform_quality":       None,
+        "waveform_overlap_score": None,
+
+        # Signature provenance — overridden to "esp_full_*" by _enrich_from_waveform
+        # when ESP full_flow / full_pressure arrays are used as canonical signatures.
+        "signature_source":       "software",
     }
 
 
@@ -287,13 +819,40 @@ class FeatureExtractor:
     """
 
     def __init__(self, event_queue: asyncio.Queue,
-                 db_conn: sqlite3.Connection, alert_manager=None):
+                 db_conn: sqlite3.Connection, alert_manager=None,
+                 ha_client=None, event_detector=None):
         self._queue = event_queue
         self._db = db_conn
         self._alert_manager = alert_manager
+        self._ha = ha_client
+        # Optional EventDetector — provides WaveformChunkAccumulator access
+        # (firmware 3.9.0+). None when running in test / historical-import
+        # contexts; _find_waveform handles the missing-detector case.
+        self._event_detector = event_detector
         self._running = False
+        # Strong references for fire-and-forget tasks (anomaly alerts).
+        # Without this, the only ref to the task is whatever
+        # asyncio.create_task returns — Python may GC the task before it
+        # completes, silently dropping the alert. add_done_callback also
+        # gives us a place to observe and log exceptions instead of the
+        # default "Task exception was never retrieved" warning.
+        self._pending_alert_tasks: set[asyncio.Task] = set()
         # Set by orchestrator after ClusterEngine is initialised and rebuilt.
         self.cluster_engine = None
+
+    def _spawn_alert_task(self, coro) -> None:
+        """Fire a background alert and keep a strong ref until it completes."""
+        t = asyncio.create_task(coro)
+        self._pending_alert_tasks.add(t)
+        t.add_done_callback(self._pending_alert_tasks.discard)
+        # Also log any unobserved exception so a failed alert isn't silent.
+        def _log_exc(task: asyncio.Task) -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                log.error("Anomaly alert task raised: %s", exc, exc_info=exc)
+        t.add_done_callback(_log_exc)
 
     async def run(self) -> None:
         """Process events from the queue until cancelled."""
@@ -314,16 +873,161 @@ class FeatureExtractor:
     def stop(self) -> None:
         self._running = False
 
+    async def _enrich_propagation_delay(self, event: RawEvent) -> None:
+        """Refine propagation_delay_ms with the precise server-side last_changed
+        timestamp of the flow-onset entity from HA history.
+
+        propagation_delay_ms is, for every trigger type, the buffer-scan delay
+        flow_onset − true_transient_onset.  The true onset is recovered here and
+        the flow-onset side is sharpened with the precise HA-history timestamp.
+        HA's recorder does not retain the 40 Hz pressure sensor at full
+        resolution, so the buffer scan stays authoritative for the pressure side.
+
+          - 'flow' / 'pressure+flow' start_ts IS the flow onset.
+          - 'pressure'               flow_onset_ts is the flow onset (start_ts
+            is the threshold crossing, not the true transient onset).
+        """
+        from datetime import timedelta
+
+        if not event.propagation_delay_ms:
+            # No measured transient delay — nothing to refine.
+            return
+        if event.start_trigger == "pressure":
+            if event.flow_onset_ts is None:
+                return
+            pressure_onset = event.flow_onset_ts - timedelta(
+                milliseconds=event.propagation_delay_ms)
+        else:
+            pressure_onset = event.start_ts - timedelta(
+                milliseconds=event.propagation_delay_ms)
+
+        window_start = pressure_onset - timedelta(seconds=5)
+        window_end   = (event.end_ts or event.start_ts) + timedelta(seconds=15)
+        try:
+            history = await self._ha.get_history(
+                event.flow_onset_entity, window_start, window_end)
+            onset = next(
+                (h for h in history
+                 if h["state"].lower() in ("on", "true", "1")
+                 and h["last_changed"] >= pressure_onset),
+                None,
+            )
+            if onset:
+                event.propagation_delay_ms = round(
+                    max(0.0, (onset["last_changed"] - pressure_onset)
+                        .total_seconds() * 1000), 1)
+                log.debug("[%s] propagation delay enriched from HA history: %.0f ms",
+                          event.circuit, event.propagation_delay_ms)
+        except Exception as e:
+            log.debug("[%s] propagation delay HA enrichment failed: %s",
+                      event.circuit, e)
+
+    def _find_waveform(self, event: RawEvent) -> "Optional[WaveformRecord]":
+        """
+        Look up the most-recently assembled WaveformRecord for this circuit and
+        check whether it correlates with the given RawEvent.
+
+        Returns the record when both the duration-overlap score exceeds
+        _WF_MATCH_MIN_SCORE and the record was assembled within
+        _WF_MATCH_WINDOW_S seconds of now; otherwise None.
+        """
+        import time as _time
+
+        if self._event_detector is None:
+            return None
+        try:
+            record = self._event_detector.get_latest_waveform(event.circuit)
+        except Exception:
+            return None
+        if record is None:
+            return None
+        # Recency guard: if the record was assembled too long ago it belongs to
+        # a previous event, not this one.
+        age_s = _time.monotonic() - record.received_at
+        if age_s > _WF_MATCH_WINDOW_S:
+            log.debug(
+                "[%s] waveform skip — event_id=%d stale (age=%.1fs > %.0fs)",
+                event.circuit, record.metadata.event_id, age_s, _WF_MATCH_WINDOW_S,
+            )
+            return None
+        # Duration overlap guard.
+        score = _wf_overlap_score(event, record)
+        if score < _WF_MATCH_MIN_SCORE:
+            log.debug(
+                "[%s] waveform skip — event_id=%d overlap=%.2f < %.2f "
+                "(event=%.1fs fw=%.1fs)",
+                event.circuit, record.metadata.event_id, score, _WF_MATCH_MIN_SCORE,
+                (event.end_ts - event.start_ts).total_seconds() if event.end_ts else 0.0,
+                (
+                    _wf_millis_sub(record.metadata.end_ms, record.metadata.start_ms)
+                    + record.metadata.tail_ms
+                ) / 1000.0,
+            )
+            return None
+        return record
+
     async def _process(self, event: RawEvent) -> None:
         if not event.complete:
             return
 
+        if self._ha and event.flow_onset_entity:
+            await self._enrich_propagation_delay(event)
+
         features = extract_features(event)
+
+        # Attempt to enrich features from ESP waveform capture (firmware 3.7.0+).
+        # Per-group routing: each group falls back to the legacy value independently.
+        wf_record = self._find_waveform(event)
+        if wf_record is not None:
+            score = _wf_overlap_score(event, wf_record)
+            _enrich_from_waveform(features, wf_record, score)
+            log.debug(
+                "[%s] waveform enriched — event_id=%d boot_id=%d "
+                "overlap=%.2f q=%d fl=0x%02x",
+                event.circuit,
+                wf_record.metadata.event_id,
+                wf_record.metadata.boot_id,
+                score,
+                wf_record.metadata.quality,
+                wf_record.metadata.flags,
+            )
 
         try:
             from .database import (insert_event, update_hourly_volume,
-                                   is_event_in_exclusion_window)
-            insert_event(self._db, features)
+                                   is_event_in_exclusion_window,
+                                   find_overlapping_event)
+
+            # Writer-boundary duplicate guard: two importer catch-up runs can
+            # both queue a reconstruction before either has written to the DB,
+            # so the importer-side check alone cannot prevent the race.  Check
+            # here too, as close to the INSERT as the architecture allows.
+            if event.end_ts is not None:
+                blocking = find_overlapping_event(
+                    self._db, event.circuit,
+                    event.start_ts.isoformat(),
+                    event.end_ts.isoformat(),
+                    exclude_event_id=features["id"],
+                )
+                if blocking is not None:
+                    suffix = ""
+                    if blocking.get("user_fixture_type"):
+                        suffix = f" (user-labeled '{blocking['user_fixture_type']}')"
+                    elif blocking.get("fixture_id") and blocking.get("user_locked"):
+                        suffix = f" (user-locked fixture id={blocking['fixture_id']})"
+                    log.info(
+                        "[%s] dropping queued event %s..%s: overlaps existing "
+                        "event id=%s %s..%s%s",
+                        event.circuit,
+                        event.start_ts.strftime("%H:%M:%S"),
+                        event.end_ts.strftime("%H:%M:%S"),
+                        blocking["id"],
+                        blocking["start_ts"],
+                        blocking["end_ts"],
+                        suffix,
+                    )
+                    return
+
+            is_new_event = insert_event(self._db, features)
 
             # ── Plumbing-event exclusion window (Phase 2.1) ───────────────
             # If the user opened an exclusion window (e.g. post-winterization
@@ -346,7 +1050,11 @@ class FeatureExtractor:
                     event.circuit,
                 )
 
-            if event.start_ts and features.get("volume_litres", 0) > 0:
+            # Only accumulate volume and training counts for genuinely new events.
+            # Re-imports (INSERT OR REPLACE replacing an existing row) must not
+            # add to these totals again — that would inflate the hourly chart and
+            # the training progress bar on every addon restart.
+            if is_new_event and event.start_ts and features.get("volume_litres", 0) > 0:
                 # Normalize to UTC and strip timezone info so hour_ts matches
                 # the format that DB queries use: strftime('%Y-%m-%dT%H:00:00', …)
                 # produces no timezone suffix.  Mixing +00:00 suffixed values
@@ -363,7 +1071,7 @@ class FeatureExtractor:
                     features["volume_litres"],
                 )
 
-            if not features.get("excluded_from_training"):
+            if is_new_event and not features.get("excluded_from_training"):
                 self._db.execute("""
                     UPDATE training_state
                     SET events_collected = events_collected + 1,
@@ -385,7 +1093,10 @@ class FeatureExtractor:
                     (event.circuit,)).fetchone()
                 if ts_row and ts_row["state"] == "live" and score >= 0.60:
                     circuit_name = event.circuit.replace("_", " ").title()
-                    asyncio.create_task(
+                    # Use _spawn_alert_task instead of bare asyncio.create_task
+                    # so Python doesn't garbage-collect the task before the
+                    # alert is sent (loose-reference antipattern).
+                    self._spawn_alert_task(
                         am.alert_flow_anomaly(event.circuit, score, circuit_name))
 
             log.debug(

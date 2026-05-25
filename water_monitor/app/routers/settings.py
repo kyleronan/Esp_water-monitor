@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from ._helpers import ingress_redirect
 
+from ..circuit_compat import resolve_circuit
 from ..config import SENSITIVITY_PRESETS
 from ..database import get_data_retention, update_data_retention, get_home_profile
 
@@ -41,12 +42,24 @@ async def settings_page(request: Request):
     except Exception:
         device_entities = []
 
-    # Group by circuit using the prefix — strip prefix then check suffix
+    # Legacy entity_id suffixes per stable circuit ID.
+    # Firmware entity_ids still end with _main / _irrigation / _irr even after
+    # the Python stable IDs were renamed to circuit_1 / circuit_2.
+    _LEGACY_SUFFIXES: dict = {
+        "circuit_1": ("main",),
+        "circuit_2": ("irrigation", "irr"),
+    }
+
+    # Group by circuit using the prefix — strip prefix then check suffix.
+    # Checks canonical suffixes (_circuit_1, _circuit1) and legacy aliases
+    # (_main, _irrigation, _irr) so firmware entities are grouped correctly.
     def circuit_of(entity_id: str) -> str:
         local = entity_id.split(".", 1)[1] if "." in entity_id else entity_id
         stem = local[len(prefix):] if local.startswith(prefix) else local
         for c in orch._cfg.circuits:
-            if stem.endswith(f"_{c.circuit}") or stem.endswith(f"_{c.circuit.replace('_', '')}"):
+            canonical = (f"_{c.circuit}", f"_{c.circuit.replace('_', '')}")
+            legacy = tuple(f"_{s}" for s in _LEGACY_SUFFIXES.get(c.circuit, ()))
+            if any(stem.endswith(sfx) for sfx in canonical + legacy):
                 return c.circuit
         return "general"
 
@@ -86,8 +99,12 @@ async def settings_page(request: Request):
         eid   = e["entity_id"]
         local = eid.split(".", 1)[1] if "." in eid else eid
         stem  = local[len(prefix):] if local.startswith(prefix) else local
-        # Strip circuit suffix
-        for suffix in (f"_{circuit}", f"_{circuit.replace('_', '')}"):
+        # Strip circuit suffix — check canonical names and legacy firmware aliases
+        _strip_candidates = (
+            (f"_{circuit}", f"_{circuit.replace('_', '')}")
+            + tuple(f"_{s}" for s in _LEGACY_SUFFIXES.get(circuit, ()))
+        )
+        for suffix in _strip_candidates:
             if stem.endswith(suffix):
                 stem = stem[: -len(suffix)]
                 break
@@ -103,23 +120,40 @@ async def settings_page(request: Request):
                     .replace("L/min",   _flow_label)
                     .replace("(PSI)",   f"({_pressure_label})")
                     .replace("PSI",     _pressure_label))
-                # Pre-convert numeric state to display units
+                # Pre-convert numeric state to display units; also convert
+                # min/max/step so the HTML input constraints match display units.
+                # native_step is preserved so the POST handler can round to it.
                 if pattern in _FLOW_PATTERNS:
-                    e["unit_type"] = "flow"
-                    e["unit"] = _flow_label
+                    e["unit_type"]   = "flow"
+                    e["unit"]        = _flow_label
+                    e["native_step"] = e.get("step")
                     try:
                         e["state"] = round(float(e["state"]) * _flow_factor, 3)
                     except (TypeError, ValueError):
                         pass
+                    for attr in ("min", "max", "step"):
+                        if e.get(attr) is not None:
+                            try:
+                                e[attr] = round(float(e[attr]) * _flow_factor, 3)
+                            except (TypeError, ValueError):
+                                pass
                 elif pattern in _PRESSURE_PATTERNS:
-                    e["unit_type"] = "pressure"
-                    e["unit"] = _pressure_label
+                    e["unit_type"]   = "pressure"
+                    e["unit"]        = _pressure_label
+                    e["native_step"] = e.get("step")
                     try:
                         e["state"] = round(float(e["state"]) * _pressure_factor, 3)
                     except (TypeError, ValueError):
                         pass
+                    for attr in ("min", "max", "step"):
+                        if e.get(attr) is not None:
+                            try:
+                                e[attr] = round(float(e[attr]) * _pressure_factor, 3)
+                            except (TypeError, ValueError):
+                                pass
                 else:
-                    e["unit_type"] = None
+                    e["unit_type"]   = None
+                    e["native_step"] = e.get("step")
                 return e
 
         # Fallback: clean up the raw friendly name
@@ -137,12 +171,21 @@ async def settings_page(request: Request):
         e["short_label"] = f"{name.title()} — {circuit.replace('_', ' ').title()}"
         e["description"] = ""
         e["unit_type"]   = None
+        e["native_step"] = e.get("step")
         return e
+
+    # Only render number.* entities — select.* support requires explicit mutable
+    # select roles and a separate hardened endpoint; exclude them here so the
+    # template never calls the number-only device-entity/update with a select.
+    number_entities = [
+        e for e in device_entities
+        if (e.get("entity_id") or "").split(".")[0] == "number"
+    ]
 
     entities_by_circuit: dict = {"general": []}
     for c in orch._cfg.circuits:
         entities_by_circuit[c.circuit] = []
-    for e in device_entities:
+    for e in number_entities:
         circ = circuit_of(e["entity_id"])
         enriched = _enrich_entity(e, prefix, circ)
         entities_by_circuit.setdefault(circ, []).append(enriched)
@@ -165,7 +208,7 @@ async def settings_page(request: Request):
         from ..database import get_active_exclusion_window
         circuits.append({
             "circuit": c,
-            "display_name": circuit_cfg.display_name,
+            "display_name": circuit_cfg.label,
             "circuit_type": circuit_cfg.circuit_type,
             "sensitivity": dict(sens) if sens else {},
             "learning": dict(learn) if learn else {},
@@ -181,6 +224,7 @@ async def settings_page(request: Request):
     if fp is not None:
         mqtt_status = fp.status()
 
+    from ..fixtures import CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP, ZONE_ONLY_ALERT_TYPES
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
         "profile": dict(get_home_profile(orch.db) or {}),
@@ -189,6 +233,10 @@ async def settings_page(request: Request):
         "presets": SENSITIVITY_PRESETS,
         "retention": get_data_retention(orch.db),
         "mqtt_status": mqtt_status,
+        "circuit_types": CIRCUIT_TYPES,
+        "circuit_type_labels": CIRCUIT_TYPE_LABELS,
+        "circuit_type_help": CIRCUIT_TYPE_HELP,
+        "zone_only_alert_types": ZONE_ONLY_ALERT_TYPES,
         "page": "settings",
     })
 
@@ -226,6 +274,7 @@ async def profile_update(request: Request):
 # ------------------------------------------------------------------
 @router.post("/sensitivity/{circuit}/update")
 async def sensitivity_update(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
     from ..database import upsert_sensitivity_config
@@ -277,6 +326,7 @@ async def sensitivity_update(circuit: str, request: Request):
 # ------------------------------------------------------------------
 @router.post("/learning/{circuit}/update")
 async def learning_update(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
     from ..database import upsert_learning_config
@@ -293,6 +343,7 @@ async def learning_update(circuit: str, request: Request):
 # ------------------------------------------------------------------
 @router.post("/recalibrate/{circuit}")
 async def recalibrate(circuit: str, request: Request):
+    circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
 
@@ -331,6 +382,7 @@ async def recalibrate(circuit: str, request: Request):
 @router.get("/recalibrate/{circuit}/suggest")
 async def suggest_days(circuit: str, request: Request):
     """Return suggested calibration days based on home profile."""
+    circuit = resolve_circuit(circuit)
     orch = _orch(request)
     from ..database import get_home_profile
     from ..config import compute_suggested_calibration_days
@@ -351,6 +403,7 @@ async def suggest_days(circuit: str, request: Request):
 # ------------------------------------------------------------------
 @router.post("/alert/{circuit}/{alert_id}/toggle")
 async def alert_toggle(circuit: str, alert_id: str, request: Request):
+    circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
     enabled = form.get("enabled") == "true"
@@ -359,12 +412,31 @@ async def alert_toggle(circuit: str, alert_id: str, request: Request):
     return JSONResponse({"status": "updated", "enabled": enabled})
 
 
+# Roles whose discovered entity_ids may be written via /settings/device-entity/update.
+# Only ESPHome number.* entities — select.* support requires a separate endpoint.
+# Keep in sync with _THRESHOLD_ROLES in device.py.
+_SETTINGS_MUTABLE_ROLES: frozenset[str] = frozenset({
+    "burst_threshold",
+    "pressure_drop_threshold",
+    "leak_pressure_threshold",
+    "trickle_min_flow",
+    "trickle_max_flow",
+    "trickle_duration",
+    "leak_test_duration_number",   # preferred name (firmware v3.6+)
+    "leak_test_duration_sensor",   # compat alias — remove after one release
+})
+
+
 # ------------------------------------------------------------------
-# Device entity updates (number and select entities on the ESP)
+# Device entity updates (number entities on the ESP)
 # ------------------------------------------------------------------
 @router.post("/device-entity/update")
 async def device_entity_update(request: Request):
-    """Update a number or select entity value on the ESP via HA."""
+    """Update a number entity value on the ESP via HA.
+
+    Only ESPHome number.* entities that belong to an explicitly mutable
+    role are accepted.  input_number, select, and input_select are rejected.
+    """
     form = await request.form()
     orch = _orch(request)
     entity_id = form.get("entity_id", "").strip()
@@ -377,31 +449,53 @@ async def device_entity_update(request: Request):
             status_code=400,
         )
 
-    if domain in ("number", "input_number"):
-        try:
-            numeric = float(value)
-            # Convert from display units back to internal units (L/min / PSI)
-            # before sending to HA/ESP.
-            _FLOW_KEYWORDS     = ("flow_threshold", "burst_threshold")
-            _PRESSURE_KEYWORDS = ("pressure_threshold", "pressure_drop")
-            if any(k in entity_id for k in _FLOW_KEYWORDS):
-                from ..units import load_unit_context as _luc
-                numeric = numeric / _luc(orch.db)["flow_factor"]
-            elif any(k in entity_id for k in _PRESSURE_KEYWORDS):
-                from ..units import load_unit_context as _luc
-                numeric = numeric / _luc(orch.db)["pressure_factor"]
-            ok = await orch.ha.set_number(entity_id, round(numeric, 4))
-        except ValueError:
-            return JSONResponse(
-                {"status": "error", "message": f"Invalid number: {value}"},
-                status_code=400,
-            )
-    elif domain in ("select", "input_select"):
-        ok = await orch.ha.set_select(entity_id, value)
-    else:
+    if domain != "number":
         return JSONResponse(
             {"status": "error",
-             "message": f"Unsupported entity domain: {domain}"},
+             "message": "Only ESPHome number.* entities are accepted"},
+            status_code=403,
+        )
+
+    # Build the allowlist from discovered entities in mutable roles only.
+    from ..device_discovery import load_circuit_entities
+    allowed: set[str] = set()
+    for c in orch._cfg.circuits:
+        ents = load_circuit_entities(orch.db, c.circuit)
+        allowed.update(v for k, v in ents.items() if k in _SETTINGS_MUTABLE_ROLES and v)
+
+    if entity_id not in allowed:
+        return JSONResponse(
+            {"status": "error", "message": "Entity not in allowed set for this device"},
+            status_code=403,
+        )
+
+    native_step = form.get("native_step", "").strip()
+    try:
+        numeric = float(value)
+        # Convert from display units back to internal units (L/min / PSI)
+        # before sending to HA/ESP.
+        _FLOW_KEYWORDS     = ("flow_threshold", "burst_threshold")
+        _PRESSURE_KEYWORDS = ("pressure_threshold", "pressure_drop")
+        if any(k in entity_id for k in _FLOW_KEYWORDS):
+            from ..units import load_unit_context as _luc
+            numeric = numeric / _luc(orch.db)["flow_factor"]
+        elif any(k in entity_id for k in _PRESSURE_KEYWORDS):
+            from ..units import load_unit_context as _luc
+            numeric = numeric / _luc(orch.db)["pressure_factor"]
+        # Round to the entity's native step to satisfy HA validation
+        if native_step:
+            try:
+                ns = float(native_step)
+                if ns > 0:
+                    numeric = round(round(numeric / ns) * ns, 6)
+            except ValueError:
+                numeric = round(numeric, 4)
+        else:
+            numeric = round(numeric, 4)
+        ok = await orch.ha.set_number(entity_id, numeric)
+    except ValueError:
+        return JSONResponse(
+            {"status": "error", "message": f"Invalid number: {value}"},
             status_code=400,
         )
 
@@ -452,6 +546,23 @@ async def retention_prune_now(request: Request):
     loop = asyncio.get_running_loop()
     deleted = await loop.run_in_executor(None, orch.data_pruner.prune_now)
     return JSONResponse({"ok": True, "deleted": deleted})
+
+
+# ── Re-run setup wizard ────────────────────────────────────────────────────
+# Flips home_profile.setup_complete back to 0 so the setup wizard's
+# state-mutating endpoints (guarded by _block_if_setup_complete()) accept
+# POSTs again. The wizard's final step (/setup/home) sets it back to 1 on
+# completion, re-locking the mutators. The route lives in the CSRF-covered
+# settings router (only /setup/* is CSRF-exempted in main.py), so a stray
+# cross-origin POST cannot trigger this.
+
+@router.post("/setup/unlock")
+async def setup_unlock(request: Request):
+    from ..database import update_home_profile
+    orch = _orch(request)
+    update_home_profile(orch.db, setup_complete=0)
+    log.warning("Setup wizard unlocked via Settings → Advanced — /setup/* mutators are open until the wizard completes again")
+    return ingress_redirect(request, "/setup")
 
 
 # ── Away mode ──────────────────────────────────────────────────────────────
@@ -540,6 +651,85 @@ async def integrations_update(request: Request):
 
 
 # ------------------------------------------------------------------
+# Circuit display name rename
+# ------------------------------------------------------------------
+
+@router.post("/circuit/{circuit}/rename")
+async def circuit_rename(circuit: str, request: Request):
+    """Update the human-readable display name for a circuit."""
+    circuit = resolve_circuit(circuit)
+    form = await request.form()
+    orch = _orch(request)
+
+    # Validate circuit exists
+    circuit_cfg = orch._cfg.get_circuit(circuit)
+    if not circuit_cfg:
+        return JSONResponse(
+            {"status": "error", "message": f"Unknown circuit: {circuit}"},
+            status_code=400,
+        )
+
+    from ..circuit_compat import validate_display_name
+    try:
+        display_name = validate_display_name(form.get("display_name", ""))
+    except ValueError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+
+    from ..database import upsert_circuit_label
+    upsert_circuit_label(orch.db, circuit, display_name)
+    orch.reload_circuit_labels()
+
+    return JSONResponse({"status": "renamed", "circuit": circuit, "display_name": display_name})
+
+
+@router.post("/circuit/{circuit}/type")
+async def circuit_type_update(circuit: str, request: Request):
+    """Update the circuit_type for a circuit.
+
+    Zone alert rows are seeded automatically when switching to 'zone'.
+    They are never deleted when switching back to 'fixture' — the UI
+    simply hides them via the zone_only_alert_types template filter.
+    """
+    from ..circuit_compat import resolve_circuit
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+
+    if not orch._cfg.get_circuit(circuit):
+        return JSONResponse(
+            {"status": "error", "message": f"Unknown circuit: {circuit}"},
+            status_code=400,
+        )
+
+    form = await request.form()
+    from ..fixtures import normalize_circuit_type, CIRCUIT_TYPES
+    from ..database import set_circuit_type
+
+    raw_type = form.get("circuit_type", "").strip()
+    circuit_type = normalize_circuit_type(raw_type)
+    if circuit_type not in CIRCUIT_TYPES:
+        return JSONResponse(
+            {"status": "error",
+             "message": f"Invalid circuit_type {raw_type!r}. Must be one of: {', '.join(sorted(CIRCUIT_TYPES))}"},
+            status_code=400,
+        )
+
+    try:
+        set_circuit_type(orch.db, circuit, circuit_type)
+    except Exception as exc:
+        log.error("[%s] set_circuit_type failed: %s", circuit, exc)
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+    orch.reload_circuit_profiles()
+    log.info("[%s] circuit_type changed to %r", circuit, circuit_type)
+
+    return JSONResponse({
+        "status": "updated",
+        "circuit": circuit,
+        "circuit_type": circuit_type,
+    })
+
+
+# ------------------------------------------------------------------
 # Plumbing-event exclusion windows
 # ------------------------------------------------------------------
 
@@ -547,6 +737,7 @@ async def integrations_update(request: Request):
 async def start_exclusion_window(request: Request, circuit: str):
     """Open an exclusion window so events during a plumbing flush are not
     used for fixture training.  Duration: 5–60 min (clamped server-side)."""
+    circuit = resolve_circuit(circuit)
     from ..database import create_exclusion_window
     form    = await request.form()
     minutes = int(form.get("minutes") or 15)
@@ -560,6 +751,7 @@ async def start_exclusion_window(request: Request, circuit: str):
 @router.post("/circuit/{circuit}/exclusion_window/cancel")
 async def cancel_exclusion_window_endpoint(request: Request, circuit: str):
     """End the active exclusion window immediately."""
+    circuit = resolve_circuit(circuit)
     from ..database import cancel_exclusion_window
     cancel_exclusion_window(_orch(request).db, circuit)
     log.info("[%s] exclusion window cancelled", circuit)
@@ -569,6 +761,7 @@ async def cancel_exclusion_window_endpoint(request: Request, circuit: str):
 @router.post("/circuit/{circuit}/exclusion_window/extend")
 async def extend_exclusion_window_endpoint(request: Request, circuit: str):
     """Add 15 minutes to the active exclusion window (capped at 60 min from start)."""
+    circuit = resolve_circuit(circuit)
     from ..database import extend_exclusion_window
     extend_exclusion_window(_orch(request).db, circuit, extra_minutes=15)
     log.info("[%s] exclusion window extended +15 min", circuit)

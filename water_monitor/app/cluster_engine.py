@@ -18,7 +18,19 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
-from river import cluster, preprocessing
+# `river` is a runtime dependency of ClusterEngine but not of the rest of
+# the package. Import it lazily so test modules that pull in
+# feature_extractor / event_detector still collect in environments where
+# river isn't installed (e.g. local test runs without the add-on's full
+# Dockerfile pip set). ClusterEngine.__init__ raises a clear error if river
+# is actually needed at runtime.
+try:                                   # pragma: no cover - import guard
+    from river import cluster, preprocessing
+    _RIVER_IMPORT_ERROR: Optional[BaseException] = None
+except ImportError as _exc:            # pragma: no cover - import guard
+    cluster = None                     # type: ignore[assignment]
+    preprocessing = None               # type: ignore[assignment]
+    _RIVER_IMPORT_ERROR = _exc
 
 log = logging.getLogger(__name__)
 
@@ -43,16 +55,79 @@ METRICS_WINDOW_HOURS          = 24
 # Nothing below touches dtaidistance yet.
 
 FEATURE_KEYS = [
+    # Core hydraulic scalars
     'avg_flow_lpm', 'peak_flow_lpm', 'duration_seconds',
     'volume_litres', 'pressure_delta_psi', 'has_pressure_transient',
     'flow_variability', 'hour_sin', 'hour_cos',
+    'propagation_delay_ms',
+    # Flow shape — 32-point normalized signature
+    'flow_sig_00', 'flow_sig_01', 'flow_sig_02', 'flow_sig_03',
+    'flow_sig_04', 'flow_sig_05', 'flow_sig_06', 'flow_sig_07',
+    'flow_sig_08', 'flow_sig_09', 'flow_sig_10', 'flow_sig_11',
+    'flow_sig_12', 'flow_sig_13', 'flow_sig_14', 'flow_sig_15',
+    'flow_sig_16', 'flow_sig_17', 'flow_sig_18', 'flow_sig_19',
+    'flow_sig_20', 'flow_sig_21', 'flow_sig_22', 'flow_sig_23',
+    'flow_sig_24', 'flow_sig_25', 'flow_sig_26', 'flow_sig_27',
+    'flow_sig_28', 'flow_sig_29', 'flow_sig_30', 'flow_sig_31',
+    # Edge complexity
+    'flow_edge_count',
+    # Open/close dynamics
+    'flow_rise_rate_lpm_s', 'flow_fall_rate_lpm_s',
+    'opening_step_lpm', 'closing_step_lpm',
+    'time_to_90pct_flow_seconds', 'time_from_90pct_to_zero_seconds',
+    # Flow summary stats (steady_state_fraction + mid_event stored; ratio/cv derived)
+    'steady_state_fraction', 'mid_event_flow_drop_lpm',
+    'peak_to_avg_flow_ratio', 'flow_cv',
+    # Compound event signals (already stored in events table)
+    'is_composite', 'other_valve_open',
+    # Pressure scalars (pre_event/min/resistance already stored; energy/duration new)
+    'pre_event_pressure_psi', 'min_pressure_psi', 'hydraulic_resistance',
+    'pressure_transient_energy', 'pressure_transient_duration_ms',
+    # Pressure transient shape features
+    'pressure_onset_ms', 'recovery_overshoot_psi', 'pressure_oscillation_count',
+    # Pressure drop signature — 32-point normalized drop curve
+    'pressure_sig_00', 'pressure_sig_01', 'pressure_sig_02', 'pressure_sig_03',
+    'pressure_sig_04', 'pressure_sig_05', 'pressure_sig_06', 'pressure_sig_07',
+    'pressure_sig_08', 'pressure_sig_09', 'pressure_sig_10', 'pressure_sig_11',
+    'pressure_sig_12', 'pressure_sig_13', 'pressure_sig_14', 'pressure_sig_15',
+    'pressure_sig_16', 'pressure_sig_17', 'pressure_sig_18', 'pressure_sig_19',
+    'pressure_sig_20', 'pressure_sig_21', 'pressure_sig_22', 'pressure_sig_23',
+    'pressure_sig_24', 'pressure_sig_25', 'pressure_sig_26', 'pressure_sig_27',
+    'pressure_sig_28', 'pressure_sig_29', 'pressure_sig_30', 'pressure_sig_31',
 ]
+
+# Per-dimension weights for weighted Euclidean distance.
+# Pressure shape (0.8) > flow shape (0.4); scalars default 1.0; hour sinusoids 0.2.
+BASE_FEATURE_WEIGHTS: Dict[str, float] = {k: 1.0 for k in FEATURE_KEYS}
+for _i in range(32):
+    BASE_FEATURE_WEIGHTS[f'flow_sig_{_i:02d}']     = 0.4
+    BASE_FEATURE_WEIGHTS[f'pressure_sig_{_i:02d}'] = 0.8
+BASE_FEATURE_WEIGHTS['hour_sin'] = 0.2
+BASE_FEATURE_WEIGHTS['hour_cos'] = 0.2
+
+# Discrimination tuning — derived from a labelled-event analysis (18 events,
+# 6 fixtures, 3 types). Flow rate was by far the strongest type discriminator
+# (F-ratio ~55-66); time-to-peak-flow and flow edge count were the next tier
+# (~8-9); propagation delay was the weakest feature measured (F-ratio ~0.2 —
+# effectively noise, swinging 1.6-3.6 s across flushes of one toilet).
+BASE_FEATURE_WEIGHTS['avg_flow_lpm']               = 2.0
+BASE_FEATURE_WEIGHTS['peak_flow_lpm']              = 2.0
+BASE_FEATURE_WEIGHTS['time_to_90pct_flow_seconds'] = 1.5
+BASE_FEATURE_WEIGHTS['flow_edge_count']            = 1.5
+BASE_FEATURE_WEIGHTS['propagation_delay_ms']       = 0.1
 
 
 class ClusterEngine:
     """Per-circuit DBSTREAM clustering engine."""
 
     def __init__(self, db, cfg):
+        if _RIVER_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "ClusterEngine requires the 'river' package, which is not "
+                "installed in this environment. Install it (it is part of "
+                "the add-on Dockerfile's pip set) before constructing the "
+                f"engine. Original ImportError: {_RIVER_IMPORT_ERROR}"
+            )
         self._db  = db
         self._cfg = cfg
         self._streams: Dict[str, cluster.DBSTREAM]             = {}
@@ -87,7 +162,7 @@ class ClusterEngine:
             "SELECT MAX(id) FROM fixture_clusters WHERE circuit = ?",
             (circuit,)
         ).fetchone()
-        self._next_cluster_id[circuit] = (row[0] or -1) + 1
+        self._next_cluster_id[circuit] = (row[0] if row[0] is not None else -1) + 1
         self._refresh_type_cache(circuit)
 
     def _refresh_type_cache(self, circuit: str) -> None:
@@ -138,7 +213,7 @@ class ClusterEngine:
     # ── Feature extraction ─────────────────────────────────────────────────────
 
     def _extract_features(self, event: dict) -> Optional[Dict[str, float]]:
-        """Build the 9-feature dict from an event row.  Returns None if unusable."""
+        """Build the full feature dict from an event DB row. Returns None if unusable."""
         if event.get('avg_flow_lpm') is None or not event.get('duration_seconds'):
             return None
         start_ts = event.get('start_ts')
@@ -151,17 +226,77 @@ class ClusterEngine:
             hour = 0
         hour_sin = math.sin(2 * math.pi * hour / 24)
         hour_cos = math.cos(2 * math.pi * hour / 24)
-        return {
-            'avg_flow_lpm':           float(event.get('avg_flow_lpm')           or 0),
-            'peak_flow_lpm':          float(event.get('peak_flow_lpm')          or 0),
+
+        avg_flow = float(event.get('avg_flow_lpm') or 0)
+        peak_flow = float(event.get('peak_flow_lpm') or 0)
+        variability = float(event.get('flow_variability') or 0)
+
+        features = {
+            # Core hydraulic scalars
+            'avg_flow_lpm':           avg_flow,
+            'peak_flow_lpm':          peak_flow,
             'duration_seconds':       float(event.get('duration_seconds')       or 0),
             'volume_litres':          float(event.get('volume_litres')          or 0),
             'pressure_delta_psi':     float(event.get('pressure_delta_psi')    or 0),
             'has_pressure_transient': float(event.get('has_pressure_transient') or 0),
-            'flow_variability':       float(event.get('flow_variability')       or 0),
+            'flow_variability':       variability,
             'hour_sin':               hour_sin,
             'hour_cos':               hour_cos,
+            'propagation_delay_ms':      float(event.get('propagation_delay_ms')      or 0),
+            # Edge complexity
+            'flow_edge_count':        float(event.get('flow_edge_count')        or 0),
+            # Open/close dynamics
+            'flow_rise_rate_lpm_s':   float(event.get('flow_rise_rate_lpm_s')  or 0),
+            'flow_fall_rate_lpm_s':   float(event.get('flow_fall_rate_lpm_s')  or 0),
+            'opening_step_lpm':       float(event.get('opening_step_lpm')      or 0),
+            'closing_step_lpm':       float(event.get('closing_step_lpm')      or 0),
+            'time_to_90pct_flow_seconds':      float(event.get('time_to_90pct_flow_seconds')      or 0),
+            'time_from_90pct_to_zero_seconds': float(event.get('time_from_90pct_to_zero_seconds') or 0),
+            # Flow summary stats
+            'steady_state_fraction':  float(event.get('steady_state_fraction') or 0),
+            'mid_event_flow_drop_lpm': float(event.get('mid_event_flow_drop_lpm') or 0),
+            # Pure derived — computed from already-stored columns, no DB column needed
+            'peak_to_avg_flow_ratio': peak_flow / avg_flow if avg_flow > 0 else 0.0,
+            'flow_cv':                variability / avg_flow if avg_flow > 0 else 0.0,
+            # Compound event signals
+            'is_composite':           float(event.get('is_composite')           or 0),
+            'other_valve_open':       float(event.get('other_valve_open')       or 0),
+            # Pressure scalars
+            'pre_event_pressure_psi': float(event.get('pre_event_pressure_psi') or 0),
+            'min_pressure_psi':       float(event.get('min_pressure_psi')       or 0),
+            'hydraulic_resistance':   float(event.get('hydraulic_resistance')   or 0),
+            'pressure_transient_energy':     float(event.get('pressure_transient_energy')     or 0),
+            'pressure_transient_duration_ms': float(event.get('pressure_transient_duration_ms') or 0),
+            'pressure_onset_ms':             float(event.get('pressure_onset_ms')             or 0),
+            'recovery_overshoot_psi':        float(event.get('recovery_overshoot_psi')        or 0),
+            'pressure_oscillation_count':    float(event.get('pressure_oscillation_count')    or 0),
         }
+
+        # Expand JSON signature → flow_sig_00 … flow_sig_31
+        sig_json = event.get('flow_signature_json')
+        if sig_json:
+            try:
+                sig = json.loads(sig_json)
+                for i, v in enumerate(sig[:32]):
+                    features[f'flow_sig_{i:02d}'] = float(v)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        for i in range(32):
+            features.setdefault(f'flow_sig_{i:02d}', 0.0)
+
+        # Expand pressure signature → pressure_sig_00 … pressure_sig_31
+        p_sig_json = event.get('pressure_signature_json')
+        if p_sig_json:
+            try:
+                p_sig = json.loads(p_sig_json)
+                for i, v in enumerate(p_sig[:32]):
+                    features[f'pressure_sig_{i:02d}'] = float(v)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        for i in range(32):
+            features.setdefault(f'pressure_sig_{i:02d}', 0.0)
+
+        return features
 
     # ── Cluster confidence ─────────────────────────────────────────────────────
 
@@ -219,7 +354,7 @@ class ClusterEngine:
         """
         from .fixtures import get_variance_profile
         profile = get_variance_profile(fixture_type)
-        weights: Dict[str, float] = {k: 1.0 for k in FEATURE_KEYS}
+        weights: Dict[str, float] = dict(BASE_FEATURE_WEIGHTS)
         for k, w in profile.get("anchor_weights", {}).items():
             if k in weights:
                 weights[k] = float(w)
@@ -337,7 +472,7 @@ class ClusterEngine:
             "SELECT circuit_type FROM circuit_profile WHERE circuit = ?",
             (circuit,)
         ).fetchone()
-        circuit_type = ct_row["circuit_type"] if ct_row else "main"
+        circuit_type = ct_row["circuit_type"] if ct_row else "fixture"
         try:
             from .fixtures import suggest_fixture_type
             suggested_type, confidence = suggest_fixture_type(centroid, circuit_type)

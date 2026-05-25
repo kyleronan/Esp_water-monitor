@@ -79,7 +79,12 @@ that's great. I'm probably not going to build another one for myself.
   on failure
 - **Fixture identification** — clusters water events by their pressure and
   flow signatures to identify individual fixtures (toilets, showers, taps,
-  appliances). Live in v0.2.0; the user-facing naming UI is complete.
+  appliances). Live in v0.2.0; naming UI complete; merge-clusters UI and
+  ESP-side waveform enrichment added in v0.2.1.
+- **Event detail modal** — every event in the History list opens an
+  inspector with trigger type, peak flow, propagation delay, anomaly score
+  and (with firmware v3.7+) an embedded waveform chart. Events can be
+  re-assigned to a fixture or ignored from this view.
 - **Anomaly detection** — flags events that don't match learned patterns,
   catches running toilets, slow leaks, and unusual usage. Planned for v0.3.x.
 - **Away mode** — pauses learning while unoccupied, automatically toggled
@@ -88,6 +93,8 @@ that's great. I'm probably not going to build another one for myself.
   services
 - **Full backup and restore** — three-tier backup (Quick Restore JSON, History
   Archive SQLite, Full ZIP) with restore-from-backup in the setup wizard
+- **Auto dark mode** — the UI follows your OS / browser appearance
+  preference automatically. No toggle, no setup.
 
 ## Repository structure
 
@@ -102,9 +109,7 @@ documentation, and (eventually) a companion native HA integration.
 │   ├── Dockerfile
 │   ├── icon.png         # Addon icon (128 × 128) — shown on HA addon card
 │   ├── logo.png         # Addon logo (250 × 100) — shown on HA store detail page
-│   ├── app/
-│   ├── README.md
-│   └── CHANGELOG.md
+│   └── app/
 ├── firmware/            # ESPHome firmware for the ESP32-S3-WROOM-1
 ├── integration/         # Native HA integration (planned for v0.4)
 └── docs/                # Hardware build notes, pinouts, parts list
@@ -140,14 +145,11 @@ with end-stop signalling, pressure transducers, and pulse-output flow meters.
 > also what every reasonable installation diagram recommends regardless of
 > monitoring.
 
-I'm planning to add the PCB design files (KiCad source + Gerbers), a bill of
-materials with digikey links, and a quarter-assed build guide (I am legally required to not do half-assed or full-assed work) to `docs/`
-at some point. No promises on timing — same ADHD that made the addon code
-take eight months will probably apply here too.
+PCB design files (KiCad + Gerbers), bill of materials, build guide, and bring-up checklist are in [`docs/hardware/`](docs/hardware/).
 
 ### Firmware
 
-1. Flash `firmware/esp-water-shut-off-3_5.yaml` (v3.5.1) to your ESP32-S3-WROOM-1
+1. Flash `firmware/esp-water-shut-off-3_10.yaml` (v3.10.0) to your ESP32-S3-WROOM-1
    using ESPHome
 2. Make sure the device is added to Home Assistant before installing the addon
 3. The setup wizard will discover the device automatically
@@ -157,7 +159,8 @@ take eight months will probably apply here too.
 | Phase | Scope | Status |
 |---|---|---|
 | **0.1.x** | Core monitoring, leak detection, calibration, display units | Shipped |
-| **0.2.x** | Fixture identification — clustering engine live, UI complete, refinement (DTW + cooccurrence) in progress | Shipped |
+| **0.2.0** | Fixture identification — clustering engine live, naming UI complete | Shipped |
+| **0.2.1** | ESP-side waveform capture & feature enrichment, event detail modal, merge-clusters UI, Basic/Advanced settings split, auto dark mode, hardware docs (PCB v1.2a) | Shipped |
 | **0.3.x+** | Anomaly detection, native HA integration | Planned? |
 
 See `CHANGELOG.md` for detailed release notes.

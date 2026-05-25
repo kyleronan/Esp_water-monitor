@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,10 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # Wait up to 5s before raising OperationalError on a locked DB.
+    # Prevents immediate failures when cluster engine executor threads and
+    # async coroutines briefly contend for the same connection.
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -192,7 +197,7 @@ CREATE TABLE IF NOT EXISTS sensitivity_config (
     mode                        TEXT DEFAULT 'simple',
     simple_level                TEXT DEFAULT 'medium',
     -- Event detection
-    pressure_drop_event_psi     REAL DEFAULT 2.0,
+    pressure_drop_event_psi     REAL DEFAULT 1.2,
     min_event_duration_seconds  REAL DEFAULT 3.0,
     -- Anomaly thresholds
     score_alert                 REAL DEFAULT 0.60,
@@ -364,6 +369,7 @@ CREATE TABLE IF NOT EXISTS events (
     hydraulic_resistance        REAL,
     resistance_curve_shape      TEXT,
     propagation_delay_seconds   REAL,
+    propagation_delay_ms        REAL DEFAULT 0,
     flow_onset_delay_seconds    REAL,
     start_trigger               TEXT DEFAULT 'unknown',
     has_pressure_transient      BOOLEAN DEFAULT 0,
@@ -385,17 +391,61 @@ CREATE TABLE IF NOT EXISTS events (
     --   'excluded_from_training' — caller skipped match_and_learn entirely
     -- NULL when the event matched cleanly.
     match_rejection_reason      TEXT,
+    -- Cluster match quality (written by _cluster_event after insert)
+    match_confidence            REAL,    -- 0.0–1.0; NULL = unmatched
+    match_level                 TEXT,    -- 'preliminary'|'confirmed'|NULL
+    -- Inter-event sequence context (written by _cluster_event)
+    seconds_since_prev_event    REAL,    -- gap from previous event end → this start
+    seconds_to_next_event       REAL,    -- retroactively filled when next event arrives
+    prev_cluster_id             INTEGER, -- cluster_id of the preceding event
     fixture_id                  TEXT REFERENCES fixtures(id),
     anomaly_score               REAL,
     anomaly_type                TEXT,
     flagged                     BOOLEAN DEFAULT 0,
     user_reviewed               BOOLEAN DEFAULT 0,
+    user_fixture_type           TEXT,              -- user-assigned fixture type (overrides clustering)
     triggered_alert             BOOLEAN DEFAULT 0,
     volume_litres               REAL DEFAULT 0,
-    created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- Flow shape features (migration 025)
+    flow_signature_json              TEXT,
+    -- Pressure drop signature (migration 029)
+    pressure_signature_json          TEXT,
+    positive_edge_count              INTEGER DEFAULT 0,
+    negative_edge_count              INTEGER DEFAULT 0,
+    flow_edge_count                  INTEGER DEFAULT 0,
+    flow_rise_rate_lpm_s             REAL DEFAULT 0,
+    flow_fall_rate_lpm_s             REAL DEFAULT 0,
+    opening_step_lpm                 REAL DEFAULT 0,
+    closing_step_lpm                 REAL DEFAULT 0,
+    time_to_90pct_flow_seconds       REAL DEFAULT 0,
+    time_from_90pct_to_zero_seconds  REAL DEFAULT 0,
+    mid_event_flow_drop_lpm          REAL DEFAULT 0,
+    steady_state_fraction            REAL DEFAULT 0,
+    -- Pressure transient features (migration 025)
+    pressure_transient_energy        REAL DEFAULT 0,
+    pressure_transient_duration_ms   REAL DEFAULT 0,
+    -- Pressure transient shape features (migration 026)
+    pressure_onset_ms                REAL DEFAULT 0,
+    recovery_overshoot_psi           REAL DEFAULT 0,
+    pressure_oscillation_count       INTEGER DEFAULT 0,
+    -- ESP waveform A/B fields (migration 031)
+    esp_waveform_used                INTEGER,
+    waveform_event_id                INTEGER,
+    waveform_quality                 INTEGER,
+    waveform_overlap_score           REAL,
+    -- Signature provenance — which source generated the shape signatures.
+    -- 'software' (default) | 'esp_full_flow' | 'esp_full_pressure' | 'esp_full_flow_pressure'
+    signature_source                 TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_circuit_ts
+-- UNIQUE(circuit, start_ts) — enforces the contract the importer / dedup
+-- helpers have always assumed (see comments in dedup_events). Replaces the
+-- earlier non-unique idx_events_circuit_ts. Fresh DBs get the unique index
+-- directly; upgrades from baseline (20260524) run dedup_events first via
+-- migration 20260525 before this index is created so the unique constraint
+-- doesn't fail on historical duplicates.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_circuit_start_unique
     ON events (circuit, start_ts);
 CREATE INDEX IF NOT EXISTS idx_events_start_ts
     ON events (start_ts);
@@ -564,6 +614,44 @@ CREATE TABLE IF NOT EXISTS data_retention (
 );
 
 INSERT OR IGNORE INTO data_retention (id) VALUES (1);
+
+-- ==========================================================================
+-- CIRCUIT DISPLAY LABELS (added migration 023)
+-- Maps circuit_id → user-visible display name (e.g. "Main", "Irrigation").
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS circuit_labels (
+    circuit_id   TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL
+);
+
+-- ==========================================================================
+-- FIXTURE HA ENTITY MAP (added migration 025)
+-- Tracks MQTT Discovery entities published to HA for each fixture.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS fixture_ha_entity_map (
+    fixture_id          TEXT REFERENCES fixtures(id),
+    ha_entity_id        TEXT NOT NULL,
+    device_class        TEXT,
+    unit_of_measurement TEXT,
+    last_published_at   TIMESTAMP,
+    retracted_at        TIMESTAMP,
+    PRIMARY KEY (fixture_id, ha_entity_id)
+);
+
+-- ==========================================================================
+-- FIXTURE DAILY SUMMARY (added migration 027)
+-- Aggregated per-fixture daily stats used for analytics and MQTT publishing.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS fixture_daily_summary (
+    circuit              TEXT NOT NULL,
+    fixture_id           TEXT NOT NULL REFERENCES fixtures(id),
+    day                  DATE NOT NULL,
+    event_count          INTEGER,
+    total_volume_litres  REAL,
+    avg_flow_lpm         REAL,
+    peak_flow_lpm        REAL,
+    PRIMARY KEY (circuit, fixture_id, day)
+);
     """)
     conn.commit()
     _apply_post_create_migrations(conn)
@@ -586,6 +674,32 @@ def _apply_post_create_migrations(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e).lower():
             log.warning("ALTER TABLE events.match_rejection_reason: %s", e)
+
+    # Migration 026 — propagation_delay in ms + pressure transient shape features.
+    try:
+        conn.execute("ALTER TABLE events ADD COLUMN propagation_delay_ms REAL DEFAULT 0")
+        conn.execute(
+            "UPDATE events SET propagation_delay_ms = propagation_delay_seconds * 1000 "
+            "WHERE propagation_delay_seconds IS NOT NULL")
+        conn.commit()
+        log.info("Migration: added events.propagation_delay_ms (backfilled from seconds column)")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            log.warning("ALTER TABLE events.propagation_delay_ms: %s", e)
+
+    for col, definition in [
+        ("pressure_onset_ms",          "REAL DEFAULT 0"),
+        ("recovery_overshoot_psi",     "REAL DEFAULT 0"),
+        ("pressure_oscillation_count", "INTEGER DEFAULT 0"),
+        ("user_fixture_type",          "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
+            conn.commit()
+            log.info("Migration: added events.%s", col)
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                log.warning("ALTER TABLE events.%s: %s", col, e)
 
 
 # ==========================================================================
@@ -835,6 +949,78 @@ def get_alert_configs(conn: sqlite3.Connection, circuit: str) -> List[sqlite3.Ro
     ).fetchall()
 
 
+VALID_CIRCUIT_TYPES = frozenset({"fixture", "zone"})
+
+
+def get_circuit_type(
+    conn: sqlite3.Connection,
+    circuit: str,
+    default: str = "fixture",
+) -> str:
+    """Return the circuit_type for a circuit, normalised to a canonical value.
+
+    Falls back to `default` if no circuit_profile row exists yet.
+    Normalises legacy "irrigation" values to "zone" transparently.
+    """
+    from .fixtures import normalize_circuit_type
+    row = conn.execute(
+        "SELECT circuit_type FROM circuit_profile WHERE circuit = ?",
+        (circuit,)
+    ).fetchone()
+    raw = row["circuit_type"] if row else default
+    return normalize_circuit_type(raw)
+
+
+def _seed_zone_alerts_only(conn: sqlite3.Connection, circuit: str) -> None:
+    """INSERT OR IGNORE zone-only alert rows — never overwrites user toggle state."""
+    zone_only_alerts = [
+        ("pre_solenoid_leak", "Pre-Solenoid Leak",
+         "Alert when flow detected with no zone commanded open"),
+        ("solenoid_weeping", "Solenoid Weeping",
+         "Alert when flow persists after zone commanded closed"),
+        ("zone_flow_deviation_high", "Zone Flow High",
+         "Alert when zone flow exceeds learned range"),
+        ("zone_flow_deviation_low", "Zone Flow Low",
+         "Alert when zone flow is below learned range — possible blocked head"),
+        ("zone_duration_overrun", "Zone Duration Overrun",
+         "Alert when zone runs significantly longer than expected"),
+    ]
+    for alert_type, label, description in zone_only_alerts:
+        alert_id = f"{alert_type}_{circuit}"
+        conn.execute("""
+            INSERT OR IGNORE INTO alert_config
+                (id, circuit, alert_type, label, description, enabled)
+            VALUES (?, ?, ?, ?, ?, 1)
+        """, (alert_id, circuit, alert_type, label, description))
+
+
+def set_circuit_type(
+    conn: sqlite3.Connection,
+    circuit: str,
+    circuit_type: str,
+) -> None:
+    """Persist circuit_type to circuit_profile.
+
+    UPSERTs the row so it is safe to call before ensure_circuit_defaults().
+    When switching to "zone", seeds any missing zone-only alert rows via
+    INSERT OR IGNORE so existing user toggle state is preserved.
+    Zone alerts are never deleted when switching back to "fixture" — they are
+    simply hidden in the UI by the template filter.
+    """
+    from .fixtures import normalize_circuit_type
+    circuit_type = normalize_circuit_type(circuit_type)
+    if circuit_type not in VALID_CIRCUIT_TYPES:
+        raise ValueError(f"Invalid circuit_type {circuit_type!r}; must be 'fixture' or 'zone'")
+    conn.execute("""
+        INSERT INTO circuit_profile (circuit, circuit_type)
+        VALUES (?, ?)
+        ON CONFLICT(circuit) DO UPDATE SET circuit_type = excluded.circuit_type
+    """, (circuit, circuit_type))
+    if circuit_type == "zone":
+        _seed_zone_alerts_only(conn, circuit)
+    conn.commit()
+
+
 def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) -> None:
     conn.execute(
         "UPDATE alert_config SET enabled = ?, updated_at = ? WHERE id = ?",
@@ -843,39 +1029,112 @@ def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) ->
     conn.commit()
 
 
-def insert_event(conn: sqlite3.Connection, event: dict) -> None:
-    cols = ", ".join(event.keys())
-    placeholders = ", ".join("?" for _ in event)
-    conn.execute(f"INSERT OR REPLACE INTO events ({cols}) VALUES ({placeholders})",
-                 list(event.values()))
+#: Columns on `events` that capture user intent — never overwritten by an
+#: importer re-insert or any other automated path. The historical importer
+#: re-imports past events when fresh history becomes available, and the
+#: live detector can re-stage the same id on retry; both must preserve any
+#: label or ignore-flag the user already set.
+_EVENT_USER_COLUMNS: frozenset[str] = frozenset({
+    "user_fixture_type",
+    "user_reviewed",
+    "excluded_from_training",
+})
+
+
+def insert_event(conn: sqlite3.Connection, event: dict) -> bool:
+    """Insert event row; returns True if genuinely new, False on conflict.
+
+    Replaces an older INSERT OR REPLACE implementation that delete-then-
+    inserted on conflict. REPLACE had three bad side-effects:
+      (1) it fired ON DELETE CASCADE against tables that reference
+          events(id) — e.g. fixture_ha_entity_map — silently dropping
+          dependent rows;
+      (2) it changed the rowid of the conflicting row, breaking any
+          rowid-based bookkeeping a long-running reader held;
+      (3) it wiped user-editable columns (user_fixture_type,
+          user_reviewed, excluded_from_training) on every same-id
+          re-insert, undoing manual labels the next time the importer
+          ran.
+
+    The new behaviour is an UPSERT via ON CONFLICT(id) DO UPDATE that
+    refreshes every measurement / system column from the incoming row but
+    deliberately omits the user-controlled columns listed in
+    _EVENT_USER_COLUMNS. Conflicts no longer fire cascades or change rowids.
+
+    "is genuinely new" is now decided by a pre-check rather than by
+    interpreting total_changes (REPLACE's old +2-on-replace trick is no
+    longer applicable). Callers use the return value to decide whether to
+    add the event's volume to hourly_volume.
+    """
+    cols = list(event.keys())
+    if "id" not in cols:
+        # Defensive — without an id we can't detect conflicts; let SQLite
+        # raise on the missing PK rather than silently insert a NULL.
+        raise ValueError("insert_event: event dict missing 'id'")
+
+    exists = conn.execute(
+        "SELECT 1 FROM events WHERE id = ?", (event["id"],),
+    ).fetchone() is not None
+
+    col_list     = ", ".join(cols)
+    placeholders = ", ".join("?" for _ in cols)
+    # Build the DO UPDATE SET clause: refresh measurement/system columns,
+    # leave id and the user-intent columns alone.
+    set_cols = [c for c in cols
+                if c != "id" and c not in _EVENT_USER_COLUMNS]
+    if set_cols:
+        set_clause = ", ".join(f"{c}=excluded.{c}" for c in set_cols)
+        sql = (
+            f"INSERT INTO events ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT(id) DO UPDATE SET {set_clause}"
+        )
+    else:
+        # The incoming dict had nothing to update beyond id / user fields —
+        # treat the existing row as authoritative.
+        sql = (
+            f"INSERT INTO events ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT(id) DO NOTHING"
+        )
+    conn.execute(sql, list(event.values()))
     conn.commit()
+    return not exists
 
 
-def get_daily_volume(conn: sqlite3.Connection, circuit: str) -> float:
+def get_daily_volume(conn: sqlite3.Connection, circuit: str,
+                     since_utc: str = "") -> float:
+    """Total volume since local midnight (expressed as a UTC ISO string).
+
+    Pass since_utc as the UTC equivalent of the HA instance's local midnight
+    (e.g. '2026-05-17T05:00:00' for UTC-5).  Falls back to UTC midnight when
+    since_utc is not provided.
     """
-    Total volume since midnight UTC today.
-    Computed from the internal hourly_volume table.
-    """
+    cutoff = since_utc or datetime.now(timezone.utc).strftime('%Y-%m-%dT00:00:00')
     row = conn.execute("""
         SELECT COALESCE(SUM(volume_litres), 0)
         FROM hourly_volume
         WHERE circuit = ?
-          AND hour_ts >= strftime('%Y-%m-%dT00:00:00', 'now')
-    """, (circuit,)).fetchone()
+          AND hour_ts >= ?
+    """, (circuit, cutoff)).fetchone()
     return round(row[0], 1) if row else 0.0
 
 
-def get_weekly_volume(conn: sqlite3.Connection, circuit: str) -> float:
+def get_weekly_volume(conn: sqlite3.Connection, circuit: str,
+                      since_utc: str = "") -> float:
+    """Total volume since local midnight 7 days ago (expressed as a UTC ISO string).
+
+    Pass since_utc as the UTC equivalent of local midnight 7 days ago.
+    Falls back to UTC midnight 7 days ago when since_utc is not provided.
     """
-    Total volume over the rolling past 7 days (midnight UTC 7 days ago → now).
-    Computed from the internal hourly_volume table.
-    """
+    if since_utc:
+        cutoff = since_utc
+    else:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime('%Y-%m-%dT00:00:00')
     row = conn.execute("""
         SELECT COALESCE(SUM(volume_litres), 0)
         FROM hourly_volume
         WHERE circuit = ?
-          AND hour_ts >= strftime('%Y-%m-%dT00:00:00', datetime('now', '-7 days'))
-    """, (circuit,)).fetchone()
+          AND hour_ts >= ?
+    """, (circuit, cutoff)).fetchone()
     return round(row[0], 1) if row else 0.0
 
 
@@ -956,16 +1215,19 @@ def compute_ha_daily_volume(
     conn: sqlite3.Connection,
     circuit: str,
     current_ha_value: float,
+    period_ts: str = "",
 ) -> float:
+    """Daily volume from the authoritative HA cumulative sensor.
+
+    period_ts is the UTC equivalent of local midnight, as a naive ISO string
+    (e.g. '2026-05-17T05:00:00').  Falls back to UTC midnight when not provided.
+    Must match the key written by _init_volume_baselines().
     """
-    Daily volume from the authoritative HA cumulative sensor.
-    Baseline key is midnight UTC today stored as a naive ISO string — matches
-    both SQLite 'now' and the key written by _init_volume_baselines.
-    """
-    today_midnight = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-    ).isoformat(timespec="seconds")
-    baseline = _get_volume_baseline(conn, circuit, today_midnight, current_ha_value)
+    if not period_ts:
+        period_ts = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+        ).isoformat(timespec="seconds")
+    baseline = _get_volume_baseline(conn, circuit, period_ts, current_ha_value)
     return round(max(0.0, current_ha_value - baseline), 1)
 
 
@@ -973,15 +1235,18 @@ def compute_ha_weekly_volume(
     conn: sqlite3.Connection,
     circuit: str,
     current_ha_value: float,
+    period_ts: str = "",
 ) -> float:
+    """Rolling 7-day volume from the authoritative HA cumulative sensor.
+
+    period_ts is the UTC equivalent of local midnight 7 days ago, as a naive
+    ISO string.  Falls back to UTC midnight 7 days ago when not provided.
     """
-    Rolling 7-day volume from the authoritative HA cumulative sensor.
-    Baseline key is midnight UTC 7 days ago stored as a naive ISO string.
-    """
-    seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).replace(
-        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-    ).isoformat(timespec="seconds")
-    baseline = _get_volume_baseline(conn, circuit, seven_days_ago, current_ha_value)
+    if not period_ts:
+        period_ts = (datetime.now(timezone.utc) - timedelta(days=7)).replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+        ).isoformat(timespec="seconds")
+    baseline = _get_volume_baseline(conn, circuit, period_ts, current_ha_value)
     return round(max(0.0, current_ha_value - baseline), 1)
 
 
@@ -1030,6 +1295,42 @@ def get_recent_events(
             (circuit, limit),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+_PATCH_UNSET = object()
+
+
+def patch_event(
+    conn: sqlite3.Connection,
+    event_id: str,
+    circuit: str,
+    *,
+    user_fixture_type=_PATCH_UNSET,
+    excluded_from_training=_PATCH_UNSET,
+) -> bool:
+    """Update user-editable fields on a single event.
+
+    Pass a value (including None) to update that field; omit a kwarg entirely
+    to leave the field unchanged.  Returns False if no matching row exists.
+    """
+    row = conn.execute(
+        "SELECT id FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if row is None:
+        return False
+    if user_fixture_type is not _PATCH_UNSET:
+        conn.execute(
+            "UPDATE events SET user_fixture_type = ? WHERE id = ? AND circuit = ?",
+            (user_fixture_type, event_id, circuit),
+        )
+    if excluded_from_training is not _PATCH_UNSET:
+        conn.execute(
+            "UPDATE events SET excluded_from_training = ? WHERE id = ? AND circuit = ?",
+            (1 if excluded_from_training else 0, event_id, circuit),
+        )
+    conn.commit()
+    return True
 
 
 def get_leak_test_schedule(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
@@ -1121,30 +1422,16 @@ def _seed_alert_configs(conn: sqlite3.Connection, circuit: str,
          "Alert when flow occurs outside expected time patterns"),
     ]
 
-    zone_only_alerts = [
-        ("pre_solenoid_leak", "Pre-Solenoid Leak",
-         "Alert when flow detected with no zone commanded open"),
-        ("solenoid_weeping", "Solenoid Weeping",
-         "Alert when flow persists after zone commanded closed"),
-        ("zone_flow_deviation_high", "Zone Flow High",
-         "Alert when zone flow exceeds learned range"),
-        ("zone_flow_deviation_low", "Zone Flow Low",
-         "Alert when zone flow is below learned range — possible blocked head"),
-        ("zone_duration_overrun", "Zone Duration Overrun",
-         "Alert when zone runs significantly longer than expected"),
-    ]
-
-    alerts = base_alerts
-    if circuit_type == "zone":
-        alerts = alerts + zone_only_alerts
-
-    for alert_type, label, description in alerts:
+    for alert_type, label, description in base_alerts:
         alert_id = f"{alert_type}_{circuit}"
         conn.execute("""
             INSERT OR IGNORE INTO alert_config
                 (id, circuit, alert_type, label, description, enabled)
             VALUES (?, ?, ?, ?, ?, 1)
         """, (alert_id, circuit, alert_type, label, description))
+
+    if circuit_type == "zone":
+        _seed_zone_alerts_only(conn, circuit)
 
 
 def get_import_state(conn: sqlite3.Connection, circuit: str) -> dict:
@@ -1185,6 +1472,107 @@ def get_last_event_ts(conn: sqlite3.Connection, circuit: str) -> Optional[str]:
     return row[0] if row and row[0] else None
 
 
+def find_overlapping_event(
+    conn: sqlite3.Connection,
+    circuit: str,
+    start_ts: str,
+    end_ts: str,
+    exclude_event_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Return an existing event row that meaningfully overlaps [start_ts, end_ts].
+
+    'Meaningful' means:
+      overlap >= 30 seconds, OR
+      overlap >= 10 seconds AND overlap / shorter_event_duration >= 0.8
+
+    Short independent events (< 10 s absolute overlap) are never blocked
+    regardless of ratio — this preserves fridge-fill / toilet events that
+    happen to start near the end of a longer shower.
+
+    When multiple rows overlap, returns the most-protected one first:
+    user-labeled rows → user-locked rows → longest event.
+
+    Returns None when no meaningful overlap exists.  When a row is found it is
+    returned as a dict so callers can log which event blocked the insert.
+    """
+    try:
+        start = datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
+        end   = datetime.fromisoformat(end_ts.replace("Z", "+00:00"))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+    start_epoch = int(start.timestamp())
+    end_epoch   = int(end.timestamp())
+    new_dur     = end_epoch - start_epoch
+
+    excl = "AND e.id != ?" if exclude_event_id is not None else ""
+    params: list = [circuit, start_epoch, end_epoch]
+    if exclude_event_id is not None:
+        params.append(exclude_event_id)
+
+    rows = conn.execute(f"""
+        SELECT e.id,
+               e.start_ts,
+               e.end_ts,
+               e.duration_seconds,
+               e.fixture_id,
+               e.user_fixture_type,
+               f.user_locked,
+               CAST(strftime('%s', e.start_ts) AS INTEGER) AS ex_start_epoch,
+               CAST(strftime('%s', e.end_ts)   AS INTEGER) AS ex_end_epoch
+          FROM events e
+          LEFT JOIN fixtures f ON f.id = e.fixture_id
+         WHERE e.circuit = ?
+           AND e.start_ts IS NOT NULL
+           AND e.end_ts IS NOT NULL
+           AND CAST(strftime('%s', e.end_ts)   AS INTEGER) > ?
+           AND CAST(strftime('%s', e.start_ts) AS INTEGER) < ?
+               {excl}
+         ORDER BY
+               CASE WHEN e.user_fixture_type IS NOT NULL THEN 0 ELSE 1 END,
+               CASE WHEN f.user_locked = 1               THEN 0 ELSE 1 END,
+               (CAST(strftime('%s', e.end_ts)   AS INTEGER) -
+                CAST(strftime('%s', e.start_ts) AS INTEGER)) DESC
+    """, params).fetchall()
+
+    for row in rows:
+        ex_start = row["ex_start_epoch"]
+        ex_end   = row["ex_end_epoch"]
+        if ex_start is None or ex_end is None:
+            continue
+        overlap = min(ex_end, end_epoch) - max(ex_start, start_epoch)
+        if overlap <= 0:
+            continue
+        ex_dur  = ex_end - ex_start
+        shorter = min(ex_dur, new_dur)
+        if shorter <= 0:
+            continue
+        if overlap >= 30 or (overlap >= 10 and (overlap / shorter) >= 0.8):
+            # "Longer wins over short unlabeled stub" — when the incoming event
+            # is ≥ 3× the existing one (the importer-partial signature) and the
+            # existing row has no user label / user-locked fixture, allow the
+            # insert. The orphan stub stays in the DB; the caller is expected
+            # to log it. This auto-heals the C0 historical_importer truncation
+            # case where the partial was stored before the live event closed.
+            user_locked = bool(row["user_locked"]) if "user_locked" in row.keys() else False
+            if (new_dur >= ex_dur * 3
+                    and row["user_fixture_type"] is None
+                    and not user_locked):
+                log.info(
+                    "[overlap] not blocking %d s event by %d s unlabeled stub %s "
+                    "— allowing the longer event to insert",
+                    new_dur, ex_dur, row["id"],
+                )
+                continue
+            return dict(row)
+
+    return None
+
+
 def event_exists_near(
     conn: sqlite3.Connection,
     circuit: str,
@@ -1220,7 +1608,7 @@ def event_exists_near(
     return row is not None
 
 
-def normalize_events_utc(conn: sqlite3.Connection) -> int:
+def normalize_events_utc(conn: sqlite3.Connection, commit: bool = True) -> int:
     """Normalize events.start_ts / end_ts to UTC ISO 8601 in-place.
 
     Intended to be called before dedup_events() in the Quick Restore path.
@@ -1228,6 +1616,11 @@ def normalize_events_utc(conn: sqlite3.Connection) -> int:
     duplicates have been removed.  Recomputing ids before dedup would cause
     a PRIMARY KEY collision when two rows represent the same instant expressed
     in different offsets (both would map to the same UUID5).
+
+    When ``commit`` is False the caller owns the transaction (e.g. a restore
+    handler running multiple helpers under one outer ``with db:`` block).
+    This prevents the inner commit from making the multi-step restore
+    partially durable on later failure.
 
     Returns the number of rows whose timestamps were changed.
     Idempotent — rows already in UTC format are skipped.
@@ -1257,17 +1650,24 @@ def normalize_events_utc(conn: sqlite3.Connection) -> int:
             "UPDATE events SET start_ts = ?, end_ts = ? WHERE id = ?",
             updates
         )
-        conn.commit()
+        if commit:
+            conn.commit()
     return len(updates)
 
 
-def dedup_events(conn: sqlite3.Connection) -> int:
+def dedup_events(conn: sqlite3.Connection, commit: bool = True) -> int:
     """Remove duplicate events sharing (circuit, start_ts) and recompute ids.
 
     Called after Quick Restore to clean any pre-dedup data from old backups.
-    Migration 021 (one-time) deduped all existing rows and added a
-    UNIQUE(circuit, start_ts) index that prevents write-time duplicates going
-    forward — this function is now only needed in the Quick Restore path.
+    Migration 021 (one-time) deduped all existing rows; the matching
+    UNIQUE(circuit, start_ts) index lands in migration 032 (this commit).
+    Dedup must run before the index creation when restoring older backups,
+    or the unique constraint will fire on the historical duplicates.
+
+    When ``commit`` is False the caller owns the transaction (see
+    ``normalize_events_utc`` for the same pattern). Required by the
+    setup-wizard restore handler so the full multi-step restore commits or
+    rolls back as one unit.
 
     Idempotent — safe to call multiple times.  Returns count of rows deleted.
     Keeps the most recently inserted row (MAX rowid) on the assumption that
@@ -1277,8 +1677,10 @@ def dedup_events(conn: sqlite3.Connection) -> int:
     - Clears cluster_id / match_confidence on survivors of contested groups so
       backfill_unmatched re-matches them with the current engine state.
     - Recomputes UUID5 id = uuid5(NAMESPACE_OID, f"{circuit}/{start_ts}") for
-      all survivors, making ids stable so future INSERT OR REPLACE on
-      UNIQUE(circuit, start_ts) keeps the row (and its fixture_id) intact.
+      all survivors, making ids stable so future inserts against the
+      UNIQUE(circuit, start_ts) index (migration 20260525) collide on the
+      same UUID5 and the ON CONFLICT(id) DO UPDATE upsert in insert_event
+      refreshes the existing row rather than triggering a duplicate.
     """
     import uuid as _uuid
 
@@ -1327,7 +1729,8 @@ def dedup_events(conn: sqlite3.Connection) -> int:
             "UPDATE events SET id = ? WHERE id = ?", id_updates
         )
 
-    conn.commit()
+    if commit:
+        conn.commit()
     return removed
 
 
@@ -1483,6 +1886,185 @@ def delete_cluster(
     conn.commit()
 
 
+def merge_clusters(
+    conn: sqlite3.Connection,
+    circuit: str,
+    survivor_id: int,
+    selected_cluster_ids: List[int],
+) -> Dict[str, int]:
+    """Merge several clusters into one survivor cluster.
+
+    Every event from the non-survivor clusters is relinked to ``survivor_id``;
+    the survivor's centroid, feature_std, member_count and confidence_level are
+    recomputed; the non-survivor cluster rows and any confirmed fixture rows
+    they own are deleted.  The survivor's own fixture row is left untouched.
+
+    Returns ``{"events_relinked", "fixtures_removed", "survivor_member_count"}``.
+    Raises ``ValueError`` on any validation failure, having written nothing.
+    All writes run in a single transaction — rolled back on any exception.
+    """
+    # ── Validation — everything before any write ───────────────────────
+    ids = list(dict.fromkeys(int(i) for i in selected_cluster_ids))
+    if len(ids) < 2:
+        raise ValueError("merge_clusters needs at least 2 distinct cluster IDs")
+    survivor_id = int(survivor_id)
+    if survivor_id not in ids:
+        raise ValueError(
+            f"survivor_id {survivor_id} not in selected cluster IDs {ids}"
+        )
+
+    id_ph = ",".join(["?"] * len(ids))
+    rows = conn.execute(
+        f"""SELECT id, centroid, feature_std, member_count
+            FROM fixture_clusters
+            WHERE circuit = ? AND id IN ({id_ph})""",
+        (circuit, *ids),
+    ).fetchall()
+    found = {int(r["id"]): r for r in rows}
+    missing = [i for i in ids if i not in found]
+    if missing:
+        raise ValueError(
+            f"clusters not found in circuit {circuit!r}: {missing}"
+        )
+
+    centroids: Dict[int, dict] = {}
+    feature_stds: Dict[int, dict] = {}
+    counts: Dict[int, int] = {}
+    for i in ids:
+        r = found[i]
+        try:
+            cen = json.loads(r["centroid"]) if r["centroid"] else {}
+            std = json.loads(r["feature_std"]) if r["feature_std"] else {}
+        except (json.JSONDecodeError, TypeError) as e:
+            raise ValueError(f"cluster {i} has malformed JSON: {e}")
+        if not isinstance(cen, dict) or not isinstance(std, dict):
+            raise ValueError(
+                f"cluster {i} centroid/feature_std is not a JSON object"
+            )
+        centroids[i] = cen
+        feature_stds[i] = std
+        counts[i] = int(r["member_count"] or 0)
+
+    total_n = sum(counts.values())
+    if total_n <= 0:
+        raise ValueError(
+            "total member_count across selected clusters is 0 — nothing to merge"
+        )
+
+    # ── Merged centroid: member-count weighted mean over the key union ──
+    centroid_keys: set = set()
+    for cen in centroids.values():
+        centroid_keys.update(cen.keys())
+    merged_centroid = {
+        k: sum(counts[i] * float(centroids[i].get(k, 0.0)) for i in ids) / total_n
+        for k in centroid_keys
+    }
+
+    # ── Merged feature_std: pooled standard deviation ──────────────────
+    # Pooled variance needs each cluster's per-feature mean (its centroid
+    # value) and std.  When a cluster lacks a std for a feature we fall back
+    # to a member-count weighted average of the available stds — feature_std
+    # is a forward-looking column, empty ('{}') in practice, so the fallback
+    # is normally what runs and the result is just {}.
+    std_keys: set = set()
+    for std in feature_stds.values():
+        std_keys.update(std.keys())
+    merged_std = {}
+    for k in std_keys:
+        full = all(k in feature_stds[i] and k in centroids[i] for i in ids)
+        if full:
+            combined_var = sum(
+                counts[i] * (
+                    float(feature_stds[i][k]) ** 2
+                    + (float(centroids[i][k]) - merged_centroid.get(k, 0.0)) ** 2
+                )
+                for i in ids
+            ) / total_n
+            merged_std[k] = math.sqrt(max(combined_var, 0.0))
+        else:
+            contributors = [i for i in ids if k in feature_stds[i]]
+            weight = sum(counts[i] for i in contributors) or 1
+            merged_std[k] = sum(
+                counts[i] * float(feature_stds[i][k]) for i in contributors
+            ) / weight
+
+    # ── confidence_level — kept in sync with cluster_engine thresholds ──
+    from .cluster_engine import LEVEL_PRELIMINARY_MAX, LEVEL_LEARNING_MAX
+    if total_n < LEVEL_PRELIMINARY_MAX:
+        level = "preliminary"
+    elif total_n < LEVEL_LEARNING_MAX:
+        level = "learning"
+    else:
+        level = "confirmed"
+
+    deleted_ids = [i for i in ids if i != survivor_id]
+    del_ph = ",".join(["?"] * len(deleted_ids))
+
+    # ── Non-survivor fixture IDs to delete (deduped, survivor excluded) ─
+    survivor_row = conn.execute(
+        "SELECT fixture_id FROM fixture_clusters WHERE circuit = ? AND id = ?",
+        (circuit, survivor_id),
+    ).fetchone()
+    survivor_fixture_id = survivor_row["fixture_id"] if survivor_row else None
+
+    fx_rows = conn.execute(
+        f"""SELECT DISTINCT fixture_id FROM fixture_clusters
+            WHERE circuit = ? AND id IN ({del_ph}) AND fixture_id IS NOT NULL""",
+        (circuit, *deleted_ids),
+    ).fetchall()
+    fixture_ids = [
+        r["fixture_id"] for r in fx_rows
+        if r["fixture_id"] != survivor_fixture_id
+    ]
+
+    # ── Writes — single transaction, rollback on any failure ───────────
+    try:
+        # Relink events to the survivor cluster.  fixture_id is also repointed
+        # to the survivor's fixture (or NULL): the non-survivor fixture rows
+        # are about to be deleted, and events.fixture_id REFERENCES fixtures(id)
+        # would otherwise either dangle or block the DELETE.
+        relink = conn.execute(
+            f"""UPDATE events SET cluster_id = ?, fixture_id = ?
+                WHERE circuit = ? AND cluster_id IN ({del_ph})""",
+            (survivor_id, survivor_fixture_id, circuit, *deleted_ids),
+        )
+        events_relinked = relink.rowcount
+
+        conn.execute(
+            """UPDATE fixture_clusters
+               SET centroid = ?, feature_std = ?, member_count = ?,
+                   confidence_level = ?
+               WHERE circuit = ? AND id = ?""",
+            (json.dumps(merged_centroid), json.dumps(merged_std),
+             total_n, level, circuit, survivor_id),
+        )
+
+        # Delete cluster rows before fixture rows — fixture_clusters.fixture_id
+        # references fixtures(id), so this avoids relying on ON DELETE SET NULL.
+        conn.execute(
+            f"DELETE FROM fixture_clusters WHERE circuit = ? AND id IN ({del_ph})",
+            (circuit, *deleted_ids),
+        )
+
+        if fixture_ids:
+            fx_ph = ",".join(["?"] * len(fixture_ids))
+            conn.execute(
+                f"DELETE FROM fixtures WHERE id IN ({fx_ph})",
+                tuple(fixture_ids),
+            )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return {
+        "events_relinked": events_relinked,
+        "fixtures_removed": len(fixture_ids),
+        "survivor_member_count": total_n,
+    }
+
+
 # ==========================================================================
 # Plumbing-event exclusion windows
 # ==========================================================================
@@ -1588,5 +2170,46 @@ def extend_exclusion_window(conn, circuit: str, extra_minutes: int = 15) -> None
         (modifier, circuit),
     )
     conn.commit()
+
+
+# ------------------------------------------------------------------
+# Circuit label helpers (circuit_1 / circuit_2 display names)
+# ------------------------------------------------------------------
+
+def load_circuit_labels(db: sqlite3.Connection) -> Dict[str, str]:
+    """Return {circuit_id: display_name} for all configured circuits."""
+    try:
+        rows = db.execute(
+            "SELECT circuit_id, display_name FROM circuit_labels"
+        ).fetchall()
+        return {row["circuit_id"]: row["display_name"] for row in rows}
+    except sqlite3.OperationalError:
+        # Table does not exist yet (pre-migration-023 DB); return empty dict.
+        log.debug("circuit_labels table not found — migration 023 not yet applied")
+        return {}
+
+
+def upsert_circuit_label(
+    db: sqlite3.Connection,
+    circuit_id: str,
+    display_name: str,
+    commit: bool = True,
+) -> None:
+    """Insert or update the display name for a circuit ID.
+
+    When ``commit`` is True (default) this runs in its own transaction via
+    ``with db:``. When False the caller owns the transaction — required by
+    multi-step paths like the restore handler so a failure later in the
+    sequence rolls back this label change too.
+    """
+    sql = (
+        "INSERT INTO circuit_labels (circuit_id, display_name) VALUES (?, ?) "
+        "ON CONFLICT(circuit_id) DO UPDATE SET display_name = excluded.display_name"
+    )
+    if commit:
+        with db:
+            db.execute(sql, (circuit_id, display_name.strip()))
+    else:
+        db.execute(sql, (circuit_id, display_name.strip()))
 
 

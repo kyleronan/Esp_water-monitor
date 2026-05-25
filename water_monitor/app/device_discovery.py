@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # Checked against the device registry sw_version field (set via project.version
 # in the ESPHome YAML). Non-numeric versions (e.g. "dev") are treated as unknown
 # — setup is not blocked, but a warning is shown.
-MIN_FIRMWARE_VERSION: tuple = (3, 5, 1)
+MIN_FIRMWARE_VERSION: tuple = (3, 9, 0)
 
 # Roles that are optional — wizard will show them as optional dropdowns
 # and they won't block setup completion if unmatched.
@@ -41,6 +41,28 @@ OPTIONAL_ROLES = {
     "leak_test_result_sensor",
     "leak_test_duration_sensor",
     "pressure_history_sensor",   # present only after firmware change removing diagnostic
+    # Reset buttons (added v3.6)
+    "fault_reset_button",
+    "trickle_reset_button",
+    # Alert enable/disable switches (added v3.6)
+    "alert_high_flow_switch",
+    "alert_pressure_drop_switch",
+    "alert_trickle_switch",
+    "alert_leak_test_switch",
+    # Threshold number entities (added v3.6)
+    "burst_threshold",
+    "pressure_drop_threshold",
+    "leak_pressure_threshold",
+    "trickle_min_flow",
+    "trickle_max_flow",
+    "trickle_duration",
+    "leak_test_duration_number",  # preferred name; leak_test_duration_sensor is the compat alias
+    # Waveform diagnostic counters (firmware 3.7.0+ / 3.9.0+, circuit_1 only).
+    # The 5 chunked text sensors were replaced by an HA event in firmware 3.8.0.
+    # Chunk drop count was added in 3.9.0 when chunked streaming replaced the
+    # single-event transport.
+    "wf_overflow_count_sensor",
+    "wf_chunk_drop_count_sensor",
 }
 
 
@@ -50,44 +72,99 @@ OPTIONAL_ROLES = {
 # the entity's original_name from the HA entity registry.
 # ------------------------------------------------------------------
 
+# Default display names for each circuit ID (used in setup wizard).
+CIRCUIT_DISPLAY_DEFAULTS: Dict[str, str] = {
+    "circuit_1": "Main",
+    "circuit_2": "Irrigation",
+}
+
 # Role → (name pattern, domain)
 # Pattern is matched against original_name (case-insensitive).
 # Domain narrows the match when multiple entities share a similar name.
+#
+# Keys are now stable circuit IDs (circuit_1 / circuit_2).
+# Regex patterns still search for "main" and "irrigation" because those are
+# the keywords in the DEFAULT firmware entity names (e.g. "Main Water Valve",
+# "Water Flow Rate - Irrigation"). For firmware with non-default label
+# substitutions (e.g. duplex installs), these patterns will not match and
+# the setup wizard's manual entity assignment UI must be used instead.
+#
+# Discovery priority: diagnostic Circuit ID/Label text sensors (added in
+# firmware v3.6+) are checked first; these regex patterns are the fallback
+# for older firmware without those sensors.
 ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
-    "main": {
-        "flow_sensor":             (r"water flow rate.*main",         "sensor"),
-        "pressure_fast_sensor":    (r"water pressure.*main.*fast",    "sensor"),
-        "pressure_avg_sensor":     (r"water pressure.*main.*averaged","sensor"),
-        # NOTE: assumes "Water Pressure Main" naming (circuit suffix last, qualifier mid).
-        # Would fail for "Water Pressure (Fast) Main" — update regex if firmware changes.
-        "pressure_history_sensor": (r"water pressure.*main(?!\s*\((?:fast|averaged))", "sensor"),
-        "flow_onset_sensor":       (r"flow pulse onset.*main",        "binary_sensor"),
-        "valve_entity":            (r"main water valve",              "valve"),
-        "fault_sensor":            (r"safety fault.*main",            "binary_sensor"),
-        "fault_reason_sensor":     (r"fault reason.*main|safety fault.*reason.*main", "sensor"),
-        "trickle_sensor":          (r"trickle.*alert.*main",          "binary_sensor"),
-        "leak_test_sensor":        (r"leak test active.*main",        "binary_sensor"),
-        "leak_test_switch":        (r"micro leak test.*main",         "switch"),
-        "leak_test_result_sensor": (r"leak test result.*main",        "sensor"),
-        "leak_test_duration_sensor": (r"leak test duration.*main",    "number"),
-        "volume_sensor":           (r"water volume total.*main",      "sensor"),
+    "circuit_1": {   # was "main" — regex patterns match default firmware names
+        "flow_sensor":             (r"water flow rate.*main",                           "sensor"),
+        # Lookahead patterns — order-insensitive so "Water Pressure (Fast) Main" and
+        # "Water Pressure Main (Fast)" both match without needing a regex update.
+        "pressure_fast_sensor":    (r"water pressure(?=.*main)(?=.*fast)",              "sensor"),
+        "pressure_avg_sensor":     (r"water pressure(?=.*main)(?=.*averaged)",          "sensor"),
+        "pressure_history_sensor": (r"water pressure(?=.*main)(?!.*fast)(?!.*averaged)","sensor"),
+        "flow_onset_sensor":       (r"flow pulse onset.*main",                          "binary_sensor"),
+        "valve_entity":            (r"main water valve",                                "valve"),
+        "fault_sensor":            (r"safety fault.*main",                              "binary_sensor"),
+        "fault_reason_sensor":     (r"fault reason.*main|safety fault.*reason.*main",   "sensor"),
+        "trickle_sensor":          (r"trickle.*alert.*main",                            "binary_sensor"),
+        "leak_test_sensor":        (r"leak test active.*main",                          "binary_sensor"),
+        "leak_test_switch":        (r"micro leak test.*main",                           "switch"),
+        "leak_test_result_sensor": (r"leak test result.*main",                          "sensor"),
+        "leak_test_duration_sensor": (r"leak test duration.*main",                      "number"),   # compat alias
+        "volume_sensor":           (r"water volume total.*main",                        "sensor"),
+        # Reset buttons (firmware v3.6+)
+        "fault_reset_button":         (r"reset safety fault.*main",                    "button"),
+        "trickle_reset_button":       (r"reset trickle alert.*main",                   "button"),
+        # Alert enable/disable switches (firmware v3.6+)
+        "alert_high_flow_switch":     (r"enable high flow alert.*main",                "switch"),
+        "alert_pressure_drop_switch": (r"enable pressure drop alert.*main",            "switch"),
+        "alert_trickle_switch":       (r"enable trickle alert.*main",                  "switch"),
+        "alert_leak_test_switch":     (r"enable leak test alert.*main",                "switch"),
+        # Writable threshold number entities (firmware v3.6+)
+        "burst_threshold":            (r"burst pipe flow threshold.*main",             "number"),
+        "pressure_drop_threshold":    (r"pressure drop threshold.*main",               "number"),
+        "leak_pressure_threshold":    (r"leak test pressure threshold.*main",          "number"),
+        "trickle_min_flow":           (r"trickle flow min threshold.*main",            "number"),
+        "trickle_max_flow":           (r"trickle flow max threshold.*main",            "number"),
+        "trickle_duration":           (r"trickle flow alert duration.*main",           "number"),
+        "leak_test_duration_number":  (r"leak test duration.*main",                    "number"),
+        # Waveform diagnostic counters (firmware 3.7.0+ / 3.9.0+, circuit_1 only).
+        # The 5 chunked text sensors were replaced by an HA event in firmware 3.8.0;
+        # chunk drop count was added in 3.9.0 alongside the chunked streaming transport.
+        "wf_overflow_count_sensor":   (r"waveform overflow dropped count.*main",       "sensor"),
+        "wf_chunk_drop_count_sensor": (r"waveform chunk drop count.*main",             "sensor"),
     },
-    "irrigation": {
-        "flow_sensor":             (r"water flow rate.*irrigation",         "sensor"),
-        "pressure_fast_sensor":    (r"water pressure.*irrigation.*fast",    "sensor"),
-        "pressure_avg_sensor":     (r"water pressure.*irrigation.*averaged","sensor"),
-        # Same naming assumption as main circuit — see comment above.
-        "pressure_history_sensor": (r"water pressure.*irrigation(?!\s*\((?:fast|averaged))", "sensor"),
-        "flow_onset_sensor":       (r"flow pulse onset.*irrigation",        "binary_sensor"),
-        "valve_entity":            (r"irrigation water valve",              "valve"),
-        "fault_sensor":            (r"safety fault.*irrigation",            "binary_sensor"),
+    "circuit_2": {   # was "irrigation" — regex patterns match default firmware names
+        "flow_sensor":             (r"water flow rate.*irrigation",                           "sensor"),
+        "pressure_fast_sensor":    (r"water pressure(?=.*irrigation)(?=.*fast)",              "sensor"),
+        "pressure_avg_sensor":     (r"water pressure(?=.*irrigation)(?=.*averaged)",          "sensor"),
+        "pressure_history_sensor": (r"water pressure(?=.*irrigation)(?!.*fast)(?!.*averaged)","sensor"),
+        "flow_onset_sensor":       (r"flow pulse onset.*irrigation",                          "binary_sensor"),
+        "valve_entity":            (r"irrigation water valve",                                "valve"),
+        "fault_sensor":            (r"safety fault.*irrigation",                              "binary_sensor"),
         "fault_reason_sensor":     (r"fault reason.*irrigation|safety fault.*reason.*irrigation", "sensor"),
-        "trickle_sensor":          (r"trickle.*alert.*irrigation",          "binary_sensor"),
-        "leak_test_sensor":        (r"leak test active.*irrigation",        "binary_sensor"),
-        "leak_test_switch":        (r"micro leak test.*irrigation",         "switch"),
-        "leak_test_result_sensor": (r"leak test result.*irrigation",        "sensor"),
-        "leak_test_duration_sensor": (r"leak test duration.*irrigation",    "number"),
-        "volume_sensor":           (r"water volume total.*irrigation",      "sensor"),
+        "trickle_sensor":          (r"trickle.*alert.*irrigation",                            "binary_sensor"),
+        "leak_test_sensor":        (r"leak test active.*irrigation",                          "binary_sensor"),
+        "leak_test_switch":        (r"micro leak test.*irrigation",                           "switch"),
+        "leak_test_result_sensor": (r"leak test result.*irrigation",                          "sensor"),
+        "leak_test_duration_sensor": (r"leak test duration.*irrigation|leak_duration_irr\b",  "number"),   # compat alias
+        "volume_sensor":           (r"water volume total.*irrigation",                        "sensor"),
+        # Reset buttons (firmware v3.6+)
+        # Display names use ${circuit_2_name} → "Irrigation"; entity_id suffix fallback uses _irr\b
+        # (_irr appears in ESPHome internal IDs; \b prevents matching "irrigation" display names)
+        "fault_reset_button":         (r"reset safety fault.*irrigation|reset_safety_fault.*_irr\b",           "button"),
+        "trickle_reset_button":       (r"reset trickle alert.*irrigation|reset_trickle_alert.*_irr\b",         "button"),
+        # Alert enable/disable switches (firmware v3.6+)
+        "alert_high_flow_switch":     (r"enable high flow alert.*irrigation|enable_high_flow_irr\b",           "switch"),
+        "alert_pressure_drop_switch": (r"enable pressure drop alert.*irrigation|enable_pressure_drop_irr\b",   "switch"),
+        "alert_trickle_switch":       (r"enable trickle alert.*irrigation|enable_trickle_irr\b",               "switch"),
+        "alert_leak_test_switch":     (r"enable leak test alert.*irrigation|enable_leak_test_irr\b",           "switch"),
+        # Writable threshold number entities (firmware v3.6+)
+        "burst_threshold":            (r"burst pipe flow threshold.*irrigation|burst_threshold_irr\b",         "number"),
+        "pressure_drop_threshold":    (r"pressure drop threshold.*irrigation|pressure_drop_threshold_irr\b",   "number"),
+        "leak_pressure_threshold":    (r"leak test pressure threshold.*irrigation|leak_threshold_psi_irr\b",   "number"),
+        "trickle_min_flow":           (r"trickle flow min threshold.*irrigation|trickle_min_flow_irr\b",       "number"),
+        "trickle_max_flow":           (r"trickle flow max threshold.*irrigation|trickle_max_flow_irr\b",       "number"),
+        "trickle_duration":           (r"trickle flow alert duration.*irrigation|trickle_duration_irr\b",      "number"),
+        "leak_test_duration_number":  (r"leak test duration.*irrigation|leak_duration_irr\b",                  "number"),
     },
 }
 
@@ -125,7 +202,13 @@ class DiscoveredDevice:
             parts = tuple(int(x) for x in version_str.split(".")[:3])
             return parts >= MIN_FIRMWARE_VERSION
         except ValueError:
-            return True   # non-numeric (e.g. "dev") — warn but don't block
+            log.warning(
+                "Firmware version %r is non-numeric — cannot verify compatibility "
+                "(minimum required: %s). Proceeding, but some features may not work.",
+                self.sw_version,
+                ".".join(str(x) for x in MIN_FIRMWARE_VERSION),
+            )
+            return True   # non-numeric (e.g. "dev") — don't block setup
 
 
 @dataclass
@@ -208,19 +291,72 @@ def find_matching_devices(
     return None, suggestions
 
 
+async def _resolve_labels_from_diagnostics(
+    ha,
+    entity_registry_entities: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Fetch live circuit display labels from v3.6+ diagnostic text sensors.
+
+    Looks up "Circuit N Label" sensors by original_name in the entity registry
+    (metadata-first — never guesses entity_ids), then fetches their live state
+    from HA.  Returns {circuit_id: label_string}, e.g. {"circuit_1": "Zone A"}.
+    Returns an empty dict when no diagnostic sensors are present (older firmware).
+    """
+    labels: Dict[str, str] = {}
+    for entity in entity_registry_entities:
+        name = (entity.get("original_name") or "").lower()
+        if not re.search(r"circuit [12] label", name):
+            continue
+        state = await ha.get_state_value(entity["entity_id"], None)
+        if not state:
+            continue
+        n = re.search(r"circuit (\d+)", name)
+        if n:
+            labels[f"circuit_{n.group(1)}"] = state
+    if labels:
+        log.info("Diagnostic circuit labels resolved: %s", labels)
+    return labels
+
+
+def _make_label_pattern(base_pattern: str, circuit: str, label: str) -> Optional[str]:
+    """Return a variant of *base_pattern* with the default firmware keyword
+    replaced by *re.escape(label)*, or None if the keyword is not in the pattern.
+
+    circuit_1 patterns contain "main"; circuit_2 patterns contain "irrigation".
+    The _irr\\b entity-id suffix alternatives in circuit_2 patterns are left
+    unchanged so entity_id fallback matching still works.
+    """
+    keyword = "main" if circuit == "circuit_1" else "irrigation"
+    if keyword not in base_pattern:
+        return None
+    escaped = re.escape(label)
+    return base_pattern.replace(f".*{keyword}", f".*{escaped}").replace(keyword, escaped)
+
+
 def match_entities_to_roles(
     device_id: str,
     entities: List[Dict[str, Any]],
     circuits: List[str],
+    labels: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, List[EntityMatch]], str]:
-    """
-    Match entities belonging to device_id to circuit roles.
+    """Match entities belonging to device_id to circuit roles.
+
+    *labels* — optional dict of {circuit_id: display_label} from
+    :func:`_resolve_labels_from_diagnostics`.  When provided, matching uses
+    three ordered tiers per role:
+
+    1. Escaped diagnostic label against ``original_name`` (handles user-renamed
+       circuits — ``re.escape`` is applied because labels are user-controlled).
+    2. Hardcoded display-name terms ("main" / "irrigation") in ``original_name``.
+    3. Entity object_id / entity_id suffix fallback (``_main`` / ``_irr\\b``).
+
+    Tiers 2 and 3 are already encoded in the ROLE_PATTERNS regexes; tier 1 is
+    attempted first by substituting the escaped label into the pattern.
 
     Returns:
         (circuit_matches, esp_device_prefix)
-        circuit_matches: dict of circuit → list of EntityMatch
-        esp_device_prefix: the common prefix derived from entity IDs
     """
+    labels = labels or {}
     # Filter to entities belonging to this device
     device_entities = [e for e in entities if e.get("device_id") == device_id]
 
@@ -236,11 +372,22 @@ def match_entities_to_roles(
 
     for circuit in circuits:
         patterns = ROLE_PATTERNS.get(circuit, {})
+        circuit_label = labels.get(circuit)
         matches = []
 
         for role, (pattern, expected_domain) in patterns.items():
-            match = _find_entity_for_role(
-                device_entities, pattern, expected_domain)
+            match = None
+
+            # Tier 1: escaped diagnostic label (non-default firmware names)
+            if circuit_label:
+                lp = _make_label_pattern(pattern, circuit, circuit_label)
+                if lp:
+                    match = _find_entity_for_role(device_entities, lp, expected_domain)
+
+            # Tiers 2+3: hardcoded "main"/"irrigation" display term + _irr\b suffix
+            if not match:
+                match = _find_entity_for_role(device_entities, pattern, expected_domain)
+
             if match:
                 entity_id = match["entity_id"]
                 name = match.get("original_name") or match.get("name") or ""
@@ -447,3 +594,186 @@ def get_device_config(db: sqlite3.Connection) -> Optional[Dict[str, Any]]:
         "SELECT * FROM device_config WHERE id = 1"
     ).fetchone()
     return dict(row) if row else None
+
+
+# ------------------------------------------------------------------
+# Optional-role re-discovery after firmware upgrades
+# ------------------------------------------------------------------
+
+# sw_version values that must never be written to fw_version.
+# Checked case-insensitively after stripping whitespace.
+_UNTRUSTWORTHY_FW = {"", "unknown", "unavailable", "none", "null"}
+
+
+def merge_optional_roles(
+    db: sqlite3.Connection,
+    circuit: str,
+    matches: List[EntityMatch],
+) -> int:
+    """Insert or update optional-role rows in circuit_entity_map without
+    overwriting user-confirmed or already-mapped entries.
+
+    Rules (applied in order per match):
+    1. Skip if ``not m.matched``, ``not m.entity_id``, or
+       ``m.role not in OPTIONAL_ROLES``.
+    2. Row missing → INSERT with confirmed=0.
+    3. Row exists, entity_id NULL/empty, confirmed=0 → UPDATE entity_id and entity_name.
+    4. Row exists, entity_id non-empty → do NOT overwrite.
+    5. Row exists, confirmed=1 → do NOT overwrite (even if entity_id is empty).
+
+    Returns the number of rows inserted or updated.  Idempotent: a second run
+    with the same data returns 0.  Commits only when at least one row changed.
+    """
+    changed = 0
+    cursor = db.cursor()
+
+    for m in matches:
+        if not m.matched or not m.entity_id or m.role not in OPTIONAL_ROLES:
+            continue
+
+        row = cursor.execute(
+            "SELECT entity_id, confirmed FROM circuit_entity_map WHERE circuit=? AND role=?",
+            (circuit, m.role),
+        ).fetchone()
+
+        if row is None:
+            # Rule 2: row missing → INSERT
+            cursor.execute(
+                """INSERT INTO circuit_entity_map (circuit, role, entity_id, entity_name, confirmed)
+                   VALUES (?, ?, ?, ?, 0)""",
+                (circuit, m.role, m.entity_id, m.original_name),
+            )
+            changed += cursor.rowcount
+        else:
+            existing_id = row[0] or ""
+            confirmed = row[1] or 0
+            if existing_id or confirmed:
+                # Rule 4 or 5: non-empty entity_id OR confirmed=1 → do NOT overwrite
+                continue
+            # Rule 3: entity_id NULL/empty and confirmed=0 → UPDATE
+            cursor.execute(
+                """UPDATE circuit_entity_map
+                   SET entity_id=?, entity_name=?
+                   WHERE circuit=? AND role=?
+                     AND (entity_id IS NULL OR entity_id='')
+                     AND confirmed=0""",
+                (m.entity_id, m.original_name, circuit, m.role),
+            )
+            changed += cursor.rowcount
+
+    if changed:
+        db.commit()
+
+    return changed
+
+
+@dataclass
+class OptionalRoleRescanResult:
+    """Result of :func:`rescan_optional_roles`."""
+    total_changed: int
+    per_circuit: Dict[str, int]
+    fw_version_updated: bool = False
+    fw_version: Optional[str] = None
+
+
+async def rescan_optional_roles(
+    ha,
+    db: sqlite3.Connection,
+    circuits: List[str],
+) -> OptionalRoleRescanResult:
+    """Scan the HA entity registry for optional roles not yet in circuit_entity_map.
+
+    Safe to call on an already-configured system — never invokes
+    :func:`save_discovery`, never overwrites confirmed or non-empty mappings.
+    Idempotent: a second run against a fully-populated DB returns 0 changed rows.
+
+    Returns an :class:`OptionalRoleRescanResult` describing what changed.
+    """
+    zero = OptionalRoleRescanResult(
+        total_changed=0,
+        per_circuit={c: 0 for c in circuits},
+    )
+
+    cfg = get_device_config(db)
+    if not cfg or not cfg.get("setup_complete") or not cfg.get("ha_device_id"):
+        log.debug("rescan_optional_roles: setup not complete or ha_device_id missing — skipping")
+        return zero
+
+    ha_device_id: str = cfg["ha_device_id"]
+
+    try:
+        devices = await ha.get_devices()
+        entity_registry = await ha.get_entity_registry()
+    except Exception as exc:  # pragma: no cover
+        log.warning("rescan_optional_roles: failed to query HA — %s", exc)
+        return zero
+
+    # Find the target DiscoveredDevice
+    target_device: Optional[DiscoveredDevice] = None
+    for raw in devices:
+        d = _to_device(raw)
+        if d.id == ha_device_id:
+            target_device = d
+            break
+
+    if target_device is None:
+        log.warning(
+            "rescan_optional_roles: device %s not found in HA device registry",
+            ha_device_id,
+        )
+        return zero
+
+    # Filter entity registry to this device only (prevent cross-device contamination)
+    device_entities = [e for e in entity_registry if e.get("device_id") == ha_device_id]
+
+    # Resolve diagnostic circuit labels scoped to this device's entities
+    try:
+        diag_labels = await _resolve_labels_from_diagnostics(ha, device_entities)
+    except Exception as exc:  # pragma: no cover
+        log.warning("rescan_optional_roles: label resolution failed — %s", exc)
+        diag_labels = {}
+
+    # Match entities to roles (uses device-scoped entity list)
+    circuit_matches, _prefix = match_entities_to_roles(
+        ha_device_id, device_entities, circuits, labels=diag_labels
+    )
+
+    # Merge optional roles per circuit, counting new rows
+    per_circuit: Dict[str, int] = {}
+    total_changed = 0
+    for circuit in circuits:
+        n = merge_optional_roles(db, circuit, circuit_matches.get(circuit, []))
+        per_circuit[circuit] = n
+        if n:
+            log.info("[%s] %d new optional entities discovered", circuit, n)
+        total_changed += n
+
+    # Update stored fw_version if the reported version is trustworthy and different.
+    # Never overwrite with empty / sentinel strings.
+    fw_version_updated = False
+    new_fw: Optional[str] = None
+    raw_sw = (target_device.sw_version or "").strip()
+    if raw_sw and raw_sw.lower() not in _UNTRUSTWORTHY_FW:
+        # Strip HA suffix: "3.7.0 (ESPHome 2024.11.0)" → "3.7.0"
+        fw_str = raw_sw.split("(")[0].strip()
+        if fw_str:
+            stored_fw = (cfg.get("fw_version") or "").strip()
+            if fw_str != stored_fw:
+                db.execute(
+                    "UPDATE device_config SET fw_version=? WHERE id=1",
+                    (fw_str,),
+                )
+                db.commit()
+                fw_version_updated = True
+                new_fw = fw_str
+                log.info(
+                    "rescan_optional_roles: fw_version updated %r → %r",
+                    stored_fw, fw_str,
+                )
+
+    return OptionalRoleRescanResult(
+        total_changed=total_changed,
+        per_circuit=per_circuit,
+        fw_version_updated=fw_version_updated,
+        fw_version=new_fw,
+    )

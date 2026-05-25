@@ -18,8 +18,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
+from datetime import tzinfo
 
 from .config import AddonConfig
 from .database import (get_leak_test_schedule, upsert_leak_test_schedule,
@@ -44,13 +46,20 @@ class LeakTestScheduler:
     """Manages scheduled and on-demand leak tests for all circuits."""
 
     def __init__(self, cfg: AddonConfig, db: sqlite3.Connection,
-                 ha: HaClient, alert_manager=None):
+                 ha: HaClient, alert_manager=None,
+                 ha_tz: Optional[tzinfo] = None):
         self._cfg = cfg
         self._db  = db
         self._ha  = ha
         self._alert_manager = alert_manager
+        self._ha_tz = ha_tz or timezone.utc
         self._stop = asyncio.Event()
         self._running_tests: Dict[str, bool] = {}
+        self._tasks: Dict[str, Optional[asyncio.Task]] = {}
+        # Strong refs for fire-and-forget guarded-run tasks so the GC can't
+        # drop them mid-flight. _check_schedule spawns one per due test; the
+        # task removes itself from the set when done.
+        self._pending_scheduled: set[asyncio.Task] = set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -95,56 +104,80 @@ class LeakTestScheduler:
         notify_fail = schedule["notify_on_fail"] if schedule else True
 
         self._running_tests[circuit] = True
-        result = {}
+        task = asyncio.create_task(self._execute_test(
+            circuit_cfg,
+            notify_pass=notify_pass,
+            notify_fail=notify_fail,
+            triggered_by=triggered_by,
+        ))
+        self._tasks[circuit] = task
         try:
-            result = await self._execute_test(
-                circuit_cfg,
-                notify_pass=notify_pass,
-                notify_fail=notify_fail,
-                triggered_by=triggered_by,
-            )
+            result = await task
+        except asyncio.CancelledError:
+            result = {"result": "cancelled"}
         finally:
             self._running_tests[circuit] = False
+            self._tasks.pop(circuit, None)
 
         return result
 
     def learn_best_hour(self, circuit: str) -> Optional[int]:
         """
-        Analyse hourly_volume history to find the quietest hour of day.
+        Analyse hourly_volume history to find the quietest local hour of day.
 
-        Queries the last 60 days of data, averages usage per hour (0-23),
-        and returns the hour with the lowest average.  Prefers 0-5am when
-        two hours are equally quiet.  Returns None if < 7 days of data exist.
+        Queries the last 60 days of data, groups by local hour (converted from
+        UTC hour_ts via self._ha_tz), and returns the local hour with the lowest
+        average volume.  Prefers 0–5 AM when two hours are equally quiet.
+        Returns None if no local hour has >= 7 data points.
         """
         rows = self._db.execute("""
-            SELECT
-                CAST(strftime('%H', hour_ts) AS INTEGER) AS hr,
-                AVG(volume_litres)                       AS avg_vol,
-                COUNT(*)                                 AS days
+            SELECT hour_ts, volume_litres
             FROM hourly_volume
             WHERE circuit = ?
               AND hour_ts >= datetime('now', '-60 days')
-            GROUP BY hr
-            HAVING days >= 7
-            ORDER BY avg_vol ASC, hr ASC
         """, (circuit,)).fetchall()
 
         if not rows:
             return None
 
-        best_hr  = None
-        best_avg = None
+        hour_vols: Dict[int, list] = defaultdict(list)
         for row in rows:
-            hr, avg_vol = row["hr"], row["avg_vol"]
-            if best_avg is None or avg_vol < best_avg * 0.95:
-                best_hr  = hr
-                best_avg = avg_vol
-            elif avg_vol < best_avg * 1.05 and 0 <= hr <= 5:
-                # Similar usage but overnight — prefer it
-                best_hr  = hr
-                best_avg = avg_vol
+            try:
+                local_hour = _parse_utc_ts(row["hour_ts"]).astimezone(self._ha_tz).hour
+                hour_vols[local_hour].append(float(row["volume_litres"] or 0.0))
+            except (ValueError, AttributeError, TypeError):
+                continue
 
-        log.info("[%s] learned best test hour: %02d:00 (avg %.3f L/h)",
+        # Two-pass selection: (1) find the global-minimum average, then
+        # (2) prefer any 0–5 AM hour that is within 5 % of that minimum.
+        # The previous single-pass tie-break re-anchored best_avg to the
+        # in-range hour, which let successive 0–5 hours monotonically drift
+        # upward (e.g. 7→2→3→5 with averages 1.00, 1.04, 1.09, 1.14 all
+        # passed the gate and ended at hour 5).
+        averages: Dict[int, float] = {}
+        for hr in sorted(hour_vols.keys()):
+            vols = hour_vols[hr]
+            if len(vols) < 7:
+                continue
+            averages[hr] = sum(vols) / len(vols)
+
+        if not averages:
+            return None
+
+        global_min_hr  = min(averages, key=lambda h: averages[h])
+        global_min_avg = averages[global_min_hr]
+        ceiling        = global_min_avg * 1.05
+
+        # Prefer the earliest 0–5 hour within 5 % of the global minimum.
+        best_hr  = global_min_hr
+        best_avg = global_min_avg
+        for hr in range(0, 6):
+            if hr in averages and averages[hr] <= ceiling:
+                best_hr  = hr
+                best_avg = averages[hr]
+                break
+
+        log.info("[%s] learned best test hour: %02d:00 local (avg %.3f L/h)",
                  circuit, best_hr, best_avg)
         return best_hr
 
@@ -153,12 +186,15 @@ class LeakTestScheduler:
 
     def cancel(self, circuit: str) -> None:
         """
-        Mark a circuit's test as no longer running.
-        Called by the abort endpoint so is_running() returns False immediately,
-        letting the live-state poll reflect the abort without delay.
-        The background _execute_test task still finishes cleanly (stores the
-        'Stopped manually' result from the firmware) but the UI won't wait for it.
+        Cancel a running leak test.  Cancels the asyncio task so _execute_test
+        stops polling immediately; is_running() returns False right away so the
+        UI reflects the abort without waiting for the next firmware poll cycle.
+        The firmware has already received the stop command from the abort route
+        before this method is called.
         """
+        task = self._tasks.get(circuit)
+        if task and not task.done():
+            task.cancel()
         self._running_tests[circuit] = False
         log.info("[%s] leak test cancelled via abort", circuit)
 
@@ -197,7 +233,12 @@ class LeakTestScheduler:
                     log.error("[%s] scheduled leak test error: %s",
                               circuit, e, exc_info=True)
 
-            asyncio.create_task(_run_guarded())
+            # Keep a strong reference so the GC can't drop the task before
+            # run_now completes — bare asyncio.create_task() is a known
+            # antipattern.
+            t = asyncio.create_task(_run_guarded())
+            self._pending_scheduled.add(t)
+            t.add_done_callback(self._pending_scheduled.discard)
             await self._update_next_run(circuit, schedule)
 
     async def _update_next_run(self, circuit: str, schedule: Any) -> None:
@@ -232,7 +273,7 @@ class LeakTestScheduler:
                     schedule = dict(schedule)
                     schedule["run_hour"] = best_hour
 
-        next_run = _compute_next_run(schedule)
+        next_run = self._compute_next_run(schedule)
         if next_run:
             upsert_leak_test_schedule(self._db, circuit,
                                       next_run_at=next_run.isoformat())
@@ -251,7 +292,7 @@ class LeakTestScheduler:
         no flow-based gating here — just valve/fault pre-checks then start.
         """
         circuit = circuit_cfg.circuit
-        name    = circuit_cfg.display_name
+        name    = circuit_cfg.label
         run_at  = datetime.now(timezone.utc)
 
         # --- Pre-check: valve open ---
@@ -381,6 +422,66 @@ class LeakTestScheduler:
             "passed":           passed,
         }
 
+    def _compute_next_run(
+        self, schedule: Any, now: Optional[datetime] = None,
+    ) -> Optional[datetime]:
+        """Compute the next scheduled run datetime (returned in UTC).
+
+        ``now`` must be timezone-aware if provided; raises ``ValueError``
+        for naive values.  Defaults to ``datetime.now(self._ha_tz)``.
+        The candidate is built in local (HA) time and converted to UTC so
+        that ``run_hour=2`` always means 2 AM local, not 2 AM UTC.
+        """
+        if now is None:
+            now = datetime.now(self._ha_tz)
+        elif now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+
+        now_local  = now.astimezone(self._ha_tz)
+        freq       = schedule["frequency"]
+        run_hour   = schedule["run_hour"]   or 2
+        run_minute = schedule["run_minute"] or 0
+
+        if freq == "daily":
+            candidate = now_local.replace(hour=run_hour, minute=run_minute,
+                                          second=0, microsecond=0)
+            if candidate <= now_local:
+                candidate += timedelta(days=1)
+            return candidate.astimezone(timezone.utc)
+
+        target_dow = schedule["day_of_week"] or 0   # 0=Monday
+        days_ahead = (target_dow - now_local.weekday()) % 7
+        # If today is the target weekday, only push to next week if today's
+        # run_hour has already passed — otherwise today at run_hour is the
+        # correct next run (mirroring the daily branch's same-day handling).
+        candidate = (now_local + timedelta(days=days_ahead)).replace(
+            hour=run_hour, minute=run_minute, second=0, microsecond=0)
+        if days_ahead == 0 and candidate <= now_local:
+            days_ahead = 7
+            candidate = (now_local + timedelta(days=days_ahead)).replace(
+                hour=run_hour, minute=run_minute, second=0, microsecond=0)
+        if freq == "fortnightly" and days_ahead != 0:
+            # Fortnightly = same weekday two weeks out, unless we already
+            # picked "today" (no extra week needed in that case).
+            candidate += timedelta(days=7)
+
+        if freq == "monthly":
+            week_of_month = schedule["week_of_month"] or 1
+            candidate = _nth_weekday_of_month(
+                now_local.year, now_local.month, target_dow, week_of_month,
+                run_hour, run_minute, self._ha_tz)
+            if candidate.astimezone(timezone.utc) <= now.astimezone(timezone.utc):
+                if now_local.month == 12:
+                    candidate = _nth_weekday_of_month(
+                        now_local.year + 1, 1, target_dow, week_of_month,
+                        run_hour, run_minute, self._ha_tz)
+                else:
+                    candidate = _nth_weekday_of_month(
+                        now_local.year, now_local.month + 1, target_dow,
+                        week_of_month, run_hour, run_minute, self._ha_tz)
+
+        return candidate.astimezone(timezone.utc)
+
     async def _store_result(
         self, circuit: str, run_at: datetime, triggered_by: str,
         result: str, duration: Optional[float],
@@ -400,56 +501,21 @@ class LeakTestScheduler:
         )
 
 
-# ------------------------------------------------------------------
-# Schedule computation helpers
-# ------------------------------------------------------------------
-
-def _compute_next_run(schedule: Any) -> Optional[datetime]:
-    """Compute the next scheduled run datetime from a schedule row."""
-    now        = datetime.now(timezone.utc)
-    freq       = schedule["frequency"]
-    run_hour   = schedule["run_hour"]   or 2
-    run_minute = schedule["run_minute"] or 0
-
-    if freq == "daily":
-        # Today at run_hour:run_minute, or tomorrow if that time has already passed
-        candidate = now.replace(hour=run_hour, minute=run_minute,
-                                second=0, microsecond=0)
-        if candidate <= now:
-            candidate += timedelta(days=1)
-        return candidate
-
-    target_dow = schedule["day_of_week"] or 0   # 0=Monday
-    days_ahead = (target_dow - now.weekday()) % 7
-    if days_ahead == 0:
-        days_ahead = 7
-    if freq == "fortnightly":
-        days_ahead += 7
-
-    candidate = (now + timedelta(days=days_ahead)).replace(
-        hour=run_hour, minute=run_minute, second=0, microsecond=0)
-
-    if freq == "monthly":
-        week_of_month = schedule["week_of_month"] or 1
-        candidate = _nth_weekday_of_month(
-            now.year, now.month, target_dow, week_of_month, run_hour, run_minute)
-        if candidate <= now:
-            if now.month == 12:
-                candidate = _nth_weekday_of_month(
-                    now.year + 1, 1, target_dow, week_of_month, run_hour, run_minute)
-            else:
-                candidate = _nth_weekday_of_month(
-                    now.year, now.month + 1, target_dow, week_of_month,
-                    run_hour, run_minute)
-
-    return candidate
+def _parse_utc_ts(ts_str: str) -> datetime:
+    """Parse an hour_ts string (UTC, possibly naive or Z-suffixed) to UTC datetime."""
+    s = ts_str.replace("Z", "+00:00")
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _nth_weekday_of_month(
     year: int, month: int, weekday: int, n: int, hour: int, minute: int,
+    tz: tzinfo = timezone.utc,
 ) -> datetime:
-    """Return the nth occurrence of weekday in the given month."""
-    first = datetime(year, month, 1, hour, minute, tzinfo=timezone.utc)
+    """Return the nth occurrence of weekday in the given month, in timezone ``tz``."""
+    first = datetime(year, month, 1, hour, minute, tzinfo=tz)
     days_ahead = (weekday - first.weekday()) % 7
     first_occurrence = first + timedelta(days=days_ahead)
 

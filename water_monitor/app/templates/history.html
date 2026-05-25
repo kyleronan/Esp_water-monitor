@@ -1,5 +1,16 @@
 {% extends "base.html" %}
 {% block content %}
+{%- macro fmt_duration(s) -%}
+  {%- if s is none or s == 0 -%}—
+  {%- elif s < 60 -%}{{ "%.0f"|format(s) }}s
+  {%- else -%}{{ (s // 60)|int }}m {{ (s % 60)|int }}s
+  {%- endif -%}
+{%- endmacro -%}
+<style>
+.hist-td-shape { white-space: nowrap; }
+.shape-cell    { display: flex; align-items: center; gap: 6px; }
+.shape-spark   { display: block; flex-shrink: 0; opacity: .85; }
+</style>
 
 <h1 class="hist-page-title">History</h1>
 
@@ -41,6 +52,44 @@
   </form>
 </div>
 
+{# ── Summary strip ────────────────────────────────────────────────── #}
+{% set ns = namespace(total_vol=0, total_events=0, tests_pass=0, tests_fail=0, total_alerts=0) %}
+{% for ch in circuit_history %}
+  {% for s in ch.summaries %}
+    {% set ns.total_vol = ns.total_vol + ((s.total_volume_litres or 0) * vol_factor) %}
+    {% set ns.total_alerts = ns.total_alerts + (s.alert_count or 0) %}
+  {% endfor %}
+  {% set ns.total_events = ns.total_events + (ch.event_count or 0) %}
+  {% for t in ch.leak_tests %}
+    {% if 'Passed' in (t.result or '') %}{% set ns.tests_pass = ns.tests_pass + 1 %}
+    {% elif t.result %}{% set ns.tests_fail = ns.tests_fail + 1 %}{% endif %}
+  {% endfor %}
+{% endfor %}
+<div class="hist-summary-strip">
+  <div class="hist-summary-item">
+    <span class="hist-summary-label">Volume (chart range)</span>
+    <span class="hist-summary-value">{{ ns.total_vol | round(vol_decimals) }} {{ vol_unit or 'L' }}</span>
+  </div>
+  <div class="hist-summary-item">
+    <span class="hist-summary-label">Events ({% if using_range %}filtered{% else %}recent {{ default_limit }}{% endif %})</span>
+    <span class="hist-summary-value">{{ ns.total_events }}</span>
+  </div>
+  <div class="hist-summary-item">
+    <span class="hist-summary-label">Leak tests (last 20)</span>
+    <span class="hist-summary-value">
+      {% if ns.tests_pass + ns.tests_fail == 0 %}—
+      {% else %}
+        <span class="hist-summary-pass">{{ ns.tests_pass }} passed</span>
+        {% if ns.tests_fail %} · <span class="hist-summary-fail">{{ ns.tests_fail }} failed</span>{% endif %}
+      {% endif %}
+    </span>
+  </div>
+  <div class="hist-summary-item">
+    <span class="hist-summary-label">Alerts (chart range)</span>
+    <span class="hist-summary-value">{{ ns.total_alerts if ns.total_alerts else '—' }}</span>
+  </div>
+</div>
+
 {% for ch in circuit_history %}
 
 {# ── Usage chart card ────────────────────────────────────────────── #}
@@ -80,14 +129,15 @@
           <th>Start ({{ pressure_unit }})</th>
           <th>End ({{ pressure_unit }})</th>
           <th>Drop</th>
+          <th>Drop rate</th>
           <th>Duration</th>
         </tr>
       </thead>
       <tbody>
         {% for t in ch.leak_tests %}
-        {% set completed = t.result and ('Passed' in t.result or 'Failed' in t.result) %}
+        {% set drop_rate = (t.pressure_drop_psi / t.duration_minutes) if (t.pressure_drop_psi is not none and t.duration_minutes) else none %}
         <tr class="{% if 'Passed' in (t.result or '') %}hist-row-pass{% elif t.result %}hist-row-fail{% endif %}">
-          <td class="hist-td hist-td-mono">{{ (t.run_at or '')[:16] }}</td>
+          <td class="hist-td hist-td-mono"><time data-ts="{{ t.run_at or '' }}">{{ (t.run_at or '')[:16] }}</time></td>
           <td class="hist-td">{{ t.triggered_by or '—' }}</td>
           <td class="hist-td">
             {% if 'Passed' in (t.result or '') %}
@@ -97,10 +147,11 @@
             {% else %}—
             {% endif %}
           </td>
-          <td class="hist-td hist-td-mono">{{ (t.baseline_psi * pressure_factor)|round(pressure_decimals) if completed and t.baseline_psi is not none else "—" }}</td>
-          <td class="hist-td hist-td-mono">{{ (t.final_psi * pressure_factor)|round(pressure_decimals) if completed and t.final_psi is not none else "—" }}</td>
-          <td class="hist-td hist-td-mono">{{ (t.pressure_drop_psi * pressure_factor)|round(pressure_decimals) if completed and t.pressure_drop_psi is not none else "—" }}</td>
-          <td class="hist-td">{{ "%.1f min"|format(t.duration_minutes) if completed and t.duration_minutes else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ (t.baseline_psi * pressure_factor)|round(pressure_decimals) if t.baseline_psi is not none else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ (t.final_psi * pressure_factor)|round(pressure_decimals) if t.final_psi is not none else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ (t.pressure_drop_psi * pressure_factor)|round(pressure_decimals) if t.pressure_drop_psi is not none else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ "%.4f %s/min"|format(drop_rate * pressure_factor, pressure_unit) if drop_rate is not none else "—" }}</td>
+          <td class="hist-td">{{ "%.1f min"|format(t.duration_minutes) if t.duration_minutes else "—" }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -137,22 +188,59 @@
       </thead>
       <tbody>
         {% for e in ch.events %}
-        <tr class="hist-event-row{% if e.is_composite %} hist-row-composite{% endif %}">
-          <td class="hist-td hist-td-mono hist-td-time">{{ (e.start_ts or '')[:16] }}</td>
-          <td class="hist-td">{{ "%.0fs"|format(e.duration_seconds) if e.duration_seconds else "—" }}</td>
-          <td class="hist-td hist-td-mono">{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm else "—" }} {{ flow_unit }}</td>
-          <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi else "—" }}</td>
-          <td class="hist-td">
+        {% set _fix_label = fixture_type_labels.get(e.user_fixture_type, '') if e.user_fixture_type else '' %}
+        <tr class="hist-event-row{% if e.is_composite %} hist-row-composite{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}"
+            tabindex="0" role="button" aria-label="Event detail"
+            data-event-id="{{ e.id }}"
+            data-circuit="{{ ch.circuit }}"
+            data-start="{{ e.start_ts or '' }}"
+            data-duration="{{ fmt_duration(e.duration_seconds) }}"
+            data-flow="{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else '—' }} {{ flow_unit }}"
+            data-pressure="{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else '—' }}"
+            data-volume="{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else '—' }} {{ vol_unit }}"
+            data-shape="{{ e.resistance_curve_shape or 'unknown' }}"
+            data-cluster="{{ e.cluster_id if e.cluster_id is not none else '—' }}"
+            data-user-type="{{ e.user_fixture_type or '' }}"
+            data-user-label="{{ _fix_label }}"
+            data-excluded="{{ '1' if e.excluded_from_training else '0' }}"
+            data-trigger="{{ e.start_trigger or 'unknown' }}"
+            data-peak-flow="{{ (e.peak_flow_lpm * flow_factor)|round(flow_decimals) if e.peak_flow_lpm is not none else '' }}"
+            data-pre-pressure="{{ (e.pre_event_pressure_psi * pressure_factor)|round(pressure_decimals) if e.pre_event_pressure_psi is not none else '' }}"
+            data-prop-ms="{{ e.propagation_delay_ms | int if e.propagation_delay_ms else '0' }}"
+            data-anomaly-score="{{ (e.anomaly_score * 100)|round(1) if e.anomaly_score is not none else '' }}"
+            data-anomaly-type="{{ e.anomaly_type or '' }}"
+            data-composite="{{ '1' if e.is_composite else '0' }}"
+            data-other-valve="{{ e.other_valve_open if e.other_valve_open is not none else '' }}"
+            data-pressure-sig="{{ e.pressure_signature_json or '' }}"
+            data-waveform-used="{{ e.esp_waveform_used or 0 }}"
+            data-sig-source="{{ e.signature_source or 'software' }}">
+          <td class="hist-td hist-td-mono hist-td-time"><time data-ts="{{ e.start_ts or '' }}">{{ (e.start_ts or '')[:16] }}</time></td>
+          <td class="hist-td">{{ fmt_duration(e.duration_seconds) }}</td>
+          <td class="hist-td hist-td-mono">{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else "—" }} {{ flow_unit }}</td>
+          <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else "—" }}</td>
+          <td class="hist-td hist-td-shape">
             {% set shape = e.resistance_curve_shape or 'unknown' %}
-            {% set shape_color = {'steady': 'pill-blue', 'rising': 'pill-amber', 'falling': 'pill-green', 'pulsed': 'pill-neutral', 'unknown': 'pill-neutral'} %}
-            <span class="pill {{ shape_color.get(shape, 'pill-neutral') }}">{{ shape }}</span>
+            {% set shape_color  = {'steady': 'pill-blue', 'rising': 'pill-amber', 'falling': 'pill-green', 'pulsed': 'pill-neutral', 'unknown': 'pill-neutral'} %}
+            {% set spark_stroke = {'steady': 'oklch(55% .18 240/.85)', 'rising': 'oklch(65% .18 80/.85)', 'falling': 'oklch(50% .18 145/.85)', 'pulsed': 'oklch(55% .05 240/.85)'} %}
+            {% set spark_fill   = {'steady': 'oklch(55% .18 240/.12)', 'rising': 'oklch(65% .18 80/.12)', 'falling': 'oklch(50% .18 145/.12)', 'pulsed': 'oklch(55% .05 240/.10)'} %}
+            <div class="shape-cell">
+              <span class="pill {{ shape_color.get(shape, 'pill-neutral') }}">{{ shape }}</span>
+              {% if e.flow_signature_json and e.flow_signature_json not in ('null', 'None', '') %}
+              <canvas class="shape-spark" width="48" height="16"
+                      data-sig="{{ e.flow_signature_json }}"
+                      data-stroke="{{ spark_stroke.get(shape, 'oklch(55% .05 240/.55)') }}"
+                      data-fill="{{ spark_fill.get(shape,   'oklch(55% .05 240/.08)') }}"></canvas>
+              {% endif %}
+            </div>
           </td>
-          <td class="hist-td hist-td-mono">{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else "—" }} {{ vol_unit if e.volume_litres is not none else '' }}</td>
           <td class="hist-td">
-            {% if e.fixture_display_name %}
-              <span class="pill pill-green">{{ e.fixture_display_name }}</span>
+            {% if e.user_fixture_type %}
+              <span class="pill pill-green" title="You assigned this">★ {{ fixture_type_labels.get(e.user_fixture_type, e.user_fixture_type | replace('_',' ') | title) }}</span>
+            {% elif e.fixture_display_name %}
+              <span class="pill pill-green">{{ e.fixture_display_name }}{% if e.cluster_id is not none %} · {{ e.cluster_id }}{% endif %}</span>
             {% elif e.suggested_type and e.cluster_id is not none %}
-              <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ e.suggested_type | replace('_', ' ') | title }}</span>
+              <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }} · {{ e.cluster_id }}</span>
             {% elif e.cluster_id is not none %}
               <span class="pill pill-neutral">Cluster {{ e.cluster_id }}</span>
             {% else %}
@@ -174,11 +262,77 @@
 
 {% endfor %}
 
+{# ── Event detail modal ──────────────────────────────────────────── #}
+<div id="evt-modal" class="evt-modal-backdrop" aria-modal="true" role="dialog" aria-labelledby="evt-modal-title">
+  <div class="evt-modal">
+    <div class="evt-modal-header">
+      <h3 class="evt-modal-title" id="evt-modal-title">Event detail</h3>
+      <button id="evt-modal-close" class="icon-btn" aria-label="Close">✕</button>
+    </div>
+    <dl class="evt-modal-dl">
+      <dt>Time</dt>       <dd id="emd-start"></dd>
+      <dt>Duration</dt>   <dd id="emd-duration"></dd>
+      <dt>Avg flow</dt>   <dd id="emd-flow"></dd>
+      <dt>ΔP</dt>         <dd id="emd-pressure"></dd>
+      <dt>Volume</dt>     <dd id="emd-volume"></dd>
+      <dt>Shape</dt>      <dd id="emd-shape"></dd>
+      <dt>Cluster</dt>    <dd id="emd-cluster"></dd>
+      <dt>Fixture</dt>    <dd id="emd-fixture"></dd>
+    </dl>
+    <div id="emd-wf-section" class="evt-modal-wf" hidden>
+      <div class="evt-modal-wf-hdr">
+        <span class="evt-modal-wf-label">Waveform shape</span>
+        <span id="emd-esp-badge" class="wf-esp-badge" hidden
+              title="Waveform captured directly by ESP firmware"
+              aria-label="Waveform captured directly by ESP firmware">ESP</span>
+      </div>
+      <div class="evt-modal-wf-wrap">
+        <canvas id="emd-wf-chart" role="img"
+                aria-label="Normalized flow and pressure waveform chart"></canvas>
+      </div>
+      <div id="emd-wf-meta" class="evt-modal-wf-meta"></div>
+    </div>
+    <details class="evt-modal-details">
+      <summary class="evt-modal-summary">Technical details</summary>
+      <dl class="evt-modal-dl evt-modal-dl-extra">
+        <dt>Start trigger</dt> <dd id="emd-trigger"></dd>
+        <dt>Peak flow</dt>     <dd id="emd-peak-flow"></dd>
+        <dt>Pre-event P</dt>   <dd id="emd-pre-pressure"></dd>
+        <dt>Prop. delay</dt>   <dd id="emd-prop-delay"></dd>
+        <dt>Anomaly</dt>       <dd id="emd-anomaly"></dd>
+        <dt>Other valve</dt>   <dd id="emd-other-valve"></dd>
+        <dt>Sig. source</dt>   <dd id="emd-sig-source"></dd>
+      </dl>
+    </details>
+    <hr class="evt-modal-hr">
+    <div class="evt-modal-section">
+      <label class="evt-modal-label" for="emd-fixture-select">Assign fixture type</label>
+      <select id="emd-fixture-select" class="evt-modal-select">
+        <option value="">— no assignment —</option>
+        {% for ft in fixture_type_options %}
+        <option value="{{ ft.value }}">{{ ft.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div id="emd-error" class="evt-modal-error" hidden></div>
+    <div class="evt-modal-btns">
+      <button id="emd-ignore-btn" class="btn btn-secondary btn-sm">Ignore event</button>
+      <button id="emd-save-btn"   class="btn btn-primary btn-sm">Save</button>
+    </div>
+  </div>
+</div>
+
 {% endblock %}
 
 {% block scripts %}
 <script>
 const CHART_RANGE = {{ chart_range|tojson }};
+
+// Read a CSS custom property from :root so Chart.js picks up the live theme
+// (light or dark, switched by prefers-color-scheme). Returns a trimmed string.
+const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+// color-mix wrapper for alpha — Chart.js accepts color-mix() as a CSS color
+const mix = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparent)`;
 
 const summaryData = {
   {% for ch in circuit_history %}
@@ -233,6 +387,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const isYoY = CHART_RANGE === 'yoy';
+    const ACCENT = cssVar('--accent');
+    const MUTED  = cssVar('--muted');
+    const RED    = cssVar('--red');
+    const TEXT_3 = cssVar('--text-3');
+    const BORDER = cssVar('--border');
+    const SURFACE_2 = cssVar('--surface-2');
+    const TEXT      = cssVar('--text');
     let datasets = [];
 
     if (isYoY) {
@@ -248,15 +409,15 @@ document.addEventListener('DOMContentLoaded', () => {
         {
           label: `This year (${thisYear})`,
           data: volumes,
-          backgroundColor: 'oklch(55% .18 240 / .35)',
-          borderColor:     'oklch(55% .18 240 / .85)',
+          backgroundColor: mix(ACCENT, 35),
+          borderColor:     mix(ACCENT, 85),
           borderWidth: 1, borderRadius: 2,
         },
         {
           label: `Prior year (${priorYear})`,
           data: labels.map(l => priorMap[l] ?? null),
-          backgroundColor: 'oklch(62% .014 240 / .3)',
-          borderColor:     'oklch(62% .014 240 / .6)',
+          backgroundColor: mix(MUTED, 30),
+          borderColor:     mix(MUTED, 60),
           borderWidth: 1, borderRadius: 2, spanGaps: true,
         },
       ];
@@ -265,8 +426,8 @@ document.addEventListener('DOMContentLoaded', () => {
         {
           label: 'Volume',
           data: volumes,
-          backgroundColor: 'oklch(55% .18 240 / .35)',
-          borderColor:     'oklch(55% .18 240 / .85)',
+          backgroundColor: mix(ACCENT, 35),
+          borderColor:     mix(ACCENT, 85),
           borderWidth: 1, borderRadius: 2,
           yAxisID: 'y',
         },
@@ -274,8 +435,8 @@ document.addEventListener('DOMContentLoaded', () => {
           label: 'Anomalies',
           data: anomalies,
           type: 'line',
-          borderColor: 'oklch(55% .22 25 / .8)',
-          backgroundColor: 'oklch(55% .22 25 / .12)',
+          borderColor:     mix(RED, 80),
+          backgroundColor: mix(RED, 12),
           borderWidth: 1.5, pointRadius: 2,
           yAxisID: 'y2',
         }] : []),
@@ -296,7 +457,11 @@ document.addEventListener('DOMContentLoaded', () => {
             labels: { boxWidth: 12, font: { family: 'DM Sans', size: 11 } },
           },
           tooltip: {
-            backgroundColor: 'oklch(18% .02 240)',
+            backgroundColor: SURFACE_2,
+            titleColor: TEXT,
+            bodyColor:  TEXT,
+            borderColor: BORDER,
+            borderWidth: 1,
             titleFont:  { family: 'DM Sans', size: 11 },
             bodyFont:   { family: 'JetBrains Mono', size: 12 },
             padding: 8, cornerRadius: 6,
@@ -317,17 +482,17 @@ document.addEventListener('DOMContentLoaded', () => {
         scales: {
           x: {
             grid:  { display: false },
-            ticks: { font: { family: 'DM Sans', size: 10 }, color: 'oklch(62% .014 240)', maxTicksLimit: 14, maxRotation: 0 },
+            ticks: { font: { family: 'DM Sans', size: 10 }, color: TEXT_3, maxTicksLimit: 14, maxRotation: 0 },
           },
           y: {
             position: 'left',
-            grid: { color: 'oklch(89% .008 240)' },
-            ticks: { font: { family: 'DM Sans', size: 10 }, color: 'oklch(62% .014 240)' },
+            grid: { color: BORDER },
+            ticks: { font: { family: 'DM Sans', size: 10 }, color: TEXT_3 },
           },
           ...(anomalies.some(v => v > 0) && !isYoY ? {
             y2: {
               position: 'right',
-              ticks: { stepSize: 1, font: { family: 'DM Sans', size: 10 }, color: 'oklch(62% .014 240)' },
+              ticks: { stepSize: 1, font: { family: 'DM Sans', size: 10 }, color: TEXT_3 },
               grid: { drawOnChartArea: false },
             },
           } : {}),
@@ -335,6 +500,283 @@ document.addEventListener('DOMContentLoaded', () => {
       },
     });
   }
+});
+
+// Convert UTC timestamps to browser local time
+document.querySelectorAll('time[data-ts]').forEach(el => {
+  const ts = el.dataset.ts;
+  if (!ts) return;
+  const d = new Date(ts);
+  if (isNaN(d)) return;
+  const pad = n => String(n).padStart(2, '0');
+  el.textContent = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+});
+
+// ── Event detail modal ──────────────────────────────────────────────────────
+(function () {
+  const INGRESS   = {{ (ingress_path or '') | tojson }};
+  const FX_LABELS = {{ fixture_type_labels | tojson }};
+
+  const modal   = document.getElementById('evt-modal');
+  const selFix  = document.getElementById('emd-fixture-select');
+  const ignBtn  = document.getElementById('emd-ignore-btn');
+  const saveBtn = document.getElementById('emd-save-btn');
+  const errBox  = document.getElementById('emd-error');
+
+  // Startup diagnostic
+  const rows = document.querySelectorAll('.hist-event-row');
+  console.debug('[evt-modal] init — rows:', rows.length, { modal, selFix, ignBtn, saveBtn, errBox });
+  if (!modal || !selFix || !ignBtn || !saveBtn || !errBox) {
+    console.error('[evt-modal] one or more required elements not found — modal will not work', { modal, selFix, ignBtn, saveBtn, errBox });
+    return;
+  }
+
+  let activeRow = null;
+  let wfChart   = null;
+
+  function openModal(row) {
+    activeRow = row;
+    const d = row.dataset;
+    document.getElementById('emd-start').textContent    = fmtTs(d.start);
+    document.getElementById('emd-duration').textContent = d.duration;
+    document.getElementById('emd-flow').textContent     = d.flow;
+    document.getElementById('emd-pressure').textContent = d.pressure;
+    document.getElementById('emd-volume').textContent   = d.volume;
+    document.getElementById('emd-shape').textContent    = d.shape;
+    document.getElementById('emd-cluster').textContent  = d.cluster;
+    const fixLabel = d.userLabel || (d.userType ? FX_LABELS[d.userType] || d.userType : null);
+    document.getElementById('emd-fixture').textContent  = fixLabel || '—';
+    selFix.value   = d.userType || '';
+    ignBtn.textContent = d.excluded === '1' ? 'Restore event' : 'Ignore event';
+
+    // Technical details
+    const TRIGGER_LABELS = { flow: 'Flow (sustained)', pressure: 'Pressure drop', 'pressure+flow': 'Pressure + flow' };
+    document.getElementById('emd-trigger').textContent =
+      TRIGGER_LABELS[d.trigger] || (d.trigger || '—');
+
+    const flowUnit = {{ (flow_unit | tojson) }};
+    document.getElementById('emd-peak-flow').textContent =
+      d.peakFlow ? `${d.peakFlow} ${flowUnit}` : '—';
+
+    const pressUnit = {{ (pressure_unit | tojson) }};
+    document.getElementById('emd-pre-pressure').textContent =
+      d.prePressure ? `${d.prePressure} ${pressUnit}` : '—';
+
+    const propMs = parseInt(d.propMs || '0', 10);
+    document.getElementById('emd-prop-delay').textContent =
+      (propMs > 0) ? `${propMs} ms` : '—';
+
+    const aScore = d.anomalyScore;
+    const aType  = d.anomalyType;
+    document.getElementById('emd-anomaly').textContent =
+      aScore ? `${aScore}%${aType ? ' · ' + aType.replace(/_/g, ' ') : ''}` : '—';
+
+    const ov = d.otherValve;
+    document.getElementById('emd-other-valve').textContent =
+      ov === '1' ? 'Yes (open)' : ov === '0' ? 'No' : '—';
+
+    document.getElementById('emd-sig-source').textContent = d.sigSource || 'software';
+
+    errBox.hidden = true;
+    errBox.textContent = '';
+    modal.classList.add('is-open');
+    modal.focus();
+
+    // ── Waveform chart ────────────────────────────────────────────────────────
+    const wfSection   = document.getElementById('emd-wf-section');
+    const espBadge    = document.getElementById('emd-esp-badge');
+    const wfMeta      = document.getElementById('emd-wf-meta');
+    const chartCanvas = document.getElementById('emd-wf-chart');
+    const flowSig     = row.querySelector('.shape-spark')?.dataset.sig || '';
+    const pressSig    = row.dataset.pressureSig || '';
+    const wfUsed      = row.dataset.waveformUsed === '1';
+
+    if (wfChart) { wfChart.destroy(); wfChart = null; }
+
+    if (!window.Chart) {
+      console.warn('[evt-modal] Chart.js unavailable; waveform chart skipped');
+      wfSection.hidden = true;
+      espBadge.hidden  = true;
+      wfMeta.textContent = '';
+    } else {
+      let flowPts = [], pressPts = [];
+      try { flowPts  = flowSig  ? JSON.parse(flowSig)  : []; }
+      catch (err) { console.warn('[evt-modal] invalid flow signature JSON', err); }
+      try { pressPts = pressSig ? JSON.parse(pressSig) : []; }
+      catch (err) { console.warn('[evt-modal] invalid pressure signature JSON', err); }
+
+      const pressHasData = pressPts.some(v => Math.abs(Number(v) || 0) > 0.01);
+      const hasFlow = flowPts.length > 0;
+
+      wfSection.hidden = !hasFlow;
+      espBadge.hidden  = !wfUsed;
+
+      if (hasFlow) {
+        const labels = flowPts.map((_, i) => i);
+        const datasets = [{
+          label: 'Flow',
+          data: flowPts,
+          borderColor: cssVar('--accent'),
+          backgroundColor: mix(cssVar('--accent'), 12),
+          fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
+        }];
+        if (pressHasData) {
+          datasets.push({
+            label: 'Pressure',
+            data: pressPts,
+            borderColor: cssVar('--red'),
+            backgroundColor: 'transparent',
+            fill: false, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
+          });
+        }
+
+        wfChart = new Chart(chartCanvas, {
+          type: 'line',
+          data: { labels, datasets },
+          options: {
+            animation: false,
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: {
+                display: pressHasData,
+                labels: { boxWidth: 12, font: { size: 11 } },
+              },
+            },
+            scales: {
+              x: { display: false },
+              y: { display: false, min: 0, max: 1 },
+            },
+          },
+        });
+
+        const channels = pressHasData ? 'flow + pressure' : 'flow only';
+        chartCanvas.setAttribute(
+          'aria-label',
+          `Normalized ${channels} waveform, ${flowPts.length} samples`
+        );
+
+        const source  = wfUsed ? 'ESP captured' : 'event computed';
+        const pkText  = d.peakFlow ? ` · peak ${d.peakFlow} ${flowUnit}` : '';
+        const pressureNum = Number.parseFloat(d.pressure);
+        const dpText  = Number.isFinite(pressureNum) && Math.abs(pressureNum) > 0.01
+          ? ` · drop ${d.pressure} ${pressUnit}`
+          : '';
+        wfMeta.textContent =
+          `${source} · ${flowPts.length} samples · ${channels}${pkText}${dpText}`;
+        const note = document.createElement('span');
+        note.textContent = 'Values show shape only, not actual flow or pressure units.';
+        wfMeta.appendChild(document.createElement('br'));
+        wfMeta.appendChild(note);
+      } else {
+        wfMeta.textContent = '';
+      }
+    }
+  }
+
+  function closeModal() {
+    modal.classList.remove('is-open');
+    activeRow = null;
+    if (wfChart) { wfChart.destroy(); wfChart = null; }
+    document.getElementById('emd-wf-meta').textContent = '';
+    document.getElementById('emd-wf-section').hidden   = true;
+  }
+
+  function fmtTs(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  // Open on row click or Enter/Space keypress
+  rows.forEach(row => {
+    row.addEventListener('click', () => { console.debug('[evt-modal] row clicked', row.dataset.eventId); openModal(row); });
+    row.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openModal(row); }
+    });
+  });
+
+  document.getElementById('evt-modal-close').addEventListener('click', closeModal);
+  modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && modal.classList.contains('is-open')) closeModal(); });
+
+  async function patchEvent(payload) {
+    const { eventId, circuit } = activeRow.dataset;
+    errBox.hidden = true;
+    saveBtn.disabled = true;
+    ignBtn.disabled  = true;
+    try {
+      // X-CSRF-Token required since the middleware now gates PATCH the
+      // same as POST. window.CSRF_TOKEN is injected by IngressTemplates
+      // (main.py) into every page render.
+      const resp = await fetch(`${INGRESS}/history/api/events/${circuit}/${eventId}`, {
+        method:  'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': window.CSRF_TOKEN || '',
+        },
+        body:    JSON.stringify(payload),
+      });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        errBox.textContent = data.error || `Error ${resp.status}`;
+        errBox.hidden = false;
+        return false;
+      }
+      return true;
+    } catch (err) {
+      errBox.textContent = 'Network error — please try again.';
+      errBox.hidden = false;
+      return false;
+    } finally {
+      saveBtn.disabled = false;
+      ignBtn.disabled  = false;
+    }
+  }
+
+  saveBtn.addEventListener('click', async () => {
+    if (!activeRow) return;
+    const ok = await patchEvent({ user_fixture_type: selFix.value || null });
+    if (ok) location.reload();
+  });
+
+  ignBtn.addEventListener('click', async () => {
+    if (!activeRow) return;
+    const excluded = activeRow.dataset.excluded !== '1';
+    const ok = await patchEvent({ excluded_from_training: excluded });
+    if (ok) location.reload();
+  });
+})();
+
+// Shape sparklines
+document.querySelectorAll('canvas.shape-spark').forEach(canvas => {
+  let sig;
+  try { sig = JSON.parse(canvas.dataset.sig || '[]'); } catch { return; }
+  if (!sig.length) return;
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d');
+  const max = Math.max(...sig, 0.001);
+  const px = 1; // inset prevents 1.5 px stroke from clipping at canvas edges
+  const pts = sig.map((v, i) => ({
+    x: px + (i / (sig.length - 1)) * (w - 2 * px),
+    y: h - (v / max) * (h - 2) - 1,
+  }));
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, h);
+  ctx.lineTo(pts[0].x, pts[0].y);
+  pts.forEach(p => ctx.lineTo(p.x, p.y));
+  ctx.lineTo(pts[pts.length - 1].x, h);
+  ctx.closePath();
+  ctx.fillStyle = canvas.dataset.fill;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  pts.forEach(p => ctx.lineTo(p.x, p.y));
+  ctx.strokeStyle = canvas.dataset.stroke;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
 });
 </script>
 {% endblock %}

@@ -14,13 +14,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from datetime import timezone
 from typing import Any, Dict, Optional
 
 from .config import AddonConfig, SENSITIVITY_PRESETS, DB_PATH
-from .database import (get_sensitivity_config, ensure_circuit_defaults, init_db,
-                       dedup_events)
+from .database import (get_sensitivity_config, ensure_circuit_defaults, init_db)
 from .device_discovery import (load_circuit_entities, is_setup_complete,
-                                get_device_config)
+                                get_device_config, rescan_optional_roles)
 from .event_detector import EventDetector
 from .feature_extractor import FeatureExtractor
 from .ha_client import HaClient
@@ -73,6 +73,7 @@ class Orchestrator:
         self._fixture_publisher: Optional[FixturePublisher] = None
         self._stop = asyncio.Event()
         self._live_state_cache: Dict[str, Any] = {}
+        self._ha_tz = timezone.utc
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -226,10 +227,46 @@ class Orchestrator:
             circuit_cfg.leak_test_result_sensor = entities.get(
                 "leak_test_result_sensor", "")
             circuit_cfg.volume_sensor = entities.get("volume_sensor", "")
+            # Waveforms now arrive via chunked HA events (firmware 3.9.0+).
+            # Only diagnostic counters remain as discoverable entities.
+            circuit_cfg.wf_overflow_count_sensor = entities.get("wf_overflow_count_sensor", "")
+            circuit_cfg.wf_chunk_drop_count_sensor = entities.get("wf_chunk_drop_count_sensor", "")
             circuit_cfg.esp_device_prefix = prefix
 
             log.debug("[%s] entity IDs loaded from DB — fully_configured=%s",
                       circuit_cfg.circuit, circuit_cfg.is_fully_configured)
+
+    def reload_circuit_labels(self) -> None:
+        """
+        Re-load circuit display names from circuit_labels into the live
+        CircuitConfig objects. Called on startup, after setup wizard
+        naming step, after settings rename, and after backup restore.
+        """
+        if not self._db:
+            return
+        from .database import load_circuit_labels
+        labels = load_circuit_labels(self._db)
+        for circuit_cfg in self._cfg.circuits:
+            circuit_cfg.display_name = labels.get(circuit_cfg.circuit, "")
+            log.debug("[%s] display_name loaded: %r",
+                      circuit_cfg.circuit, circuit_cfg.display_name)
+
+    def reload_circuit_profiles(self) -> None:
+        """Re-read circuit_type from circuit_profile into the live CircuitConfig objects.
+
+        Called after startup seeding, the setup wizard circuit-names step,
+        and the settings circuit-type endpoint. Falls back to the value already
+        on CircuitConfig (originally from options.json) if no DB row exists.
+        """
+        if not self._db:
+            return
+        from .database import get_circuit_type
+        for circuit_cfg in self._cfg.circuits:
+            circuit_cfg.circuit_type = get_circuit_type(
+                self._db,
+                circuit_cfg.circuit,
+                default=circuit_cfg.circuit_type,
+            )
 
     def stop(self) -> None:
         self._stop.set()
@@ -258,8 +295,31 @@ class Orchestrator:
         self._ha = HaClient()
         await self._ha.__aenter__()
 
-        # Load entity IDs from DB into circuit configs
+        # Load entity IDs, display labels, and circuit types from DB into circuit configs
         self.reload_circuit_entities()
+        self.reload_circuit_labels()
+        self.reload_circuit_profiles()
+
+        # On already-configured systems, scan for optional roles that may have appeared
+        # after a firmware upgrade (e.g. waveform entities added in 3.7.0).
+        # This runs before EventDetector is constructed so that CircuitConfig waveform
+        # fields are populated before setup() subscribes entities.
+        # Never calls save_discovery() — never clears existing mappings.
+        if self.setup_complete:
+            try:
+                _rescan = await rescan_optional_roles(
+                    self._ha,
+                    self._db,
+                    [c.circuit for c in self._cfg.circuits],
+                )
+                if _rescan.total_changed:
+                    log.info(
+                        "Optional-role rescan: %d new entity mapping(s) added — reloading",
+                        _rescan.total_changed,
+                    )
+                    self.reload_circuit_entities()
+            except Exception as _e:
+                log.warning("Optional-role rescan failed (non-fatal): %s", _e)
 
         # Event queue
         self._event_queue = asyncio.Queue(maxsize=1000)
@@ -274,13 +334,24 @@ class Orchestrator:
         self._presence_watcher.setup()
         await self._presence_watcher.sync_initial_state()
 
+        # Fetch the HA instance timezone so the leak-test scheduler and "Today"
+        # calculations use local time rather than UTC.
+        try:
+            await self._init_ha_timezone()
+        except Exception as e:
+            log.warning("HA timezone fetch failed (using UTC): %s", e)
+
         # Leak test scheduler
         self._leak_test_scheduler = LeakTestScheduler(
-            self._cfg, self._db, self._ha, self._alert_manager)
+            self._cfg, self._db, self._ha, self._alert_manager,
+            ha_tz=self._ha_tz)
 
-        # Historical importer — backfills missed events and runs periodic catch-up
+        # Historical importer — backfills missed events and runs periodic catch-up.
+        # Pass `self` so the importer can consult the live EventDetector and skip
+        # candidate periods that overlap a currently-active event (C0 guard).
         self._historical_importer = HistoricalImporter(
-            self._cfg, self._db, self._ha, self._event_queue)
+            self._cfg, self._db, self._ha, self._event_queue,
+            orchestrator=self)
 
         # Event detector — only if setup is complete and entities are loaded
         self._event_detector = EventDetector(
@@ -288,6 +359,7 @@ class Orchestrator:
             ha_client=self._ha,
             event_queue=self._event_queue,
             sensitivity_getter=self._get_sensitivity,
+            debug_capture_propagation=self._cfg.debug_capture_propagation,
         )
         if self.setup_complete:
             self._event_detector.setup()
@@ -297,7 +369,9 @@ class Orchestrator:
 
         # Feature extractor
         self._feature_extractor = FeatureExtractor(
-            self._event_queue, self._db, self._alert_manager)
+            self._event_queue, self._db, self._alert_manager,
+            ha_client=self._ha,
+            event_detector=self._event_detector)
 
         # Cluster engine — instantiate and rebuild state from the last 60 days
         # of already-matched events so DBSTREAM + scaler are warm on startup.
@@ -349,21 +423,38 @@ class Orchestrator:
         except Exception as e:
             log.warning("FixturePublisher start failed (non-fatal): %s", e)
 
-        # Run all background tasks concurrently
+        # Run all background tasks concurrently, each under its own supervisor
+        # so a crash in one subsystem restarts only that subsystem instead of
+        # taking down the entire orchestrator.
         try:
             await asyncio.gather(
-                self._ha.run_event_loop(),
-                self._feature_extractor.run(),
-                self._training_manager.run(),
-                self._data_pruner.run(),
-                self._leak_test_scheduler.run(),
-                self._historical_importer.run(),
-                self._cluster_metrics.run(),
+                self._supervise("ha_event_loop",       self._ha.run_event_loop),
+                self._supervise("feature_extractor",   self._feature_extractor.run),
+                self._supervise("training_manager",    self._training_manager.run),
+                self._supervise("data_pruner",         self._data_pruner.run),
+                self._supervise("leak_test_scheduler", self._leak_test_scheduler.run),
+                self._supervise("historical_importer", self._historical_importer.run),
+                self._supervise("cluster_metrics",     self._cluster_metrics.run),
             )
         except asyncio.CancelledError:
             pass
         finally:
             await self._ha.__aexit__(None, None, None)
+
+    async def _supervise(self, name: str, coro_fn) -> None:
+        """Run coro_fn() in a restart loop. A crash restarts after 5s."""
+        while not self._stop.is_set():
+            try:
+                await coro_fn()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("%s crashed — restarting in 5s", name)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=5)
+                    return
+                except asyncio.TimeoutError:
+                    pass
 
     def _get_sensitivity(self, circuit: str) -> dict:
         """Return effective sensitivity settings for a circuit."""
@@ -458,6 +549,36 @@ class Orchestrator:
         log.info("Display units auto-detected from HA: flow=%s pressure=%s",
                  flow_key, pressure_key)
 
+    async def _init_ha_timezone(self) -> None:
+        """Fetch the HA instance's configured timezone and cache it for volume queries."""
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+        try:
+            ha_cfg = await self._ha.get_ha_config()
+            tz_name = ha_cfg.get("time_zone") or "UTC"
+            self._ha_tz = ZoneInfo(tz_name)
+            log.info("HA timezone: %s", tz_name)
+        except Exception as e:
+            from datetime import timezone as _tz
+            self._ha_tz = _tz.utc
+            log.warning("Could not determine HA timezone (%s) — using UTC", e)
+
+    def _local_midnight_utc(self, days_ago: int = 0) -> str:
+        """Return the UTC equivalent of local midnight (or N days ago) as a naive ISO string.
+
+        Uses the cached HA timezone from _init_ha_timezone(); falls back to UTC.
+        """
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        ha_tz = getattr(self, "_ha_tz", _tz.utc)
+        now_local = _dt.now(ha_tz)
+        midnight_local = now_local.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) - _td(days=days_ago)
+        midnight_utc = midnight_local.astimezone(_tz.utc).replace(tzinfo=None)
+        return midnight_utc.isoformat(timespec="seconds")
+
     async def _init_volume_baselines(self) -> None:
         """
         Query HA history to set accurate midnight baselines for daily/weekly
@@ -467,14 +588,18 @@ class Orchestrator:
         the first call, which causes the dashboard to show the full cumulative
         sensor total rather than just today's volume.
 
-        period_ts keys are naive UTC ISO strings (no +00:00 suffix) to match
-        the keys produced by compute_ha_daily_volume / compute_ha_weekly_volume.
+        period_ts keys are the UTC equivalent of local midnight, stored as naive
+        ISO strings, matching the keys produced by compute_ha_daily/weekly_volume.
         """
         from datetime import datetime, timezone, timedelta
 
-        now_utc         = datetime.now(timezone.utc)
-        today_midnight  = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-        seven_days_ago  = today_midnight - timedelta(days=7)
+        today_midnight_ts   = self._local_midnight_utc(days_ago=0)
+        seven_days_ago_ts   = self._local_midnight_utc(days_ago=7)
+
+        # Reconstruct aware UTC datetimes for the get_history() call window
+        _utc = timezone.utc
+        today_midnight_dt   = datetime.fromisoformat(today_midnight_ts).replace(tzinfo=_utc)
+        seven_days_ago_dt   = datetime.fromisoformat(seven_days_ago_ts).replace(tzinfo=_utc)
 
         for cfg in self._cfg.circuits:
             if not cfg.volume_sensor:
@@ -482,12 +607,10 @@ class Orchestrator:
 
             circuit = cfg.circuit
 
-            for period_start, label in [
-                (today_midnight, "today"),
-                (seven_days_ago, "past 7 days"),
+            for period_start, period_ts, label in [
+                (today_midnight_dt,  today_midnight_ts,  "today"),
+                (seven_days_ago_dt,  seven_days_ago_ts,  "past 7 days"),
             ]:
-                # Naive UTC string — matches DB lookup keys in database.py
-                period_ts = period_start.replace(tzinfo=None).isoformat(timespec="seconds")
 
                 # Only fix baselines that are still at the 0.0 placeholder
                 row = self._db.execute(
@@ -507,7 +630,11 @@ class Orchestrator:
                         period_start + timedelta(hours=2),
                     )
                     if hist:
-                        midnight_val = float(hist[0]["state"])
+                        from .ha_client import vol_to_litres as _v2l
+                        first = hist[0]
+                        midnight_val = float(first["state"])
+                        mid_unit = (first.get("attributes") or {}).get("unit_of_measurement", "")
+                        midnight_val = _v2l(midnight_val, mid_unit)
                     else:
                         midnight_val = 0.0
                 except Exception as e:
@@ -568,16 +695,26 @@ class Orchestrator:
                                compute_ha_daily_volume, compute_ha_weekly_volume)
         ha_volume_raw = states.get(circuit_cfg.volume_sensor, "")
         try:
-            ha_volume_total = float(ha_volume_raw) if ha_volume_raw not in ("", "unknown", None) else None
+            if ha_volume_raw not in ("", "unknown", None):
+                from .ha_client import vol_to_litres as _v2l
+                raw_f    = float(ha_volume_raw)
+                vol_attrs = (full_states.get(circuit_cfg.volume_sensor) or {}).get("attributes") or {}
+                vol_unit  = vol_attrs.get("unit_of_measurement", "")
+                ha_volume_total = _v2l(raw_f, vol_unit)
+            else:
+                ha_volume_total = None
         except (ValueError, TypeError):
             ha_volume_total = None
 
+        today_ts = self._local_midnight_utc(days_ago=0)
+        week_ts  = self._local_midnight_utc(days_ago=7)
+
         if ha_volume_total is not None and ha_volume_total >= 0:
-            volume_daily  = compute_ha_daily_volume(self._db, circuit, ha_volume_total)
-            volume_weekly = compute_ha_weekly_volume(self._db, circuit, ha_volume_total)
+            volume_daily  = compute_ha_daily_volume(self._db, circuit, ha_volume_total, period_ts=today_ts)
+            volume_weekly = compute_ha_weekly_volume(self._db, circuit, ha_volume_total, period_ts=week_ts)
         else:
-            volume_daily  = get_daily_volume(self._db, circuit)
-            volume_weekly = get_weekly_volume(self._db, circuit)
+            volume_daily  = get_daily_volume(self._db, circuit, since_utc=today_ts)
+            volume_weekly = get_weekly_volume(self._db, circuit, since_utc=week_ts)
 
         fault_active = states.get(circuit_cfg.fault_sensor) == "on"
 
@@ -622,7 +759,7 @@ class Orchestrator:
         return {
             "circuit": circuit,
             "circuit_type": circuit_cfg.circuit_type,
-            "display_name": circuit_cfg.display_name,
+            "display_name": circuit_cfg.label,
             "valve_state": states.get(circuit_cfg.valve_entity, "unknown"),
             "pressure": _fmt_sensor(
                 states.get(circuit_cfg.pressure_history_sensor)

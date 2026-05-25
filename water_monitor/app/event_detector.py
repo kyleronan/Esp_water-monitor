@@ -39,11 +39,16 @@ so the feature extractor can weight pressure data appropriately.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
+import struct
+import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Deque, List, Literal, Optional
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, Deque, List, Literal, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -61,15 +66,21 @@ class RawEvent:
 
     # Pressure transient fields — populated only when a transient is detected.
     # May be absent for flow-only events.
+    # pre_event_pressure_psi is None when the baseline was not trustworthy
+    # (e.g. cold start before a settled baseline exists) — see _start_flow_event.
     has_pressure_transient: bool = False
-    pre_event_pressure_psi: float = 0.0
+    pre_event_pressure_psi: Optional[float] = 0.0
     min_pressure_psi: float = 0.0
+    max_pressure_psi: float = 0.0
     pressure_delta_psi: float = 0.0
     pressure_readings: List[float] = field(default_factory=list)
 
     # Flow onset relative to event start (only meaningful for pressure-started events)
     flow_onset_ts: Optional[datetime] = None
-    propagation_delay_seconds: Optional[float] = None
+    propagation_delay_ms: Optional[float] = None
+    # Entity ID of the flow_pulse_onset sensor — used by FeatureExtractorWorker
+    # to fetch the precise HA-history timestamp after the event closes.
+    flow_onset_entity: Optional[str] = None
 
     # 1Hz flow readings collected during the event
     flow_readings: List[float] = field(default_factory=list)
@@ -85,6 +96,193 @@ class RawEvent:
 
     is_composite: bool = False
     complete: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Propagation-delay scan — shared by live detection and the offline replay tool
+# --------------------------------------------------------------------------- #
+
+def _read_addon_version() -> Optional[str]:
+    """Best-effort add-on version from config.yaml — None if unavailable."""
+    try:
+        cfg = Path(__file__).resolve().parents[1] / "config.yaml"
+        for line in cfg.read_text(encoding="utf-8").splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return None
+
+
+def _read_git_commit() -> Optional[str]:
+    """Best-effort git short commit — None when not in a git checkout."""
+    try:
+        git_dir = Path(__file__).resolve().parents[2] / ".git"
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = head.split(":", 1)[1].strip()
+            return (git_dir / ref).read_text(encoding="utf-8").strip()[:12]
+        return head[:12]
+    except Exception:
+        return None
+
+
+_ADDON_VERSION = _read_addon_version()
+_GIT_COMMIT = _read_git_commit()
+
+# Propagation scan parameters.  The fast-pressure sensor is event-driven
+# (publishes on change), so the buffer is variable-rate — all timing is done
+# from real per-sample timestamps, never a sample-count assumption.
+_PROP_MAX_LOOKBACK_S = 12.0      # only search this far back from flow onset
+_PROP_BASELINE_GUARD_S = 5.0     # samples older than (flow_onset - this) form the baseline
+_PROP_MA_HALF_S = 0.5            # centered moving-average half-width (-> 1 s window)
+_PROP_NOISE_BAND = 0.10          # PSI below the local baseline that marks transient onset
+_PROP_ABOVE_RUN = 5              # consecutive at-baseline samples confirming pre-drop
+_PROP_MIN_BASELINE_SAMPLES = 5   # minimum samples required in the baseline-guard region
+
+
+def _median(values: List[float]) -> float:
+    s = sorted(values)
+    k = len(s)
+    mid = k // 2
+    return s[mid] if k % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+@dataclass
+class PropagationScanResult:
+    """Outcome of scan_propagation_delay — the delay plus the diagnostics
+    needed to see *why* the scan produced it, in logs or offline replay."""
+    delay_ms: Optional[float]           # value to store; None when undetermined
+    status: str                         # "valid" | "clamped" | "unknown"
+    stop_reason: str                    # no_timestamps|window_too_short|no_baseline|
+                                        # gate_failed|no_onset|above_run|window_start
+    sample_count: int
+    buffer_span_s: Optional[float]
+    baseline_psi: Optional[float]       # local resting baseline (median of guard region)
+    min_pressure_psi: Optional[float]
+    min_smoothed_psi: Optional[float]
+    magnitude_gate_passed: bool
+    onset_index: Optional[int]          # samples back from the newest sample
+    onset_ts: Optional[datetime]
+    raw_delay_ms: Optional[float]       # before the >= 0 clamp
+    final_delay_ms: Optional[float]     # after clamp; mirrors delay_ms
+
+
+def scan_propagation_delay(
+    pressure: List[float],
+    timestamps: Optional[List[datetime]],
+    flow_onset_ts: Optional[datetime],
+    propagation_onset_psi: float,
+) -> PropagationScanResult:
+    """Find the pressure-transient onset and derive the propagation delay
+    (flow onset minus transient onset, in ms).
+
+    This is the single scan implementation used by both live detection
+    (CircuitEventDetector._start_flow_event) and the offline replay harness —
+    never duplicate it.
+
+    The fast-pressure buffer is event-driven and variable-rate, so the scan is
+    fully timestamp-based — there is no samples-per-second assumption:
+
+      1. Restrict to a recent window (_PROP_MAX_LOOKBACK_S before flow onset)
+         so the search cannot wander back across earlier events.
+      2. Centered 1-second time-windowed moving average to reject noise.
+      3. Local resting baseline = median of the smoothed samples older than
+         _PROP_BASELINE_GUARD_S before flow onset (guaranteed pre-drop for
+         realistic 1-3 s delays) — NOT the global max, which sits above the
+         noisy / incompletely-recovered resting level.
+      4. Walk newest->oldest to the transient onset (last sample at the local
+         baseline); delay = flow_onset_ts - onset_ts from the real timestamps.
+    """
+    n = len(pressure)
+    ts_ok = bool(timestamps) and len(timestamps) == n and n > 0
+    span = (timestamps[-1] - timestamps[0]).total_seconds() if ts_ok else None
+
+    def _result(**kw) -> PropagationScanResult:
+        base = dict(
+            delay_ms=None, status="unknown", stop_reason="unknown",
+            sample_count=n, buffer_span_s=span, baseline_psi=None,
+            min_pressure_psi=None, min_smoothed_psi=None,
+            magnitude_gate_passed=False, onset_index=None, onset_ts=None,
+            raw_delay_ms=None, final_delay_ms=None,
+        )
+        base.update(kw)
+        return PropagationScanResult(**base)
+
+    if not ts_ok:
+        return _result(stop_reason="no_timestamps")
+    if flow_onset_ts is None:
+        return _result(stop_reason="no_flow_onset")
+
+    # 1. Bound to a recent window before flow onset.
+    win_start = flow_onset_ts - timedelta(seconds=_PROP_MAX_LOOKBACK_S)
+    win = [(t, p) for t, p in zip(timestamps, pressure) if t >= win_start]
+    if len(win) < _PROP_ABOVE_RUN + _PROP_MIN_BASELINE_SAMPLES:
+        return _result(stop_reason="window_too_short")
+    win_ts = [t for t, _ in win]
+    win_p = [p for _, p in win]
+    m = len(win)
+
+    # 2. Centered 1-second time-windowed moving average.
+    smoothed: List[float] = []
+    for i in range(m):
+        lo = win_ts[i] - timedelta(seconds=_PROP_MA_HALF_S)
+        hi = win_ts[i] + timedelta(seconds=_PROP_MA_HALF_S)
+        seg = [win_p[j] for j in range(m) if lo <= win_ts[j] <= hi]
+        smoothed.append(sum(seg) / len(seg))
+
+    min_smoothed = min(smoothed)
+    min_pressure = min(win_p)
+
+    # 3. Local resting baseline — median of the pre-drop guard region.
+    guard_cut = flow_onset_ts - timedelta(seconds=_PROP_BASELINE_GUARD_S)
+    guard = [smoothed[i] for i in range(m) if win_ts[i] <= guard_cut]
+    if len(guard) < _PROP_MIN_BASELINE_SAMPLES:
+        return _result(stop_reason="no_baseline", min_pressure_psi=min_pressure,
+                       min_smoothed_psi=min_smoothed)
+    baseline = _median(guard)
+
+    # Magnitude gate: a real transient must fall >= onset PSI below baseline.
+    if baseline - min_smoothed < propagation_onset_psi:
+        return _result(stop_reason="gate_failed", baseline_psi=baseline,
+                       min_pressure_psi=min_pressure, min_smoothed_psi=min_smoothed)
+
+    # 4. Walk newest->oldest to the transient onset.
+    onset_threshold = baseline - _PROP_NOISE_BAND
+    above_run = 0
+    onset_i: Optional[int] = None
+    stop_reason = "window_start"
+    for i in range(m - 1, -1, -1):
+        if smoothed[i] >= onset_threshold:
+            above_run += 1
+            if above_run >= _PROP_ABOVE_RUN:
+                stop_reason = "above_run"
+                break
+        else:
+            above_run = 0
+            onset_i = i
+
+    if onset_i is None:
+        return _result(stop_reason="no_onset", baseline_psi=baseline,
+                       min_pressure_psi=min_pressure, min_smoothed_psi=min_smoothed,
+                       magnitude_gate_passed=True)
+
+    onset_ts = win_ts[onset_i]
+    raw_delay_ms = (flow_onset_ts - onset_ts).total_seconds() * 1000.0
+    if raw_delay_ms > 0:
+        final_delay_ms = round(raw_delay_ms, 1)
+        status = "valid"
+    else:
+        final_delay_ms = 0.0
+        status = "clamped"
+
+    return _result(
+        delay_ms=final_delay_ms, status=status, stop_reason=stop_reason,
+        baseline_psi=baseline, min_pressure_psi=min_pressure,
+        min_smoothed_psi=min_smoothed, magnitude_gate_passed=True,
+        onset_index=m - 1 - onset_i, onset_ts=onset_ts,
+        raw_delay_ms=round(raw_delay_ms, 1), final_delay_ms=final_delay_ms,
+    )
 
 
 class CircuitEventDetector:
@@ -126,7 +324,7 @@ class CircuitEventDetector:
     BASELINE_WINDOW_SAMPLES: int = 80       # 2 s averaging window
 
     # Minimum flow rate considered real flow (filters ADC noise)
-    MIN_FLOW_LPM: float = 0.05
+    MIN_FLOW_LPM: float = 0.15
 
     # Maximum physically plausible flow rate for any residential/light-commercial
     # system.  Readings above this are treated as sensor overflow / firmware error
@@ -139,13 +337,45 @@ class CircuitEventDetector:
     # which converts to 60 counts/min / 396 ≈ 0.15 L/min.  Values in the
     # range (0, MIN_NOISE_LPM) are floating-point noise (e.g. 1.58e-36 L/min
     # from ESPHome ADC underflow) and should be treated as zero.
-    MIN_NOISE_LPM: float = 0.01
+    MIN_NOISE_LPM: float = 0.05
 
     # Seconds of sustained flow required to open a flow-triggered event
     FLOW_START_SECONDS: float = 2.0
 
     # Composite: second transient must be >= this multiple of primary threshold
     COMPOSITE_TRANSIENT_MULTIPLIER: float = 1.5
+
+    # Minimum seconds the settled baseline must be stable before a pressure
+    # drop can open an event.  Prevents oscillation peaks (rising→flat→falling)
+    # from being mistaken for a fixture open — real house pressure is stable for
+    # minutes before any tap is turned on.
+    PRESSURE_STABLE_DURATION_S: float = 10.0
+
+    # Pressure-recovery END for pressure-triggered events.
+    # A pulsed-flow event stays open while the dip persists; it closes once the
+    # dip has recovered to ≤ FRACTION of its starting magnitude for this many seconds.
+    PRESSURE_RECOVERY_FRACTION: float = 0.5
+    PRESSURE_RECOVERY_DURATION_S: float = 10.0
+
+    # Minimum event volume.  Events whose computed volume (avg_flow × duration)
+    # is below this threshold are discarded as noise.  1 mL is a sanity floor —
+    # no real water-use event produces less than 1 mL.
+    MIN_EVENT_VOLUME_L: float = 0.001
+
+    # Pressure-surge phantom rejection.  If the maximum pressure seen during an
+    # event is more than this amount ABOVE the pre-event baseline AND no net
+    # pressure drop occurred (pressure_delta_psi <= 0), the event is a turbine
+    # artefact caused by a surge (pump, water hammer) rather than real flow.
+    PRESSURE_SURGE_PHANTOM_PSI: float = 0.5
+
+    # Gate for updating the settled-pressure baseline.
+    # Only accept a sample as "resting" when historical vs. current pressure
+    # is within this margin — blocks updates during post-event recovery where
+    # the historical baseline still lags below the rising actual pressure.
+    SETTLED_STABILITY_PSI: float = 0.3
+    # Minimum pressure drop (PSI below baseline) that marks the onset of a
+    # pressure event when scanning the buffer to compute propagation delay.
+    PROPAGATION_ONSET_PSI: float = 0.2
 
     def __init__(
         self,
@@ -154,25 +384,38 @@ class CircuitEventDetector:
         min_event_duration_seconds: float,
         event_queue: asyncio.Queue,
         get_other_valve_open: Optional[Callable[[], Optional[bool]]] = None,
+        flow_onset_entity: Optional[str] = None,
+        debug_capture_propagation: bool = False,
     ) -> None:
         self.circuit = circuit
         self.pressure_drop_threshold = pressure_drop_threshold_psi
         self.min_event_duration = min_event_duration_seconds
         self._event_queue = event_queue
+        self._flow_onset_entity: Optional[str] = flow_onset_entity
         # Callable provided by parent EventDetector to read other-circuit valve states
         self._get_other_valve_open: Callable[[], Optional[bool]] = (
             get_other_valve_open or (lambda: None)
         )
 
+        self._debug_capture_propagation: bool = debug_capture_propagation
+
         self._pressure_buf: Deque[float] = deque(maxlen=self.PRESSURE_BUFFER_SIZE)
+        # Per-sample arrival timestamps, kept exactly parallel to _pressure_buf
+        # (same maxlen, appended/cleared together) — diagnostic use only.
+        self._pressure_ts_buf: Deque[datetime] = deque(maxlen=self.PRESSURE_BUFFER_SIZE)
+        self._settled_pressure_psi: Optional[float] = None
+        self._settled_pressure_since: Optional[datetime] = None
         self._active_event: Optional[RawEvent] = None
         self._current_flow_lpm: float = 0.0
         self._flow_sustained_since: Optional[datetime] = None
+        self._pressure_recovered_since: Optional[datetime] = None
 
         # Downsampling: keep all readings for the first N seconds, then every Kth.
         # Prevents 290k-sample lists for 2-hour irrigation events.
         self._DOWNSAMPLE_AFTER_SECONDS: float = 120.0
         self._DOWNSAMPLE_KEEP_EVERY: int = 5
+        self._flow_sample_count: int = 0
+        self._pressure_sample_count: int = 0
 
     # ------------------------------------------------------------------ #
     # Public                                                               #
@@ -217,8 +460,8 @@ class CircuitEventDetector:
 
         if self._active_event is not None:
             elapsed = (now - self._active_event.start_ts).total_seconds()
-            n = len(self._active_event.flow_readings)
-            if elapsed < self._DOWNSAMPLE_AFTER_SECONDS or n % self._DOWNSAMPLE_KEEP_EVERY == 0:
+            self._flow_sample_count += 1
+            if elapsed < self._DOWNSAMPLE_AFTER_SECONDS or self._flow_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.flow_readings.append(self._current_flow_lpm)
             self._flow_sustained_since = None
             return
@@ -256,6 +499,8 @@ class CircuitEventDetector:
             # ESP reconnected or went offline — stale buffer readings would mix
             # with new data and could trigger a false pressure transient.
             self._pressure_buf.clear()
+            self._pressure_ts_buf.clear()
+            self._settled_pressure_psi = None
             log.debug("[%s] pressure sensor %s — buffer cleared", self.circuit, state)
             return
 
@@ -266,6 +511,7 @@ class CircuitEventDetector:
 
         now = datetime.now(timezone.utc)
         self._pressure_buf.append(pressure)
+        self._pressure_ts_buf.append(now)
 
         # Need LOOKBACK + WINDOW samples before baseline is meaningful.
         # At 40 Hz this is ~5 seconds — well inside the firmware grace period.
@@ -285,13 +531,57 @@ class CircuitEventDetector:
         drop = baseline - pressure   # positive = pressure has fallen
 
         if self._active_event is None:
+            if abs(drop) < self.SETTLED_STABILITY_PSI:
+                if (self._settled_pressure_psi is None
+                        or abs(baseline - self._settled_pressure_psi) >= 0.1):
+                    self._settled_pressure_since = now
+                self._settled_pressure_psi = baseline
             if drop >= self.pressure_drop_threshold:
-                self._start_pressure_event(now, baseline, pressure)
+                stable_secs = (
+                    0.0 if self._settled_pressure_since is None
+                    else (now - self._settled_pressure_since).total_seconds()
+                )
+                if stable_secs < self.PRESSURE_STABLE_DURATION_S:
+                    log.debug(
+                        "[%s] pressure drop %.1f PSI suppressed — baseline not yet stable "
+                        "(%.1fs < %.1fs required)",
+                        self.circuit, drop, stable_secs, self.PRESSURE_STABLE_DURATION_S,
+                    )
+                else:
+                    self._start_pressure_event(now, baseline, pressure)
         else:
             elapsed_p = (now - self._active_event.start_ts).total_seconds()
-            np = len(self._active_event.pressure_readings)
-            if elapsed_p < self._DOWNSAMPLE_AFTER_SECONDS or np % self._DOWNSAMPLE_KEEP_EVERY == 0:
+            self._pressure_sample_count += 1
+            # Track max on every sample (before downsample gate).
+            self._active_event.max_pressure_psi = max(self._active_event.max_pressure_psi, pressure)
+            if elapsed_p < self._DOWNSAMPLE_AFTER_SECONDS or self._pressure_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.pressure_readings.append(pressure)
+
+            ev = self._active_event
+            if ev.has_pressure_transient and ev.pressure_delta_psi > 0:
+                recovery_line = (
+                    ev.pre_event_pressure_psi
+                    - ev.pressure_delta_psi * self.PRESSURE_RECOVERY_FRACTION
+                )
+                if pressure >= recovery_line:
+                    if self._pressure_recovered_since is None:
+                        self._pressure_recovered_since = now
+                    elif (
+                        (now - self._pressure_recovered_since).total_seconds()
+                        >= self.PRESSURE_RECOVERY_DURATION_S
+                        and self._current_flow_lpm < self.MIN_FLOW_LPM
+                    ):
+                        log.debug(
+                            "[%s] pressure recovered (>= %.2f PSI for %.1f s, flow=%.3f) "
+                            "— ending pressure-triggered event",
+                            self.circuit, recovery_line,
+                            (now - self._pressure_recovered_since).total_seconds(),
+                            self._current_flow_lpm,
+                        )
+                        self._end_event(now)
+                        return
+                else:
+                    self._pressure_recovered_since = None
 
             if not self._active_event.has_pressure_transient:
                 # First transient seen during this event — enrich the record.
@@ -326,13 +616,24 @@ class CircuitEventDetector:
         flow_on = state.lower() in ("on", "true", "1")
 
         if flow_on:
-            if (self._active_event is not None
-                    and self._active_event.flow_onset_ts is None):
-                self._active_event.flow_onset_ts = now
-                delay = (now - self._active_event.start_ts).total_seconds()
-                self._active_event.propagation_delay_seconds = delay
-                log.debug("[%s] flow onset — propagation delay %.2f s",
-                          self.circuit, delay)
+            ev = self._active_event
+            if ev is not None and ev.flow_onset_ts is None:
+                # Pressure-triggered event: flow is only being detected now.
+                # Scan the buffer for the TRUE transient onset (earlier than
+                # the threshold crossing that opened the event) so the delay
+                # is measured the same way as for flow-triggered events.
+                ev.flow_onset_ts = now
+                scan = self._run_propagation_scan(
+                    ev.start_trigger, ev.start_ts, now)
+                if scan.delay_ms is not None:
+                    ev.propagation_delay_ms = scan.delay_ms
+                else:
+                    # Scan could not locate an onset — fall back to the
+                    # threshold-crossing delay so the field is still set.
+                    ev.propagation_delay_ms = round(
+                        max(0.0, (now - ev.start_ts).total_seconds() * 1000.0), 1)
+                log.debug("[%s] flow onset — propagation_delay=%.0f ms",
+                          self.circuit, ev.propagation_delay_ms)
         else:
             if self._active_event is not None:
                 if self._current_flow_lpm < self.MIN_FLOW_LPM:
@@ -348,42 +649,189 @@ class CircuitEventDetector:
     # Internal lifecycle                                                   #
     # ------------------------------------------------------------------ #
 
+    def _run_propagation_scan(
+        self, trigger: str, event_start_ts: datetime, flow_onset_ts: datetime,
+    ) -> PropagationScanResult:
+        """Scan the pressure buffer for the transient onset, emit the DEBUG
+        instrumentation line, and (when enabled) a capture blob.
+
+        Shared by flow-triggered (_start_flow_event, at event start) and
+        pressure-triggered (on_flow_onset, when flow is finally detected)
+        events.  The caller stores the resulting delay on the event.
+        """
+        pressure_samples = list(self._pressure_buf)
+        pressure_ts = list(self._pressure_ts_buf)
+        scan = scan_propagation_delay(
+            pressure_samples, pressure_ts, flow_onset_ts,
+            self.PROPAGATION_ONSET_PSI,
+        )
+        self._log_propagation_scan(trigger, flow_onset_ts, scan)
+        if self._debug_capture_propagation:
+            self._emit_propagation_capture(
+                trigger, event_start_ts, flow_onset_ts,
+                pressure_samples, pressure_ts, scan)
+        return scan
+
     def _start_flow_event(self, now: datetime) -> None:
         start_ts = self._flow_sustained_since or now
         self._flow_sustained_since = None
+        self._pressure_recovered_since = None
 
-        min_samples = self.BASELINE_LOOKBACK_SAMPLES + self.BASELINE_WINDOW_SAMPLES
-        if len(self._pressure_buf) >= min_samples:
-            buf = list(self._pressure_buf)
-            b_end = len(buf) - self.BASELINE_LOOKBACK_SAMPLES
-            b_start = b_end - self.BASELINE_WINDOW_SAMPLES
-            baseline = sum(buf[b_start:b_end]) / self.BASELINE_WINDOW_SAMPLES
-        elif self._pressure_buf:
-            baseline = sum(self._pressure_buf) / len(self._pressure_buf)
+        # Warmup gate — pressure-derived fields are only trustworthy once a
+        # settled baseline has been established.  Shortly after an addon
+        # restart (or a sensor-unavailable buffer clear) there is no clean
+        # pre-event reference, so any computed drop/delay would be fabricated.
+        # In that case the event is still recorded as a real flow event, but
+        # its pressure fields are left as honest unknowns.
+        trustworthy = self._settled_pressure_psi is not None
+
+        if trustworthy:
+            baseline: Optional[float] = self._settled_pressure_psi
+            # For a flow-triggered event, start_ts IS the flow onset.
+            scan = self._run_propagation_scan("flow", start_ts, start_ts)
+            propagation_delay_ms = scan.delay_ms
         else:
-            baseline = 0.0
+            baseline = None
+            propagation_delay_ms = None
+            log.debug(
+                "[%s] propagation scan skipped — pressure baseline not "
+                "trustworthy (no settled pressure / buffer not warm)",
+                self.circuit,
+            )
+            self._log_propagation_scan("flow", start_ts, None)
+            if self._debug_capture_propagation:
+                self._emit_propagation_capture(
+                    "flow", start_ts, start_ts,
+                    list(self._pressure_buf), list(self._pressure_ts_buf), None)
 
-        log.info("[%s] event start (FLOW) — %.3f L/min for >= %.1f s",
-                 self.circuit, self._current_flow_lpm, self.FLOW_START_SECONDS)
+        delay_str = ("unknown" if propagation_delay_ms is None
+                     else f"{propagation_delay_ms:.0f} ms")
+        log.info(
+            "[%s] event start (FLOW) — %.3f L/min for >= %.1f s "
+            "propagation_delay=%s", self.circuit, self._current_flow_lpm,
+            self.FLOW_START_SECONDS, delay_str,
+        )
 
+        self._flow_sample_count = 0
+        self._pressure_sample_count = 0
         self._active_event = RawEvent(
             circuit=self.circuit,
             start_ts=start_ts,
             start_trigger="flow",
             flow_onset_ts=start_ts,
-            propagation_delay_seconds=0.0,
+            propagation_delay_ms=propagation_delay_ms,
+            flow_onset_entity=self._flow_onset_entity,
             pre_event_pressure_psi=baseline,
-            min_pressure_psi=baseline,
+            min_pressure_psi=baseline if baseline is not None else 0.0,
+            max_pressure_psi=baseline if baseline is not None else 0.0,
             flow_readings=[self._current_flow_lpm],
             other_valve_open=self._get_other_valve_open(),
         )
 
+    def _log_propagation_scan(
+        self, trigger: str, flow_onset_ts: datetime,
+        scan: Optional[PropagationScanResult],
+    ) -> None:
+        """Emit one compact DEBUG line describing the propagation scan."""
+        if scan is None:
+            log.debug("[%s] propagation scan (%s) — skipped "
+                      "(baseline untrustworthy)", self.circuit, trigger)
+            return
+
+        def _f(v: Optional[float], fmt: str) -> str:
+            return fmt % v if v is not None else "n/a"
+
+        onset_ts = (scan.onset_ts.strftime("%H:%M:%S.%f")[:-3]
+                    if scan.onset_ts is not None else "n/a")
+        log.debug(
+            "[%s] propagation scan (%s) — samples=%d span=%s flow_onset=%s "
+            "baseline=%s min_p=%s min_sm=%s gate=%s onset_idx=%s onset_ts=%s "
+            "stop=%s raw_delay=%s final=%s status=%s",
+            self.circuit, trigger, scan.sample_count,
+            _f(scan.buffer_span_s, "%.1fs"),
+            flow_onset_ts.strftime("%H:%M:%S.%f")[:-3],
+            _f(scan.baseline_psi, "%.2f"), _f(scan.min_pressure_psi, "%.2f"),
+            _f(scan.min_smoothed_psi, "%.2f"),
+            "pass" if scan.magnitude_gate_passed else "fail",
+            scan.onset_index if scan.onset_index is not None else "n/a",
+            onset_ts, scan.stop_reason,
+            _f(scan.raw_delay_ms, "%.0fms"), _f(scan.final_delay_ms, "%.0fms"),
+            scan.status,
+        )
+
+    def _emit_propagation_capture(
+        self, trigger: str, event_start_ts: datetime, flow_onset_ts: datetime,
+        pressure_samples: List[float], pressure_ts: List[datetime],
+        scan: Optional[PropagationScanResult],
+    ) -> None:
+        """Emit one compact JSON capture blob (debug_capture_propagation only)
+        so a real event can be replayed offline against scan_propagation_delay.
+
+        event_start_ts is when the event opened (flow-confirm time, or the
+        pressure threshold crossing); flow_onset_ts is what the scan measures
+        against — for pressure-triggered events the two differ.
+        """
+        try:
+            n = len(pressure_samples)
+            ts_ok = len(pressure_ts) == n and n > 0
+            t0 = pressure_ts[0] if ts_ok else None
+            downsample = 2 if n > 600 else 1
+            samples = []
+            for i in range(0, n, downsample):
+                off = (round((pressure_ts[i] - t0).total_seconds() * 1000, 1)
+                       if t0 is not None else None)
+                samples.append([off, round(pressure_samples[i], 4)])
+            blob = {
+                "capture": "propagation_delay",
+                "meta": {
+                    "version": _ADDON_VERSION,
+                    "git": _GIT_COMMIT,
+                    "circuit": self.circuit,
+                    "start_trigger": trigger,
+                    "pressure_drop_threshold_psi": self.pressure_drop_threshold,
+                    "flow_start_seconds": self.FLOW_START_SECONDS,
+                    "propagation_onset_psi": self.PROPAGATION_ONSET_PSI,
+                    "ma_half_s": _PROP_MA_HALF_S,
+                    "sample_count": n,
+                    "buffer_span_s": scan.buffer_span_s if scan else None,
+                    "downsample": downsample,
+                    "trustworthy_baseline": scan is not None,
+                },
+                "samples_t0": t0.isoformat() if t0 is not None else None,
+                "start_ts": event_start_ts.isoformat(),
+                "flow_onset_ts": flow_onset_ts.isoformat(),
+                "samples": samples,
+                "result": None if scan is None else {
+                    "delay_ms": scan.delay_ms,
+                    "status": scan.status,
+                    "stop_reason": scan.stop_reason,
+                    "baseline_psi": scan.baseline_psi,
+                    "min_pressure_psi": scan.min_pressure_psi,
+                    "min_smoothed_psi": scan.min_smoothed_psi,
+                    "magnitude_gate_passed": scan.magnitude_gate_passed,
+                    "onset_index": scan.onset_index,
+                    "onset_ts": (scan.onset_ts.isoformat()
+                                 if scan.onset_ts is not None else None),
+                    "raw_delay_ms": scan.raw_delay_ms,
+                    "final_delay_ms": scan.final_delay_ms,
+                },
+            }
+            log.debug("[%s] PROPAGATION_CAPTURE %s", self.circuit,
+                      json.dumps(blob, separators=(",", ":")))
+        except Exception as e:   # never let diagnostics break detection
+            log.debug("[%s] propagation capture failed: %s", self.circuit, e)
+
     def _start_pressure_event(self, now: datetime, baseline: float,
                               current_pressure: float) -> None:
+        self._pressure_recovered_since = None
+        if self._settled_pressure_psi is not None:
+            baseline = self._settled_pressure_psi
         drop = baseline - current_pressure
         log.info("[%s] event start (PRESSURE) — %.1f PSI drop (%.1f -> %.1f PSI)",
                  self.circuit, drop, baseline, current_pressure)
 
+        self._flow_sample_count = 0
+        self._pressure_sample_count = 0
         self._active_event = RawEvent(
             circuit=self.circuit,
             start_ts=now,
@@ -391,8 +839,10 @@ class CircuitEventDetector:
             has_pressure_transient=True,
             pre_event_pressure_psi=baseline,
             min_pressure_psi=current_pressure,
+            max_pressure_psi=current_pressure,
             pressure_delta_psi=drop,
             pressure_readings=[current_pressure],
+            flow_onset_entity=self._flow_onset_entity,
             other_valve_open=self._get_other_valve_open(),
         )
         self._flow_sustained_since = None
@@ -404,6 +854,8 @@ class CircuitEventDetector:
         if ev is None:
             return
 
+        if self._settled_pressure_psi is not None:
+            baseline = self._settled_pressure_psi
         drop = baseline - current_pressure
         ev.has_pressure_transient = True
         ev.start_trigger = "pressure+flow"
@@ -418,6 +870,7 @@ class CircuitEventDetector:
         ev = self._active_event
         if ev is None:
             return
+        self._pressure_recovered_since = None
 
         duration = (ts - ev.start_ts).total_seconds()
 
@@ -425,6 +878,8 @@ class CircuitEventDetector:
             log.debug("[%s] discarding short event (%.1f s < %.1f s)",
                       self.circuit, duration, self.min_event_duration)
             self._active_event = None
+            self._flow_sample_count = 0
+            self._pressure_sample_count = 0
             return
 
         ev.end_ts = ts
@@ -438,10 +893,39 @@ class CircuitEventDetector:
                 ev.pressure_delta_psi = ev.pre_event_pressure_psi - ev.min_pressure_psi
         ev.complete = True
         self._active_event = None
+        self._flow_sample_count = 0
+        self._pressure_sample_count = 0
 
         avg_flow = (
             sum(ev.flow_readings) / len(ev.flow_readings) if ev.flow_readings else 0.0
         )
+        volume_l = avg_flow * duration / 60.0
+        if volume_l < self.MIN_EVENT_VOLUME_L:
+            log.debug(
+                "[%s] discarding near-zero-volume event (%.5f L < %.3f L)",
+                self.circuit, volume_l, self.MIN_EVENT_VOLUME_L,
+            )
+            return
+
+        # Reject pressure-surge phantoms: turbine artefacts from pump surges or
+        # water hammer where pressure rose above baseline and never dropped.
+        if (
+            ev.pressure_readings
+            and ev.pre_event_pressure_psi is not None
+            and ev.pre_event_pressure_psi > 0
+            and ev.max_pressure_psi > 0
+        ):
+            pressure_rise = ev.max_pressure_psi - ev.pre_event_pressure_psi
+            if pressure_rise > self.PRESSURE_SURGE_PHANTOM_PSI and ev.pressure_delta_psi <= 0:
+                log.info(
+                    "[%s] rejecting pressure-surge phantom: rose %.2f PSI "
+                    "(max=%.1f baseline=%.1f delta=%.2f) duration=%.1f s",
+                    self.circuit, pressure_rise, ev.max_pressure_psi,
+                    ev.pre_event_pressure_psi, ev.pressure_delta_psi, duration,
+                )
+                self._pressure_recovered_since = None
+                return
+
         log.info(
             "[%s] event complete — trigger=%s duration=%.1f s avg_flow=%.3f L/min "
             "pressure_drop=%.1f PSI has_transient=%s composite=%s",
@@ -460,9 +944,591 @@ class CircuitEventDetector:
     def reset(self) -> None:
         """Reset all state — call when valve closes or on explicit reset."""
         self._active_event = None
+        self._flow_sample_count = 0
+        self._pressure_sample_count = 0
         self._pressure_buf.clear()
+        self._pressure_ts_buf.clear()
         self._current_flow_lpm = 0.0
         self._flow_sustained_since = None
+        self._pressure_recovered_since = None
+        self._settled_pressure_psi = None
+        self._settled_pressure_since = None
+
+
+# ------------------------------------------------------------------------------- #
+# Per-event waveform capture (firmware 3.9.0+) — chunked HA-event accumulator    #
+# ------------------------------------------------------------------------------- #
+# Each event is delivered as a stream of esphome.water_monitor_waveform_chunk
+# events. A chunk fires every time a firmware-side 1500-sample buffer fills
+# (~30 s @ ~50 Hz) and also on event end. The accumulator stitches chunks
+# keyed on (boot_id, event_id) and emits a WaveformRecord when the final
+# chunk arrives and all expected seqs are present. Native cadence is
+# preserved; arrays are variable-length — feature_extractor.py is fine with
+# variable lengths already.
+
+# Wire-format / safety constants.
+_WF_START_SAMPLES: int = 150            # first slice of full_flow used as start_flow (3 s @ ~50 Hz)
+_WF_MAX_RECORDS: int = 30               # max assembled records kept per circuit
+_WF_FLAG_VALID_MASK: int = 0x7F         # bits 0-6 only; bit 7 must be 0
+_WF_INFLIGHT_TTL_S: float = 7200.0      # 2 h — absolute upper bound on supported event length
+_WF_MAX_CHUNK_SAMPLES: int = 1500       # firmware buffer cap; bound decoded-payload length defensively
+_WF_MAX_TOTAL_CHUNKS: int = 600         # bound for the 'total' field (~5 hour event at 30s cadence)
+
+
+@dataclass
+class WaveformMetadata:
+    """Per-event waveform metadata, populated from the final chunk."""
+    event_id: int           # id  — monotonic per-boot event counter
+    boot_id: int            # b   — ESP session id
+    start_ms: int           # event_s — event-wide start millis()
+    end_ms: int             # event_e — event-wide end millis()
+    start_points: int       # sn — len(start_flow) (derived: min(_WF_START_SAMPLES, full))
+    full_points: int        # fn — len(full_flow)  (sum of chunk samples)
+    flow_scale: int         # int16 → L/min divisor (constant 100 today)
+    pressure_scale: int     # int16 → PSI divisor (constant 100 today)
+    peak_flow: float        # pk — peak flow (×100 in wire, /100 here)
+    pressure_delta: float   # dp — pressure delta (×100 in wire, /100 here)
+    propagation_delay_ms: int   # pd — onset propagation delay (ms; -1 = not detected)
+    quality: int            # q  — 0 ok, 1 incomplete, firmware never publishes 2-6
+    flags: int              # fl — bitfield (see plan)
+    # Onset position. ``onset_seq`` and ``onset_idx`` are the source chunk
+    # and within-chunk sample index as reported by firmware; ``onset_index``
+    # is the linear index into the concatenated full_flow/full_pressure and
+    # is resolved by the accumulator once chunk lengths are known.
+    #
+    # Default to -1 (not 0) so a record constructed without onset fields —
+    # malformed parse, future schema change, hand-built test fixture —
+    # cannot silently look like "onset at sample 0" and have downstream
+    # feature_extractor treat the pre-roll as the post-onset ramp. _assemble
+    # also validates that (onset_seq, onset_idx) is in bounds for the
+    # received chunks and writes -1 if not.
+    onset_seq: int = -1
+    onset_idx: int = -1
+    onset_index: int = -1
+    pressure_onset_seq: int = -1
+    pressure_onset_idx: int = -1
+    pressure_onset_index: int = -1
+    # Legacy fields kept at zero for compat — pre/post/tail no longer meaningful.
+    pre_ms: int = 0
+    post_ms: int = 0
+    tail_ms: int = 0
+    version: int = 1
+
+
+@dataclass
+class WaveformRecord:
+    """Fully assembled and decoded per-event waveform — ready for feature extraction."""
+    circuit: str
+    boot_id: int
+    event_id: int
+    metadata: WaveformMetadata
+    # Variable-length lists — feature_extractor.py guards each access with `if x:`.
+    start_flow: List[float]       # L/min — first _WF_START_SAMPLES of full_flow
+    start_pressure: List[float]   # PSI
+    full_flow: List[float]        # L/min — concatenated across all chunks
+    full_pressure: List[float]    # PSI
+    received_at: float            # time.monotonic() when the final chunk assembled
+
+
+@dataclass
+class _InflightChunkSet:
+    """Per-event scratchpad: chunks seen, final metadata once it arrives, TTL stamp."""
+    chunks: Dict[int, Tuple[List[float], List[float]]] = field(default_factory=dict)
+    total: Optional[int] = None
+    final_metadata: Optional[WaveformMetadata] = None
+    first_received_at: float = 0.0
+    # Track which (seq) we've already DEBUG-logged a duplicate for, so the
+    # log doesn't spam if a chunk arrives 3+ times.
+    duplicate_logged: set = field(default_factory=set)
+
+
+def _parse_wire_bool(value: Any) -> bool:
+    """Parse a wire-format boolean tolerantly.
+
+    HA may pass back the literal string from the template, or coerce to a
+    native bool. Accept "true"/"false" (any case) and native True/False;
+    raise ValueError on anything else so the caller can DEBUG-log + reject.
+    """
+    if value is True:
+        return True
+    if value is False:
+        return False
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+    raise ValueError(f"invalid wire bool: {value!r}")
+
+
+def _normalize_int_field(d: dict, key: str) -> Optional[int]:
+    """Get d[key] and normalize to int. Returns None on missing/invalid.
+
+    Accepts str or native int; rejects bool (Python bool is int subclass).
+    Logs DEBUG with the rejection reason; the caller just checks for None.
+    """
+    raw = d.get(key)
+    if raw is None:
+        log.debug("waveform: chunk missing field %r", key)
+        return None
+    if isinstance(raw, bool):
+        log.debug("waveform: chunk field %r has unexpected bool value", key)
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        log.debug("waveform: chunk field %r not castable to int: %.40r", key, raw)
+        return None
+
+
+def _parse_chunk_scalars(data: dict) -> Optional[dict]:
+    """Parse and range-check the per-chunk scalar fields. Returns a dict of
+    normalized ints (b, id, seq, s, e, fs, ps) or None on failure."""
+    out: dict = {}
+    for key in ("b", "id", "seq", "s", "e", "fs", "ps"):
+        v = _normalize_int_field(data, key)
+        if v is None:
+            return None
+        out[key] = v
+    if out["b"] < 0 or out["id"] < 0 or out["seq"] < 0:
+        log.debug("waveform: chunk negative b/id/seq")
+        return None
+    if out["fs"] <= 0 or out["ps"] <= 0:
+        log.debug("waveform: chunk fs/ps must be positive")
+        return None
+    return out
+
+
+def _parse_final_metadata(
+    data: dict, circuit: str, full_len: int, start_len: int,
+) -> Optional[Tuple[WaveformMetadata, int]]:
+    """Build a WaveformMetadata from the final chunk's extra fields.
+
+    `full_len` is the total sample count after concatenation; `start_len` is
+    the prefix slice length (min of _WF_START_SAMPLES and full_len).
+
+    Returns ``(metadata, total)`` so the caller does not re-parse ``total``
+    (a defensive re-parse risks silently substituting 0 and assembling an
+    incomplete record).
+    """
+    b = _normalize_int_field(data, "b")
+    eid = _normalize_int_field(data, "id")
+    evs = _normalize_int_field(data, "event_s")
+    eve = _normalize_int_field(data, "event_e")
+    total = _normalize_int_field(data, "total")
+    onset_seq = _normalize_int_field(data, "onset_seq")
+    onset_idx = _normalize_int_field(data, "onset_idx")
+    press_onset_seq = _normalize_int_field(data, "press_onset_seq")
+    press_onset_idx = _normalize_int_field(data, "press_onset_idx")
+    pk = _normalize_int_field(data, "pk")
+    dp = _normalize_int_field(data, "dp")
+    pd = _normalize_int_field(data, "pd")
+    q = _normalize_int_field(data, "q")
+    fl = _normalize_int_field(data, "fl")
+    fs = _normalize_int_field(data, "fs")
+    ps = _normalize_int_field(data, "ps")
+    if None in (b, eid, evs, eve, total, onset_seq, onset_idx,
+                pk, dp, pd, q, fl, fs, ps,
+                press_onset_seq, press_onset_idx):
+        return None
+    if total <= 0 or total > _WF_MAX_TOTAL_CHUNKS:
+        log.debug("waveform[%s]: chunk total=%d out of range", circuit, total)
+        return None
+    if not (0 <= q <= 6):
+        log.debug("waveform[%s]: final q=%d out of range", circuit, q)
+        return None
+    if fl & ~_WF_FLAG_VALID_MASK:
+        log.debug("waveform[%s]: final fl=%d has invalid high bits", circuit, fl)
+        return None
+    # Onset position is reported here in (seq, idx) form; the linear index
+    # into the concatenated full array is resolved by the accumulator once
+    # all chunk lengths are known (`_assemble`).
+    meta = WaveformMetadata(
+        event_id=eid,
+        boot_id=b,
+        start_ms=evs,
+        end_ms=eve,
+        start_points=start_len,
+        full_points=full_len,
+        flow_scale=fs,
+        pressure_scale=ps,
+        peak_flow=pk / 100.0,
+        pressure_delta=dp / 100.0,
+        propagation_delay_ms=pd,
+        quality=q,
+        flags=fl,
+        onset_seq=onset_seq,
+        onset_idx=onset_idx,
+        pressure_onset_seq=press_onset_seq,
+        pressure_onset_idx=press_onset_idx if press_onset_seq >= 0 else -1,
+    )
+    return meta, total
+
+
+def _decode_waveform(
+    b64_payload: str,
+    scale: int,
+    expected_pts: Optional[int] = None,
+) -> Optional[List[float]]:
+    """Decode a base64-encoded little-endian int16 waveform payload.
+
+    Returns the decoded floats, or None when malformed. If ``expected_pts``
+    is given, the byte length must match exactly; if None, any whole int16
+    count is accepted (used by the chunk path, where chunk length varies).
+    """
+    if not b64_payload:
+        log.debug("waveform: empty base64 payload")
+        return None
+    try:
+        raw = base64.b64decode(b64_payload, validate=True)
+    except Exception:
+        log.debug("waveform: base64 decode error for payload %.40r", b64_payload)
+        return None
+    if len(raw) % 2 != 0:
+        log.debug("waveform: payload length %d not a whole int16 count", len(raw))
+        return None
+    if expected_pts is not None and len(raw) != expected_pts * 2:
+        log.debug(
+            "waveform: payload length %d != expected %d bytes (%d pts × 2)",
+            len(raw), expected_pts * 2, expected_pts,
+        )
+        return None
+    pts = len(raw) // 2
+    if pts > _WF_MAX_CHUNK_SAMPLES:
+        log.debug(
+            "waveform: payload %d samples exceeds max chunk size %d",
+            pts, _WF_MAX_CHUNK_SAMPLES,
+        )
+        return None
+    values: List[float] = []
+    for i in range(pts):
+        (v,) = struct.unpack_from("<h", raw, i * 2)
+        values.append(v / scale)
+    return values
+
+
+def _normalize_node_name(name: str) -> str:
+    """Normalize an ESPHome node name for identity comparison.
+
+    App.get_name() may use hyphens; HA entity prefixes use underscores.
+    Both sides of the comparison must be normalized the same way.
+    """
+    return name.strip().lower().replace("-", "_")
+
+
+class WaveformChunkAccumulator:
+    """
+    Per-circuit accumulator for chunked waveform delivery (firmware 3.9.0+).
+
+    The firmware streams `esphome.water_monitor_waveform_chunk` events keyed
+    by (boot_id, event_id, seq). Each non-final chunk carries a slice of the
+    flow + pressure waveform; the final chunk carries the last slice (which
+    may be empty) plus event-wide metadata + the expected `total` chunk count.
+
+    Lifecycle per event:
+      1. Chunks arrive in any order; held in an in-flight set per (boot, id).
+      2. Final chunk sets `total` and the WaveformMetadata.
+      3. When all seqs 0..total-1 are present, the accumulator concatenates
+         them and emits a WaveformRecord. The in-flight entry is removed.
+      4. Missing seqs at final time → DEBUG log, no record (a delayed chunk
+         can still complete the set later until TTL eviction).
+
+    **Durability:** chunk accumulation is in-memory only. An add-on restart
+    during an active event drops in-flight chunks for that event; the final
+    chunk arriving after restart will be missing predecessors and won't
+    assemble. EventDetector continues normal event detection without
+    waveform enrichment in that specific case — no persistence layer.
+
+    Exposes get_record / latest_record / pop_record so EventDetector's
+    public accessors are a thin pass-through (see EventDetector below).
+    """
+
+    def __init__(self, circuit: str, expected_node: str) -> None:
+        self._circuit = circuit
+        # Normalize once so every comparison is cheap.
+        self._expected_node = _normalize_node_name(expected_node)
+        self._inflight: Dict[Tuple[int, int], _InflightChunkSet] = {}
+        self._records: List[WaveformRecord] = []
+
+    # ------------------------------------------------------------------
+    # Public callback
+    # ------------------------------------------------------------------
+
+    def on_waveform_chunk(self, data: dict) -> None:
+        """Process a single esphome.water_monitor_waveform_chunk event."""
+        now = time.monotonic()
+        self._evict_stale(now)
+
+        # Identity & schema guards.
+        if data.get("schema") != "esp_water_monitor_waveform_chunk":
+            log.debug("waveform[%s]: chunk rejected — unexpected schema %r",
+                      self._circuit, data.get("schema"))
+            return
+        if str(data.get("transport_version", "")) != "1":
+            log.debug("waveform[%s]: chunk rejected — unsupported transport_version %r",
+                      self._circuit, data.get("transport_version"))
+            return
+        node = _normalize_node_name(data.get("node", ""))
+        if self._expected_node and node != self._expected_node:
+            log.debug("waveform[%s]: chunk rejected — node %r != expected %r",
+                      self._circuit, node, self._expected_node)
+            return
+        if data.get("circuit") != self._circuit:
+            return  # silently skip other circuits
+
+        # Scalars.
+        sc = _parse_chunk_scalars(data)
+        if sc is None:
+            return
+        try:
+            is_final = _parse_wire_bool(data.get("final", "false"))
+        except ValueError:
+            log.debug("waveform[%s]: chunk rejected — invalid 'final' value %r",
+                      self._circuit, data.get("final"))
+            return
+
+        # Decode flow/press payloads. On a final chunk an empty payload is
+        # explicitly allowed (firmware flushed the last sample in a prior
+        # chunk); on a non-final chunk it's a wire-format error.
+        flow_b64 = data.get("flow", "")
+        press_b64 = data.get("press", "")
+        if is_final and flow_b64 == "" and press_b64 == "":
+            flow: List[float] = []
+            press: List[float] = []
+        else:
+            decoded_flow = _decode_waveform(flow_b64, sc["fs"])
+            decoded_press = _decode_waveform(press_b64, sc["ps"])
+            if decoded_flow is None or decoded_press is None:
+                log.debug("waveform[%s]: chunk seq=%d rejected — payload decode failed",
+                          self._circuit, sc["seq"])
+                return
+            if len(decoded_flow) != len(decoded_press):
+                log.debug(
+                    "waveform[%s]: chunk seq=%d rejected — flow/press length mismatch (%d vs %d)",
+                    self._circuit, sc["seq"], len(decoded_flow), len(decoded_press),
+                )
+                return
+            flow, press = decoded_flow, decoded_press
+
+        key = (sc["b"], sc["id"])
+        cs = self._inflight.get(key)
+        if cs is None:
+            cs = _InflightChunkSet(first_received_at=now)
+            self._inflight[key] = cs
+
+        seq = sc["seq"]
+
+        # Reject seq values that exceed any already-known total (catches
+        # corrupted/duplicate-event_id misroutes).
+        if cs.total is not None and seq >= cs.total:
+            log.debug(
+                "waveform[%s]: chunk seq=%d rejected — exceeds known total=%d (boot=%d id=%d)",
+                self._circuit, seq, cs.total, sc["b"], sc["id"],
+            )
+            return
+
+        # Duplicate handling.
+        if seq in cs.chunks:
+            prev_flow, _prev_press = cs.chunks[seq]
+            if len(prev_flow) == len(flow):
+                if seq not in cs.duplicate_logged:
+                    log.debug(
+                        "waveform[%s]: duplicate chunk seq=%d for boot=%d id=%d — same length, replacing",
+                        self._circuit, seq, sc["b"], sc["id"],
+                    )
+                    cs.duplicate_logged.add(seq)
+                cs.chunks[seq] = (flow, press)
+            else:
+                log.debug(
+                    "waveform[%s]: duplicate chunk seq=%d for boot=%d id=%d — length mismatch (%d vs %d), rejecting",
+                    self._circuit, seq, sc["b"], sc["id"], len(prev_flow), len(flow),
+                )
+                return
+        else:
+            cs.chunks[seq] = (flow, press)
+
+        # On final, capture metadata + total and try to assemble.
+        if is_final:
+            # Compute provisional full length to feed metadata builder.
+            chunks_in_order = sorted(cs.chunks.items())
+            full_len = sum(len(f) for _, (f, _p) in chunks_in_order)
+            start_len = min(_WF_START_SAMPLES, full_len)
+            parsed = _parse_final_metadata(data, self._circuit, full_len, start_len)
+            if parsed is None:
+                # Don't pop the in-flight entry — TTL will GC it. The DEBUG
+                # log already explained why.
+                return
+            meta, total = parsed
+            # Use the already-validated total from _parse_final_metadata
+            # rather than re-parsing the wire field (a re-parse failure
+            # would silently substitute 0 and assemble an empty record).
+            cs.total = total
+            cs.final_metadata = meta
+
+        # Try to assemble if we have a known total and all seqs are present.
+        if cs.total is not None and cs.final_metadata is not None:
+            missing = [s for s in range(cs.total) if s not in cs.chunks]
+            if missing:
+                log.debug(
+                    "waveform[%s]: cannot assemble event %d yet — missing %d/%d chunk(s): seqs %s",
+                    self._circuit, sc["id"], len(missing), cs.total, missing,
+                )
+                return
+            self._assemble(key, cs)
+
+    # ------------------------------------------------------------------
+    # Assembly
+    # ------------------------------------------------------------------
+
+    def _assemble(self, key: Tuple[int, int], cs: _InflightChunkSet) -> None:
+        meta = cs.final_metadata
+        assert meta is not None
+        chunks_in_order = sorted(cs.chunks.items())
+
+        full_flow: List[float] = []
+        full_press: List[float] = []
+        # Resolve the (onset_seq, onset_idx) pair to a linear index into the
+        # concatenated full_flow / full_pressure arrays by summing the lengths
+        # of all chunks strictly before onset_seq. This is robust to a future
+        # firmware that extends the pre-roll across multiple chunks or fires
+        # an event without flow pre-roll.
+        prefix_len: Dict[int, int] = {}
+        chunk_lengths: Dict[int, int] = {}
+        running = 0
+        for seq, (flow, press) in chunks_in_order:
+            prefix_len[seq] = running
+            chunk_lengths[seq] = len(flow)
+            full_flow.extend(flow)
+            full_press.extend(press)
+            running += len(flow)
+
+        def _linear(seq: int, idx: int) -> int:
+            """Resolve (seq, idx) to a linear index into full_flow/full_press.
+
+            Returns -1 when:
+              - seq < 0 (firmware reported "no onset")
+              - seq isn't among the received chunks (corrupt metadata)
+              - idx isn't a valid position inside that chunk
+
+            Downstream feature_extractor treats -1 as "use legacy onset
+            detection from the waveform itself" rather than trusting a
+            silently-clamped value (the old behaviour clamped any negative
+            idx to 0, which made a missing-onset record look like onset
+            lived at sample 0 — wrong for any event with a pre-roll).
+            """
+            if seq < 0:
+                return -1
+            if seq not in chunk_lengths:
+                return -1
+            if not (0 <= idx < chunk_lengths[seq]):
+                return -1
+            return prefix_len[seq] + idx
+
+        meta.onset_index = _linear(meta.onset_seq, meta.onset_idx)
+        meta.pressure_onset_index = _linear(
+            meta.pressure_onset_seq, meta.pressure_onset_idx)
+
+        start_flow = full_flow[:_WF_START_SAMPLES]
+        start_press = full_press[:_WF_START_SAMPLES]
+
+        # Update lengths in metadata after concat in case _parse_final_metadata
+        # under-counted (shouldn't happen but defensive).
+        meta.full_points = len(full_flow)
+        meta.start_points = len(start_flow)
+
+        # feature_extractor derives per-sample dt from (pre_ms + post_ms) /
+        # start_points. The firmware streams at native ~50 Hz cadence (20 ms
+        # per sample); populate pre_ms / post_ms so dt resolves to 0.020 s
+        # and the onset position is recoverable. When the resolved onset lies
+        # within the start window we expose it via pre_ms/post_ms; otherwise
+        # we just describe the start window's full extent and downstream code
+        # falls back to legacy onset detection from the waveform itself.
+        _SAMPLE_MS = 20
+        if meta.start_points > 0:
+            if 0 <= meta.onset_index < meta.start_points:
+                onset_in_start = meta.onset_index
+                meta.pre_ms = onset_in_start * _SAMPLE_MS
+                meta.post_ms = (meta.start_points - onset_in_start) * _SAMPLE_MS
+            else:
+                # Onset is either unknown (onset_index == -1 after the
+                # bounds-check above) or lies outside the start window.
+                # Describe the window's full extent only; feature_extractor
+                # falls back to detecting onset from the waveform itself.
+                meta.pre_ms = 0
+                meta.post_ms = meta.start_points * _SAMPLE_MS
+        # tail_ms = 0: chunked records do not capture a post-event recovery
+        # tail. The full waveform spans onset → event end only. Setting this
+        # to anything else feeds the wrong "tail" into feature_extractor's
+        # recovery_overshoot_psi / steady_state_fraction full-window math.
+        # When tail_ms is 0, those blocks fall through and the legacy
+        # _pressure_shape_features value survives (which is correct — it
+        # measures over the full pressure_readings window).
+        meta.tail_ms = 0
+
+        record = WaveformRecord(
+            circuit=self._circuit,
+            boot_id=meta.boot_id,
+            event_id=meta.event_id,
+            metadata=meta,
+            start_flow=start_flow,
+            start_pressure=start_press,
+            full_flow=full_flow,
+            full_pressure=full_press,
+            received_at=time.monotonic(),
+        )
+        self._records.append(record)
+        if len(self._records) > _WF_MAX_RECORDS:
+            self._records = self._records[-_WF_MAX_RECORDS:]
+
+        # Done — remove the in-flight entry so late stray chunks for this
+        # event_id don't keep growing memory.
+        self._inflight.pop(key, None)
+
+        log.debug(
+            "waveform[%s]: assembled event %d from %d chunk(s) "
+            "(boot=%d full=%d start=%d q=%d fl=0x%02x pk=%.2f dp=%.2f pd=%dms)",
+            self._circuit, meta.event_id, cs.total, meta.boot_id,
+            meta.full_points, meta.start_points,
+            meta.quality, meta.flags,
+            meta.peak_flow, meta.pressure_delta, meta.propagation_delay_ms,
+        )
+
+    # ------------------------------------------------------------------
+    # TTL eviction
+    # ------------------------------------------------------------------
+
+    def _evict_stale(self, now: float) -> None:
+        stale = [
+            k for k, cs in self._inflight.items()
+            if (now - cs.first_received_at) > _WF_INFLIGHT_TTL_S
+        ]
+        for k in stale:
+            cs = self._inflight.pop(k, None)
+            if cs is not None:
+                log.debug(
+                    "waveform[%s]: in-flight chunk set evicted (boot=%d id=%d, %d chunk(s), total=%s)",
+                    self._circuit, k[0], k[1], len(cs.chunks), cs.total,
+                )
+
+    # ------------------------------------------------------------------
+    # Lookup interface
+    # ------------------------------------------------------------------
+
+    def get_record(self, boot_id: int, event_id: int) -> Optional[WaveformRecord]:
+        for rec in reversed(self._records):
+            if rec.boot_id == boot_id and rec.event_id == event_id:
+                return rec
+        return None
+
+    def latest_record(self) -> Optional[WaveformRecord]:
+        return self._records[-1] if self._records else None
+
+    def pop_record(self, boot_id: int, event_id: int) -> Optional[WaveformRecord]:
+        for i in range(len(self._records) - 1, -1, -1):
+            if self._records[i].boot_id == boot_id and self._records[i].event_id == event_id:
+                return self._records.pop(i)
+        return None
 
 
 class EventDetector:
@@ -477,14 +1543,19 @@ class EventDetector:
         ha_client: Any,
         event_queue: asyncio.Queue,
         sensitivity_getter: Callable[[str], dict],
+        debug_capture_propagation: bool = False,
     ) -> None:
         self._circuits = circuits
         self._ha = ha_client
         self._queue = event_queue
         self._sensitivity_getter = sensitivity_getter
+        self._debug_capture_propagation = debug_capture_propagation
         self._detectors: Dict[str, CircuitEventDetector] = {}
         # Tracks live valve open/closed state per circuit for cross-circuit feature
         self._valve_open: Dict[str, bool] = {}
+        # Chunked HA-event waveform accumulators (firmware 3.9.0+) — sole transport.
+        self._chunk_accumulators: Dict[str, WaveformChunkAccumulator] = {}
+        self._wf_event_subscribed: bool = False
         self._is_configured = False
 
     def setup(self) -> None:
@@ -502,24 +1573,47 @@ class EventDetector:
             sens = self._sensitivity_getter(cfg.circuit)
             detector = CircuitEventDetector(
                 circuit=cfg.circuit,
-                pressure_drop_threshold_psi=sens.get("pressure_drop_event_psi", 2.0),
+                pressure_drop_threshold_psi=sens.get("pressure_drop_event_psi", 1.2),
                 min_event_duration_seconds=sens.get("min_event_duration_seconds", 3.0),
                 event_queue=self._queue,
                 get_other_valve_open=(
                     lambda c=cfg.circuit: self._get_other_valve_open(c)
                 ),
+                flow_onset_entity=cfg.flow_onset_sensor,
+                debug_capture_propagation=self._debug_capture_propagation,
             )
             self._detectors[cfg.circuit] = detector
 
-            self._ha.subscribe_entity(cfg.flow_sensor,          detector.on_flow_rate)
-            self._ha.subscribe_entity(cfg.pressure_fast_sensor, detector.on_pressure_fast)
-            self._ha.subscribe_entity(cfg.flow_onset_sensor,    detector.on_flow_onset)
+            if cfg.flow_sensor:
+                self._ha.subscribe_entity(cfg.flow_sensor,          detector.on_flow_rate)
+            if cfg.pressure_fast_sensor:
+                self._ha.subscribe_entity(cfg.pressure_fast_sensor, detector.on_pressure_fast)
+            if cfg.flow_onset_sensor:
+                self._ha.subscribe_entity(cfg.flow_onset_sensor,    detector.on_flow_onset)
             # Track valve states so we can record other-circuit valve open at event start
             if cfg.valve_entity:
                 self._ha.subscribe_entity(
                     cfg.valve_entity,
                     lambda eid, state, attrs, c=cfg.circuit: self._on_valve_state(c, state),
                 )
+
+            # Per-event waveform capture (firmware 3.9.0+, chunked streaming).
+            # esp_device_prefix is e.g. "esp_water_main_"; strip the trailing
+            # underscore to get the normalized node name for identity comparison.
+            # removesuffix("_") strips exactly one trailing underscore;
+            # rstrip("_") was over-eager and would strip multiple if a
+            # prefix were ever configured with a double-underscore tail.
+            expected_node = cfg.esp_device_prefix.removesuffix("_")
+            accumulator = WaveformChunkAccumulator(cfg.circuit, expected_node=expected_node)
+            self._chunk_accumulators[cfg.circuit] = accumulator
+
+            # Register the HA event subscription once (shared across all circuits).
+            if not self._wf_event_subscribed:
+                self._ha.subscribe_event(
+                    "esphome.water_monitor_waveform_chunk",
+                    self._on_waveform_chunk,
+                )
+                self._wf_event_subscribed = True
 
             log.info(
                 "[%s] event detector ready — triggers: "
@@ -528,15 +1622,29 @@ class EventDetector:
                 cfg.circuit,
                 detector.MIN_FLOW_LPM,
                 detector.FLOW_START_SECONDS,
-                sens.get("pressure_drop_event_psi", 2.0),
+                sens.get("pressure_drop_event_psi", 1.2),
             )
+
+        log.info(
+            "propagation-delay capture: %s",
+            "ENABLED — flow events emit PROPAGATION_CAPTURE blobs"
+            if self._debug_capture_propagation else "disabled",
+        )
 
     def update_thresholds(self) -> None:
         """Reload thresholds from config after sensitivity settings change."""
         for circuit, detector in self._detectors.items():
             sens = self._sensitivity_getter(circuit)
-            detector.update_threshold(sens.get("pressure_drop_event_psi", 2.0))
+            detector.update_threshold(sens.get("pressure_drop_event_psi", 1.2))
             detector.min_event_duration = sens.get("min_event_duration_seconds", 3.0)
+
+    def _on_waveform_chunk(self, data: dict) -> None:
+        """Route an esphome.water_monitor_waveform_chunk event to the correct circuit."""
+        circuit = data.get("circuit", "")
+        accumulator = self._chunk_accumulators.get(circuit)
+        if accumulator is not None:
+            accumulator.on_waveform_chunk(data)
+        # Wrong or missing circuit is handled silently by the accumulator itself.
 
     def _on_valve_state(self, circuit: str, state: str) -> None:
         """Update tracked valve state for cross-circuit feature."""
@@ -558,3 +1666,28 @@ class EventDetector:
     def get_active_event(self, circuit: str) -> Optional[RawEvent]:
         detector = self._detectors.get(circuit)
         return detector._active_event if detector else None
+
+    def get_waveform_record(
+        self,
+        circuit: str,
+        boot_id: int,
+        event_id: int,
+    ) -> Optional[WaveformRecord]:
+        """Return the assembled WaveformRecord for (boot_id, event_id), or None."""
+        accumulator = self._chunk_accumulators.get(circuit)
+        return accumulator.get_record(boot_id, event_id) if accumulator else None
+
+    def get_latest_waveform(self, circuit: str) -> Optional[WaveformRecord]:
+        """Return the most-recently assembled WaveformRecord for a circuit, or None."""
+        accumulator = self._chunk_accumulators.get(circuit)
+        return accumulator.latest_record() if accumulator else None
+
+    def pop_waveform_record(
+        self,
+        circuit: str,
+        boot_id: int,
+        event_id: int,
+    ) -> Optional[WaveformRecord]:
+        """Remove and return the WaveformRecord for (boot_id, event_id), or None."""
+        accumulator = self._chunk_accumulators.get(circuit)
+        return accumulator.pop_record(boot_id, event_id) if accumulator else None

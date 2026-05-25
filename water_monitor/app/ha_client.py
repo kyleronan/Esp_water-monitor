@@ -26,8 +26,20 @@ log = logging.getLogger(__name__)
 WS_URL = "ws://supervisor/core/websocket"
 REST_URL = "http://supervisor/core/api"
 
+_GAL_UNITS = {"gal", "us gal", "gallon", "gallons", "us gallon", "us liquid gallon"}
+
+
+def vol_to_litres(value: float, unit: str) -> float:
+    """Convert a volume value to litres; pass-through if already in L or unknown."""
+    if (unit or "").strip().lower() in _GAL_UNITS:
+        return value * 3.785411784
+    return value
+
 # Type for state-changed callbacks: (entity_id, new_state, attributes) -> None
 StateCallback = Callable[[str, str, dict], None]
+
+# Type for HA event callbacks: (event_data_dict) -> None
+EventCallback = Callable[[dict], None]
 
 
 class HaClient:
@@ -44,11 +56,14 @@ class HaClient:
         self._token = supervisor_token()
         self._http: Optional[aiohttp.ClientSession] = None
         self._subscriptions: Dict[str, List[StateCallback]] = {}
+        self._event_subscriptions: Dict[str, List[EventCallback]] = {}
+        self._event_sub_ids: Dict[int, str] = {}  # ws msg_id → event_type
         self._ws_msg_id = 1
         self._ws_lock = asyncio.Lock()
         self._ws_oneshot: Optional[Any] = None   # persistent connection for ws_request
         self._running = False
         self._stop_event = asyncio.Event()
+        self._reconnect_event = asyncio.Event()
 
     async def __aenter__(self) -> "HaClient":
         self._http = aiohttp.ClientSession(
@@ -68,6 +83,14 @@ class HaClient:
     def stop(self) -> None:
         self._stop_event.set()
 
+    def request_reconnect(self) -> None:
+        """Signal the listen loop to reconnect, re-subscribing with the current entity list.
+
+        Call this after adding new subscriptions on an already-running connection
+        (e.g. after the setup wizard completes and adds circuit entity subscriptions).
+        """
+        self._reconnect_event.set()
+
     def subscribe_entity(self, entity_id: str, callback: StateCallback) -> None:
         """Register a callback for state_changed events on entity_id."""
         if entity_id not in self._subscriptions:
@@ -78,6 +101,17 @@ class HaClient:
                            callback: StateCallback) -> None:
         for eid in entity_ids:
             self.subscribe_entity(eid, callback)
+
+    def subscribe_event(self, event_type: str, callback: EventCallback) -> None:
+        """Register a callback for HA bus events of event_type.
+
+        Idempotent — the same (event_type, callback) pair is never registered twice.
+        Triggers a WebSocket reconnect so the new subscription is picked up.
+        """
+        callbacks = self._event_subscriptions.setdefault(event_type, [])
+        if callback not in callbacks:
+            callbacks.append(callback)
+            self._reconnect_event.set()
 
     # ------------------------------------------------------------------
     # Persistent event subscription loop
@@ -102,21 +136,55 @@ class HaClient:
                     pass
 
     async def _connect_and_listen(self) -> None:
+        self._reconnect_event.clear()
+        # Buffer for messages that arrive mid-handshake — flushed via the
+        # normal dispatch path once subscriptions are confirmed so that
+        # state_changed / HA bus events fired during setup are not lost.
+        deferred: List[dict] = []
+        sub_id: int = 0
         async with websockets.connect(WS_URL, max_size=2**24,
                                       ping_interval=30) as ws:
             await self._auth(ws)
-            sub_id = await self._subscribe_entity_states(ws)
-            log.info("HA WebSocket connected, monitoring %d entities",
-                     len(self._subscriptions))
+            try:
+                sub_id = await self._subscribe_entity_states(ws, deferred)
+                self._event_sub_ids = await self._subscribe_ha_events(
+                    ws, sub_id, deferred)
+            except Exception:
+                # Subscribe timed out or HA rejected the subscription. Flush
+                # whatever we already buffered before propagating: the outer
+                # run_event_loop will reconnect with a fresh `deferred` list,
+                # so anything left here is lost forever otherwise. Routing
+                # uses the latest `self._event_sub_ids` (possibly stale by one
+                # connection) plus the partial sub_id — _route_event_msg's
+                # `if msg.get("type") != "event"` and id-matching guards make
+                # mis-routes safe (the message is simply not dispatched).
+                if deferred:
+                    log.warning(
+                        "HA subscribe failed; flushing %d buffered event(s) "
+                        "before reconnect", len(deferred))
+                for msg in deferred:
+                    self._route_event_msg(msg, sub_id, self._event_sub_ids)
+                raise
+            log.info(
+                "HA WebSocket connected, monitoring %d entities, %d event types",
+                len(self._subscriptions), len(self._event_sub_ids),
+            )
+            # Flush any events received during the subscription handshake.
+            for msg in deferred:
+                self._route_event_msg(msg, sub_id, self._event_sub_ids)
+            deferred.clear()
 
-            while not self._stop_event.is_set():
+            while not self._stop_event.is_set() and not self._reconnect_event.is_set():
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=60)
                 except asyncio.TimeoutError:
                     continue
                 msg = json.loads(raw)
-                if sub_id and msg.get("type") == "event" and msg.get("id") == sub_id:
-                    self._dispatch_entity_change(msg.get("event", {}))
+                self._route_event_msg(msg, sub_id, self._event_sub_ids)
+
+            if self._reconnect_event.is_set():
+                log.info("HA WebSocket reconnecting to pick up %d updated entity subscriptions",
+                         len(self._subscriptions))
 
     async def _auth(self, ws) -> None:
         hello = json.loads(await ws.recv())
@@ -130,11 +198,15 @@ class HaClient:
         if result.get("type") != "auth_ok":
             raise RuntimeError(f"Auth failed: {result}")
 
-    async def _subscribe_entity_states(self, ws) -> int:
+    async def _subscribe_entity_states(self, ws, deferred: List[dict]) -> int:
         """Subscribe to targeted entity state updates via subscribe_entities.
 
         Returns the subscription message ID so the recv loop can match
         incoming events. Returns 0 if there are no registered entity IDs.
+
+        ``deferred`` collects any non-matching messages received while
+        waiting for the result so they can be dispatched after the
+        handshake — otherwise they would be silently dropped.
         """
         entity_ids = list(self._subscriptions.keys())
         if not entity_ids:
@@ -145,7 +217,7 @@ class HaClient:
             "type": "subscribe_entities",
             "entity_ids": entity_ids,
         }))
-        # Wait for subscription confirmation.
+        # Wait for subscription confirmation; buffer everything else.
         while True:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=15)
@@ -157,6 +229,9 @@ class HaClient:
                 if msg.get("type") == "result" and msg.get("success"):
                     return msg_id
                 raise RuntimeError(f"subscribe_entities failed: {msg}")
+            # Not our result — defer for the post-handshake flush.
+            if msg.get("type") == "event":
+                deferred.append(msg)
 
     def _dispatch_entity_change(self, event: dict) -> None:
         """Dispatch subscribe_entities change events to registered callbacks.
@@ -176,6 +251,75 @@ class HaClient:
                     cb(entity_id, state, attributes)
                 except Exception as e:
                     log.error("Callback error for %s: %s", entity_id, e)
+
+    async def _subscribe_ha_events(
+        self, ws, entity_sub_id: int, deferred: List[dict],
+    ) -> Dict[int, str]:
+        """Subscribe to each registered HA event type.
+
+        Returns {msg_id: event_type} so the recv loop can match incoming
+        messages.
+
+        ``entity_sub_id`` is the already-confirmed subscribe_entities id;
+        ``deferred`` collects any event messages received while we are
+        waiting for subscribe_events results so they can be dispatched
+        after the handshake — otherwise state_changed messages on the
+        entity subscription (already streaming by this point) would be
+        silently dropped.
+        """
+        id_to_type: Dict[int, str] = {}
+        for event_type in self._event_subscriptions:
+            msg_id = self._next_id()
+            await ws.send(json.dumps({
+                "id": msg_id,
+                "type": "subscribe_events",
+                "event_type": event_type,
+            }))
+            while True:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"Timeout waiting for subscribe_events({event_type!r}) confirmation")
+                resp = json.loads(raw)
+                if resp.get("id") == msg_id:
+                    if resp.get("type") == "result" and resp.get("success"):
+                        id_to_type[msg_id] = event_type
+                        break
+                    raise RuntimeError(
+                        f"subscribe_events({event_type!r}) failed: {resp}")
+                # Not our result — defer event messages for the post-handshake
+                # flush. (entity_sub_id and prior id_to_type entries may already
+                # be streaming events at this point.)
+                if resp.get("type") == "event":
+                    deferred.append(resp)
+        return id_to_type
+
+    def _route_event_msg(
+        self, msg: dict, sub_id: int, event_sub_ids: Dict[int, str],
+    ) -> None:
+        """Dispatch a single incoming WS message to the right callback path.
+
+        Centralises the routing logic so the recv loop and the post-handshake
+        deferred-flush use identical behaviour.
+        """
+        if msg.get("type") != "event":
+            return
+        msg_id = msg.get("id")
+        if sub_id and msg_id == sub_id:
+            self._dispatch_entity_change(msg.get("event", {}))
+        elif msg_id in event_sub_ids:
+            self._dispatch_ha_event(msg.get("event", {}))
+
+    def _dispatch_ha_event(self, event: dict) -> None:
+        """Dispatch a subscribed HA bus event to registered callbacks."""
+        event_type = event.get("event_type", "")
+        data = event.get("data", {})
+        for cb in self._event_subscriptions.get(event_type, []):
+            try:
+                cb(data)
+            except Exception as e:
+                log.error("HA event callback error for %s: %s", event_type, e)
 
     def _next_id(self) -> int:
         self._ws_msg_id += 1
@@ -329,6 +473,19 @@ class HaClient:
             eid: (None if isinstance(r, Exception) else r)
             for eid, r in zip(entity_ids, results)
         }
+
+    async def get_ha_config(self) -> Dict[str, Any]:
+        """GET /api/config — returns HA instance config including time_zone."""
+        if not self._http:
+            return {}
+        try:
+            async with self._http.get(f"{REST_URL}/config") as resp:
+                if resp.status != 200:
+                    return {}
+                return await resp.json()
+        except Exception as e:
+            log.warning("get_ha_config failed: %s", e)
+            return {}
 
     async def get_all_states(self) -> List[Dict[str, Any]]:
         """GET /api/states — returns all entity states."""

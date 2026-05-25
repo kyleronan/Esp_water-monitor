@@ -20,6 +20,10 @@ class CircuitConfig:
     circuit: str
     circuit_type: str   # 'fixture' or 'zone'
 
+    # User-facing display label — loaded at runtime from circuit_labels table.
+    # Empty string means not yet loaded; use .label property to read safely.
+    display_name: str = ""
+
     # Entity IDs — populated at runtime from device_discovery / circuit_entity_map.
     # Empty string means not yet discovered.
     flow_sensor: str = ""
@@ -36,6 +40,11 @@ class CircuitConfig:
     leak_test_switch: str = ""
     leak_test_result_sensor: str = ""
     volume_sensor: str = ""
+    # Waveform diagnostic counters — the only wf_* entities after the 3.8.0
+    # HA-event transport migration removed the 5 chunked text sensors.
+    # Chunk drop count was added in 3.9.0 with chunked streaming.
+    wf_overflow_count_sensor: str = ""
+    wf_chunk_drop_count_sensor: str = ""
     esp_device_prefix: str = ""
 
     @property
@@ -43,8 +52,14 @@ class CircuitConfig:
         return self.circuit_type == "zone"
 
     @property
-    def display_name(self) -> str:
-        return self.circuit.replace("_", " ").title()
+    def label(self) -> str:
+        """Human-readable name — stored display_name value, or fallback from circuit ID."""
+        return self.display_name or self.circuit.replace("_", " ").title()
+
+    @property
+    def display_label(self) -> str:
+        """Temporary compat alias for label — remove after one release."""
+        return self.label
 
     @property
     def is_fully_configured(self) -> bool:
@@ -63,6 +78,10 @@ class AddonConfig:
     esp_device_name: str
     circuits: List[CircuitConfig]
 
+    # When true, the event detector emits a full JSON capture blob per flow
+    # event so the propagation scan can be replayed offline. Off by default.
+    debug_capture_propagation: bool = False
+
     def get_circuit(self, name: str) -> Optional[CircuitConfig]:
         return next((c for c in self.circuits if c.circuit == name), None)
 
@@ -74,24 +93,26 @@ def load_config() -> AddonConfig:
         with OPTIONS_PATH.open() as f:
             raw = json.load(f)
 
+    from .circuit_compat import resolve_circuit
     circuits = []
     for c in raw.get("circuits", []):
         circuits.append(CircuitConfig(
-            circuit=c["circuit"],
+            circuit=resolve_circuit(c["circuit"]),
             circuit_type=c.get("circuit_type", "fixture"),
         ))
 
     # Default circuits if none configured
     if not circuits:
         circuits = [
-            CircuitConfig(circuit="main", circuit_type="fixture"),
-            CircuitConfig(circuit="irrigation", circuit_type="zone"),
+            CircuitConfig(circuit="circuit_1", circuit_type="fixture"),
+            CircuitConfig(circuit="circuit_2", circuit_type="zone"),
         ]
 
     return AddonConfig(
         log_level=raw.get("log_level", "info"),
         esp_device_name=raw.get("esp_device_name", ""),
         circuits=circuits,
+        debug_capture_propagation=bool(raw.get("debug_capture_propagation", False)),
     )
 
 
@@ -113,7 +134,7 @@ SENSITIVITY_PRESETS = {
         "max_shutoffs_per_12h": 1,
     },
     "medium": {
-        "pressure_drop_event_psi": 2.0,
+        "pressure_drop_event_psi": 1.2,
         "min_event_duration_seconds": 3.0,
         "score_alert": 0.60,
         "score_shutoff": 0.80,

@@ -102,6 +102,53 @@ def user_selectable_types() -> List[str]:
     return [t for t in FIXTURE_TYPES if t not in INTERNAL_FIXTURE_TYPES]
 
 
+# ── Circuit type taxonomy ─────────────────────────────────────────────────
+
+CIRCUIT_TYPES: List[str] = ["fixture", "zone"]
+
+CIRCUIT_TYPE_LABELS: Dict[str, str] = {
+    "fixture": "Fixture / main shutoff",
+    "zone":    "Irrigation / zone valve",
+}
+
+CIRCUIT_TYPE_HELP: Dict[str, str] = {
+    "fixture": "Learns normal household fixture signatures such as toilets, showers, taps, appliances, and hose bibs.",
+    "zone":    "Learns irrigation-zone flow patterns and enables zone-specific alert types.",
+}
+
+# Zone-only alert types — used by settings UI to hide irrelevant alerts on fixture circuits.
+ZONE_ONLY_ALERT_TYPES: frozenset = frozenset({
+    "pre_solenoid_leak",
+    "solenoid_weeping",
+    "zone_flow_deviation_high",
+    "zone_flow_deviation_low",
+    "zone_duration_overrun",
+})
+
+# Fixture types appropriate for a zone (irrigation) circuit.
+_ZONE_FIXTURE_TYPES: List[str] = ["irrigation_zone", "hose_bib", "pool_fill", "other"]
+
+
+def normalize_circuit_type(value: Optional[str]) -> str:
+    """Map legacy "irrigation" → "zone"; unknown/None → "fixture"."""
+    if value == "irrigation":
+        return "zone"
+    if value in CIRCUIT_TYPES:
+        return value
+    return "fixture"
+
+
+def zone_user_selectable_types() -> List[str]:
+    """Fixture types appropriate for a zone (irrigation) circuit."""
+    return [t for t in _ZONE_FIXTURE_TYPES if t not in INTERNAL_FIXTURE_TYPES]
+
+
+def fixture_user_selectable_types() -> List[str]:
+    """Fixture types appropriate for a household fixture circuit."""
+    _zone_only = {"irrigation_zone"}
+    return [t for t in FIXTURE_TYPES if t not in INTERNAL_FIXTURE_TYPES and t not in _zone_only]
+
+
 # ── Variance profiles for type-aware cluster matching ────────────────────
 # Each fixture type has fundamentally different variance characteristics:
 #
@@ -143,11 +190,14 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     # ── Deterministic ────────────────────────────────────────────────────
     "toilet": {
         "anchor_weights": {
-            "volume_litres":          3.0,
-            "duration_seconds":       3.0,
-            "avg_flow_lpm":           2.0,
-            "has_pressure_transient": 2.0,
-            "resistance_curve_shape": 2.0,   # forward-looking
+            "volume_litres":              3.0,
+            "duration_seconds":           3.0,
+            "avg_flow_lpm":               2.0,
+            "has_pressure_transient":     2.0,
+            "resistance_curve_shape":     2.0,   # forward-looking
+            "recovery_overshoot_psi":     1.5,   # water hammer on cistern snap-shut
+            "pressure_oscillation_count": 1.5,
+            "pressure_onset_ms":          1.0,
         },
         "float_features": {"hour_sin", "hour_cos", "day_of_week", "is_weekend"},
         "expected_cv": {"volume_litres": 0.08, "duration_seconds": 0.10},
@@ -199,6 +249,8 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
             "pressure_delta_psi":     2.0,
             "flow_variability":       1.5,
             "hydraulic_resistance":   2.0,   # forward-looking
+            "recovery_overshoot_psi": 1.0,
+            "pressure_onset_ms":      1.0,
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.45, "volume_litres": 0.45},
@@ -215,8 +267,10 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     },
     "bathroom_tap": {
         "anchor_weights": {
-            "avg_flow_lpm":       2.5,
-            "pressure_delta_psi": 1.5,
+            "avg_flow_lpm":           2.5,
+            "pressure_delta_psi":     1.5,
+            "recovery_overshoot_psi": 1.0,
+            "pressure_onset_ms":      1.0,
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.60, "volume_litres": 0.60},
@@ -224,8 +278,10 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     },
     "kitchen_tap": {
         "anchor_weights": {
-            "avg_flow_lpm":       2.5,
-            "pressure_delta_psi": 1.5,
+            "avg_flow_lpm":           2.5,
+            "pressure_delta_psi":     1.5,
+            "recovery_overshoot_psi": 1.0,
+            "pressure_onset_ms":      1.0,
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.55, "volume_litres": 0.55},
@@ -263,6 +319,8 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
             "pressure_delta_psi":     1.5,
             "flow_variability":       1.5,
             "resistance_curve_shape": 2.0,   # forward-looking
+            "pressure_onset_ms":      1.5,   # solenoid valve = fast onset
+            "recovery_overshoot_psi": 1.0,
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.50, "volume_litres": 0.50},
@@ -273,6 +331,8 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
             "avg_flow_lpm":           2.0,
             "flow_variability":       1.5,
             "resistance_curve_shape": 2.0,   # forward-looking
+            "pressure_onset_ms":      1.5,   # solenoid valve = fast onset
+            "recovery_overshoot_psi": 1.0,
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.40, "volume_litres": 0.40},
@@ -292,8 +352,10 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     # ── Outdoor / programme-ish ──────────────────────────────────────────
     "irrigation_zone": {
         "anchor_weights": {
-            "avg_flow_lpm":       2.5,
-            "pressure_delta_psi": 1.5,
+            "avg_flow_lpm":           2.5,
+            "pressure_delta_psi":     1.5,
+            "pressure_onset_ms":      1.5,   # solenoid valve = fast onset
+            "recovery_overshoot_psi": 1.0,
         },
         "float_features": {"duration_seconds", "volume_litres"},
         "expected_cv": {"duration_seconds": 0.25, "volume_litres": 0.25},
@@ -464,7 +526,7 @@ def _safe(centroid: Dict, key: str, default: float = 0.0) -> float:
 
 def _rule_toilet(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Toilet flushes: 4-9 L volume, 20-60 s duration, sharp pressure transient."""
-    if circuit_type == "irrigation":
+    if circuit_type == "zone":
         return None
     vol      = _safe(centroid, "volume_litres")
     dur      = _safe(centroid, "duration_seconds")
@@ -479,7 +541,7 @@ def _rule_toilet(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float
 
 def _rule_shower(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Shower: 20-80 L, 5-15 min, sustained moderate flow."""
-    if circuit_type == "irrigation":
+    if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
@@ -491,7 +553,7 @@ def _rule_shower(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float
 
 def _rule_bath(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Bath fill: 80-200 L, 3-10 min, high flow rate."""
-    if circuit_type == "irrigation":
+    if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
@@ -503,7 +565,7 @@ def _rule_bath(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]
 
 def _rule_bathroom_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Bathroom tap: 0.3-3 L, 5-30 s, low flow."""
-    if circuit_type == "irrigation":
+    if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
@@ -514,7 +576,7 @@ def _rule_bathroom_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str,
 
 def _rule_kitchen_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Kitchen tap: 0.5-8 L, 5-60 s, variable flow."""
-    if circuit_type == "irrigation":
+    if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
@@ -525,7 +587,7 @@ def _rule_kitchen_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, 
 
 def _rule_dishwasher(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Dishwasher fill: 8-15 L per fill, 60-180 s, repeats every ~20 min during cycle."""
-    if circuit_type == "irrigation":
+    if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
@@ -537,7 +599,7 @@ def _rule_dishwasher(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, f
 
 def _rule_washing_machine(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Washing machine fill: 30-80 L total per cycle, 60-300 s per fill phase."""
-    if circuit_type == "irrigation":
+    if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
@@ -548,8 +610,8 @@ def _rule_washing_machine(centroid: Dict, circuit_type: str) -> Optional[Tuple[s
 
 
 def _rule_irrigation_zone(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Irrigation: only on irrigation circuit. Long duration, sustained high flow."""
-    if circuit_type != "irrigation":
+    """Irrigation: only on zone circuit. Long duration, sustained high flow."""
+    if circuit_type != "zone":
         return None
     dur = _safe(centroid, "duration_seconds")
     flow = _safe(centroid, "avg_flow_lpm")
@@ -564,7 +626,7 @@ def _rule_irrigation_zone(centroid: Dict, circuit_type: str) -> Optional[Tuple[s
 
 def _rule_ice_maker(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Ice maker: tiny intermittent fills, 50-300 mL, 3-15 s."""
-    if circuit_type == "irrigation":
+    if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
@@ -575,7 +637,7 @@ def _rule_ice_maker(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, fl
 
 def _rule_humidifier(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Whole-house humidifier: small slow fills, 0.5-3 L, 30-180 s."""
-    if circuit_type == "irrigation":
+    if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
@@ -587,7 +649,7 @@ def _rule_humidifier(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, f
 
 def _rule_water_softener(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Water softener regen: long sustained flow, 150-300 L, 30-90 minutes, scheduled."""
-    if circuit_type == "irrigation":
+    if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
@@ -617,7 +679,7 @@ _RULES = [
 
 def suggest_fixture_type(
     centroid: Dict,
-    circuit_type: str = "main",
+    circuit_type: str = "fixture",
 ) -> Tuple[Optional[str], float]:
     """
     Apply heuristic rules to a cluster centroid.
@@ -625,6 +687,7 @@ def suggest_fixture_type(
     Returns (type_string, confidence) or (None, 0.0) if no rule matches.
     The first matching rule wins — order in _RULES matters.
     """
+    circuit_type = normalize_circuit_type(circuit_type)
     for rule in _RULES:
         result = rule(centroid, circuit_type)
         if result is not None:

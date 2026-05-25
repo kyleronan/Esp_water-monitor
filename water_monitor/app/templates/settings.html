@@ -32,7 +32,7 @@
     {% endfor %}
 
     {% if general_entities %}
-    <button class="sett-nav-btn" id="sett-btn-general"
+    <button class="sett-nav-btn sett-nav-adv" id="sett-btn-general"
             onclick="settNav('general')">
       <span class="sett-nav-icon">⚙️</span>
       <span class="sett-nav-label">ESP General</span>
@@ -57,17 +57,29 @@
       <span class="sett-nav-label">Display Units</span>
     </button>
 
-    <button class="sett-nav-btn" id="sett-btn-integrations"
+    <button class="sett-nav-btn sett-nav-adv" id="sett-btn-integrations"
             onclick="settNav('integrations')">
       <span class="sett-nav-icon">🔗</span>
       <span class="sett-nav-label">Integrations</span>
     </button>
 
-    <button class="sett-nav-btn" id="sett-btn-retention"
+    <button class="sett-nav-btn sett-nav-adv" id="sett-btn-retention"
             onclick="settNav('retention')">
       <span class="sett-nav-icon">🗄️</span>
       <span class="sett-nav-label">Data Retention</span>
     </button>
+
+    <button class="sett-nav-btn sett-nav-adv" id="sett-btn-resetup"
+            onclick="settNav('resetup')">
+      <span class="sett-nav-icon">🔄</span>
+      <span class="sett-nav-label">Re-run Setup</span>
+    </button>
+
+    <div class="sett-mode-divider">
+      <button class="sett-mode-btn" id="sett-mode-btn" onclick="toggleSettMode()">
+        ⚙ Show Advanced
+      </button>
+    </div>
 
   </nav>
 
@@ -146,9 +158,97 @@
       </div>
       <p class="sett-section-desc">Circuit-specific detection and alert settings.</p>
 
-      {# Recalibration #}
+      {# Sub-tab strip — use loop.index as a safe DOM key #}
+      {% set circ_idx = loop.index %}
+      <div class="sett-subtab-strip" role="tablist">
+        <button type="button"
+                class="sett-subtab-btn active"
+                id="sttab-btn-{{ circ_idx }}-config"
+                role="tab" aria-selected="true"
+                onclick="settSubNav({{ circ_idx }}, 'config')">
+          Config
+        </button>
+        <button type="button"
+                class="sett-subtab-btn"
+                id="sttab-btn-{{ circ_idx }}-detection"
+                role="tab" aria-selected="false"
+                onclick="settSubNav({{ circ_idx }}, 'detection')">
+          Detection
+        </button>
+        <button type="button"
+                class="sett-subtab-btn sett-adv-card"
+                id="sttab-btn-{{ circ_idx }}-advanced"
+                role="tab" aria-selected="false"
+                onclick="settSubNav({{ circ_idx }}, 'advanced')">
+          Advanced
+        </button>
+      </div>
+
+      {# ── Config tab: name + circuit type ──────────────────────────── #}
+      <div class="sett-subtab-panel" id="sttab-{{ circ_idx }}-config" role="tabpanel">
+
+      {# Circuit rename #}
       <div class="sett-card">
-        <h3 class="sett-card-title">Recalibration</h3>
+        <h3 class="sett-card-title">Circuit name</h3>
+        <p class="sett-card-desc">
+          Change the display name shown in the dashboard for this circuit.
+          Internal ID (<code>{{ c.circuit }}</code>) is never changed.
+        </p>
+        <form method="post"
+              action="{{ ingress_path }}/settings/circuit/{{ c.circuit }}/rename"
+              class="sett-form-inline">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <div class="sett-form-group" style="flex:1">
+            <label for="rename_{{ c.circuit }}">Display name</label>
+            <input type="text"
+                   id="rename_{{ c.circuit }}"
+                   name="display_name"
+                   value="{{ c.display_name }}"
+                   maxlength="40"
+                   class="form-control">
+          </div>
+          <button type="submit" class="btn btn-secondary btn-sm" style="align-self:flex-end">
+            Rename
+          </button>
+        </form>
+      </div>
+
+      {# Circuit type #}
+      <div class="sett-card">
+        <h3 class="sett-card-title">Circuit type</h3>
+        <p class="sett-card-desc">
+          Controls which fixture types are suggested and which alert categories
+          are available for this circuit. This does not rename the valve or
+          change any entity mappings. After changing type, you may want to
+          recalibrate for best results.
+        </p>
+        {% for t in circuit_types %}
+        <label style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem;cursor:pointer">
+          <input type="radio"
+                 name="circuit_type_{{ c.circuit }}"
+                 value="{{ t }}"
+                 {% if t == c.circuit_type %}checked{% endif %}
+                 onchange="settingsCircuitTypeUpdate('{{ c.circuit }}', '{{ t }}')"
+                 style="margin-top:3px;flex-shrink:0">
+          <span>
+            <strong>{{ circuit_type_labels[t] }}</strong>
+            <span class="muted" style="font-size:.8125rem;display:block">{{ circuit_type_help[t] }}</span>
+          </span>
+        </label>
+        {% endfor %}
+        <p class="sett-card-desc" id="circuit-type-saving-{{ c.circuit }}"
+           style="display:none;color:var(--color-warn);margin-top:.5rem">Saving…</p>
+      </div>
+
+      </div>{# /Config panel #}
+
+      {# ── Advanced tab: recal + learning + sensitivity + ESP device ── #}
+      <div class="sett-subtab-panel" id="sttab-{{ circ_idx }}-advanced"
+           style="display:none" role="tabpanel">
+
+      {# Recalibration #}
+      <div class="sett-card sett-adv-card">
+        <h3 class="sett-card-title">Recalibration <span class="sett-installer-badge">⚠ Installer</span></h3>
         <p class="sett-card-desc">
           Recalibrate if you've renovated, added appliances, or your household
           has changed significantly.
@@ -201,10 +301,11 @@
             <button type="submit" class="btn btn-warning btn-sm">Start Recalibration</button>
           </form>
         </details>
+        <p class="sett-cal-warning">⚠ Incorrect calibration values may cause false shutoffs or missed leaks.</p>
       </div>
 
       {# Learning mode #}
-      <div class="sett-card">
+      <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Learning Mode</h3>
         <form method="post" action="{{ ingress_path }}/settings/learning/{{ c.circuit }}/update">
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -229,7 +330,7 @@
       </div>
 
       {# Sensitivity #}
-      <div class="sett-card">
+      <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Detection Sensitivity</h3>
         <form method="post" action="{{ ingress_path }}/settings/sensitivity/{{ c.circuit }}/update"
               id="sens-form-{{ c.circuit }}">
@@ -254,8 +355,8 @@
             <div class="sett-form-grid" style="margin-top:.75rem">
               <div class="sett-form-group">
                 <label>Pressure drop to detect event ({{ pressure_unit }})</label>
-                <input type="number" name="pressure_drop_event_psi" step="0.5" min="0.5" max="10"
-                       value="{{ c.sensitivity.pressure_drop_event_psi or 2.0 }}">
+                <input type="number" name="pressure_drop_event_psi" step="0.1" min="0.5" max="10"
+                       value="{{ c.sensitivity.pressure_drop_event_psi or 1.2 }}">
               </div>
               <div class="sett-form-group">
                 <label>Min event duration (seconds)</label>
@@ -289,28 +390,9 @@
         </form>
       </div>
 
-      {# Alerts #}
-      <div class="sett-card">
-        <h3 class="sett-card-title">Alerts</h3>
-        <p class="sett-card-desc">Toggle which anomaly alerts this add-on generates.</p>
-        {% for alert in c.alerts %}
-        <div class="sett-toggle-row">
-          <div>
-            <div class="sett-toggle-label">{{ alert.label }}</div>
-            <div class="sett-toggle-desc">{{ alert.description }}</div>
-          </div>
-          <label class="toggle">
-            <input type="checkbox" {% if alert.enabled %}checked{% endif %}
-                   onchange="settingsAlertToggle('{{ alert.id }}', this.checked)">
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
-        {% endfor %}
-      </div>
-
       {# ESP device entities for this circuit #}
       {% if c.device_entities %}
-      <div class="sett-card">
+      <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">ESP Device Settings</h3>
         <p class="sett-card-desc">Stored on the ESP device and applied immediately.</p>
         <div class="device-entity-grid">
@@ -335,10 +417,11 @@
             <div class="device-entity-number">
               <input type="number" class="device-entity-input"
                      value="{{ e.state }}"
+                     data-native-step="{{ e.native_step or '' }}"
                      {% if e.min is not none %}min="{{ e.min }}"{% endif %}
                      {% if e.max is not none %}max="{{ e.max }}"{% endif %}
                      {% if e.step is not none %}step="{{ e.step }}"{% endif %}
-                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
+                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value, this.dataset.nativeStep)">
               {% if e.unit %}<span class="unit-label">{{ e.unit }}</span>{% endif %}
             </div>
             {% endif %}
@@ -346,7 +429,39 @@
           {% endfor %}
         </div>
       </div>
+      {% else %}
+      <div class="sett-card sett-adv-card">
+        <h3 class="sett-card-title">ESP Device Settings</h3>
+        <p class="sett-card-desc">Calibration controls are not available — no calibration entities were found during setup.</p>
+      </div>
       {% endif %}
+
+      </div>{# /Advanced panel #}
+
+      {# ── Detection tab: alerts + plumbing events ───────────────────── #}
+      <div class="sett-subtab-panel" id="sttab-{{ circ_idx }}-detection"
+           style="display:none" role="tabpanel">
+
+      {# Alerts #}
+      <div class="sett-card">
+        <h3 class="sett-card-title">Alerts</h3>
+        <p class="sett-card-desc">Toggle which anomaly alerts this add-on generates.</p>
+        {% for alert in c.alerts %}
+        {% if alert.alert_type not in zone_only_alert_types or c.circuit_type == "zone" %}
+        <div class="sett-toggle-row">
+          <div>
+            <div class="sett-toggle-label">{{ alert.label }}</div>
+            <div class="sett-toggle-desc">{{ alert.description }}</div>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" {% if alert.enabled %}checked{% endif %}
+                   onchange="settingsAlertToggle('{{ alert.id }}', this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        {% endif %}
+        {% endfor %}
+      </div>
 
       {# Plumbing exclusion window #}
       <div class="sett-card" id="maintenance">
@@ -398,12 +513,21 @@
         {% endif %}
       </div>
 
+      </div>{# /Detection panel #}
+
     </div>
     {% endfor %}
 
     {# ── General (non-circuit) device entities ───────────────────── #}
     {% if general_entities %}
-    <div class="sett-section" id="sett-general" style="display:none">
+    <div class="sett-section sett-adv-section" id="sett-general" style="display:none">
+      <div class="sett-adv-banner">
+        <span>⚙</span>
+        <div class="sett-adv-banner-inner">
+          <strong>Installer settings</strong>
+          Changes here affect device behaviour and are applied immediately.
+        </div>
+      </div>
       <h2 class="sett-section-title">ESP Device — General Settings</h2>
       <p class="sett-section-desc">Non-circuit settings stored on the ESP device and applied immediately.</p>
       <div class="sett-card">
@@ -429,10 +553,11 @@
             <div class="device-entity-number">
               <input type="number" class="device-entity-input"
                      value="{{ e.state }}"
+                     data-native-step="{{ e.native_step or '' }}"
                      {% if e.min is not none %}min="{{ e.min }}"{% endif %}
                      {% if e.max is not none %}max="{{ e.max }}"{% endif %}
                      {% if e.step is not none %}step="{{ e.step }}"{% endif %}
-                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
+                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value, this.dataset.nativeStep)">
               {% if e.unit %}<span class="unit-label">{{ e.unit }}</span>{% endif %}
             </div>
             {% endif %}
@@ -588,7 +713,14 @@
     </div>
 
     {# ── Integrations ──────────────────────────────────────────────── #}
-    <div class="sett-section" id="sett-integrations" style="display:none">
+    <div class="sett-section sett-adv-section" id="sett-integrations" style="display:none">
+      <div class="sett-adv-banner">
+        <span>⚙</span>
+        <div class="sett-adv-banner-inner">
+          <strong>Installer settings</strong>
+          Changes here affect leak detection and automatic shutoff.
+        </div>
+      </div>
       <h2 class="sett-section-title">Integrations</h2>
       <p class="sett-section-desc">
         Publish confirmed fixtures to Home Assistant via MQTT Discovery.
@@ -634,7 +766,14 @@
     </div>
 
     {# ── Data Retention ────────────────────────────────────────────── #}
-    <div class="sett-section" id="sett-retention" style="display:none">
+    <div class="sett-section sett-adv-section" id="sett-retention" style="display:none">
+      <div class="sett-adv-banner">
+        <span>⚙</span>
+        <div class="sett-adv-banner-inner">
+          <strong>Installer settings</strong>
+          Changes here affect how much historical data is stored and when it is pruned.
+        </div>
+      </div>
       <h2 class="sett-section-title">Data Retention</h2>
       <p class="sett-section-desc">
         Controls how much historical data is kept. The system prunes old records
@@ -734,14 +873,92 @@
           <div style="display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap">
             <button type="submit" class="btn btn-primary btn-sm">Save retention settings</button>
             <button type="button" class="btn btn-secondary btn-sm"
-                    onclick="pruneNow()">Run pruning now</button>
+                    onclick="pruneNow(event)">Run pruning now</button>
           </div>
         </form>
       </div>
     </div>
 
+    {# ── Re-run Setup ──────────────────────────────────────────────── #}
+    <div class="sett-section sett-adv-section" id="sett-resetup" style="display:none">
+      <div class="sett-adv-banner">
+        <span>⚠</span>
+        <div class="sett-adv-banner-inner">
+          <strong>Destructive operation</strong>
+          Re-running the wizard lets you re-search for a device and
+          re-confirm entity mappings. Existing event history is kept, but
+          circuit configuration will be overwritten when you complete the
+          wizard.
+        </div>
+      </div>
+      <h2 class="sett-section-title">Re-run Setup Wizard</h2>
+      <p class="sett-section-desc">
+        Setup mutations are normally locked after initial setup so a stray
+        POST cannot wipe your configuration. Use this to deliberately
+        unlock the wizard — for example after swapping hardware or moving
+        to a new Home Assistant instance. We strongly recommend downloading
+        a backup first.
+      </p>
+
+      <div class="sett-card">
+        <p style="font-size:.9rem;margin-bottom:.75rem">
+          When you confirm:
+        </p>
+        <ul style="font-size:.85rem;margin-left:1.25rem;line-height:1.6">
+          <li>The setup wizard re-opens at step&nbsp;0 (New&nbsp;/&nbsp;Restore).</li>
+          <li>You can re-discover a device and re-confirm entity mappings.</li>
+          <li>Setup re-locks itself automatically when you finish the wizard.</li>
+          <li>Event history, training data, and clusters are preserved
+              unless you choose <em>Restore from backup</em>.</li>
+        </ul>
+
+        <div style="display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap">
+          <a href="{{ ingress_path }}/backup/export" class="btn btn-secondary btn-sm" target="_blank">
+            ⬇ Download backup first
+          </a>
+          <button type="button" class="btn btn-warning btn-sm" onclick="openResetupModal()">
+            🔄 Re-run setup wizard…
+          </button>
+        </div>
+      </div>
+    </div>
+
   </div>{# /sett-content #}
 </div>{# /sett-layout #}
+
+{# ── Re-setup confirmation modal ───────────────────────────────────── #}
+<div id="resetup-modal" class="modal-overlay" style="display:none"
+     onclick="if(event.target===this) closeResetupModal()">
+  <div class="modal-box">
+    <h3>⚠ Re-run Setup Wizard</h3>
+    <p>
+      This unlocks the setup wizard so you can re-discover your device and
+      re-confirm entity mappings. Circuit configuration will be overwritten
+      when you complete the wizard.
+    </p>
+    <p class="muted" style="font-size:.85rem">
+      Event history and training data are preserved unless you pick
+      <em>Restore from backup</em> on the first step. We still recommend
+      downloading a backup before continuing.
+    </p>
+    <form method="post" action="{{ ingress_path }}/settings/setup/unlock"
+          style="margin:0">
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+      <div class="modal-actions">
+        <a href="{{ ingress_path }}/backup/export"
+           class="btn btn-secondary" target="_blank">
+          ⬇ Download backup first
+        </a>
+        <button type="submit" class="btn btn-warning">
+          Unlock &amp; open wizard
+        </button>
+        <button type="button" class="btn btn-secondary" onclick="closeResetupModal()">
+          Cancel
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
 
 {# ── Recalibration backup modal (outside layout, absolutely positioned) #}
 <div id="recal-modal" class="modal-overlay" style="display:none"
@@ -779,6 +996,19 @@
 
 {% block scripts %}
 <script>
+// ── Circuit sub-tab navigation ─────────────────────────────────────────────
+function settSubNav(circIdx, tab) {
+  ['config', 'detection', 'advanced'].forEach(t => {
+    const panel = document.getElementById('sttab-' + circIdx + '-' + t);
+    const btn   = document.getElementById('sttab-btn-' + circIdx + '-' + t);
+    if (panel) panel.style.display = t === tab ? '' : 'none';
+    if (btn) {
+      btn.classList.toggle('active', t === tab);
+      btn.setAttribute('aria-selected', t === tab ? 'true' : 'false');
+    }
+  });
+}
+
 // ── Sidebar navigation ─────────────────────────────────────────────────────
 function settNav(id) {
   document.querySelectorAll('.sett-section').forEach(el => el.style.display = 'none');
@@ -790,9 +1020,57 @@ function settNav(id) {
   history.replaceState(null, '', '#' + id);
 }
 
+// ── Basic / Advanced mode ───────────────────────────────────────────────────
+function _applySettMode(mode) {
+  const layout = document.querySelector('.sett-layout');
+  if (!layout) return;
+  layout.dataset.settMode = mode;
+  localStorage.setItem('wm_settings_mode', mode);
+  const btn = document.getElementById('sett-mode-btn');
+  if (btn) btn.textContent = mode === 'basic' ? '⚙ Show Advanced' : '⚙ Hide Advanced';
+  if (mode === 'basic') {
+    const advSections = ['general', 'integrations', 'retention'];
+    const current = location.hash.slice(1);
+    if (advSections.includes(current)) settNav('profile');
+  }
+}
+
+function toggleSettMode() {
+  const layout = document.querySelector('.sett-layout');
+  const current = layout ? (layout.dataset.settMode || 'basic') : 'basic';
+  _applySettMode(current === 'basic' ? 'advanced' : 'basic');
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  const savedMode = localStorage.getItem('wm_settings_mode') || 'basic';
+  _applySettMode(savedMode);
+
   const id = location.hash.slice(1) || 'profile';
+  // Sections under "Advanced" are hidden in basic mode. If the user lands
+  // on one (e.g. via the "Setup is locked" banner deep-linking to #resetup),
+  // force Advanced mode on so the section is actually visible.
+  const advSections = ['general', 'integrations', 'retention', 'resetup'];
+  if (advSections.includes(id) && savedMode !== 'advanced') {
+    _applySettMode('advanced');
+  }
   settNav(id);
+
+  // Initialize all circuit sub-tabs to Config
+  document.querySelectorAll('.sett-subtab-strip').forEach(strip => {
+    const circIdx = strip.querySelector('[id^="sttab-btn-"]')
+      ?.id.split('-')[2];
+    if (circIdx) settSubNav(Number(circIdx), 'config');
+  });
+
+  // #maintenance → open first circuit section + Detection sub-tab
+  if (location.hash === '#maintenance') {
+    const firstStrip = document.querySelector('.sett-subtab-strip');
+    if (firstStrip) {
+      const circIdx = firstStrip.querySelector('[id^="sttab-btn-"]')
+        ?.id.split('-')[2];
+      if (circIdx) settSubNav(Number(circIdx), 'detection');
+    }
+  }
 
   // Recalibration modal intercept
   document.querySelectorAll('.recal-form').forEach(form => {
@@ -813,7 +1091,27 @@ async function suggestDays(circuit) {
   const sel = document.getElementById(`cal-days-${circuit}`);
   if (sel) {
     sel.value = String(data.suggested_days);
-    alert(`Suggested: ${data.suggested_days} days for a ${data.tier} home`);
+    toast(`Suggested: ${data.suggested_days} days — ${data.tier} home.`, 'info');
+  }
+}
+
+async function settingsCircuitTypeUpdate(circuit, circuitType) {
+  const note = document.getElementById(`circuit-type-saving-${circuit}`);
+  if (note) note.style.display = 'block';
+  try {
+    const resp = await fetch(`${window.INGRESS_PATH}/settings/circuit/${circuit}/type`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&circuit_type=${encodeURIComponent(circuitType)}`,
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (data.status !== 'updated') {
+      toast('Could not update circuit type: ' + (data.message || 'unknown error'), 'error');
+      document.querySelectorAll(`input[name="circuit_type_${circuit}"]`)
+        .forEach(r => { r.checked = false; });
+    }
+  } finally {
+    if (note) note.style.display = 'none';
   }
 }
 
@@ -827,15 +1125,18 @@ async function settingsAlertToggle(alertId, enabled) {
   });
 }
 
-async function updateDeviceEntity(entityId, value) {
+async function updateDeviceEntity(entityId, value, nativeStep) {
   const resp = await fetch(`${window.INGRESS_PATH}/settings/device-entity/update`, {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&entity_id=${encodeURIComponent(entityId)}&value=${encodeURIComponent(value)}`,
+    body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}`
+        + `&entity_id=${encodeURIComponent(entityId)}`
+        + `&value=${encodeURIComponent(value)}`
+        + `&native_step=${encodeURIComponent(nativeStep || '')}`,
   });
   const data = await resp.json().catch(() => ({}));
   if (data.status !== 'ok') {
-    alert('Failed to update: ' + (data.message || 'unknown error'));
+    toast('Failed to update: ' + (data.message || 'unknown error'), 'error');
   }
 }
 
@@ -858,10 +1159,18 @@ function submitRecalForm() {
   if (_recalForm) _recalForm.submit();
 }
 
+// ── Re-setup modal ──────────────────────────────────────────────────────────
+function openResetupModal() {
+  document.getElementById('resetup-modal').style.display = 'flex';
+}
+function closeResetupModal() {
+  document.getElementById('resetup-modal').style.display = 'none';
+}
+
 // ── Data retention ──────────────────────────────────────────────────────────
-async function pruneNow() {
+async function pruneNow(evt) {
   if (!confirm('Run data pruning now? This will permanently delete old history rows according to the current retention settings.')) return;
-  const btn = event.target;
+  const btn = evt.target;
   btn.disabled = true;
   btn.textContent = 'Pruning…';
   try {
@@ -870,9 +1179,9 @@ async function pruneNow() {
     });
     const data = await resp.json();
     const total = Object.values(data.deleted || {}).reduce((a, b) => a + b, 0);
-    alert(`Pruning complete — ${total} rows deleted.`);
+    toast(`Pruning complete — ${total} rows deleted.`, 'success');
   } catch (e) {
-    alert('Pruning failed: ' + e.message);
+    toast('Pruning failed: ' + e.message, 'error');
   } finally {
     btn.disabled = false;
     btn.textContent = 'Run pruning now';

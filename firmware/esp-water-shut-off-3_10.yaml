@@ -52,10 +52,12 @@
 
 substitutions:
   flow_k_factor: "396.0"   # 6.6 pulses/litre × 60s = 396
+  circuit_1_name: "Main"        # Display name for circuit 1 — change to suit your install
+  circuit_2_name: "Irrigation"  # Display name for circuit 2 — change to suit your install
 
 esphome:
   name: esp-water-shut-off-3
-  friendly_name: ESP Water Shut off 3.5
+  friendly_name: ESP Water Shut off 3.10
   min_version: 2024.6.0
   name_add_mac_suffix: false
   platformio_options:
@@ -63,7 +65,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.5.1"
+    version: "3.10.0"
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -103,6 +105,22 @@ esphome:
       # Note: if neither end stop is active on boot, state stays unknown
       # in HA until the next valve movement completes.
 
+      # --- Publish persisted fault state ---
+      # fault_main/fault_irrigation survive reboots (restore_value: yes).
+      # fault_reason strings cannot be restored; publish a generic message
+      # so HA shows the fault is active and why a reset is required.
+      - lambda: |-
+          if (id(fault_main)) {
+            if (id(fault_reason_main_str).empty())
+              id(fault_reason_main_str) = "Fault persisted across reboot — manual reset required";
+            id(fault_reason_main).publish_state(id(fault_reason_main_str));
+          }
+          if (id(fault_irrigation)) {
+            if (id(fault_reason_irr_str).empty())
+              id(fault_reason_irr_str) = "Fault persisted across reboot — manual reset required";
+            id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+          }
+
       # --- Valve 2 (Irrigation) ---
       - if:
           condition:
@@ -129,23 +147,26 @@ esp32:
     type: arduino
 
 logger:      # Enable serial logging for debugging
+  level: WARN
 
-api:         # Enable Home Assistant native API integration
+api:         # Encryption disabled for now — re-add an `encryption:` block before release
 
 ota:         # Enable over-the-air firmware updates
   - platform: esphome
+    # OTA password disabled for now — re-add `password:` before release
 
 improv_serial:   # Allows Wi-Fi provisioning via USB serial on first setup
 
 wifi:
-  ap: {}     # Create a fallback Wi-Fi access point if no credentials are stored
-             # Used with captive_portal below to provision Wi-Fi credentials
+  ap:   # Fallback hotspot — open network for now; re-add `password:` before release
 
 captive_portal:  # Serves a Wi-Fi setup page when connected to the fallback AP
 
 dashboard_import:
-  # Allows this device to appear in the ESPHome dashboard for adoption
-  package_import_url: github://esphome/firmware/esphome-web/esp32s3.yaml@main
+  # Allows this device to appear in the ESPHome dashboard for adoption.
+  # RELEASE BLOCKER: replace @main with an immutable version tag before publishing
+  #   e.g.  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_6.yaml@v3.6.0
+  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_6.yaml@main
   import_full_config: true
 
 esp32_improv:
@@ -154,20 +175,21 @@ esp32_improv:
 
 web_server:
   version: 3  # Required for sorting_groups support
+  # Web UI auth disabled for now — re-add an `auth:` block before release
   # Organises the built-in web UI into collapsible sections per valve.
   # Each entity is assigned to a group via its web_server: sorting_group_id.
   sorting_groups:
     - id: group_main_status
-      name: "Main Valve — Status & Controls"
+      name: "${circuit_1_name} Valve — Status & Controls"
       sorting_weight: 10
     - id: group_main_settings
-      name: "Main Valve — Settings"
+      name: "${circuit_1_name} Valve — Settings"
       sorting_weight: 30
     - id: group_irr_status
-      name: "Irrigation Valve — Status & Controls"
+      name: "${circuit_2_name} Valve — Status & Controls"
       sorting_weight: 20
     - id: group_irr_settings
-      name: "Irrigation Valve — Settings"
+      name: "${circuit_2_name} Valve — Settings"
       sorting_weight: 40
     - id: group_system
       name: "System"
@@ -176,21 +198,22 @@ web_server:
 # =============================================================================
 # GLOBALS
 # Runtime variables that persist across automations within a session.
-# restore_value: no means faults always start cleared on boot. A fault that
-# existed before a power cycle should be reviewed, not silently carried forward.
+# fault_main / fault_irrigation use restore_value: yes so a safety fault
+# survives a power cycle and requires explicit manual reset — matching the
+# intended "latching" safety behaviour. All other globals reset on boot.
 # =============================================================================
 globals:
   # True when a safety condition has triggered on the main valve circuit.
   # Blocks valve open_action until manually reset from Home Assistant.
   - id: fault_main
     type: bool
-    restore_value: no
+    restore_value: yes   # Fault must survive power-cycle — manual reset required
     initial_value: 'false'
 
   # Same fault flag for the irrigation valve circuit.
   - id: fault_irrigation
     type: bool
-    restore_value: no
+    restore_value: yes   # Fault must survive power-cycle — manual reset required
     initial_value: 'false'
 
   # True while leak test mode is active on the main valve circuit.
@@ -285,7 +308,7 @@ globals:
   # ---------------------------------------------------------------------------
 
   # True when the trickle alert has fired on the main circuit.
-  # Cleared by the "Reset Trickle Alert - Main" button.
+  # Cleared by the "Reset Trickle Alert - ${circuit_1_name}" button.
   - id: trickle_alert_main
     type: bool
     restore_value: no
@@ -568,6 +591,254 @@ globals:
     restore_value: no
     initial_value: '""'
 
+  # ---------------------------------------------------------------------------
+  # WAVEFORM CAPTURE GLOBALS — Per-circuit chunked streaming (firmware 3.10.0+)
+  #
+  # Per-event flow + pressure waveform capture for the water-signature add-on,
+  # delivered as a stream of esphome.water_monitor_waveform_chunk events.
+  # A new chunk fires every 30 s of capture (or whenever the 1500-sample
+  # buffer fills) and the add-on accumulates + stitches them on the final
+  # chunk. This replaces the slot+decimation design used through 3.8.x —
+  # native cadence is preserved regardless of event length.
+  #
+  # STRICTLY ADDITIVE to safety: no safety, ADC, valve, or leak-test path
+  # reads or writes any global below. All capture work runs in the dedicated
+  # `waveform_capture` interval (~50 Hz) — never in the 200 Hz ADC loop, the
+  # pulse-counter ISR, or any safety lambda. Storage is fully preallocated
+  # (no runtime allocation).
+  #
+  # int16 wire scaling:  flow = L/min x 100,  pressure = PSI x 100.
+  #
+  # Per-circuit layout: arrays indexed [2] where 0 = circuit_1 (main) and
+  # 1 = circuit_2 (irrigation). Circuit_2 onset detection is wired in a
+  # 3.10.0 wires both circuits' flow + pressure sources into the state machine,
+  # so circuit_2 (irrigation) waveforms are captured and streamed alongside
+  # circuit_1 (main). Per-circuit pre-roll rings keep their signatures isolated.
+  # ---------------------------------------------------------------------------
+
+  # Pre-roll ring buffer — 100 samples @ ~50 Hz = ~2.0 s of flow + pressure
+  # per circuit. Each circuit captures its own pre-roll so its chunk_0 holds
+  # the genuine pre-event signature, not a sibling circuit's data.
+  - id: wf_ring_flow
+    type: int16_t[2][100]
+    restore_value: no
+  - id: wf_ring_press
+    type: int16_t[2][100]
+    restore_value: no
+  - id: wf_ring_idx
+    type: int[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_ring_count
+    type: int[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+
+  # Per-circuit chunk buffers — 1500 samples = 30 s @ ~50 Hz native cadence.
+  # Statically allocated; never written past index 1499. When a buffer fills
+  # and staging is blocked, new samples are dropped (wf_chunk_drop_count++).
+  # Total: 2 circuits x 2 signals x 1500 x 2 bytes = 12 KB raw arrays.
+  - id: wf_chunk_flow
+    type: int16_t[2][1500]
+    restore_value: no
+  - id: wf_chunk_press
+    type: int16_t[2][1500]
+    restore_value: no
+
+  # Per-circuit capture state (index 0 = circuit_1, 1 = circuit_2).
+  - id: wf_chunk_len              # samples currently in chunk buffer
+    type: int[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_chunk_seq              # chunk index within the current event, 0-based
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_chunk_start_ms         # millis() when current chunk started
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_capturing              # true between onset and end-of-tail
+    type: bool[2]
+    restore_value: no
+    initial_value: '{false, false}'
+  - id: wf_event_id               # current event's id per circuit
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_event_start_ms
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_event_end_ms
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_zero_ms                # millis() when flow last dropped below gate
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_onset_seq              # chunk_seq containing the flow onset (= 0)
+    type: uint32_t[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_onset_idx              # sample index of onset within wf_onset_seq
+    type: int[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_press_onset_seq        # chunk_seq containing the pressure transient
+    type: int[2]
+    restore_value: no
+    initial_value: '{-1, -1}'
+  - id: wf_press_onset_idx        # sample index within wf_press_onset_seq, -1 = none
+    type: int[2]
+    restore_value: no
+    initial_value: '{-1, -1}'
+
+  # Running event-wide accumulators (updated every captured sample).
+  - id: wf_evt_pk                 # peak flow (int16 wire scale)
+    type: int[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+  - id: wf_evt_pmin
+    type: int[2]
+    restore_value: no
+    initial_value: '{32767, 32767}'
+  - id: wf_evt_pmax
+    type: int[2]
+    restore_value: no
+    initial_value: '{-32768, -32768}'
+  - id: wf_evt_flags              # quality/completeness bitfield
+    type: int[2]
+    restore_value: no
+    initial_value: '{0, 0}'
+
+  # Engine-wide capture state.
+  - id: wf_tick                   # free-running ~50 Hz interval tick counter
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_event_counter          # monotonic event id, resets only on reboot
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_boot_id                # random per-boot session id (0 = uninit)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_overflow_count         # events dropped because previous event still flushing
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wf_chunk_drop_count       # samples dropped because buffer full + staging blocked
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_press_baseline         # slow per-circuit pressure baseline for transient onset
+    type: float[2]
+    restore_value: no
+    initial_value: '{0.0, 0.0}'
+  - id: wf_press_baseline_valid
+    type: bool[2]
+    restore_value: no
+    initial_value: '{false, false}'
+  - id: wf_stage_rr               # round-robin starting circuit for stage fairness
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # HA-event staging globals — single shared in-flight chunk (only one
+  # esphome.water_monitor_waveform_chunk event may be queued at a time).
+  # The capture loop sets wf_ev_pending; the YAML event action fires the
+  # event reading these fields, then clears wf_ev_pending.
+  - id: wf_ev_flow_b64
+    type: std::string
+    restore_value: no
+  - id: wf_ev_press_b64
+    type: std::string
+    restore_value: no
+  - id: wf_ev_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: wf_ev_is_final
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: wf_ev_circuit             # 0 or 1 — picks circuit_1 / circuit_2 in event
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_event_id
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_boot
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_seq
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_s                   # chunk_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_e                   # chunk_end_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Final-only metadata fields (only valid when wf_ev_is_final is true).
+  - id: wf_ev_evt_s               # event-wide start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_evt_e               # event-wide end_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_total               # expected total chunk count (wf_chunk_seq + 1)
+    type: uint32_t
+    restore_value: no
+    initial_value: '1'
+  - id: wf_ev_onset_seq
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_onset_idx
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_press_onset_seq
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: wf_ev_press_onset_idx
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: wf_ev_pk
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_dp
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_pd
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: wf_ev_q
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wf_ev_fl
+    type: int
+    restore_value: no
+    initial_value: '0'
+
 # =============================================================================
 # SENSORS
 # =============================================================================
@@ -633,8 +904,8 @@ sensor:
   # ---------------------------------------------------------------------------
   # PRESSURE SENSOR 1 — Main line (GPIO01)
   # Reads raw ADC voltage and converts to PSI using a linear calibration.
-  # Sampled at 10ms, averaged with exponential moving average, reported
-  # to HA every 100 samples (~1s). Clamped to valid sensor range (0-104 PSI).
+  # Sampled at 5ms, averaged with exponential moving average, reported
+  # to HA every 100 samples (~500ms). Clamped to valid sensor range (0-104 PSI).
   #
   # Safety checks on every reported value:
   #   1. Rapid pressure drop — indicates a burst pipe or sudden large leak
@@ -643,7 +914,7 @@ sensor:
   - platform: copy
     source_id: pressure_main_base
     id: pressure_main
-    name: "Water Pressure 1 - Main"
+    name: "Water Pressure 1 - ${circuit_1_name}"
     entity_category: ""        # recorded by HA — used for historical event import
     device_class: pressure
     web_server:
@@ -817,11 +1088,14 @@ sensor:
             }
 
         # --- Fault response: close the main valve ---
-        # Guarded by the closed end stop so valve.close is only called once —
-        # not repeatedly on every sensor tick while the valve is already shut.
+        # Gated on close_in_flight_main so valve.close is requested exactly
+        # once per fault event — not on every sensor tick during the 15s
+        # travel window (or while waiting for an end stop after a failed
+        # close). The closed end stop alone is not sufficient: it stays off
+        # for the full travel time and indefinitely after a motor fault.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state;'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
             then:
               - valve.close: main_water_valve
 
@@ -833,7 +1107,7 @@ sensor:
   - platform: copy
     source_id: pressure_irrigation_base
     id: pressure_irrigation
-    name: "Water Pressure 2 - Irrigation"
+    name: "Water Pressure 2 - ${circuit_2_name}"
     entity_category: ""        # recorded by HA — used for historical event import
     device_class: pressure
     web_server:
@@ -962,11 +1236,14 @@ sensor:
               ESP_LOGI("leak_test", "IRRIGATION: leak test complete — no leak detected after %.0f minutes",
                 id(leak_duration_irr).state);
             }
-        # Guarded by the closed end stop so valve.close is only called once —
-        # not repeatedly on every sensor tick while the valve is already shut.
+        # Gated on close_in_flight_irr so valve.close is requested exactly
+        # once per fault event — not on every sensor tick during the 15s
+        # travel window (or while waiting for an end stop after a failed
+        # close). The closed end stop alone is not sufficient: it stays off
+        # for the full travel time and indefinitely after a motor fault.
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state;'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
             then:
               - valve.close: irrigation_water_valve
 
@@ -992,7 +1269,7 @@ sensor:
   - platform: copy
     source_id: pressure_main
     id: pressure_main_avg
-    name: "Water Pressure 1 - Main (Averaged)"
+    name: "Water Pressure 1 - ${circuit_1_name} (Averaged)"
     # pressure_main now has entity_category: "" (recorded by HA); explicitly
     # clear here so this copy does not inherit any future category change.
     entity_category: ""
@@ -1026,7 +1303,7 @@ sensor:
   - platform: copy
     source_id: pressure_irrigation
     id: pressure_irrigation_avg
-    name: "Water Pressure 2 - Irrigation (Averaged)"
+    name: "Water Pressure 2 - ${circuit_2_name} (Averaged)"
     # See pressure_main_avg above.
     entity_category: ""
     device_class: pressure
@@ -1066,7 +1343,7 @@ sensor:
   - platform: copy
     source_id: pressure_main_base
     id: pressure_main_fast
-    name: "Water Pressure 1 - Main (Fast)"
+    name: "Water Pressure 1 - ${circuit_1_name} (Fast)"
     entity_category: diagnostic
     device_class: pressure
     web_server:
@@ -1089,7 +1366,7 @@ sensor:
   - platform: copy
     source_id: pressure_irrigation_base
     id: pressure_irrigation_fast
-    name: "Water Pressure 2 - Irrigation (Fast)"
+    name: "Water Pressure 2 - ${circuit_2_name} (Fast)"
     entity_category: diagnostic
     device_class: pressure
     web_server:
@@ -1111,26 +1388,25 @@ sensor:
   #   where 6.6 is the sensor pulse factor (pulses per litre).
   #
   # Timing strategy:
-  #   update_interval: 1s — counts pulses over a 1 second window. This is the
-  #     shortest practical window that still gives accurate readings at low flow.
+  #   update_interval: 25ms — counts pulses over a 25ms window at 40Hz internally.
+  #     Matches the fast pressure sensor sample rate so flow_pulse_onset fires
+  #     within ~41ms of the first pulse (25ms window + ~16ms ESP loop).
+  #     HA history records the server-side last_changed timestamp for accurate
+  #     propagation delay calculation via the HA history API.
   #   Filter chain (applied in order):
   #     1. lambda — converts raw counts/min to L/min
-  #     2. sliding_window_moving_average (window 30s) — averages the last 30
-  #        one-second readings. At low flow (<1 L/min) pulses are sparse and
-  #        irregular; a 30s window captures several pulses for a stable average.
-  #     3. exponential_moving_average (alpha 0.2) — further smooths step changes.
+  #     2. sliding_window_moving_average (window_size 40 × 25ms = 1s, send_every 2)
+  #        — 1s smoothing window; sends every 2nd result → 20 HA updates/second.
   #
   # Safety checks on every reported value:
   #   1. Burst pipe — high flow above threshold triggers safety fault
   #   2. Trickle flow — low but sustained flow triggers trickle alert
   #
-  # Note on trickle detection and the 30s sliding window:
-  #   The window means flow must enter the trickle band and stay there long
-  #   enough for the average to stabilise before the elapsed timer accumulates
-  #   meaningfully. In practice this adds ~30s of natural lag before the timer
-  #   counts reliably — desirable, as it prevents brief spikes from starting
-  #   the timer. The alert duration should be several minutes or more so this
-  #   is insignificant relative to the total detection time.
+  # Note on trickle detection and the 1s sliding window:
+  #   The window averages forty 25ms readings (= 1s), reducing pulse noise while
+  #   adding only ~1s of lag. Trickle detection is reliable for flows above
+  #   ~0.15 L/min (~1 pulse/s); below that, readings are noisier but the timer
+  #   still accumulates correctly over the multi-minute alert duration.
   # ---------------------------------------------------------------------------
   # FLOW SENSOR 1 BASE — Main line (GPIO39)
   # Single pulse_counter on this GPIO — the only component on GPIO39.
@@ -1138,17 +1414,17 @@ sensor:
   # Derived sensors below convert to L/min and detect flow onset.
   #
   # on_value runs two safety checks that benefit from the raw 1s pulse count
-  # rather than the 30s-smoothed water_usage1:
+  # rather than the 2s-smoothed water_usage1:
   #
   #   1. INSTANT BURST — catches a burst pipe within 1-2 seconds rather than
-  #      waiting ~30s for the smoothing window to fill. Uses 1.5× the
-  #      configured burst threshold to tolerate 1s window variability while
-  #      still catching genuinely large bursts immediately.
+  #      waiting for the smoothing window to fill. Uses 1.5× the configured
+  #      burst threshold to tolerate 1s window variability while still catching
+  #      genuinely large bursts immediately.
   #
   #   2. FAST VALVE SEAL — detects flow pulses within 10s of the closed end
   #      stop activating. The existing slow seal check (water_usage1, 90s)
-  #      was padded to tolerate the 30s smoothing window draining. With raw
-  #      pulse data, 10s is enough to be confident the valve hasn't seated.
+  #      was originally padded for the old 30s window; the 2s window now drains
+  #      quickly but the raw check remains the fastest signal.
   #      Clearing the alert is handled by water_usage1 when flow stops.
   # ---------------------------------------------------------------------------
   - platform: pulse_counter
@@ -1157,9 +1433,10 @@ sensor:
       mode:
         input: true
         pulldown: true    # pulldown prevents floating input causing false counts
+    internal_filter: 13us  # debounce — suppresses RF noise from valve motor inductance
     id: flow_base_main
     internal: true
-    update_interval: 1s
+    update_interval: 25ms
     on_value:
       then:
         # --- Instant burst detection ---
@@ -1182,9 +1459,10 @@ sensor:
                 instant_lpm, id(burst_threshold_main).state);
             }
         # Fault response — close valve if not already closing.
+        # close_in_flight_main is the one-shot; see leak-test handler above.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state;'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
             then:
               - valve.close: main_water_valve
 
@@ -1224,7 +1502,7 @@ sensor:
     unit_of_measurement: 'L/min'
     accuracy_decimals: 2
     id: water_usage1
-    name: "Water Flow Rate - Main"
+    name: "Water Flow Rate - ${circuit_1_name}"
     device_class: volume_flow_rate
     state_class: measurement
     web_server:
@@ -1245,15 +1523,17 @@ sensor:
       - lambda: |-
           if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
           return x;
-      # Step 2: 30-second sliding window. At 0.5 L/min a pulse arrives every
-      # ~18s — a 30s window captures 1-2 pulses for a stable non-zero reading.
+      # Step 2: 0.5-second sliding window (20 samples × 25ms = 500ms). send_every: 1
+      # publishes at 40Hz (every 25ms). Shorter window reduces the stepped
+      # appearance in the HA history graph while keeping the same average volume.
       - sliding_window_moving_average:
-          window_size: 30
+          window_size: 20
           send_every: 1
-      # Step 3: EMA further smooths step changes from the sliding window output.
-      - exponential_moving_average:
-          alpha: 0.2
-          send_every: 1
+      # Throttle to 4Hz for downstream consumers (HA recorder, web dashboard,
+      # add-on event_detector — which is documented as 1Hz). Avoids flooding
+      # the web_server SSE stream and HA. on_value safety checks below run at
+      # the throttled rate; the fast burst path is on flow_base_main at 25ms.
+      - throttle: 250ms
     on_value:
       then:
         # --- Check 1: Burst pipe high flow fault ---
@@ -1269,10 +1549,10 @@ sensor:
                 ESP_LOGD("safety", "MAIN: high flow detected (%.2f L/min) — alert disabled", x);
               }
             }
-        # Guarded by the closed end stop so valve.close is only called once.
+        # Gated on close_in_flight_main so valve.close fires once per fault.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state;'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
             then:
               - valve.close: main_water_valve
 
@@ -1315,7 +1595,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(trickle_alert_main) && id(trickle_shutoff_main) && !id(closed_end_stop_valve1).state;'
+              lambda: 'return id(trickle_alert_main) && id(trickle_shutoff_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
             then:
               - valve.close: main_water_valve
 
@@ -1360,9 +1640,10 @@ sensor:
       mode:
         input: true
         pulldown: true
+    internal_filter: 13us  # debounce — suppresses RF noise from valve motor inductance
     id: flow_base_irr
     internal: true
-    update_interval: 1s
+    update_interval: 25ms
     on_value:
       then:
         # --- Instant burst detection (Irrigation) ---
@@ -1383,7 +1664,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state;'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
             then:
               - valve.close: irrigation_water_valve
 
@@ -1415,7 +1696,7 @@ sensor:
     unit_of_measurement: 'L/min'
     accuracy_decimals: 2
     id: water_usage2
-    name: "Water Flow Rate - Irrigation"
+    name: "Water Flow Rate - ${circuit_2_name}"
     device_class: volume_flow_rate
     state_class: measurement
     web_server:
@@ -1427,12 +1708,12 @@ sensor:
       - lambda: |-
           if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
           return x;
+      # 0.5-second sliding window — matches water_usage1; see comments there.
       - sliding_window_moving_average:
-          window_size: 30
+          window_size: 20
           send_every: 1
-      - exponential_moving_average:
-          alpha: 0.2
-          send_every: 1
+      # Throttle to 4Hz — see water_usage1 comment.
+      - throttle: 250ms
     on_value:
       then:
         # --- Check 1: Burst pipe high flow fault ---
@@ -1448,10 +1729,10 @@ sensor:
                 ESP_LOGD("safety", "IRRIGATION: high flow detected (%.2f L/min) — alert disabled", x);
               }
             }
-        # Guarded by the closed end stop so valve.close is only called once.
+        # Gated on close_in_flight_irr so valve.close fires once per fault.
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state;'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
             then:
               - valve.close: irrigation_water_valve
 
@@ -1479,7 +1760,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(trickle_alert_irr) && id(trickle_shutoff_irr) && !id(closed_end_stop_valve2).state;'
+              lambda: 'return id(trickle_alert_irr) && id(trickle_shutoff_irr) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
             then:
               - valve.close: irrigation_water_valve
 
@@ -1530,7 +1811,7 @@ sensor:
 # totals that survive recorder purge cycles).
 # =============================================================================
   - platform: integration
-    name: "Water Volume Total - Main"
+    name: "Water Volume Total - ${circuit_1_name}"
     id: water_volume_total_main
     sensor: water_usage1
     time_unit: min
@@ -1544,7 +1825,7 @@ sensor:
       sorting_weight: 49
 
   - platform: integration
-    name: "Water Volume Total - Irrigation"
+    name: "Water Volume Total - ${circuit_2_name}"
     id: water_volume_total_irr
     sensor: water_usage2
     time_unit: min
@@ -1557,6 +1838,52 @@ sensor:
       sorting_group_id: group_irr_status
       sorting_weight: 49
 
+  # ---------------------------------------------------------------------------
+  # WAVEFORM OVERFLOW DROPPED COUNT — Main circuit — diagnostic (firmware 3.7.0+)
+  #
+  # Increments once per water event that could not be captured because the
+  # previous event's final chunk was still flushing to HA. Climbing value =>
+  # events arriving faster than they can be staged + sent (very rare in
+  # chunked transport; was the dominant failure mode in the slot+decimation
+  # design used through 3.8.x). Published immediately on change and also
+  # polled every 60 s so HA has the value after a reconnect.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Waveform Overflow Dropped Count - ${circuit_1_name}"
+    id: waveform_overflow_dropped_count
+    entity_category: diagnostic
+    icon: mdi:waveform
+    accuracy_decimals: 0
+    state_class: total_increasing
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 47
+    update_interval: 60s
+    lambda: 'return (float) id(wf_overflow_count);'
+
+  # ---------------------------------------------------------------------------
+  # WAVEFORM CHUNK DROP COUNT — diagnostic (firmware 3.9.0+, circuit_1 only)
+  #
+  # Increments once per SAMPLE dropped because a circuit's 1500-sample chunk
+  # buffer was full AND staging was blocked (wf_ev_pending). With the
+  # in-tick stage+fire pipeline this should stay at 0 under normal operation;
+  # a non-zero value indicates HA→ESP event latency is occasionally exceeding
+  # one 20 ms tick. Investigate add-on responsiveness or HA load before
+  # declaring chunked streaming stable on a deployment.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Waveform Chunk Drop Count - ${circuit_1_name}"
+    id: waveform_chunk_drop_count
+    entity_category: diagnostic
+    icon: mdi:waveform
+    accuracy_decimals: 0
+    state_class: total_increasing
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 48
+    update_interval: 60s
+    lambda: 'return (float) id(wf_chunk_drop_count);'
+
 # =============================================================================
 # TEXT SENSORS — Leak test results
 # Persists the last result of each leak test as a human-readable string.
@@ -1567,7 +1894,7 @@ sensor:
 # =============================================================================
 text_sensor:
   - platform: template
-    name: "Leak Test Result - Main"
+    name: "Leak Test Result - ${circuit_1_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_main_status
@@ -1590,7 +1917,7 @@ text_sensor:
       }
 
   - platform: template
-    name: "Leak Test Result - Irrigation"
+    name: "Leak Test Result - ${circuit_2_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_irr_status
@@ -1632,7 +1959,7 @@ text_sensor:
   # Matched by the water signature add-on via pattern "fault reason.*main".
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Fault Reason - Main"
+    name: "Fault Reason - ${circuit_1_name}"
     id: fault_reason_main
     entity_category: diagnostic
     icon: mdi:alert-circle-outline
@@ -1643,7 +1970,7 @@ text_sensor:
     lambda: 'return {id(fault_reason_main_str)};'
 
   - platform: template
-    name: "Fault Reason - Irrigation"
+    name: "Fault Reason - ${circuit_2_name}"
     id: fault_reason_irr
     entity_category: diagnostic
     icon: mdi:alert-circle-outline
@@ -1652,6 +1979,54 @@ text_sensor:
       sorting_weight: 5.5
     update_interval: 5s
     lambda: 'return {id(fault_reason_irr_str)};'
+
+  # ---------------------------------------------------------------------------
+  # Diagnostic circuit identity sensors
+  # These allow the water monitor add-on to map circuit IDs to display labels
+  # without relying on entity name pattern matching — enabling label-independent
+  # device discovery (critical for non-default firmware labels, duplex installs).
+  # entity_category: diagnostic keeps them off the main HA overview.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Circuit 1 ID"
+    id: circuit_1_id_sensor
+    entity_category: diagnostic
+    icon: mdi:identifier
+    update_interval: 60s
+    lambda: return {"circuit_1"};
+
+  - platform: template
+    name: "Circuit 1 Label"
+    id: circuit_1_label_sensor
+    entity_category: diagnostic
+    icon: mdi:label-outline
+    update_interval: 60s
+    lambda: return {"${circuit_1_name}"};
+
+  - platform: template
+    name: "Circuit 2 ID"
+    id: circuit_2_id_sensor
+    entity_category: diagnostic
+    icon: mdi:identifier
+    update_interval: 60s
+    lambda: return {"circuit_2"};
+
+  - platform: template
+    name: "Circuit 2 Label"
+    id: circuit_2_label_sensor
+    entity_category: diagnostic
+    icon: mdi:label-outline
+    update_interval: 60s
+    lambda: return {"${circuit_2_name}"};
+
+  # ---------------------------------------------------------------------------
+  # WAVEFORM CAPTURE — Main circuit
+  # As of firmware 3.9.0 waveform data is delivered as a stream of
+  # `esphome.water_monitor_waveform_chunk` HA events — one per ~1500-sample
+  # buffer fill plus one final chunk on event end. The add-on accumulator
+  # stitches by (boot_id, event_id). The earlier 3.8.x single-event
+  # transport (and the 3.7.x 5-text-sensor transport) are both gone.
+  # ---------------------------------------------------------------------------
 
 # =============================================================================
 # BINARY SENSORS
@@ -1670,20 +2045,15 @@ binary_sensor:
   # These transition ON when the flow rate exceeds the noise floor (0.02 L/min)
   # and stay ON for 8 seconds after the last above-threshold reading.
   #
-  # Timing note: these sensors update every 1 second (the pulse counter rate).
-  # Flow onset detection now has up to ~1s latency rather than the near-
-  # instantaneous first-pulse response of the previous GPIO approach. In
-  # practice this is acceptable because HA WebSocket event timestamps already
-  # carry 1-2s delivery jitter, so sub-second propagation delay measurement
-  # via the HA event stream was not achievable anyway.
-  #
-  # The water signature add-on uses these to detect event start/end and
-  # pair with pressure_main_fast state_changed events for propagation delay
-  # estimation at ~1s resolution.
+  # Timing note: flow_pulse_onset fires within ~41ms of the first pulse —
+  # the template lambda evaluates on each ESP main loop cycle (~16ms) against
+  # flow_base_main/irr which updates every 25ms. HA records the server-side
+  # last_changed timestamp; the app queries this via the HA history API after
+  # each pressure-triggered event to compute propagation_delay_ms accurately.
   # ---------------------------------------------------------------------------
   - platform: template
     id: flow_pulse_onset_main
-    name: "Flow Pulse Onset - Main"
+    name: "Flow Pulse Onset - ${circuit_1_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_main_status
@@ -1698,7 +2068,7 @@ binary_sensor:
 
   - platform: template
     id: flow_pulse_onset_irr
-    name: "Flow Pulse Onset - Irrigation"
+    name: "Flow Pulse Onset - ${circuit_2_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_irr_status
@@ -1709,35 +2079,38 @@ binary_sensor:
 
   # ---------------------------------------------------------------------------
   # FLOW INDICATORS
-  # Boolean "is water flowing right now?" view, derived from the smoothed
-  # pulse counter — no separate GPIO sensor, no shared pin.
+  # Boolean "is water flowing right now?" — derived from the raw pulse counter
+  # (same source as flow_pulse_onset) rather than the smoothed water_usage
+  # sensor. This gives a near-instant OFF response (~1s) when flow stops,
+  # independent of the 2s smoothing window on the flow-rate sensor.
   #
-  # Threshold 0.02 L/min is below any real flow but above floating-point zero.
-  # The 30s sliding window upstream means the indicator stays ON for ~30s
-  # after flow physically stops, replicating the original delayed_off: 25s
-  # behaviour without needing the binary sensor's debounce.
+  # delayed_off: 2s debounces brief zero-pulse gaps at very low flow rates
+  # (< 1 pulse/s) without adding meaningful latency on flow stop.
   #
-  # entity_category: diagnostic — kept for HA automations that need an
-  # immediate boolean signal, but tucked away from default dashboards because
+  # entity_category: diagnostic — tucked away from default dashboards because
   # the flow rate sensor already conveys the same information numerically.
   # ---------------------------------------------------------------------------
   - platform: template
     id: flow_indicator1
-    name: "Water Flowing - Main"
+    name: "Water Flowing - ${circuit_1_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 45
-    lambda: 'return id(water_usage1).state > 0.02;'
+    lambda: 'return id(flow_base_main).state > 0;'
+    filters:
+      - delayed_off: 2s
 
   - platform: template
     id: flow_indicator2
-    name: "Water Flowing - Irrigation"
+    name: "Water Flowing - ${circuit_2_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 45
-    lambda: 'return id(water_usage2).state > 0.02;'
+    lambda: 'return id(flow_base_irr).state > 0;'
+    filters:
+      - delayed_off: 2s
 
   # ---------------------------------------------------------------------------
   # FAULT STATUS SENSORS
@@ -1745,7 +2118,7 @@ binary_sensor:
   # mobile push notifications.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Safety Fault - Main"
+    name: "Safety Fault - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 5
@@ -1753,7 +2126,7 @@ binary_sensor:
     device_class: problem
 
   - platform: template
-    name: "Safety Fault - Irrigation"
+    name: "Safety Fault - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 5
@@ -1762,7 +2135,7 @@ binary_sensor:
 
   # Indicates whether leak test mode is active on each circuit
   - platform: template
-    name: "Leak Test Active - Main"
+    name: "Leak Test Active - ${circuit_1_name}"
     entity_category: diagnostic
     device_class: running
     web_server:
@@ -1771,7 +2144,7 @@ binary_sensor:
     lambda: 'return id(leak_test_active_main) || id(leak_test_preparing_main);'
 
   - platform: template
-    name: "Leak Test Active - Irrigation"
+    name: "Leak Test Active - ${circuit_2_name}"
     entity_category: diagnostic
     device_class: running
     web_server:
@@ -1789,7 +2162,7 @@ binary_sensor:
   #   "Shut off"    — presses "Reset Trickle Alert" then calls valve.close
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Trickle Flow Alert - Main"
+    name: "Trickle Flow Alert - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 6
@@ -1797,7 +2170,7 @@ binary_sensor:
     device_class: problem
 
   - platform: template
-    name: "Trickle Flow Alert - Irrigation"
+    name: "Trickle Flow Alert - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 6
@@ -1812,7 +2185,7 @@ binary_sensor:
   # can drive mobile push notifications.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Valve Seal Alert - Main"
+    name: "Valve Seal Alert - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 85
@@ -1820,7 +2193,7 @@ binary_sensor:
     device_class: problem
 
   - platform: template
-    name: "Valve Seal Alert - Irrigation"
+    name: "Valve Seal Alert - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 85
@@ -1840,7 +2213,7 @@ binary_sensor:
         input: true
         pullup: true
     id: open_end_stop_valve1
-    name: "Open End Stop - Main"
+    name: "Open End Stop - ${circuit_1_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_main_status
@@ -1866,7 +2239,7 @@ binary_sensor:
         input: true
         pullup: true
     id: closed_end_stop_valve1
-    name: "Closed End Stop - Main"
+    name: "Closed End Stop - ${circuit_1_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_main_status
@@ -1878,9 +2251,14 @@ binary_sensor:
         - valve.template.publish:
             id: main_water_valve
             state: CLOSED
-        # Valve has reached the closed position — clear the close-in-flight
-        # guard so future closes can be requested again if needed.
-        - lambda: 'id(close_in_flight_main) = false;'
+        # Valve has reached the closed position — clear both in-flight guards.
+        # close_in_flight: close sequence completed successfully.
+        # open_in_flight: clears any open that was interrupted mid-travel by
+        # this close (e.g. safety-fault auto-close arriving during the 15s
+        # open-action delay), preventing a spurious motor fault at timeout.
+        - lambda: |-
+            id(close_in_flight_main) = false;
+            id(open_in_flight_main) = false;
 
   # ---------------------------------------------------------------------------
   # END STOP SWITCHES — Valve 2 (Irrigation)
@@ -1893,7 +2271,7 @@ binary_sensor:
         input: true
         pullup: true
     id: open_end_stop_valve2
-    name: "Open End Stop - Irrigation"
+    name: "Open End Stop - ${circuit_2_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_irr_status
@@ -1916,7 +2294,7 @@ binary_sensor:
         input: true
         pullup: true
     id: closed_end_stop_valve2
-    name: "Closed End Stop - Irrigation"
+    name: "Closed End Stop - ${circuit_2_name}"
     entity_category: diagnostic
     web_server:
       sorting_group_id: group_irr_status
@@ -1928,7 +2306,11 @@ binary_sensor:
         - valve.template.publish:
             id: irrigation_water_valve
             state: CLOSED
-        - lambda: 'id(close_in_flight_irr) = false;'
+        # Mirror the main-circuit closed end-stop: clear both guards.
+        # See closed_end_stop_valve1.on_press comment for rationale.
+        - lambda: |-
+            id(close_in_flight_irr) = false;
+            id(open_in_flight_irr) = false;
 
 # =============================================================================
 # OUTPUTS — Panel indicator LEDs
@@ -1959,7 +2341,7 @@ number:
   # BURST PIPE HIGH FLOW THRESHOLD
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Burst Pipe Flow Threshold - Main"
+    name: "Burst Pipe Flow Threshold - ${circuit_1_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -1980,7 +2362,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Burst Pipe Flow Threshold - Irrigation"
+    name: "Burst Pipe Flow Threshold - ${circuit_2_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -2018,7 +2400,7 @@ number:
   #     normal demand events.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Pressure Drop Threshold - Main"
+    name: "Pressure Drop Threshold - ${circuit_1_name}"
     entity_category: config
     device_class: pressure
     web_server:
@@ -2039,7 +2421,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Pressure Drop Threshold - Irrigation"
+    name: "Pressure Drop Threshold - ${circuit_2_name}"
     entity_category: config
     device_class: pressure
     web_server:
@@ -2063,7 +2445,7 @@ number:
   # LEAK TEST PRESSURE THRESHOLD AND DURATION
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Leak Test Pressure Threshold - Main"
+    name: "Leak Test Pressure Threshold - ${circuit_1_name}"
     entity_category: config
     device_class: pressure
     web_server:
@@ -2084,7 +2466,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Leak Test Pressure Threshold - Irrigation"
+    name: "Leak Test Pressure Threshold - ${circuit_2_name}"
     entity_category: config
     device_class: pressure
     web_server:
@@ -2105,7 +2487,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Leak Test Duration - Main"
+    name: "Leak Test Duration - ${circuit_1_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_main_settings
@@ -2125,7 +2507,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Leak Test Duration - Irrigation"
+    name: "Leak Test Duration - ${circuit_2_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_irr_settings
@@ -2171,7 +2553,7 @@ number:
   #   Toilet cistern refilling:       ~0.5–2.0 L/min for 1–2 minutes then stops
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Trickle Flow Min Threshold - Main"
+    name: "Trickle Flow Min Threshold - ${circuit_1_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -2192,7 +2574,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Trickle Flow Max Threshold - Main"
+    name: "Trickle Flow Max Threshold - ${circuit_1_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -2213,7 +2595,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Trickle Flow Alert Duration - Main"
+    name: "Trickle Flow Alert Duration - ${circuit_1_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_main_settings
@@ -2244,7 +2626,7 @@ number:
   # above 0.1 L/min, raise this threshold above the observed bleed rate.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Trickle Flow Min Threshold - Irrigation"
+    name: "Trickle Flow Min Threshold - ${circuit_2_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -2265,7 +2647,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Trickle Flow Max Threshold - Irrigation"
+    name: "Trickle Flow Max Threshold - ${circuit_2_name}"
     entity_category: config
     device_class: volume_flow_rate
     web_server:
@@ -2286,7 +2668,7 @@ number:
           args: ['x']
 
   - platform: template
-    name: "Trickle Flow Alert Duration - Irrigation"
+    name: "Trickle Flow Alert Duration - ${circuit_2_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_irr_settings
@@ -2378,7 +2760,7 @@ switch:
   # The lambda shows ON during both the prepare and active phases.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Micro Leak Test - Main"
+    name: "Micro Leak Test - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 13
@@ -2403,7 +2785,7 @@ switch:
   # Same as main — see main comments above for full usage instructions.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Micro Leak Test - Irrigation"
+    name: "Micro Leak Test - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 13
@@ -2431,7 +2813,7 @@ switch:
   # context. All default to ON. State persists across reboots.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Enable Pressure Drop Alert - Main"
+    name: "Enable Pressure Drop Alert - ${circuit_1_name}"
     entity_category: config
     id: enable_pressure_drop_main
     icon: mdi:gauge-low
@@ -2445,7 +2827,7 @@ switch:
       - lambda: 'id(alert_pressure_drop_main) = false;'
 
   - platform: template
-    name: "Enable High Flow Alert - Main"
+    name: "Enable High Flow Alert - ${circuit_1_name}"
     entity_category: config
     id: enable_high_flow_main
     icon: mdi:water-alert
@@ -2459,7 +2841,7 @@ switch:
       - lambda: 'id(alert_high_flow_main) = false;'
 
   - platform: template
-    name: "Enable Leak Test Alert - Main"
+    name: "Enable Leak Test Alert - ${circuit_1_name}"
     entity_category: config
     id: enable_leak_test_main
     icon: mdi:water-check
@@ -2473,7 +2855,7 @@ switch:
       - lambda: 'id(alert_leak_test_main) = false;'
 
   - platform: template
-    name: "Enable Trickle Alert - Main"
+    name: "Enable Trickle Alert - ${circuit_1_name}"
     entity_category: config
     id: enable_trickle_main
     icon: mdi:water-minus
@@ -2487,7 +2869,7 @@ switch:
       - lambda: 'id(alert_trickle_main) = false;'
 
   - platform: template
-    name: "Enable Pressure Drop Alert - Irrigation"
+    name: "Enable Pressure Drop Alert - ${circuit_2_name}"
     entity_category: config
     id: enable_pressure_drop_irr
     icon: mdi:gauge-low
@@ -2501,7 +2883,7 @@ switch:
       - lambda: 'id(alert_pressure_drop_irr) = false;'
 
   - platform: template
-    name: "Enable High Flow Alert - Irrigation"
+    name: "Enable High Flow Alert - ${circuit_2_name}"
     entity_category: config
     id: enable_high_flow_irr
     icon: mdi:water-alert
@@ -2515,7 +2897,7 @@ switch:
       - lambda: 'id(alert_high_flow_irr) = false;'
 
   - platform: template
-    name: "Enable Leak Test Alert - Irrigation"
+    name: "Enable Leak Test Alert - ${circuit_2_name}"
     entity_category: config
     id: enable_leak_test_irr
     icon: mdi:water-check
@@ -2529,7 +2911,7 @@ switch:
       - lambda: 'id(alert_leak_test_irr) = false;'
 
   - platform: template
-    name: "Enable Trickle Alert - Irrigation"
+    name: "Enable Trickle Alert - ${circuit_2_name}"
     entity_category: config
     id: enable_trickle_irr
     icon: mdi:water-minus
@@ -2557,7 +2939,7 @@ switch:
   # reboots — set it once and it is remembered.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Trickle Flow Auto-Shutoff - Main"
+    name: "Trickle Flow Auto-Shutoff - ${circuit_1_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_main_settings
@@ -2582,7 +2964,7 @@ switch:
   # above your normal irrigation zone flow rates to avoid false shutoffs.
   # ---------------------------------------------------------------------------
   - platform: template
-    name: "Trickle Flow Auto-Shutoff - Irrigation"
+    name: "Trickle Flow Auto-Shutoff - ${circuit_2_name}"
     entity_category: config
     web_server:
       sorting_group_id: group_irr_settings
@@ -2622,7 +3004,7 @@ switch:
 # =============================================================================
 button:
   - platform: template
-    name: "Reset Safety Fault - Main"
+    name: "Reset Safety Fault - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 11
@@ -2635,7 +3017,7 @@ button:
       - logger.log: "Main safety fault manually reset"
 
   - platform: template
-    name: "Reset Safety Fault - Irrigation"
+    name: "Reset Safety Fault - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 11
@@ -2648,7 +3030,7 @@ button:
       - logger.log: "Irrigation safety fault manually reset"
 
   - platform: template
-    name: "Reset Trickle Alert - Main"
+    name: "Reset Trickle Alert - ${circuit_1_name}"
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 12
@@ -2660,7 +3042,7 @@ button:
           ESP_LOGI("trickle", "Main trickle flow alert manually reset");
 
   - platform: template
-    name: "Reset Trickle Alert - Irrigation"
+    name: "Reset Trickle Alert - ${circuit_2_name}"
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 12
@@ -2670,6 +3052,411 @@ button:
           id(trickle_alert_irr) = false;
           id(trickle_elapsed_irr) = 0.0f;
           ESP_LOGI("trickle", "Irrigation trickle flow alert manually reset");
+
+# =============================================================================
+# INTERVALS — Per-event waveform capture (firmware 3.10.0+, dual-circuit chunked streaming)
+#
+# A single ~50 Hz interval drives the whole waveform-capture engine. STRICTLY
+# ADDITIVE — it only READS already-published sensor states (water_usage1,
+# pressure_main_fast) and writes its own wf_* globals. It never touches the
+# 200 Hz ADC loop, the pulse-counter ISR, the safety lambdas, or any valve
+# action, so it cannot regress the shut-off device.
+#
+# Each captured event is delivered as a sequence of
+# `esphome.water_monitor_waveform_chunk` events. A chunk fires every time a
+# circuit's 1500-sample buffer fills (~30 s @ ~50 Hz) and also on event end.
+# The add-on accumulates chunks by (boot_id, event_id) and stitches them on
+# the final chunk. Native cadence is preserved regardless of event length —
+# no decimation, no fixed-size resampling.
+#
+# Per-circuit layout: arrays indexed [2] where 0 = circuit_1 (main), 1 =
+# circuit_2 (irrigation). 3.10.0 wires both circuits' flow + pressure
+# sources into the state machine — circuit_2 captures alongside circuit_1.
+# Per-circuit pre-roll rings keep each event's signature isolated. The
+# single staging slot (wf_ev_pending) serialises HA event emission across
+# circuits; with stage-fire under one tick this rarely contends.
+#
+# Staging is a single shared in-flight chunk: only one
+# water_monitor_waveform_chunk event may be queued at a time. wf_ev_pending
+# guards it. When the buffer fills and staging is blocked, the new sample
+# is DROPPED and wf_chunk_drop_count++ — the buffer is NEVER written past
+# index 1499. Buffer-full AND finalizing in the same tick collapses to a
+# single final chunk.
+#
+# Wire format: see WaveformChunkAccumulator in water_monitor/app/event_detector.py
+# and the wire-format table in plans/i-would-like-to-snug-lerdorf.md.
+# =============================================================================
+interval:
+  - interval: 20ms
+    then:
+      - lambda: |-
+          /* WAVEFORM CAPTURE ENGINE — chunked streaming. Strictly additive. */
+
+          // ---- one-time per-boot init ----
+          if (id(wf_boot_id) == 0) {
+            uint32_t r = esphome::random_uint32();
+            id(wf_boot_id) = (r == 0) ? 1u : r;
+          }
+          id(wf_tick) = id(wf_tick) + 1;
+
+          // ---- helpers (stack-only lambdas, no heap allocation) ----
+          auto to_i16 = [](float v) -> int16_t {
+            float s = v * 100.0f;
+            if (s > 32767.0f) s = 32767.0f;
+            if (s < -32768.0f) s = -32768.0f;
+            return (int16_t) lroundf(s);
+          };
+          auto b64 = [](const uint8_t *d, int len) -> std::string {
+            static const char *T =
+              "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string out;
+            out.reserve(((len + 2) / 3) * 4);
+            int i = 0;
+            while (i + 3 <= len) {
+              uint32_t n = ((uint32_t) d[i] << 16) |
+                           ((uint32_t) d[i + 1] << 8) | d[i + 2];
+              out += T[(n >> 18) & 63]; out += T[(n >> 12) & 63];
+              out += T[(n >> 6) & 63];  out += T[n & 63];
+              i += 3;
+            }
+            int rem = len - i;
+            if (rem == 1) {
+              uint32_t n = (uint32_t) d[i] << 16;
+              out += T[(n >> 18) & 63]; out += T[(n >> 12) & 63];
+              out += '='; out += '=';
+            } else if (rem == 2) {
+              uint32_t n = ((uint32_t) d[i] << 16) | ((uint32_t) d[i + 1] << 8);
+              out += T[(n >> 18) & 63]; out += T[(n >> 12) & 63];
+              out += T[(n >> 6) & 63];  out += '=';
+            }
+            return out;
+          };
+          // Encode the first `len` int16 samples from a circuit's chunk buffer
+          // into base64 little-endian bytes. Heap allocation bounded by chunk
+          // size (max 1500 samples = 3000 bytes raw, ~4000 chars base64).
+          auto encode_chunk = [&](int16_t *src, int len) -> std::string {
+            if (len <= 0) return std::string();
+            std::vector<uint8_t> bytes;
+            bytes.resize((size_t) len * 2);
+            for (int i = 0; i < len; i++) {
+              uint16_t u = (uint16_t) src[i];
+              bytes[2 * i]     = (uint8_t) (u & 0xFF);
+              bytes[2 * i + 1] = (uint8_t) ((u >> 8) & 0xFF);
+            }
+            return b64(bytes.data(), (int) bytes.size());
+          };
+          // Stage one chunk for circuit c. Returns true on success, false if
+          // staging was blocked by wf_ev_pending.
+          // `is_final` triggers final-only metadata fields; on a non-final
+          // chunk those fields are set to safe defaults but ignored by the
+          // add-on (the wire-format spec only requires them when final=true).
+          auto stage_chunk = [&](int c, bool is_final, uint32_t now_ms) -> bool {
+            if (id(wf_ev_pending)) return false;
+            int len = id(wf_chunk_len)[c];
+            int16_t *fbuf = (c == 0) ? &id(wf_chunk_flow)[0][0]
+                                      : &id(wf_chunk_flow)[1][0];
+            int16_t *pbuf = (c == 0) ? &id(wf_chunk_press)[0][0]
+                                      : &id(wf_chunk_press)[1][0];
+            id(wf_ev_flow_b64)  = encode_chunk(fbuf, len);
+            id(wf_ev_press_b64) = encode_chunk(pbuf, len);
+            id(wf_ev_circuit)   = c;
+            id(wf_ev_is_final)  = is_final;
+            id(wf_ev_event_id)  = id(wf_event_id)[c];
+            id(wf_ev_boot)      = id(wf_boot_id);
+            id(wf_ev_seq)       = id(wf_chunk_seq)[c];
+            id(wf_ev_s)         = id(wf_chunk_start_ms)[c];
+            id(wf_ev_e)         = now_ms;
+            if (is_final) {
+              int fl = id(wf_evt_flags)[c] | 0x02;  // full_waveform_complete
+              uint32_t dur = (uint32_t) (id(wf_event_end_ms)[c] -
+                                          id(wf_event_start_ms)[c]);
+              if (dur < 1000u) fl |= 0x10;          // event_too_short
+              id(wf_evt_flags)[c] = fl;
+              id(wf_ev_evt_s)     = id(wf_event_start_ms)[c];
+              id(wf_ev_evt_e)     = id(wf_event_end_ms)[c];
+              id(wf_ev_total)     = id(wf_chunk_seq)[c] + 1u;
+              id(wf_ev_onset_seq) = id(wf_onset_seq)[c];
+              id(wf_ev_onset_idx) = id(wf_onset_idx)[c];
+              id(wf_ev_press_onset_seq) = id(wf_press_onset_seq)[c];
+              id(wf_ev_press_onset_idx) = id(wf_press_onset_idx)[c];
+              int dp = (id(wf_evt_pmax)[c] >= id(wf_evt_pmin)[c])
+                       ? (id(wf_evt_pmax)[c] - id(wf_evt_pmin)[c]) : 0;
+              id(wf_ev_pk) = id(wf_evt_pk)[c];
+              id(wf_ev_dp) = dp;
+              id(wf_ev_pd) = -1;  // chunk-stream propagation delay derived add-on side
+              id(wf_ev_q)  = (fl & 0x01) ? 0 : 1;
+              id(wf_ev_fl) = fl;
+            } else {
+              id(wf_ev_total)     = 0u;  // unused on non-final chunks
+              id(wf_ev_evt_s)     = 0u;
+              id(wf_ev_evt_e)     = 0u;
+              id(wf_ev_onset_seq) = 0u;
+              id(wf_ev_onset_idx) = 0;
+              id(wf_ev_press_onset_seq) = -1;
+              id(wf_ev_press_onset_idx) = -1;
+              id(wf_ev_pk) = 0; id(wf_ev_dp) = 0;
+              id(wf_ev_pd) = -1; id(wf_ev_q) = 0; id(wf_ev_fl) = 0;
+            }
+            id(wf_ev_pending) = true;
+            return true;
+          };
+
+          // ---- 1. sample both circuits into their per-circuit pre-roll rings ----
+          // Source IDs: water_usage1 / pressure_main_fast = circuit_1 (main),
+          //             water_usage2 / pressure_irrigation_fast = circuit_2 (irrigation).
+          float src_flow[2] = {
+            id(water_usage1).state,
+            id(water_usage2).state,
+          };
+          float src_press[2] = {
+            id(pressure_main_fast).state,
+            id(pressure_irrigation_fast).state,
+          };
+          bool clamped = false;
+          int16_t cur_fi[2];
+          int16_t cur_pi[2];
+          bool flow_on[2];
+          for (int c = 0; c < 2; c++) {
+            float f = src_flow[c];
+            float p = src_press[c];
+            if (!std::isfinite(f)) { f = 0.0f; clamped = true; }
+            if (!std::isfinite(p)) { p = 0.0f; clamped = true; }
+            if (f < 0.0f) f = 0.0f;
+            if (p < 0.0f) p = 0.0f;
+            int16_t fi = to_i16(f);
+            int16_t pi = to_i16(p);
+            cur_fi[c] = fi;
+            cur_pi[c] = pi;
+            flow_on[c] = (f > 0.10f);
+            int ri = id(wf_ring_idx)[c];
+            id(wf_ring_flow)[c][ri] = fi;
+            id(wf_ring_press)[c][ri] = pi;
+            id(wf_ring_idx)[c] = (ri + 1) % 100;
+            if (id(wf_ring_count)[c] < 100)
+              id(wf_ring_count)[c] = id(wf_ring_count)[c] + 1;
+          }
+
+          // ---- 2. slow per-circuit pressure baseline (frozen while CAPTURING) ----
+          for (int c = 0; c < 2; c++) {
+            float p = src_press[c];
+            if (!std::isfinite(p) || p < 0.0f) p = 0.0f;
+            if (!id(wf_press_baseline_valid)[c]) {
+              id(wf_press_baseline)[c] = p;
+              id(wf_press_baseline_valid)[c] = true;
+            } else if (!id(wf_capturing)[c]) {
+              id(wf_press_baseline)[c] =
+                id(wf_press_baseline)[c] + 0.02f * (p - id(wf_press_baseline)[c]);
+            }
+          }
+
+          uint32_t now = millis();
+
+          // ---- 3. per-circuit capture state machine ----
+          for (int c = 0; c < 2; c++) {
+            if (!id(wf_capturing)[c]) {
+              // IDLE — watch for flow onset.
+              if (!flow_on[c]) continue;
+              // Reject onset if a previous final-chunk for this circuit hasn't
+              // flushed yet (very rare — wf_ev_pending clears within one tick).
+              if (id(wf_ev_pending) && id(wf_ev_is_final) &&
+                  id(wf_ev_circuit) == c) {
+                id(wf_overflow_count) = id(wf_overflow_count) + 1;
+                id(waveform_overflow_dropped_count)->publish_state(
+                  (float) id(wf_overflow_count));
+                continue;
+              }
+              // Copy this circuit's 100-sample pre-roll into its chunk buffer.
+              int n = id(wf_ring_count)[c];
+              int ri = id(wf_ring_idx)[c];
+              int start = (ri - n + 100) % 100;
+              int16_t *fbuf = (c == 0) ? &id(wf_chunk_flow)[0][0]
+                                          : &id(wf_chunk_flow)[1][0];
+              int16_t *pbuf = (c == 0) ? &id(wf_chunk_press)[0][0]
+                                          : &id(wf_chunk_press)[1][0];
+              int pk = 0, pmin = 32767, pmax = -32768;
+              for (int k = 0; k < n; k++) {
+                int src = (start + k) % 100;
+                int16_t f = id(wf_ring_flow)[c][src];
+                int16_t p = id(wf_ring_press)[c][src];
+                fbuf[k] = f; pbuf[k] = p;
+                if (f > pk) pk = f;
+                if (p < pmin) pmin = p;
+                if (p > pmax) pmax = p;
+              }
+              int onset = (n > 0) ? (n - 1) : 0;
+              id(wf_chunk_len)[c]      = n;
+              id(wf_chunk_seq)[c]      = 0;
+              id(wf_chunk_start_ms)[c] = now;
+              id(wf_event_id)[c]       = id(wf_event_counter) + 1;
+              id(wf_event_counter)     = id(wf_event_counter) + 1;
+              id(wf_event_start_ms)[c] = now;
+              id(wf_event_end_ms)[c]   = now;
+              id(wf_zero_ms)[c]        = now;
+              id(wf_onset_seq)[c]      = 0;
+              id(wf_onset_idx)[c]      = onset;
+              id(wf_evt_pk)[c]         = pk;
+              id(wf_evt_pmin)[c]       = (n > 0) ? pmin : 32767;
+              id(wf_evt_pmax)[c]       = (n > 0) ? pmax : -32768;
+              int fl = 0;
+              if (n >= 75) fl |= 0x01;  // pre-roll covers >= 1.5 s
+              if (clamped) fl |= 0x40;  // a sample was clamped
+              id(wf_evt_flags)[c] = fl;
+              // Pressure-transient onset (earliest sample above baseline + 0.5 PSI).
+              int po = -1;
+              float thr = (id(wf_press_baseline)[c] + 0.5f) * 100.0f;
+              for (int k = 0; k <= onset; k++) {
+                if ((float) pbuf[k] >= thr) { po = k; break; }
+              }
+              id(wf_press_onset_seq)[c] = (po >= 0) ? 0 : -1;
+              id(wf_press_onset_idx)[c] = po;
+              id(wf_capturing)[c] = true;
+              continue;
+            }
+
+            // CAPTURING — try to append the current sample to circuit c's chunk.
+            int len = id(wf_chunk_len)[c];
+            int16_t *fbuf = (c == 0) ? &id(wf_chunk_flow)[0][0]
+                                        : &id(wf_chunk_flow)[1][0];
+            int16_t *pbuf = (c == 0) ? &id(wf_chunk_press)[0][0]
+                                        : &id(wf_chunk_press)[1][0];
+
+            // Buffer-full handling. NEVER write past index 1499.
+            if (len >= 1500) {
+              // Check if we should finalize this tick (collapse buffer-full+final
+              // into a single final chunk rather than non-final + zero-payload final).
+              bool ready_to_finalize =
+                !flow_on[c] &&
+                ((uint32_t) (now - id(wf_zero_ms)[c]) >= 3000u);
+              if (stage_chunk(c, ready_to_finalize, now)) {
+                // Reset buffer for next chunk.
+                id(wf_chunk_len)[c]      = 0;
+                id(wf_chunk_seq)[c]     += 1;
+                id(wf_chunk_start_ms)[c] = now;
+                if (ready_to_finalize) {
+                  id(wf_capturing)[c] = false;
+                  continue;  // event complete — current sample skipped (acceptable: tail)
+                }
+                // Append the current sample into the now-empty buffer.
+                fbuf[0] = cur_fi[c];
+                pbuf[0] = cur_pi[c];
+                id(wf_chunk_len)[c] = 1;
+                if (cur_fi[c] > id(wf_evt_pk)[c]) id(wf_evt_pk)[c] = cur_fi[c];
+                if (cur_pi[c] < id(wf_evt_pmin)[c]) id(wf_evt_pmin)[c] = cur_pi[c];
+                if (cur_pi[c] > id(wf_evt_pmax)[c]) id(wf_evt_pmax)[c] = cur_pi[c];
+                if (clamped) id(wf_evt_flags)[c] |= 0x40;
+              } else {
+                // Staging blocked — drop this sample, count it, retry next tick.
+                id(wf_chunk_drop_count) = id(wf_chunk_drop_count) + 1;
+                id(wf_evt_flags)[c] |= 0x04;  // resolution_reduced (chunk drop)
+              }
+            } else {
+              // Buffer has room — append the current sample.
+              fbuf[len] = cur_fi[c];
+              pbuf[len] = cur_pi[c];
+              id(wf_chunk_len)[c] = len + 1;
+              if (cur_fi[c] > id(wf_evt_pk)[c]) id(wf_evt_pk)[c] = cur_fi[c];
+              if (cur_pi[c] < id(wf_evt_pmin)[c]) id(wf_evt_pmin)[c] = cur_pi[c];
+              if (cur_pi[c] > id(wf_evt_pmax)[c]) id(wf_evt_pmax)[c] = cur_pi[c];
+              if (clamped) id(wf_evt_flags)[c] |= 0x40;
+            }
+
+            // Tail-timer + finalize logic.
+            if (flow_on[c]) {
+              id(wf_zero_ms)[c] = now;
+            } else {
+              if (id(wf_event_end_ms)[c] < id(wf_zero_ms)[c] ||
+                  id(wf_event_end_ms)[c] == id(wf_event_start_ms)[c]) {
+                // First tick of zero flow — record event end.
+                id(wf_event_end_ms)[c] = now;
+              }
+              if ((uint32_t) (now - id(wf_zero_ms)[c]) >= 3000u &&
+                  id(wf_capturing)[c]) {
+                // 3 s of zero flow elapsed — try to send final chunk.
+                // If the buffer happens to be empty (already flushed), this
+                // stages a zero-payload final chunk with metadata only.
+                if (stage_chunk(c, true, now)) {
+                  id(wf_chunk_len)[c] = 0;
+                  id(wf_capturing)[c] = false;
+                }
+                // If stage blocked, retry next tick. wf_capturing stays true.
+              }
+            }
+          }
+
+          // ---- 4. stage fairness — if both circuits CAPTURING + buffer-full,
+          // alternate which one wins the wf_ev_pending slot per tick.
+          // (Implemented inline in the loop above by iterating c in {0, 1};
+          // wf_stage_rr is reserved for a future fairness rotation when both
+          // circuits are routinely contending. Currently circuit_2 is idle.)
+          id(wf_stage_rr) = (id(wf_stage_rr) + 1) % 2;
+
+      # Fire the staged HA chunk event when wf_ev_pending is true. Runs in the
+      # same 20ms tick as the staging lambda (ESPHome evaluates then: actions
+      # sequentially), so staging-and-fire happens within one tick at the cost
+      # of a short retry-loop if the event coroutine yields.
+      - if:
+          condition:
+            lambda: 'return id(wf_ev_pending);'
+          then:
+            - homeassistant.event:
+                event: esphome.water_monitor_waveform_chunk
+                data_template:
+                  schema:            "{{ schema }}"
+                  transport_version: "{{ transport_version }}"
+                  node:              "{{ node }}"
+                  circuit:           "{{ circuit }}"
+                  id:                "{{ id }}"
+                  b:                 "{{ b }}"
+                  seq:               "{{ seq }}"
+                  s:                 "{{ s }}"
+                  e:                 "{{ e }}"
+                  fs:                "100"
+                  ps:                "100"
+                  flow:              "{{ flow }}"
+                  press:             "{{ press }}"
+                  final:             "{{ final }}"
+                  event_s:           "{{ event_s }}"
+                  event_e:           "{{ event_e }}"
+                  total:             "{{ total }}"
+                  onset_seq:         "{{ onset_seq }}"
+                  onset_idx:         "{{ onset_idx }}"
+                  press_onset_seq:   "{{ press_onset_seq }}"
+                  press_onset_idx:   "{{ press_onset_idx }}"
+                  pk:                "{{ pk }}"
+                  dp:                "{{ dp }}"
+                  pd:                "{{ pd }}"
+                  q:                 "{{ q }}"
+                  fl:                "{{ fl }}"
+                variables:
+                  schema:            !lambda 'return std::string("esp_water_monitor_waveform_chunk");'
+                  transport_version: !lambda 'return std::string("1");'
+                  node:              !lambda 'return App.get_name();'
+                  circuit:           !lambda 'return std::string(id(wf_ev_circuit) == 0 ? "circuit_1" : "circuit_2");'
+                  id:                !lambda 'return std::to_string(id(wf_ev_event_id));'
+                  b:                 !lambda 'return std::to_string(id(wf_ev_boot));'
+                  seq:               !lambda 'return std::to_string(id(wf_ev_seq));'
+                  s:                 !lambda 'return std::to_string(id(wf_ev_s));'
+                  e:                 !lambda 'return std::to_string(id(wf_ev_e));'
+                  flow:              !lambda 'return id(wf_ev_flow_b64);'
+                  press:             !lambda 'return id(wf_ev_press_b64);'
+                  final:             !lambda 'return std::string(id(wf_ev_is_final) ? "true" : "false");'
+                  event_s:           !lambda 'return std::to_string(id(wf_ev_evt_s));'
+                  event_e:           !lambda 'return std::to_string(id(wf_ev_evt_e));'
+                  total:             !lambda 'return std::to_string(id(wf_ev_total));'
+                  onset_seq:         !lambda 'return std::to_string(id(wf_ev_onset_seq));'
+                  onset_idx:         !lambda 'return std::to_string(id(wf_ev_onset_idx));'
+                  press_onset_seq:   !lambda 'return std::to_string(id(wf_ev_press_onset_seq));'
+                  press_onset_idx:   !lambda 'return std::to_string(id(wf_ev_press_onset_idx));'
+                  pk:                !lambda 'return std::to_string(id(wf_ev_pk));'
+                  dp:                !lambda 'return std::to_string(id(wf_ev_dp));'
+                  pd:                !lambda 'return std::to_string(id(wf_ev_pd));'
+                  q:                 !lambda 'return std::to_string(id(wf_ev_q));'
+                  fl:                !lambda 'return std::to_string(id(wf_ev_fl));'
+            - lambda: |-
+                id(wf_ev_pending) = false;
+                // Drop large staging strings to free heap promptly.
+                id(wf_ev_flow_b64).clear();
+                id(wf_ev_press_b64).clear();
 
 # =============================================================================
 # SCRIPTS — Leak test sequences
@@ -2730,13 +3517,26 @@ script:
                         # dissipate after the valve closes, so the baseline reading
                         # captured next is stable and noise-free.
                         - delay: 60s
-                        # Guard: if cancelled during settle, preparing will be false
+                        # Guard: if cancelled during settle, preparing will be false.
+                        # Also validates the baseline reading is a sane pressure value —
+                        # the ADC-backed EMA sensor can return NaN or 0.0 on cold boot
+                        # before the first valid sample arrives, which would make the
+                        # leak threshold comparison undefined or always-pass.
                         - lambda: |-
                             if (!id(leak_test_preparing_main)) return;
+                            float baseline = id(pressure_main).state;
+                            if (isnan(baseline) || baseline < 1.0f) {
+                              id(leak_test_result_main) = 6;  // Not run — sensor not ready
+                              id(leak_test_preparing_main) = false;
+                              id(leak_test_active_main) = false;
+                              ESP_LOGW("leak_test", "MAIN: baseline invalid (%.1f PSI) — "
+                                "ADC not settled after close, aborting test", baseline);
+                              return;
+                            }
                             id(leak_test_preparing_main) = false;
                             id(leak_test_elapsed_main) = 0.0f;
                             id(leak_test_start_ms_main) = millis();
-                            id(leak_test_baseline_main) = id(pressure_main).state;
+                            id(leak_test_baseline_main) = baseline;
                             id(leak_test_active_main) = true;
                             id(leak_test_result_main) = 1;  // In progress
                             ESP_LOGI("leak_test", "MAIN: test started. Baseline: %.1f PSI, "
@@ -2804,10 +3604,19 @@ script:
                         - delay: 60s
                         - lambda: |-
                             if (!id(leak_test_preparing_irr)) return;
+                            float baseline = id(pressure_irrigation).state;
+                            if (isnan(baseline) || baseline < 1.0f) {
+                              id(leak_test_result_irr) = 6;  // Not run — sensor not ready
+                              id(leak_test_preparing_irr) = false;
+                              id(leak_test_active_irr) = false;
+                              ESP_LOGW("leak_test", "IRRIGATION: baseline invalid (%.1f PSI) — "
+                                "ADC not settled after close, aborting test", baseline);
+                              return;
+                            }
                             id(leak_test_preparing_irr) = false;
                             id(leak_test_elapsed_irr) = 0.0f;
                             id(leak_test_start_ms_irr) = millis();
-                            id(leak_test_baseline_irr) = id(pressure_irrigation).state;
+                            id(leak_test_baseline_irr) = baseline;
                             id(leak_test_active_irr) = true;
                             id(leak_test_result_irr) = 1;  // In progress
                             ESP_LOGI("leak_test", "IRRIGATION: test started. Baseline: %.1f PSI, "
@@ -2860,13 +3669,19 @@ script:
 # =============================================================================
 valve:
   - platform: template
-    name: "Main Water Valve"
+    name: "${circuit_1_name} Water Valve"
     device_class: water
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 1
     id: main_water_valve
     lambda: |-
+      if (id(open_end_stop_valve1).state && id(closed_end_stop_valve1).state) {
+        // Both end stops active simultaneously — wiring fault (shorted or stuck switch).
+        // Return unknown so HA doesn't silently report VALVE_OPEN.
+        ESP_LOGE("valve", "MAIN: both end stops active simultaneously — wiring fault");
+        return {};
+      }
       if (id(open_end_stop_valve1).state) return VALVE_OPEN;
       if (id(closed_end_stop_valve1).state) return VALVE_CLOSED;
       return {};
@@ -2944,13 +3759,17 @@ valve:
                       ESP_LOGE("valve", "MAIN: closed end stop not reached after 15000ms — motor/wiring fault");
 
   - platform: template
-    name: "Irrigation Water Valve"
+    name: "${circuit_2_name} Water Valve"
     device_class: water
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 1
     id: irrigation_water_valve
     lambda: |-
+      if (id(open_end_stop_valve2).state && id(closed_end_stop_valve2).state) {
+        ESP_LOGE("valve", "IRRIGATION: both end stops active simultaneously — wiring fault");
+        return {};
+      }
       if (id(open_end_stop_valve2).state) return VALVE_OPEN;
       if (id(closed_end_stop_valve2).state) return VALVE_CLOSED;
       return {};

@@ -44,12 +44,44 @@
     <div class="dash-card-header">
       <div>
         <h2 class="dash-card-title">{{ c.display_name }}</h2>
-        <span class="dash-card-type">{{ c.circuit_type }}</span>
+        <span class="dash-card-type">{{ circuit_type_labels.get(c.circuit_type, c.circuit_type | title) }}</span>
       </div>
       <span class="pill {% if c.valve_state == 'open' %}pill-green{% else %}pill-neutral{% endif %}">
         {% if c.valve_state == 'open' %}Open{% elif c.valve_state == 'closed' %}Closed{% else %}{{ c.valve_state | title }}{% endif %}
       </span>
     </div>
+
+    {# Primary status line — always visible, updated by applyLiveState() #}
+    {% if c.fault_active %}
+    <div class="dash-status-line dash-status-fault" id="status-line-{{ c.circuit }}" aria-live="polite">
+      <span class="dash-status-icon" aria-hidden="true">●</span>
+      <span class="dash-status-text">Fault · Valve closed · Manual reset required</span>
+    </div>
+    {% elif c.trickle_active %}
+    <div class="dash-status-line dash-status-alert" id="status-line-{{ c.circuit }}" aria-live="polite">
+      <span class="dash-status-icon" aria-hidden="true">●</span>
+      <span class="dash-status-text">Attention needed · Trickle flow detected ·
+        {% if c.valve_state == 'closed' %}Valve closed
+        {% elif c.valve_state == 'open' %}Valve open
+        {% else %}Valve {{ c.valve_state }}{% endif %}
+      </span>
+    </div>
+    {% elif c.valve_state != 'open' %}
+    <div class="dash-status-line dash-status-closed" id="status-line-{{ c.circuit }}" aria-live="polite">
+      <span class="dash-status-icon" aria-hidden="true">○</span>
+      <span class="dash-status-text">Valve closed · No active alerts</span>
+    </div>
+    {% elif c.training.state == 'calibrating' %}
+    <div class="dash-status-line dash-status-learning" id="status-line-{{ c.circuit }}" aria-live="polite">
+      <span class="dash-status-icon" aria-hidden="true">●</span>
+      <span class="dash-status-text">Learning · Valve open · Monitoring active</span>
+    </div>
+    {% else %}
+    <div class="dash-status-line dash-status-normal" id="status-line-{{ c.circuit }}" aria-live="polite">
+      <span class="dash-status-icon" aria-hidden="true">●</span>
+      <span class="dash-status-text">Normal · Valve open · No active alerts</span>
+    </div>
+    {% endif %}
 
     {# Alert banner — fault or trickle, when active #}
     {% if c.fault_active %}
@@ -103,17 +135,18 @@
     {# Valve control — single button that flips by current state #}
     <div class="dash-valve-controls" id="valve-controls-{{ c.circuit }}"
          data-fault="{{ 'true' if c.fault_active else 'false' }}"
-         data-fault-reason="{{ c.fault_reason or '' }}">
+         data-fault-reason="{{ c.fault_reason or '' }}"
+         data-display-name="{{ c.display_name }}">
       {% if c.valve_state == 'open' %}
-      <button class="btn btn-danger btn-sm" onclick="valveClose('{{ c.circuit }}')">Close Valve</button>
+      <button class="btn btn-danger btn-sm" onclick="valveCloseModal('{{ c.circuit }}', this)">Close Valve</button>
       {% elif c.valve_state == 'closed' %}
         {% if c.fault_active %}
         <button class="btn btn-secondary btn-sm btn-fault-warn"
-                onclick="valveOpenWithFaultWarning('{{ c.circuit }}', {{ c.fault_reason|tojson if c.fault_reason else '\'\''}})">
+                onclick="valveOpenWithFaultWarning('{{ c.circuit }}', this)">
           Open Valve
         </button>
         {% else %}
-        <button class="btn btn-primary btn-sm" onclick="valveOpen('{{ c.circuit }}')">Open Valve</button>
+        <button class="btn btn-primary btn-sm" onclick="valveOpenModal('{{ c.circuit }}', this)">Open Valve</button>
         {% endif %}
       {% else %}
       <button class="btn btn-secondary btn-sm" disabled>{{ c.valve_state | title }}</button>
@@ -190,6 +223,11 @@
 // Chart data from server
 const chartData = {{ chart_data_json | safe }};
 
+// Read a CSS custom property from :root so Chart.js / Canvas pick up the
+// live theme (light or dark, switched by prefers-color-scheme).
+const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const mix    = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparent)`;
+
 {% for c in circuits %}
 (function() {
   const circuit = "{{ c.circuit }}";
@@ -215,8 +253,8 @@ const chartData = {{ chart_data_json | safe }};
       labels: data.labels,
       datasets: [{
         data: data.values.map(v => +(v * vf).toFixed(vd)),
-        backgroundColor: "oklch(55% .18 240 / .35)",
-        borderColor:     "oklch(55% .18 240 / .85)",
+        backgroundColor: mix(cssVar('--accent'), 35),
+        borderColor:     mix(cssVar('--accent'), 85),
         borderWidth: 1,
         borderRadius: 2,
       }]
@@ -230,7 +268,11 @@ const chartData = {{ chart_data_json | safe }};
           callbacks: {
             label: ctx => ctx.parsed.y.toFixed(vd) + " " + vu
           },
-          backgroundColor: "oklch(18% .02 240)",
+          backgroundColor: cssVar('--surface-2'),
+          titleColor: cssVar('--text'),
+          bodyColor:  cssVar('--text'),
+          borderColor: cssVar('--border'),
+          borderWidth: 1,
           titleFont: { family: "DM Sans", size: 11 },
           bodyFont:  { family: "JetBrains Mono", size: 12 },
           padding: 8, cornerRadius: 6,
@@ -241,16 +283,16 @@ const chartData = {{ chart_data_json | safe }};
           grid: { display: false },
           ticks: {
             font: { family: "DM Sans", size: 10 },
-            color: "oklch(62% .014 240)",
+            color: cssVar('--text-3'),
             maxRotation: 0, maxTicksLimit: 12
           }
         },
         y: {
           beginAtZero: true,
-          grid: { color: "oklch(89% .008 240)" },
+          grid: { color: cssVar('--border') },
           ticks: {
             font: { family: "DM Sans", size: 10 },
-            color: "oklch(62% .014 240)"
+            color: cssVar('--text-3')
           }
         }
       }
@@ -276,12 +318,12 @@ function drawSparkline(canvas, data) {
   pts.forEach(p => ctx.lineTo(p.x, p.y));
   ctx.lineTo(pts[pts.length - 1].x, h);
   ctx.closePath();
-  ctx.fillStyle = "oklch(55% .18 240 / .12)";
+  ctx.fillStyle = mix(cssVar('--accent'), 12);
   ctx.fill();
   ctx.beginPath();
   ctx.moveTo(pts[0].x, pts[0].y);
   pts.forEach(p => ctx.lineTo(p.x, p.y));
-  ctx.strokeStyle = "oklch(55% .18 240 / .85)";
+  ctx.strokeStyle = mix(cssVar('--accent'), 85);
   ctx.lineWidth = 1.5;
   ctx.stroke();
 }

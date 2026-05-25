@@ -38,31 +38,16 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from ._helpers import ingress_redirect
 from ..config import DB_PATH
+from ..database import get_data_retention
+from ..restore_utils import (
+    normalize_restore_row as _normalize_row,
+    safe_insert_rows as _safe_insert,
+    CIRCUIT_TABLES as _CIRCUIT_TABLES,
+)
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/backup")
 MAX_BACKUP_BYTES = 50 * 1024 * 1024  # 50 MB hard limit
-
-def _safe_insert(db, tbl: str, rows: list) -> int:
-    """
-    Insert rows into tbl, validating column names against the live schema
-    to prevent SQL injection via crafted backup files.
-    Returns count of rows inserted.
-    """
-    if not rows:
-        return 0
-    # Fetch the actual columns that exist in this table
-    valid_cols = {r[1] for r in db.execute(f"PRAGMA table_info({tbl})").fetchall()}
-    # Filter to only columns that exist in both the payload and the table
-    cols = [c for c in rows[0].keys() if c in valid_cols]
-    if not cols:
-        raise ValueError(f"No valid columns found for table {tbl}")
-    ph = ",".join("?" for _ in cols)
-    cn = ",".join(cols)
-    sql = f"INSERT OR REPLACE INTO {tbl} ({cn}) VALUES ({ph})"
-    for row in rows:
-        db.execute(sql, [row.get(c) for c in cols])
-    return len(rows)
 
 
 # ── Table groups ─────────────────────────────────────────────────────────────
@@ -139,11 +124,19 @@ async def export_quick_restore(request: Request):
             log.warning("Quick-restore export %s: %s", tbl, e)
             tables[tbl] = []
 
+    # Include circuit labels so custom display names survive a restore
+    from ..database import load_circuit_labels
+    circuit_labels = load_circuit_labels(db)
+
     payload = {
         "backup_type":  "quick_restore",
         "version":      3,
         "exported_at":  datetime.now(timezone.utc).isoformat(),
         "history_days": QUICK_RESTORE_DAYS,
+        "circuits": [
+            {"circuit_id": cid, "display_name": label}
+            for cid, label in circuit_labels.items()
+        ],
         "tables":       tables,
     }
     return _download(
@@ -253,11 +246,17 @@ async def export_full(request: Request):
                 log.warning("Full export quick-restore %s: %s", tbl, e)
                 qr_tables[tbl] = []
 
+        from ..database import load_circuit_labels as _load_labels
+        _circuit_labels = _load_labels(db)
         qr_payload = {
             "backup_type":  "quick_restore",
             "version":      3,
             "exported_at":  datetime.now(timezone.utc).isoformat(),
             "history_days": QUICK_RESTORE_DAYS,
+            "circuits": [
+                {"circuit_id": cid, "display_name": lbl}
+                for cid, lbl in _circuit_labels.items()
+            ],
             "tables":       qr_tables,
         }
         zf.writestr("quick_restore.json",
@@ -386,10 +385,38 @@ async def import_quick_restore(
                     removed)
         except Exception as e:
             log.warning("Quick Restore dedup failed (non-fatal): %s", e)
+
+    # Restore circuit display labels from backup, or seed defaults for old backups
+    try:
+        from ..database import load_circuit_labels, upsert_circuit_label
+        circuit_entries = payload.get("circuits", [])
+        if circuit_entries:
+            for entry in circuit_entries:
+                cid   = entry.get("circuit_id", "")
+                label = entry.get("display_name", "")
+                if cid and label:
+                    upsert_circuit_label(db, cid, label)
+            log.info("Quick Restore: restored %d circuit label(s)", len(circuit_entries))
+        else:
+            # Old backup without circuit metadata — seed defaults if table is empty
+            existing = load_circuit_labels(db)
+            if not existing:
+                upsert_circuit_label(db, "circuit_1", "Main")
+                upsert_circuit_label(db, "circuit_2", "Irrigation")
+                log.info("Quick Restore: seeded default circuit labels (legacy backup)")
+    except Exception as e:
+        log.warning("Quick Restore: circuit label restore failed (non-fatal): %s", e)
+
     try:
         orch.reload_circuit_entities()
     except Exception as e:
         log.warning("Import reload: %s", e)
+
+    # Reload circuit labels into the in-memory config
+    try:
+        orch.reload_circuit_labels()
+    except Exception as e:
+        log.warning("Import reload labels: %s", e)
 
     total = sum(imported.values())
     log.info(
@@ -459,7 +486,11 @@ async def import_history_archive(
                         f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
                     orch.db.executemany(
                         f"INSERT OR IGNORE INTO {tbl} ({cn}) VALUES ({ph})",
-                        [[r[c] for c in cols] for r in rows],
+                        [
+                            [_normalize_row(dict(zip(cols, [r[c] for c in cols])), tbl).get(c)
+                             for c in cols]
+                            for r in rows
+                        ],
                     )
                     after = orch.db.execute(
                         f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
@@ -516,6 +547,11 @@ async def backup_page(request: Request):
         if b >= 1024:       return f"{b/1024:.1f} KB"
         return f"{b} B"
 
+    try:
+        retention = get_data_retention(db)
+    except Exception:
+        retention = {}
+
     return _tmpl(request).TemplateResponse("backup.html", {
         "request":              request,
         "page":                 "backup",
@@ -526,4 +562,5 @@ async def backup_page(request: Request):
         "full_size_est":        fmt(full_est),
         "quick_tables":         QUICK_RESTORE_TABLES + QUICK_RESTORE_RECENT,
         "history_tables":       HISTORY_ARCHIVE_TABLES,
+        "retention":            retention,
     })

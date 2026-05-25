@@ -53,13 +53,15 @@ async def dashboard(request: Request):
     from ..database import get_home_profile
     profile = dict(get_home_profile(orch.db) or {})
 
+    from ..fixtures import CIRCUIT_TYPE_LABELS
     return templates.TemplateResponse("dashboard.html", {
-        "request":          request,
-        "circuits":         circuit_states,
-        "chart_data_json":  json.dumps(chart_data),
-        "page":             "dashboard",
-        "profile":          profile,
-        "away_mode":        profile.get("away_mode", False),
+        "request":             request,
+        "circuits":            circuit_states,
+        "chart_data_json":     json.dumps(chart_data),
+        "page":                "dashboard",
+        "profile":             profile,
+        "away_mode":           profile.get("away_mode", False),
+        "circuit_type_labels": CIRCUIT_TYPE_LABELS,
     })
 
 
@@ -87,6 +89,8 @@ async def dashboard_live(request: Request):
 @router.get("/api/chart/{circuit}")
 async def chart_data(circuit: str, request: Request):
     """Return hourly volume data for chart refresh."""
+    from ..circuit_compat import resolve_circuit
+    circuit = resolve_circuit(circuit)
     orch = _get_orchestrator(request)
     data = _build_chart_data(orch.db, circuit)
     return JSONResponse(data)
