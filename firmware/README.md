@@ -37,7 +37,22 @@ Paste the output into `secrets.yaml` as the value for `api_encryption_key`.
 
 ## Releasing
 
-`dashboard_import.package_import_url` currently points to `@main`. Before any
-public release, replace `@main` with an immutable version tag (e.g. `@v3.10.0`)
-so adopters always get a known-good version. This is marked as a
-`# RELEASE BLOCKER` comment in the YAML.
+Before tagging a firmware release, run the release-check script:
+
+```bash
+python scripts/check_firmware_release.py
+```
+
+It fails (non-zero exit) when any of these are missing or wrong in
+`firmware/esp-water-shut-off-3_10.yaml`:
+
+- `api.encryption.key`
+- `ota[*].password`
+- `wifi.ap.password`
+- `web_server.auth.username` / `web_server.auth.password`
+- `dashboard_import.package_import_url` not pinned to an immutable tag
+  (`@v3.10.0`, etc.) or commit SHA — `@main` is rejected
+
+When bumping the firmware version, update `dashboard_import.package_import_url`
+to the new tag at the same time as the version field. The check script
+parses the YAML, so commented-out example lines don't fool it.

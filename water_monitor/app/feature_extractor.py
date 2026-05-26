@@ -226,18 +226,50 @@ def _detrend_linear(values: List[float]) -> List[float]:
 def _autocorr_at_lag(values: List[float], lag: int) -> float:
     """Normalized autocorrelation of `values` at the given sample lag.
 
-    Returns a value in approximately [-1, 1]; returns 0 when undefined.
+    Returns an overlap-weighted Pearson correlation in [-1, 1] between
+    the head window ``values[:n]`` and the tail window
+    ``values[lag:lag+n]``, where ``n = len(values) - lag``.
+
+    The previous implementation normalised the covariance (computed
+    over only the first ``n`` samples) by the variance of the FULL
+    array. With unequal sample windows the result wasn't a proper
+    correlation coefficient and was biased for any signal with
+    non-zero DC drift in the tail.
+
+    This version centres each window by its own mean and divides by
+    ``sqrt(var_head * var_tail)`` so the result is a proper Pearson
+    correlation, then multiplies by ``n / len(values)`` (an overlap
+    weight). The weight preserves the older implementation's bias
+    toward shorter lags — important because for a periodic signal the
+    fundamental and every harmonic score equally on raw Pearson, but
+    the fundamental has more overlap and should be preferred by the
+    peak-pick in ``_dominant_period_s``.
+
+    Returns 0.0 when the lag is too large to evaluate or when one of
+    the windows is constant.
     """
     n = len(values) - lag
     if n <= 1:
         return 0.0
-    mean = sum(values) / len(values)
-    centered = [v - mean for v in values]
-    var = sum(c * c for c in centered) / len(centered)
-    if var < 1e-9:
+
+    head = values[:n]
+    tail = values[lag:lag + n]
+
+    mean_head = sum(head) / n
+    mean_tail = sum(tail) / n
+
+    ch = [v - mean_head for v in head]
+    ct = [v - mean_tail for v in tail]
+
+    var_h = sum(v * v for v in ch)
+    var_t = sum(v * v for v in ct)
+    denom = (var_h * var_t) ** 0.5
+    if denom < 1e-9:
         return 0.0
-    cov = sum(centered[i] * centered[i + lag] for i in range(n)) / n
-    return cov / var
+
+    pearson = sum(a * b for a, b in zip(ch, ct)) / denom
+    overlap_weight = n / len(values)
+    return pearson * overlap_weight
 
 
 def _dominant_period_s(

@@ -149,24 +149,32 @@ esp32:
 logger:      # Enable serial logging for debugging
   level: WARN
 
-api:         # Encryption disabled for now — re-add an `encryption:` block before release
+api:
+  # ESPHome native API — encrypted. Key lives in secrets.yaml.
+  # Generate once with `esphome wizard` or `openssl rand -base64 32`,
+  # then DO NOT regenerate or every HA integration must re-pair.
+  encryption:
+    key: !secret api_encryption_key
 
 ota:         # Enable over-the-air firmware updates
   - platform: esphome
-    # OTA password disabled for now — re-add `password:` before release
+    password: !secret ota_password
 
 improv_serial:   # Allows Wi-Fi provisioning via USB serial on first setup
 
 wifi:
-  ap:   # Fallback hotspot — open network for now; re-add `password:` before release
+  ap:
+    # Fallback hotspot — protected. Password lives in secrets.yaml.
+    password: !secret fallback_ap_password
 
 captive_portal:  # Serves a Wi-Fi setup page when connected to the fallback AP
 
 dashboard_import:
   # Allows this device to appear in the ESPHome dashboard for adoption.
-  # RELEASE BLOCKER: replace @main with an immutable version tag before publishing
-  #   e.g.  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_6.yaml@v3.6.0
-  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_6.yaml@main
+  # IMPORTANT: this URL must point at an immutable tag (e.g. @v3.10.0)
+  # before each release. scripts/check_firmware_release.py enforces this
+  # — it fails the release if the ref ends with @main or any branch ref.
+  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_10.yaml@v3.10.0
   import_full_config: true
 
 esp32_improv:
@@ -175,7 +183,9 @@ esp32_improv:
 
 web_server:
   version: 3  # Required for sorting_groups support
-  # Web UI auth disabled for now — re-add an `auth:` block before release
+  auth:
+    username: !secret web_username
+    password: !secret web_password
   # Organises the built-in web UI into collapsible sections per valve.
   # Each entity is assigned to a group via its web_server: sorting_group_id.
   sorting_groups:

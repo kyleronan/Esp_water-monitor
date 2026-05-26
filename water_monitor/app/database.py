@@ -143,9 +143,20 @@ CREATE TABLE IF NOT EXISTS home_profile (
 
 INSERT OR IGNORE INTO home_profile (id) VALUES (1);
 
--- CSRF tokens (one per browser session, rotated on use)
+-- CSRF tokens (legacy — kept for backward compat; new code uses HMAC
+-- double-submit, see csrf_server_secret below).
 CREATE TABLE IF NOT EXISTS csrf_tokens (
     token       TEXT PRIMARY KEY,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- HMAC server secret for stateless CSRF double-submit. One row
+-- (id = 1). The secret is generated once on first use and never
+-- regenerated automatically — regenerating would invalidate every
+-- in-flight browser session.
+CREATE TABLE IF NOT EXISTS csrf_server_secret (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    secret      TEXT NOT NULL,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -888,27 +899,60 @@ def update_data_retention(conn: sqlite3.Connection, **kwargs) -> None:
     conn.commit()
 
 
-def generate_csrf_token(conn: sqlite3.Connection) -> str:
-    """Generate and store a new CSRF token. Cleans up tokens older than 24h."""
-    import secrets
-    conn.execute(
-        "DELETE FROM csrf_tokens WHERE created_at < datetime('now', '-1 day')")
-    token = secrets.token_hex(32)
-    conn.execute("INSERT INTO csrf_tokens (token) VALUES (?)", (token,))
-    conn.commit()
-    return token
+def get_or_create_csrf_server_secret(conn: sqlite3.Connection) -> str:
+    """Return the persistent HMAC server secret used for CSRF tokens.
 
+    Created on first use and stored in `csrf_server_secret`. Never
+    regenerated automatically — rotating it would invalidate every
+    in-flight browser form across the addon.
 
-def validate_csrf_token(conn: sqlite3.Connection, token: str) -> bool:
-    """Return True if the token exists and is less than 24h old."""
-    if not token:
-        return False
+    The secret is a 64-character hex string (256 bits of entropy).
+    """
+    import secrets as _secrets
     row = conn.execute(
-        "SELECT token FROM csrf_tokens "
-        "WHERE token = ? AND created_at >= datetime('now', '-1 day')",
-        (token,)
+        "SELECT secret FROM csrf_server_secret WHERE id = 1"
     ).fetchone()
-    return row is not None
+    if row and row["secret"]:
+        return row["secret"]
+    secret = _secrets.token_hex(32)
+    conn.execute(
+        "INSERT OR REPLACE INTO csrf_server_secret (id, secret) "
+        "VALUES (1, ?)",
+        (secret,),
+    )
+    conn.commit()
+    return secret
+
+
+def derive_csrf_token(server_secret: str, session_id: str) -> str:
+    """Compute the CSRF token for a given session_id.
+
+    Stateless HMAC double-submit pattern: the same session_id always
+    produces the same token, but the token can't be forged without the
+    server_secret. Validation just recomputes and constant-time-compares.
+    """
+    import hashlib
+    import hmac
+    return hmac.new(
+        server_secret.encode("utf-8"),
+        session_id.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def validate_csrf_token(
+    server_secret: str, session_id: str, token: str
+) -> bool:
+    """Return True if `token` matches HMAC(server_secret, session_id).
+
+    Returns False on any missing input. Uses constant-time comparison
+    to avoid timing side-channels.
+    """
+    import hmac
+    if not server_secret or not session_id or not token:
+        return False
+    expected = derive_csrf_token(server_secret, session_id)
+    return hmac.compare_digest(expected, token)
 
 
 def get_home_profile(conn: sqlite3.Connection) -> sqlite3.Row:
