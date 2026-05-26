@@ -79,7 +79,8 @@ async def valve_open(circuit: str, request: Request):
         return JSONResponse(
             {"status": "error",
              "message": f"No valve entity configured for circuit '{circuit}'. "
-                        "Re-run the setup wizard."},
+                        "Go to Settings → Advanced → Re-discover devices "
+                        "(or re-run Setup if first install)."},
             status_code=400,
         )
     ok = await orch.ha.open_valve(cfg.valve_entity)
@@ -102,7 +103,8 @@ async def valve_close(circuit: str, request: Request):
         return JSONResponse(
             {"status": "error",
              "message": f"No valve entity configured for circuit '{circuit}'. "
-                        "Re-run the setup wizard."},
+                        "Go to Settings → Advanced → Re-discover devices "
+                        "(or re-run Setup if first install)."},
             status_code=400,
         )
     ok = await orch.ha.close_valve(cfg.valve_entity)
@@ -278,7 +280,9 @@ async def leaktest_run(circuit: str, request: Request):
     if not cfg.leak_test_switch:
         return JSONResponse(
             {"status": "error",
-             "message": "No leak test switch configured. Re-run the setup wizard."},
+             "message": "No leak test switch configured. Go to "
+                        "Settings → Advanced → Re-discover devices "
+                        "(or re-run Setup if first install)."},
             status_code=400,
         )
 
