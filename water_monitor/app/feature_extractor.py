@@ -1081,7 +1081,17 @@ def _enrich_from_waveform(
     Each feature group is routed independently — a missing or low-quality
     window falls back to the already-computed legacy value; no all-or-nothing.
 
-    Mutates ``features`` in place and sets the four waveform A/B fields.
+    Mutates ``features`` in place. At the end, sets the four waveform A/B
+    tracking fields so the History page can show whether the firmware
+    waveform was actually consulted for this event:
+
+      * ``esp_waveform_used``      — 1 if any feature was sourced from the
+                                     waveform, 0 if every group fell back
+                                     to the legacy software path.
+      * ``waveform_event_id``      — firmware-side ID of the streamed event.
+      * ``waveform_quality``       — firmware self-reported quality 0–100.
+      * ``waveform_overlap_score`` — fraction of the event window covered
+                                     by valid waveform samples (0.0–1.0).
     """
     import time as _time
 

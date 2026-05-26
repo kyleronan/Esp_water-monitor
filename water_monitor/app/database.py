@@ -832,9 +832,13 @@ def compute_daily_summary(conn: sqlite3.Connection,
     cols = ", ".join(summary.keys())
     ph   = ", ".join("?" for _ in summary)
     updates = ", ".join(f"{k}=excluded.{k}" for k in summary if k not in ("circuit", "day"))
+    # Future-proofing: if a refactor ever strips this dict down to just
+    # the conflict-key columns, `updates` becomes the empty string and
+    # `DO UPDATE SET ` is a SQL syntax error. Fall back to DO NOTHING.
+    on_conflict = f"DO UPDATE SET {updates}" if updates else "DO NOTHING"
     conn.execute(
         f"INSERT INTO daily_summary ({cols}) VALUES ({ph}) "
-        f"ON CONFLICT(circuit, day) DO UPDATE SET {updates}",
+        f"ON CONFLICT(circuit, day) {on_conflict}",
         list(summary.values()),
     )
     return summary

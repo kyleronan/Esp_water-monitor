@@ -602,14 +602,14 @@ globals:
     initial_value: '""'
 
   # ---------------------------------------------------------------------------
-  # WAVEFORM CAPTURE GLOBALS — Per-circuit chunked streaming (firmware 3.10.0+)
+  # WAVEFORM CAPTURE GLOBALS — Per-circuit chunked streaming
   #
   # Per-event flow + pressure waveform capture for the water-signature add-on,
   # delivered as a stream of esphome.water_monitor_waveform_chunk events.
   # A new chunk fires every 30 s of capture (or whenever the 1500-sample
   # buffer fills) and the add-on accumulates + stitches them on the final
-  # chunk. This replaces the slot+decimation design used through 3.8.x —
-  # native cadence is preserved regardless of event length.
+  # chunk. Native cadence is preserved regardless of event length; no
+  # decimation.
   #
   # STRICTLY ADDITIVE to safety: no safety, ADC, valve, or leak-test path
   # reads or writes any global below. All capture work runs in the dedicated

@@ -1,5 +1,104 @@
 # Changelog
 
+## [0.2.2-dev] — in development
+
+A correctness + hardening release. Headlines: a degraded-supply guard so
+events captured during pulsing municipal pressure are flagged and stop
+poisoning clustering / hourly volume; a per-circuit valve-type setting
+(2-port / 3-port) so micro leak tests are correctly disabled on
+drain-capable hardware; and a round of security and robustness work
+covering CSRF, the autocorrelation primitive behind the supply detector,
+and migration safety. Firmware credentials restored and a release-check
+script added to keep them that way.
+
+### New Features
+
+- **Degraded-supply guard** — when the municipal supply pulses, the
+  paddlewheel flow sensor produces chaotic readings (forward and
+  reverse pulses both count positive; brief zero-velocity transitions
+  read as 0 L/min). Events captured during these conditions are now
+  detected via pressure-band autocorrelation + flow-rectification
+  signatures, flagged with `degraded_supply=1`, given an
+  envelope-smoothed `volume_litres_effective` so daily totals stay
+  sensible, and excluded from clustering. Surfaces in the History
+  page with a filter, in the dashboard as a banner, and as a
+  rate-limited HA notification.
+- **Per-circuit valve type** — Setup wizard step 3b and Settings now
+  ask whether each circuit is wired for a 2-port (standard) or 3-port
+  (drain-capable, winterization-friendly) ball valve. 3-port circuits
+  automatically skip the micro leak test (the drain port would always
+  read as a constant leak); the schedule is preserved so switching
+  back to 2-port resumes it. UI shows the reason on both the Device
+  and Settings pages.
+
+### Security
+
+- **Per-session CSRF tokens** — the previous implementation cached a
+  single token per process for an hour, so every browser session
+  shared the same token. Replaced with stateless HMAC double-submit:
+  a persistent server secret (generated once, never auto-rotated) +
+  a per-browser `wm_session` cookie + `csrf_token = HMAC(secret,
+  session_id)`. Setup-wizard POSTs are no longer CSRF-exempt (the
+  earlier `startswith("/setup")` check let every `POST /setup/...`
+  through with no token). Path-prefix exemptions replaced with
+  exact-match for `/health` so `/health-anything` no longer slips
+  past ingress checks.
+- **Firmware credentials restored** — API encryption, OTA password,
+  fallback-AP password and web-server auth are no longer commented
+  out in the firmware YAML; all four read from `secrets.yaml` (see
+  `firmware/secrets.yaml.example`). `dashboard_import` URL pinned
+  to `@v3.10.0`. A new `scripts/check_firmware_release.py` script
+  parses the YAML (not greps — commented examples don't fool it)
+  and fails the release if any of those are missing or if the
+  `dashboard_import` ref is mutable.
+
+### Bug Fixes
+
+- **Autocorrelation normalisation bug** — `_autocorr_at_lag` in the
+  degraded-supply detector mismatched its numerator and denominator
+  sample windows. The fix is a proper overlap-weighted Pearson
+  correlation: each window centred by its own mean, normalised by
+  `sqrt(var_head * var_tail)`, then scaled by sample overlap so the
+  peak-pick prefers the fundamental over harmonics. The 12 existing
+  degraded-supply tests still pass; 14 new tests in
+  `test_autocorr.py` cover the primitive directly.
+- **Migration rebuild safety** — the 20260526 migration's
+  `hourly_volume` rebuild (DELETE + INSERT/SELECT from `events`) now
+  uses a temp-table swap pattern wrapped in `try/except + rollback()`,
+  so a Python-level exception mid-rebuild leaves the original table
+  intact (previously safe only against process death, via SQLite's
+  transaction durability). Eight new migration round-trip tests cover
+  forward migration from every historical schema version,
+  idempotency, rebuild correctness, and failure-injection.
+- **Daily-summary UPSERT future-proofing** — `compute_daily_summary`
+  now emits `ON CONFLICT … DO NOTHING` if the column-update list is
+  ever empty (currently 12 columns; a future trim could make this a
+  SQL syntax error otherwise).
+
+### Performance
+
+- **Async / blocking-SQLite audit** — `data_pruner.run` (nightly
+  prune + daily-summary computation), `_run_waveform_purger` (daily
+  DELETE), and `learn_best_hour` (60-day usage analysis for leak-test
+  scheduling) are now offloaded via `loop.run_in_executor()` rather
+  than running directly on the asyncio event loop. The orchestrator's
+  `rebuild_from_db` / `backfill_unmatched` were already wrapped.
+
+### Internal
+
+- **Migration sequence** updated to schema version 20260527 (added
+  `circuit_profile.valve_type` with a defensive backfill). Migration
+  20260526 added 7 columns on `events`, the `event_waveforms` table,
+  and rebuilt `hourly_volume` from events as the source of truth.
+- **Set away mode** — `CASE WHEN ?` rewritten to explicit
+  `CASE WHEN ? = 1` for clarity (same behaviour).
+- **_enrich_from_waveform** docstring now lists the four A/B tracking
+  fields it sets.
+- **Firmware globals comment** stripped of stale 3.8.x slot+decimation
+  history.
+
+---
+
 ## [0.2.1] — 2026-05-24
 
 A refinement release of the 0.2.x fixture-identification line. Headlines:

@@ -149,13 +149,18 @@ class Orchestrator:
             except Exception as e:
                 log.warning("Away-mode calibration extension failed: %s", e)
 
+        # Explicit `? = 1` comparison rather than relying on SQLite's
+        # implicit truthiness of Python bool bindings — same behaviour,
+        # but makes the intent unambiguous and survives any future
+        # binding-type changes.
+        enabled_int = 1 if enabled else 0
         self._db.execute("""
             UPDATE home_profile SET
                 away_mode  = ?,
-                away_since = CASE WHEN ? THEN ? ELSE NULL END,
+                away_since = CASE WHEN ? = 1 THEN ? ELSE NULL END,
                 updated_at = ?
             WHERE id = 1
-        """, (1 if enabled else 0, enabled, now_iso, now_iso))
+        """, (enabled_int, enabled_int, now_iso, now_iso))
         self._db.commit()
 
         if self._alert_manager and enabled:
