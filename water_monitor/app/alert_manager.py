@@ -19,11 +19,34 @@ Called by:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional
 
 log = logging.getLogger(__name__)
+
+
+# After this many consecutive failures, treat the target as broken and
+# skip further pushes for COOLDOWN duration. Stops a permanently
+# misconfigured `notify.mobile_app_*` from spamming WARN every time
+# any event fires.
+_TARGET_FAILURE_THRESHOLD = 3
+_TARGET_BACKOFF = timedelta(hours=1)
+
+# Exception types we expect when calling HA's notify service. Anything
+# outside this set falls through to a broad-except that logs at ERROR
+# (with type and traceback) so unknown failure modes don't get
+# swallowed silently.
+_EXPECTED_PUSH_EXCEPTIONS = (asyncio.TimeoutError, OSError)
+try:
+    import aiohttp
+    _EXPECTED_PUSH_EXCEPTIONS = _EXPECTED_PUSH_EXCEPTIONS + (
+        aiohttp.ClientError,
+    )
+except ImportError:  # pragma: no cover — aiohttp is a hard dep, defensive only
+    pass
 
 
 class AlertManager:
@@ -31,6 +54,9 @@ class AlertManager:
     def __init__(self, db: sqlite3.Connection, ha_client):
         self._db = db
         self._ha  = ha_client
+        # Per-target consecutive-failure tracking. Reset on success.
+        self._target_failure_counts: Dict[str, int] = {}
+        self._target_backoff_until:  Dict[str, datetime] = {}
 
     def _is_enabled(self, circuit: str, alert_type: str) -> bool:
         """Return True if this alert type is enabled for the circuit."""
@@ -85,21 +111,101 @@ class AlertManager:
 
         # 2. Mobile push (all configured targets)
         for target in self._mobile_targets():
-            try:
-                await self._ha.call_service(
-                    "notify", target,
-                    {
-                        "title":   title,
-                        "message": message,
-                        "data": {
-                            "notification_id": nid,
-                            "tag":             nid,
-                        },
-                    },
-                )
-                log.debug("Mobile push sent via notify.%s", target)
-            except Exception as e:
-                log.warning("Mobile push failed (notify.%s): %s", target, e)
+            await self._send_mobile_push(
+                target, title, message, data={
+                    "notification_id": nid,
+                    "tag":             nid,
+                },
+            )
+
+    async def _send_mobile_push(
+        self,
+        target: str,
+        title: str,
+        message: str,
+        data: Optional[dict] = None,
+    ) -> bool:
+        """Send a mobile push to a single notify.* target with backoff.
+
+        Returns True on success, False on failure (or when the target
+        is currently in its post-failure cooldown). Never raises — push
+        failures must never break the calling event-processing path.
+
+        Failure handling:
+          - Expected exceptions (network / timeout / aiohttp client
+            errors) log at WARNING with the exception type + message.
+          - Unexpected exceptions log at ERROR with full traceback so
+            unknown failure modes are visible without swallowing them.
+          - After ``_TARGET_FAILURE_THRESHOLD`` consecutive failures,
+            the target is marked broken and pushes are skipped for
+            ``_TARGET_BACKOFF`` (one entry per target). The cooldown
+            resets on the next successful push.
+        """
+        # Skip if this target is currently in its post-failure cooldown
+        now = datetime.now(timezone.utc)
+        backoff_until = self._target_backoff_until.get(target)
+        if backoff_until and now < backoff_until:
+            log.debug(
+                "Skipping notify.%s — in cooldown until %s",
+                target, backoff_until.isoformat(timespec="seconds"),
+            )
+            return False
+
+        try:
+            await self._ha.call_service(
+                "notify", target,
+                {"title": title, "message": message, "data": data or {}},
+            )
+        except _EXPECTED_PUSH_EXCEPTIONS as e:
+            self._record_push_failure(target, e, level="warning")
+            return False
+        except Exception as e:  # pragma: no cover — defensive only
+            # Unknown exception type — log at ERROR with traceback so we
+            # can add the type to _EXPECTED_PUSH_EXCEPTIONS next release.
+            log.error(
+                "Mobile push raised unexpected %s on notify.%s: %s",
+                type(e).__name__, target, e, exc_info=True,
+            )
+            self._record_push_failure(target, e, level=None)
+            return False
+
+        # Success — reset failure tracking for this target
+        if self._target_failure_counts.pop(target, 0):
+            log.info("notify.%s recovered — push delivered", target)
+        self._target_backoff_until.pop(target, None)
+        log.debug("Mobile push sent via notify.%s", target)
+        return True
+
+    def _record_push_failure(
+        self,
+        target: str,
+        exc: BaseException,
+        level: Optional[str],
+    ) -> None:
+        """Update failure counters and emit the right log line.
+
+        ``level`` is the log level to use for the failure message
+        itself; pass None to suppress (used when the caller already
+        logged at ERROR with a traceback).
+        """
+        count = self._target_failure_counts.get(target, 0) + 1
+        self._target_failure_counts[target] = count
+        if level == "warning":
+            log.warning(
+                "Mobile push failed (notify.%s): %s: %s "
+                "(consecutive failures: %d)",
+                target, type(exc).__name__, exc, count,
+            )
+        if count == _TARGET_FAILURE_THRESHOLD:
+            backoff_until = datetime.now(timezone.utc) + _TARGET_BACKOFF
+            self._target_backoff_until[target] = backoff_until
+            log.error(
+                "notify.%s reached %d consecutive failures — backing off "
+                "until %s. Check that the mobile_app integration is still "
+                "paired in Home Assistant.",
+                target, _TARGET_FAILURE_THRESHOLD,
+                backoff_until.isoformat(timespec="seconds"),
+            )
 
     # ── Convenience methods for each alert type ────────────────────────
 
@@ -219,13 +325,13 @@ class AlertManager:
             message="Leak tests continue. Baseline learning paused until you return.",
             notification_id="water_away_mode",
         )
+        # Route via the shared mobile-push helper so failures land in
+        # the same failure-counter / cooldown machinery as event alerts
+        # rather than being swallowed silently.
         for target in self._mobile_targets():
-            try:
-                await self._ha.call_service(
-                    "notify", target,
-                    {"title": "🏖 Away mode activated — Water Monitor",
-                     "message": "Leak tests continue. Baseline learning paused.",
-                     "data": {"tag": "water_away_mode"}},
-                )
-            except Exception:
-                pass
+            await self._send_mobile_push(
+                target,
+                title="🏖 Away mode activated — Water Monitor",
+                message="Leak tests continue. Baseline learning paused.",
+                data={"tag": "water_away_mode"},
+            )
