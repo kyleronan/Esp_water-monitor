@@ -789,10 +789,22 @@ class Orchestrator:
             "leak_test_running": self._leak_test_scheduler.is_running(circuit)
             if self._leak_test_scheduler else False,
             "setup_complete": self.setup_complete,
+            # Valve type for this circuit; the device template uses it to
+            # disable the manual leak-test button for 3-port valves.
+            "valve_type": self._valve_type_for(circuit),
             # Degraded-supply guard status. Python-computed UTC ISO cutoffs
             # so the comparison format matches stored start_ts exactly.
             **self._degraded_state_for(circuit),
         }
+
+    def _valve_type_for(self, circuit: str) -> str:
+        """Return the current valve_type for a circuit (forgiving)."""
+        try:
+            from .database import get_valve_type
+            return get_valve_type(self._db, circuit)
+        except Exception as e:
+            log.warning("[%s] valve_type lookup failed: %s", circuit, e)
+            return "2_port"
 
     def _degraded_state_for(self, circuit: str) -> Dict[str, Any]:
         """Return {degraded_active, degraded_events_24h} for the dashboard."""

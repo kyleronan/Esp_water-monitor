@@ -21,6 +21,7 @@ The first rule that returns a non-None result wins.
 """
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Tuple
 
 # ── Taxonomy ──────────────────────────────────────────────────────────────
@@ -186,6 +187,65 @@ def normalize_circuit_type(value: Optional[str]) -> str:
     if value in CIRCUIT_TYPES:
         return value
     return "fixture"
+
+
+# ── Valve type taxonomy ───────────────────────────────────────────────────
+#
+# 2-port: standard inline ball valve (the default; micro leak test works).
+# 3-port: drain-capable valve (third port supports drain/winterization
+#         plumbing). The micro leak test is incompatible because the drain
+#         port always vents, so any test would read as a constant leak.
+#
+# Wording deliberately avoids implying the addon performs auto-drain — only
+# that the hardware supports it. Future work may add an auto-drain workflow.
+
+VALVE_TYPES: List[str] = ["2_port", "3_port"]
+DEFAULT_VALVE_TYPE: str = "2_port"
+
+VALVE_TYPE_LABELS: Dict[str, str] = {
+    "2_port": "2-port (standard)",
+    "3_port": "3-port (drain-capable)",
+}
+
+VALVE_TYPE_HELP: Dict[str, str] = {
+    "2_port": "Standard inline ball valve. Micro leak test enabled.",
+    "3_port": ("Third port supports drain/winterization plumbing. "
+               "Micro leak test is disabled because a drain port would "
+               "always read as a constant leak."),
+}
+
+
+def normalize_valve_type(value: Optional[str]) -> str:
+    """FORGIVING fallback for reads / display.
+
+    Returns one of VALVE_TYPES; coerces blanks, unknowns, and legacy values
+    to DEFAULT_VALVE_TYPE so callers can always render something without
+    crashing.
+
+    Accepts "3-port", "3_port", "3 port", "3 -PORT" etc. via the regex.
+    Use parse_valve_type() instead for POST/API writes that must reject
+    garbage rather than silently default.
+    """
+    if not value:
+        return DEFAULT_VALVE_TYPE
+    v = re.sub(r"[\s-]+", "_", str(value).strip().lower())
+    return v if v in VALVE_TYPES else DEFAULT_VALVE_TYPE
+
+
+def parse_valve_type(value: Optional[str]) -> Optional[str]:
+    """STRICT parser for form / API writes.
+
+    Returns one of VALVE_TYPES on valid input, or None on anything invalid
+    (including blanks, None, and unknown tokens).
+
+    POST handlers MUST use this rather than normalize_valve_type — otherwise
+    garbage like 'banana' would silently become '2_port' and any
+    validation error path would be unreachable.
+    """
+    if value is None:
+        return None
+    v = re.sub(r"[\s-]+", "_", str(value).strip().lower())
+    return v if v in VALVE_TYPES else None
 
 
 def zone_user_selectable_types() -> List[str]:

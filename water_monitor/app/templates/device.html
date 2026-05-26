@@ -87,11 +87,26 @@
       {% if c.leak_test_active or c.leak_test_running %}
       <button class="btn btn-danger btn-sm"
               onclick="abortLeakTest('{{ c.circuit }}')">✕ Abort Test</button>
+      {% elif c.valve_type == "3_port" %}
+      {# 3-port drain-capable valve — leak test is automatically skipped by
+         the scheduler (see leak_test_scheduler._execute_test). We disable
+         the UI button so it's clear, but the server route stays live: a
+         direct POST will still reach the scheduler and record a skip row. #}
+      <button class="btn btn-secondary btn-sm" disabled
+              title="Disabled — 3-port drain-capable valve. Micro leak test does not apply."
+              aria-disabled="true">Run Now</button>
       {% else %}
       <button class="btn btn-secondary btn-sm"
               onclick="runLeakTest('{{ c.circuit }}')">Run Now</button>
       {% endif %}
     </div>
+    {% if c.valve_type == "3_port" %}
+    <p class="dev-schedule-note muted" style="margin-top:.5rem;font-size:.85rem">
+      Micro leak test disabled for this circuit (3-port drain-capable valve).
+      The schedule below is preserved and will resume if you switch back to
+      a 2-port valve under Settings.
+    </p>
+    {% endif %}
 
     {# Schedule settings — collapsed details ─────────────────── #}
     <details class="dev-schedule-details">

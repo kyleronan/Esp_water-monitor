@@ -353,6 +353,23 @@
         </label>
         {% endfor %}
       </fieldset>
+
+      <fieldset style="border:none;padding:0;margin:1rem 0 0 0">
+        <legend style="font-weight:600;font-size:.875rem;margin-bottom:.5rem">Valve type</legend>
+        {% for vt in valve_types %}
+        <label style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem;cursor:pointer">
+          <input type="radio"
+                 name="valve_type_{{ c.circuit }}"
+                 value="{{ vt }}"
+                 {% if vt == c.valve_type %}checked{% endif %}
+                 style="margin-top:3px;flex-shrink:0">
+          <span>
+            <strong>{{ valve_type_labels[vt] }}</strong>
+            <span class="muted" style="font-size:.8125rem;display:block">{{ valve_type_help[vt] }}</span>
+          </span>
+        </label>
+        {% endfor %}
+      </fieldset>
     </div>
     {% endfor %}
 

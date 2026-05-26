@@ -464,94 +464,134 @@ async def setup_confirm(device_id: str, request: Request):
 # Step 3b — circuit display names
 # ------------------------------------------------------------------
 
-@router.get("/circuit-names", response_class=HTMLResponse)
-async def setup_circuit_names(request: Request):
-    """Step 3b — let the user name and classify their circuits."""
-    orch = _orch(request)
-    from ..database import get_circuit_type
-    from ..fixtures import CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP
+def _step3b_template_context(orch, **extra):
+    """Build the per-circuit context dict for setup step 3b.
+
+    Pulls current values from circuit_profile so the form pre-fills
+    correctly on re-render (initial load AND validation-error re-render).
+    """
+    from ..database import get_circuit_type, get_valve_type
+    from ..fixtures import (CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS,
+                            CIRCUIT_TYPE_HELP,
+                            VALVE_TYPES, VALVE_TYPE_LABELS, VALVE_TYPE_HELP)
     circuits = [
         {
             "circuit":      c.circuit,
             "display_name": c.label,
             "circuit_type": get_circuit_type(orch.db, c.circuit, default=c.circuit_type),
+            "valve_type":   get_valve_type(orch.db, c.circuit),
         }
         for c in orch._cfg.circuits
     ]
-    return _tmpl(request).TemplateResponse("setup.html", {
-        "request":             request,
+    ctx = {
         "step":                "3b",
         "circuits":            circuits,
         "circuit_types":       CIRCUIT_TYPES,
         "circuit_type_labels": CIRCUIT_TYPE_LABELS,
         "circuit_type_help":   CIRCUIT_TYPE_HELP,
+        "valve_types":         VALVE_TYPES,
+        "valve_type_labels":   VALVE_TYPE_LABELS,
+        "valve_type_help":     VALVE_TYPE_HELP,
         "page":                "setup",
-    })
+    }
+    ctx.update(extra)
+    return ctx
+
+
+@router.get("/circuit-names", response_class=HTMLResponse)
+async def setup_circuit_names(request: Request):
+    """Step 3b — let the user name and classify their circuits."""
+    orch = _orch(request)
+    ctx = _step3b_template_context(orch)
+    ctx["request"] = request
+    return _tmpl(request).TemplateResponse("setup.html", ctx)
 
 
 @router.post("/circuit-names")
 async def setup_circuit_names_save(request: Request):
-    """Save circuit display names and types, then advance to unit selection."""
+    """Save circuit display name, type, and valve type per circuit.
+
+    Validates ALL inputs first; bails out before any write if any input
+    is invalid. After validation passes, writes everything. Note that
+    each setter commits internally so a runtime DB error between writes
+    can still partially persist — this is the same residual risk the
+    pre-refactor handler had. Validation errors are now fully atomic.
+    """
     blocked = _block_if_setup_complete(request)
     if blocked is not None:
         return blocked
     from ..circuit_compat import validate_display_name
-    from ..database import upsert_circuit_label, set_circuit_type, get_circuit_type
-    from ..fixtures import normalize_circuit_type, CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP
+    from ..database import (upsert_circuit_label, set_circuit_type,
+                            set_valve_type)
+    from ..fixtures import (normalize_circuit_type, CIRCUIT_TYPES,
+                            parse_valve_type)
     orch = _orch(request)
     form = await request.form()
 
     errors = []
+    pending = []  # one entry per circuit, populated with validated values only
 
-    # Save display names
+    # ── (1) Collect & validate ALL per-circuit fields first ──
     for c in orch._cfg.circuits:
-        raw = form.get(f"label_{c.circuit}", "").strip()
-        if not raw:
-            continue
-        try:
-            display_name = validate_display_name(raw)
-        except ValueError as exc:
-            errors.append(f"{c.circuit}: {exc}")
-            continue
-        upsert_circuit_label(orch.db, c.circuit, display_name)
+        raw_label = form.get(f"label_{c.circuit}", "").strip()
+        raw_type  = form.get(f"type_{c.circuit}", "").strip()
+        raw_vt    = form.get(f"valve_type_{c.circuit}", "").strip()
 
-    # Save circuit types
-    for c in orch._cfg.circuits:
-        raw_type = form.get(f"type_{c.circuit}", "").strip()
-        if not raw_type:
-            continue
-        normalised = normalize_circuit_type(raw_type)
-        if normalised not in CIRCUIT_TYPES:
-            errors.append(f"{c.circuit}: invalid circuit type {raw_type!r}")
-            continue
+        entry = {"circuit": c.circuit}
+
+        if raw_label:
+            try:
+                entry["display_name"] = validate_display_name(raw_label)
+            except ValueError as exc:
+                errors.append(f"{c.circuit}: {exc}")
+
+        if raw_type:
+            normalised = normalize_circuit_type(raw_type)
+            if normalised not in CIRCUIT_TYPES:
+                errors.append(f"{c.circuit}: invalid circuit type {raw_type!r}")
+            else:
+                entry["circuit_type"] = normalised
+
+        if raw_vt:
+            # STRICT parser — None on garbage. Use this instead of the
+            # forgiving normalize_valve_type so bad input surfaces an
+            # error rather than silently defaulting to 2_port.
+            parsed_vt = parse_valve_type(raw_vt)
+            if parsed_vt is None:
+                errors.append(f"{c.circuit}: invalid valve type {raw_vt!r}")
+            else:
+                entry["valve_type"] = parsed_vt
+
+        pending.append(entry)
+
+    # ── (2) Bail BEFORE any write if validation failed ──
+    if errors:
+        ctx = _step3b_template_context(orch, errors=errors)
+        ctx["request"] = request
+        return _tmpl(request).TemplateResponse("setup.html", ctx)
+
+    # ── (3) Write everything ──
+    for entry in pending:
         try:
-            set_circuit_type(orch.db, c.circuit, normalised)
+            if "display_name" in entry:
+                upsert_circuit_label(orch.db, entry["circuit"], entry["display_name"])
+            if "circuit_type" in entry:
+                set_circuit_type(orch.db, entry["circuit"], entry["circuit_type"])
+            if "valve_type" in entry:
+                set_valve_type(orch.db, entry["circuit"], entry["valve_type"])
         except Exception as exc:
-            errors.append(f"{c.circuit}: could not save circuit type: {exc}")
+            log.error("Setup save failed for %s mid-chain: %s",
+                      entry["circuit"], exc, exc_info=True)
+            errors.append(f"{entry['circuit']}: could not save changes: {exc}")
 
     if errors:
-        circuits = [
-            {
-                "circuit":      c.circuit,
-                "display_name": c.label,
-                "circuit_type": get_circuit_type(orch.db, c.circuit, default=c.circuit_type),
-            }
-            for c in orch._cfg.circuits
-        ]
-        return _tmpl(request).TemplateResponse("setup.html", {
-            "request":             request,
-            "step":                "3b",
-            "circuits":            circuits,
-            "errors":              errors,
-            "circuit_types":       CIRCUIT_TYPES,
-            "circuit_type_labels": CIRCUIT_TYPE_LABELS,
-            "circuit_type_help":   CIRCUIT_TYPE_HELP,
-            "page":                "setup",
-        })
+        ctx = _step3b_template_context(orch, errors=errors)
+        ctx["request"] = request
+        return _tmpl(request).TemplateResponse("setup.html", ctx)
 
     orch.reload_circuit_labels()
     orch.reload_circuit_profiles()
-    log.info("Setup: circuit names and types saved")
+    log.info("Setup: circuit names, types, and valve types saved")
     return ingress_redirect(request, "/setup/units")
 
 

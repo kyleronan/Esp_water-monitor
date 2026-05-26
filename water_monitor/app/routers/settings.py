@@ -205,11 +205,12 @@ async def settings_page(request: Request):
             }
         )
 
-        from ..database import get_active_exclusion_window
+        from ..database import get_active_exclusion_window, get_valve_type
         circuits.append({
             "circuit": c,
             "display_name": circuit_cfg.label,
             "circuit_type": circuit_cfg.circuit_type,
+            "valve_type": get_valve_type(orch.db, c),
             "sensitivity": dict(sens) if sens else {},
             "learning": dict(learn) if learn else {},
             "alerts": alerts,
@@ -224,7 +225,9 @@ async def settings_page(request: Request):
     if fp is not None:
         mqtt_status = fp.status()
 
-    from ..fixtures import CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP, ZONE_ONLY_ALERT_TYPES
+    from ..fixtures import (CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP,
+                            ZONE_ONLY_ALERT_TYPES,
+                            VALVE_TYPES, VALVE_TYPE_LABELS, VALVE_TYPE_HELP)
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
         "profile": dict(get_home_profile(orch.db) or {}),
@@ -236,6 +239,9 @@ async def settings_page(request: Request):
         "circuit_types": CIRCUIT_TYPES,
         "circuit_type_labels": CIRCUIT_TYPE_LABELS,
         "circuit_type_help": CIRCUIT_TYPE_HELP,
+        "valve_types": VALVE_TYPES,
+        "valve_type_labels": VALVE_TYPE_LABELS,
+        "valve_type_help": VALVE_TYPE_HELP,
         "zone_only_alert_types": ZONE_ONLY_ALERT_TYPES,
         "page": "settings",
     })
@@ -726,6 +732,64 @@ async def circuit_type_update(circuit: str, request: Request):
         "status": "updated",
         "circuit": circuit,
         "circuit_type": circuit_type,
+    })
+
+
+@router.post("/circuit/{circuit}/valve-type")
+async def circuit_valve_type_update(circuit: str, request: Request):
+    """Update the valve_type for a circuit.
+
+    Strict validation: invalid input returns HTTP 400. Mirrors the
+    circuit_type endpoint's CSRF behavior (the project uses
+    middleware-driven CSRF on the settings router — see main.py).
+    Switching to '3_port' disables the micro leak test for this circuit
+    (see leak_test_scheduler._execute_test and _check_schedule); the
+    existing leak-test schedule row is preserved so switching back to
+    '2_port' resumes the prior schedule without reconfiguration.
+    """
+    from ..circuit_compat import resolve_circuit
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+
+    if not orch._cfg.get_circuit(circuit):
+        return JSONResponse(
+            {"status": "error", "message": f"Unknown circuit: {circuit}"},
+            status_code=400,
+        )
+
+    form = await request.form()
+    from ..fixtures import parse_valve_type
+    from ..database import set_valve_type, get_valve_type
+
+    raw_vt = form.get("valve_type", "").strip()
+    parsed = parse_valve_type(raw_vt)
+    if parsed is None:
+        return JSONResponse(
+            {"status": "error",
+             "message": f"Invalid valve_type {raw_vt!r}. Must be '2_port' or '3_port'."},
+            status_code=400,
+        )
+
+    # No-change short-circuit — keeps the log clean on idempotent posts.
+    current = get_valve_type(orch.db, circuit)
+    if current == parsed:
+        return JSONResponse({
+            "status": "no_change",
+            "circuit": circuit,
+            "valve_type": parsed,
+        })
+
+    try:
+        set_valve_type(orch.db, circuit, parsed)
+    except Exception as exc:
+        log.error("[%s] set_valve_type failed: %s", circuit, exc)
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+    log.info("[%s] valve_type changed to %r", circuit, parsed)
+    return JSONResponse({
+        "status": "updated",
+        "circuit": circuit,
+        "valve_type": parsed,
     })
 
 

@@ -240,6 +240,42 @@
            style="display:none;color:var(--color-warn);margin-top:.5rem">Saving…</p>
       </div>
 
+      {# Valve type #}
+      <div class="sett-card">
+        <h3 class="sett-card-title">Valve type</h3>
+        <p class="sett-card-desc">
+          Hardware shape of the ball valve installed for this circuit. This
+          is primarily a setup-time decision — a confirmation prompt appears
+          before any change here takes effect.
+        </p>
+        {% for vt in valve_types %}
+        <label style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem;cursor:pointer">
+          <input type="radio"
+                 name="valve_type_{{ c.circuit }}"
+                 value="{{ vt }}"
+                 data-current="{{ c.valve_type }}"
+                 {% if vt == c.valve_type %}checked{% endif %}
+                 onchange="settingsValveTypeUpdate('{{ c.circuit }}', '{{ vt }}', this)"
+                 style="margin-top:3px;flex-shrink:0">
+          <span>
+            <strong>{{ valve_type_labels[vt] }}</strong>
+            <span class="muted" style="font-size:.8125rem;display:block">{{ valve_type_help[vt] }}</span>
+          </span>
+        </label>
+        {% endfor %}
+        <p class="sett-card-desc" id="valve-type-saving-{{ c.circuit }}"
+           style="display:none;color:var(--color-warn);margin-top:.5rem">Saving…</p>
+        {% if c.valve_type == "3_port" %}
+        <p class="sett-card-desc" style="margin-top:.5rem;color:var(--color-warn)">
+          <strong>Note:</strong> Micro leak test is disabled for this circuit —
+          3-port drain-capable valves are not compatible with the test (the
+          drain port would always read as a constant leak). The existing
+          leak-test schedule is preserved and will resume automatically if
+          you switch back to 2-port later.
+        </p>
+        {% endif %}
+      </div>
+
       </div>{# /Config panel #}
 
       {# ── Advanced tab: recal + learning + sensitivity + ESP device ── #}
@@ -1109,6 +1145,60 @@ async function settingsCircuitTypeUpdate(circuit, circuitType) {
       toast('Could not update circuit type: ' + (data.message || 'unknown error'), 'error');
       document.querySelectorAll(`input[name="circuit_type_${circuit}"]`)
         .forEach(r => { r.checked = false; });
+    }
+  } finally {
+    if (note) note.style.display = 'none';
+  }
+}
+
+async function settingsValveTypeUpdate(circuit, valveType, radio) {
+  // Confirm prompt: switching to 3_port disables the micro leak test;
+  // switching to 2_port re-enables it. Bail (and un-check the radio) if
+  // the user cancels so the UI doesn't show a state that didn't save.
+  let msg;
+  if (valveType === '3_port') {
+    msg = "Switching to a 3-port valve will DISABLE the micro leak test "
+        + "for this circuit. The existing leak-test schedule is preserved "
+        + "and will resume if you switch back to 2-port later.\n\nContinue?";
+  } else {
+    msg = "Switching to a 2-port valve will re-enable the micro leak test "
+        + "for this circuit. Make sure the installed valve really has only "
+        + "two ports — running the leak test on a 3-port valve will always "
+        + "fail.\n\nContinue?";
+  }
+  if (!window.confirm(msg)) {
+    // Revert UI: re-check whatever was selected before (data-current
+    // attribute reflects the value at page render).
+    if (radio) {
+      const previous = radio.dataset.current;
+      document.querySelectorAll(`input[name="valve_type_${circuit}"]`)
+        .forEach(r => { r.checked = (r.value === previous); });
+    }
+    return;
+  }
+  const note = document.getElementById(`valve-type-saving-${circuit}`);
+  if (note) note.style.display = 'block';
+  try {
+    const resp = await fetch(`${window.INGRESS_PATH}/settings/circuit/${circuit}/valve-type`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&valve_type=${encodeURIComponent(valveType)}`,
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (data.status === 'updated') {
+      // Reload to surface the conditional "leak test disabled" note,
+      // and so Device-page button state recomputes on next visit.
+      window.location.reload();
+    } else if (data.status === 'no_change') {
+      // Nothing to do — user picked the same value they already had.
+    } else {
+      toast('Could not update valve type: ' + (data.message || 'unknown error'), 'error');
+      // Revert the radio to data-current.
+      if (radio) {
+        const previous = radio.dataset.current;
+        document.querySelectorAll(`input[name="valve_type_${circuit}"]`)
+          .forEach(r => { r.checked = (r.value === previous); });
+      }
     }
   } finally {
     if (note) note.style.display = 'none';

@@ -157,7 +157,14 @@ CREATE TABLE IF NOT EXISTS circuit_profile (
     has_drip_zones      BOOLEAN DEFAULT 0,
     initial_priors_json TEXT,
     priors_computed_at  TIMESTAMP,
-    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- Ball valve hardware type (migration 20260527).
+    -- '2_port' (default): standard inline valve, micro leak test enabled.
+    -- '3_port'         : drain-capable valve; leak test is automatically
+    --                    skipped because a drain port reads as a constant
+    --                    leak. Set per circuit during setup; editable from
+    --                    Settings behind a confirmation prompt.
+    valve_type          TEXT DEFAULT '2_port'
 );
 
 -- ==========================================================================
@@ -1066,6 +1073,53 @@ def set_circuit_type(
     """, (circuit, circuit_type))
     if circuit_type == "zone":
         _seed_zone_alerts_only(conn, circuit)
+    conn.commit()
+
+
+def get_valve_type(
+    conn: sqlite3.Connection,
+    circuit: str,
+    default: str = "2_port",
+) -> str:
+    """Return the valve_type for a circuit.
+
+    Falls back to `default` if no circuit_profile row exists yet.
+    Normalises via fixtures.normalize_valve_type (forgiving) so callers
+    always get a canonical string they can render safely.
+    """
+    from .fixtures import normalize_valve_type
+    row = conn.execute(
+        "SELECT valve_type FROM circuit_profile WHERE circuit = ?",
+        (circuit,)
+    ).fetchone()
+    raw = row["valve_type"] if row and row["valve_type"] else default
+    return normalize_valve_type(raw)
+
+
+def set_valve_type(
+    conn: sqlite3.Connection,
+    circuit: str,
+    valve_type: str,
+) -> None:
+    """Persist valve_type to circuit_profile.
+
+    Uses the STRICT parser. Callers are expected to present a clean value;
+    a ValueError is raised on bad input rather than silently substituting
+    the default. UI/router layers should pre-validate via parse_valve_type
+    before calling this.
+
+    UPSERT mirrors set_circuit_type — all other circuit_profile columns
+    have DEFAULTs or allow NULL so the minimal INSERT shape is safe.
+    """
+    from .fixtures import parse_valve_type
+    parsed = parse_valve_type(valve_type)
+    if parsed is None:
+        raise ValueError(f"Invalid valve_type {valve_type!r}")
+    conn.execute("""
+        INSERT INTO circuit_profile (circuit, valve_type)
+        VALUES (?, ?)
+        ON CONFLICT(circuit) DO UPDATE SET valve_type = excluded.valve_type
+    """, (circuit, parsed))
     conn.commit()
 
 

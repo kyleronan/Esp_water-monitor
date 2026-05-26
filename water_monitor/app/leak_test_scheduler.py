@@ -211,6 +211,16 @@ class LeakTestScheduler:
         if not schedule or not schedule["enabled"]:
             return
 
+        # 3-port valves: silently skip scheduled checks. We don't write a
+        # skip row every cycle (would spam History); the user-facing
+        # explanation lives in Settings + Device-page UI annotations. The
+        # schedule row itself is preserved so switching back to 2_port
+        # resumes the schedule without reconfiguration. Manual triggers
+        # via run_now() DO record a skip row — see _execute_test().
+        from .database import get_valve_type
+        if get_valve_type(self._db, circuit, default="2_port") == "3_port":
+            return
+
         next_run_str = schedule["next_run_at"]
         if not next_run_str:
             await self._update_next_run(circuit, schedule)
@@ -310,6 +320,22 @@ class LeakTestScheduler:
         if fault == "on":
             log.info("[%s] leak test skipped — fault active", circuit)
             result = "Not run — fault active (reset fault first)"
+            await self._store_result(circuit, run_at, triggered_by, result,
+                                     None, None, None, None)
+            return {"result": result, "skipped": True}
+
+        # --- Pre-check: valve type compatibility (3-port has a drain port
+        # that always reads as a leak, so the micro leak test does not
+        # apply). The Device-page button is also disabled for 3-port
+        # circuits, but the route is intentionally still reachable so
+        # automations / direct POSTs produce a visible skip row here. ---
+        from .database import get_valve_type
+        if get_valve_type(self._db, circuit, default="2_port") == "3_port":
+            log.info("[%s] leak test skipped — valve_type='3_port' "
+                     "(drain-capable; micro leak test not applicable)",
+                     circuit)
+            result = ("Not run — 3-port valve (drain-capable; "
+                      "micro leak test not applicable)")
             await self._store_result(circuit, run_at, triggered_by, result,
                                      None, None, None, None)
             return {"result": result, "skipped": True}

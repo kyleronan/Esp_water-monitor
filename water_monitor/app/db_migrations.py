@@ -25,7 +25,8 @@ _BASELINE_VERSION: int = 20260523
 #   20260525 — added UNIQUE(circuit, start_ts) on events (dedup first)
 #   20260526 — degraded-supply guard: new event columns, event_waveforms
 #              table, rebuild hourly_volume from events
-_CURRENT_VERSION: int = 20260526
+#   20260527 — per-circuit valve_type column on circuit_profile
+_CURRENT_VERSION: int = 20260527
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -182,6 +183,29 @@ def _apply_degraded_supply_columns(conn: sqlite3.Connection) -> None:
              "added 7 degraded-supply columns + event_waveforms table")
 
 
+def _apply_valve_type_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260527.
+
+    Adds circuit_profile.valve_type with DEFAULT '2_port'. Idempotent —
+    column add guarded by _has_column. The DEFAULT clause on ADD COLUMN
+    gives all existing rows the value automatically; a defensive backfill
+    afterward handles any oddly migrated DB where the new column ended up
+    NULL or empty.
+    """
+    if not _has_column(conn, "circuit_profile", "valve_type"):
+        conn.execute(
+            "ALTER TABLE circuit_profile "
+            "ADD COLUMN valve_type TEXT DEFAULT '2_port'"
+        )
+        log.info("Added circuit_profile.valve_type (default '2_port')")
+    # Defensive backfill — handles legacy / hand-altered rows.
+    conn.execute(
+        "UPDATE circuit_profile SET valve_type = '2_port' "
+        "WHERE valve_type IS NULL OR valve_type = ''"
+    )
+    conn.commit()
+
+
 def _get_version(conn: sqlite3.Connection) -> int:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _schema_version (
@@ -234,6 +258,19 @@ def _missing_degraded_columns(conn: sqlite3.Connection) -> set[str]:
     }
 
 
+# Columns added by the 20260527 valve-type migration. Verified the same way
+# as the degraded-supply columns — catches a DB whose _schema_version was
+# stamped without the migration body running.
+_VALVE_TYPE_COLUMNS: frozenset = frozenset({"valve_type"})
+
+
+def _missing_valve_type_columns(conn: sqlite3.Connection) -> set[str]:
+    return {
+        col for col in _VALVE_TYPE_COLUMNS
+        if not _has_column(conn, "circuit_profile", col)
+    }
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -259,7 +296,11 @@ def run_migrations(
     _db_hint = f" DB file: {db_path}" if db_path else ""
 
     if version == _CURRENT_VERSION:
-        missing = _missing_baseline_columns(conn) | _missing_degraded_columns(conn)
+        missing = (
+            _missing_baseline_columns(conn)
+            | _missing_degraded_columns(conn)
+            | _missing_valve_type_columns(conn)
+        )
         if missing:
             raise RuntimeError(
                 "Database claims current schema version but is missing required "
@@ -283,6 +324,9 @@ def run_migrations(
         _apply_unique_events_index(conn)
         # Forward step 3: degraded-supply columns + waveform table + rebuild.
         _apply_degraded_supply_columns(conn)
+        # Forward step 4: per-circuit valve_type column.
+        if version < 20260527:
+            _apply_valve_type_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -290,6 +334,8 @@ def run_migrations(
     if version == _VERSION_PRE_UNIQUE_INDEX:
         _apply_unique_events_index(conn)
         _apply_degraded_supply_columns(conn)
+        if version < 20260527:
+            _apply_valve_type_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -298,9 +344,18 @@ def run_migrations(
     if version == _VERSION_PRE_DEGRADED:
         # DB has the unique index but lacks the degraded-supply columns.
         _apply_degraded_supply_columns(conn)
+        if version < 20260527:
+            _apply_valve_type_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
+        return
+
+    if version == 20260526:
+        # DB has the degraded-supply migration but lacks valve_type.
+        _apply_valve_type_column(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
 
     if version == 0:
@@ -326,6 +381,9 @@ def run_migrations(
         # fail on existing-DB upgrades — see comment there). Apply the full
         # migration step here too; idempotent and a no-op on empty tables.
         _apply_degraded_supply_columns(conn)
+        # Same pattern for valve_type — idempotent, ensures the column and
+        # the defensive backfill ran even on fresh DBs.
+        _apply_valve_type_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return
