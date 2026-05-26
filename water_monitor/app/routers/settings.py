@@ -554,6 +554,29 @@ async def retention_prune_now(request: Request):
     return JSONResponse({"ok": True, "deleted": deleted})
 
 
+@router.post("/reprocess/degraded-supply")
+async def reprocess_degraded_supply(request: Request):
+    """Re-apply current degraded-supply thresholds to every event with
+    stored diagnostics. Used after the guard's gates are tuned so past
+    verdicts (and the daily-volume totals derived from them) match the
+    new policy without waiting for new traffic."""
+    import asyncio
+    from ..feature_extractor import reprocess_degraded_supply_verdicts
+
+    orch = _orch(request)
+    loop = asyncio.get_running_loop()
+    summary = await loop.run_in_executor(
+        None, reprocess_degraded_supply_verdicts, orch.db
+    )
+    log.info(
+        "Degraded-supply reprocess: evaluated=%d flipped_to_degraded=%d "
+        "flipped_to_clean=%d skipped_legacy=%d",
+        summary["evaluated"], summary["flipped_to_degraded"],
+        summary["flipped_to_clean"], summary["skipped_legacy"],
+    )
+    return JSONResponse({"ok": True, **summary})
+
+
 # ── Re-run setup wizard ────────────────────────────────────────────────────
 # Flips home_profile.setup_complete back to 0 so the setup wizard's
 # state-mutating endpoints (guarded by _block_if_setup_complete()) accept

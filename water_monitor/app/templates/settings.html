@@ -913,6 +913,21 @@
           </div>
         </form>
       </div>
+
+      <div class="sett-card">
+        <h3 class="sett-card-title">Re-evaluate degraded-supply verdicts</h3>
+        <p class="sett-card-desc">
+          Re-applies the current degraded-supply thresholds to every past event
+          that has a stored diagnostic. Use after the guard is re-tuned so
+          historical events (and the daily-volume totals they feed) match the
+          new policy. Events captured before the guard was deployed have no
+          stored diagnostic and are skipped.
+        </p>
+        <div style="display:flex;gap:.5rem;margin-top:.5rem;flex-wrap:wrap">
+          <button type="button" class="btn btn-secondary btn-sm"
+                  onclick="reprocessDegraded(event)">Re-evaluate now</button>
+        </div>
+      </div>
     </div>
 
     {# ── Re-run Setup ──────────────────────────────────────────────── #}
@@ -1265,7 +1280,8 @@ async function pruneNow(evt) {
   btn.textContent = 'Pruning…';
   try {
     const resp = await fetch(`${window.INGRESS_PATH}/settings/retention/prune-now`, {
-      method: 'POST'
+      method: 'POST',
+      headers: { 'X-CSRF-Token': window.CSRF_TOKEN || '' },
     });
     const data = await resp.json();
     const total = Object.values(data.deleted || {}).reduce((a, b) => a + b, 0);
@@ -1275,6 +1291,32 @@ async function pruneNow(evt) {
   } finally {
     btn.disabled = false;
     btn.textContent = 'Run pruning now';
+  }
+}
+
+async function reprocessDegraded(evt) {
+  if (!confirm('Re-evaluate degraded-supply verdicts on all past events with stored diagnostics? Volume totals will be adjusted to match the new verdicts.')) return;
+  const btn = evt.target;
+  btn.disabled = true;
+  btn.textContent = 'Re-evaluating…';
+  try {
+    const resp = await fetch(`${window.INGRESS_PATH}/settings/reprocess/degraded-supply`, {
+      method: 'POST',
+      headers: { 'X-CSRF-Token': window.CSRF_TOKEN || '' },
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'unknown error');
+    const flipped = (data.flipped_to_degraded || 0) + (data.flipped_to_clean || 0);
+    toast(
+      `Re-evaluated ${data.evaluated} events — ${data.flipped_to_clean} flipped to clean, `
+      + `${data.flipped_to_degraded} flipped to degraded (${data.skipped_legacy} legacy rows skipped).`,
+      flipped > 0 ? 'success' : 'info'
+    );
+  } catch (e) {
+    toast('Re-evaluation failed: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Re-evaluate now';
   }
 }
 

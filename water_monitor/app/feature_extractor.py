@@ -434,32 +434,208 @@ def _detect_degraded_supply(
                 diag["pressure_rel_std"] = round(pressure_rel, 4)
                 return False, diag
 
-    # (H) Confirmatory signals.
-    # When periods matched, require a meaningful flow autocorr score (the
-    # match means flow has its own significant periodicity, not just a
-    # noise-driven coincidence). When inconclusive, require trough/resistance.
+    # (H) Confirmatory signals. The final decision is delegated to
+    # _evaluate_degraded_from_diag so the reprocess endpoint applies the
+    # exact same gates to stored diagnostics.
     trough_count = _count_trough_episodes(flow_readings, FLOW_TROUGH_LPM)
     trough_rate = trough_count / duration_s if duration_s > 0 else 0
     diag["flow_trough_episode_count"] = trough_count
     diag["flow_trough_episode_rate_hz"] = round(trough_rate, 3)
     diag["resistance_shape"] = resistance_shape
+    diag["period_matched"] = period_matched
+
+    is_degraded, reason = _evaluate_degraded_from_diag(diag)
+    diag["reason"] = reason
+    return is_degraded, diag
+
+
+def _evaluate_degraded_from_diag(diag: dict):
+    """Apply the post-detection threshold gates to a diagnostic dict.
+
+    Pure function over the stored diagnostic fields. Used by both the live
+    detector (so the gates exist in one place) and the reprocess endpoint
+    (so threshold changes apply retroactively to events with stored
+    diagnostics, without needing the raw sample series).
+
+    Diagnostics produced by early-exit gates (`pressure_steady`,
+    `frequency_mismatch_fixture_cycling`, `appliance_cycling`,
+    `too_short`, `no_pressure_baseline`, `mid_slice_too_short`,
+    `too_short_for_period_search`, `no_periodic_pressure_in_supply_band`)
+    do not have `flow_trough_episode_rate_hz` set — for those, this
+    helper preserves the stored reason and returns is_degraded=False.
+    Re-evaluating those would require the raw series, which is not
+    persisted post-event.
+    """
+    if "flow_trough_episode_rate_hz" not in diag:
+        return False, diag.get("reason", "unknown")
+
+    period_matched = bool(diag.get("period_matched", False))
+    flow_score = float(diag.get("flow_autocorr_score") or 0.0)
+    trough_rate = float(diag.get("flow_trough_episode_rate_hz") or 0.0)
+    resistance_shape = diag.get("resistance_shape") or ""
 
     if period_matched:
-        if flow_score < PRESSURE_AUTOCORR_THRESHOLD:
-            diag["reason"] = "no_confirmatory_signal"
-            return False, diag
+        # Require BOTH a meaningful flow autocorr score AND a meaningful
+        # trough rate. A high flow_score alone (as seen in the 16:48 /
+        # 19:48 / 20:20 false positives) can arise from low-amplitude
+        # noise patterning to ~1 Hz at the 7 Hz sample rate; requiring
+        # paddlewheel rectification evidence rules those out.
+        if (flow_score < PRESSURE_AUTOCORR_THRESHOLD
+                or trough_rate < MIN_TROUGH_EPISODE_RATE_HZ):
+            return False, "insufficient_confirmatory_signal"
     else:
         confirmed = (
             trough_rate >= MIN_TROUGH_EPISODE_RATE_HZ
             or resistance_shape == "pulsed"
         )
         if not confirmed:
-            diag["reason"] = "no_confirmatory_signal"
-            return False, diag
+            return False, "no_confirmatory_signal"
 
-    diag["reason"] = "pulsing_supply_confirmed"
-    diag["period_matched"] = period_matched
-    return True, diag
+    return True, "pulsing_supply_confirmed"
+
+
+def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
+    """Re-apply current degraded-supply gates to all events with stored diagnostics.
+
+    Walks every event that has `degraded_diagnostic_json`, re-evaluates via
+    `_evaluate_degraded_from_diag`, and updates the event row when the
+    verdict changes. The raw sample series are not retained post-event, so
+    only the post-detection gate logic can change retroactively — early
+    rejections like 'pressure_steady' stay as they were (the helper
+    preserves their reason). Events with no stored diag (pre-deploy rows)
+    are counted as `skipped_legacy`.
+
+    Volume bookkeeping is kept in sync: events flipping to degraded swap
+    `volume_litres_effective` to the envelope estimate; events flipping
+    back to clean revert to raw `volume_litres`. The hourly_volume bucket
+    is adjusted by the delta so daily totals stay correct.
+
+    Returns a summary dict with the counts the endpoint relays to the UI.
+    """
+    from .database import _hour_bucket_for, transaction
+
+    rows = conn.execute(
+        "SELECT id, circuit, start_ts, degraded_supply, "
+        "       degraded_diagnostic_json, volume_litres, "
+        "       volume_litres_estimated, hourly_volume_applied_litres, "
+        "       hourly_volume_applied_bucket, is_composite "
+        "FROM events "
+        "WHERE degraded_diagnostic_json IS NOT NULL "
+        "  AND degraded_diagnostic_json != ''"
+    ).fetchall()
+
+    skipped_legacy_row = conn.execute(
+        "SELECT COUNT(*) AS c FROM events "
+        "WHERE degraded_diagnostic_json IS NULL "
+        "   OR degraded_diagnostic_json = ''"
+    ).fetchone()
+    skipped_legacy = int(skipped_legacy_row["c"]) if skipped_legacy_row else 0
+
+    flipped_to_degraded = 0
+    flipped_to_clean = 0
+    evaluated = 0
+
+    for row in rows:
+        evaluated += 1
+        try:
+            diag = json.loads(row["degraded_diagnostic_json"])
+        except (ValueError, TypeError):
+            log.warning("reprocess: event %s has unparseable diag JSON; skipping",
+                        row["id"])
+            continue
+
+        new_is_degraded, new_reason = _evaluate_degraded_from_diag(diag)
+        old_is_degraded = bool(row["degraded_supply"])
+        if new_is_degraded == old_is_degraded:
+            continue  # verdict unchanged
+
+        # Verdict flipped — update event + hourly_volume in one transaction.
+        diag["reason"] = new_reason
+        raw_volume = float(row["volume_litres"] or 0.0)
+        envelope_volume = float(row["volume_litres_estimated"] or 0.0)
+        new_effective = envelope_volume if new_is_degraded else raw_volume
+        new_method = "pulsing_supply_envelope" if new_is_degraded else "raw"
+
+        # match_rejection_reason: 'pulsing_supply' only when flipped TO
+        # degraded AND not composite. Flipping AWAY clears the upstream
+        # reason; cluster-engine reasons live in a separate field and
+        # are not touched here.
+        if new_is_degraded and not row["is_composite"]:
+            new_rejection = "pulsing_supply"
+        else:
+            new_rejection = None
+
+        prev_applied = float(row["hourly_volume_applied_litres"] or 0.0)
+        prev_bucket = row["hourly_volume_applied_bucket"]
+        new_bucket = _hour_bucket_for(row["start_ts"])
+
+        # excluded_from_training mirrors (composite OR degraded). Composite
+        # status doesn't change here, so we OR the new degraded verdict in.
+        with transaction(conn):
+            conn.execute(
+                "UPDATE events SET "
+                "  degraded_supply = ?, "
+                "  volume_litres_effective = ?, "
+                "  volume_estimation_method = ?, "
+                "  degraded_diagnostic_json = ?, "
+                "  match_rejection_reason = ?, "
+                "  excluded_from_training = CASE "
+                "    WHEN is_composite = 1 OR ? = 1 THEN 1 ELSE 0 END "
+                "WHERE id = ?",
+                (
+                    1 if new_is_degraded else 0,
+                    round(new_effective, 3),
+                    new_method,
+                    json.dumps(diag, allow_nan=False),
+                    new_rejection,
+                    1 if new_is_degraded else 0,
+                    row["id"],
+                ),
+            )
+            if prev_bucket and prev_applied != 0:
+                conn.execute(
+                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT (circuit, hour_ts) "
+                    "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
+                    (row["circuit"], prev_bucket, -prev_applied),
+                )
+            if new_bucket and new_effective:
+                conn.execute(
+                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT (circuit, hour_ts) "
+                    "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
+                    (row["circuit"], new_bucket, new_effective),
+                )
+            conn.execute(
+                "UPDATE events SET "
+                "  hourly_volume_applied_litres = ?, "
+                "  hourly_volume_applied_bucket = ? "
+                "WHERE id = ?",
+                (new_effective, new_bucket, row["id"]),
+            )
+
+        if new_is_degraded:
+            flipped_to_degraded += 1
+        else:
+            flipped_to_clean += 1
+        log.info(
+            "reprocess: event %s flipped %s → %s (reason=%s, effective_vol %.3f → %.3f)",
+            row["id"],
+            "clean" if old_is_degraded is False else "degraded",
+            "degraded" if new_is_degraded else "clean",
+            new_reason,
+            prev_applied,
+            new_effective,
+        )
+
+    return {
+        "evaluated": evaluated,
+        "flipped_to_degraded": flipped_to_degraded,
+        "flipped_to_clean": flipped_to_clean,
+        "skipped_legacy": skipped_legacy,
+    }
 
 
 def _estimate_volume_smoothed(

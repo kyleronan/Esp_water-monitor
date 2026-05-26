@@ -320,6 +320,20 @@
         <dt>Sig. source</dt>   <dd id="emd-sig-source"></dd>
       </dl>
     </details>
+    <section id="emd-degraded-section" class="evt-modal-degraded" hidden
+             aria-label="Degraded-supply diagnostic">
+      <h4 class="evt-modal-degraded-title">Degraded-supply diagnostic</h4>
+      <dl class="evt-modal-dl evt-modal-dl-extra">
+        <dt>Reason</dt>            <dd id="emd-deg-reason">—</dd>
+        <dt>Mid-event P std</dt>   <dd id="emd-deg-pstd">—</dd>
+        <dt>Pressure period</dt>   <dd id="emd-deg-pperiod">—</dd>
+        <dt>Pressure autocorr</dt> <dd id="emd-deg-pscore">—</dd>
+        <dt>Flow period</dt>       <dd id="emd-deg-fperiod">—</dd>
+        <dt>Flow autocorr</dt>     <dd id="emd-deg-fscore">—</dd>
+        <dt>Harmonic</dt>          <dd id="emd-deg-harmonic">—</dd>
+        <dt>Flow troughs</dt>      <dd id="emd-deg-troughs">—</dd>
+      </dl>
+    </section>
     <hr class="evt-modal-hr">
     <div class="evt-modal-section">
       <label class="evt-modal-label" for="emd-fixture-select">Assign fixture type</label>
@@ -592,6 +606,51 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       ov === '1' ? 'Yes (open)' : ov === '0' ? 'No' : '—';
 
     document.getElementById('emd-sig-source').textContent = d.sigSource || 'software';
+
+    // ── Degraded-supply diagnostic ──────────────────────────────────────
+    // Only shown when the guard flagged this event. The diag JSON carries
+    // the gate values that produced the verdict, so a viewer can spot a
+    // false positive (e.g. high autocorr but trivial trough rate).
+    const degSection = document.getElementById('emd-degraded-section');
+    if (d.degraded === '1' && d.degradedDiag) {
+      let diag = null;
+      try { diag = JSON.parse(d.degradedDiag); }
+      catch (err) { console.warn('[evt-modal] invalid degraded-diag JSON', err); }
+
+      if (diag) {
+        const fmtPeriod = (v) => (v == null ? '—' : `${(+v).toFixed(2)} s`);
+        const fmtScore  = (v) => (v == null ? '—' : (+v).toFixed(2));
+        const fmtPsi    = (v) => (v == null ? '—' : `${(+v).toFixed(2)} PSI`);
+        const fmtTrough = (cnt, rate) => {
+          if (cnt == null && rate == null) return '—';
+          const c = cnt == null ? '?' : cnt;
+          const r = rate == null ? '?' : (+rate).toFixed(3);
+          return `${c} (${r} Hz)`;
+        };
+        document.getElementById('emd-deg-reason').textContent =
+          (diag.reason || '—').replace(/_/g, ' ');
+        document.getElementById('emd-deg-pstd').textContent =
+          fmtPsi(diag.mid_pressure_std_psi);
+        document.getElementById('emd-deg-pperiod').textContent =
+          fmtPeriod(diag.pressure_dominant_period_s);
+        document.getElementById('emd-deg-pscore').textContent =
+          fmtScore(diag.pressure_autocorr_score);
+        document.getElementById('emd-deg-fperiod').textContent =
+          fmtPeriod(diag.flow_dominant_period_s);
+        document.getElementById('emd-deg-fscore').textContent =
+          fmtScore(diag.flow_autocorr_score);
+        document.getElementById('emd-deg-harmonic').textContent =
+          diag.harmonic || '—';
+        document.getElementById('emd-deg-troughs').textContent =
+          fmtTrough(diag.flow_trough_episode_count,
+                    diag.flow_trough_episode_rate_hz);
+        degSection.hidden = false;
+      } else {
+        degSection.hidden = true;
+      }
+    } else {
+      degSection.hidden = true;
+    }
 
     errBox.hidden = true;
     errBox.textContent = '';

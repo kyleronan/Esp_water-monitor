@@ -1466,6 +1466,18 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .evt-modal-summary::before { content: '▶ '; font-size: 9px; }
 details[open] .evt-modal-summary::before { content: '▼ '; }
 .evt-modal-dl-extra { margin-top: 10px; }
+.evt-modal-degraded {
+  margin: 10px 0 4px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--amber);
+  background: var(--amber-bg);
+  border-radius: 4px;
+}
+.evt-modal-degraded-title {
+  font-size: 12px; font-weight: 600; color: var(--amber-text);
+  margin: 0 0 6px; text-transform: uppercase; letter-spacing: 0.4px;
+}
+.evt-modal-degraded .evt-modal-dl-extra { margin-top: 0; }
 .evt-modal-error {
   font-size: 12px; color: var(--red, oklch(55% .22 25));
   margin-bottom: 8px; padding: 6px 8px;
