@@ -837,23 +837,26 @@ class Orchestrator:
         detail modal but cost ~28 KB/event. Retention bounds storage. The
         underlying event row is untouched (cascade is from event to waveform,
         not the other way).
+
+        DELETE is offloaded to a worker thread — on a populated DB it can
+        touch thousands of rows in one shot, which would otherwise stall
+        every other ingress request for the duration.
         """
         WAVEFORM_RETENTION_DAYS = 60
         # Wait ~30s after startup so the rest of the boot sequence finishes
         # before the first purge runs.
         await asyncio.sleep(30)
+        loop = asyncio.get_running_loop()
         while not self._stop.is_set():
             try:
                 cutoff = (datetime.now(timezone.utc)
                           - timedelta(days=WAVEFORM_RETENTION_DAYS)).isoformat()
-                cur = self._db.execute(
-                    "DELETE FROM event_waveforms WHERE created_at < ?",
-                    (cutoff,),
+                rowcount = await loop.run_in_executor(
+                    None, self._purge_waveforms_sync, cutoff,
                 )
-                self._db.commit()
-                if cur.rowcount:
+                if rowcount:
                     log.info("Purged %d waveform row(s) older than %d days",
-                             cur.rowcount, WAVEFORM_RETENTION_DAYS)
+                             rowcount, WAVEFORM_RETENTION_DAYS)
             except Exception as e:
                 log.warning("Waveform purge failed (non-fatal): %s", e)
             # Sleep 24h, exiting promptly if stop is signaled.
@@ -861,6 +864,16 @@ class Orchestrator:
                 await asyncio.wait_for(self._stop.wait(), timeout=24 * 3600)
             except asyncio.TimeoutError:
                 pass
+
+    def _purge_waveforms_sync(self, cutoff: str) -> int:
+        """DELETE old event_waveforms rows. Runs in a worker thread —
+        only the calling async wrapper uses run_in_executor."""
+        cur = self._db.execute(
+            "DELETE FROM event_waveforms WHERE created_at < ?",
+            (cutoff,),
+        )
+        self._db.commit()
+        return cur.rowcount
 
     async def _compute_leak_test_etc(
         self,

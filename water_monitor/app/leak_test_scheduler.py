@@ -271,7 +271,14 @@ class LeakTestScheduler:
             auto_learn = True
 
         if auto_learn:
-            best_hour = self.learn_best_hour(circuit)
+            # learn_best_hour queries up to 60 days of hourly_volume and
+            # does Python-side aggregation — offload to a worker thread
+            # so the scheduler's async loop stays responsive while it
+            # runs.
+            loop = asyncio.get_running_loop()
+            best_hour = await loop.run_in_executor(
+                None, self.learn_best_hour, circuit,
+            )
             if best_hour is not None:
                 current_hour = schedule.get("run_hour") if isinstance(schedule, dict) \
                     else schedule["run_hour"]

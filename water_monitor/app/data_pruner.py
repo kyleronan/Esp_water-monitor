@@ -42,13 +42,20 @@ class DataPruner:
         """
         On first start: run a full backfill immediately if daily_summary is empty.
         Then wait until 03:00 and run the full nightly job daily.
+
+        prune_now() and _startup_backfill() do many sync SQLite operations
+        (DELETEs + daily-summary computation across all events) which can
+        block the event loop for several seconds on a populated DB. They're
+        offloaded to a worker thread via run_in_executor so the rest of the
+        addon stays responsive to ingress requests.
         """
-        await self._startup_backfill()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._startup_backfill_sync)
 
         await self._wait_until_3am()
         while not self._stop.is_set():
             try:
-                self.prune_now()
+                await loop.run_in_executor(None, self.prune_now)
                 await self._run_auto_backup()
             except Exception as e:
                 log.error("Data pruner nightly error: %s", e, exc_info=True)
@@ -59,10 +66,14 @@ class DataPruner:
 
     # ── Startup backfill ────────────────────────────────────────────────────
 
-    async def _startup_backfill(self) -> None:
-        """
-        If daily_summary is empty (first install or fresh DB), compute summaries
-        for all historical events immediately so the history chart isn't blank.
+    def _startup_backfill_sync(self) -> None:
+        """Synchronous variant of the startup backfill — invoked from
+        run() via run_in_executor so the heavy summary computation
+        doesn't block the event loop.
+
+        If daily_summary is empty (first install or fresh DB), compute
+        summaries for all historical events immediately so the history
+        chart isn't blank.
         """
         try:
             count = self._db.execute(
@@ -78,6 +89,13 @@ class DataPruner:
             # Also catch any days missed since last run (e.g. after an update)
             self._compute_missing_summaries(now)
         self._compute_fixture_daily_summaries(now)
+
+    async def _startup_backfill(self) -> None:
+        """Async wrapper kept for any external callers that expect the
+        original signature. Delegates to the sync variant via the loop's
+        default executor so the heavy work happens off the event loop."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._startup_backfill_sync)
 
     # ── Nightly job ─────────────────────────────────────────────────────────
 
