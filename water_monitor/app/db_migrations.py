@@ -168,17 +168,40 @@ def _apply_degraded_supply_columns(conn: sqlite3.Connection) -> None:
     # Rebuild hourly_volume from events as the source of truth.
     # CRITICAL: no excluded_from_training filter — degraded events still
     # count toward volume totals.
-    conn.execute("DELETE FROM hourly_volume")
-    conn.execute(
-        "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-        "SELECT circuit, "
-        "       strftime('%Y-%m-%dT%H:00:00', start_ts) AS hour_ts, "
-        "       SUM(COALESCE(volume_litres_effective, volume_litres, 0)) "
-        "FROM events "
-        "WHERE start_ts IS NOT NULL "
-        "GROUP BY circuit, strftime('%Y-%m-%dT%H:00:00', start_ts)"
-    )
-    conn.commit()
+    #
+    # Temp-table swap pattern: build the new rows into a TEMP table
+    # first, only THEN clear hourly_volume and copy across. Anything that
+    # raises before the final COMMIT is rolled back atomically, leaving
+    # the original hourly_volume intact. If the process dies mid-rebuild,
+    # SQLite's transaction durability does the same thing automatically.
+    try:
+        conn.execute(
+            "CREATE TEMP TABLE hourly_volume_rebuild AS "
+            "SELECT circuit, "
+            "       strftime('%Y-%m-%dT%H:00:00', start_ts) AS hour_ts, "
+            "       SUM(COALESCE(volume_litres_effective, volume_litres, 0)) "
+            "         AS volume_litres "
+            "FROM events "
+            "WHERE start_ts IS NOT NULL "
+            "GROUP BY circuit, strftime('%Y-%m-%dT%H:00:00', start_ts)"
+        )
+        conn.execute("DELETE FROM hourly_volume")
+        conn.execute(
+            "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+            "SELECT circuit, hour_ts, volume_litres "
+            "FROM hourly_volume_rebuild"
+        )
+        conn.execute("DROP TABLE hourly_volume_rebuild")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        # Best-effort cleanup — DROP IF EXISTS so rerun is safe.
+        try:
+            conn.execute("DROP TABLE IF EXISTS hourly_volume_rebuild")
+            conn.commit()
+        except Exception:
+            pass
+        raise
     log.info("Migration 20260526: rebuilt hourly_volume from events; "
              "added 7 degraded-supply columns + event_waveforms table")
 
