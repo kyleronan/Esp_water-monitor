@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from jinja2 import select_autoescape
 
 import os as _os
 
@@ -170,8 +171,15 @@ async def lifespan(app: FastAPI):
     finally:
         _db.close()
 
+    # autoescape pinned explicitly. Starlette's Jinja2Templates default
+    # has been select_autoescape(["html", "htm"]) for a long time, but
+    # the safety belt is cheap and survives any future framework
+    # default change. Every {{ … }} in our .html templates is escaped
+    # by default; |safe is required to opt out.
     app.state.templates = IngressTemplates(
-        directory=str(APP_DIR / "templates"))
+        directory=str(APP_DIR / "templates"),
+        autoescape=select_autoescape(["html", "htm"]),
+    )
 
     # Register tojson filter (not included by default in FastAPI's Jinja2).
     # Must return Markup so Jinja2 autoescape does not HTML-encode the JSON
