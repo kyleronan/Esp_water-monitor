@@ -4,6 +4,11 @@ from __future__ import annotations
 from fastapi import Request
 from fastapi.responses import RedirectResponse
 
+# Re-export coerce_int so existing `from ._helpers import coerce_int`
+# imports keep working. The implementation lives in `..forms` so it
+# can be unit-tested without pulling in FastAPI.
+from ..forms import coerce_int  # noqa: F401
+
 
 def ingress_redirect(
     request: Request,

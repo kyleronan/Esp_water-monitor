@@ -15,7 +15,7 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from ._helpers import ingress_redirect
+from ._helpers import coerce_int, ingress_redirect
 
 from ..device_discovery import (
     find_matching_devices,
@@ -668,14 +668,24 @@ async def setup_home_details_save(request: Request):
     from ..database import update_home_profile
     from ..config import compute_suggested_calibration_days
 
-    bathrooms_full             = int(form.get("bathrooms_full", 1) or 1)
-    bathrooms_half             = int(form.get("bathrooms_half", 0) or 0)
-    floors                     = int(form.get("floors", 1) or 1)
-    occupants                  = int(form.get("occupants", 2) or 2)
+    # Bounded coercion — out-of-range submissions (negative bathrooms,
+    # occupants=0, sqft=-1, build_year=99999) fall back to the listed
+    # default rather than being persisted as garbage. Bounds chosen as
+    # "absurd-to-reach" limits; downstream heuristics clamp tighter.
+    bathrooms_full             = coerce_int(form.get("bathrooms_full"), lo=0, hi=20, default=1)
+    bathrooms_half             = coerce_int(form.get("bathrooms_half"), lo=0, hi=20, default=0)
+    floors                     = coerce_int(form.get("floors"),         lo=1, hi=10, default=1)
+    occupants                  = coerce_int(form.get("occupants"),      lo=1, hi=30, default=2)
     supply_type                = form.get("supply_type", "mains")
-    build_year_raw             = form.get("build_year", "")
-    build_year                 = int(build_year_raw) if build_year_raw.strip().isdigit() else None
-    sqft                       = int(form.get("sqft", 0) or 0)
+    # build_year stays as Optional[int]: a missing/blank field is None
+    # (no override), but a present-but-garbage value falls back to None
+    # rather than persisting nonsense like 99999.
+    build_year_raw             = form.get("build_year", "").strip()
+    if build_year_raw:
+        build_year = coerce_int(build_year_raw, lo=1800, hi=2100, default=0) or None
+    else:
+        build_year = None
+    sqft                       = coerce_int(form.get("sqft"),           lo=0, hi=100000, default=0)
     historical_import_enabled  = form.get("historical_import_enabled") == "1"
 
     update_home_profile(

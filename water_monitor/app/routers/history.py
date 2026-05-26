@@ -27,11 +27,16 @@ def _tmpl(r): return r.app.state.templates
 async def history_page(request: Request):
     try:
         return await _history_page(request)
-    except Exception as e:
-        log.error("History page error: %s", e, exc_info=True)
+    except Exception:
+        # Log with full traceback at ERROR; the user-facing page stays
+        # generic so we don't leak exception text / stack info into the
+        # HTML. Pointing at the addon log is enough actionable detail
+        # for the user; the rest belongs in the log only.
+        log.error("History page error", exc_info=True)
         return HTMLResponse(
-            f"<h1>History page error</h1><pre>{e}</pre>"
-            "<p>Check the addon log for details.</p>",
+            "<h1>History temporarily unavailable</h1>"
+            "<p>Something went wrong rendering this page. "
+            "Check the addon log for details, or refresh to retry.</p>",
             status_code=500,
         )
 

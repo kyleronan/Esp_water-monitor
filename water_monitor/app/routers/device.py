@@ -6,7 +6,7 @@ import logging
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from ._helpers import ingress_redirect
+from ._helpers import coerce_int, ingress_redirect
 from ..circuit_compat import resolve_circuit
 
 log = logging.getLogger(__name__)
@@ -380,15 +380,23 @@ async def leaktest_schedule(circuit: str, request: Request):
     orch = _orch(request)
 
     from ..database import upsert_leak_test_schedule
+    # Bounded coercion: out-of-range form values (run_hour=99,
+    # day_of_week=-1, etc.) fall back to the listed default rather
+    # than being persisted as garbage. The numeric bounds match the
+    # semantic ranges enforced by the scheduler:
+    #   day_of_week    0..6   (Mon..Sun)
+    #   week_of_month  1..5
+    #   run_hour       0..23
+    #   run_minute     0..59
     upsert_leak_test_schedule(
         orch.db, circuit,
         enabled=form.get("enabled") == "on",
         auto_learn_hour=form.get("auto_learn_hour") == "on",
         frequency=form.get("frequency", "monthly"),
-        day_of_week=int(form.get("day_of_week", 0)),
-        week_of_month=int(form.get("week_of_month", 1)),
-        run_hour=int(form.get("run_hour", 2)),
-        run_minute=int(form.get("run_minute", 0)),
+        day_of_week=coerce_int(form.get("day_of_week"), lo=0, hi=6, default=0),
+        week_of_month=coerce_int(form.get("week_of_month"), lo=1, hi=5, default=1),
+        run_hour=coerce_int(form.get("run_hour"), lo=0, hi=23, default=2),
+        run_minute=coerce_int(form.get("run_minute"), lo=0, hi=59, default=0),
         notify_on_pass=form.get("notify_on_pass") == "on",
         notify_on_fail=form.get("notify_on_fail") == "on",
     )

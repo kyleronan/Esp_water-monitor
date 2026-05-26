@@ -5,7 +5,7 @@ import logging
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from ._helpers import ingress_redirect
+from ._helpers import coerce_int, ingress_redirect
 
 from ..circuit_compat import resolve_circuit
 from ..config import SENSITIVITY_PRESETS
@@ -255,19 +255,24 @@ async def profile_update(request: Request):
     form = await request.form()
     orch = _orch(request)
 
-    try:
-        build_year = int(form.get("build_year", "") or 0) or None
-    except (ValueError, TypeError):
+    # Bounds match the setup wizard's home-details form (see setup.py).
+    # Out-of-range values fall back to the listed default instead of
+    # poisoning the DB; build_year is Optional[int] so a blank field
+    # stays None.
+    build_year_raw = form.get("build_year", "").strip()
+    if build_year_raw:
+        build_year = coerce_int(build_year_raw, lo=1800, hi=2100, default=0) or None
+    else:
         build_year = None
 
     from ..database import update_home_profile
     update_home_profile(
         orch.db,
-        bathrooms_full=int(form.get("bathrooms_full", 1) or 1),
-        bathrooms_half=int(form.get("bathrooms_half", 0) or 0),
-        sqft=int(form.get("sqft", 0) or 0),
-        floors=int(form.get("floors", 1) or 1),
-        occupants=int(form.get("occupants", 2) or 2),
+        bathrooms_full=coerce_int(form.get("bathrooms_full"), lo=0, hi=20, default=1),
+        bathrooms_half=coerce_int(form.get("bathrooms_half"), lo=0, hi=20, default=0),
+        sqft=coerce_int(form.get("sqft"),                     lo=0, hi=100000, default=0),
+        floors=coerce_int(form.get("floors"),                 lo=1, hi=10, default=1),
+        occupants=coerce_int(form.get("occupants"),           lo=1, hi=30, default=2),
         build_year=build_year,
         supply_type=form.get("supply_type", "mains"),
         setup_complete=1,
@@ -355,10 +360,11 @@ async def recalibrate(circuit: str, request: Request):
 
     fixtures_changed = form.get("fixtures_changed") == "yes"
     occupants_changed = form.get("occupants_changed") == "yes"
-    try:
-        calibration_days = int(form.get("calibration_days", 14))
-    except (ValueError, TypeError):
-        calibration_days = 14
+    # 1..365 days — anything outside that range almost certainly a typo
+    # or stale form; default-back rather than persist an absurd window.
+    calibration_days = coerce_int(
+        form.get("calibration_days"), lo=1, hi=365, default=14,
+    )
 
     if not orch.training_manager:
         return JSONResponse(
@@ -827,8 +833,10 @@ async def start_exclusion_window(request: Request, circuit: str):
     circuit = resolve_circuit(circuit)
     from ..database import create_exclusion_window
     form    = await request.form()
-    minutes = int(form.get("minutes") or 15)
-    minutes = max(5, min(60, minutes))
+    # 5..60 minutes — same clamp the old code applied, now expressed
+    # as one helper call so out-of-range AND malformed inputs both
+    # fall back to the 15 minute default.
+    minutes = coerce_int(form.get("minutes"), lo=5, hi=60, default=15)
     reason  = (form.get("reason") or "plumbing").strip() or "plumbing"
     create_exclusion_window(_orch(request).db, circuit, minutes, reason)
     log.info("[%s] exclusion window started — %d min (%s)", circuit, minutes, reason)
