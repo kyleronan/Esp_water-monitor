@@ -736,7 +736,9 @@ async def circuit_type_update(circuit: str, request: Request):
         )
 
     form = await request.form()
-    from ..fixtures import normalize_circuit_type, CIRCUIT_TYPES
+    from ..fixtures import (
+        normalize_circuit_type, CIRCUIT_TYPES, zone_user_selectable_types,
+    )
     from ..database import set_circuit_type
 
     raw_type = form.get("circuit_type", "").strip()
@@ -747,6 +749,54 @@ async def circuit_type_update(circuit: str, request: Request):
              "message": f"Invalid circuit_type {raw_type!r}. Must be one of: {', '.join(sorted(CIRCUIT_TYPES))}"},
             status_code=400,
         )
+
+    # When switching to 'zone', refuse if the circuit already has
+    # confirmed fixtures whose type is not appropriate for a zone
+    # (e.g. toilet, shower, kitchen_tap). Otherwise the type system
+    # silently goes inconsistent — a "zone" circuit with toilet
+    # fixtures attached. Suggested types from clustering are NOT
+    # blockers: only user-confirmed `fixtures.fixture_type` counts.
+    # Zone → fixture is always allowed (zone alert rows are preserved
+    # and just hidden by the template filter).
+    if circuit_type == "zone":
+        allowed_zone_types = set(zone_user_selectable_types())
+        rows = orch.db.execute(
+            """SELECT f.id, f.fixture_type, COALESCE(f.display_name, f.name) AS name
+               FROM fixture_clusters fc
+               JOIN fixtures f ON fc.fixture_id = f.id
+              WHERE fc.circuit = ?
+                AND f.fixture_type IS NOT NULL
+                AND f.fixture_type != ''""",
+            (circuit,),
+        ).fetchall()
+        conflicts = [
+            dict(r) for r in rows
+            if r["fixture_type"] not in allowed_zone_types
+        ]
+        if conflicts:
+            # Summarise per type so the message stays short when many
+            # fixtures share a non-zone type (e.g. 4 toilets).
+            from collections import Counter
+            type_counts = Counter(c["fixture_type"] for c in conflicts)
+            summary = ", ".join(
+                f"{count}× {t}" if count > 1 else t
+                for t, count in sorted(type_counts.items())
+            )
+            log.info(
+                "[%s] zone-flip refused — %d non-zone fixture(s): %s",
+                circuit, len(conflicts), summary,
+            )
+            return JSONResponse(
+                {"status": "error",
+                 "message": (
+                     f"Cannot switch to zone — this circuit has "
+                     f"{len(conflicts)} confirmed fixture(s) with "
+                     f"non-zone types ({summary}). Reassign or delete "
+                     f"them under Fixtures first."
+                 ),
+                 "conflicts": conflicts},
+                status_code=409,  # 409 Conflict — request well-formed but state forbids
+            )
 
     try:
         set_circuit_type(orch.db, circuit, circuit_type)
