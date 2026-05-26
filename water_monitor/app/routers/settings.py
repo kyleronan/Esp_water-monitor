@@ -462,10 +462,11 @@ async def device_entity_update(request: Request):
         )
 
     if domain != "number":
+        # 400 not 403 — domain mismatch is input validation, not auth.
         return JSONResponse(
             {"status": "error",
              "message": "Only ESPHome number.* entities are accepted"},
-            status_code=403,
+            status_code=400,
         )
 
     # Build the allowlist from discovered entities in mutable roles only.
@@ -476,9 +477,12 @@ async def device_entity_update(request: Request):
         allowed.update(v for k, v in ents.items() if k in _SETTINGS_MUTABLE_ROLES and v)
 
     if entity_id not in allowed:
+        # 400 not 403 — entity_id failed enum validation against the
+        # discovered allowlist. The request is well-formed; the value
+        # is just not in the accepted set.
         return JSONResponse(
             {"status": "error", "message": "Entity not in allowed set for this device"},
-            status_code=403,
+            status_code=400,
         )
 
     native_step = form.get("native_step", "").strip()
@@ -701,7 +705,7 @@ async def circuit_rename(circuit: str, request: Request):
     if not circuit_cfg:
         return JSONResponse(
             {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=400,
+            status_code=404,
         )
 
     from ..circuit_compat import validate_display_name
@@ -732,7 +736,7 @@ async def circuit_type_update(circuit: str, request: Request):
     if not orch._cfg.get_circuit(circuit):
         return JSONResponse(
             {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=400,
+            status_code=404,
         )
 
     form = await request.form()
@@ -833,7 +837,7 @@ async def circuit_valve_type_update(circuit: str, request: Request):
     if not orch._cfg.get_circuit(circuit):
         return JSONResponse(
             {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=400,
+            status_code=404,
         )
 
     form = await request.form()

@@ -65,13 +65,16 @@ def _block_if_setup_complete(request: Request):
         initial_name = (
             device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
         )
+        # 409 Conflict — request well-formed, but current state forbids
+        # it (initial setup already complete; rerun goes through
+        # Settings → Advanced → Re-run Setup).
         return _tmpl(request).TemplateResponse("setup.html", {
             "request": request,
             "step": 0,
             "initial_name": initial_name,
             "setup_locked": True,
             "page": "setup",
-        }, status_code=403)
+        }, status_code=409)
     return None
 
 
@@ -827,8 +830,10 @@ async def setup_complete(request: Request):
 async def rediscover_circuit(device_id: str, circuit: str, request: Request):
     blocked = _block_if_setup_complete(request)
     if blocked is not None:
-        # Same JSON shape as the error branch below — keep the client happy.
-        return JSONResponse({"error": "setup already complete"}, status_code=403)
+        # Same JSON shape as the error branch below — keep the client
+        # happy. 409 Conflict — state forbids the operation; not an
+        # auth failure.
+        return JSONResponse({"error": "setup already complete"}, status_code=409)
     from ..circuit_compat import resolve_circuit
     circuit = resolve_circuit(circuit)
     orch = _orch(request)

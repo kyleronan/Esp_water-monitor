@@ -81,7 +81,7 @@ async def valve_open(circuit: str, request: Request):
              "message": f"No valve entity configured for circuit '{circuit}'. "
                         "Go to Settings → Advanced → Re-discover devices "
                         "(or re-run Setup if first install)."},
-            status_code=400,
+            status_code=404,
         )
     ok = await orch.ha.open_valve(cfg.valve_entity)
     return JSONResponse({
@@ -105,7 +105,7 @@ async def valve_close(circuit: str, request: Request):
              "message": f"No valve entity configured for circuit '{circuit}'. "
                         "Go to Settings → Advanced → Re-discover devices "
                         "(or re-run Setup if first install)."},
-            status_code=400,
+            status_code=404,
         )
     ok = await orch.ha.close_valve(cfg.valve_entity)
     return JSONResponse({
@@ -133,7 +133,7 @@ async def fault_reset(circuit: str, request: Request):
             {"status": "error",
              "message": "Fault reset button not found for this circuit. "
                         "Re-run device discovery to map the entity."},
-            status_code=400,
+            status_code=404,
         )
     ok = await orch.ha.call_service("button", "press", {"entity_id": entity_id})
     if not ok:
@@ -157,7 +157,7 @@ async def trickle_reset(circuit: str, request: Request):
             {"status": "error",
              "message": "Trickle reset button not found for this circuit. "
                         "Re-run device discovery to map the entity."},
-            status_code=400,
+            status_code=404,
         )
     ok = await orch.ha.call_service("button", "press", {"entity_id": entity_id})
     if not ok:
@@ -184,7 +184,7 @@ async def threshold_update(
     if not circuit_cfg:
         return JSONResponse(
             {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=400,
+            status_code=404,
         )
 
     # Build allowlist from only the writable threshold roles for this circuit
@@ -192,9 +192,12 @@ async def threshold_update(
     entities = load_circuit_entities(orch.db, circuit)
     allowed = {v for k, v in entities.items() if k in _THRESHOLD_ROLES and v}
     if entity_id not in allowed:
+        # 400 not 403 — the request is well-formed, but the supplied
+        # entity_id failed enum validation. This is input validation,
+        # not an authorization check.
         return JSONResponse(
             {"status": "error", "message": "Entity not in allowed set for this circuit"},
-            status_code=403,
+            status_code=400,
         )
 
     # Runtime domain guard — only ESPHome number.* entities are accepted.
@@ -203,7 +206,7 @@ async def threshold_update(
         return JSONResponse(
             {"status": "error",
              "message": "Only ESPHome number.* entities are accepted for threshold updates"},
-            status_code=403,
+            status_code=400,
         )
 
     ok = await orch.ha.set_number_value(entity_id, value)
@@ -234,7 +237,7 @@ async def alert_toggle(
     if not circuit_cfg:
         return JSONResponse(
             {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=400,
+            status_code=404,
         )
     from ..device_discovery import load_circuit_entities
     entities = load_circuit_entities(orch.db, circuit)
@@ -245,7 +248,7 @@ async def alert_toggle(
             {"status": "error",
              "message": f"Alert switch for '{alert_type}' not found for this circuit. "
                         "Re-run device discovery to map the entity."},
-            status_code=400,
+            status_code=404,
         )
     ok = await orch.ha.turn_on(entity_id) if enabled else await orch.ha.turn_off(entity_id)
     if not ok:
@@ -274,7 +277,7 @@ async def leaktest_run(circuit: str, request: Request):
     if not cfg:
         return JSONResponse(
             {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=400,
+            status_code=404,
         )
 
     if not cfg.leak_test_switch:
@@ -283,7 +286,7 @@ async def leaktest_run(circuit: str, request: Request):
              "message": "No leak test switch configured. Go to "
                         "Settings → Advanced → Re-discover devices "
                         "(or re-run Setup if first install)."},
-            status_code=400,
+            status_code=404,
         )
 
     # Quick pre-flight checks for immediate user feedback
@@ -340,7 +343,7 @@ async def leaktest_abort(circuit: str, request: Request):
     if not cfg:
         return JSONResponse(
             {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=400,
+            status_code=404,
         )
 
     # Turn off the leak test switch on the ESP (stops the test)
