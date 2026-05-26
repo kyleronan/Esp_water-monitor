@@ -380,6 +380,58 @@ async def ingress_middleware(request: Request, call_next):
     return response
 
 
+# Defense-in-depth response headers (plan C-IQ-18). Applied to every
+# response on top of the per-route content. Behind HA ingress these
+# mostly guard against accidental drift (a future template that loads
+# a third-party script, a same-host XSS proxying through us); they
+# also harden the addon if a user ever exposes it directly.
+#
+# CSP is deliberately permissive: the current UI has ~60 inline event
+# handlers (onclick="…") and a few inline <script> / <style> blocks,
+# plus Chart.js loaded from cdnjs. A strict CSP would require
+# refactoring all of those to external files + per-request nonces.
+# What we ship today catches the easy wins (frame-ancestors,
+# object-src, base-uri) and pins the CDN origin so a compromised
+# template can't pull script from anywhere new. Future tightening
+# (drop 'unsafe-inline' for script-src, self-host Chart.js) is its
+# own sprint.
+_CHART_CDN = "https://cdnjs.cloudflare.com"
+_CSP_DIRECTIVES = (
+    "default-src 'self'; "
+    f"script-src 'self' 'unsafe-inline' {_CHART_CDN}; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "font-src 'self' data:; "
+    "connect-src 'self'; "
+    "frame-ancestors 'self'; "
+    "form-action 'self'; "
+    "base-uri 'self'; "
+    "object-src 'none'"
+)
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Set defense-in-depth response headers on every response.
+
+    Skipping `/static/*` would also be defensible, but static assets
+    serving CSS/JS benefit from `X-Content-Type-Options: nosniff` too,
+    so headers are applied uniformly. `/health` keeps the headers
+    since they don't break a JSON response.
+    """
+    response = await call_next(request)
+    # X-Frame-Options: SAMEORIGIN keeps HA ingress (which iframes the
+    # addon inside the HA dashboard) working while blocking cross-origin
+    # embedding. `frame-ancestors 'self'` in the CSP gives the same
+    # guarantee for modern browsers; XFO stays as belt-and-suspenders
+    # for older clients.
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Content-Security-Policy", _CSP_DIRECTIVES)
+    return response
+
+
 app.include_router(setup.router)
 app.include_router(dashboard.router)
 app.include_router(device.router)
