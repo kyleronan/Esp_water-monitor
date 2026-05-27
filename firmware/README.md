@@ -35,6 +35,22 @@ Paste the output into `secrets.yaml` as the value for `api_encryption_key`.
 | Built-in web UI | Basic auth — credentials in `secrets.yaml` |
 | Bluetooth provisioning | `authorizer: none` — any nearby device can provision via Improv. Disable `esp32_improv` in the YAML if this is a concern. |
 
+## Per-circuit pressure calibration
+
+Both pressure transducers default to a shared factory-typical linear
+fit. After bench measurement, override the per-circuit calibration via
+the `substitutions:` block at the top of
+`esp-water-shut-off-3_10.yaml` — eight values
+(`pressure_cal_main_zero_raw / _psi`, `pressure_cal_main_max_raw /
+_psi`, plus the irrigation counterparts). See
+[`docs/hardware/bring-up-checklist.md`](../docs/hardware/bring-up-checklist.md)
+for the two-point measurement procedure.
+
+The defaults work for un-calibrated installs (existing flashes keep
+their behaviour unchanged), but per-circuit calibration removes
+transducer-to-transducer bias and makes the micro leak test more
+sensitive.
+
 ## Releasing
 
 Before tagging a firmware release, run the release-check script:

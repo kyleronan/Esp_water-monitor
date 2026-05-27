@@ -55,6 +55,34 @@ substitutions:
   circuit_1_name: "Main"        # Display name for circuit 1 — change to suit your install
   circuit_2_name: "Irrigation"  # Display name for circuit 2 — change to suit your install
 
+  # ---------------------------------------------------------------------------
+  # PRESSURE TRANSDUCER CALIBRATION — per-circuit two-point linear fit.
+  # Defaults below are the factory-typical fit for a 0.5–4.5 V / 100 PSI
+  # transducer; identical defaults on both circuits so existing flashes
+  # behave exactly as before this block was parametrised.
+  #
+  # To recalibrate one circuit:
+  #   1. Disconnect (or ground) the transducer signal and read the raw
+  #      ADC voltage from HA — that's your zero_raw.
+  #   2. Apply a known reference pressure (e.g. a hand pump with an
+  #      analogue gauge), read the raw ADC voltage — that's your max_raw.
+  #   3. zero_psi is the calibrated PSI at zero_raw (typically slightly
+  #      negative; the transducer's lowest output rarely lines up with
+  #      0 PSI exactly). max_psi is the corresponding gauge reading.
+  #   4. Override the four substitutions below per circuit. The pair of
+  #      (raw, psi) datapoints feeds ESPHome's calibrate_linear filter.
+  #
+  # See docs/hardware/bring-up-checklist.md for the full procedure.
+  # ---------------------------------------------------------------------------
+  pressure_cal_main_zero_raw: "0.0"
+  pressure_cal_main_zero_psi: "-9.4359"
+  pressure_cal_main_max_raw:  "3.1"
+  pressure_cal_main_max_psi:  "104.1172"
+  pressure_cal_irr_zero_raw:  "0.0"
+  pressure_cal_irr_zero_psi:  "-9.4359"
+  pressure_cal_irr_max_raw:   "3.1"
+  pressure_cal_irr_max_psi:   "104.1172"
+
 esphome:
   name: esp-water-shut-off-3
   friendly_name: ESP Water Shut off 3.10
@@ -884,8 +912,8 @@ sensor:
       - calibrate_linear:
           method: least_squares
           datapoints:
-            - 0.0 -> -9.4359
-            - 3.1 -> 104.1172
+            - ${pressure_cal_main_zero_raw} -> ${pressure_cal_main_zero_psi}
+            - ${pressure_cal_main_max_raw} -> ${pressure_cal_main_max_psi}
       - clamp:
           min_value: 0
           max_value: 104
@@ -903,8 +931,8 @@ sensor:
       - calibrate_linear:
           method: least_squares
           datapoints:
-            - 0.0 -> -9.4359
-            - 3.1 -> 104.1172
+            - ${pressure_cal_irr_zero_raw} -> ${pressure_cal_irr_zero_psi}
+            - ${pressure_cal_irr_max_raw} -> ${pressure_cal_irr_max_psi}
       - clamp:
           min_value: 0
           max_value: 104
