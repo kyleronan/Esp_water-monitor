@@ -84,6 +84,49 @@ def _safe_float(values: list, default: float = 0.0) -> float:
     return default if not valid else sum(valid) / len(valid)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Resistance-shape classification constants (extracted 2026-05-27 from
+# inline magic numbers; original calibration was during the Phase-2
+# resistance-shape work circa 2026-04).
+#
+# All four values are tunable and ALL affect _classify_resistance_shape().
+# Keep them here so changes in one place don't drift from related ones
+# (e.g. RAMP_EXCLUSION_FRACTION and MIN_READINGS_FOR_SHAPE both have to
+# leave enough samples that the third-vs-third trend analysis is
+# statistically meaningful).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Minimum total sample count before we'll attempt classification at all.
+# Below this, return "unknown" rather than producing noisy labels for
+# very short events. 10 ≈ 5 s at the 2 Hz pressure publish rate.
+MIN_READINGS_FOR_SHAPE       = 10
+
+# Fraction of samples to drop from each end before classifying. Ramp-up
+# and ramp-down phases distort both CV and trend; cutting 20% off each
+# end leaves the steady-state middle 60% for analysis.
+RAMP_EXCLUSION_FRACTION      = 5     # used as n // RAMP_EXCLUSION_FRACTION
+
+# Minimum samples LEFT after ramp exclusion + low-flow filtering before
+# we proceed. Below this, return "unknown" — the trend analysis splits
+# into thirds and needs at least 2 samples per third.
+MIN_RESISTANCE_SAMPLES       = 6
+
+# Coefficient of variation threshold for "pulsed". 0.55 is calibrated to
+# reject sensor noise at the pressure trough while still catching real
+# oscillating appliances (dishwashers, washing machines) which typically
+# produce CV > 0.80. Was raised from 0.40 when the autocorr
+# normalisation bug was discovered — see plan A-3 in
+# zany-yawning-church.md.
+RESISTANCE_PULSED_CV         = 0.55
+
+# Trend threshold for rising / falling. ΔP/Q changing by more than this
+# fraction between the first third and the last third of the steady-
+# state samples is classified as a trend; otherwise "steady". 15% is a
+# conservative bar — too low and noise gets called rising; too high and
+# real toilet-fill rising-resistance signatures get classified steady.
+RESISTANCE_TREND_RATIO       = 0.15
+
+
 def _safe_std(values: list) -> float:
     valid = [v for v in values if v is not None and not math.isnan(v)]
     if len(valid) < 2:
@@ -109,11 +152,12 @@ def _classify_resistance_shape(
     Returns one of: steady | rising | falling | pulsed | unknown
     """
     n = min(len(pressure_readings), len(flow_readings))
-    if n < 10:
+    if n < MIN_READINGS_FOR_SHAPE:
         return "unknown"
 
-    # Exclude ramp-up and ramp-down (first and last 20%)
-    ramp = max(1, n // 5)
+    # Exclude ramp-up and ramp-down (the leading and trailing
+    # RAMP_EXCLUSION_FRACTION of the series).
+    ramp = max(1, n // RAMP_EXCLUSION_FRACTION)
     p_mid = pressure_readings[ramp: n - ramp]
     f_mid = flow_readings[ramp: n - ramp]
 
@@ -128,7 +172,7 @@ def _classify_resistance_shape(
             if delta_p >= 0:                        # only during actual demand
                 resistance.append(delta_p / f)
 
-    if len(resistance) < 6:
+    if len(resistance) < MIN_RESISTANCE_SAMPLES:
         return "unknown"
 
     mean_r = statistics.mean(resistance)
@@ -136,12 +180,8 @@ def _classify_resistance_shape(
         return "unknown"
 
     # Coefficient of variation — high CV = genuinely pulsed demand.
-    # Threshold 0.55 is calibrated to reject sensor noise at the pressure
-    # trough (which inflated CV under the old formula) while still catching
-    # real oscillating appliances (dishwashers, washing machines) which
-    # typically produce CV > 0.80.
     cv = _safe_std(resistance) / mean_r
-    if cv >= 0.55:
+    if cv >= RESISTANCE_PULSED_CV:
         return "pulsed"
 
     # Trend: compare first and last third of steady-state resistance
@@ -149,11 +189,10 @@ def _classify_resistance_shape(
     r1 = statistics.mean(resistance[:third])
     r3 = statistics.mean(resistance[-third:])
 
-    # 15% change threshold for rising / falling
     change_ratio = (r3 - r1) / max(abs(r1), 0.01)
-    if change_ratio > 0.15:
+    if change_ratio > RESISTANCE_TREND_RATIO:
         return "rising"
-    if change_ratio < -0.15:
+    if change_ratio < -RESISTANCE_TREND_RATIO:
         return "falling"
     return "steady"
 
