@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from ..circuit_compat import resolve_circuit
 from ..fixtures import FIXTURE_TYPE_LABELS, user_selectable_types
 from ..database import patch_event as _patch_event
+from ._helpers import run_blocking
 
 _VALID_USER_FIXTURE_TYPES: frozenset = frozenset(user_selectable_types())
 
@@ -41,6 +42,86 @@ async def history_page(request: Request):
         )
 
 
+def _collect_circuit_history_sync(
+    db,
+    circuits,
+    date_from: str,
+    date_to: str,
+    chart_range: str,
+    chart_from,
+    filter_param: str,
+    filter_circuit: str,
+    today,
+) -> list[dict]:
+    """Synchronous bundle of the history page's per-circuit DB work.
+
+    Owns the per-circuit loop so the calling async handler can offload
+    it via run_blocking() in one executor hop. Everything inside is
+    plain sqlite3 + dict assembly — no awaits.
+    """
+    from ..database import (get_recent_events, get_leak_test_history,
+                            get_daily_summaries)
+    out: list[dict] = []
+    for circuit_cfg in circuits:
+        if filter_circuit and circuit_cfg.circuit != filter_circuit:
+            continue
+        events = get_recent_events(
+            db, circuit_cfg.circuit,
+            limit=DEFAULT_EVENT_LIMIT,
+            date_from=date_from or None,
+            date_to=date_to or None,
+        )
+        # Dashboard "Degraded supply" View-link uses ?filter=degraded.
+        # Post-filter rather than a dedicated SQL path so the rest of
+        # the rendering machinery doesn't need to change.
+        if filter_param == "degraded":
+            events = [e for e in events if dict(e).get("degraded_supply")]
+        leak_tests = get_leak_test_history(db, circuit_cfg.circuit, limit=20)
+        summaries  = get_daily_summaries(
+            db, circuit_cfg.circuit,
+            date_from=chart_from,
+        )
+
+        # For YoY: also fetch prior-year summaries (shifted 365 days).
+        prior_summaries = []
+        if chart_range == "yoy" and chart_from:
+            from datetime import date as _date, timedelta as _td
+            prior_from = (_date.fromisoformat(chart_from)
+                          - _td(days=365)).isoformat()
+            prior_to   = (today - _td(days=365)).isoformat()
+            prior_summaries = get_daily_summaries(
+                db, circuit_cfg.circuit,
+                date_from=prior_from,
+                date_to=prior_to,
+            )
+
+        # Hourly-volume fallback: aggregate to daily for chart when no
+        # summaries exist yet (first-day install).
+        hv_daily: dict = {}
+        if not summaries:
+            hv_rows = db.execute("""
+                SELECT date(hour_ts) AS day, SUM(volume_litres) AS vol
+                FROM hourly_volume
+                WHERE circuit = ?
+                  AND (? IS NULL OR hour_ts >= ?)
+                GROUP BY date(hour_ts)
+                ORDER BY day ASC
+            """, (circuit_cfg.circuit, chart_from, chart_from)).fetchall()
+            hv_daily = {r["day"]: r["vol"] for r in hv_rows}
+
+        out.append({
+            "circuit":         circuit_cfg.circuit,
+            "display_name":    circuit_cfg.label,
+            "events":          events,
+            "leak_tests":      leak_tests,
+            "event_count":     len(events),
+            "summaries":       summaries,
+            "prior_summaries": prior_summaries,
+            "hv_daily":        hv_daily,
+        })
+    return out
+
+
 async def _history_page(request: Request):
     orch = _orch(request)
     cfg  = orch._cfg
@@ -69,67 +150,20 @@ async def _history_page(request: Request):
     }
     chart_from = chart_from_map.get(chart_range, chart_from_map["30d"])
 
-    circuit_history = []
-    for circuit_cfg in cfg.circuits:
-        # If a specific circuit filter is set, skip rendering the other ones.
-        if filter_circuit and circuit_cfg.circuit != filter_circuit:
-            continue
-        from ..database import (get_recent_events, get_leak_test_history,
-                                get_daily_summaries)
-        events = get_recent_events(
-            orch.db, circuit_cfg.circuit,
-            limit=DEFAULT_EVENT_LIMIT,
-            date_from=date_from or None,
-            date_to=date_to or None,
-        )
-        # Filter to only degraded events when the page is opened from the
-        # dashboard "Degraded supply" View link. Post-filter rather than a
-        # dedicated SQL path because the rendering machinery is already in
-        # place to handle a filtered list; this avoids touching the DB layer.
-        if filter_param == "degraded":
-            events = [e for e in events if dict(e).get("degraded_supply")]
-        leak_tests = get_leak_test_history(orch.db, circuit_cfg.circuit, limit=20)
-        summaries  = get_daily_summaries(
-            orch.db, circuit_cfg.circuit,
-            date_from=chart_from,
-        )
-
-        # For YoY: also fetch prior-year summaries (shifted by 365 days)
-        prior_summaries = []
-        if chart_range == "yoy" and chart_from:
-            from datetime import date as _date, timedelta as _td
-            prior_from = (_date.fromisoformat(chart_from)
-                          - _td(days=365)).isoformat()
-            prior_to   = (today - _td(days=365)).isoformat()
-            prior_summaries = get_daily_summaries(
-                orch.db, circuit_cfg.circuit,
-                date_from=prior_from,
-                date_to=prior_to,
-            )
-
-        # Hourly volume fallback: aggregate to daily for chart when no summaries yet
-        hv_daily = {}
-        if not summaries:
-            hv_rows = orch.db.execute("""
-                SELECT date(hour_ts) AS day, SUM(volume_litres) AS vol
-                FROM hourly_volume
-                WHERE circuit = ?
-                  AND (? IS NULL OR hour_ts >= ?)
-                GROUP BY date(hour_ts)
-                ORDER BY day ASC
-            """, (circuit_cfg.circuit, chart_from, chart_from)).fetchall()
-            hv_daily = {r["day"]: r["vol"] for r in hv_rows}
-
-        circuit_history.append({
-            "circuit":         circuit_cfg.circuit,
-            "display_name":    circuit_cfg.label,
-            "events":          events,
-            "leak_tests":      leak_tests,
-            "event_count":     len(events),
-            "summaries":       summaries,
-            "prior_summaries": prior_summaries,
-            "hv_daily":        hv_daily,
-        })
+    # All per-circuit DB work (recent events with full columns, leak
+    # test history, daily summaries, optional YoY summaries, hourly
+    # volume fallback) runs in a single thread-pool hop instead of
+    # blocking the event loop per query. On a 2-circuit deployment
+    # with a year of events this is the difference between a ~150 ms
+    # dashboard-fight and a clean async hand-off.
+    circuit_history = await run_blocking(
+        _collect_circuit_history_sync,
+        orch.db,
+        list(cfg.circuits),
+        date_from, date_to, chart_range, chart_from,
+        filter_param, filter_circuit,
+        today,
+    )
 
     fixture_type_options = [
         {"value": k, "label": FIXTURE_TYPE_LABELS.get(k, k.replace("_", " ").title())}

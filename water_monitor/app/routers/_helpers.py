@@ -1,5 +1,32 @@
 """Shared helpers for routers.
 
+Async-safety convention (plan C-IQ-4 follow-up)
+================================================
+
+sqlite3 is sync. Multi-second queries inside an `async def` path
+block the event loop and stall every other ingress request for the
+duration. The orchestrator's startup hot path
+(`rebuild_from_db` / `backfill_unmatched`) already wraps with
+`loop.run_in_executor(...)`; route handlers should do the same when
+their DB work is non-trivial.
+
+Cheap single-row UPSERTs / SELECTs (e.g. `set_circuit_type`,
+`upsert_circuit_label`) are NOT worth wrapping — the executor
+context-switch overhead outweighs the actual query time. Wrap when:
+
+  - The handler iterates over circuits / events doing N queries
+    inline (e.g. history page assembles event lists, leak-test
+    history, and daily summaries for every circuit).
+  - The handler runs a join or aggregation that touches more than
+    a few thousand rows.
+  - The handler does any blocking I/O other than SQLite (file
+    write, subprocess, etc.) — wrap to keep the loop responsive.
+
+Use `run_blocking(fn, *args, **kwargs)` for one-off offloads. For
+hot paths, extract a `_xxx_sync(...)` helper that bundles ALL the
+sync DB calls so the executor hop happens once.
+
+
 HTTP status-code convention (plan C-IQ-24)
 ==========================================
 
@@ -40,6 +67,9 @@ reaching for something outside this list, add a comment explaining why.
 """
 from __future__ import annotations
 
+import asyncio
+from typing import Any, Awaitable, Callable, TypeVar
+
 from fastapi import Request
 from fastapi.responses import RedirectResponse
 
@@ -47,6 +77,29 @@ from fastapi.responses import RedirectResponse
 # imports keep working. The implementation lives in `..forms` so it
 # can be unit-tested without pulling in FastAPI.
 from ..forms import coerce_int  # noqa: F401
+
+
+T = TypeVar("T")
+
+
+async def run_blocking(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Run `fn(*args, **kwargs)` on the default thread executor.
+
+    Thin wrapper over ``loop.run_in_executor`` for the common case
+    "call this sync helper and await its result". Use it to offload
+    heavy SQLite work (or any other blocking I/O) from async route
+    handlers so a long-running DB query doesn't stall every other
+    ingress request.
+
+    See the module docstring for guidance on when to wrap and when
+    to leave sync calls inline.
+    """
+    loop = asyncio.get_running_loop()
+    # functools.partial avoids creating a closure per call; lambda is
+    # fine here too and keeps the surface area small.
+    return await loop.run_in_executor(
+        None, lambda: fn(*args, **kwargs),
+    )
 
 
 def ingress_redirect(

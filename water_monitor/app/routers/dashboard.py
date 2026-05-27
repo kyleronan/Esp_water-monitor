@@ -8,6 +8,8 @@ from typing import Any, Dict
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from ._helpers import run_blocking
+
 router = APIRouter()
 
 
@@ -41,17 +43,18 @@ async def dashboard(request: Request):
 
         circuit_states.append(state)
 
-    # Volume chart data for each circuit
-    chart_data = {}
-    for circuit_cfg in cfg.circuits:
-        chart_data[circuit_cfg.circuit] = _build_chart_data(
-            orch.db, circuit_cfg.circuit)
+    # Volume chart data for each circuit. Pull the sync DB queries
+    # for ALL circuits + the home_profile read in a single executor
+    # hop so the dashboard refresh doesn't make the event loop fight
+    # for control across N circuits' worth of `get_hourly_volumes`.
+    from ..database import get_home_profile
+    dashboard_payload = await run_blocking(
+        _build_dashboard_sync_payload, orch.db, cfg.circuits, get_home_profile,
+    )
+    chart_data = dashboard_payload["chart_data"]
+    profile = dashboard_payload["profile"]
 
     templates = request.app.state.templates
-
-    # Home profile — used for away mode banner
-    from ..database import get_home_profile
-    profile = dict(get_home_profile(orch.db) or {})
 
     from ..fixtures import CIRCUIT_TYPE_LABELS
     return templates.TemplateResponse("dashboard.html", {
@@ -92,8 +95,25 @@ async def chart_data(circuit: str, request: Request):
     from ..circuit_compat import resolve_circuit
     circuit = resolve_circuit(circuit)
     orch = _get_orchestrator(request)
-    data = _build_chart_data(orch.db, circuit)
+    data = await run_blocking(_build_chart_data, orch.db, circuit)
     return JSONResponse(data)
+
+
+def _build_dashboard_sync_payload(db, circuits, get_home_profile) -> dict:
+    """Synchronous bundle of the dashboard's DB work.
+
+    Combined into one executor hop so a multi-circuit refresh doesn't
+    bounce in and out of the thread pool for every per-circuit query.
+    Returns the chart_data dict (keyed by circuit id) plus the resolved
+    home_profile row.
+    """
+    chart_data: Dict[str, Any] = {}
+    for c in circuits:
+        chart_data[c.circuit] = _build_chart_data(db, c.circuit)
+    return {
+        "chart_data": chart_data,
+        "profile":    dict(get_home_profile(db) or {}),
+    }
 
 
 def _build_chart_data(db, circuit: str) -> Dict[str, Any]:
