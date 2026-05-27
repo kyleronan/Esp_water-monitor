@@ -2133,6 +2133,15 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   .bk-tier           { padding: 16px; }
 }
 
+/* 6a. Dashboard per-circuit card header stacks on tiny phones so a
+   long display name can't crash into the valve-state pill. The
+   device-card header already stacks at 520px; this is the same
+   treatment for the dashboard, deferred lower because the dashboard
+   header is shorter (no readings row). */
+@media (max-width: 480px) {
+  .dash-card-header { flex-direction: column; align-items: flex-start; gap: 6px; }
+}
+
 /* 7. History range buttons wrap cleanly */
 @media (max-width: 520px) {
   .hist-chart-header { flex-direction: column; align-items: flex-start; }
