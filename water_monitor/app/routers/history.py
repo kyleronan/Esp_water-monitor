@@ -273,4 +273,70 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
     found = _patch_event(db, event_id, circuit, **kwargs)
     if not found:
         return JSONResponse({"error": "Event not found"}, status_code=404)
-    return JSONResponse({"ok": True})
+
+    # Sprint B — if the patch touched user_fixture_type, propagate the
+    # signal into the cluster's suggested_type (soft hint; never silently
+    # links a cluster to a fixture). When the event has no cluster_id we
+    # have nowhere to land the signal — log it so the gap is visible.
+    propagation_meta: dict = {}
+    signature_meta: dict = {}
+    if "user_fixture_type" in payload:
+        try:
+            from ..database import (
+                recompute_cluster_suggestion_from_user_labels,
+                upsert_fixture_signature,
+            )
+            row = db.execute(
+                "SELECT cluster_id, excluded_from_training "
+                "FROM events WHERE id = ? AND circuit = ?",
+                (event_id, circuit),
+            ).fetchone()
+            cid = row["cluster_id"] if row else None
+            if cid is not None:
+                result = recompute_cluster_suggestion_from_user_labels(
+                    db, circuit, int(cid)
+                )
+                if result is not None:
+                    propagation_meta["cluster_id"] = int(cid)
+                    propagation_meta["suggested_type"] = result["suggested_type"]
+                    propagation_meta["labelled_member_count"] = \
+                        result["labelled_member_count"]
+                    propagation_meta["total_label_count"] = \
+                        result["total_label_count"]
+            elif row and not row["excluded_from_training"]:
+                # Event eligible for clustering but never got a cluster_id —
+                # likely the preliminary-match-without-commit gap surfaced
+                # in the Sprint B context. Make this visible in the log so
+                # the gap is loud once it actually fires in production.
+                log.info(
+                    "[%s] event %s labelled but cluster_id is NULL "
+                    "(excluded_from_training=0) — label recorded but has "
+                    "no cluster to propagate into",
+                    circuit, event_id,
+                )
+
+            # Sprint C — refresh the fixture_type signature for whichever
+            # type(s) this patch touched. We refresh the NEW type and,
+            # if the user changed an existing label, also the OLD type
+            # (otherwise the old signature keeps a stale event member).
+            old_type = payload.get("_previous_user_fixture_type")
+            new_type = payload.get("user_fixture_type") or None
+            for sig_type in {t for t in (new_type, old_type) if t}:
+                sig = upsert_fixture_signature(db, circuit, sig_type)
+                if sig is not None:
+                    signature_meta[sig_type] = {
+                        "member_count": sig["member_count"],
+                    }
+        except Exception as e:
+            # Propagation is best-effort. A failure here must not block
+            # the label save the user already saw succeed.
+            log.warning(
+                "[%s] propagate user label for event %s failed: %s",
+                circuit, event_id, e,
+            )
+
+    return JSONResponse({
+        "ok": True,
+        "propagation": propagation_meta,
+        "signatures": signature_meta,
+    })

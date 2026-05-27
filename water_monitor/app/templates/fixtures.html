@@ -15,6 +15,12 @@
 <div class="fx-msg fx-msg-ok">Clusters merged by fixture type.</div>
 {% elif msg == 'merge_failed' %}
 <div class="fx-msg fx-msg-err">Could not merge clusters — the selected clusters may have changed. Refresh and try again.</div>
+{% elif msg == 'relinked' %}
+<div class="fx-msg fx-msg-ok">Fixture re-linked to cluster. Future matching events will land here.</div>
+{% elif msg == 'relink_failed' %}
+<div class="fx-msg fx-msg-err">Could not re-link the fixture — the chosen cluster may already be in use, or was deleted. Refresh and try again.</div>
+{% elif msg == 'signature_forgotten' %}
+<div class="fx-msg fx-msg-ok">Signature forgotten. Re-label more events to rebuild it.</div>
 {% elif msg == 'error' %}
 <div class="fx-msg fx-msg-err">Action failed — check the addon log for details.</div>
 {% endif %}
@@ -98,6 +104,45 @@
     Manage in Settings
   </a>
 </div>
+{% endif %}
+
+{# Sprint A — orphaned fixtures (confirmed but no cluster pointing back). #}
+{# A fixture lands here when its old cluster was deleted/merged without #}
+{# carrying the link forward. Without a backing cluster, the fixture is #}
+{# invisible on this page and can't match new events. The user picks a #}
+{# current cluster and re-links — typically the cluster that holds the #}
+{# events they've labelled for this fixture type. #}
+{% if circ.orphaned_fixtures %}
+{% for orphan in circ.orphaned_fixtures %}
+<div class="fx-msg fx-msg-warn" style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+  <span>⚠ <strong>{{ orphan.name or orphan.display_name or orphan.fixture_type }}</strong>
+    has no backing cluster — re-link to a current cluster, or it won't match future events.</span>
+  {% if circ.relink_candidate_clusters %}
+  <form method="post"
+        action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/fixture/{{ orphan.id }}/relink-cluster"
+        style="display:flex;align-items:center;gap:.5rem">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <label class="muted" style="font-size:11px"
+           for="relink-{{ orphan.id }}">Re-link to:</label>
+    <select id="relink-{{ orphan.id }}" name="cluster_id" required>
+      {% for cand in circ.relink_candidate_clusters %}
+      <option value="{{ cand.id }}">
+        Cluster {{ cand.id }} ({{ cand.member_count }} events{% if cand.suggested_type %} — {{ cand.suggested_type | replace('_',' ') }}{% endif %})
+      </option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="btn btn-primary btn-sm"
+            onclick="return confirm('Re-link {{ orphan.name or orphan.fixture_type }} to the selected cluster? Future events that match this cluster will be tagged as this fixture.')">
+      Re-link
+    </button>
+  </form>
+  {% else %}
+  <span class="muted" style="font-size:11px">
+    No unconfirmed clusters available — wait for more events, then re-link.
+  </span>
+  {% endif %}
+</div>
+{% endfor %}
 {% endif %}
 
 {% if circ.training_state in ('idle', 'calibrating') and not circ.clusters | selectattr('fixture_id') | list and not (preview and circ.clusters) %}
@@ -208,6 +253,25 @@
         </div>
       </div>
 
+      {# Sprint B — user-labels suggestion hint. #}
+      {# Surfaces when the cluster's suggested_type was set by the #}
+      {# majority-vote pass over events.user_fixture_type rather than the #}
+      {# centroid heuristic. The dropdown below is already pre-selected #}
+      {# via the active_type fall-through; this banner just tells the user #}
+      {# WHY the suggestion is what it is, so confirmation is informed. #}
+      {% if not is_confirmed and cl.suggestion_source == 'user_labels'
+            and cl.suggested_type %}
+      <div class="fx-msg fx-msg-ok" style="margin:8px 0;font-size:12px;padding:6px 10px">
+        ★ Suggested
+        <strong>{{ fixture_type_labels.get(cl.suggested_type, cl.suggested_type | replace('_',' ') | title) }}</strong>
+        — based on the events you've labeled here
+        {% if cl.suggested_confidence %}
+          ({{ (cl.suggested_confidence * 100) | int }}% agree)
+        {% endif %}.
+        Confirm to lock it in.
+      </div>
+      {% endif %}
+
       {# Confirm / save form #}
       <form class="fx-confirm-form" method="post"
             action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/cluster/{{ cl.id }}/confirm">
@@ -247,6 +311,39 @@
     </div>
   {% endfor %}
   </div>
+{% endif %}
+
+{# Sprint C — fixture_type signatures learned from this circuit's labels. #}
+{# Each row represents a fixture_type the matcher knows about; events that #}
+{# don't fit any cluster will still get tagged with this type if their #}
+{# features are close to its centroid. The Forget button is a clean-slate #}
+{# escape hatch — useful when the user realises some labels were wrong. #}
+{% if circ.type_signatures %}
+<div class="fx-learned-section" style="margin:18px 0 32px">
+  <h3 style="margin:0 0 8px 0;font-size:14px;font-weight:600">
+    Learned from your labels
+    <span class="muted" style="font-weight:400;font-size:12px;margin-left:6px">
+      — new events that match these will be tagged automatically
+    </span>
+  </h3>
+  <div style="display:flex;flex-wrap:wrap;gap:8px">
+    {% for sig in circ.type_signatures %}
+    <div class="fx-msg" style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px">
+      <span class="pill pill-blue">{{ fixture_type_labels.get(sig.fixture_type, sig.fixture_type | replace('_',' ') | title) }}</span>
+      <span class="muted">{{ sig.member_count }} event{{ 's' if sig.member_count != 1 else '' }}</span>
+      <form method="post"
+            action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/signature/{{ sig.fixture_type }}/forget"
+            style="display:inline">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-ghost btn-sm"
+                onclick="return confirm('Forget the {{ sig.fixture_type }} signature? Future events that look like this will stop being auto-tagged. (Re-labelling events rebuilds it.)')">
+          Forget
+        </button>
+      </form>
+    </div>
+    {% endfor %}
+  </div>
+</div>
 {% endif %}
 
 {% endfor %}

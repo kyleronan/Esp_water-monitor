@@ -486,11 +486,29 @@ class ClusterEngine:
             from .fixtures import suggest_fixture_type
             old_type = row["suggested_type"]
             suggested_type, confidence = suggest_fixture_type(centroid, circuit_type)
+            # Sprint B: only overwrite when the existing suggestion was
+            # NULL or heuristic. A user-labels suggestion is a stronger
+            # signal than the centroid heuristic and must not be silently
+            # replaced when the heuristic runs every 10 events.
+            current_src_row = self._db.execute(
+                "SELECT suggestion_source FROM fixture_clusters "
+                "WHERE circuit = ? AND id = ?",
+                (circuit, cluster_id)
+            ).fetchone()
+            current_src = current_src_row["suggestion_source"] if current_src_row else None
+            if current_src == "user_labels":
+                # Leave the user-labels suggestion in place. Skip the
+                # auto-merge trigger too — the user's call wins.
+                return
             self._db.execute(
                 """UPDATE fixture_clusters
-                   SET suggested_type = ?, suggested_confidence = ?
+                   SET suggested_type = ?, suggested_confidence = ?,
+                       suggestion_source = CASE WHEN ? IS NOT NULL
+                                                THEN 'heuristic'
+                                                ELSE NULL END
                    WHERE circuit = ? AND id = ?""",
-                (suggested_type, confidence, circuit, cluster_id)
+                (suggested_type, confidence, suggested_type,
+                 circuit, cluster_id)
             )
             # If the type is newly assigned, try to merge sibling clusters.
             if suggested_type and suggested_type != old_type:

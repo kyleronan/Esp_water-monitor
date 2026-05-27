@@ -296,6 +296,31 @@ class Orchestrator:
             ensure_circuit_defaults(
                 self._db, circuit_cfg.circuit, circuit_cfg.circuit_type)
 
+        # Sprint A — boot-time orphan-reference integrity check.
+        # Migration 20260528 already ran the repair once. This pass is
+        # READ-ONLY (repair=False) — it only logs when something has
+        # drifted since (e.g. user restored an older backup, or future
+        # bugs introduce new orphans). The fix-at-boot button is left
+        # off intentionally so a surprising DB state stays observable
+        # rather than getting silently mutated; the Fixtures-page banner
+        # is the user-facing fix path.
+        try:
+            from .database import find_orphaned_cluster_references
+            _orphans = find_orphaned_cluster_references(self._db, repair=False)
+            if any(_orphans.values()):
+                log.warning(
+                    "Orphan-reference integrity check: events_orphaned=%d "
+                    "fixtures_unbacked=%d clusters_dangling=%d — see "
+                    "Fixtures page for relink affordance",
+                    _orphans["events_orphaned"],
+                    _orphans["fixtures_unbacked"],
+                    _orphans["clusters_dangling"],
+                )
+        except Exception as _e:
+            log.warning(
+                "Orphan-reference integrity check failed (non-fatal): %s", _e
+            )
+
         # HA client
         self._ha = HaClient()
         await self._ha.__aenter__()

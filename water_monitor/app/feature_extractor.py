@@ -1955,6 +1955,38 @@ class FeatureExtractor:
             # — treat as fully anomalous.
             features["anomaly_score"] = 1.0
 
+        # Sprint C — signature-matcher fallback. Runs when the cluster
+        # matcher either returned no cluster_id (most rejection reasons)
+        # or returned a low-confidence match. The matcher centroid is
+        # learned from the user's labelled events, so a hit here gives
+        # the UI a confident fixture_type even without a cluster link.
+        # Caught broadly because matcher-or-DB failure must NEVER block
+        # the regular cluster_id write below.
+        matched_fixture_type: Optional[str] = None
+        weak_match = (
+            cluster_id_result is None
+            or (match_confidence is not None and match_confidence < 0.5)
+        )
+        if weak_match:
+            try:
+                from .database import match_event_to_signature
+                sig_hit = match_event_to_signature(
+                    self._db, circuit, features
+                )
+                if sig_hit is not None:
+                    matched_fixture_type = sig_hit["fixture_type"]
+                    log.info(
+                        "[%s] event %s matched signature %s (dist=%.2f, "
+                        "trained on %d events)",
+                        circuit, event_id, matched_fixture_type,
+                        sig_hit["distance"], sig_hit["member_count"],
+                    )
+            except Exception as e:
+                log.warning(
+                    "[%s] signature-match fallback failed (non-fatal): %s",
+                    circuit, e,
+                )
+
         # Write cluster results back to the event row
         self._db.execute(
             """UPDATE events SET
@@ -1963,11 +1995,13 @@ class FeatureExtractor:
                  match_level              = ?,
                  match_rejection_reason   = ?,
                  seconds_since_prev_event = ?,
-                 prev_cluster_id          = ?
+                 prev_cluster_id          = ?,
+                 matched_fixture_type     = ?
                WHERE id = ?""",
             (cluster_id_result, match_confidence, match_level,
              match_rejection_reason,
-             seconds_since_prev, prev_cluster_id, event_id)
+             seconds_since_prev, prev_cluster_id, matched_fixture_type,
+             event_id)
         )
 
         # 4. Update fixtures.last_seen_at when this event matched a named fixture

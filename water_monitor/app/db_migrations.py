@@ -26,7 +26,13 @@ _BASELINE_VERSION: int = 20260523
 #   20260526 — degraded-supply guard: new event columns, event_waveforms
 #              table, rebuild hourly_volume from events
 #   20260527 — per-circuit valve_type column on circuit_profile
-_CURRENT_VERSION: int = 20260527
+#   20260528 — Sprint A orphan repair: fixtures.cluster_backfill_needed
+#              column + one-shot repair of orphaned cluster/fixture refs
+#   20260529 — Sprint B label propagation: fixture_clusters.suggestion_source
+#              column ('heuristic' | 'user_labels' | NULL)
+#   20260530 — Sprint C signature matcher: fixture_type_signatures table +
+#              events.matched_fixture_type column
+_CURRENT_VERSION: int = 20260530
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -229,6 +235,118 @@ def _apply_valve_type_column(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _apply_signature_matcher(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260530 — Sprint C signature matcher.
+
+    Adds two artefacts:
+
+      1. ``fixture_type_signatures`` table (per-circuit, per-fixture-type
+         centroid learned from user-labelled events). The legacy
+         ``fixture_signatures`` table (per-fixture, per-feature) was never
+         populated by any code path; it's left in place for backup-restore
+         compat but the matcher reads from the new table.
+
+      2. ``events.matched_fixture_type`` column — populated when the
+         signature matcher tags an event with a fixture_type, independent
+         of cluster_id.
+
+    Idempotent — both creates are guarded.
+    """
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS fixture_type_signatures (
+            circuit       TEXT NOT NULL,
+            fixture_type  TEXT NOT NULL,
+            centroid      TEXT NOT NULL DEFAULT '{}',
+            member_count  INTEGER NOT NULL DEFAULT 0,
+            created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (circuit, fixture_type)
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_type_signatures_circuit "
+        "ON fixture_type_signatures (circuit)"
+    )
+    if not _has_column(conn, "events", "matched_fixture_type"):
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN matched_fixture_type TEXT"
+        )
+        log.info("Added events.matched_fixture_type (TEXT, NULL)")
+    conn.commit()
+    log.info("Migration 20260530: signature-matcher infrastructure ready")
+
+
+def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260529 — Sprint B label propagation.
+
+    Adds ``fixture_clusters.suggestion_source`` (TEXT, nullable). Values:
+    ``NULL`` (no suggestion yet), ``'heuristic'`` (set by the centroid
+    feature-range rules in cluster_engine), ``'user_labels'`` (set by the
+    majority-vote helper in ``database.recompute_cluster_suggestion_from_user_labels``).
+
+    Backfill: clusters that already had a non-NULL ``suggested_type`` get
+    ``suggestion_source = 'heuristic'`` — historically that's the only
+    code path that could have set it. The new majority-vote helper hasn't
+    run yet, so we know nothing in the DB is from user labels.
+
+    Idempotent — column add is guarded by ``_has_column``; the backfill
+    only touches rows where ``suggestion_source IS NULL``.
+    """
+    if not _has_column(conn, "fixture_clusters", "suggestion_source"):
+        conn.execute(
+            "ALTER TABLE fixture_clusters ADD COLUMN suggestion_source TEXT"
+        )
+        log.info("Added fixture_clusters.suggestion_source (TEXT, NULL)")
+    conn.execute(
+        "UPDATE fixture_clusters SET suggestion_source = 'heuristic' "
+        "WHERE suggestion_source IS NULL AND suggested_type IS NOT NULL"
+    )
+    conn.commit()
+    log.info("Migration 20260529: suggestion_source column added + backfilled")
+
+
+def _apply_orphan_repair(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260528 — Sprint A orphan repair.
+
+    Adds ``fixtures.cluster_backfill_needed`` (INTEGER DEFAULT 0) and
+    runs a one-shot pass that:
+
+      1. NULLs ``events.cluster_id`` where the referenced cluster row
+         no longer exists (so the next backfill pass re-clusters them).
+      2. Flags ``fixtures.cluster_backfill_needed = 1`` for confirmed
+         fixtures that have no cluster pointing back at them — surfaces
+         the relink banner on the Fixtures page.
+      3. NULLs ``fixture_clusters.fixture_id`` where the referenced
+         fixture row no longer exists.
+
+    Idempotent — column add is guarded by ``_has_column``; the repair
+    helper itself yields zero counts on a second invocation.
+    """
+    if not _has_column(conn, "fixtures", "cluster_backfill_needed"):
+        conn.execute(
+            "ALTER TABLE fixtures "
+            "ADD COLUMN cluster_backfill_needed INTEGER DEFAULT 0"
+        )
+        log.info("Added fixtures.cluster_backfill_needed (default 0)")
+    conn.commit()
+
+    # Lazy import — keeps this module importable without database.py
+    # side effects during test collection.
+    from .database import find_orphaned_cluster_references
+    counts = find_orphaned_cluster_references(conn, repair=True)
+    total = sum(counts.values())
+    if total:
+        log.info(
+            "Migration 20260528: orphan-repair fixed %d event(s), flagged "
+            "%d unbacked fixture(s), nulled %d dangling cluster fixture_id(s)",
+            counts["events_orphaned"],
+            counts["fixtures_unbacked"],
+            counts["clusters_dangling"],
+        )
+    else:
+        log.info("Migration 20260528: orphan-repair found nothing to fix")
+
+
 def _get_version(conn: sqlite3.Connection) -> int:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _schema_version (
@@ -291,6 +409,41 @@ def _missing_valve_type_columns(conn: sqlite3.Connection) -> set[str]:
     return {
         col for col in _VALVE_TYPE_COLUMNS
         if not _has_column(conn, "circuit_profile", col)
+    }
+
+
+# Columns added by the 20260528 orphan-repair migration. Same verification
+# pattern as above — catches a DB whose _schema_version was stamped without
+# the migration body running.
+_ORPHAN_REPAIR_COLUMNS: frozenset = frozenset({"cluster_backfill_needed"})
+
+
+def _missing_orphan_repair_columns(conn: sqlite3.Connection) -> set[str]:
+    return {
+        col for col in _ORPHAN_REPAIR_COLUMNS
+        if not _has_column(conn, "fixtures", col)
+    }
+
+
+# Columns added by the 20260529 suggestion-source migration (Sprint B).
+_SUGGESTION_SOURCE_COLUMNS: frozenset = frozenset({"suggestion_source"})
+
+
+def _missing_suggestion_source_columns(conn: sqlite3.Connection) -> set[str]:
+    return {
+        col for col in _SUGGESTION_SOURCE_COLUMNS
+        if not _has_column(conn, "fixture_clusters", col)
+    }
+
+
+# Columns added by the 20260530 signature-matcher migration (Sprint C).
+_SIGNATURE_MATCHER_COLUMNS: frozenset = frozenset({"matched_fixture_type"})
+
+
+def _missing_signature_matcher_columns(conn: sqlite3.Connection) -> set[str]:
+    return {
+        col for col in _SIGNATURE_MATCHER_COLUMNS
+        if not _has_column(conn, "events", col)
     }
 
 
@@ -387,6 +540,9 @@ def _run_migrations_impl(
             _missing_baseline_columns(conn)
             | _missing_degraded_columns(conn)
             | _missing_valve_type_columns(conn)
+            | _missing_orphan_repair_columns(conn)
+            | _missing_suggestion_source_columns(conn)
+            | _missing_signature_matcher_columns(conn)
         )
         if missing:
             raise RuntimeError(
@@ -412,8 +568,13 @@ def _run_migrations_impl(
         # Forward step 3: degraded-supply columns + waveform table + rebuild.
         _apply_degraded_supply_columns(conn)
         # Forward step 4: per-circuit valve_type column.
-        if version < 20260527:
-            _apply_valve_type_column(conn)
+        _apply_valve_type_column(conn)
+        # Forward step 5: orphan repair.
+        _apply_orphan_repair(conn)
+        # Forward step 6: suggestion_source column.
+        _apply_suggestion_source_column(conn)
+        # Forward step 7: signature-matcher table + column.
+        _apply_signature_matcher(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -421,8 +582,10 @@ def _run_migrations_impl(
     if version == _VERSION_PRE_UNIQUE_INDEX:
         _apply_unique_events_index(conn)
         _apply_degraded_supply_columns(conn)
-        if version < 20260527:
-            _apply_valve_type_column(conn)
+        _apply_valve_type_column(conn)
+        _apply_orphan_repair(conn)
+        _apply_suggestion_source_column(conn)
+        _apply_signature_matcher(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -431,8 +594,10 @@ def _run_migrations_impl(
     if version == _VERSION_PRE_DEGRADED:
         # DB has the unique index but lacks the degraded-supply columns.
         _apply_degraded_supply_columns(conn)
-        if version < 20260527:
-            _apply_valve_type_column(conn)
+        _apply_valve_type_column(conn)
+        _apply_orphan_repair(conn)
+        _apply_suggestion_source_column(conn)
+        _apply_signature_matcher(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -441,8 +606,37 @@ def _run_migrations_impl(
     if version == 20260526:
         # DB has the degraded-supply migration but lacks valve_type.
         _apply_valve_type_column(conn)
+        _apply_orphan_repair(conn)
+        _apply_suggestion_source_column(conn)
+        _apply_signature_matcher(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
+        return
+
+    if version == 20260527:
+        # DB has the valve_type column but lacks the orphan-repair column
+        # and hasn't run the one-shot orphan cleanup yet.
+        _apply_orphan_repair(conn)
+        _apply_suggestion_source_column(conn)
+        _apply_signature_matcher(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
+        return
+
+    if version == 20260528:
+        # DB has the orphan-repair column but lacks suggestion_source.
+        _apply_suggestion_source_column(conn)
+        _apply_signature_matcher(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
+        return
+
+    if version == 20260529:
+        # DB has suggestion_source but lacks the signature-matcher
+        # infrastructure (table + matched_fixture_type column).
+        _apply_signature_matcher(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
 
     if version == 0:
@@ -471,6 +665,15 @@ def _run_migrations_impl(
         # Same pattern for valve_type — idempotent, ensures the column and
         # the defensive backfill ran even on fresh DBs.
         _apply_valve_type_column(conn)
+        # Same pattern for orphan-repair — column add is guarded, and the
+        # repair scan finds nothing on an empty DB.
+        _apply_orphan_repair(conn)
+        # Same pattern for suggestion_source — column add guarded, backfill
+        # only touches non-NULL suggestion rows.
+        _apply_suggestion_source_column(conn)
+        # Same pattern for signature-matcher — CREATE TABLE IF NOT EXISTS
+        # and the column-add guard mean this is a no-op on fresh DBs.
+        _apply_signature_matcher(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

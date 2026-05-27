@@ -800,6 +800,20 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         errBox.hidden = false;
         return false;
       }
+      // Sprint B: log the propagation metadata so devs / power users
+      // can see in DevTools whether a label fed back into a cluster.
+      // The visible-on-Fixtures hint is the user-facing surface; this
+      // console line is the diagnostic surface.
+      try {
+        const data = await resp.json();
+        if (data && data.propagation && data.propagation.cluster_id != null) {
+          console.info(
+            `[history] label saved → cluster ${data.propagation.cluster_id}` +
+            ` suggested ${data.propagation.suggested_type}` +
+            ` (${data.propagation.labelled_member_count}/${data.propagation.total_label_count} agree)`
+          );
+        }
+      } catch (_) { /* tolerate any JSON parse hiccup */ }
       return true;
     } catch (err) {
       errBox.textContent = 'Network error — please try again.';

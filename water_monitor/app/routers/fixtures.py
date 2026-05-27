@@ -45,6 +45,8 @@ async def fixtures_page(request: Request, preview: bool = False):
     total_unreviewed = 0
     circuit_type_selectable = {}
 
+    from ..database import (get_active_exclusion_window, get_orphaned_fixtures,
+                             get_fixture_type_signatures)
     for circ_cfg in orch._cfg.circuits:
         c = circ_cfg.circuit
         training = (
@@ -66,7 +68,26 @@ async def fixtures_page(request: Request, preview: bool = False):
         # both render the grid and so do contribute to the count.
         if state not in ("idle", "calibrating"):
             total_unreviewed += unreviewed
-        from ..database import get_active_exclusion_window
+
+        # Sprint A — fixtures the migration flagged as orphaned (confirmed
+        # but with no cluster pointing back). The template renders a relink
+        # affordance per orphan; eligible cluster IDs are the unconfirmed
+        # clusters on the same circuit (anything with fixture_id NULL).
+        orphaned_fixtures = get_orphaned_fixtures(orch.db, c)
+        relink_candidate_clusters = [
+            {"id": cl["id"],
+             "member_count": cl.get("member_count") or 0,
+             "suggested_type": cl.get("suggested_type")}
+            for cl in clusters
+            if not cl.get("fixture_id")
+        ]
+
+        # Sprint C — fixture_type signatures learned from user labels.
+        # Surfaces a "Learned from your labels" section so the user can
+        # see which types the matcher knows about and forget any built
+        # from mistaken labels.
+        type_signatures = get_fixture_type_signatures(orch.db, c)
+
         circuits_ctx.append({
             "circuit":          c,
             "display_name":     circ_cfg.label,
@@ -74,6 +95,9 @@ async def fixtures_page(request: Request, preview: bool = False):
             "clusters":         clusters,
             "unreviewed_count": unreviewed,
             "active_exclusion": get_active_exclusion_window(orch.db, c),
+            "orphaned_fixtures":          orphaned_fixtures,
+            "relink_candidate_clusters":  relink_candidate_clusters,
+            "type_signatures":            type_signatures,
         })
 
         if circ_cfg.circuit_type == "zone":
@@ -170,6 +194,107 @@ async def confirm_cluster(request: Request, cluster_id: int, circuit: str = Depe
     if engine:
         engine.notify_fixture_confirmed(circuit, cluster_id, fixture_type)
     return ingress_redirect(request, "/fixtures")
+
+
+# ── Relink an orphaned fixture to a cluster (Sprint A) ────────────────────────
+
+@router.post("/{circuit}/fixture/{fixture_id}/relink-cluster")
+async def relink_orphaned_fixture(
+    request: Request,
+    fixture_id: str,
+    circuit: str = Depends(_valid_circuit),
+):
+    """Attach a fixture flagged as ``cluster_backfill_needed`` to a chosen
+    cluster on the same circuit. Form field: ``cluster_id``.
+
+    Conservative gate (in database.relink_fixture_to_cluster):
+      - fixture must exist on this circuit
+      - cluster must exist on this circuit
+      - target cluster must not already be linked to a different fixture
+    On success: clears the backfill flag, updates the cluster, re-publishes
+    to HA so the entity reappears, and notifies the cluster engine so its
+    type-aware match gate applies immediately.
+    """
+    form = await request.form()
+    try:
+        cluster_id = int(form.get("cluster_id") or 0)
+    except (TypeError, ValueError):
+        return ingress_redirect(request, "/fixtures?msg=error")
+    if cluster_id <= 0:
+        return ingress_redirect(request, "/fixtures?msg=error")
+
+    orch = _orch(request)
+    from ..database import relink_fixture_to_cluster
+    try:
+        relink_fixture_to_cluster(orch.db, circuit, fixture_id, cluster_id)
+    except ValueError as e:
+        log.warning("[%s] relink %s → cluster %d rejected: %s",
+                    circuit, fixture_id, cluster_id, e)
+        return ingress_redirect(request, "/fixtures?msg=relink_failed")
+    except Exception as e:
+        log.error("[%s] relink %s → cluster %d failed: %s",
+                  circuit, fixture_id, cluster_id, e, exc_info=True)
+        return ingress_redirect(request, "/fixtures?msg=error")
+
+    # Re-publish to HA so the entity reappears for this fixture.
+    fp = getattr(orch, "_fixture_publisher", None)
+    if fp:
+        try:
+            fp.publish_fixture(fixture_id)
+        except Exception as e:
+            log.error("[%s] publish_fixture %s after relink failed: %s",
+                      circuit, fixture_id, e)
+
+    # Tell the cluster engine to apply the type-aware match gate to events
+    # landing in this cluster going forward.
+    engine = getattr(orch, "cluster_engine", None)
+    if engine:
+        # Look up the fixture_type to feed the notification.
+        row = orch.db.execute(
+            "SELECT fixture_type FROM fixtures WHERE id = ?", (fixture_id,)
+        ).fetchone()
+        ftype = row["fixture_type"] if row else None
+        if ftype:
+            try:
+                engine.notify_fixture_confirmed(circuit, cluster_id, ftype)
+            except Exception as e:
+                log.error("[%s] notify_fixture_confirmed after relink "
+                          "failed: %s", circuit, e)
+
+    log.info("[%s] relinked fixture %s → cluster %d", circuit, fixture_id, cluster_id)
+    return ingress_redirect(request, "/fixtures?msg=relinked")
+
+
+# ── Forget a signature (Sprint C) ─────────────────────────────────────────────
+
+@router.post("/{circuit}/signature/{fixture_type}/forget")
+async def forget_signature(
+    request: Request,
+    fixture_type: str,
+    circuit: str = Depends(_valid_circuit),
+):
+    """Remove a learned-from-labels signature so future events stop being
+    tagged ``matched_fixture_type = <fixture_type>`` by the signature matcher.
+
+    Useful when the user realises they mis-labelled some events and wants
+    the matcher to start fresh — they don't have to hunt down each
+    individual labelled event. (Re-labelling will repopulate the signature
+    on the next save.)
+    """
+    orch = _orch(request)
+    from ..database import delete_fixture_signature
+    try:
+        removed = delete_fixture_signature(orch.db, circuit, fixture_type)
+    except Exception as e:
+        log.error("[%s] forget signature %s failed: %s",
+                  circuit, fixture_type, e, exc_info=True)
+        return ingress_redirect(request, "/fixtures?msg=error")
+    if not removed:
+        log.info("[%s] forget signature %s: no row existed",
+                 circuit, fixture_type)
+    log.info("[%s] forgot signature for fixture_type=%s",
+             circuit, fixture_type)
+    return ingress_redirect(request, "/fixtures?msg=signature_forgotten")
 
 
 # ── Delete a cluster ──────────────────────────────────────────────────────────

@@ -264,6 +264,10 @@ CREATE TABLE IF NOT EXISTS fixtures (
     display_name  TEXT,         -- may differ from `name` for HA entity slug
     user_locked   INTEGER DEFAULT 0,
     publish_to_ha INTEGER DEFAULT 1,
+    -- Sprint A orphan-repair flag: set to 1 when this fixture is confirmed
+    -- but no fixture_clusters row has fixture_id pointing at it. The UI
+    -- shows a relink banner so the user can pick a cluster to attach.
+    cluster_backfill_needed INTEGER DEFAULT 0,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -281,6 +285,29 @@ CREATE TABLE IF NOT EXISTS fixture_signatures (
 );
 
 -- ==========================================================================
+-- FIXTURE TYPE SIGNATURES (Sprint C) — per-(circuit, fixture_type) centroid
+-- learned from user-labelled events. The legacy fixture_signatures table
+-- above is per-(fixture_id, feature); it was never populated by any code
+-- path and is kept only for backwards-compat with backup files that
+-- include it. The matcher (cluster_engine + feature_extractor) reads from
+-- this new table, which is keyed by user-facing fixture *type* (e.g.
+-- "toilet"), not a specific fixture row — that matches how the History
+-- page's label dropdown is structured.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS fixture_type_signatures (
+    circuit       TEXT NOT NULL,
+    fixture_type  TEXT NOT NULL,
+    centroid      TEXT NOT NULL DEFAULT '{}',   -- JSON dict of feature means
+    member_count  INTEGER NOT NULL DEFAULT 0,
+    created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (circuit, fixture_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_type_signatures_circuit
+    ON fixture_type_signatures (circuit);
+
+-- ==========================================================================
 -- FIXTURE CLUSTERS (Phase 2.1) — raw DBSTREAM clustering output
 -- ==========================================================================
 CREATE TABLE IF NOT EXISTS fixture_clusters (
@@ -292,6 +319,13 @@ CREATE TABLE IF NOT EXISTS fixture_clusters (
     member_count          INTEGER DEFAULT 0,
     suggested_type        TEXT,                 -- from fixtures.suggest_fixture_type
     suggested_confidence  REAL DEFAULT 0,
+    -- Sprint B: provenance of suggested_type. NULL = nothing suggested yet,
+    -- 'heuristic' = set by cluster_engine._run_suggest_type_if_needed
+    -- (centroid feature-range rules), 'user_labels' = set by majority vote
+    -- of events.user_fixture_type on this cluster's members. The UI uses
+    -- this to render different hint copy and treat user-labels as a
+    -- stronger signal than heuristics.
+    suggestion_source     TEXT,
     confidence_level      TEXT DEFAULT 'preliminary',  -- preliminary/learning/confirmed
     fixture_id            TEXT REFERENCES fixtures(id) ON DELETE SET NULL,
     is_compound           INTEGER DEFAULT 0,    -- 2.3 placeholder
@@ -468,7 +502,14 @@ CREATE TABLE IF NOT EXISTS events (
     volume_estimation_method         TEXT DEFAULT 'raw',
     hourly_volume_applied_litres     REAL DEFAULT 0,
     hourly_volume_applied_bucket     TEXT,
-    degraded_diagnostic_json         TEXT
+    degraded_diagnostic_json         TEXT,
+    -- Sprint C signature matcher: the fixture_type matched by the
+    -- fixture_type_signatures table when cluster matching couldn't
+    -- assign a cluster_id (or assigned one with low confidence).
+    -- Independent of cluster_id — a single event can have cluster_id
+    -- set AND matched_fixture_type set if the cluster matched but the
+    -- signature gave a more specific type guess.
+    matched_fixture_type             TEXT
 );
 
 -- NOTE: the partial index on (circuit, start_ts) WHERE degraded_supply = 1
@@ -2353,6 +2394,576 @@ def merge_clusters(
         "fixtures_removed": len(fixture_ids),
         "survivor_member_count": total_n,
     }
+
+
+# ============================================================================
+# Sprint A — orphan repair
+#
+# Three classes of cluster/fixture FK inconsistency that can leak in over a
+# product lifetime:
+#
+#   1. events.cluster_id → fixture_clusters(circuit,id) where the cluster row
+#      no longer exists (cluster was deleted/merged without cleaning up event
+#      references). Symptom in the field: events show "Cluster 26" on the
+#      History page but cluster 26 is missing from the Fixtures page.
+#
+#   2. fixtures.confirmed=1 but no fixture_clusters row has fixture_id
+#      pointing at this fixture. Symptom: a "★ Toilet" pill on history
+#      events, but the Toilet fixture is invisible on the Fixtures page and
+#      future toilet-shaped events have no cluster to land in.
+#
+#   3. fixture_clusters.fixture_id → fixtures(id) where the fixtures row no
+#      longer exists. The ON DELETE SET NULL FK should prevent this if
+#      PRAGMA foreign_keys was on when the fixture was deleted — but it
+#      isn't always (per-connection setting; old code paths may have
+#      committed without it).
+#
+# The repair is conservative: never delete user-confirmed fixtures, never
+# delete events. Class 1 nulls the event's stale cluster_id so the next
+# backfill pass can re-cluster it. Class 2 flags the fixture with
+# cluster_backfill_needed=1 so the UI shows a relink affordance. Class 3
+# nulls the cluster's dangling fixture_id (matches the FK's ON DELETE
+# SET NULL semantics retroactively).
+# ============================================================================
+
+def find_orphaned_cluster_references(
+    conn: sqlite3.Connection, *, repair: bool = False
+) -> Dict[str, int]:
+    """Detect (and optionally repair) cluster/fixture FK inconsistencies.
+
+    Returns a dict with three counts:
+
+      - events_orphaned: events.cluster_id pointing to a missing cluster
+      - fixtures_unbacked: fixtures.confirmed=1 with no cluster pointing back
+      - clusters_dangling: fixture_clusters.fixture_id pointing to a missing
+        fixture
+
+    With ``repair=False`` (default) the function only counts — used by the
+    orchestrator's startup integrity check (logs non-zero counts; never
+    mutates the DB at boot to avoid surprising side effects).
+
+    With ``repair=True`` the function applies the fixes described in the
+    module-section comment above and commits. Idempotent: running twice
+    yields zero on the second call.
+    """
+    counts: Dict[str, int] = {
+        "events_orphaned": 0,
+        "fixtures_unbacked": 0,
+        "clusters_dangling": 0,
+    }
+
+    # Class 1: events with stale cluster_id.
+    # Composite key match — cluster_id alone isn't unique across circuits.
+    orphan_events = conn.execute(
+        """SELECT e.id FROM events e
+           WHERE e.cluster_id IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM fixture_clusters fc
+               WHERE fc.circuit = e.circuit AND fc.id = e.cluster_id
+             )"""
+    ).fetchall()
+    counts["events_orphaned"] = len(orphan_events)
+
+    # Class 2: fixtures confirmed but unbacked AND not yet flagged.
+    #
+    # confirmed=1 only — unconfirmed fixtures aren't expected to have a
+    # cluster yet (they could exist transiently during cluster creation).
+    #
+    # The extra ``cluster_backfill_needed = 0`` filter makes detection
+    # match what repair actually changes (the flag), so the function is
+    # truly idempotent: once flagged, the fixture is "managed" — awaiting
+    # user action via the Fixtures page relink banner — and the integrity
+    # check stops re-reporting it on every boot. A genuine *new* orphan
+    # appearing after migration (e.g. a bug deleted the wrong cluster
+    # row) will still be detected because it won't have the flag set yet.
+    unbacked_fixtures = conn.execute(
+        """SELECT f.id FROM fixtures f
+           WHERE f.confirmed = 1
+             AND COALESCE(f.cluster_backfill_needed, 0) = 0
+             AND NOT EXISTS (
+               SELECT 1 FROM fixture_clusters fc
+               WHERE fc.fixture_id = f.id
+             )"""
+    ).fetchall()
+    counts["fixtures_unbacked"] = len(unbacked_fixtures)
+
+    # Class 3: clusters with dangling fixture_id.
+    dangling_clusters = conn.execute(
+        """SELECT fc.circuit, fc.id FROM fixture_clusters fc
+           WHERE fc.fixture_id IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM fixtures f WHERE f.id = fc.fixture_id
+             )"""
+    ).fetchall()
+    counts["clusters_dangling"] = len(dangling_clusters)
+
+    if not repair:
+        return counts
+
+    # Repair pass — single transaction so a mid-repair crash doesn't leave
+    # half-fixed state.
+    try:
+        if orphan_events:
+            ev_ids = [r["id"] for r in orphan_events]
+            ph = ",".join(["?"] * len(ev_ids))
+            conn.execute(
+                f"UPDATE events SET cluster_id = NULL, "
+                f"match_level = 'unmatched', "
+                f"match_rejection_reason = 'orphan_cluster_repair' "
+                f"WHERE id IN ({ph})",
+                tuple(ev_ids),
+            )
+
+        if unbacked_fixtures:
+            fx_ids = [r["id"] for r in unbacked_fixtures]
+            ph = ",".join(["?"] * len(fx_ids))
+            conn.execute(
+                f"UPDATE fixtures SET cluster_backfill_needed = 1 "
+                f"WHERE id IN ({ph})",
+                tuple(fx_ids),
+            )
+
+        if dangling_clusters:
+            # Composite key — iterate row-wise rather than build a huge IN
+            # clause; counts here are typically small (single-digit).
+            for r in dangling_clusters:
+                conn.execute(
+                    "UPDATE fixture_clusters SET fixture_id = NULL "
+                    "WHERE circuit = ? AND id = ?",
+                    (r["circuit"], r["id"]),
+                )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return counts
+
+
+def get_orphaned_fixtures(
+    conn: sqlite3.Connection, circuit: str,
+) -> List[Dict[str, Any]]:
+    """Return fixtures on this circuit flagged for cluster backfill.
+
+    Used by the Fixtures-page route to render the relink banner. Each row
+    has the fields the template needs (id, name, fixture_type) plus the
+    raw flag so the banner is only shown when actually needed.
+    """
+    rows = conn.execute(
+        """SELECT id, name, display_name, fixture_type,
+                  cluster_backfill_needed
+           FROM fixtures
+           WHERE circuit = ? AND confirmed = 1
+             AND cluster_backfill_needed = 1
+           ORDER BY name, id""",
+        (circuit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ============================================================================
+# Sprint B — propagate per-event labels into cluster.suggested_type
+#
+# When the user labels an event "★ Toilet" on the History page, the row update
+# in events.user_fixture_type is by itself cosmetic — only the History page
+# renders the pill. The recompute helper below closes the loop: it looks at
+# every labelled event on the cluster, takes a majority vote, and pushes the
+# winning type into the cluster row with suggestion_source='user_labels'.
+#
+# Soft-hints model: this never silently links a cluster to a fixture.
+# upsert_fixture_from_cluster (the route the Fixtures-page Confirm button
+# calls) is still the only path that sets fixture_clusters.fixture_id. The
+# helper just makes that confirmation one click away by pre-filling the
+# suggestion.
+#
+# Edge cases handled explicitly:
+#   - No labels yet → leave heuristic suggestion alone, return None
+#   - Mixed labels → majority wins; ties broken by alphabetical type
+#   - All labels removed by user → reset suggestion to NULL so the next
+#     heuristic pass (every 10 events) can repopulate
+# ============================================================================
+
+def recompute_cluster_suggestion_from_user_labels(
+    conn: sqlite3.Connection,
+    circuit: str,
+    cluster_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Recompute a cluster's suggested_type from majority vote of user
+    labels on its member events.
+
+    Returns a dict ``{suggested_type, suggested_confidence,
+    suggestion_source, labelled_member_count, total_label_count}`` when
+    the cluster row was updated (or reset). Returns ``None`` when there
+    are no labels yet AND no prior user-labels suggestion is in place
+    (so the cluster row is untouched and the heuristic suggestion, if
+    any, stays valid).
+    """
+    rows = conn.execute(
+        "SELECT user_fixture_type, COUNT(*) AS cnt "
+        "FROM events "
+        "WHERE circuit = ? AND cluster_id = ? "
+        "  AND user_fixture_type IS NOT NULL "
+        "GROUP BY user_fixture_type",
+        (circuit, cluster_id),
+    ).fetchall()
+
+    if not rows:
+        # No labels on this cluster's events. If the current suggestion
+        # is from user labels (i.e. the user just *removed* every label),
+        # reset back to NULL so the heuristic pass can pick a fresh
+        # value next time it runs. Otherwise leave the row alone.
+        cur = conn.execute(
+            "SELECT suggestion_source FROM fixture_clusters "
+            "WHERE circuit = ? AND id = ?",
+            (circuit, cluster_id),
+        ).fetchone()
+        if cur and cur["suggestion_source"] == "user_labels":
+            conn.execute(
+                "UPDATE fixture_clusters SET "
+                "  suggested_type = NULL, "
+                "  suggested_confidence = 0, "
+                "  suggestion_source = NULL "
+                "WHERE circuit = ? AND id = ?",
+                (circuit, cluster_id),
+            )
+            conn.commit()
+            return {
+                "suggested_type": None,
+                "suggested_confidence": 0.0,
+                "suggestion_source": None,
+                "labelled_member_count": 0,
+                "total_label_count": 0,
+            }
+        return None
+
+    total = sum(r["cnt"] for r in rows)
+    # Sort by (count desc, type asc) — ties broken alphabetically so the
+    # result is deterministic across re-runs / restart re-replays.
+    ranked = sorted(
+        rows, key=lambda r: (-int(r["cnt"]), str(r["user_fixture_type"]))
+    )
+    winner_type = ranked[0]["user_fixture_type"]
+    winner_count = int(ranked[0]["cnt"])
+    confidence = winner_count / total if total > 0 else 0.0
+
+    conn.execute(
+        "UPDATE fixture_clusters SET "
+        "  suggested_type = ?, "
+        "  suggested_confidence = ?, "
+        "  suggestion_source = 'user_labels' "
+        "WHERE circuit = ? AND id = ?",
+        (winner_type, confidence, circuit, cluster_id),
+    )
+    conn.commit()
+    return {
+        "suggested_type": winner_type,
+        "suggested_confidence": confidence,
+        "suggestion_source": "user_labels",
+        "labelled_member_count": winner_count,
+        "total_label_count": total,
+    }
+
+
+def relink_fixture_to_cluster(
+    conn: sqlite3.Connection,
+    circuit: str,
+    fixture_id: str,
+    cluster_id: int,
+) -> None:
+    """Attach an orphaned fixture to a chosen cluster.
+
+    Validates that the fixture exists on this circuit, the cluster exists
+    on this circuit, and the cluster isn't already linked to a different
+    fixture (which would silently steal it). Atomically updates the
+    cluster's ``fixture_id`` and clears the fixture's
+    ``cluster_backfill_needed`` flag. Raises ``ValueError`` with a precise
+    message if any precondition fails, having written nothing.
+    """
+    fx = conn.execute(
+        "SELECT id FROM fixtures WHERE id = ? AND circuit = ?",
+        (fixture_id, circuit),
+    ).fetchone()
+    if not fx:
+        raise ValueError(
+            f"fixture {fixture_id!r} not found on circuit {circuit!r}"
+        )
+
+    cl = conn.execute(
+        "SELECT id, fixture_id FROM fixture_clusters "
+        "WHERE circuit = ? AND id = ?",
+        (circuit, cluster_id),
+    ).fetchone()
+    if not cl:
+        raise ValueError(
+            f"cluster {cluster_id} not found on circuit {circuit!r}"
+        )
+
+    existing = cl["fixture_id"]
+    if existing and existing != fixture_id:
+        raise ValueError(
+            f"cluster {cluster_id} is already linked to fixture "
+            f"{existing!r} — pick a different cluster"
+        )
+
+    try:
+        conn.execute(
+            "UPDATE fixture_clusters SET fixture_id = ? "
+            "WHERE circuit = ? AND id = ?",
+            (fixture_id, circuit, cluster_id),
+        )
+        conn.execute(
+            "UPDATE fixtures SET cluster_backfill_needed = 0 "
+            "WHERE id = ?",
+            (fixture_id,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# ============================================================================
+# Sprint C — fixture_type_signatures matcher
+#
+# Per-(circuit, fixture_type) centroid built from user-labelled events. The
+# matcher runs as a second-chance pass after cluster matching: if the cluster
+# matcher rejected the event (no_centers / features_missing) OR matched it
+# only at low confidence, we still want a user-facing label when the event's
+# features sit close to a fixture type the user has been training.
+#
+# The signature centroid is a simple per-feature arithmetic mean over the
+# labelled events' raw feature values (the cluster_engine's StandardScaler
+# is per-circuit and not stable across boots, so we deliberately avoid it
+# here — raw-feature Euclidean is good enough for the small feature subset
+# the matcher considers, and stays interpretable across restarts).
+#
+# The feature subset used for matching is conservative: the same first-rank
+# scalar features the cluster centroid heuristic already keys on (volume,
+# duration, flow, pressure delta). Signature shape vectors are NOT used —
+# they'd dominate the distance arithmetic and the user-labelled corpus is
+# typically too small to learn a meaningful shape centroid.
+# ============================================================================
+
+# Features the signature matcher uses. Kept small + interpretable; matches
+# the cluster_engine's first-rank features so the two centroids are
+# comparable. Update both at once if this list changes.
+_SIGNATURE_MATCH_FEATURES: tuple = (
+    "avg_flow_lpm",
+    "peak_flow_lpm",
+    "duration_seconds",
+    "volume_litres",
+    "pressure_delta_psi",
+    "steady_state_fraction",
+)
+
+# Signature matcher distance threshold — Euclidean over the feature subset
+# above. Heuristic value picked so a clear toilet-shaped event (3 gal, 60s,
+# ~2 lpm, ~5 psi drop) doesn't accidentally match a washing-machine
+# signature (~6 gal, ~3 min, ~2 lpm, ~6 psi). Compared after subtracting
+# centroid means and dividing each feature by its rough scale below.
+_SIGNATURE_MATCH_THRESHOLD: float = 1.5
+_SIGNATURE_MATCH_SCALES: dict = {
+    "avg_flow_lpm":           2.0,    # 0.5–5 gal/min typical range
+    "peak_flow_lpm":          3.0,
+    "duration_seconds":     120.0,    # 30s – several min
+    "volume_litres":         10.0,
+    "pressure_delta_psi":     5.0,
+    "steady_state_fraction":  0.5,
+}
+
+
+def upsert_fixture_signature(
+    conn: sqlite3.Connection,
+    circuit: str,
+    fixture_type: str,
+) -> Optional[Dict[str, Any]]:
+    """Recompute (or remove) the signature for one (circuit, fixture_type).
+
+    Reads every event on ``circuit`` whose ``user_fixture_type`` matches
+    ``fixture_type`` and ``excluded_from_training = 0`` (degraded /
+    composite events shouldn't pollute the type centroid), averages the
+    feature subset, and upserts the row.
+
+    Returns the upserted row as a dict on success, or ``None`` when there
+    are no eligible labelled events. In the no-eligible case the existing
+    signature is DELETED so a stale centroid doesn't keep matching after
+    the user has un-labelled their training set.
+    """
+    rows = conn.execute(
+        f"""SELECT {', '.join(_SIGNATURE_MATCH_FEATURES)}
+            FROM events
+            WHERE circuit = ?
+              AND user_fixture_type = ?
+              AND COALESCE(excluded_from_training, 0) = 0""",
+        (circuit, fixture_type),
+    ).fetchall()
+    if not rows:
+        conn.execute(
+            "DELETE FROM fixture_type_signatures "
+            "WHERE circuit = ? AND fixture_type = ?",
+            (circuit, fixture_type),
+        )
+        conn.commit()
+        return None
+
+    # Arithmetic mean per feature, ignoring NULLs in any individual row.
+    centroid: Dict[str, float] = {}
+    for feat in _SIGNATURE_MATCH_FEATURES:
+        vals = [float(r[feat]) for r in rows if r[feat] is not None]
+        if vals:
+            centroid[feat] = sum(vals) / len(vals)
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO fixture_type_signatures
+               (circuit, fixture_type, centroid, member_count,
+                created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(circuit, fixture_type) DO UPDATE SET
+               centroid     = excluded.centroid,
+               member_count = excluded.member_count,
+               updated_at   = excluded.updated_at""",
+        (circuit, fixture_type, json.dumps(centroid), len(rows), now, now),
+    )
+    conn.commit()
+    return {
+        "circuit": circuit,
+        "fixture_type": fixture_type,
+        "centroid": centroid,
+        "member_count": len(rows),
+    }
+
+
+def get_fixture_type_signatures(
+    conn: sqlite3.Connection, circuit: str,
+) -> List[Dict[str, Any]]:
+    """Return all signatures for one circuit, centroid pre-decoded.
+
+    Ordered by member_count desc so the UI lists the most-trained types
+    first. Empty list when nothing has been labelled yet.
+    """
+    rows = conn.execute(
+        "SELECT circuit, fixture_type, centroid, member_count, "
+        "       created_at, updated_at "
+        "FROM fixture_type_signatures "
+        "WHERE circuit = ? "
+        "ORDER BY member_count DESC, fixture_type",
+        (circuit,),
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            centroid = json.loads(r["centroid"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            centroid = {}
+        out.append({
+            "circuit": r["circuit"],
+            "fixture_type": r["fixture_type"],
+            "centroid": centroid,
+            "member_count": int(r["member_count"] or 0),
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        })
+    return out
+
+
+def delete_fixture_signature(
+    conn: sqlite3.Connection,
+    circuit: str,
+    fixture_type: str,
+) -> bool:
+    """Forget a signature so the user can recover from bad labels.
+
+    Returns True if a row was deleted, False if none existed.
+    """
+    cur = conn.execute(
+        "DELETE FROM fixture_type_signatures "
+        "WHERE circuit = ? AND fixture_type = ?",
+        (circuit, fixture_type),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def match_event_to_signature(
+    conn: sqlite3.Connection,
+    circuit: str,
+    event_features: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return the closest signature within
+    ``_SIGNATURE_MATCH_THRESHOLD`` on ``circuit``, or None.
+
+    Distance is computed in scale-normalised space:
+    sqrt(sum_i ((event_i - centroid_i) / scale_i)^2) over the matcher
+    feature subset. ``_SIGNATURE_MATCH_SCALES`` provides per-feature
+    typical ranges; the threshold is then in "rough fixture-typical-range
+    units" so it's interpretable.
+
+    Caller is responsible for deciding *when* to call this (e.g. only as
+    a fallback after cluster matching). The matcher itself doesn't gate
+    on whether the cluster matched.
+    """
+    sigs = get_fixture_type_signatures(conn, circuit)
+    if not sigs:
+        return None
+
+    best: Optional[Dict[str, Any]] = None
+    best_dist = float("inf")
+    for sig in sigs:
+        cen = sig["centroid"]
+        if not cen:
+            continue
+        sq = 0.0
+        used = 0
+        for feat in _SIGNATURE_MATCH_FEATURES:
+            ev_v = event_features.get(feat)
+            cn_v = cen.get(feat)
+            if ev_v is None or cn_v is None:
+                continue
+            scale = _SIGNATURE_MATCH_SCALES.get(feat, 1.0)
+            try:
+                delta = (float(ev_v) - float(cn_v)) / scale
+            except (TypeError, ValueError):
+                continue
+            sq += delta * delta
+            used += 1
+        if used == 0:
+            continue
+        # Normalise distance by feature count so signatures with sparse
+        # centroids (only a few features populated) aren't unfairly
+        # penalised vs full-feature ones.
+        dist = (sq / used) ** 0.5
+        if dist < best_dist:
+            best_dist = dist
+            best = sig
+
+    if best is None or best_dist > _SIGNATURE_MATCH_THRESHOLD:
+        return None
+    return {
+        "fixture_type": best["fixture_type"],
+        "distance": best_dist,
+        "member_count": best["member_count"],
+    }
+
+
+def set_event_matched_fixture_type(
+    conn: sqlite3.Connection,
+    circuit: str,
+    event_id: str,
+    fixture_type: Optional[str],
+) -> None:
+    """Write ``events.matched_fixture_type`` for one event.
+
+    Does not commit — caller batches with surrounding writes (typically
+    the cluster_id update in feature_extractor._cluster_event).
+    """
+    conn.execute(
+        "UPDATE events SET matched_fixture_type = ? "
+        "WHERE id = ? AND circuit = ?",
+        (fixture_type, event_id, circuit),
+    )
 
 
 def migrate_to_type_level_clusters(
