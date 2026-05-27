@@ -302,6 +302,53 @@ def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     }
 
 
+def _log_schema_state(conn: sqlite3.Connection) -> None:
+    """Emit a single INFO line summarising the current schema.
+
+    Plan C-IQ-15 / C-IQ-22 (lightweight variant). Walks `sqlite_master`
+    for user tables and reports each table's column count alongside
+    the stamped schema version. A divergent DB (e.g. a partially
+    restored backup, or a hand-edited database) will be loud in the
+    logs without forcing a hard-fail boot abort — which the plan
+    downgraded over dev-time false-alarm risk.
+
+    Format chosen so the line is greppable but compact:
+        Schema v=20260527  tables: events(56), fixtures(11), ...
+
+    Best-effort: any SQL error here is swallowed so a deeply broken DB
+    doesn't keep the addon from starting in the diagnose-and-restore
+    path. The migration verification block above is the real guard.
+    """
+    try:
+        version = _get_version(conn)
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' "
+            "  AND name NOT LIKE 'sqlite_%' "
+            "  AND name NOT LIKE '_schema_version' "
+            "ORDER BY name"
+        ).fetchall()
+        parts = []
+        for r in rows:
+            tbl = r[0]
+            try:
+                cols = conn.execute(
+                    f"PRAGMA table_info({tbl})"
+                ).fetchall()
+                parts.append(f"{tbl}({len(cols)})")
+            except sqlite3.OperationalError:
+                # Table dropped between SELECT and PRAGMA — rare.
+                parts.append(f"{tbl}(?)")
+        log.info(
+            "Schema v=%d  tables: %s",
+            version, ", ".join(parts) or "(none)",
+        )
+    except Exception as exc:
+        # Schema diagnostic must never fail the boot. Log the error
+        # itself at INFO so a developer running locally can spot it.
+        log.info("Schema diagnostic failed (non-fatal): %s", exc)
+
+
 def run_migrations(
     conn: sqlite3.Connection,
     db_path: Optional[Path] = None,
@@ -314,7 +361,24 @@ def run_migrations(
     _schema_version. Distinguish by checking for ALL required baseline columns:
       - All present  → fresh DB created by current schema → stamp baseline
       - Any absent   → old pre-squash DB → fail fast
+
+    Always emits the schema-state diagnostic line at the end (via the
+    `finally` below), even when migration aborts with a RuntimeError —
+    that way the supervisor logs show exactly what tables/columns the
+    on-disk DB had at the moment things went wrong.
     """
+    try:
+        _run_migrations_impl(conn, db_path)
+    finally:
+        _log_schema_state(conn)
+
+
+def _run_migrations_impl(
+    conn: sqlite3.Connection,
+    db_path: Optional[Path] = None,
+) -> None:
+    """Actual migration dispatch. Kept separate so run_migrations can
+    log the schema state unconditionally via try/finally."""
     version = _get_version(conn)
     _db_hint = f" DB file: {db_path}" if db_path else ""
 
