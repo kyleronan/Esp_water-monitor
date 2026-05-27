@@ -573,19 +573,37 @@ async def setup_circuit_names_save(request: Request):
         ctx["request"] = request
         return _tmpl(request).TemplateResponse("setup.html", ctx)
 
-    # ── (3) Write everything ──
-    for entry in pending:
-        try:
-            if "display_name" in entry:
-                upsert_circuit_label(orch.db, entry["circuit"], entry["display_name"])
-            if "circuit_type" in entry:
-                set_circuit_type(orch.db, entry["circuit"], entry["circuit_type"])
-            if "valve_type" in entry:
-                set_valve_type(orch.db, entry["circuit"], entry["valve_type"])
-        except Exception as exc:
-            log.error("Setup save failed for %s mid-chain: %s",
-                      entry["circuit"], exc, exc_info=True)
-            errors.append(f"{entry['circuit']}: could not save changes: {exc}")
+    # ── (3) Write everything in ONE transaction ──
+    # All three setters accept commit=False, so we control the
+    # commit boundary here. A runtime DB error mid-chain rolls back
+    # every prior write — no more partial-commit risk where a circuit
+    # ends up with the new display_name but the old circuit_type.
+    from ..database import transaction
+    try:
+        with transaction(orch.db):
+            for entry in pending:
+                if "display_name" in entry:
+                    upsert_circuit_label(
+                        orch.db, entry["circuit"], entry["display_name"],
+                        commit=False,
+                    )
+                if "circuit_type" in entry:
+                    set_circuit_type(
+                        orch.db, entry["circuit"], entry["circuit_type"],
+                        commit=False,
+                    )
+                if "valve_type" in entry:
+                    set_valve_type(
+                        orch.db, entry["circuit"], entry["valve_type"],
+                        commit=False,
+                    )
+    except Exception as exc:
+        log.error("Setup step 3b save failed (rolled back): %s",
+                  exc, exc_info=True)
+        errors.append(
+            "Could not save changes — all fields were rolled back. "
+            f"Details: {exc}"
+        )
 
     if errors:
         ctx = _step3b_template_context(orch, errors=errors)

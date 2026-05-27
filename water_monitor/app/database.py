@@ -1101,14 +1101,21 @@ def set_circuit_type(
     conn: sqlite3.Connection,
     circuit: str,
     circuit_type: str,
+    commit: bool = True,
 ) -> None:
     """Persist circuit_type to circuit_profile.
 
     UPSERTs the row so it is safe to call before ensure_circuit_defaults().
     When switching to "zone", seeds any missing zone-only alert rows via
     INSERT OR IGNORE so existing user toggle state is preserved.
-    Zone alerts are never deleted when switching back to "fixture" — they are
-    simply hidden in the UI by the template filter.
+    Zone alerts are never deleted when switching back to "fixture" — they
+    are simply hidden in the UI by the template filter.
+
+    When ``commit`` is True (default) the change is committed before
+    returning. Pass ``commit=False`` when this is part of a multi-step
+    write sequence the caller wants to make atomic via ``with
+    transaction(conn):`` — see setup wizard step 3b for the canonical
+    example.
     """
     from .fixtures import normalize_circuit_type
     circuit_type = normalize_circuit_type(circuit_type)
@@ -1121,7 +1128,8 @@ def set_circuit_type(
     """, (circuit, circuit_type))
     if circuit_type == "zone":
         _seed_zone_alerts_only(conn, circuit)
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def get_valve_type(
@@ -1148,6 +1156,7 @@ def set_valve_type(
     conn: sqlite3.Connection,
     circuit: str,
     valve_type: str,
+    commit: bool = True,
 ) -> None:
     """Persist valve_type to circuit_profile.
 
@@ -1158,6 +1167,11 @@ def set_valve_type(
 
     UPSERT mirrors set_circuit_type — all other circuit_profile columns
     have DEFAULTs or allow NULL so the minimal INSERT shape is safe.
+
+    Pass ``commit=False`` when this is part of a multi-step write
+    sequence the caller wants to make atomic via ``with
+    transaction(conn):`` — see setup wizard step 3b for the canonical
+    example.
     """
     from .fixtures import parse_valve_type
     parsed = parse_valve_type(valve_type)
@@ -1168,7 +1182,8 @@ def set_valve_type(
         VALUES (?, ?)
         ON CONFLICT(circuit) DO UPDATE SET valve_type = excluded.valve_type
     """, (circuit, parsed))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) -> None:
