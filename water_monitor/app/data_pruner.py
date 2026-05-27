@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -359,7 +358,7 @@ class DataPruner:
 
         try:
             from .routers.backup import (
-                QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT, QUICK_RESTORE_DAYS)
+                QUICK_RESTORE_TABLES, QUICK_RESTORE_DAYS)
             from datetime import timedelta
 
             cutoff = (datetime.now(timezone.utc)

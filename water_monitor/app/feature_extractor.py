@@ -1132,8 +1132,6 @@ def _enrich_from_waveform(
       * ``waveform_overlap_score`` — fraction of the event window covered
                                      by valid waveform samples (0.0–1.0).
     """
-    import time as _time
-
     meta = record.metadata
     fl   = meta.flags
     any_wf_used = False
