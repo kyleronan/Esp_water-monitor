@@ -2376,7 +2376,9 @@ def migrate_to_type_level_clusters(
 
     Returns {"types_merged", "clusters_removed", "survivor_ids"}.
     """
-    from .fixtures import get_match_threshold, FIXTURE_TYPE_LABELS
+    # get_match_threshold was removed from the import — see the comment
+    # inside the per-type loop below explaining the simplified gate.
+    from .fixtures import FIXTURE_TYPE_LABELS
 
     rows = conn.execute(
         """SELECT fc.id, fc.member_count,
@@ -2404,7 +2406,16 @@ def migrate_to_type_level_clusters(
     survivor_ids: List[int] = []
 
     for ftype, clusters in by_type.items():
-        threshold = get_match_threshold(ftype)
+        # NOTE: an earlier version of this migration used
+        # get_match_threshold(ftype) to gate which clusters could
+        # merge by per-type centroid distance. That gate was replaced
+        # by the simpler "any 2+ eligible clusters merge into one"
+        # logic below (centroid-distance approximation at the
+        # eligible_close filter, then deterministic survivor pick).
+        # The migration is one-shot; users have already run it. The
+        # threshold call is removed because it had no effect — but
+        # this comment documents the design simplification in case
+        # the rigorous gate is ever wanted back.
 
         # Apply safety gate
         eligible = [

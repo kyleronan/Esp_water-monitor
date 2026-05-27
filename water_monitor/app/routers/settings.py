@@ -9,7 +9,7 @@ from ._helpers import coerce_int, ingress_redirect
 
 from ..circuit_compat import resolve_circuit
 from ..config import SENSITIVITY_PRESETS
-from ..database import get_data_retention, update_data_retention, get_home_profile
+from ..database import get_data_retention, update_data_retention
 
 log = logging.getLogger(__name__)
 

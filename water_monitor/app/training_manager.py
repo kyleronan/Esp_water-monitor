@@ -22,7 +22,7 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from .config import AddonConfig, compute_suggested_calibration_days, compute_minimum_events
 from .database import (get_training_state, upsert_training_state,
@@ -405,7 +405,7 @@ class TrainingManager:
             circuit_cfg = self._cfg.get_circuit(circuit)
             if circuit_cfg:
                 await self._ha.notify(
-                    title=f"Water Monitor — Training extended",
+                    title="Water Monitor — Training extended",
                     message=(
                         f"{circuit_cfg.label}: training period elapsed but only "
                         f"{state_row['events_collected']} of "
@@ -450,11 +450,10 @@ class TrainingManager:
                 remaining_hours = remaining_td.seconds // 3600
                 total_days = state_row["calibration_days"] or 14
                 time_pct = min(100, int(elapsed_days / max(total_days, 1) * 100))
-                event_pct = min(100, int(
-                    (state_row["events_collected"] or 0) /
-                    max(state_row["minimum_events"] or 1, 1) * 100
-                ))
-                # Progress is purely time-based for user-facing display
+                # Progress is purely time-based for user-facing display.
+                # An earlier hybrid scheme also computed event_pct from
+                # events_collected / minimum_events, but the events
+                # metric is internal only and is no longer surfaced.
                 pct = time_pct
             else:
                 remaining_days  = 0
@@ -507,15 +506,13 @@ class TrainingManager:
             else:
                 time_pct = 0
 
-            event_pct = min(100, int(
-                (state_row["events_collected"] or 0) /
-                max(state_row["minimum_events"] or 1, 1) * 100
-            ))
             remaining_td = max(ends_at - now, timedelta(0))
             result["days_remaining"]  = remaining_td.days
             result["hours_remaining"] = remaining_td.seconds // 3600
-            # Percent complete is purely time-based — events are an internal
-            # metric and don't affect the displayed progress.
+            # Percent complete is purely time-based — events_collected
+            # / minimum_events is an internal metric and doesn't affect
+            # the displayed progress. (Earlier code computed an event_pct
+            # here and discarded it.)
             result["percent_complete"] = time_pct
         else:
             # 'labelling' is post-calibration review — calibration itself

@@ -764,7 +764,7 @@ class ClusterEngine:
         _merge_lock so concurrent executor threads see consistent state.
         """
         from .database import merge_clusters
-        from .fixtures import get_match_threshold, get_variance_profile
+        from .fixtures import get_match_threshold
 
         with self._merge_lock:
             rows = self._db.execute(

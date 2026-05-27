@@ -564,7 +564,8 @@ class HistoricalImporter:
         """
         periods: List[Tuple[datetime, datetime]] = []
         current_start: Optional[datetime] = None
-        last_ts: Optional[datetime] = None
+        # (no last_ts tracking — see the comment in the loop body
+        # below; off-transition `ts` is used directly.)
 
         for entry in history:
             ts = _parse_ts(entry.get("last_changed"))
@@ -584,8 +585,8 @@ class HistoricalImporter:
                     # _onset_to_periods which closes at the OFF timestamp.
                     periods.append((current_start, ts))
                     current_start = None
-
-            last_ts = ts
+            # (last_ts tracking removed — the off-transition `ts` is used
+            # directly above, per the same convention as _onset_to_periods.)
 
         # Same rationale as _onset_to_periods: do NOT flush still-active
         # flow-rate periods at query_end. The live detector / next importer

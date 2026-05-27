@@ -31,18 +31,16 @@ import tempfile
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from ._helpers import ingress_redirect
 from ..config import DB_PATH
 from ..database import get_data_retention
 from ..restore_utils import (
     normalize_restore_row as _normalize_row,
     safe_insert_rows as _safe_insert,
-    CIRCUIT_TABLES as _CIRCUIT_TABLES,
 )
 
 log = logging.getLogger(__name__)

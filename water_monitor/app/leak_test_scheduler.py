@@ -362,7 +362,10 @@ class LeakTestScheduler:
         # Wait for result — firmware takes 60s settle + up to configured duration + 2min buffer.
         # Fetch the firmware-configured test duration from the HA sensor entity.
         # (duration_minutes is NOT a DB column; it lives on the ESP firmware entity.)
-        schedule = get_leak_test_schedule(self._db, circuit)
+        # An earlier version of this function also fetched the DB
+        # leak_test_schedules row here, but never read from it — duration
+        # always comes from the live HA entity below, so the extra DB
+        # roundtrip was deleted.
         try:
             dur_str = await self._ha.get_state_value(
                 circuit_cfg.leak_test_duration_entity, "30")
@@ -373,7 +376,6 @@ class LeakTestScheduler:
         start_wait   = datetime.now(timezone.utc)
         final_result = "In progress"
         result_str   = "unknown"   # initialised before loop so timeout log is safe
-        timed_out    = False
 
         while (datetime.now(timezone.utc) - start_wait).total_seconds() < max_wait_seconds:
             try:
@@ -388,7 +390,6 @@ class LeakTestScheduler:
                 final_result = result_str
                 break
         else:
-            timed_out = True
             log.warning(
                 "[%s] leak test timed out after %.0f s — firmware result '%s' not in "
                 "TERMINAL_RESULTS. Check firmware version or update TERMINAL_RESULTS.",

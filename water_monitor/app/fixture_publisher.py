@@ -24,7 +24,6 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
 from typing import Dict, Optional, Set
 
 log = logging.getLogger(__name__)
@@ -188,7 +187,6 @@ class FixturePublisher:
         """Publish MQTT Discovery payloads for one circuit+category."""
         slug  = _category_slug(circuit, category)
         name  = cat_label
-        now   = datetime.now(timezone.utc).isoformat()
 
         device = {
             "identifiers":  [f"{_NODE_ID}_{_slugify(circuit)}"],

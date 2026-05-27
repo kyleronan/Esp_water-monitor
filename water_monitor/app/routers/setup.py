@@ -24,7 +24,6 @@ from ..device_discovery import (
     save_discovery,
     mark_setup_complete,
     get_device_config,
-    DiscoveryResult,
     DiscoveredDevice,
 )
 
@@ -128,7 +127,6 @@ async def setup_restore(request: Request):
         return blocked
     import json as _json
     from urllib.parse import quote_plus as _qp
-    from fastapi import File, UploadFile
     from ..routers.backup import (
         QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT, MAX_BACKUP_BYTES,
     )
