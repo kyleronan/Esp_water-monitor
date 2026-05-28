@@ -1,15 +1,21 @@
 """
 Fixture publisher — Phase 2 (Gap 6).
 
-Publishes water fixture activity to Home Assistant via MQTT Discovery using
-broad categories rather than individual fixture names.  Per circuit the
-publisher creates up to six HA entity sets (one per broad category present):
+Publishes water fixture activity to Home Assistant via MQTT Discovery.
+After the Sprint D taxonomy consolidation each fixture type is its own
+HA category, so per circuit the publisher creates up to one entity set
+per type present:
 
-  sensor.water_monitor_{circuit}_{category}_count_today
-  sensor.water_monitor_{circuit}_{category}_volume_today
-  binary_sensor.water_monitor_{circuit}_{category}_running
+  sensor.water_monitor_{circuit}_{type}_count_today
+  sensor.water_monitor_{circuit}_{type}_volume_today
+  binary_sensor.water_monitor_{circuit}_{type}_running
 
-Categories: toilet, shower_tub, tap, appliance, irrigation, other.
+Types / categories: toilet, shower_tub, tap, washing_machine,
+dishwasher, irrigation_zone, other.
+
+NOTE: The old "appliance" and "irrigation" super-categories were
+removed in Sprint D. Any HA entities created under those slugs will
+be orphaned and should be deleted from HA by the user.
 
 Broker credentials are fetched from the HA supervisor at startup:
   GET http://supervisor/services/mqtt  (requires SUPERVISOR_TOKEN env var)

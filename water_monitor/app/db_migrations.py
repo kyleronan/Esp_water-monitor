@@ -32,7 +32,10 @@ _BASELINE_VERSION: int = 20260523
 #              column ('heuristic' | 'user_labels' | NULL)
 #   20260530 — Sprint C signature matcher: fixture_type_signatures table +
 #              events.matched_fixture_type column
-_CURRENT_VERSION: int = 20260530
+#   20260531 — Sprint D taxonomy consolidation: 23 → 8 fixture types;
+#              rewrites stored type strings in events, fixtures,
+#              fixture_clusters, and clears fixture_type_signatures
+_CURRENT_VERSION: int = 20260531
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -274,6 +277,53 @@ def _apply_signature_matcher(conn: sqlite3.Connection) -> None:
         log.info("Added events.matched_fixture_type (TEXT, NULL)")
     conn.commit()
     log.info("Migration 20260530: signature-matcher infrastructure ready")
+
+
+def _apply_fixture_taxonomy_consolidation(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260531 — Sprint D taxonomy consolidation.
+
+    Collapses the old 23-entry fixture type list down to 8 coarse types.
+    Applies LEGACY_TYPE_REMAP (from fixtures.py) to every stored type string
+    in four columns, then clears fixture_type_signatures so that centroids
+    are rebuilt against the new type names on the next user label save.
+
+    This is a pure data migration — no schema changes. Idempotent: old type
+    strings no longer appear after the first run, so subsequent UPDATEs
+    affect zero rows.
+    """
+    from .fixtures import LEGACY_TYPE_REMAP
+
+    cols_tables = [
+        ("events",           "user_fixture_type"),
+        ("events",           "matched_fixture_type"),
+        ("fixtures",         "fixture_type"),
+        ("fixture_clusters", "suggested_type"),
+    ]
+
+    total_updated = 0
+    for old_type, new_type in LEGACY_TYPE_REMAP.items():
+        if old_type == new_type:
+            continue  # nothing to rewrite
+        for table, col in cols_tables:
+            cur = conn.execute(
+                f"UPDATE {table} SET {col} = ? WHERE {col} = ?",
+                (new_type, old_type),
+            )
+            total_updated += cur.rowcount
+
+    conn.commit()
+
+    # Clear signatures — centroids were computed against old type strings
+    # and will be rebuilt on the next label save or on demand.
+    cur = conn.execute("DELETE FROM fixture_type_signatures")
+    sig_count = cur.rowcount
+    conn.commit()
+
+    log.info(
+        "Migration 20260531: taxonomy consolidation rewrote %d stored type "
+        "value(s) across 4 columns; cleared %d fixture_type_signatures row(s)",
+        total_updated, sig_count,
+    )
 
 
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
@@ -553,6 +603,14 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260530:
+        # DB has signature-matcher infrastructure but hasn't had the taxonomy
+        # consolidation applied yet.
+        _apply_fixture_taxonomy_consolidation(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
+        return
+
     if version == _BASELINE_VERSION:
         # Forward step 1: drop retired text-sensor waveform roles.
         missing = _missing_baseline_columns(conn)
@@ -575,6 +633,8 @@ def _run_migrations_impl(
         _apply_suggestion_source_column(conn)
         # Forward step 7: signature-matcher table + column.
         _apply_signature_matcher(conn)
+        # Forward step 8: taxonomy consolidation (23 → 8 types).
+        _apply_fixture_taxonomy_consolidation(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -586,6 +646,7 @@ def _run_migrations_impl(
         _apply_orphan_repair(conn)
         _apply_suggestion_source_column(conn)
         _apply_signature_matcher(conn)
+        _apply_fixture_taxonomy_consolidation(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -598,6 +659,7 @@ def _run_migrations_impl(
         _apply_orphan_repair(conn)
         _apply_suggestion_source_column(conn)
         _apply_signature_matcher(conn)
+        _apply_fixture_taxonomy_consolidation(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -609,6 +671,7 @@ def _run_migrations_impl(
         _apply_orphan_repair(conn)
         _apply_suggestion_source_column(conn)
         _apply_signature_matcher(conn)
+        _apply_fixture_taxonomy_consolidation(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -619,6 +682,7 @@ def _run_migrations_impl(
         _apply_orphan_repair(conn)
         _apply_suggestion_source_column(conn)
         _apply_signature_matcher(conn)
+        _apply_fixture_taxonomy_consolidation(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -627,6 +691,7 @@ def _run_migrations_impl(
         # DB has the orphan-repair column but lacks suggestion_source.
         _apply_suggestion_source_column(conn)
         _apply_signature_matcher(conn)
+        _apply_fixture_taxonomy_consolidation(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -635,6 +700,7 @@ def _run_migrations_impl(
         # DB has suggestion_source but lacks the signature-matcher
         # infrastructure (table + matched_fixture_type column).
         _apply_signature_matcher(conn)
+        _apply_fixture_taxonomy_consolidation(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -674,6 +740,8 @@ def _run_migrations_impl(
         # Same pattern for signature-matcher — CREATE TABLE IF NOT EXISTS
         # and the column-add guard mean this is a no-op on fresh DBs.
         _apply_signature_matcher(conn)
+        # Taxonomy consolidation is a data-only pass; no-op on empty DBs.
+        _apply_fixture_taxonomy_consolidation(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

@@ -191,17 +191,14 @@ async def lifespan(app: FastAPI):
 
     # fixture_icon: maps a cluster dict to an emoji for the fixture type.
     _FX_ICONS = {
-        "toilet": "\U0001F6BD", "shower": "\U0001F6BF", "bath": "\U0001F6C1",
-        "bathroom_tap": "\U0001FAA5", "bidet": "\U0001F6BF",
-        "kitchen_tap": "\U0001F37D", "dishwasher": "\U0001F37D",
-        "washing_machine": "\U0001F455", "utility_tap": "\U0001F527",
-        "irrigation_zone": "\U0001F4A7", "hose_bib": "\U0001F33F",
-        "outdoor_tap": "\U0001F33F", "pool_fill": "\U0001F3CA",
-        "humidifier": "\U0001F4A8", "water_softener": "\U0001F52C",
-        "ice_maker": "\U0001F9CA", "refrigerator_water": "\U0001F9CA",
-        "ro_drinking_faucet": "\U0001F48E", "ro_system_whole_house": "\U0001F48E",
-        "evaporative_cooler": "❄️", "boiler_makeup": "\U0001F525",
-        "leak_test": "\U0001F50D", "other": "❓",
+        "toilet":          "\U0001F6BD",  # 🚽
+        "shower_tub":      "\U0001F6BF",  # 🚿
+        "tap":             "\U0001F6B0",  # 🚰
+        "washing_machine": "\U0001F455",  # 👕
+        "dishwasher":      "\U0001F37D",  # 🍽
+        "irrigation_zone": "\U0001F4A7",  # 💧
+        "other":           "❓",
+        "leak_test":       "\U0001F50D",  # 🔍
     }
     app.state.templates.env.filters["fixture_icon"] = (
         lambda cl: _FX_ICONS.get(

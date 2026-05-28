@@ -29,62 +29,61 @@ from typing import Dict, List, Optional, Tuple
 # treats them as a flat set.
 
 FIXTURE_TYPES: List[str] = [
-    # Bathroom
+    # User-selectable (household fixture circuit)
     "toilet",
-    "shower",
-    "bath",
-    "bathroom_tap",
-    "bidet",
-    # Kitchen
-    "kitchen_tap",
-    "dishwasher",
-    "ice_maker",
-    "refrigerator_water",
-    "ro_drinking_faucet",
-    # Laundry / utility
+    "shower_tub",
+    "tap",
     "washing_machine",
-    "utility_tap",
-    # Outdoor
-    "hose_bib",
-    "outdoor_tap",
+    "dishwasher",
+    # Zone-circuit only
     "irrigation_zone",
-    "pool_fill",
-    # Whole-house systems
-    "humidifier",
-    "water_softener",
-    "ro_system_whole_house",
-    "evaporative_cooler",
-    "boiler_makeup",
-    # Special / catch-all
-    "leak_test",
+    # Catch-all / internal
     "other",
+    "leak_test",
 ]
+
+# Mapping from the old 23-entry taxonomy to the new 8-entry taxonomy.
+# Used by db_migrations to rewrite stored type strings, and importable
+# by tests as a regression guard.
+LEGACY_TYPE_REMAP: Dict[str, str] = {
+    # Unchanged
+    "toilet":                "toilet",
+    "washing_machine":       "washing_machine",
+    "dishwasher":            "dishwasher",
+    "irrigation_zone":       "irrigation_zone",
+    "other":                 "other",
+    "leak_test":             "leak_test",
+    # Merged
+    "shower":                "shower_tub",
+    "bath":                  "shower_tub",
+    "bidet":                 "toilet",
+    "bathroom_tap":          "tap",
+    "kitchen_tap":           "tap",
+    "utility_tap":           "tap",
+    # Folded into other
+    "ice_maker":             "other",
+    "refrigerator_water":    "other",
+    "ro_drinking_faucet":    "other",
+    "humidifier":            "other",
+    "water_softener":        "other",
+    "ro_system_whole_house": "other",
+    "evaporative_cooler":    "other",
+    "boiler_makeup":         "other",
+    "hose_bib":              "other",
+    "outdoor_tap":           "other",
+    "pool_fill":             "other",
+}
 
 # Friendly display labels (UI shows these instead of the raw key)
 FIXTURE_TYPE_LABELS: Dict[str, str] = {
-    "toilet":                "Toilet",
-    "shower":                "Shower",
-    "bath":                  "Bath",
-    "bathroom_tap":          "Bathroom tap",
-    "bidet":                 "Bidet",
-    "kitchen_tap":           "Kitchen tap",
-    "dishwasher":            "Dishwasher",
-    "ice_maker":             "Ice maker",
-    "refrigerator_water":    "Refrigerator water",
-    "ro_drinking_faucet":    "RO drinking faucet",
-    "washing_machine":       "Washing machine",
-    "utility_tap":           "Utility tap",
-    "hose_bib":              "Hose bib",
-    "outdoor_tap":           "Outdoor tap",
-    "irrigation_zone":       "Irrigation zone",
-    "pool_fill":             "Pool fill",
-    "humidifier":            "Humidifier",
-    "water_softener":        "Water softener",
-    "ro_system_whole_house": "RO system (whole-house)",
-    "evaporative_cooler":    "Evaporative cooler",
-    "boiler_makeup":         "Boiler make-up",
-    "leak_test":             "Leak test (auto)",
-    "other":                 "Other",
+    "toilet":           "Toilet",
+    "shower_tub":       "Shower / Tub",
+    "tap":              "Tap",
+    "washing_machine":  "Washing Machine",
+    "dishwasher":       "Dishwasher",
+    "irrigation_zone":  "Irrigation Zone",
+    "other":            "Other",
+    "leak_test":        "Leak Test (auto)",
 }
 
 # Types that are NOT user-selectable in the UI (auto-managed only).
@@ -92,50 +91,37 @@ FIXTURE_TYPE_LABELS: Dict[str, str] = {
 # they never show up as a real fixture for clustering or HA publishing.
 INTERNAL_FIXTURE_TYPES: List[str] = ["leak_test"]
 
-# Broad HA publishing categories. DB clusters remain at granular type level;
-# these categories are used only in fixture_publisher to produce one HA
-# entity per category per circuit (e.g., "Tap" covers bathroom_tap +
-# kitchen_tap + utility_tap). Never stored in the database.
+# HA publishing categories. Each fixture type is its own category now —
+# the taxonomy IS the category set. Used only in fixture_publisher to
+# name HA entities. Never stored in the database.
 FIXTURE_CATEGORIES: Dict[str, Optional[str]] = {
-    "toilet":                "toilet",
-    "bidet":                 "toilet",
-    "shower":                "shower_tub",
-    "bath":                  "shower_tub",
-    "bathroom_tap":          "tap",
-    "kitchen_tap":           "tap",
-    "utility_tap":           "tap",
-    "washing_machine":       "appliance",
-    "dishwasher":            "appliance",
-    "water_softener":        "appliance",
-    "boiler_makeup":         "appliance",
-    "ro_system_whole_house": "appliance",
-    "irrigation_zone":       "irrigation",
-    "hose_bib":              "other",
-    "outdoor_tap":           "other",
-    "pool_fill":             "other",
-    "humidifier":            "other",
-    "ice_maker":             "other",
-    "refrigerator_water":    "other",
-    "ro_drinking_faucet":    "other",
-    "evaporative_cooler":    "other",
-    "other":                 "other",
-    "leak_test":             None,    # never publish
+    "toilet":           "toilet",
+    "shower_tub":       "shower_tub",
+    "tap":              "tap",
+    "washing_machine":  "washing_machine",
+    "dishwasher":       "dishwasher",
+    "irrigation_zone":  "irrigation_zone",
+    "other":            "other",
+    "leak_test":        None,    # never publish
 }
 
 FIXTURE_CATEGORY_LABELS: Dict[str, str] = {
-    "toilet":     "Toilet",
-    "shower_tub": "Shower/Tub",
-    "tap":        "Tap",
-    "appliance":  "Appliance",
-    "irrigation": "Irrigation",
-    "other":      "Other",
+    "toilet":           "Toilet",
+    "shower_tub":       "Shower / Tub",
+    "tap":              "Tap",
+    "washing_machine":  "Washing Machine",
+    "dishwasher":       "Dishwasher",
+    "irrigation_zone":  "Irrigation Zone",
+    "other":            "Other",
 }
 
 
 def get_fixture_category(fixture_type: Optional[str]) -> Optional[str]:
-    """Return the broad HA publishing category for a granular fixture type.
+    """Return the HA publishing category for a fixture type.
 
-    Returns None for leak_test (never published) and for unknown types.
+    Since the taxonomy consolidation (Sprint D) the type IS the category,
+    so this function is effectively an identity for known types.
+    Returns None for leak_test (never published).
     Returns 'other' for None or any type not in FIXTURE_CATEGORIES.
     """
     if fixture_type is None:
@@ -177,7 +163,9 @@ ZONE_ONLY_ALERT_TYPES: frozenset = frozenset({
 })
 
 # Fixture types appropriate for a zone (irrigation) circuit.
-_ZONE_FIXTURE_TYPES: List[str] = ["irrigation_zone", "hose_bib", "pool_fill", "other"]
+# hose_bib and pool_fill were folded into "other" during the Sprint D
+# taxonomy consolidation; zone circuits now offer only two choices.
+_ZONE_FIXTURE_TYPES: List[str] = ["irrigation_zone", "other"]
 
 
 def normalize_circuit_type(value: Optional[str]) -> str:
@@ -317,47 +305,13 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         "expected_cv": {"volume_litres": 0.20, "duration_seconds": 0.25},
         "multimodal": False,
     },
-    "ice_maker": {
-        "anchor_weights": {
-            "volume_litres":    4.0,
-            "duration_seconds": 4.0,
-            "avg_flow_lpm":     3.0,
-        },
-        "float_features": {"hour_sin", "hour_cos", "day_of_week"},
-        "expected_cv": {"volume_litres": 0.03, "duration_seconds": 0.05},
-        "multimodal": False,
-    },
-    "refrigerator_water": {
-        "anchor_weights": {
-            "volume_litres":    2.5,
-            "duration_seconds": 2.0,
-            "avg_flow_lpm":     2.0,
-        },
-        "float_features": {"hour_sin", "hour_cos"},
-        "expected_cv": {"volume_litres": 0.10, "duration_seconds": 0.15},
-        "multimodal": False,
-    },
-    "humidifier": {
-        "anchor_weights": {
-            "volume_litres": 2.0,
-            "avg_flow_lpm":  2.5,
-        },
-        "float_features": {"duration_seconds", "hour_sin", "hour_cos"},
-        "expected_cv": {"volume_litres": 0.20, "duration_seconds": 0.20},
-        "multimodal": False,
-    },
-    "boiler_makeup": {
-        "anchor_weights": {
-            "volume_litres": 2.5,
-            "avg_flow_lpm":  2.0,
-        },
-        "float_features": {"hour_sin", "hour_cos"},
-        "expected_cv": {"volume_litres": 0.15, "duration_seconds": 0.15},
-        "multimodal": False,
-    },
 
     # ── User-driven ──────────────────────────────────────────────────────
-    "shower": {
+    "shower_tub": {
+        # Merged from old shower + bath profiles. Duration and volume are
+        # behavioural choices (whether the user showers or fills a tub);
+        # anchor on flow rate and pressure delta which are hydraulically
+        # stable per installation.
         "anchor_weights": {
             "avg_flow_lpm":           3.0,
             "pressure_delta_psi":     2.0,
@@ -370,16 +324,9 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         "expected_cv": {"duration_seconds": 0.45, "volume_litres": 0.45},
         "multimodal": False,
     },
-    "bath": {
-        "anchor_weights": {
-            "avg_flow_lpm":       3.0,
-            "pressure_delta_psi": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.30, "volume_litres": 0.25},
-        "multimodal": False,
-    },
-    "bathroom_tap": {
+    "tap": {
+        # Merged from old bathroom_tap + kitchen_tap + utility_tap profiles.
+        # Short, low-volume events; duration and volume vary with use.
         "anchor_weights": {
             "avg_flow_lpm":           2.5,
             "pressure_delta_psi":     1.5,
@@ -388,41 +335,6 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.60, "volume_litres": 0.60},
-        "multimodal": False,
-    },
-    "kitchen_tap": {
-        "anchor_weights": {
-            "avg_flow_lpm":           2.5,
-            "pressure_delta_psi":     1.5,
-            "recovery_overshoot_psi": 1.0,
-            "pressure_onset_ms":      1.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.55, "volume_litres": 0.55},
-        "multimodal": False,
-    },
-    "utility_tap": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.65, "volume_litres": 0.65},
-        "multimodal": False,
-    },
-    "bidet": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.50, "volume_litres": 0.50},
-        "multimodal": False,
-    },
-    "ro_drinking_faucet": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.5,
-        },
-        "float_features": {"duration_seconds", "volume_litres"},
-        "expected_cv": {"duration_seconds": 0.50, "volume_litres": 0.50},
         "multimodal": False,
     },
 
@@ -452,18 +364,8 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         "expected_cv": {"duration_seconds": 0.40, "volume_litres": 0.40},
         "multimodal": True,
     },
-    "water_softener": {
-        "anchor_weights": {
-            "avg_flow_lpm":           2.0,
-            "flow_variability":       1.5,
-            "resistance_curve_shape": 2.0,   # forward-looking
-        },
-        "float_features": {"duration_seconds", "volume_litres"},
-        "expected_cv": {"duration_seconds": 0.35, "volume_litres": 0.35},
-        "multimodal": True,
-    },
 
-    # ── Outdoor / programme-ish ──────────────────────────────────────────
+    # ── Zone / outdoor ───────────────────────────────────────────────────
     "irrigation_zone": {
         "anchor_weights": {
             "avg_flow_lpm":           2.5,
@@ -473,46 +375,6 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         },
         "float_features": {"duration_seconds", "volume_litres"},
         "expected_cv": {"duration_seconds": 0.25, "volume_litres": 0.25},
-        "multimodal": False,
-    },
-    "pool_fill": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres"},
-        "expected_cv": {"duration_seconds": 0.20, "volume_litres": 0.20},
-        "multimodal": False,
-    },
-    "hose_bib": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.55, "volume_litres": 0.55},
-        "multimodal": False,
-    },
-    "outdoor_tap": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.55, "volume_litres": 0.55},
-        "multimodal": False,
-    },
-    "evaporative_cooler": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres"},
-        "expected_cv": {"duration_seconds": 0.30, "volume_litres": 0.30},
-        "multimodal": False,
-    },
-    "ro_system_whole_house": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres"},
-        "expected_cv": {"duration_seconds": 0.40, "volume_litres": 0.40},
         "multimodal": False,
     },
 
@@ -549,29 +411,14 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
 # single type centroid rather than splitting into separate clusters.
 # "other" is unchanged — it is a catch-all, not a named type.
 FIXTURE_MATCH_THRESHOLDS: Dict[str, float] = {
-    "toilet":              3.0,
-    "ice_maker":           1.2,
-    "refrigerator_water":  1.5,
-    "humidifier":          2.0,
-    "boiler_makeup":       2.0,
-    "shower":              4.0,
-    "bath":                4.5,
-    "bathroom_tap":        3.5,
-    "kitchen_tap":         3.5,
-    "utility_tap":         3.5,
-    "bidet":               3.0,
-    "ro_drinking_faucet":  2.5,
-    "washing_machine":     4.5,
-    "dishwasher":          4.5,
-    "water_softener":      4.0,
-    "irrigation_zone":     3.5,
-    "pool_fill":           2.5,
-    "hose_bib":            4.0,
-    "outdoor_tap":         4.0,
-    "evaporative_cooler":  2.5,
-    "ro_system_whole_house": 3.5,
-    "leak_test":           0.8,
-    "other":               1.5,
+    "toilet":           3.0,
+    "shower_tub":       4.5,   # looser of old shower(4.0) + bath(4.5)
+    "tap":              3.5,   # same as old bathroom_tap / kitchen_tap
+    "washing_machine":  4.5,
+    "dishwasher":       4.5,
+    "irrigation_zone":  3.5,
+    "leak_test":        0.8,
+    "other":            1.5,
 }
 
 
@@ -641,49 +488,30 @@ def _rule_toilet(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float
     return None
 
 
-def _rule_shower(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Shower: 20-80 L, 5-15 min, sustained moderate flow."""
+def _rule_shower_tub(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
+    """Shower or bath fill: 20-250 L, 3-20 min, moderate-to-high flow.
+
+    Merges the old shower (20-100 L, 4-20 min, 5-15 lpm) and bath
+    (80-250 L, 3-10 min, 12-25 lpm) rules into a single type.
+    """
     if circuit_type == "zone":
         return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
+    vol  = _safe(centroid, "volume_litres")
+    dur  = _safe(centroid, "duration_seconds")
     flow = _safe(centroid, "avg_flow_lpm")
-    if _between(vol, 20, 100) and _between(dur, 240, 1200) and _between(flow, 5, 15):
-        return ("shower", 0.85)
+    if _between(vol, 20, 250) and _between(dur, 180, 1200) and _between(flow, 5, 25):
+        return ("shower_tub", 0.80)
     return None
 
 
-def _rule_bath(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Bath fill: 80-200 L, 3-10 min, high flow rate."""
+def _rule_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
+    """Tap use: 0.3-8 L, 5-60 s — covers bathroom, kitchen, and utility taps."""
     if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
-    flow = _safe(centroid, "avg_flow_lpm")
-    if _between(vol, 80, 250) and _between(dur, 180, 600) and _between(flow, 12, 25):
-        return ("bath", 0.80)
-    return None
-
-
-def _rule_bathroom_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Bathroom tap: 0.3-3 L, 5-30 s, low flow."""
-    if circuit_type == "zone":
-        return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
-    if _between(vol, 0.3, 3) and _between(dur, 5, 30):
-        return ("bathroom_tap", 0.65)
-    return None
-
-
-def _rule_kitchen_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Kitchen tap: 0.5-8 L, 5-60 s, variable flow."""
-    if circuit_type == "zone":
-        return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
-    if _between(vol, 0.5, 8) and _between(dur, 5, 60):
-        return ("kitchen_tap", 0.60)
+    if _between(vol, 0.3, 8) and _between(dur, 5, 60):
+        return ("tap", 0.65)
     return None
 
 
@@ -715,43 +543,27 @@ def _rule_irrigation_zone(centroid: Dict, circuit_type: str) -> Optional[Tuple[s
     """Irrigation: only on zone circuit. Long duration, sustained high flow."""
     if circuit_type != "zone":
         return None
-    dur = _safe(centroid, "duration_seconds")
+    dur  = _safe(centroid, "duration_seconds")
     flow = _safe(centroid, "avg_flow_lpm")
     # Irrigation zones run 5-60 minutes at sustained flow
     if dur >= 300 and flow >= 5:
         return ("irrigation_zone", 0.85)
-    # Short irrigation events might be a hose bib used outside
-    if _between(dur, 30, 300) and flow >= 3:
-        return ("hose_bib", 0.55)
-    return None
-
-
-def _rule_water_softener(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Water softener regen: long sustained flow, 150-300 L, 30-90 minutes, scheduled."""
-    if circuit_type == "zone":
-        return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
-    flow = _safe(centroid, "avg_flow_lpm")
-    if _between(vol, 100, 400) and _between(dur, 1800, 5400) and _between(flow, 3, 8):
-        return ("water_softener", 0.70)
+    # Short zone events fall through to 'other' (hose_bib removed from taxonomy)
     return None
 
 
 # Rule chain -------------------------------------------------------------
 # Order matters: more-specific rules first.
+# shower_tub must come before tap: a bath-fill volume would also satisfy
+# the broader tap volume range if tap were checked first.
 
 _RULES = [
     _rule_irrigation_zone,
-    _rule_water_softener,    # high volume, must check before shower/bath
-    _rule_bath,              # high volume, must check before shower
-    _rule_shower,
+    _rule_shower_tub,        # high volume, before washing_machine + tap
     _rule_washing_machine,
     _rule_dishwasher,
-    _rule_toilet,            # very characteristic, but check after high-vol rules
-    _rule_bathroom_tap,      # before kitchen_tap because bathroom_tap has lower vol bound
-    _rule_kitchen_tap,
-    # ice_maker and humidifier removed: too ambiguous at type level, route to other
+    _rule_toilet,            # very characteristic, check after high-vol rules
+    _rule_tap,
 ]
 
 
