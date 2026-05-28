@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from datetime import tzinfo
@@ -123,12 +122,22 @@ class LeakTestScheduler:
 
     def learn_best_hour(self, circuit: str) -> Optional[int]:
         """
-        Analyse hourly_volume history to find the quietest local hour of day.
+        Find the quietest local hour from the last 60 days of usage.
 
-        Queries the last 60 days of data, groups by local hour (converted from
-        UTC hour_ts via self._ha_tz), and returns the local hour with the lowest
-        average volume.  Prefers 0–5 AM when two hours are equally quiet.
-        Returns None if no local hour has >= 7 data points.
+        hourly_volume only stores rows when water actually flowed
+        (database.py: "skip if zero — keeps hourly_volume clean"), so
+        hours absent from the table represent genuinely silent hours.
+        Score = (active_sample_count, avg_volume_lph, hour); lower wins
+        on every key with `hour` as a deterministic final tiebreak.
+
+        Returns None only when the table has no rows for this circuit
+        at all (no signal yet).
+
+        0–5 AM preference is a policy bias toward night-time testing:
+        pick the best-scoring 0–5 hour whose active count is within
+        +1 of the global minimum. The +1 tolerance lets a night hour
+        with one sample edge out a daytime hour with count=0 — early-
+        morning leak tests are safer for the occupants.
         """
         rows = self._db.execute("""
             SELECT hour_ts, volume_litres
@@ -140,45 +149,32 @@ class LeakTestScheduler:
         if not rows:
             return None
 
-        hour_vols: Dict[int, list] = defaultdict(list)
+        counts: Dict[int, int]   = {hr: 0   for hr in range(24)}
+        sums:   Dict[int, float] = {hr: 0.0 for hr in range(24)}
         for row in rows:
             try:
                 local_hour = _parse_utc_ts(row["hour_ts"]).astimezone(self._ha_tz).hour
-                hour_vols[local_hour].append(float(row["volume_litres"] or 0.0))
+                counts[local_hour] += 1
+                sums[local_hour]   += float(row["volume_litres"] or 0.0)
             except (ValueError, AttributeError, TypeError):
                 continue
 
-        # Two-pass selection: (1) find the global-minimum average, then
-        # (2) prefer any 0–5 AM hour that is within 5 % of that minimum.
-        # The previous single-pass tie-break re-anchored best_avg to the
-        # in-range hour, which let successive 0–5 hours monotonically drift
-        # upward (e.g. 7→2→3→5 with averages 1.00, 1.04, 1.09, 1.14 all
-        # passed the gate and ended at hour 5).
-        averages: Dict[int, float] = {}
-        for hr in sorted(hour_vols.keys()):
-            vols = hour_vols[hr]
-            if len(vols) < 7:
-                continue
-            averages[hr] = sum(vols) / len(vols)
+        def score(hr: int) -> tuple:
+            n   = counts[hr]
+            avg = sums[hr] / n if n else 0.0
+            return (n, avg, hr)
 
-        if not averages:
-            return None
+        global_min_hr  = min(range(24), key=score)
+        global_min_cnt = counts[global_min_hr]
 
-        global_min_hr  = min(averages, key=lambda h: averages[h])
-        global_min_avg = averages[global_min_hr]
-        ceiling        = global_min_avg * 1.05
+        candidates = [hr for hr in range(0, 6)
+                      if counts[hr] <= global_min_cnt + 1]
+        best_hr = min(candidates, key=score) if candidates else global_min_hr
 
-        # Prefer the earliest 0–5 hour within 5 % of the global minimum.
-        best_hr  = global_min_hr
-        best_avg = global_min_avg
-        for hr in range(0, 6):
-            if hr in averages and averages[hr] <= ceiling:
-                best_hr  = hr
-                best_avg = averages[hr]
-                break
-
-        log.info("[%s] learned best test hour: %02d:00 local (avg %.3f L/h)",
-                 circuit, best_hr, best_avg)
+        avg = sums[best_hr] / counts[best_hr] if counts[best_hr] else 0.0
+        log.info("[%s] learned best test hour: %02d:00 local "
+                 "(count %d, avg %.3f L/h)",
+                 circuit, best_hr, counts[best_hr], avg)
         return best_hr
 
     def is_running(self, circuit: str) -> bool:
@@ -249,9 +245,16 @@ class LeakTestScheduler:
             t = asyncio.create_task(_run_guarded())
             self._pending_scheduled.add(t)
             t.add_done_callback(self._pending_scheduled.discard)
-            await self._update_next_run(circuit, schedule)
+            # next_run_at is advanced here, immediately after dispatch —
+            # not after completion. A failed background start (rare) will
+            # still consume the slot. after_trigger=True prevents auto-
+            # learn from scheduling another run today if it picked a
+            # later hour. TODO: track dispatched vs completed if the
+            # consumed-slot edge case becomes a real problem.
+            await self._update_next_run(circuit, schedule, after_trigger=True)
 
-    async def _update_next_run(self, circuit: str, schedule: Any) -> None:
+    async def _update_next_run(self, circuit: str, schedule: Any,
+                               *, after_trigger: bool = False) -> None:
         """
         Compute and store the next run timestamp.
 
@@ -290,7 +293,7 @@ class LeakTestScheduler:
                     schedule = dict(schedule)
                     schedule["run_hour"] = best_hour
 
-        next_run = self._compute_next_run(schedule)
+        next_run = self._compute_next_run(schedule, after_trigger=after_trigger)
         if next_run:
             upsert_leak_test_schedule(self._db, circuit,
                                       next_run_at=next_run.isoformat())
@@ -458,6 +461,7 @@ class LeakTestScheduler:
 
     def _compute_next_run(
         self, schedule: Any, now: Optional[datetime] = None,
+        *, after_trigger: bool = False,
     ) -> Optional[datetime]:
         """Compute the next scheduled run datetime (returned in UTC).
 
@@ -465,6 +469,12 @@ class LeakTestScheduler:
         for naive values.  Defaults to ``datetime.now(self._ha_tz)``.
         The candidate is built in local (HA) time and converted to UTC so
         that ``run_hour=2`` always means 2 AM local, not 2 AM UTC.
+
+        ``after_trigger`` is set by ``_check_schedule`` immediately after
+        dispatching a test, so auto-learn moving ``run_hour`` to a later
+        time today can't schedule a second test on the same day. It only
+        affects the daily branch; weekly/fortnightly/monthly already have
+        ≥7-day natural gaps.
         """
         if now is None:
             now = datetime.now(self._ha_tz)
@@ -480,6 +490,8 @@ class LeakTestScheduler:
             candidate = now_local.replace(hour=run_hour, minute=run_minute,
                                           second=0, microsecond=0)
             if candidate <= now_local:
+                candidate += timedelta(days=1)
+            if after_trigger and candidate - now_local < timedelta(hours=18):
                 candidate += timedelta(days=1)
             return candidate.astimezone(timezone.utc)
 

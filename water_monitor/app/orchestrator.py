@@ -376,6 +376,15 @@ class Orchestrator:
             self._cfg, self._db, self._ha, self._alert_manager,
             ha_tz=self._ha_tz)
 
+        # Recompute every enabled leak-test schedule on startup so that
+        # stale next_run_at values (from prior bad scheduler state,
+        # timezone changes, or the same-day-duplicate bug) are corrected
+        # before the scheduler task starts polling.
+        try:
+            await self._recompute_leak_test_schedules()
+        except Exception as e:
+            log.warning("Leak-test schedule recompute failed (non-fatal): %s", e)
+
         # Historical importer — backfills missed events and runs periodic catch-up.
         # Pass `self` so the importer can consult the live EventDetector and skip
         # candidate periods that overlap a currently-active event (C0 guard).
@@ -682,6 +691,58 @@ class Orchestrator:
                 self._db.commit()
                 log.info("[%s] volume baseline set for %s: %.2f L",
                          circuit, label, midnight_val)
+
+    async def _recompute_leak_test_schedules(self) -> None:
+        """Recompute next_run_at for every enabled leak-test schedule.
+
+        Called once on startup so stale next_run_at values — from prior
+        bad scheduler state, timezone changes, or the auto-learn same-
+        day-duplicate bug — are corrected before the scheduler task
+        starts polling. Unconditional by design: the cost (one
+        learn_best_hour pass per circuit) is small and the upside
+        (deterministic, predictable next-run after boot) is worth it.
+
+        Invalid or unparsable existing values are logged and overwritten;
+        naive datetimes are treated as UTC for the diff log.
+        """
+        from .database import get_leak_test_schedule
+
+        for circuit_cfg in self._cfg.circuits:
+            circuit = circuit_cfg.circuit
+            try:
+                schedule = get_leak_test_schedule(self._db, circuit)
+            except Exception as e:
+                log.warning("[%s] could not read leak_test_schedule: %s",
+                            circuit, e)
+                continue
+            if not schedule or not schedule["enabled"]:
+                continue
+
+            prior_str = schedule["next_run_at"]
+            prior_dt: Optional[datetime] = None
+            if prior_str:
+                try:
+                    prior_dt = datetime.fromisoformat(
+                        prior_str.replace("Z", "+00:00"))
+                    if prior_dt.tzinfo is None:
+                        prior_dt = prior_dt.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    log.warning("[%s] unparsable next_run_at %r — recomputing",
+                                circuit, prior_str)
+
+            try:
+                await self._leak_test_scheduler._update_next_run(
+                    circuit, schedule)
+            except Exception as e:
+                log.warning("[%s] startup next-run recompute failed: %s",
+                            circuit, e)
+                continue
+
+            new_row = get_leak_test_schedule(self._db, circuit)
+            new_str = new_row["next_run_at"] if new_row else None
+            if new_str and new_str != prior_str:
+                log.info("[%s] startup recompute: next_run_at %s → %s",
+                         circuit, prior_str or "(none)", new_str)
 
     async def _fetch_live_state(self, circuit: str) -> Dict[str, Any]:
         circuit_cfg = self._cfg.get_circuit(circuit)
