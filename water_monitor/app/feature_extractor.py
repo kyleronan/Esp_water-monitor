@@ -222,6 +222,20 @@ VOLUME_ENVELOPE_WINDOW_S     = 5.0
 FIXTURE_CYCLE_PERIOD_MAX_S   = 30.0
 MAX_WAVEFORM_BINS            = 1000
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Pressure-restoration phantom guard (added 2026-05-28)
+#
+# City supply-pressure restoration or regulator hunting can hold the
+# paddlewheel above the flow threshold for many minutes while almost no real
+# water is drawn — and crucially with NO fixture pressure load. These events
+# look "steady" so the degraded-supply detector does not catch them, yet they
+# inflate daily volume totals badly (one confirmed event was 287 gal of false
+# volume over 135 min). The fingerprint is a long duration combined with a
+# near-zero pressure drop. Circuit-agnostic — real zone irrigation produces a
+# genuine solenoid pressure drop (> 2 PSI) so it is not affected.
+_PHANTOM_MIN_DURATION_S: float = 1800.0   # 30 min
+_PHANTOM_MAX_DELTA_PSI:  float = 2.0
+
 
 def _finite_float_series(values) -> List[float]:
     """Strip None/NaN/inf; coerce to float at full precision.
@@ -565,6 +579,149 @@ def _evaluate_degraded_from_diag(diag: dict):
     return True, "pulsing_supply_confirmed"
 
 
+def _detect_pressure_restoration_phantom(duration_s, pressure_delta_psi) -> bool:
+    """True when an event's duration + near-zero pressure drop indicate a
+    city-pressure restoration or oscillation artifact, not real water use.
+
+    Calibrated from 3 confirmed phantom events (May 2026 export). Circuit-
+    agnostic — applies to fixture AND zone circuits (real zone irrigation
+    produces > 2 PSI solenoid drop, so it is not affected).
+
+    Bad inputs (None / non-numeric / NaN / inf) → False (treat as "not
+    phantom" so a parse error never zeroes a real event's volume). Negative
+    delta (shouldn't occur — pressure_delta_psi is clamped to >= 0 upstream —
+    but possible in imported/legacy rows) is INTENTIONALLY treated as phantom:
+    a `< 2.0` threshold includes negatives, consistent with 'no real load'.
+    """
+    try:
+        duration = float(duration_s)
+        delta = float(pressure_delta_psi)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(duration) or not math.isfinite(delta):
+        return False
+    return duration >= _PHANTOM_MIN_DURATION_S and delta < _PHANTOM_MAX_DELTA_PSI
+
+
+def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
+    """Scan all events for the phantom fingerprint; zero their volume
+    contributions and flag them.
+
+    Mirrors reprocess_degraded_supply_verdicts(): for each matching unflagged
+    event, set is_pressure_restoration_phantom=1, zero volume_litres_effective,
+    mark excluded_from_training, and reverse any prior hourly_volume
+    contribution so daily totals shed the false volume.
+
+    Idempotent — already-flagged events are excluded by the WHERE clause and
+    their bookkeeping is zeroed, so a second call neither re-selects nor
+    re-subtracts.
+
+    Migration-safe — depends on nothing beyond a sqlite3.Connection and the
+    is_pressure_restoration_phantom column. Called from the 20260532 migration
+    immediately after the column is added, before any app/orchestrator state
+    exists.
+
+    Derived-stats notes:
+      • Volume aggregates — hourly_volume and daily_summary.total_volume_litres
+        — are both corrected here (hourly_volume via the reversal INSERT,
+        daily_summary via a recompute of each affected day). Both now read
+        volume_litres_effective, which is zeroed for phantoms.
+      • fixture_type_signatures: upsert_fixture_signature already excludes
+        excluded_from_training=1 rows, so flagged phantoms can never pollute a
+        signature centroid; no rebuild needed.
+      • Cluster centroids: maintained as an incremental running mean. NEW
+        phantoms are gated out of match_and_learn by excluded_from_training
+        before they ever reach the clusterer, so they never contribute. Any
+        pre-existing phantom already folded into a centroid is left in place —
+        cluster_id is intentionally NOT nulled (preserving existing
+        assignments), and the residual influence of at most a handful of
+        extreme outliers is negligible and not worth a full retrain. This is a
+        deliberate scope decision, not an oversight.
+
+    Returns {"flagged": N}.
+    """
+    from .database import transaction, compute_daily_summary
+
+    rows = conn.execute(
+        "SELECT id, circuit, start_ts, duration_seconds, pressure_delta_psi, "
+        "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
+        "FROM events "
+        "WHERE duration_seconds >= ? "
+        "  AND pressure_delta_psi < ? "
+        "  AND (is_pressure_restoration_phantom = 0 "
+        "       OR is_pressure_restoration_phantom IS NULL)",
+        (_PHANTOM_MIN_DURATION_S, _PHANTOM_MAX_DELTA_PSI),
+    ).fetchall()
+
+    flagged = 0
+    affected_days: set = set()   # (circuit, 'YYYY-MM-DD') to recompute
+    for row in rows:
+        # Re-run the canonical detector rather than trusting the SQL filter
+        # alone — keeps the threshold logic in one place and guards bad data.
+        if not _detect_pressure_restoration_phantom(
+            row["duration_seconds"], row["pressure_delta_psi"]
+        ):
+            continue
+
+        prev_applied = float(row["hourly_volume_applied_litres"] or 0.0)
+        prev_bucket = row["hourly_volume_applied_bucket"]
+
+        with transaction(conn):
+            conn.execute(
+                "UPDATE events SET "
+                "  is_pressure_restoration_phantom = 1, "
+                "  volume_litres_effective = 0, "
+                "  volume_estimation_method = 'pressure_restoration_phantom', "
+                "  excluded_from_training = 1, "
+                "  match_rejection_reason = 'pressure_restoration_phantom' "
+                "WHERE id = ?",
+                (row["id"],),
+            )
+            # Reverse the prior hourly_volume contribution ONLY when there is
+            # one recorded — skip cleanly on NULL/0 bookkeeping (no reversal
+            # row, no crash).
+            if prev_bucket and prev_applied != 0:
+                conn.execute(
+                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT (circuit, hour_ts) "
+                    "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
+                    (row["circuit"], prev_bucket, -prev_applied),
+                )
+            conn.execute(
+                "UPDATE events SET "
+                "  hourly_volume_applied_litres = 0, "
+                "  hourly_volume_applied_bucket = NULL "
+                "WHERE id = ?",
+                (row["id"],),
+            )
+
+        flagged += 1
+        day = (row["start_ts"] or "")[:10]   # UTC date portion of ISO ts
+        if day:
+            affected_days.add((row["circuit"], day))
+        log.info(
+            "phantom-reprocess: event %s flagged (duration=%.0fs ΔP=%.2f); "
+            "reversed %.3f L from hourly bucket %s",
+            row["id"], row["duration_seconds"] or 0.0,
+            row["pressure_delta_psi"] or 0.0, prev_applied, prev_bucket,
+        )
+
+    # Recompute the daily_summary for every affected day so the History
+    # charts/totals shed the false volume immediately (compute_daily_summary
+    # now reads volume_litres_effective, which we just zeroed). hourly_volume
+    # was already corrected by the per-event reversal above.
+    for circ, day in affected_days:
+        compute_daily_summary(conn, circ, day)
+    if affected_days:
+        conn.commit()
+
+    if flagged:
+        log.info("phantom-reprocess: flagged %d event(s) total across %d day(s)",
+                 flagged, len(affected_days))
+    return {"flagged": flagged}
+
+
 def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
     """Re-apply current degraded-supply gates to all events with stored diagnostics.
 
@@ -592,7 +749,10 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
         "       hourly_volume_applied_bucket, is_composite "
         "FROM events "
         "WHERE degraded_diagnostic_json IS NOT NULL "
-        "  AND degraded_diagnostic_json != ''"
+        "  AND degraded_diagnostic_json != '' "
+        # Phantom takes precedence over degraded: never let a degraded
+        # re-verdict un-zero a pressure-restoration phantom's volume.
+        "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0"
     ).fetchall()
 
     skipped_legacy_row = conn.execute(
@@ -1407,6 +1567,17 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         volume_litres_effective = volume_litres
         volume_estimation_method = "raw"
 
+    # ── Pressure-restoration phantom guard ────────────────────────────────
+    # A long event with a near-zero pressure drop is a city-pressure
+    # restoration / regulator-hunting artifact, not real water use. These
+    # look "steady" so the degraded detector misses them. Phantom takes
+    # precedence over degraded: zero the effective volume outright (not the
+    # envelope estimate) so it contributes nothing to daily totals.
+    is_phantom = _detect_pressure_restoration_phantom(duration, pressure_delta_psi)
+    if is_phantom:
+        volume_litres_effective = 0.0
+        volume_estimation_method = "pressure_restoration_phantom"
+
     # Time features
     ts = event.start_ts
     hour = ts.hour
@@ -1476,18 +1647,21 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         ),
         # Excluded from cluster training when:
         #   - composite event (multiple fixtures concurrent), OR
-        #   - degraded by supply pulsation (chaotic flow readings)
+        #   - degraded by supply pulsation (chaotic flow readings), OR
+        #   - pressure-restoration phantom (fake long event, no real flow)
         # Note: clustering exclusion is NOT the same as volume exclusion;
-        # the volume_litres_effective field still contributes to daily totals.
-        "excluded_from_training": 1 if (event.is_composite or is_degraded) else 0,
-        # match_rejection_reason: 'pulsing_supply' on degraded events, BUT
-        # only if no other exclusion reason was set first (composite events
-        # keep their authoritative reason). The cluster-engine reason values
-        # ('no_centers', 'features_missing', etc.) are written separately by
-        # match_and_learn; this field carries the *upstream* reason set by
-        # feature extraction.
+        # the volume_litres_effective field still contributes to daily totals
+        # (except phantoms, whose effective volume is forced to 0 above).
+        "excluded_from_training": 1 if (event.is_composite or is_degraded or is_phantom) else 0,
+        # match_rejection_reason: phantom takes precedence, then 'pulsing_supply'
+        # on degraded events, BUT only if no other exclusion reason was set
+        # first (composite events keep their authoritative reason). The
+        # cluster-engine reason values ('no_centers', 'features_missing', etc.)
+        # are written separately by match_and_learn; this field carries the
+        # *upstream* reason set by feature extraction.
         "match_rejection_reason": (
-            "pulsing_supply" if (is_degraded and not event.is_composite)
+            "pressure_restoration_phantom" if is_phantom
+            else "pulsing_supply" if (is_degraded and not event.is_composite)
             else None
         ),
 
@@ -1497,6 +1671,9 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         "volume_litres_effective":     round(volume_litres_effective, 3),
         "volume_estimation_method":    volume_estimation_method,
         "degraded_diagnostic_json":    json.dumps(deg_diag, allow_nan=False),
+
+        # Pressure-restoration phantom guard (volume forced to 0 above)
+        "is_pressure_restoration_phantom": 1 if is_phantom else 0,
 
         # Flow shape features
         "flow_signature_json":    json.dumps(sig),

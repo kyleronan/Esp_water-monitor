@@ -739,6 +739,22 @@
               </select>
             </div>
           </div>
+          <div class="sett-toggle-row" style="margin-bottom:14px;padding-top:.75rem;border-top:1px solid var(--border)">
+            <div class="sett-toggle-info">
+              <span class="sett-toggle-label">Hide pressure-artifact events from History</span>
+              <span class="sett-toggle-desc">
+                Long "phantom" events caused by city-pressure restoration are
+                always removed from volume totals. Enable this to also hide them
+                from the History list. Off by default — they stay visible with a
+                👻 flag.
+              </span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" name="hide_pressure_artifact_events" value="1"
+                     {% if profile.hide_pressure_artifact_events %}checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
           <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
             <button type="submit" class="btn btn-primary btn-sm">Save</button>
             <button type="button" class="btn btn-secondary btn-sm"

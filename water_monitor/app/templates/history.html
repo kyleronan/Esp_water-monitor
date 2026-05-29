@@ -193,12 +193,13 @@
           <th>Fixture</th>
           {% if ch.events | selectattr('is_composite') | list %}<th title="Composite event">⚡</th>{% endif %}
           {% if ch.events | selectattr('degraded_supply') | list %}<th title="Degraded supply detected — volume estimated">〰</th>{% endif %}
+          {% if ch.events | selectattr('is_pressure_restoration_phantom') | list %}<th title="Pressure artifact — volume removed from totals">👻</th>{% endif %}
         </tr>
       </thead>
       <tbody>
         {% for e in ch.events %}
         {% set _fix_label = fixture_type_labels.get(e.user_fixture_type, '') if e.user_fixture_type else '' %}
-        <tr class="hist-event-row{% if e.is_composite %} hist-row-composite{% endif %}{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}"
+        <tr class="hist-event-row{% if e.is_composite %} hist-row-composite{% endif %}{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.is_pressure_restoration_phantom %} hist-row-phantom{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}"
             tabindex="0" role="button" aria-label="Event detail"
             data-event-id="{{ e.id }}"
             data-circuit="{{ ch.circuit }}"
@@ -220,6 +221,7 @@
             data-anomaly-type="{{ e.anomaly_type or '' }}"
             data-composite="{{ '1' if e.is_composite else '0' }}"
             data-degraded="{{ '1' if e.degraded_supply else '0' }}"
+            data-phantom="{{ '1' if e.is_pressure_restoration_phantom else '0' }}"
             data-volume-effective="{{ (e.volume_litres_effective * vol_factor)|round(vol_decimals) if e.volume_litres_effective is not none else '' }}"
             data-volume-method="{{ e.volume_estimation_method or 'raw' }}"
             data-degraded-diag="{{ e.degraded_diagnostic_json or '' }}"
@@ -246,7 +248,11 @@
               {% endif %}
             </div>
           </td>
-          <td class="hist-td hist-td-mono">{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else "—" }} {{ vol_unit if e.volume_litres is not none else '' }}</td>
+          {# Phantom rows show their effective (zeroed) volume so the list
+             doesn't display the fake reading; the raw value stays in the
+             event-detail modal, clearly labelled. Other rows are unchanged. #}
+          {% set _row_vol = e.volume_litres_effective if e.is_pressure_restoration_phantom else e.volume_litres %}
+          <td class="hist-td hist-td-mono">{{ (_row_vol * vol_factor)|round(vol_decimals) if _row_vol is not none else "—" }} {{ vol_unit if _row_vol is not none else '' }}</td>
           <td class="hist-td">
             {% if e.user_fixture_type %}
               <span class="pill pill-green" title="You assigned this">★ {{ fixture_type_labels.get(e.user_fixture_type, e.user_fixture_type | replace('_',' ') | title) }}</span>
@@ -265,6 +271,9 @@
           {% endif %}
           {% if ch.events | selectattr('degraded_supply') | list %}
           <td class="hist-td">{% if e.degraded_supply %}<span title="Degraded supply detected — volume estimated" aria-label="Degraded supply event">〰</span>{% endif %}</td>
+          {% endif %}
+          {% if ch.events | selectattr('is_pressure_restoration_phantom') | list %}
+          <td class="hist-td">{% if e.is_pressure_restoration_phantom %}<span title="Pressure artifact — volume removed from totals" aria-label="Pressure artifact event">👻</span>{% endif %}</td>
           {% endif %}
         </tr>
         {% endfor %}
@@ -332,6 +341,18 @@
         <dt>Flow autocorr</dt>     <dd id="emd-deg-fscore">—</dd>
         <dt>Harmonic</dt>          <dd id="emd-deg-harmonic">—</dd>
         <dt>Flow troughs</dt>      <dd id="emd-deg-troughs">—</dd>
+      </dl>
+    </section>
+    <section id="emd-phantom-section" class="evt-modal-degraded" hidden
+             aria-label="Pressure-restoration artifact">
+      <h4 class="evt-modal-degraded-title">Pressure-restoration artifact</h4>
+      <p>This event matched the long-duration, near-zero-pressure-drop
+         signature of a city-pressure restoration or regulator oscillation —
+         not real water use. Its volume has been removed from all totals.</p>
+      <dl class="evt-modal-dl evt-modal-dl-extra">
+        <dt>Duration</dt>          <dd id="emd-ph-duration">—</dd>
+        <dt>ΔP</dt>                <dd id="emd-ph-dp">—</dd>
+        <dt>Raw sensor volume</dt> <dd id="emd-ph-rawvol">—</dd>
       </dl>
     </section>
     <hr class="evt-modal-hr">
@@ -650,6 +671,20 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       }
     } else {
       degSection.hidden = true;
+    }
+
+    // ── Pressure-restoration phantom ────────────────────────────────────
+    // Shown when the phantom guard flagged this event. Surfaces the two
+    // discriminating values plus the raw sensor volume that was discarded.
+    const phSection = document.getElementById('emd-phantom-section');
+    if (d.phantom === '1') {
+      document.getElementById('emd-ph-duration').textContent = d.duration || '—';
+      document.getElementById('emd-ph-dp').textContent =
+        (d.pressure && d.pressure !== '—') ? `${d.pressure} ${pressUnit}` : '—';
+      document.getElementById('emd-ph-rawvol').textContent = d.volume || '—';
+      phSection.hidden = false;
+    } else {
+      phSection.hidden = true;
     }
 
     errBox.hidden = true;

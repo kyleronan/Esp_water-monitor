@@ -666,9 +666,14 @@ async def units_update(request: Request):
         flow_key = "L/min"
     if pressure_key not in PRESSURE_OPTIONS:
         pressure_key = "psi"
+    # History display: hide pressure-restoration phantom events from the list.
+    # Display-only — never affects totals (phantom volume is zeroed at
+    # detection regardless of this flag).
+    hide_phantoms = 1 if form.get("hide_pressure_artifact_events") == "1" else 0
     orch.db.execute(
-        "UPDATE home_profile SET flow_unit=?, pressure_unit=? WHERE id=1",
-        (flow_key, pressure_key),
+        "UPDATE home_profile SET flow_unit=?, pressure_unit=?, "
+        "hide_pressure_artifact_events=? WHERE id=1",
+        (flow_key, pressure_key, hide_phantoms),
     )
     orch.db.commit()
     from ..units import invalidate_unit_cache

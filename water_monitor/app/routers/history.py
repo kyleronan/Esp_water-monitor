@@ -59,7 +59,12 @@ def _collect_circuit_history_sync(
     plain sqlite3 + dict assembly — no awaits.
     """
     from ..database import (get_recent_events, get_leak_test_history,
-                            get_daily_summaries)
+                            get_daily_summaries, get_home_profile)
+    # Read the hide-phantom display preference once (same for all circuits).
+    # Display-only: phantom volume is already zeroed at detection, so hiding
+    # never changes any total — it only removes rows from the History list.
+    _profile = get_home_profile(db)
+    hide_phantoms = bool(_profile and _profile["hide_pressure_artifact_events"])
     out: list[dict] = []
     for circuit_cfg in circuits:
         if filter_circuit and circuit_cfg.circuit != filter_circuit:
@@ -75,6 +80,10 @@ def _collect_circuit_history_sync(
         # the rendering machinery doesn't need to change.
         if filter_param == "degraded":
             events = [e for e in events if dict(e).get("degraded_supply")]
+        # Settings "Hide pressure-artifact events" toggle.
+        if hide_phantoms:
+            events = [e for e in events
+                      if not dict(e).get("is_pressure_restoration_phantom")]
         leak_tests = get_leak_test_history(db, circuit_cfg.circuit, limit=20)
         summaries  = get_daily_summaries(
             db, circuit_cfg.circuit,

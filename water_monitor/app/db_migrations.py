@@ -35,7 +35,11 @@ _BASELINE_VERSION: int = 20260523
 #   20260531 — Sprint D taxonomy consolidation: 23 → 8 fixture types;
 #              rewrites stored type strings in events, fixtures,
 #              fixture_clusters, and clears fixture_type_signatures
-_CURRENT_VERSION: int = 20260531
+#   20260532 — Sprint E pressure-restoration phantom guard:
+#              events.is_pressure_restoration_phantom +
+#              home_profile.hide_pressure_artifact_events columns; one-shot
+#              reprocess zeros phantom volume + reverses hourly_volume
+_CURRENT_VERSION: int = 20260532
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -326,6 +330,47 @@ def _apply_fixture_taxonomy_consolidation(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_phantom_event_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260532 — Sprint E phantom guard.
+
+    Adds two columns:
+      1. ``events.is_pressure_restoration_phantom`` — flags events matching
+         the long-duration + near-zero-pressure-drop fingerprint of a city-
+         pressure-restoration artifact.
+      2. ``home_profile.hide_pressure_artifact_events`` — backs the Settings
+         toggle that hides flagged events from the History list.
+
+    After the column adds, runs ``reprocess_pressure_restoration_phantoms``
+    to retroactively flag existing events and reverse their hourly_volume
+    contributions so historical daily totals shed the false volume.
+
+    Idempotent — both column adds are guarded by ``_has_column``; the
+    reprocess helper skips already-flagged events.
+    """
+    if not _has_column(conn, "events", "is_pressure_restoration_phantom"):
+        conn.execute(
+            "ALTER TABLE events "
+            "ADD COLUMN is_pressure_restoration_phantom INTEGER DEFAULT 0"
+        )
+        log.info("Added events.is_pressure_restoration_phantom (default 0)")
+    if not _has_column(conn, "home_profile", "hide_pressure_artifact_events"):
+        conn.execute(
+            "ALTER TABLE home_profile "
+            "ADD COLUMN hide_pressure_artifact_events INTEGER NOT NULL DEFAULT 0"
+        )
+        log.info("Added home_profile.hide_pressure_artifact_events (default 0)")
+    conn.commit()
+
+    # Lazy import — keeps this module importable without feature_extractor
+    # side effects during test collection.
+    from .feature_extractor import reprocess_pressure_restoration_phantoms
+    result = reprocess_pressure_restoration_phantoms(conn)
+    log.info(
+        "Migration 20260532: phantom guard ready; flagged %d existing event(s)",
+        result.get("flagged", 0),
+    )
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -497,6 +542,17 @@ def _missing_signature_matcher_columns(conn: sqlite3.Connection) -> set[str]:
     }
 
 
+# Column added by the 20260532 phantom-guard migration (Sprint E) on events.
+_PHANTOM_COLUMNS: frozenset = frozenset({"is_pressure_restoration_phantom"})
+
+
+def _missing_phantom_columns(conn: sqlite3.Connection) -> set[str]:
+    return {
+        col for col in _PHANTOM_COLUMNS
+        if not _has_column(conn, "events", col)
+    }
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -593,6 +649,7 @@ def _run_migrations_impl(
             | _missing_orphan_repair_columns(conn)
             | _missing_suggestion_source_columns(conn)
             | _missing_signature_matcher_columns(conn)
+            | _missing_phantom_columns(conn)
         )
         if missing:
             raise RuntimeError(
@@ -603,10 +660,19 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260531:
+        # DB has the taxonomy consolidation but lacks the phantom guard
+        # columns + retroactive reprocess.
+        _apply_phantom_event_column(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260530:
         # DB has signature-matcher infrastructure but hasn't had the taxonomy
-        # consolidation applied yet.
+        # consolidation or phantom guard applied yet.
         _apply_fixture_taxonomy_consolidation(conn)
+        _apply_phantom_event_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -635,6 +701,8 @@ def _run_migrations_impl(
         _apply_signature_matcher(conn)
         # Forward step 8: taxonomy consolidation (23 → 8 types).
         _apply_fixture_taxonomy_consolidation(conn)
+        # Forward step 9: phantom guard columns + reprocess.
+        _apply_phantom_event_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -647,6 +715,7 @@ def _run_migrations_impl(
         _apply_suggestion_source_column(conn)
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
+        _apply_phantom_event_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -660,6 +729,7 @@ def _run_migrations_impl(
         _apply_suggestion_source_column(conn)
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
+        _apply_phantom_event_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -672,6 +742,7 @@ def _run_migrations_impl(
         _apply_suggestion_source_column(conn)
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
+        _apply_phantom_event_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -683,6 +754,7 @@ def _run_migrations_impl(
         _apply_suggestion_source_column(conn)
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
+        _apply_phantom_event_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -692,6 +764,7 @@ def _run_migrations_impl(
         _apply_suggestion_source_column(conn)
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
+        _apply_phantom_event_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -701,6 +774,7 @@ def _run_migrations_impl(
         # infrastructure (table + matched_fixture_type column).
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
+        _apply_phantom_event_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -742,6 +816,9 @@ def _run_migrations_impl(
         _apply_signature_matcher(conn)
         # Taxonomy consolidation is a data-only pass; no-op on empty DBs.
         _apply_fixture_taxonomy_consolidation(conn)
+        # Phantom guard — columns guarded by _has_column; reprocess scan
+        # finds nothing on an empty DB.
+        _apply_phantom_event_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

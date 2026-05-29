@@ -319,7 +319,9 @@ class DataPruner:
                     SELECT circuit, fixture_id,
                            date(start_ts)    AS day,
                            COUNT(*)          AS event_count,
-                           COALESCE(SUM(volume_litres), 0) AS total_volume_litres,
+                           COALESCE(SUM(COALESCE(volume_litres_effective,
+                                                 volume_litres, 0)), 0)
+                                             AS total_volume_litres,
                            AVG(avg_flow_lpm)               AS avg_flow_lpm,
                            MAX(peak_flow_lpm)              AS peak_flow_lpm
                     FROM events

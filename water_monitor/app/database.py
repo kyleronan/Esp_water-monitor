@@ -137,6 +137,11 @@ CREATE TABLE IF NOT EXISTS home_profile (
     ha_home_state           TEXT DEFAULT 'home',
     -- MQTT publishing toggle (Phase 2.1)
     mqtt_publish_enabled    INTEGER NOT NULL DEFAULT 0,
+    -- History display: hide pressure-restoration phantom events from the
+    -- History list (Sprint E). Off by default — phantoms are shown with a
+    -- flag. This is display-only; it never affects volume totals (phantom
+    -- volume is always zeroed at detection regardless of this toggle).
+    hide_pressure_artifact_events  INTEGER NOT NULL DEFAULT 0,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -509,7 +514,13 @@ CREATE TABLE IF NOT EXISTS events (
     -- Independent of cluster_id — a single event can have cluster_id
     -- set AND matched_fixture_type set if the cluster matched but the
     -- signature gave a more specific type guess.
-    matched_fixture_type             TEXT
+    matched_fixture_type             TEXT,
+    -- Pressure-restoration phantom guard (migration 20260532). When 1, this
+    -- event matched the long-duration + near-zero-pressure-drop fingerprint
+    -- of a city-pressure-restoration artifact. Its volume_litres_effective is
+    -- forced to 0 and it is excluded_from_training. Shown in History with a
+    -- flag; volume contributes nothing to totals.
+    is_pressure_restoration_phantom  INTEGER DEFAULT 0
 );
 
 -- NOTE: the partial index on (circuit, start_ts) WHERE degraded_supply = 1
@@ -820,10 +831,15 @@ def compute_daily_summary(conn: sqlite3.Connection,
     day format: 'YYYY-MM-DD'.
     Returns the summary dict, or None if no events that day.
     """
+    # Volume uses volume_litres_effective (falling back to raw) so degraded-
+    # supply estimates and zeroed pressure-restoration phantoms are reflected
+    # here exactly as they are in hourly_volume. Keeps the History charts /
+    # daily totals consistent with the dashboard cards.
     rows = conn.execute("""
         SELECT
             COUNT(*)                    AS event_count,
-            SUM(volume_litres)          AS total_volume_litres,
+            SUM(COALESCE(volume_litres_effective, volume_litres, 0))
+                                        AS total_volume_litres,
             AVG(avg_flow_lpm)           AS avg_flow_lpm,
             MAX(peak_flow_lpm)          AS peak_flow_lpm,
             AVG(pre_event_pressure_psi) AS avg_pressure_psi,

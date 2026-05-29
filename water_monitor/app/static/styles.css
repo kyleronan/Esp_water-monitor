@@ -37,6 +37,7 @@
   --red:            oklch(55% 0.22 25);
   --red-bg:         oklch(96% 0.05 25);
   --red-text:       oklch(35% 0.16 25);
+  --violet-bg:      oklch(95% 0.04 300);
   --red-border:     oklch(82% 0.12 25);
   --accent-border:  oklch(82% 0.10 240);
   --accent-text:    oklch(35% 0.14 240);
@@ -95,6 +96,7 @@
     --red:            oklch(68% 0.22 25);
     --red-bg:         oklch(28% 0.08 25);
     --red-text:       oklch(85% 0.16 25);
+    --violet-bg:      oklch(28% 0.06 300);
     --red-border:     oklch(45% 0.14 25);
 
     /* Shadows — stronger blacks read better on dark surfaces */
@@ -1409,6 +1411,7 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .hist-row-fail { background: var(--red-bg); }
 .hist-row-composite { background: var(--accent-bg); }
 .hist-row-degraded  { background: var(--amber-bg); }
+.hist-row-phantom   { background: var(--violet-bg); }
 
 .hist-filter-banner {
   display: flex; align-items: center; justify-content: space-between;
