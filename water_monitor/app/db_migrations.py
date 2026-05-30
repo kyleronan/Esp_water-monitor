@@ -39,7 +39,11 @@ _BASELINE_VERSION: int = 20260523
 #              events.is_pressure_restoration_phantom +
 #              home_profile.hide_pressure_artifact_events columns; one-shot
 #              reprocess zeros phantom volume + reverses hourly_volume
-_CURRENT_VERSION: int = 20260532
+#   20260533 — Sprint F per-category Fixtures rollup: new category_publish
+#              table (per-(circuit, fixture_type) HA publish gate). Seeded
+#              from MIN(fixtures.publish_to_ha) so any existing off
+#              preference carries over to the new category-level gate.
+_CURRENT_VERSION: int = 20260533
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -371,6 +375,53 @@ def _apply_phantom_event_column(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_category_publish_table(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260533 — Sprint F category rollup.
+
+    Creates the ``category_publish`` table (per-(circuit, fixture_type) HA
+    publish gate) and seeds it from existing confirmed fixtures so any
+    previously-disabled HA entity stays disabled under the new model.
+
+    Seeding rule: ``publish_to_ha = MIN(fixtures.publish_to_ha)`` across each
+    (circuit, fixture_type). MIN, not MAX, so if the user previously
+    silenced ANY fixture in a category, the new category gate starts off —
+    we never surprise-republish an HA entity the user had disabled.
+
+    Idempotent — CREATE IF NOT EXISTS guards the table; INSERT OR IGNORE
+    guards the seed (subsequent runs leave existing rows alone).
+    """
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS category_publish (
+            circuit         TEXT NOT NULL,
+            fixture_type    TEXT NOT NULL,
+            publish_to_ha   INTEGER NOT NULL DEFAULT 1,
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (circuit, fixture_type)
+        )"""
+    )
+    conn.commit()
+
+    # Seed from confirmed fixtures' per-fixture publish flags. MIN preserves
+    # any explicit user "off" preference at the category level.
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO category_publish "
+        "  (circuit, fixture_type, publish_to_ha) "
+        "SELECT circuit, fixture_type, COALESCE(MIN(publish_to_ha), 1) "
+        "FROM fixtures "
+        "WHERE confirmed = 1 "
+        "  AND fixture_type IS NOT NULL "
+        "  AND fixture_type != '' "
+        "GROUP BY circuit, fixture_type"
+    )
+    seeded = cur.rowcount
+    conn.commit()
+    log.info(
+        "Migration 20260533: category_publish table ready; seeded %d "
+        "(circuit, fixture_type) row(s) from existing fixtures.publish_to_ha (MIN)",
+        seeded,
+    )
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -553,6 +604,17 @@ def _missing_phantom_columns(conn: sqlite3.Connection) -> set[str]:
     }
 
 
+# Table added by the 20260533 category-publish migration (Sprint F).
+# A "missing column" here is actually a missing TABLE check — the verifier
+# treats the table's absence as a single missing-column-equivalent entry.
+def _missing_category_publish_columns(conn: sqlite3.Connection) -> set[str]:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'category_publish'"
+    ).fetchone()
+    return set() if row else {"category_publish"}
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -650,6 +712,7 @@ def _run_migrations_impl(
             | _missing_suggestion_source_columns(conn)
             | _missing_signature_matcher_columns(conn)
             | _missing_phantom_columns(conn)
+            | _missing_category_publish_columns(conn)
         )
         if missing:
             raise RuntimeError(
@@ -660,19 +723,28 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260532:
+        # DB has the phantom guard but lacks the category_publish table.
+        _apply_category_publish_table(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260531:
-        # DB has the taxonomy consolidation but lacks the phantom guard
-        # columns + retroactive reprocess.
+        # DB has the taxonomy consolidation but lacks the phantom guard +
+        # category_publish.
         _apply_phantom_event_column(conn)
+        _apply_category_publish_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
 
     if version == 20260530:
         # DB has signature-matcher infrastructure but hasn't had the taxonomy
-        # consolidation or phantom guard applied yet.
+        # consolidation, phantom guard, or category_publish applied yet.
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
+        _apply_category_publish_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -703,6 +775,8 @@ def _run_migrations_impl(
         _apply_fixture_taxonomy_consolidation(conn)
         # Forward step 9: phantom guard columns + reprocess.
         _apply_phantom_event_column(conn)
+        # Forward step 10: category_publish table + seed.
+        _apply_category_publish_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -716,6 +790,7 @@ def _run_migrations_impl(
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
+        _apply_category_publish_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -730,6 +805,7 @@ def _run_migrations_impl(
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
+        _apply_category_publish_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -743,6 +819,7 @@ def _run_migrations_impl(
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
+        _apply_category_publish_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -755,6 +832,7 @@ def _run_migrations_impl(
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
+        _apply_category_publish_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -765,6 +843,7 @@ def _run_migrations_impl(
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
+        _apply_category_publish_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -775,6 +854,7 @@ def _run_migrations_impl(
         _apply_signature_matcher(conn)
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
+        _apply_category_publish_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -819,6 +899,9 @@ def _run_migrations_impl(
         # Phantom guard — columns guarded by _has_column; reprocess scan
         # finds nothing on an empty DB.
         _apply_phantom_event_column(conn)
+        # Category publish table — CREATE IF NOT EXISTS, seed pulls from
+        # empty fixtures table on a fresh DB so no rows are inserted.
+        _apply_category_publish_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

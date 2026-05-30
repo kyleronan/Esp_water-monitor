@@ -36,92 +36,202 @@ def _valid_circuit(circuit: str, request: Request) -> str:
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def fixtures_page(request: Request, preview: bool = False):
+    """Sprint F: per-category rollup (one card per fixture type per circuit).
+
+    The clustering engine continues to produce micro-clusters underneath; this
+    page is a pure view-layer rollup that buckets events by their effective
+    type via fixtures.normalize_fixture_type_for_circuit. Correction of
+    mis-bucketed events happens on the History page (Sprint B feedback loop).
+    """
     orch = _orch(request)
-    from ..database import get_clusters_with_fixtures, get_all_cluster_stats
-    from ..fixtures import (FIXTURE_TYPE_LABELS, user_selectable_types,
-                            zone_user_selectable_types, fixture_user_selectable_types)
+    from ..database import (get_active_exclusion_window, get_category_rollup,
+                            get_category_publish_map, get_orphaned_fixtures)
+    from ..fixtures import (FIXTURE_TYPE_LABELS,
+                            fixture_user_selectable_types,
+                            normalize_fixture_type_for_circuit,
+                            zone_user_selectable_types)
+
+    # Icon map — keep aligned with main.py:_FX_ICONS and the post-Sprint-D
+    # canonical type set. (Duplicated rather than imported to keep main.py's
+    # internal _FX_ICONS private; both are tiny dicts that share semantics.)
+    fx_icons = {
+        "toilet":          "\U0001F6BD",
+        "shower_tub":      "\U0001F6BF",
+        "tap":             "\U0001F6B0",
+        "washing_machine": "\U0001F455",
+        "dishwasher":      "\U0001F37D",
+        "irrigation_zone": "\U0001F4A7",
+        "other":           "❓",
+    }
+
+    # Local-midnight UTC anchor — same helper the dashboard uses for
+    # get_daily_volume so the "today" boundary matches across pages.
+    midnight_utc = orch._local_midnight_utc(days_ago=0)
 
     circuits_ctx = []
-    total_unreviewed = 0
-    circuit_type_selectable = {}
-
-    from ..database import (get_active_exclusion_window, get_orphaned_fixtures,
-                             get_fixture_type_signatures)
     for circ_cfg in orch._cfg.circuits:
         c = circ_cfg.circuit
+        circuit_kind = "zone" if circ_cfg.circuit_type == "zone" else "fixture"
+        allowed = (zone_user_selectable_types() if circuit_kind == "zone"
+                   else fixture_user_selectable_types())
+
         training = (
             orch.training_manager.get_training_info(c)
             if orch.training_manager
             else {"state": "idle"}
         )
-        clusters_raw = get_clusters_with_fixtures(orch.db, c)
-        all_stats = get_all_cluster_stats(orch.db, c)
-        clusters = [{**cl, **all_stats.get(cl["id"], {})} for cl in clusters_raw]
-
         state = training.get("state", "idle")
-        unreviewed = sum(1 for cl in clusters if not cl.get("fixture_id"))
-        # Only count clusters from circuits whose grid is actually rendered.
-        # Circuits in idle/calibrating states show a "Still calibrating" stub
-        # instead of the cluster grid, so counting their clusters in the
-        # review banner produces a contradiction ("7 need review" with
-        # nothing visible to review below).  Labelling and live circuits
-        # both render the grid and so do contribute to the count.
-        if state not in ("idle", "calibrating"):
-            total_unreviewed += unreviewed
 
-        # Sprint A — fixtures the migration flagged as orphaned (confirmed
-        # but with no cluster pointing back). The template renders a relink
-        # affordance per orphan; eligible cluster IDs are the unconfirmed
-        # clusters on the same circuit (anything with fixture_id NULL).
-        orphaned_fixtures = get_orphaned_fixtures(orch.db, c)
-        relink_candidate_clusters = [
-            {"id": cl["id"],
-             "member_count": cl.get("member_count") or 0,
-             "suggested_type": cl.get("suggested_type")}
-            for cl in clusters
-            if not cl.get("fixture_id")
-        ]
+        # Seed an empty canonical map — every allowed category gets a card,
+        # even with zero events, so the user sees the full set on day one.
+        categories = {
+            t: {
+                "type":                 t,
+                "label":                FIXTURE_TYPE_LABELS.get(t, t.replace("_", " ").title()),
+                "icon":                 fx_icons.get(t, "❓"),
+                "today_volume_l":       0.0,
+                "today_event_count":    0,
+                "lifetime_volume_l":    0.0,
+                "lifetime_event_count": 0,
+                "last_seen_at":         None,
+                "publish_to_ha":        True,    # default; overwritten from map
+            }
+            for t in allowed
+        }
 
-        # Sprint C — fixture_type signatures learned from user labels.
-        # Surfaces a "Learned from your labels" section so the user can
-        # see which types the matcher knows about and forget any built
-        # from mistaken labels.
-        type_signatures = get_fixture_type_signatures(orch.db, c)
+        # Pull rollup + publish gate map.
+        raw_rows = get_category_rollup(orch.db, c, midnight_utc)
+        publish_map = get_category_publish_map(orch.db, c)
+
+        # Merge SQL rows through the normalizer so legacy / wrong-kind types
+        # fold into 'other' rather than producing extra cards.
+        for row in raw_rows:
+            typ = normalize_fixture_type_for_circuit(row["eff_type"], circuit_kind)
+            bucket = categories[typ]   # guaranteed present by seed
+            bucket["lifetime_volume_l"]    += row["lifetime_volume_l"]
+            bucket["lifetime_event_count"] += row["lifetime_event_count"]
+            bucket["today_volume_l"]       += row["today_volume_l"]
+            bucket["today_event_count"]    += row["today_event_count"]
+            bucket["last_seen_at"] = _max_iso(bucket["last_seen_at"],
+                                              row["last_seen_at"])
+
+        # Per-category publish gate — missing rows default to True (publish on).
+        for typ, bucket in categories.items():
+            bucket["publish_to_ha"] = bool(publish_map.get(typ, True))
+
+        # Lifetime-desc order; empty cards last so the user sees real usage
+        # first.
+        ordered = sorted(
+            categories.values(),
+            key=lambda r: (r["lifetime_event_count"] == 0,
+                           -r["lifetime_volume_l"], r["label"]),
+        )
 
         circuits_ctx.append({
             "circuit":          c,
             "display_name":     circ_cfg.label,
             "training_state":   state,
-            "clusters":         clusters,
-            "unreviewed_count": unreviewed,
+            "categories":       ordered,
             "active_exclusion": get_active_exclusion_window(orch.db, c),
-            "orphaned_fixtures":          orphaned_fixtures,
-            "relink_candidate_clusters":  relink_candidate_clusters,
-            "type_signatures":            type_signatures,
+            # Sprint A banner — kept; the orphan-relink workflow lives on a
+            # different surface but the warning is still useful here.
+            "orphaned_fixtures": get_orphaned_fixtures(orch.db, c),
         })
 
-        if circ_cfg.circuit_type == "zone":
-            circuit_type_selectable[c] = zone_user_selectable_types()
-        else:
-            circuit_type_selectable[c] = fixture_user_selectable_types()
-
-    # Differentiates banner copy + CSS treatment so users in the labelling
-    # phase get a clearer call to action ("confirm then activate") than
-    # users in the live phase ("confirm or remove").
-    any_labelling = any(c["training_state"] == "labelling"
-                        for c in circuits_ctx)
-
     return _tmpl(request).TemplateResponse("fixtures.html", {
-        "request":                 request,
-        "page":                    "fixtures",
-        "circuits":                circuits_ctx,
-        "total_unreviewed":        total_unreviewed,
-        "any_labelling":           any_labelling,
-        "fixture_type_labels":     FIXTURE_TYPE_LABELS,
-        "user_selectable_types":   user_selectable_types(),
-        "circuit_type_selectable": circuit_type_selectable,
-        "preview":                 preview,
+        "request":             request,
+        "page":                "fixtures",
+        "circuits":            circuits_ctx,
+        "fixture_type_labels": FIXTURE_TYPE_LABELS,
+        "preview":             preview,
     })
+
+
+def _max_iso(a, b):
+    """Return the lexicographically-greater ISO timestamp, None-safe.
+
+    Both inputs may be None; this just folds across rows during the rollup
+    bucketing. events.start_ts is always written as UTC ISO with timezone
+    suffix by feature_extractor, so a lex compare suffices.
+    """
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a >= b else b
+
+
+# ── Sprint F: per-category publish toggle ────────────────────────────────────
+
+@router.post("/{circuit}/category/{fixture_type}/publish")
+async def category_publish_toggle(
+    fixture_type: str,
+    request: Request,
+    circuit: str = Depends(_valid_circuit),
+):
+    """Flip the HA-publish gate for one (circuit, fixture_type).
+
+    Validation, in order:
+      1. CSRF — enforced by the project-wide middleware (POST routes covered).
+      2. circuit exists — handled by the ``_valid_circuit`` dependency.
+      3. circuit_kind resolved from the configured circuit_type ('zone' vs
+         'fixture').
+      4. fixture_type allowed for that kind — rejects e.g. ``dishwasher`` on
+         a zone circuit or ``irrigation_zone`` on a fixture circuit.
+      5. Unchecked checkbox (form field absent) → publish_to_ha = 0.
+
+    On success: persist via ``set_category_publish`` (which also re-validates
+    defensively) and call ``fixture_publisher.publish_category`` /
+    ``retract_category`` so the HA entity flips immediately rather than
+    waiting for the next 60 s state tick.
+    """
+    from ..database import set_category_publish
+    from ..fixtures import (fixture_user_selectable_types,
+                            zone_user_selectable_types)
+
+    orch = _orch(request)
+    circ_cfg = next((c for c in orch._cfg.circuits if c.circuit == circuit), None)
+    if circ_cfg is None:
+        # Defence-in-depth — _valid_circuit already returned 404 for
+        # unknown circuits, but keep this branch obvious to a reader.
+        raise HTTPException(status_code=404, detail=f"Unknown circuit: {circuit!r}")
+    circuit_kind = "zone" if circ_cfg.circuit_type == "zone" else "fixture"
+    allowed = set(zone_user_selectable_types() if circuit_kind == "zone"
+                  else fixture_user_selectable_types())
+    if fixture_type not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"fixture_type {fixture_type!r} not allowed on "
+                    f"{circuit_kind} circuit {circuit!r}"),
+        )
+
+    form = await request.form()
+    publish_to_ha = 1 if form.get("publish_to_ha") == "1" else 0
+    set_category_publish(orch.db, circuit, fixture_type, publish_to_ha)
+
+    # Apply to the live HA broker immediately (no wait for the periodic tick).
+    fp = getattr(orch, "_fixture_publisher", None) or getattr(orch, "fixture_publisher", None)
+    if fp is not None:
+        try:
+            if publish_to_ha:
+                fp.publish_category(circuit, fixture_type)
+            else:
+                fp.retract_category(circuit, fixture_type)
+        except Exception as e:
+            # Don't fail the request if the publisher is offline — the DB
+            # state is what governs the next tick.
+            log.warning("category_publish_toggle: publisher call failed "
+                        "for %s/%s: %s", circuit, fixture_type, e)
+
+    return ingress_redirect(request, f"/fixtures#cat-{fixture_type}")
+
+
+# ── LEGACY per-cluster routes (kept registered but unlinked from the Sprint F
+#    template). Backend helpers they call (upsert_fixture_from_cluster,
+#    delete_cluster, merge_clusters, migrate_to_type_level_clusters,
+#    delete_fixture_signature) remain consumed by cluster_engine and tests;
+#    pruning these route handlers themselves is a future cleanup pass.
+# ────────────────────────────────────────────────────────────────────────────
 
 
 # ── Re-run clustering ─────────────────────────────────────────────────────────

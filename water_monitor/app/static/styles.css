@@ -2280,6 +2280,82 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   margin-bottom: 24px;
 }
 
+/* ── Sprint F: per-category rollup cards ───────────────────────────────── */
+.fx-page-intro {
+  font-size: 13px;
+  max-width: 720px;
+}
+.fx-cat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 16px;
+  margin-bottom: 28px;
+}
+.fx-cat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-shadow: var(--shadow);
+}
+.fx-cat-card.fx-cat-empty {
+  opacity: 0.55;
+}
+.fx-cat-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.fx-cat-icon { font-size: 22px; line-height: 1; }
+.fx-cat-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -.01em;
+  color: var(--text);
+}
+.fx-cat-totals {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fx-cat-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.fx-cat-stat .fx-num {
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.fx-cat-stat .fx-unit {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.fx-cat-stat small {
+  font-size: 11px;
+}
+.fx-cat-last-seen {
+  font-size: 11px;
+}
+.fx-cat-publish {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.fx-cat-publish-label {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
 /* Individual cluster card */
 .fx-cluster-card {
   background: var(--surface);

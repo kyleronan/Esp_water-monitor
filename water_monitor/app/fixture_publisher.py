@@ -30,7 +30,7 @@ import logging
 import os
 import re
 import sqlite3
-from typing import Dict, Optional, Set
+from typing import Dict, Optional
 
 log = logging.getLogger(__name__)
 
@@ -154,38 +154,61 @@ class FixturePublisher:
 
     def _categories_for_circuit(self, circuit: str) -> Dict[str, dict]:
         """Return {category: {label, circuit_label}} for categories that have
-        at least one confirmed publish_to_ha=1 fixture on this circuit.
+        any non-phantom events on this circuit AND are publish_to_ha=1 in the
+        category_publish table.
 
-        Also includes categories inferred from suggested_type on unconfirmed
-        clusters so that the publisher tracks all active usage, not just
-        user-confirmed fixtures.
+        Sprint F change: source of truth is now ``category_publish`` (per-
+        (circuit, fixture_type) gate), not per-fixture ``fixtures.publish_to_ha``.
+        Categories with no row in category_publish default to publish=True.
         """
-        from .fixtures import get_fixture_category, FIXTURE_CATEGORY_LABELS
+        from .database import get_category_publish_map
+        from .fixtures import (FIXTURE_CATEGORY_LABELS,
+                               fixture_user_selectable_types,
+                               normalize_fixture_type_for_circuit,
+                               zone_user_selectable_types)
 
         circ_label = circuit
+        circuit_kind = "fixture"
         for c in self._cfg.circuits:
             if c.circuit == circuit:
                 circ_label = getattr(c, "label", circuit)
+                if getattr(c, "circuit_type", None) == "zone":
+                    circuit_kind = "zone"
                 break
 
+        # Effective-type set present on the circuit (excluding phantoms),
+        # normalized into the canonical allowed-set for this circuit kind.
         rows = self._db.execute(
-            """SELECT COALESCE(f.fixture_type, fc.suggested_type) AS ftype
-               FROM fixture_clusters fc
-               LEFT JOIN fixtures f ON fc.fixture_id = f.id
-               WHERE fc.circuit = ?
-                 AND (f.publish_to_ha = 1 OR (f.publish_to_ha IS NULL AND fc.suggested_type IS NOT NULL))
-                 AND fc.member_count >= 5""",
+            """SELECT DISTINCT
+                 COALESCE(e.user_fixture_type, f.fixture_type, fc.suggested_type,
+                          e.matched_fixture_type, 'other') AS eff_type
+               FROM events e
+               LEFT JOIN fixtures f          ON e.fixture_id = f.id
+               LEFT JOIN fixture_clusters fc ON fc.circuit = e.circuit AND fc.id = e.cluster_id
+               WHERE e.circuit = ?
+                 AND COALESCE(e.is_pressure_restoration_phantom, 0) = 0""",
             (circuit,),
         ).fetchall()
 
+        allowed = set(zone_user_selectable_types() if circuit_kind == "zone"
+                      else fixture_user_selectable_types())
+        present_types = {
+            normalize_fixture_type_for_circuit(r["eff_type"], circuit_kind)
+            for r in rows
+        }
+        present_types &= allowed   # belt-and-braces; normalizer already enforces this
+
+        publish_map = get_category_publish_map(self._db, circuit)
         cats: Dict[str, dict] = {}
-        for r in rows:
-            cat = get_fixture_category(r["ftype"])
-            if cat and cat not in cats:
-                cats[cat] = {
-                    "label":         FIXTURE_CATEGORY_LABELS.get(cat, cat.replace("_", " ").title()),
-                    "circuit_label": circ_label,
-                }
+        for typ in present_types:
+            # Missing row → default ON (the documented contract for
+            # get_category_publish_map; pinned by a test).
+            if not publish_map.get(typ, True):
+                continue
+            cats[typ] = {
+                "label":         FIXTURE_CATEGORY_LABELS.get(typ, typ.replace("_", " ").title()),
+                "circuit_label": circ_label,
+            }
         return cats
 
     def _publish_category_discovery(self, circuit: str, category: str,
@@ -259,51 +282,48 @@ class FixturePublisher:
 
     # ── Public API ──────────────────────────────────────────────────────────────
 
-    def publish_fixture(self, fixture_id: str) -> None:
-        """Publish/update HA Discovery for the category this fixture belongs to."""
+    # ── Sprint F: category-level publish/retract (immediate flips) ────────────
+    #
+    # These are the entry points the new Fixtures POST route calls when the
+    # user toggles a category. They wrap the existing per-category Discovery
+    # machinery and bypass the once-per-60-s state-update tick so the HA
+    # entity flips right away.
+
+    def publish_category(self, circuit: str, fixture_type: str) -> None:
+        """Publish HA Discovery for one (circuit, fixture_type) now."""
         if not self._connected or not self._is_publishing_enabled():
             return
-        row = self._db.execute(
-            "SELECT * FROM fixtures WHERE id = ? AND publish_to_ha = 1",
-            (fixture_id,),
-        ).fetchone()
-        if not row:
-            return
-        from .fixtures import get_fixture_category, FIXTURE_CATEGORY_LABELS
-        category = get_fixture_category(row["fixture_type"])
-        if not category:
-            return
-        cat_label = FIXTURE_CATEGORY_LABELS.get(category, category.replace("_", " ").title())
-        self._publish_category_discovery(row["circuit"], category, cat_label)
+        from .fixtures import FIXTURE_CATEGORY_LABELS
+        label = FIXTURE_CATEGORY_LABELS.get(
+            fixture_type, fixture_type.replace("_", " ").title()
+        )
+        self._publish_category_discovery(circuit, fixture_type, label)
 
-    def retract_fixture(self, fixture_id: str) -> None:
-        """Retract the category HA entity only if no other fixtures remain in it."""
+    def retract_category(self, circuit: str, fixture_type: str) -> None:
+        """Retract HA Discovery for one (circuit, fixture_type) now."""
         if not self._connected:
             return
-        row = self._db.execute(
-            "SELECT * FROM fixtures WHERE id = ?", (fixture_id,)
-        ).fetchone()
-        if not row:
-            return
-        from .fixtures import get_fixture_category
-        category = get_fixture_category(row["fixture_type"])
-        if not category:
-            return
-        circuit = row["circuit"]
+        self._retract_category_entity(circuit, fixture_type)
 
-        # Check if any other publish_to_ha=1 fixture in the same category remains
-        remaining_rows = self._db.execute(
-            """SELECT f.fixture_type FROM fixtures f
-               WHERE f.circuit = ? AND f.publish_to_ha = 1 AND f.id != ?""",
-            (circuit, fixture_id),
-        ).fetchall()
-        remaining_categories: Set[str] = {
-            get_fixture_category(r["fixture_type"])
-            for r in remaining_rows
-            if get_fixture_category(r["fixture_type"])
-        }
-        if category not in remaining_categories:
-            self._retract_category_entity(circuit, category)
+    # ── LEGACY per-fixture hooks ──────────────────────────────────────────────
+    #
+    # Compatibility no-ops since Sprint F. Category publish state is now
+    # controlled only by category_publish and publish_category /
+    # retract_category. Existing callers in cluster_engine and the legacy
+    # per-cluster routes still invoke these — we keep the signatures so they
+    # don't break, but the calls have no MQTT effect. A debug log per call
+    # makes the reason discoverable when a developer chases "why didn't this
+    # publish?".
+
+    def publish_fixture(self, fixture_id: str) -> None:
+        log.debug("publish_fixture(%s): no-op since Sprint F; category_publish "
+                  "is now the source of truth (toggle on the Fixtures page).",
+                  fixture_id)
+
+    def retract_fixture(self, fixture_id: str) -> None:
+        log.debug("retract_fixture(%s): no-op since Sprint F; category_publish "
+                  "is now the source of truth (toggle on the Fixtures page).",
+                  fixture_id)
 
     def _publish_all_confirmed_sync(self) -> None:
         """Re-publish Discovery configs for all circuits and their active categories."""
@@ -321,58 +341,77 @@ class FixturePublisher:
             log.error("publish_all_confirmed failed: %s", e)
 
     async def update_state(self, circuit: str) -> None:
-        """Push current aggregated state for all categories on this circuit."""
+        """Push today's aggregated state per category for this circuit.
+
+        Sprint F: aggregates by EFFECTIVE TYPE (via the same COALESCE chain
+        the Fixtures page uses) and gates on the per-category publish map.
+        A category toggled off mid-day will NOT have its state republished
+        by the next tick — this is the second half of the off-toggle gate.
+        """
         if not self._connected or not self._is_publishing_enabled():
             return
 
-        from .fixtures import get_fixture_category
+        from datetime import datetime, timezone
+        from .database import get_category_publish_map
+        from .fixtures import (fixture_user_selectable_types,
+                               normalize_fixture_type_for_circuit,
+                               zone_user_selectable_types)
 
+        # Determine circuit kind for normalizer.
+        circuit_kind = "fixture"
+        for c in self._cfg.circuits:
+            if c.circuit == circuit:
+                if getattr(c, "circuit_type", None) == "zone":
+                    circuit_kind = "zone"
+                break
+        allowed = set(zone_user_selectable_types() if circuit_kind == "zone"
+                      else fixture_user_selectable_types())
+
+        # Read publish gates once. Categories missing from the map default
+        # to True (publish on) — same contract as the Fixtures page.
+        publish_map = get_category_publish_map(self._db, circuit)
+
+        # Today's per-event-by-effective-type aggregates. Excludes phantoms,
+        # matches Sprint F's get_category_rollup semantics. UTC-midnight
+        # boundary matches the existing publisher behaviour (HA-side daily
+        # sensors anchor on HA's own day handling).
+        utc_midnight = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00+00:00")
         try:
             rows = self._db.execute(
-                """SELECT f.fixture_type, fc.suggested_type,
-                          COALESCE(fds.event_count, 0)          AS event_count,
-                          COALESCE(fds.total_volume_litres, 0.0) AS total_volume,
-                          f.id AS fixture_id
-                   FROM fixture_clusters fc
-                   LEFT JOIN fixtures f ON fc.fixture_id = f.id
-                   LEFT JOIN fixture_daily_summary fds
-                       ON fds.fixture_id = f.id AND fds.day = date('now')
-                   WHERE fc.circuit = ?
-                     AND (f.publish_to_ha = 1
-                          OR (f.publish_to_ha IS NULL AND fc.suggested_type IS NOT NULL))
-                     AND fc.member_count >= 5""",
-                (circuit,),
+                """SELECT
+                     COALESCE(e.user_fixture_type, f.fixture_type, fc.suggested_type,
+                              e.matched_fixture_type, 'other') AS eff_type,
+                     COUNT(*) AS event_count,
+                     COALESCE(SUM(COALESCE(e.volume_litres_effective, e.volume_litres, 0)), 0)
+                              AS total_volume_l,
+                     SUM(CASE WHEN e.end_ts IS NULL THEN 1 ELSE 0 END) AS running_count
+                   FROM events e
+                   LEFT JOIN fixtures f          ON e.fixture_id = f.id
+                   LEFT JOIN fixture_clusters fc ON fc.circuit = e.circuit AND fc.id = e.cluster_id
+                   WHERE e.circuit = ?
+                     AND e.start_ts >= ?
+                     AND COALESCE(e.is_pressure_restoration_phantom, 0) = 0
+                   GROUP BY eff_type""",
+                (circuit, utc_midnight),
             ).fetchall()
         except Exception as e:
             log.warning("[%s] fixture state update failed: %s", circuit, e)
             return
 
-        # Aggregate per category
+        # Normalize + bucket by canonical category, gated by publish_map.
         cat_counts:  Dict[str, int]   = {}
         cat_volumes: Dict[str, float] = {}
         cat_running: Dict[str, bool]  = {}
-
-        for row in rows:
-            ftype = row["fixture_type"] or row["suggested_type"]
-            cat   = get_fixture_category(ftype)
-            if not cat:
+        for r in rows:
+            cat = normalize_fixture_type_for_circuit(r["eff_type"], circuit_kind)
+            if cat not in allowed:
                 continue
-            cat_counts[cat]  = cat_counts.get(cat, 0)  + (row["event_count"] or 0)
-            cat_volumes[cat] = cat_volumes.get(cat, 0.0) + (row["total_volume"] or 0.0)
-
-            # Check if currently running
-            if row["fixture_id"] and not cat_running.get(cat):
-                try:
-                    active = self._db.execute(
-                        """SELECT 1 FROM events
-                           WHERE circuit = ? AND fixture_id = ?
-                             AND end_ts IS NULL LIMIT 1""",
-                        (circuit, row["fixture_id"]),
-                    ).fetchone()
-                    if active:
-                        cat_running[cat] = True
-                except Exception:
-                    pass
+            if not publish_map.get(cat, True):
+                continue   # publish gate is off — skip this category entirely
+            cat_counts[cat]  = cat_counts.get(cat, 0)  + int(r["event_count"] or 0)
+            cat_volumes[cat] = cat_volumes.get(cat, 0.0) + float(r["total_volume_l"] or 0.0)
+            if (r["running_count"] or 0) > 0:
+                cat_running[cat] = True
 
         for cat in cat_counts:
             slug   = _category_slug(circuit, cat)

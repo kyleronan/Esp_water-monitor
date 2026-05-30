@@ -247,6 +247,54 @@ def fixture_user_selectable_types() -> List[str]:
     return [t for t in FIXTURE_TYPES if t not in INTERNAL_FIXTURE_TYPES and t not in _zone_only]
 
 
+def normalize_fixture_type_for_circuit(
+    name: Optional[str],
+    circuit_kind: str,
+) -> str:
+    """Coerce any string into a canonical category for the given circuit.
+
+    Used by the Sprint F per-category rollup (Fixtures page) to ensure stored
+    type strings — which may include legacy values predating Sprint D, user
+    typos, display labels, or wrong-circuit-kind types — always collapse to a
+    valid category for the circuit being rendered.
+
+    circuit_kind: ``"fixture"`` (the default) or ``"zone"``. Anything else is
+    treated as ``"fixture"``. Unknown / blank / legacy / wrong-kind inputs all
+    collapse to ``"other"``. NEVER returns ``"leak_test"`` (internal-only).
+
+    Normalization stages, in order:
+      1. None / non-string / empty after strip → ``"other"``.
+      2. Strip whitespace, lowercase, collapse hyphens/spaces to ``_``.
+      3. Strip a trailing ``/`` and split on ``/`` — take the first segment
+         (catches display labels like ``"Shower / Tub"`` → ``"shower"``).
+      4. Look up in LEGACY_TYPE_REMAP (Sprint D alias map).
+      5. If the result is in the allowed-set for this circuit kind, return
+         it; otherwise return ``"other"``.
+    """
+    if not isinstance(name, str):
+        return "other"
+    s = name.strip().lower()
+    if not s:
+        return "other"
+    # Take the first '/'-separated segment FIRST so display labels like
+    # "Shower / Tub" canonicalize via 'shower' (and not 'shower_/_tub' after
+    # whitespace-to-underscore folding). Strip both the leading/trailing '/'
+    # and surrounding whitespace before the next stage.
+    s = s.strip("/").split("/", 1)[0].strip()
+    # Collapse hyphens / internal whitespace to underscores; strip stray
+    # leading/trailing underscores.
+    s = re.sub(r"[\s\-]+", "_", s).strip("_")
+    if not s:
+        return "other"
+    # Apply Sprint D alias map (shower→shower_tub, bathroom_tap→tap,
+    # hose_bib→other, etc.).
+    canonical = LEGACY_TYPE_REMAP.get(s, s)
+    allowed = (set(zone_user_selectable_types())
+               if circuit_kind == "zone"
+               else set(fixture_user_selectable_types()))
+    return canonical if canonical in allowed else "other"
+
+
 # ── Variance profiles for type-aware cluster matching ────────────────────
 # Each fixture type has fundamentally different variance characteristics:
 #

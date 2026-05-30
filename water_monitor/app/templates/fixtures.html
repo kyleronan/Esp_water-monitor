@@ -9,18 +9,10 @@
 <div class="fx-msg fx-msg-warn">Not enough events yet (need 150+). Keep collecting data and try again.</div>
 {% elif msg == 'activated' %}
 <div class="fx-msg fx-msg-ok">Fixtures activated — circuit is now live.</div>
-{% elif msg == 'merged' %}
-<div class="fx-msg fx-msg-ok">Clusters merged successfully.</div>
-{% elif msg == 'migrated' %}
-<div class="fx-msg fx-msg-ok">Clusters merged by fixture type.</div>
-{% elif msg == 'merge_failed' %}
-<div class="fx-msg fx-msg-err">Could not merge clusters — the selected clusters may have changed. Refresh and try again.</div>
 {% elif msg == 'relinked' %}
 <div class="fx-msg fx-msg-ok">Fixture re-linked to cluster. Future matching events will land here.</div>
 {% elif msg == 'relink_failed' %}
 <div class="fx-msg fx-msg-err">Could not re-link the fixture — the chosen cluster may already be in use, or was deleted. Refresh and try again.</div>
-{% elif msg == 'signature_forgotten' %}
-<div class="fx-msg fx-msg-ok">Signature forgotten. Re-label more events to rebuild it.</div>
 {% elif msg == 'error' %}
 <div class="fx-msg fx-msg-err">Action failed — check the addon log for details.</div>
 {% endif %}
@@ -28,30 +20,14 @@
 {# ── Page header ──────────────────────────────────────────────────────── #}
 <div class="fx-header">
   <h1 class="page-title" style="margin:0">Fixtures</h1>
-  {% for circ in circuits %}
-  {% if circ.training_state in ('live', 'labelling') %}
-  <form method="post" action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/cluster"
-        style="display:inline">
-    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-    <button type="submit" class="btn btn-ghost btn-sm fx-recluster-btn">
-      ↺ Re-run clustering
-    </button>
-  </form>
-  {% endif %}
-  {% endfor %}
 </div>
 
-{# ── Review banner ────────────────────────────────────────────────────── #}
-{% if total_unreviewed > 0 %}
-<div class="fx-review-banner{% if any_labelling %} fx-review-banner--labelling{% endif %}">
-  ⚠️ <strong>{{ total_unreviewed }} fixture type{{ 's' if total_unreviewed != 1 else '' }}</strong>
-  {% if any_labelling %}
-    need{{ '' if total_unreviewed != 1 else 's' }} review — confirm below, then activate the circuit.
-  {% else %}
-    need{{ '' if total_unreviewed != 1 else 's' }} your review — confirm or remove them below.
-  {% endif %}
-</div>
-{% endif %}
+<p class="muted fx-page-intro" style="margin:0 0 18px 0">
+  One card per water category. Today and lifetime totals are aggregated from
+  every event of that type — phantom events (pressure artifacts) are
+  excluded. To re-categorise an event, star-label it on the
+  <a href="{{ ingress_path }}/history">History</a> page.
+</p>
 
 {# ── Per-circuit sections ─────────────────────────────────────────────── #}
 {% for circ in circuits %}
@@ -60,7 +36,7 @@
   {{ circ.display_name }}
   {% if circ.training_state == 'labelling' %}
   <span class="pill pill-amber" style="margin-left:8px;font-size:11px;font-weight:500">
-    awaiting review
+    awaiting activation
   </span>
   {% endif %}
 </h2>
@@ -68,8 +44,8 @@
 {% if circ.training_state == 'labelling' %}
   <div class="fx-labelling-callout">
     <p style="margin:0 0 8px 0">
-      <strong>Training complete.</strong> Confirm the fixture types below, then
-      activate this circuit to start anomaly detection.
+      <strong>Training complete.</strong> Activate this circuit to start
+      anomaly detection.
     </p>
     <form method="post"
           action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/activate"
@@ -79,17 +55,8 @@
         Activate fixtures →
       </button>
     </form>
-    <form method="post"
-          action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/migrate"
-          style="display:inline;margin-left:8px">
-      <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-      <button type="submit" class="btn btn-ghost btn-sm"
-              onclick="return confirm('Merge all clusters of the same fixture type? This cannot be undone.')">
-        Merge by type
-      </button>
-    </form>
     <span class="muted" style="font-size:11px;margin-left:10px">
-      Auto-activates after 7 days if no review.
+      Auto-activates after 7 days.
     </span>
   </div>
 {% endif %}
@@ -107,310 +74,59 @@
 {% endif %}
 
 {# Sprint A — orphaned fixtures (confirmed but no cluster pointing back). #}
-{# A fixture lands here when its old cluster was deleted/merged without #}
-{# carrying the link forward. Without a backing cluster, the fixture is #}
-{# invisible on this page and can't match new events. The user picks a #}
-{# current cluster and re-links — typically the cluster that holds the #}
-{# events they've labelled for this fixture type. #}
+{# The per-cluster relink UI moved out of Sprint F; the warning stays so #}
+{# the user knows action is still needed. #}
 {% if circ.orphaned_fixtures %}
 {% for orphan in circ.orphaned_fixtures %}
-<div class="fx-msg fx-msg-warn" style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
-  <span>⚠ <strong>{{ orphan.name or orphan.display_name or orphan.fixture_type }}</strong>
-    has no backing cluster — re-link to a current cluster, or it won't match future events.</span>
-  {% if circ.relink_candidate_clusters %}
-  <form method="post"
-        action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/fixture/{{ orphan.id }}/relink-cluster"
-        style="display:flex;align-items:center;gap:.5rem">
-    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-    <label class="muted" style="font-size:11px"
-           for="relink-{{ orphan.id }}">Re-link to:</label>
-    <select id="relink-{{ orphan.id }}" name="cluster_id" required>
-      {% for cand in circ.relink_candidate_clusters %}
-      <option value="{{ cand.id }}">
-        Cluster {{ cand.id }} ({{ cand.member_count }} events{% if cand.suggested_type %} — {{ cand.suggested_type | replace('_',' ') }}{% endif %})
-      </option>
-      {% endfor %}
-    </select>
-    <button type="submit" class="btn btn-primary btn-sm"
-            onclick="return confirm('Re-link {{ orphan.name or orphan.fixture_type }} to the selected cluster? Future events that match this cluster will be tagged as this fixture.')">
-      Re-link
-    </button>
-  </form>
-  {% else %}
-  <span class="muted" style="font-size:11px">
-    No unconfirmed clusters available — wait for more events, then re-link.
-  </span>
-  {% endif %}
+<div class="fx-msg fx-msg-warn">
+  ⚠ <strong>{{ orphan.name or orphan.display_name or orphan.fixture_type }}</strong>
+  has no backing cluster — events of this type may not be tagged correctly.
 </div>
 {% endfor %}
 {% endif %}
 
-{% if circ.training_state in ('idle', 'calibrating') and not circ.clusters | selectattr('fixture_id') | list and not (preview and circ.clusters) %}
-  <p class="muted" style="margin-bottom:16px">
-    Still calibrating — clusters will appear here once training ends.
-    {% if circ.clusters %}
-      <a href="?preview=1" style="margin-left:8px">Show {{ circ.clusters | length }} detected cluster{{ 's' if circ.clusters | length != 1 }} (preview)</a>
+{# ── Category cards ───────────────────────────────────────────────────── #}
+<div class="fx-cat-grid">
+{% for cat in circ.categories %}
+<div class="fx-cat-card{% if not cat.lifetime_event_count %} fx-cat-empty{% endif %}"
+     id="cat-{{ cat.type }}">
+  <header class="fx-cat-header">
+    <span class="fx-cat-icon" aria-hidden="true">{{ cat.icon }}</span>
+    <h3 class="fx-cat-title">{{ cat.label }}</h3>
+  </header>
+  <div class="fx-cat-totals">
+    <div class="fx-cat-stat">
+      <span class="fx-num">{{ (cat.today_volume_l * vol_factor)|round(vol_decimals) }}</span>
+      <span class="fx-unit">{{ vol_unit }} today</span>
+      <small class="muted">· {{ cat.today_event_count }} event{{ '' if cat.today_event_count == 1 else 's' }}</small>
+    </div>
+    <div class="fx-cat-stat">
+      <span class="fx-num">{{ (cat.lifetime_volume_l * vol_factor)|round(vol_decimals) }}</span>
+      <span class="fx-unit">{{ vol_unit }} lifetime</span>
+      <small class="muted">· {{ cat.lifetime_event_count }} event{{ '' if cat.lifetime_event_count == 1 else 's' }}</small>
+    </div>
+    {% if cat.last_seen_at %}
+    <div class="fx-cat-last-seen muted">
+      last seen
+      <time data-ts="{{ cat.last_seen_at }}">{{ (cat.last_seen_at or '')[:16] }}</time>
+    </div>
     {% endif %}
-  </p>
-
-{% elif not circ.clusters %}
-  <div class="fx-empty">
-    <span class="fx-empty-icon">🔍</span>
-    <p>No clusters found for this circuit.</p>
-    <p class="muted" style="font-size:12px;margin-top:6px">
-      Use the Re-run clustering button above, or wait until more events have been collected.
-    </p>
   </div>
-
-{% else %}
-  {% if preview and circ.training_state in ('idle', 'calibrating') %}
-  <div class="fx-preview-banner">
-    ⚠ Preview — still calibrating. These clusters may shift or merge as more events are collected.
-    <a href="{{ ingress_path }}/fixtures" style="margin-left:8px">Hide preview</a>
-  </div>
-  {% endif %}
-  {# Merge action bar — shown by JS when ≥2 boxes in this circuit are checked #}
-  {% set circ_idx = loop.index %}
-  <div class="fx-merge-bar" id="fx-merge-bar-{{ circ_idx }}"
-       data-circuit="{{ circ.circuit }}" style="display:none">
-    <span class="fx-merge-bar-info">
-      <strong class="fx-merge-count">0</strong> clusters selected
-    </span>
-    <button type="button" class="btn btn-primary btn-sm fx-merge-btn"
-            data-circuit="{{ circ.circuit }}" data-circ-idx="{{ circ_idx }}">
-      Merge selected
-    </button>
-    <button type="button" class="btn btn-ghost btn-sm fx-merge-clear"
-            data-circ-idx="{{ circ_idx }}">
-      Clear
-    </button>
-  </div>
-
-  <div class="fx-cluster-grid">
-  {% for cl in circ.clusters %}
-    {% set is_confirmed  = cl.fixture_id is not none %}
-    {% set confidence    = cl.suggested_confidence or 0 %}
-    {% set conf_pct      = confidence if confidence > 1 else (confidence * 100) %}
-    {% set needs_review  = not is_confirmed and (conf_pct < 65 or cl.confidence_level == 'preliminary') %}
-    {% set not_enough    = (cl.member_count or 0) < 5 %}
-    {% set active_type   = cl.user_type or cl.suggested_type or 'other' %}
-    {% set display_name  = cl.name or cl.display_name or (active_type | replace('_',' ') | title) %}
-
-    <div class="fx-cluster-card{% if not_enough %}{% elif needs_review %} needs-review{% elif is_confirmed %} confirmed{% endif %}">
-
-      {# Header: icon + name + confidence pill #}
-      <div class="fx-card-header">
-        {% if not not_enough %}
-        <label class="fx-card-check" title="Select to merge">
-          <input type="checkbox"
-                 class="fx-cluster-select"
-                 data-circuit="{{ circ.circuit }}"
-                 data-circ-idx="{{ circ_idx }}"
-                 value="{{ cl.id }}"
-                 aria-label="Select {{ display_name }} to merge">
-        </label>
-        {% endif %}
-        <span class="fx-card-icon">{{ cl | fixture_icon }}</span>
-        <div style="flex:1;min-width:0">
-          <div class="fx-card-title">{{ display_name }} <small class="fx-cluster-id">· Cluster {{ cl.id }}</small></div>
-          {% if not_enough %}
-          <div class="fx-card-sub fx-not-enough-label">Not enough data to classify automatically</div>
-          {% elif needs_review %}
-          <div class="fx-card-sub fx-needs-review-label">Needs review</div>
-          {% else %}
-          <div class="fx-card-sub">{{ cl.member_count }} events</div>
-          {% endif %}
-        </div>
-        {% if conf_pct > 0 %}
-        <span class="pill {% if conf_pct >= 85 %}pill-green{% elif conf_pct >= 65 %}pill-amber{% else %}pill-red{% endif %}">
-          {{ conf_pct | int }}% confidence · {{ cl.member_count }} events
-        </span>
-        {% endif %}
-      </div>
-
-      {# Stats row #}
-      <div class="fx-stats">
-        <div class="fx-stat">
-          <div class="fx-stat-label">Avg vol</div>
-          <div class="fx-stat-value">
-            {{ ((cl.avg_volume_litres or 0) * vol_factor) | round(vol_decimals) }}
-            <small>{{ vol_unit }}</small>
-          </div>
-        </div>
-        <div class="fx-stat">
-          <div class="fx-stat-label">Avg dur</div>
-          <div class="fx-stat-value">
-            {{ (cl.avg_duration_s or 0) | int }}
-            <small>s</small>
-          </div>
-        </div>
-        <div class="fx-stat">
-          <div class="fx-stat-label">Avg flow</div>
-          <div class="fx-stat-value">
-            {{ ((cl.avg_flow_lpm or 0) * flow_factor) | round(flow_decimals) }}
-            <small>{{ flow_unit }}</small>
-          </div>
-        </div>
-      </div>
-
-      {# Sprint B — user-labels suggestion hint. #}
-      {# Surfaces when the cluster's suggested_type was set by the #}
-      {# majority-vote pass over events.user_fixture_type rather than the #}
-      {# centroid heuristic. The dropdown below is already pre-selected #}
-      {# via the active_type fall-through; this banner just tells the user #}
-      {# WHY the suggestion is what it is, so confirmation is informed. #}
-      {% if not is_confirmed and cl.suggestion_source == 'user_labels'
-            and cl.suggested_type %}
-      <div class="fx-msg fx-msg-ok" style="margin:8px 0;font-size:12px;padding:6px 10px">
-        ★ Suggested
-        <strong>{{ fixture_type_labels.get(cl.suggested_type, cl.suggested_type | replace('_',' ') | title) }}</strong>
-        — based on the events you've labeled here
-        {% if cl.suggested_confidence %}
-          ({{ (cl.suggested_confidence * 100) | int }}% agree)
-        {% endif %}.
-        Confirm to lock it in.
-      </div>
-      {% endif %}
-
-      {# Confirm / save form #}
-      <form class="fx-confirm-form" method="post"
-            action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/cluster/{{ cl.id }}/confirm">
-        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-        <div class="fx-confirm-row">
-          {# Name is derived from the selected type; hidden so the endpoint still receives it #}
-          <input type="hidden" class="fx-name-input" name="name"
-                 value="{{ cl.name or cl.display_name or (active_type | replace('_',' ') | title) }}">
-          <select class="fx-type-select" name="fixture_type">
-            {% set types_for_circuit = circuit_type_selectable.get(circ.circuit, user_selectable_types) %}
-            {% for t in types_for_circuit %}
-            <option value="{{ t }}"
-              {% if t == active_type %}selected{% endif %}>
-              {{ fixture_type_labels.get(t, t | replace('_',' ') | title) }}
-            </option>
-            {% endfor %}
-          </select>
-        </div>
-        <div class="fx-confirm-row">
-          <label style="font-size:12px;display:flex;align-items:center;gap:6px;flex:1">
-            <input type="checkbox" name="publish_to_ha" value="1"
-              {% if cl.fixture_publish_to_ha or (not cl.fixture_id) %}checked{% endif %}>
-            Publish to Home Assistant
-          </label>
-          <button type="submit" class="btn btn-primary btn-sm">
-            {{ 'Save' if is_confirmed else 'Confirm type' }}
-          </button>
-          <button type="submit"
-                  formaction="{{ ingress_path }}/fixtures/{{ circ.circuit }}/cluster/{{ cl.id }}/delete"
-                  class="btn btn-ghost btn-sm"
-                  onclick="return confirm('{% if is_confirmed %}Remove confirmed fixture \'{{ display_name }}\'? This will unlink all matched events.{% else %}Remove this cluster? Events will be kept but unlinked.{% endif %}')">
-            Remove
-          </button>
-        </div>
-      </form>
-
-    </div>
-  {% endfor %}
-  </div>
-{% endif %}
-
-{# Sprint C — fixture_type signatures learned from this circuit's labels. #}
-{# Each row represents a fixture_type the matcher knows about; events that #}
-{# don't fit any cluster will still get tagged with this type if their #}
-{# features are close to its centroid. The Forget button is a clean-slate #}
-{# escape hatch — useful when the user realises some labels were wrong. #}
-{% if circ.type_signatures %}
-<div class="fx-learned-section" style="margin:18px 0 32px">
-  <h3 style="margin:0 0 8px 0;font-size:14px;font-weight:600">
-    Learned from your labels
-    <span class="muted" style="font-weight:400;font-size:12px;margin-left:6px">
-      — new events that match these will be tagged automatically
-    </span>
-  </h3>
-  <div style="display:flex;flex-wrap:wrap;gap:8px">
-    {% for sig in circ.type_signatures %}
-    <div class="fx-msg" style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px">
-      <span class="pill pill-blue">{{ fixture_type_labels.get(sig.fixture_type, sig.fixture_type | replace('_',' ') | title) }}</span>
-      <span class="muted">{{ sig.member_count }} event{{ 's' if sig.member_count != 1 else '' }}</span>
-      <form method="post"
-            action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/signature/{{ sig.fixture_type }}/forget"
-            style="display:inline">
-        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-        <button type="submit" class="btn btn-ghost btn-sm"
-                onclick="return confirm('Forget the {{ sig.fixture_type }} signature? Future events that look like this will stop being auto-tagged. (Re-labelling events rebuilds it.)')">
-          Forget
-        </button>
-      </form>
-    </div>
-    {% endfor %}
-  </div>
+  <form method="post" class="fx-cat-publish"
+        action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/category/{{ cat.type }}/publish">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <label class="toggle" title="Publish this category as a Home Assistant entity">
+      <input type="checkbox" name="publish_to_ha" value="1"
+             onchange="this.form.submit()"
+             {% if cat.publish_to_ha %}checked{% endif %}>
+      <span class="toggle-slider"></span>
+    </label>
+    <span class="fx-cat-publish-label">Publish to Home Assistant</span>
+  </form>
 </div>
-{% endif %}
+{% endfor %}
+</div>
 
 {% endfor %}
 
-{% endblock %}
-
-{% block scripts %}
-<script>
-// Spinner on re-cluster submit
-document.querySelectorAll('.fx-recluster-btn').forEach(btn =>
-  btn.closest('form').addEventListener('submit', () => {
-    btn.disabled = true;
-    btn.textContent = '↺ Running…';
-  })
-);
-
-// Update hidden name field when type selection changes
-document.querySelectorAll('.fx-type-select').forEach(sel => {
-  sel.addEventListener('change', () => {
-    const inp = sel.closest('form').querySelector('.fx-name-input');
-    if (inp && !inp.dataset.usernamed) {
-      inp.value = sel.options[sel.selectedIndex].text;
-    }
-  });
-});
-
-// ── Merge cluster selection ────────────────────────────────────────────────
-function _updateMergeBar(circIdx) {
-  const boxes = document.querySelectorAll(
-    `.fx-cluster-select[data-circ-idx="${circIdx}"]`
-  );
-  const checked = Array.from(boxes).filter(b => b.checked);
-  const bar = document.getElementById('fx-merge-bar-' + circIdx);
-  if (!bar) return;
-  bar.style.display = checked.length >= 2 ? '' : 'none';
-  const countEl = bar.querySelector('.fx-merge-count');
-  if (countEl) countEl.textContent = checked.length;
-  const btn = bar.querySelector('.fx-merge-btn');
-  if (btn) btn.textContent = `Merge ${checked.length} selected`;
-}
-
-document.querySelectorAll('.fx-cluster-select').forEach(box => {
-  box.addEventListener('change', () => _updateMergeBar(box.dataset.circIdx));
-});
-
-document.querySelectorAll('.fx-merge-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    const circIdx = btn.dataset.circIdx;
-    const circuit = btn.dataset.circuit;
-    const checked = Array.from(document.querySelectorAll(
-      `.fx-cluster-select[data-circ-idx="${circIdx}"]:checked`
-    ));
-    const ids = checked.map(b => encodeURIComponent(b.value)).join(',');
-    const base = (window.INGRESS_PATH || '') +
-      '/fixtures/' + encodeURIComponent(circuit) + '/merge';
-    window.location.href = base + '?ids=' + ids;
-  });
-});
-
-document.querySelectorAll('.fx-merge-clear').forEach(btn => {
-  btn.addEventListener('click', () => {
-    const circIdx = btn.dataset.circIdx;
-    document.querySelectorAll(
-      `.fx-cluster-select[data-circ-idx="${circIdx}"]`
-    ).forEach(b => { b.checked = false; });
-    _updateMergeBar(circIdx);
-  });
-});
-</script>
 {% endblock %}

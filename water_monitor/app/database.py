@@ -313,6 +313,21 @@ CREATE INDEX IF NOT EXISTS idx_type_signatures_circuit
     ON fixture_type_signatures (circuit);
 
 -- ==========================================================================
+-- CATEGORY PUBLISH (Sprint F) — per-(circuit, fixture_type) HA publish gate.
+-- Replaces the per-fixture `fixtures.publish_to_ha` flag as the source of
+-- truth for the fixture_publisher. Each row toggles whether the HA discovery
+-- entity set for that category on that circuit is published. publish_to_ha=1
+-- by default; missing rows default to True at the caller via .get(typ, True).
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS category_publish (
+    circuit         TEXT NOT NULL,
+    fixture_type    TEXT NOT NULL,
+    publish_to_ha   INTEGER NOT NULL DEFAULT 1,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (circuit, fixture_type)
+);
+
+-- ==========================================================================
 -- FIXTURE CLUSTERS (Phase 2.1) — raw DBSTREAM clustering output
 -- ==========================================================================
 CREATE TABLE IF NOT EXISTS fixture_clusters (
@@ -2901,6 +2916,113 @@ def delete_fixture_signature(
     )
     conn.commit()
     return cur.rowcount > 0
+
+
+# ── Sprint F: Per-category Fixtures-page rollup ─────────────────────────────
+
+def get_category_rollup(
+    conn: sqlite3.Connection,
+    circuit: str,
+    midnight_utc: str,
+) -> List[Dict[str, Any]]:
+    """Per-effective-type aggregate for one circuit.
+
+    ``midnight_utc`` is the UTC ISO timestamp of HA-local midnight (same
+    format the dashboard's get_daily_volume uses). Returned rows have raw
+    ``eff_type`` strings — the router MUST funnel each through
+    ``fixtures.normalize_fixture_type_for_circuit`` before bucketing, since
+    legacy / wrong-kind / typo strings can appear in stored data.
+
+    Phantom events (is_pressure_restoration_phantom=1) are excluded — their
+    effective volume is already 0 and counting them would inflate the event
+    count. Degraded and composite events ARE included; the Fixtures count
+    should match what the History list shows, not the training subset.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+          COALESCE(e.user_fixture_type, f.fixture_type, fc.suggested_type,
+                   e.matched_fixture_type, 'other') AS eff_type,
+          COALESCE(SUM(COALESCE(e.volume_litres_effective, e.volume_litres, 0)), 0)
+                                                          AS lifetime_volume_l,
+          COUNT(*)                                        AS lifetime_event_count,
+          MAX(e.start_ts)                                 AS last_seen_at,
+          COALESCE(SUM(CASE WHEN e.start_ts >= ?
+                      THEN COALESCE(e.volume_litres_effective, e.volume_litres, 0)
+                      ELSE 0 END), 0)                     AS today_volume_l,
+          SUM(CASE WHEN e.start_ts >= ? THEN 1 ELSE 0 END) AS today_event_count
+        FROM events e
+        LEFT JOIN fixtures f          ON e.fixture_id = f.id
+        LEFT JOIN fixture_clusters fc ON fc.circuit = e.circuit AND fc.id = e.cluster_id
+        WHERE e.circuit = ?
+          AND COALESCE(e.is_pressure_restoration_phantom, 0) = 0
+        GROUP BY eff_type
+        """,
+        (midnight_utc, midnight_utc, circuit),
+    ).fetchall()
+    return [
+        {
+            "eff_type":             r["eff_type"],
+            "lifetime_volume_l":    float(r["lifetime_volume_l"] or 0.0),
+            "lifetime_event_count": int(r["lifetime_event_count"] or 0),
+            "last_seen_at":         r["last_seen_at"],
+            "today_volume_l":       float(r["today_volume_l"] or 0.0),
+            "today_event_count":    int(r["today_event_count"] or 0),
+        }
+        for r in rows
+    ]
+
+
+def get_category_publish_map(
+    conn: sqlite3.Connection, circuit: str,
+) -> Dict[str, bool]:
+    """Return {fixture_type: bool} for one circuit's per-category publish gates.
+
+    Only returns rows that exist — missing keys MUST be defaulted to True
+    (publish on) at the call site via ``publish_map.get(typ, True)``. This
+    contract is pinned by ``test_category_publish_missing_row_defaults_true``.
+    """
+    rows = conn.execute(
+        "SELECT fixture_type, publish_to_ha FROM category_publish "
+        "WHERE circuit = ?",
+        (circuit,),
+    ).fetchall()
+    return {r["fixture_type"]: bool(r["publish_to_ha"]) for r in rows}
+
+
+def set_category_publish(
+    conn: sqlite3.Connection,
+    circuit: str,
+    fixture_type: str,
+    publish_to_ha: int,
+) -> None:
+    """Upsert the publish gate for one (circuit, fixture_type).
+
+    Defensive: validates ``fixture_type`` against the union of fixture-
+    selectable and zone-selectable types. Raises ``ValueError`` on unknown
+    or empty input so a stray internal caller cannot persist garbage rows
+    even if it skipped the route-level validation.
+    """
+    # Local import to avoid widening the module-load import surface.
+    from .fixtures import (fixture_user_selectable_types,
+                           zone_user_selectable_types)
+    allowed = set(fixture_user_selectable_types()) | set(zone_user_selectable_types())
+    if fixture_type not in allowed:
+        raise ValueError(
+            f"set_category_publish: unknown fixture_type {fixture_type!r}; "
+            f"expected one of {sorted(allowed)}"
+        )
+    conn.execute(
+        "INSERT INTO category_publish "
+        "  (circuit, fixture_type, publish_to_ha, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT (circuit, fixture_type) DO UPDATE SET "
+        "  publish_to_ha = excluded.publish_to_ha, "
+        "  updated_at = excluded.updated_at",
+        (circuit, fixture_type, 1 if publish_to_ha else 0,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
 
 
 def match_event_to_signature(
