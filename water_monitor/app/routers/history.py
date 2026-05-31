@@ -273,11 +273,32 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                 status_code=400,
             )
 
+    # Sprint H — manual classification (independent checkboxes). Authoritative
+    # over auto-detection; a Phantom mark zeroes volume from totals (reversible).
+    if "classification" in payload:
+        from ..database import set_event_classification
+        cls = payload["classification"] or {}
+        found = set_event_classification(
+            db, event_id, circuit,
+            phantom=bool(cls.get("phantom")),
+            supply_pressure=bool(cls.get("supply_pressure")),
+            combined=bool(cls.get("combined")),
+        )
+        if not found:
+            return JSONResponse({"error": "Event not found"}, status_code=404)
+        return JSONResponse({"ok": True, "classification": {
+            "phantom": bool(cls.get("phantom")),
+            "supply_pressure": bool(cls.get("supply_pressure")),
+            "combined": bool(cls.get("combined")),
+        }})
+
     kwargs: dict = {}
     if "user_fixture_type" in payload:
         kwargs["user_fixture_type"] = payload["user_fixture_type"] or None
     if "excluded_from_training" in payload:
-        kwargs["excluded_from_training"] = bool(payload["excluded_from_training"])
+        # Ignore/Restore — route to the explicit user_ignored intent (Sprint H);
+        # patch_event re-derives effective excluded_from_training.
+        kwargs["user_ignored"] = bool(payload["excluded_from_training"])
 
     found = _patch_event(db, event_id, circuit, **kwargs)
     if not found:

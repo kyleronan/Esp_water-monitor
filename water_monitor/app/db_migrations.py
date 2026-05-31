@@ -43,7 +43,11 @@ _BASELINE_VERSION: int = 20260523
 #              table (per-(circuit, fixture_type) HA publish gate). Seeded
 #              from MIN(fixtures.publish_to_ha) so any existing off
 #              preference carries over to the new category-level gate.
-_CURRENT_VERSION: int = 20260533
+#   20260534 — Sprint H phantom misclassification fix + manual classification:
+#              events.user_ignored + events.user_classified columns; one-shot
+#              repair un-flags wrongly-flagged phantoms (delta>=2.0) and
+#              restores their real volume to hourly_volume + daily_summary.
+_CURRENT_VERSION: int = 20260534
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -422,6 +426,48 @@ def _apply_category_publish_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_manual_classification_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260534 — Sprint H.
+
+    Adds ``events.user_ignored`` (explicit Ignore/Restore intent, split out of
+    the now-derived ``excluded_from_training``) and ``events.user_classified``
+    (lock bit guarding a manual classification). Then runs a one-shot repair
+    of phantom misclassifications: a real event that got a stale
+    ``is_pressure_restoration_phantom=1`` despite ``pressure_delta_psi >= 2.0``
+    (e.g. a long shower flagged before its ESP-waveform pressure landed) is
+    un-flagged and its real volume restored to hourly_volume + daily_summary.
+
+    Idempotent — column adds guarded by ``_has_column``; the repair skips rows
+    that are already consistent and rows the user has manually classified.
+    """
+    if not _has_column(conn, "events", "user_ignored"):
+        conn.execute("ALTER TABLE events ADD COLUMN user_ignored INTEGER DEFAULT 0")
+        log.info("Added events.user_ignored (default 0)")
+        # Backfill the explicit Ignore intent from the legacy combined column:
+        # rows excluded with no auto reason were excluded by a user Ignore.
+        conn.execute(
+            "UPDATE events SET user_ignored = 1 "
+            "WHERE excluded_from_training = 1 "
+            "  AND COALESCE(is_composite, 0) = 0 "
+            "  AND COALESCE(degraded_supply, 0) = 0 "
+            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+            "  AND (match_rejection_reason IS NULL "
+            "       OR match_rejection_reason = 'excluded_from_training')"
+        )
+    if not _has_column(conn, "events", "user_classified"):
+        conn.execute("ALTER TABLE events ADD COLUMN user_classified INTEGER DEFAULT 0")
+        log.info("Added events.user_classified (default 0)")
+    conn.commit()
+
+    from .database import repair_misflagged_phantom_events
+    result = repair_misflagged_phantom_events(conn)
+    log.info(
+        "Migration 20260534: manual-classification columns ready; repaired %d "
+        "misflagged phantom event(s), restored %.1f L to totals",
+        result.get("repaired", 0), result.get("litres_restored", 0.0),
+    )
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -615,6 +661,17 @@ def _missing_category_publish_columns(conn: sqlite3.Connection) -> set[str]:
     return set() if row else {"category_publish"}
 
 
+# Columns added by the 20260534 manual-classification migration (Sprint H).
+_MANUAL_CLASSIFICATION_COLUMNS: frozenset = frozenset({"user_ignored", "user_classified"})
+
+
+def _missing_manual_classification_columns(conn: sqlite3.Connection) -> set[str]:
+    return {
+        col for col in _MANUAL_CLASSIFICATION_COLUMNS
+        if not _has_column(conn, "events", col)
+    }
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -713,6 +770,7 @@ def _run_migrations_impl(
             | _missing_signature_matcher_columns(conn)
             | _missing_phantom_columns(conn)
             | _missing_category_publish_columns(conn)
+            | _missing_manual_classification_columns(conn)
         )
         if missing:
             raise RuntimeError(
@@ -723,28 +781,39 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260533:
+        # DB has category_publish but lacks the manual-classification columns
+        # + the phantom-misflag repair.
+        _apply_manual_classification_columns(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260532:
-        # DB has the phantom guard but lacks the category_publish table.
+        # DB has the phantom guard but lacks category_publish + manual class.
         _apply_category_publish_table(conn)
+        _apply_manual_classification_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
 
     if version == 20260531:
         # DB has the taxonomy consolidation but lacks the phantom guard +
-        # category_publish.
+        # category_publish + manual class.
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
+        _apply_manual_classification_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
 
     if version == 20260530:
         # DB has signature-matcher infrastructure but hasn't had the taxonomy
-        # consolidation, phantom guard, or category_publish applied yet.
+        # consolidation, phantom guard, category_publish, or manual class.
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
+        _apply_manual_classification_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -777,6 +846,7 @@ def _run_migrations_impl(
         _apply_phantom_event_column(conn)
         # Forward step 10: category_publish table + seed.
         _apply_category_publish_table(conn)
+        _apply_manual_classification_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -791,6 +861,7 @@ def _run_migrations_impl(
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
+        _apply_manual_classification_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -806,6 +877,7 @@ def _run_migrations_impl(
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
+        _apply_manual_classification_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -820,6 +892,7 @@ def _run_migrations_impl(
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
+        _apply_manual_classification_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -833,6 +906,7 @@ def _run_migrations_impl(
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
+        _apply_manual_classification_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -844,6 +918,7 @@ def _run_migrations_impl(
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
+        _apply_manual_classification_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -855,6 +930,7 @@ def _run_migrations_impl(
         _apply_fixture_taxonomy_consolidation(conn)
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
+        _apply_manual_classification_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -902,6 +978,7 @@ def _run_migrations_impl(
         # Category publish table — CREATE IF NOT EXISTS, seed pulls from
         # empty fixtures table on a fresh DB so no rows are inserted.
         _apply_category_publish_table(conn)
+        _apply_manual_classification_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

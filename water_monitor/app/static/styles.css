@@ -1489,6 +1489,22 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 }
 .evt-modal-btns { display: flex; gap: 8px; justify-content: flex-end; }
 
+/* Sprint H — manual classification checkboxes in the event-detail modal */
+.emd-classify-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.emd-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.emd-check input { cursor: pointer; }
+
 .evt-modal-wf {
   padding: 0.5rem 1rem 0.25rem;
   border-top: 1px solid var(--border);

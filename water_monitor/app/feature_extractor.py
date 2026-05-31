@@ -603,6 +603,61 @@ def _detect_pressure_restoration_phantom(duration_s, pressure_delta_psi) -> bool
     return duration >= _PHANTOM_MIN_DURATION_S and delta < _PHANTOM_MAX_DELTA_PSI
 
 
+def _finalize_derived_verdicts(features: dict) -> None:
+    """Single source of truth for the phantom verdict + its dependent fields.
+
+    Recomputes, IN PLACE, from the CURRENT values in ``features``:
+        is_pressure_restoration_phantom, volume_litres_effective,
+        volume_estimation_method, excluded_from_training, match_rejection_reason
+
+    Idempotent — safe to call again after ``_enrich_from_waveform`` mutates
+    pressure_delta_psi / peak_flow_lpm, so the stored verdict always matches the
+    stored pressure (fixes the late-ESP-waveform staleness bug where a real
+    long shower kept a stale phantom flag + zeroed volume).
+
+    Skips rows the user has manually classified (``user_classified`` == 1) —
+    their category flags are authoritative and must never be auto-overridden.
+
+    Reads: duration_seconds, pressure_delta_psi, degraded_supply, is_composite,
+    user_ignored, volume_litres, volume_litres_estimated.
+    """
+    if features.get("user_classified"):
+        return  # manual classification wins — never auto-override
+
+    is_degraded  = bool(features.get("degraded_supply"))
+    is_composite = bool(features.get("is_composite"))
+    user_ignored = bool(features.get("user_ignored"))
+    is_phantom = _detect_pressure_restoration_phantom(
+        features.get("duration_seconds"), features.get("pressure_delta_psi"))
+
+    raw = float(features.get("volume_litres") or 0.0)
+    est = features.get("volume_litres_estimated")
+    est = float(est) if est is not None else raw
+
+    # Effective volume: phantom → 0 (false water); degraded → envelope estimate;
+    # else raw. Phantom takes precedence over degraded.
+    if is_phantom:
+        features["volume_litres_effective"]  = 0.0
+        features["volume_estimation_method"] = "pressure_restoration_phantom"
+    elif is_degraded:
+        features["volume_litres_effective"]  = round(est, 3)
+        features["volume_estimation_method"] = "pulsing_supply_envelope"
+    else:
+        features["volume_litres_effective"]  = round(raw, 3)
+        features["volume_estimation_method"] = "raw"
+
+    features["is_pressure_restoration_phantom"] = 1 if is_phantom else 0
+    features["excluded_from_training"] = (
+        1 if (is_composite or is_degraded or is_phantom or user_ignored) else 0
+    )
+    # Upstream rejection reason (cluster-engine reasons are written separately).
+    features["match_rejection_reason"] = (
+        "pressure_restoration_phantom" if is_phantom
+        else "pulsing_supply" if (is_degraded and not is_composite)
+        else None
+    )
+
+
 def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
     """Scan all events for the phantom fingerprint; zero their volume
     contributions and flag them.
@@ -1560,23 +1615,10 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         shape,
         duration,
     )
-    if is_degraded:
-        volume_litres_effective = volume_litres_estimated
-        volume_estimation_method = "pulsing_supply_envelope"
-    else:
-        volume_litres_effective = volume_litres
-        volume_estimation_method = "raw"
-
-    # ── Pressure-restoration phantom guard ────────────────────────────────
-    # A long event with a near-zero pressure drop is a city-pressure
-    # restoration / regulator-hunting artifact, not real water use. These
-    # look "steady" so the degraded detector misses them. Phantom takes
-    # precedence over degraded: zero the effective volume outright (not the
-    # envelope estimate) so it contributes nothing to daily totals.
-    is_phantom = _detect_pressure_restoration_phantom(duration, pressure_delta_psi)
-    if is_phantom:
-        volume_litres_effective = 0.0
-        volume_estimation_method = "pressure_restoration_phantom"
+    # The phantom verdict + volume_litres_effective + volume_estimation_method
+    # + excluded_from_training + match_rejection_reason are ALL derived by
+    # _finalize_derived_verdicts() on the assembled dict below — the single
+    # source of truth, re-run after ESP-waveform enrichment in _process().
 
     # Time features
     ts = event.start_ts
@@ -1601,7 +1643,7 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     else:
         end_utc = None
 
-    return {
+    result = {
         # Identity — UUID5 keyed on UTC start_ts so re-imports of the same
         # event always produce the same id and INSERT OR REPLACE is a no-op.
         "id": str(uuid.uuid5(uuid.NAMESPACE_OID,
@@ -1645,35 +1687,20 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
             else 0 if event.other_valve_open is False
             else None
         ),
-        # Excluded from cluster training when:
-        #   - composite event (multiple fixtures concurrent), OR
-        #   - degraded by supply pulsation (chaotic flow readings), OR
-        #   - pressure-restoration phantom (fake long event, no real flow)
-        # Note: clustering exclusion is NOT the same as volume exclusion;
-        # the volume_litres_effective field still contributes to daily totals
-        # (except phantoms, whose effective volume is forced to 0 above).
-        "excluded_from_training": 1 if (event.is_composite or is_degraded or is_phantom) else 0,
-        # match_rejection_reason: phantom takes precedence, then 'pulsing_supply'
-        # on degraded events, BUT only if no other exclusion reason was set
-        # first (composite events keep their authoritative reason). The
-        # cluster-engine reason values ('no_centers', 'features_missing', etc.)
-        # are written separately by match_and_learn; this field carries the
-        # *upstream* reason set by feature extraction.
-        "match_rejection_reason": (
-            "pressure_restoration_phantom" if is_phantom
-            else "pulsing_supply" if (is_degraded and not event.is_composite)
-            else None
-        ),
+        # The next five fields are DERIVED — provisional values here, then
+        # overwritten by _finalize_derived_verdicts() before return (and again
+        # after ESP-waveform enrichment in _process). Single source of truth
+        # there; do not duplicate the verdict logic in this literal.
+        "excluded_from_training":          0,       # set by finalizer
+        "match_rejection_reason":          None,    # set by finalizer
+        "volume_litres_effective":         round(volume_litres, 3),  # finalizer recomputes
+        "volume_estimation_method":        "raw",   # finalizer recomputes
+        "is_pressure_restoration_phantom": 0,       # set by finalizer
 
-        # Degraded-supply guard
+        # Degraded-supply guard — INPUTS the finalizer reads.
         "degraded_supply":             1 if is_degraded else 0,
         "volume_litres_estimated":     round(volume_litres_estimated, 3),
-        "volume_litres_effective":     round(volume_litres_effective, 3),
-        "volume_estimation_method":    volume_estimation_method,
         "degraded_diagnostic_json":    json.dumps(deg_diag, allow_nan=False),
-
-        # Pressure-restoration phantom guard (volume forced to 0 above)
-        "is_pressure_restoration_phantom": 1 if is_phantom else 0,
 
         # Flow shape features
         "flow_signature_json":    json.dumps(sig),
@@ -1704,6 +1731,10 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         # when ESP full_flow / full_pressure arrays are used as canonical signatures.
         "signature_source":       "software",
     }
+    # Derive the phantom verdict + volume_effective + exclusion from the
+    # assembled feature values (single source of truth).
+    _finalize_derived_verdicts(result)
+    return result
 
 
 class FeatureExtractor:
@@ -1881,6 +1912,12 @@ class FeatureExtractor:
         if wf_record is not None:
             score = _wf_overlap_score(event, wf_record)
             _enrich_from_waveform(features, wf_record, score)
+            # NOTE: enrichment overwrites pressure_delta_psi / peak_flow_lpm
+            # with ESP-measured values. The phantom verdict is re-derived
+            # below (after the existing-row read), so a real long event — e.g.
+            # a 40-min shower whose pressure drop wasn't captured in the
+            # software pass — is NOT left with a stale phantom flag + zeroed
+            # volume.
             log.debug(
                 "[%s] waveform enriched — event_id=%d boot_id=%d "
                 "overlap=%.2f q=%d fl=0x%02x",
@@ -1926,6 +1963,46 @@ class FeatureExtractor:
                         suffix,
                     )
                     return
+
+            # ── Honour stored user intent (Sprint H) ──────────────────────
+            # extract_features() computes verdicts fresh from the RawEvent and
+            # has no knowledge of stored user choices. Pull them from the
+            # existing row (if any) and apply BEFORE the upsert:
+            #   • user_ignored — folded into excluded_from_training (which is
+            #     a derived column, no longer preserved by the upsert, so a
+            #     re-import would otherwise silently un-ignore the event).
+            #   • user_classified — manual classification is authoritative:
+            #     copy the stored category flags and SKIP the auto finalizer
+            #     so auto-detection / waveform enrichment never overrides it.
+            existing = self._db.execute(
+                "SELECT user_ignored, user_classified, "
+                "       is_pressure_restoration_phantom, degraded_supply, "
+                "       is_composite, volume_litres_effective "
+                "FROM events WHERE id = ?",
+                (features["id"],),
+            ).fetchone()
+            if existing is not None and existing["user_classified"]:
+                features["user_classified"] = 1
+                features["user_ignored"] = int(existing["user_ignored"] or 0)
+                features["is_pressure_restoration_phantom"] = \
+                    int(existing["is_pressure_restoration_phantom"] or 0)
+                features["degraded_supply"] = int(existing["degraded_supply"] or 0)
+                features["is_composite"] = int(existing["is_composite"] or 0)
+                features["volume_litres_effective"] = \
+                    float(existing["volume_litres_effective"] or 0.0)
+                features["excluded_from_training"] = 1 if (
+                    features["is_pressure_restoration_phantom"]
+                    or features["degraded_supply"]
+                    or features["is_composite"]
+                    or features["user_ignored"]
+                ) else 0
+            else:
+                # Not manually classified — re-derive verdicts with the
+                # preserved Ignore intent (and post-enrichment pressure).
+                features["user_ignored"] = (
+                    int(existing["user_ignored"] or 0) if existing is not None else 0
+                )
+                _finalize_derived_verdicts(features)
 
             # Atomic upsert + hourly_volume update. Uses
             # volume_litres_effective (which is volume_litres for healthy

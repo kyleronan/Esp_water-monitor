@@ -535,7 +535,14 @@ CREATE TABLE IF NOT EXISTS events (
     -- of a city-pressure-restoration artifact. Its volume_litres_effective is
     -- forced to 0 and it is excluded_from_training. Shown in History with a
     -- flag; volume contributes nothing to totals.
-    is_pressure_restoration_phantom  INTEGER DEFAULT 0
+    is_pressure_restoration_phantom  INTEGER DEFAULT 0,
+    -- Sprint H. user_ignored: explicit Ignore/Restore intent (separate from
+    -- the derived excluded_from_training, which is auto OR user_ignored OR
+    -- manual). user_classified: lock bit — when 1 the three category flags
+    -- (is_pressure_restoration_phantom / degraded_supply / is_composite) hold
+    -- the user's manual choices and auto-detection must never overwrite them.
+    user_ignored                     INTEGER DEFAULT 0,
+    user_classified                  INTEGER DEFAULT 0
 );
 
 -- NOTE: the partial index on (circuit, start_ts) WHERE degraded_supply = 1
@@ -1274,7 +1281,14 @@ def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) ->
 _EVENT_USER_COLUMNS: frozenset[str] = frozenset({
     "user_fixture_type",
     "user_reviewed",
-    "excluded_from_training",
+    # Sprint H: the explicit user intents are preserved across re-import/
+    # enrichment upserts. excluded_from_training is NO LONGER preserved here —
+    # it's a DERIVED field (auto verdicts OR user_ignored OR manual) recomputed
+    # by _finalize_derived_verdicts, so preserving it would freeze stale
+    # auto-exclusion. user_ignored carries the Ignore/Restore intent instead;
+    # user_classified locks a manual classification against auto-override.
+    "user_ignored",
+    "user_classified",
 })
 
 # Columns whose values must NOT be overwritten by an event-row upsert.
@@ -1669,14 +1683,22 @@ def patch_event(
     *,
     user_fixture_type=_PATCH_UNSET,
     excluded_from_training=_PATCH_UNSET,
+    user_ignored=_PATCH_UNSET,
 ) -> bool:
     """Update user-editable fields on a single event.
 
     Pass a value (including None) to update that field; omit a kwarg entirely
     to leave the field unchanged.  Returns False if no matching row exists.
+
+    Sprint H: ``user_ignored`` is the Ignore/Restore intent. Setting it also
+    re-derives ``excluded_from_training`` (= user_ignored OR any auto/manual
+    category flag) so the effective exclusion stays consistent. The legacy
+    ``excluded_from_training`` kwarg is still accepted for back-compat but
+    callers should prefer ``user_ignored``.
     """
     row = conn.execute(
-        "SELECT id FROM events WHERE id = ? AND circuit = ?",
+        "SELECT id, is_pressure_restoration_phantom, degraded_supply, is_composite "
+        "FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit),
     ).fetchone()
     if row is None:
@@ -1686,12 +1708,125 @@ def patch_event(
             "UPDATE events SET user_fixture_type = ? WHERE id = ? AND circuit = ?",
             (user_fixture_type, event_id, circuit),
         )
+    if user_ignored is not _PATCH_UNSET:
+        ign = 1 if user_ignored else 0
+        excluded = 1 if (ign or row["is_pressure_restoration_phantom"]
+                         or row["degraded_supply"] or row["is_composite"]) else 0
+        conn.execute(
+            "UPDATE events SET user_ignored = ?, excluded_from_training = ? "
+            "WHERE id = ? AND circuit = ?",
+            (ign, excluded, event_id, circuit),
+        )
     if excluded_from_training is not _PATCH_UNSET:
         conn.execute(
             "UPDATE events SET excluded_from_training = ? WHERE id = ? AND circuit = ?",
             (1 if excluded_from_training else 0, event_id, circuit),
         )
     conn.commit()
+    return True
+
+
+def set_event_classification(
+    conn: sqlite3.Connection,
+    event_id: str,
+    circuit: str,
+    *,
+    phantom: bool,
+    supply_pressure: bool,
+    combined: bool,
+) -> bool:
+    """Apply a user's manual event classification (Sprint H, authoritative).
+
+    Sets the three category flags + ``user_classified=1``, re-derives
+    ``volume_litres_effective`` (phantom → 0; elif degraded → envelope
+    estimate; else raw), recomputes ``excluded_from_training``, and resyncs
+    ``hourly_volume`` + ``daily_summary`` for the volume delta.
+
+    If all three are False this is "reset to automatic": ``user_classified=0``
+    and the phantom verdict is re-derived from the stored duration/pressure
+    (degraded/composite keep their stored auto values — raw readings needed to
+    recompute them aren't persisted).
+
+    Returns False if no such event.
+    """
+    from .feature_extractor import _detect_pressure_restoration_phantom
+
+    row = conn.execute(
+        "SELECT volume_litres, volume_litres_estimated, duration_seconds, "
+        "       pressure_delta_psi, degraded_supply, user_ignored, "
+        "       hourly_volume_applied_litres, hourly_volume_applied_bucket, start_ts "
+        "FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if row is None:
+        return False
+
+    manual = bool(phantom or supply_pressure or combined)
+    if manual:
+        new_phantom   = 1 if phantom else 0
+        new_degraded  = 1 if supply_pressure else 0
+        new_composite = 1 if combined else 0
+        user_classified = 1
+    else:
+        # Reset to automatic.
+        new_phantom = 1 if _detect_pressure_restoration_phantom(
+            row["duration_seconds"], row["pressure_delta_psi"]) else 0
+        new_degraded  = int(row["degraded_supply"] or 0)
+        new_composite = 0
+        user_classified = 0
+
+    raw = float(row["volume_litres"] or 0.0)
+    est = row["volume_litres_estimated"]
+    if new_phantom:
+        new_effective, method = 0.0, "pressure_restoration_phantom"
+    elif new_degraded:
+        new_effective = float(est) if est is not None else raw
+        method = "pulsing_supply_envelope"
+    else:
+        new_effective, method = raw, "raw"
+
+    user_ignored = int(row["user_ignored"] or 0)
+    excluded = 1 if (new_phantom or new_degraded or new_composite or user_ignored) else 0
+    reason = (
+        "pressure_restoration_phantom" if new_phantom
+        else "pulsing_supply" if (new_degraded and not new_composite)
+        else None
+    )
+
+    prev_applied = float(row["hourly_volume_applied_litres"] or 0.0)
+    prev_bucket = row["hourly_volume_applied_bucket"] or _hour_bucket_for(row["start_ts"])
+    delta = new_effective - prev_applied
+
+    with transaction(conn):
+        conn.execute(
+            "UPDATE events SET "
+            "  is_pressure_restoration_phantom = ?, degraded_supply = ?, "
+            "  is_composite = ?, user_classified = ?, "
+            "  volume_litres_effective = ?, volume_estimation_method = ?, "
+            "  excluded_from_training = ?, match_rejection_reason = ? "
+            "WHERE id = ? AND circuit = ?",
+            (new_phantom, new_degraded, new_composite, user_classified,
+             round(new_effective, 3), method, excluded, reason,
+             event_id, circuit),
+        )
+        if prev_bucket and abs(delta) > 1e-9:
+            conn.execute(
+                "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (circuit, hour_ts) "
+                "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
+                (circuit, prev_bucket, delta),
+            )
+        conn.execute(
+            "UPDATE events SET hourly_volume_applied_litres = ?, "
+            "  hourly_volume_applied_bucket = ? WHERE id = ? AND circuit = ?",
+            (round(new_effective, 3), prev_bucket, event_id, circuit),
+        )
+
+    day = (row["start_ts"] or "")[:10]
+    if day:
+        compute_daily_summary(conn, circuit, day)
+        conn.commit()
     return True
 
 
@@ -3023,6 +3158,103 @@ def set_category_publish(
          datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
+
+
+def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
+    """Sprint H — un-flag events wrongly marked as pressure-restoration phantoms.
+
+    A real event can be left with a stale ``is_pressure_restoration_phantom=1``
+    when the phantom verdict was computed from the software-path pressure
+    (< 2 PSI) and a late ESP waveform then raised ``pressure_delta_psi`` to a
+    real value without re-deriving the verdict (fixed forward by
+    ``_finalize_derived_verdicts``). Such a row is internally contradictory:
+    flagged phantom yet ``pressure_delta_psi >= 2.0``. This restores it:
+    clears the flag, restores ``volume_litres_effective`` (degraded → envelope
+    estimate, else raw) and re-applies that real volume to ``hourly_volume`` +
+    ``daily_summary``.
+
+    Skips ``user_classified`` rows (manual classification is authoritative).
+    Idempotent — once repaired the WHERE clause no longer selects the row.
+
+    Returns ``{"repaired": N, "litres_restored": L}``.
+    """
+    from .feature_extractor import _PHANTOM_MAX_DELTA_PSI
+
+    rows = conn.execute(
+        "SELECT id, circuit, start_ts, volume_litres, volume_litres_estimated, "
+        "       degraded_supply, is_composite, user_ignored, "
+        "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
+        "FROM events "
+        "WHERE is_pressure_restoration_phantom = 1 "
+        "  AND pressure_delta_psi >= ? "
+        "  AND COALESCE(user_classified, 0) = 0",
+        (_PHANTOM_MAX_DELTA_PSI,),
+    ).fetchall()
+
+    repaired = 0
+    litres_restored = 0.0
+    affected_days: set = set()
+    for row in rows:
+        is_degraded = bool(row["degraded_supply"])
+        raw = float(row["volume_litres"] or 0.0)
+        est = row["volume_litres_estimated"]
+        restored = (float(est) if (is_degraded and est is not None) else raw)
+        new_method = "pulsing_supply_envelope" if is_degraded else "raw"
+        new_excluded = 1 if (
+            bool(row["is_composite"]) or is_degraded or bool(row["user_ignored"])
+        ) else 0
+        new_reason = "pulsing_supply" if (is_degraded and not row["is_composite"]) else None
+
+        prev_applied = float(row["hourly_volume_applied_litres"] or 0.0)
+        prev_bucket = row["hourly_volume_applied_bucket"] or _hour_bucket_for(row["start_ts"])
+        delta = restored - prev_applied   # phantom had effective 0 → applied 0
+
+        with transaction(conn):
+            conn.execute(
+                "UPDATE events SET "
+                "  is_pressure_restoration_phantom = 0, "
+                "  volume_litres_effective = ?, "
+                "  volume_estimation_method = ?, "
+                "  excluded_from_training = ?, "
+                "  match_rejection_reason = ? "
+                "WHERE id = ?",
+                (round(restored, 3), new_method, new_excluded, new_reason, row["id"]),
+            )
+            if prev_bucket and abs(delta) > 1e-9:
+                conn.execute(
+                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT (circuit, hour_ts) "
+                    "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
+                    (row["circuit"], prev_bucket, delta),
+                )
+            conn.execute(
+                "UPDATE events SET "
+                "  hourly_volume_applied_litres = ?, "
+                "  hourly_volume_applied_bucket = ? "
+                "WHERE id = ?",
+                (round(restored, 3), prev_bucket, row["id"]),
+            )
+
+        repaired += 1
+        litres_restored += restored
+        day = (row["start_ts"] or "")[:10]
+        if day:
+            affected_days.add((row["circuit"], day))
+        log.info(
+            "phantom-repair: event %s un-flagged (restored %.3f L to bucket %s)",
+            row["id"], restored, prev_bucket,
+        )
+
+    for circ, day in affected_days:
+        compute_daily_summary(conn, circ, day)
+    if affected_days:
+        conn.commit()
+
+    if repaired:
+        log.info("phantom-repair: un-flagged %d event(s), restored %.1f L total",
+                 repaired, litres_restored)
+    return {"repaired": repaired, "litres_restored": round(litres_restored, 3)}
 
 
 def match_event_to_signature(

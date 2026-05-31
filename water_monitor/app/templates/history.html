@@ -222,6 +222,7 @@
             data-composite="{{ '1' if e.is_composite else '0' }}"
             data-degraded="{{ '1' if e.degraded_supply else '0' }}"
             data-phantom="{{ '1' if e.is_pressure_restoration_phantom else '0' }}"
+            data-classified="{{ '1' if e.user_classified else '0' }}"
             data-volume-effective="{{ (e.volume_litres_effective * vol_factor)|round(vol_decimals) if e.volume_litres_effective is not none else '' }}"
             data-volume-method="{{ e.volume_estimation_method or 'raw' }}"
             data-degraded-diag="{{ e.degraded_diagnostic_json or '' }}"
@@ -364,6 +365,28 @@
         <option value="{{ ft.value }}">{{ ft.label }}</option>
         {% endfor %}
       </select>
+    </div>
+    <hr class="evt-modal-hr">
+    <div class="evt-modal-section">
+      <label class="evt-modal-label">Classification</label>
+      <p class="muted" style="font-size:11px;margin:.2rem 0 .5rem">
+        Override automatic detection. Marking <strong>Pressure artifact</strong>
+        removes this event's volume from all totals (reversible).
+      </p>
+      <div class="emd-classify-row">
+        <label class="emd-check"><input type="checkbox" id="emd-cls-phantom">
+          <span>Pressure artifact (phantom)</span></label>
+        <label class="emd-check"><input type="checkbox" id="emd-cls-supply">
+          <span>Supply-pressure issue</span></label>
+        <label class="emd-check"><input type="checkbox" id="emd-cls-combined">
+          <span>Combined event</span></label>
+      </div>
+      <div style="display:flex;align-items:center;gap:.75rem;margin-top:.5rem">
+        <button id="emd-classify-save-btn" class="btn btn-secondary btn-sm">Save classification</button>
+        <span id="emd-classify-hint" class="muted" style="font-size:11px" hidden>
+          ⓘ manually classified — auto-detection overridden
+        </span>
+      </div>
     </div>
     <div id="emd-error" class="evt-modal-error" hidden></div>
     <div class="evt-modal-btns">
@@ -573,6 +596,12 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   const ignBtn  = document.getElementById('emd-ignore-btn');
   const saveBtn = document.getElementById('emd-save-btn');
   const errBox  = document.getElementById('emd-error');
+  // Sprint H — manual classification controls.
+  const clsPhantom  = document.getElementById('emd-cls-phantom');
+  const clsSupply   = document.getElementById('emd-cls-supply');
+  const clsCombined = document.getElementById('emd-cls-combined');
+  const clsSaveBtn  = document.getElementById('emd-classify-save-btn');
+  const clsHint     = document.getElementById('emd-classify-hint');
 
   // Startup diagnostic
   const rows = document.querySelectorAll('.hist-event-row');
@@ -599,6 +628,12 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     document.getElementById('emd-fixture').textContent  = fixLabel || '—';
     selFix.value   = d.userType || '';
     ignBtn.textContent = d.excluded === '1' ? 'Restore event' : 'Ignore event';
+
+    // Sprint H — pre-check the classification boxes from the row's flags.
+    if (clsPhantom)  clsPhantom.checked  = d.phantom === '1';
+    if (clsSupply)   clsSupply.checked   = d.degraded === '1';
+    if (clsCombined) clsCombined.checked = d.composite === '1';
+    if (clsHint)     clsHint.hidden      = d.classified !== '1';
 
     // Technical details
     const TRIGGER_LABELS = { flow: 'Flow (sustained)', pressure: 'Pressure drop', 'pressure+flow': 'Pressure + flow' };
@@ -872,6 +907,19 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const ok = await patchEvent({ excluded_from_training: excluded });
     if (ok) location.reload();
   });
+
+  // Sprint H — save manual classification (independent checkboxes).
+  if (clsSaveBtn) {
+    clsSaveBtn.addEventListener('click', async () => {
+      if (!activeRow) return;
+      const ok = await patchEvent({ classification: {
+        phantom:         clsPhantom  && clsPhantom.checked,
+        supply_pressure: clsSupply   && clsSupply.checked,
+        combined:        clsCombined && clsCombined.checked,
+      }});
+      if (ok) location.reload();
+    });
+  }
 })();
 
 // Shape sparklines

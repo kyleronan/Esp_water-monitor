@@ -82,6 +82,23 @@ APP_DIR = Path(__file__).resolve().parent
 log = logging.getLogger(__name__)
 
 
+def _read_addon_version() -> str:
+    """Read the addon `version:` from config.yaml (one line, no YAML dep).
+
+    Used as the static-asset cache-buster so a version bump on deploy busts
+    the browser's cached styles.css/JS. Falls back to 'dev' if unreadable.
+    """
+    try:
+        cfg_path = APP_DIR.parent / "config.yaml"
+        for line in cfg_path.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s.startswith("version:"):
+                return s.split(":", 1)[1].strip().strip("\"'") or "dev"
+    except Exception:
+        pass
+    return "dev"
+
+
 class IngressTemplates(Jinja2Templates):
     """Jinja2Templates that auto-injects ingress_path, CSRF token, and
     unit context into every template response.
@@ -104,6 +121,12 @@ class IngressTemplates(Jinja2Templates):
             context.setdefault(
                 "csrf_token",
                 getattr(request.state, "csrf_token", ""),
+            )
+            # Static-asset cache-buster (see _read_addon_version). Defaults to
+            # 'dev' before lifespan sets it / outside the app context.
+            context.setdefault(
+                "asset_version",
+                getattr(request.app.state, "asset_version", "dev"),
             )
             # Hide the top-level Setup tab once initial setup is complete;
             # the wizard is locked anyway, so the tab would be a dead-end.
@@ -179,6 +202,10 @@ async def lifespan(app: FastAPI):
         directory=str(APP_DIR / "templates"),
         autoescape=select_autoescape(["html", "htm"]),
     )
+
+    # Static-asset cache-buster — derived from the addon version so a deploy
+    # version bump automatically busts the browser's cached styles.css / JS.
+    app.state.asset_version = _read_addon_version()
 
     # Register tojson filter (not included by default in FastAPI's Jinja2).
     # Must return Markup so Jinja2 autoescape does not HTML-encode the JSON
