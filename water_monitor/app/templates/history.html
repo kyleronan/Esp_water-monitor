@@ -382,7 +382,7 @@
           <span>Combined event</span></label>
       </div>
       <div style="display:flex;align-items:center;gap:.75rem;margin-top:.5rem;flex-wrap:wrap">
-        <button id="emd-classify-save-btn" class="btn btn-secondary btn-sm">Save classification</button>
+        <span class="muted" style="font-size:11px">Saved with the <strong>Save</strong> button below.</span>
         <button id="emd-classify-reset-btn" class="btn btn-ghost btn-sm" hidden>Reset to automatic</button>
       </div>
       <p id="emd-classify-hint" class="muted" style="font-size:11px;margin:.35rem 0 0" hidden>
@@ -601,9 +601,12 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   const clsPhantom  = document.getElementById('emd-cls-phantom');
   const clsSupply   = document.getElementById('emd-cls-supply');
   const clsCombined = document.getElementById('emd-cls-combined');
-  const clsSaveBtn  = document.getElementById('emd-classify-save-btn');
   const clsResetBtn = document.getElementById('emd-classify-reset-btn');
   const clsHint     = document.getElementById('emd-classify-hint');
+  // Initial checkbox state captured on modal open — used so the main Save
+  // only sends `classification` when the user actually changed something
+  // (labelling alone must not silently lock auto-detection off).
+  let clsInitial = { phantom: false, supply_pressure: false, combined: false };
 
   // Startup diagnostic
   const rows = document.querySelectorAll('.hist-event-row');
@@ -631,10 +634,16 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     selFix.value   = d.userType || '';
     ignBtn.textContent = d.excluded === '1' ? 'Restore event' : 'Ignore event';
 
-    // Sprint H — pre-check the classification boxes from the row's flags.
+    // Sprint H — pre-check the classification boxes from the row's flags,
+    // and remember the initial state for change-detection on Save.
     if (clsPhantom)  clsPhantom.checked  = d.phantom === '1';
     if (clsSupply)   clsSupply.checked   = d.degraded === '1';
     if (clsCombined) clsCombined.checked = d.composite === '1';
+    clsInitial = {
+      phantom:         d.phantom === '1',
+      supply_pressure: d.degraded === '1',
+      combined:        d.composite === '1',
+    };
     // Sprint H.1 — the "manually classified" hint + Reset link only apply
     // once the user has locked a manual classification.
     const isClassified = d.classified === '1';
@@ -903,7 +912,21 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
 
   saveBtn.addEventListener('click', async () => {
     if (!activeRow) return;
-    const ok = await patchEvent({ user_fixture_type: selFix.value || null });
+    const payload = { user_fixture_type: selFix.value || null };
+    // Only include classification if the user actually toggled a box — so a
+    // type-only edit never locks auto-detection off. Sending it always sets
+    // user_classified=1 (incl. all-false = "manually normal"), which sticks.
+    const cur = {
+      phantom:         !!(clsPhantom && clsPhantom.checked),
+      supply_pressure: !!(clsSupply && clsSupply.checked),
+      combined:        !!(clsCombined && clsCombined.checked),
+    };
+    if (cur.phantom !== clsInitial.phantom
+        || cur.supply_pressure !== clsInitial.supply_pressure
+        || cur.combined !== clsInitial.combined) {
+      payload.classification = cur;
+    }
+    const ok = await patchEvent(payload);
     if (ok) location.reload();
   });
 
@@ -913,20 +936,6 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const ok = await patchEvent({ excluded_from_training: excluded });
     if (ok) location.reload();
   });
-
-  // Sprint H — save manual classification (independent checkboxes). Always
-  // locks (incl. all-unchecked = "manually normal"), so un-marking sticks.
-  if (clsSaveBtn) {
-    clsSaveBtn.addEventListener('click', async () => {
-      if (!activeRow) return;
-      const ok = await patchEvent({ classification: {
-        phantom:         clsPhantom  && clsPhantom.checked,
-        supply_pressure: clsSupply   && clsSupply.checked,
-        combined:        clsCombined && clsCombined.checked,
-      }});
-      if (ok) location.reload();
-    });
-  }
 
   // Sprint H.1 — reset an event back to automatic detection.
   if (clsResetBtn) {

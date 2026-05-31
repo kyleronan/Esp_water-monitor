@@ -273,10 +273,17 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                 status_code=400,
             )
 
+    propagation_meta: dict = {}
+    signature_meta: dict = {}
+    classification_meta = None
+
     # Sprint H — manual classification (independent checkboxes). Authoritative
     # over auto-detection; a Phantom mark zeroes volume from totals. Sprint H.1:
     # a manual save (incl. all-false = "normal") always locks; reset:true
-    # returns the event to automatic detection.
+    # returns the event to automatic detection. Processed alongside (not
+    # instead of) a fixture-type change, so the single Save button persists
+    # both in one request — the client only sends `classification` when the
+    # user actually changed a checkbox, so labelling alone never locks it.
     if "classification" in payload:
         from ..database import (set_event_classification,
                                 clear_event_classification, classify_action)
@@ -284,17 +291,17 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
         if action == "error":
             return JSONResponse({"error": data["msg"]}, status_code=400)
         if action == "reset":
-            found = clear_event_classification(db, event_id, circuit)
+            ok = clear_event_classification(db, event_id, circuit)
         else:
-            found = set_event_classification(
+            ok = set_event_classification(
                 db, event_id, circuit,
                 phantom=data["phantom"],
                 supply_pressure=data["supply_pressure"],
                 combined=data["combined"],
             )
-        if not found:
+        if not ok:
             return JSONResponse({"error": "Event not found"}, status_code=404)
-        return JSONResponse({"ok": True, "action": action, "classification": data})
+        classification_meta = {"action": action, "classification": data}
 
     kwargs: dict = {}
     if "user_fixture_type" in payload:
@@ -304,16 +311,15 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
         # patch_event re-derives effective excluded_from_training.
         kwargs["user_ignored"] = bool(payload["excluded_from_training"])
 
-    found = _patch_event(db, event_id, circuit, **kwargs)
-    if not found:
-        return JSONResponse({"error": "Event not found"}, status_code=404)
+    if kwargs:
+        found = _patch_event(db, event_id, circuit, **kwargs)
+        if not found:
+            return JSONResponse({"error": "Event not found"}, status_code=404)
 
     # Sprint B — if the patch touched user_fixture_type, propagate the
     # signal into the cluster's suggested_type (soft hint; never silently
     # links a cluster to a fixture). When the event has no cluster_id we
     # have nowhere to land the signal — log it so the gap is visible.
-    propagation_meta: dict = {}
-    signature_meta: dict = {}
     if "user_fixture_type" in payload:
         try:
             from ..database import (
@@ -373,4 +379,5 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
         "ok": True,
         "propagation": propagation_meta,
         "signatures": signature_meta,
+        "classification": classification_meta,
     })
