@@ -1434,12 +1434,24 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   background: rgba(0,0,0,.45);
   align-items: center; justify-content: center;
   z-index: 500;
+  padding: 16px;            /* breathing room so the modal never hugs edges */
+  box-sizing: border-box;
 }
 .evt-modal-backdrop.is-open { display: flex; }
 .evt-modal {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 10px; padding: 24px; width: 600px; max-width: 95vw;
   box-shadow: 0 8px 32px rgba(0,0,0,.25);
+  /* Scroll the modal body when it's taller than the viewport (mobile),
+     so the action row and close button stay reachable. dvh accounts for
+     the mobile browser chrome; the vh line is the older-browser fallback. */
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+@media (max-width: 480px) {
+  .evt-modal { padding: 16px; }
 }
 .evt-modal-header {
   display: flex; align-items: center; justify-content: space-between;
@@ -1487,7 +1499,16 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   background: var(--red-bg, oklch(97% .02 25));
   border-radius: 4px;
 }
-.evt-modal-btns { display: flex; gap: 8px; justify-content: flex-end; }
+.evt-modal-btns {
+  display: flex; gap: 8px; justify-content: flex-end;
+  /* Keep Save / Ignore reachable while the modal body scrolls. The footer
+     bg is the modal's own surface colour, so the side-padding gaps show no
+     seam — breakpoint-safe, no negative-margin trick needed. */
+  position: sticky; bottom: 0;
+  background: var(--surface);
+  margin-top: 12px; padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
 
 /* Sprint H — manual classification checkboxes in the event-detail modal */
 .emd-classify-row {

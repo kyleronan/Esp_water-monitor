@@ -1726,54 +1726,35 @@ def patch_event(
     return True
 
 
-def set_event_classification(
+def _apply_event_verdicts(
     conn: sqlite3.Connection,
     event_id: str,
     circuit: str,
     *,
-    phantom: bool,
-    supply_pressure: bool,
-    combined: bool,
+    new_phantom: int,
+    new_degraded: int,
+    new_composite: int,
+    user_classified: int,
 ) -> bool:
-    """Apply a user's manual event classification (Sprint H, authoritative).
+    """Shared core: write category flags + user_classified, re-derive
+    volume_litres_effective (phantom → 0; elif degraded → envelope estimate;
+    else raw), recompute excluded_from_training, and resync hourly_volume +
+    daily_summary.
 
-    Sets the three category flags + ``user_classified=1``, re-derives
-    ``volume_litres_effective`` (phantom → 0; elif degraded → envelope
-    estimate; else raw), recomputes ``excluded_from_training``, and resyncs
-    ``hourly_volume`` + ``daily_summary`` for the volume delta.
-
-    If all three are False this is "reset to automatic": ``user_classified=0``
-    and the phantom verdict is re-derived from the stored duration/pressure
-    (degraded/composite keep their stored auto values — raw readings needed to
-    recompute them aren't persisted).
-
-    Returns False if no such event.
+    Volume resync is idempotent: it reads the event's stored
+    ``hourly_volume_applied_litres`` (the prior contribution), applies
+    ``delta = new_effective − prev_applied`` to the hour bucket, then writes
+    back ``hourly_volume_applied_litres = new_effective``. Repeated toggles
+    therefore never drift. Returns False if no such event.
     """
-    from .feature_extractor import _detect_pressure_restoration_phantom
-
     row = conn.execute(
-        "SELECT volume_litres, volume_litres_estimated, duration_seconds, "
-        "       pressure_delta_psi, degraded_supply, user_ignored, "
+        "SELECT volume_litres, volume_litres_estimated, user_ignored, "
         "       hourly_volume_applied_litres, hourly_volume_applied_bucket, start_ts "
         "FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit),
     ).fetchone()
     if row is None:
         return False
-
-    manual = bool(phantom or supply_pressure or combined)
-    if manual:
-        new_phantom   = 1 if phantom else 0
-        new_degraded  = 1 if supply_pressure else 0
-        new_composite = 1 if combined else 0
-        user_classified = 1
-    else:
-        # Reset to automatic.
-        new_phantom = 1 if _detect_pressure_restoration_phantom(
-            row["duration_seconds"], row["pressure_delta_psi"]) else 0
-        new_degraded  = int(row["degraded_supply"] or 0)
-        new_composite = 0
-        user_classified = 0
 
     raw = float(row["volume_litres"] or 0.0)
     est = row["volume_litres_estimated"]
@@ -1828,6 +1809,94 @@ def set_event_classification(
         compute_daily_summary(conn, circuit, day)
         conn.commit()
     return True
+
+
+def classify_action(cls: dict):
+    """Pure dispatch for a PATCH ``classification`` payload (Sprint H.1).
+
+    Returns one of:
+      ("reset", {})                                   — reset to automatic
+      ("set",   {phantom, supply_pressure, combined}) — authoritative manual set
+      ("error", {"msg": ...})                         — invalid → caller 400s
+
+    ``reset: true`` is EXCLUSIVE — combining it with any category flag is
+    rejected rather than silently picking one behaviour. Pure (no DB, no
+    request object) so it is unit-testable without the FastAPI stack; lives
+    here in database.py alongside set_/clear_event_classification for that
+    reason (routers/history.py imports fastapi, which the test env lacks).
+    """
+    cls = cls or {}
+    flags = {
+        "phantom":         bool(cls.get("phantom")),
+        "supply_pressure": bool(cls.get("supply_pressure")),
+        "combined":        bool(cls.get("combined")),
+    }
+    if cls.get("reset") is True:
+        if any(flags.values()):
+            return ("error", {"msg": "reset cannot be combined with category flags"})
+        return ("reset", {})
+    return ("set", flags)
+
+
+def set_event_classification(
+    conn: sqlite3.Connection,
+    event_id: str,
+    circuit: str,
+    *,
+    phantom: bool,
+    supply_pressure: bool,
+    combined: bool,
+) -> bool:
+    """Apply a user's manual event classification (Sprint H, authoritative).
+
+    ALWAYS sets ``user_classified=1`` — including the all-three-false case,
+    which means "manually marked normal" and **sticks** (the
+    ``_finalize_derived_verdicts`` skip on user_classified prevents auto from
+    re-flagging it; this is what makes un-marking a phantom permanent). Use
+    ``clear_event_classification`` to return an event to automatic detection.
+
+    Returns False if no such event.
+    """
+    return _apply_event_verdicts(
+        conn, event_id, circuit,
+        new_phantom=1 if phantom else 0,
+        new_degraded=1 if supply_pressure else 0,
+        new_composite=1 if combined else 0,
+        user_classified=1,
+    )
+
+
+def clear_event_classification(
+    conn: sqlite3.Connection,
+    event_id: str,
+    circuit: str,
+) -> bool:
+    """Reset an event to AUTOMATIC classification (Sprint H.1).
+
+    Clears ``user_classified`` and re-derives the phantom verdict from the
+    stored duration/pressure via ``_detect_pressure_restoration_phantom``.
+    degraded/composite keep their stored values (the raw readings needed to
+    recompute them aren't persisted). Volume + summaries resync. Returns
+    False if no such event.
+    """
+    from .feature_extractor import _detect_pressure_restoration_phantom
+
+    row = conn.execute(
+        "SELECT duration_seconds, pressure_delta_psi, degraded_supply, is_composite "
+        "FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if row is None:
+        return False
+    new_phantom = 1 if _detect_pressure_restoration_phantom(
+        row["duration_seconds"], row["pressure_delta_psi"]) else 0
+    return _apply_event_verdicts(
+        conn, event_id, circuit,
+        new_phantom=new_phantom,
+        new_degraded=int(row["degraded_supply"] or 0),
+        new_composite=int(row["is_composite"] or 0),
+        user_classified=0,
+    )
 
 
 def get_leak_test_schedule(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:

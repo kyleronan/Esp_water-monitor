@@ -274,23 +274,27 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
             )
 
     # Sprint H — manual classification (independent checkboxes). Authoritative
-    # over auto-detection; a Phantom mark zeroes volume from totals (reversible).
+    # over auto-detection; a Phantom mark zeroes volume from totals. Sprint H.1:
+    # a manual save (incl. all-false = "normal") always locks; reset:true
+    # returns the event to automatic detection.
     if "classification" in payload:
-        from ..database import set_event_classification
-        cls = payload["classification"] or {}
-        found = set_event_classification(
-            db, event_id, circuit,
-            phantom=bool(cls.get("phantom")),
-            supply_pressure=bool(cls.get("supply_pressure")),
-            combined=bool(cls.get("combined")),
-        )
+        from ..database import (set_event_classification,
+                                clear_event_classification, classify_action)
+        action, data = classify_action(payload["classification"])
+        if action == "error":
+            return JSONResponse({"error": data["msg"]}, status_code=400)
+        if action == "reset":
+            found = clear_event_classification(db, event_id, circuit)
+        else:
+            found = set_event_classification(
+                db, event_id, circuit,
+                phantom=data["phantom"],
+                supply_pressure=data["supply_pressure"],
+                combined=data["combined"],
+            )
         if not found:
             return JSONResponse({"error": "Event not found"}, status_code=404)
-        return JSONResponse({"ok": True, "classification": {
-            "phantom": bool(cls.get("phantom")),
-            "supply_pressure": bool(cls.get("supply_pressure")),
-            "combined": bool(cls.get("combined")),
-        }})
+        return JSONResponse({"ok": True, "action": action, "classification": data})
 
     kwargs: dict = {}
     if "user_fixture_type" in payload:

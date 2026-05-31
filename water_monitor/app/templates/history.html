@@ -381,12 +381,13 @@
         <label class="emd-check"><input type="checkbox" id="emd-cls-combined">
           <span>Combined event</span></label>
       </div>
-      <div style="display:flex;align-items:center;gap:.75rem;margin-top:.5rem">
+      <div style="display:flex;align-items:center;gap:.75rem;margin-top:.5rem;flex-wrap:wrap">
         <button id="emd-classify-save-btn" class="btn btn-secondary btn-sm">Save classification</button>
-        <span id="emd-classify-hint" class="muted" style="font-size:11px" hidden>
-          ⓘ manually classified — auto-detection overridden
-        </span>
+        <button id="emd-classify-reset-btn" class="btn btn-ghost btn-sm" hidden>Reset to automatic</button>
       </div>
+      <p id="emd-classify-hint" class="muted" style="font-size:11px;margin:.35rem 0 0" hidden>
+        ⓘ Manually classified — auto-detection is off for this event.
+      </p>
     </div>
     <div id="emd-error" class="evt-modal-error" hidden></div>
     <div class="evt-modal-btns">
@@ -601,6 +602,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   const clsSupply   = document.getElementById('emd-cls-supply');
   const clsCombined = document.getElementById('emd-cls-combined');
   const clsSaveBtn  = document.getElementById('emd-classify-save-btn');
+  const clsResetBtn = document.getElementById('emd-classify-reset-btn');
   const clsHint     = document.getElementById('emd-classify-hint');
 
   // Startup diagnostic
@@ -633,7 +635,11 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     if (clsPhantom)  clsPhantom.checked  = d.phantom === '1';
     if (clsSupply)   clsSupply.checked   = d.degraded === '1';
     if (clsCombined) clsCombined.checked = d.composite === '1';
-    if (clsHint)     clsHint.hidden      = d.classified !== '1';
+    // Sprint H.1 — the "manually classified" hint + Reset link only apply
+    // once the user has locked a manual classification.
+    const isClassified = d.classified === '1';
+    if (clsHint)     clsHint.hidden     = !isClassified;
+    if (clsResetBtn) clsResetBtn.hidden = !isClassified;
 
     // Technical details
     const TRIGGER_LABELS = { flow: 'Flow (sustained)', pressure: 'Pressure drop', 'pressure+flow': 'Pressure + flow' };
@@ -908,7 +914,8 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     if (ok) location.reload();
   });
 
-  // Sprint H — save manual classification (independent checkboxes).
+  // Sprint H — save manual classification (independent checkboxes). Always
+  // locks (incl. all-unchecked = "manually normal"), so un-marking sticks.
   if (clsSaveBtn) {
     clsSaveBtn.addEventListener('click', async () => {
       if (!activeRow) return;
@@ -917,6 +924,15 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         supply_pressure: clsSupply   && clsSupply.checked,
         combined:        clsCombined && clsCombined.checked,
       }});
+      if (ok) location.reload();
+    });
+  }
+
+  // Sprint H.1 — reset an event back to automatic detection.
+  if (clsResetBtn) {
+    clsResetBtn.addEventListener('click', async () => {
+      if (!activeRow) return;
+      const ok = await patchEvent({ classification: { reset: true } });
       if (ok) location.reload();
     });
   }
