@@ -367,6 +367,13 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                     signature_meta[sig_type] = {
                         "member_count": sig["member_count"],
                     }
+
+            # Re-run the label-trained k-NN over the circuit's unlabelled events
+            # so this new label immediately spreads to similar events AND any now-
+            # stale matched_fixture_type is cleared (e.g. the user removed/changed
+            # a label). Sub-second for a home-sized corpus; idempotent.
+            from ..database import reclassify_all_events_from_signatures
+            reclassify_all_events_from_signatures(db, circuit)
         except Exception as e:
             # Propagation is best-effort. A failure here must not block
             # the label save the user already saw succeed.

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -536,6 +537,13 @@ CREATE TABLE IF NOT EXISTS events (
     -- forced to 0 and it is excluded_from_training. Shown in History with a
     -- flag; volume contributes nothing to totals.
     is_pressure_restoration_phantom  INTEGER DEFAULT 0,
+    -- Low-flow dribble guard (migration 20260535). When 1, this event is a
+    -- brief low-flow / low-volume / near-zero-pressure trickle (sensor or
+    -- pressure-equalisation noise). UNLIKE a phantom it does NOT zero volume —
+    -- it only sets excluded_from_training so the event stays out of the
+    -- classifier / clustering training set while its (tiny) volume still counts
+    -- toward totals. Auto-derived; suppressed for user_classified rows.
+    is_low_flow_dribble              INTEGER NOT NULL DEFAULT 0,
     -- Sprint H. user_ignored: explicit Ignore/Restore intent (separate from
     -- the derived excluded_from_training, which is auto OR user_ignored OR
     -- manual). user_classified: lock bit — when 1 the three category flags
@@ -1697,7 +1705,8 @@ def patch_event(
     callers should prefer ``user_ignored``.
     """
     row = conn.execute(
-        "SELECT id, is_pressure_restoration_phantom, degraded_supply, is_composite "
+        "SELECT id, is_pressure_restoration_phantom, degraded_supply, is_composite, "
+        "       is_low_flow_dribble "
         "FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit),
     ).fetchone()
@@ -1711,7 +1720,8 @@ def patch_event(
     if user_ignored is not _PATCH_UNSET:
         ign = 1 if user_ignored else 0
         excluded = 1 if (ign or row["is_pressure_restoration_phantom"]
-                         or row["degraded_supply"] or row["is_composite"]) else 0
+                         or row["degraded_supply"] or row["is_composite"]
+                         or row["is_low_flow_dribble"]) else 0
         conn.execute(
             "UPDATE events SET user_ignored = ?, excluded_from_training = ? "
             "WHERE id = ? AND circuit = ?",
@@ -1735,6 +1745,7 @@ def _apply_event_verdicts(
     new_degraded: int,
     new_composite: int,
     user_classified: int,
+    new_dribble: int = 0,
 ) -> bool:
     """Shared core: write category flags + user_classified, re-derive
     volume_litres_effective (phantom → 0; elif degraded → envelope estimate;
@@ -1767,10 +1778,12 @@ def _apply_event_verdicts(
         new_effective, method = raw, "raw"
 
     user_ignored = int(row["user_ignored"] or 0)
-    excluded = 1 if (new_phantom or new_degraded or new_composite or user_ignored) else 0
+    excluded = 1 if (new_phantom or new_degraded or new_composite
+                     or new_dribble or user_ignored) else 0
     reason = (
         "pressure_restoration_phantom" if new_phantom
         else "pulsing_supply" if (new_degraded and not new_composite)
+        else "low_flow_dribble" if new_dribble
         else None
     )
 
@@ -1782,11 +1795,11 @@ def _apply_event_verdicts(
         conn.execute(
             "UPDATE events SET "
             "  is_pressure_restoration_phantom = ?, degraded_supply = ?, "
-            "  is_composite = ?, user_classified = ?, "
+            "  is_composite = ?, user_classified = ?, is_low_flow_dribble = ?, "
             "  volume_litres_effective = ?, volume_estimation_method = ?, "
             "  excluded_from_training = ?, match_rejection_reason = ? "
             "WHERE id = ? AND circuit = ?",
-            (new_phantom, new_degraded, new_composite, user_classified,
+            (new_phantom, new_degraded, new_composite, user_classified, new_dribble,
              round(new_effective, 3), method, excluded, reason,
              event_id, circuit),
         )
@@ -1879,10 +1892,13 @@ def clear_event_classification(
     recompute them aren't persisted). Volume + summaries resync. Returns
     False if no such event.
     """
-    from .feature_extractor import _detect_pressure_restoration_phantom
+    from .feature_extractor import (
+        _detect_pressure_restoration_phantom, _detect_low_flow_dribble,
+    )
 
     row = conn.execute(
-        "SELECT duration_seconds, pressure_delta_psi, degraded_supply, is_composite "
+        "SELECT duration_seconds, pressure_delta_psi, degraded_supply, is_composite, "
+        "       volume_litres, avg_flow_lpm "
         "FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit),
     ).fetchone()
@@ -1890,12 +1906,20 @@ def clear_event_classification(
         return False
     new_phantom = 1 if _detect_pressure_restoration_phantom(
         row["duration_seconds"], row["pressure_delta_psi"]) else 0
+    new_degraded = int(row["degraded_supply"] or 0)
+    # Dribble only when not phantom and not degraded (mirrors the finalizer).
+    new_dribble = 1 if (
+        not new_phantom and not new_degraded
+        and _detect_low_flow_dribble(
+            row["volume_litres"], row["avg_flow_lpm"], row["pressure_delta_psi"])
+    ) else 0
     return _apply_event_verdicts(
         conn, event_id, circuit,
         new_phantom=new_phantom,
-        new_degraded=int(row["degraded_supply"] or 0),
+        new_degraded=new_degraded,
         new_composite=int(row["is_composite"] or 0),
         user_classified=0,
+        new_dribble=new_dribble,
     )
 
 
@@ -3007,6 +3031,62 @@ _SIGNATURE_MATCH_SCALES: dict = {
     "steady_state_fraction":  0.5,
 }
 
+# ── Label-trained k-NN matcher (2026-05-31) ─────────────────────────────────
+# The mean-centroid matcher above scored ~70% leave-one-out on the May-2026
+# labelled archive; a weighted k-NN over the labelled events themselves scored
+# ~80% (and stays in sync with labels — no stale centroid). The k-NN is the
+# production path (live classify + backfill); the mean-centroid is retained for
+# the Signatures UI display and back-compat tests.
+#
+# Right-skewed features are log1p-compressed so the centroid + Euclidean
+# distance behave on log-normal data. The transform is applied identically to
+# the query event AND every labelled neighbour at query time, so train/serve
+# are consistent by construction (nothing log-space is persisted).
+_SIGNATURE_LOG_FEATURES: frozenset = frozenset({
+    "volume_litres", "duration_seconds", "avg_flow_lpm", "peak_flow_lpm",
+})
+
+
+def _sig_transform(feat: str, value) -> float:
+    """log1p the right-skewed signature features; identity for the rest.
+
+    MUST be applied identically in training (the labelled neighbours) and
+    serving (the query event). None / non-numeric → 0.0 in the (already
+    non-negative) transformed space.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(v):
+        return 0.0
+    if feat in _SIGNATURE_LOG_FEATURES:
+        return math.log1p(max(0.0, v))
+    return v
+
+
+# k-NN tuning. All values derived from the May-2026 labelled archive (104
+# non-excluded labelled events); re-tune as more labels accrue.
+_SIGNATURE_KNN_K: int = 5
+# Below these floors the matcher abstains rather than overfit a tiny corpus:
+_SIGNATURE_KNN_MIN_TOTAL_LABELS: int = 10     # whole circuit too sparse → None
+_SIGNATURE_KNN_MIN_LABELS_PER_CLASS: int = 2  # class too sparse → not voted
+# Accept a winner only when its summed inverse-distance vote clears an absolute
+# floor (catches out-of-distribution events whose nearest neighbours are far)
+# AND holds a clear majority share (catches genuinely ambiguous events). At
+# margin 0.6 the LOO set was 85% covered / 86% accurate on what it typed.
+_SIGNATURE_KNN_CONFIDENCE_THRESHOLD: float = 1.5
+_SIGNATURE_KNN_MARGIN_THRESHOLD: float = 0.6
+# Per-feature scales ≈ each feature's std in log1p space on the labelled set.
+_SIGNATURE_KNN_SCALES: dict = {
+    "avg_flow_lpm":          0.70,
+    "peak_flow_lpm":         0.74,
+    "duration_seconds":      1.27,
+    "volume_litres":         1.52,
+    "pressure_delta_psi":    2.88,
+    "steady_state_fraction": 0.25,
+}
+
 
 def upsert_fixture_signature(
     conn: sqlite3.Connection,
@@ -3141,12 +3221,17 @@ def get_category_rollup(
     effective volume is already 0 and counting them would inflate the event
     count. Degraded and composite events ARE included; the Fixtures count
     should match what the History list shows, not the training subset.
+
+    Effective-type precedence (clustering demoted 2026-05-31): user label >
+    confirmed fixture > label-trained matched_fixture_type > cluster suggestion
+    > 'other'. The k-NN match outranks the (impure) cluster suggestion so the
+    classifier — not clustering — drives fixture identity on the cards.
     """
     rows = conn.execute(
         """
         SELECT
-          COALESCE(e.user_fixture_type, f.fixture_type, fc.suggested_type,
-                   e.matched_fixture_type, 'other') AS eff_type,
+          COALESCE(e.user_fixture_type, f.fixture_type, e.matched_fixture_type,
+                   fc.suggested_type, 'other') AS eff_type,
           COALESCE(SUM(COALESCE(e.volume_litres_effective, e.volume_litres, 0)), 0)
                                                           AS lifetime_volume_l,
           COUNT(*)                                        AS lifetime_event_count,
@@ -3244,6 +3329,12 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
 
     Skips ``user_classified`` rows (manual classification is authoritative).
     Idempotent — once repaired the WHERE clause no longer selects the row.
+
+    Scope: this contradiction-repair concerns only the LONG-DURATION
+    pressure-restoration phantom (which zeroes volume and requires
+    ``pressure_delta_psi < 2.0``). The low-flow dribble flag is unrelated — it
+    never zeroes volume and lives on low-pressure rows that can't satisfy the
+    ``pressure_delta_psi >= 2.0`` filter below, so dribbles are never touched.
 
     Returns ``{"repaired": N, "litres_restored": L}``.
     """
@@ -3403,6 +3494,197 @@ def set_event_matched_fixture_type(
         "WHERE id = ? AND circuit = ?",
         (fixture_type, event_id, circuit),
     )
+
+
+def _canonical_fixture_type(name: Optional[str]) -> Optional[str]:
+    """Collapse a fixture-type string to its canonical slug (circuit-kind
+    independent): lowercase, take the first '/'-segment, fold separators to
+    '_', then apply the Sprint-D alias remap (shower→shower_tub, etc.).
+
+    Returns None for None/blank input. Does NOT map unknowns to 'other' (that's
+    the circuit-kind-aware display layer's job) — it only unifies variants so
+    'Toilet'/'toilets'/'toilet ' all store as 'toilet'. Reused at every write
+    of user_fixture_type / matched_fixture_type so the rollup groups cleanly.
+    """
+    if not isinstance(name, str):
+        return None
+    s = name.strip().lower()
+    if not s:
+        return None
+    s = s.strip("/").split("/", 1)[0].strip()
+    s = re.sub(r"[\s\-]+", "_", s).strip("_")
+    if not s:
+        return None
+    # Lazy import — fixtures.py owns the alias map; importing at module load
+    # would be a (currently absent) cycle risk.
+    try:
+        from .fixtures import LEGACY_TYPE_REMAP
+        return LEGACY_TYPE_REMAP.get(s, s)
+    except Exception:
+        return s
+
+
+def match_event_to_signature_knn(
+    conn: sqlite3.Connection,
+    circuit: str,
+    event_features: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Inverse-distance weighted k-NN over the circuit's labelled events.
+
+    The production fixture-type matcher (replaces the mean-centroid
+    ``match_event_to_signature`` on the live + backfill paths). Pulls every
+    labelled, non-excluded event on ``circuit``, log-compresses the skewed
+    features (``_sig_transform``), and votes with weight ``1/(distance+eps)``.
+
+    Abstains (returns ``None``) when:
+      • fewer than ``_SIGNATURE_KNN_MIN_TOTAL_LABELS`` labelled events exist;
+      • no class has ``_SIGNATURE_KNN_MIN_LABELS_PER_CLASS`` members;
+      • the winner's summed vote is below ``_SIGNATURE_KNN_CONFIDENCE_THRESHOLD``
+        (out-of-distribution — nearest neighbours are far); or
+      • the winner's share of the total vote is below
+        ``_SIGNATURE_KNN_MARGIN_THRESHOLD`` (genuinely ambiguous).
+
+    On a hit returns ``{"fixture_type", "distance", "score", "margin",
+    "member_count"}``. fixture_type is canonical.
+    """
+    rows = conn.execute(
+        "SELECT user_fixture_type, avg_flow_lpm, peak_flow_lpm, duration_seconds, "
+        "       volume_litres, pressure_delta_psi, steady_state_fraction "
+        "FROM events "
+        "WHERE circuit = ? "
+        "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
+        "  AND COALESCE(excluded_from_training, 0) = 0",
+        (circuit,),
+    ).fetchall()
+    if len(rows) < _SIGNATURE_KNN_MIN_TOTAL_LABELS:
+        return None
+
+    # Canonicalise labels + count per class.
+    labelled: list = []
+    counts: Dict[str, int] = {}
+    for r in rows:
+        t = _canonical_fixture_type(r["user_fixture_type"])
+        if not t:
+            continue
+        counts[t] = counts.get(t, 0) + 1
+        labelled.append((t, r))
+    eligible = {t for t, c in counts.items()
+                if c >= _SIGNATURE_KNN_MIN_LABELS_PER_CLASS}
+    if not eligible:
+        return None
+
+    q = {f: _sig_transform(f, event_features.get(f))
+         for f in _SIGNATURE_MATCH_FEATURES}
+    dists: list = []
+    for t, r in labelled:
+        if t not in eligible:
+            continue
+        sq = 0.0
+        for f in _SIGNATURE_MATCH_FEATURES:
+            scale = _SIGNATURE_KNN_SCALES.get(f, 1.0)
+            d = (q[f] - _sig_transform(f, r[f])) / scale
+            sq += d * d
+        dists.append((math.sqrt(sq / len(_SIGNATURE_MATCH_FEATURES)), t))
+    if not dists:
+        return None
+
+    dists.sort(key=lambda x: x[0])
+    neighbours = dists[:_SIGNATURE_KNN_K]
+    score: Dict[str, float] = {}
+    for d, t in neighbours:
+        score[t] = score.get(t, 0.0) + 1.0 / (d + 1e-6)
+    total = sum(score.values())
+    win_t, win_s = max(score.items(), key=lambda kv: kv[1])
+    if (win_s < _SIGNATURE_KNN_CONFIDENCE_THRESHOLD
+            or total <= 0
+            or (win_s / total) < _SIGNATURE_KNN_MARGIN_THRESHOLD):
+        return None
+    if win_t == "other":
+        # 'other' stays a VOTABLE class above (so a genuinely-misc event resolves
+        # to it instead of being force-typed into a real fixture card), but it is
+        # the heterogeneous catch-all, not a specific fixture identity. Treat a
+        # winning 'other' vote as abstention so matched_fixture_type only ever
+        # holds a real type; the rollup supplies 'other' for NULLs (req: never
+        # persist 'other' as an auto type).
+        return None
+    nearest = min(d for d, t in neighbours if t == win_t)
+    return {
+        "fixture_type": win_t,
+        "distance": nearest,
+        "score": win_s,
+        "margin": win_s / total,
+        "member_count": counts[win_t],
+    }
+
+
+def reclassify_all_events_from_signatures(
+    conn: sqlite3.Connection,
+    circuit: str,
+) -> Dict[str, Any]:
+    """Retrain signatures, then backfill ``matched_fixture_type`` over every
+    unlabelled event on ``circuit`` via the k-NN matcher.
+
+    NEVER touches user-labelled rows (WHERE user_fixture_type IS NULL). Writes
+    the canonical matched type, or NULL on abstention — writing NULL clears a
+    stale prior match, making the whole pass idempotent. Never writes 'other'
+    (that is a display-only fallback).
+
+    Returns counts: ``{"signatures_trained", "events_scanned", "events_matched",
+    "events_cleared", "events_abstained"}``.
+    """
+    # 1. Retrain the per-type centroids (for the Signatures UI display). The
+    #    k-NN itself reads events directly, so this is purely cosmetic but keeps
+    #    the Signatures page in sync.
+    signatures_trained = 0
+    type_rows = conn.execute(
+        "SELECT DISTINCT user_fixture_type FROM events "
+        "WHERE circuit = ? AND user_fixture_type IS NOT NULL "
+        "  AND user_fixture_type <> ''",
+        (circuit,),
+    ).fetchall()
+    for tr in type_rows:
+        if upsert_fixture_signature(conn, circuit, tr[0]) is not None:
+            signatures_trained += 1
+
+    # 2. Backfill over unlabelled events.
+    rows = conn.execute(
+        "SELECT id, matched_fixture_type, avg_flow_lpm, peak_flow_lpm, "
+        "       duration_seconds, volume_litres, pressure_delta_psi, "
+        "       steady_state_fraction "
+        "FROM events "
+        "WHERE circuit = ? AND user_fixture_type IS NULL "
+        "ORDER BY start_ts",
+        (circuit,),
+    ).fetchall()
+    scanned = matched = cleared = abstained = 0
+    for r in rows:
+        scanned += 1
+        feats = {f: r[f] for f in _SIGNATURE_MATCH_FEATURES}
+        hit = match_event_to_signature_knn(conn, circuit, feats)
+        new_type = _canonical_fixture_type(hit["fixture_type"]) if hit else None
+        prev = r["matched_fixture_type"]
+        if new_type != prev:
+            set_event_matched_fixture_type(conn, circuit, r["id"], new_type)
+            if new_type is None and prev is not None:
+                cleared += 1
+        if new_type is not None:
+            matched += 1
+        else:
+            abstained += 1
+    conn.commit()
+    result = {
+        "signatures_trained": signatures_trained,
+        "events_scanned": scanned,
+        "events_matched": matched,
+        "events_cleared": cleared,
+        "events_abstained": abstained,
+    }
+    log.info(
+        "[%s] reclassify: trained %d signature(s); scanned %d unlabelled "
+        "event(s) → %d matched, %d abstained (%d stale cleared)",
+        circuit, signatures_trained, scanned, matched, abstained, cleared,
+    )
+    return result
 
 
 def migrate_to_type_level_clusters(

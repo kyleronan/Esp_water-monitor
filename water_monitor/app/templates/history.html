@@ -194,6 +194,7 @@
           {% if ch.events | selectattr('is_composite') | list %}<th title="Composite event">⚡</th>{% endif %}
           {% if ch.events | selectattr('degraded_supply') | list %}<th title="Degraded supply detected — volume estimated">〰</th>{% endif %}
           {% if ch.events | selectattr('is_pressure_restoration_phantom') | list %}<th title="Pressure artifact — volume removed from totals">👻</th>{% endif %}
+          {% if ch.events | selectattr('is_low_flow_dribble') | list %}<th title="Low-flow noise — excluded from training, volume kept">💧</th>{% endif %}
         </tr>
       </thead>
       <tbody>
@@ -255,14 +256,17 @@
           {% set _row_vol = e.volume_litres_effective if e.is_pressure_restoration_phantom else e.volume_litres %}
           <td class="hist-td hist-td-mono">{{ (_row_vol * vol_factor)|round(vol_decimals) if _row_vol is not none else "—" }} {{ vol_unit if _row_vol is not none else '' }}</td>
           <td class="hist-td">
+            {# Fixture identity is driven by your labels (clustering demoted):
+               your label > confirmed fixture > label-trained match > cluster
+               suggestion. Raw cluster numbers are no longer surfaced. #}
             {% if e.user_fixture_type %}
               <span class="pill pill-green" title="You assigned this">★ {{ fixture_type_labels.get(e.user_fixture_type, e.user_fixture_type | replace('_',' ') | title) }}</span>
             {% elif e.fixture_display_name %}
-              <span class="pill pill-green">{{ e.fixture_display_name }}{% if e.cluster_id is not none %} · {{ e.cluster_id }}{% endif %}</span>
-            {% elif e.suggested_type and e.cluster_id is not none %}
-              <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }} · {{ e.cluster_id }}</span>
-            {% elif e.cluster_id is not none %}
-              <span class="pill pill-neutral">Cluster {{ e.cluster_id }}</span>
+              <span class="pill pill-green">{{ e.fixture_display_name }}</span>
+            {% elif e.matched_fixture_type %}
+              <span class="pill pill-neutral" title="Auto-matched from your labels">~ {{ fixture_type_labels.get(e.matched_fixture_type, e.matched_fixture_type | replace('_',' ') | title) }}</span>
+            {% elif e.suggested_type %}
+              <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }}</span>
             {% else %}
               —
             {% endif %}
@@ -275,6 +279,9 @@
           {% endif %}
           {% if ch.events | selectattr('is_pressure_restoration_phantom') | list %}
           <td class="hist-td">{% if e.is_pressure_restoration_phantom %}<span title="Pressure artifact — volume removed from totals" aria-label="Pressure artifact event">👻</span>{% endif %}</td>
+          {% endif %}
+          {% if ch.events | selectattr('is_low_flow_dribble') | list %}
+          <td class="hist-td">{% if e.is_low_flow_dribble %}<span title="Low-flow noise — excluded from training, volume kept" aria-label="Low-flow noise event">💧</span>{% endif %}</td>
           {% endif %}
         </tr>
         {% endfor %}

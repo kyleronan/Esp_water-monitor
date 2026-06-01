@@ -438,6 +438,32 @@ class Orchestrator:
         except Exception as e:
             log.error("ClusterEngine init failed (non-fatal): %s", e, exc_info=True)
 
+        # Auto-exclusion verdicts + label-trained fixture typing. Runs after the
+        # cluster engine so matched_fixture_type reflects the newest user labels.
+        # Both passes are idempotent and best-effort — a failure must not block
+        # boot. The 20260535 migration only adds the dribble column (lightweight
+        # DDL); the verdict + typing backfill lands here.
+        try:
+            loop = asyncio.get_running_loop()
+            from .feature_extractor import reprocess_event_exclusion_verdicts
+            res = await loop.run_in_executor(
+                None, reprocess_event_exclusion_verdicts, self._db)
+            if res.get("dribbles_flagged"):
+                log.info("startup: flagged %d low-flow dribble event(s)",
+                         res["dribbles_flagged"])
+            from .database import reclassify_all_events_from_signatures
+            for c in self._cfg.circuits:
+                r = await loop.run_in_executor(
+                    None, reclassify_all_events_from_signatures,
+                    self._db, c.circuit)
+                if r.get("events_matched") or r.get("events_cleared"):
+                    log.info(
+                        "[%s] startup reclassify: %d matched, %d abstained, "
+                        "%d stale cleared", c.circuit, r["events_matched"],
+                        r["events_abstained"], r["events_cleared"])
+        except Exception as e:
+            log.warning("startup reclassify/reprocess failed (non-fatal): %s", e)
+
         # Initialise daily/weekly volume baselines from HA history so that
         # the dashboard shows accurate totals from the first page load.
         try:

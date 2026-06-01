@@ -236,6 +236,26 @@ MAX_WAVEFORM_BINS            = 1000
 _PHANTOM_MIN_DURATION_S: float = 1800.0   # 30 min
 _PHANTOM_MAX_DELTA_PSI:  float = 2.0
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Low-flow "dribble" guard (added 2026-05-31)
+#
+# A DIFFERENT phenomenon from the long-duration phantom above: brief, tiny-
+# volume, low-flow trickles with no real pressure load — sensor noise or
+# pressure-equalisation blips registering as flow. In the May-2026 ground-truth
+# export the events the user hand-marked as artifacts clustered at median
+# duration 12 s, volume 0.10 L, avg_flow 0.30 lpm, ΔP 0.00 — the long-duration
+# rule caught only 1 of 49. These thresholds (derived from that labelled set,
+# ~76% recall / ~73% precision) catch them.
+#
+# CRITICAL: unlike a phantom, a dribble does NOT zero volume. It only sets
+# is_low_flow_dribble + excluded_from_training, keeping it out of the
+# classifier/clustering training set while its (negligible) volume still counts
+# toward totals. Manual phantom marks remain the only short-event path that
+# zeroes volume. Re-tune here as more labelled data arrives.
+_DRIBBLE_MAX_VOLUME_L:  float = 0.5
+_DRIBBLE_MAX_FLOW_LPM:  float = 1.0
+_DRIBBLE_MAX_DELTA_PSI: float = 1.5
+
 
 def _finite_float_series(values) -> List[float]:
     """Strip None/NaN/inf; coerce to float at full precision.
@@ -603,6 +623,37 @@ def _detect_pressure_restoration_phantom(duration_s, pressure_delta_psi) -> bool
     return duration >= _PHANTOM_MIN_DURATION_S and delta < _PHANTOM_MAX_DELTA_PSI
 
 
+def _detect_low_flow_dribble(volume_litres, avg_flow_lpm, pressure_delta_psi) -> bool:
+    """True when an event is a brief low-flow trickle (sensor / pressure-
+    equalisation noise) rather than real water use.
+
+    Fingerprint: tiny volume AND low average flow AND near-zero pressure drop
+    (all three below their thresholds). Distinct from the long-duration
+    pressure-restoration phantom — these are short blips. Calibrated from the
+    May-2026 labelled export (see the constants above).
+
+    Returns False if ANY input is None / non-numeric / non-finite. That keeps
+    the verdict conservative: a parse error never excludes a real event, and a
+    legacy caller that passes nothing (e.g. the phantom-only repair path) gets
+    a clean False rather than a spurious dribble flag.
+    """
+    if volume_litres is None or avg_flow_lpm is None or pressure_delta_psi is None:
+        return False
+    try:
+        vol = float(volume_litres)
+        flow = float(avg_flow_lpm)
+        delta = float(pressure_delta_psi)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(vol) and math.isfinite(flow) and math.isfinite(delta)):
+        return False
+    return (
+        vol < _DRIBBLE_MAX_VOLUME_L
+        and flow < _DRIBBLE_MAX_FLOW_LPM
+        and delta < _DRIBBLE_MAX_DELTA_PSI
+    )
+
+
 def _finalize_derived_verdicts(features: dict) -> None:
     """Single source of truth for the phantom verdict + its dependent fields.
 
@@ -629,13 +680,25 @@ def _finalize_derived_verdicts(features: dict) -> None:
     user_ignored = bool(features.get("user_ignored"))
     is_phantom = _detect_pressure_restoration_phantom(
         features.get("duration_seconds"), features.get("pressure_delta_psi"))
+    # Low-flow dribble: only for events that are NOT a phantom and NOT degraded
+    # (a degraded event's low flow is a measurement artifact, not a true
+    # trickle, and is already excluded). Folds into the exclusion set WITHOUT
+    # zeroing volume — see the constants block.
+    is_dribble = (
+        not is_phantom and not is_degraded
+        and _detect_low_flow_dribble(
+            features.get("volume_litres"), features.get("avg_flow_lpm"),
+            features.get("pressure_delta_psi"))
+    )
 
     raw = float(features.get("volume_litres") or 0.0)
     est = features.get("volume_litres_estimated")
     est = float(est) if est is not None else raw
 
     # Effective volume: phantom → 0 (false water); degraded → envelope estimate;
-    # else raw. Phantom takes precedence over degraded.
+    # else raw. Phantom takes precedence over degraded. A dribble keeps its raw
+    # volume (it counts toward totals) — it is excluded from TRAINING, not from
+    # consumption, so it falls through to the raw branch here.
     if is_phantom:
         features["volume_litres_effective"]  = 0.0
         features["volume_estimation_method"] = "pressure_restoration_phantom"
@@ -647,36 +710,45 @@ def _finalize_derived_verdicts(features: dict) -> None:
         features["volume_estimation_method"] = "raw"
 
     features["is_pressure_restoration_phantom"] = 1 if is_phantom else 0
+    features["is_low_flow_dribble"] = 1 if is_dribble else 0
     features["excluded_from_training"] = (
-        1 if (is_composite or is_degraded or is_phantom or user_ignored) else 0
+        1 if (is_composite or is_degraded or is_phantom or is_dribble or user_ignored)
+        else 0
     )
     # Upstream rejection reason (cluster-engine reasons are written separately).
+    # is_low_flow_dribble is the authoritative dribble state; this reason string
+    # is a secondary signal kept consistent with the live finalizer.
     features["match_rejection_reason"] = (
         "pressure_restoration_phantom" if is_phantom
         else "pulsing_supply" if (is_degraded and not is_composite)
+        else "low_flow_dribble" if is_dribble
         else None
     )
 
 
-def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
-    """Scan all events for the phantom fingerprint; zero their volume
-    contributions and flag them.
+def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
+    """Recompute the auto exclusion verdicts over all events.
 
-    Mirrors reprocess_degraded_supply_verdicts(): for each matching unflagged
-    event, set is_pressure_restoration_phantom=1, zero volume_litres_effective,
-    mark excluded_from_training, and reverse any prior hourly_volume
-    contribution so daily totals shed the false volume.
+    Two independent scans, in order:
+      1. Pressure-restoration phantoms (long duration + near-zero ΔP) — flag
+         them, ZERO volume_litres_effective, mark excluded_from_training, and
+         reverse any prior hourly_volume contribution so daily totals shed the
+         false volume.
+      2. Low-flow dribbles (brief low-flow / low-volume / near-zero ΔP) — flag
+         is_low_flow_dribble + excluded_from_training only. Volume is PRESERVED
+         (a dribble still counts toward totals); no hourly/daily resync needed.
 
-    Idempotent — already-flagged events are excluded by the WHERE clause and
-    their bookkeeping is zeroed, so a second call neither re-selects nor
-    re-subtracts.
+    Both scans skip ``user_classified`` rows (manual classification wins) and
+    are idempotent — already-flagged events are excluded by their WHERE clauses.
 
-    Migration-safe — depends on nothing beyond a sqlite3.Connection and the
-    is_pressure_restoration_phantom column. Called from the 20260532 migration
-    immediately after the column is added, before any app/orchestrator state
-    exists.
+    The dribble scan is guarded by a column-existence check so this stays safe
+    to call from the phantom-only wrapper during a sequential upgrade where the
+    is_low_flow_dribble column hasn't been added yet (caution A: the migration
+    only adds DDL; this backfill runs from startup / import / manual paths).
 
-    Derived-stats notes:
+    Returns {"flagged": <phantoms>, "dribbles_flagged": <dribbles>}.
+
+    Derived-stats notes (phantom scan):
       • Volume aggregates — hourly_volume and daily_summary.total_volume_litres
         — are both corrected here (hourly_volume via the reversal INSERT,
         daily_summary via a recompute of each affected day). Both now read
@@ -692,11 +764,17 @@ def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
         assignments), and the residual influence of at most a handful of
         extreme outliers is negligible and not worth a full retrain. This is a
         deliberate scope decision, not an oversight.
-
-    Returns {"flagged": N}.
     """
     from .database import transaction, compute_daily_summary
 
+    # Skip manually-classified rows so a startup re-run never re-flags an event
+    # the user deliberately un-marked. Column-guarded because the back-compat
+    # wrapper is called from the 20260532 migration, before user_classified
+    # exists in a sequential upgrade.
+    uc_guard = (
+        " AND COALESCE(user_classified, 0) = 0"
+        if _events_has_column(conn, "user_classified") else ""
+    )
     rows = conn.execute(
         "SELECT id, circuit, start_ts, duration_seconds, pressure_delta_psi, "
         "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
@@ -704,7 +782,8 @@ def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
         "WHERE duration_seconds >= ? "
         "  AND pressure_delta_psi < ? "
         "  AND (is_pressure_restoration_phantom = 0 "
-        "       OR is_pressure_restoration_phantom IS NULL)",
+        "       OR is_pressure_restoration_phantom IS NULL)"
+        + uc_guard,
         (_PHANTOM_MIN_DURATION_S, _PHANTOM_MAX_DELTA_PSI),
     ).fetchall()
 
@@ -774,7 +853,66 @@ def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
     if flagged:
         log.info("phantom-reprocess: flagged %d event(s) total across %d day(s)",
                  flagged, len(affected_days))
-    return {"flagged": flagged}
+
+    # ── Scan 2: low-flow dribbles ────────────────────────────────────────────
+    # Non-zeroing exclusion. Guarded by the column check so the phantom-only
+    # wrapper stays safe mid-upgrade (column added later in the chain).
+    dribbles_flagged = 0
+    if _events_has_column(conn, "is_low_flow_dribble"):
+        drows = conn.execute(
+            "SELECT id, duration_seconds, pressure_delta_psi, "
+            "       volume_litres, avg_flow_lpm "
+            "FROM events "
+            "WHERE (is_low_flow_dribble = 0 OR is_low_flow_dribble IS NULL) "
+            "  AND COALESCE(user_classified, 0) = 0 "
+            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+            "  AND COALESCE(degraded_supply, 0) = 0 "
+            "  AND volume_litres < ? AND avg_flow_lpm < ? "
+            "  AND pressure_delta_psi < ?",
+            (_DRIBBLE_MAX_VOLUME_L, _DRIBBLE_MAX_FLOW_LPM, _DRIBBLE_MAX_DELTA_PSI),
+        ).fetchall()
+        for row in drows:
+            # Re-run the canonical detector (SQL is only a prefilter).
+            if not _detect_low_flow_dribble(
+                row["volume_litres"], row["avg_flow_lpm"], row["pressure_delta_psi"]
+            ):
+                continue
+            # Flag + exclude WITHOUT touching volume_litres_effective or
+            # hourly_volume — the event still counts toward totals.
+            conn.execute(
+                "UPDATE events SET "
+                "  is_low_flow_dribble = 1, "
+                "  excluded_from_training = 1, "
+                "  match_rejection_reason = 'low_flow_dribble' "
+                "WHERE id = ?",
+                (row["id"],),
+            )
+            dribbles_flagged += 1
+        if dribbles_flagged:
+            conn.commit()
+            log.info("dribble-reprocess: flagged %d low-flow dribble event(s)",
+                     dribbles_flagged)
+
+    return {"flagged": flagged, "dribbles_flagged": dribbles_flagged}
+
+
+def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
+    """Back-compat alias for the phantom component of the exclusion reprocess.
+
+    Retained because the 20260532 migration calls this name. Delegates to
+    ``reprocess_event_exclusion_verdicts``; the dribble half is a no-op there
+    when the is_low_flow_dribble column doesn't exist yet (sequential upgrade).
+    """
+    return reprocess_event_exclusion_verdicts(conn)
+
+
+def _events_has_column(conn: sqlite3.Connection, col: str) -> bool:
+    """True if the events table has ``col``. Used to make the dribble scan
+    safe to call before its migration has added the column."""
+    try:
+        return any(r[1] == col for r in conn.execute("PRAGMA table_info(events)"))
+    except sqlite3.Error:
+        return False
 
 
 def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
@@ -2223,8 +2361,8 @@ class FeatureExtractor:
         )
         if weak_match:
             try:
-                from .database import match_event_to_signature
-                sig_hit = match_event_to_signature(
+                from .database import match_event_to_signature_knn
+                sig_hit = match_event_to_signature_knn(
                     self._db, circuit, features
                 )
                 if sig_hit is not None:

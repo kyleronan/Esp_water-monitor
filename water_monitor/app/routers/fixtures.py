@@ -567,6 +567,34 @@ async def migrate_circuit(request: Request, circuit: str = Depends(_valid_circui
     return ingress_redirect(request, "/fixtures?msg=migrated")
 
 
+@router.post("/{circuit}/reclassify")
+async def reclassify_circuit(request: Request, circuit: str = Depends(_valid_circuit)):
+    """Retrain fixture-type signatures from the user's labels and backfill
+    ``matched_fixture_type`` over every unlabelled event on this circuit.
+
+    Idempotent and safe: never touches user-labelled rows, writes NULL on
+    abstention (clearing stale matches), and never persists 'other'.
+    """
+    orch = _orch(request)
+    from ..database import reclassify_all_events_from_signatures
+    try:
+        import asyncio, functools
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(
+            None, functools.partial(
+                reclassify_all_events_from_signatures, orch.db, circuit)
+        )
+        log.info("[%s] manual reclassify: %s", circuit, res)
+    except Exception as e:
+        log.error("[%s] reclassify_circuit failed: %s", circuit, e, exc_info=True)
+        return ingress_redirect(request, "/fixtures?msg=error")
+    return ingress_redirect(
+        request,
+        f"/fixtures?msg=reclassified&matched={res['events_matched']}"
+        f"&abstained={res['events_abstained']}&cleared={res['events_cleared']}",
+    )
+
+
 # ── JSON API ──────────────────────────────────────────────────────────────────
 
 @router.get("/api/{circuit}/clusters")

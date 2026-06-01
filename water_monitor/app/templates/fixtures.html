@@ -13,6 +13,11 @@
 <div class="fx-msg fx-msg-ok">Fixture re-linked to cluster. Future matching events will land here.</div>
 {% elif msg == 'relink_failed' %}
 <div class="fx-msg fx-msg-err">Could not re-link the fixture — the chosen cluster may already be in use, or was deleted. Refresh and try again.</div>
+{% elif msg == 'reclassified' %}
+<div class="fx-msg fx-msg-ok">Re-typed from your labels —
+  {{ request.query_params.get('matched', '0') }} event(s) auto-typed,
+  {{ request.query_params.get('abstained', '0') }} left for you to label{% if request.query_params.get('cleared', '0') != '0' %},
+  {{ request.query_params.get('cleared') }} stale match(es) cleared{% endif %}.</div>
 {% elif msg == 'error' %}
 <div class="fx-msg fx-msg-err">Action failed — check the addon log for details.</div>
 {% endif %}
@@ -39,6 +44,13 @@
     awaiting activation
   </span>
   {% endif %}
+  <form method="post"
+        action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/reclassify"
+        style="display:inline;margin-left:10px"
+        title="Re-derive fixture types for unlabelled events from the events you've labelled on the History page">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <button type="submit" class="btn btn-ghost btn-sm">↻ Re-type from my labels</button>
+  </form>
 </h2>
 
 {% if circ.training_state == 'labelling' %}

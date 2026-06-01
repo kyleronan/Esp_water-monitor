@@ -47,7 +47,12 @@ _BASELINE_VERSION: int = 20260523
 #              events.user_ignored + events.user_classified columns; one-shot
 #              repair un-flags wrongly-flagged phantoms (delta>=2.0) and
 #              restores their real volume to hourly_volume + daily_summary.
-_CURRENT_VERSION: int = 20260534
+#   20260535 — Low-flow dribble exclusion: events.is_low_flow_dribble column
+#              (non-zeroing training-exclusion flag for brief low-flow
+#              trickles) + two indexes backing the label-training and
+#              reclassify-backfill queries. Lightweight DDL only; the verdict
+#              backfill runs from the startup / import / manual reprocess paths.
+_CURRENT_VERSION: int = 20260535
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -468,6 +473,43 @@ def _apply_manual_classification_columns(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_low_flow_dribble_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260535 — low-flow dribble exclusion.
+
+    Adds ``events.is_low_flow_dribble`` (a non-zeroing training-exclusion flag
+    for brief low-flow / low-volume / near-zero-pressure trickles) plus two
+    indexes that back the label-training and reclassify-backfill queries.
+
+    LIGHTWEIGHT DDL ONLY. Unlike the phantom migration above, this does NOT
+    import feature_extractor or run a data backfill — the per-event verdict is
+    backfilled idempotently from the startup / import / manual reprocess paths
+    (``reprocess_event_exclusion_verdicts``) AFTER migration completes, so this
+    module stays free of heavy app-logic imports (avoids circular imports).
+
+    Idempotent — the column add is guarded by ``_has_column`` and both indexes
+    use ``CREATE INDEX IF NOT EXISTS``.
+    """
+    if not _has_column(conn, "events", "is_low_flow_dribble"):
+        conn.execute(
+            "ALTER TABLE events "
+            "ADD COLUMN is_low_flow_dribble INTEGER NOT NULL DEFAULT 0"
+        )
+        log.info("Added events.is_low_flow_dribble (default 0)")
+    # Indexes live here (not _create_schema) because idx_events_unlabelled_
+    # reclassify references matched_fixture_type, which a baseline DB doesn't
+    # have until _apply_signature_matcher runs earlier in the same upgrade.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_training_labels "
+        "ON events (circuit, user_fixture_type, excluded_from_training)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_unlabelled_reclassify "
+        "ON events (circuit, user_fixture_type, matched_fixture_type)"
+    )
+    conn.commit()
+    log.info("Migration 20260535: low-flow dribble column + reclassify indexes ready")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -672,6 +714,17 @@ def _missing_manual_classification_columns(conn: sqlite3.Connection) -> set[str]
     }
 
 
+# Column added by the 20260535 low-flow-dribble migration on events.
+_LOW_FLOW_DRIBBLE_COLUMNS: frozenset = frozenset({"is_low_flow_dribble"})
+
+
+def _missing_low_flow_dribble_columns(conn: sqlite3.Connection) -> set[str]:
+    return {
+        col for col in _LOW_FLOW_DRIBBLE_COLUMNS
+        if not _has_column(conn, "events", col)
+    }
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -771,6 +824,7 @@ def _run_migrations_impl(
             | _missing_phantom_columns(conn)
             | _missing_category_publish_columns(conn)
             | _missing_manual_classification_columns(conn)
+            | _missing_low_flow_dribble_columns(conn)
         )
         if missing:
             raise RuntimeError(
@@ -781,10 +835,19 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260534:
+        # DB has the manual-classification columns but lacks the low-flow
+        # dribble exclusion column + reclassify indexes.
+        _apply_low_flow_dribble_column(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260533:
         # DB has category_publish but lacks the manual-classification columns
         # + the phantom-misflag repair.
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
         return
@@ -793,6 +856,7 @@ def _run_migrations_impl(
         # DB has the phantom guard but lacks category_publish + manual class.
         _apply_category_publish_table(conn)
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
@@ -803,6 +867,7 @@ def _run_migrations_impl(
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
@@ -814,6 +879,7 @@ def _run_migrations_impl(
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -847,6 +913,7 @@ def _run_migrations_impl(
         # Forward step 10: category_publish table + seed.
         _apply_category_publish_table(conn)
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -862,6 +929,7 @@ def _run_migrations_impl(
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -878,6 +946,7 @@ def _run_migrations_impl(
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -893,6 +962,7 @@ def _run_migrations_impl(
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -907,6 +977,7 @@ def _run_migrations_impl(
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -919,6 +990,7 @@ def _run_migrations_impl(
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -931,6 +1003,7 @@ def _run_migrations_impl(
         _apply_phantom_event_column(conn)
         _apply_category_publish_table(conn)
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -979,6 +1052,7 @@ def _run_migrations_impl(
         # empty fixtures table on a fresh DB so no rows are inserted.
         _apply_category_publish_table(conn)
         _apply_manual_classification_columns(conn)
+        _apply_low_flow_dribble_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return
