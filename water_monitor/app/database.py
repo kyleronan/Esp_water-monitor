@@ -1572,15 +1572,19 @@ def _get_volume_baseline(
     ).fetchone()
 
     if row is None:
-        # No baseline yet — store 0.0 as placeholder.
-        # The orchestrator's _init_volume_baselines() will overwrite this
-        # with the real midnight reading from HA history shortly after startup.
+        # No baseline yet — seed with the CURRENT reading, NOT 0.0.
+        # A 0.0 baseline makes the period total (= current − baseline) balloon
+        # to the entire cumulative meter reading (the dashboard "today shows
+        # 1000 gal" bug). Seeding with the current value caps the worst case at
+        # ~0 for a just-started period; the orchestrator's midnight rollover
+        # (_init_volume_baselines) then force-overwrites this with the accurate
+        # midnight reading from HA history.
         conn.execute(
             "INSERT INTO volume_snapshots (circuit, period_ts, ha_volume) VALUES (?,?,?)",
-            (circuit, period_ts, 0.0),
+            (circuit, period_ts, current_ha_value),
         )
         conn.commit()
-        return 0.0
+        return current_ha_value
 
     baseline = row[0]
     if current_ha_value < baseline:

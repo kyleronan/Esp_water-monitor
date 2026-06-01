@@ -501,6 +501,8 @@ class Orchestrator:
                 self._supervise("historical_importer", self._historical_importer.run),
                 self._supervise("cluster_metrics",     self._cluster_metrics.run),
                 self._supervise("waveform_purger",     self._run_waveform_purger),
+                self._supervise("volume_baseline_rollover",
+                                self._run_volume_baseline_rollover),
             )
         except asyncio.CancelledError:
             pass
@@ -645,14 +647,34 @@ class Orchestrator:
         midnight_utc = midnight_local.astimezone(_tz.utc).replace(tzinfo=None)
         return midnight_utc.isoformat(timespec="seconds")
 
-    async def _init_volume_baselines(self) -> None:
+    def _seconds_until_next_local_midnight(self) -> float:
+        """Seconds from now until the next local midnight (DST-aware)."""
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        ha_tz = getattr(self, "_ha_tz", _tz.utc)
+        now_local = _dt.now(ha_tz)
+        next_midnight_local = now_local.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) + _td(days=1)
+        delta = next_midnight_local.astimezone(_tz.utc) - _dt.now(_tz.utc)
+        return max(0.0, delta.total_seconds())
+
+    async def _init_volume_baselines(self, force: bool = False) -> None:
         """
         Query HA history to set accurate midnight baselines for daily/weekly
-        volume calculations.  Called once at startup before the main loop.
+        volume calculations.  Called once at startup, then again after every
+        local-midnight rollover (with ``force=True``) by
+        ``_run_volume_baseline_rollover``.
 
-        Without this, _get_volume_baseline() uses 0.0 as a placeholder on
-        the first call, which causes the dashboard to show the full cumulative
-        sensor total rather than just today's volume.
+        Without a per-day refresh, after the local day ticks over the "today"
+        baseline key has no snapshot; _get_volume_baseline() then seeds it from
+        the current reading, which is only accurate for the just-started "today"
+        period — the rolling 7-day baseline must come from HA history. This is
+        why the rollover re-derives both, force-overwriting stale values.
+
+        ``force``: when False (startup) an existing non-zero baseline is left
+        untouched. When True (rollover) the freshly-fetched HA-history value
+        overwrites whatever is there, so a value lazily seeded by
+        _get_volume_baseline (current reading) is corrected to the real midnight.
 
         period_ts keys are the UTC equivalent of local midnight, stored as naive
         ISO strings, matching the keys produced by compute_ha_daily/weekly_volume.
@@ -678,14 +700,15 @@ class Orchestrator:
                 (seven_days_ago_dt,  seven_days_ago_ts,  "past 7 days"),
             ]:
 
-                # Only fix baselines that are still at the 0.0 placeholder
+                # At startup only fix baselines still at the 0.0 placeholder; on
+                # a forced rollover always re-derive from HA history.
                 row = self._db.execute(
                     "SELECT ha_volume FROM volume_snapshots "
                     "WHERE circuit=? AND period_ts=?",
                     (circuit, period_ts),
                 ).fetchone()
 
-                if row is not None and row[0] != 0.0:
+                if not force and row is not None and row[0] != 0.0:
                     continue   # already set to a real value
 
                 # Query HA history for the earliest reading at/after midnight
@@ -702,7 +725,11 @@ class Orchestrator:
                         mid_unit = (first.get("attributes") or {}).get("unit_of_measurement", "")
                         midnight_val = _v2l(midnight_val, mid_unit)
                     else:
-                        midnight_val = 0.0
+                        # No HA history for this window — do NOT write a 0.0
+                        # baseline (that resurrects the full-cumulative-total
+                        # bug). Leave the row absent so _get_volume_baseline
+                        # seeds it safely from the current reading instead.
+                        continue
                 except Exception as e:
                     log.debug("[%s] could not fetch volume history for %s: %s",
                               circuit, label, e)
@@ -946,6 +973,32 @@ class Orchestrator:
         except Exception as e:
             log.warning("[%s] degraded-state query failed: %s", circuit, e)
             return {"degraded_active": False, "degraded_events_24h": 0}
+
+    async def _run_volume_baseline_rollover(self) -> None:
+        """Re-capture the daily + weekly volume baselines at each local midnight.
+
+        ``_init_volume_baselines`` runs once at startup; without a rollover, after
+        the local day ticks over the dashboard's "today" baseline key has no
+        snapshot and the per-day volume balloons toward the full cumulative meter
+        total. This re-derives both baselines (force-overwriting) from HA history
+        shortly after each local midnight so the daily / 7-day figures stay
+        accurate without a restart.
+        """
+        while not self._stop.is_set():
+            # Sleep until just after the next local midnight (+120s so HA's
+            # recorder has the post-midnight reading on hand). Interruptible by
+            # the stop event so shutdown isn't blocked for hours.
+            delay = self._seconds_until_next_local_midnight() + 120.0
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                return  # stop requested during the wait
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._init_volume_baselines(force=True)
+                log.info("Volume baselines refreshed after local-midnight rollover")
+            except Exception as e:
+                log.warning("Volume baseline rollover failed (non-fatal): %s", e)
 
     async def _run_waveform_purger(self) -> None:
         """Daily housekeeping: drop event_waveforms rows older than 60 days.
