@@ -466,8 +466,12 @@ class Orchestrator:
 
         # Initialise daily/weekly volume baselines from HA history so that
         # the dashboard shows accurate totals from the first page load.
+        # force=True so a restart/redeploy re-derives the midnight readings and
+        # CORRECTS a stale or wrong-but-nonzero baseline immediately, instead of
+        # leaving the dashboard inflated until the next midnight rollover. When
+        # HA history is unavailable the existing value is left untouched.
         try:
-            await self._init_volume_baselines()
+            await self._init_volume_baselines(force=True)
         except Exception as e:
             log.warning("Volume baseline init failed (non-fatal): %s", e)
 
@@ -689,11 +693,27 @@ class Orchestrator:
         today_midnight_dt   = datetime.fromisoformat(today_midnight_ts).replace(tzinfo=_utc)
         seven_days_ago_dt   = datetime.fromisoformat(seven_days_ago_ts).replace(tzinfo=_utc)
 
+        from .ha_client import vol_to_litres as _v2l
+
         for cfg in self._cfg.circuits:
             if not cfg.volume_sensor:
                 continue
 
             circuit = cfg.circuit
+
+            # get_history() is fetched with no_attributes=True, so historical
+            # readings carry NO unit_of_measurement. Converting them with that
+            # empty unit left a gallon reading UNCONVERTED in the litres column,
+            # so "today" (= meter_litres − baseline_gallons) inflated ~3.8x. The
+            # sensor's unit doesn't change over time, so fetch the current unit
+            # and convert the historical readings with it.
+            sensor_unit = ""
+            try:
+                cur_state = await self._ha.get_state(cfg.volume_sensor)
+                sensor_unit = ((cur_state or {}).get("attributes") or {}).get(
+                    "unit_of_measurement", "")
+            except Exception as e:
+                log.debug("[%s] could not fetch volume sensor unit: %s", circuit, e)
 
             for period_start, period_ts, label in [
                 (today_midnight_dt,  today_midnight_ts,  "today"),
@@ -719,11 +739,10 @@ class Orchestrator:
                         period_start + timedelta(hours=2),
                     )
                     if hist:
-                        from .ha_client import vol_to_litres as _v2l
                         first = hist[0]
-                        midnight_val = float(first["state"])
-                        mid_unit = (first.get("attributes") or {}).get("unit_of_measurement", "")
-                        midnight_val = _v2l(midnight_val, mid_unit)
+                        # Convert with the sensor's real unit (the historical
+                        # entry has none — see sensor_unit above).
+                        midnight_val = _v2l(float(first["state"]), sensor_unit)
                     else:
                         # No HA history for this window — do NOT write a 0.0
                         # baseline (that resurrects the full-cumulative-total
@@ -860,6 +879,36 @@ class Orchestrator:
         else:
             volume_daily  = get_daily_volume(self._db, circuit, since_utc=today_ts)
             volume_weekly = get_weekly_volume(self._db, circuit, since_utc=week_ts)
+
+        # One-shot diagnostic (once per circuit per process): dump the exact
+        # volume arithmetic so a "today shows the full meter total" report can be
+        # pinned down from a single restart's log instead of guessing. Cheap and
+        # self-limiting; safe to leave in.
+        if not hasattr(self, "_vol_diag_done"):
+            self._vol_diag_done = set()
+        if circuit not in self._vol_diag_done:
+            self._vol_diag_done.add(circuit)
+            try:
+                _bt = self._db.execute(
+                    "SELECT ha_volume FROM volume_snapshots WHERE circuit=? AND period_ts=?",
+                    (circuit, today_ts)).fetchone()
+                _bw = self._db.execute(
+                    "SELECT ha_volume FROM volume_snapshots WHERE circuit=? AND period_ts=?",
+                    (circuit, week_ts)).fetchone()
+                log.info(
+                    "[%s] VOLUME DIAG: sensor_raw=%r unit=%r meter_total_L=%s | "
+                    "baseline_today_L=%s (ts=%s) baseline_week_L=%s (ts=%s) | "
+                    "computed today=%s week=%s (path=%s)",
+                    circuit, ha_volume_raw, locals().get("vol_unit", "?"),
+                    None if ha_volume_total is None else round(ha_volume_total, 1),
+                    None if _bt is None else round(_bt[0], 1), today_ts,
+                    None if _bw is None else round(_bw[0], 1), week_ts,
+                    volume_daily, volume_weekly,
+                    "ha_meter" if (ha_volume_total is not None and ha_volume_total >= 0)
+                    else "hourly_table",
+                )
+            except Exception as _e:
+                log.debug("[%s] volume diag failed: %s", circuit, _e)
 
         fault_active = states.get(circuit_cfg.fault_sensor) == "on"
 
