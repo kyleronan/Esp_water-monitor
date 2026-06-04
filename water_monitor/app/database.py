@@ -1726,7 +1726,7 @@ def patch_event(
     callers should prefer ``user_ignored``.
     """
     row = conn.execute(
-        "SELECT id, is_pressure_restoration_phantom, degraded_supply, is_composite, "
+        "SELECT id, is_pressure_restoration_phantom, degraded_supply, "
         "       is_low_flow_dribble "
         "FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit),
@@ -1741,7 +1741,7 @@ def patch_event(
     if user_ignored is not _PATCH_UNSET:
         ign = 1 if user_ignored else 0
         excluded = 1 if (ign or row["is_pressure_restoration_phantom"]
-                         or row["degraded_supply"] or row["is_composite"]
+                         or row["degraded_supply"]
                          or row["is_low_flow_dribble"]) else 0
         conn.execute(
             "UPDATE events SET user_ignored = ?, excluded_from_training = ? "
@@ -1764,7 +1764,6 @@ def _apply_event_verdicts(
     *,
     new_phantom: int,
     new_degraded: int,
-    new_composite: int,
     user_classified: int,
     new_dribble: int = 0,
 ) -> bool:
@@ -1799,11 +1798,11 @@ def _apply_event_verdicts(
         new_effective, method = raw, "raw"
 
     user_ignored = int(row["user_ignored"] or 0)
-    excluded = 1 if (new_phantom or new_degraded or new_composite
+    excluded = 1 if (new_phantom or new_degraded
                      or new_dribble or user_ignored) else 0
     reason = (
         "pressure_restoration_phantom" if new_phantom
-        else "pulsing_supply" if (new_degraded and not new_composite)
+        else "pulsing_supply" if new_degraded
         else "low_flow_dribble" if new_dribble
         else None
     )
@@ -1816,11 +1815,11 @@ def _apply_event_verdicts(
         conn.execute(
             "UPDATE events SET "
             "  is_pressure_restoration_phantom = ?, degraded_supply = ?, "
-            "  is_composite = ?, user_classified = ?, is_low_flow_dribble = ?, "
+            "  user_classified = ?, is_low_flow_dribble = ?, "
             "  volume_litres_effective = ?, volume_estimation_method = ?, "
             "  excluded_from_training = ?, match_rejection_reason = ? "
             "WHERE id = ? AND circuit = ?",
-            (new_phantom, new_degraded, new_composite, user_classified, new_dribble,
+            (new_phantom, new_degraded, user_classified, new_dribble,
              round(new_effective, 3), method, excluded, reason,
              event_id, circuit),
         )
@@ -1849,21 +1848,23 @@ def classify_action(cls: dict):
     """Pure dispatch for a PATCH ``classification`` payload (Sprint H.1).
 
     Returns one of:
-      ("reset", {})                                   — reset to automatic
-      ("set",   {phantom, supply_pressure, combined}) — authoritative manual set
-      ("error", {"msg": ...})                         — invalid → caller 400s
+      ("reset", {})                          — reset to automatic
+      ("set",   {phantom, supply_pressure})  — authoritative manual set
+      ("error", {"msg": ...})                — invalid → caller 400s
 
     ``reset: true`` is EXCLUSIVE — combining it with any category flag is
     rejected rather than silently picking one behaviour. Pure (no DB, no
     request object) so it is unit-testable without the FastAPI stack; lives
     here in database.py alongside set_/clear_event_classification for that
     reason (routers/history.py imports fastapi, which the test env lacks).
+
+    'combined' is deprecated (2026-06-04): it is accepted but ignored, so old
+    clients don't 400; combined usage is classified as the dominant fixture.
     """
     cls = cls or {}
     flags = {
         "phantom":         bool(cls.get("phantom")),
         "supply_pressure": bool(cls.get("supply_pressure")),
-        "combined":        bool(cls.get("combined")),
     }
     if cls.get("reset") is True:
         if any(flags.values()):
@@ -1879,7 +1880,6 @@ def set_event_classification(
     *,
     phantom: bool,
     supply_pressure: bool,
-    combined: bool,
 ) -> bool:
     """Apply a user's manual event classification (Sprint H, authoritative).
 
@@ -1895,7 +1895,6 @@ def set_event_classification(
         conn, event_id, circuit,
         new_phantom=1 if phantom else 0,
         new_degraded=1 if supply_pressure else 0,
-        new_composite=1 if combined else 0,
         user_classified=1,
     )
 
@@ -1918,15 +1917,19 @@ def clear_event_classification(
     )
 
     row = conn.execute(
-        "SELECT duration_seconds, pressure_delta_psi, degraded_supply, is_composite, "
-        "       volume_litres, avg_flow_lpm "
+        "SELECT duration_seconds, pressure_delta_psi, degraded_supply, "
+        "       volume_litres, avg_flow_lpm, true_avg_flow_lpm, "
+        "       flow_integral_litres, flow_on_ratio "
         "FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit),
     ).fetchone()
     if row is None:
         return False
     new_phantom = 1 if _detect_pressure_restoration_phantom(
-        row["duration_seconds"], row["pressure_delta_psi"]) else 0
+        row["duration_seconds"], row["pressure_delta_psi"],
+        true_avg_flow_lpm=row["true_avg_flow_lpm"],
+        flow_integral_litres=row["flow_integral_litres"],
+        flow_on_ratio=row["flow_on_ratio"]) else 0
     new_degraded = int(row["degraded_supply"] or 0)
     # Dribble only when not phantom and not degraded (mirrors the finalizer).
     new_dribble = 1 if (
@@ -1938,7 +1941,6 @@ def clear_event_classification(
         conn, event_id, circuit,
         new_phantom=new_phantom,
         new_degraded=new_degraded,
-        new_composite=int(row["is_composite"] or 0),
         user_classified=0,
         new_dribble=new_dribble,
     )
@@ -3449,7 +3451,7 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
 
     rows = conn.execute(
         "SELECT id, circuit, start_ts, volume_litres, volume_litres_estimated, "
-        "       degraded_supply, is_composite, user_ignored, "
+        "       degraded_supply, user_ignored, "
         "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
         "FROM events "
         "WHERE is_pressure_restoration_phantom = 1 "
@@ -3468,9 +3470,9 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
         restored = (float(est) if (is_degraded and est is not None) else raw)
         new_method = "pulsing_supply_envelope" if is_degraded else "raw"
         new_excluded = 1 if (
-            bool(row["is_composite"]) or is_degraded or bool(row["user_ignored"])
+            is_degraded or bool(row["user_ignored"])
         ) else 0
-        new_reason = "pulsing_supply" if (is_degraded and not row["is_composite"]) else None
+        new_reason = "pulsing_supply" if is_degraded else None
 
         prev_applied = float(row["hourly_volume_applied_litres"] or 0.0)
         prev_bucket = row["hourly_volume_applied_bucket"] or _hour_bucket_for(row["start_ts"])
@@ -3740,11 +3742,15 @@ def reclassify_all_events_from_signatures(
         if upsert_fixture_signature(conn, circuit, tr[0]) is not None:
             signatures_trained += 1
 
-    # 2. Backfill over unlabelled events.
+    # 2. Backfill over unlabelled events. Query carries BOTH the legacy and the
+    #    active-flow features so the matcher uses whichever it can (active when
+    #    backfilled). An event now excluded_from_training carries no fixture
+    #    identity → its matched_fixture_type is cleared (stale-match carry-forward).
+    qfeats = tuple(dict.fromkeys(
+        _SIGNATURE_MATCH_FEATURES + _SIGNATURE_KNN_ACTIVE_FEATURES))
     rows = conn.execute(
-        "SELECT id, matched_fixture_type, avg_flow_lpm, peak_flow_lpm, "
-        "       duration_seconds, volume_litres, pressure_delta_psi, "
-        "       steady_state_fraction "
+        "SELECT id, matched_fixture_type, excluded_from_training, "
+        "       " + ", ".join(qfeats) + " "
         "FROM events "
         "WHERE circuit = ? AND user_fixture_type IS NULL "
         "ORDER BY start_ts",
@@ -3753,9 +3759,12 @@ def reclassify_all_events_from_signatures(
     scanned = matched = cleared = abstained = 0
     for r in rows:
         scanned += 1
-        feats = {f: r[f] for f in _SIGNATURE_MATCH_FEATURES}
-        hit = match_event_to_signature_knn(conn, circuit, feats)
-        new_type = _canonical_fixture_type(hit["fixture_type"]) if hit else None
+        if r["excluded_from_training"]:
+            new_type = None     # artifacts/excluded carry no fixture identity
+        else:
+            feats = {f: r[f] for f in qfeats}
+            hit = match_event_to_signature_knn(conn, circuit, feats)
+            new_type = _canonical_fixture_type(hit["fixture_type"]) if hit else None
         prev = r["matched_fixture_type"]
         if new_type != prev:
             set_event_matched_fixture_type(conn, circuit, r["id"], new_type)
@@ -3779,6 +3788,47 @@ def reclassify_all_events_from_signatures(
         circuit, signatures_trained, scanned, matched, abstained, cleared,
     )
     return result
+
+
+def cleanup_composite_flags(conn: sqlite3.Connection) -> Dict[str, int]:
+    """One-shot: composite is deprecated as an authoritative flag. Re-derive
+    ``excluded_from_training`` for events that were excluded ONLY because they
+    were composite, so they become classifiable again.
+
+    Guard (review): do NOT make an event training-eligible unless it has valid
+    (non-NULL) active-flow features AND a non-degraded integration_quality — an
+    un-backfilled composite row stays excluded until its features exist. Skips
+    user_classified rows (their verdict is authoritative). Does not touch the
+    diagnostic ``is_composite`` column. Returns counts.
+    """
+    rows = conn.execute(
+        "SELECT id, circuit, is_pressure_restoration_phantom, degraded_supply, "
+        "       is_low_flow_dribble, user_ignored, integration_quality, "
+        "       true_avg_flow_lpm, excluded_from_training "
+        "FROM events "
+        "WHERE COALESCE(is_composite, 0) = 1 AND COALESCE(user_classified, 0) = 0",
+    ).fetchall()
+    cleaned = unexcluded = 0
+    for r in rows:
+        degraded_integ = r["integration_quality"] not in (None, "ok")
+        other_excl = bool(
+            r["is_pressure_restoration_phantom"] or r["degraded_supply"]
+            or r["is_low_flow_dribble"] or r["user_ignored"] or degraded_integ
+        )
+        has_valid_features = r["true_avg_flow_lpm"] is not None and not degraded_integ
+        new_excluded = 0 if (not other_excl and has_valid_features) else 1
+        if new_excluded != (r["excluded_from_training"] or 0):
+            conn.execute(
+                "UPDATE events SET excluded_from_training = ? "
+                "WHERE id = ? AND circuit = ?",
+                (new_excluded, r["id"], r["circuit"]),
+            )
+            cleaned += 1
+            if new_excluded == 0:
+                unexcluded += 1
+    conn.commit()
+    log.info("composite cleanup: %d row(s) re-derived, %d un-excluded", cleaned, unexcluded)
+    return {"composite_rows_changed": cleaned, "unexcluded": unexcluded}
 
 
 def migrate_to_type_level_clusters(

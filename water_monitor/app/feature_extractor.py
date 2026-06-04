@@ -701,8 +701,10 @@ def _finalize_derived_verdicts(features: dict) -> None:
         return  # manual classification wins — never auto-override
 
     is_degraded  = bool(features.get("degraded_supply"))
-    is_composite = bool(features.get("is_composite"))
     user_ignored = bool(features.get("user_ignored"))
+    # is_composite is now a DIAGNOSTIC-only signal (deprecated 2026-06-04): it no
+    # longer excludes the event from training or sets a rejection reason. Combined
+    # usage is classified as the dominant fixture (or 'other') by the k-NN.
     is_phantom = _detect_pressure_restoration_phantom(
         features.get("duration_seconds"), features.get("pressure_delta_psi"),
         true_avg_flow_lpm=features.get("true_avg_flow_lpm"),
@@ -743,7 +745,7 @@ def _finalize_derived_verdicts(features: dict) -> None:
     features["is_pressure_restoration_phantom"] = 1 if is_phantom else 0
     features["is_low_flow_dribble"] = 1 if is_dribble else 0
     features["excluded_from_training"] = (
-        1 if (is_composite or is_degraded or is_phantom or is_dribble
+        1 if (is_degraded or is_phantom or is_dribble
               or user_ignored or integration_degraded)
         else 0
     )
@@ -752,7 +754,7 @@ def _finalize_derived_verdicts(features: dict) -> None:
     # is a secondary signal kept consistent with the live finalizer.
     features["match_rejection_reason"] = (
         "pressure_restoration_phantom" if is_phantom
-        else "pulsing_supply" if (is_degraded and not is_composite)
+        else "pulsing_supply" if is_degraded
         else "low_flow_dribble" if is_dribble
         else None
     )

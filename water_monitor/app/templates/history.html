@@ -191,7 +191,6 @@
           <th>Shape</th>
           <th>Volume ({{ vol_unit }})</th>
           <th>Fixture</th>
-          {% if ch.events | selectattr('is_composite') | list %}<th title="Composite event">⚡</th>{% endif %}
           {% if ch.events | selectattr('degraded_supply') | list %}<th title="Degraded supply detected — volume estimated">〰</th>{% endif %}
           {% if ch.events | selectattr('is_pressure_restoration_phantom') | list %}<th title="Pressure artifact — volume removed from totals">👻</th>{% endif %}
           {% if ch.events | selectattr('is_low_flow_dribble') | list %}<th title="Low-flow noise — excluded from training, volume kept">💧</th>{% endif %}
@@ -200,7 +199,7 @@
       <tbody>
         {% for e in ch.events %}
         {% set _fix_label = fixture_type_labels.get(e.user_fixture_type, '') if e.user_fixture_type else '' %}
-        <tr class="hist-event-row{% if e.is_composite %} hist-row-composite{% endif %}{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.is_pressure_restoration_phantom %} hist-row-phantom{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}"
+        <tr class="hist-event-row{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.is_pressure_restoration_phantom %} hist-row-phantom{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}"
             tabindex="0" role="button" aria-label="Event detail"
             data-event-id="{{ e.id }}"
             data-circuit="{{ ch.circuit }}"
@@ -220,7 +219,6 @@
             data-prop-ms="{{ e.propagation_delay_ms | int if e.propagation_delay_ms else '0' }}"
             data-anomaly-score="{{ (e.anomaly_score * 100)|round(1) if e.anomaly_score is not none else '' }}"
             data-anomaly-type="{{ e.anomaly_type or '' }}"
-            data-composite="{{ '1' if e.is_composite else '0' }}"
             data-degraded="{{ '1' if e.degraded_supply else '0' }}"
             data-phantom="{{ '1' if e.is_pressure_restoration_phantom else '0' }}"
             data-classified="{{ '1' if e.user_classified else '0' }}"
@@ -271,9 +269,6 @@
               —
             {% endif %}
           </td>
-          {% if ch.events | selectattr('is_composite') | list %}
-          <td class="hist-td">{% if e.is_composite %}<span title="Composite event" aria-label="Composite event">⚡</span>{% endif %}</td>
-          {% endif %}
           {% if ch.events | selectattr('degraded_supply') | list %}
           <td class="hist-td">{% if e.degraded_supply %}<span title="Degraded supply detected — volume estimated" aria-label="Degraded supply event">〰</span>{% endif %}</td>
           {% endif %}
@@ -385,8 +380,6 @@
           <span>Pressure artifact (phantom)</span></label>
         <label class="emd-check"><input type="checkbox" id="emd-cls-supply">
           <span>Supply-pressure issue</span></label>
-        <label class="emd-check"><input type="checkbox" id="emd-cls-combined">
-          <span>Combined event</span></label>
       </div>
       <div style="display:flex;align-items:center;gap:.75rem;margin-top:.5rem;flex-wrap:wrap">
         <span class="muted" style="font-size:11px">Saved with the <strong>Save</strong> button below.</span>
@@ -607,13 +600,12 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   // Sprint H — manual classification controls.
   const clsPhantom  = document.getElementById('emd-cls-phantom');
   const clsSupply   = document.getElementById('emd-cls-supply');
-  const clsCombined = document.getElementById('emd-cls-combined');
   const clsResetBtn = document.getElementById('emd-classify-reset-btn');
   const clsHint     = document.getElementById('emd-classify-hint');
   // Initial checkbox state captured on modal open — used so the main Save
   // only sends `classification` when the user actually changed something
   // (labelling alone must not silently lock auto-detection off).
-  let clsInitial = { phantom: false, supply_pressure: false, combined: false };
+  let clsInitial = { phantom: false, supply_pressure: false };
 
   // Startup diagnostic
   const rows = document.querySelectorAll('.hist-event-row');
@@ -645,11 +637,9 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     // and remember the initial state for change-detection on Save.
     if (clsPhantom)  clsPhantom.checked  = d.phantom === '1';
     if (clsSupply)   clsSupply.checked   = d.degraded === '1';
-    if (clsCombined) clsCombined.checked = d.composite === '1';
     clsInitial = {
       phantom:         d.phantom === '1',
       supply_pressure: d.degraded === '1',
-      combined:        d.composite === '1',
     };
     // Sprint H.1 — the "manually classified" hint + Reset link only apply
     // once the user has locked a manual classification.
@@ -926,11 +916,9 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const cur = {
       phantom:         !!(clsPhantom && clsPhantom.checked),
       supply_pressure: !!(clsSupply && clsSupply.checked),
-      combined:        !!(clsCombined && clsCombined.checked),
     };
     if (cur.phantom !== clsInitial.phantom
-        || cur.supply_pressure !== clsInitial.supply_pressure
-        || cur.combined !== clsInitial.combined) {
+        || cur.supply_pressure !== clsInitial.supply_pressure) {
       payload.classification = cur;
     }
     const ok = await patchEvent(payload);

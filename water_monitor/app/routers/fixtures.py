@@ -595,6 +595,59 @@ async def reclassify_circuit(request: Request, circuit: str = Depends(_valid_cir
     )
 
 
+@router.post("/{circuit}/recompute")
+async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circuit)):
+    """Re-derive volume + active-flow for this circuit's events from the raw HA
+    flow history (applies the over-count fix retroactively). Retention-limited:
+    events whose flow history has aged out keep their stored volume.
+    """
+    import asyncio
+    import functools
+    from datetime import datetime, timezone, timedelta
+
+    orch = _orch(request)
+    cfg = next((c for c in orch._cfg.circuits if c.circuit == circuit), None)
+    if cfg is None or not getattr(cfg, "flow_sensor", None):
+        return ingress_redirect(request, "/fixtures?msg=error")
+    try:
+        from ..volume_recompute import (build_flow_fetch,
+                                         recompute_volume_and_active_flow)
+        from ..database import (reclassify_all_events_from_signatures,
+                                cleanup_composite_flags)
+        rng = orch.db.execute(
+            "SELECT MIN(start_ts) mn, MAX(end_ts) mx FROM events WHERE circuit = ?",
+            (circuit,),
+        ).fetchone()
+        if not rng or not rng["mn"]:
+            return ingress_redirect(
+                request, "/fixtures?msg=recomputed&recomputed=0&skipped=0&degraded=0")
+
+        def _p(s):
+            return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+
+        retention_floor = datetime.now(timezone.utc) - timedelta(days=10)
+        range_start = max(_p(rng["mn"]) - timedelta(minutes=15), retention_floor)
+        range_end = _p(rng["mx"]) + timedelta(minutes=5)
+        fetch = await build_flow_fetch(orch._ha, cfg.flow_sensor,
+                                       range_start, range_end)
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(None, functools.partial(
+            recompute_volume_and_active_flow, orch.db, circuit, fetch))
+        await loop.run_in_executor(None, functools.partial(
+            cleanup_composite_flags, orch.db))
+        await loop.run_in_executor(None, functools.partial(
+            reclassify_all_events_from_signatures, orch.db, circuit))
+        log.info("[%s] manual recompute: %s", circuit, res)
+    except Exception as e:
+        log.error("[%s] recompute_circuit failed: %s", circuit, e, exc_info=True)
+        return ingress_redirect(request, "/fixtures?msg=error")
+    return ingress_redirect(
+        request,
+        f"/fixtures?msg=recomputed&recomputed={res['recomputed']}"
+        f"&skipped={res['skipped']}&degraded={res['degraded']}",
+    )
+
+
 # ── JSON API ──────────────────────────────────────────────────────────────────
 
 @router.get("/api/{circuit}/clusters")

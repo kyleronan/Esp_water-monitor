@@ -18,6 +18,11 @@
   {{ request.query_params.get('matched', '0') }} event(s) auto-typed,
   {{ request.query_params.get('abstained', '0') }} left for you to label{% if request.query_params.get('cleared', '0') != '0' %},
   {{ request.query_params.get('cleared') }} stale match(es) cleared{% endif %}.</div>
+{% elif msg == 'recomputed' %}
+<div class="fx-msg fx-msg-ok">Volume recomputed from raw flow —
+  {{ request.query_params.get('recomputed', '0') }} event(s) corrected,
+  {{ request.query_params.get('skipped', '0') }} skipped (history aged out){% if request.query_params.get('degraded', '0') != '0' %},
+  {{ request.query_params.get('degraded') }} marked degraded{% endif %}.</div>
 {% elif msg == 'error' %}
 <div class="fx-msg fx-msg-err">Action failed — check the addon log for details.</div>
 {% endif %}
@@ -50,6 +55,13 @@
         title="Re-derive fixture types for unlabelled events from the events you've labelled on the History page">
     <input type="hidden" name="_csrf" value="{{ csrf_token }}">
     <button type="submit" class="btn btn-ghost btn-sm">↻ Re-type from my labels</button>
+  </form>
+  <form method="post"
+        action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/recompute"
+        style="display:inline;margin-left:6px"
+        title="Re-derive event volumes from the raw flow history (fixes the volume over-count). Limited to events still within HA's recorder retention.">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <button type="submit" class="btn btn-ghost btn-sm">⟳ Recompute volume</button>
   </form>
 </h2>
 
