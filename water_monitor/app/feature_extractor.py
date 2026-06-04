@@ -235,6 +235,14 @@ MAX_WAVEFORM_BINS            = 1000
 # genuine solenoid pressure drop (> 2 PSI) so it is not affected.
 _PHANTOM_MIN_DURATION_S: float = 1800.0   # 30 min
 _PHANTOM_MAX_DELTA_PSI:  float = 2.0
+# True-flow guard (added 2026-06-04). A real pressure-restoration phantom moves
+# near-ZERO water; the long-duration + low-dP rule alone would wrongly zero a
+# real low-dP irrigation run (validated: a 665-gal run at dP 1.1 was saved only
+# because it was manually labelled). When the integrated-flow metrics are
+# available, ANY one above its ceiling means real water moved → NOT a phantom.
+_PHANTOM_MAX_TRUE_FLOW_LPM:   float = 2.0
+_PHANTOM_MAX_FLOW_INTEGRAL_L: float = 1.0
+_PHANTOM_MAX_FLOW_ON_RATIO:   float = 0.05
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Low-flow "dribble" guard (added 2026-05-31)
@@ -599,19 +607,22 @@ def _evaluate_degraded_from_diag(diag: dict):
     return True, "pulsing_supply_confirmed"
 
 
-def _detect_pressure_restoration_phantom(duration_s, pressure_delta_psi) -> bool:
-    """True when an event's duration + near-zero pressure drop indicate a
-    city-pressure restoration or oscillation artifact, not real water use.
+def _detect_pressure_restoration_phantom(
+    duration_s, pressure_delta_psi,
+    true_avg_flow_lpm=None, flow_integral_litres=None, flow_on_ratio=None,
+) -> bool:
+    """True when an event's duration + near-zero pressure drop AND near-zero
+    real flow indicate a city-pressure restoration / oscillation artifact.
 
-    Calibrated from 3 confirmed phantom events (May 2026 export). Circuit-
-    agnostic — applies to fixture AND zone circuits (real zone irrigation
-    produces > 2 PSI solenoid drop, so it is not affected).
+    Long-duration + low-ΔP is necessary but not sufficient: a real low-pressure
+    irrigation run also matches it. So when the integrated-flow metrics are
+    available, ANY of them exceeding its ceiling (`_PHANTOM_MAX_TRUE_FLOW_LPM`,
+    `_PHANTOM_MAX_FLOW_INTEGRAL_L`, `_PHANTOM_MAX_FLOW_ON_RATIO`) means real water
+    moved → NOT a phantom. Metrics are optional (None) so legacy callers keep the
+    old duration+ΔP behaviour.
 
-    Bad inputs (None / non-numeric / NaN / inf) → False (treat as "not
-    phantom" so a parse error never zeroes a real event's volume). Negative
-    delta (shouldn't occur — pressure_delta_psi is clamped to >= 0 upstream —
-    but possible in imported/legacy rows) is INTENTIONALLY treated as phantom:
-    a `< 2.0` threshold includes negatives, consistent with 'no real load'.
+    Bad inputs (None / non-numeric / NaN / inf) → False. Negative delta is
+    INTENTIONALLY treated as phantom (a `< 2.0` threshold includes negatives).
     """
     try:
         duration = float(duration_s)
@@ -620,7 +631,21 @@ def _detect_pressure_restoration_phantom(duration_s, pressure_delta_psi) -> bool
         return False
     if not math.isfinite(duration) or not math.isfinite(delta):
         return False
-    return duration >= _PHANTOM_MIN_DURATION_S and delta < _PHANTOM_MAX_DELTA_PSI
+    if not (duration >= _PHANTOM_MIN_DURATION_S and delta < _PHANTOM_MAX_DELTA_PSI):
+        return False
+    # True-flow guard — real water moved ⇒ not a phantom.
+    for val, ceil in (
+        (true_avg_flow_lpm,   _PHANTOM_MAX_TRUE_FLOW_LPM),
+        (flow_integral_litres, _PHANTOM_MAX_FLOW_INTEGRAL_L),
+        (flow_on_ratio,       _PHANTOM_MAX_FLOW_ON_RATIO),
+    ):
+        if val is not None:
+            try:
+                if float(val) >= ceil:
+                    return False
+            except (TypeError, ValueError):
+                pass
+    return True
 
 
 def _detect_low_flow_dribble(volume_litres, avg_flow_lpm, pressure_delta_psi) -> bool:
@@ -679,7 +704,10 @@ def _finalize_derived_verdicts(features: dict) -> None:
     is_composite = bool(features.get("is_composite"))
     user_ignored = bool(features.get("user_ignored"))
     is_phantom = _detect_pressure_restoration_phantom(
-        features.get("duration_seconds"), features.get("pressure_delta_psi"))
+        features.get("duration_seconds"), features.get("pressure_delta_psi"),
+        true_avg_flow_lpm=features.get("true_avg_flow_lpm"),
+        flow_integral_litres=features.get("flow_integral_litres"),
+        flow_on_ratio=features.get("flow_on_ratio"))
     # Low-flow dribble: only for events that are NOT a phantom and NOT degraded
     # (a degraded event's low flow is a measurement artifact, not a true
     # trickle, and is already excluded). Folds into the exclusion set WITHOUT
@@ -709,10 +737,14 @@ def _finalize_derived_verdicts(features: dict) -> None:
         features["volume_litres_effective"]  = round(raw, 3)
         features["volume_estimation_method"] = "raw"
 
+    # A capped / degraded integration may under-count real water — keep it out of
+    # classifier training (NULL = unknown/legacy = not degraded).
+    integration_degraded = features.get("integration_quality") not in (None, "ok")
     features["is_pressure_restoration_phantom"] = 1 if is_phantom else 0
     features["is_low_flow_dribble"] = 1 if is_dribble else 0
     features["excluded_from_training"] = (
-        1 if (is_composite or is_degraded or is_phantom or is_dribble or user_ignored)
+        1 if (is_composite or is_degraded or is_phantom or is_dribble
+              or user_ignored or integration_degraded)
         else 0
     )
     # Upstream rejection reason (cluster-engine reasons are written separately).
@@ -1695,14 +1727,20 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         event.pressure_readings, pre_event_pressure, pressure_delta_psi
     )
 
-    # Volume: prefer the firmware's cumulative integration sensor delta (set by
-    # the historical importer) over the flow-average approximation, which can
-    # overstate volume for long events with fill-pause-fill patterns after
-    # downsampling kicks in at 120 s.
+    # Volume = TIME-INTEGRAL of the timestamped flow samples (not mean × duration,
+    # which over-counts a brief burst trapped in a long pressure-defined event).
+    # Prefer the firmware's cumulative integration sensor when present; fall back
+    # to the old approximation only for legacy events with no timestamped samples.
+    from .flow_integral import integrate_litres, active_flow_features
+    flow_integral_litres, _integral_capped = integrate_litres(event.flow_samples)
+    active = active_flow_features(event.flow_samples, duration)
     if event.volume_litres_measured is not None:
         volume_litres = event.volume_litres_measured
+    elif event.flow_samples:
+        volume_litres = flow_integral_litres
     else:
         volume_litres = avg_flow * (duration / 60.0) if duration > 0 else 0.0
+    integration_quality = "capped" if _integral_capped else "ok"
 
     # True hydraulic resistance: ΔP / avg_Q
     # Only meaningful when flow is above noise floor and a pressure
@@ -1801,6 +1839,16 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         "hydraulic_resistance": round(resistance, 3) if resistance is not None else None,
         "resistance_curve_shape": shape,
         "volume_litres": round(volume_litres, 3),
+
+        # Active-flow features (timestamped-flow integral). Drive classification
+        # and the hardened phantom guard; NULL only for legacy/no-sample events.
+        "flow_integral_litres": round(flow_integral_litres, 3),
+        "active_flow_duration_seconds": active["active_flow_duration_seconds"],
+        "true_avg_flow_lpm": active["true_avg_flow_lpm"],
+        "flow_on_ratio": active["flow_on_ratio"],
+        "active_flow_segment_count": active["active_flow_segment_count"],
+        "flow_cv_on_segments": active["flow_cv_on_segments"],
+        "integration_quality": integration_quality,
 
         # Detection provenance — tells Phase 2 how reliable pressure data is
         "start_trigger": event.start_trigger,

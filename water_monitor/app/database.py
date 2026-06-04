@@ -521,6 +521,23 @@ CREATE TABLE IF NOT EXISTS events (
     volume_litres_estimated          REAL,
     volume_litres_effective          REAL,
     volume_estimation_method         TEXT DEFAULT 'raw',
+    -- Active-flow features (migration 20260536). Computed by time-integrating the
+    -- timestamped flow samples (flow_integral.py). NULLABLE on purpose: NULL =
+    -- unknown / not yet backfilled (NOT the same as 0 = known no flow). Drive
+    -- classification + the hardened phantom guard. integration_quality is 'ok',
+    -- 'capped' (offline-gap clamp), or 'degraded' (bad/sparse backfill history);
+    -- anything but 'ok'/NULL is kept out of classifier training.
+    flow_integral_litres             REAL,
+    active_flow_duration_seconds     REAL,
+    true_avg_flow_lpm                REAL,
+    flow_on_ratio                    REAL,
+    active_flow_segment_count        INTEGER,
+    flow_cv_on_segments              REAL,
+    integration_quality              TEXT,
+    -- Volume-recompute audit trail (Phase 2 backfill): original pre-recompute
+    -- volume + when it was last recomputed, for verification / rollback.
+    volume_litres_original           REAL,
+    volume_recomputed_at             TIMESTAMP,
     hourly_volume_applied_litres     REAL DEFAULT 0,
     hourly_volume_applied_bucket     TEXT,
     degraded_diagnostic_json         TEXT,
@@ -3091,6 +3108,92 @@ _SIGNATURE_KNN_SCALES: dict = {
     "steady_state_fraction": 0.25,
 }
 
+# ── Active-flow feature set (preferred after the 20260536 backfill) ──────────
+# Once the backfill populates the active-flow columns on labelled events, the
+# matcher prefers these (true_avg_flow + active_flow_duration replace the
+# pressure-window-inflated avg_flow + duration; flow_on_ratio flags artifacts).
+# Until then labelled rows have NULL active features, so the matcher falls back
+# to the legacy set — this is what stops classification coverage collapsing.
+# RETUNE _SIGNATURE_KNN_ACTIVE_SCALES (LOO on the labelled archive) once backfill
+# has run; the values below are estimated from the raw-flow analysis.
+_SIGNATURE_KNN_ACTIVE_FEATURES: tuple = (
+    "true_avg_flow_lpm", "peak_flow_lpm", "active_flow_duration_seconds",
+    "volume_litres", "pressure_delta_psi", "steady_state_fraction", "flow_on_ratio",
+)
+_SIGNATURE_KNN_ACTIVE_LOG_FEATURES: frozenset = frozenset({
+    "true_avg_flow_lpm", "peak_flow_lpm", "active_flow_duration_seconds", "volume_litres",
+})
+_SIGNATURE_KNN_ACTIVE_SCALES: dict = {
+    "true_avg_flow_lpm":           0.70,
+    "peak_flow_lpm":               0.74,
+    "active_flow_duration_seconds": 1.40,
+    "volume_litres":               1.52,
+    "pressure_delta_psi":          2.88,
+    "steady_state_fraction":       0.25,
+    "flow_on_ratio":               0.25,   # linear (a 0–1 ratio), not log
+}
+
+
+def _knn_transform(feat: str, value, log_features: frozenset) -> float:
+    """log1p the right-skewed features (per ``log_features``), identity for the
+    rest. None / non-finite → 0.0. Applied identically to query + neighbours."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(v):
+        return 0.0
+    return math.log1p(max(0.0, v)) if feat in log_features else v
+
+
+def _knn_vote(labelled, event_features, features, scales, log_features):
+    """Inverse-distance weighted k-NN vote over ``labelled`` = [(canon_type, row)].
+
+    Shared by the active-flow and legacy matchers. Returns a hit dict or None
+    (abstain). 'other' wins are treated as abstention.
+    """
+    counts: Dict[str, int] = {}
+    for t, _ in labelled:
+        counts[t] = counts.get(t, 0) + 1
+    eligible = {t for t, c in counts.items()
+                if c >= _SIGNATURE_KNN_MIN_LABELS_PER_CLASS}
+    if not eligible:
+        return None
+    q = {f: _knn_transform(f, event_features.get(f), log_features) for f in features}
+    dists: list = []
+    for t, r in labelled:
+        if t not in eligible:
+            continue
+        sq = 0.0
+        for f in features:
+            scale = scales.get(f, 1.0)
+            d = (q[f] - _knn_transform(f, r[f], log_features)) / scale
+            sq += d * d
+        dists.append((math.sqrt(sq / len(features)), t))
+    if not dists:
+        return None
+    dists.sort(key=lambda x: x[0])
+    neighbours = dists[:_SIGNATURE_KNN_K]
+    score: Dict[str, float] = {}
+    for d, t in neighbours:
+        score[t] = score.get(t, 0.0) + 1.0 / (d + 1e-6)
+    total = sum(score.values())
+    win_t, win_s = max(score.items(), key=lambda kv: kv[1])
+    if (win_s < _SIGNATURE_KNN_CONFIDENCE_THRESHOLD
+            or total <= 0
+            or (win_s / total) < _SIGNATURE_KNN_MARGIN_THRESHOLD):
+        return None
+    if win_t == "other":
+        return None
+    nearest = min(d for d, t in neighbours if t == win_t)
+    return {
+        "fixture_type": win_t,
+        "distance": nearest,
+        "score": win_s,
+        "margin": win_s / total,
+        "member_count": counts[win_t],
+    }
+
 
 def upsert_fixture_signature(
     conn: sqlite3.Connection,
@@ -3551,74 +3654,61 @@ def match_event_to_signature_knn(
     On a hit returns ``{"fixture_type", "distance", "score", "margin",
     "member_count"}``. fixture_type is canonical.
     """
-    rows = conn.execute(
+    def _labelled(sql: str):
+        rows = conn.execute(sql, (circuit,)).fetchall()
+        out = []
+        for r in rows:
+            t = _canonical_fixture_type(r["user_fixture_type"])
+            if t:
+                out.append((t, r))
+        return out
+
+    # 1) Prefer the active-flow features — but only when the QUERY has them and
+    #    enough labelled events have been backfilled with non-NULL, non-degraded
+    #    active features. 'other' wins → abstain (handled in _knn_vote).
+    query_has_active = all(
+        event_features.get(f) is not None
+        for f in ("true_avg_flow_lpm", "active_flow_duration_seconds", "flow_on_ratio")
+    )
+    if query_has_active:
+        active = _labelled(
+            "SELECT user_fixture_type, true_avg_flow_lpm, peak_flow_lpm, "
+            "       active_flow_duration_seconds, volume_litres, pressure_delta_psi, "
+            "       steady_state_fraction, flow_on_ratio "
+            "FROM events "
+            "WHERE circuit = ? "
+            "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
+            "  AND COALESCE(excluded_from_training, 0) = 0 "
+            "  AND COALESCE(integration_quality, 'ok') = 'ok' "
+            "  AND true_avg_flow_lpm IS NOT NULL "
+            "  AND active_flow_duration_seconds IS NOT NULL "
+            "  AND flow_on_ratio IS NOT NULL"
+        )
+        if len(active) >= _SIGNATURE_KNN_MIN_TOTAL_LABELS:
+            hit = _knn_vote(active, event_features, _SIGNATURE_KNN_ACTIVE_FEATURES,
+                            _SIGNATURE_KNN_ACTIVE_SCALES, _SIGNATURE_KNN_ACTIVE_LOG_FEATURES)
+            if hit is not None:
+                hit["match_source"] = "active_flow"
+                return hit
+            # Active had enough labels but abstained → fall through to legacy so
+            # classification coverage never regresses below the legacy baseline.
+
+    # 2) Legacy fallback (pre-backfill, or active abstained).
+    legacy = _labelled(
         "SELECT user_fixture_type, avg_flow_lpm, peak_flow_lpm, duration_seconds, "
         "       volume_litres, pressure_delta_psi, steady_state_fraction "
         "FROM events "
         "WHERE circuit = ? "
         "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
-        "  AND COALESCE(excluded_from_training, 0) = 0",
-        (circuit,),
-    ).fetchall()
-    if len(rows) < _SIGNATURE_KNN_MIN_TOTAL_LABELS:
+        "  AND COALESCE(excluded_from_training, 0) = 0"
+    )
+    if len(legacy) < _SIGNATURE_KNN_MIN_TOTAL_LABELS:
         return None
-
-    # Canonicalise labels + count per class.
-    labelled: list = []
-    counts: Dict[str, int] = {}
-    for r in rows:
-        t = _canonical_fixture_type(r["user_fixture_type"])
-        if not t:
-            continue
-        counts[t] = counts.get(t, 0) + 1
-        labelled.append((t, r))
-    eligible = {t for t, c in counts.items()
-                if c >= _SIGNATURE_KNN_MIN_LABELS_PER_CLASS}
-    if not eligible:
-        return None
-
-    q = {f: _sig_transform(f, event_features.get(f))
-         for f in _SIGNATURE_MATCH_FEATURES}
-    dists: list = []
-    for t, r in labelled:
-        if t not in eligible:
-            continue
-        sq = 0.0
-        for f in _SIGNATURE_MATCH_FEATURES:
-            scale = _SIGNATURE_KNN_SCALES.get(f, 1.0)
-            d = (q[f] - _sig_transform(f, r[f])) / scale
-            sq += d * d
-        dists.append((math.sqrt(sq / len(_SIGNATURE_MATCH_FEATURES)), t))
-    if not dists:
-        return None
-
-    dists.sort(key=lambda x: x[0])
-    neighbours = dists[:_SIGNATURE_KNN_K]
-    score: Dict[str, float] = {}
-    for d, t in neighbours:
-        score[t] = score.get(t, 0.0) + 1.0 / (d + 1e-6)
-    total = sum(score.values())
-    win_t, win_s = max(score.items(), key=lambda kv: kv[1])
-    if (win_s < _SIGNATURE_KNN_CONFIDENCE_THRESHOLD
-            or total <= 0
-            or (win_s / total) < _SIGNATURE_KNN_MARGIN_THRESHOLD):
-        return None
-    if win_t == "other":
-        # 'other' stays a VOTABLE class above (so a genuinely-misc event resolves
-        # to it instead of being force-typed into a real fixture card), but it is
-        # the heterogeneous catch-all, not a specific fixture identity. Treat a
-        # winning 'other' vote as abstention so matched_fixture_type only ever
-        # holds a real type; the rollup supplies 'other' for NULLs (req: never
-        # persist 'other' as an auto type).
-        return None
-    nearest = min(d for d, t in neighbours if t == win_t)
-    return {
-        "fixture_type": win_t,
-        "distance": nearest,
-        "score": win_s,
-        "margin": win_s / total,
-        "member_count": counts[win_t],
-    }
+    hit = _knn_vote(legacy, event_features, _SIGNATURE_MATCH_FEATURES,
+                    _SIGNATURE_KNN_SCALES, _SIGNATURE_LOG_FEATURES)
+    if hit is not None:
+        hit["match_source"] = "legacy_features"
+    return hit
 
 
 def reclassify_all_events_from_signatures(

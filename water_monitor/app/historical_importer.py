@@ -896,6 +896,15 @@ class HistoricalImporter:
                     )
                     break
 
+        # Timestamped flow samples for the volume TIME-INTEGRAL — identical code
+        # path to the live detector (so volume + active-flow features match).
+        # Pad with the pre-start flow and an end sample so the first/last
+        # intervals integrate correctly.
+        flow_samples = [(start, flow_default)]
+        flow_samples += [(t, v) for t, v in all_flow_entries if start <= t <= end]
+        if flow_samples[-1][0] < end:
+            flow_samples.append((end, flow_samples[-1][1]))
+
         return RawEvent(
             circuit=circuit,
             start_ts=start,
@@ -910,6 +919,7 @@ class HistoricalImporter:
             flow_onset_ts=start,
             propagation_delay_ms=propagation_delay_ms,
             flow_readings=flow_readings,
+            flow_samples=flow_samples,
             volume_litres_measured=volume_litres_measured,
             complete=True,
         )

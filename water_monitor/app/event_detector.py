@@ -85,6 +85,12 @@ class RawEvent:
     # 1Hz flow readings collected during the event
     flow_readings: List[float] = field(default_factory=list)
 
+    # Coalesced timestamped flow samples (ts, L/min) for the volume TIME-INTEGRAL
+    # (flow_integral.integrate_litres / active_flow_features). Distinct from the
+    # downsampled flow_readings used for the 32-pt signature: volume must be a
+    # time-integral, not mean(flow) × pressure-window duration.
+    flow_samples: List[Tuple[datetime, float]] = field(default_factory=list)
+
     # True if any other circuit's valve was open when this event started.
     # Helps distinguish main-circuit irrigation bleed-through from household demand.
     other_valve_open: Optional[bool] = None
@@ -417,6 +423,14 @@ class CircuitEventDetector:
         self._flow_sample_count: int = 0
         self._pressure_sample_count: int = 0
 
+        # Coalescing for the timestamped flow_samples (volume integral): keep a
+        # sample only when the flow changes by > delta, crosses the on/off
+        # threshold, or a heartbeat elapses. The heartbeat (< the integrator's
+        # 120s dt cap) guarantees a steady flow never trips the offline-gap cap,
+        # while bounding memory to ~O(seconds of change) instead of O(callbacks).
+        self._FLOW_SAMPLE_MIN_DELTA_LPM: float = 0.2
+        self._FLOW_SAMPLE_HEARTBEAT_S: float = 30.0
+
     # ------------------------------------------------------------------ #
     # Public                                                               #
     # ------------------------------------------------------------------ #
@@ -463,6 +477,18 @@ class CircuitEventDetector:
             self._flow_sample_count += 1
             if elapsed < self._DOWNSAMPLE_AFTER_SECONDS or self._flow_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.flow_readings.append(self._current_flow_lpm)
+            # Coalesced timestamped capture for the volume integral.
+            fs = self._active_event.flow_samples
+            v = self._current_flow_lpm
+            if not fs:
+                fs.append((now, v))
+            else:
+                lt, lv = fs[-1]
+                crossed = (lv > self.MIN_FLOW_LPM) != (v > self.MIN_FLOW_LPM)
+                if (crossed
+                        or abs(v - lv) > self._FLOW_SAMPLE_MIN_DELTA_LPM
+                        or (now - lt).total_seconds() >= self._FLOW_SAMPLE_HEARTBEAT_S):
+                    fs.append((now, v))
             self._flow_sustained_since = None
             return
 
@@ -725,6 +751,7 @@ class CircuitEventDetector:
             min_pressure_psi=baseline if baseline is not None else 0.0,
             max_pressure_psi=baseline if baseline is not None else 0.0,
             flow_readings=[self._current_flow_lpm],
+            flow_samples=[(start_ts, self._current_flow_lpm)],
             other_valve_open=self._get_other_valve_open(),
         )
 
@@ -842,6 +869,7 @@ class CircuitEventDetector:
             max_pressure_psi=current_pressure,
             pressure_delta_psi=drop,
             pressure_readings=[current_pressure],
+            flow_samples=[(now, self._current_flow_lpm)],
             flow_onset_entity=self._flow_onset_entity,
             other_valve_open=self._get_other_valve_open(),
         )
@@ -883,6 +911,10 @@ class CircuitEventDetector:
             return
 
         ev.end_ts = ts
+        # Close the timestamped flow series with an end sample so the final
+        # interval to end_ts is integrated at the real (low) end flow. The end
+        # condition guarantees flow < MIN_FLOW here, so the tail integrates to ~0.
+        ev.flow_samples.append((ts, self._current_flow_lpm))
         # Use `is not None` — pre_event_pressure_psi defaults to 0.0,
         # which is falsy but valid for zero-baseline (unpressurised) systems.
         if ev.pressure_readings:
@@ -896,10 +928,22 @@ class CircuitEventDetector:
         self._flow_sample_count = 0
         self._pressure_sample_count = 0
 
-        avg_flow = (
-            sum(ev.flow_readings) / len(ev.flow_readings) if ev.flow_readings else 0.0
-        )
-        volume_l = avg_flow * duration / 60.0
+        # Discard gate uses the TIME-INTEGRAL of the timestamped flow samples,
+        # not mean(flow_readings) × duration (which over-counts brief bursts in
+        # long pressure-defined events). The stored volume is recomputed the same
+        # way in feature_extractor.
+        from .flow_integral import integrate_litres
+        volume_l, _capped = integrate_litres(ev.flow_samples)
+        # Degenerate-timestamp guard: if every flow sample shares ~one instant
+        # (synthetic/test injection — live on-change samples always span the
+        # event), fall back to the duration estimate for the DISCARD decision
+        # only, so a real event isn't dropped. Stored volume still uses the
+        # integral. Inert in production (span is always >> 1s for a real event).
+        if (len(ev.flow_samples) >= 2
+                and (ev.flow_samples[-1][0] - ev.flow_samples[0][0]).total_seconds() < 1.0
+                and ev.flow_readings):
+            est = (sum(ev.flow_readings) / len(ev.flow_readings)) * (duration / 60.0)
+            volume_l = max(volume_l, est)
         if volume_l < self.MIN_EVENT_VOLUME_L:
             log.debug(
                 "[%s] discarding near-zero-volume event (%.5f L < %.3f L)",
@@ -927,10 +971,10 @@ class CircuitEventDetector:
                 return
 
         log.info(
-            "[%s] event complete — trigger=%s duration=%.1f s avg_flow=%.3f L/min "
-            "pressure_drop=%.1f PSI has_transient=%s composite=%s",
-            self.circuit, ev.start_trigger, duration, avg_flow,
-            ev.pressure_delta_psi, ev.has_pressure_transient, ev.is_composite,
+            "[%s] event complete — trigger=%s duration=%.1f s volume=%.2f L "
+            "(%d flow samples) pressure_drop=%.1f PSI has_transient=%s",
+            self.circuit, ev.start_trigger, duration, volume_l,
+            len(ev.flow_samples), ev.pressure_delta_psi, ev.has_pressure_transient,
         )
         try:
             self._event_queue.put_nowait(ev)
