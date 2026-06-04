@@ -880,36 +880,6 @@ class Orchestrator:
             volume_daily  = get_daily_volume(self._db, circuit, since_utc=today_ts)
             volume_weekly = get_weekly_volume(self._db, circuit, since_utc=week_ts)
 
-        # One-shot diagnostic (once per circuit per process): dump the exact
-        # volume arithmetic so a "today shows the full meter total" report can be
-        # pinned down from a single restart's log instead of guessing. Cheap and
-        # self-limiting; safe to leave in.
-        if not hasattr(self, "_vol_diag_done"):
-            self._vol_diag_done = set()
-        if circuit not in self._vol_diag_done:
-            self._vol_diag_done.add(circuit)
-            try:
-                _bt = self._db.execute(
-                    "SELECT ha_volume FROM volume_snapshots WHERE circuit=? AND period_ts=?",
-                    (circuit, today_ts)).fetchone()
-                _bw = self._db.execute(
-                    "SELECT ha_volume FROM volume_snapshots WHERE circuit=? AND period_ts=?",
-                    (circuit, week_ts)).fetchone()
-                log.info(
-                    "[%s] VOLUME DIAG: sensor_raw=%r unit=%r meter_total_L=%s | "
-                    "baseline_today_L=%s (ts=%s) baseline_week_L=%s (ts=%s) | "
-                    "computed today=%s week=%s (path=%s)",
-                    circuit, ha_volume_raw, locals().get("vol_unit", "?"),
-                    None if ha_volume_total is None else round(ha_volume_total, 1),
-                    None if _bt is None else round(_bt[0], 1), today_ts,
-                    None if _bw is None else round(_bw[0], 1), week_ts,
-                    volume_daily, volume_weekly,
-                    "ha_meter" if (ha_volume_total is not None and ha_volume_total >= 0)
-                    else "hourly_table",
-                )
-            except Exception as _e:
-                log.debug("[%s] volume diag failed: %s", circuit, _e)
-
         fault_active = states.get(circuit_cfg.fault_sensor) == "on"
 
         # Fault reason — try dedicated reason sensor first, then
