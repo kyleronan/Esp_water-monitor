@@ -246,10 +246,15 @@ async def retrigger_cluster(request: Request, circuit: str = Depends(_valid_circ
         return ingress_redirect(request, "/fixtures?msg=error")
     try:
         import asyncio, functools
+        from ..database import get_write_lock
         loop = asyncio.get_running_loop()
-        count = await loop.run_in_executor(
-            None, functools.partial(engine.rebuild_from_db, circuit)
-        )
+        # Serialise against recompute/reclassify/other rebuilds — all share the
+        # write lock so heavy DB writers never run concurrently on the engine's
+        # shared connection.
+        async with get_write_lock():
+            count = await loop.run_in_executor(
+                None, functools.partial(engine.rebuild_from_db, circuit)
+            )
         log.info("[%s] manual rebuild: %d events replayed", circuit, count)
         if count == 0:
             return ingress_redirect(request, "/fixtures?msg=too_few_events")
@@ -522,10 +527,12 @@ async def merge_clusters_endpoint(
     if engine:
         try:
             import asyncio, functools
+            from ..database import get_write_lock
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None, functools.partial(engine.rebuild_from_db, circuit)
-            )
+            async with get_write_lock():
+                await loop.run_in_executor(
+                    None, functools.partial(engine.rebuild_from_db, circuit)
+                )
         except Exception as e:
             log.error("[%s] rebuild_from_db after merge failed: %s", circuit, e)
 
@@ -575,15 +582,14 @@ async def reclassify_circuit(request: Request, circuit: str = Depends(_valid_cir
     Idempotent and safe: never touches user-labelled rows, writes NULL on
     abstention (clearing stale matches), and never persists 'other'.
     """
-    orch = _orch(request)
-    from ..database import reclassify_all_events_from_signatures
+    from ..database import (reclassify_all_events_from_signatures,
+                            run_isolated_write, get_write_lock)
+    from ..config import DB_PATH
+    if get_write_lock().locked():
+        return ingress_redirect(request, "/fixtures?msg=busy")
     try:
-        import asyncio, functools
-        loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(
-            None, functools.partial(
-                reclassify_all_events_from_signatures, orch.db, circuit)
-        )
+        res = await run_isolated_write(
+            DB_PATH, lambda c: reclassify_all_events_from_signatures(c, circuit))
         log.info("[%s] manual reclassify: %s", circuit, res)
     except Exception as e:
         log.error("[%s] reclassify_circuit failed: %s", circuit, e, exc_info=True)
@@ -601,8 +607,6 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
     flow history (applies the over-count fix retroactively). Retention-limited:
     events whose flow history has aged out keep their stored volume.
     """
-    import asyncio
-    import functools
     from datetime import datetime, timezone, timedelta
 
     orch = _orch(request)
@@ -613,7 +617,14 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
         from ..volume_recompute import (build_flow_fetch,
                                          recompute_volume_and_active_flow)
         from ..database import (reclassify_all_events_from_signatures,
-                                cleanup_composite_flags)
+                                cleanup_composite_flags, run_isolated_write,
+                                get_write_lock)
+        from ..config import DB_PATH
+        # Reject (don't silently queue for many seconds) if another heavy DB
+        # write is already running — recompute/reclassify/recluster all share
+        # the write lock. Best-effort UX guard; correctness is the lock itself.
+        if get_write_lock().locked():
+            return ingress_redirect(request, "/fixtures?msg=busy")
         rng = orch.db.execute(
             "SELECT MIN(start_ts) mn, MAX(end_ts) mx FROM events WHERE circuit = ?",
             (circuit,),
@@ -630,13 +641,18 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
         range_end = _p(rng["mx"]) + timedelta(minutes=5)
         fetch = await build_flow_fetch(orch._ha, cfg.flow_sensor,
                                        range_start, range_end)
-        loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(None, functools.partial(
-            recompute_volume_and_active_flow, orch.db, circuit, fetch))
-        await loop.run_in_executor(None, functools.partial(
-            cleanup_composite_flags, orch.db))
-        await loop.run_in_executor(None, functools.partial(
-            reclassify_all_events_from_signatures, orch.db, circuit))
+
+        # Run the whole recompute → cleanup → reclassify sequence on a single
+        # private connection, serialised by the write lock (see
+        # database.run_isolated_write). This is what fixes the shared-connection
+        # races that crashed concurrent recomputes.
+        def _job(conn):
+            r = recompute_volume_and_active_flow(conn, circuit, fetch)
+            cleanup_composite_flags(conn)
+            reclassify_all_events_from_signatures(conn, circuit)
+            return r
+
+        res = await run_isolated_write(DB_PATH, _job)
         log.info("[%s] manual recompute: %s", circuit, res)
     except Exception as e:
         log.error("[%s] recompute_circuit failed: %s", circuit, e, exc_info=True)

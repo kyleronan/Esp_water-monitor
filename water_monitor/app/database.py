@@ -46,6 +46,41 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+async def run_isolated_write(db_path, fn):
+    """Serialise a heavy DB-write job and run it on a fresh PRIVATE connection.
+
+    Two guarantees that make user-triggered admin writes (recompute, reclassify)
+    safe — both against each other AND against the inline writers on the shared
+    ``orch.db`` connection (the live feature extractor, the pruner, …):
+
+    * ``get_write_lock()`` is held for the whole job, so two admin writes can't
+      run concurrently. (The bug this fixes: two simultaneous /recompute requests
+      drove the *shared* connection from two worker threads → SQLite
+      ``InterfaceError`` / "cannot commit - no transaction is active".)
+    * the job runs on its OWN ``sqlite3.Connection`` (opened in the worker thread,
+      closed after), so it never shares connection state across threads. WAL +
+      ``busy_timeout`` handle writer-vs-writer between connections, and the job's
+      per-row commits release the file write-lock between rows.
+
+    ``fn`` is a sync callable taking the private connection; its return value is
+    propagated. The connection is closed even if ``fn`` raises. ``db_path`` is
+    passed in (not imported) so this module stays free of config imports.
+    """
+    import asyncio
+
+    async with get_write_lock():
+        loop = asyncio.get_running_loop()
+
+        def _run():
+            conn = get_connection(db_path)
+            try:
+                return fn(conn)
+            finally:
+                conn.close()
+
+        return await loop.run_in_executor(None, _run)
+
+
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Generator:
     try:

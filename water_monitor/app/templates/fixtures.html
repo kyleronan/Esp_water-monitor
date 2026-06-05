@@ -23,6 +23,9 @@
   {{ request.query_params.get('recomputed', '0') }} event(s) corrected,
   {{ request.query_params.get('skipped', '0') }} skipped (history aged out){% if request.query_params.get('degraded', '0') != '0' %},
   {{ request.query_params.get('degraded') }} marked degraded{% endif %}.</div>
+{% elif msg == 'busy' %}
+<div class="fx-msg fx-msg-warn">Another volume operation is already running — wait for it
+  to finish, then try again.</div>
 {% elif msg == 'error' %}
 <div class="fx-msg fx-msg-err">Action failed — check the addon log for details.</div>
 {% endif %}
