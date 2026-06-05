@@ -58,7 +58,11 @@ _BASELINE_VERSION: int = 20260523
 #              columns (volume_litres_original, volume_recomputed_at). All
 #              NULLABLE. Lightweight DDL only; the per-event recompute runs from
 #              the startup / import / manual recompute paths after migration.
-_CURRENT_VERSION: int = 20260536
+#   20260537 — Temporal appliance signal: events.cycle_pulse_count (nullable
+#              INTEGER, count of similar-volume neighbours within ±45 min). DDL
+#              only; the count backfill + cluster re-suggest run from the startup
+#              / manual recompute paths after migration.
+_CURRENT_VERSION: int = 20260537
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -548,6 +552,29 @@ def _apply_active_flow_columns(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260536: active-flow feature columns ready")
 
 
+_CYCLE_PULSE_NEW_COLUMNS: tuple = (
+    ("cycle_pulse_count", "INTEGER"),
+)
+
+
+def _apply_cycle_pulse_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260537 — temporal appliance signal.
+
+    Adds ``events.cycle_pulse_count`` (nullable INTEGER; NULL = not yet computed,
+    0 = computed/no qualifying neighbours). LIGHTWEIGHT DDL ONLY — the count
+    backfill (``database.recompute_cycle_pulse_counts``) + cluster re-suggest run
+    from the startup / manual recompute paths after migration.
+
+    Idempotent — each add is guarded by ``_has_column``.
+    """
+    for col, decl in _CYCLE_PULSE_NEW_COLUMNS:
+        if not _has_column(conn, "events", col):
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
+            log.info("Added events.%s (%s)", col, decl)
+    conn.commit()
+    log.info("Migration 20260537: cycle_pulse_count column ready")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -774,6 +801,17 @@ def _missing_active_flow_columns(conn: sqlite3.Connection) -> set[str]:
     }
 
 
+# Columns added by the 20260537 cycle-pulse migration on events.
+_CYCLE_PULSE_COLUMNS: frozenset = frozenset(c for c, _ in _CYCLE_PULSE_NEW_COLUMNS)
+
+
+def _missing_cycle_pulse_columns(conn: sqlite3.Connection) -> set[str]:
+    return {
+        col for col in _CYCLE_PULSE_COLUMNS
+        if not _has_column(conn, "events", col)
+    }
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -875,6 +913,7 @@ def _run_migrations_impl(
             | _missing_manual_classification_columns(conn)
             | _missing_low_flow_dribble_columns(conn)
             | _missing_active_flow_columns(conn)
+            | _missing_cycle_pulse_columns(conn)
         )
         if missing:
             raise RuntimeError(
@@ -885,9 +924,17 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260536:
+        # DB has the active-flow columns but lacks cycle_pulse_count.
+        _apply_cycle_pulse_column(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260536 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260535:
         # DB has the low-flow-dribble column but lacks the active-flow columns.
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260535 → %d", _CURRENT_VERSION)
         return
@@ -897,6 +944,7 @@ def _run_migrations_impl(
         # dribble exclusion column + reclassify indexes.
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
         return
@@ -907,6 +955,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
         return
@@ -917,6 +966,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
@@ -929,6 +979,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
@@ -942,6 +993,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -977,6 +1029,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -994,6 +1047,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -1012,6 +1066,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -1029,6 +1084,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -1045,6 +1101,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -1059,6 +1116,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -1073,6 +1131,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -1123,6 +1182,7 @@ def _run_migrations_impl(
         _apply_manual_classification_columns(conn)
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
+        _apply_cycle_pulse_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

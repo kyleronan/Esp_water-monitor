@@ -809,10 +809,20 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
         " AND COALESCE(user_classified, 0) = 0"
         if _events_has_column(conn, "user_classified") else ""
     )
+    # The hardened phantom guard needs the active-flow features so a REAL
+    # high-flow low-ΔP run (e.g. irrigation at ΔP ~1.2) is never zeroed. Without
+    # them this scan re-applies the bare duration+ΔP rule on every startup and
+    # re-zeroes real runs — even ones a Recompute just restored. Column-guarded
+    # because this backfill also runs from an early migration, before the
+    # 20260536 active-flow columns exist in a sequential upgrade.
+    has_af = _events_has_column(conn, "true_avg_flow_lpm")
+    af_select = (", true_avg_flow_lpm, flow_integral_litres, flow_on_ratio"
+                 if has_af else "")
     rows = conn.execute(
         "SELECT id, circuit, start_ts, duration_seconds, pressure_delta_psi, "
-        "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
-        "FROM events "
+        "       hourly_volume_applied_litres, hourly_volume_applied_bucket"
+        + af_select +
+        " FROM events "
         "WHERE duration_seconds >= ? "
         "  AND pressure_delta_psi < ? "
         "  AND (is_pressure_restoration_phantom = 0 "
@@ -827,7 +837,10 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
         # Re-run the canonical detector rather than trusting the SQL filter
         # alone — keeps the threshold logic in one place and guards bad data.
         if not _detect_pressure_restoration_phantom(
-            row["duration_seconds"], row["pressure_delta_psi"]
+            row["duration_seconds"], row["pressure_delta_psi"],
+            true_avg_flow_lpm=(row["true_avg_flow_lpm"] if has_af else None),
+            flow_integral_litres=(row["flow_integral_litres"] if has_af else None),
+            flow_on_ratio=(row["flow_on_ratio"] if has_af else None),
         ):
             continue
 

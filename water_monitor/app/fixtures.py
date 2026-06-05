@@ -498,7 +498,9 @@ def get_match_threshold(fixture_type: Optional[str]) -> float:
 # Centroid keys are the feature names used by feature_extractor:
 #   avg_flow_lpm, peak_flow_lpm, duration_seconds, volume_litres,
 #   pressure_delta_psi, has_pressure_transient (0 or 1 average),
-#   flow_variability, hour_sin, hour_cos, ...
+#   flow_variability, hour_sin, hour_cos,
+#   cycle_pulse_count (mean # of similar-volume neighbours within ±45 min — the
+#     temporal "appliance cycle" signal; see database.recompute_cycle_pulse_counts), ...
 #
 # Confidence scoring guideline:
 #   0.90+ — extremely characteristic, multiple distinguishing features match
@@ -522,43 +524,54 @@ def _safe(centroid: Dict, key: str, default: float = 0.0) -> float:
 # Individual rules -------------------------------------------------------
 
 def _rule_toilet(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Toilet flushes: 4-9 L volume, 20-60 s duration, sharp pressure transient."""
+    """Toilet flushes: 3-10 L volume, 20-120 s fill, sharp pressure transient.
+
+    Bands widened from the originals (4-9 L / 20-60 s / 4-25 L/min) to span
+    dual-flush and slow-fill cisterns across houses (observed real fills run to
+    ~98 s and down to ~2.8 L) while keeping the has_xt transient signature that
+    separates a toilet from a tap.
+    """
     if circuit_type == "zone":
         return None
     vol      = _safe(centroid, "volume_litres")
     dur      = _safe(centroid, "duration_seconds")
     has_xt   = _safe(centroid, "has_pressure_transient")
     flow     = _safe(centroid, "avg_flow_lpm")
-    if _between(vol, 4, 9) and _between(dur, 20, 60) and has_xt > 0.5:
-        # Flow rate sanity check: ~6 L over ~30 s = ~12 L/min average
-        if _between(flow, 4, 25):
+    if _between(vol, 3, 10) and _between(dur, 20, 120) and has_xt > 0.5:
+        if _between(flow, 3, 15):
             return ("toilet", 0.90)
     return None
 
 
 def _rule_shower_tub(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Shower or bath fill: 20-250 L, 3-20 min, moderate-to-high flow.
+    """Shower or bath fill: 15-300 L, 3-60 min, moderate flow.
 
-    Merges the old shower (20-100 L, 4-20 min, 5-15 lpm) and bath
-    (80-250 L, 3-10 min, 12-25 lpm) rules into a single type.
+    Merges shower + bath. Duration ceiling raised from 20 to 60 min (real
+    showers run past 50 min) and the flow floor lowered from 5 to 4 L/min for
+    low-flow heads.
     """
     if circuit_type == "zone":
         return None
     vol  = _safe(centroid, "volume_litres")
     dur  = _safe(centroid, "duration_seconds")
     flow = _safe(centroid, "avg_flow_lpm")
-    if _between(vol, 20, 250) and _between(dur, 180, 1200) and _between(flow, 5, 25):
+    if _between(vol, 15, 300) and _between(dur, 180, 3600) and _between(flow, 4, 22):
         return ("shower_tub", 0.80)
     return None
 
 
 def _rule_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Tap use: 0.3-8 L, 5-60 s — covers bathroom, kitchen, and utility taps."""
+    """Tap use: 0.3-6 L, 4-75 s — bathroom/kitchen/utility taps.
+
+    Deliberately kept NARROW (balanced posture): tap is the broadest, lowest-
+    confidence rule and the last in the chain, so it must not become a catch-all
+    that pulls miscellaneous small events out of 'other'.
+    """
     if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
-    if _between(vol, 0.3, 8) and _between(dur, 5, 60):
+    if _between(vol, 0.3, 6) and _between(dur, 4, 75):
         return ("tap", 0.65)
     return None
 
@@ -593,10 +606,44 @@ def _rule_irrigation_zone(centroid: Dict, circuit_type: str) -> Optional[Tuple[s
         return None
     dur  = _safe(centroid, "duration_seconds")
     flow = _safe(centroid, "avg_flow_lpm")
-    # Irrigation zones run 5-60 minutes at sustained flow
-    if dur >= 300 and flow >= 5:
+    # Irrigation zones run ~4-60 minutes at sustained flow
+    if dur >= 240 and flow >= 5:
         return ("irrigation_zone", 0.85)
     # Short zone events fall through to 'other' (hose_bib removed from taxonomy)
+    return None
+
+
+# Temporal appliance rules -----------------------------------------------
+# Dishwasher / washing-machine FILL PULSES look like small taps in a single
+# event; the discriminator is that they REPEAT (a cycle of similar-volume
+# pulses). ``cycle_pulse_count`` is the centroid-mean count of similar-volume
+# neighbours within ±45 min (database.recompute_cycle_pulse_counts). Both rules
+# gate on has_pressure_transient < 0.5, so a toilet's sharp transient can never
+# satisfy them, and they run BEFORE the broadened toilet/tap bands in the chain.
+
+def _rule_dishwasher_temporal(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
+    """Dishwasher fill pulse: repeated low-flow small pulses (a cycle)."""
+    if circuit_type == "zone":
+        return None
+    if (_safe(centroid, "cycle_pulse_count") >= 3
+            and _safe(centroid, "has_pressure_transient") < 0.5
+            and _between(_safe(centroid, "avg_flow_lpm"), 1, 5)
+            and _between(_safe(centroid, "volume_litres"), 0.5, 6)
+            and _between(_safe(centroid, "duration_seconds"), 20, 220)):
+        return ("dishwasher", 0.80)
+    return None
+
+
+def _rule_washing_machine_temporal(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
+    """Washing-machine fill pulse: repeated higher-flow pulses (a cycle)."""
+    if circuit_type == "zone":
+        return None
+    if (_safe(centroid, "cycle_pulse_count") >= 3
+            and _safe(centroid, "has_pressure_transient") < 0.5
+            and _between(_safe(centroid, "avg_flow_lpm"), 5, 16)
+            and _between(_safe(centroid, "volume_litres"), 3, 40)
+            and _between(_safe(centroid, "duration_seconds"), 40, 400)):
+        return ("washing_machine", 0.80)
     return None
 
 
@@ -607,11 +654,13 @@ def _rule_irrigation_zone(centroid: Dict, circuit_type: str) -> Optional[Tuple[s
 
 _RULES = [
     _rule_irrigation_zone,
-    _rule_shower_tub,        # high volume, before washing_machine + tap
-    _rule_washing_machine,
-    _rule_dishwasher,
-    _rule_toilet,            # very characteristic, check after high-vol rules
-    _rule_tap,
+    _rule_dishwasher_temporal,       # temporal appliance cycles first — they
+    _rule_washing_machine_temporal,  # gate on has_xt<0.5 so toilets are safe
+    _rule_shower_tub,                # high volume, before tap
+    _rule_washing_machine,           # centroid-only fallback (legacy clusters)
+    _rule_dishwasher,                # centroid-only fallback (legacy clusters)
+    _rule_toilet,                    # characteristic; after high-vol/appliance
+    _rule_tap,                       # broadest, narrow band, last
 ]
 
 

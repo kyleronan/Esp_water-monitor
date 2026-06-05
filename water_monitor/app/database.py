@@ -602,7 +602,13 @@ CREATE TABLE IF NOT EXISTS events (
     -- (is_pressure_restoration_phantom / degraded_supply / is_composite) hold
     -- the user's manual choices and auto-detection must never overwrite them.
     user_ignored                     INTEGER DEFAULT 0,
-    user_classified                  INTEGER DEFAULT 0
+    user_classified                  INTEGER DEFAULT 0,
+    -- Temporal "appliance cycle" signal: count of similar-volume neighbour
+    -- events within ±45 min (database.recompute_cycle_pulse_counts). NULL = not
+    -- yet computed, 0 = computed/no qualifying neighbours. Aggregated into the
+    -- cluster centroid for the heuristic; deliberately NOT in FEATURE_KEYS so it
+    -- never affects clustering distance.
+    cycle_pulse_count                INTEGER
 );
 
 -- NOTE: the partial index on (circuit, start_ts) WHERE degraded_supply = 1
@@ -3864,6 +3870,202 @@ def cleanup_composite_flags(conn: sqlite3.Connection) -> Dict[str, int]:
     conn.commit()
     log.info("composite cleanup: %d row(s) re-derived, %d un-excluded", cleaned, unexcluded)
     return {"composite_rows_changed": cleaned, "unexcluded": unexcluded}
+
+
+# ── Temporal appliance-cycle signal (cycle_pulse_count) ───────────────────────
+# A dishwasher / washing-machine fill PULSE is indistinguishable from a tap in a
+# single event; the discriminator is that pulses REPEAT. cycle_pulse_count is the
+# number of same-circuit events within ±45 min whose volume is within ratio
+# [0.4, 2.5] of this event. It rides in the cluster centroid (mean over members)
+# as a heuristic-only signal — see fixtures.py temporal appliance rules.
+
+_CYCLE_PULSE_WINDOW_SECONDS: float = 2700.0      # ±45 min
+_CYCLE_PULSE_VOL_RATIO_LO: float = 0.4
+_CYCLE_PULSE_VOL_RATIO_HI: float = 2.5
+
+
+def compute_cycle_pulse_count(this_volume, neighbour_volumes) -> int:
+    """Count neighbour volumes within ratio [0.4, 2.5] of ``this_volume``.
+
+    Pure (no DB). The event itself must already be excluded from
+    ``neighbour_volumes``. Returns 0 when ``this_volume`` is missing or <= 0.
+    """
+    try:
+        tv = float(this_volume)
+    except (TypeError, ValueError):
+        return 0
+    if tv <= 0:
+        return 0
+    n = 0
+    for v in neighbour_volumes:
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv > 0 and _CYCLE_PULSE_VOL_RATIO_LO <= fv / tv <= _CYCLE_PULSE_VOL_RATIO_HI:
+            n += 1
+    return n
+
+
+def _parse_event_ts(s):
+    if isinstance(s, datetime):
+        return s
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _load_pulse_events(conn: sqlite3.Connection, circuit: str):
+    """Sorted ``[(epoch, id, volume)]`` for same-circuit, non-excluded events
+    with a parseable timestamp and positive volume (the cycle candidates)."""
+    rows = conn.execute(
+        "SELECT id, start_ts, volume_litres FROM events "
+        "WHERE circuit = ? AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND start_ts IS NOT NULL AND volume_litres IS NOT NULL",
+        (circuit,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        t = _parse_event_ts(r["start_ts"])
+        if t is None:
+            continue
+        try:
+            vol = float(r["volume_litres"])
+        except (TypeError, ValueError):
+            continue
+        if vol > 0:
+            out.append((t.timestamp(), r["id"], vol))
+    out.sort(key=lambda e: e[0])
+    return out
+
+
+def cycle_pulse_count_for_event(conn: sqlite3.Connection, circuit: str, event_id,
+                                start_ts, volume, past_only: bool = True) -> int:
+    """Best-effort online cycle_pulse_count for one (just-completed) event.
+
+    ``past_only`` (default) counts only earlier neighbours — there is no future at
+    event-completion time; the batch ``recompute_cycle_pulse_counts`` fills the
+    full ±45 min window later (authoritative). Uses a bounded ``LIMIT`` query so a
+    bulk import can never make this O(n²) — the most-recent rows are exactly the
+    ones inside a ±45 min window of a freshly-completed event."""
+    t = _parse_event_ts(start_ts)
+    try:
+        vol = float(volume)
+    except (TypeError, ValueError):
+        vol = 0.0
+    if t is None or vol <= 0:
+        return 0
+    center = t.timestamp()
+    rows = conn.execute(
+        "SELECT start_ts, volume_litres FROM events "
+        "WHERE circuit = ? AND id <> ? AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND start_ts IS NOT NULL AND volume_litres IS NOT NULL "
+        "ORDER BY start_ts DESC LIMIT 400",
+        (circuit, event_id),
+    ).fetchall()
+    nbrs = []
+    for r in rows:
+        rt = _parse_event_ts(r["start_ts"])
+        if rt is None:
+            continue
+        dt = center - rt.timestamp()
+        if (0 <= dt <= _CYCLE_PULSE_WINDOW_SECONDS) or \
+           (not past_only and -_CYCLE_PULSE_WINDOW_SECONDS <= dt < 0):
+            nbrs.append(r["volume_litres"])
+    return compute_cycle_pulse_count(vol, nbrs)
+
+
+def recompute_cycle_pulse_counts(conn: sqlite3.Connection, circuit: str) -> Dict[str, int]:
+    """Authoritative full-window (±45 min, past+future) backfill of
+    ``events.cycle_pulse_count``, then patch each cluster centroid's mean so the
+    heuristic sees the signal immediately. Idempotent (only changed rows written).
+    Returns ``{"scanned", "updated"}``."""
+    evs = _load_pulse_events(conn, circuit)
+    n = len(evs)
+    stored = {
+        r["id"]: r["cycle_pulse_count"]
+        for r in conn.execute(
+            "SELECT id, cycle_pulse_count FROM events WHERE circuit = ?", (circuit,)
+        ).fetchall()
+    }
+    updated = 0
+    lo = hi = 0
+    for i in range(n):
+        center = evs[i][0]
+        while lo < n and evs[lo][0] < center - _CYCLE_PULSE_WINDOW_SECONDS:
+            lo += 1
+        while hi < n and evs[hi][0] <= center + _CYCLE_PULSE_WINDOW_SECONDS:
+            hi += 1
+        nbrs = [evs[j][2] for j in range(lo, hi) if j != i]
+        cnt = compute_cycle_pulse_count(evs[i][2], nbrs)
+        eid = evs[i][1]
+        if stored.get(eid) != cnt:
+            conn.execute(
+                "UPDATE events SET cycle_pulse_count = ? WHERE id = ? AND circuit = ?",
+                (cnt, eid, circuit),
+            )
+            updated += 1
+
+    # Patch cluster centroids with the member-mean so suggest_fixture_type can
+    # read the cycle signal without waiting for 10 fresh events.
+    for cr in conn.execute(
+        "SELECT cluster_id, AVG(cycle_pulse_count) AS avgc FROM events "
+        "WHERE circuit = ? AND cluster_id IS NOT NULL "
+        "  AND cycle_pulse_count IS NOT NULL GROUP BY cluster_id",
+        (circuit,),
+    ).fetchall():
+        row = conn.execute(
+            "SELECT centroid FROM fixture_clusters WHERE circuit = ? AND id = ?",
+            (circuit, cr["cluster_id"]),
+        ).fetchone()
+        if not row or not row["centroid"]:
+            continue
+        try:
+            cen = json.loads(row["centroid"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        cen["cycle_pulse_count"] = round(float(cr["avgc"] or 0.0), 4)
+        conn.execute(
+            "UPDATE fixture_clusters SET centroid = ? WHERE circuit = ? AND id = ?",
+            (json.dumps(cen), circuit, cr["cluster_id"]),
+        )
+    conn.commit()
+    log.info("[%s] cycle_pulse_count: %d scanned, %d updated", circuit, n, updated)
+    return {"scanned": n, "updated": updated}
+
+
+def resuggest_all_clusters(conn: sqlite3.Connection, circuit: str) -> Dict[str, int]:
+    """Re-run the heuristic ``suggest_fixture_type`` over each cluster centroid
+    (e.g. after a cycle_pulse_count backfill). Only touches clusters whose
+    ``suggestion_source`` is NULL or 'heuristic' — user-label votes are never
+    overwritten. Returns ``{"clusters", "updated"}``."""
+    from .fixtures import suggest_fixture_type
+    ctype = get_circuit_type(conn, circuit)
+    rows = conn.execute(
+        "SELECT id, centroid, suggested_type, suggestion_source "
+        "FROM fixture_clusters WHERE circuit = ?", (circuit,)
+    ).fetchall()
+    updated = 0
+    for r in rows:
+        if r["suggestion_source"] == "user_labels" or not r["centroid"]:
+            continue
+        try:
+            centroid = json.loads(r["centroid"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        new_type, new_conf = suggest_fixture_type(centroid, ctype)
+        if new_type != r["suggested_type"]:
+            conn.execute(
+                "UPDATE fixture_clusters SET suggested_type = ?, "
+                "  suggested_confidence = ?, suggestion_source = 'heuristic' "
+                "WHERE circuit = ? AND id = ?",
+                (new_type, new_conf if new_type else 0.0, circuit, r["id"]),
+            )
+            updated += 1
+    conn.commit()
+    log.info("[%s] resuggest: %d clusters, %d updated", circuit, len(rows), updated)
+    return {"clusters": len(rows), "updated": updated}
 
 
 def migrate_to_type_level_clusters(

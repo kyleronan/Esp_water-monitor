@@ -643,6 +643,19 @@ class ClusterEngine:
 
         cluster_id   = self._upsert_cluster(circuit, nearest_id)
         member_count = self._increment_member_count(circuit, cluster_id)
+        # Attach the temporal appliance-cycle signal to the feature dict ONLY
+        # now — after clustering — so it rides into the centroid running-mean but
+        # never reaches the scaler / DBSTREAM (it is intentionally absent from
+        # FEATURE_KEYS). Best-effort past-only online; the startup / manual batch
+        # recompute fills the full ±45 min window authoritatively.
+        try:
+            from .database import cycle_pulse_count_for_event
+            features['cycle_pulse_count'] = float(cycle_pulse_count_for_event(
+                self._db, circuit, event.get('id'),
+                event.get('start_ts'), event.get('volume_litres'), past_only=True))
+        except Exception as e:
+            log.debug("[%s] online cycle_pulse_count failed: %s", circuit, e)
+            features.setdefault('cycle_pulse_count', 0.0)
         self._update_cluster_centroid(circuit, cluster_id, features, member_count)
         self._run_suggest_type_if_needed(circuit, cluster_id, member_count)
 

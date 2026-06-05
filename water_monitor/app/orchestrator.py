@@ -451,7 +451,9 @@ class Orchestrator:
             if res.get("dribbles_flagged"):
                 log.info("startup: flagged %d low-flow dribble event(s)",
                          res["dribbles_flagged"])
-            from .database import reclassify_all_events_from_signatures
+            from .database import (reclassify_all_events_from_signatures,
+                                   recompute_cycle_pulse_counts,
+                                   resuggest_all_clusters)
             for c in self._cfg.circuits:
                 r = await loop.run_in_executor(
                     None, reclassify_all_events_from_signatures,
@@ -461,6 +463,17 @@ class Orchestrator:
                         "[%s] startup reclassify: %d matched, %d abstained, "
                         "%d stale cleared", c.circuit, r["events_matched"],
                         r["events_abstained"], r["events_cleared"])
+                # Temporal appliance-cycle backfill (authoritative full ±45 min
+                # window), then re-run the heuristic suggestion over the patched
+                # centroids so dishwasher/washing-machine cycles get labelled.
+                cyc = await loop.run_in_executor(
+                    None, recompute_cycle_pulse_counts, self._db, c.circuit)
+                rs = await loop.run_in_executor(
+                    None, resuggest_all_clusters, self._db, c.circuit)
+                if cyc.get("updated") or rs.get("updated"):
+                    log.info("[%s] startup cycle-pulse: %d events updated, "
+                             "%d cluster suggestion(s) re-derived",
+                             c.circuit, cyc["updated"], rs["updated"])
         except Exception as e:
             log.warning("startup reclassify/reprocess failed (non-fatal): %s", e)
 
