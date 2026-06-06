@@ -196,12 +196,27 @@ def compute_suggested_calibration_days(
     return min(base_days, 35), tier
 
 
+# Zone (irrigation) circuits see only a handful of repetitive cycles per
+# day, so the whole-home fixture target below is unreachable for them. A
+# small fixed target is enough to characterise their flow signature.
+# Tunable.
+ZONE_MINIMUM_EVENTS = 20
+
+
 def compute_minimum_events(
     bathrooms_full: int,
     bathrooms_half: int,
     floors: int,
+    circuit_kind: str = "fixture",
 ) -> int:
-    """Minimum event count before calibration can complete."""
+    """Minimum event count before calibration can complete.
+
+    ``circuit_kind`` is the circuit taxonomy value ('fixture' or 'zone').
+    Zone/irrigation circuits use a small fixed target since they generate
+    far fewer discrete events than the whole-home main shutoff.
+    """
+    if circuit_kind == "zone":
+        return ZONE_MINIMUM_EVENTS
     estimated_fixtures = (
         bathrooms_full * 3.2
         + bathrooms_half * 1.2

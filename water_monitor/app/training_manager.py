@@ -26,7 +26,8 @@ from typing import Any, Dict
 
 from .config import AddonConfig, compute_suggested_calibration_days, compute_minimum_events
 from .database import (get_training_state, upsert_training_state,
-                       get_home_profile, ensure_circuit_defaults)
+                       get_home_profile, ensure_circuit_defaults,
+                       get_circuit_type)
 from .ha_client import HaClient
 
 log = logging.getLogger(__name__)
@@ -62,6 +63,10 @@ class TrainingManager:
             ensure_circuit_defaults(
                 self._db, circuit_cfg.circuit, circuit_cfg.circuit_type)
 
+        # Lower stale whole-home event targets for in-progress zone
+        # calibrations so they aren't stuck forever (see method docstring).
+        self._reconcile_calibration_thresholds()
+
         # Initial publish
         for circuit_cfg in self._cfg.circuits:
             await self._publish_status(circuit_cfg.circuit)
@@ -80,6 +85,41 @@ class TrainingManager:
                 except Exception as e:
                     log.error("[%s] training manager error: %s",
                               circuit_cfg.circuit, e)
+
+    def _reconcile_calibration_thresholds(self) -> None:
+        """Lower stale ``minimum_events`` for in-progress calibrations.
+
+        Earlier builds applied the whole-home event target to every
+        circuit, leaving low-traffic zone (irrigation) circuits unable to
+        ever reach it — they froze at a time-capped 100% forever. For any
+        circuit still ``calibrating``, recompute the type-aware target and
+        lower the stored value if it now sits below the old one. Only ever
+        lower it, never raise, so a mid-run fixture circuit can't be
+        re-stuck. ``started_at``/``calibration_ends_at``/``events_collected``
+        are left untouched; the next ``_check_progress`` tick completes any
+        circuit whose time has already elapsed.
+        """
+        profile = get_home_profile(self._db)
+        for circuit_cfg in self._cfg.circuits:
+            circuit = circuit_cfg.circuit
+            state_row = get_training_state(self._db, circuit)
+            if not state_row or state_row["state"] != "calibrating":
+                continue
+            circuit_kind = get_circuit_type(
+                self._db, circuit, default=circuit_cfg.circuit_type)
+            new_min = compute_minimum_events(
+                profile["bathrooms_full"] or 2,
+                profile["bathrooms_half"] or 0,
+                profile["floors"] or 1,
+                circuit_kind=circuit_kind,
+            )
+            current_min = state_row["minimum_events"] or 0
+            if new_min < current_min:
+                upsert_training_state(
+                    self._db, circuit, minimum_events=new_min)
+                log.info(
+                    "[%s] lowered calibration target %d → %d (%s circuit)",
+                    circuit, current_min, new_min, circuit_kind)
 
     async def start_calibration(self, circuit: str,
                                 calibration_days: int) -> bool:
@@ -110,10 +150,15 @@ class TrainingManager:
             return True
 
         profile = get_home_profile(self._db)
+        circuit_cfg = self._cfg.get_circuit(circuit)
+        circuit_kind = get_circuit_type(
+            self._db, circuit,
+            default=circuit_cfg.circuit_type if circuit_cfg else "fixture")
         minimum_events = compute_minimum_events(
             profile["bathrooms_full"] or 2,
             profile["bathrooms_half"] or 0,
             profile["floors"] or 1,
+            circuit_kind=circuit_kind,
         )
 
         now = datetime.now(timezone.utc)
