@@ -26,11 +26,11 @@
   <button class="btn btn-primary btn-sm"   data-act="confirm" data-circuit="{{ circ.circuit }}" id="tr-confirm-{{ circ.circuit }}" hidden>Accept</button>
 </div>
 
-{% if not circ.items %}
+{% if not circ.fixtures %}
 <p class="muted">No capturable fixtures for this circuit.</p>
 {% endif %}
 <div class="fx-cat-grid">
-  {% for it in circ.items %}
+  {% for it in circ.fixtures %}
   <div class="fx-cat-card" data-circuit="{{ circ.circuit }}" data-type="{{ it.type }}">
     <header class="fx-cat-header" style="justify-content:space-between">
       <h3 class="fx-cat-title">{{ it.label }}</h3>

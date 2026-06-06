@@ -89,7 +89,9 @@ async def training_page(request: Request):
         circuits.append({
             "circuit": cc.circuit,
             "display_name": getattr(cc, "label", cc.circuit),
-            "items": items,
+            # NB: NOT "items" — Jinja's `circ.items` resolves attribute-first to
+            # dict.items() (a method), never the key. Use a non-colliding name.
+            "fixtures": items,
         })
     return _tmpl(request).TemplateResponse("training.html", {
         "request": request, "page": "training", "circuits": circuits,
