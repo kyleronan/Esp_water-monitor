@@ -2267,6 +2267,19 @@ class FeatureExtractor:
             await self._cluster_event(event.circuit, features)
             # ──────────────────────────────────────────────────────────────
 
+            # 2b training-helper capture: if a capture is armed on this circuit,
+            # record this just-completed event as a candidate (writes NO label —
+            # the user confirms in the wizard). Cheap (one indexed SELECT; free when
+            # idle). Lazy import matches this module's circular-import-avoidance
+            # pattern (cf. the database imports above); best-effort — a capture-logic
+            # bug must never block event storage.
+            try:
+                from .database import record_training_candidate
+                record_training_candidate(self._db, event.circuit, features)
+            except Exception as e:
+                log.warning("[%s] training-capture hook failed (non-fatal): %s",
+                            event.circuit, e)
+
             am = self._alert_manager
             if am and features.get("anomaly_score"):
                 score = float(features["anomaly_score"])

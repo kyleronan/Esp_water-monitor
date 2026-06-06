@@ -22,6 +22,22 @@ def _orch(r): return r.app.state.orchestrator
 def _tmpl(r): return r.app.state.templates
 
 
+async def _bg_reclassify(circuit: str) -> None:
+    """Fire-and-forget k-NN reclassify after a label change — offloaded so the
+    label POST returns immediately (reclassify can be slow on a large history).
+    Runs on a private connection under the write lock (dev.8 run_isolated_write),
+    so it never races live writes; errors are logged, not surfaced. The user's own
+    label + any cycle-mates are already applied synchronously before this fires."""
+    try:
+        from ..database import (reclassify_all_events_from_signatures,
+                                run_isolated_write)
+        from ..config import DB_PATH
+        await run_isolated_write(
+            DB_PATH, lambda c: reclassify_all_events_from_signatures(c, circuit))
+    except Exception as e:
+        log.warning("[%s] background reclassify failed: %s", circuit, e)
+
+
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def history_page(request: Request):
@@ -310,6 +326,29 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
         # patch_event re-derives effective excluded_from_training.
         kwargs["user_ignored"] = bool(payload["excluded_from_training"])
 
+    # B7 — guard against accidentally EXCLUDING a sparse 'training' anchor: that
+    # silently unseeds the class from the k-NN, and in History the event looks
+    # ordinary. Warn (single confirm) only on this harmful action — relabel and
+    # excluding a 'cycle'/'user' event are unaffected.
+    if payload.get("excluded_from_training") and not payload.get("confirm_exclude"):
+        srow = db.execute(
+            "SELECT fixture_label_source, user_fixture_type FROM events "
+            "WHERE id = ? AND circuit = ?", (event_id, circuit)).fetchone()
+        if srow and srow["fixture_label_source"] == "training":
+            ftype = srow["user_fixture_type"] or "this fixture"
+            others = db.execute(
+                "SELECT COUNT(*) FROM events WHERE circuit = ? "
+                "  AND fixture_label_source = 'training' AND user_fixture_type = ? "
+                "  AND id <> ? AND COALESCE(excluded_from_training, 0) = 0",
+                (circuit, srow["user_fixture_type"], event_id)).fetchone()[0]
+            scope = "the only" if others == 0 else "one of several"
+            return JSONResponse({
+                "needs_confirm": "exclude_training",
+                "message": (f"This event was captured during setup and is {scope} "
+                            f"training example for {ftype}. Excluding it may leave "
+                            f"that fixture unclassified. Exclude anyway?"),
+            })
+
     if kwargs:
         found = _patch_event(db, event_id, circuit, **kwargs)
         if not found:
@@ -367,12 +406,22 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                         "member_count": sig["member_count"],
                     }
 
-            # Re-run the label-trained k-NN over the circuit's unlabelled events
-            # so this new label immediately spreads to similar events AND any now-
-            # stale matched_fixture_type is cleared (e.g. the user removed/changed
-            # a label). Sub-second for a home-sized corpus; idempotent.
-            from ..database import reclassify_all_events_from_signatures
-            reclassify_all_events_from_signatures(db, circuit)
+            # 2a — auto-label this appliance event's cycle-mates (source='cycle')
+            # so one label seeds several. No-op for non-appliance types. Commit so
+            # the cycle labels are durable + visible to the History reload and the
+            # background reclassify below.
+            from ..database import propagate_cycle_label
+            cycle_propagated = propagate_cycle_label(db, circuit, event_id, new_type)
+            if cycle_propagated:
+                db.commit()
+                propagation_meta["cycle_propagated"] = cycle_propagated
+
+            # Re-run the label-trained k-NN over unlabelled events so the new label
+            # spreads + stale matched_fixture_type clears. Offloaded to the background
+            # so the POST returns immediately (the user's own label + cycle-mates are
+            # already applied synchronously above).
+            import asyncio
+            asyncio.create_task(_bg_reclassify(circuit))
         except Exception as e:
             # Propagation is best-effort. A failure here must not block
             # the label save the user already saw succeed.
@@ -387,3 +436,42 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
         "signatures": signature_meta,
         "classification": classification_meta,
     })
+
+
+@router.post("/api/events/{circuit}/undo_auto_cycle")
+async def undo_auto_cycle_api(circuit: str, request: Request):
+    """Bulk-undo the auto 'cycle' labels around an anchor event — clears every
+    `source='cycle'` label within ±45 min of it (the cycle), then refreshes the
+    k-NN in the background. Never touches 'user'/'training'/legacy labels."""
+    from datetime import timedelta
+    from ..database import (clear_auto_labels, _parse_event_ts,
+                            _CYCLE_PULSE_WINDOW_SECONDS)
+    db = _orch(request).db
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    event_id = (payload or {}).get("event_id")
+    if not event_id:
+        return JSONResponse({"error": "event_id required"}, status_code=400)
+    anchor = db.execute(
+        "SELECT start_ts FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if anchor is None:
+        return JSONResponse({"error": "Event not found"}, status_code=404)
+    a_ts = _parse_event_ts(anchor["start_ts"])
+    if a_ts is None:
+        return JSONResponse({"error": "Event has no usable timestamp"}, status_code=400)
+    lo = (a_ts - timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
+    hi = (a_ts + timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
+    ids = [r["id"] for r in db.execute(
+        "SELECT id FROM events WHERE circuit = ? AND fixture_label_source = 'cycle' "
+        "  AND start_ts BETWEEN ? AND ?",
+        (circuit, lo, hi),
+    ).fetchall()]
+    cleared = clear_auto_labels(db, circuit, event_ids=ids) if ids else 0
+    if cleared:
+        import asyncio
+        asyncio.create_task(_bg_reclassify(circuit))
+    return JSONResponse({"ok": True, "cleared": cleared})

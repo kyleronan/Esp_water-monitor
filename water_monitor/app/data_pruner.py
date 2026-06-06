@@ -205,6 +205,19 @@ class DataPruner:
             log.error("Pruning circuit_exclusion_windows: %s", e)
             deleted["circuit_exclusion_windows"] = 0
 
+        # training_capture — transient wizard state, keep 30 days. Orphaned
+        # candidate rows (parent pruned) are swept too.
+        try:
+            cur = self._db.execute(
+                "DELETE FROM training_capture WHERE created_at < ?", (excl_cutoff,))
+            deleted["training_capture"] = cur.rowcount
+            self._db.execute(
+                "DELETE FROM training_capture_candidates WHERE capture_id NOT IN "
+                "(SELECT id FROM training_capture)")
+        except Exception as e:
+            log.error("Pruning training_capture: %s", e)
+            deleted["training_capture"] = 0
+
         # Step 5: compute per-fixture daily summaries for any gaps
         self._compute_fixture_daily_summaries(now)
 

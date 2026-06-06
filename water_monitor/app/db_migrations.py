@@ -62,7 +62,12 @@ _BASELINE_VERSION: int = 20260523
 #              INTEGER, count of similar-volume neighbours within ±45 min). DDL
 #              only; the count backfill + cluster re-suggest run from the startup
 #              / manual recompute paths after migration.
-_CURRENT_VERSION: int = 20260537
+#   20260538 — Label provenance: events.fixture_label_source (nullable TEXT,
+#              'user'/'cycle'/'training'; NULL = legacy/explicit). DDL only — no
+#              backfill (NULL is the correct default for pre-existing labels).
+#   20260539 — Training-helper capture (2b): training_capture +
+#              training_capture_candidates tables. DDL only.
+_CURRENT_VERSION: int = 20260539
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -575,6 +580,62 @@ def _apply_cycle_pulse_column(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260537: cycle_pulse_count column ready")
 
 
+_LABEL_SOURCE_NEW_COLUMNS: tuple = (
+    ("fixture_label_source", "TEXT"),
+)
+
+
+def _apply_label_source_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260538 — label provenance.
+
+    Adds ``events.fixture_label_source`` (nullable TEXT; 'user'/'cycle'/'training';
+    NULL = legacy/explicit). LIGHTWEIGHT DDL ONLY — no backfill (NULL is the correct
+    default for pre-existing labels, and is protected like a 'user' label).
+
+    Idempotent — each add is guarded by ``_has_column``.
+    """
+    for col, decl in _LABEL_SOURCE_NEW_COLUMNS:
+        if not _has_column(conn, "events", col):
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
+            log.info("Added events.%s (%s)", col, decl)
+    conn.commit()
+    log.info("Migration 20260538: fixture_label_source column ready")
+
+
+def _apply_training_capture_tables(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260539 — training-helper capture (2b).
+
+    Creates ``training_capture`` + ``training_capture_candidates`` (+ indexes),
+    all ``CREATE TABLE/INDEX IF NOT EXISTS`` so it is idempotent. DDL only.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS training_capture (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            circuit         TEXT NOT NULL,
+            fixture_type    TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'armed',
+            armed_at        TIMESTAMP NOT NULL,
+            expires_at      TIMESTAMP NOT NULL,
+            window_minutes  INTEGER,
+            captured_count  INTEGER NOT NULL DEFAULT 0,
+            created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_training_capture_active "
+                 "ON training_capture (circuit, status)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS training_capture_candidates (
+            capture_id      INTEGER NOT NULL,
+            event_id        TEXT NOT NULL,
+            created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_training_capture_candidates "
+                 "ON training_capture_candidates (capture_id)")
+    conn.commit()
+    log.info("Migration 20260539: training_capture tables ready")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -812,6 +873,29 @@ def _missing_cycle_pulse_columns(conn: sqlite3.Connection) -> set[str]:
     }
 
 
+# Columns added by the 20260538 label-provenance migration on events.
+_LABEL_SOURCE_COLUMNS: frozenset = frozenset(c for c, _ in _LABEL_SOURCE_NEW_COLUMNS)
+
+
+def _missing_label_source_columns(conn: sqlite3.Connection) -> set[str]:
+    return {
+        col for col in _LABEL_SOURCE_COLUMNS
+        if not _has_column(conn, "events", col)
+    }
+
+
+def _missing_training_capture_table(conn: sqlite3.Connection) -> set[str]:
+    """Return any of the 20260539 training-capture tables that are absent."""
+    needed = {"training_capture", "training_capture_candidates"}
+    present = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('training_capture','training_capture_candidates')"
+        ).fetchall()
+    }
+    return needed - present
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -914,6 +998,8 @@ def _run_migrations_impl(
             | _missing_low_flow_dribble_columns(conn)
             | _missing_active_flow_columns(conn)
             | _missing_cycle_pulse_columns(conn)
+            | _missing_label_source_columns(conn)
+            | _missing_training_capture_table(conn)
         )
         if missing:
             raise RuntimeError(
@@ -924,9 +1010,26 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260538:
+        # DB has fixture_label_source but lacks the training_capture tables.
+        _apply_training_capture_tables(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260538 → %d", _CURRENT_VERSION)
+        return
+
+    if version == 20260537:
+        # DB has cycle_pulse_count but lacks fixture_label_source.
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260537 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260536:
         # DB has the active-flow columns but lacks cycle_pulse_count.
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260536 → %d", _CURRENT_VERSION)
         return
@@ -935,6 +1038,8 @@ def _run_migrations_impl(
         # DB has the low-flow-dribble column but lacks the active-flow columns.
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260535 → %d", _CURRENT_VERSION)
         return
@@ -945,6 +1050,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
         return
@@ -956,6 +1063,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
         return
@@ -967,6 +1076,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
@@ -980,6 +1091,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
@@ -994,6 +1107,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -1030,6 +1145,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -1048,6 +1165,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -1067,6 +1186,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -1085,6 +1206,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -1102,6 +1225,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -1117,6 +1242,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -1132,6 +1259,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -1183,6 +1312,8 @@ def _run_migrations_impl(
         _apply_low_flow_dribble_column(conn)
         _apply_active_flow_columns(conn)
         _apply_cycle_pulse_column(conn)
+        _apply_label_source_column(conn)
+        _apply_training_capture_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

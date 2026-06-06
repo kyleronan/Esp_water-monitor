@@ -236,6 +236,34 @@ CREATE TABLE IF NOT EXISTS training_state (
 );
 
 -- ==========================================================================
+-- TRAINING-HELPER CAPTURE (2b) — a one-time "run each fixture once" wizard.
+-- One active ('armed') row per circuit; the event-completion hook records
+-- candidate event ids, the user confirms/accepts to write 'training' labels.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS training_capture (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit         TEXT NOT NULL,
+    fixture_type    TEXT NOT NULL,
+    -- armed | ready | captured | cancelled | expired | rejected
+    status          TEXT NOT NULL DEFAULT 'armed',
+    armed_at        TIMESTAMP NOT NULL,
+    expires_at      TIMESTAMP NOT NULL,
+    window_minutes  INTEGER,
+    captured_count  INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_training_capture_active
+    ON training_capture (circuit, status);
+-- Candidate events recorded by the hot-path hook (plain INSERT, no JSON).
+CREATE TABLE IF NOT EXISTS training_capture_candidates (
+    capture_id      INTEGER NOT NULL,
+    event_id        TEXT NOT NULL,
+    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_training_capture_candidates
+    ON training_capture_candidates (capture_id);
+
+-- ==========================================================================
 -- LEARNING CONFIGURATION
 -- ==========================================================================
 CREATE TABLE IF NOT EXISTS learning_config (
@@ -608,7 +636,12 @@ CREATE TABLE IF NOT EXISTS events (
     -- yet computed, 0 = computed/no qualifying neighbours. Aggregated into the
     -- cluster centroid for the heuristic; deliberately NOT in FEATURE_KEYS so it
     -- never affects clustering distance.
-    cycle_pulse_count                INTEGER
+    cycle_pulse_count                INTEGER,
+    -- Label provenance: 'user' = explicit user label, 'cycle' = auto cycle-mate
+    -- expansion (2a), 'training' = capture wizard (2b). NULL = legacy/unlabeled
+    -- and is protected exactly like a 'user' label (auto-undo never touches it).
+    -- Preserved across event re-imports via _EVENT_USER_COLUMNS.
+    fixture_label_source             TEXT
 );
 
 -- NOTE: the partial index on (circuit, start_ts) WHERE degraded_supply = 1
@@ -1355,6 +1388,9 @@ _EVENT_USER_COLUMNS: frozenset[str] = frozenset({
     # user_classified locks a manual classification against auto-override.
     "user_ignored",
     "user_classified",
+    # Label provenance ('user'/'cycle'/'training') — preserved so a re-import
+    # never drops the auto-label source that drives the undo + exclude-warning.
+    "fixture_label_source",
 })
 
 # Columns whose values must NOT be overwritten by an event-row upsert.
@@ -1775,9 +1811,13 @@ def patch_event(
     if row is None:
         return False
     if user_fixture_type is not _PATCH_UNSET:
+        # Stamp provenance: an explicit label is 'user'; clearing resets to NULL
+        # (so a relabel always overrides an auto 'cycle'/'training' source).
+        src = "user" if user_fixture_type else None
         conn.execute(
-            "UPDATE events SET user_fixture_type = ? WHERE id = ? AND circuit = ?",
-            (user_fixture_type, event_id, circuit),
+            "UPDATE events SET user_fixture_type = ?, fixture_label_source = ? "
+            "WHERE id = ? AND circuit = ?",
+            (user_fixture_type, src, event_id, circuit),
         )
     if user_ignored is not _PATCH_UNSET:
         ign = 1 if user_ignored else 0
@@ -4066,6 +4106,320 @@ def resuggest_all_clusters(conn: sqlite3.Connection, circuit: str) -> Dict[str, 
     conn.commit()
     log.info("[%s] resuggest: %d clusters, %d updated", circuit, len(rows), updated)
     return {"clusters": len(rows), "updated": updated}
+
+
+# ── 2a: auto cycle-labeling + provenance-scoped undo ──────────────────────────
+# When the user labels an APPLIANCE event, its repeated fill pulses (the cycle)
+# are almost certainly the same appliance. Auto-label the vol+flow-similar mates
+# within ±45 min (source='cycle') so one label seeds several — validated 92%
+# pure. Appliances only (toilet/tap/shower aren't cyclic). Fully reversible.
+
+_CYCLE_FLOW_RATIO_LO: float = 0.5
+_CYCLE_FLOW_RATIO_HI: float = 2.0
+_CYCLE_APPLIANCE_TYPES: frozenset = frozenset({"dishwasher", "washing_machine"})
+
+
+def propagate_cycle_label(conn: sqlite3.Connection, circuit: str, event_id,
+                          fixture_type) -> int:
+    """Auto-label an appliance event's cycle-mates the same type (source='cycle').
+
+    A mate is a same-circuit, currently-unlabeled, non-excluded event within
+    ±45 min whose volume AND avg flow are within ratio of the anchor. No-op for
+    non-appliance types. Caller owns the transaction (no commit). Returns the
+    number of mates labeled.
+    """
+    if fixture_type not in _CYCLE_APPLIANCE_TYPES:
+        return 0
+    anchor = conn.execute(
+        "SELECT start_ts, volume_litres, avg_flow_lpm FROM events "
+        "WHERE id = ? AND circuit = ?", (event_id, circuit),
+    ).fetchone()
+    if anchor is None:
+        return 0
+    a_ts = _parse_event_ts(anchor["start_ts"])
+    try:
+        a_vol = float(anchor["volume_litres"])
+        a_flow = float(anchor["avg_flow_lpm"])
+    except (TypeError, ValueError):
+        return 0
+    if a_ts is None or a_vol <= 0 or a_flow <= 0:
+        return 0
+    # Coarse time-window pre-filter (bounds the rows; the 90-min window keeps it
+    # small), then a precise parsed-timestamp check so an ISO tz-format quirk can
+    # never over-include.
+    lo_ts = (a_ts - timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
+    hi_ts = (a_ts + timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
+    a_epoch = a_ts.timestamp()
+    mates = conn.execute(
+        "SELECT id, start_ts, volume_litres, avg_flow_lpm FROM events "
+        "WHERE circuit = ? AND id <> ? AND user_fixture_type IS NULL "
+        "  AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND start_ts BETWEEN ? AND ? "
+        "  AND volume_litres > 0 AND avg_flow_lpm > 0",
+        (circuit, event_id, lo_ts, hi_ts),
+    ).fetchall()
+    n = 0
+    for mr in mates:
+        mt = _parse_event_ts(mr["start_ts"])
+        if mt is None or abs(mt.timestamp() - a_epoch) > _CYCLE_PULSE_WINDOW_SECONDS:
+            continue
+        try:
+            v = float(mr["volume_litres"])
+            f = float(mr["avg_flow_lpm"])
+        except (TypeError, ValueError):
+            continue
+        if (_CYCLE_PULSE_VOL_RATIO_LO <= v / a_vol <= _CYCLE_PULSE_VOL_RATIO_HI
+                and _CYCLE_FLOW_RATIO_LO <= f / a_flow <= _CYCLE_FLOW_RATIO_HI):
+            conn.execute(
+                "UPDATE events SET user_fixture_type = ?, fixture_label_source = 'cycle' "
+                "WHERE id = ? AND circuit = ? AND user_fixture_type IS NULL",
+                (fixture_type, mr["id"], circuit),
+            )
+            n += 1
+    return n
+
+
+def clear_auto_labels(conn: sqlite3.Connection, circuit: str, event_ids=None,
+                      commit: bool = True) -> int:
+    """Reverse auto-applied labels: rows with `fixture_label_source IN
+    ('cycle','training')` → `user_fixture_type` + `fixture_label_source` back to
+    NULL. NEVER touches an explicit 'user' label or a NULL-source (legacy) row.
+
+    When ``event_ids`` (a list) is given, scopes to exactly those ids — so
+    rejecting one training capture can't wipe another capture's (or a cycle's)
+    labels. When None, clears all auto-source rows on the circuit. Returns the count.
+    """
+    if event_ids is not None:
+        ids = list(event_ids)
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        cur = conn.execute(
+            "UPDATE events SET user_fixture_type = NULL, fixture_label_source = NULL "
+            "WHERE circuit = ? AND fixture_label_source IN ('cycle','training') "
+            f"  AND id IN ({placeholders})",
+            (circuit, *ids),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE events SET user_fixture_type = NULL, fixture_label_source = NULL "
+            "WHERE circuit = ? AND fixture_label_source IN ('cycle','training')",
+            (circuit,),
+        )
+    if commit:
+        conn.commit()
+    return cur.rowcount
+
+
+# ── 2b: training-helper capture ───────────────────────────────────────────────
+# A one-time wizard: the user runs each fixture once, the event-completion hook
+# records candidate event ids, and the user confirms to write ~100%-pure
+# 'training' labels. Instant types capture the next event; windowed types capture
+# every event in a user-chosen monitoring window (then accept/reject the run).
+
+_TRAINING_INSTANT_TYPES: frozenset = frozenset({"toilet", "tap"})
+_TRAINING_INSTANT_WINDOW_MIN: int = 5
+# Allowed monitoring-window options per windowed type (minutes).
+_TRAINING_WINDOW_INCREMENTS: Dict[str, List[int]] = {
+    "shower":          [5, 10, 15, 20, 25, 30],
+    "irrigation_zone": [5, 10, 15, 20, 30, 45, 60],
+    "washing_machine": [15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180],
+    "dishwasher":      [15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180],
+}
+
+
+def training_capturable_types() -> frozenset:
+    """Fixture types the wizard can capture (excludes 'other'/'leak_test')."""
+    return _TRAINING_INSTANT_TYPES | frozenset(_TRAINING_WINDOW_INCREMENTS)
+
+
+def training_window_options(fixture_type: str) -> List[int]:
+    """The monitoring-duration dropdown options for a windowed type ([] = instant)."""
+    return list(_TRAINING_WINDOW_INCREMENTS.get(fixture_type, []))
+
+
+def training_capture_band_match(fixture_type: str, volume_litres,
+                                duration_seconds) -> bool:
+    """Loose, named sanity band for an INSTANT capture (toilet/tap). Catches a
+    clearly-wrong fixture (e.g. a sub-litre tap during a 'toilet' capture);
+    windowed types are not gated here (the user accepts/rejects)."""
+    try:
+        v = float(volume_litres) if volume_litres is not None else 0.0
+        d = float(duration_seconds) if duration_seconds is not None else 0.0
+    except (TypeError, ValueError):
+        return False
+    if fixture_type == "toilet":
+        return v >= 2.0                      # a real flush is 3-13 L
+    if fixture_type == "tap":
+        return v <= 10.0 and d <= 180.0      # rejects shower/appliance-sized
+    return True
+
+
+def arm_training_capture(conn: sqlite3.Connection, circuit: str, fixture_type: str,
+                         window_minutes=None) -> Dict[str, Any]:
+    """Arm a capture for ``fixture_type`` on ``circuit`` (cancels any existing
+    armed/ready row — one active per circuit). ``window_minutes`` is required (and
+    validated to the per-type increments) for windowed types; instant types use a
+    fixed short window. Raises ValueError for a non-capturable type / bad window."""
+    if fixture_type in _TRAINING_INSTANT_TYPES:
+        wm = _TRAINING_INSTANT_WINDOW_MIN
+    elif fixture_type in _TRAINING_WINDOW_INCREMENTS:
+        allowed = _TRAINING_WINDOW_INCREMENTS[fixture_type]
+        if window_minutes is None:
+            wm = allowed[0]
+        elif int(window_minutes) in allowed:
+            wm = int(window_minutes)
+        else:
+            raise ValueError(
+                f"window_minutes {window_minutes} not allowed for {fixture_type}")
+    else:
+        raise ValueError(f"{fixture_type} is not capturable in the training helper")
+    conn.execute(
+        "UPDATE training_capture SET status = 'cancelled' "
+        "WHERE circuit = ? AND status IN ('armed','ready')", (circuit,))
+    cur = conn.execute(
+        "INSERT INTO training_capture (circuit, fixture_type, status, armed_at, "
+        " expires_at, window_minutes, captured_count) "
+        "VALUES (?, ?, 'armed', datetime('now'), datetime('now', ?), ?, 0)",
+        (circuit, fixture_type, f"+{wm} minutes", wm))
+    conn.commit()
+    return {"id": cur.lastrowid, "circuit": circuit, "fixture_type": fixture_type,
+            "window_minutes": wm, "status": "armed"}
+
+
+def get_active_training_capture(conn: sqlite3.Connection, circuit: str):
+    """The newest armed/ready capture on the circuit (None if none). Includes
+    `seconds_remaining` and `candidate_count`."""
+    row = conn.execute(
+        "SELECT *, CAST((julianday(expires_at) - julianday('now')) * 86400 AS INTEGER) "
+        "         AS seconds_remaining "
+        "FROM training_capture "
+        "WHERE circuit = ? AND status IN ('armed','ready') "
+        "ORDER BY id DESC LIMIT 1", (circuit,)).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d["candidate_count"] = conn.execute(
+        "SELECT COUNT(*) FROM training_capture_candidates WHERE capture_id = ?",
+        (row["id"],)).fetchone()[0]
+    return d
+
+
+def cancel_training_capture(conn: sqlite3.Connection, circuit: str) -> int:
+    """Cancel the active (armed/ready, not-yet-confirmed) capture on the circuit."""
+    cur = conn.execute(
+        "UPDATE training_capture SET status = 'cancelled' "
+        "WHERE circuit = ? AND status IN ('armed','ready')", (circuit,))
+    conn.commit()
+    return cur.rowcount
+
+
+def extend_training_capture(conn: sqlite3.Connection, circuit: str,
+                            add_minutes: int) -> Dict[str, int]:
+    """Push out a still-running windowed capture's expiry (don't strand a long cycle)."""
+    am = max(1, int(add_minutes))
+    cur = conn.execute(
+        "UPDATE training_capture SET expires_at = datetime(expires_at, ?) "
+        "WHERE circuit = ? AND status = 'armed'", (f"+{am} minutes", circuit))
+    conn.commit()
+    return {"extended": cur.rowcount, "add_minutes": am}
+
+
+def expire_stale_training_captures(conn: sqlite3.Connection) -> int:
+    """Mark armed captures whose window has elapsed (and never caught/awaited a
+    confirm) as expired. 'ready' captures are NOT expired — their event is caught,
+    awaiting the user's confirm. Called opportunistically (poll + pruner)."""
+    cur = conn.execute(
+        "UPDATE training_capture SET status = 'expired' "
+        "WHERE status = 'armed' AND expires_at <= datetime('now')")
+    conn.commit()
+    return cur.rowcount
+
+
+def confirm_training_capture(conn: sqlite3.Connection, circuit: str) -> Dict[str, Any]:
+    """Accept the active capture: write `user_fixture_type` + source='training' for
+    each candidate (only unlabeled rows), status→captured. Returns counts. Caller
+    runs the reclassify (once)."""
+    cap = conn.execute(
+        "SELECT id, fixture_type FROM training_capture "
+        "WHERE circuit = ? AND status IN ('armed','ready') "
+        "ORDER BY id DESC LIMIT 1", (circuit,)).fetchone()
+    if cap is None:
+        return {"labeled": 0}
+    ids = [r["event_id"] for r in conn.execute(
+        "SELECT event_id FROM training_capture_candidates WHERE capture_id = ?",
+        (cap["id"],)).fetchall()]
+    labeled = 0
+    for eid in ids:
+        cur = conn.execute(
+            "UPDATE events SET user_fixture_type = ?, fixture_label_source = 'training' "
+            "WHERE id = ? AND circuit = ? AND user_fixture_type IS NULL",
+            (cap["fixture_type"], eid, circuit))
+        labeled += cur.rowcount
+    conn.execute("UPDATE training_capture SET status = 'captured' WHERE id = ?",
+                 (cap["id"],))
+    conn.commit()
+    return {"capture_id": cap["id"], "fixture_type": cap["fixture_type"], "labeled": labeled}
+
+
+def reject_training_capture(conn: sqlite3.Connection, circuit: str,
+                            capture_id: int) -> Dict[str, Any]:
+    """Discard a capture (contaminated): clear ONLY this capture's 'training' labels
+    (scoped to its candidate ids), status→rejected, so the checklist item re-arms."""
+    ids = [r["event_id"] for r in conn.execute(
+        "SELECT event_id FROM training_capture_candidates WHERE capture_id = ?",
+        (capture_id,)).fetchall()]
+    cleared = clear_auto_labels(conn, circuit, event_ids=ids, commit=False) if ids else 0
+    conn.execute("UPDATE training_capture SET status = 'rejected' "
+                 "WHERE id = ? AND circuit = ?", (capture_id, circuit))
+    conn.commit()
+    return {"capture_id": capture_id, "cleared": cleared}
+
+
+def get_training_checklist(conn: sqlite3.Connection, circuit: str,
+                           applicable_types) -> Dict[str, dict]:
+    """Per-type latest capture status for the checklist (resumable)."""
+    out: Dict[str, dict] = {}
+    for t in applicable_types:
+        row = conn.execute(
+            "SELECT id, status, captured_count FROM training_capture "
+            "WHERE circuit = ? AND fixture_type = ? ORDER BY id DESC LIMIT 1",
+            (circuit, t)).fetchone()
+        out[t] = {
+            "status": row["status"] if row else "none",
+            "captured_count": row["captured_count"] if row else 0,
+            "capture_id": row["id"] if row else None,
+        }
+    return out
+
+
+def record_training_candidate(conn: sqlite3.Connection, circuit: str,
+                              event_features: dict) -> bool:
+    """HOT-PATH hook: if a capture is armed (non-expired) on the circuit, record
+    this just-completed event as a candidate. Writes NO label (labels are written
+    only on the user's confirm). Instant types flip to 'ready' after the first
+    event; windowed types stay armed and accumulate. Returns True if recorded."""
+    cap = conn.execute(
+        "SELECT id, fixture_type, captured_count FROM training_capture "
+        "WHERE circuit = ? AND status = 'armed' AND expires_at > datetime('now') "
+        "ORDER BY id DESC LIMIT 1", (circuit,)).fetchone()
+    if cap is None:
+        return False
+    eid = event_features.get("id")
+    if not eid:
+        return False
+    conn.execute(
+        "INSERT INTO training_capture_candidates (capture_id, event_id) VALUES (?, ?)",
+        (cap["id"], eid))
+    new_count = (cap["captured_count"] or 0) + 1
+    if cap["fixture_type"] in _TRAINING_INSTANT_TYPES:
+        conn.execute("UPDATE training_capture SET captured_count = ?, status = 'ready' "
+                     "WHERE id = ?", (new_count, cap["id"]))
+    else:
+        conn.execute("UPDATE training_capture SET captured_count = ? WHERE id = ?",
+                     (new_count, cap["id"]))
+    conn.commit()
+    return True
 
 
 def migrate_to_type_level_clusters(

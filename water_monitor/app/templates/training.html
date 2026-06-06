@@ -1,0 +1,167 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="fx-header"><h1 class="page-title" style="margin:0">Training helper</h1></div>
+<p class="muted" style="margin:0 0 18px 0">
+  <strong>Optional, but recommended.</strong> Run each fixture once and the app
+  captures a clean sample to teach the auto-labeler. Without it, more events stay
+  labeled <em>“other”</em> until you correct them on the
+  <a href="{{ ingress_path }}/history">History</a> page. You can leave and come
+  back any time — your progress is saved. Keep this screen open while you run a
+  fixture.
+</p>
+
+{% for circ in circuits %}
+<h2 class="fx-circuit-heading" style="margin-top:18px">{{ circ.display_name }}</h2>
+
+{# Active-capture panel (shown via polling when a capture is armed/ready) #}
+<div class="fx-msg fx-msg-warn" id="tr-active-{{ circ.circuit }}" hidden
+     style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+  <span id="tr-msg-{{ circ.circuit }}" style="font-weight:600">…</span>
+  <span class="muted" id="tr-sub-{{ circ.circuit }}" style="font-size:12px"></span>
+  <span style="flex:1"></span>
+  <button class="btn btn-secondary btn-sm" data-act="cancel"  data-circuit="{{ circ.circuit }}" id="tr-cancel-{{ circ.circuit }}"  hidden>Cancel</button>
+  <button class="btn btn-secondary btn-sm" data-act="extend"  data-circuit="{{ circ.circuit }}" id="tr-extend-{{ circ.circuit }}"  hidden>+15 min</button>
+  <button class="btn btn-secondary btn-sm" data-act="reject"  data-circuit="{{ circ.circuit }}" id="tr-reject-{{ circ.circuit }}"  hidden>Redo</button>
+  <button class="btn btn-primary btn-sm"   data-act="confirm" data-circuit="{{ circ.circuit }}" id="tr-confirm-{{ circ.circuit }}" hidden>Accept</button>
+</div>
+
+{% if not circ.items %}
+<p class="muted">No capturable fixtures for this circuit.</p>
+{% endif %}
+<div class="fx-cat-grid">
+  {% for it in circ.items %}
+  <div class="fx-cat-card" data-circuit="{{ circ.circuit }}" data-type="{{ it.type }}">
+    <header class="fx-cat-header" style="justify-content:space-between">
+      <h3 class="fx-cat-title">{{ it.label }}</h3>
+      <span class="pill {{ 'pill-green' if it.status == 'captured' else 'pill-neutral' }}"
+            id="tr-status-{{ circ.circuit }}-{{ it.type }}" style="font-size:11px">
+        {{ '✓ captured' if it.status == 'captured'
+           else ('not done' if it.status in ('none','cancelled','expired','rejected') else it.status) }}
+      </span>
+    </header>
+    <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-top:6px">
+      {% if it.windows %}
+      <select class="tr-window" id="tr-win-{{ circ.circuit }}-{{ it.type }}"
+              style="padding:4px 6px;font-size:12px">
+        {% for w in it.windows %}<option value="{{ w }}">monitor {{ w }} min</option>{% endfor %}
+      </select>
+      {% endif %}
+      <button class="btn btn-ghost btn-sm tr-arm" data-circuit="{{ circ.circuit }}"
+              data-type="{{ it.type }}"{% if it.windows %} data-windowed="1"{% endif %}>
+        I'm about to use the {{ it.label }}
+      </button>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endfor %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const INGRESS = "{{ ingress_path }}";
+  const CSRF = window.CSRF_TOKEN || "";
+  const INSTANT = new Set(["toilet", "tap"]);
+  const SUB_MSG = {
+    waiting:    "ready when you are — run it now, then come back",
+    capturing:  "capturing — keep the water running…",
+    processing: "processing…",
+  };
+  let autoConfirming = false;
+
+  async function post(url, body) {
+    const r = await fetch(INGRESS + url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": CSRF },
+      body: JSON.stringify(body || {}),
+    });
+    let d = null; try { d = await r.json(); } catch (_) {}
+    return { ok: r.ok, status: r.status, data: d };
+  }
+
+  document.querySelectorAll(".tr-arm").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const { circuit, type } = btn.dataset;
+      const body = { fixture_type: type };
+      if (btn.dataset.windowed) {
+        const sel = document.getElementById(`tr-win-${circuit}-${type}`);
+        body.window_minutes = sel ? parseInt(sel.value, 10) : null;
+      }
+      const res = await post(`/training/api/${circuit}/arm`, body);
+      if (!res.ok) alert((res.data && res.data.error) || "Could not start capture");
+      poll();
+    });
+  });
+
+  document.querySelectorAll("[data-act]").forEach(b => {
+    b.addEventListener("click", async () => {
+      const { circuit, act } = b.dataset;
+      const body = act === "extend" ? { add_minutes: 15 } : {};
+      await post(`/training/api/${circuit}/${act}`, body);
+      if (act === "confirm" || act === "reject" || act === "cancel") location.reload();
+      else poll();
+    });
+  });
+
+  function show(id, on) { const el = document.getElementById(id); if (el) el.hidden = !on; }
+  function setText(id, t) { const el = document.getElementById(id); if (el) el.textContent = t; }
+
+  async function poll() {
+    let data;
+    try {
+      const r = await fetch(INGRESS + "/training/api/state", { signal: AbortSignal.timeout(5000) });
+      if (!r.ok) return;
+      data = await r.json();
+    } catch (_) { return; }
+
+    for (const [circuit, s] of Object.entries(data)) {
+      const active = s.status === "armed" || s.status === "ready";
+      // Block every arm button on this circuit while one item is active.
+      document.querySelectorAll(`.tr-arm[data-circuit="${circuit}"]`).forEach(b => { b.disabled = active; });
+      show(`tr-active-${circuit}`, active);
+      if (!active) continue;
+
+      const ft = s.fixture_type || "fixture";
+      const instant = INSTANT.has(ft);
+      const captured = (s.captured_count || 0) > 0;
+      const instantReady = instant && s.status === "ready";
+
+      if (instantReady && s.matches) {
+        setText(`tr-msg-${circuit}`, `Captured ${ft} ✓`);
+        show(`tr-cancel-${circuit}`, false); show(`tr-extend-${circuit}`, false);
+        show(`tr-reject-${circuit}`, false); show(`tr-confirm-${circuit}`, false);
+        if (!autoConfirming) {                       // frictionless auto-accept
+          autoConfirming = true;
+          post(`/training/api/${circuit}/confirm`, {}).then(() => location.reload());
+        }
+      } else if (instantReady && !s.matches) {
+        setText(`tr-msg-${circuit}`, `Captured an event that looks small for a ${ft}.`);
+        show(`tr-cancel-${circuit}`, false); show(`tr-extend-${circuit}`, false);
+        show(`tr-reject-${circuit}`, true);  // Redo
+        show(`tr-confirm-${circuit}`, true); // Confirm anyway
+        document.getElementById(`tr-confirm-${circuit}`).textContent = "Confirm anyway";
+      } else {
+        // windowed (always armed, accumulating) or instant waiting
+        setText(`tr-msg-${circuit}`, instant
+          ? `${ft}: ${SUB_MSG[s.capture_sub_state] || "…"}`
+          : `${ft} — ${SUB_MSG[s.capture_sub_state] || "monitoring"} (window running)`);
+        show(`tr-cancel-${circuit}`,  !captured);
+        show(`tr-extend-${circuit}`,  !instant);
+        show(`tr-reject-${circuit}`,  captured);
+        show(`tr-confirm-${circuit}`, captured);
+        const cb = document.getElementById(`tr-confirm-${circuit}`);
+        if (cb) cb.textContent = "Accept";
+      }
+      setText(`tr-sub-${circuit}`, captured
+        ? `${s.captured_count} event(s) captured`
+        : (s.seconds_remaining > 0 ? `${s.seconds_remaining}s left` : ""));
+    }
+  }
+
+  window.addEventListener("DOMContentLoaded", () => { poll(); setInterval(poll, 3000); });
+})();
+</script>
+{% endblock %}

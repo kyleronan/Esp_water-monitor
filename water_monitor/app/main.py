@@ -75,7 +75,8 @@ def _is_static_path(path: str) -> bool:
 
 from .db_migrations import run_migrations
 from .orchestrator import Orchestrator
-from .routers import dashboard, device, history, fixtures, settings, setup, backup
+from .routers import (dashboard, device, history, fixtures, settings, setup,
+                      backup, training)
 from .units import build_unit_context, load_unit_context
 
 APP_DIR = Path(__file__).resolve().parent
@@ -462,6 +463,7 @@ app.include_router(history.router)
 app.include_router(fixtures.router)
 app.include_router(settings.router)
 app.include_router(backup.router)
+app.include_router(training.router)
 
 
 @app.get("/health")

@@ -25,6 +25,9 @@
     <a href="{{ ingress_path }}/device"   class="nav-item {% if page == 'device' %}active{% endif %}">Device</a>
     <a href="{{ ingress_path }}/history"  class="nav-item {% if page == 'history' %}active{% endif %}">History</a>
     <a href="{{ ingress_path }}/fixtures" class="nav-item {% if page == 'fixtures' %}active{% endif %}">Fixtures</a>
+    {% if setup_complete %}
+    <a href="{{ ingress_path }}/training" class="nav-item {% if page == 'training' %}active{% endif %}">Training</a>
+    {% endif %}
     <a href="{{ ingress_path }}/settings" class="nav-item {% if page == 'settings' %}active{% endif %}">Settings</a>
     <a href="{{ ingress_path }}/backup"   class="nav-item {% if page == 'backup'   %}active{% endif %}">Backup</a>
     {% if not setup_complete %}

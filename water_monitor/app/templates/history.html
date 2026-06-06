@@ -212,6 +212,7 @@
             data-cluster="{{ e.cluster_id if e.cluster_id is not none else '—' }}"
             data-user-type="{{ e.user_fixture_type or '' }}"
             data-user-label="{{ _fix_label }}"
+            data-label-source="{{ e.fixture_label_source or '' }}"
             data-excluded="{{ '1' if e.excluded_from_training else '0' }}"
             data-trigger="{{ e.start_trigger or 'unknown' }}"
             data-peak-flow="{{ (e.peak_flow_lpm * flow_factor)|round(flow_decimals) if e.peak_flow_lpm is not none else '' }}"
@@ -258,7 +259,9 @@
                your label > confirmed fixture > label-trained match > cluster
                suggestion. Raw cluster numbers are no longer surfaced. #}
             {% if e.user_fixture_type %}
-              <span class="pill pill-green" title="You assigned this">★ {{ fixture_type_labels.get(e.user_fixture_type, e.user_fixture_type | replace('_',' ') | title) }}</span>
+              {% set _src = e.fixture_label_source %}
+              <span class="pill pill-green"
+                    title="{% if _src == 'cycle' %}Auto-labeled from this cycle (↻) — relabel or undo to change{% elif _src == 'training' %}Captured by the training helper (◎){% else %}You assigned this (★){% endif %}">{% if _src == 'cycle' %}↻{% elif _src == 'training' %}◎{% else %}★{% endif %} {{ fixture_type_labels.get(e.user_fixture_type, e.user_fixture_type | replace('_',' ') | title) }}</span>
             {% elif e.fixture_display_name %}
               <span class="pill pill-green">{{ e.fixture_display_name }}</span>
             {% elif e.matched_fixture_type %}
@@ -391,6 +394,8 @@
     </div>
     <div id="emd-error" class="evt-modal-error" hidden></div>
     <div class="evt-modal-btns">
+      <button id="emd-undo-cycle-btn" class="btn btn-secondary btn-sm" hidden
+              title="Clear the auto labels applied to this appliance cycle">↩ Undo cycle labels</button>
       <button id="emd-ignore-btn" class="btn btn-secondary btn-sm">Ignore event</button>
       <button id="emd-save-btn"   class="btn btn-primary btn-sm">Save</button>
     </div>
@@ -596,6 +601,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   const selFix  = document.getElementById('emd-fixture-select');
   const ignBtn  = document.getElementById('emd-ignore-btn');
   const saveBtn = document.getElementById('emd-save-btn');
+  const undoCycleBtn = document.getElementById('emd-undo-cycle-btn');
   const errBox  = document.getElementById('emd-error');
   // Sprint H — manual classification controls.
   const clsPhantom  = document.getElementById('emd-cls-phantom');
@@ -632,6 +638,8 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     document.getElementById('emd-fixture').textContent  = fixLabel || '—';
     selFix.value   = d.userType || '';
     ignBtn.textContent = d.excluded === '1' ? 'Restore event' : 'Ignore event';
+    // Undo only shown for auto cycle-labeled events (source='cycle').
+    if (undoCycleBtn) undoCycleBtn.hidden = (d.labelSource !== 'cycle');
 
     // Sprint H — pre-check the classification boxes from the row's flags,
     // and remember the initial state for change-detection on Save.
@@ -886,16 +894,23 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       // can see in DevTools whether a label fed back into a cluster.
       // The visible-on-Fixtures hint is the user-facing surface; this
       // console line is the diagnostic surface.
-      try {
-        const data = await resp.json();
-        if (data && data.propagation && data.propagation.cluster_id != null) {
-          console.info(
-            `[history] label saved → cluster ${data.propagation.cluster_id}` +
-            ` suggested ${data.propagation.suggested_type}` +
-            ` (${data.propagation.labelled_member_count}/${data.propagation.total_label_count} agree)`
-          );
+      let data = null;
+      try { data = await resp.json(); } catch (_) { /* tolerate parse hiccup */ }
+      if (data && data.needs_confirm) {
+        // B7 — excluding a setup training example: single confirm, then re-send.
+        saveBtn.disabled = false; ignBtn.disabled = false;
+        if (window.confirm(data.message || 'Exclude this training example?')) {
+          return await patchEvent({ ...payload, confirm_exclude: true });
         }
-      } catch (_) { /* tolerate any JSON parse hiccup */ }
+        return false;
+      }
+      if (data && data.propagation && data.propagation.cluster_id != null) {
+        console.info(
+          `[history] label saved → cluster ${data.propagation.cluster_id}` +
+          ` suggested ${data.propagation.suggested_type}` +
+          ` (${data.propagation.labelled_member_count}/${data.propagation.total_label_count} agree)`
+        );
+      }
       return true;
     } catch (err) {
       errBox.textContent = 'Network error — please try again.';
@@ -930,6 +945,25 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const excluded = activeRow.dataset.excluded !== '1';
     const ok = await patchEvent({ excluded_from_training: excluded });
     if (ok) location.reload();
+  });
+
+  // Undo the auto cycle-labels around this appliance event.
+  if (undoCycleBtn) undoCycleBtn.addEventListener('click', async () => {
+    if (!activeRow) return;
+    const { eventId, circuit } = activeRow.dataset;
+    if (!window.confirm('Clear the auto labels applied to this appliance cycle?')) return;
+    undoCycleBtn.disabled = true; errBox.hidden = true;
+    try {
+      const resp = await fetch(`${INGRESS}/history/api/events/${circuit}/undo_auto_cycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': window.CSRF_TOKEN || '' },
+        body: JSON.stringify({ event_id: eventId }),
+      });
+      if (resp.ok) { location.reload(); return; }
+    } catch (_) {}
+    undoCycleBtn.disabled = false;
+    errBox.textContent = 'Undo failed — see the addon log.';
+    errBox.hidden = false;
   });
 
   // Sprint H.1 — reset an event back to automatic detection.
