@@ -755,6 +755,23 @@
               <span class="toggle-slider"></span>
             </label>
           </div>
+          <div class="sett-toggle-row" style="margin-bottom:14px">
+            <div class="sett-toggle-info">
+              <span class="sett-toggle-label">Hide cross-talk events from History</span>
+              <span class="sett-toggle-desc">
+                "Cross-talk" events register on this circuit when the <em>other</em>
+                circuit's draw drops the shared-supply pressure — no real water flows
+                through this meter, so their volume is always removed from totals.
+                Enable this to also hide them from the History list. Off by default —
+                they stay visible with a ↔ flag.
+              </span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" name="hide_cross_talk_events" value="1"
+                     {% if profile.hide_cross_talk_events %}checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
           <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
             <button type="submit" class="btn btn-primary btn-sm">Save</button>
             <button type="button" class="btn btn-secondary btn-sm"

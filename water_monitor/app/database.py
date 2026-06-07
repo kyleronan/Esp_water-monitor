@@ -178,6 +178,9 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- flag. This is display-only; it never affects volume totals (phantom
     -- volume is always zeroed at detection regardless of this toggle).
     hide_pressure_artifact_events  INTEGER NOT NULL DEFAULT 0,
+    -- History display: hide cross-talk events (migration 20260540). Mirrors the
+    -- phantom toggle above; display-only — cross-talk volume is already zeroed.
+    hide_cross_talk_events         INTEGER NOT NULL DEFAULT 0,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -624,11 +627,19 @@ CREATE TABLE IF NOT EXISTS events (
     -- classifier / clustering training set while its (tiny) volume still counts
     -- toward totals. Auto-derived; suppressed for user_classified rows.
     is_low_flow_dribble              INTEGER NOT NULL DEFAULT 0,
+    -- Cross-talk artifact (migration 20260540). When 1, a long event registered
+    -- via a pressure drop with essentially no real flow on THIS circuit (another
+    -- circuit's draw pulled the shared-supply pressure down). Like a phantom it
+    -- forces volume_litres_effective=0 + excluded_from_training; a distinct flag so
+    -- it can be shown / hidden separately. Auto-derived; suppressed for
+    -- user_classified rows (a peer of the phantom flag in patch_event).
+    is_cross_talk                    INTEGER NOT NULL DEFAULT 0,
     -- Sprint H. user_ignored: explicit Ignore/Restore intent (separate from
     -- the derived excluded_from_training, which is auto OR user_ignored OR
     -- manual). user_classified: lock bit — when 1 the three category flags
-    -- (is_pressure_restoration_phantom / degraded_supply / is_composite) hold
-    -- the user's manual choices and auto-detection must never overwrite them.
+    -- (is_pressure_restoration_phantom / is_cross_talk / degraded_supply /
+    -- is_composite) hold the user's manual choices and auto-detection must never
+    -- overwrite them.
     user_ignored                     INTEGER DEFAULT 0,
     user_classified                  INTEGER DEFAULT 0,
     -- Temporal "appliance cycle" signal: count of similar-volume neighbour
@@ -1847,6 +1858,7 @@ def _apply_event_verdicts(
     new_degraded: int,
     user_classified: int,
     new_dribble: int = 0,
+    new_cross_talk: int = 0,
 ) -> bool:
     """Shared core: write category flags + user_classified, re-derive
     volume_litres_effective (phantom → 0; elif degraded → envelope estimate;
@@ -1872,6 +1884,8 @@ def _apply_event_verdicts(
     est = row["volume_litres_estimated"]
     if new_phantom:
         new_effective, method = 0.0, "pressure_restoration_phantom"
+    elif new_cross_talk:
+        new_effective, method = 0.0, "cross_talk"
     elif new_degraded:
         new_effective = float(est) if est is not None else raw
         method = "pulsing_supply_envelope"
@@ -1879,10 +1893,11 @@ def _apply_event_verdicts(
         new_effective, method = raw, "raw"
 
     user_ignored = int(row["user_ignored"] or 0)
-    excluded = 1 if (new_phantom or new_degraded
+    excluded = 1 if (new_phantom or new_cross_talk or new_degraded
                      or new_dribble or user_ignored) else 0
     reason = (
         "pressure_restoration_phantom" if new_phantom
+        else "cross_talk" if new_cross_talk
         else "pulsing_supply" if new_degraded
         else "low_flow_dribble" if new_dribble
         else None
@@ -1895,12 +1910,13 @@ def _apply_event_verdicts(
     with transaction(conn):
         conn.execute(
             "UPDATE events SET "
-            "  is_pressure_restoration_phantom = ?, degraded_supply = ?, "
+            "  is_pressure_restoration_phantom = ?, is_cross_talk = ?, "
+            "  degraded_supply = ?, "
             "  user_classified = ?, is_low_flow_dribble = ?, "
             "  volume_litres_effective = ?, volume_estimation_method = ?, "
             "  excluded_from_training = ?, match_rejection_reason = ? "
             "WHERE id = ? AND circuit = ?",
-            (new_phantom, new_degraded, user_classified, new_dribble,
+            (new_phantom, new_cross_talk, new_degraded, user_classified, new_dribble,
              round(new_effective, 3), method, excluded, reason,
              event_id, circuit),
         )

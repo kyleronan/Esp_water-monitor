@@ -67,7 +67,10 @@ _BASELINE_VERSION: int = 20260523
 #              backfill (NULL is the correct default for pre-existing labels).
 #   20260539 — Training-helper capture (2b): training_capture +
 #              training_capture_candidates tables. DDL only.
-_CURRENT_VERSION: int = 20260539
+#   20260540 — Cross-talk event category: events.is_cross_talk +
+#              home_profile.hide_cross_talk_events. DDL only; the flag backfill
+#              runs from the startup / manual recompute paths after migration.
+_CURRENT_VERSION: int = 20260540
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -636,6 +639,30 @@ def _apply_training_capture_tables(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260539: training_capture tables ready")
 
 
+def _apply_cross_talk_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260540 — cross-talk event category.
+
+    Adds ``events.is_cross_talk`` (INTEGER, default 0 — a long no-flow event whose
+    pressure dropped because *another* circuit drew water: registered but no real
+    flow through this meter, so it is zeroed + excluded like a phantom) and
+    ``home_profile.hide_cross_talk_events`` (the Settings 'hide from History' toggle,
+    mirroring ``hide_pressure_artifact_events``). DDL only; idempotent (each add is
+    guarded by ``_has_column``). The flag backfill runs from the startup /
+    manual-recompute paths.
+    """
+    if not _has_column(conn, "events", "is_cross_talk"):
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN is_cross_talk INTEGER NOT NULL DEFAULT 0")
+        log.info("Added events.is_cross_talk (INTEGER DEFAULT 0)")
+    if not _has_column(conn, "home_profile", "hide_cross_talk_events"):
+        conn.execute(
+            "ALTER TABLE home_profile ADD COLUMN hide_cross_talk_events "
+            "INTEGER NOT NULL DEFAULT 0")
+        log.info("Added home_profile.hide_cross_talk_events (default 0)")
+    conn.commit()
+    log.info("Migration 20260540: cross-talk columns ready")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -896,6 +923,16 @@ def _missing_training_capture_table(conn: sqlite3.Connection) -> set[str]:
     return needed - present
 
 
+def _missing_cross_talk_columns(conn: sqlite3.Connection) -> set[str]:
+    """Return the 20260540 cross-talk columns that are absent (events + home_profile)."""
+    missing: set[str] = set()
+    if not _has_column(conn, "events", "is_cross_talk"):
+        missing.add("events.is_cross_talk")
+    if not _has_column(conn, "home_profile", "hide_cross_talk_events"):
+        missing.add("home_profile.hide_cross_talk_events")
+    return missing
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -1000,6 +1037,7 @@ def _run_migrations_impl(
             | _missing_cycle_pulse_columns(conn)
             | _missing_label_source_columns(conn)
             | _missing_training_capture_table(conn)
+            | _missing_cross_talk_columns(conn)
         )
         if missing:
             raise RuntimeError(
@@ -1010,9 +1048,17 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260539:
+        # DB has the training_capture tables but lacks the cross-talk columns.
+        _apply_cross_talk_columns(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260539 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260538:
         # DB has fixture_label_source but lacks the training_capture tables.
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260538 → %d", _CURRENT_VERSION)
         return
@@ -1021,6 +1067,7 @@ def _run_migrations_impl(
         # DB has cycle_pulse_count but lacks fixture_label_source.
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260537 → %d", _CURRENT_VERSION)
         return
@@ -1030,6 +1077,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260536 → %d", _CURRENT_VERSION)
         return
@@ -1040,6 +1088,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260535 → %d", _CURRENT_VERSION)
         return
@@ -1052,6 +1101,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
         return
@@ -1065,6 +1115,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
         return
@@ -1078,6 +1129,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
@@ -1093,6 +1145,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
@@ -1109,6 +1162,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -1147,6 +1201,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -1167,6 +1222,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -1188,6 +1244,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -1208,6 +1265,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -1227,6 +1285,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -1244,6 +1303,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -1261,6 +1321,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -1314,6 +1375,7 @@ def _run_migrations_impl(
         _apply_cycle_pulse_column(conn)
         _apply_label_source_column(conn)
         _apply_training_capture_tables(conn)
+        _apply_cross_talk_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

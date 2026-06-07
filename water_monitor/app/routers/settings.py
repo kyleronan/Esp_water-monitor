@@ -670,10 +670,11 @@ async def units_update(request: Request):
     # Display-only — never affects totals (phantom volume is zeroed at
     # detection regardless of this flag).
     hide_phantoms = 1 if form.get("hide_pressure_artifact_events") == "1" else 0
+    hide_cross_talk = 1 if form.get("hide_cross_talk_events") == "1" else 0
     orch.db.execute(
         "UPDATE home_profile SET flow_unit=?, pressure_unit=?, "
-        "hide_pressure_artifact_events=? WHERE id=1",
-        (flow_key, pressure_key, hide_phantoms),
+        "hide_pressure_artifact_events=?, hide_cross_talk_events=? WHERE id=1",
+        (flow_key, pressure_key, hide_phantoms, hide_cross_talk),
     )
     orch.db.commit()
     from ..units import invalidate_unit_cache

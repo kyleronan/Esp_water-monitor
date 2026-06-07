@@ -200,6 +200,7 @@
           {% if ch.events | selectattr('degraded_supply') | list %}<th title="Degraded supply detected — volume estimated">〰</th>{% endif %}
           {% if ch.events | selectattr('is_pressure_restoration_phantom') | list %}<th title="Pressure artifact — volume removed from totals">👻</th>{% endif %}
           {% if ch.events | selectattr('is_low_flow_dribble') | list %}<th title="Low-flow noise — excluded from training, volume kept">💧</th>{% endif %}
+          {% if ch.events | selectattr('is_cross_talk') | list %}<th title="Cross-talk — the other circuit's draw dropped this circuit's pressure; no real flow, volume removed">↔</th>{% endif %}
         </tr>
       </thead>
       <tbody>
@@ -228,6 +229,7 @@
             data-anomaly-type="{{ e.anomaly_type or '' }}"
             data-degraded="{{ '1' if e.degraded_supply else '0' }}"
             data-phantom="{{ '1' if e.is_pressure_restoration_phantom else '0' }}"
+            data-cross-talk="{{ '1' if e.is_cross_talk else '0' }}"
             data-classified="{{ '1' if e.user_classified else '0' }}"
             data-volume-effective="{{ (e.volume_litres_effective * vol_factor)|round(vol_decimals) if e.volume_litres_effective is not none else '' }}"
             data-volume-method="{{ e.volume_estimation_method or 'raw' }}"
@@ -286,6 +288,9 @@
           {% endif %}
           {% if ch.events | selectattr('is_low_flow_dribble') | list %}
           <td class="hist-td">{% if e.is_low_flow_dribble %}<span title="Low-flow noise — excluded from training, volume kept" aria-label="Low-flow noise event">💧</span>{% endif %}</td>
+          {% endif %}
+          {% if ch.events | selectattr('is_cross_talk') | list %}
+          <td class="hist-td">{% if e.is_cross_talk %}<span title="Cross-talk — the other circuit's draw dropped this circuit's pressure; no real flow, volume removed from totals{% if e.other_valve_open %} · other circuit was drawing{% endif %}" aria-label="Cross-talk event">↔</span>{% endif %}</td>
           {% endif %}
         </tr>
         {% endfor %}

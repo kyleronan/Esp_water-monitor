@@ -244,6 +244,14 @@ _PHANTOM_MAX_TRUE_FLOW_LPM:   float = 2.0
 _PHANTOM_MAX_FLOW_INTEGRAL_L: float = 1.0
 _PHANTOM_MAX_FLOW_ON_RATIO:   float = 0.05
 
+# Cross-talk (migration 20260540): a long event registered via a REAL pressure drop
+# (ΔP >= _PHANTOM_MAX_DELTA_PSI) with essentially no real flow on this circuit —
+# another circuit's draw pulled the shared-supply pressure down. Reuses the phantom's
+# no-flow ceilings (_PHANTOM_MAX_FLOW_INTEGRAL_L / _PHANTOM_MAX_FLOW_ON_RATIO); the only
+# NEW constant is a shorter min duration — the no-flow metrics make a 2-min event
+# unambiguous, unlike the 30-min near-zero-ΔP phantom rule.
+_XTALK_MIN_DURATION_S: float = 120.0
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Low-flow "dribble" guard (added 2026-05-31)
 #
@@ -679,6 +687,44 @@ def _detect_low_flow_dribble(volume_litres, avg_flow_lpm, pressure_delta_psi) ->
     )
 
 
+def _detect_cross_talk(duration_s, pressure_delta_psi,
+                       flow_integral_litres, flow_on_ratio) -> bool:
+    """True when a multi-minute event registered via a REAL pressure drop but moved
+    essentially no water through THIS meter — i.e. another circuit's draw pulled the
+    shared-supply pressure down (cross-talk), not water use here.
+
+    Fingerprint: long enough (>= _XTALK_MIN_DURATION_S) AND near-zero integrated volume
+    (flow_integral < _PHANTOM_MAX_FLOW_INTEGRAL_L) AND flow on only a tiny fraction of
+    the window (flow_on_ratio < _PHANTOM_MAX_FLOW_ON_RATIO) AND a REAL pressure drop
+    (delta >= _PHANTOM_MAX_DELTA_PSI). The ΔP floor is exactly what separates this from
+    the near-zero-ΔP pressure-restoration phantom (delta < _PHANTOM_MAX_DELTA_PSI), so
+    the two are mutually exclusive. Reuses the phantom's already-calibrated no-flow
+    ceilings.
+
+    Returns False on any None / non-numeric / non-finite input — conservative, so a
+    parse error never zeroes a real event.
+    """
+    if (duration_s is None or pressure_delta_psi is None
+            or flow_integral_litres is None or flow_on_ratio is None):
+        return False
+    try:
+        duration = float(duration_s)
+        delta = float(pressure_delta_psi)
+        integ = float(flow_integral_litres)
+        onr = float(flow_on_ratio)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(duration) and math.isfinite(delta)
+            and math.isfinite(integ) and math.isfinite(onr)):
+        return False
+    return (
+        duration >= _XTALK_MIN_DURATION_S
+        and integ < _PHANTOM_MAX_FLOW_INTEGRAL_L
+        and onr < _PHANTOM_MAX_FLOW_ON_RATIO
+        and delta >= _PHANTOM_MAX_DELTA_PSI
+    )
+
+
 def _finalize_derived_verdicts(features: dict) -> None:
     """Single source of truth for the phantom verdict + its dependent fields.
 
@@ -714,8 +760,18 @@ def _finalize_derived_verdicts(features: dict) -> None:
     # (a degraded event's low flow is a measurement artifact, not a true
     # trickle, and is already excluded). Folds into the exclusion set WITHOUT
     # zeroing volume — see the constants block.
-    is_dribble = (
+    # Cross-talk: a long no-flow event with a REAL pressure drop (ΔP >= 2.0) — the
+    # other circuit's draw pulled this circuit's pressure down. ΔP-exclusive with the
+    # phantom (ΔP < 2.0). Gated off degraded events (their flow metrics are unreliable,
+    # so the no-flow signal can't be trusted). Zeroes volume + excludes, like a phantom.
+    is_cross_talk = (
         not is_phantom and not is_degraded
+        and _detect_cross_talk(
+            features.get("duration_seconds"), features.get("pressure_delta_psi"),
+            features.get("flow_integral_litres"), features.get("flow_on_ratio"))
+    )
+    is_dribble = (
+        not is_phantom and not is_cross_talk and not is_degraded
         and _detect_low_flow_dribble(
             features.get("volume_litres"), features.get("avg_flow_lpm"),
             features.get("pressure_delta_psi"))
@@ -732,6 +788,9 @@ def _finalize_derived_verdicts(features: dict) -> None:
     if is_phantom:
         features["volume_litres_effective"]  = 0.0
         features["volume_estimation_method"] = "pressure_restoration_phantom"
+    elif is_cross_talk:
+        features["volume_litres_effective"]  = 0.0
+        features["volume_estimation_method"] = "cross_talk"
     elif is_degraded:
         features["volume_litres_effective"]  = round(est, 3)
         features["volume_estimation_method"] = "pulsing_supply_envelope"
@@ -743,9 +802,10 @@ def _finalize_derived_verdicts(features: dict) -> None:
     # classifier training (NULL = unknown/legacy = not degraded).
     integration_degraded = features.get("integration_quality") not in (None, "ok")
     features["is_pressure_restoration_phantom"] = 1 if is_phantom else 0
+    features["is_cross_talk"] = 1 if is_cross_talk else 0
     features["is_low_flow_dribble"] = 1 if is_dribble else 0
     features["excluded_from_training"] = (
-        1 if (is_degraded or is_phantom or is_dribble
+        1 if (is_degraded or is_phantom or is_cross_talk or is_dribble
               or user_ignored or integration_degraded)
         else 0
     )
@@ -754,6 +814,7 @@ def _finalize_derived_verdicts(features: dict) -> None:
     # is a secondary signal kept consistent with the live finalizer.
     features["match_rejection_reason"] = (
         "pressure_restoration_phantom" if is_phantom
+        else "cross_talk" if is_cross_talk
         else "pulsing_supply" if is_degraded
         else "low_flow_dribble" if is_dribble
         else None
@@ -940,7 +1001,76 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             log.info("dribble-reprocess: flagged %d low-flow dribble event(s)",
                      dribbles_flagged)
 
-    return {"flagged": flagged, "dribbles_flagged": dribbles_flagged}
+    # ── Scan 3: cross-talk (no real flow + a REAL pressure drop ≥ 2.0) ────────
+    # Another circuit's draw pulled this circuit's pressure down — registered but
+    # no water through this meter. ZEROES volume (like a phantom) + excludes, and
+    # reverses any prior hourly_volume contribution. Excludes already-phantom rows
+    # so a row is never double-zeroed (auto-phantoms have ΔP<2 and never match this
+    # rule anyway, and the reversal is idempotent on an already-zeroed bucket).
+    cross_talk_flagged = 0
+    xt_days: set = set()
+    if _events_has_column(conn, "is_cross_talk"):
+        xrows = conn.execute(
+            "SELECT id, circuit, start_ts, duration_seconds, pressure_delta_psi, "
+            "       flow_integral_litres, flow_on_ratio, "
+            "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
+            "FROM events "
+            "WHERE (is_cross_talk = 0 OR is_cross_talk IS NULL) "
+            "  AND COALESCE(user_classified, 0) = 0 "
+            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+            "  AND COALESCE(degraded_supply, 0) = 0 "
+            "  AND duration_seconds >= ? "
+            "  AND flow_integral_litres < ? AND flow_on_ratio < ? "
+            "  AND pressure_delta_psi >= ?",
+            (_XTALK_MIN_DURATION_S, _PHANTOM_MAX_FLOW_INTEGRAL_L,
+             _PHANTOM_MAX_FLOW_ON_RATIO, _PHANTOM_MAX_DELTA_PSI),
+        ).fetchall()
+        for row in xrows:
+            # Re-run the canonical detector (SQL is only a prefilter).
+            if not _detect_cross_talk(
+                row["duration_seconds"], row["pressure_delta_psi"],
+                row["flow_integral_litres"], row["flow_on_ratio"]
+            ):
+                continue
+            prev_applied = float(row["hourly_volume_applied_litres"] or 0.0)
+            prev_bucket = row["hourly_volume_applied_bucket"]
+            with transaction(conn):
+                conn.execute(
+                    "UPDATE events SET "
+                    "  is_cross_talk = 1, "
+                    "  volume_litres_effective = 0, "
+                    "  volume_estimation_method = 'cross_talk', "
+                    "  excluded_from_training = 1, "
+                    "  match_rejection_reason = 'cross_talk' "
+                    "WHERE id = ?",
+                    (row["id"],),
+                )
+                if prev_bucket and prev_applied != 0:
+                    conn.execute(
+                        "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                        "VALUES (?, ?, ?) "
+                        "ON CONFLICT (circuit, hour_ts) "
+                        "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
+                        (row["circuit"], prev_bucket, -prev_applied),
+                    )
+                conn.execute(
+                    "UPDATE events SET hourly_volume_applied_litres = 0, "
+                    "  hourly_volume_applied_bucket = NULL WHERE id = ?",
+                    (row["id"],),
+                )
+            cross_talk_flagged += 1
+            day = (row["start_ts"] or "")[:10]
+            if day:
+                xt_days.add((row["circuit"], day))
+        for circ, day in xt_days:
+            compute_daily_summary(conn, circ, day)
+        if cross_talk_flagged:
+            conn.commit()
+            log.info("cross-talk-reprocess: flagged %d event(s) across %d day(s)",
+                     cross_talk_flagged, len(xt_days))
+
+    return {"flagged": flagged, "dribbles_flagged": dribbles_flagged,
+            "cross_talk_flagged": cross_talk_flagged}
 
 
 def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:

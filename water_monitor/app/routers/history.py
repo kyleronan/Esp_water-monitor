@@ -81,6 +81,7 @@ def _collect_circuit_history_sync(
     # never changes any total — it only removes rows from the History list.
     _profile = get_home_profile(db)
     hide_phantoms = bool(_profile and _profile["hide_pressure_artifact_events"])
+    hide_cross_talk = bool(_profile and _profile["hide_cross_talk_events"])
     out: list[dict] = []
     for circuit_cfg in circuits:
         if filter_circuit and circuit_cfg.circuit != filter_circuit:
@@ -100,6 +101,9 @@ def _collect_circuit_history_sync(
         if hide_phantoms:
             events = [e for e in events
                       if not dict(e).get("is_pressure_restoration_phantom")]
+        # Settings "Hide cross-talk events" toggle (independent of the phantom one).
+        if hide_cross_talk:
+            events = [e for e in events if not dict(e).get("is_cross_talk")]
         leak_tests = get_leak_test_history(db, circuit_cfg.circuit, limit=20)
         summaries  = get_daily_summaries(
             db, circuit_cfg.circuit,
