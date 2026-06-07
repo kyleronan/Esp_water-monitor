@@ -108,6 +108,13 @@
 
   function show(id, on, disp) { const el = document.getElementById(id); if (el) el.style.display = on ? (disp || "") : "none"; }
   function setText(id, t) { const el = document.getElementById(id); if (el) el.textContent = t; }
+  function fmtCountdown(sec) {
+    sec = Math.max(0, Math.floor(Number(sec) || 0));
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    if (h) return `${h}h ${m}m ${s}s`;
+    if (m) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
 
   async function poll() {
     let data;
@@ -157,7 +164,7 @@
       }
       setText(`tr-sub-${circuit}`, captured
         ? `${s.captured_count} event(s) captured`
-        : (s.seconds_remaining > 0 ? `${s.seconds_remaining}s left` : ""));
+        : (s.seconds_remaining > 0 ? `${fmtCountdown(s.seconds_remaining)} left` : ""));
     }
   }
 
