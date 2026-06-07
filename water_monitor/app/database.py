@@ -4348,21 +4348,28 @@ def extend_training_capture(conn: sqlite3.Connection, circuit: str,
 
 
 def expire_stale_training_captures(conn: sqlite3.Connection) -> int:
-    """Sweep armed captures whose window has elapsed. A windowed capture that DID
-    catch events must NOT evaporate on the timer — flip it to 'ready' (awaiting the
-    user's Accept/Reject; candidates preserved). Only truly-empty armed captures
-    expire. 'ready' captures are never touched. Called opportunistically (poll +
-    pruner). Returns the number EXPIRED (the empty ones)."""
-    # Windowed-with-events → 'ready'. Instant captures already flip to 'ready' on
-    # their first event, so (armed AND captured_count > 0) is uniquely a windowed run.
+    """Sweep armed captures whose window has elapsed — split by TYPE, not count.
+
+    A **windowed** (non-instant) capture flips to 'ready' regardless of count, so it
+    NEVER evaporates on the timer: with events it becomes "review your N events", with
+    zero it becomes an actionable "no events captured — redo" prompt — either way the
+    user gets closure (an active item to Accept / Reject / Cancel). Only an **instant**
+    (toilet/tap) capture that never caught an event expires (an instant WITH an event is
+    already 'ready'). 'ready' captures are never touched. Called opportunistically
+    (poll + pruner). Returns the number EXPIRED.
+    """
+    instant = tuple(_TRAINING_INSTANT_TYPES)
+    ph = ",".join("?" * len(instant))
+    # Windowed (non-instant) past-due → 'ready' (review, or "no events" redo).
     conn.execute(
-        "UPDATE training_capture SET status = 'ready' "
-        "WHERE status = 'armed' AND expires_at <= datetime('now') "
-        "AND captured_count > 0")
+        f"UPDATE training_capture SET status = 'ready' "
+        f"WHERE status = 'armed' AND expires_at <= datetime('now') "
+        f"AND fixture_type NOT IN ({ph})", instant)
+    # Instant past-due that never caught an event → 'expired'.
     cur = conn.execute(
-        "UPDATE training_capture SET status = 'expired' "
-        "WHERE status = 'armed' AND expires_at <= datetime('now') "
-        "AND captured_count = 0")
+        f"UPDATE training_capture SET status = 'expired' "
+        f"WHERE status = 'armed' AND expires_at <= datetime('now') "
+        f"AND fixture_type IN ({ph})", instant)
     conn.commit()
     return cur.rowcount
 

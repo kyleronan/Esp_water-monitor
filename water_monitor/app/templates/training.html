@@ -52,6 +52,11 @@
         I'm about to use the {{ it.label }}
       </button>
     </div>
+    {% if it.windows and (it.windows | max) >= 60 %}
+    <p class="muted" style="font-size:11px;margin:6px 0 0">
+      A full cycle can run 1–2.5 h — pick a window that covers it (or hit +15 min while it runs).
+    </p>
+    {% endif %}
   </div>
   {% endfor %}
 </div>
@@ -153,17 +158,26 @@
       } else {
         // windowed (armed = accumulating, ready = window ended) or instant waiting
         const windowEnded = !instant && s.status === "ready";
-        setText(`tr-msg-${circuit}`, windowEnded
-          ? `${ft} — window ended · review your ${s.captured_count} event(s)`
-          : (instant
-            ? `${ft}: ${SUB_MSG[s.capture_sub_state] || "…"}`
-            : `${ft} — ${SUB_MSG[s.capture_sub_state] || "monitoring"} (window running)`));
-        show(`tr-cancel-${circuit}`,  !captured);
-        show(`tr-extend-${circuit}`,  !instant && s.status === "armed");
-        show(`tr-reject-${circuit}`,  captured);
-        show(`tr-confirm-${circuit}`, captured);
-        const cb = document.getElementById(`tr-confirm-${circuit}`);
-        if (cb) cb.textContent = "Accept";
+        if (windowEnded && !captured) {
+          // window elapsed with no events — give closure, not a silent dead-end
+          setText(`tr-msg-${circuit}`, `${ft} — window ended · no events were captured`);
+          show(`tr-cancel-${circuit}`,  true);    // dismiss / re-arm
+          show(`tr-extend-${circuit}`,  false);
+          show(`tr-reject-${circuit}`,  false);
+          show(`tr-confirm-${circuit}`, false);
+        } else {
+          setText(`tr-msg-${circuit}`, windowEnded
+            ? `${ft} — window ended · review your ${s.captured_count} event(s)`
+            : (instant
+              ? `${ft}: ${SUB_MSG[s.capture_sub_state] || "…"}`
+              : `${ft} — ${SUB_MSG[s.capture_sub_state] || "monitoring"} (window running)`));
+          show(`tr-cancel-${circuit}`,  !captured);
+          show(`tr-extend-${circuit}`,  !instant && s.status === "armed");
+          show(`tr-reject-${circuit}`,  captured);
+          show(`tr-confirm-${circuit}`, captured);
+          const cb = document.getElementById(`tr-confirm-${circuit}`);
+          if (cb) cb.textContent = "Accept";
+        }
       }
       const sub = [];
       if (captured) sub.push(`${s.captured_count} event(s) captured`);
