@@ -412,6 +412,13 @@ class Orchestrator:
             ha_client=self._ha,
             event_detector=self._event_detector)
 
+        # Reverse link: a late-assembled ESP waveform upgrades a recent
+        # software-signature event to ESP provenance (signature-only, Fix 1).
+        # Optional sink → a no-op until both sides exist.
+        self._event_detector._waveform_upgrade_sink = (
+            self._feature_extractor.handle_late_waveform
+        )
+
         # Cluster engine — instantiate and rebuild state from the last 60 days
         # of already-matched events so DBSTREAM + scaler are warm on startup.
         try:

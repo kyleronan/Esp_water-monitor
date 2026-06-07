@@ -4243,7 +4243,7 @@ _TRAINING_INSTANT_TYPES: frozenset = frozenset({"toilet", "tap"})
 _TRAINING_INSTANT_WINDOW_MIN: int = 5
 # Allowed monitoring-window options per windowed type (minutes).
 _TRAINING_WINDOW_INCREMENTS: Dict[str, List[int]] = {
-    "shower":          [5, 10, 15, 20, 25, 30],
+    "shower_tub":      [5, 10, 15, 20, 25, 30],
     "irrigation_zone": [5, 10, 15, 20, 30, 45, 60],
     "washing_machine": [15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180],
     "dishwasher":      [15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180],

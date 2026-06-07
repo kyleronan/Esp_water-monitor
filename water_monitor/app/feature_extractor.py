@@ -1836,6 +1836,105 @@ def _enrich_from_waveform(
     features["waveform_overlap_score"] = round(overlap_score, 4)
 
 
+# --------------------------------------------------------------------------- #
+# Late-waveform upgrade (Fix 1) — flip a recent software-signature event to ESP
+# provenance once its chunked waveform finishes assembling. The ESP streams the
+# waveform in ~30 s chunks, so a short event finalises 'software' before its
+# waveform is ready and the immediate _find_waveform lookup misses it. This
+# reverse path re-matches the assembled record to that event and upgrades the
+# signature/provenance + shape columns ONLY — never volume, user labels, or
+# hourly bookkeeping; the derived verdict is left to the periodic reprocess.
+# --------------------------------------------------------------------------- #
+
+# Exactly the columns _enrich_from_waveform writes. Pinned disjoint from
+# _EVENT_USER_COLUMNS / _EVENT_APPLIED_BOOKKEEPING_COLUMNS / volume columns by
+# test_late_waveform_upgrade's column-guard (which also asserts _enrich's live
+# output keys stay within this set, so a future _enrich edit can't silently
+# write a volume/user/bookkeeping column through this path).
+_WF_UPGRADE_COLUMNS = (
+    "signature_source", "flow_signature_json", "pressure_signature_json",
+    "esp_waveform_used", "waveform_event_id", "waveform_quality",
+    "waveform_overlap_score",
+    "peak_flow_lpm", "pressure_delta_psi", "propagation_delay_ms",
+    "flow_rise_rate_lpm_s", "time_to_90pct_flow_seconds", "opening_step_lpm",
+    "pressure_onset_ms", "steady_state_fraction", "flow_variability",
+    "recovery_overshoot_psi",
+)
+
+
+def _parse_iso(ts):
+    """Parse a stored ISO timestamp to an aware UTC datetime, or None."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _late_waveform_upgrade_job(conn, circuit: str, record: WaveformRecord):
+    """Reverse-match a just-assembled waveform to a recent software-signature event
+    on ``circuit`` and upgrade ONLY its signature/provenance columns to ESP.
+
+    Runs on a private, write-locked connection (one lock acquisition = the SELECT
+    match AND the UPDATE here, not select-release-update): a concurrent assembly
+    that already upgraded the row makes the ``signature_source='software'`` WHERE a
+    no-op, so there is no double-upgrade and no downgrade. Volume / user-label /
+    hourly-bookkeeping columns are NEVER written, and ``_finalize_derived_verdicts``
+    is NOT re-run — the periodic reprocess reconciles any verdict drift.
+
+    Returns the upgraded event id, or None when nothing matched / nothing flipped.
+    """
+    from types import SimpleNamespace
+
+    now = datetime.now(timezone.utc)
+    rows = conn.execute(
+        "SELECT * FROM events WHERE circuit = ? AND signature_source = 'software' "
+        "ORDER BY end_ts DESC LIMIT 50",
+        (circuit,),
+    ).fetchall()
+
+    best = None
+    best_score = 0.0
+    best_end: Optional[datetime] = None
+    for row in rows:
+        start_dt = _parse_iso(row["start_ts"])
+        end_dt = _parse_iso(row["end_ts"])
+        if start_dt is None or end_dt is None:
+            continue
+        if (now - end_dt).total_seconds() > _WF_MATCH_WINDOW_S:
+            continue   # outside the 90 s window — belongs to a prior event
+        score = _wf_overlap_score(
+            SimpleNamespace(start_ts=start_dt, end_ts=end_dt), record)
+        # Best score wins; tie-break to the most-recent end_ts (rows are already
+        # end_ts-DESC, so the first max-score row is the most recent among ties).
+        if score > best_score or (
+                score == best_score and best_end is not None and end_dt > best_end):
+            best, best_score, best_end = row, score, end_dt
+
+    if best is None or best_score < _WF_MATCH_MIN_SCORE:
+        return None
+
+    features = dict(best)
+    _enrich_from_waveform(features, record, best_score)
+    # Only persist a genuine signature flip (software → esp_*). A no-flow / no-
+    # signal waveform leaves signature_source 'software' → nothing to upgrade, so
+    # artifact rows (phantom/cross-talk/dribble) are never rewritten through here.
+    if not str(features.get("signature_source") or "software").startswith("esp"):
+        return None
+
+    cols = [c for c in _WF_UPGRADE_COLUMNS if c in features]
+    set_clause = ", ".join(f"{c} = ?" for c in cols)
+    params = [features[c] for c in cols] + [best["id"]]
+    cur = conn.execute(
+        f"UPDATE events SET {set_clause} WHERE id = ? AND signature_source = 'software'",
+        params,
+    )
+    conn.commit()
+    return best["id"] if cur.rowcount > 0 else None
+
+
 def extract_features(event: RawEvent) -> Dict[str, Any]:
     """Compute the full feature vector from a RawEvent."""
     duration = 0.0
@@ -2093,6 +2192,9 @@ class FeatureExtractor:
         # gives us a place to observe and log exceptions instead of the
         # default "Task exception was never retrieved" warning.
         self._pending_alert_tasks: set[asyncio.Task] = set()
+        # Strong refs for the late-waveform upgrade tasks (Fix 1) — same GC-safety
+        # pattern as the alert tasks above.
+        self._pending_wf_tasks: set[asyncio.Task] = set()
         # Per-circuit cooldown timestamps for the pulsing-supply alert.
         # In-memory only — resets on addon restart. That's acceptable for now:
         # if a real pulsing episode persists across a restart the user will
@@ -2227,6 +2329,46 @@ class FeatureExtractor:
             )
             return None
         return record
+
+    def handle_late_waveform(self, circuit: str, record: WaveformRecord) -> None:
+        """Sink (wired by the orchestrator to EventDetector) for a freshly-assembled
+        ESP waveform. Schedules a background, write-locked upgrade of a recent
+        software-signature event to ESP provenance. Runs on the loop's WS callback;
+        no-op without a running loop (test/import contexts)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        t = loop.create_task(self._upgrade_event_from_late_waveform(circuit, record))
+        self._pending_wf_tasks.add(t)
+        t.add_done_callback(self._pending_wf_tasks.discard)
+
+        def _log_exc(task: asyncio.Task) -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                log.warning("[%s] late-waveform upgrade task raised: %s", circuit, exc)
+        t.add_done_callback(_log_exc)
+
+    async def _upgrade_event_from_late_waveform(
+            self, circuit: str, record: WaveformRecord) -> None:
+        """Run the reverse-match + signature upgrade off the event loop, serialised
+        through the write lock on its OWN connection (never the shared one)."""
+        from .config import DB_PATH
+        from .database import run_isolated_write
+
+        def _job(conn):
+            return _late_waveform_upgrade_job(conn, circuit, record)
+
+        try:
+            upgraded_id = await run_isolated_write(DB_PATH, _job)
+        except Exception as e:
+            log.warning("[%s] late-waveform upgrade failed (non-fatal): %s", circuit, e)
+            return
+        if upgraded_id is not None:
+            log.debug("[%s] late-waveform upgrade — event %s software→esp",
+                      circuit, upgraded_id)
 
     async def _process(self, event: RawEvent) -> None:
         if not event.complete:

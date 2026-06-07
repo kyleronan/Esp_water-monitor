@@ -431,6 +431,14 @@ class CircuitEventDetector:
         self._FLOW_SAMPLE_MIN_DELTA_LPM: float = 0.2
         self._FLOW_SAMPLE_HEARTBEAT_S: float = 30.0
 
+        # Pre-trigger onset buffer: idle (ts, flow_lpm) kept for ~5 s so the
+        # opening ramp the FLOW_START_SECONDS sustain trigger discards can seed
+        # flow_readings at event start. SIGNATURE-ONLY — it never feeds
+        # flow_samples, so the volume integral is byte-identical with/without it.
+        # The deque maxlen is the hard count cap; the time-trim keeps only ~5 s.
+        self._PRETRIGGER_WINDOW_S: float = 5.0
+        self._pretrigger_flow: Deque[Tuple[datetime, float]] = deque(maxlen=64)
+
     # ------------------------------------------------------------------ #
     # Public                                                               #
     # ------------------------------------------------------------------ #
@@ -492,7 +500,16 @@ class CircuitEventDetector:
             self._flow_sustained_since = None
             return
 
-        # No active event — manage flow start timer
+        # No active event — manage flow start timer.
+        # Pre-trigger onset buffer (signature-only): record idle flow regardless
+        # of the MIN_FLOW gate so the sub-threshold opening ramp — lost to the
+        # FLOW_START_SECONDS sustain delay — can seed flow_readings. NEVER touches
+        # flow_samples (the volume integral).
+        self._pretrigger_flow.append((now, self._current_flow_lpm))
+        _pt_cutoff = now - timedelta(seconds=self._PRETRIGGER_WINDOW_S)
+        while self._pretrigger_flow and self._pretrigger_flow[0][0] < _pt_cutoff:
+            self._pretrigger_flow.popleft()
+
         if self._current_flow_lpm >= self.MIN_FLOW_LPM:
             if self._flow_sustained_since is None:
                 self._flow_sustained_since = now
@@ -750,7 +767,13 @@ class CircuitEventDetector:
             pre_event_pressure_psi=baseline,
             min_pressure_psi=baseline if baseline is not None else 0.0,
             max_pressure_psi=baseline if baseline is not None else 0.0,
-            flow_readings=[self._current_flow_lpm],
+            # Seed the signature series with the recovered pre-onset ramp
+            # (samples strictly before start_ts) so the "front" the sustain
+            # trigger cut off is restored. flow_samples (volume) is untouched.
+            flow_readings=(
+                [v for (t, v) in self._pretrigger_flow if t < start_ts]
+                + [self._current_flow_lpm]
+            ),
             flow_samples=[(start_ts, self._current_flow_lpm)],
             other_valve_open=self._get_other_valve_open(),
         )
@@ -997,6 +1020,7 @@ class CircuitEventDetector:
         self._pressure_recovered_since = None
         self._settled_pressure_psi = None
         self._settled_pressure_since = None
+        self._pretrigger_flow.clear()
 
 
 # ------------------------------------------------------------------------------- #
@@ -1288,12 +1312,17 @@ class WaveformChunkAccumulator:
     public accessors are a thin pass-through (see EventDetector below).
     """
 
-    def __init__(self, circuit: str, expected_node: str) -> None:
+    def __init__(self, circuit: str, expected_node: str,
+                 on_record_assembled: Optional[Callable[[WaveformRecord], None]] = None) -> None:
         self._circuit = circuit
         # Normalize once so every comparison is cheap.
         self._expected_node = _normalize_node_name(expected_node)
         self._inflight: Dict[Tuple[int, int], _InflightChunkSet] = {}
         self._records: List[WaveformRecord] = []
+        # Optional sink fired once a record finishes assembling (late-waveform
+        # upgrade, Fix 1). Kept DB-free; invoked in a try/except in _assemble so a
+        # sink bug can never corrupt assembly. None in most tests.
+        self._on_record_assembled = on_record_assembled
 
     # ------------------------------------------------------------------
     # Public callback
@@ -1538,6 +1567,15 @@ class WaveformChunkAccumulator:
             meta.peak_flow, meta.pressure_delta, meta.propagation_delay_ms,
         )
 
+        # Notify the optional sink (late-waveform upgrade). Wrapped so a sink
+        # error can never corrupt assembly or escape the WS callback.
+        if self._on_record_assembled is not None:
+            try:
+                self._on_record_assembled(record)
+            except Exception as e:
+                log.warning("waveform[%s]: on_record_assembled sink raised "
+                            "(non-fatal): %s", self._circuit, e)
+
     # ------------------------------------------------------------------
     # TTL eviction
     # ------------------------------------------------------------------
@@ -1601,6 +1639,10 @@ class EventDetector:
         self._chunk_accumulators: Dict[str, WaveformChunkAccumulator] = {}
         self._wf_event_subscribed: bool = False
         self._is_configured = False
+        # Optional sink for late-assembled waveforms (signature upgrade, Fix 1).
+        # Wired by the orchestrator to FeatureExtractor.handle_late_waveform;
+        # left None in tests / import → assembly notifies nothing.
+        self._waveform_upgrade_sink: Optional[Callable[[str, WaveformRecord], None]] = None
 
     def setup(self) -> None:
         """Instantiate detectors and register HA entity subscriptions.
@@ -1648,7 +1690,10 @@ class EventDetector:
             # rstrip("_") was over-eager and would strip multiple if a
             # prefix were ever configured with a double-underscore tail.
             expected_node = cfg.esp_device_prefix.removesuffix("_")
-            accumulator = WaveformChunkAccumulator(cfg.circuit, expected_node=expected_node)
+            accumulator = WaveformChunkAccumulator(
+                cfg.circuit, expected_node=expected_node,
+                on_record_assembled=self._on_waveform_assembled,
+            )
             self._chunk_accumulators[cfg.circuit] = accumulator
 
             # Register the HA event subscription once (shared across all circuits).
@@ -1689,6 +1734,19 @@ class EventDetector:
         if accumulator is not None:
             accumulator.on_waveform_chunk(data)
         # Wrong or missing circuit is handled silently by the accumulator itself.
+
+    def _on_waveform_assembled(self, record: WaveformRecord) -> None:
+        """Forward a freshly-assembled waveform to the late-upgrade sink (if wired).
+        Runs on the event loop (WS callback); the sink schedules its own background
+        write. Wrapped so a sink error can't escape into assembly."""
+        sink = self._waveform_upgrade_sink
+        if sink is None:
+            return
+        try:
+            sink(record.circuit, record)
+        except Exception as e:
+            log.warning("[%s] late-waveform sink raised (non-fatal): %s",
+                        record.circuit, e)
 
     def _on_valve_state(self, circuit: str, state: str) -> None:
         """Update tracked valve state for cross-circuit feature."""

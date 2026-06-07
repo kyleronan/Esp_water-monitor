@@ -192,7 +192,7 @@
         <tr>
           <th>Time</th>
           <th>Duration</th>
-          <th>Avg flow</th>
+          <th title="Average flow while water is actually running (idle gaps excluded)">Avg flow</th>
           <th>ΔP ({{ pressure_unit }})</th>
           <th>Shape</th>
           <th>Volume ({{ vol_unit }})</th>
@@ -206,13 +206,14 @@
       <tbody>
         {% for e in ch.events %}
         {% set _fix_label = fixture_type_labels.get(e.user_fixture_type, '') if e.user_fixture_type else '' %}
+        {% set _disp_flow = e.true_avg_flow_lpm if e.true_avg_flow_lpm is not none else e.avg_flow_lpm %}
         <tr class="hist-event-row{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.is_pressure_restoration_phantom %} hist-row-phantom{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}{% if loop.index > 25 %} hist-extra-row{% endif %}"{% if loop.index > 25 %} style="display:none"{% endif %}
             tabindex="0" role="button" aria-label="Event detail"
             data-event-id="{{ e.id }}"
             data-circuit="{{ ch.circuit }}"
             data-start="{{ e.start_ts or '' }}"
             data-duration="{{ fmt_duration(e.duration_seconds) }}"
-            data-flow="{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else '—' }} {{ flow_unit }}"
+            data-flow="{{ (_disp_flow * flow_factor)|round(flow_decimals) if _disp_flow is not none else '—' }} {{ flow_unit }}"
             data-pressure="{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else '—' }}"
             data-volume="{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else '—' }} {{ vol_unit }}"
             data-shape="{{ e.resistance_curve_shape or 'unknown' }}"
@@ -241,7 +242,7 @@
             data-sig-source="{{ e.signature_source or 'software' }}">
           <td class="hist-td hist-td-mono hist-td-time"><time data-ts="{{ e.start_ts or '' }}">{{ (e.start_ts or '')[:16] }}</time></td>
           <td class="hist-td">{{ fmt_duration(e.duration_seconds) }}</td>
-          <td class="hist-td hist-td-mono">{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else "—" }} {{ flow_unit }}</td>
+          <td class="hist-td hist-td-mono">{{ (_disp_flow * flow_factor)|round(flow_decimals) if _disp_flow is not none else "—" }} {{ flow_unit }}</td>
           <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else "—" }}</td>
           <td class="hist-td hist-td-shape">
             {% set shape = e.resistance_curve_shape or 'unknown' %}

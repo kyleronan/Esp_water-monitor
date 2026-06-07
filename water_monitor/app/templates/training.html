@@ -24,6 +24,8 @@
   <button class="btn btn-secondary btn-sm" data-act="extend"  data-circuit="{{ circ.circuit }}" id="tr-extend-{{ circ.circuit }}"  style="display:none">+15 min</button>
   <button class="btn btn-secondary btn-sm" data-act="reject"  data-circuit="{{ circ.circuit }}" id="tr-reject-{{ circ.circuit }}"  style="display:none">Redo</button>
   <button class="btn btn-primary btn-sm"   data-act="confirm" data-circuit="{{ circ.circuit }}" id="tr-confirm-{{ circ.circuit }}" style="display:none">Accept</button>
+  <button class="btn btn-secondary btn-sm tr-again" data-circuit="{{ circ.circuit }}" id="tr-again-{{ circ.circuit }}" style="display:none">Capture another</button>
+  <button class="btn btn-primary btn-sm tr-done"    data-circuit="{{ circ.circuit }}" id="tr-done-{{ circ.circuit }}"  style="display:none">Done</button>
 </div>
 
 {% if not circ.fixtures %}
@@ -76,6 +78,8 @@
     processing: "processing…",
   };
   let autoConfirming = false;
+  const justCaptured = {};   // circuit -> fixture_type held on the "capture another?" prompt
+  const sessionCount = {};   // circuit -> instant samples captured this sitting
 
   async function post(url, body) {
     const r = await fetch(INGRESS + url, {
@@ -90,14 +94,16 @@
   document.querySelectorAll(".tr-arm").forEach(btn => {
     btn.addEventListener("click", async () => {
       const { circuit, type } = btn.dataset;
+      const wasHolding = !!justCaptured[circuit];   // arming clears a held "capture another?" prompt
+      justCaptured[circuit] = null;
       const body = { fixture_type: type };
       if (btn.dataset.windowed) {
         const sel = document.getElementById(`tr-win-${circuit}-${type}`);
         body.window_minutes = sel ? parseInt(sel.value, 10) : null;
       }
       const res = await post(`/training/api/${circuit}/arm`, body);
-      if (!res.ok) alert((res.data && res.data.error) || "Could not start capture");
-      poll();
+      if (!res.ok) { alert((res.data && res.data.error) || "Could not start capture"); poll(); return; }
+      if (wasHolding) location.reload(); else poll();   // pick-another-fixture refreshes the ✓ pill
     });
   });
 
@@ -109,6 +115,25 @@
       if (act === "confirm" || act === "reject" || act === "cancel") location.reload();
       else poll();
     });
+  });
+
+  // Instant multi-sample: "Capture another" re-arms the same fixture in place (keeps
+  // the per-sitting count); "Done" closes the held prompt and reloads so the
+  // checklist pill flips to ✓ captured.
+  document.querySelectorAll(".tr-again").forEach(b => {
+    b.addEventListener("click", async () => {
+      const circuit = b.dataset.circuit;
+      const ft = justCaptured[circuit];
+      justCaptured[circuit] = null;
+      if (ft) {
+        const res = await post(`/training/api/${circuit}/arm`, { fixture_type: ft });
+        if (!res.ok) alert((res.data && res.data.error) || "Could not start capture");
+      }
+      poll();
+    });
+  });
+  document.querySelectorAll(".tr-done").forEach(b => {
+    b.addEventListener("click", () => { justCaptured[b.dataset.circuit] = null; location.reload(); });
   });
 
   function show(id, on, disp) { const el = document.getElementById(id); if (el) el.style.display = on ? (disp || "") : "none"; }
@@ -130,6 +155,14 @@
     } catch (_) { return; }
 
     for (const [circuit, s] of Object.entries(data)) {
+      // Held "capture another?" prompt after an instant capture — additive, not a
+      // lock: the panel stays up, but this circuit is free to arm a new fixture.
+      if (justCaptured[circuit]) {
+        document.querySelectorAll(`.tr-arm[data-circuit="${circuit}"]`).forEach(b => { b.disabled = false; });
+        show(`tr-active-${circuit}`, true, "flex");
+        continue;
+      }
+      show(`tr-again-${circuit}`, false); show(`tr-done-${circuit}`, false);
       const active = s.status === "armed" || s.status === "ready";
       // Block every arm button on this circuit while one item is active.
       document.querySelectorAll(`.tr-arm[data-circuit="${circuit}"]`).forEach(b => { b.disabled = active; });
@@ -147,7 +180,18 @@
         show(`tr-reject-${circuit}`, false); show(`tr-confirm-${circuit}`, false);
         if (!autoConfirming) {                       // frictionless auto-accept
           autoConfirming = true;
-          post(`/training/api/${circuit}/confirm`, {}).then(() => location.reload());
+          post(`/training/api/${circuit}/confirm`, {}).then(() => {
+            autoConfirming = false;
+            sessionCount[circuit] = (sessionCount[circuit] || 0) + 1;
+            justCaptured[circuit] = ft;              // hold the "capture another?" prompt
+            const n = sessionCount[circuit];
+            setText(`tr-msg-${circuit}`, `Captured ${ft} ✓ — ${n} this session. Capture another, or pick another fixture.`);
+            setText(`tr-sub-${circuit}`, "");
+            show(`tr-cancel-${circuit}`, false); show(`tr-extend-${circuit}`, false);
+            show(`tr-reject-${circuit}`, false); show(`tr-confirm-${circuit}`, false);
+            show(`tr-again-${circuit}`, true);  show(`tr-done-${circuit}`, true);
+            document.querySelectorAll(`.tr-arm[data-circuit="${circuit}"]`).forEach(b => { b.disabled = false; });
+          });
         }
       } else if (instantReady && !s.matches) {
         setText(`tr-msg-${circuit}`, `Captured an event that looks small for a ${ft}.`);
