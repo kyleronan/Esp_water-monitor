@@ -397,8 +397,15 @@ class HaClient:
         entity_id: str,
         start: dt.datetime,
         end: dt.datetime,
+        significant_changes_only: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Fetch state history for one entity. Returns [{state, last_changed}]."""
+        """Fetch state history for one entity. Returns [{state, last_changed}].
+
+        `significant_changes_only` thins the series at the HA recorder — the 24h
+        pressure chart passes True to avoid pulling a full 2 Hz run into memory; the
+        default keeps full fidelity for the historical importer (and the WS call is
+        then byte-identical to before)."""
+        extra = {"significant_changes_only": True} if significant_changes_only else {}
         result = await self.ws_request(
             "history/history_during_period",
             start_time=start.isoformat(),
@@ -406,6 +413,7 @@ class HaClient:
             entity_ids=[entity_id],
             minimal_response=True,
             no_attributes=True,
+            **extra,
         )
         return self._parse_history_entries((result or {}).get(entity_id, []))
 

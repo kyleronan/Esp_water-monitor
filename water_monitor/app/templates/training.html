@@ -151,20 +151,24 @@
         show(`tr-confirm-${circuit}`, true); // Confirm anyway
         document.getElementById(`tr-confirm-${circuit}`).textContent = "Confirm anyway";
       } else {
-        // windowed (always armed, accumulating) or instant waiting
-        setText(`tr-msg-${circuit}`, instant
-          ? `${ft}: ${SUB_MSG[s.capture_sub_state] || "…"}`
-          : `${ft} — ${SUB_MSG[s.capture_sub_state] || "monitoring"} (window running)`);
+        // windowed (armed = accumulating, ready = window ended) or instant waiting
+        const windowEnded = !instant && s.status === "ready";
+        setText(`tr-msg-${circuit}`, windowEnded
+          ? `${ft} — window ended · review your ${s.captured_count} event(s)`
+          : (instant
+            ? `${ft}: ${SUB_MSG[s.capture_sub_state] || "…"}`
+            : `${ft} — ${SUB_MSG[s.capture_sub_state] || "monitoring"} (window running)`));
         show(`tr-cancel-${circuit}`,  !captured);
-        show(`tr-extend-${circuit}`,  !instant);
+        show(`tr-extend-${circuit}`,  !instant && s.status === "armed");
         show(`tr-reject-${circuit}`,  captured);
         show(`tr-confirm-${circuit}`, captured);
         const cb = document.getElementById(`tr-confirm-${circuit}`);
         if (cb) cb.textContent = "Accept";
       }
-      setText(`tr-sub-${circuit}`, captured
-        ? `${s.captured_count} event(s) captured`
-        : (s.seconds_remaining > 0 ? `${fmtCountdown(s.seconds_remaining)} left` : ""));
+      const sub = [];
+      if (captured) sub.push(`${s.captured_count} event(s) captured`);
+      if (s.status === "armed" && s.seconds_remaining > 0) sub.push(`${fmtCountdown(s.seconds_remaining)} left`);
+      setText(`tr-sub-${circuit}`, sub.join(" · "));
     }
   }
 

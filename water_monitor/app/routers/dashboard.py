@@ -1,7 +1,9 @@
 """Dashboard router — main status page."""
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
@@ -11,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from ._helpers import run_blocking
 
 router = APIRouter()
+log = logging.getLogger(__name__)
 
 
 def _get_orchestrator(request: Request):
@@ -97,6 +100,45 @@ async def chart_data(circuit: str, request: Request):
     orch = _get_orchestrator(request)
     data = await run_blocking(_build_chart_data, orch.db, circuit)
     return JSONResponse(data)
+
+
+@router.get("/api/dashboard/pressure/{circuit}")
+async def dashboard_pressure(circuit: str, request: Request):
+    """Last-24h pressure series (from the HA recorder) + resting baseline for the
+    modal chart. Reads live from HA — the addon stores no pressure time series. Never
+    500s; failure modes are surfaced via `error` so the modal shows the right hint."""
+    from ..circuit_compat import resolve_circuit
+    from ..database import downsample_pressure_series, recent_pressure_baseline
+    orch = _get_orchestrator(request)
+    circuit = resolve_circuit(circuit)
+
+    def _fail(err: str, baseline=None):
+        return JSONResponse({"available": False, "error": err, "points": [],
+                             "baseline_psi": baseline, "unit": "psi"})
+
+    cfg = orch._cfg.get_circuit(circuit)
+    entity = (cfg.pressure_history_sensor or cfg.pressure_avg_sensor) if cfg else ""
+    if not entity:
+        return _fail("no_entity")
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=24)
+    try:
+        states = await asyncio.wait_for(
+            orch.ha.get_history(entity, start, end, significant_changes_only=True),
+            timeout=8.0)
+    except Exception as e:                       # timeout / HA down / WS error
+        log.warning("[%s] pressure history fetch failed: %s", circuit, e)
+        return _fail("ha_unreachable")
+
+    points = downsample_pressure_series(
+        states, start.timestamp(), end.timestamp(), buckets=288)
+    baseline = await run_blocking(
+        recent_pressure_baseline, orch.db, circuit, start.isoformat())
+    if not any(p["v"] is not None for p in points):
+        return _fail("no_history", baseline)
+    return JSONResponse({"available": True, "points": points,
+                         "baseline_psi": baseline, "unit": "psi"})
 
 
 def _build_dashboard_sync_payload(db, circuits, get_home_profile) -> dict:

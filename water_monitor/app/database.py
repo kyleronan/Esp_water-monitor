@@ -4326,12 +4326,21 @@ def extend_training_capture(conn: sqlite3.Connection, circuit: str,
 
 
 def expire_stale_training_captures(conn: sqlite3.Connection) -> int:
-    """Mark armed captures whose window has elapsed (and never caught/awaited a
-    confirm) as expired. 'ready' captures are NOT expired — their event is caught,
-    awaiting the user's confirm. Called opportunistically (poll + pruner)."""
+    """Sweep armed captures whose window has elapsed. A windowed capture that DID
+    catch events must NOT evaporate on the timer — flip it to 'ready' (awaiting the
+    user's Accept/Reject; candidates preserved). Only truly-empty armed captures
+    expire. 'ready' captures are never touched. Called opportunistically (poll +
+    pruner). Returns the number EXPIRED (the empty ones)."""
+    # Windowed-with-events → 'ready'. Instant captures already flip to 'ready' on
+    # their first event, so (armed AND captured_count > 0) is uniquely a windowed run.
+    conn.execute(
+        "UPDATE training_capture SET status = 'ready' "
+        "WHERE status = 'armed' AND expires_at <= datetime('now') "
+        "AND captured_count > 0")
     cur = conn.execute(
         "UPDATE training_capture SET status = 'expired' "
-        "WHERE status = 'armed' AND expires_at <= datetime('now')")
+        "WHERE status = 'armed' AND expires_at <= datetime('now') "
+        "AND captured_count = 0")
     conn.commit()
     return cur.rowcount
 
@@ -4420,6 +4429,102 @@ def record_training_candidate(conn: sqlite3.Connection, circuit: str,
                      (new_count, cap["id"]))
     conn.commit()
     return True
+
+
+# ── Pressure-history helpers (24 h dashboard chart) ──────────────────────────
+_BAD_PRESSURE_STATES = frozenset({"", "unavailable", "unknown", "none", "nan"})
+
+
+def coerce_pressure_state(state) -> Optional[float]:
+    """Parse a HA state to a float PSI, or None for unavailable/unknown/non-numeric
+    (those mark a recorder gap, not a reading)."""
+    if state is None:
+        return None
+    s = str(state).strip().lower()
+    if s in _BAD_PRESSURE_STATES:
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def downsample_pressure_series(states, start_epoch: float, end_epoch: float,
+                               buckets: int = 288) -> List[Dict[str, Any]]:
+    """Bucket [start,end] (epoch seconds) into `buckets` even slots for a 24 h line.
+    Each slot = mean of the numeric samples in it; an empty *quiet* slot carries the
+    last-known value forward (a recorded sensor holds its value between changes); an
+    unavailable/unknown sample breaks the carry so a real outage renders as a gap
+    (`v: None`). Leading slots before the first sample are gaps. Returns
+    [{t: epoch_ms, v: float|None}] of length `buckets` (client formats `t` → HH:MM)."""
+    span = end_epoch - start_epoch
+    if span <= 0 or buckets <= 0:
+        return []
+    width = span / buckets
+    sums = [0.0] * buckets
+    counts = [0] * buckets
+    breaks = [False] * buckets
+    for s in states:
+        ts = s.get("last_changed")
+        if ts is None:
+            continue
+        ep = ts.timestamp() if hasattr(ts, "timestamp") else float(ts)
+        offset = ep - start_epoch
+        if offset < 0:
+            offset = 0.0
+        if offset >= span:
+            continue
+        idx = int(offset / width)
+        if idx >= buckets:
+            idx = buckets - 1
+        v = coerce_pressure_state(s.get("state"))
+        if v is None:
+            breaks[idx] = True
+        else:
+            sums[idx] += v
+            counts[idx] += 1
+    out: List[Dict[str, Any]] = []
+    last: Optional[float] = None
+    for i in range(buckets):
+        t_ms = int((start_epoch + width * i) * 1000)
+        if counts[i]:
+            val: Optional[float] = round(sums[i] / counts[i], 2)
+            last = val
+        elif breaks[i]:
+            val = None
+            last = None
+        else:
+            val = last
+        out.append({"t": t_ms, "v": val})
+    return out
+
+
+def recent_pressure_baseline(conn: sqlite3.Connection, circuit: str,
+                             since_iso: str) -> Optional[float]:
+    """Typical *resting* pressure for the baseline reference line: AVG of recent
+    pre-event pressures over the window; fall back to the latest event's pre-event
+    pressure, then the latest leak-test baseline, else None. PSI."""
+    row = conn.execute(
+        "SELECT AVG(pre_event_pressure_psi) AS b FROM events "
+        "WHERE circuit = ? AND start_ts >= ? "
+        "AND pre_event_pressure_psi IS NOT NULL AND pre_event_pressure_psi > 0",
+        (circuit, since_iso)).fetchone()
+    if row and row["b"] is not None:
+        return round(row["b"], 2)
+    row = conn.execute(
+        "SELECT pre_event_pressure_psi AS b FROM events "
+        "WHERE circuit = ? AND pre_event_pressure_psi IS NOT NULL "
+        "AND pre_event_pressure_psi > 0 ORDER BY start_ts DESC LIMIT 1",
+        (circuit,)).fetchone()
+    if row and row["b"] is not None:
+        return round(row["b"], 2)
+    row = conn.execute(
+        "SELECT baseline_psi AS b FROM leak_test_history "
+        "WHERE circuit = ? AND baseline_psi IS NOT NULL "
+        "ORDER BY run_at DESC LIMIT 1", (circuit,)).fetchone()
+    if row and row["b"] is not None:
+        return round(row["b"], 2)
+    return None
 
 
 def migrate_to_type_level_clusters(

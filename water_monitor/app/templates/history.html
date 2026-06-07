@@ -144,7 +144,7 @@
       <tbody>
         {% for t in ch.leak_tests %}
         {% set drop_rate = (t.pressure_drop_psi / t.duration_minutes) if (t.pressure_drop_psi is not none and t.duration_minutes) else none %}
-        <tr class="{% if 'Passed' in (t.result or '') %}hist-row-pass{% elif t.result %}hist-row-fail{% endif %}">
+        <tr class="{% if 'Passed' in (t.result or '') %}hist-row-pass{% elif t.result %}hist-row-fail{% endif %}{% if loop.index > 3 %} hist-extra-row{% endif %}"{% if loop.index > 3 %} style="display:none"{% endif %}>
           <td class="hist-td hist-td-mono"><time data-ts="{{ t.run_at or '' }}">{{ (t.run_at or '')[:16] }}</time></td>
           <td class="hist-td">{{ t.triggered_by or '—' }}</td>
           <td class="hist-td">
@@ -165,6 +165,12 @@
       </tbody>
     </table>
   </div>
+  {% if ch.leak_tests|length > 3 %}
+  <div class="hist-see-more-wrap" style="margin-top:8px">
+    <button type="button" class="btn btn-ghost btn-sm hist-see-more" data-expanded="0"
+            data-more-label="See {{ ch.leak_tests|length - 3 }} more">See {{ ch.leak_tests|length - 3 }} more</button>
+  </div>
+  {% endif %}
   {% else %}
   <p class="hist-empty">No leak tests run yet.</p>
   {% endif %}
@@ -199,7 +205,7 @@
       <tbody>
         {% for e in ch.events %}
         {% set _fix_label = fixture_type_labels.get(e.user_fixture_type, '') if e.user_fixture_type else '' %}
-        <tr class="hist-event-row{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.is_pressure_restoration_phantom %} hist-row-phantom{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}"
+        <tr class="hist-event-row{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.is_pressure_restoration_phantom %} hist-row-phantom{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}{% if loop.index > 25 %} hist-extra-row{% endif %}"{% if loop.index > 25 %} style="display:none"{% endif %}
             tabindex="0" role="button" aria-label="Event detail"
             data-event-id="{{ e.id }}"
             data-circuit="{{ ch.circuit }}"
@@ -286,6 +292,12 @@
       </tbody>
     </table>
   </div>
+  {% if ch.events|length > 25 %}
+  <div class="hist-see-more-wrap" style="margin-top:8px">
+    <button type="button" class="btn btn-ghost btn-sm hist-see-more" data-expanded="0"
+            data-more-label="See {{ ch.events|length - 25 }} more">See {{ ch.events|length - 25 }} more</button>
+  </div>
+  {% endif %}
   {% else %}
   <p class="hist-empty">No events detected yet. Events appear once training begins.</p>
   {% endif %}
@@ -590,6 +602,20 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   if (isNaN(d)) return;
   const pad = n => String(n).padStart(2, '0');
   el.textContent = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+});
+
+// ── Collapsible "See more" tables (leak tests show 3, events show 25) ────────
+document.querySelectorAll('.hist-see-more').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const card = btn.closest('.hist-card');
+    if (!card) return;
+    const expanded = btn.dataset.expanded === '1';
+    card.querySelectorAll('tr.hist-extra-row').forEach(r => {
+      r.style.display = expanded ? 'none' : 'table-row';
+    });
+    btn.dataset.expanded = expanded ? '0' : '1';
+    btn.textContent = expanded ? btn.dataset.moreLabel : 'See less';
+  });
 });
 
 // ── Event detail modal ──────────────────────────────────────────────────────
