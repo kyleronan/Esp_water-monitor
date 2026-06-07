@@ -15,15 +15,15 @@
 <h2 class="fx-circuit-heading" style="margin-top:18px">{{ circ.display_name }}</h2>
 
 {# Active-capture panel (shown via polling when a capture is armed/ready) #}
-<div class="fx-msg fx-msg-warn" id="tr-active-{{ circ.circuit }}" hidden
-     style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+<div class="fx-msg fx-msg-warn" id="tr-active-{{ circ.circuit }}"
+     style="display:none;align-items:center;gap:.75rem;flex-wrap:wrap">
   <span id="tr-msg-{{ circ.circuit }}" style="font-weight:600">…</span>
   <span class="muted" id="tr-sub-{{ circ.circuit }}" style="font-size:12px"></span>
   <span style="flex:1"></span>
-  <button class="btn btn-secondary btn-sm" data-act="cancel"  data-circuit="{{ circ.circuit }}" id="tr-cancel-{{ circ.circuit }}"  hidden>Cancel</button>
-  <button class="btn btn-secondary btn-sm" data-act="extend"  data-circuit="{{ circ.circuit }}" id="tr-extend-{{ circ.circuit }}"  hidden>+15 min</button>
-  <button class="btn btn-secondary btn-sm" data-act="reject"  data-circuit="{{ circ.circuit }}" id="tr-reject-{{ circ.circuit }}"  hidden>Redo</button>
-  <button class="btn btn-primary btn-sm"   data-act="confirm" data-circuit="{{ circ.circuit }}" id="tr-confirm-{{ circ.circuit }}" hidden>Accept</button>
+  <button class="btn btn-secondary btn-sm" data-act="cancel"  data-circuit="{{ circ.circuit }}" id="tr-cancel-{{ circ.circuit }}"  style="display:none">Cancel</button>
+  <button class="btn btn-secondary btn-sm" data-act="extend"  data-circuit="{{ circ.circuit }}" id="tr-extend-{{ circ.circuit }}"  style="display:none">+15 min</button>
+  <button class="btn btn-secondary btn-sm" data-act="reject"  data-circuit="{{ circ.circuit }}" id="tr-reject-{{ circ.circuit }}"  style="display:none">Redo</button>
+  <button class="btn btn-primary btn-sm"   data-act="confirm" data-circuit="{{ circ.circuit }}" id="tr-confirm-{{ circ.circuit }}" style="display:none">Accept</button>
 </div>
 
 {% if not circ.fixtures %}
@@ -44,7 +44,7 @@
       {% if it.windows %}
       <select class="tr-window" id="tr-win-{{ circ.circuit }}-{{ it.type }}"
               style="padding:4px 6px;font-size:12px">
-        {% for w in it.windows %}<option value="{{ w }}">monitor {{ w }} min</option>{% endfor %}
+        {% for w in it.windows %}<option value="{{ w }}">monitor {% if w >= 60 %}{{ w // 60 }} hr{% if w % 60 %} {{ w % 60 }} min{% endif %}{% else %}{{ w }} min{% endif %}</option>{% endfor %}
       </select>
       {% endif %}
       <button class="btn btn-ghost btn-sm tr-arm" data-circuit="{{ circ.circuit }}"
@@ -106,7 +106,7 @@
     });
   });
 
-  function show(id, on) { const el = document.getElementById(id); if (el) el.hidden = !on; }
+  function show(id, on, disp) { const el = document.getElementById(id); if (el) el.style.display = on ? (disp || "") : "none"; }
   function setText(id, t) { const el = document.getElementById(id); if (el) el.textContent = t; }
 
   async function poll() {
@@ -121,7 +121,7 @@
       const active = s.status === "armed" || s.status === "ready";
       // Block every arm button on this circuit while one item is active.
       document.querySelectorAll(`.tr-arm[data-circuit="${circuit}"]`).forEach(b => { b.disabled = active; });
-      show(`tr-active-${circuit}`, active);
+      show(`tr-active-${circuit}`, active, "flex");
       if (!active) continue;
 
       const ft = s.fixture_type || "fixture";
