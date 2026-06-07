@@ -317,6 +317,8 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                 db, event_id, circuit,
                 phantom=data["phantom"],
                 supply_pressure=data["supply_pressure"],
+                dribble=data["dribble"],
+                cross_talk=data["cross_talk"],
             )
         if not ok:
             return JSONResponse({"error": "Event not found"}, status_code=404)

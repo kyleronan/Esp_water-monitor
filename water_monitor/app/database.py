@@ -1962,6 +1962,8 @@ def classify_action(cls: dict):
     flags = {
         "phantom":         bool(cls.get("phantom")),
         "supply_pressure": bool(cls.get("supply_pressure")),
+        "dribble":         bool(cls.get("dribble")),
+        "cross_talk":      bool(cls.get("cross_talk")),
     }
     if cls.get("reset") is True:
         if any(flags.values()):
@@ -1977,6 +1979,8 @@ def set_event_classification(
     *,
     phantom: bool,
     supply_pressure: bool,
+    dribble: bool = False,
+    cross_talk: bool = False,
 ) -> bool:
     """Apply a user's manual event classification (Sprint H, authoritative).
 
@@ -1992,6 +1996,8 @@ def set_event_classification(
         conn, event_id, circuit,
         new_phantom=1 if phantom else 0,
         new_degraded=1 if supply_pressure else 0,
+        new_dribble=1 if dribble else 0,
+        new_cross_talk=1 if cross_talk else 0,
         user_classified=1,
     )
 

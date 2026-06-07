@@ -230,6 +230,7 @@
             data-degraded="{{ '1' if e.degraded_supply else '0' }}"
             data-phantom="{{ '1' if e.is_pressure_restoration_phantom else '0' }}"
             data-cross-talk="{{ '1' if e.is_cross_talk else '0' }}"
+            data-dribble="{{ '1' if e.is_low_flow_dribble else '0' }}"
             data-classified="{{ '1' if e.user_classified else '0' }}"
             data-volume-effective="{{ (e.volume_litres_effective * vol_factor)|round(vol_decimals) if e.volume_litres_effective is not none else '' }}"
             data-volume-method="{{ e.volume_estimation_method or 'raw' }}"
@@ -400,6 +401,10 @@
           <span>Pressure artifact (phantom)</span></label>
         <label class="emd-check"><input type="checkbox" id="emd-cls-supply">
           <span>Supply-pressure issue</span></label>
+        <label class="emd-check"><input type="checkbox" id="emd-cls-dribble">
+          <span>Low-flow dribble</span></label>
+        <label class="emd-check"><input type="checkbox" id="emd-cls-crosstalk">
+          <span>Cross-talk</span></label>
       </div>
       <div style="display:flex;align-items:center;gap:.75rem;margin-top:.5rem;flex-wrap:wrap">
         <span class="muted" style="font-size:11px">Saved with the <strong>Save</strong> button below.</span>
@@ -637,12 +642,14 @@ document.querySelectorAll('.hist-see-more').forEach(btn => {
   // Sprint H — manual classification controls.
   const clsPhantom  = document.getElementById('emd-cls-phantom');
   const clsSupply   = document.getElementById('emd-cls-supply');
+  const clsDribble  = document.getElementById('emd-cls-dribble');
+  const clsCrosstalk = document.getElementById('emd-cls-crosstalk');
   const clsResetBtn = document.getElementById('emd-classify-reset-btn');
   const clsHint     = document.getElementById('emd-classify-hint');
   // Initial checkbox state captured on modal open — used so the main Save
   // only sends `classification` when the user actually changed something
   // (labelling alone must not silently lock auto-detection off).
-  let clsInitial = { phantom: false, supply_pressure: false };
+  let clsInitial = { phantom: false, supply_pressure: false, dribble: false, cross_talk: false };
 
   // Startup diagnostic
   const rows = document.querySelectorAll('.hist-event-row');
@@ -676,9 +683,13 @@ document.querySelectorAll('.hist-see-more').forEach(btn => {
     // and remember the initial state for change-detection on Save.
     if (clsPhantom)  clsPhantom.checked  = d.phantom === '1';
     if (clsSupply)   clsSupply.checked   = d.degraded === '1';
+    if (clsDribble)  clsDribble.checked  = d.dribble === '1';
+    if (clsCrosstalk) clsCrosstalk.checked = d.crossTalk === '1';
     clsInitial = {
       phantom:         d.phantom === '1',
       supply_pressure: d.degraded === '1',
+      dribble:         d.dribble === '1',
+      cross_talk:      d.crossTalk === '1',
     };
     // Sprint H.1 — the "manually classified" hint + Reset link only apply
     // once the user has locked a manual classification.
@@ -962,9 +973,13 @@ document.querySelectorAll('.hist-see-more').forEach(btn => {
     const cur = {
       phantom:         !!(clsPhantom && clsPhantom.checked),
       supply_pressure: !!(clsSupply && clsSupply.checked),
+      dribble:         !!(clsDribble && clsDribble.checked),
+      cross_talk:      !!(clsCrosstalk && clsCrosstalk.checked),
     };
     if (cur.phantom !== clsInitial.phantom
-        || cur.supply_pressure !== clsInitial.supply_pressure) {
+        || cur.supply_pressure !== clsInitial.supply_pressure
+        || cur.dribble !== clsInitial.dribble
+        || cur.cross_talk !== clsInitial.cross_talk) {
       payload.classification = cur;
     }
     const ok = await patchEvent(payload);
