@@ -2969,10 +2969,28 @@ def get_orphaned_fixtures(
 #     heuristic pass (every 10 events) can repopulate
 # ============================================================================
 
+# dev.22 — cluster-suggestion gate. A mixed cluster must ABSTAIN rather than
+# broadcast its (possibly training-inflated) plurality to every unlabelled member.
+_SUGGEST_MIN_MEMBERS: int = 3       # cluster needs >=3 labelled events to define a type
+_SUGGEST_MIN_SHARE: float = 0.65    # weighted winner must hold a clear majority
+_SUGGEST_MIN_WINNER_RAW: int = 3    # the winning type needs >=3 raw labels of its own
+
+
+def _knn_usable_label_counts(conn: sqlite3.Connection, circuit: str) -> Dict[str, int]:
+    """Per-type count of kNN-usable labels on a circuit — the inverse-frequency
+    denominator for the class-balanced cluster vote (precompute once, reuse)."""
+    return {r[0]: int(r[1]) for r in conn.execute(
+        "SELECT user_fixture_type, COUNT(*) FROM events "
+        "WHERE circuit = ? AND user_fixture_type IS NOT NULL "
+        "  AND COALESCE(excluded_from_training, 0) = 0 "
+        "GROUP BY user_fixture_type", (circuit,)).fetchall()}
+
+
 def recompute_cluster_suggestion_from_user_labels(
     conn: sqlite3.Connection,
     circuit: str,
     cluster_id: int,
+    global_counts: Optional[Dict[str, int]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Recompute a cluster's suggested_type from majority vote of user
     labels on its member events.
@@ -2984,16 +3002,20 @@ def recompute_cluster_suggestion_from_user_labels(
     (so the cluster row is untouched and the heuristic suggestion, if
     any, stays valid).
     """
-    rows = conn.execute(
-        "SELECT user_fixture_type, COUNT(*) AS cnt "
-        "FROM events "
-        "WHERE circuit = ? AND cluster_id = ? "
-        "  AND user_fixture_type IS NOT NULL "
-        "GROUP BY user_fixture_type",
+    # One row per labelled non-excluded member; MIN(capture_id) dedups the
+    # training_capture_candidates fan-out so each event is counted exactly once.
+    detail = conn.execute(
+        "SELECT e.id AS eid, e.user_fixture_type AS t, MIN(tcc.capture_id) AS cap "
+        "FROM events e "
+        "LEFT JOIN training_capture_candidates tcc ON tcc.event_id = e.id "
+        "WHERE e.circuit = ? AND e.cluster_id = ? "
+        "  AND e.user_fixture_type IS NOT NULL "
+        "  AND COALESCE(e.excluded_from_training, 0) = 0 "
+        "GROUP BY e.id, e.user_fixture_type",
         (circuit, cluster_id),
     ).fetchall()
 
-    if not rows:
+    if not detail:
         # No labels on this cluster's events. If the current suggestion
         # is from user labels (i.e. the user just *removed* every label),
         # reset back to NULL so the heuristic pass can pick a fresh
@@ -3022,15 +3044,38 @@ def recompute_cluster_suggestion_from_user_labels(
             }
         return None
 
-    total = sum(r["cnt"] for r in rows)
-    # Sort by (count desc, type asc) — ties broken alphabetically so the
-    # result is deterministic across re-runs / restart re-replays.
-    ranked = sorted(
-        rows, key=lambda r: (-int(r["cnt"]), str(r["user_fixture_type"]))
-    )
-    winner_type = ranked[0]["user_fixture_type"]
-    winner_count = int(ranked[0]["cnt"])
-    confidence = winner_count / total if total > 0 else 0.0
+    # Class-balanced, capture-collapsed weighted vote (dev.22). Each labelled
+    # member is weighted 1/global_count[type]; events sharing a training capture
+    # collapse to a single vote so one windowed capture can't manufacture a
+    # plurality. global_counts is passed in by the bulk caller (computed once).
+    if global_counts is None:
+        global_counts = _knn_usable_label_counts(conn, circuit)
+
+    raw_counts: Dict[str, int] = {}
+    vote_keys: Dict[str, set] = {}
+    for d in detail:
+        t = d["t"]
+        raw_counts[t] = raw_counts.get(t, 0) + 1
+        key = ("cap", d["cap"]) if d["cap"] is not None else ("ev", d["eid"])
+        vote_keys.setdefault(t, set()).add(key)
+    total_raw = sum(raw_counts.values())
+
+    weighted = {t: len(keys) / max(1, global_counts.get(t, 0))
+                for t, keys in vote_keys.items()}
+    # Winner = max weighted vote; deterministic alphabetical tie-break. EVERY gate
+    # below tests this same weighted winner (not the raw plurality).
+    winner_type = sorted(weighted.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    total_w = sum(weighted.values())
+    share = weighted[winner_type] / total_w if total_w > 0 else 0.0
+    winner_raw = raw_counts.get(winner_type, 0)
+
+    # Suggest the winner only if it clears all three gates; else ABSTAIN with a
+    # NULL type but source 'user_labels' (so the heuristic pass won't repopulate).
+    suggest = (winner_type != "other"
+               and total_raw >= _SUGGEST_MIN_MEMBERS
+               and share >= _SUGGEST_MIN_SHARE
+               and winner_raw >= _SUGGEST_MIN_WINNER_RAW)
+    new_type = winner_type if suggest else None
 
     conn.execute(
         "UPDATE fixture_clusters SET "
@@ -3038,16 +3083,58 @@ def recompute_cluster_suggestion_from_user_labels(
         "  suggested_confidence = ?, "
         "  suggestion_source = 'user_labels' "
         "WHERE circuit = ? AND id = ?",
-        (winner_type, confidence, circuit, cluster_id),
+        (new_type, share, circuit, cluster_id),
     )
     conn.commit()
     return {
-        "suggested_type": winner_type,
-        "suggested_confidence": confidence,
+        "suggested_type": new_type,
+        "suggested_confidence": share,
         "suggestion_source": "user_labels",
-        "labelled_member_count": winner_count,
-        "total_label_count": total,
+        "labelled_member_count": winner_raw,
+        "total_label_count": total_raw,
+        "abstained": not suggest,
     }
+
+
+def recompute_all_user_label_suggestions(
+    conn: sqlite3.Connection, circuit: str
+) -> Dict[str, int]:
+    """Re-run the gated user-label suggestion across every cluster that has user
+    labels (or a stale 'user_labels' suggestion). Computes the global class balance
+    ONCE and passes it into each cluster — O(clusters), not O(clusters x corpus).
+
+    This is the ONLY path that un-poisons a cluster whose suggestion was set under
+    the pre-dev.22 ungated plurality vote (``resuggest_all_clusters`` deliberately
+    skips 'user_labels' clusters). Returns ``{clusters, suggested, abstained,
+    cleared}`` (cleared = a prior non-NULL suggestion now abstained)."""
+    global_counts = _knn_usable_label_counts(conn, circuit)
+    cluster_ids = [r[0] for r in conn.execute(
+        "SELECT fc.id FROM fixture_clusters fc "
+        "WHERE fc.circuit = ? AND ("
+        "  fc.suggestion_source = 'user_labels' "
+        "  OR EXISTS (SELECT 1 FROM events e WHERE e.circuit = fc.circuit "
+        "             AND e.cluster_id = fc.id AND e.user_fixture_type IS NOT NULL "
+        "             AND COALESCE(e.excluded_from_training, 0) = 0))",
+        (circuit,)).fetchall()]
+    suggested = abstained = cleared = 0
+    for cid in cluster_ids:
+        prev = conn.execute(
+            "SELECT suggested_type FROM fixture_clusters WHERE circuit = ? AND id = ?",
+            (circuit, cid)).fetchone()
+        prev_type = prev["suggested_type"] if prev else None
+        res = recompute_cluster_suggestion_from_user_labels(
+            conn, circuit, int(cid), global_counts=global_counts)
+        new_type = res.get("suggested_type") if res else None
+        if new_type:
+            suggested += 1
+        else:
+            abstained += 1
+            if prev_type is not None:
+                cleared += 1
+    log.info("[%s] user-label resuggest: %d clusters, %d suggested, %d abstained, "
+             "%d cleared", circuit, len(cluster_ids), suggested, abstained, cleared)
+    return {"clusters": len(cluster_ids), "suggested": suggested,
+            "abstained": abstained, "cleared": cleared}
 
 
 def relink_fixture_to_cluster(
@@ -3203,6 +3290,12 @@ _SIGNATURE_KNN_MIN_LABELS_PER_CLASS: int = 2  # class too sparse → not voted
 # margin 0.6 the LOO set was 85% covered / 86% accurate on what it typed.
 _SIGNATURE_KNN_CONFIDENCE_THRESHOLD: float = 1.5
 _SIGNATURE_KNN_MARGIN_THRESHOLD: float = 0.6
+# dev.22 imbalance hardening — cap a single class to this many of the K neighbours
+# so the most-labelled class can't fill every slot in a contested region. LOCKED at
+# 4 by the LOO sweep (tools/eval_knn_classifier.py) on the labelled archive: cap<=3
+# over-restricted (coverage collapsed to ~0.47); 4 holds dishwasher/toilet recall at
+# baseline while inverse-freq weighting + the cycle feature lift tap/washing-machine.
+_SIGNATURE_KNN_MAX_PER_CLASS: int = 4
 # Per-feature scales ≈ each feature's std in log1p space on the labelled set.
 _SIGNATURE_KNN_SCALES: dict = {
     "avg_flow_lpm":          0.70,
@@ -3224,6 +3317,12 @@ _SIGNATURE_KNN_SCALES: dict = {
 _SIGNATURE_KNN_ACTIVE_FEATURES: tuple = (
     "true_avg_flow_lpm", "peak_flow_lpm", "active_flow_duration_seconds",
     "volume_litres", "pressure_delta_psi", "steady_state_fraction", "flow_on_ratio",
+    # dev.22: cycle_pulse_count separates appliance fills (dishwasher ~3.5,
+    # washing-machine ~2.9 pulses) from single toilet/tap fills (<1.3). Active set
+    # only — kept out of _SIGNATURE_MATCH_FEATURES (which also feeds the stored
+    # centroid signature) to avoid changing that shape. Requires the cycle-pulse
+    # backfill to run BEFORE reclassify (orchestrator/fixtures reordered in dev.22).
+    "cycle_pulse_count",
 )
 _SIGNATURE_KNN_ACTIVE_LOG_FEATURES: frozenset = frozenset({
     "true_avg_flow_lpm", "peak_flow_lpm", "active_flow_duration_seconds", "volume_litres",
@@ -3236,6 +3335,11 @@ _SIGNATURE_KNN_ACTIVE_SCALES: dict = {
     "pressure_delta_psi":          2.88,
     "steady_state_fraction":       0.25,
     "flow_on_ratio":               0.25,   # linear (a 0–1 ratio), not log
+    # dev.22: cycle_pulse_count is a small integer count (0–7), linear, NOT log.
+    # Scale 0.75 LOCKED by the LOO sweep (interior optimum; 0.5 and 1.0 both
+    # slightly worse) — overall LOO accuracy 0.593→0.638, washing-machine recall
+    # 0.23→0.69, dishwasher/toilet held at baseline.
+    "cycle_pulse_count":           0.75,
 }
 
 
@@ -3278,15 +3382,35 @@ def _knn_vote(labelled, event_features, features, scales, log_features):
     if not dists:
         return None
     dists.sort(key=lambda x: x[0])
-    neighbours = dists[:_SIGNATURE_KNN_K]
-    score: Dict[str, float] = {}
+    # Per-class neighbour cap (dev.22): take the K nearest, but stop adding a
+    # class once it already holds _SIGNATURE_KNN_MAX_PER_CLASS slots, so a
+    # numerically dominant class can't fill every neighbour in a contested region.
+    neighbours: list = []
+    per_class: Dict[str, int] = {}
+    for d, t in dists:
+        if per_class.get(t, 0) >= _SIGNATURE_KNN_MAX_PER_CLASS:
+            continue
+        neighbours.append((d, t))
+        per_class[t] = per_class.get(t, 0) + 1
+        if len(neighbours) >= _SIGNATURE_KNN_K:
+            break
+
+    # Two scores (dev.22): raw inverse-distance drives the absolute confidence
+    # floor (the out-of-distribution guard, calibrated at 1.5); a class-balanced
+    # score (× 1/sqrt(global count)) drives winner selection + margin so the
+    # most-labelled class can't take over the ambiguous region by sheer numbers.
+    score_raw: Dict[str, float] = {}
+    score_bal: Dict[str, float] = {}
     for d, t in neighbours:
-        score[t] = score.get(t, 0.0) + 1.0 / (d + 1e-6)
-    total = sum(score.values())
-    win_t, win_s = max(score.items(), key=lambda kv: kv[1])
-    if (win_s < _SIGNATURE_KNN_CONFIDENCE_THRESHOLD
-            or total <= 0
-            or (win_s / total) < _SIGNATURE_KNN_MARGIN_THRESHOLD):
+        w = 1.0 / (d + 1e-6)
+        score_raw[t] = score_raw.get(t, 0.0) + w
+        score_bal[t] = score_bal.get(t, 0.0) + w / math.sqrt(counts[t])
+    total_bal = sum(score_bal.values())
+    win_t, win_bal = max(score_bal.items(), key=lambda kv: kv[1])
+    win_raw = score_raw[win_t]
+    if (win_raw < _SIGNATURE_KNN_CONFIDENCE_THRESHOLD
+            or total_bal <= 0
+            or (win_bal / total_bal) < _SIGNATURE_KNN_MARGIN_THRESHOLD):
         return None
     if win_t == "other":
         return None
@@ -3294,8 +3418,8 @@ def _knn_vote(labelled, event_features, features, scales, log_features):
     return {
         "fixture_type": win_t,
         "distance": nearest,
-        "score": win_s,
-        "margin": win_s / total,
+        "score": win_raw,
+        "margin": win_bal / total_bal,
         "member_count": counts[win_t],
     }
 
@@ -3779,7 +3903,7 @@ def match_event_to_signature_knn(
         active = _labelled(
             "SELECT user_fixture_type, true_avg_flow_lpm, peak_flow_lpm, "
             "       active_flow_duration_seconds, volume_litres, pressure_delta_psi, "
-            "       steady_state_fraction, flow_on_ratio "
+            "       steady_state_fraction, flow_on_ratio, cycle_pulse_count "
             "FROM events "
             "WHERE circuit = ? "
             "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "

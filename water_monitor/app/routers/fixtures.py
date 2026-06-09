@@ -619,7 +619,8 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
         from ..database import (reclassify_all_events_from_signatures,
                                 cleanup_composite_flags, run_isolated_write,
                                 get_write_lock, recompute_cycle_pulse_counts,
-                                resuggest_all_clusters)
+                                resuggest_all_clusters,
+                                recompute_all_user_label_suggestions)
         from ..config import DB_PATH
         # Reject (don't silently queue for many seconds) if another heavy DB
         # write is already running — recompute/reclassify/recluster all share
@@ -650,11 +651,12 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
         def _job(conn):
             r = recompute_volume_and_active_flow(conn, circuit, fetch)
             cleanup_composite_flags(conn)
-            reclassify_all_events_from_signatures(conn, circuit)
-            # Temporal appliance-cycle backfill + heuristic re-suggest so the
-            # corrected volumes feed dishwasher/washing-machine cycle detection.
+            # dev.22: cycle-pulse backfill MUST precede reclassify so the matcher's
+            # cycle_pulse_count feature is populated before it types events.
             recompute_cycle_pulse_counts(conn, circuit)
-            resuggest_all_clusters(conn, circuit)
+            reclassify_all_events_from_signatures(conn, circuit)
+            resuggest_all_clusters(conn, circuit)                # heuristic clusters
+            recompute_all_user_label_suggestions(conn, circuit)  # gated user-label clusters
             return r
 
         res = await run_isolated_write(DB_PATH, _job)
