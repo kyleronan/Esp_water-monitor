@@ -614,6 +614,13 @@ CREATE TABLE IF NOT EXISTS events (
     -- set AND matched_fixture_type set if the cluster matched but the
     -- signature gave a more specific type guess.
     matched_fixture_type             TEXT,
+    -- Match provenance (migration 20260541, dev.23 rules tier): how
+    -- matched_fixture_type was produced — 'knn' (signature k-NN),
+    -- 'washer_cycle' (anchor + same-peak family), 'rule_toilet'/
+    -- 'rule_dishwasher'/'rule_shower' (structural event rules),
+    -- 'zone_default' (zone-circuit fallback), NULL (legacy/cluster/none).
+    -- Machine-derived; recomputed by every reclassify; NEVER user-preserved.
+    matched_via                      TEXT,
     -- Pressure-restoration phantom guard (migration 20260532). When 1, this
     -- event matched the long-duration + near-zero-pressure-drop fingerprint
     -- of a city-pressure-restoration artifact. Its volume_litres_effective is
@@ -3819,16 +3826,20 @@ def set_event_matched_fixture_type(
     circuit: str,
     event_id: str,
     fixture_type: Optional[str],
+    via: Optional[str] = None,
 ) -> None:
-    """Write ``events.matched_fixture_type`` for one event.
+    """Write ``events.matched_fixture_type`` (+ its ``matched_via`` provenance)
+    for one event. ``via`` is forced NULL whenever the type is NULL (an abstain
+    clears both), so a stale provenance can never outlive its match.
 
     Does not commit — caller batches with surrounding writes (typically
     the cluster_id update in feature_extractor._cluster_event).
     """
     conn.execute(
-        "UPDATE events SET matched_fixture_type = ? "
+        "UPDATE events SET matched_fixture_type = ?, matched_via = ? "
         "WHERE id = ? AND circuit = ?",
-        (fixture_type, event_id, circuit),
+        (fixture_type, via if fixture_type is not None else None,
+         event_id, circuit),
     )
 
 
@@ -3945,15 +3956,17 @@ def reclassify_all_events_from_signatures(
     circuit: str,
 ) -> Dict[str, Any]:
     """Retrain signatures, then backfill ``matched_fixture_type`` over every
-    unlabelled event on ``circuit`` via the k-NN matcher.
+    unlabelled event on ``circuit`` — STRUCTURAL RULES FIRST (dev.23: washer-cycle
+    sweep, then the per-event toilet/dishwasher/shower/zone rules), k-NN as the
+    residual for events no rule claims. Each write stamps ``matched_via``.
 
     NEVER touches user-labelled rows (WHERE user_fixture_type IS NULL). Writes
     the canonical matched type, or NULL on abstention — writing NULL clears a
-    stale prior match, making the whole pass idempotent. Never writes 'other'
-    (that is a display-only fallback).
+    stale prior match (and its provenance), making the whole pass idempotent.
+    Never writes 'other' (that is a display-only fallback).
 
     Returns counts: ``{"signatures_trained", "events_scanned", "events_matched",
-    "events_cleared", "events_abstained"}``.
+    "events_rule_matched", "events_cleared", "events_abstained"}``.
     """
     # 1. Retrain the per-type centroids (for the Signatures UI display). The
     #    k-NN itself reads events directly, so this is purely cosmetic but keeps
@@ -3973,32 +3986,49 @@ def reclassify_all_events_from_signatures(
     #    active-flow features so the matcher uses whichever it can (active when
     #    backfilled). An event now excluded_from_training carries no fixture
     #    identity → its matched_fixture_type is cleared (stale-match carry-forward).
+    from .event_rules import detect_washer_cycles, rule_classify_event
+
     qfeats = tuple(dict.fromkeys(
-        _SIGNATURE_MATCH_FEATURES + _SIGNATURE_KNN_ACTIVE_FEATURES))
+        _SIGNATURE_MATCH_FEATURES + _SIGNATURE_KNN_ACTIVE_FEATURES
+        + ("has_pressure_transient",)))   # the flush predicate's extra input
+    circuit_type = get_circuit_type(conn, circuit)
+    # One O(n) pass for the whole circuit — the per-row loop then does dict
+    # lookups, never per-event window queries.
+    washer_ids = detect_washer_cycles(conn, circuit) if circuit_type != "zone" else {}
     rows = conn.execute(
-        "SELECT id, matched_fixture_type, excluded_from_training, "
+        "SELECT id, matched_fixture_type, matched_via, excluded_from_training, "
         "       " + ", ".join(qfeats) + " "
         "FROM events "
         "WHERE circuit = ? AND user_fixture_type IS NULL "
         "ORDER BY start_ts",
         (circuit,),
     ).fetchall()
-    scanned = matched = cleared = abstained = 0
+    scanned = matched = rule_matched = cleared = abstained = 0
     for r in rows:
         scanned += 1
         if r["excluded_from_training"]:
-            new_type = None     # artifacts/excluded carry no fixture identity
+            new_type, new_via = None, None   # artifacts carry no fixture identity
+        elif r["id"] in washer_ids:
+            new_type, new_via = "washing_machine", "washer_cycle"
         else:
             feats = {f: r[f] for f in qfeats}
-            hit = match_event_to_signature_knn(conn, circuit, feats)
-            new_type = _canonical_fixture_type(hit["fixture_type"]) if hit else None
+            rule_hit = rule_classify_event(feats, circuit_type)
+            if rule_hit is not None:
+                new_type, new_via = rule_hit
+            else:
+                hit = match_event_to_signature_knn(conn, circuit, feats)
+                new_type = _canonical_fixture_type(hit["fixture_type"]) if hit else None
+                new_via = "knn" if new_type is not None else None
         prev = r["matched_fixture_type"]
-        if new_type != prev:
-            set_event_matched_fixture_type(conn, circuit, r["id"], new_type)
+        if (new_type, new_via) != (prev, r["matched_via"]):
+            set_event_matched_fixture_type(conn, circuit, r["id"], new_type,
+                                           via=new_via)
             if new_type is None and prev is not None:
                 cleared += 1
         if new_type is not None:
             matched += 1
+            if new_via != "knn":
+                rule_matched += 1
         else:
             abstained += 1
     conn.commit()
@@ -4006,13 +4036,15 @@ def reclassify_all_events_from_signatures(
         "signatures_trained": signatures_trained,
         "events_scanned": scanned,
         "events_matched": matched,
+        "events_rule_matched": rule_matched,
         "events_cleared": cleared,
         "events_abstained": abstained,
     }
     log.info(
         "[%s] reclassify: trained %d signature(s); scanned %d unlabelled "
-        "event(s) → %d matched, %d abstained (%d stale cleared)",
-        circuit, signatures_trained, scanned, matched, abstained, cleared,
+        "event(s) → %d matched (%d via rules), %d abstained (%d stale cleared)",
+        circuit, signatures_trained, scanned, matched, rule_matched, abstained,
+        cleared,
     )
     return result
 
@@ -4269,26 +4301,45 @@ def propagate_cycle_label(conn: sqlite3.Connection, circuit: str, event_id,
                           fixture_type) -> int:
     """Auto-label an appliance event's cycle-mates the same type (source='cycle').
 
-    A mate is a same-circuit, currently-unlabeled, non-excluded event within
-    ±45 min whose volume AND avg flow are within ratio of the anchor. No-op for
-    non-appliance types. Caller owns the transaction (no commit). Returns the
-    number of mates labeled.
+    Dishwasher: a mate is a same-circuit, currently-unlabeled, non-excluded event
+    within ±45 min whose volume AND avg flow are within ratio of the anchor.
+
+    Washing machine (dev.23): the volume-ratio gate structurally fails — a washer
+    cycle alternates ≥9 L fills with sub-1.5 L top-offs (15× spread) at ~constant
+    PEAK. So washer mates are keyed on the PEAK family instead (pk within
+    0.8–1.3× of the anchor's, vol ≥ 0.5 L, dur ≤ 400 s), excluding flush-shaped
+    events (a toilet flush during laundry stays unlabeled).
+
+    No-op for non-appliance types. Caller owns the transaction (no commit).
+    Returns the number of mates labeled.
     """
     if fixture_type not in _CYCLE_APPLIANCE_TYPES:
         return 0
     anchor = conn.execute(
-        "SELECT start_ts, volume_litres, avg_flow_lpm FROM events "
-        "WHERE id = ? AND circuit = ?", (event_id, circuit),
+        "SELECT start_ts, volume_litres, avg_flow_lpm, peak_flow_lpm "
+        "FROM events WHERE id = ? AND circuit = ?", (event_id, circuit),
     ).fetchone()
     if anchor is None:
         return 0
     a_ts = _parse_event_ts(anchor["start_ts"])
-    try:
-        a_vol = float(anchor["volume_litres"])
-        a_flow = float(anchor["avg_flow_lpm"])
-    except (TypeError, ValueError):
+    washer_mode = fixture_type == "washing_machine"
+
+    def _num(v) -> float:
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    a_vol = _num(anchor["volume_litres"])
+    a_flow = _num(anchor["avg_flow_lpm"])
+    a_pk = _num(anchor["peak_flow_lpm"])
+    if a_ts is None:
         return 0
-    if a_ts is None or a_vol <= 0 or a_flow <= 0:
+    if washer_mode:
+        # Peak is the washer family key; vol/avg-flow may legitimately be NULL.
+        if a_pk <= 0:
+            return 0
+    elif a_vol <= 0 or a_flow <= 0:
         return 0
     # Coarse time-window pre-filter (bounds the rows; the 90-min window keeps it
     # small), then a precise parsed-timestamp check so an ISO tz-format quirk can
@@ -4297,13 +4348,17 @@ def propagate_cycle_label(conn: sqlite3.Connection, circuit: str, event_id,
     hi_ts = (a_ts + timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
     a_epoch = a_ts.timestamp()
     mates = conn.execute(
-        "SELECT id, start_ts, volume_litres, avg_flow_lpm FROM events "
+        "SELECT id, start_ts, volume_litres, avg_flow_lpm, duration_seconds, "
+        "       peak_flow_lpm, has_pressure_transient, pressure_delta_psi "
+        "FROM events "
         "WHERE circuit = ? AND id <> ? AND user_fixture_type IS NULL "
         "  AND COALESCE(excluded_from_training, 0) = 0 "
         "  AND start_ts BETWEEN ? AND ? "
-        "  AND volume_litres > 0 AND avg_flow_lpm > 0",
+        "  AND volume_litres > 0",
         (circuit, event_id, lo_ts, hi_ts),
     ).fetchall()
+    from .event_rules import (_WASHER_FAMILY_PK_RATIO, _WASHER_SIBLING_MAX_DUR_S,
+                              _WASHER_SIBLING_MIN_VOL_L, is_flush_shaped)
     n = 0
     for mr in mates:
         mt = _parse_event_ts(mr["start_ts"])
@@ -4311,11 +4366,23 @@ def propagate_cycle_label(conn: sqlite3.Connection, circuit: str, event_id,
             continue
         try:
             v = float(mr["volume_litres"])
-            f = float(mr["avg_flow_lpm"])
+            f = float(mr["avg_flow_lpm"]) if mr["avg_flow_lpm"] is not None else 0.0
+            pk = (float(mr["peak_flow_lpm"])
+                  if mr["peak_flow_lpm"] is not None else 0.0)
         except (TypeError, ValueError):
             continue
-        if (_CYCLE_PULSE_VOL_RATIO_LO <= v / a_vol <= _CYCLE_PULSE_VOL_RATIO_HI
-                and _CYCLE_FLOW_RATIO_LO <= f / a_flow <= _CYCLE_FLOW_RATIO_HI):
+        if washer_mode:
+            dur = mr["duration_seconds"]
+            ok = (v >= _WASHER_SIBLING_MIN_VOL_L
+                  and (dur is None or dur <= _WASHER_SIBLING_MAX_DUR_S)
+                  and _WASHER_FAMILY_PK_RATIO[0] * a_pk <= pk
+                  <= _WASHER_FAMILY_PK_RATIO[1] * a_pk
+                  and not is_flush_shaped(dict(mr)))
+        else:
+            ok = (f > 0
+                  and _CYCLE_PULSE_VOL_RATIO_LO <= v / a_vol <= _CYCLE_PULSE_VOL_RATIO_HI
+                  and _CYCLE_FLOW_RATIO_LO <= f / a_flow <= _CYCLE_FLOW_RATIO_HI)
+        if ok:
             conn.execute(
                 "UPDATE events SET user_fixture_type = ?, fixture_label_source = 'cycle' "
                 "WHERE id = ? AND circuit = ? AND user_fixture_type IS NULL",
@@ -4771,13 +4838,13 @@ def migrate_to_type_level_clusters(
             continue
 
         # Deterministic survivor: confirmed first, then member_count desc,
-        # then last_match_at desc, then id asc
-        eligible.sort(key=lambda c: (
-            -c["is_confirmed"],
-            -(c["member_count"] or 0),
-            -(c["last_match_at"] or ""),
-            c["id"],
-        ))
+        # then last_match_at desc, then id asc.  last_match_at is a TEXT
+        # ISO-8601 timestamp — it can't be negated into a single descending
+        # tuple key, so apply staged stable sorts, least-significant first.
+        eligible.sort(key=lambda c: c["id"])
+        eligible.sort(key=lambda c: c["last_match_at"] or "", reverse=True)
+        eligible.sort(key=lambda c: c["member_count"] or 0, reverse=True)
+        eligible.sort(key=lambda c: c["is_confirmed"], reverse=True)
         survivor = eligible[0]
         all_ids  = [cl["id"] for cl in eligible]
 
@@ -4785,7 +4852,7 @@ def migrate_to_type_level_clusters(
             result = merge_clusters(conn, circuit, survivor["id"], all_ids)
             clusters_removed += result["fixtures_removed"]
             types_merged     += 1
-        except (ValueError, Exception) as exc:
+        except Exception as exc:
             log.warning(
                 "[%s] migrate: merge_clusters failed for '%s': %s",
                 circuit, ftype, exc,

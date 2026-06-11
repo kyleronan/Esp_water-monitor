@@ -2203,6 +2203,9 @@ class FeatureExtractor:
         self._last_pulsing_alert_at: dict[str, datetime] = {}
         # Set by orchestrator after ClusterEngine is initialised and rebuilt.
         self.cluster_engine = None
+        # dev.23: per-circuit circuit_type cache for the structural rules tier
+        # (one DB read per circuit per process lifetime, not per event).
+        self._circuit_type_cache: dict[str, str] = {}
 
     def _spawn_alert_task(self, coro) -> None:
         """Fire a background alert and keep a strong ref until it completes."""
@@ -2695,19 +2698,52 @@ class FeatureExtractor:
             # — treat as fully anomalous.
             features["anomaly_score"] = 1.0
 
-        # Sprint C — signature-matcher fallback. Runs when the cluster
-        # matcher either returned no cluster_id (most rejection reasons)
-        # or returned a low-confidence match. The matcher centroid is
-        # learned from the user's labelled events, so a hit here gives
-        # the UI a confident fixture_type even without a cluster link.
-        # Caught broadly because matcher-or-DB failure must NEVER block
-        # the regular cluster_id write below.
+        # dev.23 — structural rules tier (rules-first; Pass-5 semantics). Runs
+        # BEFORE the k-NN regardless of cluster strength, mirroring the batch
+        # reclassify. The trailing washer scan is pre-gated to fixture circuits
+        # AND peaks inside the family envelope, so micro/gentle events skip it.
+        # Caught broadly: a rules failure must NEVER block the cluster_id write.
         matched_fixture_type: Optional[str] = None
+        matched_via: Optional[str] = None
+        washer_members: dict = {}
+        try:
+            from .event_rules import (
+                WASHER_FAMILY_PK_ENVELOPE, detect_washer_cycles,
+                rule_classify_event,
+            )
+            ctype = self._circuit_type_cache.get(circuit)
+            if ctype is None:
+                from .database import get_circuit_type
+                ctype = get_circuit_type(self._db, circuit)
+                self._circuit_type_cache[circuit] = ctype
+            pk = features.get("peak_flow_lpm")
+            if (ctype != "zone" and pk is not None
+                    and WASHER_FAMILY_PK_ENVELOPE[0] <= pk
+                    <= WASHER_FAMILY_PK_ENVELOPE[1]):
+                since = (datetime.now(timezone.utc)
+                         - timedelta(minutes=50)).isoformat()
+                washer_members = detect_washer_cycles(
+                    self._db, circuit, since_ts=since, limit=400)
+            if event_id in washer_members:
+                matched_fixture_type, matched_via = ("washing_machine",
+                                                     "washer_cycle")
+            else:
+                rule_hit = rule_classify_event(features, ctype)
+                if rule_hit is not None:
+                    matched_fixture_type, matched_via = rule_hit
+        except Exception as e:
+            log.warning("[%s] structural rules tier failed (non-fatal): %s",
+                        circuit, e)
+
+        # Sprint C — signature-matcher (k-NN) residual. Runs when no structural
+        # rule claimed the event AND the cluster matcher either returned no
+        # cluster_id or a low-confidence match. Caught broadly because
+        # matcher-or-DB failure must NEVER block the regular cluster_id write.
         weak_match = (
             cluster_id_result is None
             or (match_confidence is not None and match_confidence < 0.5)
         )
-        if weak_match:
+        if matched_fixture_type is None and weak_match:
             try:
                 from .database import match_event_to_signature_knn
                 sig_hit = match_event_to_signature_knn(
@@ -2715,6 +2751,7 @@ class FeatureExtractor:
                 )
                 if sig_hit is not None:
                     matched_fixture_type = sig_hit["fixture_type"]
+                    matched_via = "knn"
                     log.info(
                         "[%s] event %s matched signature %s (dist=%.2f, "
                         "trained on %d events)",
@@ -2736,13 +2773,40 @@ class FeatureExtractor:
                  match_rejection_reason   = ?,
                  seconds_since_prev_event = ?,
                  prev_cluster_id          = ?,
-                 matched_fixture_type     = ?
+                 matched_fixture_type     = ?,
+                 matched_via              = ?
                WHERE id = ?""",
             (cluster_id_result, match_confidence, match_level,
              match_rejection_reason,
              seconds_since_prev, prev_cluster_id, matched_fixture_type,
+             matched_via if matched_fixture_type is not None else None,
              event_id)
         )
+
+        # dev.23 — trailing retro-scan: a washer cycle COMPLETES over ~45 min,
+        # so earlier pulses were classified before the family existed (and there
+        # is no periodic reprocess). Retro-stamp the window's members now.
+        # Cycle context outranks any per-event machine match, so this MAY
+        # overwrite a prior knn/rule_* match; user labels are never touched.
+        if washer_members:
+            try:
+                retro = [eid for eid in washer_members if eid != event_id]
+                if retro:
+                    marks = ",".join("?" * len(retro))
+                    cur = self._db.execute(
+                        "UPDATE events SET matched_fixture_type = 'washing_machine', "
+                        "       matched_via = 'washer_cycle' "
+                        f"WHERE circuit = ? AND id IN ({marks}) "
+                        "  AND user_fixture_type IS NULL "
+                        "  AND COALESCE(matched_via, '') <> 'washer_cycle'",
+                        [circuit] + retro,
+                    )
+                    if cur.rowcount:
+                        log.info("[%s] washer cycle retro-matched %d earlier "
+                                 "event(s)", circuit, cur.rowcount)
+            except Exception as e:
+                log.warning("[%s] washer retro-scan failed (non-fatal): %s",
+                            circuit, e)
 
         # 4. Update fixtures.last_seen_at when this event matched a named fixture
         if cluster_id_result is not None:

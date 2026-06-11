@@ -25,7 +25,8 @@ from water_monitor.app import database as db  # noqa: E402
 
 def _load_labelled(conn, circuit):
     feats = list(dict.fromkeys(
-        db._SIGNATURE_MATCH_FEATURES + db._SIGNATURE_KNN_ACTIVE_FEATURES))
+        db._SIGNATURE_MATCH_FEATURES + db._SIGNATURE_KNN_ACTIVE_FEATURES
+        + ("has_pressure_transient",)))   # the rules tier's flush predicate input
     cols = ["id", "user_fixture_type", "integration_quality"] + feats
     rows = conn.execute(
         f"SELECT {', '.join(cols)} FROM events "
@@ -64,17 +65,30 @@ def _predict_loo(held, others):
     return hit["fixture_type"] if hit else None
 
 
-def evaluate(db_path, circuit, cycle_scale=None, max_per_class=None):
+def evaluate(db_path, circuit, cycle_scale=None, max_per_class=None,
+             with_rules=False):
+    """LOO evaluation. ``with_rules`` prepends the dev.23 structural rules tier
+    (washer-cycle sweep + per-event rules) before the k-NN residual — the
+    production reclassify order. The washer-cycle set is computed once from
+    features/timestamps only (label-free; see test_detector_is_label_free), so
+    the leave-one-out stays honest."""
     if cycle_scale is not None:
         db._SIGNATURE_KNN_ACTIVE_SCALES["cycle_pulse_count"] = cycle_scale
         db._SIGNATURE_KNN_SCALES["cycle_pulse_count"] = cycle_scale
     if max_per_class is not None and hasattr(db, "_SIGNATURE_KNN_MAX_PER_CLASS"):
         db._SIGNATURE_KNN_MAX_PER_CLASS = max_per_class
 
+    washer_ids = {}
+    circuit_type = "fixture"
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         labelled = _load_labelled(conn, circuit)
+        if with_rules:
+            from water_monitor.app.event_rules import detect_washer_cycles
+            circuit_type = db.get_circuit_type(conn, circuit)
+            if circuit_type != "zone":
+                washer_ids = detect_washer_cycles(conn, circuit)
     finally:
         conn.close()
 
@@ -82,11 +96,22 @@ def evaluate(db_path, circuit, cycle_scale=None, max_per_class=None):
     cls_total = defaultdict(int)
     cls_correct = defaultdict(int)
     confusion = defaultdict(lambda: defaultdict(int))
+    if with_rules:
+        from water_monitor.app.event_rules import rule_classify_event
     for i, held in enumerate(labelled):
         actual = db._canonical_fixture_type(held["user_fixture_type"])
         if not actual:
             continue
-        pred = _predict_loo(held, labelled[:i] + labelled[i + 1:])
+        pred = None
+        if with_rules:
+            if held["id"] in washer_ids:
+                pred = "washing_machine"
+            else:
+                rule_hit = rule_classify_event(held, circuit_type)
+                if rule_hit is not None:
+                    pred = rule_hit[0]
+        if pred is None:
+            pred = _predict_loo(held, labelled[:i] + labelled[i + 1:])
         total += 1
         cls_total[actual] += 1
         if pred is None:
@@ -122,9 +147,13 @@ def main():
     ap.add_argument("circuit", nargs="?", default="main")
     ap.add_argument("--cycle-scale", type=float, default=None)
     ap.add_argument("--max-per-class", type=int, default=None)
+    ap.add_argument("--with-rules", action="store_true",
+                    help="prepend the dev.23 structural rules tier (production order)")
     a = ap.parse_args()
-    res = evaluate(a.db_path, a.circuit, a.cycle_scale, a.max_per_class)
-    lbl = f"{a.circuit} cycle_scale={a.cycle_scale} max_per_class={a.max_per_class}"
+    res = evaluate(a.db_path, a.circuit, a.cycle_scale, a.max_per_class,
+                   with_rules=a.with_rules)
+    lbl = (f"{a.circuit} cycle_scale={a.cycle_scale} "
+           f"max_per_class={a.max_per_class} rules={a.with_rules}")
     _print(res, lbl)
 
 

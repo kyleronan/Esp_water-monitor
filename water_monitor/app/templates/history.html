@@ -275,7 +275,8 @@
             {% elif e.fixture_display_name %}
               <span class="pill pill-green">{{ e.fixture_display_name }}</span>
             {% elif e.matched_fixture_type %}
-              <span class="pill pill-neutral" title="Auto-matched from your labels">~ {{ fixture_type_labels.get(e.matched_fixture_type, e.matched_fixture_type | replace('_',' ') | title) }}</span>
+              {% set _via = e.matched_via or '' %}
+              <span class="pill pill-neutral" title="{% if _via == 'washer_cycle' %}Matched by washer cycle pattern — anchor fill plus same-peak top-offs/rinses{% elif _via == 'zone_default' %}Zone-circuit default — long high-flow run on an irrigation circuit{% elif _via.startswith('rule_') %}Matched by structural rule (volume/duration/pressure shape){% else %}Auto-matched from your labels{% endif %}">~ {{ fixture_type_labels.get(e.matched_fixture_type, e.matched_fixture_type | replace('_',' ') | title) }}</span>
             {% elif e.suggested_type %}
               <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }}</span>
             {% else %}

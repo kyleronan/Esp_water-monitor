@@ -873,16 +873,15 @@ class ClusterEngine:
                         )
                         continue
 
-                # Pick survivor deterministically
-                def _survivor_key(c: dict):
-                    return (
-                        -c["is_confirmed"],
-                        -(c["member_count"] or 0),
-                        -(c["last_match_at"] or ""),
-                        c["id"],
-                    )
-
-                eligible.sort(key=_survivor_key)
+                # Pick survivor deterministically: confirmed first, then
+                # member_count desc, then last_match_at desc, then id asc.
+                # last_match_at is a TEXT ISO-8601 timestamp — it can't be
+                # negated into a single descending tuple key, so apply
+                # staged stable sorts, least-significant key first.
+                eligible.sort(key=lambda c: c["id"])
+                eligible.sort(key=lambda c: c["last_match_at"] or "", reverse=True)
+                eligible.sort(key=lambda c: c["member_count"] or 0, reverse=True)
+                eligible.sort(key=lambda c: c["is_confirmed"], reverse=True)
                 survivor_id = eligible[0]["id"]
                 all_ids = [cl["id"] for cl in eligible]
 
@@ -893,7 +892,7 @@ class ClusterEngine:
                 try:
                     merge_clusters(self._db, circuit, survivor_id, all_ids)
                     merges += 1
-                except (ValueError, Exception) as exc:
+                except Exception as exc:
                     log.warning(
                         "[%s] auto_merge: merge_clusters failed for '%s': %s",
                         circuit, ftype, exc,
