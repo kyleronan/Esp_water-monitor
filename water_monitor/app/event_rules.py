@@ -333,12 +333,14 @@ def detect_softener_sessions(
     History rollup key, §7).
 
     A session is a run of consecutive NON-flush events — each within
-    ``_SOFTENER_CHAIN_GAP_MIN`` of the previous — that STARTS with a low-flow
-    event whose local clock time falls within ``band_center_min`` ±
-    ``_SOFTENER_START_BAND_MIN`` and whose total span is >= ``_SOFTENER_MIN_SPAN_
-    MIN``. A flush-shaped event ends the run (a 3 am flush during laundry/regen is
-    irreducibly ambiguous, so it is left to the per-event tiers). A trailing
-    backwash up to ``_SOFTENER_BACKWASH_TAIL_MIN`` past the run is also claimed.
+    ``_SOFTENER_CHAIN_GAP_MIN`` of the previous (and within ``_SOFTENER_MAX_SPAN_
+    MIN`` of the start) — that STARTS with a low-flow event whose local clock time
+    falls within ``band_center_min`` ± ``_SOFTENER_START_BAND_MIN``, AND whose
+    LOW-FLOW brine itself spans >= ``_SOFTENER_MIN_SPAN_MIN`` (a single low-flow
+    blip followed by moderate-flow draws is incidental morning activity, not a
+    regen). A flush-shaped event ends the run (a 3 am flush during laundry/regen
+    is irreducibly ambiguous, left to the per-event tiers). A trailing backwash up
+    to ``_SOFTENER_BACKWASH_TAIL_MIN`` past the run is also claimed.
 
     ``band_center_min`` is minutes-since-LOCAL-midnight (parse_hhmm_to_minutes of
     the user's regen time). ``tz`` is the home timezone used to convert each
@@ -399,6 +401,7 @@ def detect_softener_sessions(
         # Walk the run of consecutive non-flush events (a flush ends it).
         chain = [(sdt, edt, r)]
         last_end = edt
+        last_low_end = edt                        # the band start is low by construction
         j = i + 1
         while j < n:
             s2, e2, r2 = evs[j]
@@ -410,9 +413,16 @@ def detect_softener_sessions(
                 break                             # cap span — a regen isn't all morning
             chain.append((s2, e2, r2))
             last_end = max(last_end, e2)
+            if _is_low(r2):
+                last_low_end = max(last_low_end, e2)
             j += 1
-        if (last_end - sdt).total_seconds() / 60.0 < _SOFTENER_MIN_SPAN_MIN:
-            continue                              # too short to be a regen
+        # The BRINE (the low-flow draw) must itself span >= MIN_SPAN. A single
+        # low-flow blip at the regen time followed by moderate-flow draws (which a
+        # 45-min chain would otherwise absorb into a fake "session") is NOT a regen
+        # — this is what separates a real overnight regen from incidental morning
+        # activity that merely starts near the configured time.
+        if (last_low_end - sdt).total_seconds() / 60.0 < _SOFTENER_MIN_SPAN_MIN:
+            continue                              # brine too short to be a regen
         group_id = r["id"]
         for (_s, _e, rc) in chain:
             out[rc["id"]] = ("span" if _is_low(rc) else "backwash", group_id)
