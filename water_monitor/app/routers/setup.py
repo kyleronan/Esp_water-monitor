@@ -672,6 +672,7 @@ async def setup_home_details(request: Request):
         "request": request,
         "step": 5,
         "profile": profile,
+        "circuits": [c.circuit for c in orch._cfg.circuits],
         "page": "setup",
     })
 
@@ -707,6 +708,23 @@ async def setup_home_details_save(request: Request):
     sqft                       = coerce_int(form.get("sqft"),           lo=0, hi=100000, default=0)
     historical_import_enabled  = form.get("historical_import_enabled") == "1"
 
+    # dev.24 water softener (opt-in). The regen start time is REQUIRED when
+    # enabled — the session detector and the leak-test blackout both key on it,
+    # so re-prompt rather than silently persist has_water_softener=1 with no time.
+    from ..event_rules import parse_hhmm_to_minutes
+    has_softener = form.get("has_water_softener") == "1"
+    softener_start = (form.get("softener_regen_start") or "").strip()
+    softener_circuit = (form.get("softener_circuit") or "").strip() or None
+    if has_softener and parse_hhmm_to_minutes(softener_start) is None:
+        from ..database import get_home_profile
+        return _tmpl(request).TemplateResponse("setup.html", {
+            "request": request, "step": 5, "page": "setup",
+            "profile": dict(get_home_profile(orch.db) or {}),
+            "circuits": [c.circuit for c in orch._cfg.circuits],
+            "error": "Enter the water softener's regeneration start time "
+                     "(HH:MM, 24-hour).",
+        })
+
     update_home_profile(
         orch.db,
         bathrooms_full=bathrooms_full,
@@ -716,6 +734,9 @@ async def setup_home_details_save(request: Request):
         occupants=occupants,
         build_year=build_year,
         supply_type=supply_type,
+        has_water_softener=1 if has_softener else 0,
+        softener_regen_start=softener_start if has_softener else None,
+        softener_circuit=softener_circuit if has_softener else None,
         setup_complete=1,
     )
 

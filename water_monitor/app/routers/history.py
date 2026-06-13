@@ -461,21 +461,34 @@ async def undo_auto_cycle_api(circuit: str, request: Request):
     if not event_id:
         return JSONResponse({"error": "event_id required"}, status_code=400)
     anchor = db.execute(
-        "SELECT start_ts FROM events WHERE id = ? AND circuit = ?",
+        "SELECT start_ts, cycle_group_id FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit),
     ).fetchone()
     if anchor is None:
         return JSONResponse({"error": "Event not found"}, status_code=404)
-    a_ts = _parse_event_ts(anchor["start_ts"])
-    if a_ts is None:
-        return JSONResponse({"error": "Event has no usable timestamp"}, status_code=400)
-    lo = (a_ts - timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
-    hi = (a_ts + timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
-    ids = [r["id"] for r in db.execute(
-        "SELECT id FROM events WHERE circuit = ? AND fixture_label_source = 'cycle' "
-        "  AND start_ts BETWEEN ? AND ?",
-        (circuit, lo, hi),
-    ).fetchall()]
+    gid = anchor["cycle_group_id"]
+    if gid:
+        # dev.24 — precise: clear by the persisted cycle-group key (the rollup
+        # grouping), so exactly this cycle's auto labels are undone.
+        ids = [r["id"] for r in db.execute(
+            "SELECT id FROM events WHERE circuit = ? AND cycle_group_id = ? "
+            "  AND fixture_label_source = 'cycle'",
+            (circuit, gid),
+        ).fetchall()]
+    else:
+        # Legacy fallback — pre-dev.24 cycle labels have no group id, so undo by
+        # the original ±45-min proximity window around the anchor.
+        a_ts = _parse_event_ts(anchor["start_ts"])
+        if a_ts is None:
+            return JSONResponse({"error": "Event has no usable timestamp"},
+                                status_code=400)
+        lo = (a_ts - timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
+        hi = (a_ts + timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
+        ids = [r["id"] for r in db.execute(
+            "SELECT id FROM events WHERE circuit = ? AND fixture_label_source = 'cycle' "
+            "  AND start_ts BETWEEN ? AND ?",
+            (circuit, lo, hi),
+        ).fetchall()]
     cleared = clear_auto_labels(db, circuit, event_ids=ids) if ids else 0
     if cleared:
         import asyncio

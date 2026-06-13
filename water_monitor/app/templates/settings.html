@@ -57,6 +57,12 @@
       <span class="sett-nav-label">Display Units</span>
     </button>
 
+    <button class="sett-nav-btn" id="sett-btn-water-softener"
+            onclick="settNav('water-softener')">
+      <span class="sett-nav-icon">🧂</span>
+      <span class="sett-nav-label">Water Softener</span>
+    </button>
+
     <button class="sett-nav-btn sett-nav-adv" id="sett-btn-integrations"
             onclick="settNav('integrations')">
       <span class="sett-nav-icon">🔗</span>
@@ -777,6 +783,61 @@
             <button type="button" class="btn btn-secondary btn-sm"
                     onclick="autoDetectUnits(this)">Re-detect from HA</button>
           </div>
+        </form>
+      </div>
+    </div>
+
+    {# ── Water Softener ────────────────────────────────────────────── #}
+    <div class="sett-section" id="sett-water-softener" style="display:none">
+      <h2 class="sett-section-title">Water Softener</h2>
+      <p class="sett-section-desc">
+        If you have a water softener, tell us when it regenerates. The monitor
+        labels those overnight cycles as “Water Softener” and skips scheduled
+        leak tests during the regeneration window (so a regen never trips a
+        false leak alert).
+      </p>
+      <div class="sett-card">
+        <form method="post" action="{{ ingress_path }}/settings/water-softener/update">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <div class="sett-toggle-row" style="margin-bottom:14px">
+            <div class="sett-toggle-info">
+              <span class="sett-toggle-label">I have a water softener</span>
+              <span class="sett-toggle-desc">
+                Off by default. When on, set the regeneration start time below —
+                it is required so the monitor knows the nightly window.
+              </span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" name="has_water_softener" value="1"
+                     onchange="document.getElementById('sett-softener-cfg').style.display = this.checked ? '' : 'none'"
+                     {% if profile.has_water_softener %}checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div id="sett-softener-cfg"
+               style="{% if not profile.has_water_softener %}display:none{% endif %}">
+            <div class="sett-form-grid" style="margin-bottom:14px">
+              <div class="sett-form-group">
+                <label for="sett_softener_regen_start">Regeneration start (24-hour)</label>
+                <input type="time" id="sett_softener_regen_start"
+                       name="softener_regen_start"
+                       value="{{ profile.softener_regen_start or '' }}">
+              </div>
+              <div class="sett-form-group">
+                <label for="sett_softener_circuit">Softener circuit</label>
+                <select id="sett_softener_circuit" name="softener_circuit">
+                  {% for c in circuits %}
+                  <option value="{{ c.circuit }}"
+                    {% if profile.softener_circuit == c.circuit
+                          or (not profile.softener_circuit and loop.first) %}selected{% endif %}>
+                    {{ c.display_name }}
+                  </option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+          </div>
+          <button type="submit" class="btn btn-primary btn-sm">Save</button>
         </form>
       </div>
     </div>

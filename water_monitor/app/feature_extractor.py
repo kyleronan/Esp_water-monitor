@@ -2175,11 +2175,15 @@ class FeatureExtractor:
 
     def __init__(self, event_queue: asyncio.Queue,
                  db_conn: sqlite3.Connection, alert_manager=None,
-                 ha_client=None, event_detector=None):
+                 ha_client=None, event_detector=None, ha_tz=None):
         self._queue = event_queue
         self._db = db_conn
         self._alert_manager = alert_manager
         self._ha = ha_client
+        # Home timezone (dev.24) — converts UTC-stored event timestamps to LOCAL
+        # for the water-softener regen band match. None → compare in UTC (the
+        # batch reclassify will still detect it once a tz-aware caller runs).
+        self._ha_tz = ha_tz
         # Optional EventDetector — provides WaveformChunkAccumulator access
         # (firmware 3.9.0+). None when running in test / historical-import
         # contexts; _find_waveform handles the missing-detector case.
@@ -2705,17 +2709,34 @@ class FeatureExtractor:
         # Caught broadly: a rules failure must NEVER block the cluster_id write.
         matched_fixture_type: Optional[str] = None
         matched_via: Optional[str] = None
+        cycle_group_id: Optional[str] = None
         washer_members: dict = {}
+        softener_members: dict = {}
         try:
             from .event_rules import (
-                WASHER_FAMILY_PK_ENVELOPE, detect_washer_cycles,
+                WASHER_FAMILY_PK_ENVELOPE, detect_softener_sessions,
+                detect_washer_cycles, get_home_timezone, parse_hhmm_to_minutes,
                 rule_classify_event,
             )
+            from .database import get_home_profile
             ctype = self._circuit_type_cache.get(circuit)
             if ctype is None:
                 from .database import get_circuit_type
                 ctype = get_circuit_type(self._db, circuit)
                 self._circuit_type_cache[circuit] = ctype
+            # dev.24 — water-softener session (precedence: softener → washer →
+            # rules → knn). Profile read FRESH (NOT cached) so a Settings toggle
+            # takes effect on the next event with no restart. Hard-gated.
+            prof = get_home_profile(self._db)
+            if (prof is not None and prof["has_water_softener"]
+                    and (prof["softener_circuit"] or "main") == circuit):
+                band = parse_hhmm_to_minutes(prof["softener_regen_start"])
+                if band is not None:
+                    s_since = (datetime.now(timezone.utc)
+                               - timedelta(hours=3.5)).isoformat()
+                    softener_members = detect_softener_sessions(
+                        self._db, circuit, band, since_ts=s_since,
+                        tz=(get_home_timezone() or self._ha_tz))
             pk = features.get("peak_flow_lpm")
             if (ctype != "zone" and pk is not None
                     and WASHER_FAMILY_PK_ENVELOPE[0] <= pk
@@ -2724,9 +2745,14 @@ class FeatureExtractor:
                          - timedelta(minutes=50)).isoformat()
                 washer_members = detect_washer_cycles(
                     self._db, circuit, since_ts=since, limit=400)
-            if event_id in washer_members:
+            if event_id in softener_members:
+                matched_fixture_type, matched_via = ("water_softener",
+                                                     "softener_session")
+                cycle_group_id = softener_members[event_id][1]
+            elif event_id in washer_members:
                 matched_fixture_type, matched_via = ("washing_machine",
                                                      "washer_cycle")
+                cycle_group_id = washer_members[event_id][1]
             else:
                 rule_hit = rule_classify_event(features, ctype)
                 if rule_hit is not None:
@@ -2774,39 +2800,43 @@ class FeatureExtractor:
                  seconds_since_prev_event = ?,
                  prev_cluster_id          = ?,
                  matched_fixture_type     = ?,
-                 matched_via              = ?
+                 matched_via              = ?,
+                 cycle_group_id           = ?
                WHERE id = ?""",
             (cluster_id_result, match_confidence, match_level,
              match_rejection_reason,
              seconds_since_prev, prev_cluster_id, matched_fixture_type,
              matched_via if matched_fixture_type is not None else None,
+             cycle_group_id if matched_fixture_type is not None else None,
              event_id)
         )
 
-        # dev.23 — trailing retro-scan: a washer cycle COMPLETES over ~45 min,
-        # so earlier pulses were classified before the family existed (and there
-        # is no periodic reprocess). Retro-stamp the window's members now.
-        # Cycle context outranks any per-event machine match, so this MAY
-        # overwrite a prior knn/rule_* match; user labels are never touched.
-        if washer_members:
-            try:
-                retro = [eid for eid in washer_members if eid != event_id]
-                if retro:
-                    marks = ",".join("?" * len(retro))
-                    cur = self._db.execute(
-                        "UPDATE events SET matched_fixture_type = 'washing_machine', "
-                        "       matched_via = 'washer_cycle' "
-                        f"WHERE circuit = ? AND id IN ({marks}) "
+        # dev.23/dev.24 — trailing retro-scan: a washer cycle (~45 min) and a
+        # softener session (~3 h) COMPLETE over time, so earlier members were
+        # classified before the family existed (there is no periodic reprocess).
+        # Retro-stamp the window's members now WITH their cycle_group_id. Cycle/
+        # session context outranks a per-event machine match, so this MAY overwrite
+        # a prior knn/rule_* match (e.g. a backwash mis-typed shower_tub); user
+        # labels are never touched.
+        for _members, _mtype, _mvia in (
+                (softener_members, "water_softener", "softener_session"),
+                (washer_members, "washing_machine", "washer_cycle")):
+            for _eid, _rolegid in _members.items():
+                if _eid == event_id:
+                    continue
+                _gid = _rolegid[1] if isinstance(_rolegid, tuple) else None
+                try:
+                    self._db.execute(
+                        "UPDATE events SET matched_fixture_type = ?, "
+                        "       matched_via = ?, cycle_group_id = ? "
+                        "WHERE circuit = ? AND id = ? "
                         "  AND user_fixture_type IS NULL "
-                        "  AND COALESCE(matched_via, '') <> 'washer_cycle'",
-                        [circuit] + retro,
+                        "  AND COALESCE(matched_via, '') <> ?",
+                        (_mtype, _mvia, _gid, circuit, _eid, _mvia),
                     )
-                    if cur.rowcount:
-                        log.info("[%s] washer cycle retro-matched %d earlier "
-                                 "event(s)", circuit, cur.rowcount)
-            except Exception as e:
-                log.warning("[%s] washer retro-scan failed (non-fatal): %s",
-                            circuit, e)
+                except Exception as e:
+                    log.warning("[%s] cycle retro-scan failed (non-fatal): %s",
+                                circuit, e)
 
         # 4. Update fixtures.last_seen_at when this event matched a named fixture
         if cluster_id_result is not None:

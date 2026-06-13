@@ -75,7 +75,11 @@ _BASELINE_VERSION: int = 20260523
 #              'zone_default'; NULL = legacy/cluster). DDL only — no backfill
 #              (NULL is correct for pre-existing matches; the rules tier and
 #              reclassify stamp it going forward).
-_CURRENT_VERSION: int = 20260541
+#   20260542 — dev.24: opt-in water-softener config (home_profile.has_water_softener
+#              + softener_regen_start + softener_circuit) and the History cycle-rollup
+#              grouping key (events.cycle_group_id). DDL only — no backfill (softener
+#              off until enabled; cycle_group_id stamped by the next reclassify).
+_CURRENT_VERSION: int = 20260542
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -688,6 +692,37 @@ def _apply_matched_via_column(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260541: matched_via column ready")
 
 
+def _apply_dev24_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260542 — dev.24.
+
+    Adds the opt-in water-softener config to ``home_profile``:
+      • ``has_water_softener``   (INTEGER NOT NULL DEFAULT 0 — the setup opt-in)
+      • ``softener_regen_start`` (TEXT, 'HH:MM' local — REQUIRED when enabled)
+      • ``softener_circuit``     (TEXT — which circuit the softener is on; Main)
+    and the History cycle-rollup grouping key to ``events``:
+      • ``cycle_group_id``       (TEXT, nullable — washer anchor id / softener
+        session id / dishwasher cycle anchor id; NULL = ungrouped singleton).
+    DDL only; idempotent (each add guarded by ``_has_column``). No backfill —
+    softener detection is off until enabled, and cycle_group_id is stamped by
+    the next reclassify.
+    """
+    if not _has_column(conn, "home_profile", "has_water_softener"):
+        conn.execute("ALTER TABLE home_profile ADD COLUMN has_water_softener "
+                     "INTEGER NOT NULL DEFAULT 0")
+        log.info("Added home_profile.has_water_softener (default 0)")
+    if not _has_column(conn, "home_profile", "softener_regen_start"):
+        conn.execute("ALTER TABLE home_profile ADD COLUMN softener_regen_start TEXT")
+        log.info("Added home_profile.softener_regen_start (TEXT)")
+    if not _has_column(conn, "home_profile", "softener_circuit"):
+        conn.execute("ALTER TABLE home_profile ADD COLUMN softener_circuit TEXT")
+        log.info("Added home_profile.softener_circuit (TEXT)")
+    if not _has_column(conn, "events", "cycle_group_id"):
+        conn.execute("ALTER TABLE events ADD COLUMN cycle_group_id TEXT")
+        log.info("Added events.cycle_group_id (TEXT, nullable)")
+    conn.commit()
+    log.info("Migration 20260542: dev.24 columns ready")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -965,6 +1000,21 @@ def _missing_matched_via_column(conn: sqlite3.Connection) -> set[str]:
     return set()
 
 
+def _missing_dev24_columns(conn: sqlite3.Connection) -> set[str]:
+    """Return the 20260542 dev.24 columns that are absent (home_profile + events).
+
+    Spans TWO tables — without the events check a DB missing only
+    ``events.cycle_group_id`` would pass and the rollup would fail at runtime.
+    """
+    missing: set[str] = set()
+    for col in ("has_water_softener", "softener_regen_start", "softener_circuit"):
+        if not _has_column(conn, "home_profile", col):
+            missing.add(f"home_profile.{col}")
+    if not _has_column(conn, "events", "cycle_group_id"):
+        missing.add("events.cycle_group_id")
+    return missing
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -1071,6 +1121,7 @@ def _run_migrations_impl(
             | _missing_training_capture_table(conn)
             | _missing_cross_talk_columns(conn)
             | _missing_matched_via_column(conn)
+            | _missing_dev24_columns(conn)
         )
         if missing:
             raise RuntimeError(
@@ -1081,9 +1132,18 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260541:
+        # DB has the matched_via column but lacks the dev.24 columns
+        # (water-softener config + cycle_group_id rollup key).
+        _apply_dev24_columns(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260541 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260540:
         # DB has the cross-talk columns but lacks the matched_via provenance column.
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260540 → %d", _CURRENT_VERSION)
         return
@@ -1092,6 +1152,7 @@ def _run_migrations_impl(
         # DB has the training_capture tables but lacks the cross-talk columns.
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260539 → %d", _CURRENT_VERSION)
         return
@@ -1101,6 +1162,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260538 → %d", _CURRENT_VERSION)
         return
@@ -1111,6 +1173,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260537 → %d", _CURRENT_VERSION)
         return
@@ -1122,6 +1185,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260536 → %d", _CURRENT_VERSION)
         return
@@ -1134,6 +1198,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260535 → %d", _CURRENT_VERSION)
         return
@@ -1148,6 +1213,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
         return
@@ -1163,6 +1229,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
         return
@@ -1178,6 +1245,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
@@ -1195,6 +1263,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
@@ -1213,6 +1282,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -1253,6 +1323,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -1275,6 +1346,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -1298,6 +1370,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -1320,6 +1393,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -1341,6 +1415,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -1360,6 +1435,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -1379,6 +1455,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -1434,6 +1511,7 @@ def _run_migrations_impl(
         _apply_training_capture_tables(conn)
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
+        _apply_dev24_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

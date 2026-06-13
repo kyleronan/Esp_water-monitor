@@ -181,6 +181,12 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- History display: hide cross-talk events (migration 20260540). Mirrors the
     -- phantom toggle above; display-only — cross-talk volume is already zeroed.
     hide_cross_talk_events         INTEGER NOT NULL DEFAULT 0,
+    -- Water softener opt-in (migration 20260542, dev.24). Off until the user
+    -- enables it at setup; regen_start is REQUIRED when enabled (HH:MM local),
+    -- circuit is which circuit the softener draws on (defaults to Main).
+    has_water_softener             INTEGER NOT NULL DEFAULT 0,
+    softener_regen_start           TEXT,
+    softener_circuit               TEXT,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -621,6 +627,12 @@ CREATE TABLE IF NOT EXISTS events (
     -- 'zone_default' (zone-circuit fallback), NULL (legacy/cluster/none).
     -- Machine-derived; recomputed by every reclassify; NEVER user-preserved.
     matched_via                      TEXT,
+    -- History cycle-rollup grouping key (migration 20260542, dev.24): the id
+    -- members of one appliance run share so History can collapse them under one
+    -- expandable parent row — washer anchor id / softener session id / dishwasher
+    -- cycle anchor id; NULL = ungrouped singleton. Stamped by reclassify; SKIPS
+    -- user-labelled events (so a relabel pulls a member out of its group).
+    cycle_group_id                   TEXT,
     -- Pressure-restoration phantom guard (migration 20260532). When 1, this
     -- event matched the long-duration + near-zero-pressure-drop fingerprint
     -- of a city-pressure-restoration artifact. Its volume_litres_effective is
@@ -1596,6 +1608,219 @@ def upsert_event_and_apply_hourly_volume(
     return is_new
 
 
+def snapshot_database(conn: sqlite3.Connection, db_path,
+                      label: str = "snapshot") -> Optional[str]:
+    """Write a consistent ``VACUUM INTO`` snapshot of the live DB beside
+    ``db_path`` — the recovery point taken before a destructive coalesce pass
+    (dev.24). Returns the snapshot path, or None when db_path is not a real
+    on-disk file (e.g. the ``:memory:`` databases used in tests) or the snapshot
+    could not be written. A failure is logged but never raised — it must not
+    block the user's recompute, and the coalesce is itself volume-preserving."""
+    try:
+        if str(db_path) in (":memory:", ""):
+            return None
+        p = Path(str(db_path))
+        if not p.exists():
+            return None
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        dest = p.with_name(f"{p.name}.{label}-{ts}")
+        conn.execute("VACUUM INTO ?", (str(dest),))
+        log.info("DB snapshot written before destructive pass: %s", dest)
+        return str(dest)
+    except Exception as e:
+        log.warning("DB snapshot failed (%s) — coalesce will still proceed "
+                    "(it is volume-preserving)", e)
+        return None
+
+
+def coalesce_low_flow_events(
+    conn: sqlite3.Connection, circuit: str, dry_run: bool = False,
+) -> Dict[str, int]:
+    """Merge adjacent low-flow sensor-chatter fragments into one event each (dev.24).
+
+    The turbine flow sensor can't hold a reading at very low flow, so a single
+    sustained low draw is chopped into many tiny events (the softener brine cycle:
+    ~17 fragments, median gap ~19 s). This is the one-time cleanup for PRE-EXISTING
+    history — the live detector's off-grace prevents new fragmentation. Only
+    UNLABELED, non-user-classified, non-degraded events that are low-flow per the
+    SHARED predicate (``event_rules.is_low_flow_chatter``) and within
+    LOWFLOW_OFF_GRACE_S of each other — with NO other event between them, so a real
+    flush/labelled use is never merged across — are grouped.
+
+    Per group the earliest event survives and absorbs the others' volume (exact
+    sum), end_ts/duration span, peak (max) and ΔP (max); avg = volume / duration.
+    Its dribble/exclusion verdict is RECOMPUTED from the aggregated volume via the
+    single-source ``_finalize_derived_verdicts`` — because ``reprocess_event_
+    exclusion_verdicts`` only ever FLAGS, never un-flags, a 17×0.4 L dribble train
+    that merges to one 6.8 L draw must be un-excluded HERE (this is what *improves*
+    slow-leak detectability: the sustained draw stops being dismissed as chatter).
+    ``flow_integral_litres`` is set to the merged volume so the later phantom
+    rescan never zeroes a real merged draw; cluster_id / matched_fixture_type /
+    matched_via are cleared so reclassify re-derives cleanly (match_rejection_
+    reason is set by the finalizer, never overloaded with a 'coalesced' marker).
+
+    hourly_volume is kept exact (reverse every member's applied contribution,
+    re-apply the survivor's total → net-zero); daily_summary is recomputed for
+    every affected day. Absorbed rows are deleted — cascading event_waveforms /
+    zone_flow_history (foreign_keys=ON), with training_capture_candidates cleaned
+    manually (no FK). Idempotent (a second run finds no adjacent low-flow pairs).
+
+    DESTRUCTIVE but volume-preserving — callers MUST snapshot the DB first
+    (``snapshot_database``) and run this only from the user-triggered recompute,
+    never silently at startup. ``dry_run=True`` returns the would-merge counts
+    without mutating. Returns {"groups": <merge groups>, "absorbed": <rows removed>}.
+    """
+    from .event_rules import LOWFLOW_OFF_GRACE_S, is_low_flow_chatter
+
+    def _ts(v):
+        if not v:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+    rows = conn.execute(
+        "SELECT id, start_ts, end_ts, volume_litres, volume_litres_effective, "
+        "       avg_flow_lpm, true_avg_flow_lpm, peak_flow_lpm, pressure_delta_psi, "
+        "       user_fixture_type, user_classified, user_ignored, degraded_supply, "
+        "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
+        "FROM events WHERE circuit = ? ORDER BY start_ts ASC",
+        (circuit,),
+    ).fetchall()
+
+    def _is_candidate(r) -> bool:
+        if r["user_fixture_type"] is not None or r["user_classified"]:
+            return False
+        if r["degraded_supply"]:
+            return False
+        peak = r["peak_flow_lpm"]
+        if peak is None:
+            return False
+        mean = r["true_avg_flow_lpm"]
+        mean = r["avg_flow_lpm"] if mean is None else mean
+        return is_low_flow_chatter(mean, peak)
+
+    # Build merge groups: maximal runs of consecutive CANDIDATE events each within
+    # grace of the previous, BROKEN by any non-candidate event in between (so a
+    # real flush / labelled use sitting between two trickles is never merged across).
+    groups = []
+    cur = []
+    for r in rows:
+        if _is_candidate(r):
+            s = _ts(r["start_ts"])
+            if cur:
+                prev_end = _ts(cur[-1]["end_ts"]) or _ts(cur[-1]["start_ts"])
+                if (s is not None and prev_end is not None
+                        and (s - prev_end).total_seconds() <= LOWFLOW_OFF_GRACE_S):
+                    cur.append(r)
+                    continue
+            if len(cur) >= 2:
+                groups.append(cur)
+            cur = [r]
+        else:
+            if len(cur) >= 2:
+                groups.append(cur)
+            cur = []
+    if len(cur) >= 2:
+        groups.append(cur)
+
+    absorbed_total = sum(len(g) - 1 for g in groups)
+    if dry_run or not groups:
+        return {"groups": len(groups), "absorbed": absorbed_total}
+
+    from .feature_extractor import _finalize_derived_verdicts
+    affected_days = set()
+
+    with transaction(conn):
+        for g in groups:
+            survivor = g[0]
+            sid = survivor["id"]
+            s_start = _ts(survivor["start_ts"])
+            ends = [(_ts(m["end_ts"]) or _ts(m["start_ts"])) for m in g]
+            ends = [e for e in ends if e is not None]
+            end_ts = max(ends) if ends else s_start
+            duration = ((end_ts - s_start).total_seconds()
+                        if (end_ts and s_start) else 0.0)
+            total_vol = sum(float(m["volume_litres"] or 0.0) for m in g)
+            peak = max(float(m["peak_flow_lpm"] or 0.0) for m in g)
+            delta = max(float(m["pressure_delta_psi"] or 0.0) for m in g)
+            avg = (total_vol / (duration / 60.0)) if duration > 0 else 0.0
+
+            # Recompute the survivor's verdict from the AGGREGATED features (the
+            # single source of truth). Pass active-flow fields that reflect a REAL
+            # draw (flow_integral = merged volume) so it is never re-flagged phantom
+            # / cross-talk; the dribble verdict falls out of the summed volume.
+            feats = {
+                "volume_litres": total_vol, "volume_litres_estimated": None,
+                "avg_flow_lpm": avg, "peak_flow_lpm": peak,
+                "duration_seconds": duration, "pressure_delta_psi": delta,
+                "degraded_supply": 0, "user_ignored": bool(survivor["user_ignored"]),
+                "user_classified": 0, "integration_quality": "ok",
+                "true_avg_flow_lpm": avg, "flow_integral_litres": total_vol,
+                "flow_on_ratio": None, "is_composite": 0,
+            }
+            _finalize_derived_verdicts(feats)
+            new_eff = float(feats["volume_litres_effective"] or 0.0)
+
+            # (1) Reverse every member's applied hourly contribution.
+            for m in g:
+                applied = float(m["hourly_volume_applied_litres"] or 0.0)
+                bucket = m["hourly_volume_applied_bucket"]
+                if bucket and applied:
+                    conn.execute(
+                        "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                        "VALUES (?, ?, ?) ON CONFLICT (circuit, hour_ts) DO UPDATE "
+                        "SET volume_litres = volume_litres + excluded.volume_litres",
+                        (circuit, bucket, -applied),
+                    )
+            # (2) Apply the survivor's merged effective volume to its bucket.
+            s_bucket = _hour_bucket_for(survivor["start_ts"])
+            if s_bucket and new_eff:
+                conn.execute(
+                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                    "VALUES (?, ?, ?) ON CONFLICT (circuit, hour_ts) DO UPDATE "
+                    "SET volume_litres = volume_litres + excluded.volume_litres",
+                    (circuit, s_bucket, new_eff),
+                )
+            # (3) Rewrite the survivor row (verdict reset; match cleared).
+            conn.execute(
+                "UPDATE events SET end_ts = ?, duration_seconds = ?, "
+                "  volume_litres = ?, volume_litres_effective = ?, "
+                "  volume_estimation_method = ?, avg_flow_lpm = ?, "
+                "  true_avg_flow_lpm = ?, peak_flow_lpm = ?, flow_integral_litres = ?, "
+                "  pressure_delta_psi = ?, is_low_flow_dribble = ?, "
+                "  is_pressure_restoration_phantom = ?, is_cross_talk = ?, "
+                "  excluded_from_training = ?, match_rejection_reason = ?, "
+                "  cluster_id = NULL, matched_fixture_type = NULL, matched_via = NULL, "
+                "  hourly_volume_applied_litres = ?, hourly_volume_applied_bucket = ? "
+                "WHERE id = ?",
+                (end_ts.isoformat() if end_ts else None, duration, total_vol, new_eff,
+                 feats["volume_estimation_method"], avg, avg, peak, total_vol, delta,
+                 feats["is_low_flow_dribble"], feats["is_pressure_restoration_phantom"],
+                 feats["is_cross_talk"], feats["excluded_from_training"],
+                 feats["match_rejection_reason"], new_eff, s_bucket, sid),
+            )
+            # (4) Delete absorbed rows (cascades waveforms / zone_flow_history).
+            for m in g[1:]:
+                conn.execute(
+                    "DELETE FROM training_capture_candidates WHERE event_id = ?",
+                    (m["id"],))
+                conn.execute("DELETE FROM events WHERE id = ?", (m["id"],))
+            for m in g:
+                d = _ts(m["start_ts"])
+                if d:
+                    affected_days.add(d.strftime("%Y-%m-%d"))
+            if end_ts:
+                affected_days.add(end_ts.strftime("%Y-%m-%d"))
+
+        for day in sorted(affected_days):
+            compute_daily_summary(conn, circuit, day)
+
+    return {"groups": len(groups), "absorbed": absorbed_total}
+
+
 def get_daily_volume(conn: sqlite3.Connection, circuit: str,
                      since_utc: str = "") -> float:
     """Total volume since local midnight (expressed as a UTC ISO string).
@@ -1832,8 +2057,14 @@ def patch_event(
         # Stamp provenance: an explicit label is 'user'; clearing resets to NULL
         # (so a relabel always overrides an auto 'cycle'/'training' source).
         src = "user" if user_fixture_type else None
+        # dev.24: an explicit relabel pulls the event OUT of any machine/cycle
+        # rollup group (clear cycle_group_id). For a cycle appliance the caller
+        # then runs propagate_cycle_label, which re-stamps the anchor + mates; a
+        # non-cycle relabel just stays a singleton. This is what makes a
+        # user-relabeled member "leave the group" (§7).
         conn.execute(
-            "UPDATE events SET user_fixture_type = ?, fixture_label_source = ? "
+            "UPDATE events SET user_fixture_type = ?, fixture_label_source = ?, "
+            "cycle_group_id = NULL "
             "WHERE id = ? AND circuit = ?",
             (user_fixture_type, src, event_id, circuit),
         )
@@ -3827,18 +4058,24 @@ def set_event_matched_fixture_type(
     event_id: str,
     fixture_type: Optional[str],
     via: Optional[str] = None,
+    cycle_group_id: Optional[str] = None,
 ) -> None:
-    """Write ``events.matched_fixture_type`` (+ its ``matched_via`` provenance)
-    for one event. ``via`` is forced NULL whenever the type is NULL (an abstain
-    clears both), so a stale provenance can never outlive its match.
+    """Write ``events.matched_fixture_type`` (+ its ``matched_via`` provenance and
+    ``cycle_group_id`` rollup key) for one event. ``via`` and ``cycle_group_id``
+    are forced NULL whenever the type is NULL (an abstain clears all three), so a
+    stale provenance / group can never outlive its match. ``cycle_group_id`` is
+    the History rollup key (washer anchor id / softener session id) and is NULL
+    for non-cycle matches; recomputed by every reclassify.
 
     Does not commit — caller batches with surrounding writes (typically
     the cluster_id update in feature_extractor._cluster_event).
     """
     conn.execute(
-        "UPDATE events SET matched_fixture_type = ?, matched_via = ? "
-        "WHERE id = ? AND circuit = ?",
-        (fixture_type, via if fixture_type is not None else None,
+        "UPDATE events SET matched_fixture_type = ?, matched_via = ?, "
+        "cycle_group_id = ? WHERE id = ? AND circuit = ?",
+        (fixture_type,
+         via if fixture_type is not None else None,
+         cycle_group_id if fixture_type is not None else None,
          event_id, circuit),
     )
 
@@ -3954,11 +4191,18 @@ def match_event_to_signature_knn(
 def reclassify_all_events_from_signatures(
     conn: sqlite3.Connection,
     circuit: str,
+    ha_tz=None,
 ) -> Dict[str, Any]:
     """Retrain signatures, then backfill ``matched_fixture_type`` over every
-    unlabelled event on ``circuit`` — STRUCTURAL RULES FIRST (dev.23: washer-cycle
-    sweep, then the per-event toilet/dishwasher/shower/zone rules), k-NN as the
-    residual for events no rule claims. Each write stamps ``matched_via``.
+    unlabelled event on ``circuit`` — STRUCTURAL RULES FIRST (dev.24 precedence:
+    water-softener session, then dev.23's washer-cycle sweep, then the per-event
+    toilet/dishwasher/shower/zone rules), k-NN as the residual. Each write stamps
+    ``matched_via`` and ``cycle_group_id`` (the History rollup key, §7).
+
+    ``ha_tz`` (the home timezone) is needed only for the water-softener regen-band
+    match (local clock vs UTC-stored timestamps) — pass it from EVERY caller so
+    the softener label is stable across reclassifies. Softener detection is
+    hard-gated by ``home_profile.has_water_softener`` + ``softener_circuit``.
 
     NEVER touches user-labelled rows (WHERE user_fixture_type IS NULL). Writes
     the canonical matched type, or NULL on abstention — writing NULL clears a
@@ -3986,7 +4230,9 @@ def reclassify_all_events_from_signatures(
     #    active-flow features so the matcher uses whichever it can (active when
     #    backfilled). An event now excluded_from_training carries no fixture
     #    identity → its matched_fixture_type is cleared (stale-match carry-forward).
-    from .event_rules import detect_washer_cycles, rule_classify_event
+    from .event_rules import (detect_softener_sessions, detect_washer_cycles,
+                              get_home_timezone, parse_hhmm_to_minutes,
+                              rule_classify_event)
 
     qfeats = tuple(dict.fromkeys(
         _SIGNATURE_MATCH_FEATURES + _SIGNATURE_KNN_ACTIVE_FEATURES
@@ -3995,21 +4241,40 @@ def reclassify_all_events_from_signatures(
     # One O(n) pass for the whole circuit — the per-row loop then does dict
     # lookups, never per-event window queries.
     washer_ids = detect_washer_cycles(conn, circuit) if circuit_type != "zone" else {}
+    # dev.24 — water-softener sessions (hard-gated: enabled AND this circuit).
+    softener_ids: Dict[str, Any] = {}
+    prof = get_home_profile(conn)
+    if (prof is not None and prof["has_water_softener"]
+            and (prof["softener_circuit"] or "main") == circuit):
+        band = parse_hhmm_to_minutes(prof["softener_regen_start"])
+        if band is not None:
+            tz = ha_tz if ha_tz is not None else get_home_timezone()
+            softener_ids = detect_softener_sessions(conn, circuit, band, tz=tz)
     rows = conn.execute(
-        "SELECT id, matched_fixture_type, matched_via, excluded_from_training, "
+        "SELECT id, matched_fixture_type, matched_via, cycle_group_id, "
+        "       excluded_from_training, "
         "       " + ", ".join(qfeats) + " "
         "FROM events "
         "WHERE circuit = ? AND user_fixture_type IS NULL "
         "ORDER BY start_ts",
         (circuit,),
     ).fetchall()
-    scanned = matched = rule_matched = cleared = abstained = 0
+    scanned = matched = rule_matched = softener_matched = cleared = abstained = 0
     for r in rows:
         scanned += 1
-        if r["excluded_from_training"]:
+        new_group = None
+        if r["id"] in softener_ids:
+            # Softener is checked BEFORE the excluded gate — a deliberate exception
+            # to dev.23's "excluded → no identity": regen consumption is real, and
+            # matched_* is written separately from the volume verdict, so a
+            # dribble-flagged regen pulse keeps its verdict AND reads water_softener.
+            _role, new_group = softener_ids[r["id"]]
+            new_type, new_via = "water_softener", "softener_session"
+        elif r["excluded_from_training"]:
             new_type, new_via = None, None   # artifacts carry no fixture identity
         elif r["id"] in washer_ids:
             new_type, new_via = "washing_machine", "washer_cycle"
+            new_group = washer_ids[r["id"]][1]
         else:
             feats = {f: r[f] for f in qfeats}
             rule_hit = rule_classify_event(feats, circuit_type)
@@ -4020,14 +4285,17 @@ def reclassify_all_events_from_signatures(
                 new_type = _canonical_fixture_type(hit["fixture_type"]) if hit else None
                 new_via = "knn" if new_type is not None else None
         prev = r["matched_fixture_type"]
-        if (new_type, new_via) != (prev, r["matched_via"]):
+        if (new_type, new_via, new_group) != (
+                prev, r["matched_via"], r["cycle_group_id"]):
             set_event_matched_fixture_type(conn, circuit, r["id"], new_type,
-                                           via=new_via)
+                                           via=new_via, cycle_group_id=new_group)
             if new_type is None and prev is not None:
                 cleared += 1
         if new_type is not None:
             matched += 1
-            if new_via != "knn":
+            if new_via == "softener_session":
+                softener_matched += 1
+            elif new_via != "knn":
                 rule_matched += 1
         else:
             abstained += 1
@@ -4037,6 +4305,7 @@ def reclassify_all_events_from_signatures(
         "events_scanned": scanned,
         "events_matched": matched,
         "events_rule_matched": rule_matched,
+        "events_softener_matched": softener_matched,
         "events_cleared": cleared,
         "events_abstained": abstained,
     }
@@ -4384,11 +4653,20 @@ def propagate_cycle_label(conn: sqlite3.Connection, circuit: str, event_id,
                   and _CYCLE_FLOW_RATIO_LO <= f / a_flow <= _CYCLE_FLOW_RATIO_HI)
         if ok:
             conn.execute(
-                "UPDATE events SET user_fixture_type = ?, fixture_label_source = 'cycle' "
+                "UPDATE events SET user_fixture_type = ?, "
+                "fixture_label_source = 'cycle', cycle_group_id = ? "
                 "WHERE id = ? AND circuit = ? AND user_fixture_type IS NULL",
-                (fixture_type, mr["id"], circuit),
+                (fixture_type, str(event_id), mr["id"], circuit),
             )
             n += 1
+    if n:
+        # Stamp the anchor with its OWN id as the group key so the History rollup
+        # (dev.24 §7) collapses the whole cycle — anchor + cycle-mates — under one
+        # expandable parent row.
+        conn.execute(
+            "UPDATE events SET cycle_group_id = ? WHERE id = ? AND circuit = ?",
+            (str(event_id), event_id, circuit),
+        )
     return n
 
 

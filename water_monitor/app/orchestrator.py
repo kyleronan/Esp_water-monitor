@@ -653,6 +653,7 @@ class Orchestrator:
             from zoneinfo import ZoneInfo
         except ImportError:
             from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+        from .event_rules import set_home_timezone
         try:
             ha_cfg = await self._ha.get_ha_config()
             tz_name = ha_cfg.get("time_zone") or "UTC"
@@ -662,6 +663,9 @@ class Orchestrator:
             from datetime import timezone as _tz
             self._ha_tz = _tz.utc
             log.warning("Could not determine HA timezone (%s) — using UTC", e)
+        # dev.24 — cache for the softener regen-band match (reclassify + live path
+        # read this without threading a tzinfo through every caller).
+        set_home_timezone(self._ha_tz)
 
     def _local_midnight_utc(self, days_ago: int = 0) -> str:
         """Return the UTC equivalent of local midnight (or N days ago) as a naive ISO string.

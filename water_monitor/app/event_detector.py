@@ -50,6 +50,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Deque, List, Literal, Optional, Tuple
 
+from .event_rules import LOWFLOW_OFF_GRACE_S, is_low_flow_chatter
+
 log = logging.getLogger(__name__)
 
 StartTrigger = Literal["flow", "pressure", "pressure+flow"]
@@ -102,6 +104,12 @@ class RawEvent:
 
     is_composite: bool = False
     complete: bool = False
+
+    # dev.24 low-flow off-grace: when a sustained low draw dips below MIN_FLOW,
+    # the event is held open until this deadline instead of finalizing, so the
+    # turbine's low-flow chatter doesn't fragment one draw into many events.
+    # Cleared by on_flow_rate the instant flow resumes (bridging the dip).
+    low_flow_hold_until: Optional[datetime] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -481,6 +489,16 @@ class CircuitEventDetector:
         now = datetime.now(timezone.utc)
 
         if self._active_event is not None:
+            ev = self._active_event
+            # dev.24 low-flow off-grace: flow resuming bridges a held dip (the
+            # same event continues); a hold whose grace expired with no resume
+            # finalizes here. Otherwise fall through and record as before.
+            if ev.low_flow_hold_until is not None and self._current_flow_lpm >= self.MIN_FLOW_LPM:
+                ev.low_flow_hold_until = None
+                log.debug("[%s] low-flow hold released — flow resumed (%.3f L/min)",
+                          self.circuit, self._current_flow_lpm)
+            elif self._maybe_finalize_held_low_flow(now):
+                return
             elapsed = (now - self._active_event.start_ts).total_seconds()
             self._flow_sample_count += 1
             if elapsed < self._DOWNSAMPLE_AFTER_SECONDS or self._flow_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
@@ -593,6 +611,11 @@ class CircuitEventDetector:
                 else:
                     self._start_pressure_event(now, baseline, pressure)
         else:
+            # dev.24 low-flow off-grace backstop: flow_rate can stop ticking at 0
+            # during a dip, but the fast-pressure sensor keeps sampling — so a
+            # held event whose grace expired is finalized here too.
+            if self._maybe_finalize_held_low_flow(now):
+                return
             elapsed_p = (now - self._active_event.start_ts).total_seconds()
             self._pressure_sample_count += 1
             # Track max on every sample (before downsample gate).
@@ -621,7 +644,10 @@ class CircuitEventDetector:
                             (now - self._pressure_recovered_since).total_seconds(),
                             self._current_flow_lpm,
                         )
-                        self._end_event(now)
+                        # Pressure recovery is a definitive "draw is over" signal
+                        # (only fires for events WITH a real transient — not the
+                        # low-flow chatter case), so it bypasses the off-grace hold.
+                        self._end_event(now, force=True)
                         return
                 else:
                     self._pressure_recovered_since = None
@@ -917,9 +943,54 @@ class CircuitEventDetector:
         log.debug("[%s] pressure transient enriched active event — %.1f PSI drop",
                   self.circuit, drop)
 
-    def _end_event(self, ts: datetime) -> None:
+    def _is_low_flow_event(self, ev: RawEvent) -> bool:
+        """Low-flow per the shared chatter predicate, measured over the ACTIVE
+        flow readings (v >= MIN_FLOW_LPM). Filtering to active flow excludes both
+        the sub-threshold pre-trigger ramp and any mid-event zero-flow dips — the
+        coalesced flow_samples' sparse leading/trailing zeros would otherwise
+        skew the mean (a steady 1.6 L/min event with one trailing 0 sample would
+        average to ~0.5 and read as low-flow)."""
+        active = [v for v in ev.flow_readings if v >= self.MIN_FLOW_LPM]
+        if not active:
+            return False
+        return is_low_flow_chatter(sum(active) / len(active), max(active))
+
+    def _should_hold_low_flow(self, ev: RawEvent, ts: datetime) -> bool:
+        """Whether to hold a low-flow event open through a sub-threshold dip.
+        Returns False once the grace deadline passes (-> finalize) and for
+        normal-flow events (which end immediately, exactly as before dev.24)."""
+        if ev.low_flow_hold_until is not None and ts >= ev.low_flow_hold_until:
+            return False
+        return self._is_low_flow_event(ev)
+
+    def _maybe_finalize_held_low_flow(self, now: datetime) -> bool:
+        """Finalize a held low-flow event whose grace expired with no resume.
+        end_ts is the dip time (deadline - grace), not ``now``, so the trailing
+        grace wait never inflates the event's duration/volume. Returns True when
+        it finalized (the caller must then stop touching self._active_event)."""
+        ev = self._active_event
+        if (ev is not None and ev.low_flow_hold_until is not None
+                and self._current_flow_lpm < self.MIN_FLOW_LPM
+                and now >= ev.low_flow_hold_until):
+            dip_ts = ev.low_flow_hold_until - timedelta(seconds=LOWFLOW_OFF_GRACE_S)
+            self._end_event(dip_ts, force=True)
+            return True
+        return False
+
+    def _end_event(self, ts: datetime, force: bool = False) -> None:
         ev = self._active_event
         if ev is None:
+            return
+        # dev.24 low-flow off-grace: a sustained low draw the turbine chatters on
+        # must not finalize on a brief sub-threshold dip. Hold the event open
+        # until the grace deadline; on_flow_rate clears the hold the instant flow
+        # resumes, bridging the dip into one event. force=True (grace expired)
+        # skips the hold so the held event actually finalizes.
+        if not force and self._should_hold_low_flow(ev, ts):
+            if ev.low_flow_hold_until is None:
+                ev.low_flow_hold_until = ts + timedelta(seconds=LOWFLOW_OFF_GRACE_S)
+                log.debug("[%s] low-flow event held open at dip %s (grace %.0f s)",
+                          self.circuit, ts.isoformat(), LOWFLOW_OFF_GRACE_S)
             return
         self._pressure_recovered_since = None
 

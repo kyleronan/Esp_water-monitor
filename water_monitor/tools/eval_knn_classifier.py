@@ -79,16 +79,32 @@ def evaluate(db_path, circuit, cycle_scale=None, max_per_class=None,
         db._SIGNATURE_KNN_MAX_PER_CLASS = max_per_class
 
     washer_ids = {}
+    softener_ids = {}
     circuit_type = "fixture"
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         labelled = _load_labelled(conn, circuit)
         if with_rules:
-            from water_monitor.app.event_rules import detect_washer_cycles
+            from water_monitor.app.event_rules import (
+                detect_softener_sessions, detect_washer_cycles,
+                parse_hhmm_to_minutes)
             circuit_type = db.get_circuit_type(conn, circuit)
             if circuit_type != "zone":
                 washer_ids = detect_washer_cycles(conn, circuit)
+            # dev.24 — water-softener sessions (label-free, configured band).
+            # Guarded: a pre-dev.24 export DB lacks the home_profile softener
+            # columns. tz=None compares the regen band in the stored (UTC) clock,
+            # so set softener_regen_start to the UTC-equivalent time when evaling.
+            try:
+                prof = db.get_home_profile(conn)
+                if (prof is not None and prof["has_water_softener"]
+                        and (prof["softener_circuit"] or "main") == circuit):
+                    band = parse_hhmm_to_minutes(prof["softener_regen_start"])
+                    if band is not None:
+                        softener_ids = detect_softener_sessions(conn, circuit, band)
+            except (KeyError, IndexError):
+                pass   # pre-dev.24 schema — no softener config
     finally:
         conn.close()
 
@@ -104,7 +120,9 @@ def evaluate(db_path, circuit, cycle_scale=None, max_per_class=None,
             continue
         pred = None
         if with_rules:
-            if held["id"] in washer_ids:
+            if held["id"] in softener_ids:
+                pred = "water_softener"
+            elif held["id"] in washer_ids:
                 pred = "washing_machine"
             else:
                 rule_hit = rule_classify_event(held, circuit_type)

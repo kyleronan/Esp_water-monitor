@@ -35,6 +35,7 @@ FIXTURE_TYPES: List[str] = [
     "tap",
     "washing_machine",
     "dishwasher",
+    "water_softener",
     # Zone-circuit only
     "irrigation_zone",
     # Catch-all / internal
@@ -65,7 +66,9 @@ LEGACY_TYPE_REMAP: Dict[str, str] = {
     "refrigerator_water":    "other",
     "ro_drinking_faucet":    "other",
     "humidifier":            "other",
-    "water_softener":        "other",
+    # dev.24: water_softener is a first-class type again — preserve it through
+    # _canonical_fixture_type so user labels + session matches store correctly.
+    "water_softener":        "water_softener",
     "ro_system_whole_house": "other",
     "evaporative_cooler":    "other",
     "boiler_makeup":         "other",
@@ -81,6 +84,7 @@ FIXTURE_TYPE_LABELS: Dict[str, str] = {
     "tap":              "Tap",
     "washing_machine":  "Washing Machine",
     "dishwasher":       "Dishwasher",
+    "water_softener":   "Water Softener",
     "irrigation_zone":  "Irrigation Zone",
     "other":            "Other",
     "leak_test":        "Leak Test (auto)",
@@ -100,6 +104,7 @@ FIXTURE_CATEGORIES: Dict[str, Optional[str]] = {
     "tap":              "tap",
     "washing_machine":  "washing_machine",
     "dishwasher":       "dishwasher",
+    "water_softener":   "water_softener",
     "irrigation_zone":  "irrigation_zone",
     "other":            "other",
     "leak_test":        None,    # never publish
@@ -111,6 +116,7 @@ FIXTURE_CATEGORY_LABELS: Dict[str, str] = {
     "tap":              "Tap",
     "washing_machine":  "Washing Machine",
     "dishwasher":       "Dishwasher",
+    "water_softener":   "Water Softener",
     "irrigation_zone":  "Irrigation Zone",
     "other":            "Other",
 }
@@ -426,6 +432,17 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         "multimodal": False,
     },
 
+    "water_softener": {
+        # dev.24: detected by the SESSION detector (event_rules.detect_softener_
+        # sessions), never the k-NN — this profile only keeps the dict in lockstep
+        # with FIXTURE_TYPES. Uniform (like 'other'): the k-NN has no
+        # water_softener centroid to match against, so the values are inert.
+        "anchor_weights": {},
+        "float_features": set(),
+        "expected_cv": {},
+        "multimodal": False,
+    },
+
     # ── Special ──────────────────────────────────────────────────────────
     "leak_test": {
         # Internal type used by the leak-test scheduler. Events tagged with
@@ -464,6 +481,7 @@ FIXTURE_MATCH_THRESHOLDS: Dict[str, float] = {
     "tap":              3.5,   # same as old bathroom_tap / kitchen_tap
     "washing_machine":  4.5,
     "dishwasher":       4.5,
+    "water_softener":   1.5,   # session-detected; neutral (inert for k-NN)
     "irrigation_zone":  3.5,
     "leak_test":        0.8,
     "other":            1.5,

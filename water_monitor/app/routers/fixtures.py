@@ -620,7 +620,8 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
                                 cleanup_composite_flags, run_isolated_write,
                                 get_write_lock, recompute_cycle_pulse_counts,
                                 resuggest_all_clusters,
-                                recompute_all_user_label_suggestions)
+                                recompute_all_user_label_suggestions,
+                                coalesce_low_flow_events, snapshot_database)
         from ..config import DB_PATH
         # Reject (don't silently queue for many seconds) if another heavy DB
         # write is already running — recompute/reclassify/recluster all share
@@ -651,6 +652,19 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
         def _job(conn):
             r = recompute_volume_and_active_flow(conn, circuit, fetch)
             cleanup_composite_flags(conn)
+            # dev.24: coalesce low-flow sensor-chatter fragments (one sustained low
+            # draw the turbine chopped into many tiny events) into one event each.
+            # DESTRUCTIVE (merges + deletes rows) but volume-preserving — snapshot
+            # the DB first, and only when there is actually something to merge (so
+            # clean recomputes stay backup-free). Runs BEFORE reclassify so all
+            # downstream sees merged events. This is the ONLY place coalesce runs —
+            # never silently at startup (the recovery gate).
+            plan = coalesce_low_flow_events(conn, circuit, dry_run=True)
+            if plan["absorbed"]:
+                snapshot_database(conn, DB_PATH, "pre-coalesce")
+                cres = coalesce_low_flow_events(conn, circuit)
+                log.info("[%s] coalesced %d low-flow fragment(s) into %d group(s)",
+                         circuit, cres["absorbed"], cres["groups"])
             # dev.22: cycle-pulse backfill MUST precede reclassify so the matcher's
             # cycle_pulse_count feature is populated before it types events.
             recompute_cycle_pulse_counts(conn, circuit)

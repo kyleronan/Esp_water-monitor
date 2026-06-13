@@ -682,6 +682,32 @@ async def units_update(request: Request):
     return ingress_redirect(request, "/settings#units")
 
 
+@router.post("/water-softener/update")
+async def water_softener_update(request: Request):
+    """dev.24 — persist the opt-in water-softener config. The regen start time is
+    REQUIRED when enabled (the session detector + leak-test blackout key on it),
+    so an enabled-but-invalid submission is rejected rather than stored blank.
+    The live path reads this profile FRESH per event, so the toggle takes effect
+    on the next event with no restart."""
+    from ..event_rules import parse_hhmm_to_minutes
+    from ..database import update_home_profile
+    orch = _orch(request)
+    form = await request.form()
+    enabled = form.get("has_water_softener") == "1"
+    start = (form.get("softener_regen_start") or "").strip()
+    circuit = (form.get("softener_circuit") or "").strip() or None
+    if enabled and parse_hhmm_to_minutes(start) is None:
+        return ingress_redirect(
+            request, "/settings?msg=softener_time_required#water-softener")
+    update_home_profile(
+        orch.db,
+        has_water_softener=1 if enabled else 0,
+        softener_regen_start=start if enabled else None,
+        softener_circuit=circuit if enabled else None,
+    )
+    return ingress_redirect(request, "/settings#water-softener")
+
+
 @router.post("/integrations/update")
 async def integrations_update(request: Request):
     form = await request.form()

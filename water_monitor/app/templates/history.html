@@ -218,6 +218,8 @@
             data-volume="{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else '—' }} {{ vol_unit }}"
             data-shape="{{ e.resistance_curve_shape or 'unknown' }}"
             data-cluster="{{ e.cluster_id if e.cluster_id is not none else '—' }}"
+            data-cycle-group="{{ e.cycle_group_id or '' }}"
+            data-eff-type="{{ e.user_fixture_type or e.matched_fixture_type or '' }}"
             data-user-type="{{ e.user_fixture_type or '' }}"
             data-user-label="{{ _fix_label }}"
             data-label-source="{{ e.fixture_label_source or '' }}"
@@ -276,7 +278,7 @@
               <span class="pill pill-green">{{ e.fixture_display_name }}</span>
             {% elif e.matched_fixture_type %}
               {% set _via = e.matched_via or '' %}
-              <span class="pill pill-neutral" title="{% if _via == 'washer_cycle' %}Matched by washer cycle pattern — anchor fill plus same-peak top-offs/rinses{% elif _via == 'zone_default' %}Zone-circuit default — long high-flow run on an irrigation circuit{% elif _via.startswith('rule_') %}Matched by structural rule (volume/duration/pressure shape){% else %}Auto-matched from your labels{% endif %}">~ {{ fixture_type_labels.get(e.matched_fixture_type, e.matched_fixture_type | replace('_',' ') | title) }}</span>
+              <span class="pill pill-neutral" title="{% if _via == 'washer_cycle' %}Matched by washer cycle pattern — anchor fill plus same-peak top-offs/rinses{% elif _via == 'softener_session' %}Matched by water-softener regeneration (scheduled overnight cycle){% elif _via == 'zone_default' %}Zone-circuit default — long high-flow run on an irrigation circuit{% elif _via.startswith('rule_') %}Matched by structural rule (volume/duration/pressure shape){% else %}Auto-matched from your labels{% endif %}">~ {{ fixture_type_labels.get(e.matched_fixture_type, e.matched_fixture_type | replace('_',' ') | title) }}</span>
             {% elif e.suggested_type %}
               <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }}</span>
             {% else %}
@@ -629,6 +631,74 @@ document.querySelectorAll('.hist-see-more').forEach(btn => {
     btn.textContent = expanded ? btn.dataset.moreLabel : 'See less';
   });
 });
+
+// ── dev.24 — cycle rollup: collapse a washer / dishwasher / water-softener
+// cycle (events sharing data-cycle-group) into ONE expandable parent row so the
+// History list stays readable. Members are taken OUT of See-more's management
+// (their hist-extra-row class is removed) so the two toggles never conflict; the
+// parent inherits the extra-row state, so See-more still reveals an off-page
+// group. Singletons (no group, or a user-relabeled member whose group was
+// cleared) render exactly as before. ──
+(function () {
+  const prettify = t => (t || 'cycle').replace(/_/g, ' ')
+      .replace(/\b\w/g, c => c.toUpperCase());
+  document.querySelectorAll('.hist-card table tbody').forEach(tbody => {
+    const groups = {};
+    tbody.querySelectorAll('tr.hist-event-row[data-cycle-group]').forEach(r => {
+      const g = r.getAttribute('data-cycle-group');
+      if (g) (groups[g] = groups[g] || []).push(r);
+    });
+    Object.keys(groups).forEach(g => {
+      const members = groups[g];
+      if (members.length < 2) return;                 // lone grouped event → single
+      const first = members[0];                        // latest member (start_ts DESC)
+      let totVol = 0, unit = '';
+      members.forEach(m => {
+        const dv = (m.getAttribute('data-volume') || '').split(' ');
+        const n = parseFloat(dv[0]); if (!isNaN(n)) totVol += n;
+        if (dv[1]) unit = dv[1];
+      });
+      const tNew = (first.getAttribute('data-start') || '').slice(11, 16);
+      const tOld = (members[members.length - 1].getAttribute('data-start') || '')
+          .slice(11, 16);
+      const label = prettify(first.getAttribute('data-eff-type'));
+      const wasExtra = first.classList.contains('hist-extra-row');
+      const parent = document.createElement('tr');
+      parent.className = 'hist-group-parent' + (wasExtra ? ' hist-extra-row' : '');
+      if (wasExtra) parent.style.display = 'none';
+      parent.style.cursor = 'pointer';
+      parent.setAttribute('tabindex', '0');
+      parent.setAttribute('role', 'button');
+      parent.setAttribute('aria-label', label + ' cycle — expand');
+      const td = document.createElement('td');
+      td.colSpan = first.children.length;
+      td.className = 'hist-td';
+      td.style.fontWeight = '600';
+      td.innerHTML = '<span class="hist-group-chevron">▸</span> ↻ ' + label +
+        ' · ' + members.length + ' events · ' +
+        (Math.round(totVol * 10) / 10) + (unit ? ' ' + unit : '') +
+        (tNew && tOld ? ' · ' + tOld + '–' + tNew : '');
+      parent.appendChild(td);
+      first.parentNode.insertBefore(parent, first);
+      members.forEach(m => {
+        m.classList.add('hist-group-member');
+        m.classList.remove('hist-extra-row');         // hand visibility to the group
+        m.style.display = 'none';
+      });
+      let open = false;
+      const toggle = () => {
+        open = !open;
+        members.forEach(m => { m.style.display = open ? 'table-row' : 'none'; });
+        const chev = td.querySelector('.hist-group-chevron');
+        if (chev) chev.textContent = open ? '▾' : '▸';
+      };
+      parent.addEventListener('click', toggle);
+      parent.addEventListener('keydown', ev => {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); }
+      });
+    });
+  });
+})();
 
 // ── Event detail modal ──────────────────────────────────────────────────────
 (function () {
