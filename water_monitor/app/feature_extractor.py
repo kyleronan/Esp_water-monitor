@@ -2696,7 +2696,7 @@ class FeatureExtractor:
         if match_confidence is not None:
             features["anomaly_score"] = round(1.0 - match_confidence, 3)
         elif cluster_id_result is None and match_rejection_reason not in (
-            "type_gate_rejected", "excluded_from_training"
+            "type_gate_rejected", "excluded_from_training", "type_gate_error"
         ):
             # Unmatched event in live state with no explicit rejection reason
             # — treat as fully anomalous.

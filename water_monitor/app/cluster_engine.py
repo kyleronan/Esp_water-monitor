@@ -152,6 +152,10 @@ class ClusterEngine:
         # Protects merge + rebuild sequences so concurrent executor threads
         # cannot read stale river→DB ID maps while a merge is in progress.
         self._merge_lock = threading.Lock()
+        # Phase 5 §2.3 — count type-gate crashes. The gate now fails CLOSED (a crash
+        # rejects the match rather than silently accepting a possibly-wrong one), so
+        # this surfaces a gate that's quietly erroring on every event.
+        self._type_gate_errors: Dict[str, int] = {}
 
         for c in cfg.circuits:
             self._init_circuit(c.circuit)
@@ -571,6 +575,10 @@ class ClusterEngine:
         self._frozen[circuit] = False
         log.info("[%s] cluster engine unfrozen (learning resumed)", circuit)
 
+    def type_gate_error_count(self, circuit: str) -> int:
+        """Total type-gate crashes for a circuit (fail-closed rejections, §2.3)."""
+        return self._type_gate_errors.get(circuit, 0)
+
     def _is_frozen(self, circuit: str) -> bool:
         cached = self._frozen.get(circuit)
         if cached is not None:
@@ -626,8 +634,12 @@ class ClusterEngine:
                     if wdist > get_match_threshold(fixture_type):
                         return (None, 0.0, '', 'type_gate_rejected')
             except Exception as e:
-                log.warning("[%s] frozen type-gate failed (matching anyway): %s",
-                            circuit, e)
+                self._type_gate_errors[circuit] = (
+                    self._type_gate_errors.get(circuit, 0) + 1)
+                log.warning("[%s] frozen type-gate failed — rejecting (fail-closed, "
+                            "%d total): %s",
+                            circuit, self._type_gate_errors[circuit], e)
+                return (None, 0.0, '', 'type_gate_error')
 
         confidence = math.exp(-distance / DBSTREAM_CLUSTERING_THRESHOLD)
         member_count = 0
@@ -730,14 +742,17 @@ class ClusterEngine:
                         # learned shape.
                         return (None, 0.0, '', 'type_gate_rejected')
             except Exception as e:
-                # Fail open: if the gate itself crashes (corrupt JSON,
-                # missing column, etc.) we'd rather match than lose the
-                # event entirely. The error is logged for follow-up.
+                # Fail CLOSED (§2.3): a crashed gate must not silently accept a
+                # possibly-wrong match. Reject + count; backfill_unmatched can retry
+                # the event later once the underlying issue is fixed.
+                self._type_gate_errors[circuit] = (
+                    self._type_gate_errors.get(circuit, 0) + 1)
                 log.warning(
-                    "[%s] type-aware gate failed for cluster %s "
-                    "(falling through to default match): %s",
-                    circuit, candidate_id, e,
+                    "[%s] type-aware gate failed for cluster %s — rejecting "
+                    "(fail-closed, %d total): %s",
+                    circuit, candidate_id, self._type_gate_errors[circuit], e,
                 )
+                return (None, 0.0, '', 'type_gate_error')
 
         confidence = math.exp(-distance / DBSTREAM_CLUSTERING_THRESHOLD)
         # Stage 3: multiply confidence by SEQUENCE_BOOST_WEIGHT when

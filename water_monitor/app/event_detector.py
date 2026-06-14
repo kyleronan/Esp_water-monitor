@@ -356,6 +356,11 @@ class CircuitEventDetector:
     # Seconds of sustained flow required to open a flow-triggered event
     FLOW_START_SECONDS: float = 2.0
 
+    # Consecutive sub-MIN_FLOW samples tolerated mid-formation before the sustain
+    # timer is abandoned. The turbine chatters / drops out for a sample or two on a
+    # slow ramp-up, and a single glitch must not reset a nearly-complete timer.
+    FLOW_START_DIP_TOLERANCE: int = 2
+
     # Composite: second transient must be >= this multiple of primary threshold
     COMPOSITE_TRANSIENT_MULTIPLIER: float = 1.5
 
@@ -434,6 +439,7 @@ class CircuitEventDetector:
         self._active_event: Optional[RawEvent] = None
         self._current_flow_lpm: float = 0.0
         self._flow_sustained_since: Optional[datetime] = None
+        self._flow_start_dips: int = 0   # consecutive sub-threshold samples mid-start
         self._pressure_recovered_since: Optional[datetime] = None
 
         # Downsampling: keep all readings for the first N seconds, then every Kth.
@@ -543,17 +549,23 @@ class CircuitEventDetector:
             self._pretrigger_flow.popleft()
 
         if self._current_flow_lpm >= self.MIN_FLOW_LPM:
+            self._flow_start_dips = 0
             if self._flow_sustained_since is None:
                 self._flow_sustained_since = now
                 log.debug("[%s] flow start timer begins (%.3f L/min)",
                           self.circuit, self._current_flow_lpm)
             elif (now - self._flow_sustained_since).total_seconds() >= self.FLOW_START_SECONDS:
                 self._start_flow_event(now)
-        else:
-            if self._flow_sustained_since is not None:
-                log.debug("[%s] flow start timer reset (%.3f L/min)",
-                          self.circuit, self._current_flow_lpm)
-            self._flow_sustained_since = None
+        elif self._flow_sustained_since is not None:
+            # Tolerate a few consecutive sub-threshold samples mid-formation: a dip
+            # does NOT advance the timer, but it must not reset a nearly-complete one
+            # either, until the tolerance is exceeded.
+            self._flow_start_dips += 1
+            if self._flow_start_dips > self.FLOW_START_DIP_TOLERANCE:
+                log.debug("[%s] flow start timer reset after %d dip(s) (%.3f L/min)",
+                          self.circuit, self._flow_start_dips, self._current_flow_lpm)
+                self._flow_sustained_since = None
+                self._flow_start_dips = 0
 
     def on_pressure_fast(self, entity_id: str, state: str, attributes: dict) -> None:
         """
