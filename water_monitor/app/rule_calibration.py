@@ -138,36 +138,44 @@ def _provenance_weight(uft, src, mft, via) -> Optional[Tuple[str, float, bool]]:
     return None
 
 
-def _fit_pool(conn: sqlite3.Connection, circuit: str) -> Dict[str, List[dict]]:
-    """Group this circuit's typed events by effective type, each entry carrying its
+def _pool_from_rows(rows: List[dict]) -> Dict[str, List[dict]]:
+    """Group typed-event row dicts by effective type, each entry carrying its
     flow/volume features + provenance weight. Artifact-flagged events are kept only
-    when they carry an explicit (user/training) label."""
-    rows = conn.execute(
-        "SELECT user_fixture_type, fixture_label_source, matched_fixture_type, "
-        "       matched_via, COALESCE(excluded_from_training, 0) AS excl, "
-        "       volume_litres, duration_seconds, peak_flow_lpm "
-        "FROM events WHERE circuit = ?",
-        (circuit,),
-    ).fetchall()
+    when they carry an explicit (user/training) label. Each row dict needs:
+    user_fixture_type, fixture_label_source, matched_fixture_type, matched_via,
+    excluded_from_training, volume_litres, duration_seconds, peak_flow_lpm."""
     pool: Dict[str, List[dict]] = {}
     for r in rows:
         tagged = _provenance_weight(
-            r["user_fixture_type"], r["fixture_label_source"],
-            r["matched_fixture_type"], r["matched_via"])
+            r.get("user_fixture_type"), r.get("fixture_label_source"),
+            r.get("matched_fixture_type"), r.get("matched_via"))
         if tagged is None:
             continue
         ftype, weight, explicit = tagged
         # Artifact-flagged auto event with no explicit label → unreliable features.
-        if r["excl"] and not explicit:
+        if (r.get("excluded_from_training") or 0) and not explicit:
             continue
         pool.setdefault(ftype, []).append({
-            "vol": r["volume_litres"],
-            "dur": r["duration_seconds"],
-            "pk":  r["peak_flow_lpm"],
+            "vol": r.get("volume_litres"),
+            "dur": r.get("duration_seconds"),
+            "pk":  r.get("peak_flow_lpm"),
             "weight": weight,
             "explicit": explicit,
         })
     return pool
+
+
+def _fit_pool(conn: sqlite3.Connection, circuit: str) -> Dict[str, List[dict]]:
+    """Build the fit pool from all of one circuit's events."""
+    rows = conn.execute(
+        "SELECT user_fixture_type, fixture_label_source, matched_fixture_type, "
+        "       matched_via, "
+        "       COALESCE(excluded_from_training, 0) AS excluded_from_training, "
+        "       volume_litres, duration_seconds, peak_flow_lpm "
+        "FROM events WHERE circuit = ?",
+        (circuit,),
+    ).fetchall()
+    return _pool_from_rows([dict(r) for r in rows])
 
 
 def _pairs(entries: List[dict], field: str) -> List[Tuple[float, float]]:
@@ -277,16 +285,10 @@ def _is_sane(key: str, value: Any) -> bool:
 
 # ── Public API ──────────────────────────────────────────────────────────────────
 
-def fit_rule_constants(conn: sqlite3.Connection,
-                       circuit: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Derive per-home rule bands from this circuit's weighted, gated, sanity-
-    checked label pool. Returns ``(calib, report)``.
-
-    ``calib`` is the dict of accepted overrides (omitted keys keep their default).
-    ``report`` maps each fixture type → ``{status, explicit, weight, keys_fit,
-    keys_fallback}`` for activation-time visibility. Pure read — does not persist.
-    """
-    pool = _fit_pool(conn, circuit)
+def _fit_from_pool(pool: Dict[str, List[dict]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Run the per-type fit + dual gate + sanity gate over a prepared pool.
+    Returns ``(calib, report)``. Shared by the DB-backed ``fit_rule_constants`` and
+    the row-backed ``fit_rule_constants_from_rows`` (which powers held-out eval)."""
     calib: Dict[str, Any] = {}
     report: Dict[str, Any] = {}
 
@@ -315,6 +317,22 @@ def fit_rule_constants(conn: sqlite3.Connection,
         report[ftype] = rep
 
     return calib, report
+
+
+def fit_rule_constants(conn: sqlite3.Connection,
+                       circuit: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Derive per-home rule bands from this circuit's weighted, gated, sanity-
+    checked label pool. Returns ``(calib, report)``; pure read — does not persist."""
+    return _fit_from_pool(_fit_pool(conn, circuit))
+
+
+def fit_rule_constants_from_rows(
+        rows: List[dict]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Same fit as ``fit_rule_constants`` but over an explicit list of event row
+    dicts (e.g. a k-fold train split, excluding the held-out events). Used by the
+    held-out eval so the held-out events never leak into their own fit."""
+    norm = [r if isinstance(r, dict) else dict(r) for r in rows]
+    return _fit_from_pool(_pool_from_rows(norm))
 
 
 def save_rule_calibration(conn: sqlite3.Connection, circuit: str,

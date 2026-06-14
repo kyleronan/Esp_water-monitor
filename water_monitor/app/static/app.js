@@ -48,6 +48,20 @@ function toast(message, type = 'info') {
   if (type === 'success' || type === 'info') setTimeout(dismiss, 4000);
 }
 
+// ── Dev tools (Settings → Dev; gated server-side by WM_DEV_TOOLS) ───
+async function devRetrain(circuit) {
+  if (!confirm(`Dev: re-fit and re-lock rule calibration for "${circuit}" `
+               + `from the current labels (no new learning period)?`)) return;
+  toast(`Re-training ${circuit}…`, 'info');
+  const { ok, data } = await post(`/settings/dev/retrain/${circuit}`);
+  if (!ok) { toast((data && data.error) || 'Re-train failed', 'error'); return; }
+  const rep = (data && data.report) || {};
+  const fit = Object.keys(rep).filter(t => rep[t] && rep[t].status === 'fit');
+  const fell = Object.keys(rep).filter(t => rep[t] && rep[t].status !== 'fit');
+  toast(`Re-locked. Home-fit: ${fit.join(', ') || 'none'} · `
+        + `defaults: ${fell.join(', ') || 'none'}`, 'success');
+}
+
 // ── Live state updater ─────────────────────────────────────────────
 // Always-on poll — reflects valve changes from HA, the ESP firmware
 // (faults, leak tests, bypass switch), or any other source.

@@ -228,8 +228,10 @@ async def settings_page(request: Request):
     from ..fixtures import (CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP,
                             ZONE_ONLY_ALERT_TYPES,
                             VALVE_TYPES, VALVE_TYPE_LABELS, VALVE_TYPE_HELP)
+    from ..config import DEV_TOOLS
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
+        "dev_tools": DEV_TOOLS,
         "profile": dict(get_home_profile(orch.db) or {}),
         "circuits": circuits,
         "general_entities": entities_by_circuit.get("general", []),

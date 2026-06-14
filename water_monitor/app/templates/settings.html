@@ -343,6 +343,18 @@
             <button type="submit" class="btn btn-warning btn-sm">Start Recalibration</button>
           </form>
         </details>
+        {% if dev_tools %}
+        <details class="recal-details" style="margin-top:.5rem">
+          <summary>🛠 Dev tools</summary>
+          <p class="sett-help" style="margin:.5rem 0">
+            Instant re-fit + re-lock of the rule calibration from the current
+            labels (no new learning period). Testing only — hidden unless
+            <code>WM_DEV_TOOLS</code> is set.
+          </p>
+          <button type="button" class="btn btn-secondary btn-sm"
+                  onclick="devRetrain('{{ c.circuit }}')">Re-train now (dev)</button>
+        </details>
+        {% endif %}
         <p class="sett-cal-warning">⚠ Incorrect calibration values may cause false shutoffs or missed leaks.</p>
       </div>
 
