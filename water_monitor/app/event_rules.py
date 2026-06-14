@@ -40,14 +40,16 @@ LOWFLOW_PK_CEIL_LPM: float = 4.0     # ...and no spike reaches this (excludes di
 LOWFLOW_OFF_GRACE_S: float = 120.0   # detector hold window AND coalesce max inter-fragment gap
 
 
-def is_low_flow_chatter(mean_flow: Optional[float], peak: Optional[float]) -> bool:
+def is_low_flow_chatter(mean_flow: Optional[float], peak: Optional[float],
+                        calib: Optional[Dict[str, Any]] = None) -> bool:
     """True when an event's flow profile is a sustained LOW draw the turbine
     fragments: mean below ``LOWFLOW_CEIL_LPM`` and no spike reaching
     ``LOWFLOW_PK_CEIL_LPM``. Single-sourced so the live off-grace and the
     post-hoc coalesce never disagree on the boundary."""
     if mean_flow is None or peak is None:
         return False
-    return mean_flow < LOWFLOW_CEIL_LPM and peak < LOWFLOW_PK_CEIL_LPM
+    return (mean_flow < _cv(calib, "LOWFLOW_CEIL_LPM")
+            and peak < _cv(calib, "LOWFLOW_PK_CEIL_LPM"))
 
 
 def parse_hhmm_to_minutes(value: Optional[str]) -> Optional[int]:
@@ -127,6 +129,49 @@ _ZONE_MIN_DUR_S: float = 240.0
 _ZONE_MIN_PK_LPM: float = 5.0
 
 
+# ── Per-home calibration plumbing (Phase 1) ─────────────────────────────────────
+# event_rules ships the defaults above; a frozen per-home fit (rule_calibration.py)
+# may override any subset via an optional ``calib`` dict threaded through the
+# predicates below. ``RULE_DEFAULTS`` is the single source of truth for BOTH the
+# fallback here AND the sanity-gate span comparison in rule_calibration (which
+# imports it) — so the two can never drift apart. Keys mirror the constant names
+# without the leading underscore.
+RULE_DEFAULTS: Dict[str, Any] = {
+    "FLUSH_VOL_L":             _FLUSH_VOL_L,
+    "FLUSH_DUR_S":             _FLUSH_DUR_S,
+    "FLUSH_MIN_PK_LPM":        _FLUSH_MIN_PK_LPM,
+    "DW_VOL_L":                _DW_VOL_L,
+    "DW_MAX_PK_LPM":           _DW_MAX_PK_LPM,
+    "SHOWER_BIG_VOL_L":        _SHOWER_BIG_VOL_L,
+    "SHOWER_BIG_DUR_S":        _SHOWER_BIG_DUR_S,
+    "SHOWER_BIG_MIN_PK":       _SHOWER_BIG_MIN_PK,
+    "SHOWER_SMALL_VOL_L":      _SHOWER_SMALL_VOL_L,
+    "SHOWER_SMALL_DUR_S":      _SHOWER_SMALL_DUR_S,
+    "ZONE_MIN_DUR_S":          _ZONE_MIN_DUR_S,
+    "ZONE_MIN_PK_LPM":         _ZONE_MIN_PK_LPM,
+    "WASHER_ANCHOR_MIN_VOL_L": _WASHER_ANCHOR_MIN_VOL_L,
+    "WASHER_ANCHOR_DUR_S":     _WASHER_ANCHOR_DUR_S,
+    "WASHER_ANCHOR_PK_LPM":    _WASHER_ANCHOR_PK_LPM,
+    "WASHER_FAMILY_PK_RATIO":  _WASHER_FAMILY_PK_RATIO,
+    "LOWFLOW_CEIL_LPM":        LOWFLOW_CEIL_LPM,
+    "LOWFLOW_PK_CEIL_LPM":     LOWFLOW_PK_CEIL_LPM,
+}
+
+
+def _cv(calib: Optional[Dict[str, Any]], key: str) -> Any:
+    """Resolve a rule constant: the per-home calibrated value if the frozen
+    ``calib`` carries it, else the shipped default. Tuples round-trip through JSON
+    as lists, so normalise a list back to a tuple when the default is a tuple."""
+    default = RULE_DEFAULTS[key]
+    if calib is not None:
+        v = calib.get(key)
+        if v is not None:
+            if isinstance(default, tuple) and isinstance(v, list):
+                return tuple(v)
+            return v
+    return default
+
+
 def _f(features: Dict[str, Any], key: str) -> Optional[float]:
     """Feature as float, or None (missing / non-numeric)."""
     v = features.get(key)
@@ -136,7 +181,8 @@ def _f(features: Dict[str, Any], key: str) -> Optional[float]:
         return None
 
 
-def is_flush_shaped(features: Dict[str, Any]) -> bool:
+def is_flush_shaped(features: Dict[str, Any],
+                    calib: Optional[Dict[str, Any]] = None) -> bool:
     """THE shared flush predicate — both the toilet rule's positive match AND the
     washer sweep's exclusion. Single-sourcing it makes the invariant structural:
     the washer family can never claim an event the toilet rule would claim (a
@@ -147,22 +193,26 @@ def is_flush_shaped(features: Dict[str, Any]) -> bool:
     pk = _f(features, "peak_flow_lpm")
     if vol is None or dur is None or pk is None:
         return False
-    if not (_FLUSH_VOL_L[0] <= vol <= _FLUSH_VOL_L[1]):
+    flush_vol = _cv(calib, "FLUSH_VOL_L")
+    flush_dur = _cv(calib, "FLUSH_DUR_S")
+    if not (flush_vol[0] <= vol <= flush_vol[1]):
         return False
-    if not (_FLUSH_DUR_S[0] <= dur <= _FLUSH_DUR_S[1]):
+    if not (flush_dur[0] <= dur <= flush_dur[1]):
         return False
-    if pk < _FLUSH_MIN_PK_LPM:
+    if pk < _cv(calib, "FLUSH_MIN_PK_LPM"):
         return False
     transient = features.get("has_pressure_transient")
     delta = _f(features, "pressure_delta_psi")
     return bool(transient) or (delta is not None and delta >= _FLUSH_MIN_DELTA_PSI)
 
 
-def _is_washer_anchor(vol, dur, pk) -> bool:
+def _is_washer_anchor(vol, dur, pk, calib: Optional[Dict[str, Any]] = None) -> bool:
+    anchor_dur = _cv(calib, "WASHER_ANCHOR_DUR_S")
+    anchor_pk = _cv(calib, "WASHER_ANCHOR_PK_LPM")
     return (vol is not None and dur is not None and pk is not None
-            and vol >= _WASHER_ANCHOR_MIN_VOL_L
-            and _WASHER_ANCHOR_DUR_S[0] <= dur <= _WASHER_ANCHOR_DUR_S[1]
-            and _WASHER_ANCHOR_PK_LPM[0] <= pk <= _WASHER_ANCHOR_PK_LPM[1])
+            and vol >= _cv(calib, "WASHER_ANCHOR_MIN_VOL_L")
+            and anchor_dur[0] <= dur <= anchor_dur[1]
+            and anchor_pk[0] <= pk <= anchor_pk[1])
 
 
 def detect_washer_cycles(
@@ -170,6 +220,7 @@ def detect_washer_cycles(
     circuit: str,
     since_ts: Optional[str] = None,
     limit: int = 4000,
+    calib: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Tuple[str, str]]:
     """Find washer-cycle members on ``circuit``: anchors (main fills) that have at
     least one same-peak sibling 2-45 min away, plus the family's non-flush-shaped
@@ -208,9 +259,10 @@ def detect_washer_cycles(
     out: Dict[str, Tuple[str, str]] = {}
     win = _WASHER_FAMILY_WINDOW_MIN * 60.0
     min_gap = _WASHER_FAMILY_MIN_GAP_MIN * 60.0
+    fam_ratio = _cv(calib, "WASHER_FAMILY_PK_RATIO")
     for ts_a, a in evs:
         if not _is_washer_anchor(a["volume_litres"], a["duration_seconds"],
-                                 a["peak_flow_lpm"]):
+                                 a["peak_flow_lpm"], calib):
             continue
         pk_a = a["peak_flow_lpm"]
         family = []
@@ -226,8 +278,7 @@ def detect_washer_cycles(
                 continue
             if dur_o is not None and dur_o > _WASHER_SIBLING_MAX_DUR_S:
                 continue
-            if not (_WASHER_FAMILY_PK_RATIO[0] * pk_a <= pk_o
-                    <= _WASHER_FAMILY_PK_RATIO[1] * pk_a):
+            if not (fam_ratio[0] * pk_a <= pk_o <= fam_ratio[1] * pk_a):
                 continue
             family.append(o)
         if not family:
@@ -239,7 +290,7 @@ def detect_washer_cycles(
                      "peak_flow_lpm": o["peak_flow_lpm"],
                      "has_pressure_transient": o["has_pressure_transient"],
                      "pressure_delta_psi": o["pressure_delta_psi"]}
-            if is_flush_shaped(feats):
+            if is_flush_shaped(feats, calib):
                 continue                   # flush during laundry — leave it alone
             out.setdefault(o["id"], ("member", a["id"]))
     return out
@@ -247,6 +298,7 @@ def detect_washer_cycles(
 
 def rule_classify_event(
     features: Dict[str, Any], circuit_type: str = "fixture",
+    calib: Optional[Dict[str, Any]] = None,
 ) -> Optional[Tuple[str, str]]:
     """Ordered structural rules — first hit wins; None = no rule claims the event
     (falls through to the k-NN residual). Washer is deliberately NOT here: it
@@ -259,24 +311,29 @@ def rule_classify_event(
         # Zone circuits host no toilets/dishwashers/showers; the only rule is the
         # irrigation default (fixes the audit's 0/6: the k-NN can never fire
         # under its 10-label floor on a young zone circuit).
-        if (dur is not None and dur >= _ZONE_MIN_DUR_S
-                and pk is not None and pk >= _ZONE_MIN_PK_LPM):
+        if (dur is not None and dur >= _cv(calib, "ZONE_MIN_DUR_S")
+                and pk is not None and pk >= _cv(calib, "ZONE_MIN_PK_LPM")):
             return "irrigation_zone", "zone_default"
         return None
 
-    if is_flush_shaped(features):
+    if is_flush_shaped(features, calib):
         return "toilet", "rule_toilet"
 
+    dw_vol = _cv(calib, "DW_VOL_L")
     cyc = _f(features, "cycle_pulse_count")
-    if (vol is not None and _DW_VOL_L[0] <= vol <= _DW_VOL_L[1]
-            and pk is not None and pk <= _DW_MAX_PK_LPM
+    if (vol is not None and dw_vol[0] <= vol <= dw_vol[1]
+            and pk is not None and pk <= _cv(calib, "DW_MAX_PK_LPM")
             and cyc is not None and cyc >= _DW_MIN_CYCLE_PULSES):
         return "dishwasher", "rule_dishwasher"
 
     if vol is not None and dur is not None and pk is not None:
-        if vol >= _SHOWER_BIG_VOL_L and dur >= _SHOWER_BIG_DUR_S and pk >= _SHOWER_BIG_MIN_PK:
+        shower_small_vol = _cv(calib, "SHOWER_SMALL_VOL_L")
+        if (vol >= _cv(calib, "SHOWER_BIG_VOL_L")
+                and dur >= _cv(calib, "SHOWER_BIG_DUR_S")
+                and pk >= _cv(calib, "SHOWER_BIG_MIN_PK")):
             return "shower_tub", "rule_shower"
-        if _SHOWER_SMALL_VOL_L[0] <= vol < _SHOWER_SMALL_VOL_L[1] and dur >= _SHOWER_SMALL_DUR_S:
+        if (shower_small_vol[0] <= vol < shower_small_vol[1]
+                and dur >= _cv(calib, "SHOWER_SMALL_DUR_S")):
             return "shower_tub", "rule_shower"
 
     return None
@@ -331,6 +388,7 @@ def detect_softener_sessions(
     band_center_min: int,
     since_ts: Optional[str] = None,
     tz=None,
+    calib: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Tuple[str, str]]:
     """Find water-softener regeneration sessions on ``circuit``.
 
@@ -414,7 +472,7 @@ def detect_softener_sessions(
         j = i + 1
         while j < n:
             s2, e2, r2 = evs[j]
-            if is_flush_shaped(_softener_feat(r2)):
+            if is_flush_shaped(_softener_feat(r2), calib):
                 break
             if (s2 - last_end).total_seconds() > chain_gap:
                 break
@@ -453,7 +511,7 @@ def detect_softener_sessions(
         win_end = min(last_end + tail, sdt + timedelta(minutes=_SOFTENER_MAX_SPAN_MIN))
         for (s2, e2, r2) in evs:
             if (r2["id"] in claimed or s2 <= last_end or s2 > win_end
-                    or _is_low(r2) or is_flush_shaped(_softener_feat(r2))):
+                    or _is_low(r2) or is_flush_shaped(_softener_feat(r2), calib)):
                 continue
             out[r2["id"]] = ("backwash", group_id)
             claimed.add(r2["id"])

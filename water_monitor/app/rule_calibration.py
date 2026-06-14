@@ -1,25 +1,37 @@
 """Per-home rule calibration (Phase 1 — fit-once-at-activation, then frozen).
 
 The structural-rules-tier bands in :mod:`event_rules` ship as developer-tuned
-module constants shaped by one home's data. At **activation** (labelling → live)
-those bands are re-fit from THIS home's labelled events and stored, frozen, in
-the ``rule_calibration`` table. The :mod:`event_rules` predicates read the fitted
-values through an optional ``calib`` dict, falling back to their module-default
-constant for any band this home lacks enough labels to fit.
+module constants shaped by one home's data. At **activation** (labelling → live,
+or an explicit dev re-train) those bands are re-fit from THIS home's labelled +
+accepted-auto events and stored, frozen, in the ``rule_calibration`` table. The
+:mod:`event_rules` predicates read the fitted values through an optional ``calib``
+dict, falling back to ``event_rules.RULE_DEFAULTS`` for any band this home lacks
+enough labels to fit (or whose fit fails the sanity gate).
 
-Design notes:
+Design (per the approved plan):
 
-* **Fit once, then freeze.** Calibration is written only at activation and on an
-  explicit re-train — never on ordinary reclassify or on incoming live events. A
-  locked baseline is what lets future leak / odd-usage detection treat a
-  non-conforming event as anomalous instead of silently learning it as normal.
-* **No import cycle.** This module never imports :mod:`event_rules`. It only
-  produces / loads the dict of overridable keys; ``event_rules`` owns the
-  defaults and the fallback. The key names here mirror the ``event_rules``
-  constant names (sans leading underscore).
-* **Graceful fallback.** A fixture type with fewer than ``MIN_LABELS_FOR_FIT``
-  clean labels contributes nothing to the dict, so its rule keeps the shipped
-  default — no type is ever left worse off than today.
+* **Fit once, then freeze.** Calibration is written only at activation / explicit
+  re-train — never on ordinary reclassify or live events. A locked baseline is
+  what lets future leak / odd-usage detection treat a non-conforming event as
+  anomalous instead of silently learning it as normal.
+* **Weighted, inclusive pool.** Every typed event contributes, weighted by
+  provenance (``fixture_label_source`` / ``matched_via``): explicit ``user`` /
+  ``training`` = 1.0, ``cycle`` = 0.75, ``knn`` = 0.5, base structural detectors
+  = 0.25. Explicit labels *authorize* a per-type fit; auto-labels only *refine*
+  the band.
+* **Dual gate.** A type is fit only with ≥ ``MIN_EXPLICIT_LABELS`` explicit
+  labels AND ≥ ``MIN_FIT_WEIGHT`` weighted mass — so a type can't be frozen onto
+  unconfirmed auto-labels the explicit-only eval can't validate.
+* **Artifacts.** Explicit labels count even when ``excluded_from_training=1`` (a
+  human label overrides the auto artifact flag); artifact-flagged events with no
+  explicit label are dropped (their flow/volume features are unreliable). The
+  phantom/dribble/cross-talk *detectors* are calibrated separately in Phase 2.
+* **Bounded-expansion sanity gate (shared path).** Each fitted band is checked
+  against absolute physical limits and a span cap relative to the default; a band
+  that fails falls back to the default for that type. The gate lives HERE in the
+  shared fit path so BOTH activation and the dev ``retrain()`` enforce it.
+* **No event_rules → rule_calibration import.** This module imports
+  ``RULE_DEFAULTS`` from event_rules (one-way); event_rules never imports back.
 """
 from __future__ import annotations
 
@@ -27,153 +39,312 @@ import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from .event_rules import RULE_DEFAULTS
 
 log = logging.getLogger(__name__)
 
-# A fixture type needs at least this many clean (non-excluded) labels before we
-# trust a per-home fit over the shipped default.
-MIN_LABELS_FOR_FIT = 5
+# ── Gates / knobs (placeholders until the held-out eval locks them on real data) ─
+MIN_EXPLICIT_LABELS = 5        # ≥ this many user/training labels to AUTHORISE a fit
+MIN_FIT_WEIGHT = 8.0           # AND ≥ this weighted label mass
+_FIT_MAX_SPAN_FACTOR = 2.0     # a fitted range span may be at most this × default span
 
-# Robust percentiles for range fits; ranges are padded outward by _RANGE_PAD so a
-# slightly-out-of-sample event of the same type isn't rejected by a too-tight band.
 _LO_PCT = 10.0
 _HI_PCT = 90.0
-_RANGE_PAD = 0.10
+_RANGE_PAD = 0.10              # widen fitted [lo, hi] ranges by 10% each side
+
+# Provenance → (weight, is_explicit). Explicit labels authorise; the rest refine.
+_W_EXPLICIT = 1.0
+_W_CYCLE = 0.75
+_W_KNN = 0.5
+_W_RULE = 0.25
+
+# Per-key sanity metadata: kind + absolute physical bounds. Range keys also get a
+# span cap relative to RULE_DEFAULTS. Floor/ceiling keys are scalar.
+#   kind: "range" (a [lo, hi] tuple) | "floor" | "ceiling" (a scalar)
+_SANITY: Dict[str, Tuple[str, float, float]] = {
+    "FLUSH_VOL_L":             ("range",   0.0,   30.0),
+    "FLUSH_DUR_S":             ("range",   0.0,  600.0),
+    "FLUSH_MIN_PK_LPM":        ("floor",   0.0,   30.0),
+    "DW_VOL_L":                ("range",   0.0,   30.0),
+    "DW_MAX_PK_LPM":           ("ceiling", 0.0,   30.0),
+    "SHOWER_BIG_VOL_L":        ("floor",   0.0,  600.0),
+    "SHOWER_BIG_DUR_S":        ("floor",   0.0, 7200.0),
+    "SHOWER_BIG_MIN_PK":       ("floor",   0.0,   60.0),
+    "ZONE_MIN_DUR_S":          ("floor",   0.0, 7200.0),
+    "ZONE_MIN_PK_LPM":         ("floor",   0.0,   60.0),
+    "WASHER_ANCHOR_MIN_VOL_L": ("floor",   0.0,  200.0),
+    "WASHER_ANCHOR_DUR_S":     ("range",   0.0, 1200.0),
+    "WASHER_ANCHOR_PK_LPM":    ("range",   0.0,   60.0),
+}
 
 
-def _percentile(vals: List[Optional[float]], pct: float) -> Optional[float]:
-    """Linear-interpolated percentile of the non-None values, or None if empty."""
-    xs = sorted(float(v) for v in vals if v is not None)
-    if not xs:
+# ── Weighted percentile helpers ─────────────────────────────────────────────────
+
+def _wpct(pairs: List[Tuple[float, float]], pct: float) -> Optional[float]:
+    """Weighted percentile of (value, weight) pairs, or None if empty.
+
+    Uses the standard weighted-percentile convention: order by value, walk the
+    cumulative weight, and interpolate at ``pct`` of the total weight.
+    """
+    pts = sorted((float(v), float(w)) for v, w in pairs if v is not None and w > 0)
+    if not pts:
         return None
-    if len(xs) == 1:
-        return xs[0]
-    k = (len(xs) - 1) * (pct / 100.0)
-    lo = int(k)
-    hi = min(lo + 1, len(xs) - 1)
-    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+    if len(pts) == 1:
+        return pts[0][0]
+    total = sum(w for _, w in pts)
+    if total <= 0:
+        return None
+    target = (pct / 100.0) * total
+    cum = 0.0
+    prev_v = pts[0][0]
+    for v, w in pts:
+        if cum + w >= target:
+            # linear interpolate between prev_v and v across this segment
+            span = w if w > 0 else 1.0
+            frac = max(0.0, min(1.0, (target - cum) / span))
+            return prev_v + (v - prev_v) * frac
+        cum += w
+        prev_v = v
+    return pts[-1][0]
 
 
-def _range(vals: List[Optional[float]]) -> Optional[List[float]]:
-    """Padded [p10, p90] range as a 2-list (JSON-friendly), or None if empty."""
-    lo = _percentile(vals, _LO_PCT)
-    hi = _percentile(vals, _HI_PCT)
+def _wrange(pairs: List[Tuple[float, float]]) -> Optional[List[float]]:
+    """Padded weighted [p10, p90] as a JSON-friendly 2-list, or None if empty."""
+    lo = _wpct(pairs, _LO_PCT)
+    hi = _wpct(pairs, _HI_PCT)
     if lo is None or hi is None:
         return None
     span = max(hi - lo, 0.0)
     return [max(0.0, lo - span * _RANGE_PAD), hi + span * _RANGE_PAD]
 
 
-def _clean_label_rows(conn: sqlite3.Connection, circuit: str,
-                      fixture_type: str) -> List[sqlite3.Row]:
-    """Clean (training-eligible) labelled events of one type on one circuit."""
-    return conn.execute(
-        "SELECT volume_litres, duration_seconds, peak_flow_lpm "
-        "FROM events WHERE circuit = ? AND user_fixture_type = ? "
-        "  AND COALESCE(excluded_from_training, 0) = 0",
-        (circuit, fixture_type),
+# ── Fit pool ────────────────────────────────────────────────────────────────────
+
+def _provenance_weight(uft, src, mft, via) -> Optional[Tuple[str, float, bool]]:
+    """Return (effective_type, weight, is_explicit) for one event row, or None to
+    skip (no usable type)."""
+    if uft:
+        if src == "cycle":
+            return (uft, _W_CYCLE, False)
+        # 'user', 'training', or legacy NULL source on a user-set label → explicit
+        return (uft, _W_EXPLICIT, True)
+    if mft:
+        if via == "knn":
+            return (mft, _W_KNN, False)
+        # rule_*, washer_cycle, softener_session, zone_default, legacy cluster
+        return (mft, _W_RULE, False)
+    return None
+
+
+def _fit_pool(conn: sqlite3.Connection, circuit: str) -> Dict[str, List[dict]]:
+    """Group this circuit's typed events by effective type, each entry carrying its
+    flow/volume features + provenance weight. Artifact-flagged events are kept only
+    when they carry an explicit (user/training) label."""
+    rows = conn.execute(
+        "SELECT user_fixture_type, fixture_label_source, matched_fixture_type, "
+        "       matched_via, COALESCE(excluded_from_training, 0) AS excl, "
+        "       volume_litres, duration_seconds, peak_flow_lpm "
+        "FROM events WHERE circuit = ?",
+        (circuit,),
     ).fetchall()
+    pool: Dict[str, List[dict]] = {}
+    for r in rows:
+        tagged = _provenance_weight(
+            r["user_fixture_type"], r["fixture_label_source"],
+            r["matched_fixture_type"], r["matched_via"])
+        if tagged is None:
+            continue
+        ftype, weight, explicit = tagged
+        # Artifact-flagged auto event with no explicit label → unreliable features.
+        if r["excl"] and not explicit:
+            continue
+        pool.setdefault(ftype, []).append({
+            "vol": r["volume_litres"],
+            "dur": r["duration_seconds"],
+            "pk":  r["peak_flow_lpm"],
+            "weight": weight,
+            "explicit": explicit,
+        })
+    return pool
 
 
-def fit_rule_constants(conn: sqlite3.Connection, circuit: str) -> Dict[str, Any]:
-    """Derive per-home rule bands from this circuit's labelled events.
+def _pairs(entries: List[dict], field: str) -> List[Tuple[float, float]]:
+    return [(e[field], e["weight"]) for e in entries if e.get(field) is not None]
 
-    Returns a dict of overridable keys (mirroring the ``event_rules`` constant
-    names without the leading underscore). Only types with at least
-    ``MIN_LABELS_FOR_FIT`` clean labels contribute; everything else is omitted so
-    the rule keeps its shipped default. Pure read — does not persist.
+
+# ── Per-type fitters → candidate bands (pre-sanity) ─────────────────────────────
+
+def _fit_toilet(e):
+    out = {}
+    if (v := _wrange(_pairs(e, "vol"))) is not None:
+        out["FLUSH_VOL_L"] = v
+    if (d := _wrange(_pairs(e, "dur"))) is not None:
+        out["FLUSH_DUR_S"] = d
+    p = _wpct(_pairs(e, "pk"), _LO_PCT)
+    if p is not None:
+        out["FLUSH_MIN_PK_LPM"] = max(0.0, p * (1.0 - _RANGE_PAD))
+    return out
+
+
+def _fit_dishwasher(e):
+    out = {}
+    if (v := _wrange(_pairs(e, "vol"))) is not None:
+        out["DW_VOL_L"] = v
+    p = _wpct(_pairs(e, "pk"), _HI_PCT)
+    if p is not None:
+        out["DW_MAX_PK_LPM"] = p * (1.0 + _RANGE_PAD)
+    return out
+
+
+def _fit_shower(e):
+    out = {}
+    v = _wpct(_pairs(e, "vol"), _LO_PCT)
+    d = _wpct(_pairs(e, "dur"), _LO_PCT)
+    p = _wpct(_pairs(e, "pk"), _LO_PCT)
+    if v is not None:
+        out["SHOWER_BIG_VOL_L"] = max(0.0, v * (1.0 - _RANGE_PAD))
+    if d is not None:
+        out["SHOWER_BIG_DUR_S"] = max(0.0, d * (1.0 - _RANGE_PAD))
+    if p is not None:
+        out["SHOWER_BIG_MIN_PK"] = max(0.0, p * (1.0 - _RANGE_PAD))
+    return out
+
+
+def _fit_zone(e):
+    out = {}
+    d = _wpct(_pairs(e, "dur"), _LO_PCT)
+    p = _wpct(_pairs(e, "pk"), _LO_PCT)
+    if d is not None:
+        out["ZONE_MIN_DUR_S"] = max(0.0, d * (1.0 - _RANGE_PAD))
+    if p is not None:
+        out["ZONE_MIN_PK_LPM"] = max(0.0, p * (1.0 - _RANGE_PAD))
+    return out
+
+
+def _fit_washer(e):
+    """Anchor bands fit only over the upper-half-by-volume events (top-offs are
+    family members, not anchors)."""
+    out = {}
+    med = _wpct(_pairs(e, "vol"), 50.0)
+    if med is None:
+        return out
+    out["WASHER_ANCHOR_MIN_VOL_L"] = max(0.0, med * (1.0 - _RANGE_PAD))
+    anchors = [x for x in e if x.get("vol") is not None and x["vol"] >= med]
+    if (d := _wrange(_pairs(anchors, "dur"))) is not None:
+        out["WASHER_ANCHOR_DUR_S"] = d
+    if (p := _wrange(_pairs(anchors, "pk"))) is not None:
+        out["WASHER_ANCHOR_PK_LPM"] = p
+    return out
+
+
+# type → (fitter, list of keys it produces) — keys also drive the report.
+_FITTERS = {
+    "toilet":          _fit_toilet,
+    "dishwasher":      _fit_dishwasher,
+    "shower_tub":      _fit_shower,
+    "irrigation_zone": _fit_zone,
+    "washing_machine": _fit_washer,
+}
+
+
+# ── Sanity gate (bounded expansion + absolute bounds) ───────────────────────────
+
+def _is_sane(key: str, value: Any) -> bool:
+    spec = _SANITY.get(key)
+    if spec is None:
+        return True
+    kind, lo_abs, hi_abs = spec
+    if kind == "range":
+        if not (isinstance(value, (list, tuple)) and len(value) == 2):
+            return False
+        lo, hi = float(value[0]), float(value[1])
+        if not (lo >= lo_abs and hi <= hi_abs and hi > lo):
+            return False
+        default = RULE_DEFAULTS[key]
+        default_span = float(default[1]) - float(default[0])
+        if default_span > 0 and (hi - lo) > _FIT_MAX_SPAN_FACTOR * default_span:
+            return False  # implausibly wide → noisy labels, fall back
+        return True
+    # floor / ceiling scalar
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    return lo_abs <= v <= hi_abs
+
+
+# ── Public API ──────────────────────────────────────────────────────────────────
+
+def fit_rule_constants(conn: sqlite3.Connection,
+                       circuit: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Derive per-home rule bands from this circuit's weighted, gated, sanity-
+    checked label pool. Returns ``(calib, report)``.
+
+    ``calib`` is the dict of accepted overrides (omitted keys keep their default).
+    ``report`` maps each fixture type → ``{status, explicit, weight, keys_fit,
+    keys_fallback}`` for activation-time visibility. Pure read — does not persist.
     """
+    pool = _fit_pool(conn, circuit)
     calib: Dict[str, Any] = {}
+    report: Dict[str, Any] = {}
 
-    def cols(ftype: str):
-        rows = _clean_label_rows(conn, circuit, ftype)
-        return (rows,
-                [r["volume_litres"] for r in rows],
-                [r["duration_seconds"] for r in rows],
-                [r["peak_flow_lpm"] for r in rows])
+    for ftype, fitter in _FITTERS.items():
+        entries = pool.get(ftype, [])
+        explicit_n = sum(1 for x in entries if x["explicit"])
+        weight = sum(x["weight"] for x in entries)
+        rep: Dict[str, Any] = {
+            "explicit": explicit_n,
+            "weight": round(weight, 2),
+            "keys_fit": [],
+            "keys_fallback": [],
+        }
+        if explicit_n < MIN_EXPLICIT_LABELS or weight < MIN_FIT_WEIGHT:
+            rep["status"] = "insufficient_labels"
+            report[ftype] = rep
+            continue
+        candidates = fitter(entries)
+        for key, value in candidates.items():
+            if _is_sane(key, value):
+                calib[key] = value
+                rep["keys_fit"].append(key)
+            else:
+                rep["keys_fallback"].append(key)
+        rep["status"] = "fit" if rep["keys_fit"] else "sanity_fallback"
+        report[ftype] = rep
 
-    # ── Toilet → flush bands ────────────────────────────────────────────────
-    rows, vol, dur, pk = cols("toilet")
-    if len(rows) >= MIN_LABELS_FOR_FIT:
-        if (v := _range(vol)) is not None:
-            calib["FLUSH_VOL_L"] = v
-        if (d := _range(dur)) is not None:
-            calib["FLUSH_DUR_S"] = d
-        p_lo = _percentile(pk, _LO_PCT)
-        if p_lo is not None:
-            calib["FLUSH_MIN_PK_LPM"] = max(0.0, p_lo * (1.0 - _RANGE_PAD))
-
-    # ── Dishwasher → volume band + peak ceiling ─────────────────────────────
-    rows, vol, dur, pk = cols("dishwasher")
-    if len(rows) >= MIN_LABELS_FOR_FIT:
-        if (v := _range(vol)) is not None:
-            calib["DW_VOL_L"] = v
-        p_hi = _percentile(pk, _HI_PCT)
-        if p_hi is not None:
-            calib["DW_MAX_PK_LPM"] = p_hi * (1.0 + _RANGE_PAD)
-
-    # ── Shower/tub → big-branch floors (vol/dur/peak minimums) ──────────────
-    rows, vol, dur, pk = cols("shower_tub")
-    if len(rows) >= MIN_LABELS_FOR_FIT:
-        v_lo = _percentile(vol, _LO_PCT)
-        d_lo = _percentile(dur, _LO_PCT)
-        p_lo = _percentile(pk, _LO_PCT)
-        if v_lo is not None:
-            calib["SHOWER_BIG_VOL_L"] = v_lo * (1.0 - _RANGE_PAD)
-        if d_lo is not None:
-            calib["SHOWER_BIG_DUR_S"] = d_lo * (1.0 - _RANGE_PAD)
-        if p_lo is not None:
-            calib["SHOWER_BIG_MIN_PK"] = max(0.0, p_lo * (1.0 - _RANGE_PAD))
-
-    # ── Irrigation zone → duration/peak floors ──────────────────────────────
-    rows, vol, dur, pk = cols("irrigation_zone")
-    if len(rows) >= MIN_LABELS_FOR_FIT:
-        d_lo = _percentile(dur, _LO_PCT)
-        p_lo = _percentile(pk, _LO_PCT)
-        if d_lo is not None:
-            calib["ZONE_MIN_DUR_S"] = d_lo * (1.0 - _RANGE_PAD)
-        if p_lo is not None:
-            calib["ZONE_MIN_PK_LPM"] = max(0.0, p_lo * (1.0 - _RANGE_PAD))
-
-    # ── Washing machine → anchor (main-fill) bands ──────────────────────────
-    # Washer labels mix big fills (anchors) with small top-offs, so fit the
-    # anchor bands only over the upper half by volume (>= median) — the top-offs
-    # are matched as same-peak family members, not anchors.
-    rows, vol, dur, pk = cols("washing_machine")
-    if len(rows) >= MIN_LABELS_FOR_FIT:
-        v_med = _percentile(vol, 50.0)
-        if v_med is not None:
-            anchors = [r for r in rows
-                       if r["volume_litres"] is not None
-                       and r["volume_litres"] >= v_med]
-            calib["WASHER_ANCHOR_MIN_VOL_L"] = v_med * (1.0 - _RANGE_PAD)
-            a_dur = _range([r["duration_seconds"] for r in anchors])
-            a_pk = _range([r["peak_flow_lpm"] for r in anchors])
-            if a_dur is not None:
-                calib["WASHER_ANCHOR_DUR_S"] = a_dur
-            if a_pk is not None:
-                calib["WASHER_ANCHOR_PK_LPM"] = a_pk
-
-    return calib
+    return calib, report
 
 
 def save_rule_calibration(conn: sqlite3.Connection, circuit: str,
                           calib: Dict[str, Any],
+                          report: Optional[Dict[str, Any]] = None,
                           source: str = "activation") -> None:
-    """Persist (freeze) the fitted calibration for a circuit with a lock stamp."""
+    """Persist (freeze) the fitted calibration + report for a circuit with a stamp."""
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "INSERT INTO rule_calibration (circuit, params, source, locked_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?) "
+        "INSERT INTO rule_calibration "
+        "    (circuit, params, report, source, locked_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(circuit) DO UPDATE SET "
-        "  params = excluded.params, source = excluded.source, "
-        "  locked_at = excluded.locked_at, updated_at = excluded.updated_at",
-        (circuit, json.dumps(calib), source, now, now),
+        "  params = excluded.params, report = excluded.report, "
+        "  source = excluded.source, locked_at = excluded.locked_at, "
+        "  updated_at = excluded.updated_at",
+        (circuit, json.dumps(calib), json.dumps(report or {}), source, now, now),
     )
     conn.commit()
     log.info("[%s] rule calibration frozen (%s): %d band(s) fit — %s",
              circuit, source, len(calib), ", ".join(sorted(calib)) or "none")
+
+
+def fit_and_freeze(conn: sqlite3.Connection, circuit: str,
+                   source: str = "activation") -> Dict[str, Any]:
+    """Shared fit → sanity → persist path used by BOTH activation and the dev
+    ``retrain()``. Returns the per-type report (for UI display / logging)."""
+    calib, report = fit_rule_constants(conn, circuit)
+    save_rule_calibration(conn, circuit, calib, report=report, source=source)
+    return report
 
 
 def load_rule_calibration(conn: sqlite3.Connection, circuit: str) -> Dict[str, Any]:
@@ -200,11 +371,11 @@ def load_rule_calibration(conn: sqlite3.Connection, circuit: str) -> Dict[str, A
 
 def get_rule_calibration_meta(conn: sqlite3.Connection,
                               circuit: str) -> Optional[Dict[str, Any]]:
-    """Lock metadata for the UI/diagnostics: when it was frozen and how many
-    bands were fit. Returns None if the circuit has never been calibrated."""
+    """Lock metadata for the UI/diagnostics: when it was frozen, how many bands
+    were fit, and the per-type fit-vs-fallback report. None if never calibrated."""
     try:
         row = conn.execute(
-            "SELECT params, source, locked_at FROM rule_calibration WHERE circuit = ?",
+            "SELECT report, source, locked_at FROM rule_calibration WHERE circuit = ?",
             (circuit,),
         ).fetchone()
     except sqlite3.OperationalError:
@@ -212,9 +383,14 @@ def get_rule_calibration_meta(conn: sqlite3.Connection,
     if not row:
         return None
     calib = load_rule_calibration(conn, circuit)
+    try:
+        report = json.loads(row["report"]) if row["report"] else {}
+    except (json.JSONDecodeError, TypeError):
+        report = {}
     return {
         "locked_at": row["locked_at"],
         "source": row["source"],
         "fit_keys": sorted(calib),
         "fit_count": len(calib),
+        "report": report,
     }

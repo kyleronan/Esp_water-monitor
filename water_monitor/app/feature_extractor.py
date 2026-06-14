@@ -2719,11 +2719,15 @@ class FeatureExtractor:
                 rule_classify_event,
             )
             from .database import get_home_profile
+            from .rule_calibration import load_rule_calibration
             ctype = self._circuit_type_cache.get(circuit)
             if ctype is None:
                 from .database import get_circuit_type
                 ctype = get_circuit_type(self._db, circuit)
                 self._circuit_type_cache[circuit] = ctype
+            # Frozen per-home rule bands (empty → shipped defaults). Read fresh so
+            # an activation / recalibration takes effect on the next event.
+            calib = load_rule_calibration(self._db, circuit)
             # dev.24 — water-softener session (precedence: softener → washer →
             # rules → knn). Profile read FRESH (NOT cached) so a Settings toggle
             # takes effect on the next event with no restart. Hard-gated.
@@ -2736,7 +2740,7 @@ class FeatureExtractor:
                                - timedelta(hours=3.5)).isoformat()
                     softener_members = detect_softener_sessions(
                         self._db, circuit, band, since_ts=s_since,
-                        tz=(get_home_timezone() or self._ha_tz))
+                        tz=(get_home_timezone() or self._ha_tz), calib=calib)
             pk = features.get("peak_flow_lpm")
             if (ctype != "zone" and pk is not None
                     and WASHER_FAMILY_PK_ENVELOPE[0] <= pk
@@ -2744,7 +2748,7 @@ class FeatureExtractor:
                 since = (datetime.now(timezone.utc)
                          - timedelta(minutes=50)).isoformat()
                 washer_members = detect_washer_cycles(
-                    self._db, circuit, since_ts=since, limit=400)
+                    self._db, circuit, since_ts=since, limit=400, calib=calib)
             if event_id in softener_members:
                 matched_fixture_type, matched_via = ("water_softener",
                                                      "softener_session")
@@ -2754,7 +2758,7 @@ class FeatureExtractor:
                                                      "washer_cycle")
                 cycle_group_id = washer_members[event_id][1]
             else:
-                rule_hit = rule_classify_event(features, ctype)
+                rule_hit = rule_classify_event(features, ctype, calib=calib)
                 if rule_hit is not None:
                     matched_fixture_type, matched_via = rule_hit
         except Exception as e:

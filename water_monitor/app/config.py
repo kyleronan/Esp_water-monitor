@@ -14,6 +14,12 @@ OPTIONS_PATH = Path(os.environ.get("OPTIONS_PATH", "/data/options.json"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "water_monitor.db"
 
+# Phase 1 dev/testing tools (e.g. instant rule-calibration re-fit, bypassing the
+# weeks-long recalibration). Gated OFF by default; the whole Settings → Dev tab and
+# its routes are hidden unless WM_DEV_TOOLS is truthy, so it can be disabled later.
+DEV_TOOLS = os.environ.get("WM_DEV_TOOLS", "").strip().lower() in (
+    "1", "true", "yes", "on")
+
 
 @dataclass
 class CircuitConfig:

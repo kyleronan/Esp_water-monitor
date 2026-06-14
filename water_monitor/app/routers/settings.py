@@ -391,6 +391,28 @@ async def recalibrate(circuit: str, request: Request):
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
+@router.post("/dev/retrain/{circuit}")
+async def dev_retrain(circuit: str, request: Request):
+    """DEV/testing only — instant rule-calibration re-fit + re-lock against the
+    CURRENT labels (no new learning period), reusing the shared activation
+    fit+freeze path (so the sanity gate still applies). Gated behind the
+    ``WM_DEV_TOOLS`` feature flag so the whole capability can be disabled later;
+    recalibration remains the normal long-term mechanism. Returns the per-type
+    fit-vs-fallback report as JSON."""
+    from ..config import DEV_TOOLS
+    if not DEV_TOOLS:
+        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    if not orch.training_manager:
+        return JSONResponse(
+            {"error": "System still starting up — try again in a moment"},
+            status_code=503,
+        )
+    report = await orch.training_manager.retrain(circuit)
+    return JSONResponse({"ok": True, "circuit": circuit, "report": report})
+
+
 @router.get("/recalibrate/{circuit}/suggest")
 async def suggest_days(circuit: str, request: Request):
     """Return suggested calibration days based on home profile."""

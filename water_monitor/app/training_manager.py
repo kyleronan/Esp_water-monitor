@@ -194,6 +194,9 @@ class TrainingManager:
         if self.cluster_engine is not None:
             try:
                 self.cluster_engine.reset_circuit(circuit)
+                # A (re)calibration re-opens learning — unfreeze so the new period
+                # adapts again until it re-locks at the next activation.
+                self.cluster_engine.unfreeze_circuit(circuit)
             except Exception as e:
                 log.warning("[%s] reset_circuit failed (non-fatal): %s",
                             circuit, e)
@@ -301,8 +304,89 @@ class TrainingManager:
             completed_at=now.isoformat(),
         )
         await self._publish_status(circuit)
-        log.info("[%s] fixtures activated — now live", circuit)
+        # Phase 1: fit the per-home rule bands off this home's labels and FREEZE
+        # them + the cluster engine. The reference is now locked — live events match
+        # against it but never reshape it (the basis for leak / odd-usage detection).
+        report = await self._fit_and_lock(circuit, source="activation")
+        await self._notify_calibration_report(circuit, report)
+        log.info("[%s] fixtures activated — now live (locked)", circuit)
         return True
+
+    # ── Fit + freeze (Phase 1) ──────────────────────────────────────────────────
+
+    def _fit_and_lock_sync(self, circuit: str, source: str) -> Dict[str, Any]:
+        """Shared fit → sanity-gate → freeze path (sync; run via executor). Used by
+        BOTH activation and the dev ``retrain`` so the activation sanity gate (in
+        rule_calibration.fit_and_freeze) can never be skipped."""
+        from .rule_calibration import fit_and_freeze
+        from .database import reclassify_all_events_from_signatures
+        report = fit_and_freeze(self._db, circuit, source=source)
+        # Re-type events with the freshly-frozen rules so matched_* reflects the fit.
+        try:
+            reclassify_all_events_from_signatures(self._db, circuit)
+        except Exception as e:
+            log.warning("[%s] post-lock reclassify failed (non-fatal): %s",
+                        circuit, e)
+        if self.cluster_engine is not None:
+            try:
+                self.cluster_engine.freeze_circuit(circuit)
+            except Exception as e:
+                log.warning("[%s] freeze_circuit failed (non-fatal): %s",
+                            circuit, e)
+        return report
+
+    async def _fit_and_lock(self, circuit: str, source: str) -> Dict[str, Any]:
+        import functools
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(
+                None, functools.partial(self._fit_and_lock_sync, circuit, source))
+        except Exception as e:
+            log.error("[%s] fit-and-lock failed: %s", circuit, e)
+            return {}
+
+    async def _notify_calibration_report(self, circuit: str,
+                                         report: Dict[str, Any]) -> None:
+        """Surface the per-type fit-vs-fallback so a sparse/bad fit is visible, not
+        silent — the signal to watch on the first real activation."""
+        if not report:
+            return
+        fit = [t for t, r in report.items() if r.get("status") == "fit"]
+        fell = [t for t, r in report.items() if r.get("status") != "fit"]
+        circuit_cfg = self._cfg.get_circuit(circuit)
+        label = circuit_cfg.label if circuit_cfg else circuit
+        msg = (f"{label}: rule calibration locked. "
+               f"Home-fit: {', '.join(sorted(fit)) or 'none'}. "
+               f"Using defaults: {', '.join(sorted(fell)) or 'none'}.")
+        log.info("[%s] calibration report — %s", circuit, msg)
+        try:
+            await self._ha.notify(
+                title=f"Water Monitor — {label} calibration locked",
+                message=msg,
+                notification_id=f"water_calibration_locked_{circuit}")
+        except Exception as e:
+            log.warning("[%s] calibration report notify failed: %s", circuit, e)
+
+    async def retrain(self, circuit: str) -> Dict[str, Any]:
+        """DEV/testing only: re-fit + re-lock immediately against CURRENT labels —
+        no new learning period. Reuses the shared fit+freeze path (so the sanity
+        gate applies). Exposed only behind the feature-flagged Settings → Dev tab;
+        recalibration remains the normal long-term mechanism."""
+        if self.cluster_engine is not None:
+            import functools
+            loop = asyncio.get_running_loop()
+            try:
+                self.cluster_engine.unfreeze_circuit(circuit)
+                await loop.run_in_executor(
+                    None,
+                    functools.partial(self.cluster_engine.rebuild_from_db, circuit))
+            except Exception as e:
+                log.warning("[%s] retrain rebuild failed (non-fatal): %s",
+                            circuit, e)
+        report = await self._fit_and_lock(circuit, source="retrain")
+        await self._notify_calibration_report(circuit, report)
+        log.info("[%s] dev retrain complete — reference re-locked", circuit)
+        return report
 
     async def trigger_full_recalibration(self, circuit: str,
                                          days: int) -> bool:

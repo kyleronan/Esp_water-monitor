@@ -145,6 +145,10 @@ class ClusterEngine:
         # Unconfirmed clusters are intentionally absent — match_and_learn
         # bypasses the type gate when the lookup returns None.
         self._type_cache: Dict[str, Dict[int, str]]            = {}
+        # Phase 1 hard lock: circuit -> frozen?  None/absent = derive lazily from
+        # the training state (frozen iff 'live'). freeze_circuit/unfreeze_circuit
+        # set it explicitly on lifecycle transitions.
+        self._frozen: Dict[str, bool]                          = {}
         # Protects merge + rebuild sequences so concurrent executor threads
         # cannot read stale river→DB ID maps while a merge is in progress.
         self._merge_lock = threading.Lock()
@@ -546,6 +550,99 @@ class ClusterEngine:
         except Exception as e:
             log.warning("[%s] cooccurrence update failed: %s", circuit, e)
 
+    # ── Freeze / unfreeze (Phase 1 hard lock) ───────────────────────────────────
+    # A circuit FREEZES once it reaches the 'live' training state: the reference
+    # (scaler + DBSTREAM centers + cluster centroids) stops adapting and the engine
+    # only MATCHES against the locked reference — this is what stops a post-
+    # activation event (incl. a slow leak) from being silently learned as "normal".
+    # Per the plan's state→{frozen|unfrozen} table: unfrozen for every pre-'live'
+    # state (idle / calibrating / labelling), frozen once 'live'; fault/disabled
+    # inherit (no transition ⇒ no change). freeze_circuit/unfreeze_circuit set it
+    # on lifecycle transitions; the lazy fallback reads training_state so a fresh
+    # process is correct without waiting for a transition.
+
+    def freeze_circuit(self, circuit: str) -> None:
+        """Lock the circuit: match-only, no learning (called at activation)."""
+        self._frozen[circuit] = True
+        log.info("[%s] cluster engine frozen (locked reference)", circuit)
+
+    def unfreeze_circuit(self, circuit: str) -> None:
+        """Unlock so a restarted learning period can adapt again (recalibration)."""
+        self._frozen[circuit] = False
+        log.info("[%s] cluster engine unfrozen (learning resumed)", circuit)
+
+    def _is_frozen(self, circuit: str) -> bool:
+        cached = self._frozen.get(circuit)
+        if cached is not None:
+            return cached
+        frozen = False
+        try:
+            row = self._db.execute(
+                "SELECT state FROM training_state WHERE circuit = ?",
+                (circuit,),
+            ).fetchone()
+            frozen = bool(row and row["state"] == "live")
+        except Exception as e:
+            log.debug("[%s] freeze-state lookup failed (assuming unfrozen): %s",
+                      circuit, e)
+        self._frozen[circuit] = frozen
+        return frozen
+
+    def _match_frozen(
+        self, features: dict, circuit: str,
+    ) -> Tuple[Optional[int], float, str, Optional[str]]:
+        """Match-only path for a locked circuit: classify against the frozen
+        reference WITHOUT learning. No scaler.learn_one, no stream.learn_one, and
+        no centroid / member-count / cooccurrence writes — so a post-activation
+        event can never reshape what 'normal' means."""
+        scaler = self._scalers[circuit]
+        x = scaler.transform_one(features)          # transform only — NOT learn_one
+        stream = self._streams[circuit]
+        if not stream.centers:
+            return (None, 0.0, '', 'no_centers')
+        nearest_id, distance = self._nearest_center(stream, x)
+        if nearest_id is None:
+            return (None, 0.0, '', 'no_centers')
+
+        candidate_id = self._river_id_map.get(circuit, {}).get(nearest_id)
+        fixture_type = (
+            self._type_cache.get(circuit, {}).get(candidate_id)
+            if candidate_id is not None else None
+        )
+        if fixture_type:
+            try:
+                from .fixtures import get_match_threshold
+                row = self._db.execute(
+                    "SELECT centroid FROM fixture_clusters "
+                    "WHERE circuit = ? AND id = ?",
+                    (circuit, candidate_id),
+                ).fetchone()
+                if row and row["centroid"]:
+                    db_orig   = json.loads(row["centroid"])
+                    db_feat   = {k: float(db_orig.get(k, 0)) for k in FEATURE_KEYS}
+                    db_scaled = scaler.transform_one(db_feat)
+                    weights   = self._build_match_weights(fixture_type)
+                    wdist     = self._weighted_distance(x, db_scaled, weights)
+                    if wdist > get_match_threshold(fixture_type):
+                        return (None, 0.0, '', 'type_gate_rejected')
+            except Exception as e:
+                log.warning("[%s] frozen type-gate failed (matching anyway): %s",
+                            circuit, e)
+
+        confidence = math.exp(-distance / DBSTREAM_CLUSTERING_THRESHOLD)
+        member_count = 0
+        if candidate_id is not None:
+            try:
+                r = self._db.execute(
+                    "SELECT member_count FROM fixture_clusters "
+                    "WHERE circuit = ? AND id = ?",
+                    (circuit, candidate_id),
+                ).fetchone()
+                member_count = int(r["member_count"]) if r and r["member_count"] else 0
+            except Exception:
+                member_count = 0
+        return (candidate_id, confidence, self._confidence_level(member_count), None)
+
     # ── Core: match and learn ──────────────────────────────────────────────────
 
     def match_and_learn(
@@ -574,6 +671,11 @@ class ClusterEngine:
         features = self._extract_features(event)
         if features is None:
             return (None, 0.0, '', 'features_missing')
+
+        # Phase 1 hard lock: a frozen (live) circuit matches against the locked
+        # reference without learning — never reshaping "normal".
+        if self._is_frozen(circuit):
+            return self._match_frozen(features, circuit)
 
         scaler = self._scalers[circuit]
         scaler.learn_one(features)

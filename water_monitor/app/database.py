@@ -396,6 +396,7 @@ CREATE INDEX IF NOT EXISTS idx_type_signatures_circuit
 CREATE TABLE IF NOT EXISTS rule_calibration (
     circuit     TEXT PRIMARY KEY,
     params      TEXT NOT NULL DEFAULT '{}',   -- JSON dict of fitted rule bands
+    report      TEXT,                         -- JSON per-type fit-vs-fallback report
     source      TEXT,                         -- 'activation' | 'retrain'
     locked_at   TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -4311,14 +4312,18 @@ def reclassify_all_events_from_signatures(
     from .event_rules import (detect_softener_sessions, detect_washer_cycles,
                               get_home_timezone, parse_hhmm_to_minutes,
                               rule_classify_event)
+    from .rule_calibration import load_rule_calibration
 
+    # Frozen per-home rule bands (empty dict → predicates use shipped defaults).
+    calib = load_rule_calibration(conn, circuit)
     qfeats = tuple(dict.fromkeys(
         _SIGNATURE_MATCH_FEATURES + _SIGNATURE_KNN_ACTIVE_FEATURES
         + ("has_pressure_transient",)))   # the flush predicate's extra input
     circuit_type = get_circuit_type(conn, circuit)
     # One O(n) pass for the whole circuit — the per-row loop then does dict
     # lookups, never per-event window queries.
-    washer_ids = detect_washer_cycles(conn, circuit) if circuit_type != "zone" else {}
+    washer_ids = (detect_washer_cycles(conn, circuit, calib=calib)
+                  if circuit_type != "zone" else {})
     # dev.24 — water-softener sessions (hard-gated: enabled AND this circuit).
     softener_ids: Dict[str, Any] = {}
     prof = get_home_profile(conn)
@@ -4327,7 +4332,8 @@ def reclassify_all_events_from_signatures(
         band = parse_hhmm_to_minutes(prof["softener_regen_start"])
         if band is not None:
             tz = ha_tz if ha_tz is not None else get_home_timezone()
-            softener_ids = detect_softener_sessions(conn, circuit, band, tz=tz)
+            softener_ids = detect_softener_sessions(conn, circuit, band, tz=tz,
+                                                    calib=calib)
     rows = conn.execute(
         "SELECT id, matched_fixture_type, matched_via, cycle_group_id, "
         "       excluded_from_training, "
@@ -4355,7 +4361,7 @@ def reclassify_all_events_from_signatures(
             new_group = washer_ids[r["id"]][1]
         else:
             feats = {f: r[f] for f in qfeats}
-            rule_hit = rule_classify_event(feats, circuit_type)
+            rule_hit = rule_classify_event(feats, circuit_type, calib=calib)
             if rule_hit is not None:
                 new_type, new_via = rule_hit
             else:
