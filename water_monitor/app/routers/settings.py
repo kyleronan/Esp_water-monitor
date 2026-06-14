@@ -432,21 +432,18 @@ async def dev_retrain(circuit: str, request: Request):
     """DEV/testing only — instant rule-calibration re-fit + re-lock against the
     CURRENT labels (no new learning period), reusing the shared activation
     fit+freeze path (so the sanity gate still applies). Gated behind the
-    ``WM_DEV_TOOLS`` feature flag so the whole capability can be disabled later;
-    recalibration remains the normal long-term mechanism. Returns the per-type
-    fit-vs-fallback report as JSON."""
+    ``dev_tools`` add-on option. Plain form POST → redirects back to the Dev tab;
+    the reloaded page shows the updated 'Locked …' status. The per-type
+    fit/fallback is surfaced via the HA 'calibration locked' notification + log
+    (kept off the JS path so a stale app.js can't break the button)."""
     from ..config import DEV_TOOLS
     if not DEV_TOOLS:
         return JSONResponse({"error": "dev tools disabled"}, status_code=404)
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
-    if not orch.training_manager:
-        return JSONResponse(
-            {"error": "System still starting up — try again in a moment"},
-            status_code=503,
-        )
-    report = await orch.training_manager.retrain(circuit)
-    return JSONResponse({"ok": True, "circuit": circuit, "report": report})
+    if orch.training_manager:
+        await orch.training_manager.retrain(circuit)
+    return ingress_redirect(request, "/settings#sett-dev")
 
 
 @router.post("/dev/reimport-range/{circuit}")

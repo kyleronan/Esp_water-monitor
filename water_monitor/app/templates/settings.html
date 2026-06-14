@@ -1114,8 +1114,12 @@
               {% endif %}
             </div>
           </div>
-          <button type="button" class="btn btn-secondary btn-sm"
-                  onclick="devRetrain('{{ c.circuit }}')">Re-train now</button>
+          <form method="post"
+                action="{{ ingress_path }}/settings/dev/retrain/{{ c.circuit }}"
+                style="margin:0">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">Re-train now</button>
+          </form>
         </div>
         {% endfor %}
       </div>
