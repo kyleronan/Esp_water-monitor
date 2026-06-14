@@ -273,6 +273,35 @@ _DRIBBLE_MAX_FLOW_LPM:  float = 1.0
 _DRIBBLE_MAX_DELTA_PSI: float = 1.5
 
 
+# ── Per-home artifact-detector calibration (Phase 2.4) ──────────────────────────
+# A frozen per-home calib (artifact_calibration.py) may override ONLY the
+# "long-quiet" / dribble IDENTIFIER thresholds below. The leak-safety guards — the
+# phantom/cross-talk TRUE-FLOW ceilings (_PHANTOM_MAX_TRUE_FLOW_LPM,
+# _PHANTOM_MAX_FLOW_INTEGRAL_L, _PHANTOM_MAX_FLOW_ON_RATIO) — are DELIBERATELY absent
+# from ARTIFACT_DEFAULTS so they can NEVER be calibrated: a real leak moves water and
+# is excluded by them regardless of the duration/ΔP tuning, so they stay frozen.
+# ARTIFACT_DEFAULTS is the single source of truth (artifact_calibration imports it).
+ARTIFACT_DEFAULTS: Dict[str, float] = {
+    "PHANTOM_MIN_DURATION_S": _PHANTOM_MIN_DURATION_S,
+    "PHANTOM_MAX_DELTA_PSI":  _PHANTOM_MAX_DELTA_PSI,
+    "XTALK_MIN_DURATION_S":   _XTALK_MIN_DURATION_S,
+    "DRIBBLE_MAX_VOLUME_L":   _DRIBBLE_MAX_VOLUME_L,
+    "DRIBBLE_MAX_FLOW_LPM":   _DRIBBLE_MAX_FLOW_LPM,
+    "DRIBBLE_MAX_DELTA_PSI":  _DRIBBLE_MAX_DELTA_PSI,
+}
+
+
+def _ac(calib, key):
+    """Resolve an artifact-detector threshold: the per-home calibrated value if the
+    frozen ``calib`` carries it, else the shipped default. The leak-safety true-flow
+    guards are intentionally absent from ARTIFACT_DEFAULTS → never overridable."""
+    if calib is not None:
+        v = calib.get(key)
+        if v is not None:
+            return v
+    return ARTIFACT_DEFAULTS[key]
+
+
 def _finite_float_series(values) -> List[float]:
     """Strip None/NaN/inf; coerce to float at full precision.
 
@@ -618,6 +647,7 @@ def _evaluate_degraded_from_diag(diag: dict):
 def _detect_pressure_restoration_phantom(
     duration_s, pressure_delta_psi,
     true_avg_flow_lpm=None, flow_integral_litres=None, flow_on_ratio=None,
+    calib=None,
 ) -> bool:
     """True when an event's duration + near-zero pressure drop AND near-zero
     real flow indicate a city-pressure restoration / oscillation artifact.
@@ -639,9 +669,11 @@ def _detect_pressure_restoration_phantom(
         return False
     if not math.isfinite(duration) or not math.isfinite(delta):
         return False
-    if not (duration >= _PHANTOM_MIN_DURATION_S and delta < _PHANTOM_MAX_DELTA_PSI):
+    if not (duration >= _ac(calib, "PHANTOM_MIN_DURATION_S")
+            and delta < _ac(calib, "PHANTOM_MAX_DELTA_PSI")):
         return False
-    # True-flow guard — real water moved ⇒ not a phantom.
+    # True-flow guard — real water moved ⇒ not a phantom. FROZEN (leak safety):
+    # never calibrated, so a real leak (which moves water) can't be zeroed.
     for val, ceil in (
         (true_avg_flow_lpm,   _PHANTOM_MAX_TRUE_FLOW_LPM),
         (flow_integral_litres, _PHANTOM_MAX_FLOW_INTEGRAL_L),
@@ -656,7 +688,8 @@ def _detect_pressure_restoration_phantom(
     return True
 
 
-def _detect_low_flow_dribble(volume_litres, avg_flow_lpm, pressure_delta_psi) -> bool:
+def _detect_low_flow_dribble(volume_litres, avg_flow_lpm, pressure_delta_psi,
+                             calib=None) -> bool:
     """True when an event is a brief low-flow trickle (sensor / pressure-
     equalisation noise) rather than real water use.
 
@@ -681,14 +714,14 @@ def _detect_low_flow_dribble(volume_litres, avg_flow_lpm, pressure_delta_psi) ->
     if not (math.isfinite(vol) and math.isfinite(flow) and math.isfinite(delta)):
         return False
     return (
-        vol < _DRIBBLE_MAX_VOLUME_L
-        and flow < _DRIBBLE_MAX_FLOW_LPM
-        and delta < _DRIBBLE_MAX_DELTA_PSI
+        vol < _ac(calib, "DRIBBLE_MAX_VOLUME_L")
+        and flow < _ac(calib, "DRIBBLE_MAX_FLOW_LPM")
+        and delta < _ac(calib, "DRIBBLE_MAX_DELTA_PSI")
     )
 
 
 def _detect_cross_talk(duration_s, pressure_delta_psi,
-                       flow_integral_litres, flow_on_ratio) -> bool:
+                       flow_integral_litres, flow_on_ratio, calib=None) -> bool:
     """True when a multi-minute event registered via a REAL pressure drop but moved
     essentially no water through THIS meter — i.e. another circuit's draw pulled the
     shared-supply pressure down (cross-talk), not water use here.
@@ -718,15 +751,19 @@ def _detect_cross_talk(duration_s, pressure_delta_psi,
             and math.isfinite(integ) and math.isfinite(onr)):
         return False
     return (
-        duration >= _XTALK_MIN_DURATION_S
-        and integ < _PHANTOM_MAX_FLOW_INTEGRAL_L
-        and onr < _PHANTOM_MAX_FLOW_ON_RATIO
-        and delta >= _PHANTOM_MAX_DELTA_PSI
+        duration >= _ac(calib, "XTALK_MIN_DURATION_S")
+        and integ < _PHANTOM_MAX_FLOW_INTEGRAL_L       # frozen no-flow guard
+        and onr < _PHANTOM_MAX_FLOW_ON_RATIO           # frozen no-flow guard
+        and delta >= _ac(calib, "PHANTOM_MAX_DELTA_PSI")
     )
 
 
-def _finalize_derived_verdicts(features: dict) -> None:
+def _finalize_derived_verdicts(features: dict, calib=None) -> None:
     """Single source of truth for the phantom verdict + its dependent fields.
+
+    ``calib`` is the frozen per-home artifact-detector calibration (Phase 2.4) —
+    overrides only the long-quiet / dribble identifier thresholds; the leak-safety
+    true-flow guards are never calibrated. None → shipped defaults.
 
     Recomputes, IN PLACE, from the CURRENT values in ``features``:
         is_pressure_restoration_phantom, volume_litres_effective,
@@ -755,7 +792,7 @@ def _finalize_derived_verdicts(features: dict) -> None:
         features.get("duration_seconds"), features.get("pressure_delta_psi"),
         true_avg_flow_lpm=features.get("true_avg_flow_lpm"),
         flow_integral_litres=features.get("flow_integral_litres"),
-        flow_on_ratio=features.get("flow_on_ratio"))
+        flow_on_ratio=features.get("flow_on_ratio"), calib=calib)
     # Low-flow dribble: only for events that are NOT a phantom and NOT degraded
     # (a degraded event's low flow is a measurement artifact, not a true
     # trickle, and is already excluded). Folds into the exclusion set WITHOUT
@@ -768,13 +805,14 @@ def _finalize_derived_verdicts(features: dict) -> None:
         not is_phantom and not is_degraded
         and _detect_cross_talk(
             features.get("duration_seconds"), features.get("pressure_delta_psi"),
-            features.get("flow_integral_litres"), features.get("flow_on_ratio"))
+            features.get("flow_integral_litres"), features.get("flow_on_ratio"),
+            calib=calib)
     )
     is_dribble = (
         not is_phantom and not is_cross_talk and not is_degraded
         and _detect_low_flow_dribble(
             features.get("volume_litres"), features.get("avg_flow_lpm"),
-            features.get("pressure_delta_psi"))
+            features.get("pressure_delta_psi"), calib=calib)
     )
 
     raw = float(features.get("volume_litres") or 0.0)
@@ -2478,11 +2516,14 @@ class FeatureExtractor:
                 ) else 0
             else:
                 # Not manually classified — re-derive verdicts with the
-                # preserved Ignore intent (and post-enrichment pressure).
+                # preserved Ignore intent (and post-enrichment pressure), applying
+                # any frozen per-home artifact calibration (Phase 2.4).
                 features["user_ignored"] = (
                     int(existing["user_ignored"] or 0) if existing is not None else 0
                 )
-                _finalize_derived_verdicts(features)
+                from .artifact_calibration import load_artifact_calibration
+                _acal = load_artifact_calibration(self._db, features.get("circuit"))
+                _finalize_derived_verdicts(features, _acal or None)
 
             # Atomic upsert + hourly_volume update. Uses
             # volume_litres_effective (which is volume_litres for healthy

@@ -118,7 +118,9 @@ def recompute_volume_and_active_flow(
     """
     from .database import transaction, compute_daily_summary, _hour_bucket_for
     from .feature_extractor import _finalize_derived_verdicts
+    from .artifact_calibration import load_artifact_calibration
 
+    _acal = load_artifact_calibration(conn, circuit) or None  # Phase 2.4
     stamp = (now or datetime.now(timezone.utc)).isoformat()
     rows = conn.execute(
         "SELECT id, start_ts, end_ts, duration_seconds, pressure_delta_psi, "
@@ -186,7 +188,7 @@ def recompute_volume_and_active_flow(
                 "flow_on_ratio": af["flow_on_ratio"],
                 "integration_quality": quality,
             }
-            _finalize_derived_verdicts(feat)
+            _finalize_derived_verdicts(feat, _acal)
             eff = feat["volume_litres_effective"]
             method = feat["volume_estimation_method"]
 

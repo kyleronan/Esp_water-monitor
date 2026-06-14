@@ -336,6 +336,15 @@ class TrainingManager:
         except Exception as e:
             log.warning("[%s] usage-baseline freeze failed (non-fatal): %s",
                         circuit, e)
+        # Phase 2.4: freeze the per-home artifact-detector thresholds (phantom /
+        # cross-talk / dribble identifiers), safety-gated so a calibration can never
+        # zero a confirmed-real event. Applies to new events + future recomputes.
+        try:
+            from .artifact_calibration import freeze_artifact_thresholds
+            freeze_artifact_thresholds(self._db, circuit, source=source)
+        except Exception as e:
+            log.warning("[%s] artifact-threshold freeze failed (non-fatal): %s",
+                        circuit, e)
         if self.cluster_engine is not None:
             try:
                 self.cluster_engine.freeze_circuit(circuit)

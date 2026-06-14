@@ -418,6 +418,22 @@ CREATE TABLE IF NOT EXISTS usage_baseline (
 );
 
 -- ==========================================================================
+-- ARTIFACT CALIBRATION (Phase 2.4) — per-home phantom/dribble/cross-talk detector
+-- thresholds, FROZEN at activation. Calibrates ONLY the long-quiet / dribble
+-- identifier thresholds (never the leak-safety true-flow guards) and is gated
+-- do-no-harm: a fitted threshold is applied only if it flags zero confirmed-NORMAL
+-- events (never zeros confirmed-real water). params is a JSON {threshold_key:value}.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS artifact_calibration (
+    circuit     TEXT PRIMARY KEY,
+    params      TEXT NOT NULL DEFAULT '{}',   -- JSON {threshold_key: value}
+    report      TEXT,                         -- JSON per-detector fit/fallback
+    source      TEXT,                         -- 'activation' | 'retrain'
+    locked_at   TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
 -- CATEGORY PUBLISH (Sprint F) — per-(circuit, fixture_type) HA publish gate.
 -- Replaces the per-fixture `fixtures.publish_to_ha` flag as the source of
 -- truth for the fixture_publisher. Each row toggles whether the HA discovery
@@ -1763,6 +1779,8 @@ def coalesce_low_flow_events(
         return {"groups": len(groups), "absorbed": absorbed_total}
 
     from .feature_extractor import _finalize_derived_verdicts
+    from .artifact_calibration import load_artifact_calibration
+    _acal = load_artifact_calibration(conn, circuit) or None  # Phase 2.4
     affected_days = set()
 
     with transaction(conn):
@@ -1793,7 +1811,7 @@ def coalesce_low_flow_events(
                 "true_avg_flow_lpm": avg, "flow_integral_litres": total_vol,
                 "flow_on_ratio": None, "is_composite": 0,
             }
-            _finalize_derived_verdicts(feats)
+            _finalize_derived_verdicts(feats, _acal)
             new_eff = float(feats["volume_litres_effective"] or 0.0)
 
             # (1) Reverse every member's applied hourly contribution.
@@ -2365,6 +2383,7 @@ def clear_event_classification(
     from .feature_extractor import (
         _detect_pressure_restoration_phantom, _detect_low_flow_dribble,
     )
+    from .artifact_calibration import load_artifact_calibration
 
     row = conn.execute(
         "SELECT duration_seconds, pressure_delta_psi, degraded_supply, "
@@ -2375,17 +2394,21 @@ def clear_event_classification(
     ).fetchone()
     if row is None:
         return False
+    # Apply the frozen per-home artifact calibration so a manual reset re-derives
+    # the SAME verdict the live finalizer would (Phase 2.4 consistency).
+    _acal = load_artifact_calibration(conn, circuit) or None
     new_phantom = 1 if _detect_pressure_restoration_phantom(
         row["duration_seconds"], row["pressure_delta_psi"],
         true_avg_flow_lpm=row["true_avg_flow_lpm"],
         flow_integral_litres=row["flow_integral_litres"],
-        flow_on_ratio=row["flow_on_ratio"]) else 0
+        flow_on_ratio=row["flow_on_ratio"], calib=_acal) else 0
     new_degraded = int(row["degraded_supply"] or 0)
     # Dribble only when not phantom and not degraded (mirrors the finalizer).
     new_dribble = 1 if (
         not new_phantom and not new_degraded
         and _detect_low_flow_dribble(
-            row["volume_litres"], row["avg_flow_lpm"], row["pressure_delta_psi"])
+            row["volume_litres"], row["avg_flow_lpm"], row["pressure_delta_psi"],
+            calib=_acal)
     ) else 0
     return _apply_event_verdicts(
         conn, event_id, circuit,
