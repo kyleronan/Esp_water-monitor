@@ -618,19 +618,8 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   el.textContent = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 });
 
-// ── Collapsible "See more" tables (leak tests show 3, events show 25) ────────
-document.querySelectorAll('.hist-see-more').forEach(btn => {
-  btn.addEventListener('click', () => {
-    const card = btn.closest('.hist-card');
-    if (!card) return;
-    const expanded = btn.dataset.expanded === '1';
-    card.querySelectorAll('tr.hist-extra-row').forEach(r => {
-      r.style.display = expanded ? 'none' : 'table-row';
-    });
-    btn.dataset.expanded = expanded ? '0' : '1';
-    btn.textContent = expanded ? btn.dataset.moreLabel : 'See less';
-  });
-});
+// ── Collapsible "See more" tables — handled by the persisting block below
+// (after the cycle rollup) so the expanded state survives a modal-save reload. ─
 
 // ── dev.24 — cycle rollup: collapse a washer / dishwasher / water-softener
 // cycle (events sharing data-cycle-group) into ONE expandable parent row so the
@@ -697,6 +686,37 @@ document.querySelectorAll('.hist-see-more').forEach(btn => {
         if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); }
       });
     });
+  });
+})();
+
+// ── Collapsible "See more" tables, WITH expanded-state persistence ───────────
+// A modal save reloads the page; without this the events list snaps back to 25
+// rows after every edit. Persist each card's expanded state in sessionStorage
+// (keyed by its index among the See-more buttons — stable across reloads) and
+// restore it on load. Runs AFTER the cycle rollup so group parent rows already
+// exist (and inherit the correct extra-row visibility).
+(function () {
+  const KEY = 'histSeeMore';
+  let openSet;
+  try { openSet = new Set(JSON.parse(sessionStorage.getItem(KEY) || '[]')); }
+  catch (e) { openSet = new Set(); }
+  const save = () => {
+    try { sessionStorage.setItem(KEY, JSON.stringify(Array.from(openSet))); }
+    catch (e) { /* sessionStorage unavailable — degrade to non-persistent */ }
+  };
+  document.querySelectorAll('.hist-see-more').forEach((btn, idx) => {
+    const card = btn.closest('.hist-card');
+    const setState = (expand) => {
+      if (card) card.querySelectorAll('tr.hist-extra-row').forEach(r => {
+        r.style.display = expand ? 'table-row' : 'none';
+      });
+      btn.dataset.expanded = expand ? '1' : '0';
+      btn.textContent = expand ? 'See less' : btn.dataset.moreLabel;
+      if (expand) openSet.add(idx); else openSet.delete(idx);
+      save();
+    };
+    btn.addEventListener('click', () => setState(btn.dataset.expanded !== '1'));
+    if (openSet.has(idx)) setState(true);   // restore after a modal-save reload
   });
 })();
 
