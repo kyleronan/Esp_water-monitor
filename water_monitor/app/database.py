@@ -1840,13 +1840,21 @@ def coalesce_low_flow_events(
 
 def delete_events_in_range(
     conn: sqlite3.Connection, circuit: str, from_ts: str, to_ts: str,
-) -> int:
-    """Delete the purely-machine-derived events whose ``start_ts`` falls in
-    [from_ts, to_ts] on ``circuit`` — reversing each one's hourly_volume
-    contribution and recomputing the affected daily summaries — so a date range
-    can be cleanly RE-IMPORTED from HA history without orphaned bookkeeping (the
-    remedy for a garbled stored event, e.g. an irrigation run that failed to
-    close and absorbed a whole day).
+) -> Dict[str, Any]:
+    """Delete the purely-machine-derived events that OVERLAP [from_ts, to_ts] on
+    ``circuit`` — reversing each one's hourly_volume contribution and recomputing
+    the affected daily summaries — so a range can be cleanly RE-IMPORTED from HA
+    history without orphaned bookkeeping (the remedy for a garbled stored event,
+    e.g. an irrigation run that failed to close and absorbed a whole day).
+
+    Selection is INTERVAL-OVERLAP, not start-in-window: an event counts if its
+    ``[start_ts, end_ts]`` intersects the window (``start_ts <= to_ts AND
+    COALESCE(end_ts, start_ts) >= from_ts``). This is essential — the garbled
+    27.6 h event the tool exists for *starts before* a single-day window yet spans
+    it; a start-only filter would miss it (and leave it blocking the re-import).
+    A NULL ``end_ts`` collapses to start-only, so a never-closed row is still only
+    caught when its start is in-window (live/active events are excluded upstream by
+    the write-lock guard).
 
     PRESERVES anything the user has touched: a row with a ``user_fixture_type``,
     OR ``user_classified``, OR ``user_ignored`` is SKIPPED — labels/intent (e.g. a
@@ -1854,21 +1862,28 @@ def delete_events_in_range(
     overlap-dedup simply works around the kept rows. Reuses the coalesce
     reverse-hourly + cascade-delete pattern: deleting an event cascades
     event_waveforms / zone_flow_history (foreign_keys=ON); training_capture_
-    candidates (no FK) is cleaned manually. Single transaction; returns the count.
+    candidates (no FK) is cleaned manually. Single transaction.
+
+    Returns ``{"deleted": n, "span_start": <earliest start ISO or None>,
+    "span_end": <latest end ISO or None>}`` — the caller uses the true deleted span
+    to widen the re-import so an event extending beyond the window is fully rebuilt.
     """
     rows = conn.execute(
-        "SELECT id, start_ts, hourly_volume_applied_litres, "
+        "SELECT id, start_ts, end_ts, hourly_volume_applied_litres, "
         "       hourly_volume_applied_bucket "
         "FROM events "
-        "WHERE circuit = ? AND start_ts >= ? AND start_ts <= ? "
+        "WHERE circuit = ? AND start_ts <= ? "
+        "  AND COALESCE(end_ts, start_ts) >= ? "
         "  AND user_fixture_type IS NULL "
         "  AND COALESCE(user_classified, 0) = 0 "
         "  AND COALESCE(user_ignored, 0) = 0 "
         "ORDER BY start_ts ASC",
-        (circuit, from_ts, to_ts),
+        (circuit, to_ts, from_ts),
     ).fetchall()
     if not rows:
-        return 0
+        return {"deleted": 0, "span_start": None, "span_end": None}
+    span_start = rows[0]["start_ts"]                       # earliest (ORDER BY ASC)
+    span_end = max((r["end_ts"] or r["start_ts"]) for r in rows)
     affected_days = set()
     with transaction(conn):
         for r in rows:
@@ -1897,7 +1912,7 @@ def delete_events_in_range(
                 conn.execute(
                     "DELETE FROM daily_summary WHERE circuit = ? AND day = ?",
                     (circuit, day))
-    return len(rows)
+    return {"deleted": len(rows), "span_start": span_start, "span_end": span_end}
 
 
 def get_daily_volume(conn: sqlite3.Connection, circuit: str,

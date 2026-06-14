@@ -23,11 +23,6 @@
   {{ request.query_params.get('recomputed', '0') }} event(s) corrected,
   {{ request.query_params.get('skipped', '0') }} skipped (history aged out){% if request.query_params.get('degraded', '0') != '0' %},
   {{ request.query_params.get('degraded') }} marked degraded{% endif %}.</div>
-{% elif msg == 'reimported' %}
-<div class="fx-msg fx-msg-ok">Reprocessed range —
-  {{ request.query_params.get('deleted', '0') }} old event(s) removed,
-  {{ request.query_params.get('imported', '0') }} re-imported from HA history
-  (they appear as they finish processing — refresh in a moment).</div>
 {% elif msg == 'busy' %}
 <div class="fx-msg fx-msg-warn">Another volume operation is already running — wait for it
   to finish, then try again.</div>
@@ -76,15 +71,6 @@
         title="Re-derive event volumes from the raw flow history (fixes the volume over-count). Limited to events still within HA's recorder retention.">
     <input type="hidden" name="_csrf" value="{{ csrf_token }}">
     <button type="submit" class="btn btn-ghost btn-sm">⟳ Recompute volume</button>
-  </form>
-  <form method="post"
-        action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/reimport-range"
-        style="display:inline;margin-left:6px"
-        title="Delete this circuit's auto events in the date range and rebuild them from HA flow history. Fixes a garbled/unclosed event (a run that failed to close). Your labelled events in the range are kept.">
-    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-    <input type="date" name="range_start" required style="font-size:.85em;padding:2px 4px">
-    <input type="date" name="range_end" required style="font-size:.85em;padding:2px 4px">
-    <button type="submit" class="btn btn-ghost btn-sm">🔄 Reprocess range</button>
   </form>
 </h2>
 

@@ -449,6 +449,50 @@ async def dev_retrain(circuit: str, request: Request):
     return JSONResponse({"ok": True, "circuit": circuit, "report": report})
 
 
+@router.post("/dev/reimport-range/{circuit}")
+async def dev_reimport_range(circuit: str, request: Request):
+    """DEV/testing only — delete this circuit's purely-machine-derived events in a
+    LOCAL date range and rebuild them from HA flow history. The bulk counterpart to
+    the per-event Reprocess on the History modal (both share ``reprocess_window``);
+    fixes a garbled/unclosed event that absorbed a whole day. User-labelled /
+    classified / ignored events are preserved. Gated behind ``dev_tools``."""
+    from ..config import DEV_TOOLS
+    if not DEV_TOOLS:
+        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+    from datetime import datetime, timezone
+    from ..reprocess import reprocess_window
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    # The date inputs are LOCAL calendar days — span them in the home tz, then to
+    # UTC so the window matches the user's day (and the stored UTC timestamps).
+    tz = getattr(orch, "_ha_tz", timezone.utc) or timezone.utc
+    try:
+        from_dt = (datetime.fromisoformat((payload.get("range_start") or "") + "T00:00:00")
+                   .replace(tzinfo=tz).astimezone(timezone.utc))
+        to_dt = (datetime.fromisoformat((payload.get("range_end") or "") + "T23:59:59")
+                 .replace(tzinfo=tz).astimezone(timezone.utc))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "Invalid date range"}, status_code=400)
+    if to_dt < from_dt:
+        return JSONResponse({"error": "End date is before start date"},
+                            status_code=400)
+    try:
+        result = await reprocess_window(orch, circuit, from_dt, to_dt)
+    except Exception as e:
+        log.error("[%s] dev_reimport_range failed: %s", circuit, e, exc_info=True)
+        return JSONResponse({"error": "Reprocess failed — see addon log."},
+                            status_code=500)
+    if result.get("busy"):
+        return JSONResponse(
+            {"error": "Another volume operation is running — try again shortly."},
+            status_code=409)
+    return JSONResponse({"ok": True, **result})
+
+
 @router.get("/recalibrate/{circuit}/suggest")
 async def suggest_days(circuit: str, request: Request):
     """Return suggested calibration days based on home profile."""

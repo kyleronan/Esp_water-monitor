@@ -1119,6 +1119,32 @@
         </div>
         {% endfor %}
       </div>
+
+      <div class="sett-card">
+        <h3 class="sett-card-title">Reprocess range</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Delete a circuit's auto events in a date range and rebuild them from HA
+          flow history — the bulk counterpart to the per-event <em>Reprocess</em>
+          on the History event modal. Fixes a garbled/unclosed event that absorbed
+          a whole day. Your labelled / classified / ignored events are kept, and
+          re-imported events appear shortly as they finish processing.
+        </p>
+        {% for c in circuits %}
+        <div class="dev-retrain-row"
+             style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
+          <strong>{{ c.display_name }}</strong>
+          <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">
+            <input type="date" id="repro-start-{{ c.circuit }}"
+                   aria-label="Range start" style="font-size:.85em;padding:2px 4px">
+            <span class="muted">→</span>
+            <input type="date" id="repro-end-{{ c.circuit }}"
+                   aria-label="Range end" style="font-size:.85em;padding:2px 4px">
+            <button type="button" class="btn btn-secondary btn-sm"
+                    onclick="devReimportRange('{{ c.circuit }}')">🔄 Reprocess range</button>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
     </div>
     {% endif %}
 

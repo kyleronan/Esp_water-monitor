@@ -494,3 +494,66 @@ async def undo_auto_cycle_api(circuit: str, request: Request):
         import asyncio
         asyncio.create_task(_bg_reclassify(circuit))
     return JSONResponse({"ok": True, "cleared": cleared})
+
+
+@router.post("/api/events/{circuit}/{event_id}/reprocess")
+async def reprocess_event_api(circuit: str, event_id: str, request: Request):
+    """dev.26 — rebuild ONE event from HA history.
+
+    Deletes this event (and any overlapping purely-machine-derived events),
+    reversing their volume, then re-imports the event's own span — optionally
+    padded by ``buffer_minutes`` — so a garbled/unclosed event (e.g. an irrigation
+    run that failed to close and absorbed a whole day) becomes the real runs. The
+    window comes from the event's authoritative ``start_ts``/``end_ts``, so the
+    user never has to guess which day a long event began. User-labelled / classified
+    / ignored events are preserved (``delete_events_in_range`` skips them); the
+    re-import deliberately does not move the catch-up checkpoint.
+    """
+    from datetime import timedelta, timezone
+    from ..reprocess import reprocess_window
+    from ..database import _parse_event_ts
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    db = orch.db
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    try:
+        buffer_min = int((payload or {}).get("buffer_minutes", 0) or 0)
+    except (TypeError, ValueError):
+        buffer_min = 0
+    buffer_min = max(0, min(buffer_min, 240))            # clamp 0..4 h
+
+    row = db.execute(
+        "SELECT start_ts, end_ts FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if row is None:
+        return JSONResponse({"error": "Event not found"}, status_code=404)
+    start = _parse_event_ts(row["start_ts"])
+    if start is None:
+        return JSONResponse({"error": "Event has no usable timestamp"},
+                            status_code=400)
+    end = _parse_event_ts(row["end_ts"]) or start
+    # Normalise to aware UTC so the widen math (compute_widened_window) compares
+    # like with like — stored strings are +00:00 but guard a stray naive value.
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    buf = timedelta(minutes=buffer_min)
+    from_dt, to_dt = start - buf, end + buf
+
+    try:
+        result = await reprocess_window(orch, circuit, from_dt, to_dt)
+    except Exception as e:
+        log.error("[%s] reprocess_event %s failed: %s", circuit, event_id, e,
+                  exc_info=True)
+        return JSONResponse({"error": "Reprocess failed — see addon log."},
+                            status_code=500)
+    if result.get("busy"):
+        return JSONResponse(
+            {"error": "Another volume operation is running — try again shortly."},
+            status_code=409)
+    return JSONResponse({"ok": True, **result})

@@ -62,6 +62,26 @@ async function devRetrain(circuit) {
         + `defaults: ${fell.join(', ') || 'none'}`, 'success');
 }
 
+// dev.26 — reprocess a date range from HA history (bulk counterpart to the
+// per-event Reprocess on the History modal). Gated server-side by dev_tools.
+async function devReimportRange(circuit) {
+  const startEl = document.getElementById(`repro-start-${circuit}`);
+  const endEl   = document.getElementById(`repro-end-${circuit}`);
+  const range_start = startEl && startEl.value;
+  const range_end   = endEl && endEl.value;
+  if (!range_start || !range_end) { toast('Pick a start and end date', 'error'); return; }
+  if (!confirm(`Dev: delete "${circuit}" auto events from ${range_start} to `
+               + `${range_end} and rebuild them from HA history? `
+               + `Your labelled events are kept.`)) return;
+  toast(`Reprocessing ${circuit} ${range_start}…${range_end}`, 'info');
+  const { ok, data } = await post(`/settings/dev/reimport-range/${circuit}`,
+                                  { range_start, range_end });
+  if (!ok) { toast((data && data.error) || 'Reprocess failed', 'error'); return; }
+  toast(`Deleted ${data.deleted}, re-imported ${data.imported}`
+        + `${data.widened ? ' (range widened)' : ''} — new events appear shortly.`,
+        'success');
+}
+
 // ── Live state updater ─────────────────────────────────────────────
 // Always-on poll — reflects valve changes from HA, the ESP firmware
 // (faults, leak tests, bypass switch), or any other source.

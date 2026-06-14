@@ -418,6 +418,28 @@
         ⓘ Manually classified — auto-detection is off for this event.
       </p>
     </div>
+    <hr class="evt-modal-hr">
+    <div class="evt-modal-section" id="emd-reprocess-section">
+      <label class="evt-modal-label" for="emd-reprocess-buffer">Reprocess from HA history</label>
+      <p class="muted" style="font-size:11px;margin:.15rem 0 .5rem">
+        Delete this event (and any overlapping auto events) and rebuild it from
+        Home Assistant flow history — fixes a garbled or unclosed run that absorbed
+        a whole day. Your labelled events are kept.
+      </p>
+      <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+        <label class="muted" style="font-size:11px">Pad window
+          <select id="emd-reprocess-buffer" class="evt-modal-select"
+                  style="width:auto;display:inline-block">
+            <option value="0">exact span</option>
+            <option value="5">± 5 min</option>
+            <option value="15">± 15 min</option>
+            <option value="30">± 30 min</option>
+            <option value="60">± 60 min</option>
+          </select>
+        </label>
+        <button id="emd-reprocess-btn" class="btn btn-secondary btn-sm">🔄 Reprocess event</button>
+      </div>
+    </div>
     <div id="emd-error" class="evt-modal-error" hidden></div>
     <div class="evt-modal-btns">
       <button id="emd-undo-cycle-btn" class="btn btn-secondary btn-sm" hidden
@@ -742,6 +764,10 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   const saveBtn = document.getElementById('emd-save-btn');
   const undoCycleBtn = document.getElementById('emd-undo-cycle-btn');
   const errBox  = document.getElementById('emd-error');
+  // dev.26 — reprocess-from-HA-history controls.
+  const reproSection = document.getElementById('emd-reprocess-section');
+  const reproBtn = document.getElementById('emd-reprocess-btn');
+  const reproBuf = document.getElementById('emd-reprocess-buffer');
   // Sprint H — manual classification controls.
   const clsPhantom  = document.getElementById('emd-cls-phantom');
   const clsSupply   = document.getElementById('emd-cls-supply');
@@ -781,6 +807,11 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     ignBtn.textContent = d.excluded === '1' ? 'Restore event' : 'Ignore event';
     // Undo only shown for auto cycle-labeled events (source='cycle').
     if (undoCycleBtn) undoCycleBtn.hidden = (d.labelSource !== 'cycle');
+    // Reprocess only for auto events — a user-labelled / classified event is
+    // preserved by the delete, so rebuilding it would be a no-op. Reset any
+    // prior success styling on the shared status box.
+    if (reproSection) reproSection.hidden = !!(d.userType || d.classified === '1');
+    errBox.style.color = '';
 
     // Sprint H — pre-check the classification boxes from the row's flags,
     // and remember the initial state for change-detection on Save.
@@ -1113,6 +1144,41 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     undoCycleBtn.disabled = false;
     errBox.textContent = 'Undo failed — see the addon log.';
     errBox.hidden = false;
+  });
+
+  // dev.26 — reprocess this event from HA history (delete + re-import its span).
+  if (reproBtn) reproBtn.addEventListener('click', async () => {
+    if (!activeRow) return;
+    const { eventId, circuit } = activeRow.dataset;
+    if (!window.confirm('Delete this event and rebuild it — and any overlapping '
+      + 'auto events — from HA history? Your labelled events are kept.')) return;
+    const buffer_minutes = parseInt((reproBuf && reproBuf.value) || '0', 10) || 0;
+    reproBtn.disabled = true; errBox.hidden = true; errBox.style.color = '';
+    try {
+      const resp = await fetch(
+        `${INGRESS}/history/api/events/${circuit}/${eventId}/reprocess`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json',
+                     'X-CSRF-Token': window.CSRF_TOKEN || '' },
+          body: JSON.stringify({ buffer_minutes }),
+        });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok) {
+        errBox.style.color = 'var(--ok, #2e7d32)';
+        errBox.textContent = `✓ Deleted ${data.deleted}, re-importing ${data.imported} `
+          + `run(s)${data.widened ? ' (range widened to rebuild a long event)' : ''}`
+          + ' — new events appear shortly. Reloading…';
+        errBox.hidden = false;
+        setTimeout(() => location.reload(), 1600);
+        return;
+      }
+      errBox.textContent = data.error || `Error ${resp.status}`;
+      errBox.hidden = false;
+    } catch (_) {
+      errBox.textContent = 'Network error — please try again.';
+      errBox.hidden = false;
+    }
+    reproBtn.disabled = false;
   });
 
   // Sprint H.1 — reset an event back to automatic detection.
