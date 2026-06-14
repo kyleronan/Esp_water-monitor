@@ -247,13 +247,25 @@ def _fit_washer(e):
     return out
 
 
-# type → (fitter, list of keys it produces) — keys also drive the report.
+# type → fitter.
 _FITTERS = {
     "toilet":          _fit_toilet,
     "dishwasher":      _fit_dishwasher,
     "shower_tub":      _fit_shower,
     "irrigation_zone": _fit_zone,
     "washing_machine": _fit_washer,
+}
+
+# Types the per-event rule tier (rule_classify_event) can predict — used by the
+# do-no-harm held-out check. washing_machine is matched by detect_washer_cycles,
+# not rule_classify_event, so it isn't validated this way (its fitted anchor bands
+# are kept as-is).
+_RULE_TYPES = ("toilet", "dishwasher", "shower_tub", "irrigation_zone")
+_TYPE_KEYS = {
+    "toilet":          ("FLUSH_VOL_L", "FLUSH_DUR_S", "FLUSH_MIN_PK_LPM"),
+    "dishwasher":      ("DW_VOL_L", "DW_MAX_PK_LPM"),
+    "shower_tub":      ("SHOWER_BIG_VOL_L", "SHOWER_BIG_DUR_S", "SHOWER_BIG_MIN_PK"),
+    "irrigation_zone": ("ZONE_MIN_DUR_S", "ZONE_MIN_PK_LPM"),
 }
 
 
@@ -356,11 +368,101 @@ def save_rule_calibration(conn: sqlite3.Connection, circuit: str,
              circuit, source, len(calib), ", ".join(sorted(calib)) or "none")
 
 
+def _load_pool_rows(conn: sqlite3.Connection, circuit: str) -> List[dict]:
+    return [dict(r) for r in conn.execute(
+        "SELECT id, user_fixture_type, fixture_label_source, matched_fixture_type, "
+        "       matched_via, "
+        "       COALESCE(excluded_from_training,0) AS excluded_from_training, "
+        "       volume_litres, duration_seconds, peak_flow_lpm "
+        "FROM events WHERE circuit = ?", (circuit,)).fetchall()]
+
+
+def _load_explicit_rows(conn: sqlite3.Connection, circuit: str) -> List[dict]:
+    return [dict(r) for r in conn.execute(
+        "SELECT id, user_fixture_type, volume_litres, duration_seconds, "
+        "       peak_flow_lpm, cycle_pulse_count, has_pressure_transient, "
+        "       pressure_delta_psi "
+        "FROM events WHERE circuit = ? AND user_fixture_type IS NOT NULL "
+        "  AND user_fixture_type <> '' AND COALESCE(excluded_from_training,0)=0 "
+        "  AND fixture_label_source IN ('user','training') ORDER BY id",
+        (circuit,)).fetchall()]
+
+
+def kfold_type_accuracy(pool_rows: List[dict], explicit_rows: List[dict],
+                        circuit_type: str, k: int = 5) -> Dict[str, Dict[str, int]]:
+    """Per-type held-out recall of each type's FITTED bands (isolated) vs the FROZEN
+    defaults, scored on the explicit (user/training) test rows. Deterministic
+    round-robin folds; a held-out row is excluded from its fold's fit. Returns
+    ``{type: {"fitted": n, "frozen": n, "n": n}}`` over the per-event rule types."""
+    from .database import _canonical_fixture_type as _canon
+    from .event_rules import rule_classify_event
+    test = [e for e in explicit_rows
+            if _canon(e.get("user_fixture_type")) in _RULE_TYPES]
+    folds: List[List[dict]] = [[] for _ in range(k)]
+    for i, e in enumerate(sorted(test, key=lambda r: str(r.get("id")))):
+        folds[i % k].append(e)
+    acc: Dict[str, Dict[str, int]] = {}
+    for fold in folds:
+        if not fold:
+            continue
+        held_ids = {e["id"] for e in fold}
+        train = [r for r in pool_rows if r.get("id") not in held_ids]
+        fitted_full, _ = fit_rule_constants_from_rows(train)
+        for e in fold:
+            actual = _canon(e.get("user_fixture_type"))
+            keys = _TYPE_KEYS.get(actual)
+            if keys is None:
+                continue
+            # Isolate THIS type's fitted bands (others stay default) so the check
+            # measures only this type's marginal effect.
+            calib_t = {kk: fitted_full[kk] for kk in keys if kk in fitted_full}
+            a = acc.setdefault(actual, {"fitted": 0, "frozen": 0, "n": 0})
+            a["n"] += 1
+            hf = rule_classify_event(e, circuit_type, calib=calib_t)
+            if hf and hf[0] == actual:
+                a["fitted"] += 1
+            hz = rule_classify_event(e, circuit_type, calib=None)
+            if hz and hz[0] == actual:
+                a["frozen"] += 1
+    return acc
+
+
+def _do_no_harm(conn: sqlite3.Connection, circuit: str,
+                calib: Dict[str, Any],
+                report: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Drop fitted bands that REDUCE held-out recall vs the frozen default for their
+    type — so the per-home fit can only help an atypical home, never regress a
+    well-tuned one. (washing_machine isn't validated here — cycle detector.)"""
+    try:
+        from .database import get_circuit_type
+        circuit_type = get_circuit_type(conn, circuit)
+    except Exception:
+        circuit_type = "fixture"
+    acc = kfold_type_accuracy(_load_pool_rows(conn, circuit),
+                              _load_explicit_rows(conn, circuit), circuit_type)
+    for ftype, keys in _TYPE_KEYS.items():
+        a = acc.get(ftype)
+        if a and a["fitted"] < a["frozen"]:
+            for key in keys:
+                calib.pop(key, None)
+            if ftype in report:
+                report[ftype]["status"] = "regressed_kept_default"
+                report[ftype]["held_out"] = {
+                    "fitted": a["fitted"], "frozen": a["frozen"], "n": a["n"]}
+            log.info("[%s] do-no-harm: dropped %s fit (held-out %d<%d) — kept default",
+                     circuit, ftype, a["fitted"], a["frozen"])
+    return calib, report
+
+
 def fit_and_freeze(conn: sqlite3.Connection, circuit: str,
-                   source: str = "activation") -> Dict[str, Any]:
-    """Shared fit → sanity → persist path used by BOTH activation and the dev
-    ``retrain()``. Returns the per-type report (for UI display / logging)."""
+                   source: str = "activation",
+                   do_no_harm: bool = True) -> Dict[str, Any]:
+    """Shared fit → sanity → do-no-harm → persist path used by BOTH activation and
+    the dev ``retrain()``. ``do_no_harm`` drops fitted bands that regress vs the
+    frozen default on held-out labels. Returns the per-type report."""
     calib, report = fit_rule_constants(conn, circuit)
+    if do_no_harm and calib:
+        calib, report = _do_no_harm(conn, circuit, calib, report)
     save_rule_calibration(conn, circuit, calib, report=report, source=source)
     return report
 

@@ -403,6 +403,21 @@ CREATE TABLE IF NOT EXISTS rule_calibration (
 );
 
 -- ==========================================================================
+-- USAGE BASELINE (Phase 2) — per-home "normal" envelopes, FROZEN at activation
+-- alongside rule_calibration. params is a JSON dict {fixture_type: {vol/dur/peak:
+-- [lo,hi], n}} of padded percentile bands from this home's labelled+matched
+-- events. The future leak / odd-usage detector compares a live event against its
+-- type's frozen envelope; because it's frozen, a slow leak can't drift it.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS usage_baseline (
+    circuit     TEXT PRIMARY KEY,
+    params      TEXT NOT NULL DEFAULT '{}',   -- JSON {type: {vol/dur/peak:[lo,hi], n}}
+    source      TEXT,                         -- 'activation' | 'retrain'
+    locked_at   TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
 -- CATEGORY PUBLISH (Sprint F) — per-(circuit, fixture_type) HA publish gate.
 -- Replaces the per-fixture `fixtures.publish_to_ha` flag as the source of
 -- truth for the fixture_publisher. Each row toggles whether the HA discovery

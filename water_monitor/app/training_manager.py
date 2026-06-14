@@ -327,6 +327,15 @@ class TrainingManager:
         except Exception as e:
             log.warning("[%s] post-lock reclassify failed (non-fatal): %s",
                         circuit, e)
+        # Phase 2: freeze the per-home usage baselines (envelopes + overall volume
+        # percentiles) AFTER reclassify so matched types are fresh. Frozen reference
+        # for future leak / odd-usage detection.
+        try:
+            from .anomaly_baseline import freeze_usage_baselines
+            freeze_usage_baselines(self._db, circuit, source=source)
+        except Exception as e:
+            log.warning("[%s] usage-baseline freeze failed (non-fatal): %s",
+                        circuit, e)
         if self.cluster_engine is not None:
             try:
                 self.cluster_engine.freeze_circuit(circuit)
