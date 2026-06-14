@@ -126,8 +126,10 @@ def recompute_volume_and_active_flow(
     rows = conn.execute(
         "SELECT id, start_ts, end_ts, duration_seconds, pressure_delta_psi, "
         "       volume_litres, volume_litres_estimated, volume_litres_original, "
+        "       volume_recorder_litres, "
         "       degraded_supply, is_composite, user_classified, user_ignored, "
-        "       is_pressure_restoration_phantom, "
+        "       is_pressure_restoration_phantom, is_cross_talk, is_low_flow_dribble, "
+        "       excluded_from_training, "
         "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
         "FROM events WHERE circuit = ? ORDER BY start_ts",
         (circuit,),
@@ -153,6 +155,16 @@ def recompute_volume_and_active_flow(
         af = active_flow_features(samples, (end - start).total_seconds())
         degraded = capped or no_prestate or max_gap > _MAX_GAP_DEGRADED_S
         quality = "degraded" if degraded else "ok"
+
+        # §2 coherence: the recorder cumulative-sensor delta is the authoritative volume
+        # for a healthy event — prefer it over this (re-integrated, lossy) value so a
+        # manual Recompute can't undo a recorder reconcile. Healthy only (un-flagged +
+        # not degraded); the verdict/effective logic below is unchanged.
+        rec = r["volume_recorder_litres"]
+        if (rec is not None and float(rec) > 0 and not degraded
+                and not (r["is_pressure_restoration_phantom"] or r["is_cross_talk"]
+                         or r["is_low_flow_dribble"] or r["excluded_from_training"])):
+            new_litres = float(rec)
 
         old_volume = float(r["volume_litres"] or 0.0)
         if old_volume > 0 and (

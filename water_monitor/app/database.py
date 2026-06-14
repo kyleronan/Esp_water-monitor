@@ -15,6 +15,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any, Dict, Generator, List, Optional
 
 log = logging.getLogger(__name__)
@@ -296,6 +297,9 @@ CREATE TABLE IF NOT EXISTS sensitivity_config (
     -- | 'shutoff_any'. Governs what happens when an event deviates from the
     -- frozen baseline. Shut-off levels are guardrailed (see anomaly_baseline).
     anomaly_response            TEXT DEFAULT 'notify',
+    -- Phase 3 §2: 1 = auto-correct event volume from the recorder firmware-sensor
+    -- delta, 0 = flag-only (detect + surface, don't change).
+    recorder_reconcile_auto     INTEGER DEFAULT 1,
     -- Event detection
     pressure_drop_event_psi     REAL DEFAULT 1.2,
     min_event_duration_seconds  REAL DEFAULT 3.0,
@@ -473,6 +477,21 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_id ON jobs (id);
+
+-- ==========================================================================
+-- RECORDER RECONCILIATION CHECKPOINT (Phase 3 §2) — per-circuit position the
+-- hourly recorder-volume reconcile has processed up to, plus cumulative diagnostic
+-- counters. Pure checkpoint/stats (no data dependency) → created here via
+-- CREATE TABLE IF NOT EXISTS, like jobs / anomaly_shutoff_log.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS reconcile_state (
+    circuit           TEXT PRIMARY KEY,
+    through_ts        TIMESTAMP,         -- events with end_ts <= here are reconciled
+    corrections       INTEGER DEFAULT 0, -- cumulative auto-corrections applied
+    flagged           INTEGER DEFAULT 0, -- cumulative divergences flagged (flag-mode)
+    last_run_at       TIMESTAMP,
+    last_delta_litres REAL
+);
 
 -- ==========================================================================
 -- CATEGORY PUBLISH (Sprint F) — per-(circuit, fixture_type) HA publish gate.
@@ -699,6 +718,10 @@ CREATE TABLE IF NOT EXISTS events (
     -- volume + when it was last recomputed, for verification / rollback.
     volume_litres_original           REAL,
     volume_recomputed_at             TIMESTAMP,
+    -- Phase 3 §2: the authoritative firmware cumulative-volume-sensor delta over the
+    -- event window, from the HA recorder (NULL = not reconciled / sensor unavailable).
+    -- Audit ("recorder said X vs stored Y") + what flag-mode review/apply uses.
+    volume_recorder_litres           REAL,
     hourly_volume_applied_litres     REAL DEFAULT 0,
     hourly_volume_applied_bucket     TEXT,
     degraded_diagnostic_json         TEXT,
@@ -1356,6 +1379,39 @@ def get_jobs_since(conn: sqlite3.Connection, since_id: int = 0,
     except sqlite3.OperationalError:
         return []
     return [dict(r) for r in rows]
+
+
+# ── Recorder reconciliation checkpoint (Phase 3 §2) ──────────────────────────────
+
+def get_reconcile_state(conn: sqlite3.Connection,
+                        circuit: str) -> Optional[sqlite3.Row]:
+    try:
+        return conn.execute(
+            "SELECT * FROM reconcile_state WHERE circuit = ?", (circuit,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def set_reconcile_state(conn: sqlite3.Connection, circuit: str, *,
+                        through_ts: Optional[str] = None,
+                        corrections_delta: int = 0, flagged_delta: int = 0,
+                        last_delta_litres: Optional[float] = None) -> None:
+    """Advance the per-circuit checkpoint + bump cumulative counters (upsert)."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO reconcile_state "
+        "  (circuit, through_ts, corrections, flagged, last_run_at, last_delta_litres) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(circuit) DO UPDATE SET "
+        "  through_ts = COALESCE(excluded.through_ts, reconcile_state.through_ts), "
+        "  corrections = reconcile_state.corrections + ?, "
+        "  flagged = reconcile_state.flagged + ?, "
+        "  last_run_at = excluded.last_run_at, "
+        "  last_delta_litres = COALESCE(excluded.last_delta_litres, "
+        "                               reconcile_state.last_delta_litres)",
+        (circuit, through_ts, corrections_delta, flagged_delta, now, last_delta_litres,
+         corrections_delta, flagged_delta))
+    conn.commit()
 
 
 def get_sensitivity_config(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
@@ -2642,6 +2698,51 @@ def get_last_event_ts(conn: sqlite3.Connection, circuit: str) -> Optional[str]:
         "SELECT MAX(start_ts) FROM events WHERE circuit = ?", (circuit,)
     ).fetchone()
     return row[0] if row and row[0] else None
+
+
+def get_event_cadence_seconds(
+    conn: sqlite3.Connection,
+    circuit: str,
+    *,
+    since_iso: Optional[str] = None,
+    lookback_days: int = 60,
+    max_events: int = 50,
+    min_gaps: int = 2,
+) -> Optional[float]:
+    """Median gap (seconds) between consecutive real events for a circuit.
+
+    This is the UNCAPPED inter-event interval, unlike the stored
+    ``events.seconds_since_prev_event`` column (capped at the sequence-gap
+    limit, so it only ever measures within-burst gaps). Filters
+    ``excluded_from_training = 0`` so it reflects the same event population that
+    drives ``events_collected``. The window floor is the later of
+    ``now - lookback_days`` and ``since_iso``, so a circuit still calibrating
+    measures its CALIBRATION-period cadence and never pulls in pre-install /
+    historical-import bursts.
+
+    Returns ``None`` when fewer than ``min_gaps + 1`` qualifying events exist;
+    callers apply an explicit fallback in that case.
+    """
+    floor_iso = (datetime.now(timezone.utc)
+                 - timedelta(days=lookback_days)).isoformat()
+    if since_iso and since_iso > floor_iso:
+        floor_iso = since_iso
+    rows = conn.execute(
+        """SELECT CAST(strftime('%s', start_ts) AS INTEGER) AS ts_epoch
+             FROM events
+            WHERE circuit = ?
+              AND start_ts IS NOT NULL
+              AND COALESCE(excluded_from_training, 0) = 0
+              AND start_ts >= ?
+            ORDER BY start_ts DESC
+            LIMIT ?""",
+        (circuit, floor_iso, max_events),
+    ).fetchall()
+    epochs = sorted(r["ts_epoch"] for r in rows if r["ts_epoch"] is not None)
+    gaps = [b - a for a, b in zip(epochs, epochs[1:]) if b > a]
+    if len(gaps) < min_gaps:
+        return None
+    return float(median(gaps))
 
 
 def find_overlapping_event(

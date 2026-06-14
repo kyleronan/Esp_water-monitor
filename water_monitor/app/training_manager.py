@@ -22,12 +22,12 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from .config import AddonConfig, compute_suggested_calibration_days, compute_minimum_events
 from .database import (get_training_state, upsert_training_state,
                        get_home_profile, ensure_circuit_defaults,
-                       get_circuit_type)
+                       get_circuit_type, get_event_cadence_seconds)
 from .ha_client import HaClient
 
 log = logging.getLogger(__name__)
@@ -36,6 +36,27 @@ log = logging.getLogger(__name__)
 # user inaction, so anomaly detection isn't blocked indefinitely waiting
 # for the user to review clusters.
 LABELLING_AUTO_TIMEOUT_DAYS = 7
+
+# When a circuit has passed its calibration deadline but hasn't collected enough
+# events, re-checking happens every 60 s poll — but re-warning that often is
+# pointless for a sparse circuit (e.g. irrigation that only runs every few days).
+# Instead, stay quiet for roughly one observed inter-event interval between
+# warnings. These bound that quiet period.
+RECHECK_GAP_FACTOR       = 1.25        # head-room past the median inter-event gap
+RECHECK_MIN_SECONDS      = 3600        # 1 h  — hard anti-spam floor
+RECHECK_MAX_SECONDS      = 7 * 86400   # 7 d  — cap on the quiet period
+RECHECK_FALLBACK_SECONDS = 12 * 3600   # 12 h — cold start (< 3 prior events)
+
+
+def _compute_recheck_interval(cadence_seconds: Optional[float]) -> timedelta:
+    """Quiet period before re-warning an under-target calibration, derived from
+    the circuit's observed inter-event cadence and clamped to sane bounds."""
+    if cadence_seconds is None:
+        secs: float = float(RECHECK_FALLBACK_SECONDS)
+    else:
+        secs = cadence_seconds * RECHECK_GAP_FACTOR
+    secs = max(float(RECHECK_MIN_SECONDS), min(secs, float(RECHECK_MAX_SECONDS)))
+    return timedelta(seconds=secs)
 
 
 class TrainingManager:
@@ -50,6 +71,11 @@ class TrainingManager:
         self._db = db
         self._ha = ha
         self._stop = asyncio.Event()
+        # Per-circuit timestamp of the last "under target" calibration warning,
+        # so a circuit past its deadline but short on events isn't re-warned on
+        # every 60 s poll (see _compute_recheck_interval). In-memory by design:
+        # one warning after a restart is fine, so this resets on restart.
+        self._last_undertarget_warn: Dict[str, datetime] = {}
         # Set by orchestrator after ClusterEngine is initialised
         self.cluster_engine = None
 
@@ -625,25 +651,40 @@ class TrainingManager:
                      circuit)
             await self.complete_calibration(circuit)
         elif time_elapsed and not events_ok:
-            # Extend calibration — notify user
-            log.warning(
-                "[%s] calibration time elapsed but only %d/%d events collected — extending",
-                circuit,
-                state_row["events_collected"],
-                state_row["minimum_events"],
-            )
-            circuit_cfg = self._cfg.get_circuit(circuit)
-            if circuit_cfg:
-                await self._ha.notify(
-                    title="Water Monitor — Training extended",
-                    message=(
-                        f"{circuit_cfg.label}: training period elapsed but only "
-                        f"{state_row['events_collected']} of "
-                        f"{state_row['minimum_events']} events collected. "
-                        f"Training continues automatically."
-                    ),
-                    notification_id=f"water_training_extended_{circuit}",
+            # Past the deadline but short on events. Don't re-warn on every 60 s
+            # poll — for a sparse circuit (e.g. irrigation that only runs every
+            # few days) stay quiet for roughly one observed inter-event interval
+            # between warnings. Completion still fires promptly: the deadline is
+            # already in the past, so the next events_ok tick completes on the
+            # branch above. The deadline itself is intentionally NOT moved.
+            last = self._last_undertarget_warn.get(circuit)
+            cadence = get_event_cadence_seconds(
+                self._db, circuit, since_iso=state_row["started_at"])
+            interval = _compute_recheck_interval(cadence)
+            if last is None or (now - last) >= interval:
+                self._last_undertarget_warn[circuit] = now
+                log.warning(
+                    "[%s] calibration under target (%d/%d events) — sparse "
+                    "circuit; next notice in ~%.1f h (cadence=%s)",
+                    circuit,
+                    state_row["events_collected"],
+                    state_row["minimum_events"],
+                    interval.total_seconds() / 3600.0,
+                    f"{cadence / 3600.0:.1f}h" if cadence else "unknown",
                 )
+                circuit_cfg = self._cfg.get_circuit(circuit)
+                if circuit_cfg:
+                    await self._ha.notify(
+                        title="Water Monitor — Training extended",
+                        message=(
+                            f"{circuit_cfg.label}: training period elapsed but only "
+                            f"{state_row['events_collected']} of "
+                            f"{state_row['minimum_events']} events collected. "
+                            f"Training continues automatically."
+                        ),
+                        notification_id=f"water_training_extended_{circuit}",
+                    )
+            # else: under target but still within the quiet interval — stay silent.
 
     async def _publish_status(self, circuit: str) -> None:
         """Publish training status sensor to HA."""
