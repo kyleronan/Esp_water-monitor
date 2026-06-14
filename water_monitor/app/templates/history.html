@@ -647,9 +647,14 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         const n = parseFloat(dv[0]); if (!isNaN(n)) totVol += n;
         if (dv[1]) unit = dv[1];
       });
-      const tNew = (first.getAttribute('data-start') || '').slice(11, 16);
-      const tOld = (members[members.length - 1].getAttribute('data-start') || '')
-          .slice(11, 16);
+      const fmtLocal = ts => {
+        const d = new Date(ts);                    // UTC ISO -> local HH:MM (rows are local)
+        return isNaN(d.getTime()) ? '' :
+          String(d.getHours()).padStart(2, '0') + ':' +
+          String(d.getMinutes()).padStart(2, '0');
+      };
+      const tNew = fmtLocal(first.getAttribute('data-start'));
+      const tOld = fmtLocal(members[members.length - 1].getAttribute('data-start'));
       const label = prettify(first.getAttribute('data-eff-type'));
       const wasExtra = first.classList.contains('hist-extra-row');
       const parent = document.createElement('tr');

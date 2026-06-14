@@ -299,6 +299,13 @@ _SOFTENER_MAX_SPAN_MIN: float = 210.0       # ...and <=3.5 h — caps the chain 
 _SOFTENER_CHAIN_GAP_MIN: float = 45.0       # max gap between consecutive session events
 _SOFTENER_START_BAND_MIN: float = 20.0      # +/- around the configured regen start
 _SOFTENER_BACKWASH_TAIL_MIN: float = 30.0   # grab a trailing backwash this long after
+_SOFTENER_POST_BACKWASH_LOWFLOW_MIN: float = 10.0  # after the refill, stop chaining
+#                                             low-flow beyond this short rinse tail
+#                                             (post-regen morning activity is not it)
+_SOFTENER_BACKWASH_MIN_VOL_L: float = 30.0  # a TERMINAL backwash/refill is a big fill
+#                                             (~220 L observed); a brief high-peak
+#                                             blip mid-brine (<30 L) is not, so it must
+#                                             not trip the post-backwash low-flow cutoff
 
 
 def _softener_feat(r) -> Dict[str, Any]:
@@ -402,6 +409,8 @@ def detect_softener_sessions(
         chain = [(sdt, edt, r)]
         last_end = edt
         last_low_end = edt                        # the band start is low by construction
+        last_bw_end = None                        # end of the last backwash/refill fill
+        post_bw = _SOFTENER_POST_BACKWASH_LOWFLOW_MIN * 60.0
         j = i + 1
         while j < n:
             s2, e2, r2 = evs[j]
@@ -411,10 +420,22 @@ def detect_softener_sessions(
                 break
             if (s2 - sdt).total_seconds() > max_span:
                 break                             # cap span — a regen isn't all morning
+            low = _is_low(r2)
+            # The TERMINAL backwash/refill (a big non-low fill, ~220 L) is the
+            # regen's last phase. Once it has happened, stop absorbing LOW-flow
+            # events more than a short rinse-tail past it — those are post-regen
+            # morning activity, not the softener. A brief high-peak blip mid-brine
+            # (<30 L) is NOT a terminal backwash, so it doesn't trip the cutoff; a
+            # later big fill IS, keeping a genuine multi-backwash cycle.
+            if (low and last_bw_end is not None
+                    and (s2 - last_bw_end).total_seconds() > post_bw):
+                break
             chain.append((s2, e2, r2))
             last_end = max(last_end, e2)
-            if _is_low(r2):
+            if low:
                 last_low_end = max(last_low_end, e2)
+            elif (r2["volume_litres"] or 0.0) >= _SOFTENER_BACKWASH_MIN_VOL_L:
+                last_bw_end = e2 if last_bw_end is None else max(last_bw_end, e2)
             j += 1
         # The BRINE (the low-flow draw) must itself span >= MIN_SPAN. A single
         # low-flow blip at the regen time followed by moderate-flow draws (which a
