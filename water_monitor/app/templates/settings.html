@@ -374,7 +374,10 @@
 
           <div class="sett-sens-grid">
             {% for level in ['low', 'medium', 'high'] %}
-            <label class="sett-sens-btn {% if c.sensitivity.simple_level == level %}active{% endif %}">
+            {# Highlight is driven purely by the radio :checked state (see
+               .sett-sens-btn:has(input:checked)). A server-rendered `active` class
+               would linger on the saved value when the user picks another. #}
+            <label class="sett-sens-btn">
               <input type="radio" name="simple_level" value="{{ level }}"
                      {% if c.sensitivity.simple_level == level %}checked{% endif %}>
               {{ level | title }}

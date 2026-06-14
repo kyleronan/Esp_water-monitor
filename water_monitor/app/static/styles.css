@@ -2111,7 +2111,8 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   transition: border-color .1s, background .1s, color .1s;
 }
 .sett-sens-btn input[type=radio] { display: none; }
-.sett-sens-btn.active,
+/* Highlight follows the live :checked radio (not a server-rendered class), so
+   picking a different level updates immediately without a save/reload. */
 .sett-sens-btn:has(input:checked) {
   border: 2px solid var(--accent);
   background: var(--accent-bg2);
