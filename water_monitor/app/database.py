@@ -4301,6 +4301,7 @@ def reclassify_all_events_from_signatures(
     conn: sqlite3.Connection,
     circuit: str,
     ha_tz=None,
+    since_ts: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Retrain signatures, then backfill ``matched_fixture_type`` over every
     unlabelled event on ``circuit`` — STRUCTURAL RULES FIRST (dev.24 precedence:
@@ -4350,9 +4351,20 @@ def reclassify_all_events_from_signatures(
         _SIGNATURE_MATCH_FEATURES + _SIGNATURE_KNN_ACTIVE_FEATURES
         + ("has_pressure_transient",)))   # the flush predicate's extra input
     circuit_type = get_circuit_type(conn, circuit)
+    # Windowed (periodic maturity re-check): bound the expensive per-event k-NN row
+    # loop below to events >= since_ts, but give the detectors a lookback (>= the
+    # softener's max session span) so a cycle straddling the window start is still seen
+    # WHOLE — otherwise its in-window members would be wrongly retracted. since_ts=None
+    # → full circuit (startup / manual reprocess).
+    detector_since = since_ts
+    if since_ts is not None:
+        _s = _parse_event_ts(since_ts)
+        if _s is not None:
+            detector_since = (_s - timedelta(hours=4)).isoformat()
     # One O(n) pass for the whole circuit — the per-row loop then does dict
     # lookups, never per-event window queries.
-    washer_ids = (detect_washer_cycles(conn, circuit, calib=calib)
+    washer_ids = (detect_washer_cycles(conn, circuit, since_ts=detector_since,
+                                       calib=calib)
                   if circuit_type != "zone" else {})
     # dev.24 — water-softener sessions (hard-gated: enabled AND this circuit).
     softener_ids: Dict[str, Any] = {}
@@ -4362,16 +4374,22 @@ def reclassify_all_events_from_signatures(
         band = parse_hhmm_to_minutes(prof["softener_regen_start"])
         if band is not None:
             tz = ha_tz if ha_tz is not None else get_home_timezone()
-            softener_ids = detect_softener_sessions(conn, circuit, band, tz=tz,
+            softener_ids = detect_softener_sessions(conn, circuit, band,
+                                                    since_ts=detector_since, tz=tz,
                                                     calib=calib)
+    where = "WHERE circuit = ? AND user_fixture_type IS NULL"
+    qparams: list = [circuit]
+    if since_ts is not None:
+        where += " AND start_ts >= ?"
+        qparams.append(since_ts)
     rows = conn.execute(
         "SELECT id, matched_fixture_type, matched_via, cycle_group_id, "
         "       excluded_from_training, "
         "       " + ", ".join(qfeats) + " "
         "FROM events "
-        "WHERE circuit = ? AND user_fixture_type IS NULL "
+        + where + " "
         "ORDER BY start_ts",
-        (circuit,),
+        qparams,
     ).fetchall()
     scanned = matched = rule_matched = softener_matched = cleared = abstained = 0
     for r in rows:
@@ -4577,13 +4595,21 @@ def cycle_pulse_count_for_event(conn: sqlite3.Connection, circuit: str, event_id
     return compute_cycle_pulse_count(vol, nbrs)
 
 
-def recompute_cycle_pulse_counts(conn: sqlite3.Connection, circuit: str) -> Dict[str, int]:
+def recompute_cycle_pulse_counts(conn: sqlite3.Connection, circuit: str,
+                                 since_ts: Optional[str] = None) -> Dict[str, int]:
     """Authoritative full-window (±45 min, past+future) backfill of
     ``events.cycle_pulse_count``, then patch each cluster centroid's mean so the
     heuristic sees the signal immediately. Idempotent (only changed rows written).
-    Returns ``{"scanned", "updated"}``."""
+    ``since_ts`` (periodic maturity re-check) restricts the WRITE-back to events at or
+    after it — older events are still loaded for neighbour context but keep their
+    already-authoritative counts. Returns ``{"scanned", "updated"}``."""
     evs = _load_pulse_events(conn, circuit)
     n = len(evs)
+    since_epoch = None
+    if since_ts is not None:
+        _s = _parse_event_ts(since_ts)
+        if _s is not None:
+            since_epoch = _s.timestamp()
     stored = {
         r["id"]: r["cycle_pulse_count"]
         for r in conn.execute(
@@ -4598,6 +4624,8 @@ def recompute_cycle_pulse_counts(conn: sqlite3.Connection, circuit: str) -> Dict
             lo += 1
         while hi < n and evs[hi][0] <= center + _CYCLE_PULSE_WINDOW_SECONDS:
             hi += 1
+        if since_epoch is not None and center < since_epoch:
+            continue                  # neighbour-only: keep its authoritative count
         nbrs = [evs[j][2] for j in range(lo, hi) if j != i]
         cnt = compute_cycle_pulse_count(evs[i][2], nbrs)
         eid = evs[i][1]

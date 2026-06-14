@@ -594,10 +594,19 @@ def _rule_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     return None
 
 
+# Centroid-only appliance fallbacks (legacy clusters) require the SAME multi-pulse
+# evidence as the temporal rules below: a cluster whose mean is one isolated draw must
+# not be typed as a multi-draw appliance. STRUCTURAL — suggest_fixture_type takes no
+# calib, so this gate is unconditional (never frozen per-home).
+_FALLBACK_MIN_CYCLE_PULSES: float = 3.0
+
+
 def _rule_dishwasher(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Dishwasher fill: 8-15 L per fill, 60-180 s, repeats every ~20 min during cycle."""
     if circuit_type == "zone":
         return None
+    if _safe(centroid, "cycle_pulse_count") < _FALLBACK_MIN_CYCLE_PULSES:
+        return None                  # isolated draw — not a dishwasher cycle
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
     flow = _safe(centroid, "avg_flow_lpm")
@@ -610,6 +619,8 @@ def _rule_washing_machine(centroid: Dict, circuit_type: str) -> Optional[Tuple[s
     """Washing machine fill: 30-80 L total per cycle, 60-300 s per fill phase."""
     if circuit_type == "zone":
         return None
+    if _safe(centroid, "cycle_pulse_count") < _FALLBACK_MIN_CYCLE_PULSES:
+        return None                  # isolated draw — not a washing-machine cycle
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
     flow = _safe(centroid, "avg_flow_lpm")

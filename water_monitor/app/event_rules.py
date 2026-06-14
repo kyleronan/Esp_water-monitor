@@ -96,6 +96,9 @@ _WASHER_ANCHOR_PK_LPM: Tuple[float, float] = (7.5, 15.0)
 _WASHER_FAMILY_PK_RATIO: Tuple[float, float] = (0.8, 1.3)
 _WASHER_FAMILY_WINDOW_MIN: float = 45.0
 _WASHER_FAMILY_MIN_GAP_MIN: float = 2.0
+_WASHER_FAMILY_MIN_SIBLINGS: int = 2    # anchor + >=2 siblings = a real >=3-fill cycle;
+#                                         one sibling (2 draws) is a coincidental pair,
+#                                         not laundry. STRUCTURAL — never in RULE_DEFAULTS.
 _WASHER_SIBLING_MIN_VOL_L: float = 0.5
 _WASHER_SIBLING_MAX_DUR_S: float = 400.0
 # Live-path pre-gate: an event can only participate in a family if its peak lies
@@ -117,7 +120,12 @@ _DW_VOL_L: Tuple[float, float] = (0.2, 3.5)
 # 3.6 — the audit's strict gentle-train cut — restores tap while keeping
 # dishwasher at 0.933 and overall LOO at 0.685 (baseline 0.624).
 _DW_MAX_PK_LPM: float = 3.6
-_DW_MIN_CYCLE_PULSES: int = 2
+_DW_MIN_CYCLE_PULSES: int = 3   # >=3 similar-volume neighbours in ±45 min == a real
+#                                 cycle. Raised from 2 (one coincidental neighbour was
+#                                 enough); aligns with the fixtures.py temporal rules.
+#                                 MITIGATION: cycle_pulse_count is still volume-only — a
+#                                 shape-aware count is the root fix (see plan follow-up).
+#                                 STRUCTURAL gate — never add to RULE_DEFAULTS.
 
 _SHOWER_BIG_VOL_L: float = 30.0
 _SHOWER_BIG_DUR_S: float = 300.0
@@ -281,8 +289,9 @@ def detect_washer_cycles(
             if not (fam_ratio[0] * pk_a <= pk_o <= fam_ratio[1] * pk_a):
                 continue
             family.append(o)
-        if not family:
-            continue                       # lone big fill (sink/tub) — not a cycle
+        if len(family) < _WASHER_FAMILY_MIN_SIBLINGS:
+            continue                       # <2 siblings: a lone big fill (sink/tub) or a
+            #                                coincidental pair — not a multi-fill cycle
         out[a["id"]] = ("anchor", a["id"])
         for o in family:
             feats = {"volume_litres": o["volume_litres"],
@@ -363,6 +372,11 @@ _SOFTENER_BACKWASH_MIN_VOL_L: float = 30.0  # a TERMINAL backwash/refill is a bi
 #                                             (~220 L observed); a brief high-peak
 #                                             blip mid-brine (<30 L) is not, so it must
 #                                             not trip the post-backwash low-flow cutoff
+_SOFTENER_MIN_CHAIN_EVENTS: int = 2         # a real regen is multi-draw (brine + >=1
+#                                             backwash/rinse). A lone low-flow span with no
+#                                             backwash at the regen time is incidental low
+#                                             activity, not a regen. STRUCTURAL — never in
+#                                             RULE_DEFAULTS.
 
 
 def _softener_feat(r) -> Dict[str, Any]:
@@ -502,17 +516,31 @@ def detect_softener_sessions(
         # activity that merely starts near the configured time.
         if (last_low_end - sdt).total_seconds() / 60.0 < _SOFTENER_MIN_SPAN_MIN:
             continue                              # brine too short to be a regen
+        # Trailing-backwash window (also feeds the multi-draw gate below): a non-flush,
+        # non-low fill just past the run, never beyond the max-span cap from the start.
+        win_end = min(last_end + tail, sdt + timedelta(minutes=_SOFTENER_MAX_SPAN_MIN))
+
+        def _is_trailing_bw(s2, r2) -> bool:
+            return not (r2["id"] in claimed or s2 <= last_end or s2 > win_end
+                        or _is_low(r2) or is_flush_shaped(_softener_feat(r2), calib))
+
+        # A real regen is multi-draw: the brine plus one or more backwash/rinse fills.
+        # A lone low-flow span (one chain event AND no backwash anywhere — neither in the
+        # chain nor a trailing fill) at the regen time is incidental low activity, not a
+        # regen. Coalescing may merge a real brine into ONE span, but that regen still
+        # ends with a backwash — so gate on ">=2 chain events OR a confirmed backwash",
+        # never a hard event count (which would drop a coalesced single-span regen).
+        has_backwash = last_bw_end is not None or any(
+            _is_trailing_bw(s2, r2) for (s2, _e2, r2) in evs)
+        if len(chain) < _SOFTENER_MIN_CHAIN_EVENTS and not has_backwash:
+            continue
         group_id = r["id"]
         for (_s, _e, rc) in chain:
             out[rc["id"]] = ("span" if _is_low(rc) else "backwash", group_id)
             claimed.add(rc["id"])
-        # Trailing backwash: a non-flush, non-low fill just past the run (but never
-        # beyond the max-span cap from the session start).
-        win_end = min(last_end + tail, sdt + timedelta(minutes=_SOFTENER_MAX_SPAN_MIN))
-        for (s2, e2, r2) in evs:
-            if (r2["id"] in claimed or s2 <= last_end or s2 > win_end
-                    or _is_low(r2) or is_flush_shaped(_softener_feat(r2), calib)):
-                continue
-            out[r2["id"]] = ("backwash", group_id)
-            claimed.add(r2["id"])
+        # Trailing backwash: claim the non-flush, non-low fills just past the run.
+        for (s2, _e2, r2) in evs:
+            if _is_trailing_bw(s2, r2):
+                out[r2["id"]] = ("backwash", group_id)
+                claimed.add(r2["id"])
     return out
