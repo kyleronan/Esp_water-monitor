@@ -52,6 +52,11 @@
 
 substitutions:
   flow_k_factor: "396.0"   # 6.6 pulses/litre × 60s = 396
+  # §1.4 — flow-clamp bounds (lifted out of the per-circuit filter lambdas so both
+  # circuits share one source of truth). Below min = ADC/float noise → 0; above max
+  # = impossible (ADC overflow) → 0.
+  flow_min_lpm: "0.01"
+  flow_max_lpm: "200.0"
   circuit_1_name: "Main"        # Display name for circuit 1 — change to suit your install
   circuit_2_name: "Irrigation"  # Display name for circuit 2 — change to suit your install
 
@@ -85,7 +90,7 @@ substitutions:
 
 esphome:
   name: esp-water-shut-off-3
-  friendly_name: ESP Water Shut off 3.10
+  friendly_name: ESP Water Shut off 3.11
   min_version: 2024.6.0
   name_add_mac_suffix: false
   platformio_options:
@@ -93,7 +98,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.10.0"
+    version: "3.11.0"   # §1.4 — configurable Valve Travel Timeout number entities
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -1559,7 +1564,7 @@ sensor:
       # Returning 0.0 keeps the smoothed output well-behaved and prevents
       # open-forever event detection bugs in the companion addon.
       - lambda: |-
-          if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
+          if (!std::isfinite(x) || x < ${flow_min_lpm}f || x > ${flow_max_lpm}f) return 0.0f;
           return x;
       # Step 2: 0.5-second sliding window (20 samples × 25ms = 500ms). send_every: 1
       # publishes at 40Hz (every 25ms). Shorter window reduces the stepped
@@ -1744,7 +1749,7 @@ sensor:
       - lambda: return (x / ${flow_k_factor});
       # Clamp — same guard as water_usage1; see comments there.
       - lambda: |-
-          if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
+          if (!std::isfinite(x) || x < ${flow_min_lpm}f || x > ${flow_max_lpm}f) return 0.0f;
           return x;
       # 0.5-second sliding window — matches water_usage1; see comments there.
       - sliding_window_moving_average:
@@ -2418,6 +2423,55 @@ number:
     set_action:
       - logger.log:
           format: "Irrigation burst pipe flow threshold set to %.1f L/min"
+          args: ['x']
+
+  # ---------------------------------------------------------------------------
+  # §1.4 VALVE-TRAVEL TIMEOUT — how long to wait for the motor to reach its end
+  # stop before declaring a motor/wiring fault. Per-circuit + configurable so a
+  # slow motor / low supply voltage no longer latches a FALSE motor fault. The
+  # default 15000 ms is the historical hardcoded value (zero behaviour change on
+  # an existing install); raise it for a slower valve. The travel lambdas fall
+  # back to 15000 ms if the value is unset/NaN, so the fault logic is never
+  # disabled by a bad number.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Valve Travel Timeout - ${circuit_1_name}"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 2
+    id: valve_travel_ms_main
+    icon: mdi:timer-cog-outline
+    unit_of_measurement: "ms"
+    min_value: 3000
+    max_value: 30000
+    step: 500
+    initial_value: 15000
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Main valve travel timeout set to %.0f ms"
+          args: ['x']
+
+  - platform: template
+    name: "Valve Travel Timeout - ${circuit_2_name}"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 2
+    id: valve_travel_ms_irr
+    icon: mdi:timer-cog-outline
+    unit_of_measurement: "ms"
+    min_value: 3000
+    max_value: 30000
+    step: 500
+    initial_value: 15000
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Irrigation valve travel timeout set to %.0f ms"
           args: ['x']
 
   # ---------------------------------------------------------------------------
@@ -3693,9 +3747,11 @@ script:
 #   2. De-energise RESET (close) coil — ensures it is fully off
 #   3. Wait 20ms — mandatory inter-coil gap (2x the RT424F12 max operate time)
 #   4. Pulse SET coil 15ms then de-energise — relay latches, motor starts
-#   5. Wait 15000ms — allow time for full valve travel
-#      (increase if spurious end-stop-timeout faults occur at low temperature
-#      or low supply voltage; decrease if your motor travels much faster)
+#   5. Wait the configurable "Valve Travel Timeout" (§1.4 number entity, default
+#      15000ms) — allow time for full valve travel. Raise it via the entity if
+#      spurious end-stop-timeout faults occur at low temperature / low supply
+#      voltage; lower it if your motor travels much faster. (Falls back to 15000ms
+#      if the value is unset/NaN, so the fault logic is never disabled.)
 #   6. Check open end stop — if not active, raise fault, publish CLOSED
 #
 # Close action (always permitted — safety action, no fault check):
@@ -3747,7 +3803,7 @@ valve:
                   - switch.turn_on: relay_open_valve1
                   - delay: 15ms
                   - switch.turn_off: relay_open_valve1
-                  - delay: 15000ms
+                  - delay: !lambda 'float t = id(valve_travel_ms_main).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
                   - if:
                       condition:
                         # Check both: guard still set (open truly in flight) AND end stop not reached.
@@ -3760,7 +3816,7 @@ valve:
                             id(fault_reason_main_str) = "Motor fault — open end stop not reached";
                             id(fault_reason_main).publish_state(id(fault_reason_main_str));
                             id(open_in_flight_main) = false;
-                            ESP_LOGE("valve", "MAIN: open end stop not reached after 15000ms — motor/wiring fault");
+                            ESP_LOGE("valve", "MAIN: open end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_main).state);
     close_action:
       # Guard against repeated valve.close calls while a close is already
       # in flight. The guard is set on first entry, cleared when the open
@@ -3785,7 +3841,7 @@ valve:
             - switch.turn_on: relay_closed_valve1
             - delay: 15ms
             - switch.turn_off: relay_closed_valve1
-            - delay: 15000ms
+            - delay: !lambda 'float t = id(valve_travel_ms_main).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
             - if:
                 condition:
                   binary_sensor.is_off: closed_end_stop_valve1
@@ -3794,7 +3850,7 @@ valve:
                       id(fault_main) = true;
                       id(fault_reason_main_str) = "Motor fault — closed end stop not reached";
                       id(fault_reason_main).publish_state(id(fault_reason_main_str));
-                      ESP_LOGE("valve", "MAIN: closed end stop not reached after 15000ms — motor/wiring fault");
+                      ESP_LOGE("valve", "MAIN: closed end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_main).state);
 
   - platform: template
     name: "${circuit_2_name} Water Valve"
@@ -3835,7 +3891,7 @@ valve:
                   - switch.turn_on: relay_open_valve2
                   - delay: 15ms
                   - switch.turn_off: relay_open_valve2
-                  - delay: 15000ms
+                  - delay: !lambda 'float t = id(valve_travel_ms_irr).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
                   - if:
                       condition:
                         # Same guard-check pattern as main valve — see main open_action comment.
@@ -3846,7 +3902,7 @@ valve:
                             id(fault_reason_irr_str) = "Motor fault — open end stop not reached";
                             id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
                             id(open_in_flight_irr) = false;
-                            ESP_LOGE("valve", "IRRIGATION: open end stop not reached after 15000ms — motor/wiring fault");
+                            ESP_LOGE("valve", "IRRIGATION: open end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_irr).state);
     close_action:
       # See main valve close_action for explanation of the close-in-flight guard.
       - if:
@@ -3867,7 +3923,7 @@ valve:
             - switch.turn_on: relay_closed_valve2
             - delay: 15ms
             - switch.turn_off: relay_closed_valve2
-            - delay: 15000ms
+            - delay: !lambda 'float t = id(valve_travel_ms_irr).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
             - if:
                 condition:
                   binary_sensor.is_off: closed_end_stop_valve2
@@ -3876,4 +3932,4 @@ valve:
                       id(fault_irrigation) = true;
                       id(fault_reason_irr_str) = "Motor fault — closed end stop not reached";
                       id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
-                      ESP_LOGE("valve", "IRRIGATION: closed end stop not reached after 15000ms — motor/wiring fault");
+                      ESP_LOGE("valve", "IRRIGATION: closed end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_irr).state);
