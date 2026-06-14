@@ -370,6 +370,18 @@ class CircuitEventDetector:
     # dip has recovered to ≤ FRACTION of its starting magnitude for this many seconds.
     PRESSURE_RECOVERY_FRACTION: float = 0.5
     PRESSURE_RECOVERY_DURATION_S: float = 10.0
+    # Flow-override END: if pressure has been recovered for this much longer, end
+    # the event REGARDLESS of the flow reading. Covers a flow sensor that reports
+    # high while flowing but never reports 0 when it stops, leaving
+    # _current_flow_lpm stale-high so the flow<MIN gate never fires — the cause of
+    # the 27.6 h irrigation event. Pressure (40 Hz) is the authority once it has
+    # sat at baseline this long; a real run keeps pressure DROPPED so the timer
+    # only completes when the draw is genuinely over.
+    PRESSURE_RECOVERY_FLOW_OVERRIDE_S: float = 300.0   # 5 min
+    # Absolute hard cap on event duration (watchdog). The longest legitimate run
+    # (a multi-zone irrigation cycle) is ~2.8 h; anything past this is a missed
+    # end signal, so force-close. Bounds the blast radius of ANY unclosed event.
+    MAX_EVENT_DURATION_S: float = 21600.0              # 6 h
 
     # Minimum event volume.  Events whose computed volume (avg_flow × duration)
     # is below this threshold are discarded as noise.  1 mL is a sanity floor —
@@ -499,6 +511,8 @@ class CircuitEventDetector:
                           self.circuit, self._current_flow_lpm)
             elif self._maybe_finalize_held_low_flow(now):
                 return
+            if self._maybe_force_close_overlong(now):        # over-long watchdog
+                return
             elapsed = (now - self._active_event.start_ts).total_seconds()
             self._flow_sample_count += 1
             if elapsed < self._DOWNSAMPLE_AFTER_SECONDS or self._flow_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
@@ -616,6 +630,8 @@ class CircuitEventDetector:
             # held event whose grace expired is finalized here too.
             if self._maybe_finalize_held_low_flow(now):
                 return
+            if self._maybe_force_close_overlong(now):    # over-long watchdog
+                return
             elapsed_p = (now - self._active_event.start_ts).total_seconds()
             self._pressure_sample_count += 1
             # Track max on every sample (before downsample gate).
@@ -632,23 +648,28 @@ class CircuitEventDetector:
                 if pressure >= recovery_line:
                     if self._pressure_recovered_since is None:
                         self._pressure_recovered_since = now
-                    elif (
-                        (now - self._pressure_recovered_since).total_seconds()
-                        >= self.PRESSURE_RECOVERY_DURATION_S
-                        and self._current_flow_lpm < self.MIN_FLOW_LPM
-                    ):
-                        log.debug(
-                            "[%s] pressure recovered (>= %.2f PSI for %.1f s, flow=%.3f) "
-                            "— ending pressure-triggered event",
-                            self.circuit, recovery_line,
-                            (now - self._pressure_recovered_since).total_seconds(),
-                            self._current_flow_lpm,
-                        )
-                        # Pressure recovery is a definitive "draw is over" signal
-                        # (only fires for events WITH a real transient — not the
-                        # low-flow chatter case), so it bypasses the off-grace hold.
-                        self._end_event(now, force=True)
-                        return
+                    else:
+                        rec_secs = (now - self._pressure_recovered_since).total_seconds()
+                        flow_stopped = self._current_flow_lpm < self.MIN_FLOW_LPM
+                        # Normal END: pressure back >= 10 s AND flow has stopped.
+                        # Flow-override END: pressure back for a LONG time regardless
+                        # of the flow value — a flow sensor that never reports 0 on
+                        # stop leaves _current_flow_lpm stale-high so flow<MIN never
+                        # fires (the 27.6 h irrigation event). Pressure is the
+                        # authority once it has sat at baseline this long.
+                        if ((rec_secs >= self.PRESSURE_RECOVERY_DURATION_S
+                             and flow_stopped)
+                                or rec_secs >= self.PRESSURE_RECOVERY_FLOW_OVERRIDE_S):
+                            log.info(
+                                "[%s] pressure recovered (>= %.2f PSI for %.0f s, "
+                                "flow=%.3f%s) — ending pressure-triggered event",
+                                self.circuit, recovery_line, rec_secs,
+                                self._current_flow_lpm,
+                                "" if flow_stopped else " [flow-override]",
+                            )
+                            # Definitive "draw is over" — bypasses the off-grace hold.
+                            self._end_event(now, force=True)
+                            return
                 else:
                     self._pressure_recovered_since = None
 
@@ -974,6 +995,24 @@ class CircuitEventDetector:
                 and now >= ev.low_flow_hold_until):
             dip_ts = ev.low_flow_hold_until - timedelta(seconds=LOWFLOW_OFF_GRACE_S)
             self._end_event(dip_ts, force=True)
+            return True
+        return False
+
+    def _maybe_force_close_overlong(self, now: datetime) -> bool:
+        """Watchdog: force-close an event that has exceeded MAX_EVENT_DURATION_S —
+        a missed end signal (e.g. a flow sensor that never reports 0 on stop, or a
+        stuck zone valve) must never leave an event open for hours/days. Returns
+        True when it finalized (caller must stop touching self._active_event)."""
+        ev = self._active_event
+        if (ev is not None
+                and (now - ev.start_ts).total_seconds() > self.MAX_EVENT_DURATION_S):
+            log.warning(
+                "[%s] force-closing over-long event: %.1f h > %.1f h cap "
+                "(missed end signal — e.g. flow sensor not reporting 0 on stop)",
+                self.circuit, (now - ev.start_ts).total_seconds() / 3600.0,
+                self.MAX_EVENT_DURATION_S / 3600.0,
+            )
+            self._end_event(now, force=True)
             return True
         return False
 
