@@ -212,6 +212,7 @@ async def settings_page(request: Request):
 
     from ..event_rules import get_home_timezone
     from ..rule_calibration import get_rule_calibration_meta
+    from ..artifact_calibration import get_artifact_calibration_meta
     _home_tz = get_home_timezone()
     circuits = []
     for circuit_cfg in orch._cfg.circuits:
@@ -228,6 +229,7 @@ async def settings_page(request: Request):
             }
         )
         cal_meta = get_rule_calibration_meta(orch.db, c)
+        art_meta = get_artifact_calibration_meta(orch.db, c)
 
         from ..database import get_active_exclusion_window, get_valve_type
         circuits.append({
@@ -249,6 +251,13 @@ async def settings_page(request: Request):
                 "source": cal_meta["source"],
                 "fit_count": cal_meta["fit_count"],
             } if cal_meta else None,
+            # Phase 2.4 artifact-detector calibration lock status (Dev Tools).
+            "artifact_calibration": {
+                "locked_at": _fmt_local_ts(art_meta["locked_at"], _home_tz),
+                "source": art_meta["source"],
+                "count": art_meta["count"],
+                "detectors": art_meta["detectors"],
+            } if art_meta else None,
             "device_entities": entities_by_circuit.get(c, []),
             "active_exclusion": get_active_exclusion_window(orch.db, c),
         })

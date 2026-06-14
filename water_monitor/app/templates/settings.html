@@ -1125,6 +1125,36 @@
       </div>
 
       <div class="sett-card">
+        <h3 class="sett-card-title">Artifact-detector calibration</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Per-home phantom / cross-talk / dribble thresholds, frozen at activation
+          (and re-frozen by Re-train above). Each is applied only if it would flag
+          <em>none</em> of your confirmed-real events — otherwise it keeps the safe
+          default. The leak-safety true-flow guards are never calibrated.
+        </p>
+        {% for c in circuits %}
+        <div style="margin:.6rem 0">
+          <strong>{{ c.display_name }}</strong>
+          {% if c.artifact_calibration %}
+            <span class="muted" style="font-size:.85em">
+              · Locked {{ c.artifact_calibration.locked_at or '—' }}
+              ({{ c.artifact_calibration.source or '—' }},
+              {{ c.artifact_calibration.count }}
+              threshold{{ '' if c.artifact_calibration.count == 1 else 's' }} calibrated)
+            </span>
+            <ul class="muted" style="font-size:.85em;margin:.3rem 0 0;padding-left:1.2rem">
+              {% for d in c.artifact_calibration.detectors %}
+              <li>{{ d.label }}: {{ d.summary }}</li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <span class="muted" style="font-size:.85em">· not yet locked</span>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+
+      <div class="sett-card">
         <h3 class="sett-card-title">Reprocess range</h3>
         <p class="sett-help" style="margin:.25rem 0 .75rem">
           Delete a circuit's auto events in a date range and rebuild them from HA

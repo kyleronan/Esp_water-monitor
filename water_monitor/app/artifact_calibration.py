@@ -227,3 +227,51 @@ def load_artifact_calibration(conn: sqlite3.Connection, circuit: str,
     if use_cache:
         _calib_cache[circuit] = data
     return data
+
+
+_DETECTOR_LABELS = (("phantom", "Phantom"), ("cross_talk", "Cross-talk"),
+                    ("dribble", "Dribble"))
+
+
+def _detector_summary(rep: Dict[str, Any]) -> str:
+    """One-line, human-readable outcome for a detector's fit report."""
+    st = rep.get("status")
+    if st == "fit":
+        return f"calibrated ({rep.get('caught')}/{rep.get('positives')} caught)"
+    if st == "rejected_would_harm":
+        return f"defaults — fit would flag {rep.get('harmed')} confirmed-real"
+    if st == "insufficient_truth":
+        return f"defaults — {rep.get('positives', 0)} confirmed (need {MIN_POSITIVES})"
+    return "defaults"
+
+
+def get_artifact_calibration_meta(conn: sqlite3.Connection,
+                                  circuit: str) -> Optional[Dict[str, Any]]:
+    """Lock metadata for the UI: when frozen, how many thresholds were calibrated,
+    and a per-detector fit-vs-fallback summary. None if never frozen."""
+    try:
+        row = conn.execute(
+            "SELECT params, report, source, locked_at "
+            "FROM artifact_calibration WHERE circuit = ?", (circuit,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    try:
+        params = json.loads(row["params"]) if row["params"] else {}
+    except (json.JSONDecodeError, TypeError):
+        params = {}
+    try:
+        report = json.loads(row["report"]) if row["report"] else {}
+    except (json.JSONDecodeError, TypeError):
+        report = {}
+    return {
+        "locked_at": row["locked_at"],
+        "source": row["source"],
+        "count": len(params),
+        "detectors": [
+            {"label": label, "summary": _detector_summary(report.get(key, {}))}
+            for key, label in _DETECTOR_LABELS
+        ],
+    }
