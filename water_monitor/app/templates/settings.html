@@ -1198,6 +1198,53 @@
       </div>
 
       <div class="sett-card">
+        <h3 class="sett-card-title">Detector self-validation</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Reconciles detected events against the raw flow re-scraped from HA (the last
+          ≤10 days of high-fidelity history) to confirm the phantom / cross-talk / dribble
+          settings behave. Runs automatically at activation / re-train.
+          <strong>Diagnostic only — never changes a threshold.</strong>
+        </p>
+        {% for c in circuits %}
+        <div class="dev-retrain-row"
+             style="display:flex;gap:.5rem;align-items:flex-start;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
+          <div style="min-width:60%">
+            <strong>{{ c.display_name }}</strong>
+            {% set dv = c.detector_validation %}
+            {% if dv and dv.volume %}
+              {% set warn = dv.overall == 'warn' %}
+              <span class="muted" style="font-size:.85em">
+                · <span style="font-weight:600;color:{{ '#c0392b' if warn else '#27ae60' }}">{{ 'NEEDS REVIEW' if warn else 'OK' }}</span>
+                · validated {{ dv.validated_at_local or '—' }}{% if dv.window and dv.window.days %} (last {{ dv.window.days }} d){% endif %}
+              </span>
+              <ul class="muted" style="font-size:.85em;margin:.3rem 0 0;padding-left:1.2rem">
+                <li>{{ dv.volume.summary }}</li>
+                {% if dv.detectors %}
+                  {% for key, label in [('phantom','Phantom'), ('cross_talk','Cross-talk'), ('dribble','Dribble')] %}
+                    {% set d = dv.detectors[key] %}
+                    {% if d %}<li>{{ label }}: {{ d.summary }}</li>{% endif %}
+                  {% endfor %}
+                {% endif %}
+                <li>Leak-safety: {{ dv.suspect_zeroings|length }} zeroed event(s) that moved real water{{ ' ⚠ review' if dv.suspect_zeroings|length else ' — none' }}</li>
+                <li>Unflagged no-flow (gap sentinel): {{ dv.unflagged_no_flow.count if dv.unflagged_no_flow else 0 }}</li>
+              </ul>
+            {% elif dv %}
+              <span class="muted" style="font-size:.85em">· could not validate ({{ dv.error or 'unknown' }}){% if dv.validated_at_local %} at {{ dv.validated_at_local }}{% endif %}</span>
+            {% else %}
+              <span class="muted" style="font-size:.85em">· not yet validated — runs at activation / re-train, or click →</span>
+            {% endif %}
+          </div>
+          <form method="post"
+                action="{{ ingress_path }}/settings/dev/validate-detectors/{{ c.circuit }}"
+                style="margin:0">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">Run validation now</button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+
+      <div class="sett-card">
         <h3 class="sett-card-title">Reprocess range</h3>
         <p class="sett-help" style="margin:.25rem 0 .75rem">
           Delete a circuit's auto events in a date range and rebuild them from HA

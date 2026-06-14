@@ -235,6 +235,7 @@ async def settings_page(request: Request):
     from ..event_rules import get_home_timezone
     from ..rule_calibration import get_rule_calibration_meta
     from ..artifact_calibration import get_artifact_calibration_meta
+    from ..detector_validation import load_validation_report
     from ..anomaly_baseline import MIN_N_FOR_SHUTOFF, MIN_LIVE_DAYS_FOR_SHUTOFF
     _home_tz = get_home_timezone()
     circuits = []
@@ -253,6 +254,7 @@ async def settings_page(request: Request):
         )
         cal_meta = get_rule_calibration_meta(orch.db, c)
         art_meta = get_artifact_calibration_meta(orch.db, c)
+        dv = load_validation_report(orch.db, c)
 
         from ..database import get_active_exclusion_window, get_valve_type
         circuits.append({
@@ -286,6 +288,11 @@ async def settings_page(request: Request):
                 "count": art_meta["count"],
                 "detectors": art_meta["detectors"],
             } if art_meta else None,
+            # P6 detector self-validation against HA history (Dev Tools, diagnostic).
+            "detector_validation": ({
+                **dv,
+                "validated_at_local": _fmt_local_ts(dv.get("validated_at"), _home_tz),
+            } if dv else None),
             "device_entities": entities_by_circuit.get(c, []),
             "active_exclusion": get_active_exclusion_window(orch.db, c),
         })
@@ -505,10 +512,11 @@ async def dev_validate_detectors(circuit: str, request: Request):
         return JSONResponse({"error": "dev tools disabled"}, status_code=404)
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
-    if not orch.training_manager:
-        return JSONResponse({"error": "training manager unavailable"}, status_code=503)
-    report = await orch.training_manager.validate_detectors(circuit)
-    return JSONResponse(report)
+    if orch.training_manager:
+        # Persists a single latest-per-circuit report; the reloaded page renders it
+        # (plain form POST → redirect, like dev_retrain — kept off the JS path).
+        await orch.training_manager.validate_detectors(circuit)
+    return ingress_redirect(request, "/settings#sett-dev")
 
 
 @router.post("/dev/reimport-range/{circuit}")
