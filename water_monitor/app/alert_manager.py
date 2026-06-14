@@ -49,6 +49,20 @@ except ImportError:  # pragma: no cover — aiohttp is a hard dep, defensive onl
     pass
 
 
+def _humanize_anomaly_type(atype: Optional[str]) -> str:
+    """Turn the stored anomaly_type tag into a human reason for the notification."""
+    a = atype or ""
+    vol = "high_volume" in a
+    shape = "envelope" in a or "abnormal_shape" in a
+    if vol and shape:
+        return "Unusually high volume and an abnormal pattern"
+    if vol:
+        return "Unusually high water volume"
+    if shape:
+        return "An abnormal usage pattern for this fixture"
+    return "Unusual water usage"
+
+
 class AlertManager:
 
     def __init__(self, db: sqlite3.Connection, ha_client):
@@ -259,6 +273,42 @@ class AlertManager:
                      f"(anomaly score {score:.0%}). "
                      "Review the History page for details."),
         )
+
+    async def alert_unusual_usage(self, circuit: str, score: float,
+                                  anomaly_type: Optional[str], circuit_name: str,
+                                  shutoff: bool = False,
+                                  event_id: Optional[str] = None,
+                                  valve_entity: Optional[str] = None) -> None:
+        """Phase 2.3 — unusual-usage alert (frozen-baseline deviation).
+
+        On ``shutoff`` the valve was auto-closed: the message MUST say WHY and HOW to
+        reopen in one action (toggle the named valve entity), and is sent ``critical``
+        so a safety shut-off always notifies regardless of the user's alert config —
+        an opaque or suppressed shut-off would be worse than no feature.
+        """
+        reason = _humanize_anomaly_type(anomaly_type)
+        if shutoff:
+            where = (f"open “{valve_entity}” in Home Assistant"
+                     if valve_entity else "open your main water valve in Home Assistant")
+            await self.fire(
+                circuit, "unusual_usage",
+                title=f"\U0001f6b1 Water shut off — {circuit_name}",
+                message=(f"Automatic shut-off: {reason} (anomaly score {score:.0%}). "
+                         f"Water to {circuit_name} was closed as a precaution. "
+                         f"To restore water, {where}, or use the Open Valve button on "
+                         f"the Water Monitor device page. If this was normal usage, "
+                         f"recalibrate so it is not flagged again."),
+                notification_id=f"water_unusual_shutoff_{circuit}",
+                critical=True,
+            )
+        else:
+            await self.fire(
+                circuit, "unusual_usage",
+                title=f"\U0001f50d Unusual water usage — {circuit_name}",
+                message=(f"{reason} (anomaly score {score:.0%}). This did not fit "
+                         f"{circuit_name}'s learned pattern — review the History "
+                         f"page. Lower Detection Sensitivity if these are false alarms."),
+            )
 
     async def alert_pulsing_supply(self, circuit: str,
                                     circuit_name: str,

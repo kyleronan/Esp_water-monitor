@@ -292,6 +292,10 @@ CREATE TABLE IF NOT EXISTS sensitivity_config (
     circuit                     TEXT PRIMARY KEY,
     mode                        TEXT DEFAULT 'simple',
     simple_level                TEXT DEFAULT 'medium',
+    -- Phase 2.3 anomaly response: 'off' | 'notify' | 'notify_shutoff_severe'
+    -- | 'shutoff_any'. Governs what happens when an event deviates from the
+    -- frozen baseline. Shut-off levels are guardrailed (see anomaly_baseline).
+    anomaly_response            TEXT DEFAULT 'notify',
     -- Event detection
     pressure_drop_event_psi     REAL DEFAULT 1.2,
     min_event_duration_seconds  REAL DEFAULT 3.0,
@@ -308,6 +312,9 @@ CREATE TABLE IF NOT EXISTS sensitivity_config (
     baseline_anomaly_p85        REAL,
     baseline_anomaly_p95        REAL,
     baseline_anomaly_p99        REAL,
+    -- Event count behind the percentiles — the confidence the shut-off gate
+    -- reads (a thin/default baseline must never close the valve).
+    baseline_anomaly_n          INTEGER,
     baseline_cluster_std_mean   REAL,
     baseline_computed_at        TIMESTAMP,
     updated_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -432,6 +439,23 @@ CREATE TABLE IF NOT EXISTS artifact_calibration (
     locked_at   TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ==========================================================================
+-- ANOMALY AUTO-SHUTOFF LOG (Phase 2.3) — one row per automated valve close.
+-- PERSISTENT so the per-12h rate limit survives an addon restart (an in-memory
+-- counter would reset on exactly the restart a pathological condition could
+-- cause). Queried for COUNT in the last 12h before any auto-shutoff.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS anomaly_shutoff_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit       TEXT NOT NULL,
+    event_id      TEXT,
+    anomaly_type  TEXT,
+    score         REAL,
+    closed_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_anomaly_shutoff_circuit_time
+    ON anomaly_shutoff_log (circuit, closed_at);
 
 -- ==========================================================================
 -- CATEGORY PUBLISH (Sprint F) — per-(circuit, fixture_type) HA publish gate.
@@ -4400,15 +4424,27 @@ def reclassify_all_events_from_signatures(
             softener_ids = detect_softener_sessions(conn, circuit, band,
                                                     since_ts=detector_since, tz=tz,
                                                     calib=calib)
+    # Phase 2.3 — re-score each scanned event against the FROZEN baseline (storage
+    # only; reclassify NEVER notifies or shuts off). Baseline + sensitivity loaded
+    # once for the whole pass; the extra SELECT columns the scorer needs are deduped
+    # into the query so a column already in qfeats isn't selected twice.
+    from .anomaly_baseline import load_usage_baselines, score_event_anomaly
+    _baselines = load_usage_baselines(conn, circuit)
+    _sens = get_sensitivity_config(conn, circuit)
+    _SCORE_COLS = ("volume_litres_effective", "volume_litres", "duration_seconds",
+                   "peak_flow_lpm", "is_pressure_restoration_phantom", "is_cross_talk",
+                   "is_low_flow_dribble", "user_ignored")
+
     where = "WHERE circuit = ? AND user_fixture_type IS NULL"
     qparams: list = [circuit]
     if since_ts is not None:
         where += " AND start_ts >= ?"
         qparams.append(since_ts)
+    select_cols = list(dict.fromkeys(
+        ("id", "matched_fixture_type", "matched_via", "cycle_group_id",
+         "excluded_from_training") + qfeats + _SCORE_COLS))
     rows = conn.execute(
-        "SELECT id, matched_fixture_type, matched_via, cycle_group_id, "
-        "       excluded_from_training, "
-        "       " + ", ".join(qfeats) + " "
+        "SELECT " + ", ".join(select_cols) + " "
         "FROM events "
         + where + " "
         "ORDER BY start_ts",
@@ -4454,6 +4490,17 @@ def reclassify_all_events_from_signatures(
                 rule_matched += 1
         else:
             abstained += 1
+        # Re-score against the frozen baseline + persist (storage only — no notify /
+        # shut-off from a backfill). flagged=1 marks a genuine (non-artifact) anomaly.
+        sfeats = {c: r[c] for c in _SCORE_COLS}
+        sfeats["matched_fixture_type"] = new_type
+        av = score_event_anomaly(sfeats, _baselines, _sens)
+        conn.execute(
+            "UPDATE events SET anomaly_score = ?, anomaly_type = ?, flagged = ? "
+            "WHERE id = ?",
+            (av.get("score"), av.get("anomaly_type"),
+             1 if av.get("is_anomalous") else 0, r["id"]),
+        )
     conn.commit()
     result = {
         "signatures_trained": signatures_trained,

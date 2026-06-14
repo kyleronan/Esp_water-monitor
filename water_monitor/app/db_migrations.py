@@ -79,7 +79,12 @@ _BASELINE_VERSION: int = 20260523
 #              + softener_regen_start + softener_circuit) and the History cycle-rollup
 #              grouping key (events.cycle_group_id). DDL only — no backfill (softener
 #              off until enabled; cycle_group_id stamped by the next reclassify).
-_CURRENT_VERSION: int = 20260542
+#   20260543 — Phase 2.3 anomaly response: sensitivity_config.anomaly_response
+#              (TEXT DEFAULT 'notify') + sensitivity_config.baseline_anomaly_n
+#              (INTEGER — event count behind the frozen percentiles, read by the
+#              shut-off confidence gate). DDL only; no backfill (defaults are
+#              correct — 'notify', and NULL n until the next activation freeze).
+_CURRENT_VERSION: int = 20260543
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -723,6 +728,31 @@ def _apply_dev24_columns(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260542: dev.24 columns ready")
 
 
+def _apply_anomaly_response_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260543 — Phase 2.3 anomaly response.
+
+    Adds two ``sensitivity_config`` columns:
+      • ``anomaly_response`` (TEXT DEFAULT 'notify') — the graduated response level
+        ('off' | 'notify' | 'notify_shutoff_severe' | 'shutoff_any').
+      • ``baseline_anomaly_n`` (INTEGER) — event count behind the frozen volume
+        percentiles, read by the shut-off confidence gate so a thin/default
+        baseline can never close the valve.
+    DDL only; idempotent (each add guarded by ``_has_column``). No backfill —
+    'notify' is the correct default and ``baseline_anomaly_n`` is written by the
+    next activation freeze (NULL until then → shut-off degrades to notify).
+    """
+    if not _has_column(conn, "sensitivity_config", "anomaly_response"):
+        conn.execute("ALTER TABLE sensitivity_config "
+                     "ADD COLUMN anomaly_response TEXT DEFAULT 'notify'")
+        log.info("Added sensitivity_config.anomaly_response (default 'notify')")
+    if not _has_column(conn, "sensitivity_config", "baseline_anomaly_n"):
+        conn.execute("ALTER TABLE sensitivity_config "
+                     "ADD COLUMN baseline_anomaly_n INTEGER")
+        log.info("Added sensitivity_config.baseline_anomaly_n (INTEGER)")
+    conn.commit()
+    log.info("Migration 20260543: anomaly-response columns ready")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -1015,6 +1045,15 @@ def _missing_dev24_columns(conn: sqlite3.Connection) -> set[str]:
     return missing
 
 
+def _missing_anomaly_response_columns(conn: sqlite3.Connection) -> set[str]:
+    """Return the 20260543 anomaly-response columns absent from sensitivity_config."""
+    return {
+        f"sensitivity_config.{col}"
+        for col in ("anomaly_response", "baseline_anomaly_n")
+        if not _has_column(conn, "sensitivity_config", col)
+    }
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -1122,6 +1161,7 @@ def _run_migrations_impl(
             | _missing_cross_talk_columns(conn)
             | _missing_matched_via_column(conn)
             | _missing_dev24_columns(conn)
+            | _missing_anomaly_response_columns(conn)
         )
         if missing:
             raise RuntimeError(
@@ -1132,10 +1172,18 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260542:
+        # DB has the dev.24 columns but lacks the Phase 2.3 anomaly-response columns.
+        _apply_anomaly_response_columns(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260542 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260541:
         # DB has the matched_via column but lacks the dev.24 columns
         # (water-softener config + cycle_group_id rollup key).
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260541 → %d", _CURRENT_VERSION)
         return
@@ -1144,6 +1192,7 @@ def _run_migrations_impl(
         # DB has the cross-talk columns but lacks the matched_via provenance column.
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260540 → %d", _CURRENT_VERSION)
         return
@@ -1153,6 +1202,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260539 → %d", _CURRENT_VERSION)
         return
@@ -1163,6 +1213,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260538 → %d", _CURRENT_VERSION)
         return
@@ -1174,6 +1225,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260537 → %d", _CURRENT_VERSION)
         return
@@ -1186,6 +1238,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260536 → %d", _CURRENT_VERSION)
         return
@@ -1199,6 +1252,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260535 → %d", _CURRENT_VERSION)
         return
@@ -1214,6 +1268,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
         return
@@ -1230,6 +1285,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
         return
@@ -1246,6 +1302,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
@@ -1264,6 +1321,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
@@ -1283,6 +1341,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -1324,6 +1383,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -1347,6 +1407,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -1371,6 +1432,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -1394,6 +1456,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -1416,6 +1479,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -1436,6 +1500,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -1456,6 +1521,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -1512,6 +1578,7 @@ def _run_migrations_impl(
         _apply_cross_talk_columns(conn)
         _apply_matched_via_column(conn)
         _apply_dev24_columns(conn)
+        _apply_anomaly_response_columns(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

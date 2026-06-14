@@ -267,6 +267,39 @@ class FixturePublisher:
 
         log.debug("Published Discovery for %s/%s (%s)", circuit, category, slug)
 
+    def _publish_circuit_discovery(self, circuit: str) -> None:
+        """Publish the per-circuit (device-level) anomaly binary_sensor (Phase 2.3).
+
+        Not tied to a fixture type — it mirrors whether a recent event deviated from
+        the home's FROZEN baseline. Automation-friendly (device_class 'problem') so a
+        user can build their own response (dashboard card, valve shutoff, etc.); the
+        built-in graduated response lives in feature_extractor, not here.
+        """
+        cslug = _slugify(circuit)
+        object_id = f"{_NODE_ID}_{cslug}_unusual_usage"
+        circ_label = circuit
+        for c in self._cfg.circuits:
+            if c.circuit == circuit:
+                circ_label = getattr(c, "label", circuit)
+                break
+        device = {
+            "identifiers":  [f"{_NODE_ID}_{cslug}"],
+            "name":         f"Water Monitor — {getattr(self._cfg, 'home_name', 'Home')}",
+            "manufacturer": "Water Monitor",
+            "model":        "Water Usage Monitor",
+        }
+        payload = {
+            "name":         f"{circ_label} — unusual usage",
+            "unique_id":    f"{_NODE_ID}_{object_id}",
+            "state_topic":  f"{_DISCOVERY_PREFIX}/binary_sensor/{object_id}/state",
+            "device":       device,
+            "device_class": "problem",
+            "icon":         "mdi:water-alert",
+        }
+        topic = f"{_DISCOVERY_PREFIX}/binary_sensor/{object_id}/config"
+        self._client.publish(topic, json.dumps(payload), retain=True)
+        log.debug("Published unusual-usage Discovery for %s", circuit)
+
     def _retract_category_entity(self, circuit: str, category: str) -> None:
         """Send empty-payload retract for a category's three HA entities."""
         slug = _category_slug(circuit, category)
@@ -332,6 +365,9 @@ class FixturePublisher:
         try:
             circuits = [c.circuit for c in self._cfg.circuits]
             for circuit in circuits:
+                # Phase 2.3 — the per-circuit unusual-usage sensor exists even before
+                # any fixture category does, so publish it unconditionally per circuit.
+                self._publish_circuit_discovery(circuit)
                 cats = self._categories_for_circuit(circuit)
                 for category, info in cats.items():
                     self._publish_category_discovery(circuit, category, info["label"])
@@ -351,7 +387,7 @@ class FixturePublisher:
         if not self._connected or not self._is_publishing_enabled():
             return
 
-        from datetime import datetime, timezone
+        from datetime import datetime, timedelta, timezone
         from .database import get_category_publish_map
         from .fixtures import (fixture_user_selectable_types,
                                normalize_fixture_type_for_circuit,
@@ -431,3 +467,22 @@ class FixturePublisher:
                 f"{_DISCOVERY_PREFIX}/binary_sensor/{_NODE_ID}_{slug}_running/state",
                 "ON" if running else "OFF",
             )
+
+        # Phase 2.3 — per-circuit unusual-usage flag: ON when a recent event (by
+        # start_ts, last 15 min) is flagged anomalous. STATE MIRROR ONLY — the notify
+        # / shut-off response is applied live in feature_extractor, never from this
+        # tick, and the by-start_ts window means a backfill re-flagging an OLD event
+        # cannot make the sensor fire.
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).strftime(
+            "%Y-%m-%dT%H:%M:%S+00:00")
+        try:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM events WHERE circuit = ? AND start_ts >= ? "
+                "AND COALESCE(flagged, 0) = 1", (circuit, cutoff)).fetchone()
+            unusual = bool(row and row[0])
+        except Exception:
+            unusual = False
+        self._client.publish(
+            f"{_DISCOVERY_PREFIX}/binary_sensor/{_NODE_ID}_{_slugify(circuit)}_unusual_usage/state",
+            "ON" if unusual else "OFF",
+        )

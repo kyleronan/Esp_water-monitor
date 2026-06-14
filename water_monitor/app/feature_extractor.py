@@ -2205,6 +2205,11 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     return result
 
 
+# Phase 2.3 — minimum gap between anomaly NOTIFY pushes per circuit (the shut-off
+# path is governed separately by the persistent per-12h cap, not this cooldown).
+_ANOMALY_ALERT_COOLDOWN_MIN = 15
+
+
 class FeatureExtractor:
     """
     Consumes RawEvent objects from the queue and stores
@@ -2243,6 +2248,10 @@ class FeatureExtractor:
         # be re-alerted (mildly annoying, not dangerous). Persist to DB
         # later if it becomes a problem.
         self._last_pulsing_alert_at: dict[str, datetime] = {}
+        # Per-circuit cooldown for the Phase 2.3 anomaly NOTIFY path (in-memory is
+        # fine — at worst a few extra notifications after a restart). The shut-off
+        # rate limit is PERSISTENT (anomaly_shutoff_log), not in-memory.
+        self._last_anomaly_alert_at: dict[str, datetime] = {}
         # Set by orchestrator after ClusterEngine is initialised and rebuilt.
         self.cluster_engine = None
         # dev.23: per-circuit circuit_type cache for the structural rules tier
@@ -2600,19 +2609,22 @@ class FeatureExtractor:
                 log.warning("[%s] training-capture hook failed (non-fatal): %s",
                             event.circuit, e)
 
+            # ── Phase 2.3 anomaly response (frozen-baseline deviation) ─────────
+            # Replaces the old match-confidence alert (which fired on anything that
+            # didn't strongly match — the false-positive source). The verdict was
+            # scored + stored in _cluster_event; here we apply the user's graduated
+            # response, but ONLY in the locked 'live' state. A circuit calibrating /
+            # labelling / mid-recalibration has no trustworthy baseline → no notify,
+            # no shut-off. Shut-off carries extra guardrails (see _apply_anomaly_response).
             am = self._alert_manager
-            if am and features.get("anomaly_score"):
-                score = float(features["anomaly_score"])
+            anomaly = features.get("_anomaly") or {}
+            if am and anomaly.get("is_anomalous"):
                 ts_row = self._db.execute(
                     "SELECT state FROM training_state WHERE circuit = ?",
                     (event.circuit,)).fetchone()
-                if ts_row and ts_row["state"] == "live" and score >= 0.60:
-                    circuit_name = event.circuit.replace("_", " ").title()
-                    # Use _spawn_alert_task instead of bare asyncio.create_task
-                    # so Python doesn't garbage-collect the task before the
-                    # alert is sent (loose-reference antipattern).
-                    self._spawn_alert_task(
-                        am.alert_flow_anomaly(event.circuit, score, circuit_name))
+                if ts_row and ts_row["state"] == "live":
+                    await self._apply_anomaly_response(
+                        event.circuit, features, anomaly)
 
             # ── Pulsing-supply alert (rate-limited) ────────────────────────
             # Fire at most once per hour per circuit, and only when at least
@@ -2658,6 +2670,134 @@ class FeatureExtractor:
             )
         except Exception as e:
             log.error("[%s] failed to store event: %s", event.circuit, e, exc_info=True)
+
+    def _score_anomaly(self, circuit: str, features: dict) -> dict:
+        """Score an event against the FROZEN baseline (Phase 2.3). Read-only — the
+        notify / shut-off response is applied separately in ``_process`` behind a
+        'live' state gate. Returns the inert verdict for artifact / excluded events
+        or when no baseline exists."""
+        from .anomaly_baseline import load_usage_baselines, score_event_anomaly
+        from .database import get_sensitivity_config
+        baselines = load_usage_baselines(self._db, circuit)
+        sens = get_sensitivity_config(self._db, circuit)
+        return score_event_anomaly(features, baselines, sens)
+
+    async def _apply_anomaly_response(self, circuit: str, features: dict,
+                                      anomaly: dict) -> None:
+        """Phase 2.3 — graduated response to a LIVE baseline-deviation event.
+
+        The shut-off paths carry guardrails the notify paths do not: a thin/default
+        baseline (``shutoff_ok_*`` False) or a circuit that has not been live for
+        ``MIN_LIVE_DAYS_FOR_SHUTOFF`` degrades shut-off to notify, and the per-12h
+        shut-off cap is read from the PERSISTENT ``anomaly_shutoff_log`` (it survives
+        the very restart a pathological run could otherwise use to reset it).
+        """
+        from .database import get_sensitivity_config
+        from .anomaly_baseline import _row_get, MIN_LIVE_DAYS_FOR_SHUTOFF
+        sens = get_sensitivity_config(self._db, circuit)
+        response = (_row_get(sens, "anomaly_response", "notify") or "notify")
+        if response == "off":
+            return
+        circuit_name = circuit.replace("_", " ").title()
+        score = float(anomaly.get("score") or 0.0)
+        atype = anomaly.get("anomaly_type")
+        event_id = features.get("id")
+
+        want_shutoff = (
+            (response == "shutoff_any" and anomaly.get("shutoff_ok_any"))
+            or (response == "notify_shutoff_severe" and anomaly.get("shutoff_ok_severe"))
+        )
+        if (want_shutoff
+                and self._anomaly_seasoned(sens, MIN_LIVE_DAYS_FOR_SHUTOFF)
+                and self._anomaly_shutoff_rate_ok(circuit, sens)):
+            if await self._auto_shutoff(circuit, circuit_name, score, atype, event_id):
+                return   # the shut-off path already notified (why + reopen)
+        # Off-ramp: degrade to / default notify, rate-limited so it cannot spam.
+        self._notify_anomaly(circuit, circuit_name, score, atype, event_id)
+
+    def _anomaly_seasoned(self, sens, min_days: int) -> bool:
+        """Earned-trust gate — the baseline has had ≥ ``min_days`` of real usage since
+        it was frozen at activation (``baseline_computed_at``). Unseasoned → no shut-off."""
+        from .anomaly_baseline import _row_get
+        ts = _row_get(sens, "baseline_computed_at")
+        if not ts:
+            return False
+        try:
+            frozen = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return False
+        if frozen.tzinfo is None:
+            frozen = frozen.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - frozen) >= timedelta(days=min_days)
+
+    def _anomaly_shutoff_rate_ok(self, circuit: str, sens) -> bool:
+        """Persistent per-12h shut-off cap (counted from anomaly_shutoff_log so it
+        survives a restart)."""
+        from .anomaly_baseline import _row_get
+        cap = int(_row_get(sens, "max_shutoffs_per_12h", 2) or 2)
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+        row = self._db.execute(
+            "SELECT COUNT(*) FROM anomaly_shutoff_log "
+            "WHERE circuit = ? AND closed_at >= ?", (circuit, cutoff)).fetchone()
+        return (int(row[0]) if row else 0) < cap
+
+    def _resolve_valve_entity(self, circuit: str) -> Optional[str]:
+        row = self._db.execute(
+            "SELECT entity_id FROM circuit_entity_map "
+            "WHERE circuit = ? AND role = 'valve_entity'", (circuit,)).fetchone()
+        return row[0] if row and row[0] else None
+
+    async def _auto_shutoff(self, circuit: str, circuit_name: str, score: float,
+                            atype, event_id) -> bool:
+        """Close the valve, log it (persistent), and notify with why + a one-action
+        reopen. Returns False (→ caller falls back to notify) when no valve is
+        configured or the close fails — a shut-off must never silently swallow."""
+        valve = self._resolve_valve_entity(circuit)
+        if not valve or self._ha is None:
+            log.warning("[%s] anomaly auto-shutoff requested but no valve entity / "
+                        "ha client — degrading to notify", circuit)
+            return False
+        try:
+            ok = await self._ha.close_valve(valve)
+        except Exception as e:
+            log.error("[%s] anomaly auto-shutoff close_valve failed: %s", circuit, e)
+            return False
+        if not ok:
+            return False
+        # Store closed_at as an explicit UTC ISO timestamp (NOT the CURRENT_TIMESTAMP
+        # default, whose 'YYYY-MM-DD HH:MM:SS' space format sorts BELOW the
+        # 'YYYY-MM-DDT…+00:00' cutoff in _anomaly_shutoff_rate_ok — the rate limit
+        # would never trip). Both ends must use the same ISO format.
+        self._db.execute(
+            "INSERT INTO anomaly_shutoff_log "
+            "    (circuit, event_id, anomaly_type, score, closed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (circuit, event_id, atype, score,
+             datetime.now(timezone.utc).isoformat()))
+        self._db.commit()
+        log.warning("[%s] ANOMALY AUTO-SHUTOFF — closed valve %s (event %s, %s, "
+                    "score %.2f)", circuit, valve, event_id, atype, score)
+        am = self._alert_manager
+        if am:
+            self._spawn_alert_task(am.alert_unusual_usage(
+                circuit, score, atype, circuit_name, shutoff=True,
+                event_id=event_id, valve_entity=valve))
+        return True
+
+    def _notify_anomaly(self, circuit: str, circuit_name: str, score: float,
+                        atype, event_id) -> None:
+        """Notify (persistent + push) with a per-circuit cooldown so a stream of
+        anomalous events can't spam."""
+        am = self._alert_manager
+        if not am:
+            return
+        now = datetime.now(timezone.utc)
+        last = self._last_anomaly_alert_at.get(circuit)
+        if last is not None and now - last < timedelta(minutes=_ANOMALY_ALERT_COOLDOWN_MIN):
+            return
+        self._last_anomaly_alert_at[circuit] = now
+        self._spawn_alert_task(am.alert_unusual_usage(
+            circuit, score, atype, circuit_name, shutoff=False, event_id=event_id))
 
     async def _cluster_event(self, circuit: str, features: dict) -> None:
         """Compute sequence context, run cluster matching, write results back."""
@@ -2726,22 +2866,12 @@ class FeatureExtractor:
                 log.error("[%s] cluster matching failed: %s", circuit, e,
                           exc_info=True)
 
-        # 3. Derive anomaly_score and store it in features so the alert
-        #    check in _process() can read it.  anomaly_score is intentionally
-        #    NOT stored in the events table — it is ephemeral and recalculated
-        #    by the live match path only; backfill uses match_confidence directly.
-        #    High score = anomalous:
-        #      • no match at all           → 1.0
-        #      • poor confidence match     → 1.0 - confidence
-        #      • good confidence match     → near 0.0
-        if match_confidence is not None:
-            features["anomaly_score"] = round(1.0 - match_confidence, 3)
-        elif cluster_id_result is None and match_rejection_reason not in (
-            "type_gate_rejected", "excluded_from_training", "type_gate_error"
-        ):
-            # Unmatched event in live state with no explicit rejection reason
-            # — treat as fully anomalous.
-            features["anomaly_score"] = 1.0
+        # NOTE (Phase 2.3): the old match-confidence anomaly_score (1.0 - confidence)
+        # was retired here — it fired on anything that didn't strongly match a known
+        # fixture, which is most of what a real home produces (the false-positive
+        # source). The stored anomaly_score / anomaly_type / flagged columns are now
+        # the FROZEN-BASELINE deviation verdict, computed below once the type is known
+        # (see _score_anomaly + the write-back UPDATE).
 
         # dev.23 — structural rules tier (rules-first; Pass-5 semantics). Runs
         # BEFORE the k-NN regardless of cluster strength, mirroring the batch
@@ -2835,6 +2965,16 @@ class FeatureExtractor:
                     circuit, e,
                 )
 
+        # Phase 2.3 — score the event against the FROZEN baseline now that its type
+        # is known, and persist the verdict (reviving the dormant anomaly columns +
+        # the daily anomaly_count rollup). Stash it on `features` so the _process
+        # response policy reads the same verdict without re-scoring. flagged=1 marks
+        # a genuine (non-artifact) anomaly. Side effects (notify / shut-off) are
+        # NOT done here — only in _process, behind the 'live' state gate.
+        features["matched_fixture_type"] = matched_fixture_type
+        anomaly = self._score_anomaly(circuit, features)
+        features["_anomaly"] = anomaly
+
         # Write cluster results back to the event row
         self._db.execute(
             """UPDATE events SET
@@ -2846,13 +2986,18 @@ class FeatureExtractor:
                  prev_cluster_id          = ?,
                  matched_fixture_type     = ?,
                  matched_via              = ?,
-                 cycle_group_id           = ?
+                 cycle_group_id           = ?,
+                 anomaly_score            = ?,
+                 anomaly_type             = ?,
+                 flagged                  = ?
                WHERE id = ?""",
             (cluster_id_result, match_confidence, match_level,
              match_rejection_reason,
              seconds_since_prev, prev_cluster_id, matched_fixture_type,
              matched_via if matched_fixture_type is not None else None,
              cycle_group_id if matched_fixture_type is not None else None,
+             anomaly.get("score"), anomaly.get("anomaly_type"),
+             1 if anomaly.get("is_anomalous") else 0,
              event_id)
         )
 

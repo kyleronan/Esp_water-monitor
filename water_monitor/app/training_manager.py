@@ -345,6 +345,18 @@ class TrainingManager:
         except Exception as e:
             log.warning("[%s] artifact-threshold freeze failed (non-fatal): %s",
                         circuit, e)
+        # Phase 2.3: re-score anomalies now the baseline is frozen. The FIRST
+        # reclassify ran before the baseline existed (it had to — the baseline is fit
+        # FROM its matched types), so its anomaly verdicts were inert. This second
+        # pass scores history against the freshly-frozen baseline (the freeze
+        # invalidated the cache; invalidate again defensively). Idempotent on types.
+        try:
+            from .anomaly_baseline import invalidate_baseline_cache
+            invalidate_baseline_cache(circuit)
+            reclassify_all_events_from_signatures(self._db, circuit)
+        except Exception as e:
+            log.warning("[%s] post-baseline anomaly rescore failed (non-fatal): %s",
+                        circuit, e)
         if self.cluster_engine is not None:
             try:
                 self.cluster_engine.freeze_circuit(circuit)

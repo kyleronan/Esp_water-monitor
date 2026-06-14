@@ -359,34 +359,14 @@
         <p class="sett-cal-warning">⚠ Incorrect calibration values may cause false shutoffs or missed leaks.</p>
       </div>
 
-      {# Learning mode #}
-      <div class="sett-card sett-adv-card">
-        <h3 class="sett-card-title">Learning Mode</h3>
-        <form method="post" action="{{ ingress_path }}/settings/learning/{{ c.circuit }}/update">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-          <label class="sett-radio-card">
-            <input type="radio" name="learning_mode" value="adaptive"
-                   {% if c.learning.learning_mode != 'static' %}checked{% endif %}>
-            <div>
-              <div class="sett-radio-label">Adaptive <span style="font-weight:400;color:var(--text-3)">(recommended)</span></div>
-              <div class="sett-radio-desc">Usage patterns update automatically as your household evolves. Fixture signatures never change.</div>
-            </div>
-          </label>
-          <label class="sett-radio-card">
-            <input type="radio" name="learning_mode" value="static"
-                   {% if c.learning.learning_mode == 'static' %}checked{% endif %}>
-            <div>
-              <div class="sett-radio-label">Static</div>
-              <div class="sett-radio-desc">Everything fixed as learned during calibration. Recalibrate manually when needed.</div>
-            </div>
-          </label>
-          <button type="submit" class="btn btn-primary btn-sm" style="margin-top:8px">Save</button>
-        </form>
-      </div>
-
       {# Sensitivity #}
       <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Detection Sensitivity</h3>
+        <p class="sett-help" style="margin:.25rem 0 .6rem">
+          Also tunes anomaly detection against your frozen baseline: <strong>Low</strong>
+          alerts only on the most extreme events (p99), <strong>High</strong> is the most
+          sensitive (p85). Lower this if you get too many false alarms.
+        </p>
         <form method="post" action="{{ ingress_path }}/settings/sensitivity/{{ c.circuit }}/update"
               id="sens-form-{{ c.circuit }}">
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -442,6 +422,66 @@
           </details>
 
           <button type="submit" class="btn btn-primary btn-sm" style="margin-top:12px">Save Sensitivity</button>
+        </form>
+      </div>
+
+      {# Anomaly response #}
+      <div class="sett-card sett-adv-card">
+        <h3 class="sett-card-title">Anomaly Response</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          What happens when an event deviates from your home's frozen baseline.
+          Detection Sensitivity (above) controls <em>how much</em> deviation counts;
+          this controls the <em>response</em>.
+        </p>
+        <form method="post" action="{{ ingress_path }}/settings/anomaly/{{ c.circuit }}/update">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          {% set ar = c.anomaly_response or 'notify' %}
+          <label class="sett-radio-card">
+            <input type="radio" name="anomaly_response" value="off"
+                   {% if ar == 'off' %}checked{% endif %}>
+            <div>
+              <div class="sett-radio-label">Off</div>
+              <div class="sett-radio-desc">Do nothing. The unusual-usage sensor still
+                updates for your own automations.</div>
+            </div>
+          </label>
+          <label class="sett-radio-card">
+            <input type="radio" name="anomaly_response" value="notify"
+                   {% if ar == 'notify' %}checked{% endif %}>
+            <div>
+              <div class="sett-radio-label">Notify <span style="font-weight:400;color:var(--text-3)">(recommended)</span></div>
+              <div class="sett-radio-desc">Send a notification. Never closes your water.</div>
+            </div>
+          </label>
+          <label class="sett-radio-card">
+            <input type="radio" name="anomaly_response" value="notify_shutoff_severe"
+                   {% if ar == 'notify_shutoff_severe' %}checked{% endif %}>
+            <div>
+              <div class="sett-radio-label">⚠ Notify + shut off on severe</div>
+              <div class="sett-radio-desc">Notify on any anomaly; automatically close the
+                water valve only on a <strong>severe</strong> one. This can close your
+                water on a false positive.</div>
+            </div>
+          </label>
+          <label class="sett-radio-card">
+            <input type="radio" name="anomaly_response" value="shutoff_any"
+                   {% if ar == 'shutoff_any' %}checked{% endif %}>
+            <div>
+              <div class="sett-radio-label">⚠⚠ Shut off on any anomaly</div>
+              <div class="sett-radio-desc">Close the water valve at the first sign of
+                <strong>any</strong> anomaly. Most aggressive — this <strong>will</strong>
+                close your water on a false positive eventually.</div>
+            </div>
+          </label>
+          {% if ar in ('notify_shutoff_severe', 'shutoff_any') and not c.anomaly_shutoff_ready %}
+          <div class="sett-help" style="margin-top:.5rem;color:#b8860b">
+            ⓘ Auto-shutoff is held back (currently notify-only): the baseline must be fit
+            from ≥{{ c.anomaly_shutoff_min_n }} events and run for
+            ~{{ c.anomaly_shutoff_min_days }} days before it can close your water. It
+            activates automatically once that trust is earned.
+          </div>
+          {% endif %}
+          <button type="submit" class="btn btn-primary btn-sm" style="margin-top:8px">Save</button>
         </form>
       </div>
 

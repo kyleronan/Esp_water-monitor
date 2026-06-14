@@ -44,12 +44,34 @@ def _fmt_local_ts(iso, tz) -> "str | None":
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
+def _anomaly_shutoff_ready(sdict: dict) -> bool:
+    """Display helper (Phase 2.3): is auto-shutoff currently ARMED, or held back
+    (degraded to notify) until the baseline earns trust? Mirrors the feature_extractor
+    guardrails — fit from enough events AND seasoned long enough. Display-only; the
+    real gate lives in _process."""
+    from datetime import datetime, timezone
+    from ..anomaly_baseline import MIN_N_FOR_SHUTOFF, MIN_LIVE_DAYS_FOR_SHUTOFF
+    n = sdict.get("baseline_anomaly_n")
+    if n is None or n < MIN_N_FOR_SHUTOFF:
+        return False
+    ts = sdict.get("baseline_computed_at")
+    if not ts:
+        return False
+    try:
+        frozen = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    if frozen.tzinfo is None:
+        frozen = frozen.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - frozen).days >= MIN_LIVE_DAYS_FOR_SHUTOFF
+
+
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def settings_page(request: Request):
     orch = _orch(request)
     from ..database import (get_home_profile, get_sensitivity_config,
-                            get_learning_config, get_alert_configs)
+                            get_alert_configs)
     from ..device_discovery import get_device_config
 
 
@@ -213,12 +235,13 @@ async def settings_page(request: Request):
     from ..event_rules import get_home_timezone
     from ..rule_calibration import get_rule_calibration_meta
     from ..artifact_calibration import get_artifact_calibration_meta
+    from ..anomaly_baseline import MIN_N_FOR_SHUTOFF, MIN_LIVE_DAYS_FOR_SHUTOFF
     _home_tz = get_home_timezone()
     circuits = []
     for circuit_cfg in orch._cfg.circuits:
         c = circuit_cfg.circuit
         sens = get_sensitivity_config(orch.db, c)
-        learn = get_learning_config(orch.db, c)
+        sdict = dict(sens) if sens else {}
         alerts = [dict(a) for a in get_alert_configs(orch.db, c)]
         training = (
             orch.training_manager.get_training_info(c)
@@ -237,8 +260,13 @@ async def settings_page(request: Request):
             "display_name": circuit_cfg.label,
             "circuit_type": circuit_cfg.circuit_type,
             "valve_type": get_valve_type(orch.db, c),
-            "sensitivity": dict(sens) if sens else {},
-            "learning": dict(learn) if learn else {},
+            "sensitivity": sdict,
+            # Phase 2.3 anomaly response level + whether auto-shutoff is currently
+            # armed or held back (degraded to notify until the baseline earns trust).
+            "anomaly_response": sdict.get("anomaly_response") or "notify",
+            "anomaly_shutoff_ready": _anomaly_shutoff_ready(sdict),
+            "anomaly_shutoff_min_n": MIN_N_FOR_SHUTOFF,
+            "anomaly_shutoff_min_days": MIN_LIVE_DAYS_FOR_SHUTOFF,
             "alerts": alerts,
             "training": training,
             # When the last learning period completed (UTC→local). After activation
@@ -378,19 +406,22 @@ async def sensitivity_update(circuit: str, request: Request):
 
 
 # ------------------------------------------------------------------
-# Learning mode
+# Anomaly response (Phase 2.3)
 # ------------------------------------------------------------------
-@router.post("/learning/{circuit}/update")
-async def learning_update(circuit: str, request: Request):
+_ANOMALY_RESPONSE_LEVELS = {"off", "notify", "notify_shutoff_severe", "shutoff_any"}
+
+
+@router.post("/anomaly/{circuit}/update")
+async def anomaly_update(circuit: str, request: Request):
     circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
-    from ..database import upsert_learning_config
+    from ..database import upsert_sensitivity_config
 
-    upsert_learning_config(
-        orch.db, circuit,
-        learning_mode=form.get("learning_mode", "adaptive"),
-    )
+    level = form.get("anomaly_response", "notify")
+    if level not in _ANOMALY_RESPONSE_LEVELS:
+        level = "notify"
+    upsert_sensitivity_config(orch.db, circuit, anomaly_response=level)
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
