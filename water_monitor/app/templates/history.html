@@ -144,16 +144,49 @@
       <tbody>
         {% for t in ch.leak_tests %}
         {% set drop_rate = (t.pressure_drop_psi / t.duration_minutes) if (t.pressure_drop_psi is not none and t.duration_minutes) else none %}
-        <tr class="{% if 'Passed' in (t.result or '') %}hist-row-pass{% elif t.result %}hist-row-fail{% endif %}{% if loop.index > 3 %} hist-extra-row{% endif %}"{% if loop.index > 3 %} style="display:none"{% endif %}>
+        {% set _r = t.result or '' %}
+        {% set lt = namespace(label='', pill='pill-neutral', row='') %}
+        {# Red badge follows leak_test_scheduler.py:525,531 — a leak failure is 'Failed' or any
+           'leak' mention, with Passed excluded. Pre-flight skips ('Not run …', incl. the 3-port
+           "micro leak test not applicable" wording) short-circuit BEFORE that check in the
+           scheduler, so we match the skip/abort prefixes FIRST and only then apply the 'leak'
+           catch-all — otherwise the benign 3-port message would read as a red leak. KEEP IN SYNC. #}
+        {% if _r.startswith('Passed') %}
+          {% set lt.label = 'Passed' %}{% set lt.pill = 'pill-green' %}{% set lt.row = 'hist-row-pass' %}
+        {% elif _r.startswith('Failed') %}
+          {% set lt.label = 'Failed' %}{% set lt.pill = 'pill-red' %}{% set lt.row = 'hist-row-fail' %}
+        {% elif _r.startswith('Aborted') %}
+          {% set lt.label = 'Aborted' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
+        {% elif _r.startswith('Timed out') %}
+          {% set lt.label = 'Timed out' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
+        {% elif _r.startswith('Not run') %}
+          {% set lt.label = 'Not run' %}{% set lt.pill = 'pill-neutral' %}{% set lt.row = 'hist-row-skip' %}
+        {% elif _r.startswith('Stopped') %}
+          {% set lt.label = 'Stopped' %}{% set lt.pill = 'pill-neutral' %}{% set lt.row = 'hist-row-skip' %}
+        {% elif _r|lower == 'cancelled' %}
+          {% set lt.label = 'Cancelled' %}{% set lt.pill = 'pill-neutral' %}{% set lt.row = 'hist-row-skip' %}
+        {% elif 'leak' in _r|lower %}
+          {# Any other wording mentioning a leak (and not a pre-flight skip) → treat as a leak. #}
+          {% set lt.label = 'Failed' %}{% set lt.pill = 'pill-red' %}{% set lt.row = 'hist-row-fail' %}
+        {% elif _r %}
+          {# Unrecognized non-empty result → AMBER (caution), never benign grey #}
+          {% set lt.label = 'Unknown' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
+        {% endif %}
+        <tr class="lt-row {{ lt.row }}{% if loop.index > 3 %} hist-extra-row{% endif %}"{% if loop.index > 3 %} style="display:none"{% endif %}
+            tabindex="0" role="button" aria-label="Leak test detail"
+            data-ts="{{ t.run_at or '' }}"
+            data-triggered="{{ t.triggered_by or '—' }}"
+            data-result="{{ t.result or '' }}"
+            data-label="{{ lt.label }}" data-pill="{{ lt.pill }}"
+            data-baseline="{{ (t.baseline_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.baseline_psi is not none else '—' }}"
+            data-final="{{ (t.final_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.final_psi is not none else '—' }}"
+            data-drop="{{ (t.pressure_drop_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.pressure_drop_psi is not none else '—' }}"
+            data-drop-rate="{{ '%.4f %s/min'|format(drop_rate * pressure_factor, pressure_unit) if drop_rate is not none else '—' }}"
+            data-duration="{{ '%.1f min'|format(t.duration_minutes) if t.duration_minutes else '—' }}">
           <td class="hist-td hist-td-mono"><time data-ts="{{ t.run_at or '' }}">{{ (t.run_at or '')[:16] }}</time></td>
           <td class="hist-td">{{ t.triggered_by or '—' }}</td>
           <td class="hist-td">
-            {% if 'Passed' in (t.result or '') %}
-            <span class="pill pill-green">Passed</span>
-            {% elif t.result %}
-            <span class="pill pill-red">Failed</span>
-            {% else %}—
-            {% endif %}
+            {% if t.result %}<span class="pill {{ lt.pill }}">{{ lt.label }}</span>{% else %}—{% endif %}
           </td>
           <td class="hist-td hist-td-mono">{{ (t.baseline_psi * pressure_factor)|round(pressure_decimals) if t.baseline_psi is not none else "—" }}</td>
           <td class="hist-td hist-td-mono">{{ (t.final_psi * pressure_factor)|round(pressure_decimals) if t.final_psi is not none else "—" }}</td>
@@ -447,6 +480,28 @@
       <button id="emd-ignore-btn" class="btn btn-secondary btn-sm">Ignore event</button>
       <button id="emd-save-btn"   class="btn btn-primary btn-sm">Save</button>
     </div>
+  </div>
+</div>
+
+{# ── Leak-test detail modal (read-only) ──────────────────────────── #}
+<div id="lt-modal" class="evt-modal-backdrop" aria-modal="true" role="dialog" aria-labelledby="lt-modal-title">
+  <div class="evt-modal">
+    <div class="evt-modal-header">
+      <h3 class="evt-modal-title" id="lt-modal-title">Leak test detail</h3>
+      <button id="lt-modal-close" class="icon-btn" aria-label="Close">✕</button>
+    </div>
+    <p class="lt-modal-status"><span id="ltm-badge" class="pill pill-neutral"></span></p>
+    <p id="ltm-explain" class="lt-modal-explain"></p>
+    <dl class="evt-modal-dl">
+      <dt>Time</dt>          <dd id="ltm-time"></dd>
+      <dt>Triggered by</dt>  <dd id="ltm-triggered"></dd>
+      <dt>Result</dt>        <dd id="ltm-result"></dd>
+      <dt>Baseline</dt>      <dd id="ltm-baseline"></dd>
+      <dt>Final</dt>         <dd id="ltm-final"></dd>
+      <dt>Pressure drop</dt> <dd id="ltm-drop"></dd>
+      <dt>Drop rate</dt>     <dd id="ltm-drop-rate"></dd>
+      <dt>Duration</dt>      <dd id="ltm-duration"></dd>
+    </dl>
   </div>
 </div>
 
@@ -1189,6 +1244,92 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       if (ok) location.reload();
     });
   }
+})();
+
+// ── Leak-test detail modal (read-only) ───────────────────────────────────────
+(function () {
+  const modal = document.getElementById('lt-modal');
+  if (!modal) return;
+  const rows = document.querySelectorAll('.lt-row');
+
+  const LT_EXPLAIN = {
+    'Passed — no leak detected':
+      'No pressure loss was detected while the valve was closed. Your plumbing held steady — no sign of a leak on this circuit.',
+    'Failed — leak detected':
+      'Pressure dropped while the valve was closed, meaning water is escaping downstream. Check for running toilets, dripping fixtures, or wet spots; consider keeping the valve closed until you find the source.',
+    'Aborted — external pressure influence':
+      'Stopped because outside pressure changes (the street supply or the other circuit) made the reading unreliable. Try again during a quieter period.',
+    'Aborted — demand detected (sudden pressure drop)':
+      'Stopped because water was used during the test, causing a sudden pressure drop. Re-run it when no water is being used.',
+    'Stopped manually':
+      'The test was cancelled by hand before it finished, so there is no pass/fail result.',
+    'Not run — valve was closed (open valve first)':
+      'Skipped because the shutoff valve was already closed. Open the valve, then run the test again.',
+    'Not run — fault active (reset fault first)':
+      'Skipped because a safety fault is active. Clear the fault first, then run the test again.',
+    'Not run — water softener regenerating (deferred)':
+      'Skipped because the water softener was regenerating (it draws water and would look like a leak). It will run automatically at the next quiet period.',
+    'Not run — 3-port valve (drain-capable; micro leak test not applicable)':
+      'This circuit uses a 3-port (drain-capable) valve, which always vents a little pressure, so the micro leak test does not apply here. Expected — not a problem.',
+    'Timed out — no terminal result received':
+      'The device did not report a result in time, so the outcome is unknown. Usually a temporary communication hiccup — try running the test again.',
+    'cancelled': 'The test was cancelled before it produced a result.',
+  };
+  const LT_PREFIX = [
+    ['Passed', LT_EXPLAIN['Passed — no leak detected']],
+    ['Failed', LT_EXPLAIN['Failed — leak detected']],
+    ['Aborted', 'Stopped early because conditions made the reading unreliable. Try again during a quiet period.'],
+    ['Stopped', LT_EXPLAIN['Stopped manually']],
+    ['Timed out', LT_EXPLAIN['Timed out — no terminal result received']],
+    ['Not run', 'Skipped this time — see the Result line above for the specific reason.'],
+  ];
+  function ltExplain(r) {
+    if (!r) return 'No result was recorded for this test.';
+    if (LT_EXPLAIN[r]) return LT_EXPLAIN[r];
+    if (r.toLowerCase() === 'cancelled') return LT_EXPLAIN['cancelled'];
+    // Known prefixes (Not run / Aborted / …) first, so a pre-flight skip whose text
+    // happens to contain "leak" (the 3-port message) doesn't get the leak explanation.
+    for (const [p, m] of LT_PREFIX) if (r.startsWith(p)) return m;
+    // Any other wording that mentions a leak (and isn't a Pass) → leak explanation.
+    if (!r.startsWith('Passed') && r.toLowerCase().includes('leak')) return LT_EXPLAIN['Failed — leak detected'];
+    return r;
+  }
+  function fmtTs(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso); if (isNaN(d)) return iso;
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  function openLeakModal(row) {
+    const d = row.dataset;
+    const badge = document.getElementById('ltm-badge');
+    badge.className = 'pill ' + (d.pill || 'pill-neutral');
+    badge.textContent = d.label || 'Unknown';
+    document.getElementById('ltm-explain').textContent   = ltExplain(d.result);
+    document.getElementById('ltm-time').textContent      = fmtTs(d.ts);
+    document.getElementById('ltm-triggered').textContent = d.triggered || '—';
+    document.getElementById('ltm-result').textContent    = d.result || '—';
+    document.getElementById('ltm-baseline').textContent  = d.baseline || '—';
+    document.getElementById('ltm-final').textContent     = d.final || '—';
+    document.getElementById('ltm-drop').textContent      = d.drop || '—';
+    document.getElementById('ltm-drop-rate').textContent = d.dropRate || '—';
+    document.getElementById('ltm-duration').textContent  = d.duration || '—';
+    modal.classList.add('is-open'); modal.focus();
+  }
+  function closeLeakModal() { modal.classList.remove('is-open'); }
+
+  rows.forEach(row => {
+    row.addEventListener('click', () => openLeakModal(row));
+    row.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openLeakModal(row); }
+    });
+  });
+  document.getElementById('lt-modal-close').addEventListener('click', closeLeakModal);
+  modal.addEventListener('click', e => { if (e.target === modal) closeLeakModal(); });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && modal.classList.contains('is-open')) closeLeakModal();
+  });
 })();
 
 // Shape sparklines

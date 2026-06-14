@@ -1412,6 +1412,7 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .hist-row-composite { background: var(--accent-bg); }
 .hist-row-degraded  { background: var(--amber-bg); }
 .hist-row-phantom   { background: var(--violet-bg); }
+.hist-row-skip      { background: var(--surface-2); }   /* leak test not-run / stopped / cancelled */
 
 .hist-filter-banner {
   display: flex; align-items: center; justify-content: space-between;
@@ -1426,6 +1427,16 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .hist-event-row:hover  { background: var(--surface-2); }
 .hist-event-row:focus  { outline: 2px solid var(--accent); outline-offset: -2px; }
 .hist-row-ignored      { opacity: 0.4; }
+
+/* Leak-test rows — clickable. Hover is a translucent overlay (background-image
+   layers over background-color) so every category, including grey skip rows,
+   shows a visible hover while keeping its category color. */
+.lt-row { cursor: pointer; }
+.lt-row:hover { background-image: linear-gradient(rgba(128,128,128,.15), rgba(128,128,128,.15)); }
+.lt-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.lt-modal-status { margin: 0 0 14px; }
+.lt-modal-status .pill { font-size: 13px; padding: 4px 12px; }
+.lt-modal-explain { font-size: 13px; line-height: 1.5; color: var(--text-2); margin: 0 0 16px; }
 
 /* ── Event detail modal ──────────────────────────────────────────── */
 .evt-modal-backdrop {
