@@ -1161,6 +1161,11 @@ _WF_START_SAMPLES: int = 150            # first slice of full_flow used as start
 _WF_MAX_RECORDS: int = 30               # max assembled records kept per circuit
 _WF_FLAG_VALID_MASK: int = 0x7F         # bits 0-6 only; bit 7 must be 0
 _WF_INFLIGHT_TTL_S: float = 7200.0      # 2 h — absolute upper bound on supported event length
+# Phase 3 — once the FINAL chunk has arrived (so `total` is known), a set still
+# missing chunks is a transport GAP: give up after this grace (rather than holding
+# memory for the full 2 h TTL) and count it. Generous enough for a delayed chunk.
+_WF_FINAL_GAP_TIMEOUT_S: float = 120.0
+_WF_FL_RESOLUTION_REDUCED: int = 0x04   # firmware dropped/decimated samples (a hole)
 _WF_MAX_CHUNK_SAMPLES: int = 1500       # firmware buffer cap; bound decoded-payload length defensively
 _WF_MAX_TOTAL_CHUNKS: int = 600         # bound for the 'total' field (~5 hour event at 30s cadence)
 
@@ -1441,6 +1446,12 @@ class WaveformChunkAccumulator:
         self._expected_node = _normalize_node_name(expected_node)
         self._inflight: Dict[Tuple[int, int], _InflightChunkSet] = {}
         self._records: List[WaveformRecord] = []
+        # Phase 3 transport-health counters (since boot/restart): total assembled,
+        # assembled-but-firmware-flagged-degraded (quality / resolution-reduced), and
+        # transport GAPS (final arrived but chunks lost → waveform discarded).
+        self._n_assembled = 0
+        self._n_degraded = 0
+        self._n_gaps = 0
         # Optional sink fired once a record finishes assembling (late-waveform
         # upgrade, Fix 1). Kept DB-free; invoked in a try/except in _assemble so a
         # sink bug can never corrupt assembly. None in most tests.
@@ -1675,6 +1686,11 @@ class WaveformChunkAccumulator:
         self._records.append(record)
         if len(self._records) > _WF_MAX_RECORDS:
             self._records = self._records[-_WF_MAX_RECORDS:]
+        # Phase 3 — count it; flag if the firmware self-reported a degraded capture
+        # (these still assemble, but their SIGNATURE is gated in _enrich_from_waveform).
+        self._n_assembled += 1
+        if meta.quality != 0 or (meta.flags & _WF_FL_RESOLUTION_REDUCED):
+            self._n_degraded += 1
 
         # Done — remove the in-flight entry so late stray chunks for this
         # event_id don't keep growing memory.
@@ -1703,17 +1719,41 @@ class WaveformChunkAccumulator:
     # ------------------------------------------------------------------
 
     def _evict_stale(self, now: float) -> None:
-        stale = [
-            k for k, cs in self._inflight.items()
-            if (now - cs.first_received_at) > _WF_INFLIGHT_TTL_S
-        ]
-        for k in stale:
+        # A set whose FINAL chunk has arrived (total known) but is still incomplete
+        # is a transport GAP — evict it after a short grace and COUNT it. A set still
+        # awaiting its final chunk uses the long TTL (the event may still be running).
+        stale: List[Tuple[Tuple[int, int], bool]] = []
+        for k, cs in self._inflight.items():
+            final_incomplete = cs.final_metadata is not None
+            ttl = _WF_FINAL_GAP_TIMEOUT_S if final_incomplete else _WF_INFLIGHT_TTL_S
+            if (now - cs.first_received_at) > ttl:
+                stale.append((k, final_incomplete))
+        for k, final_incomplete in stale:
             cs = self._inflight.pop(k, None)
-            if cs is not None:
+            if cs is None:
+                continue
+            if final_incomplete:
+                self._n_gaps += 1
+                missing = ([s for s in range(cs.total) if s not in cs.chunks]
+                           if cs.total else [])
+                log.info(
+                    "waveform[%s]: GAP — event %d lost %d/%s chunk(s) in transport "
+                    "(missing seqs %s); waveform discarded",
+                    self._circuit, k[1], len(missing), cs.total, missing,
+                )
+            else:
                 log.debug(
                     "waveform[%s]: in-flight chunk set evicted (boot=%d id=%d, %d chunk(s), total=%s)",
                     self._circuit, k[0], k[1], len(cs.chunks), cs.total,
                 )
+
+    def transport_stats(self) -> Dict[str, int]:
+        """Phase 3 waveform-transport health since boot: how many waveforms
+        assembled, how many were firmware-flagged degraded, and how many were lost
+        to transport gaps (a final chunk arrived but predecessors never did)."""
+        return {"assembled": self._n_assembled,
+                "degraded": self._n_degraded,
+                "gaps": self._n_gaps}
 
     # ------------------------------------------------------------------
     # Lookup interface
@@ -1905,6 +1945,13 @@ class EventDetector:
         """Return the most-recently assembled WaveformRecord for a circuit, or None."""
         accumulator = self._chunk_accumulators.get(circuit)
         return accumulator.latest_record() if accumulator else None
+
+    def waveform_transport_stats(self, circuit: str) -> Dict[str, int]:
+        """Phase 3 — per-circuit waveform-transport health counters (or zeros)."""
+        accumulator = self._chunk_accumulators.get(circuit)
+        if accumulator is None:
+            return {"assembled": 0, "degraded": 0, "gaps": 0}
+        return accumulator.transport_stats()
 
     def pop_waveform_record(
         self,

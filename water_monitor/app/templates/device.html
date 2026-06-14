@@ -200,6 +200,44 @@
     </details>
   </div>
 
+  {# Phase 3 — waveform-transport health #}
+  {% if c.waveform %}
+  <div class="dev-leak-card">
+    <details class="advanced-details">
+      <summary>Waveform health</summary>
+      <div class="sett-help" style="margin:.4rem 0 .6rem">
+        The high-resolution waveform stream is best-effort. A dropped/degraded
+        capture never poisons fixture training — it falls back to the software
+        signature. These counters reset when the add-on restarts.
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label">Waveforms assembled</span>
+        <span class="dev-reading-mono">{{ c.waveform.assembled }}</span>
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="Firmware self-reported the capture as incomplete or resolution-reduced; its signature was not used.">
+          Degraded captures
+        </span>
+        <span class="dev-reading-mono">{{ c.waveform.degraded }}</span>
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="The final chunk arrived but earlier chunks were lost in transport; the waveform was discarded.">
+          Transport gaps
+        </span>
+        <span class="dev-reading-mono">{{ c.waveform.gaps }}</span>
+      </div>
+      {% if c.waveform.fw_chunk_drops is not none %}
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="Firmware counter: samples dropped because its buffer filled while the previous chunk was still queued.">
+          Firmware samples dropped
+        </span>
+        <span class="dev-reading-mono">{{ c.waveform.fw_chunk_drops }}</span>
+      </div>
+      {% endif %}
+    </details>
+  </div>
+  {% endif %}
+
 </section>
 {% endfor %}
 

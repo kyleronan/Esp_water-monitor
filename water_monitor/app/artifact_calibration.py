@@ -38,11 +38,12 @@ log = logging.getLogger(__name__)
 MIN_POSITIVES = 8       # confirmed positives before a detector is calibrated
 _MARGIN = 0.10
 
-# Absolute clamps for each calibratable threshold (key → (lo, hi)). Phantom/xtalk
-# min-durations only LOWER toward the floor (catch the home's shorter artifacts);
+# Absolute clamps for each calibratable threshold (key → (lo, hi)). The cross-talk
+# min-duration only LOWERS toward the floor (catch the home's shorter artifacts);
 # dribble ceilings only RAISE toward the cap. Anything fitted is clamped here.
+# Phantom duration is intentionally NOT here — its floors became frozen structural
+# constants (feature_extractor 2026-06-14) so the legacy floor can never be lowered.
 _BOUNDS: Dict[str, Tuple[float, float]] = {
-    "PHANTOM_MIN_DURATION_S": (300.0, 1800.0),
     "XTALK_MIN_DURATION_S":   (60.0, 120.0),
     "DRIBBLE_MAX_VOLUME_L":   (0.5, 2.0),
     "DRIBBLE_MAX_FLOW_LPM":   (1.0, 2.0),
@@ -157,8 +158,10 @@ def fit_artifact_thresholds(
     report: Dict[str, Any] = {}
 
     for name, flag, detect, fit_keys in (
-        ("phantom", "ph", _phantom,
-         {"PHANTOM_MIN_DURATION_S": ("min", "duration_seconds")}),
+        # Phantom has no calibratable threshold any more (its duration floors are frozen
+        # structural constants). Kept in the loop with empty fit_keys so the report still
+        # carries its confirmed-positive count for the UI ("Phantom: defaults").
+        ("phantom", "ph", _phantom, {}),
         ("cross_talk", "ct", _xtalk,
          {"XTALK_MIN_DURATION_S": ("min", "duration_seconds")}),
         ("dribble", "dr", _dribble,

@@ -233,13 +233,25 @@ MAX_WAVEFORM_BINS            = 1000
 # volume over 135 min). The fingerprint is a long duration combined with a
 # near-zero pressure drop. Circuit-agnostic — real zone irrigation produces a
 # genuine solenoid pressure drop (> 2 PSI) so it is not affected.
-_PHANTOM_MIN_DURATION_S: float = 1800.0   # 30 min
+# Two FROZEN duration floors (2026-06-14) — NEITHER is per-home calibratable; both behave
+# like the leak-safety guards below. When the honest active-flow metrics (flow_integral +
+# flow_on_ratio) are present they PROVE no water moved, so even a 2-min event is unambiguous
+# (the same justification cross-talk uses for its 120 s floor) → _PHANTOM_NOFLOW_MIN_DURATION_S.
+# A LEGACY event predating the active-flow columns has NULL metrics and no no-flow proof, so it
+# must keep the conservative 30-min floor: without the proof a shorter low-ΔP event cannot be
+# told apart from a real slow draw → _PHANTOM_MIN_DURATION_S. (PHANTOM_MIN_DURATION_S is read
+# from the module constant directly, never via _ac/calib, so it can never be lowered.)
+_PHANTOM_MIN_DURATION_S: float = 1800.0          # 30 min — frozen LEGACY (no-metrics) floor
+_PHANTOM_NOFLOW_MIN_DURATION_S: float = 120.0    # frozen metric-present floor (no-flow proof exists)
 _PHANTOM_MAX_DELTA_PSI:  float = 2.0
-# True-flow guard (added 2026-06-04). A real pressure-restoration phantom moves
-# near-ZERO water; the long-duration + low-dP rule alone would wrongly zero a
-# real low-dP irrigation run (validated: a 665-gal run at dP 1.1 was saved only
-# because it was manually labelled). When the integrated-flow metrics are
-# available, ANY one above its ceiling means real water moved → NOT a phantom.
+# Brief-burst guard (was the "true-flow" guard, added 2026-06-04; re-scoped 2026-06-14). A SHORT
+# window (< _PHANTOM_MIN_DURATION_S) that reaches a real-fixture flow rate is most likely a genuine
+# brief draw caught inside a long pressure window (validated: a66e0d63, an 8.4 s / 16.9 lpm burst
+# moving 0.80 L) — NOT a regulator/restoration artifact — so true_avg over its active segment
+# rescues it. At/above the 30-min floor the long span is itself dispositive (no real draw runs that
+# long at < 5 % flow-on), so this guard is LIFTED there. _PHANTOM_MAX_FLOW_INTEGRAL_L /
+# _PHANTOM_MAX_FLOW_ON_RATIO below are the FROZEN no-flow leak-safety guards (a real leak is
+# continuous ⇒ high flow_on_ratio): ANY above its ceiling means real water moved → NOT a phantom.
 _PHANTOM_MAX_TRUE_FLOW_LPM:   float = 2.0
 _PHANTOM_MAX_FLOW_INTEGRAL_L: float = 1.0
 _PHANTOM_MAX_FLOW_ON_RATIO:   float = 0.05
@@ -274,15 +286,19 @@ _DRIBBLE_MAX_DELTA_PSI: float = 1.5
 
 
 # ── Per-home artifact-detector calibration (Phase 2.4) ──────────────────────────
-# A frozen per-home calib (artifact_calibration.py) may override ONLY the
-# "long-quiet" / dribble IDENTIFIER thresholds below. The leak-safety guards — the
-# phantom/cross-talk TRUE-FLOW ceilings (_PHANTOM_MAX_TRUE_FLOW_LPM,
-# _PHANTOM_MAX_FLOW_INTEGRAL_L, _PHANTOM_MAX_FLOW_ON_RATIO) — are DELIBERATELY absent
-# from ARTIFACT_DEFAULTS so they can NEVER be calibrated: a real leak moves water and
-# is excluded by them regardless of the duration/ΔP tuning, so they stay frozen.
-# ARTIFACT_DEFAULTS is the single source of truth (artifact_calibration imports it).
+# A frozen per-home calib (artifact_calibration.py) may override ONLY the cross-talk
+# min-duration and the dribble IDENTIFIER thresholds below. Two sets stay FROZEN /
+# never calibratable and so are absent from ARTIFACT_DEFAULTS:
+#   • the phantom duration floors (_PHANTOM_MIN_DURATION_S / _PHANTOM_NOFLOW_MIN_DURATION_S) —
+#     structural constants since 2026-06-14 (the legacy floor must never be lowerable, else a
+#     no-metrics legacy event could be zeroed on duration+ΔP alone);
+#   • the leak-safety guards (_PHANTOM_MAX_TRUE_FLOW_LPM brief-burst guard,
+#     _PHANTOM_MAX_FLOW_INTEGRAL_L / _PHANTOM_MAX_FLOW_ON_RATIO no-flow ceilings) — a real leak
+#     moves water and is excluded by them regardless of any duration/ΔP tuning.
+# (XTALK_MIN_DURATION_S stays calibratable: cross-talk ALWAYS requires the no-flow metrics, so a
+# lowered floor still demands no-flow proof — no legacy hazard.) ARTIFACT_DEFAULTS is the single
+# source of truth (artifact_calibration imports it).
 ARTIFACT_DEFAULTS: Dict[str, float] = {
-    "PHANTOM_MIN_DURATION_S": _PHANTOM_MIN_DURATION_S,
     "PHANTOM_MAX_DELTA_PSI":  _PHANTOM_MAX_DELTA_PSI,
     "XTALK_MIN_DURATION_S":   _XTALK_MIN_DURATION_S,
     "DRIBBLE_MAX_VOLUME_L":   _DRIBBLE_MAX_VOLUME_L,
@@ -652,12 +668,21 @@ def _detect_pressure_restoration_phantom(
     """True when an event's duration + near-zero pressure drop AND near-zero
     real flow indicate a city-pressure restoration / oscillation artifact.
 
-    Long-duration + low-ΔP is necessary but not sufficient: a real low-pressure
-    irrigation run also matches it. So when the integrated-flow metrics are
-    available, ANY of them exceeding its ceiling (`_PHANTOM_MAX_TRUE_FLOW_LPM`,
-    `_PHANTOM_MAX_FLOW_INTEGRAL_L`, `_PHANTOM_MAX_FLOW_ON_RATIO`) means real water
-    moved → NOT a phantom. Metrics are optional (None) so legacy callers keep the
-    old duration+ΔP behaviour.
+    Duration floor (FROZEN, never calibrated):
+      • metrics present (flow_integral + flow_on_ratio non-None) ⇒ the no-flow proof
+        makes even a 2-min event unambiguous → ``_PHANTOM_NOFLOW_MIN_DURATION_S`` (120 s);
+      • legacy event (NULL metrics) ⇒ no proof, keep the conservative 30-min
+        ``_PHANTOM_MIN_DURATION_S`` floor (read directly, so calib can never lower it).
+
+    Leak-safety no-flow guards (FROZEN): ANY of flow_integral_litres /
+    flow_on_ratio at-or-above its ceiling means real water moved → NOT a phantom.
+    A real leak is continuous (high flow_on_ratio) so it can never be zeroed.
+
+    Brief-burst guard: a SHORT event (< ``_PHANTOM_MIN_DURATION_S``) whose active-segment
+    mean ``true_avg_flow_lpm`` reaches a real-fixture rate (``>= _PHANTOM_MAX_TRUE_FLOW_LPM``)
+    is most likely a genuine brief draw caught in a long pressure window, so it is rescued.
+    This guard is LIFTED at/above the 30-min floor, where the long span at < 5 % flow-on is
+    itself dispositive — that is what lets long near-zero-water events through.
 
     Bad inputs (None / non-numeric / NaN / inf) → False. Negative delta is
     INTENTIONALLY treated as phantom (a `< 2.0` threshold includes negatives).
@@ -669,13 +694,12 @@ def _detect_pressure_restoration_phantom(
         return False
     if not math.isfinite(duration) or not math.isfinite(delta):
         return False
-    if not (duration >= _ac(calib, "PHANTOM_MIN_DURATION_S")
-            and delta < _ac(calib, "PHANTOM_MAX_DELTA_PSI")):
+    have_noflow_metrics = flow_integral_litres is not None and flow_on_ratio is not None
+    floor = _PHANTOM_NOFLOW_MIN_DURATION_S if have_noflow_metrics else _PHANTOM_MIN_DURATION_S
+    if not (duration >= floor and delta < _ac(calib, "PHANTOM_MAX_DELTA_PSI")):
         return False
-    # True-flow guard — real water moved ⇒ not a phantom. FROZEN (leak safety):
-    # never calibrated, so a real leak (which moves water) can't be zeroed.
+    # No-flow leak-safety guards (FROZEN): real water moved ⇒ not a phantom.
     for val, ceil in (
-        (true_avg_flow_lpm,   _PHANTOM_MAX_TRUE_FLOW_LPM),
         (flow_integral_litres, _PHANTOM_MAX_FLOW_INTEGRAL_L),
         (flow_on_ratio,       _PHANTOM_MAX_FLOW_ON_RATIO),
     ):
@@ -685,6 +709,13 @@ def _detect_pressure_restoration_phantom(
                     return False
             except (TypeError, ValueError):
                 pass
+    # Brief-burst guard — only below the long-quiet regime (see docstring).
+    if duration < _PHANTOM_MIN_DURATION_S and true_avg_flow_lpm is not None:
+        try:
+            if float(true_avg_flow_lpm) >= _PHANTOM_MAX_TRUE_FLOW_LPM:
+                return False
+        except (TypeError, ValueError):
+            pass
     return True
 
 
@@ -785,14 +816,22 @@ def _finalize_derived_verdicts(features: dict, calib=None) -> None:
 
     is_degraded  = bool(features.get("degraded_supply"))
     user_ignored = bool(features.get("user_ignored"))
+    # A user-applied fixture type means "confirmed real water" (mirrors
+    # artifact_calibration._is_real_label). The VOLUME-ZEROING verdicts (phantom,
+    # cross-talk) must never override it — so they are gated off below. Dribble /
+    # degraded (non-zeroing) are left as-is.
+    has_user_type = bool(str(features.get("user_fixture_type") or "").strip())
     # is_composite is now a DIAGNOSTIC-only signal (deprecated 2026-06-04): it no
     # longer excludes the event from training or sets a rejection reason. Combined
     # usage is classified as the dominant fixture (or 'other') by the k-NN.
-    is_phantom = _detect_pressure_restoration_phantom(
-        features.get("duration_seconds"), features.get("pressure_delta_psi"),
-        true_avg_flow_lpm=features.get("true_avg_flow_lpm"),
-        flow_integral_litres=features.get("flow_integral_litres"),
-        flow_on_ratio=features.get("flow_on_ratio"), calib=calib)
+    is_phantom = (
+        not has_user_type
+        and _detect_pressure_restoration_phantom(
+            features.get("duration_seconds"), features.get("pressure_delta_psi"),
+            true_avg_flow_lpm=features.get("true_avg_flow_lpm"),
+            flow_integral_litres=features.get("flow_integral_litres"),
+            flow_on_ratio=features.get("flow_on_ratio"), calib=calib)
+    )
     # Low-flow dribble: only for events that are NOT a phantom and NOT degraded
     # (a degraded event's low flow is a measurement artifact, not a true
     # trickle, and is already excluded). Folds into the exclusion set WITHOUT
@@ -802,7 +841,7 @@ def _finalize_derived_verdicts(features: dict, calib=None) -> None:
     # phantom (ΔP < 2.0). Gated off degraded events (their flow metrics are unreliable,
     # so the no-flow signal can't be trusted). Zeroes volume + excludes, like a phantom.
     is_cross_talk = (
-        not is_phantom and not is_degraded
+        not is_phantom and not is_degraded and not has_user_type
         and _detect_cross_talk(
             features.get("duration_seconds"), features.get("pressure_delta_psi"),
             features.get("flow_integral_litres"), features.get("flow_on_ratio"),
@@ -859,6 +898,105 @@ def _finalize_derived_verdicts(features: dict, calib=None) -> None:
     )
 
 
+def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
+    """One-time idempotent repair of cross-cutting artifact-flag invariants (P2).
+
+    Two fixes, both safe to re-run:
+      A. Any row with a volume-ZEROING flag (phantom or cross-talk) set must have
+         ``excluded_from_training = 1`` — repairs rows where a recompute path left a
+         zeroed event still feeding training (the is_cross_talk=1 / excluded=0 case).
+      B. A row must not carry more than one of the mutually-exclusive verdict flags
+         {phantom, cross_talk, dribble}. Stale auto-flags can be left set under a later
+         manual classification. Resolve by the row's RECORDED EFFECT — its stored
+         ``volume_litres_effective`` — rather than guessing intent:
+           veff == 0                       -> a zeroing verdict was operative
+           veff == volume_litres_estimated -> degraded was operative
+           veff == volume_litres (raw)     -> dribble (or none) was operative
+         Keep the flag that matches that effect and clear the others (and recompute
+         excluded_from_training + match_rejection_reason to suit). A row whose veff
+         matches no branch is left UNTOUCHED and logged for manual review.
+
+    Column-guarded so it is a no-op on a schema predating is_cross_talk /
+    is_low_flow_dribble. Returns
+    ``{"excluded_fixed", "pairs_resolved", "unresolved"}``.
+    """
+    if not (_events_has_column(conn, "is_cross_talk")
+            and _events_has_column(conn, "is_low_flow_dribble")):
+        return {"excluded_fixed": 0, "pairs_resolved": 0, "unresolved": 0}
+
+    EPS = 1e-6
+
+    # ── A: a zeroing flag ⇒ excluded_from_training = 1 ──────────────────────────
+    cur = conn.execute(
+        "UPDATE events SET excluded_from_training = 1 "
+        "WHERE (COALESCE(is_pressure_restoration_phantom,0) = 1 "
+        "       OR COALESCE(is_cross_talk,0) = 1) "
+        "  AND COALESCE(excluded_from_training,0) = 0"
+    )
+    excluded_fixed = cur.rowcount or 0
+
+    # ── B: resolve mutually-exclusive flag collisions by recorded effect ────────
+    rows = conn.execute(
+        "SELECT id, user_ignored AS ui, "
+        "  COALESCE(is_pressure_restoration_phantom,0) AS ph, "
+        "  COALESCE(is_cross_talk,0) AS ct, "
+        "  COALESCE(is_low_flow_dribble,0) AS dr, "
+        "  COALESCE(degraded_supply,0) AS dg, "
+        "  volume_litres, volume_litres_estimated, volume_litres_effective AS veff "
+        "FROM events "
+        "WHERE (COALESCE(is_pressure_restoration_phantom,0) "
+        "     + COALESCE(is_cross_talk,0) "
+        "     + COALESCE(is_low_flow_dribble,0)) >= 2"
+    ).fetchall()
+
+    pairs_resolved = 0
+    unresolved = 0
+    for r in rows:
+        veff, raw, est = r["veff"], r["volume_litres"], r["volume_litres_estimated"]
+        if veff is not None and abs(float(veff)) < EPS:
+            keep = "phantom" if r["ph"] else "cross_talk"      # a zeroing verdict won
+        elif (r["dg"] and est is not None and veff is not None
+              and abs(float(veff) - float(est)) < EPS):
+            # Envelope estimate AND the event is actually degraded — degraded won.
+            # (The dg requirement prevents a clean row where est==raw==veff from being
+            # mis-read as degraded by the estimate-match alone.)
+            keep = "degraded"
+        elif (raw is not None and veff is not None
+              and abs(float(veff) - float(raw)) < EPS):
+            keep = "dribble" if r["dr"] else "none"
+        else:
+            unresolved += 1
+            log.warning("flag-repair: event %s contradictory flags "
+                        "(ph=%d ct=%d dr=%d) but veff=%s matches no verdict effect "
+                        "(raw=%s est=%s) — left for manual review",
+                        r["id"], r["ph"], r["ct"], r["dr"], veff, raw, est)
+            continue
+
+        new_ph = 1 if keep == "phantom" else 0
+        new_ct = 1 if keep == "cross_talk" else 0
+        new_dr = 1 if keep == "dribble" else 0
+        new_excluded = 1 if (new_ph or new_ct or new_dr or r["dg"] or r["ui"]) else 0
+        reason = ("pressure_restoration_phantom" if new_ph
+                  else "cross_talk" if new_ct
+                  else "pulsing_supply" if r["dg"]
+                  else "low_flow_dribble" if new_dr
+                  else None)
+        conn.execute(
+            "UPDATE events SET is_pressure_restoration_phantom = ?, "
+            "  is_cross_talk = ?, is_low_flow_dribble = ?, "
+            "  excluded_from_training = ?, match_rejection_reason = ? WHERE id = ?",
+            (new_ph, new_ct, new_dr, new_excluded, reason, r["id"]),
+        )
+        pairs_resolved += 1
+
+    if excluded_fixed or pairs_resolved or unresolved:
+        conn.commit()
+        log.info("flag-repair: %d excluded-from-training fixed, %d flag collisions "
+                 "resolved, %d unresolved", excluded_fixed, pairs_resolved, unresolved)
+    return {"excluded_fixed": excluded_fixed, "pairs_resolved": pairs_resolved,
+            "unresolved": unresolved}
+
+
 def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     """Recompute the auto exclusion verdicts over all events.
 
@@ -900,6 +1038,10 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     """
     from .database import transaction, compute_daily_summary, apply_effective_volume
 
+    # Repair any cross-cutting flag-consistency violations first (P2): zeroed events
+    # that slipped through still feeding training, and stale mutually-exclusive flags.
+    repair = repair_artifact_flag_consistency(conn)
+
     # Skip manually-classified rows so a startup re-run never re-flags an event
     # the user deliberately un-marked. Column-guarded because the back-compat
     # wrapper is called from the 20260532 migration, before user_classified
@@ -917,17 +1059,38 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     has_af = _events_has_column(conn, "true_avg_flow_lpm")
     af_select = (", true_avg_flow_lpm, flow_integral_litres, flow_on_ratio"
                  if has_af else "")
+    # A user-applied fixture type means confirmed-real water — never auto-zero it
+    # (mirrors _is_real_label + the live finalizer's has_user_type gate).
+    uft_guard = (
+        " AND (user_fixture_type IS NULL OR user_fixture_type = '')"
+        if _events_has_column(conn, "user_fixture_type") else ""
+    )
+    # Duration prefilter is metric-gated: legacy rows (no active-flow metrics) stay at the
+    # frozen 1800 s floor, while rows that HAVE the no-flow metrics also qualify from 120 s.
+    # The canonical _detect_pressure_restoration_phantom re-runs inside the loop and does the
+    # real gating, so legacy rows pulled in at 120 s are correctly rejected (they fall back to
+    # the 1800 s floor there) — no flip-flop.
+    if has_af:
+        dur_clause = (
+            "(duration_seconds >= ? "
+            "   OR (duration_seconds >= ? AND flow_integral_litres IS NOT NULL "
+            "       AND flow_on_ratio IS NOT NULL))"
+        )
+        dur_params = (_PHANTOM_MIN_DURATION_S, _PHANTOM_NOFLOW_MIN_DURATION_S)
+    else:
+        dur_clause = "duration_seconds >= ?"
+        dur_params = (_PHANTOM_MIN_DURATION_S,)
     rows = conn.execute(
         "SELECT id, circuit, start_ts, duration_seconds, pressure_delta_psi, "
         "       hourly_volume_applied_litres, hourly_volume_applied_bucket"
         + af_select +
         " FROM events "
-        "WHERE duration_seconds >= ? "
+        "WHERE " + dur_clause +
         "  AND pressure_delta_psi < ? "
         "  AND (is_pressure_restoration_phantom = 0 "
         "       OR is_pressure_restoration_phantom IS NULL)"
-        + uc_guard,
-        (_PHANTOM_MIN_DURATION_S, _PHANTOM_MAX_DELTA_PSI),
+        + uc_guard + uft_guard,
+        dur_params + (_PHANTOM_MAX_DELTA_PSI,),
     ).fetchall()
 
     flagged = 0
@@ -1038,6 +1201,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "FROM events "
             "WHERE (is_cross_talk = 0 OR is_cross_talk IS NULL) "
             "  AND COALESCE(user_classified, 0) = 0 "
+            "  AND (user_fixture_type IS NULL OR user_fixture_type = '') "
             "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
             "  AND COALESCE(degraded_supply, 0) = 0 "
             "  AND duration_seconds >= ? "
@@ -1079,7 +1243,10 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                      cross_talk_flagged, len(xt_days))
 
     return {"flagged": flagged, "dribbles_flagged": dribbles_flagged,
-            "cross_talk_flagged": cross_talk_flagged}
+            "cross_talk_flagged": cross_talk_flagged,
+            "excluded_fixed": repair["excluded_fixed"],
+            "flag_pairs_resolved": repair["pairs_resolved"],
+            "flag_pairs_unresolved": repair["unresolved"]}
 
 
 def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
@@ -1752,11 +1919,23 @@ def _enrich_from_waveform(
 
     # ── 3b. Shape signatures — firmware arrays are time-aligned, flow starts near zero ──
     # Use separate flags so signature_source reflects exactly what was overridden.
+    #
+    # Phase 3 (§1.3) — TRAIN-ON-A-HOLE GUARD. The flow/pressure SIGNATURES feed the
+    # cluster engine + the per-home fit, so they must come only from a fully-reliable
+    # firmware waveform. A capture that is incomplete, resolution-reduced (samples
+    # dropped because the buffer filled — the wf_chunk_drop_count path), or
+    # self-reported low quality is a HOLE: it must NOT replace the software signature
+    # or flip signature_source to esp_*. The firmware-computed metadata above
+    # (peak/ΔP/propagation) stays — it is onboard-accurate at 200 Hz regardless of
+    # buffer/transport loss; only the sample-array-derived signatures are gated.
+    _sig_usable = (bool(fl & _WF_FL_FULL_COMPLETE)
+                   and not (fl & _WF_FL_RESOLUTION_REDUCED)
+                   and meta.quality == 0)
     _flow_sig_overridden  = False
     _press_sig_overridden = False
 
     # Flow: full_flow is in L/min; guard against zero/noise arrays before overriding.
-    if record.full_flow:
+    if record.full_flow and _sig_usable:
         peak_fw = max(record.full_flow)
         if peak_fw >= _WF_FLOW_SIG_MIN_PEAK_LPM:
             features["flow_signature_json"] = json.dumps(
@@ -1768,7 +1947,8 @@ def _enrich_from_waveform(
     # Pressure: derive baseline from pre-roll samples (pressure before flow onset).
     # record.start_pressure and record.full_pressure both use meta.pressure_scale
     # and belong to the same WaveformRecord — units are identical (PSI).
-    if record.full_pressure:
+    # Gated by _sig_usable (Phase 3) — same train-on-a-hole guard as the flow signature.
+    if record.full_pressure and _sig_usable:
         baseline_psi: Optional[float] = None
 
         # Priority 1: median of pre-roll samples from start_pressure (most accurate —
@@ -2453,6 +2633,7 @@ class FeatureExtractor:
             existing = self._db.execute(
                 "SELECT user_ignored, user_classified, "
                 "       is_pressure_restoration_phantom, degraded_supply, "
+                "       is_cross_talk, is_low_flow_dribble, "
                 "       is_composite, volume_litres_effective "
                 "FROM events WHERE id = ?",
                 (features["id"],),
@@ -2463,12 +2644,19 @@ class FeatureExtractor:
                 features["is_pressure_restoration_phantom"] = \
                     int(existing["is_pressure_restoration_phantom"] or 0)
                 features["degraded_supply"] = int(existing["degraded_supply"] or 0)
+                # Carry ALL volume-affecting verdict flags back from the stored manual
+                # classification — not just phantom/degraded — so excluded_from_training
+                # stays consistent with a user-marked cross-talk or dribble (P2 fix).
+                features["is_cross_talk"] = int(existing["is_cross_talk"] or 0)
+                features["is_low_flow_dribble"] = int(existing["is_low_flow_dribble"] or 0)
                 features["is_composite"] = int(existing["is_composite"] or 0)
                 features["volume_litres_effective"] = \
                     float(existing["volume_litres_effective"] or 0.0)
                 features["excluded_from_training"] = 1 if (
                     features["is_pressure_restoration_phantom"]
                     or features["degraded_supply"]
+                    or features["is_cross_talk"]
+                    or features["is_low_flow_dribble"]
                     or features["is_composite"]
                     or features["user_ignored"]
                 ) else 0

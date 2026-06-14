@@ -57,6 +57,23 @@ async def device_page(request: Request):
         sched = get_leak_test_schedule(orch.db, circuit_cfg.circuit)
         state["schedule"] = dict(sched) if sched else {}
 
+        # Phase 3 — waveform-transport health: addon-side counters (assembled /
+        # firmware-flagged degraded / transport gaps) + the firmware's own dropped-
+        # sample count. Surfaces the silently-lossy waveform stream.
+        ed = orch.event_detector
+        wf = (ed.waveform_transport_stats(circuit_cfg.circuit)
+              if ed else {"assembled": 0, "degraded": 0, "gaps": 0})
+        wf["fw_chunk_drops"] = None
+        drop_sensor = getattr(circuit_cfg, "wf_chunk_drop_count_sensor", "")
+        if drop_sensor and orch.ha:
+            raw = await orch.ha.get_state_value(drop_sensor, None)
+            if raw not in (None, "unknown", "unavailable", ""):
+                try:
+                    wf["fw_chunk_drops"] = int(float(raw))
+                except (TypeError, ValueError):
+                    pass
+        state["waveform"] = wf
+
         circuit_states.append(state)
 
     return _templates(request).TemplateResponse("device.html", {
