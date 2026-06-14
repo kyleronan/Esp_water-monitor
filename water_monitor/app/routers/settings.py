@@ -493,6 +493,24 @@ async def dev_retrain(circuit: str, request: Request):
     return ingress_redirect(request, "/settings#sett-dev")
 
 
+@router.post("/dev/validate-detectors/{circuit}")
+async def dev_validate_detectors(circuit: str, request: Request):
+    """DEV/testing only — run the detector self-validation (P6) against HA history on
+    demand, WITHOUT re-freezing. Reconciles detected events vs the raw flow the addon
+    re-scrapes from HA to confirm the phantom / cross-talk / dribble settings behave.
+    Diagnostic only — writes no thresholds. Returns the report JSON. Gated behind
+    ``dev_tools``."""
+    from ..config import DEV_TOOLS
+    if not DEV_TOOLS:
+        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    if not orch.training_manager:
+        return JSONResponse({"error": "training manager unavailable"}, status_code=503)
+    report = await orch.training_manager.validate_detectors(circuit)
+    return JSONResponse(report)
+
+
 @router.post("/dev/reimport-range/{circuit}")
 async def dev_reimport_range(circuit: str, request: Request):
     """DEV/testing only — delete this circuit's purely-machine-derived events in a

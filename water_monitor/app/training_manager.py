@@ -381,11 +381,66 @@ class TrainingManager:
                         if isinstance(r, dict) and r.get("status") == "fit")
             finish_job(self._db, job, "done",
                        f"{label}: calibration locked ({n_fit} home-fit)")
+            # P6: validate the just-frozen detectors against HA history (diagnostic
+            # only — never writes a threshold). Best-effort; a failure must not affect
+            # the freeze.
+            try:
+                from .detector_validation import run_detector_validation
+                await run_detector_validation(
+                    self._db, self._ha, self._cfg, circuit,
+                    datetime.now(timezone.utc), source=source)
+            except Exception as e:
+                log.warning("[%s] detector self-validation failed (non-fatal): %s",
+                            circuit, e)
             return report
         except Exception as e:
             log.error("[%s] fit-and-lock failed: %s", circuit, e)
             finish_job(self._db, job, "error", f"{label}: calibration failed")
             return {}
+
+    async def validate_detectors(self, circuit: str) -> Dict[str, Any]:
+        """Run the detector self-validation against HA history on demand (dev tab).
+        Diagnostic only — writes no thresholds. Returns the report dict."""
+        from .detector_validation import run_detector_validation
+        return await run_detector_validation(
+            self._db, self._ha, self._cfg, circuit,
+            datetime.now(timezone.utc), source="manual")
+
+    async def _maybe_interim_validation(self, circuit: str, state_row,
+                                        now: datetime) -> None:
+        """Fire the ~day-7 advisory once per learning period (keyed by started_at)."""
+        from .detector_validation import (INTERIM_VALIDATION_DAY, build_interim_advisory,
+                                          interim_already_sent, mark_interim_sent,
+                                          run_detector_validation)
+        started_str = state_row["started_at"]
+        if not started_str:
+            return
+        try:
+            started = datetime.fromisoformat(started_str.replace("Z", "+00:00"))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return
+        if (now - started).days < INTERIM_VALIDATION_DAY:
+            return
+        if interim_already_sent(self._db, circuit, started_str):
+            return
+        try:
+            report = await run_detector_validation(
+                self._db, self._ha, self._cfg, circuit, now, source="interim")
+            if report.get("error"):
+                return
+            title, message = build_interim_advisory(self._db, circuit, report)
+            await self._ha.notify(
+                title=title, message=message,
+                notification_id=f"water_interim_validate_{circuit}")
+            # Mark sent only AFTER a successful notify, so a transient failure retries.
+            mark_interim_sent(self._db, circuit, started_str)
+            log.info("[%s] interim (day-%d) detector advisory sent",
+                     circuit, INTERIM_VALIDATION_DAY)
+        except Exception as e:
+            log.warning("[%s] interim validation advisory failed (non-fatal): %s",
+                        circuit, e)
 
     async def _notify_calibration_report(self, circuit: str,
                                          report: Dict[str, Any]) -> None:
@@ -547,6 +602,10 @@ class TrainingManager:
             log.warning("[%s] away mode check failed: %s", circuit, e)
 
         now = datetime.now(timezone.utc)
+
+        # P6: one-time interim (~day 7) self-validation ADVISORY so the user can label
+        # better before the freeze locks calibration. Best-effort, diagnostic only.
+        await self._maybe_interim_validation(circuit, state_row, now)
 
         # Check time elapsed
         ends_at_str = state_row["calibration_ends_at"]

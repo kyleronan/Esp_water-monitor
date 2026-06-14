@@ -1110,6 +1110,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             conn.execute(
                 "UPDATE events SET "
                 "  is_pressure_restoration_phantom = 1, "
+                "  is_cross_talk = 0, is_low_flow_dribble = 0, "   # phantom has precedence
                 "  volume_litres_effective = 0, "
                 "  volume_estimation_method = 'pressure_restoration_phantom', "
                 "  excluded_from_training = 1, "
@@ -1220,7 +1221,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             with transaction(conn):
                 conn.execute(
                     "UPDATE events SET "
-                    "  is_cross_talk = 1, "
+                    "  is_cross_talk = 1, is_low_flow_dribble = 0, "   # xtalk has precedence
                     "  volume_litres_effective = 0, "
                     "  volume_estimation_method = 'cross_talk', "
                     "  excluded_from_training = 1, "
