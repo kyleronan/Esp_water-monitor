@@ -386,6 +386,22 @@ CREATE INDEX IF NOT EXISTS idx_type_signatures_circuit
     ON fixture_type_signatures (circuit);
 
 -- ==========================================================================
+-- RULE CALIBRATION (Phase 1) — per-home fit of the structural-rules-tier bands
+-- (event_rules.py), frozen at activation. One JSON blob per circuit; the rule
+-- predicates read it via an optional `calib` dict and fall back to their shipped
+-- module defaults for any absent key. Written ONLY at activation / explicit
+-- re-train — never on ordinary reclassify or live events — so the locked
+-- reference can't drift (the basis for leak / odd-usage detection).
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS rule_calibration (
+    circuit     TEXT PRIMARY KEY,
+    params      TEXT NOT NULL DEFAULT '{}',   -- JSON dict of fitted rule bands
+    source      TEXT,                         -- 'activation' | 'retrain'
+    locked_at   TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
 -- CATEGORY PUBLISH (Sprint F) — per-(circuit, fixture_type) HA publish gate.
 -- Replaces the per-fixture `fixtures.publish_to_ha` flag as the source of
 -- truth for the fixture_publisher. Each row toggles whether the HA discovery
@@ -1819,6 +1835,68 @@ def coalesce_low_flow_events(
             compute_daily_summary(conn, circuit, day)
 
     return {"groups": len(groups), "absorbed": absorbed_total}
+
+
+def delete_events_in_range(
+    conn: sqlite3.Connection, circuit: str, from_ts: str, to_ts: str,
+) -> int:
+    """Delete the purely-machine-derived events whose ``start_ts`` falls in
+    [from_ts, to_ts] on ``circuit`` — reversing each one's hourly_volume
+    contribution and recomputing the affected daily summaries — so a date range
+    can be cleanly RE-IMPORTED from HA history without orphaned bookkeeping (the
+    remedy for a garbled stored event, e.g. an irrigation run that failed to
+    close and absorbed a whole day).
+
+    PRESERVES anything the user has touched: a row with a ``user_fixture_type``,
+    OR ``user_classified``, OR ``user_ignored`` is SKIPPED — labels/intent (e.g. a
+    manually marked cross-talk event) must never be lost; the re-import's
+    overlap-dedup simply works around the kept rows. Reuses the coalesce
+    reverse-hourly + cascade-delete pattern: deleting an event cascades
+    event_waveforms / zone_flow_history (foreign_keys=ON); training_capture_
+    candidates (no FK) is cleaned manually. Single transaction; returns the count.
+    """
+    rows = conn.execute(
+        "SELECT id, start_ts, hourly_volume_applied_litres, "
+        "       hourly_volume_applied_bucket "
+        "FROM events "
+        "WHERE circuit = ? AND start_ts >= ? AND start_ts <= ? "
+        "  AND user_fixture_type IS NULL "
+        "  AND COALESCE(user_classified, 0) = 0 "
+        "  AND COALESCE(user_ignored, 0) = 0 "
+        "ORDER BY start_ts ASC",
+        (circuit, from_ts, to_ts),
+    ).fetchall()
+    if not rows:
+        return 0
+    affected_days = set()
+    with transaction(conn):
+        for r in rows:
+            applied = float(r["hourly_volume_applied_litres"] or 0.0)
+            bucket = r["hourly_volume_applied_bucket"]
+            if bucket and applied:
+                conn.execute(
+                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                    "VALUES (?, ?, ?) ON CONFLICT (circuit, hour_ts) DO UPDATE "
+                    "SET volume_litres = volume_litres + excluded.volume_litres",
+                    (circuit, bucket, -applied),
+                )
+            conn.execute(
+                "DELETE FROM training_capture_candidates WHERE event_id = ?",
+                (r["id"],))
+            conn.execute("DELETE FROM events WHERE id = ?", (r["id"],))
+            d = (r["start_ts"] or "")[:10]
+            if d:
+                affected_days.add(d)
+        for day in sorted(affected_days):
+            # compute_daily_summary returns None (and leaves any prior row
+            # untouched) when a day has no events left — so a day emptied by the
+            # delete keeps a STALE inflated summary. Drop that row explicitly;
+            # the re-import repopulates it, or it correctly stays absent.
+            if compute_daily_summary(conn, circuit, day) is None:
+                conn.execute(
+                    "DELETE FROM daily_summary WHERE circuit = ? AND day = ?",
+                    (circuit, day))
+    return len(rows)
 
 
 def get_daily_volume(conn: sqlite3.Connection, circuit: str,

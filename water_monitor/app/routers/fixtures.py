@@ -685,6 +685,54 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
     )
 
 
+@router.post("/{circuit}/reimport-range")
+async def reimport_range(request: Request, circuit: str = Depends(_valid_circuit)):
+    """Reprocess a date range: delete this circuit's machine events in the range
+    (reversing their volume) and re-import them from HA flow history, so a garbled
+    stored event (e.g. an irrigation run that failed to close and absorbed a whole
+    day) is rebuilt as the real runs. User-labelled / classified / ignored events
+    in the range are preserved (delete_events_in_range skips them)."""
+    from datetime import datetime, timezone
+    orch = _orch(request)
+    importer = getattr(orch, "historical_importer", None)
+    if importer is None:
+        return ingress_redirect(request, "/fixtures?msg=error")
+    form = await request.form()
+    # The date inputs are LOCAL calendar days — span them in the home tz, then to
+    # UTC so the window matches the user's day (and the stored UTC timestamps).
+    try:
+        tz = getattr(orch, "_ha_tz", timezone.utc) or timezone.utc
+        from_dt = (datetime.fromisoformat(form.get("range_start") + "T00:00:00")
+                   .replace(tzinfo=tz).astimezone(timezone.utc))
+        to_dt = (datetime.fromisoformat(form.get("range_end") + "T23:59:59")
+                 .replace(tzinfo=tz).astimezone(timezone.utc))
+    except (TypeError, ValueError):
+        return ingress_redirect(request, "/fixtures?msg=error")
+    if to_dt < from_dt:
+        return ingress_redirect(request, "/fixtures?msg=error")
+    try:
+        from ..database import (delete_events_in_range, run_isolated_write,
+                                get_write_lock)
+        from ..config import DB_PATH
+        if get_write_lock().locked():
+            return ingress_redirect(request, "/fixtures?msg=busy")
+        from_iso, to_iso = from_dt.isoformat(), to_dt.isoformat()
+        # 1) Delete the range's machine events under the write lock (sync).
+        deleted = await run_isolated_write(
+            DB_PATH, lambda c: delete_events_in_range(c, circuit, from_iso, to_iso))
+        # 2) Re-import from HA history — queues the reconstructed events onto the
+        #    live pipeline; the FeatureExtractor worker stores + classifies them.
+        #    (Past-range import deliberately does NOT touch the catch-up checkpoint.)
+        imported = await importer.import_range(circuit, from_dt, to_dt)
+        log.info("[%s] reprocess range %s..%s: deleted %d, re-imported %d",
+                 circuit, from_iso, to_iso, deleted, imported)
+    except Exception as e:
+        log.error("[%s] reimport_range failed: %s", circuit, e, exc_info=True)
+        return ingress_redirect(request, "/fixtures?msg=error")
+    return ingress_redirect(
+        request, f"/fixtures?msg=reimported&deleted={deleted}&imported={imported}")
+
+
 # ── JSON API ──────────────────────────────────────────────────────────────────
 
 @router.get("/api/{circuit}/clusters")
