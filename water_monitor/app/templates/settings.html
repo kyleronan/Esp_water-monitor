@@ -303,6 +303,11 @@
           Recalibrate if you've renovated, added appliances, or your household
           has changed significantly.
         </p>
+        {% if c.last_completed %}
+        <p class="sett-card-desc muted" style="margin-top:-.25rem">
+          Last learning period completed: <strong>{{ c.last_completed }}</strong>
+        </p>
+        {% endif %}
         {% if c.training.state == 'calibrating' %}
         <div style="margin-bottom:.75rem">
           <span class="muted">
@@ -1095,8 +1100,20 @@
         </p>
         {% for c in circuits %}
         <div class="dev-retrain-row"
-             style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.4rem 0">
-          <span>{{ c.display_name }}</span>
+             style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
+          <div>
+            <strong>{{ c.display_name }}</strong>
+            <div class="muted" style="font-size:.85em">
+              Learning completed: {{ c.last_completed or '—' }}
+              {% if c.calibration %}
+                · Locked {{ c.calibration.locked_at or '—' }}
+                ({{ c.calibration.source or '—' }},
+                {{ c.calibration.fit_count }} band{{ '' if c.calibration.fit_count == 1 else 's' }} fit)
+              {% else %}
+                · not yet locked
+              {% endif %}
+            </div>
+          </div>
           <button type="button" class="btn btn-secondary btn-sm"
                   onclick="devRetrain('{{ c.circuit }}')">Re-train now</button>
         </div>

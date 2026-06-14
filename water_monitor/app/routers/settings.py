@@ -24,6 +24,26 @@ def _tmpl(request: Request):
     return request.app.state.templates
 
 
+def _fmt_local_ts(iso, tz) -> "str | None":
+    """ISO-UTC timestamp → 'YYYY-MM-DD HH:MM' in the home timezone (or UTC if none).
+    Returns None for blank/unparseable input."""
+    if not iso:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if tz is not None:
+        try:
+            dt = dt.astimezone(tz)
+        except Exception:
+            pass
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def settings_page(request: Request):
@@ -190,6 +210,9 @@ async def settings_page(request: Request):
         enriched = _enrich_entity(e, prefix, circ)
         entities_by_circuit.setdefault(circ, []).append(enriched)
 
+    from ..event_rules import get_home_timezone
+    from ..rule_calibration import get_rule_calibration_meta
+    _home_tz = get_home_timezone()
     circuits = []
     for circuit_cfg in orch._cfg.circuits:
         c = circuit_cfg.circuit
@@ -204,6 +227,7 @@ async def settings_page(request: Request):
                 "percent_complete": 0,
             }
         )
+        cal_meta = get_rule_calibration_meta(orch.db, c)
 
         from ..database import get_active_exclusion_window, get_valve_type
         circuits.append({
@@ -215,6 +239,16 @@ async def settings_page(request: Request):
             "learning": dict(learn) if learn else {},
             "alerts": alerts,
             "training": training,
+            # When the last learning period completed (UTC→local). After activation
+            # this is the go-live time; while 'labelling' it's when learning ended.
+            "last_completed": _fmt_local_ts(
+                (training or {}).get("completed_at"), _home_tz),
+            # When the per-home rule reference was last frozen (activation/retrain).
+            "calibration": {
+                "locked_at": _fmt_local_ts(cal_meta["locked_at"], _home_tz),
+                "source": cal_meta["source"],
+                "fit_count": cal_meta["fit_count"],
+            } if cal_meta else None,
             "device_entities": entities_by_circuit.get(c, []),
             "active_exclusion": get_active_exclusion_window(orch.db, c),
         })
