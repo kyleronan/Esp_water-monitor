@@ -621,41 +621,47 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
 // ── Collapsible "See more" tables — handled by the persisting block below
 // (after the cycle rollup) so the expanded state survives a modal-save reload. ─
 
-// ── dev.24 — cycle rollup: collapse a washer / dishwasher / water-softener
-// cycle (events sharing data-cycle-group) into ONE expandable parent row so the
-// History list stays readable. Members are taken OUT of See-more's management
-// (their hist-extra-row class is removed) so the two toggles never conflict; the
-// parent inherits the extra-row state, so See-more still reveals an off-page
-// group. Singletons (no group, or a user-relabeled member whose group was
-// cleared) render exactly as before. ──
+// ── dev.24 — appliance-cycle rollup: collapse a maximal run of CONSECUTIVE
+// events of the same appliance type (water softener / dishwasher / washing
+// machine) into ONE expandable parent row, so the History list stays readable.
+// Grouped by EFFECTIVE type (data-eff-type = your label OR the auto-match), so a
+// run mixes ~matched, ↻cycle and ★user-labelled rows freely — confirming an
+// event as the same type keeps it in the group; relabelling it to something else
+// changes its type and drops it out naturally. Individual fixtures (toilet, tap,
+// shower) never roll up. Members leave See-more's management (their hist-extra-
+// row class is removed) so the two toggles never conflict; the parent inherits
+// the extra-row state so See-more still reveals an off-page group. ──
 (function () {
+  const GROUPABLE = new Set(['water_softener', 'dishwasher', 'washing_machine']);
   const prettify = t => (t || 'cycle').replace(/_/g, ' ')
       .replace(/\b\w/g, c => c.toUpperCase());
+  const fmtLocal = ts => {
+    const d = new Date(ts);                          // UTC ISO -> local HH:MM
+    return isNaN(d.getTime()) ? '' :
+      String(d.getHours()).padStart(2, '0') + ':' +
+      String(d.getMinutes()).padStart(2, '0');
+  };
   document.querySelectorAll('.hist-card table tbody').forEach(tbody => {
-    const groups = {};
-    tbody.querySelectorAll('tr.hist-event-row[data-cycle-group]').forEach(r => {
-      const g = r.getAttribute('data-cycle-group');
-      if (g) (groups[g] = groups[g] || []).push(r);
-    });
-    Object.keys(groups).forEach(g => {
-      const members = groups[g];
-      if (members.length < 2) return;                 // lone grouped event → single
-      const first = members[0];                        // latest member (start_ts DESC)
+    const rows = Array.from(tbody.querySelectorAll('tr.hist-event-row'));
+    let i = 0;
+    while (i < rows.length) {
+      const t = rows[i].getAttribute('data-eff-type');
+      if (!GROUPABLE.has(t)) { i++; continue; }
+      let j = i;                                       // maximal same-type run
+      while (j < rows.length && rows[j].getAttribute('data-eff-type') === t) j++;
+      const members = rows.slice(i, j);
+      i = j;
+      if (members.length < 2) continue;
+      const first = members[0];                        // latest (start_ts DESC)
       let totVol = 0, unit = '';
       members.forEach(m => {
         const dv = (m.getAttribute('data-volume') || '').split(' ');
         const n = parseFloat(dv[0]); if (!isNaN(n)) totVol += n;
         if (dv[1]) unit = dv[1];
       });
-      const fmtLocal = ts => {
-        const d = new Date(ts);                    // UTC ISO -> local HH:MM (rows are local)
-        return isNaN(d.getTime()) ? '' :
-          String(d.getHours()).padStart(2, '0') + ':' +
-          String(d.getMinutes()).padStart(2, '0');
-      };
       const tNew = fmtLocal(first.getAttribute('data-start'));
       const tOld = fmtLocal(members[members.length - 1].getAttribute('data-start'));
-      const label = prettify(first.getAttribute('data-eff-type'));
+      const label = prettify(t);
       const wasExtra = first.classList.contains('hist-extra-row');
       const parent = document.createElement('tr');
       parent.className = 'hist-group-parent' + (wasExtra ? ' hist-extra-row' : '');
@@ -663,7 +669,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       parent.style.cursor = 'pointer';
       parent.setAttribute('tabindex', '0');
       parent.setAttribute('role', 'button');
-      parent.setAttribute('aria-label', label + ' cycle — expand');
+      parent.setAttribute('aria-label', label + ' — expand');
       const td = document.createElement('td');
       td.colSpan = first.children.length;
       td.className = 'hist-td';
@@ -690,7 +696,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       parent.addEventListener('keydown', ev => {
         if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); }
       });
-    });
+    }
   });
 })();
 
