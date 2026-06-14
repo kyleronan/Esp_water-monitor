@@ -2708,6 +2708,7 @@ class FeatureExtractor:
             or (response == "notify_shutoff_severe" and anomaly.get("shutoff_ok_severe"))
         )
         if (want_shutoff
+                and self._anomaly_shutoff_state_ok(circuit)
                 and self._anomaly_seasoned(sens, MIN_LIVE_DAYS_FOR_SHUTOFF)
                 and self._anomaly_shutoff_rate_ok(circuit, sens)):
             if await self._auto_shutoff(circuit, circuit_name, score, atype, event_id):
@@ -2741,6 +2742,32 @@ class FeatureExtractor:
             "WHERE circuit = ? AND closed_at >= ?", (circuit, cutoff)).fetchone()
         return (int(row[0]) if row else 0) < cap
 
+    def _anomaly_shutoff_state_ok(self, circuit: str) -> bool:
+        """HARD safety gate — an automated valve close is permitted ONLY when the
+        circuit is locked ('live') AND not in an active (re)calibration / accelerated-
+        adaptation window. Blocks auto-shutoff during setup, learning, labelling, and
+        BOTH full recalibration (state ≠ 'live') and partial recalibration (stays
+        'live' but opens a 14-day adaptation window): the system must never cut the
+        user's water while it is still (re)learning what normal looks like."""
+        row = self._db.execute(
+            "SELECT state FROM training_state WHERE circuit = ?", (circuit,)).fetchone()
+        if not row or row["state"] != "live":
+            return False
+        lc = self._db.execute(
+            "SELECT accelerated_adaptation_until FROM learning_config WHERE circuit = ?",
+            (circuit,)).fetchone()
+        until = lc["accelerated_adaptation_until"] if lc else None
+        if until:
+            try:
+                t = datetime.fromisoformat(str(until).replace("Z", "+00:00"))
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=timezone.utc)
+                if t > datetime.now(timezone.utc):
+                    return False   # active recalibration / adaptation window
+            except (ValueError, TypeError):
+                pass
+        return True
+
     def _resolve_valve_entity(self, circuit: str) -> Optional[str]:
         row = self._db.execute(
             "SELECT entity_id FROM circuit_entity_map "
@@ -2752,6 +2779,13 @@ class FeatureExtractor:
         """Close the valve, log it (persistent), and notify with why + a one-action
         reopen. Returns False (→ caller falls back to notify) when no valve is
         configured or the close fails — a shut-off must never silently swallow."""
+        # HARD final gate at the actuation chokepoint: the valve can NEVER close
+        # unless the circuit is live and settled (not learning / setup / recalibrating),
+        # independent of how this method was reached.
+        if not self._anomaly_shutoff_state_ok(circuit):
+            log.warning("[%s] anomaly auto-shutoff refused — circuit is not in a live, "
+                        "settled state (learning / setup / recalibrating)", circuit)
+            return False
         valve = self._resolve_valve_entity(circuit)
         if not valve or self._ha is None:
             log.warning("[%s] anomaly auto-shutoff requested but no valve entity / "
