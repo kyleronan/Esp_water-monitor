@@ -458,6 +458,23 @@ CREATE INDEX IF NOT EXISTS idx_anomaly_shutoff_circuit_time
     ON anomaly_shutoff_log (circuit, closed_at);
 
 -- ==========================================================================
+-- BACKGROUND JOB STATUS (§2.4) — one row per long-running op (reclassify,
+-- calibration/re-lock, recalibration) so the UI can poll + toast success /
+-- failure. DB-backed (not in-memory) because reclassify runs on an isolated
+-- write connection whose status must still be visible to the poll endpoint.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS jobs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit     TEXT,
+    kind        TEXT NOT NULL,                     -- 'reclassify'|'calibration'|'recalibration'
+    status      TEXT NOT NULL DEFAULT 'running',   -- 'running'|'done'|'error'
+    message     TEXT,
+    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_id ON jobs (id);
+
+-- ==========================================================================
 -- CATEGORY PUBLISH (Sprint F) — per-(circuit, fixture_type) HA publish gate.
 -- Replaces the per-fixture `fixtures.publish_to_ha` flag as the source of
 -- truth for the fixture_publisher. Each row toggles whether the HA discovery
@@ -1305,6 +1322,42 @@ def upsert_training_state(conn: sqlite3.Connection, circuit: str, **kwargs) -> N
     _upsert_by_circuit(conn, "training_state", circuit, **kwargs)
 
 
+# ── Background job status (§2.4) ─────────────────────────────────────────────────
+
+def start_job(conn: sqlite3.Connection, kind: str, circuit: Optional[str] = None,
+              message: Optional[str] = None) -> int:
+    """Record a long-running background op as 'running'; returns its id. Also prunes
+    finished rows older than 2 days so the table stays tiny."""
+    cur = conn.execute(
+        "INSERT INTO jobs (circuit, kind, status, message) VALUES (?, ?, 'running', ?)",
+        (circuit, kind, message))
+    conn.execute("DELETE FROM jobs WHERE status <> 'running' "
+                 "AND created_at < datetime('now', '-2 days')")
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def finish_job(conn: sqlite3.Connection, job_id: int, status: str = "done",
+               message: Optional[str] = None) -> None:
+    conn.execute(
+        "UPDATE jobs SET status = ?, message = ?, finished_at = ? WHERE id = ?",
+        (status, message, datetime.now(timezone.utc).isoformat(), job_id))
+    conn.commit()
+
+
+def get_jobs_since(conn: sqlite3.Connection, since_id: int = 0,
+                   limit: int = 20) -> list:
+    """Jobs with id > ``since_id`` (newest first) for the UI poll-and-toast."""
+    try:
+        rows = conn.execute(
+            "SELECT id, circuit, kind, status, message, created_at, finished_at "
+            "FROM jobs WHERE id > ? ORDER BY id DESC LIMIT ?",
+            (since_id, limit)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [dict(r) for r in rows]
+
+
 def get_sensitivity_config(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM sensitivity_config WHERE circuit = ?", (circuit,)
@@ -1602,6 +1655,70 @@ def _do_event_upsert(conn: sqlite3.Connection, event: dict) -> None:
     conn.execute(sql, list(event.values()))
 
 
+# Shared upsert that adds a signed delta to one (circuit, hour) ledger bucket.
+_HOURLY_VOLUME_DELTA_SQL = (
+    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) VALUES (?, ?, ?) "
+    "ON CONFLICT (circuit, hour_ts) "
+    "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres"
+)
+
+
+def apply_effective_volume(
+    conn: sqlite3.Connection, event_id: str, circuit: str, start_ts,
+    new_effective: float,
+) -> float:
+    """THE single chokepoint for the hourly-volume ledger math (§2.5).
+
+    Reverses the event's PRIOR applied contribution (from its recorded bucket),
+    applies ``new_effective`` to the bucket derived from ``start_ts``, then records
+    the new applied bookkeeping (``hourly_volume_applied_litres`` / ``_bucket``). Every
+    per-event volume write — the live upsert AND every reprocess / recompute / merge
+    path — routes through here so the events ↔ hourly_volume ledger can never drift
+    (previously this reverse/apply/bookkeep math was hand-copied at ~8 sites). The
+    caller writes ``events.volume_litres_effective`` to the SAME returned value;
+    ``volume_ledger_discrepancy()`` + its test pin the invariant. Assumes a caller
+    transaction. Returns the rounded effective volume actually applied.
+    """
+    new_effective = round(float(new_effective or 0.0), 3)
+    # NULL bucket when nothing is applied (a phantom/cross-talk zero) — "no
+    # contribution lives anywhere", the convention the reprocess paths already used.
+    new_bucket = _hour_bucket_for(start_ts) if new_effective else None
+    prev = conn.execute(
+        "SELECT hourly_volume_applied_litres, hourly_volume_applied_bucket "
+        "FROM events WHERE id = ?", (event_id,),
+    ).fetchone()
+    prev_litres = float(prev["hourly_volume_applied_litres"] or 0.0) if prev else 0.0
+    prev_bucket = prev["hourly_volume_applied_bucket"] if prev else None
+    # Reverse the prior contribution, then apply the new one (handles a bucket move
+    # AND the same-bucket case — net delta — identically).
+    if prev_bucket and prev_litres:
+        conn.execute(_HOURLY_VOLUME_DELTA_SQL, (circuit, prev_bucket, -prev_litres))
+    if new_bucket and new_effective:
+        conn.execute(_HOURLY_VOLUME_DELTA_SQL, (circuit, new_bucket, new_effective))
+    conn.execute(
+        "UPDATE events SET hourly_volume_applied_litres = ?, "
+        "  hourly_volume_applied_bucket = ? WHERE id = ?",
+        (new_effective, new_bucket, event_id),
+    )
+    return new_effective
+
+
+def volume_ledger_discrepancy(conn: sqlite3.Connection,
+                              circuit: Optional[str] = None) -> float:
+    """SUM(events.hourly_volume_applied_litres) − SUM(hourly_volume.volume_litres);
+    ~0 when the ledger is consistent. Backs the §2.5 reconciliation test + is safe to
+    log as a diagnostic. Rounded to swallow float noise."""
+    where = "" if circuit is None else " WHERE circuit = ?"
+    args = () if circuit is None else (circuit,)
+    applied = conn.execute(
+        "SELECT COALESCE(SUM(hourly_volume_applied_litres), 0) FROM events" + where,
+        args).fetchone()[0]
+    ledger = conn.execute(
+        "SELECT COALESCE(SUM(volume_litres), 0) FROM hourly_volume" + where,
+        args).fetchone()[0]
+    return round(float(applied) - float(ledger), 3)
+
+
 def upsert_event_and_apply_hourly_volume(
     conn: sqlite3.Connection,
     event: dict,
@@ -1632,50 +1749,16 @@ def upsert_event_and_apply_hourly_volume(
 
     event_id = event["id"]
     circuit = event["circuit"]
-    new_bucket = _hour_bucket_for(event["start_ts"])
 
     with transaction(conn):
-        # (1) Read prior applied state.
-        prev = conn.execute(
-            "SELECT hourly_volume_applied_litres, hourly_volume_applied_bucket "
-            "FROM events WHERE id = ?",
-            (event_id,),
-        ).fetchone()
-        prev_litres = float(prev["hourly_volume_applied_litres"] or 0) if prev else 0.0
-        prev_bucket = prev["hourly_volume_applied_bucket"] if prev else None
-        is_new = prev is None
-
-        # (2) UPSERT the event (preserves applied bookkeeping columns).
+        # is_new = no prior row at all (caller uses it to bump training counters).
+        is_new = conn.execute(
+            "SELECT 1 FROM events WHERE id = ?", (event_id,)).fetchone() is None
+        # UPSERT the event — preserves the applied-bookkeeping columns, so the
+        # chokepoint below reads the PRIOR applied state (to reverse it) correctly.
         _do_event_upsert(conn, event)
-
-        # (3) Reverse prior contribution if any.
-        if prev_bucket and prev_litres != 0:
-            conn.execute(
-                "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-                "VALUES (?, ?, ?) "
-                "ON CONFLICT (circuit, hour_ts) "
-                "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
-                (circuit, prev_bucket, -prev_litres),
-            )
-
-        # (4) Apply new contribution (skip if zero — keeps hourly_volume clean).
-        if new_bucket and new_effective_volume:
-            conn.execute(
-                "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-                "VALUES (?, ?, ?) "
-                "ON CONFLICT (circuit, hour_ts) "
-                "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
-                (circuit, new_bucket, new_effective_volume),
-            )
-
-        # (5) Record new applied state on the event row.
-        conn.execute(
-            "UPDATE events "
-            "SET hourly_volume_applied_litres = ?, "
-            "    hourly_volume_applied_bucket = ? "
-            "WHERE id = ?",
-            (new_effective_volume, new_bucket, event_id),
-        )
+        apply_effective_volume(conn, event_id, circuit, event["start_ts"],
+                               new_effective_volume)
 
     return is_new
 
@@ -1838,8 +1921,10 @@ def coalesce_low_flow_events(
             _finalize_derived_verdicts(feats, _acal)
             new_eff = float(feats["volume_litres_effective"] or 0.0)
 
-            # (1) Reverse every member's applied hourly contribution.
-            for m in g:
+            # (1) Reverse each ABSORBED member's applied contribution. The survivor's
+            # own prior contribution is reversed by the §2.5 chokepoint below, so it
+            # must NOT be double-reversed here.
+            for m in g[1:]:
                 applied = float(m["hourly_volume_applied_litres"] or 0.0)
                 bucket = m["hourly_volume_applied_bucket"]
                 if bucket and applied:
@@ -1849,16 +1934,8 @@ def coalesce_low_flow_events(
                         "SET volume_litres = volume_litres + excluded.volume_litres",
                         (circuit, bucket, -applied),
                     )
-            # (2) Apply the survivor's merged effective volume to its bucket.
-            s_bucket = _hour_bucket_for(survivor["start_ts"])
-            if s_bucket and new_eff:
-                conn.execute(
-                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-                    "VALUES (?, ?, ?) ON CONFLICT (circuit, hour_ts) DO UPDATE "
-                    "SET volume_litres = volume_litres + excluded.volume_litres",
-                    (circuit, s_bucket, new_eff),
-                )
-            # (3) Rewrite the survivor row (verdict reset; match cleared).
+            # (2) Rewrite the survivor row (verdict reset; match cleared). Volume +
+            # ledger go through the chokepoint right after.
             conn.execute(
                 "UPDATE events SET end_ts = ?, duration_seconds = ?, "
                 "  volume_litres = ?, volume_litres_effective = ?, "
@@ -1867,15 +1944,15 @@ def coalesce_low_flow_events(
                 "  pressure_delta_psi = ?, is_low_flow_dribble = ?, "
                 "  is_pressure_restoration_phantom = ?, is_cross_talk = ?, "
                 "  excluded_from_training = ?, match_rejection_reason = ?, "
-                "  cluster_id = NULL, matched_fixture_type = NULL, matched_via = NULL, "
-                "  hourly_volume_applied_litres = ?, hourly_volume_applied_bucket = ? "
+                "  cluster_id = NULL, matched_fixture_type = NULL, matched_via = NULL "
                 "WHERE id = ?",
                 (end_ts.isoformat() if end_ts else None, duration, total_vol, new_eff,
                  feats["volume_estimation_method"], avg, avg, peak, total_vol, delta,
                  feats["is_low_flow_dribble"], feats["is_pressure_restoration_phantom"],
                  feats["is_cross_talk"], feats["excluded_from_training"],
-                 feats["match_rejection_reason"], new_eff, s_bucket, sid),
+                 feats["match_rejection_reason"], sid),
             )
+            apply_effective_volume(conn, sid, circuit, survivor["start_ts"], new_eff)
             # (4) Delete absorbed rows (cascades waveforms / zone_flow_history).
             for m in g[1:]:
                 conn.execute(
@@ -2292,10 +2369,6 @@ def _apply_event_verdicts(
         else None
     )
 
-    prev_applied = float(row["hourly_volume_applied_litres"] or 0.0)
-    prev_bucket = row["hourly_volume_applied_bucket"] or _hour_bucket_for(row["start_ts"])
-    delta = new_effective - prev_applied
-
     with transaction(conn):
         conn.execute(
             "UPDATE events SET "
@@ -2309,19 +2382,8 @@ def _apply_event_verdicts(
              round(new_effective, 3), method, excluded, reason,
              event_id, circuit),
         )
-        if prev_bucket and abs(delta) > 1e-9:
-            conn.execute(
-                "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-                "VALUES (?, ?, ?) "
-                "ON CONFLICT (circuit, hour_ts) "
-                "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
-                (circuit, prev_bucket, delta),
-            )
-        conn.execute(
-            "UPDATE events SET hourly_volume_applied_litres = ?, "
-            "  hourly_volume_applied_bucket = ? WHERE id = ? AND circuit = ?",
-            (round(new_effective, 3), prev_bucket, event_id, circuit),
-        )
+        # §2.5 — the ledger reverse/apply/bookkeep goes through the one chokepoint.
+        apply_effective_volume(conn, event_id, circuit, row["start_ts"], new_effective)
 
     day = (row["start_ts"] or "")[:10]
     if day:
@@ -4095,10 +4157,6 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
         ) else 0
         new_reason = "pulsing_supply" if is_degraded else None
 
-        prev_applied = float(row["hourly_volume_applied_litres"] or 0.0)
-        prev_bucket = row["hourly_volume_applied_bucket"] or _hour_bucket_for(row["start_ts"])
-        delta = restored - prev_applied   # phantom had effective 0 → applied 0
-
         with transaction(conn):
             conn.execute(
                 "UPDATE events SET "
@@ -4110,21 +4168,9 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
                 "WHERE id = ?",
                 (round(restored, 3), new_method, new_excluded, new_reason, row["id"]),
             )
-            if prev_bucket and abs(delta) > 1e-9:
-                conn.execute(
-                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-                    "VALUES (?, ?, ?) "
-                    "ON CONFLICT (circuit, hour_ts) "
-                    "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
-                    (row["circuit"], prev_bucket, delta),
-                )
-            conn.execute(
-                "UPDATE events SET "
-                "  hourly_volume_applied_litres = ?, "
-                "  hourly_volume_applied_bucket = ? "
-                "WHERE id = ?",
-                (round(restored, 3), prev_bucket, row["id"]),
-            )
+            # §2.5 — restore the real volume to the ledger via the one chokepoint.
+            apply_effective_volume(conn, row["id"], row["circuit"], row["start_ts"],
+                                   restored)
 
         repaired += 1
         litres_restored += restored
@@ -4133,7 +4179,7 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
             affected_days.add((row["circuit"], day))
         log.info(
             "phantom-repair: event %s un-flagged (restored %.3f L to bucket %s)",
-            row["id"], restored, prev_bucket,
+            row["id"], restored, _hour_bucket_for(row["start_ts"]),
         )
 
     for circ, day in affected_days:

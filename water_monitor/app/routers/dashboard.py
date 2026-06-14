@@ -92,6 +92,15 @@ async def dashboard_live(request: Request):
     return JSONResponse(result)
 
 
+@router.get("/api/jobs")
+async def jobs_poll(request: Request, since: int = 0):
+    """Recent background-job statuses with id > ``since`` for the UI poll-and-toast
+    (§2.4 reclassify / calibration feedback). Newest first."""
+    orch = _get_orchestrator(request)
+    from ..database import get_jobs_since
+    return JSONResponse({"jobs": get_jobs_since(orch.db, since_id=since)})
+
+
 @router.get("/api/chart/{circuit}")
 async def chart_data(circuit: str, request: Request):
     """Return hourly volume data for chart refresh."""

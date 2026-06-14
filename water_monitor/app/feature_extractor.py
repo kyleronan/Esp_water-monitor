@@ -898,7 +898,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
         extreme outliers is negligible and not worth a full retrain. This is a
         deliberate scope decision, not an oversight.
     """
-    from .database import transaction, compute_daily_summary
+    from .database import transaction, compute_daily_summary, apply_effective_volume
 
     # Skip manually-classified rows so a startup re-run never re-flags an event
     # the user deliberately un-marked. Column-guarded because the back-compat
@@ -943,9 +943,6 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
         ):
             continue
 
-        prev_applied = float(row["hourly_volume_applied_litres"] or 0.0)
-        prev_bucket = row["hourly_volume_applied_bucket"]
-
         with transaction(conn):
             conn.execute(
                 "UPDATE events SET "
@@ -957,24 +954,8 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                 "WHERE id = ?",
                 (row["id"],),
             )
-            # Reverse the prior hourly_volume contribution ONLY when there is
-            # one recorded — skip cleanly on NULL/0 bookkeeping (no reversal
-            # row, no crash).
-            if prev_bucket and prev_applied != 0:
-                conn.execute(
-                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-                    "VALUES (?, ?, ?) "
-                    "ON CONFLICT (circuit, hour_ts) "
-                    "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
-                    (row["circuit"], prev_bucket, -prev_applied),
-                )
-            conn.execute(
-                "UPDATE events SET "
-                "  hourly_volume_applied_litres = 0, "
-                "  hourly_volume_applied_bucket = NULL "
-                "WHERE id = ?",
-                (row["id"],),
-            )
+            # §2.5 — zero the ledger contribution via the one chokepoint.
+            apply_effective_volume(conn, row["id"], row["circuit"], row["start_ts"], 0)
 
         flagged += 1
         day = (row["start_ts"] or "")[:10]   # UTC date portion of ISO ts
@@ -984,7 +965,9 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "phantom-reprocess: event %s flagged (duration=%.0fs ΔP=%.2f); "
             "reversed %.3f L from hourly bucket %s",
             row["id"], row["duration_seconds"] or 0.0,
-            row["pressure_delta_psi"] or 0.0, prev_applied, prev_bucket,
+            row["pressure_delta_psi"] or 0.0,
+            float(row["hourly_volume_applied_litres"] or 0.0),
+            row["hourly_volume_applied_bucket"],
         )
 
     # Recompute the daily_summary for every affected day so the History
@@ -1070,8 +1053,6 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                 row["flow_integral_litres"], row["flow_on_ratio"]
             ):
                 continue
-            prev_applied = float(row["hourly_volume_applied_litres"] or 0.0)
-            prev_bucket = row["hourly_volume_applied_bucket"]
             with transaction(conn):
                 conn.execute(
                     "UPDATE events SET "
@@ -1083,19 +1064,9 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                     "WHERE id = ?",
                     (row["id"],),
                 )
-                if prev_bucket and prev_applied != 0:
-                    conn.execute(
-                        "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-                        "VALUES (?, ?, ?) "
-                        "ON CONFLICT (circuit, hour_ts) "
-                        "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
-                        (row["circuit"], prev_bucket, -prev_applied),
-                    )
-                conn.execute(
-                    "UPDATE events SET hourly_volume_applied_litres = 0, "
-                    "  hourly_volume_applied_bucket = NULL WHERE id = ?",
-                    (row["id"],),
-                )
+                # §2.5 — zero the ledger contribution via the one chokepoint.
+                apply_effective_volume(conn, row["id"], row["circuit"],
+                                       row["start_ts"], 0)
             cross_talk_flagged += 1
             day = (row["start_ts"] or "")[:10]
             if day:
@@ -1148,7 +1119,7 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
 
     Returns a summary dict with the counts the endpoint relays to the UI.
     """
-    from .database import _hour_bucket_for, transaction
+    from .database import _hour_bucket_for, transaction, apply_effective_volume
 
     rows = conn.execute(
         "SELECT id, circuit, start_ts, degraded_supply, "
@@ -1205,8 +1176,6 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
             new_rejection = None
 
         prev_applied = float(row["hourly_volume_applied_litres"] or 0.0)
-        prev_bucket = row["hourly_volume_applied_bucket"]
-        new_bucket = _hour_bucket_for(row["start_ts"])
 
         # excluded_from_training mirrors (composite OR degraded). Composite
         # status doesn't change here, so we OR the new degraded verdict in.
@@ -1231,29 +1200,9 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
                     row["id"],
                 ),
             )
-            if prev_bucket and prev_applied != 0:
-                conn.execute(
-                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-                    "VALUES (?, ?, ?) "
-                    "ON CONFLICT (circuit, hour_ts) "
-                    "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
-                    (row["circuit"], prev_bucket, -prev_applied),
-                )
-            if new_bucket and new_effective:
-                conn.execute(
-                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-                    "VALUES (?, ?, ?) "
-                    "ON CONFLICT (circuit, hour_ts) "
-                    "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
-                    (row["circuit"], new_bucket, new_effective),
-                )
-            conn.execute(
-                "UPDATE events SET "
-                "  hourly_volume_applied_litres = ?, "
-                "  hourly_volume_applied_bucket = ? "
-                "WHERE id = ?",
-                (new_effective, new_bucket, row["id"]),
-            )
+            # §2.5 — reverse/apply/bookkeep via the one chokepoint.
+            apply_effective_volume(conn, row["id"], row["circuit"], row["start_ts"],
+                                   new_effective)
 
         if new_is_degraded:
             flipped_to_degraded += 1

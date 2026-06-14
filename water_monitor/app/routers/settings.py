@@ -448,6 +448,7 @@ async def recalibrate(circuit: str, request: Request):
             status_code=503,
         )
 
+    kind = "full" if fixtures_changed else "partial"
     if fixtures_changed:
         # Full recalibration — wipe events and restart from scratch
         await orch.training_manager.trigger_full_recalibration(
@@ -464,6 +465,12 @@ async def recalibrate(circuit: str, request: Request):
             await orch.training_manager.start_calibration(
                 circuit, calibration_days)
 
+    # §2.4 — confirm the (fast) recalibration trigger; the slow re-lock at the next
+    # activation is tracked separately by _fit_and_lock.
+    from ..database import start_job, finish_job
+    job = start_job(orch.db, "recalibration", circuit, "Recalibration…")
+    finish_job(orch.db, job, "done",
+               f"{circuit}: {kind} recalibration started — new learning period")
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 

@@ -26,14 +26,24 @@ async def _bg_reclassify(circuit: str) -> None:
     """Fire-and-forget k-NN reclassify after a label change — offloaded so the
     label POST returns immediately (reclassify can be slow on a large history).
     Runs on a private connection under the write lock (dev.8 run_isolated_write),
-    so it never races live writes; errors are logged, not surfaced. The user's own
-    label + any cycle-mates are already applied synchronously before this fires."""
+    so it never races live writes. §2.4 — tracked as a job so a FAILURE is surfaced
+    to the UI (success is silent; the label change already gave instant feedback).
+    The user's own label + any cycle-mates are applied synchronously before this."""
+    from ..database import (reclassify_all_events_from_signatures,
+                            run_isolated_write, start_job, finish_job)
+    from ..config import DB_PATH
+
+    def _work(c):
+        job = start_job(c, "reclassify", circuit, "Reclassifying events…")
+        try:
+            reclassify_all_events_from_signatures(c, circuit)
+            finish_job(c, job, "done", "Reclassify complete")
+        except Exception:
+            finish_job(c, job, "error", "Reclassify failed — see addon log")
+            raise
+
     try:
-        from ..database import (reclassify_all_events_from_signatures,
-                                run_isolated_write)
-        from ..config import DB_PATH
-        await run_isolated_write(
-            DB_PATH, lambda c: reclassify_all_events_from_signatures(c, circuit))
+        await run_isolated_write(DB_PATH, _work)
     except Exception as e:
         log.warning("[%s] background reclassify failed: %s", circuit, e)
 

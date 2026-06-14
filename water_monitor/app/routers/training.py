@@ -58,13 +58,23 @@ def _applicable_types(orch, circuit) -> list:
 
 async def _bg_reclassify_training(circuit: str) -> None:
     """Single deferred reclassify after a checklist item is accepted/rejected —
-    serialized + private connection (dev.8), so it never races live writes."""
+    serialized + private connection (dev.8), so it never races live writes. §2.4 —
+    tracked as a job so a FAILURE surfaces to the UI (success is silent)."""
+    from ..database import (reclassify_all_events_from_signatures,
+                            run_isolated_write, start_job, finish_job)
+    from ..config import DB_PATH
+
+    def _work(c):
+        job = start_job(c, "reclassify", circuit, "Reclassifying events…")
+        try:
+            reclassify_all_events_from_signatures(c, circuit)
+            finish_job(c, job, "done", "Reclassify complete")
+        except Exception:
+            finish_job(c, job, "error", "Reclassify failed — see addon log")
+            raise
+
     try:
-        from ..database import (reclassify_all_events_from_signatures,
-                                run_isolated_write)
-        from ..config import DB_PATH
-        await run_isolated_write(
-            DB_PATH, lambda c: reclassify_all_events_from_signatures(c, circuit))
+        await run_isolated_write(DB_PATH, _work)
     except Exception as e:
         log.warning("[%s] training reclassify failed: %s", circuit, e)
 

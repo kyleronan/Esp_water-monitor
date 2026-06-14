@@ -116,7 +116,8 @@ def recompute_volume_and_active_flow(
 
     Returns counts: recomputed, skipped (no history), degraded, unchanged.
     """
-    from .database import transaction, compute_daily_summary, _hour_bucket_for
+    from .database import (transaction, compute_daily_summary,
+                           apply_effective_volume)
     from .feature_extractor import _finalize_derived_verdicts
     from .artifact_calibration import load_artifact_calibration
 
@@ -196,10 +197,6 @@ def recompute_volume_and_active_flow(
         if original is None:
             original = old_volume
 
-        prev_applied = float(r["hourly_volume_applied_litres"] or 0.0)
-        prev_bucket = r["hourly_volume_applied_bucket"] or _hour_bucket_for(r["start_ts"])
-        delta = eff - prev_applied
-
         with transaction(conn):
             conn.execute(
                 "UPDATE events SET "
@@ -229,19 +226,8 @@ def recompute_volume_and_active_flow(
                     r["id"], circuit,
                 ),
             )
-            if prev_bucket and abs(delta) > 1e-9:
-                conn.execute(
-                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-                    "VALUES (?, ?, ?) "
-                    "ON CONFLICT (circuit, hour_ts) "
-                    "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres",
-                    (circuit, prev_bucket, delta),
-                )
-            conn.execute(
-                "UPDATE events SET hourly_volume_applied_litres = ?, "
-                "  hourly_volume_applied_bucket = ? WHERE id = ? AND circuit = ?",
-                (round(eff, 3), prev_bucket, r["id"], circuit),
-            )
+            # §2.5 — reverse/apply/bookkeep via the one chokepoint.
+            apply_effective_volume(conn, r["id"], circuit, r["start_ts"], eff)
 
         day = (r["start_ts"] or "")[:10]
         if day:

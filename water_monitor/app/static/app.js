@@ -189,10 +189,43 @@ async function fetchLiveState() {
   } catch (_) {}
 }
 
+// ── Background-job status poll → toast (§2.4) ──────────────────────
+// A job appears as 'running' first and 'done'/'error' later, so we track which
+// ids we've toasted rather than a high-water-mark. The first poll only baselines
+// existing jobs so page history doesn't toast on every load.
+const _jobsToasted = new Set();
+let _jobsInitialized = false;
+async function pollJobs() {
+  try {
+    const resp = await fetch(`${BASE}/api/jobs?since=0`,
+                             { signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) return;
+    const { jobs } = await resp.json();
+    if (!Array.isArray(jobs)) return;
+    if (!_jobsInitialized) {
+      for (const j of jobs) if (j.status !== 'running') _jobsToasted.add(j.id);
+      _jobsInitialized = true;
+      return;
+    }
+    for (const j of jobs.slice().reverse()) {        // oldest-first
+      if (j.status === 'running' || _jobsToasted.has(j.id)) continue;
+      _jobsToasted.add(j.id);
+      if (j.status === 'error') {
+        toast(j.message || 'A background job failed', 'error');
+      } else if (j.kind !== 'reclassify') {
+        // Reclassify success is silent (frequent; the label UI already updated).
+        toast(j.message || 'Done', 'success');
+      }
+    }
+  } catch (_) {}
+}
+
 // Start polling on page load — always runs
 window.addEventListener('DOMContentLoaded', () => {
   fetchLiveState();                    // immediate first update
   setInterval(fetchLiveState, 5000);  // then every 5 seconds
+  pollJobs();                          // baseline existing jobs
+  setInterval(pollJobs, 6000);        // then toast new completions
 });
 
 // Modal event wiring (only runs if the modal scaffold is present in base.html)

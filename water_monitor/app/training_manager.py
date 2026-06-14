@@ -367,12 +367,24 @@ class TrainingManager:
 
     async def _fit_and_lock(self, circuit: str, source: str) -> Dict[str, Any]:
         import functools
+        from .database import start_job, finish_job
+        circuit_cfg = self._cfg.get_circuit(circuit)
+        label = circuit_cfg.label if circuit_cfg else circuit
+        # §2.4 — track the (slow) re-lock so the UI can toast its success/failure.
+        # Covers BOTH activation and the dev retrain (both route through here).
+        job = start_job(self._db, "calibration", circuit, f"Calibrating {label}…")
         loop = asyncio.get_running_loop()
         try:
-            return await loop.run_in_executor(
+            report = await loop.run_in_executor(
                 None, functools.partial(self._fit_and_lock_sync, circuit, source))
+            n_fit = sum(1 for r in report.values()
+                        if isinstance(r, dict) and r.get("status") == "fit")
+            finish_job(self._db, job, "done",
+                       f"{label}: calibration locked ({n_fit} home-fit)")
+            return report
         except Exception as e:
             log.error("[%s] fit-and-lock failed: %s", circuit, e)
+            finish_job(self._db, job, "error", f"{label}: calibration failed")
             return {}
 
     async def _notify_calibration_report(self, circuit: str,
