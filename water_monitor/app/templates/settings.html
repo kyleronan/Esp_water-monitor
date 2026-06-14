@@ -81,6 +81,14 @@
       <span class="sett-nav-label">Re-run Setup</span>
     </button>
 
+    {% if dev_tools %}
+    <button class="sett-nav-btn" id="sett-btn-dev"
+            onclick="settNav('dev')">
+      <span class="sett-nav-icon">🛠</span>
+      <span class="sett-nav-label">Dev Tools</span>
+    </button>
+    {% endif %}
+
     <div class="sett-mode-divider">
       <button class="sett-mode-btn" id="sett-mode-btn" onclick="toggleSettMode()">
         ⚙ Show Advanced
@@ -343,18 +351,6 @@
             <button type="submit" class="btn btn-warning btn-sm">Start Recalibration</button>
           </form>
         </details>
-        {% if dev_tools %}
-        <details class="recal-details" style="margin-top:.5rem">
-          <summary>🛠 Dev tools</summary>
-          <p class="sett-help" style="margin:.5rem 0">
-            Instant re-fit + re-lock of the rule calibration from the current
-            labels (no new learning period). Testing only — hidden unless
-            <code>WM_DEV_TOOLS</code> is set.
-          </p>
-          <button type="button" class="btn btn-secondary btn-sm"
-                  onclick="devRetrain('{{ c.circuit }}')">Re-train now (dev)</button>
-        </details>
-        {% endif %}
         <p class="sett-cal-warning">⚠ Incorrect calibration values may cause false shutoffs or missed leaks.</p>
       </div>
 
@@ -1079,6 +1075,35 @@
         </div>
       </div>
     </div>
+
+    {% if dev_tools %}
+    {# ── Dev Tools (gated by the dev_tools add-on option) ──────────── #}
+    <div class="sett-section" id="sett-dev" style="display:none">
+      <h2 class="sett-section-title">🛠 Dev Tools</h2>
+      <p class="sett-section-desc">
+        Testing-only utilities, hidden unless the <code>dev_tools</code> add-on
+        option is enabled. Recalibration (per circuit, above) remains the normal
+        long-term mechanism.
+      </p>
+      <div class="sett-card">
+        <h3 class="sett-card-title">Re-train rule calibration</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Instantly re-fit + re-lock the per-home rule bands from the CURRENT
+          labels — no new learning period. Runs the same activation fit+freeze
+          (sanity gate included) and re-types events. The fit-vs-fallback result
+          is shown as a toast.
+        </p>
+        {% for c in circuits %}
+        <div class="dev-retrain-row"
+             style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.4rem 0">
+          <span>{{ c.display_name }}</span>
+          <button type="button" class="btn btn-secondary btn-sm"
+                  onclick="devRetrain('{{ c.circuit }}')">Re-train now</button>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
 
   </div>{# /sett-content #}
 </div>{# /sett-layout #}

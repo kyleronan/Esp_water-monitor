@@ -16,9 +16,25 @@ DB_PATH = DATA_DIR / "water_monitor.db"
 
 # Phase 1 dev/testing tools (e.g. instant rule-calibration re-fit, bypassing the
 # weeks-long recalibration). Gated OFF by default; the whole Settings → Dev tab and
-# its routes are hidden unless WM_DEV_TOOLS is truthy, so it can be disabled later.
-DEV_TOOLS = os.environ.get("WM_DEV_TOOLS", "").strip().lower() in (
-    "1", "true", "yes", "on")
+# its routes are hidden unless enabled. Controlled by the `dev_tools` add-on option
+# (settable from the HA add-on Configuration UI) with a WM_DEV_TOOLS env override
+# for local/dev runs. Read once at import — flip the option then restart the add-on.
+def _read_dev_tools() -> bool:
+    env = os.environ.get("WM_DEV_TOOLS", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    try:
+        if OPTIONS_PATH.exists():
+            with OPTIONS_PATH.open() as f:
+                return bool(json.load(f).get("dev_tools", False))
+    except Exception:
+        pass
+    return False
+
+
+DEV_TOOLS = _read_dev_tools()
 
 
 @dataclass

@@ -1,5 +1,5 @@
 name: "Water Monitor"
-version: "0.2.2-dev.25"
+version: "0.2.2-dev.26"
 slug: water_monitor
 description: >-
   Intelligent water monitoring with fixture signature recognition,
@@ -32,6 +32,7 @@ options:
   log_level: "info"
   esp_device_name: "ESP Water Shut off"
   debug_capture_propagation: false
+  dev_tools: false
   circuits:
     - circuit: "main"
       circuit_type: "fixture"
@@ -41,6 +42,7 @@ schema:
   log_level: "list(trace|debug|info|warning|error|fatal)"
   esp_device_name: "str"
   debug_capture_propagation: "bool"
+  dev_tools: "bool?"
   circuits:
     - circuit: "str"
       circuit_type: "list(fixture|zone)"
