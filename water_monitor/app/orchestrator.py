@@ -517,7 +517,7 @@ class Orchestrator:
 
         # Maturity re-check — periodically confirms/retracts provisional appliance
         # labels once an event's cycle-mates have had time to occur (Branch-2.2).
-        self._maturity_recheck = MaturityRecheck(self._db, self._cfg)
+        self._maturity_recheck = MaturityRecheck(self._db, self._cfg, self._ha)
 
         # Fixture publisher — MQTT Discovery for confirmed fixtures
         self._fixture_publisher = FixturePublisher(self._db, self._cfg, self._ha)

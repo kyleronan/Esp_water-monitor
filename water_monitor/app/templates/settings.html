@@ -488,6 +488,34 @@
         </form>
       </div>
 
+      {# Phase 3 §2 — recorder volume reconciliation (only when a cumulative volume sensor exists) #}
+      {% if c.has_volume_sensor %}
+      <div class="sett-card sett-adv-card">
+        <h3 class="sett-card-title">Volume reconciliation</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Live event volumes are integrated from the flow stream, which can under-count when
+          samples drop. The firmware's cumulative volume sensor is the source of truth.
+          When on, a settled event whose volume diverges from the recorder is corrected
+          automatically (originals are preserved). When off, divergences are recorded only —
+          review and apply them from the Device page.
+        </p>
+        <form method="post" action="{{ ingress_path }}/settings/reconcile/{{ c.circuit }}/update">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <label class="sett-radio-card" style="align-items:center">
+            <input type="checkbox" name="recorder_reconcile_auto"
+                   {% if c.recorder_reconcile_auto %}checked{% endif %}>
+            <div>
+              <div class="sett-radio-label">Auto-correct volumes from recorder
+                <span style="font-weight:400;color:var(--text-3)">(recommended)</span></div>
+              <div class="sett-radio-desc">Uncheck to flag divergences for review instead of
+                correcting them automatically.</div>
+            </div>
+          </label>
+          <button type="submit" class="btn btn-primary btn-sm" style="margin-top:8px">Save</button>
+        </form>
+      </div>
+      {% endif %}
+
       {# ESP device entities for this circuit #}
       {% if c.device_entities %}
       <div class="sett-card sett-adv-card">

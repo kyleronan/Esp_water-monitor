@@ -851,20 +851,12 @@ class HistoricalImporter:
 
         # ── Volume from firmware integration sensor ────────────────────
         # Prefer the cumulative sensor delta over avg_flow × duration to avoid
-        # downsampling errors in long events with fill-pause-fill patterns.
-        volume_litres_measured: Optional[float] = None
-        volume_in_period = [
-            float(e["state"])
-            for e in volume_hist
-            if _is_numeric(e.get("state"))
-            and math.isfinite(float(e["state"]))
-            and start <= (_parse_ts(e.get("last_changed")) or start) <= end
-        ]
-        if len(volume_in_period) >= 2:
-            delta = volume_in_period[-1] - volume_in_period[0]
-            if 0 < delta < 10_000:   # sanity: reject resets and absurd values
-                from .ha_client import vol_to_litres as _v2l
-                volume_litres_measured = round(_v2l(delta, vol_unit), 3)
+        # downsampling errors in long events with fill-pause-fill patterns. The
+        # cumulative-delta computation is shared with the §2 recorder reconcile
+        # (single source of truth); the importer consumes only the litres.
+        from .recorder_reconcile import firmware_volume_delta
+        _vd = firmware_volume_delta(volume_hist, start, end, vol_unit)
+        volume_litres_measured: Optional[float] = _vd[0] if _vd else None
 
         # Volume floor — mirrors CircuitEventDetector._end_event
         avg_flow = sum(flow_readings) / len(flow_readings) if flow_readings else 0.0

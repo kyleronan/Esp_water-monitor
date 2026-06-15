@@ -46,9 +46,10 @@ _SETTLE_HORIZON_HOURS = 6         # only re-evaluate events newer than this; > t
 class MaturityRecheck:
     """Periodically confirms or retracts provisional appliance labels on matured events."""
 
-    def __init__(self, db: sqlite3.Connection, cfg: AddonConfig):
+    def __init__(self, db: sqlite3.Connection, cfg: AddonConfig, ha=None):
         self._db = db
         self._cfg = cfg
+        self._ha = ha          # HA client — needed by the §2 recorder reconcile pass
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -99,3 +100,13 @@ class MaturityRecheck:
             log.info("[%s] maturity re-check (last %dh): %d matched, %d cleared",
                      circuit, _SETTLE_HORIZON_HOURS, res.get("events_matched", 0),
                      res.get("events_cleared", 0))
+
+        # §2 recorder reconciliation — best-effort, AFTER the reclassify job released the
+        # write lock (the reconcile pass takes its own isolated write). A reconcile bug
+        # must never break the maturity reclassify above, so it runs in its own guard.
+        if self._ha is not None:
+            try:
+                from .recorder_reconcile import reconcile_circuit_volumes
+                await reconcile_circuit_volumes(DB_PATH, self._ha, self._cfg, circuit)
+            except Exception as e:
+                log.error("[%s] recorder reconcile error: %s", circuit, e, exc_info=True)

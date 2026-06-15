@@ -74,6 +74,31 @@ async def device_page(request: Request):
                     pass
         state["waveform"] = wf
 
+        # Phase 3 §2 — recorder volume reconciliation surface: cumulative correction /
+        # flag counts + last-run time (from reconcile_state) and the current flag backlog
+        # (healthy events whose stored volume still diverges from the recorder's). Only
+        # shown when the firmware publishes a cumulative volume sensor.
+        if getattr(circuit_cfg, "volume_sensor", ""):
+            from ..database import get_reconcile_state, get_sensitivity_config
+            from ..recorder_reconcile import count_flagged_backlog
+            from ..routers.settings import _fmt_local_ts
+            from ..event_rules import get_home_timezone
+            rs = get_reconcile_state(orch.db, circuit_cfg.circuit)
+            sens = get_sensitivity_config(orch.db, circuit_cfg.circuit)
+            auto = True
+            if sens and "recorder_reconcile_auto" in sens.keys() \
+                    and sens["recorder_reconcile_auto"] is not None:
+                auto = bool(sens["recorder_reconcile_auto"])
+            state["reconcile"] = {
+                "auto": auto,
+                "corrections": (rs["corrections"] if rs else 0) or 0,
+                "flagged": (rs["flagged"] if rs else 0) or 0,
+                "last_run": _fmt_local_ts(rs["last_run_at"] if rs else None,
+                                          get_home_timezone()),
+                "last_delta": (rs["last_delta_litres"] if rs else None),
+                "backlog": count_flagged_backlog(orch.db, circuit_cfg.circuit),
+            }
+
         circuit_states.append(state)
 
     return _templates(request).TemplateResponse("device.html", {
@@ -424,4 +449,26 @@ async def leaktest_schedule(circuit: str, request: Request):
         notify_on_pass=form.get("notify_on_pass") == "on",
         notify_on_fail=form.get("notify_on_fail") == "on",
     )
+    return ingress_redirect(request, "/device")
+
+
+# ------------------------------------------------------------------
+# Recorder volume reconciliation — apply the flagged backlog (Phase 3 §2)
+# ------------------------------------------------------------------
+@router.post("/reconcile/{circuit}/apply")
+async def reconcile_apply(circuit: str, request: Request):
+    """Flag-mode review→apply: correct every healthy event whose stored recorder value
+    still diverges from its volume, from the STORED recorder value (no HA re-fetch).
+    Runs under the write lock (serialized with recompute/reclassify)."""
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    from ..database import run_isolated_write
+    from ..config import DB_PATH
+    from ..recorder_reconcile import apply_flagged_backlog
+
+    def _job(conn):
+        return apply_flagged_backlog(conn, circuit)
+
+    res = await run_isolated_write(DB_PATH, _job)
+    log.info("[%s] recorder reconcile backlog applied: %s", circuit, res)
     return ingress_redirect(request, "/device")

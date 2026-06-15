@@ -269,6 +269,11 @@ async def settings_page(request: Request):
             "anomaly_shutoff_ready": _anomaly_shutoff_ready(sdict),
             "anomaly_shutoff_min_n": MIN_N_FOR_SHUTOFF,
             "anomaly_shutoff_min_days": MIN_LIVE_DAYS_FOR_SHUTOFF,
+            # Phase 3 §2 — recorder volume reconciliation. Auto-correct is the default
+            # (NULL ⇒ on); the toggle only renders when a cumulative volume sensor exists.
+            "has_volume_sensor": bool(getattr(circuit_cfg, "volume_sensor", "")),
+            "recorder_reconcile_auto": (
+                0 if sdict.get("recorder_reconcile_auto") == 0 else 1),
             "alerts": alerts,
             "training": training,
             # When the last learning period completed (UTC→local). After activation
@@ -429,6 +434,20 @@ async def anomaly_update(circuit: str, request: Request):
     if level not in _ANOMALY_RESPONSE_LEVELS:
         level = "notify"
     upsert_sensitivity_config(orch.db, circuit, anomaly_response=level)
+    return ingress_redirect(request, f"/settings#circuit-{circuit}")
+
+
+@router.post("/reconcile/{circuit}/update")
+async def reconcile_update(circuit: str, request: Request):
+    """Phase 3 §2 — per-circuit recorder reconciliation mode. Checkbox present ⇒
+    auto-correct; absent ⇒ flag-only (record divergences, don't change volumes)."""
+    circuit = resolve_circuit(circuit)
+    form = await request.form()
+    orch = _orch(request)
+    from ..database import upsert_sensitivity_config
+
+    auto = 1 if form.get("recorder_reconcile_auto") == "on" else 0
+    upsert_sensitivity_config(orch.db, circuit, recorder_reconcile_auto=auto)
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 

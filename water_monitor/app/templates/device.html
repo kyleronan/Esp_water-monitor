@@ -238,6 +238,62 @@
   </div>
   {% endif %}
 
+  {# Phase 3 §2 — recorder volume reconciliation #}
+  {% if c.reconcile %}
+  <div class="dev-leak-card">
+    <details class="advanced-details">
+      <summary>Volume reconciliation</summary>
+      <div class="sett-help" style="margin:.4rem 0 .6rem">
+        Live event volumes are integrated from the flow stream, which can under-count when
+        samples drop. The firmware's cumulative volume sensor is the source of truth — its
+        recorder delta over each settled event is compared hourly.
+        {% if c.reconcile.auto %}Divergent volumes are corrected automatically.
+        {% else %}This circuit is in <strong>flag-only</strong> mode — divergences are
+        recorded but not changed until you apply them.{% endif %}
+        Per-circuit auto/flag is set under Settings.
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label">Mode</span>
+        <span class="dev-reading-mono">{{ "Auto-correct" if c.reconcile.auto else "Flag only" }}</span>
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="Events whose volume was corrected to the recorder value.">
+          Corrections applied
+        </span>
+        <span class="dev-reading-mono">{{ c.reconcile.corrections }}</span>
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="Divergent events recorded but not yet corrected (flag-only mode).">
+          Flagged for review
+        </span>
+        <span class="dev-reading-mono">{{ c.reconcile.flagged }}</span>
+      </div>
+      {% if c.reconcile.last_run %}
+      <div class="dev-sched-row">
+        <span class="dev-sched-label">Last checked</span>
+        <span class="dev-reading-mono">{{ c.reconcile.last_run }}</span>
+      </div>
+      {% endif %}
+      {% if c.reconcile.backlog %}
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="Healthy events whose stored recorder value still diverges from their volume.">
+          Pending corrections
+        </span>
+        <span class="dev-reading-mono">{{ c.reconcile.backlog }}</span>
+      </div>
+      <form method="post" action="{{ ingress_path }}/device/reconcile/{{ c.circuit }}/apply"
+            style="margin-top:.6rem"
+            onsubmit="return confirm('Correct {{ c.reconcile.backlog }} event volume(s) to the recorder value? This is reversible (original volumes are preserved).');">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-secondary btn-sm">
+          Apply {{ c.reconcile.backlog }} recorder correction(s) now
+        </button>
+      </form>
+      {% endif %}
+    </details>
+  </div>
+  {% endif %}
+
 </section>
 {% endfor %}
 
