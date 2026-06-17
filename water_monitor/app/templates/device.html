@@ -1,7 +1,14 @@
 {% extends "base.html" %}
 {% block content %}
 
-<h1 class="dev-page-title">Device</h1>
+<h1 class="dev-page-title">Valve &amp; Tests</h1>
+
+<p class="muted fx-page-intro" style="margin:0 0 18px 0">
+  Control your water valve and run safety checks here. Open or close the valve for each
+  line, run the <strong>Micro Leak Test</strong> (briefly closes the valve to check for
+  tiny leaks while no water is being used), and clear a safety shut-off if one was
+  triggered.
+</p>
 
 {% for c in circuits %}
 <section class="dev-circuit-card" data-circuit="{{ c.circuit }}">

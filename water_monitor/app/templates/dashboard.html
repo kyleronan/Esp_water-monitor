@@ -4,7 +4,7 @@
 {# ── Away mode banner (only when active) ─────────────────────────── #}
 {% if away_mode %}
 <div class="dash-away-banner">
-  <span>🏖 <strong>Away mode active</strong> — baseline learning paused.
+  <span>🏖 <strong>Away mode active</strong> — learning your normal usage is paused.
     Leak tests and valve control still running.</span>
   <form method="post" action="{{ ingress_path }}/settings/away-mode/toggle"
         style="margin:0">
@@ -14,11 +14,33 @@
 </div>
 {% endif %}
 
+{# Compute a single page-level "what to do next" hint from state already in
+   context (no new backend data). Branch on training.state first, then events —
+   so live-with-no-events reads differently from a circuit still calibrating. #}
+{% set ds = namespace(fault=false, labelling=false, calibrating=false, live_zero=false) %}
+{% for c in circuits %}
+  {% if c.fault_active %}{% set ds.fault = true %}{% endif %}
+  {% if c.training.state == 'labelling' %}{% set ds.labelling = true %}{% endif %}
+  {% if c.training.state == 'calibrating' %}{% set ds.calibrating = true %}{% endif %}
+  {% if c.training.state == 'live' and (c.training.events_collected or 0) == 0 %}{% set ds.live_zero = true %}{% endif %}
+{% endfor %}
+
 {# ── Title row with Home/Away pill toggle on the right ──────────── #}
 <div class="dash-title-row">
   <div>
     <h1 class="dash-title">Dashboard</h1>
     <span class="dash-subtitle">Live readings · updated every 5s</span>
+    {% if ds.fault %}
+    <span class="dash-next-chip is-alert">⚠ Action needed — reset the safety fault on the affected line below.</span>
+    {% elif ds.labelling %}
+    <a class="dash-next-chip" href="{{ ingress_path }}/fixtures">👉 Last step: activate your line on Water Use →</a>
+    {% elif ds.calibrating %}
+    <a class="dash-next-chip" href="{{ ingress_path }}/training">👉 While it learns: run your fixtures in the Training helper →</a>
+    {% elif ds.live_zero %}
+    <span class="dash-next-chip">Run some water to get started — your first events will appear here.</span>
+    {% else %}
+    <span class="dash-next-chip is-ok">✅ All set — monitoring for leaks.</span>
+    {% endif %}
   </div>
   <form method="post" action="{{ ingress_path }}/settings/away-mode/toggle"
         class="dash-away-toggle-form">
@@ -108,9 +130,10 @@
     {% if c.degraded_active %}
     <div class="dash-alert dash-alert-degraded" aria-live="polite">
       <div class="dash-alert-body">
-        <span class="dash-alert-title">⚠ Degraded supply</span>
+        <span class="dash-alert-title">⚠ Unsteady water pressure</span>
         <span class="dash-alert-detail">
-          {{ c.degraded_events_24h }} affected event{% if c.degraded_events_24h != 1 %}s{% endif %} in past 24h — volume totals are estimated.
+          {{ c.degraded_events_24h }} affected event{% if c.degraded_events_24h != 1 %}s{% endif %} in past 24h — usage totals here are estimates.
+          <a class="dash-alert-help" href="{{ ingress_path }}/history?filter=degraded&circuit={{ c.circuit }}#legend">What's this?</a>
         </span>
       </div>
       <a class="btn btn-secondary btn-sm"
@@ -202,7 +225,9 @@
       {% endif %}
     </div>
 
-    {# Training progress — visible only while calibrating #}
+    {# Training progress + a guided next step — the dashboard is the first
+       thing seen post-setup, so the learn → train → label → activate path
+       must be visible here, not only on other pages. #}
     {% if c.training.state == 'calibrating' %}
     <div class="dash-training">
       <div class="dash-training-row">
@@ -212,6 +237,21 @@
       <div class="dash-training-bar">
         <div class="dash-training-fill" style="width: {{ c.training.percent_complete }}%"></div>
       </div>
+      <p class="dash-training-next">
+        While it learns, you can speed things up:
+        <a href="{{ ingress_path }}/training">run each fixture once in the Training helper</a>,
+        or <a href="{{ ingress_path }}/history">label a few events on History</a>.
+      </p>
+    </div>
+    {% elif c.training.state == 'labelling' %}
+    <div class="dash-training">
+      <div class="dash-training-row">
+        <span class="dash-training-label">✅ Learning complete</span>
+      </div>
+      <p class="dash-training-next">
+        Last step — <a href="{{ ingress_path }}/fixtures">activate this line on the Water Use page</a>
+        to turn on leak &amp; anomaly detection.
+      </p>
     </div>
     {% endif %}
 
@@ -391,12 +431,12 @@ const mix    = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparen
     if (d.baseline_psi != null) {
       const b = +(d.baseline_psi * pf).toFixed(pd);
       datasets.push({
-        label: "resting baseline",
+        label: "normal resting pressure",
         data: series.map(() => b),
         borderColor: mix(cssVar("--text-3"), 80),
         borderDash: [5, 4], fill: false, pointRadius: 0, borderWidth: 1,
       });
-      capEl.textContent = `Resting baseline ≈ ${b} ${pu} — the typical pre-event pressure (sits near the top).`;
+      capEl.textContent = `Normal resting pressure ≈ ${b} ${pu} — what your pipes sit at between water use.`;
     }
     chart = new Chart(canvas, {
       type: "line",

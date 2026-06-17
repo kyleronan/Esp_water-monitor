@@ -14,10 +14,17 @@
 
 <h1 class="hist-page-title">History</h1>
 
+<p class="muted fx-page-intro" style="margin:0 0 14px 0">
+  Every burst of water use is logged here. <strong>Tap a row</strong> to inspect it,
+  and star-label a few events so the app learns your fixtures. If the app marked
+  something as <em>not real use</em> but water <strong>was</strong> running, open it
+  and relabel — your call overrides the app's.
+</p>
+
 {% if filter_param == 'degraded' %}
 {# Filter banner — explains why the list is restricted and offers a way out. #}
 <div class="hist-filter-banner" role="status" aria-live="polite">
-  <span><strong>Filtered:</strong> showing only events flagged as degraded (pulsing supply detected). Volume totals for these events are estimated.</span>
+  <span><strong>Filtered:</strong> showing only events where the water pressure was unsteady (pulsing supply). Volume totals for these events are estimates.</span>
   <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history">Clear filter</a>
 </div>
 {% endif %}
@@ -61,13 +68,20 @@
 </div>
 
 {# ── Summary strip ────────────────────────────────────────────────── #}
-{% set ns = namespace(total_vol=0, total_events=0, tests_pass=0, tests_fail=0, total_alerts=0) %}
+{% set ns = namespace(total_vol=0, total_events=0, tests_pass=0, tests_fail=0, total_alerts=0,
+                      has_events=false, has_phantom=false, has_crosstalk=false,
+                      has_degraded=false, has_dribble=false) %}
 {% for ch in circuit_history %}
   {% for s in ch.summaries %}
     {% set ns.total_vol = ns.total_vol + ((s.total_volume_litres or 0) * vol_factor) %}
     {% set ns.total_alerts = ns.total_alerts + (s.alert_count or 0) %}
   {% endfor %}
   {% set ns.total_events = ns.total_events + (ch.event_count or 0) %}
+  {% if ch.events %}{% set ns.has_events = true %}{% endif %}
+  {% if ch.events | selectattr('is_pressure_restoration_phantom') | list %}{% set ns.has_phantom = true %}{% endif %}
+  {% if ch.events | selectattr('is_cross_talk') | list %}{% set ns.has_crosstalk = true %}{% endif %}
+  {% if ch.events | selectattr('degraded_supply') | list %}{% set ns.has_degraded = true %}{% endif %}
+  {% if ch.events | selectattr('is_low_flow_dribble') | list %}{% set ns.has_dribble = true %}{% endif %}
   {% for t in ch.leak_tests %}
     {% if 'Passed' in (t.result or '') %}{% set ns.tests_pass = ns.tests_pass + 1 %}
     {% elif t.result %}{% set ns.tests_fail = ns.tests_fail + 1 %}{% endif %}
@@ -97,6 +111,47 @@
     <span class="hist-summary-value">{{ ns.total_alerts if ns.total_alerts else '—' }}</span>
   </div>
 </div>
+
+{# ── Symbol legend ────────────────────────────────────────────────── #}
+{# Always rendered (collapsed) when the page has events, so the #legend
+   deep-link target from other pages always resolves. Flag rows appear
+   only for symbols that are actually present. The phantom / other-line
+   rows deliberately say "relabel if water was running" rather than
+   "ignore" — these are the app's automatic, least-certain calls. #}
+{% if ns.has_events %}
+<details class="hist-legend" id="legend">
+  <summary>What do these symbols mean?</summary>
+  <dl class="hist-legend-dl">
+    {% if ns.has_phantom %}
+    <dt><span class="pill pill-neutral">👻 Not real use</span></dt>
+    <dd>A city water-pressure blip, not a tap or appliance — volume removed from your
+      totals. This is the app's automatic call; if water <strong>was</strong> running,
+      open the event and relabel it.</dd>
+    {% endif %}
+    {% if ns.has_crosstalk %}
+    <dt><span class="pill pill-neutral">↔ Not real use</span></dt>
+    <dd>Your other water line's draw briefly dropped this line's pressure — no real flow
+      here, so the volume was removed. If water <strong>was</strong> running here, open
+      the event and relabel it.</dd>
+    {% endif %}
+    {% if ns.has_degraded %}
+    <dt><span class="pill pill-amber">〰 Estimated</span></dt>
+    <dd>Water pressure was pulsing during the event, so its volume is an estimate, not
+      exact. Worth a glance if it happens often.</dd>
+    {% endif %}
+    {% if ns.has_dribble %}
+    <dt><span class="pill pill-neutral">Drip</span></dt>
+    <dd>A very small flow; its water still counts in totals but it's too small to learn
+      your fixtures from. Relabel if it was a real fixture.</dd>
+    {% endif %}
+    <dt class="hist-legend-fix">★ ◎ ↻ ~</dt>
+    <dd>How a fixture was labeled: <strong>★</strong> you assigned it ·
+      <strong>◎</strong> captured by the Training helper ·
+      <strong>↻</strong> auto-labeled from a known cycle ·
+      <strong>~</strong> our best guess from your past labels.</dd>
+  </dl>
+</details>
+{% endif %}
 
 {% for ch in circuit_history %}
 
@@ -219,6 +274,14 @@
     </span>
   </h3>
   {% if ch.events %}
+  {# Single "Note" column replaces the four per-flag emoji columns. Its
+     existence is the UNION of all four flag checks, so a page with only one
+     kind of flag still gets the column; each cell stacks whichever flags the
+     row actually has (see guardrail 4). #}
+  {% set _has_flags = (ch.events|selectattr('degraded_supply')|list)
+                       or (ch.events|selectattr('is_pressure_restoration_phantom')|list)
+                       or (ch.events|selectattr('is_low_flow_dribble')|list)
+                       or (ch.events|selectattr('is_cross_talk')|list) %}
   <div class="hist-table-wrap">
     <table class="hist-table">
       <thead>
@@ -230,10 +293,7 @@
           <th>Shape</th>
           <th>Volume ({{ vol_unit }})</th>
           <th>Fixture</th>
-          {% if ch.events | selectattr('degraded_supply') | list %}<th title="Degraded supply detected — volume estimated">〰</th>{% endif %}
-          {% if ch.events | selectattr('is_pressure_restoration_phantom') | list %}<th title="Pressure artifact — volume removed from totals">👻</th>{% endif %}
-          {% if ch.events | selectattr('is_low_flow_dribble') | list %}<th title="Low-flow noise — excluded from training, volume kept">💧</th>{% endif %}
-          {% if ch.events | selectattr('is_cross_talk') | list %}<th title="Cross-talk — the other circuit's draw dropped this circuit's pressure; no real flow, volume removed">↔</th>{% endif %}
+          {% if _has_flags %}<th title="Notes the app added — tap a row to see details">Note</th>{% endif %}
         </tr>
       </thead>
       <tbody>
@@ -318,17 +378,15 @@
               —
             {% endif %}
           </td>
-          {% if ch.events | selectattr('degraded_supply') | list %}
-          <td class="hist-td">{% if e.degraded_supply %}<span title="Degraded supply detected — volume estimated" aria-label="Degraded supply event">〰</span>{% endif %}</td>
-          {% endif %}
-          {% if ch.events | selectattr('is_pressure_restoration_phantom') | list %}
-          <td class="hist-td">{% if e.is_pressure_restoration_phantom %}<span title="Pressure artifact — volume removed from totals" aria-label="Pressure artifact event">👻</span>{% endif %}</td>
-          {% endif %}
-          {% if ch.events | selectattr('is_low_flow_dribble') | list %}
-          <td class="hist-td">{% if e.is_low_flow_dribble %}<span title="Low-flow noise — excluded from training, volume kept" aria-label="Low-flow noise event">💧</span>{% endif %}</td>
-          {% endif %}
-          {% if ch.events | selectattr('is_cross_talk') | list %}
-          <td class="hist-td">{% if e.is_cross_talk %}<span title="Cross-talk — the other circuit's draw dropped this circuit's pressure; no real flow, volume removed from totals{% if e.other_valve_open %} · other circuit was drawing{% endif %}" aria-label="Cross-talk event">↔</span>{% endif %}</td>
+          {% if _has_flags %}
+          <td class="hist-td">
+            <div class="hist-note-cell">
+              {% if e.is_pressure_restoration_phantom %}<span class="pill pill-neutral" title="Not real water use — a city water-pressure blip, not a tap or appliance. Volume removed from your totals. If water was running, open it and relabel.">👻 Not real use</span>{% endif %}
+              {% if e.is_cross_talk %}<span class="pill pill-neutral" title="Caused by the other water line — its draw briefly dropped this line's pressure; no real flow here, volume removed. If water was running here, open it and relabel.{% if e.other_valve_open %} The other line was drawing.{% endif %}">↔ Not real use</span>{% endif %}
+              {% if e.degraded_supply %}<span class="pill pill-amber" title="Unsteady water pressure — pressure was pulsing, so this volume is an estimate, not exact.">〰 Estimated</span>{% endif %}
+              {% if e.is_low_flow_dribble %}<span class="pill pill-neutral" title="Drip — a very small flow; its water still counts but it's too small to learn your fixtures from.">Drip</span>{% endif %}
+            </div>
+          </td>
           {% endif %}
         </tr>
         {% endfor %}
@@ -391,29 +449,37 @@
       </dl>
     </details>
     <section id="emd-degraded-section" class="evt-modal-degraded" hidden
-             aria-label="Degraded-supply diagnostic">
-      <h4 class="evt-modal-degraded-title">Degraded-supply diagnostic</h4>
-      <dl class="evt-modal-dl evt-modal-dl-extra">
-        <dt>Reason</dt>            <dd id="emd-deg-reason">—</dd>
-        <dt>Mid-event P std</dt>   <dd id="emd-deg-pstd">—</dd>
-        <dt>Pressure period</dt>   <dd id="emd-deg-pperiod">—</dd>
-        <dt>Pressure autocorr</dt> <dd id="emd-deg-pscore">—</dd>
-        <dt>Flow period</dt>       <dd id="emd-deg-fperiod">—</dd>
-        <dt>Flow autocorr</dt>     <dd id="emd-deg-fscore">—</dd>
-        <dt>Harmonic</dt>          <dd id="emd-deg-harmonic">—</dd>
-        <dt>Flow troughs</dt>      <dd id="emd-deg-troughs">—</dd>
-      </dl>
+             aria-label="Unsteady water pressure">
+      <h4 class="evt-modal-degraded-title">Unsteady water pressure</h4>
+      <p>Your home's water pressure was weak or fluctuating during this event, so the
+         exact amount couldn't be measured — the volume shown is our best estimate. The
+         numbers below are the technical signals that flagged it.</p>
+      <details class="evt-modal-details">
+        <summary class="evt-modal-summary">Technical signals</summary>
+        <dl class="evt-modal-dl evt-modal-dl-extra">
+          <dt>Reason</dt>            <dd id="emd-deg-reason">—</dd>
+          <dt>Mid-event P std</dt>   <dd id="emd-deg-pstd">—</dd>
+          <dt>Pressure period</dt>   <dd id="emd-deg-pperiod">—</dd>
+          <dt>Pressure autocorr</dt> <dd id="emd-deg-pscore">—</dd>
+          <dt>Flow period</dt>       <dd id="emd-deg-fperiod">—</dd>
+          <dt>Flow autocorr</dt>     <dd id="emd-deg-fscore">—</dd>
+          <dt>Harmonic</dt>          <dd id="emd-deg-harmonic">—</dd>
+          <dt>Flow troughs</dt>      <dd id="emd-deg-troughs">—</dd>
+        </dl>
+      </details>
     </section>
     <section id="emd-phantom-section" class="evt-modal-degraded" hidden
-             aria-label="Pressure-restoration artifact">
-      <h4 class="evt-modal-degraded-title">Pressure-restoration artifact</h4>
-      <p>This event matched the long-duration, near-zero-pressure-drop
-         signature of a city-pressure restoration or regulator oscillation —
-         not real water use. Its volume has been removed from all totals.</p>
+             aria-label="Removed: not real water use">
+      <h4 class="evt-modal-degraded-title">Removed: not real water use</h4>
+      <p>A long, very steady reading like this is usually your city water
+         pressure recovering after a dip — not a tap or appliance. We've removed
+         its volume from every total so it doesn't inflate your usage.
+         <strong>If water really was running, open Classification below and
+         relabel it</strong> — your label overrides this call.</p>
       <dl class="evt-modal-dl evt-modal-dl-extra">
-        <dt>Duration</dt>          <dd id="emd-ph-duration">—</dd>
-        <dt>ΔP</dt>                <dd id="emd-ph-dp">—</dd>
-        <dt>Raw sensor volume</dt> <dd id="emd-ph-rawvol">—</dd>
+        <dt>Duration</dt>           <dd id="emd-ph-duration">—</dd>
+        <dt>Pressure drop</dt>      <dd id="emd-ph-dp">—</dd>
+        <dt>Reading we ignored</dt> <dd id="emd-ph-rawvol">—</dd>
       </dl>
     </section>
     <hr class="evt-modal-hr">
@@ -430,18 +496,18 @@
     <div class="evt-modal-section">
       <label class="evt-modal-label">Classification</label>
       <p class="muted" style="font-size:11px;margin:.2rem 0 .5rem">
-        Override automatic detection. Marking <strong>Pressure artifact</strong>
-        removes this event's volume from all totals (reversible).
+        Override the app's automatic call. Marking <strong>Not real water use</strong>
+        removes this event's volume from all totals (you can undo this).
       </p>
       <div class="emd-classify-row">
         <label class="emd-check"><input type="checkbox" id="emd-cls-phantom">
-          <span>Pressure artifact (phantom)</span></label>
+          <span>Not real water use</span></label>
         <label class="emd-check"><input type="checkbox" id="emd-cls-supply">
-          <span>Supply-pressure issue</span></label>
+          <span>Unsteady water pressure</span></label>
         <label class="emd-check"><input type="checkbox" id="emd-cls-dribble">
-          <span>Low-flow dribble</span></label>
+          <span>Drip (very low flow)</span></label>
         <label class="emd-check"><input type="checkbox" id="emd-cls-crosstalk">
-          <span>Cross-talk</span></label>
+          <span>Caused by the other water line</span></label>
       </div>
       <div style="display:flex;align-items:center;gap:.75rem;margin-top:.5rem;flex-wrap:wrap">
         <span class="muted" style="font-size:11px">Saved with the <strong>Save</strong> button below.</span>

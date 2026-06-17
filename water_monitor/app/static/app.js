@@ -572,6 +572,19 @@ function startLeakTestCountdowns() {
 
 document.addEventListener('DOMContentLoaded', startLeakTestCountdowns);
 
+// ── Legend deep-link (#legend) ──────────────────────────────────────
+// Other pages link to the History symbol key with #legend. The legend
+// <details id="legend"> only renders when the page has events, so we
+// null-check before touching it — a flag-free / event-free History page
+// simply has no legend and this no-ops.
+document.addEventListener('DOMContentLoaded', () => {
+  if (location.hash !== '#legend') return;
+  const el = document.getElementById('legend');
+  if (!el) return;
+  el.open = true;
+  el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+
 // ── Connection status indicator ────────────────────────────────────
 window.addEventListener("load", () => {
   const el = document.getElementById("conn-status");

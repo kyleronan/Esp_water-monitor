@@ -6,12 +6,14 @@
   {# ── Sidebar nav ──────────────────────────────────────────────────── #}
   <nav class="sett-sidebar">
 
+    <div class="sett-nav-group">Your home</div>
     <button class="sett-nav-btn" id="sett-btn-profile"
             onclick="settNav('profile')">
       <span class="sett-nav-icon">🏠</span>
       <span class="sett-nav-label">Home Profile</span>
     </button>
 
+    <div class="sett-nav-group">Water circuits</div>
     {% for c in circuits %}
     <button class="sett-nav-btn" id="sett-btn-circuit-{{ c.circuit }}"
             onclick="settNav('circuit-{{ c.circuit }}')">
@@ -39,6 +41,7 @@
     </button>
     {% endif %}
 
+    <div class="sett-nav-group">Preferences</div>
     <button class="sett-nav-btn" id="sett-btn-away"
             onclick="settNav('away')">
       <span class="sett-nav-icon">✈️</span>
@@ -103,7 +106,11 @@
     {# ── Home Profile ─────────────────────────────────────────────── #}
     <div class="sett-section" id="sett-profile">
       <h2 class="sett-section-title">Home Profile</h2>
-      <p class="sett-section-desc">Used to suggest calibration duration and initialise thresholds.</p>
+      <p class="sett-section-desc">Tell us a bit about your home so the monitor can set
+        smarter starting defaults. More bathrooms and occupants mean more normal water use,
+        so this helps it learn what's typical for you and how long the initial learning
+        period should run. You can change these anytime — it only affects starting estimates,
+        never your live alerts.</p>
 
       <div class="sett-card">
         <form method="post" action="{{ ingress_path }}/settings/profile/update">
@@ -170,7 +177,10 @@
               else c.training.state | title -}}
         </span>
       </div>
-      <p class="sett-section-desc">Circuit-specific detection and alert settings.</p>
+      <p class="sett-section-desc">Settings for this water line. For most homes the only
+        control you'll ever touch is <strong>Detection sensitivity</strong> (Low / Medium /
+        High) under the Advanced tab — everything else is set automatically during the
+        learning period.</p>
 
       {# Sub-tab strip — use loop.index as a safe DOM key #}
       {% set circ_idx = loop.index %}
@@ -298,10 +308,12 @@
 
       {# Recalibration #}
       <div class="sett-card sett-adv-card">
-        <h3 class="sett-card-title">Recalibration <span class="sett-installer-badge">⚠ Installer</span></h3>
+        <h3 class="sett-card-title">Recalibration <span class="sett-installer-badge" title="Advanced step — usually done by your installer. Safe to use, but only recalibrate when your home or plumbing has genuinely changed.">⚠ Installer</span></h3>
         <p class="sett-card-desc">
-          Recalibrate if you've renovated, added appliances, or your household
-          has changed significantly.
+          Recalibrate if you've renovated, added appliances, or your household has changed
+          significantly. The monitor re-learns your home's normal water use over a few weeks
+          (a “learning period”). <strong>Leak and anomaly protection stay fully active the
+          whole time — nothing is turned off.</strong>
         </p>
         {% if c.last_completed %}
         <p class="sett-card-desc muted" style="margin-top:-.25rem">
@@ -390,34 +402,39 @@
                 this.closest('form').querySelector('[name=mode]').value = 'advanced';
               }">
             <summary>Advanced settings</summary>
+            <p class="sett-help" style="margin:.5rem 0">
+              These raw values are set automatically by the Low / Medium / High picker
+              above. Only change them if you know exactly what you're tuning — the picker
+              covers almost every home.
+            </p>
             <div class="sett-form-grid" style="margin-top:.75rem">
               <div class="sett-form-group">
-                <label>Pressure drop to detect event ({{ pressure_unit }})</label>
+                <label title="How big a pressure dip starts watching an event. Lower = catches smaller draws (and more noise).">Pressure drop to detect event ({{ pressure_unit }})</label>
                 <input type="number" name="pressure_drop_event_psi" step="0.1" min="0.5" max="10"
                        value="{{ c.sensitivity.pressure_drop_event_psi or 1.2 }}">
               </div>
               <div class="sett-form-group">
-                <label>Min event duration (seconds)</label>
+                <label title="How long flow must last to count as an event. Higher = ignores very brief blips.">Min event duration (seconds)</label>
                 <input type="number" name="min_event_duration_seconds" step="0.5" min="1" max="30"
                        value="{{ c.sensitivity.min_event_duration_seconds or 3.0 }}">
               </div>
               <div class="sett-form-group">
-                <label>Anomaly score to alert (0–1)</label>
+                <label title="How unusual an event must be before you get a notification. Lower = more alerts (more false alarms); higher = fewer.">Anomaly score to alert (0–1)</label>
                 <input type="number" name="score_alert" step="0.05" min="0.1" max="1"
                        value="{{ c.sensitivity.score_alert or 0.6 }}">
               </div>
               <div class="sett-form-group">
-                <label>Anomaly score to auto-shutoff (0–1)</label>
+                <label title="How unusual an event must be before the valve auto-closes (once auto-shutoff is trusted). Higher = only the most extreme events.">Anomaly score to auto-shutoff (0–1)</label>
                 <input type="number" name="score_shutoff" step="0.05" min="0.1" max="1"
                        value="{{ c.sensitivity.score_shutoff or 0.8 }}">
               </div>
               <div class="sett-form-group">
-                <label>Flow tolerance (%)</label>
+                <label title="How far flow can drift from normal before it counts as off. Higher = more forgiving.">Flow tolerance (%)</label>
                 <input type="number" name="flow_tolerance_pct" step="1" min="5" max="80"
                        value="{{ c.sensitivity.flow_tolerance_pct or 20 }}">
               </div>
               <div class="sett-form-group">
-                <label>Alert sustained duration (min)</label>
+                <label title="How long an unusual flow must persist before alerting. Higher = waits longer before flagging.">Alert sustained duration (min)</label>
                 <input type="number" name="sustained_alert_minutes" step="1" min="1" max="60"
                        value="{{ c.sensitivity.sustained_alert_minutes or 10 }}">
               </div>
@@ -497,7 +514,7 @@
           samples drop. The firmware's cumulative volume sensor is the source of truth.
           When on, a settled event whose volume diverges from the recorder is corrected
           automatically (originals are preserved). When off, divergences are recorded only —
-          review and apply them from the Device page.
+          review and apply them from the Valve &amp; Tests page.
         </p>
         <form method="post" action="{{ ingress_path }}/settings/reconcile/{{ c.circuit }}/update">
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -698,7 +715,7 @@
     <div class="sett-section" id="sett-away" style="display:none">
       <h2 class="sett-section-title">Away / Vacation Mode</h2>
       <p class="sett-section-desc">
-        Pauses baseline learning while you're away. Leak tests, valve control, and fault detection continue normally.
+        Pauses learning your normal usage while you're away (so a quiet house isn't mistaken for a change). Leak tests, valve control, and fault detection continue normally.
       </p>
 
       <div class="sett-card">
@@ -831,12 +848,12 @@
           </div>
           <div class="sett-toggle-row" style="margin-bottom:14px;padding-top:.75rem;border-top:1px solid var(--border)">
             <div class="sett-toggle-info">
-              <span class="sett-toggle-label">Hide pressure-artifact events from History</span>
+              <span class="sett-toggle-label">Hide removed (not-real-water) events from History</span>
               <span class="sett-toggle-desc">
-                Long "phantom" events caused by city-pressure restoration are
-                always removed from volume totals. Enable this to also hide them
-                from the History list. Off by default — they stay visible with a
-                👻 flag.
+                Sometimes city water-pressure recovery looks like a long, flat
+                reading. We always remove its volume from your totals; turn this
+                on to also hide those rows. Off by default — they stay visible
+                with a 👻 flag.
               </span>
             </div>
             <label class="toggle">
@@ -847,13 +864,13 @@
           </div>
           <div class="sett-toggle-row" style="margin-bottom:14px">
             <div class="sett-toggle-info">
-              <span class="sett-toggle-label">Hide cross-talk events from History</span>
+              <span class="sett-toggle-label">Hide other-line events from History</span>
               <span class="sett-toggle-desc">
-                "Cross-talk" events register on this circuit when the <em>other</em>
-                circuit's draw drops the shared-supply pressure — no real water flows
-                through this meter, so their volume is always removed from totals.
-                Enable this to also hide them from the History list. Off by default —
-                they stay visible with a ↔ flag.
+                When your <em>other</em> water line draws, it can briefly drop this
+                line's pressure and register here even though no real water flowed
+                through this meter — so its volume is always removed from totals.
+                Turn this on to also hide those rows. Off by default — they stay
+                visible with a ↔ flag.
               </span>
             </div>
             <label class="toggle">
@@ -1093,13 +1110,13 @@
       </div>
 
       <div class="sett-card">
-        <h3 class="sett-card-title">Re-evaluate degraded-supply verdicts</h3>
+        <h3 class="sett-card-title">Re-evaluate unsteady-pressure events</h3>
         <p class="sett-card-desc">
-          Re-applies the current degraded-supply thresholds to every past event
-          that has a stored diagnostic. Use after the guard is re-tuned so
-          historical events (and the daily-volume totals they feed) match the
-          new policy. Events captured before the guard was deployed have no
-          stored diagnostic and are skipped.
+          Re-applies the current unsteady-pressure (pulsing-supply) thresholds to every
+          past event that has a stored diagnostic. Use after the detector is re-tuned so
+          historical events (and the daily-volume totals they feed) match the new policy.
+          Events captured before the detector was deployed have no stored diagnostic and
+          are skipped.
         </p>
         <div style="display:flex;gap:.5rem;margin-top:.5rem;flex-wrap:wrap">
           <button type="button" class="btn btn-secondary btn-sm"

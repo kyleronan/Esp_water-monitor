@@ -14,15 +14,15 @@
 {% elif msg == 'relink_failed' %}
 <div class="fx-msg fx-msg-err">Could not re-link the fixture — the chosen cluster may already be in use, or was deleted. Refresh and try again.</div>
 {% elif msg == 'reclassified' %}
-<div class="fx-msg fx-msg-ok">Re-typed from your labels —
+<div class="fx-msg fx-msg-ok">Labels applied —
   {{ request.query_params.get('matched', '0') }} event(s) auto-typed,
   {{ request.query_params.get('abstained', '0') }} left for you to label{% if request.query_params.get('cleared', '0') != '0' %},
   {{ request.query_params.get('cleared') }} stale match(es) cleared{% endif %}.</div>
 {% elif msg == 'recomputed' %}
-<div class="fx-msg fx-msg-ok">Volume recomputed from raw flow —
+<div class="fx-msg fx-msg-ok">Volume totals fixed from raw flow —
   {{ request.query_params.get('recomputed', '0') }} event(s) corrected,
   {{ request.query_params.get('skipped', '0') }} skipped (history aged out){% if request.query_params.get('degraded', '0') != '0' %},
-  {{ request.query_params.get('degraded') }} marked degraded{% endif %}.</div>
+  {{ request.query_params.get('degraded') }} flagged as unsteady pressure{% endif %}.</div>
 {% elif msg == 'busy' %}
 <div class="fx-msg fx-msg-warn">Another volume operation is already running — wait for it
   to finish, then try again.</div>
@@ -32,21 +32,17 @@
 
 {# ── Page header ──────────────────────────────────────────────────────── #}
 <div class="fx-header">
-  <h1 class="page-title" style="margin:0">Fixtures</h1>
+  <h1 class="page-title" style="margin:0">Water Use</h1>
 </div>
 
 <p class="muted fx-page-intro" style="margin:0 0 18px 0">
-  One card per water category. Today and lifetime totals are aggregated from
-  every event of that type — phantom events (pressure artifacts) are
-  excluded. To re-categorise an event, star-label it on the
-  <a href="{{ ingress_path }}/history">History</a> page.
+  <strong>Your job here:</strong> check that water use looks normal — a category that's
+  suddenly high can mean a leak — and help the app learn by
+  <a href="{{ ingress_path }}/history">star-labeling a few events on History</a>.
+  Each card sums today's and lifetime use for one category; readings we removed as
+  not-real-water-use are excluded. Want faster, more accurate labels? Run each fixture
+  once with the <a href="{{ ingress_path }}/training">Training helper</a>.
 </p>
-
-<div class="fx-msg fx-msg-ok" style="margin:0 0 18px 0">
-  ✦ <strong>New:</strong> the <a href="{{ ingress_path }}/training">Training helper</a>
-  lets you run each fixture once to capture a clean sample — recommended for faster,
-  more accurate auto-labeling (without it, more events stay “other”).
-</div>
 
 {# ── Per-circuit sections ─────────────────────────────────────────────── #}
 {% for circ in circuits %}
@@ -61,16 +57,16 @@
   <form method="post"
         action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/reclassify"
         style="display:inline;margin-left:10px"
-        title="Re-derive fixture types for unlabelled events from the events you've labelled on the History page">
+        title="Tag similar unlabeled events using the fixtures you've already star-labeled on History.">
     <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-    <button type="submit" class="btn btn-ghost btn-sm">↻ Re-type from my labels</button>
+    <button type="submit" class="btn btn-ghost btn-sm">↻ Apply my labels</button>
   </form>
   <form method="post"
         action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/recompute"
         style="display:inline;margin-left:6px"
-        title="Re-derive event volumes from the raw flow history (fixes the volume over-count). Limited to events still within HA's recorder retention.">
+        title="Recalculate event volumes from the raw flow history — fixes over-counted totals. Only covers recent events still in Home Assistant's history.">
     <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-    <button type="submit" class="btn btn-ghost btn-sm">⟳ Recompute volume</button>
+    <button type="submit" class="btn btn-ghost btn-sm">⟳ Fix volume totals</button>
   </form>
 </h2>
 
@@ -145,6 +141,10 @@
     </div>
     {% endif %}
   </div>
+  {% if not cat.lifetime_event_count %}
+  <p class="fx-cat-empty-note muted">No water use recorded here yet — this fills in once
+    the app sees it. If you don't have this fixture, you can ignore the card.</p>
+  {% endif %}
   <form method="post" class="fx-cat-publish"
         action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/category/{{ cat.type }}/publish">
     <input type="hidden" name="_csrf" value="{{ csrf_token }}">

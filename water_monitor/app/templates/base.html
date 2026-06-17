@@ -22,9 +22,11 @@
 
   <nav class="app-nav">
     <a href="{{ ingress_path }}/"         class="nav-item {% if page == 'dashboard' %}active{% endif %}">Dashboard</a>
-    <a href="{{ ingress_path }}/device"   class="nav-item {% if page == 'device' %}active{% endif %}">Device</a>
+    <a href="{{ ingress_path }}/device"   class="nav-item {% if page == 'device' %}active{% endif %}"
+       title="Open or close your water valve, run the leak test, and clear safety faults">Valve &amp; Tests</a>
     <a href="{{ ingress_path }}/history"  class="nav-item {% if page == 'history' %}active{% endif %}">History</a>
-    <a href="{{ ingress_path }}/fixtures" class="nav-item {% if page == 'fixtures' %}active{% endif %}">Fixtures</a>
+    <a href="{{ ingress_path }}/fixtures" class="nav-item {% if page == 'fixtures' %}active{% endif %}"
+       title="See how much water each category (shower, toilet, irrigation…) uses today and over time">Water Use</a>
     {% if setup_complete %}
     <a href="{{ ingress_path }}/training" class="nav-item {% if page == 'training' %}active{% endif %}">Training</a>
     {% endif %}

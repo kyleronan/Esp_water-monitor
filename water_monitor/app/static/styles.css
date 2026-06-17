@@ -690,6 +690,18 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   display: block;
 }
 
+/* "What to do next" chip under the dashboard subtitle */
+.dash-next-chip {
+  display: inline-block; margin-top: 6px;
+  font-size: 12px; padding: 3px 10px; border-radius: 999px;
+  background: var(--surface-2); color: var(--text-2);
+  border: 1px solid var(--border); text-decoration: none;
+}
+a.dash-next-chip:hover { text-decoration: underline; }
+.dash-next-chip.is-alert { background: var(--amber-bg); color: var(--amber-text); border-color: var(--amber); }
+.dash-next-chip.is-ok    { color: var(--text-3); }
+.dash-alert-help { font-size: 11px; text-decoration: underline; margin-left: 6px; white-space: nowrap; }
+
 /* Away pill toggle — pill-shaped button, top-right of dashboard ──── */
 .dash-away-toggle-form { margin: 0; }
 .dash-away-toggle {
@@ -926,6 +938,11 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   background: var(--accent);
   border-radius: 999px;
 }
+.dash-training-next {
+  font-size: 12px; color: var(--text-2);
+  margin: 8px 0 0; line-height: 1.45;
+}
+.dash-training-next a { color: var(--accent); }
 @media (prefers-reduced-motion: no-preference) {
   .dash-training-fill { transition: width .4s ease; }
 }
@@ -1421,6 +1438,31 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   border-left: 3px solid var(--amber); border-radius: 0 6px 6px 0;
   font-size: 13px;
 }
+
+/* ── Symbol legend (collapsible key above the events tables) ──────── */
+.hist-legend {
+  margin: 0 0 16px; padding: 8px 14px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 8px; font-size: 13px;
+}
+.hist-legend > summary {
+  cursor: pointer; user-select: none; list-style: none;
+  font-weight: 600; color: var(--text-2);
+}
+.hist-legend > summary::-webkit-details-marker { display: none; }
+.hist-legend > summary::before { content: '▶ '; font-size: 9px; }
+.hist-legend[open] > summary::before { content: '▼ '; }
+.hist-legend-dl {
+  display: grid; grid-template-columns: auto 1fr;
+  gap: 8px 14px; margin: 12px 0 4px; align-items: start;
+}
+.hist-legend-dl dt { white-space: nowrap; }
+.hist-legend-dl dd { margin: 0; color: var(--text-2); line-height: 1.45; }
+.hist-legend-fix   { color: var(--text-2); font-weight: 600; letter-spacing: 2px; }
+
+/* Note column — stacked word-pills for the per-event flags */
+.hist-note-cell        { display: flex; flex-wrap: wrap; gap: 4px; }
+.hist-note-cell .pill  { font-size: 11px; }
 
 /* Event rows — clickable + hover highlight */
 .hist-event-row        { cursor: pointer; }
@@ -1976,6 +2018,14 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 .sett-nav-icon { font-size: 14px; width: 18px; text-align: center; flex-shrink: 0; }
 .sett-nav-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Group headers in the settings sidebar (visual structure only) */
+.sett-nav-group {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-3);
+  padding: 4px 10px; margin-top: 12px;
+}
+.sett-nav-group:first-child { margin-top: 0; }
+
 /* Training state badges on sidebar */
 .sett-nav-badge {
   font-size: 9px; font-weight: 700;
@@ -2009,6 +2059,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   }
   .sett-nav-label { white-space: nowrap; overflow: visible; }
   .sett-nav-badge { display: none; } /* hide state badges on mobile */
+  .sett-nav-group { display: none; } /* group headers don't fit the horizontal strip */
 }
 
 /* ── Content area ────────────────────────────────────────────────── */
@@ -2333,6 +2384,9 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 .fx-page-intro {
   font-size: 13px;
   max-width: 720px;
+}
+.fx-cat-empty-note {
+  font-size: 12px; margin: 0 0 8px; line-height: 1.4;
 }
 .fx-cat-grid {
   display: grid;

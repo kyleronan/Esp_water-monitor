@@ -296,7 +296,7 @@ class AlertManager:
                 message=(f"Automatic shut-off: {reason} (anomaly score {score:.0%}). "
                          f"Water to {circuit_name} was closed as a precaution. "
                          f"To restore water, {where}, or use the Open Valve button on "
-                         f"the Water Monitor device page. If this was normal usage, "
+                         f"the Water Monitor Valve & Tests page. If this was normal usage, "
                          f"recalibrate so it is not flagged again."),
                 notification_id=f"water_unusual_shutoff_{circuit}",
                 critical=True,
