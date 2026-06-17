@@ -256,6 +256,16 @@ _PHANTOM_MAX_TRUE_FLOW_LPM:   float = 2.0
 _PHANTOM_MAX_FLOW_INTEGRAL_L: float = 1.0
 _PHANTOM_MAX_FLOW_ON_RATIO:   float = 0.05
 
+# Sparse envelope (Fix 4): a LONG event that is almost entirely idle — a brief real draw
+# followed by a long no-flow tail the pressure-defined boundary never closed. Real water
+# moved (so NOT a phantom — its volume is kept), but the envelope's duration/shape are
+# unreliable, so it is kept out of training and carries no fixture identity. Distinct from a
+# phantom (≈no water moved) and a dribble (BRIEF). flow_on_ratio is the discriminator: a real
+# slow draw flows continuously (high ratio); <= 0.10 over >= 10 min is >= 90 % idle. (An
+# 8113 s "shower" with 46 s of flow on the real export was polluting the shower signature.)
+_SPARSE_ENVELOPE_MIN_DURATION_S:    float = 600.0
+_SPARSE_ENVELOPE_MAX_FLOW_ON_RATIO: float = 0.10
+
 # Cross-talk (migration 20260540): a long event registered via a REAL pressure drop
 # (ΔP >= _PHANTOM_MAX_DELTA_PSI) with essentially no real flow on this circuit —
 # another circuit's draw pulled the shared-supply pressure down. Reuses the phantom's
@@ -789,6 +799,29 @@ def _detect_cross_talk(duration_s, pressure_delta_psi,
     )
 
 
+def _is_sparse_envelope(duration_s, flow_on_ratio, is_phantom: bool) -> bool:
+    """True when a LONG event is almost entirely idle — a brief real draw plus a long
+    no-flow tail the pressure-defined boundary never closed (the 37-min envelope around a
+    45 s draw). Real water moved, so it is NOT a phantom and its volume is kept; but the
+    envelope's duration/shape are unreliable, so the caller excludes it from training and
+    gives it no fixture identity. flow_on_ratio is the discriminator: a real slow draw flows
+    continuously (high ratio), so <= _SPARSE_ENVELOPE_MAX_FLOW_ON_RATIO over
+    >= _SPARSE_ENVELOPE_MIN_DURATION_S is >= 90% idle. Single-sourced so the live finalizer
+    and the batch reprocess never disagree on the boundary. Conservative on bad input: a
+    NULL/absent ratio is 'not sparse'."""
+    if is_phantom or flow_on_ratio is None or duration_s is None:
+        return False
+    try:
+        dur = float(duration_s)
+        onr = float(flow_on_ratio)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(dur) and math.isfinite(onr)):
+        return False
+    return (dur >= _SPARSE_ENVELOPE_MIN_DURATION_S
+            and 0 < onr <= _SPARSE_ENVELOPE_MAX_FLOW_ON_RATIO)
+
+
 def _finalize_derived_verdicts(features: dict, calib=None) -> None:
     """Single source of truth for the phantom verdict + its dependent fields.
 
@@ -875,15 +908,23 @@ def _finalize_derived_verdicts(features: dict, calib=None) -> None:
         features["volume_litres_effective"]  = round(raw, 3)
         features["volume_estimation_method"] = "raw"
 
-    # A capped / degraded integration may under-count real water — keep it out of
-    # classifier training (NULL = unknown/legacy = not degraded).
-    integration_degraded = features.get("integration_quality") not in (None, "ok")
+    # Fix 3 — 'capped' only means a sample gap may have UNDER-counted volume; the event is
+    # real and well-shaped, so keep its identity (the 27.7-gal shower that was wrongly greyed
+    # out). Only a genuinely 'degraded' integration is unusable for training. NULL = unknown/
+    # legacy = treated as not-unusable (unchanged: the prior guard also listed None).
+    integration_unusable = features.get("integration_quality") == "degraded"
+    # Fix 4 — a long, almost-entirely-idle envelope (a brief draw + a long no-flow tail the
+    # boundary never closed). Real water moved (NOT a phantom, so the raw-volume branch above
+    # is kept), but duration/shape are unreliable: out of training, no identity. A short event
+    # or a continuously-flowing draw (high on-ratio, or a NULL/legacy ratio) is exempt.
+    is_sparse_envelope = _is_sparse_envelope(
+        features.get("duration_seconds"), features.get("flow_on_ratio"), is_phantom)
     features["is_pressure_restoration_phantom"] = 1 if is_phantom else 0
     features["is_cross_talk"] = 1 if is_cross_talk else 0
     features["is_low_flow_dribble"] = 1 if is_dribble else 0
     features["excluded_from_training"] = (
         1 if (is_degraded or is_phantom or is_cross_talk or is_dribble
-              or user_ignored or integration_degraded)
+              or user_ignored or integration_unusable or is_sparse_envelope)
         else 0
     )
     # Upstream rejection reason (cluster-engine reasons are written separately).
@@ -894,6 +935,7 @@ def _finalize_derived_verdicts(features: dict, calib=None) -> None:
         else "cross_talk" if is_cross_talk
         else "pulsing_supply" if is_degraded
         else "low_flow_dribble" if is_dribble
+        else "sparse_envelope" if is_sparse_envelope
         else None
     )
 
@@ -1243,8 +1285,74 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             log.info("cross-talk-reprocess: flagged %d event(s) across %d day(s)",
                      cross_talk_flagged, len(xt_days))
 
+    # ── Scan 4: sparse envelopes (Fix 4) ─────────────────────────────────────
+    # A long event almost entirely idle (a brief draw + a long no-flow tail). Real water
+    # moved (NOT a phantom — volume is PRESERVED, so no hourly/daily resync, like the
+    # dribble scan), but the envelope is unreliable: exclude from training, no identity.
+    # Needs flow_on_ratio (an active-flow column) → has_af. Only claims rows with NO
+    # existing artifact reason (NULL) so it never overrides a phantom/cross-talk/dribble
+    # verdict — matching the live finalizer's match_rejection_reason precedence.
+    sparse_flagged = 0
+    if has_af:
+        sprows = conn.execute(
+            "SELECT id, duration_seconds, flow_on_ratio FROM events "
+            "WHERE duration_seconds >= ? "
+            "  AND flow_on_ratio > 0 AND flow_on_ratio <= ? "
+            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+            "  AND match_rejection_reason IS NULL"
+            + uc_guard + uft_guard,
+            (_SPARSE_ENVELOPE_MIN_DURATION_S, _SPARSE_ENVELOPE_MAX_FLOW_ON_RATIO),
+        ).fetchall()
+        for row in sprows:
+            # Re-run the canonical predicate (SQL is only a prefilter) — single-sourced
+            # with the live finalizer so the two paths never disagree on the boundary.
+            if not _is_sparse_envelope(row["duration_seconds"], row["flow_on_ratio"],
+                                       False):
+                continue
+            conn.execute(
+                "UPDATE events SET excluded_from_training = 1, "
+                "  match_rejection_reason = 'sparse_envelope' "
+                "WHERE id = ?",
+                (row["id"],),
+            )
+            sparse_flagged += 1
+        if sparse_flagged:
+            conn.commit()
+            log.info("sparse-envelope-reprocess: flagged %d event(s)", sparse_flagged)
+
+    # ── Scan 5: un-exclude capped-only events (Fix 3) ────────────────────────
+    # 'capped' integration only means a sample gap may have UNDER-counted volume — the
+    # event is still a real, well-shaped draw and must not be excluded just for that.
+    # Re-include rows excluded ONLY because of 'capped': no other artifact flag, not a
+    # sparse envelope (Scan 4 may have just claimed one), not user-classified, with valid
+    # active-flow features (mirrors cleanup_composite_flags' guard). 'degraded' integration
+    # is untouched — it still excludes.
+    capped_reincluded = 0
+    if has_af and _events_has_column(conn, "integration_quality"):
+        cur = conn.execute(
+            "UPDATE events SET excluded_from_training = 0 "
+            "WHERE integration_quality = 'capped' "
+            "  AND COALESCE(excluded_from_training, 0) = 1 "
+            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+            "  AND COALESCE(is_cross_talk, 0) = 0 "
+            "  AND COALESCE(is_low_flow_dribble, 0) = 0 "
+            "  AND COALESCE(degraded_supply, 0) = 0 "
+            "  AND COALESCE(user_ignored, 0) = 0 "
+            "  AND COALESCE(user_classified, 0) = 0 "
+            "  AND (match_rejection_reason IS NULL "
+            "       OR match_rejection_reason <> 'sparse_envelope') "
+            "  AND true_avg_flow_lpm IS NOT NULL"
+        )
+        capped_reincluded = cur.rowcount or 0
+        if capped_reincluded:
+            conn.commit()
+            log.info("capped-reprocess: re-included %d capped-only event(s)",
+                     capped_reincluded)
+
     return {"flagged": flagged, "dribbles_flagged": dribbles_flagged,
             "cross_talk_flagged": cross_talk_flagged,
+            "sparse_flagged": sparse_flagged,
+            "capped_reincluded": capped_reincluded,
             "excluded_fixed": repair["excluded_fixed"],
             "flag_pairs_resolved": repair["pairs_resolved"],
             "flag_pairs_unresolved": repair["unresolved"]}
@@ -3119,10 +3227,19 @@ class FeatureExtractor:
         if matched_fixture_type is None and weak_match:
             try:
                 from .database import match_event_to_signature_knn
+                from .event_rules import CYCLE_ONLY_FIXTURE_TYPES
                 sig_hit = match_event_to_signature_knn(
                     self._db, circuit, features
                 )
-                if sig_hit is not None:
+                if sig_hit is None:
+                    pass
+                elif sig_hit["fixture_type"] in CYCLE_ONLY_FIXTURE_TYPES:
+                    # Multi-fill appliance from a LONE signature — needs cycle context
+                    # (washer_cycle / dishwasher rule), so leave it unlabelled. A real
+                    # cycle's first fill is re-stamped by the retro-scan on completion.
+                    log.info("[%s] event %s: suppressed lone k-NN %s (no cycle context)",
+                             circuit, event_id, sig_hit["fixture_type"])
+                else:
                     matched_fixture_type = sig_hit["fixture_type"]
                     matched_via = "knn"
                     log.info(

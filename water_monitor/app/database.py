@@ -4534,9 +4534,9 @@ def reclassify_all_events_from_signatures(
     #    active-flow features so the matcher uses whichever it can (active when
     #    backfilled). An event now excluded_from_training carries no fixture
     #    identity → its matched_fixture_type is cleared (stale-match carry-forward).
-    from .event_rules import (detect_softener_sessions, detect_washer_cycles,
-                              get_home_timezone, parse_hhmm_to_minutes,
-                              rule_classify_event)
+    from .event_rules import (CYCLE_ONLY_FIXTURE_TYPES, detect_softener_sessions,
+                              detect_washer_cycles, get_home_timezone,
+                              parse_hhmm_to_minutes, rule_classify_event)
     from .rule_calibration import load_rule_calibration
 
     # Frozen per-home rule bands (empty dict → predicates use shipped defaults).
@@ -4621,6 +4621,10 @@ def reclassify_all_events_from_signatures(
             else:
                 hit = match_event_to_signature_knn(conn, circuit, feats)
                 new_type = _canonical_fixture_type(hit["fixture_type"]) if hit else None
+                # Multi-fill appliances need cycle context (washer_cycle / dishwasher
+                # rule, both checked above) — a lone k-NN signature must not stamp them.
+                if new_type in CYCLE_ONLY_FIXTURE_TYPES:
+                    new_type = None
                 new_via = "knn" if new_type is not None else None
         prev = r["matched_fixture_type"]
         if (new_type, new_via, new_group) != (

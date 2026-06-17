@@ -281,7 +281,8 @@
   {% set _has_flags = (ch.events|selectattr('degraded_supply')|list)
                        or (ch.events|selectattr('is_pressure_restoration_phantom')|list)
                        or (ch.events|selectattr('is_low_flow_dribble')|list)
-                       or (ch.events|selectattr('is_cross_talk')|list) %}
+                       or (ch.events|selectattr('is_cross_talk')|list)
+                       or (ch.events|selectattr('match_rejection_reason','equalto','sparse_envelope')|list) %}
   <div class="hist-table-wrap">
     <table class="hist-table">
       <thead>
@@ -300,7 +301,7 @@
         {% for e in ch.events %}
         {% set _fix_label = fixture_type_labels.get(e.user_fixture_type, '') if e.user_fixture_type else '' %}
         {% set _disp_flow = e.true_avg_flow_lpm if e.true_avg_flow_lpm is not none else e.avg_flow_lpm %}
-        <tr class="hist-event-row{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.is_pressure_restoration_phantom %} hist-row-phantom{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}{% if loop.index > 25 %} hist-extra-row{% endif %}"{% if loop.index > 25 %} style="display:none"{% endif %}
+        <tr class="hist-event-row{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.is_pressure_restoration_phantom %} hist-row-phantom{% endif %}{% if e.excluded_from_training and e.match_rejection_reason != 'sparse_envelope' %} hist-row-ignored{% endif %}{% if loop.index > 25 %} hist-extra-row{% endif %}"{% if loop.index > 25 %} style="display:none"{% endif %}
             tabindex="0" role="button" aria-label="Event detail"
             data-event-id="{{ e.id }}"
             data-circuit="{{ ch.circuit }}"
@@ -385,6 +386,7 @@
               {% if e.is_cross_talk %}<span class="pill pill-neutral" title="Caused by the other water line — its draw briefly dropped this line's pressure; no real flow here, volume removed. If water was running here, open it and relabel.{% if e.other_valve_open %} The other line was drawing.{% endif %}">↔ Not real use</span>{% endif %}
               {% if e.degraded_supply %}<span class="pill pill-amber" title="Unsteady water pressure — pressure was pulsing, so this volume is an estimate, not exact.">〰 Estimated</span>{% endif %}
               {% if e.is_low_flow_dribble %}<span class="pill pill-neutral" title="Drip — a very small flow; its water still counts but it's too small to learn your fixtures from.">Drip</span>{% endif %}
+              {% if e.match_rejection_reason == 'sparse_envelope' %}<span class="pill pill-neutral" title="A brief use followed by a long idle stretch — the listed time is mostly no-flow. The water still counts, but it's too irregular to learn your fixtures from.">⏳ Brief use, long idle tail</span>{% endif %}
             </div>
           </td>
           {% endif %}

@@ -108,6 +108,17 @@ WASHER_FAMILY_PK_ENVELOPE: Tuple[float, float] = (
     _WASHER_ANCHOR_PK_LPM[1] * _WASHER_FAMILY_PK_RATIO[1],   # 19.5
 )
 
+# Cycle/session-detected fixtures are NEVER typed from a lone k-NN signature:
+# washing_machine comes only from detect_washer_cycles (anchor + >=2 same-peak fills),
+# dishwasher only from its cycle-pulse rule, and water_softener only from detect_softener_
+# sessions (a scheduled multi-draw regen). The k-NN residual must NOT stamp these onto a
+# single event — a lone draw resembling one is a tap / quick fill / slow trickle. Shared by
+# the reclassify and live k-NN write paths so the guard can never drift apart. A real
+# cycle/session member suppressed here is re-stamped by its session detector (the washer
+# retro-scan live, or the softener/washer sweep on the next full reclassify).
+CYCLE_ONLY_FIXTURE_TYPES: frozenset = frozenset(
+    {"washing_machine", "dishwasher", "water_softener"})
+
 # ── Other rule constants ───────────────────────────────────────────────────────
 _FLUSH_VOL_L: Tuple[float, float] = (2.2, 8.5)
 _FLUSH_DUR_S: Tuple[float, float] = (20.0, 150.0)
@@ -372,11 +383,9 @@ _SOFTENER_BACKWASH_MIN_VOL_L: float = 30.0  # a TERMINAL backwash/refill is a bi
 #                                             (~220 L observed); a brief high-peak
 #                                             blip mid-brine (<30 L) is not, so it must
 #                                             not trip the post-backwash low-flow cutoff
-_SOFTENER_MIN_CHAIN_EVENTS: int = 2         # a real regen is multi-draw (brine + >=1
-#                                             backwash/rinse). A lone low-flow span with no
-#                                             backwash at the regen time is incidental low
-#                                             activity, not a regen. STRUCTURAL — never in
-#                                             RULE_DEFAULTS.
+# NOTE: a real regen is multi-draw (brine + >=1 backwash/rinse), but the gate is now a
+# REQUIRED backwash (see detect_softener_sessions), not an event count — a lone low-flow
+# span and a multi-fragment low-flow chain are BOTH rejected when no >=30 L fill exists.
 
 
 def _softener_feat(r) -> Dict[str, Any]:
@@ -417,18 +426,31 @@ def detect_softener_sessions(
     falls within ``band_center_min`` ± ``_SOFTENER_START_BAND_MIN``, AND whose
     LOW-FLOW brine itself spans >= ``_SOFTENER_MIN_SPAN_MIN`` (a single low-flow
     blip followed by moderate-flow draws is incidental morning activity, not a
-    regen). A flush-shaped event ends the run (a 3 am flush during laundry/regen
-    is irreducibly ambiguous, left to the per-event tiers). A trailing backwash up
-    to ``_SOFTENER_BACKWASH_TAIL_MIN`` past the run is also claimed.
+    regen), AND that contains a REAL backwash — a >= ``_SOFTENER_BACKWASH_MIN_VOL_L``
+    non-low fill, in-chain or trailing. A low-flow chain with no such fill (however
+    many fragments) is rejected: a real regen always ends with a backwash/refill.
+    A flush-shaped event ends the run (a 3 am flush during laundry/regen is
+    irreducibly ambiguous, left to the per-event tiers). A trailing backwash up to
+    ``_SOFTENER_BACKWASH_TAIL_MIN`` past the run is also claimed.
 
     ``band_center_min`` is minutes-since-LOCAL-midnight (parse_hhmm_to_minutes of
     the user's regen time). ``tz`` is the home timezone used to convert each
     event's stored-UTC start_ts to local for the band test — pass it so the band
     is DST-correct; tz=None compares in the stored (UTC) clock (tests/eval).
-    ``since_ts`` bounds the scan for the live trailing pass. Reads ONLY
-    feature/timestamp columns — never a label — so the eval's LOO stays honest.
+    ``since_ts`` bounds the scan for the live trailing pass. Reads only feature/
+    timestamp columns plus the phantom/cross-talk ARTIFACT verdicts (never a fixture
+    LABEL), so the eval's label-free LOO stays honest.
+
+    Pressure-restoration phantoms and cross-talk are EXCLUDED from the candidate
+    stream: both moved no real water on this circuit (volume_litres_effective == 0),
+    so neither can be part of a brine draw. A 66-min phantom must not anchor a session
+    or bridge an 80-min gap between unrelated drips — the 2026-06-16 false positive,
+    where the phantom-bridged chain walked 3 h and absorbed a real 97 L shower as a
+    fake "backwash", clearing even the backwash gate.
     """
-    where = "WHERE circuit = ?"
+    where = ("WHERE circuit = ? "
+             "AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+             "AND COALESCE(is_cross_talk, 0) = 0")
     params: list = [circuit]
     if since_ts is not None:
         where += " AND start_ts >= ?"
@@ -522,17 +544,21 @@ def detect_softener_sessions(
 
         def _is_trailing_bw(s2, r2) -> bool:
             return not (r2["id"] in claimed or s2 <= last_end or s2 > win_end
-                        or _is_low(r2) or is_flush_shaped(_softener_feat(r2), calib))
+                        or _is_low(r2)
+                        or (r2["volume_litres"] or 0.0) < _SOFTENER_BACKWASH_MIN_VOL_L
+                        or is_flush_shaped(_softener_feat(r2), calib))
 
-        # A real regen is multi-draw: the brine plus one or more backwash/rinse fills.
-        # A lone low-flow span (one chain event AND no backwash anywhere — neither in the
-        # chain nor a trailing fill) at the regen time is incidental low activity, not a
-        # regen. Coalescing may merge a real brine into ONE span, but that regen still
-        # ends with a backwash — so gate on ">=2 chain events OR a confirmed backwash",
-        # never a hard event count (which would drop a coalesced single-span regen).
+        # A real regen ALWAYS ends with a backwash/refill — a big (>= _SOFTENER_BACKWASH_
+        # MIN_VOL_L), non-low, non-flush fill (~220 L observed), either in the chain
+        # (last_bw_end, the >=30 L test above) or just past it (_is_trailing_bw, same
+        # floor). A multi-event low-flow chain with NO such fill — e.g. scattered overnight
+        # drips bridged across a gap by a zero-volume pressure-restoration phantom — is
+        # incidental activity, not a regen, however many fragments it has. The backwash is
+        # high-flow (~15 L/min) so coalescing (low-flow chatter only) can never absorb it
+        # into the brine span, so requiring it never drops a real coalesced regen.
         has_backwash = last_bw_end is not None or any(
             _is_trailing_bw(s2, r2) for (s2, _e2, r2) in evs)
-        if len(chain) < _SOFTENER_MIN_CHAIN_EVENTS and not has_backwash:
+        if not has_backwash:
             continue
         group_id = r["id"]
         for (_s, _e, rc) in chain:
