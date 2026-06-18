@@ -46,10 +46,12 @@ _SETTLE_HORIZON_HOURS = 6         # only re-evaluate events newer than this; > t
 class MaturityRecheck:
     """Periodically confirms or retracts provisional appliance labels on matured events."""
 
-    def __init__(self, db: sqlite3.Connection, cfg: AddonConfig, ha=None):
+    def __init__(self, db: sqlite3.Connection, cfg: AddonConfig, ha=None, orch=None):
         self._db = db
         self._cfg = cfg
         self._ha = ha          # HA client — needed by the §2 recorder reconcile pass
+        self._orch = orch      # orchestrator — needed by the dev.38 auto-split pass
+        self._auto_split_checked: set = set()   # ids dry-run-checked this process (efficiency)
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -110,3 +112,16 @@ class MaturityRecheck:
                 await reconcile_circuit_volumes(DB_PATH, self._ha, self._cfg, circuit)
             except Exception as e:
                 log.error("[%s] recorder reconcile error: %s", circuit, e, exc_info=True)
+
+        # dev.38 — guarded auto-split of over-merged events (OFF unless
+        # home_profile.auto_split_enabled). AFTER reconcile, in its own guard so a split
+        # bug never breaks the maturity reclassify. Carries an in-memory checked-set across
+        # passes to avoid re-fetching settled non-split candidates. The function self-gates
+        # on the flag and takes its own write lock per split via reprocess_window.
+        if self._orch is not None:
+            try:
+                from .reprocess import auto_split_merged_events
+                await auto_split_merged_events(
+                    self._orch, circuit, checked=self._auto_split_checked)
+            except Exception as e:
+                log.error("[%s] auto-split error: %s", circuit, e, exc_info=True)

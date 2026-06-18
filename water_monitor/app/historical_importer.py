@@ -220,6 +220,40 @@ class HistoricalImporter:
                 total += n
         return total
 
+    async def count_candidate_periods(
+        self,
+        circuit: str,
+        start: datetime,
+        end: datetime,
+    ) -> list:
+        """Dry-run: return the candidate flow PERIODS the importer would reconstruct over
+        [start, end] WITHOUT deleting or storing anything. The guarded auto-split (dev.38)
+        uses the period count to decide whether ONE stored event is really several distinct
+        draws (2..K periods) vs a single draw (1) or chatter (> K). Returns a list of
+        ``(start_dt, end_dt)`` tuples; empty on an unconfigured circuit or a fetch failure
+        (fail-safe — a dry-run that can't see history must never trigger a split)."""
+        cfg = self._cfg.get_circuit(circuit)
+        if not cfg or not self._circuit_has_sensors(cfg):
+            return []
+        pressure_entity = cfg.pressure_history_sensor or cfg.pressure_avg_sensor
+        entities = [e for e in (cfg.flow_onset_sensor, cfg.flow_sensor,
+                                pressure_entity) if e]
+        if not cfg.flow_onset_sensor and not cfg.flow_sensor:
+            return []
+        try:
+            histories = await self._ha.get_history_batch(entities, start, end)
+        except Exception as exc:
+            log.warning("[%s] auto-split dry-run history fetch failed: %s", circuit, exc)
+            return []
+        onset_hist     = histories.get(cfg.flow_onset_sensor, [])
+        flow_rate_hist = histories.get(cfg.flow_sensor, [])
+        pressure_hist  = histories.get(pressure_entity, []) if pressure_entity else []
+        using_avg_pressure = (pressure_entity == cfg.pressure_avg_sensor)
+        return self._find_flow_periods(
+            onset_hist, flow_rate_hist, query_end=end,
+            pressure_hist=pressure_hist, using_avg_pressure=using_avg_pressure,
+        ) or []
+
     # ------------------------------------------------------------------ #
     # Scheduled operations                                                 #
     # ------------------------------------------------------------------ #

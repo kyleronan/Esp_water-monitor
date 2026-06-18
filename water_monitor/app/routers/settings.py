@@ -862,10 +862,13 @@ async def units_update(request: Request):
     # detection regardless of this flag).
     hide_phantoms = 1 if form.get("hide_pressure_artifact_events") == "1" else 0
     hide_cross_talk = 1 if form.get("hide_cross_talk_events") == "1" else 0
+    # dev.38 — guarded auto-split opt-in (read fresh by the periodic maturity pass).
+    auto_split = 1 if form.get("auto_split_enabled") == "1" else 0
     orch.db.execute(
         "UPDATE home_profile SET flow_unit=?, pressure_unit=?, "
-        "hide_pressure_artifact_events=?, hide_cross_talk_events=? WHERE id=1",
-        (flow_key, pressure_key, hide_phantoms, hide_cross_talk),
+        "hide_pressure_artifact_events=?, hide_cross_talk_events=?, "
+        "auto_split_enabled=? WHERE id=1",
+        (flow_key, pressure_key, hide_phantoms, hide_cross_talk, auto_split),
     )
     orch.db.commit()
     from ..units import invalidate_unit_cache

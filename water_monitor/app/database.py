@@ -188,6 +188,10 @@ CREATE TABLE IF NOT EXISTS home_profile (
     has_water_softener             INTEGER NOT NULL DEFAULT 0,
     softener_regen_start           TEXT,
     softener_circuit               TEXT,
+    -- Guarded auto-split opt-in (migration 20260545, dev.38). OFF by default — the
+    -- first automated, destructive pass (re-import over-merged events split) is
+    -- opt-in. User-labeled rows are never touched by the split.
+    auto_split_enabled             INTEGER NOT NULL DEFAULT 0,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
