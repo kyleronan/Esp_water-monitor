@@ -376,7 +376,11 @@
             {% elif e.suggested_type %}
               <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }}</span>
             {% else %}
-              —
+              {# Unmatched → the "Other" catch-all. Its water IS counted under Other on the
+                 Water Use page (get_category_rollup's COALESCE(...,'other')); show that here
+                 rather than a blank em-dash so the catch-all is visible. Display-only — the
+                 code still never writes 'other' as a label, distinct from the user's ★ Other. #}
+              <span class="pill pill-neutral" title="Counted under “Other” — we couldn't match this to a specific fixture, but its water is still included in your totals (the Other category on the Water Use page).">Other</span>
             {% endif %}
           </td>
           {% if _has_flags %}
