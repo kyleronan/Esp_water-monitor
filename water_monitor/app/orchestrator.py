@@ -479,6 +479,18 @@ class Orchestrator:
                         "[%s] startup reclassify: %d matched, %d abstained, "
                         "%d stale cleared", c.circuit, r["events_matched"],
                         r["events_abstained"], r["events_cleared"])
+                # dev.37 — backfill cluster_id over events the reprocess just
+                # un-excluded (capped-rescued) and any accumulated NULL backlog. The
+                # ~line-440 backfill ran BEFORE reprocess, so those events never got a
+                # cluster and user labels on them had nothing to propagate into. This
+                # pass assigns them. Idempotent: backfill_unmatched only touches
+                # cluster_id IS NULL rows, so it skips everything already clustered.
+                if self._cluster_engine is not None:
+                    bf = await loop.run_in_executor(
+                        None, self._cluster_engine.backfill_unmatched, c.circuit)
+                    if bf:
+                        log.info("[%s] startup post-reprocess backfill: "
+                                 "%d event(s) clustered", c.circuit, bf)
                 # Re-run the heuristic suggestion over the patched centroids, then
                 # the GATED user-label suggestion to un-poison mixed clusters
                 # (dev.22) — the only path that clears a stale 'user_labels' vote.

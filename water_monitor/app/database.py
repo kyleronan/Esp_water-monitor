@@ -4722,27 +4722,66 @@ def cleanup_composite_flags(conn: sqlite3.Connection) -> Dict[str, int]:
 _CYCLE_PULSE_WINDOW_SECONDS: float = 2700.0      # ±45 min
 _CYCLE_PULSE_VOL_RATIO_LO: float = 0.4
 _CYCLE_PULSE_VOL_RATIO_HI: float = 2.5
+# dev.37 — a cycle PULSE must also be a STEADY fill, not just volume-similar. A real
+# dishwasher fill is a steady solenoid draw (high steady-state fraction, low on-segment
+# flow CV); repeated kitchen taps are choppy (low steady, high CV). These gate the count
+# so tap-bursts stop accumulating a dishwasher signal (the volume-only count's root flaw).
+# Eval-tuned (tools/eval_knn_classifier.py --with-rules). Legacy events with NULL shape
+# features fall back to volume-only via _is_fill_shaped, so old detections never regress.
+# LOCKED by the eval sweep over the home's labels: (0.40, 0.35) beat the volume-only
+# baseline on EVERY metric — overall LOO 0.676->0.698, dishwasher precision 0.838->0.895
+# (false dishwashers 18->11), dishwasher recall 0.921->0.931, tap recall 0.333->0.467.
+_CYCLE_PULSE_MIN_STEADY_FRAC: float = 0.40
+_CYCLE_PULSE_MAX_FLOW_CV: float = 0.35
 
 
-def compute_cycle_pulse_count(this_volume, neighbour_volumes) -> int:
-    """Count neighbour volumes within ratio [0.4, 2.5] of ``this_volume``.
+def _is_fill_shaped(steady_frac, flow_cv) -> bool:
+    """True when an event looks like a STEADY appliance fill (a dishwasher solenoid):
+    high steady-state fraction AND low on-segment flow CV. Legacy events with NULL shape
+    features return True so the cycle-pulse count falls back to volume-only —
+    pre-active-flow detections never regress."""
+    if steady_frac is None or flow_cv is None:
+        return True
+    try:
+        return (float(steady_frac) >= _CYCLE_PULSE_MIN_STEADY_FRAC
+                and float(flow_cv) <= _CYCLE_PULSE_MAX_FLOW_CV)
+    except (TypeError, ValueError):
+        return True
 
-    Pure (no DB). The event itself must already be excluded from
-    ``neighbour_volumes``. Returns 0 when ``this_volume`` is missing or <= 0.
-    """
+
+def compute_cycle_pulse_count(this_volume, neighbours,
+                              this_steady=None, this_flow_cv=None) -> int:
+    """Count cycle PULSES near this event: neighbours whose volume is within ratio
+    [0.4, 2.5] of ``this_volume`` AND that are fill-shaped (a steady draw).
+
+    ``neighbours`` is an iterable of ``(volume, steady_state_fraction,
+    flow_cv_on_segments)`` records (the event itself already excluded); a bare float is
+    also accepted (volume with unknown shape → volume-only). A choppy event (THIS event
+    not fill-shaped) returns 0 — it is not an appliance fill, so repeated taps no longer
+    accumulate a dishwasher count. Pure (no DB). Returns 0 when ``this_volume`` is missing
+    or <= 0. Legacy rows (NULL shape) fall back to volume-only via _is_fill_shaped."""
     try:
         tv = float(this_volume)
     except (TypeError, ValueError):
         return 0
     if tv <= 0:
         return 0
+    if not _is_fill_shaped(this_steady, this_flow_cv):
+        return 0
     n = 0
-    for v in neighbour_volumes:
+    for rec in neighbours:
+        if isinstance(rec, (tuple, list)):
+            v = rec[0]
+            nsteady = rec[1] if len(rec) > 1 else None
+            ncv = rec[2] if len(rec) > 2 else None
+        else:
+            v, nsteady, ncv = rec, None, None
         try:
             fv = float(v)
         except (TypeError, ValueError):
             continue
-        if fv > 0 and _CYCLE_PULSE_VOL_RATIO_LO <= fv / tv <= _CYCLE_PULSE_VOL_RATIO_HI:
+        if (fv > 0 and _CYCLE_PULSE_VOL_RATIO_LO <= fv / tv <= _CYCLE_PULSE_VOL_RATIO_HI
+                and _is_fill_shaped(nsteady, ncv)):
             n += 1
     return n
 
@@ -4757,10 +4796,12 @@ def _parse_event_ts(s):
 
 
 def _load_pulse_events(conn: sqlite3.Connection, circuit: str):
-    """Sorted ``[(epoch, id, volume)]`` for same-circuit, non-excluded events
-    with a parseable timestamp and positive volume (the cycle candidates)."""
+    """Sorted ``[(epoch, id, volume, steady_state_fraction, flow_cv_on_segments)]`` for
+    same-circuit, non-excluded events with a parseable timestamp and positive volume
+    (the cycle candidates). The two shape columns feed the fill-shaped pulse gate."""
     rows = conn.execute(
-        "SELECT id, start_ts, volume_litres FROM events "
+        "SELECT id, start_ts, volume_litres, steady_state_fraction, "
+        "       flow_cv_on_segments FROM events "
         "WHERE circuit = ? AND COALESCE(excluded_from_training, 0) = 0 "
         "  AND start_ts IS NOT NULL AND volume_litres IS NOT NULL",
         (circuit,),
@@ -4775,7 +4816,8 @@ def _load_pulse_events(conn: sqlite3.Connection, circuit: str):
         except (TypeError, ValueError):
             continue
         if vol > 0:
-            out.append((t.timestamp(), r["id"], vol))
+            out.append((t.timestamp(), r["id"], vol,
+                        r["steady_state_fraction"], r["flow_cv_on_segments"]))
     out.sort(key=lambda e: e[0])
     return out
 
@@ -4797,8 +4839,15 @@ def cycle_pulse_count_for_event(conn: sqlite3.Connection, circuit: str, event_id
     if t is None or vol <= 0:
         return 0
     center = t.timestamp()
+    me = conn.execute(
+        "SELECT steady_state_fraction, flow_cv_on_segments FROM events "
+        "WHERE id = ? AND circuit = ?", (event_id, circuit),
+    ).fetchone()
+    my_steady = me["steady_state_fraction"] if me else None
+    my_cv = me["flow_cv_on_segments"] if me else None
     rows = conn.execute(
-        "SELECT start_ts, volume_litres FROM events "
+        "SELECT start_ts, volume_litres, steady_state_fraction, flow_cv_on_segments "
+        "FROM events "
         "WHERE circuit = ? AND id <> ? AND COALESCE(excluded_from_training, 0) = 0 "
         "  AND start_ts IS NOT NULL AND volume_litres IS NOT NULL "
         "ORDER BY start_ts DESC LIMIT 400",
@@ -4812,8 +4861,10 @@ def cycle_pulse_count_for_event(conn: sqlite3.Connection, circuit: str, event_id
         dt = center - rt.timestamp()
         if (0 <= dt <= _CYCLE_PULSE_WINDOW_SECONDS) or \
            (not past_only and -_CYCLE_PULSE_WINDOW_SECONDS <= dt < 0):
-            nbrs.append(r["volume_litres"])
-    return compute_cycle_pulse_count(vol, nbrs)
+            nbrs.append((r["volume_litres"], r["steady_state_fraction"],
+                         r["flow_cv_on_segments"]))
+    return compute_cycle_pulse_count(vol, nbrs,
+                                     this_steady=my_steady, this_flow_cv=my_cv)
 
 
 def recompute_cycle_pulse_counts(conn: sqlite3.Connection, circuit: str,
@@ -4847,8 +4898,10 @@ def recompute_cycle_pulse_counts(conn: sqlite3.Connection, circuit: str,
             hi += 1
         if since_epoch is not None and center < since_epoch:
             continue                  # neighbour-only: keep its authoritative count
-        nbrs = [evs[j][2] for j in range(lo, hi) if j != i]
-        cnt = compute_cycle_pulse_count(evs[i][2], nbrs)
+        nbrs = [(evs[j][2], evs[j][3], evs[j][4])
+                for j in range(lo, hi) if j != i]
+        cnt = compute_cycle_pulse_count(evs[i][2], nbrs,
+                                        this_steady=evs[i][3], this_flow_cv=evs[i][4])
         eid = evs[i][1]
         if stored.get(eid) != cnt:
             conn.execute(

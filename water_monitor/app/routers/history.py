@@ -398,14 +398,16 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                     propagation_meta["total_label_count"] = \
                         result["total_label_count"]
             elif row and not row["excluded_from_training"]:
-                # Event eligible for clustering but never got a cluster_id —
-                # likely the preliminary-match-without-commit gap surfaced
-                # in the Sprint B context. Make this visible in the log so
-                # the gap is loud once it actually fires in production.
-                log.info(
-                    "[%s] event %s labelled but cluster_id is NULL "
-                    "(excluded_from_training=0) — label recorded but has "
-                    "no cluster to propagate into",
+                # Event eligible for clustering but has no cluster_id yet (the
+                # preliminary-match-without-commit gap). The label IS recorded and
+                # trains the k-NN classifier — only the legacy cluster bulk-propagation
+                # is skipped until the next backfill assigns this event a cluster.
+                # DEBUG, not INFO: a known low-impact gap, not an error, and it would
+                # otherwise fire on every label of an un-clustered event.
+                log.debug(
+                    "[%s] event %s labelled with cluster_id NULL — label recorded and "
+                    "trains the classifier; cluster propagation follows once it is "
+                    "clustered (next backfill)",
                     circuit, event_id,
                 )
 
