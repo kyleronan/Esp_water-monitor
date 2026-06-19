@@ -848,34 +848,19 @@
           </div>
           <div class="sett-toggle-row" style="margin-bottom:14px;padding-top:.75rem;border-top:1px solid var(--border)">
             <div class="sett-toggle-info">
-              <span class="sett-toggle-label">Hide removed (not-real-water) events from History</span>
+              <span class="sett-toggle-label">Hide not-real-use events from History</span>
               <span class="sett-toggle-desc">
-                Sometimes city water-pressure recovery looks like a long, flat
-                reading. We always remove its volume from your totals; turn this
-                on to also hide those rows. Off by default — they stay visible
-                with a 👻 flag.
+                The monitor automatically flags readings that aren't real water use —
+                city water-pressure blips (👻), draws on your <em>other</em> water line
+                (↔), and tiny drips or sensor noise (Drip). Their volume is always
+                removed from your totals; turn this on to also hide those rows from the
+                list. Off by default — they stay visible with their flag so you can
+                relabel any that really were water.
               </span>
             </div>
             <label class="toggle">
               <input type="checkbox" name="hide_pressure_artifact_events" value="1"
-                     {% if profile.hide_pressure_artifact_events %}checked{% endif %}>
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-          <div class="sett-toggle-row" style="margin-bottom:14px">
-            <div class="sett-toggle-info">
-              <span class="sett-toggle-label">Hide other-line events from History</span>
-              <span class="sett-toggle-desc">
-                When your <em>other</em> water line draws, it can briefly drop this
-                line's pressure and register here even though no real water flowed
-                through this meter — so its volume is always removed from totals.
-                Turn this on to also hide those rows. Off by default — they stay
-                visible with a ↔ flag.
-              </span>
-            </div>
-            <label class="toggle">
-              <input type="checkbox" name="hide_cross_talk_events" value="1"
-                     {% if profile.hide_cross_talk_events %}checked{% endif %}>
+                     {% if profile.hide_pressure_artifact_events or profile.hide_cross_talk_events %}checked{% endif %}>
               <span class="toggle-slider"></span>
             </label>
           </div>

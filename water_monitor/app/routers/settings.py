@@ -857,11 +857,14 @@ async def units_update(request: Request):
         flow_key = "L/min"
     if pressure_key not in PRESSURE_OPTIONS:
         pressure_key = "psi"
-    # History display: hide pressure-restoration phantom events from the list.
-    # Display-only — never affects totals (phantom volume is zeroed at
-    # detection regardless of this flag).
-    hide_phantoms = 1 if form.get("hide_pressure_artifact_events") == "1" else 0
-    hide_cross_talk = 1 if form.get("hide_cross_talk_events") == "1" else 0
+    # History display: one unified "Hide not-real-use events" toggle hides every
+    # volume-zeroing verdict (phantom / cross-talk / dribble). Display-only — never
+    # affects totals (their volume is zeroed at detection regardless of this flag).
+    # The single checkbox drives BOTH legacy columns in lockstep so any reader stays
+    # consistent and a legacy split state is normalised on first save.
+    hide_not_real = 1 if form.get("hide_pressure_artifact_events") == "1" else 0
+    hide_phantoms = hide_not_real
+    hide_cross_talk = hide_not_real
     # dev.38 — guarded auto-split opt-in (read fresh by the periodic maturity pass).
     auto_split = 1 if form.get("auto_split_enabled") == "1" else 0
     orch.db.execute(

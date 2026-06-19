@@ -86,12 +86,16 @@ def _collect_circuit_history_sync(
     """
     from ..database import (get_recent_events, get_leak_test_history,
                             get_daily_summaries, get_home_profile)
-    # Read the hide-phantom display preference once (same for all circuits).
-    # Display-only: phantom volume is already zeroed at detection, so hiding
-    # never changes any total — it only removes rows from the History list.
+    # Read the "hide not-real-use events" display preference once (same for all
+    # circuits). One unified toggle hides EVERY volume-zeroing verdict — phantom,
+    # cross-talk, and low-flow dribble — so the single "Not real use" label maps to a
+    # single switch. Display-only: their volume is already zeroed at detection, so
+    # hiding never changes any total — it only removes rows from the History list. OR
+    # of the two legacy columns (kept in lockstep by the settings save) so an older
+    # profile that set only one still hides all.
     _profile = get_home_profile(db)
-    hide_phantoms = bool(_profile and _profile["hide_pressure_artifact_events"])
-    hide_cross_talk = bool(_profile and _profile["hide_cross_talk_events"])
+    hide_not_real = bool(_profile and (_profile["hide_pressure_artifact_events"]
+                                       or _profile["hide_cross_talk_events"]))
     out: list[dict] = []
     for circuit_cfg in circuits:
         if filter_circuit and circuit_cfg.circuit != filter_circuit:
@@ -107,13 +111,14 @@ def _collect_circuit_history_sync(
         # the rendering machinery doesn't need to change.
         if filter_param == "degraded":
             events = [e for e in events if dict(e).get("degraded_supply")]
-        # Settings "Hide pressure-artifact events" toggle.
-        if hide_phantoms:
+        # Settings "Hide not-real-use events" toggle — hides every volume-zeroing
+        # verdict (phantom / cross-talk / dribble) so the one "Not real use" label
+        # maps to one switch.
+        if hide_not_real:
             events = [e for e in events
-                      if not dict(e).get("is_pressure_restoration_phantom")]
-        # Settings "Hide cross-talk events" toggle (independent of the phantom one).
-        if hide_cross_talk:
-            events = [e for e in events if not dict(e).get("is_cross_talk")]
+                      if not (dict(e).get("is_pressure_restoration_phantom")
+                              or dict(e).get("is_cross_talk")
+                              or dict(e).get("is_low_flow_dribble"))]
         leak_tests = get_leak_test_history(db, circuit_cfg.circuit, limit=20)
         summaries  = get_daily_summaries(
             db, circuit_cfg.circuit,
