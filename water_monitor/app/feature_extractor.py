@@ -1261,6 +1261,13 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     # long event) — a continuous leak cannot be silently zeroed. ΔP<1.5 also makes
     # this disjoint from cross-talk (ΔP>=2.0). Guarded by the column check so the
     # phantom-only wrapper stays safe mid-upgrade (column added later in the chain).
+    #
+    # The row filter selects an event when it is EITHER not yet flagged a dribble OR
+    # flagged but still carrying volume (volume_litres_effective > 0). The second arm
+    # is the one-time self-healing backfill for the 2026-06-19 semantics change
+    # (dribble used to keep its volume): on the next startup reprocess, every
+    # already-flagged dribble gets its volume zeroed + ledger reversed. Idempotent —
+    # once veff is 0 the row no longer matches, so re-runs are no-ops.
     dribbles_flagged = 0
     dr_days: set = set()
     if _events_has_column(conn, "is_low_flow_dribble"):
@@ -1268,9 +1275,11 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "SELECT id, circuit, start_ts, duration_seconds, pressure_delta_psi, "
             "       volume_litres, avg_flow_lpm "
             "FROM events "
-            "WHERE (is_low_flow_dribble = 0 OR is_low_flow_dribble IS NULL) "
+            "WHERE (is_low_flow_dribble = 0 OR is_low_flow_dribble IS NULL "
+            "       OR COALESCE(volume_litres_effective, volume_litres, 0) > 0) "
             "  AND COALESCE(user_classified, 0) = 0 "
             "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+            "  AND COALESCE(is_cross_talk, 0) = 0 "
             "  AND COALESCE(degraded_supply, 0) = 0 "
             "  AND volume_litres < ? AND avg_flow_lpm < ? "
             "  AND pressure_delta_psi < ?",
