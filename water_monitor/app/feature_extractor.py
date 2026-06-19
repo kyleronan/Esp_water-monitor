@@ -285,11 +285,18 @@ _XTALK_MIN_DURATION_S: float = 120.0
 # rule caught only 1 of 49. These thresholds (derived from that labelled set,
 # ~76% recall / ~73% precision) catch them.
 #
-# CRITICAL: unlike a phantom, a dribble does NOT zero volume. It only sets
-# is_low_flow_dribble + excluded_from_training, keeping it out of the
-# classifier/clustering training set while its (negligible) volume still counts
-# toward totals. Manual phantom marks remain the only short-event path that
-# zeroes volume. Re-tune here as more labelled data arrives.
+# A dribble is a VOLUME-ZEROING verdict (changed 2026-06-19): it sets
+# is_low_flow_dribble + excluded_from_training AND zeroes volume_litres_effective,
+# removing the brief blip from totals like a phantom does. (Previously it kept the
+# volume as a benign "Drip"; users were hand-marking these short ~0-ΔP blips as
+# "not real use" to suppress them, so the auto-verdict now does it.) Leak-safe
+# because the flow<1 L·min⁻¹ gate excludes real small draws (icemaker / fridge
+# dispenser run ~3 L·min⁻¹) and a sustained slow flow accumulates past
+# _DRIBBLE_MAX_VOLUME_L, so it stays a counted long event — a continuous leak is
+# never fragmented into zeroed dribbles (verified on the archive: 0 / 347 auto
+# dribbles moved >= SUSPECT_ZERO_LITRES of real HA flow). detector_validation now
+# holds dribble to the same suspect-zeroing leak-safety bar as phantom/cross-talk.
+# Re-tune here as more labelled data arrives.
 _DRIBBLE_MAX_VOLUME_L:  float = 0.5
 _DRIBBLE_MAX_FLOW_LPM:  float = 1.0
 _DRIBBLE_MAX_DELTA_PSI: float = 1.5
@@ -891,10 +898,14 @@ def _finalize_derived_verdicts(features: dict, calib=None) -> None:
     est = features.get("volume_litres_estimated")
     est = float(est) if est is not None else raw
 
-    # Effective volume: phantom → 0 (false water); degraded → envelope estimate;
-    # else raw. Phantom takes precedence over degraded. A dribble keeps its raw
-    # volume (it counts toward totals) — it is excluded from TRAINING, not from
-    # consumption, so it falls through to the raw branch here.
+    # Effective volume: phantom → 0 (false water); cross-talk → 0; degraded →
+    # envelope estimate; low-flow dribble → 0; else raw. Phantom takes precedence
+    # over degraded. A dribble (brief sub-0.5 L / sub-1 L·min⁻¹ blip at ~0 ΔP) is
+    # sensor / pressure-equalisation noise, not real use, so its volume is removed
+    # from totals like a phantom's — and the flow<1 L·min⁻¹ gate keeps real small
+    # draws (icemaker / fridge dispenser run ~3 L·min⁻¹) out of this branch. A
+    # sustained slow flow accumulates past 0.5 L and never reaches here (it stays a
+    # counted long event), so this cannot silently zero a continuous leak.
     if is_phantom:
         features["volume_litres_effective"]  = 0.0
         features["volume_estimation_method"] = "pressure_restoration_phantom"
@@ -904,6 +915,9 @@ def _finalize_derived_verdicts(features: dict, calib=None) -> None:
     elif is_degraded:
         features["volume_litres_effective"]  = round(est, 3)
         features["volume_estimation_method"] = "pulsing_supply_envelope"
+    elif is_dribble:
+        features["volume_litres_effective"]  = 0.0
+        features["volume_estimation_method"] = "low_flow_dribble"
     else:
         features["volume_litres_effective"]  = round(raw, 3)
         features["volume_estimation_method"] = "raw"
@@ -951,9 +965,17 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
          {phantom, cross_talk, dribble}. Stale auto-flags can be left set under a later
          manual classification. Resolve by the row's RECORDED EFFECT — its stored
          ``volume_litres_effective`` — rather than guessing intent:
-           veff == 0                       -> a zeroing verdict was operative
+           veff == 0                       -> a zeroing verdict (phantom / cross_talk /
+                                              dribble — all three now zero volume) was
+                                              operative. veff alone can't say which, so
+                                              pick by the user's match_rejection_reason
+                                              (manual rows) or by RE-RUNNING the live
+                                              detectors (auto rows), priority
+                                              phantom > cross_talk > dribble — never the
+                                              stale flag bits, so a fossil bit can't win
+                                              over the current verdict.
            veff == volume_litres_estimated -> degraded was operative
-           veff == volume_litres (raw)     -> dribble (or none) was operative
+           veff == volume_litres (raw)     -> a pre-zeroing dribble (or none) was operative
          Keep the flag that matches that effect and clear the others (and recompute
          excluded_from_training + match_rejection_reason to suit). A row whose veff
          matches no branch is left UNTOUCHED and logged for manual review.
@@ -979,11 +1001,14 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
 
     # ── B: resolve mutually-exclusive flag collisions by recorded effect ────────
     rows = conn.execute(
-        "SELECT id, user_ignored AS ui, "
+        "SELECT id, user_ignored AS ui, COALESCE(user_classified,0) AS uc, "
+        "  match_rejection_reason AS mrr, "
         "  COALESCE(is_pressure_restoration_phantom,0) AS ph, "
         "  COALESCE(is_cross_talk,0) AS ct, "
         "  COALESCE(is_low_flow_dribble,0) AS dr, "
         "  COALESCE(degraded_supply,0) AS dg, "
+        "  duration_seconds, pressure_delta_psi, true_avg_flow_lpm, "
+        "  flow_integral_litres, flow_on_ratio, avg_flow_lpm, "
         "  volume_litres, volume_litres_estimated, volume_litres_effective AS veff "
         "FROM events "
         "WHERE (COALESCE(is_pressure_restoration_phantom,0) "
@@ -996,7 +1021,43 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
     for r in rows:
         veff, raw, est = r["veff"], r["volume_litres"], r["volume_litres_estimated"]
         if veff is not None and abs(float(veff)) < EPS:
-            keep = "phantom" if r["ph"] else "cross_talk"      # a zeroing verdict won
+            # All three zeroing verdicts (phantom / cross-talk / dribble) record
+            # veff==0, so the stored effect can't disambiguate them.
+            if r["uc"]:
+                # Manual classification is authoritative — never re-derive it. The
+                # user's verdict is in match_rejection_reason; honour it, falling back
+                # to flag-priority only if it names no zeroing verdict.
+                mrr = r["mrr"]
+                keep = ("phantom"    if mrr == "pressure_restoration_phantom"
+                        else "cross_talk" if mrr == "cross_talk"
+                        else "dribble"    if mrr == "low_flow_dribble"
+                        else "phantom"    if r["ph"]
+                        else "cross_talk" if r["ct"]
+                        else "dribble")
+            else:
+                # Auto row: keep the verdict the CURRENT detectors produce (priority
+                # phantom > cross-talk > dribble), not the fossilised flag bits — a
+                # stale bit can never win over the live verdict. calib=None (shipped
+                # defaults) is enough to pick the category for a rare collision row.
+                if _detect_pressure_restoration_phantom(
+                        r["duration_seconds"], r["pressure_delta_psi"],
+                        true_avg_flow_lpm=r["true_avg_flow_lpm"],
+                        flow_integral_litres=r["flow_integral_litres"],
+                        flow_on_ratio=r["flow_on_ratio"]):
+                    keep = "phantom"
+                elif _detect_cross_talk(
+                        r["duration_seconds"], r["pressure_delta_psi"],
+                        r["flow_integral_litres"], r["flow_on_ratio"]):
+                    keep = "cross_talk"
+                elif _detect_low_flow_dribble(
+                        r["volume_litres"], r["avg_flow_lpm"],
+                        r["pressure_delta_psi"]):
+                    keep = "dribble"
+                else:
+                    # veff==0 but no current detector fires (stale/legacy zeroing):
+                    # keep the highest-priority flag actually set, deterministically.
+                    keep = ("phantom" if r["ph"]
+                            else "cross_talk" if r["ct"] else "dribble")
         elif (r["dg"] and est is not None and veff is not None
               and abs(float(veff) - float(est)) < EPS):
             # Envelope estimate AND the event is actually degraded — degraded won.
@@ -1048,8 +1109,9 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
          reverse any prior hourly_volume contribution so daily totals shed the
          false volume.
       2. Low-flow dribbles (brief low-flow / low-volume / near-zero ΔP) — flag
-         is_low_flow_dribble + excluded_from_training only. Volume is PRESERVED
-         (a dribble still counts toward totals); no hourly/daily resync needed.
+         is_low_flow_dribble + excluded_from_training, ZERO volume_litres_effective,
+         and reverse any prior hourly_volume contribution (same shape as scan 1):
+         a dribble is sensor / pressure-equalisation noise, removed from totals.
 
     Both scans skip ``user_classified`` rows (manual classification wins) and
     are idempotent — already-flagged events are excluded by their WHERE clauses.
@@ -1190,12 +1252,20 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                  flagged, len(affected_days))
 
     # ── Scan 2: low-flow dribbles ────────────────────────────────────────────
-    # Non-zeroing exclusion. Guarded by the column check so the phantom-only
-    # wrapper stays safe mid-upgrade (column added later in the chain).
+    # ZEROES volume + excludes, reversing any prior hourly contribution via the
+    # §2.5 chokepoint — same shape as the cross-talk scan below. A brief sub-0.5 L
+    # / sub-1 L·min⁻¹ blip at ~0 ΔP is sensor / pressure-equalisation noise, not
+    # real use, so it is removed from totals like a phantom. The flow<1 L·min⁻¹
+    # gate keeps real small draws (icemaker / dispenser ~3 L·min⁻¹) counted, and a
+    # sustained slow flow exceeds 0.5 L so it never matches here (it stays a counted
+    # long event) — a continuous leak cannot be silently zeroed. ΔP<1.5 also makes
+    # this disjoint from cross-talk (ΔP>=2.0). Guarded by the column check so the
+    # phantom-only wrapper stays safe mid-upgrade (column added later in the chain).
     dribbles_flagged = 0
+    dr_days: set = set()
     if _events_has_column(conn, "is_low_flow_dribble"):
         drows = conn.execute(
-            "SELECT id, duration_seconds, pressure_delta_psi, "
+            "SELECT id, circuit, start_ts, duration_seconds, pressure_delta_psi, "
             "       volume_litres, avg_flow_lpm "
             "FROM events "
             "WHERE (is_low_flow_dribble = 0 OR is_low_flow_dribble IS NULL) "
@@ -1212,21 +1282,30 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                 row["volume_litres"], row["avg_flow_lpm"], row["pressure_delta_psi"]
             ):
                 continue
-            # Flag + exclude WITHOUT touching volume_litres_effective or
-            # hourly_volume — the event still counts toward totals.
-            conn.execute(
-                "UPDATE events SET "
-                "  is_low_flow_dribble = 1, "
-                "  excluded_from_training = 1, "
-                "  match_rejection_reason = 'low_flow_dribble' "
-                "WHERE id = ?",
-                (row["id"],),
-            )
+            with transaction(conn):
+                conn.execute(
+                    "UPDATE events SET "
+                    "  is_low_flow_dribble = 1, "
+                    "  volume_litres_effective = 0, "
+                    "  volume_estimation_method = 'low_flow_dribble', "
+                    "  excluded_from_training = 1, "
+                    "  match_rejection_reason = 'low_flow_dribble' "
+                    "WHERE id = ?",
+                    (row["id"],),
+                )
+                # §2.5 — zero the ledger contribution via the one chokepoint.
+                apply_effective_volume(conn, row["id"], row["circuit"],
+                                       row["start_ts"], 0)
             dribbles_flagged += 1
+            day = (row["start_ts"] or "")[:10]
+            if day:
+                dr_days.add((row["circuit"], day))
+        for circ, day in dr_days:
+            compute_daily_summary(conn, circ, day)
         if dribbles_flagged:
             conn.commit()
-            log.info("dribble-reprocess: flagged %d low-flow dribble event(s)",
-                     dribbles_flagged)
+            log.info("dribble-reprocess: flagged %d low-flow dribble event(s) "
+                     "across %d day(s)", dribbles_flagged, len(dr_days))
 
     # ── Scan 3: cross-talk (no real flow + a REAL pressure drop ≥ 2.0) ────────
     # Another circuit's draw pulled this circuit's pressure down — registered but

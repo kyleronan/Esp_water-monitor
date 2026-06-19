@@ -140,9 +140,10 @@
       exact. Worth a glance if it happens often.</dd>
     {% endif %}
     {% if ns.has_dribble %}
-    <dt><span class="pill pill-neutral">Drip</span></dt>
-    <dd>A very small flow; its water still counts in totals but it's too small to learn
-      your fixtures from. Relabel if it was a real fixture.</dd>
+    <dt><span class="pill pill-neutral">Drip — not real use</span></dt>
+    <dd>A very small flow, too small to be a real tap or appliance — its volume is removed
+      from your totals. This is the app's automatic call; if water <strong>was</strong>
+      running here, open the event and relabel it.</dd>
     {% endif %}
     <dt class="hist-legend-fix">★ ◎ ↻ ~</dt>
     <dd>How a fixture was labeled: <strong>★</strong> you assigned it ·
@@ -355,10 +356,11 @@
               {% endif %}
             </div>
           </td>
-          {# Phantom rows show their effective (zeroed) volume so the list
-             doesn't display the fake reading; the raw value stays in the
-             event-detail modal, clearly labelled. Other rows are unchanged. #}
-          {% set _row_vol = e.volume_litres_effective if e.is_pressure_restoration_phantom else e.volume_litres %}
+          {# Volume-zeroing verdicts (phantom / cross-talk / dribble) show their
+             effective (zeroed) volume so the list doesn't display the fake reading;
+             the raw value stays in the event-detail modal, clearly labelled. Other
+             rows are unchanged. #}
+          {% set _row_vol = e.volume_litres_effective if (e.is_pressure_restoration_phantom or e.is_cross_talk or e.is_low_flow_dribble) else e.volume_litres %}
           <td class="hist-td hist-td-mono">{{ (_row_vol * vol_factor)|round(vol_decimals) if _row_vol is not none else "—" }} {{ vol_unit if _row_vol is not none else '' }}</td>
           <td class="hist-td">
             {# Fixture identity is driven by your labels (clustering demoted):
@@ -389,7 +391,7 @@
               {% if e.is_pressure_restoration_phantom %}<span class="pill pill-neutral" title="Not real water use — a city water-pressure blip, not a tap or appliance. Volume removed from your totals. If water was running, open it and relabel.">👻 Not real use</span>{% endif %}
               {% if e.is_cross_talk %}<span class="pill pill-neutral" title="Caused by the other water line — its draw briefly dropped this line's pressure; no real flow here, volume removed. If water was running here, open it and relabel.{% if e.other_valve_open %} The other line was drawing.{% endif %}">↔ Not real use</span>{% endif %}
               {% if e.degraded_supply %}<span class="pill pill-amber" title="Unsteady water pressure — pressure was pulsing, so this volume is an estimate, not exact.">〰 Estimated</span>{% endif %}
-              {% if e.is_low_flow_dribble %}<span class="pill pill-neutral" title="Drip — a very small flow; its water still counts but it's too small to learn your fixtures from.">Drip</span>{% endif %}
+              {% if e.is_low_flow_dribble %}<span class="pill pill-neutral" title="Not real water use — a very small flow, too small to be a real tap or appliance. Volume removed from your totals. If water was running here, open it and relabel.">Drip — not real use</span>{% endif %}
               {% if e.match_rejection_reason == 'sparse_envelope' %}<span class="pill pill-neutral" title="A brief use followed by a long idle stretch — the listed time is mostly no-flow. The water still counts, but it's too irregular to learn your fixtures from.">⏳ Brief use, long idle tail</span>{% endif %}
             </div>
           </td>
@@ -511,7 +513,7 @@
         <label class="emd-check"><input type="checkbox" id="emd-cls-supply">
           <span>Unsteady water pressure</span></label>
         <label class="emd-check"><input type="checkbox" id="emd-cls-dribble">
-          <span>Drip (very low flow)</span></label>
+          <span>Drip — very low flow (removes its volume)</span></label>
         <label class="emd-check"><input type="checkbox" id="emd-cls-crosstalk">
           <span>Caused by the other water line</span></label>
       </div>

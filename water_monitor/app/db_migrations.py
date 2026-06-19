@@ -514,9 +514,11 @@ def _apply_manual_classification_columns(conn: sqlite3.Connection) -> None:
 def _apply_low_flow_dribble_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260535 — low-flow dribble exclusion.
 
-    Adds ``events.is_low_flow_dribble`` (a non-zeroing training-exclusion flag
-    for brief low-flow / low-volume / near-zero-pressure trickles) plus two
-    indexes that back the label-training and reclassify-backfill queries.
+    Adds ``events.is_low_flow_dribble`` (a verdict flag for brief low-flow /
+    low-volume / near-zero-pressure trickles) plus two indexes that back the
+    label-training and reclassify-backfill queries. (The verdict was originally
+    non-zeroing; since 2026-06-19 it also zeroes volume_litres_effective — see
+    feature_extractor._finalize_derived_verdicts. This DDL is unaffected.)
 
     LIGHTWEIGHT DDL ONLY. Unlike the phantom migration above, this does NOT
     import feature_extractor or run a data backfill — the per-event verdict is

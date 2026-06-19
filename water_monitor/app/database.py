@@ -2387,9 +2387,9 @@ def _apply_event_verdicts(
     new_cross_talk: int = 0,
 ) -> bool:
     """Shared core: write category flags + user_classified, re-derive
-    volume_litres_effective (phantom → 0; elif degraded → envelope estimate;
-    else raw), recompute excluded_from_training, and resync hourly_volume +
-    daily_summary.
+    volume_litres_effective (phantom → 0; elif cross-talk → 0; elif degraded →
+    envelope estimate; elif dribble → 0; else raw), recompute
+    excluded_from_training, and resync hourly_volume + daily_summary.
 
     Volume resync is idempotent: it reads the event's stored
     ``hourly_volume_applied_litres`` (the prior contribution), applies
@@ -2415,6 +2415,10 @@ def _apply_event_verdicts(
     elif new_degraded:
         new_effective = float(est) if est is not None else raw
         method = "pulsing_supply_envelope"
+    elif new_dribble:
+        # Dribble is now a volume-zeroing verdict (matches _finalize_derived_verdicts):
+        # a brief low-flow blip is removed from totals, not just excluded from training.
+        new_effective, method = 0.0, "low_flow_dribble"
     else:
         new_effective, method = raw, "raw"
 

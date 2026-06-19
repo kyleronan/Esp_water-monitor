@@ -209,7 +209,8 @@ def validate_detectors_against_history(
     }
 
     # ── 2. Suspect zeroings — the leak-safety regression guard (EXACT window) ────
-    # A volume-zeroed event that actually moved real water. Split by provenance:
+    # A volume-zeroed event (phantom / cross-talk / dribble — all three now zero the
+    # event's volume) that actually moved real water. Split by provenance:
     #   • AUTO  (user_classified=0): the DETECTOR zeroed real water → a genuine leak-safety
     #     red flag, and what drives the per-detector WARN — this is the continuous proof the
     #     auto-detector still honours the invariant.
@@ -217,7 +218,8 @@ def validate_detectors_against_history(
     #     "flow" is a paddlewheel misread / cross-talk) → informational only, never a WARN.
     suspects: List[Dict[str, Any]] = []
     user_zeroed: List[Dict[str, Any]] = []
-    zeroed = [e for e in events if (e["ph"] or e["ct"]) and float(e["veff"] or 0.0) == 0.0]
+    zeroed = [e for e in events
+              if (e["ph"] or e["ct"] or e["dr"]) and float(e["veff"] or 0.0) == 0.0]
     for e in zeroed:
         a, b = _to_utc(e["start_ts"]), _to_utc(e["end_ts"])
         if not (a and b and b > a):
@@ -232,7 +234,9 @@ def validate_detectors_against_history(
                 + _integrate(main, main_t, inner_b, b + guard))
         if raw_in >= SUSPECT_ZERO_LITRES:
             entry = {
-                "id": e["id"], "kind": "phantom" if e["ph"] else "cross_talk",
+                "id": e["id"],
+                "kind": ("phantom" if e["ph"] else "cross_talk" if e["ct"]
+                         else "dribble"),
                 "raw_litres": round(raw_in, 3), "edge_litres": round(edge, 3),
                 "start_ts": e["start_ts"],
             }
@@ -243,8 +247,10 @@ def validate_detectors_against_history(
     auto_zeroed = [e for e in zeroed if not e["uc"]]
     ph_n = sum(1 for e in auto_zeroed if e["ph"])
     ct_n = sum(1 for e in auto_zeroed if e["ct"])
+    dr_n = sum(1 for e in auto_zeroed if e["dr"])
     ph_bad = sum(1 for s in suspects if s["kind"] == "phantom")
     ct_bad = sum(1 for s in suspects if s["kind"] == "cross_talk")
+    dr_bad = sum(1 for s in suspects if s["kind"] == "dribble")
     report["detectors"]["phantom"] = {
         "status": "warn" if ph_bad else "ok", "zeroed": ph_n, "suspect": ph_bad,
         "summary": (f"{ph_bad} of {ph_n} zeroed phantom(s) actually moved >= "
@@ -268,16 +274,16 @@ def validate_detectors_against_history(
                           f"raw irrigation draw" if ct_events else "no cross-talk events")),
     }
 
-    # ── 4. Dribble sanity (low stakes — dribble keeps volume) ───────────────────
-    dribbles = [e for e in events if e["dr"]]
-    dribble_hi = [e["id"] for e in dribbles
-                  if _integrate(main, main_t, _to_utc(e["start_ts"]),
-                                _to_utc(e["end_ts"])) > 2.0]
+    # ── 4. Dribble — now a VOLUME-ZEROING verdict (it removes the event's volume
+    #       from totals), so it is held to the SAME leak-safety bar as phantom /
+    #       cross-talk via the suspect-zeroing pass above (a zeroed dribble that moved
+    #       >= SUSPECT_ZERO_LITRES of real water is a red flag and a WARN), not the old
+    #       low-stakes 2 L sanity note. ────────────────────────────────────────────
     report["detectors"]["dribble"] = {
-        "status": "warn" if dribble_hi else "ok",
-        "count": len(dribbles), "with_real_flow": len(dribble_hi),
-        "summary": (f"{len(dribble_hi)} of {len(dribbles)} dribble(s) show > 2 L raw flow"
-                    if dribble_hi else f"{len(dribbles)} dribble(s), flow consistent"),
+        "status": "warn" if dr_bad else "ok", "zeroed": dr_n, "suspect": dr_bad,
+        "summary": (f"{dr_bad} of {dr_n} zeroed dribble(s) actually moved >= "
+                    f"{SUSPECT_ZERO_LITRES:g} L of raw water" if dr_bad
+                    else f"{dr_n} zeroed dribble(s), 0 suspect"),
     }
 
     # ── 5. Unflagged-no-flow sentinel (the gap-class scan, run continuously) ─────
@@ -291,8 +297,10 @@ def validate_detectors_against_history(
     report["unflagged_no_flow"] = {"count": len(sentinel), "ids": sentinel[:50]}
 
     # ── overall verdict ─────────────────────────────────────────────────────────
+    # `suspects` now includes dribble suspects (dribble zeroes volume), so it drives
+    # the dribble WARN too — no separate low-stakes signal.
     report["overall"] = (
-        "warn" if (suspects or cov_warn or sentinel or dribble_hi) else "ok")
+        "warn" if (suspects or cov_warn or sentinel) else "ok")
     return report
 
 
