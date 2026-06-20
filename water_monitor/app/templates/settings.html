@@ -1554,7 +1554,8 @@ function calOpen(circuit, label) {
 }
 async function _calPost(path, body) {
   const r = await fetch(_calBase + '/' + _calCircuit + path, {
-    method:'POST', headers:{'Content-Type':'application/json'},
+    method:'POST',
+    headers:{'Content-Type':'application/json', 'X-CSRF-Token': window.CSRF_TOKEN || ''},
     body: JSON.stringify(body || {})});
   return r.json();
 }
