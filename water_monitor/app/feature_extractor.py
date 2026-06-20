@@ -1719,6 +1719,70 @@ def _flow_signature(flow_readings: list, peak: float, n: int = 32) -> list:
     return result
 
 
+def classify_flow_shape(signature, *, steady_state_fraction=None,
+                        flow_rise_rate=None, flow_fall_rate=None,
+                        mid_event_flow_drop=None, peak=None) -> str:
+    """Describe the FLOW waveform shape for DISPLAY — what the History sparkline
+    actually draws — so the label matches the picture.
+
+    Distinct from ``_classify_resistance_shape`` (which describes the ΔP/Q
+    hydraulic-load curve, an internal feature): a steady shower is a flat-topped
+    FLOW rectangle even when its pressure-per-flow ratio wobbles. The primary input
+    is the peak-normalised flow ``signature`` (the same 0–1 array the sparkline
+    renders), so the returned word provably matches the drawn shape; when no usable
+    signature is present it falls back to the stored scalar flow features.
+
+    Returns one of: steady | rising | falling | pulsed | unknown. Thresholds are
+    presentation heuristics (tunable) pinned by the unit tests.
+    """
+    sig = [float(v) for v in (signature or []) if isinstance(v, (int, float))]
+    if len(sig) >= 6 and max(sig) > 0.0:
+        n = len(sig)
+        ramp = max(1, n // 5)                 # drop leading/trailing 20% ramp
+        mid = sig[ramp:n - ramp] or sig
+        # Oscillation — count significant direction reversals (vs the last
+        # significant value, so sub-EPS noise / slow drift never counts).
+        EPS = 0.12                            # of peak (sig is 0..1)
+        reversals, last_dir, prev = 0, 0, mid[0]
+        for v in mid[1:]:
+            d = v - prev
+            if abs(d) >= EPS:
+                cur_dir = 1 if d > 0 else -1
+                if last_dir and cur_dir != last_dir:
+                    reversals += 1
+                last_dir, prev = cur_dir, v
+        if reversals >= 2:
+            return "pulsed"
+        third = max(1, len(mid) // 3)
+        slope = statistics.mean(mid[-third:]) - statistics.mean(mid[:third])
+        if slope > 0.15:
+            return "rising"
+        if slope < -0.15:
+            return "falling"
+        return "steady"
+
+    # ── Fallback: no usable signature → stored scalar flow features ──────────────
+    def _f(x):
+        try:
+            return float(x) if x is not None else None
+        except (TypeError, ValueError):
+            return None
+    ssf, pk = _f(steady_state_fraction), _f(peak)
+    drop, rr, fr = _f(mid_event_flow_drop) or 0.0, _f(flow_rise_rate) or 0.0, \
+        _f(flow_fall_rate) or 0.0
+    if pk and pk > 0 and drop >= 0.2 * pk:
+        return "pulsed"
+    if ssf is not None and ssf >= 0.6:
+        return "steady"
+    if rr > 2.0 and rr > fr:
+        return "rising"
+    if fr > 2.0 and fr > rr:
+        return "falling"
+    if ssf is not None and ssf > 0:
+        return "steady"
+    return "unknown"
+
+
 def _pressure_signature(
     pressure_readings: list,
     pre_event_pressure_psi: float,

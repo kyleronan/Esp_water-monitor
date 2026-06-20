@@ -311,7 +311,8 @@
             data-flow="{{ (_disp_flow * flow_factor)|round(flow_decimals) if _disp_flow is not none else '—' }} {{ flow_unit }}"
             data-pressure="{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else '—' }}"
             data-volume="{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else '—' }} {{ vol_unit }}"
-            data-shape="{{ e.resistance_curve_shape or 'unknown' }}"
+            data-shape="{{ e.flow_shape or 'unknown' }}"
+            data-pressure-shape="{{ e.resistance_curve_shape or 'unknown' }}"
             data-cluster="{{ e.cluster_id if e.cluster_id is not none else '—' }}"
             data-cycle-group="{{ e.cycle_group_id or '' }}"
             data-eff-type="{{ e.user_fixture_type or e.matched_fixture_type or '' }}"
@@ -342,7 +343,7 @@
           <td class="hist-td hist-td-mono">{{ (_disp_flow * flow_factor)|round(flow_decimals) if _disp_flow is not none else "—" }} {{ flow_unit }}</td>
           <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else "—" }}</td>
           <td class="hist-td hist-td-shape">
-            {% set shape = e.resistance_curve_shape or 'unknown' %}
+            {% set shape = e.flow_shape or 'unknown' %}
             {% set shape_color  = {'steady': 'pill-blue', 'rising': 'pill-amber', 'falling': 'pill-green', 'pulsed': 'pill-neutral', 'unknown': 'pill-neutral'} %}
             {% set spark_stroke = {'steady': 'oklch(55% .18 240/.85)', 'rising': 'oklch(65% .18 80/.85)', 'falling': 'oklch(50% .18 145/.85)', 'pulsed': 'oklch(55% .05 240/.85)'} %}
             {% set spark_fill   = {'steady': 'oklch(55% .18 240/.12)', 'rising': 'oklch(65% .18 80/.12)', 'falling': 'oklch(50% .18 145/.12)', 'pulsed': 'oklch(55% .05 240/.10)'} %}
@@ -428,6 +429,8 @@
       <dt>ΔP</dt>         <dd id="emd-pressure"></dd>
       <dt>Volume</dt>     <dd id="emd-volume"></dd>
       <dt>Shape</dt>      <dd id="emd-shape"></dd>
+      <dt title="How steady the pressure-per-flow load was (ΔP ÷ flow). 'pulsed' here means an oscillating pressure load, not the flow shape.">Pressure pattern</dt>
+                          <dd id="emd-pressure-shape"></dd>
       <dt>Cluster</dt>    <dd id="emd-cluster"></dd>
       <dt>Fixture</dt>    <dd id="emd-fixture"></dd>
     </dl>
@@ -929,6 +932,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     document.getElementById('emd-pressure').textContent = d.pressure;
     document.getElementById('emd-volume').textContent   = d.volume;
     document.getElementById('emd-shape').textContent    = d.shape;
+    document.getElementById('emd-pressure-shape').textContent = d.pressureShape || '—';
     document.getElementById('emd-cluster').textContent  = d.cluster;
     const fixLabel = d.userLabel || (d.userType ? FX_LABELS[d.userType] || d.userType : null);
     document.getElementById('emd-fixture').textContent  = fixLabel || '—';

@@ -139,7 +139,7 @@ def _load_events(conn: sqlite3.Connection, circuit: str,
         "  COALESCE(is_cross_talk,0) AS ct, "
         "  COALESCE(is_low_flow_dribble,0) AS dr, "
         "  COALESCE(degraded_supply,0) AS dg, "
-        "  flow_integral_litres, flow_on_ratio, "
+        "  flow_integral_litres, flow_on_ratio, pressure_delta_psi, "
         "  COALESCE(user_classified,0) AS uc, user_fixture_type AS uft "
         "FROM events WHERE circuit = ? AND start_ts >= ? AND start_ts < ? "
         "ORDER BY start_ts",
@@ -287,14 +287,20 @@ def validate_detectors_against_history(
     }
 
     # ── 5. Unflagged-no-flow sentinel (the gap-class scan, run continuously) ─────
+    # Carry per-event detail (not just IDs) so the Settings panel can list the
+    # specific events for the user to open in History and relabel.
     sentinel = [
-        e["id"] for e in events
+        {"id": e["id"], "start_ts": e["start_ts"],
+         "duration_s": e["duration_seconds"],
+         "delta_psi": e["pressure_delta_psi"],
+         "integral_l": e["flow_integral_litres"]}
+        for e in events
         if not (e["ph"] or e["ct"] or e["dr"] or e["dg"] or e["uc"] or e["uft"])
         and (e["flow_integral_litres"] is not None and e["flow_on_ratio"] is not None)
         and float(e["flow_integral_litres"]) < 1.0 and float(e["flow_on_ratio"]) < 0.05
         and float(e["duration_seconds"] or 0) >= 120
     ]
-    report["unflagged_no_flow"] = {"count": len(sentinel), "ids": sentinel[:50]}
+    report["unflagged_no_flow"] = {"count": len(sentinel), "events": sentinel[:50]}
 
     # ── overall verdict ─────────────────────────────────────────────────────────
     # `suspects` now includes dribble suspects (dribble zeroes volume), so it drives

@@ -84,8 +84,10 @@ def _collect_circuit_history_sync(
     it via run_blocking() in one executor hop. Everything inside is
     plain sqlite3 + dict assembly — no awaits.
     """
+    import json
     from ..database import (get_recent_events, get_leak_test_history,
                             get_daily_summaries, get_home_profile)
+    from ..feature_extractor import classify_flow_shape
     # Read the "hide not-real-use events" display preference once (same for all
     # circuits). One unified toggle hides EVERY volume-zeroing verdict — phantom,
     # cross-talk, and low-flow dribble — so the single "Not real use" label maps to a
@@ -119,6 +121,23 @@ def _collect_circuit_history_sync(
                       if not (dict(e).get("is_pressure_restoration_phantom")
                               or dict(e).get("is_cross_talk")
                               or dict(e).get("is_low_flow_dribble"))]
+        # Display-time FLOW-shape label so the History "Shape" word matches the flow
+        # sparkline it sits next to (the stored resistance_curve_shape describes the
+        # ΔP/Q pressure load, which can read "pulsed" over a flat-flow rectangle).
+        # Derived from the same flow_signature_json the sparkline draws.
+        for e in events:
+            try:
+                _sig = json.loads(e.get("flow_signature_json") or "[]")
+            except (ValueError, TypeError):
+                _sig = []
+            e["flow_shape"] = classify_flow_shape(
+                _sig,
+                steady_state_fraction=e.get("steady_state_fraction"),
+                flow_rise_rate=e.get("flow_rise_rate_lpm_s"),
+                flow_fall_rate=e.get("flow_fall_rate_lpm_s"),
+                mid_event_flow_drop=e.get("mid_event_flow_drop_lpm"),
+                peak=e.get("peak_flow_lpm"),
+            )
         leak_tests = get_leak_test_history(db, circuit_cfg.circuit, limit=20)
         summaries  = get_daily_summaries(
             db, circuit_cfg.circuit,

@@ -44,6 +44,24 @@ def _fmt_local_ts(iso, tz) -> "str | None":
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
+def _localize_validation(dv: dict, tz) -> dict:
+    """Shallow-copy a detector-validation report with local-time strings added so the
+    Settings panel can list the flagged events: ``validated_at_local`` plus a
+    ``time_local`` on each leak-safety suspect and gap-sentinel event. Never mutates
+    the cached/stored report dict."""
+    out = dict(dv)
+    out["validated_at_local"] = _fmt_local_ts(dv.get("validated_at"), tz)
+
+    def _stamp(items):
+        return [{**it, "time_local": _fmt_local_ts(it.get("start_ts"), tz)}
+                for it in (items or [])]
+
+    out["suspect_zeroings"] = _stamp(dv.get("suspect_zeroings"))
+    unf = dv.get("unflagged_no_flow") or {}
+    out["unflagged_no_flow"] = {**unf, "events": _stamp(unf.get("events"))}
+    return out
+
+
 def _anomaly_shutoff_ready(sdict: dict) -> bool:
     """Display helper (Phase 2.3): is auto-shutoff currently ARMED, or held back
     (degraded to notify) until the baseline earns trust? Mirrors the feature_extractor
@@ -294,10 +312,7 @@ async def settings_page(request: Request):
                 "detectors": art_meta["detectors"],
             } if art_meta else None,
             # P6 detector self-validation against HA history (Dev Tools, diagnostic).
-            "detector_validation": ({
-                **dv,
-                "validated_at_local": _fmt_local_ts(dv.get("validated_at"), _home_tz),
-            } if dv else None),
+            "detector_validation": _localize_validation(dv, _home_tz) if dv else None,
             "device_entities": entities_by_circuit.get(c, []),
             "active_exclusion": get_active_exclusion_window(orch.db, c),
         })

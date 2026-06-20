@@ -1272,8 +1272,29 @@
                     {% if d %}<li>{{ label }}: {{ d.summary }}</li>{% endif %}
                   {% endfor %}
                 {% endif %}
-                <li>Leak-safety: {{ dv.suspect_zeroings|length }} zeroed event(s) that moved real water{{ ' ⚠ review' if dv.suspect_zeroings|length else ' — none' }}</li>
-                <li>Unflagged no-flow (gap sentinel): {{ dv.unflagged_no_flow.count if dv.unflagged_no_flow else 0 }}</li>
+                <li>Leak-safety: {{ dv.suspect_zeroings|length }} zeroed event(s) that moved real water{{ ' ⚠ review' if dv.suspect_zeroings|length else ' — none' }}
+                  {% if dv.suspect_zeroings %}
+                  <ul style="margin:.15rem 0;padding-left:1.1rem">
+                    {% for s in dv.suspect_zeroings[:10] %}
+                    <li>{{ s.time_local or s.start_ts }} · {{ s.kind|replace('_',' ') }} · {{ '%.2f'|format(s.raw_litres) }} L</li>
+                    {% endfor %}
+                    {% if dv.suspect_zeroings|length > 10 %}<li>+{{ dv.suspect_zeroings|length - 10 }} more</li>{% endif %}
+                  </ul>
+                  {% endif %}
+                </li>
+                <li>Unflagged no-flow (gap sentinel): {{ dv.unflagged_no_flow.count if dv.unflagged_no_flow else 0 }}
+                  {% if dv.unflagged_no_flow and dv.unflagged_no_flow.events %}
+                  <ul style="margin:.15rem 0;padding-left:1.1rem">
+                    {% for s in dv.unflagged_no_flow.events[:10] %}
+                    <li>{{ s.time_local or s.start_ts }} · {{ (s.duration_s / 60)|round(1) }} min · ΔP {{ '%.1f'|format(s.delta_psi) if s.delta_psi is not none else '—' }}</li>
+                    {% endfor %}
+                    {% if dv.unflagged_no_flow.events|length > 10 %}<li>+{{ dv.unflagged_no_flow.events|length - 10 }} more</li>{% endif %}
+                  </ul>
+                  {% endif %}
+                </li>
+                {% if dv.suspect_zeroings or (dv.unflagged_no_flow and dv.unflagged_no_flow.events) %}
+                <li style="margin-top:.2rem">Open these in <strong>History</strong> to confirm, or mark them <em>Not real water use</em>.</li>
+                {% endif %}
               </ul>
             {% elif dv %}
               <span class="muted" style="font-size:.85em">· could not validate ({{ dv.error or 'unknown' }}){% if dv.validated_at_local %} at {{ dv.validated_at_local }}{% endif %}</span>
