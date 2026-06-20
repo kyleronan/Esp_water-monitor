@@ -337,7 +337,9 @@ class CircuitEventDetector:
     BASELINE_LOOKBACK_SAMPLES: int = 120    # 3 s lookback
     BASELINE_WINDOW_SAMPLES: int = 80       # 2 s averaging window
 
-    # Minimum flow rate considered real flow (filters ADC noise)
+    # Minimum flow rate considered real flow (filters ADC noise). This CLASS value
+    # is the 396-ppl turbine default (60 ÷ 396 ≈ 0.15 L/min); __init__ overrides it
+    # per circuit with the meter-derived floor (60 ÷ ppl) — see CircuitConfig.min_flow_lpm.
     MIN_FLOW_LPM: float = 0.15
 
     # Maximum physically plausible flow rate for any residential/light-commercial
@@ -348,9 +350,10 @@ class CircuitEventDetector:
 
     # Minimum physically meaningful flow rate from this sensor.
     # The pulse counter cannot produce a non-zero value below 1 pulse/second,
-    # which converts to 60 counts/min / 396 ≈ 0.15 L/min.  Values in the
-    # range (0, MIN_NOISE_LPM) are floating-point noise (e.g. 1.58e-36 L/min
-    # from ESPHome ADC underflow) and should be treated as zero.
+    # which converts to 60 counts/min ÷ ppl (≈0.15 L/min at 396 ppl, ≈0.83 at
+    # 72 ppl) — that floor is the per-circuit MIN_FLOW_LPM. MIN_NOISE_LPM below is a
+    # meter-independent float-underflow guard: values in (0, MIN_NOISE_LPM) are
+    # noise (e.g. 1.58e-36 L/min from ESPHome ADC underflow) and are treated as zero.
     MIN_NOISE_LPM: float = 0.05
 
     # Seconds of sustained flow required to open a flow-triggered event
@@ -417,10 +420,15 @@ class CircuitEventDetector:
         get_other_valve_open: Optional[Callable[[], Optional[bool]]] = None,
         flow_onset_entity: Optional[str] = None,
         debug_capture_propagation: bool = False,
+        min_flow_lpm: float = 0.15,
     ) -> None:
         self.circuit = circuit
         self.pressure_drop_threshold = pressure_drop_threshold_psi
         self.min_event_duration = min_event_duration_seconds
+        # Per-circuit meter-derived low-flow floor (60 ÷ ppl), overriding the class
+        # default. A coarser meter (72-ppl oval gear → 0.83) must not treat
+        # single-pulse quantization as real flow; the 396-ppl turbine stays at 0.15.
+        self.MIN_FLOW_LPM = min_flow_lpm
         self._event_queue = event_queue
         self._flow_onset_entity: Optional[str] = flow_onset_entity
         # Callable provided by parent EventDetector to read other-circuit valve states
@@ -471,6 +479,10 @@ class CircuitEventDetector:
 
     def update_threshold(self, threshold_psi: float) -> None:
         self.pressure_drop_threshold = threshold_psi
+
+    def update_min_flow(self, min_flow_lpm: float) -> None:
+        """Update the meter-derived low-flow floor live (after a PPL change)."""
+        self.MIN_FLOW_LPM = min_flow_lpm
 
     # ------------------------------------------------------------------ #
     # HA state_changed callbacks                                           #
@@ -1806,6 +1818,18 @@ class EventDetector:
         # left None in tests / import → assembly notifies nothing.
         self._waveform_upgrade_sink: Optional[Callable[[str, WaveformRecord], None]] = None
 
+    def min_flow_for(self, circuit: str) -> float:
+        """Per-circuit meter-derived low-flow floor (60 ÷ ppl). Falls back to the
+        396-ppl turbine default if the circuit's detector isn't built yet."""
+        det = self._detectors.get(circuit)
+        return det.MIN_FLOW_LPM if det is not None else 0.15
+
+    def set_min_flow(self, circuit: str, min_flow_lpm: float) -> None:
+        """Update a circuit detector's low-flow floor live (after a PPL change)."""
+        det = self._detectors.get(circuit)
+        if det is not None:
+            det.update_min_flow(min_flow_lpm)
+
     def setup(self) -> None:
         """Instantiate detectors and register HA entity subscriptions.
 
@@ -1829,6 +1853,7 @@ class EventDetector:
                 ),
                 flow_onset_entity=cfg.flow_onset_sensor,
                 debug_capture_propagation=self._debug_capture_propagation,
+                min_flow_lpm=getattr(cfg, "min_flow_lpm", 0.15),
             )
             self._detectors[cfg.circuit] = detector
 

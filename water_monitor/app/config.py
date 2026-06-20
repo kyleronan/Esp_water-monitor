@@ -62,6 +62,8 @@ class CircuitConfig:
     leak_test_switch: str = ""
     leak_test_result_sensor: str = ""
     volume_sensor: str = ""
+    # Runtime per-circuit flow-meter pulses-per-litre number entity (firmware 3.12.0+).
+    flow_meter_ppl_entity: str = ""
     # Waveform diagnostic counters — the only wf_* entities after the 3.8.0
     # HA-event transport migration removed the 5 chunked text sensors.
     # Chunk drop count was added in 3.9.0 with chunked streaming.
@@ -69,9 +71,25 @@ class CircuitConfig:
     wf_chunk_drop_count_sensor: str = ""
     esp_device_prefix: str = ""
 
+    # Cached pulses-per-litre for this circuit's flow meter. Refreshed at runtime
+    # from flow_meter_ppl_entity (the firmware number entity is the source of
+    # truth); the circuit_profile.pulses_per_litre DB column is the fallback cache.
+    # Default 396 = reference turbine (YF-B5).
+    pulses_per_litre: float = 396.0
+
     @property
     def is_zone_circuit(self) -> bool:
         return self.circuit_type == "zone"
+
+    @property
+    def min_flow_lpm(self) -> float:
+        """Meter-derived low-flow noise floor: 1 pulse/second = 60 ÷ ppl L/min.
+        (≈0.15 for a 396-ppl turbine; ≈0.83 for a 72-ppl oval gear.) Guards a
+        bad cached ppl by falling back to the reference-turbine floor."""
+        ppl = self.pulses_per_litre
+        if not (ppl and ppl >= 1.0):
+            ppl = 396.0
+        return 60.0 / ppl
 
     @property
     def label(self) -> str:

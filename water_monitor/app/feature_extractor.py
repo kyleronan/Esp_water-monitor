@@ -138,6 +138,7 @@ def _classify_resistance_shape(
     pressure_readings: List[float],
     flow_readings: List[float],
     pre_event_pressure_psi: float,
+    min_flow: float = 0.15,
 ) -> str:
     """
     Classify the hydraulic resistance curve shape.
@@ -164,10 +165,10 @@ def _classify_resistance_shape(
     # Compute true ΔP/Q resistance at each steady-state point.
     # Skip readings where flow is below noise floor to avoid division
     # by near-zero inflating variance.
-    MIN_FLOW = 0.15   # L/min noise floor (matches event_detector.MIN_FLOW_LPM)
+    # L/min noise floor — per-circuit, matches event_detector MIN_FLOW_LPM (60 ÷ ppl).
     resistance = []
     for p, f in zip(p_mid, f_mid):
-        if f >= MIN_FLOW:
+        if f >= min_flow:
             delta_p = pre_event_pressure_psi - p   # positive = pressure has dropped
             if delta_p >= 0:                        # only during actual demand
                 resistance.append(delta_p / f)
@@ -300,6 +301,15 @@ _XTALK_MIN_DURATION_S: float = 120.0
 _DRIBBLE_MAX_VOLUME_L:  float = 0.5
 _DRIBBLE_MAX_FLOW_LPM:  float = 1.0
 _DRIBBLE_MAX_DELTA_PSI: float = 1.5
+
+# Coarse-meter safety guard (runtime-PPL meters). When a circuit's meter-derived
+# low-flow floor (60 ÷ ppl) is at/above this, the meter measures sub-1-L/min flows
+# RELIABLY (e.g. a 72-ppl oval gear → 0.83 L/min), so a low-flow reading is real
+# water — NOT the turbine quantization-noise the dribble heuristic suppresses.
+# Above this floor we never dribble-zero (bias conservative: "never make real water
+# invisible"). The 396-ppl turbine floor (0.15) is far below, so turbine behaviour
+# is unchanged. Tune with real positive-displacement data.
+_DRIBBLE_RELIABLE_METER_FLOOR_LPM: float = 0.5
 
 
 # ── Per-home artifact-detector calibration (Phase 2.4) ──────────────────────────
@@ -737,7 +747,7 @@ def _detect_pressure_restoration_phantom(
 
 
 def _detect_low_flow_dribble(volume_litres, avg_flow_lpm, pressure_delta_psi,
-                             calib=None) -> bool:
+                             calib=None, min_flow_lpm: float = 0.15) -> bool:
     """True when an event is a brief low-flow trickle (sensor / pressure-
     equalisation noise) rather than real water use.
 
@@ -761,11 +771,30 @@ def _detect_low_flow_dribble(volume_litres, avg_flow_lpm, pressure_delta_psi,
         return False
     if not (math.isfinite(vol) and math.isfinite(flow) and math.isfinite(delta)):
         return False
+    # Coarse-meter safety: a meter that reliably measures down to min_flow_lpm
+    # (high resolution floor) produces real low-flow readings, not the quantization
+    # noise this heuristic suppresses — never dribble-zero on such a meter.
+    if min_flow_lpm >= _DRIBBLE_RELIABLE_METER_FLOOR_LPM:
+        return False
     return (
         vol < _ac(calib, "DRIBBLE_MAX_VOLUME_L")
         and flow < _ac(calib, "DRIBBLE_MAX_FLOW_LPM")
         and delta < _ac(calib, "DRIBBLE_MAX_DELTA_PSI")
     )
+
+
+def _circuit_min_flow(conn, circuit: str) -> float:
+    """Per-circuit meter-derived low-flow floor (60 ÷ ppl) from the cached PPL.
+    Feeds the coarse-meter dribble guard on reprocess paths. Falls back to the
+    396-ppl turbine floor on any error."""
+    try:
+        from .database import get_circuit_pulses_per_litre
+        ppl = get_circuit_pulses_per_litre(conn, circuit)
+        if ppl and ppl >= 1.0:
+            return 60.0 / ppl
+    except Exception:
+        pass
+    return 0.15
 
 
 def _detect_cross_talk(duration_s, pressure_delta_psi,
@@ -829,7 +858,8 @@ def _is_sparse_envelope(duration_s, flow_on_ratio, is_phantom: bool) -> bool:
             and 0 < onr <= _SPARSE_ENVELOPE_MAX_FLOW_ON_RATIO)
 
 
-def _finalize_derived_verdicts(features: dict, calib=None) -> None:
+def _finalize_derived_verdicts(features: dict, calib=None,
+                               min_flow_lpm: float = 0.15) -> None:
     """Single source of truth for the phantom verdict + its dependent fields.
 
     ``calib`` is the frozen per-home artifact-detector calibration (Phase 2.4) —
@@ -891,7 +921,8 @@ def _finalize_derived_verdicts(features: dict, calib=None) -> None:
         not is_phantom and not is_cross_talk and not is_degraded
         and _detect_low_flow_dribble(
             features.get("volume_litres"), features.get("avg_flow_lpm"),
-            features.get("pressure_delta_psi"), calib=calib)
+            features.get("pressure_delta_psi"), calib=calib,
+            min_flow_lpm=min_flow_lpm)
     )
 
     raw = float(features.get("volume_litres") or 0.0)
@@ -1288,7 +1319,8 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
         for row in drows:
             # Re-run the canonical detector (SQL is only a prefilter).
             if not _detect_low_flow_dribble(
-                row["volume_litres"], row["avg_flow_lpm"], row["pressure_delta_psi"]
+                row["volume_litres"], row["avg_flow_lpm"], row["pressure_delta_psi"],
+                min_flow_lpm=_circuit_min_flow(conn, row["circuit"])
             ):
                 continue
             with transaction(conn):
@@ -2363,8 +2395,14 @@ def _late_waveform_upgrade_job(conn, circuit: str, record: WaveformRecord):
     return best["id"] if cur.rowcount > 0 else None
 
 
-def extract_features(event: RawEvent) -> Dict[str, Any]:
-    """Compute the full feature vector from a RawEvent."""
+def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15) -> Dict[str, Any]:
+    """Compute the full feature vector from a RawEvent.
+
+    ``min_flow_lpm`` is the per-circuit meter-derived low-flow floor (60 ÷ ppl);
+    it gates which steady-state points feed the resistance-shape classifier so a
+    coarse meter's single-pulse quantization doesn't inflate the variance. Defaults
+    to the 396-ppl turbine floor for callers that don't supply it.
+    """
     duration = 0.0
     if event.end_ts and event.start_ts:
         duration = (event.end_ts - event.start_ts).total_seconds()
@@ -2445,6 +2483,7 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
         pressure_for_shape,
         event.flow_readings,
         pre_event_pressure,
+        min_flow=min_flow_lpm,
     )
 
     # ── Degraded-supply guard ─────────────────────────────────────────────
@@ -2591,7 +2630,7 @@ def extract_features(event: RawEvent) -> Dict[str, Any]:
     }
     # Derive the phantom verdict + volume_effective + exclusion from the
     # assembled feature values (single source of truth).
-    _finalize_derived_verdicts(result)
+    _finalize_derived_verdicts(result, min_flow_lpm=min_flow_lpm)
     return result
 
 
@@ -2821,7 +2860,12 @@ class FeatureExtractor:
         if self._ha and event.flow_onset_entity:
             await self._enrich_propagation_delay(event)
 
-        features = extract_features(event)
+        # Per-circuit low-flow floor (60 ÷ ppl) from the live detector; falls back
+        # to the 396-ppl turbine default if the detector isn't wired (tests/import).
+        min_flow_lpm = 0.15
+        if self._event_detector is not None:
+            min_flow_lpm = self._event_detector.min_flow_for(event.circuit)
+        features = extract_features(event, min_flow_lpm=min_flow_lpm)
 
         # Attempt to enrich features from ESP waveform capture (firmware 3.7.0+).
         # Per-group routing: each group falls back to the legacy value independently.
@@ -2930,7 +2974,8 @@ class FeatureExtractor:
                 )
                 from .artifact_calibration import load_artifact_calibration
                 _acal = load_artifact_calibration(self._db, features.get("circuit"))
-                _finalize_derived_verdicts(features, _acal or None)
+                _finalize_derived_verdicts(features, _acal or None,
+                                           min_flow_lpm=min_flow_lpm)
 
             # Atomic upsert + hourly_volume update. Uses
             # volume_litres_effective (which is volume_litres for healthy

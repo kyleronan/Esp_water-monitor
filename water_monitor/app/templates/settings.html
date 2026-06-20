@@ -300,6 +300,33 @@
         {% endif %}
       </div>
 
+      {# ── Flow Meter (read-only; the PPL is set in Home Assistant) ── #}
+      <div class="sett-card">
+        <h3 class="sett-card-title">Flow Meter</h3>
+        <p class="sett-card-desc">
+          Pulses per litre for this circuit's meter, read from the device — the
+          <code>Flow Meter PPL</code> number entity in Home Assistant is the single
+          source of truth. Set it there to match your meter (e.g. turbine YF-B5 = 396,
+          oval-gear ZJ-HSM = 72). Changing it makes the monitor re-learn the baseline
+          (automatic shut-off pauses until it matures); past usage totals are
+          <strong>not</strong> recalculated.
+        </p>
+        <p class="sett-card-desc" style="margin-top:.25rem">
+          <strong>{{ c.pulses_per_litre }}</strong> pulses/litre
+          <span class="muted">· smallest detectable flow ≈ {{ c.min_flow_lpm }} L/min</span>
+          {% if c.flow_meter_ppl_entity %}
+          <span class="muted" style="display:block;font-size:.8125rem">
+            Entity: <code>{{ c.flow_meter_ppl_entity }}</code>
+          </span>
+          {% else %}
+          <span class="muted" style="display:block;font-size:.8125rem">
+            Firmware PPL entity not detected — using the cached/default value
+            (update firmware to 3.12.0+ for runtime control).
+          </span>
+          {% endif %}
+        </p>
+      </div>
+
       </div>{# /Config panel #}
 
       {# ── Advanced tab: recal + learning + sensitivity + ESP device ── #}

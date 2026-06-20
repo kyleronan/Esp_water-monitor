@@ -83,6 +83,21 @@ Pressure sensors are powered from 5 V. The sense output is scaled by a resistor 
 - Selected version: 5 V version
 - Used from the PCB 3.3 V supply because the sensor works down to 3.3 V
 
+#### Pulses per litre (PPL) — set per circuit in Home Assistant
+
+The firmware no longer hard-codes a flow K-factor. Each circuit exposes a
+`Flow Meter PPL - <circuit>` number entity (NVS-backed); set it to match the meter you
+installed. Conversion: `L/min = pulses_per_minute ÷ PPL`.
+
+| Meter | Type | PPL | Notes |
+| --- | --- | --- | --- |
+| YF-B5 (default) | turbine, hall-effect | 396 | `F = 6.6 Hz per L/min × 60` |
+| ZJ-HSM-OFZATS-06 | oval-gear positive displacement, hall-effect | 72 | `F = 1.2 × Q`; ±1%; 30–3000 L/h (0.5–50 L/min); ~5–6× cost; more accurate at low flow but debris/over-speed sensitive |
+
+For an unlisted meter, use its datasheet PPL, or **bucket-test**: run a known volume through
+and divide the counted pulses by the measured litres. Changing PPL triggers a per-circuit
+re-baseline (auto-shutoff pauses until it matures); past usage totals are not recalculated.
+
 #### Flow sensor wiring
 
 | Wire color | Function |

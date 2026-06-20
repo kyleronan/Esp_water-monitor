@@ -280,6 +280,14 @@ async def settings_page(request: Request):
             "display_name": circuit_cfg.label,
             "circuit_type": circuit_cfg.circuit_type,
             "valve_type": get_valve_type(orch.db, c),
+            # Runtime per-circuit flow meter (read-only). The firmware "Flow Meter PPL"
+            # number entity is the source of truth; the add-on caches it and derives the
+            # low-flow floor (60 ÷ ppl). Read from the LIVE config so the display reflects
+            # the latest value (the subscription updates it before this page renders).
+            "pulses_per_litre": round(
+                getattr(circuit_cfg, "pulses_per_litre", 396.0) or 396.0),
+            "min_flow_lpm": round(getattr(circuit_cfg, "min_flow_lpm", 0.15), 2),
+            "flow_meter_ppl_entity": getattr(circuit_cfg, "flow_meter_ppl_entity", ""),
             "sensitivity": sdict,
             # Phase 2.3 anomaly response level + whether auto-shutoff is currently
             # armed or held back (degraded to notify until the baseline earns trust).

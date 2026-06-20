@@ -76,6 +76,10 @@ class Orchestrator:
         self._stop = asyncio.Event()
         self._live_state_cache: Dict[str, Any] = {}
         self._ha_tz = timezone.utc
+        # Strong refs for fire-and-forget PPL-change re-baseline tasks (scheduled
+        # from the sync HA state_changed callback). Without this the only reference
+        # is create_task's return value, which Python may GC before the task runs.
+        self._ppl_tasks: set = set()
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -234,6 +238,7 @@ class Orchestrator:
             circuit_cfg.leak_test_result_sensor = entities.get(
                 "leak_test_result_sensor", "")
             circuit_cfg.volume_sensor = entities.get("volume_sensor", "")
+            circuit_cfg.flow_meter_ppl_entity = entities.get("flow_meter_ppl", "")
             # Waveforms now arrive via chunked HA events (firmware 3.9.0+).
             # Only diagnostic counters remain as discoverable entities.
             circuit_cfg.wf_overflow_count_sensor = entities.get("wf_overflow_count_sensor", "")
@@ -267,13 +272,111 @@ class Orchestrator:
         """
         if not self._db:
             return
-        from .database import get_circuit_type
+        from .database import get_circuit_type, get_circuit_pulses_per_litre
         for circuit_cfg in self._cfg.circuits:
             circuit_cfg.circuit_type = get_circuit_type(
                 self._db,
                 circuit_cfg.circuit,
                 default=circuit_cfg.circuit_type,
             )
+            # Cached pulses-per-litre. The firmware number entity is the source of
+            # truth; the async refresh (_refresh_ppl_from_entities) updates both this
+            # field and the DB cache when HA is reachable. This sync read keeps a sane
+            # floor (min_flow_lpm = 60 ÷ ppl) when HA/firmware is briefly unavailable.
+            circuit_cfg.pulses_per_litre = get_circuit_pulses_per_litre(
+                self._db,
+                circuit_cfg.circuit,
+                default=circuit_cfg.pulses_per_litre,
+            )
+
+    async def _sync_ppl_and_watch(self) -> None:
+        """Sync each circuit's runtime flow-meter PPL from its HA number entity and
+        subscribe for changes. The firmware number entity is the single source of
+        truth; circuit_profile.pulses_per_litre is the local cache."""
+        if not self._ha:
+            return
+        watched = False
+        for cfg in self._cfg.circuits:
+            entity = getattr(cfg, "flow_meter_ppl_entity", "")
+            if not entity:
+                continue
+            raw = await self._ha.get_state_value(entity, None)
+            await self._apply_ppl_change(cfg, raw, reason="startup")
+            self._ha.subscribe_entity(
+                entity,
+                lambda eid, state, attrs, c=cfg.circuit: self._on_ppl_state(c, state),
+            )
+            watched = True
+        if watched:
+            # Pick up the new subscriptions on the already-running WS connection.
+            self._ha.request_reconnect()
+
+    def _on_ppl_state(self, circuit: str, state: Any) -> None:
+        """Sync HA state_changed callback → schedule the async PPL-change handler.
+
+        PPL is read-only in the add-on, so the HA number entity is the ONLY write
+        path: this subscription is the complete re-baseline trigger surface."""
+        cfg = self._cfg.get_circuit(circuit)
+        if cfg is None:
+            return
+        task = asyncio.create_task(
+            self._apply_ppl_change(cfg, state, reason="runtime"))
+        self._ppl_tasks.add(task)
+        task.add_done_callback(self._ppl_tasks.discard)
+
+    async def _apply_ppl_change(self, cfg: Any, raw_value: Any, *,
+                                reason: str) -> None:
+        """Apply an observed flow-meter PPL for a circuit.
+
+        Re-baseline IFF the value differs from the cached one, so an NVS-restore of
+        the same value on a firmware reboot is a no-op (debounce). On a genuine
+        change: update the cache + the live detector floor, then force a
+        NON-DESTRUCTIVE partial recalibration (keeps history + opens the
+        accelerated-adaptation window that suppresses auto-shutoff). NEVER recomputes
+        historical volumes and NEVER uses full recalibration (which deletes events).
+        """
+        try:
+            new_ppl = float(raw_value)
+        except (TypeError, ValueError):
+            return  # 'unknown' / 'unavailable' / None — ignore
+        if not (1.0 <= new_ppl <= 5000.0):
+            return
+        cached = float(getattr(cfg, "pulses_per_litre", 396.0) or 396.0)
+        if abs(new_ppl - cached) < 0.5:
+            return  # same value (NVS restore / redundant publish) — no re-baseline
+        circuit = cfg.circuit
+        log.warning(
+            "[%s] flow-meter PPL changed %.0f → %.0f (%s) — re-baselining; auto-shutoff "
+            "suppressed until the new baseline matures. Past event volumes are NOT recomputed.",
+            circuit, cached, new_ppl, reason)
+        # 1) Persist to the DB cache + live config.
+        try:
+            from .database import set_circuit_pulses_per_litre
+            set_circuit_pulses_per_litre(self._db, circuit, new_ppl)
+        except Exception as e:
+            log.warning("[%s] PPL cache write failed: %s", circuit, e)
+        cfg.pulses_per_litre = new_ppl
+        # 2) Update the live detector low-flow floor (60 ÷ ppl).
+        if self._event_detector is not None:
+            self._event_detector.set_min_flow(circuit, cfg.min_flow_lpm)
+        # 3) Non-destructive re-baseline (partial — keeps history; opens the
+        #    accelerated-adaptation window that blocks auto-shutoff). Full
+        #    recalibration deletes events, so it must NEVER be used here.
+        if self._training_manager is not None:
+            try:
+                await self._training_manager.trigger_partial_recalibration(circuit)
+            except Exception as e:
+                log.warning("[%s] PPL re-baseline trigger failed: %s", circuit, e)
+        # 4) Surface to the user (best-effort).
+        if self._ha is not None:
+            try:
+                await self._ha.notify(
+                    "Flow meter changed",
+                    f"{cfg.label}: flow-meter pulses/litre set to {new_ppl:.0f}. "
+                    f"Re-learning the baseline — automatic shut-off is paused until it "
+                    f"matures. Past usage totals are unchanged.")
+            except Exception as e:
+                log.debug("[%s] PPL change notify failed: %s", circuit, e)
 
     def stop(self) -> None:
         self._stop.set()
@@ -407,6 +510,13 @@ class Orchestrator:
         if self.setup_complete:
             self._event_detector.setup()
             log.info("Event detection active")
+            # Runtime per-circuit flow-meter PPL: sync current values from the firmware
+            # number entities (the source of truth) into the cache + detector floor, and
+            # watch for changes. A change forces a non-destructive re-baseline.
+            try:
+                await self._sync_ppl_and_watch()
+            except Exception as e:
+                log.warning("Flow-meter PPL sync/watch failed (non-fatal): %s", e)
         else:
             log.info("Setup not complete — event detection paused until wizard finishes")
 

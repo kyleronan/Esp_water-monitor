@@ -90,7 +90,11 @@ _BASELINE_VERSION: int = 20260523
 #              — per-circuit auto-correct vs flag-only toggle). DDL only; no backfill
 #              (NULL/default are correct; reconciliation fills them going forward).
 #   20260545 — dev.38: guarded auto-split opt-in (home_profile.auto_split_enabled)
-_CURRENT_VERSION: int = 20260545
+#   20260546 — runtime per-circuit flow meter: circuit_profile.pulses_per_litre
+#              (REAL DEFAULT 396.0) — add-on cache of the firmware PPL number
+#              entity; the low-flow floor is derived (60 ÷ ppl). DDL only; the
+#              DEFAULT is correct for existing rows (reference turbine).
+_CURRENT_VERSION: int = 20260546
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -804,6 +808,35 @@ def _apply_dev38_columns(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260545: dev.38 auto-split flag ready")
 
 
+def _apply_ppl_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260546 — runtime per-circuit flow meter.
+
+    Adds circuit_profile.pulses_per_litre with DEFAULT 396.0 (reference turbine).
+    This column is the add-on's CACHE of the firmware's runtime PPL number entity
+    (firmware is the source of truth); the low-flow floor is derived as 60 ÷ ppl.
+    Idempotent — column add guarded by _has_column; the DEFAULT gives existing
+    rows 396.0 automatically, with a defensive backfill for legacy NULL/0 rows.
+    """
+    # circuit_profile is created by _create_schema before migrations in every real
+    # upgrade; guard for minimal synthetic DBs that walk the chain without it.
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='circuit_profile'"
+    ).fetchone()
+    if has_table:
+        if not _has_column(conn, "circuit_profile", "pulses_per_litre"):
+            conn.execute(
+                "ALTER TABLE circuit_profile "
+                "ADD COLUMN pulses_per_litre REAL DEFAULT 396.0"
+            )
+            log.info("Added circuit_profile.pulses_per_litre (default 396.0)")
+        # Defensive backfill — handles legacy / hand-altered rows.
+        conn.execute(
+            "UPDATE circuit_profile SET pulses_per_litre = 396.0 "
+            "WHERE pulses_per_litre IS NULL OR pulses_per_litre <= 0"
+        )
+    conn.commit()
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -1122,6 +1155,13 @@ def _missing_dev38_columns(conn: sqlite3.Connection) -> set[str]:
     return set()
 
 
+def _missing_ppl_columns(conn: sqlite3.Connection) -> set[str]:
+    """Return the 20260546 pulses_per_litre column if absent from circuit_profile."""
+    if not _has_column(conn, "circuit_profile", "pulses_per_litre"):
+        return {"circuit_profile.pulses_per_litre"}
+    return set()
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -1232,6 +1272,7 @@ def _run_migrations_impl(
             | _missing_anomaly_response_columns(conn)
             | _missing_recorder_reconcile_columns(conn)
             | _missing_dev38_columns(conn)
+            | _missing_ppl_columns(conn)
         )
         if missing:
             raise RuntimeError(
@@ -1242,9 +1283,17 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260545:
+        # DB has the dev.38 auto-split flag but lacks the per-circuit pulses_per_litre column.
+        _apply_ppl_column(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260545 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260544:
         # DB has the recorder-reconcile columns but lacks the dev.38 auto-split flag.
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260544 → %d", _CURRENT_VERSION)
         return
@@ -1254,6 +1303,7 @@ def _run_migrations_impl(
         # columns.
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260543 → %d", _CURRENT_VERSION)
         return
@@ -1263,6 +1313,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260542 → %d", _CURRENT_VERSION)
         return
@@ -1274,6 +1325,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260541 → %d", _CURRENT_VERSION)
         return
@@ -1285,6 +1337,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260540 → %d", _CURRENT_VERSION)
         return
@@ -1297,6 +1350,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260539 → %d", _CURRENT_VERSION)
         return
@@ -1310,6 +1364,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260538 → %d", _CURRENT_VERSION)
         return
@@ -1324,6 +1379,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260537 → %d", _CURRENT_VERSION)
         return
@@ -1339,6 +1395,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260536 → %d", _CURRENT_VERSION)
         return
@@ -1355,6 +1412,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260535 → %d", _CURRENT_VERSION)
         return
@@ -1373,6 +1431,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
         return
@@ -1392,6 +1451,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
         return
@@ -1411,6 +1471,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
@@ -1432,6 +1493,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
@@ -1454,6 +1516,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -1498,6 +1561,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -1524,6 +1588,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -1551,6 +1616,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -1577,6 +1643,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -1602,6 +1669,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -1625,6 +1693,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -1648,6 +1717,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -1707,6 +1777,7 @@ def _run_migrations_impl(
         _apply_anomaly_response_columns(conn)
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
+        _apply_ppl_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

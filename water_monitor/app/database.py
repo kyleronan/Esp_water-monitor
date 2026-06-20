@@ -230,7 +230,11 @@ CREATE TABLE IF NOT EXISTS circuit_profile (
     --                    skipped because a drain port reads as a constant
     --                    leak. Set per circuit during setup; editable from
     --                    Settings behind a confirmation prompt.
-    valve_type          TEXT DEFAULT '2_port'
+    valve_type          TEXT DEFAULT '2_port',
+    -- Flow-meter pulses-per-litre (migration 20260546). The add-on's CACHE of
+    -- the firmware's runtime PPL number entity (firmware is the source of truth);
+    -- the low-flow floor is derived as 60 ÷ ppl. Default 396 = reference turbine.
+    pulses_per_litre    REAL DEFAULT 396.0
 );
 
 -- ==========================================================================
@@ -1579,6 +1583,62 @@ def set_valve_type(
         conn.commit()
 
 
+#: Reference-turbine default pulses-per-litre (YF-B5). Mirrors the firmware
+#: ppl_main/ppl_irr number entities' initial_value, so an un-discovered circuit
+#: still has a sane low-flow floor (60 ÷ 396 ≈ 0.15 L/min).
+DEFAULT_PULSES_PER_LITRE: float = 396.0
+
+
+def get_circuit_pulses_per_litre(
+    conn: sqlite3.Connection,
+    circuit: str,
+    default: float = DEFAULT_PULSES_PER_LITRE,
+) -> float:
+    """Return the cached pulses-per-litre for a circuit.
+
+    This is the add-on's local CACHE of the firmware's runtime PPL number
+    entity (the firmware entity is the single source of truth; the add-on
+    refreshes this from the entity when HA is reachable). Falls back to
+    `default` if no circuit_profile row exists yet or the stored value is
+    unusable (NULL / non-numeric / out of range).
+    """
+    row = conn.execute(
+        "SELECT pulses_per_litre FROM circuit_profile WHERE circuit = ?",
+        (circuit,)
+    ).fetchone()
+    raw = row["pulses_per_litre"] if row else None
+    try:
+        ppl = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return ppl if 1.0 <= ppl <= 5000.0 else default
+
+
+def set_circuit_pulses_per_litre(
+    conn: sqlite3.Connection,
+    circuit: str,
+    pulses_per_litre: float,
+    commit: bool = True,
+) -> None:
+    """Persist the cached pulses-per-litre for a circuit (UPSERT).
+
+    The firmware number entity stays the source of truth; this only caches the
+    last value the add-on observed so detection keeps a sane floor when HA is
+    briefly unreachable. Rejects non-finite / out-of-range values (matches the
+    firmware entity's 1..5000 bounds).
+    """
+    ppl = float(pulses_per_litre)
+    if not (1.0 <= ppl <= 5000.0):
+        raise ValueError(f"Invalid pulses_per_litre {pulses_per_litre!r}")
+    conn.execute("""
+        INSERT INTO circuit_profile (circuit, pulses_per_litre)
+        VALUES (?, ?)
+        ON CONFLICT(circuit) DO UPDATE SET pulses_per_litre = excluded.pulses_per_litre
+    """, (circuit, ppl))
+    if commit:
+        conn.commit()
+
+
 def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) -> None:
     conn.execute(
         "UPDATE alert_config SET enabled = ?, updated_at = ? WHERE id = ?",
@@ -2558,7 +2618,8 @@ def clear_event_classification(
         not new_phantom and not new_degraded
         and _detect_low_flow_dribble(
             row["volume_litres"], row["avg_flow_lpm"], row["pressure_delta_psi"],
-            calib=_acal)
+            calib=_acal,
+            min_flow_lpm=(60.0 / get_circuit_pulses_per_litre(conn, circuit)))
     ) else 0
     return _apply_event_verdicts(
         conn, event_id, circuit,

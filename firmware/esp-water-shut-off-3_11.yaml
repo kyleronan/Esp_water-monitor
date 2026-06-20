@@ -51,7 +51,9 @@
 # =============================================================================
 
 substitutions:
-  flow_k_factor: "396.0"   # 396 pulses/litre (sensor: F = 6.6 Hz per L/min; 6.6 × 60s = 396)
+  # Flow-meter pulses-per-litre is a RUNTIME, per-circuit number entity
+  # (ppl_main / ppl_irr, NVS-backed) — set it in Home Assistant to match your
+  # meter (turbine YF-B5 = 396; oval-gear ZJ-HSM = 72). No firmware edit / no k-factor.
   # §1.4 — flow-clamp bounds (lifted out of the per-circuit filter lambdas so both
   # circuits share one source of truth). Below min = ADC/float noise → 0; above max
   # = impossible (ADC overflow) → 0.
@@ -98,7 +100,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.11.0"   # §1.4 — configurable Valve Travel Timeout number entities
+    version: "3.12.0"   # runtime per-circuit Flow Meter PPL number entities (ppl_main / ppl_irr)
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -1427,9 +1429,9 @@ sensor:
   # FLOW SENSOR 1 — Main line (GPIO39)
   # Pulse counter connected to a turbine flow meter.
   # Converts pulse frequency to flow rate in litres per minute.
-  # Formula: pulses per minute / (6.6 * 60) = L/min
-  #   where 6.6 is the sensor frequency factor (Hz per L/min), so
-  #   6.6 * 60 = 396 pulses per litre = flow_k_factor.
+  # Formula: L/min = pulses_per_minute / ppl, where ppl is the runtime per-circuit
+  #   pulses-per-litre number entity (ppl_main / ppl_irr). No ÷60 — the pulse
+  #   counter already reports counts per minute.
   #
   # Timing strategy:
   #   update_interval: 25ms — counts pulses over a 25ms window at 40Hz internally.
@@ -1484,13 +1486,15 @@ sensor:
     on_value:
       then:
         # --- Instant burst detection ---
-        # x is raw pulses/min. x/396 = instantaneous L/min.
+        # x is raw pulses/min. x / ppl_main = instantaneous L/min (no ÷60).
         # 1.5× multiplier compensates for single-second window variability —
         # a genuine burst at 25 L/min still reads >>37.5 on the raw counter.
         # Gated by the open end stop so this only fires while the valve is open
         # and the system is in normal operation.
         - lambda: |-
-            float instant_lpm = x / ${flow_k_factor}f;
+            float ppl = id(ppl_main).state;
+            if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
+            float instant_lpm = x / ppl;
             if (!id(fault_main)
                 && id(alert_high_flow_main)
                 && id(open_end_stop_valve1).state
@@ -1553,8 +1557,12 @@ sensor:
       sorting_group_id: group_main_status
       sorting_weight: 4
     filters:
-      # Step 1: Convert raw counts/min to L/min (flow_k_factor = 396 pulses/litre = 6.6 Hz/(L/min) × 60s)
-      - lambda: return (x / ${flow_k_factor});
+      # Step 1: Convert raw counts/min to L/min via the runtime ppl_main number entity
+      # (pulses/litre). L/min = pulses/min ÷ ppl — no ÷60 (counter already reports /min).
+      - lambda: |-
+          float ppl = id(ppl_main).state;
+          if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
+          return x / ppl;
       # Step 1b: Clamp — reject garbage values before they corrupt the smoothing
       # windows. Two classes of garbage are possible:
       #   HIGH: ADC float overflow produces values like 1.58e+36 L/min.
@@ -1694,7 +1702,9 @@ sensor:
         # Same logic as flow_base_main — see comments above.
         # Irrigation auto-shutoff fires on the irrigation valve only.
         - lambda: |-
-            float instant_lpm = x / ${flow_k_factor}f;
+            float ppl = id(ppl_irr).state;
+            if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
+            float instant_lpm = x / ppl;
             if (!id(fault_irrigation)
                 && id(alert_high_flow_irr)
                 && id(open_end_stop_valve2).state
@@ -1747,7 +1757,11 @@ sensor:
       sorting_group_id: group_irr_status
       sorting_weight: 4
     filters:
-      - lambda: return (x / ${flow_k_factor});
+      # Convert raw counts/min to L/min via the runtime ppl_irr number entity (no ÷60).
+      - lambda: |-
+          float ppl = id(ppl_irr).state;
+          if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
+          return x / ppl;
       # Clamp — same guard as water_usage1; see comments there.
       - lambda: |-
           if (!std::isfinite(x) || x < ${flow_min_lpm}f || x > ${flow_max_lpm}f) return 0.0f;
@@ -2381,6 +2395,56 @@ output:
 # All values persist across reboots (restore_value: yes).
 # =============================================================================
 number:
+  # ---------------------------------------------------------------------------
+  # FLOW METER PULSES-PER-LITRE (PPL) — runtime, per circuit, NVS-backed.
+  # Single source of truth for the pulses→L/min conversion. Set in HA to match
+  # each circuit's meter: turbine YF-B5 = 396; oval-gear ZJ-HSM = 72; any other
+  # meter = its datasheet ppl (or bucket-test: counted pulses ÷ measured litres).
+  # restore_value keeps it across reboots/OTA. Changing it makes the add-on
+  # re-baseline that circuit; past event volumes are NOT recomputed.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Flow Meter PPL - ${circuit_1_name}"
+    id: ppl_main
+    entity_category: config
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 0
+    icon: mdi:counter
+    unit_of_measurement: "ppl"
+    min_value: 1
+    max_value: 5000
+    step: 1
+    initial_value: 396
+    restore_value: yes
+    optimistic: true
+    mode: box
+    set_action:
+      - logger.log:
+          format: "Main flow meter PPL set to %.0f pulses/litre"
+          args: ['x']
+
+  - platform: template
+    name: "Flow Meter PPL - ${circuit_2_name}"
+    id: ppl_irr
+    entity_category: config
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 0
+    icon: mdi:counter
+    unit_of_measurement: "ppl"
+    min_value: 1
+    max_value: 5000
+    step: 1
+    initial_value: 396
+    restore_value: yes
+    optimistic: true
+    mode: box
+    set_action:
+      - logger.log:
+          format: "Irrigation flow meter PPL set to %.0f pulses/litre"
+          args: ['x']
+
   # ---------------------------------------------------------------------------
   # BURST PIPE HIGH FLOW THRESHOLD
   # ---------------------------------------------------------------------------

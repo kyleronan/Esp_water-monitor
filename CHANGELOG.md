@@ -13,6 +13,18 @@ script added to keep them that way.
 
 ### New Features
 
+- **Runtime-configurable per-circuit flow meter (PPL)** — pulses-per-litre is now a
+  per-circuit Home Assistant `number` entity (`Flow Meter PPL - <circuit>`), NVS-backed
+  so it survives reboots and OTA updates. Set it to match any meter — turbine YF-B5 = 396,
+  oval-gear ZJ-HSM-OFZATS-06 = 72, or any datasheet / bucket-tested value — with no firmware
+  edit (replaces the old compile-time `flow_k_factor`). The firmware converts pulses→L/min
+  from the live entity; the add-on reads it as the single source of truth (read-only in
+  Settings) and derives each circuit's low-flow noise floor (60 ÷ ppl: ≈0.15 L/min at 396,
+  ≈0.83 at 72). Changing the PPL forces a NON-destructive re-baseline of that circuit
+  (auto-shutoff degrades to notify until the new baseline matures); historical event volumes
+  are never recomputed. A coarse positive-displacement meter's small real draws are protected
+  from the low-flow dribble-zeroing heuristic (which was tuned for the turbine). DB migration
+  20260546 adds the `circuit_profile.pulses_per_litre` cache (default 396).
 - **Degraded-supply guard** — when the municipal supply pulses, the
   paddlewheel flow sensor produces chaotic readings (forward and
   reverse pulses both count positive; brief zero-velocity transitions

@@ -153,7 +153,8 @@ def validate_detectors_against_history(
         conn: sqlite3.Connection,
         circuit: str,
         flow_histories: Dict[str, Sequence[Tuple[Any, Any]]],
-        window: Tuple[Any, Any]) -> Dict[str, Any]:
+        window: Tuple[Any, Any],
+        min_flow: float = MIN_FLOW_LPM) -> Dict[str, Any]:
     """Reconcile detected events against raw HA flow. Pure / read-only — returns a report dict.
 
     ``flow_histories``: ``{"main": [(ts, lpm), ...], "irrigation": [(ts, lpm), ...]}`` — already
@@ -259,7 +260,7 @@ def validate_detectors_against_history(
     }
 
     # ── 3. Cross-talk corroboration vs raw irrigation draws ─────────────────────
-    irr_on = _on_windows(irrig, irrig_t) if irrig else []
+    irr_on = _on_windows(irrig, irrig_t, min_flow=min_flow) if irrig else []
     ct_events = [e for e in events if e["ct"]]
     ct_overlap = sum(1 for e in ct_events
                      if _overlaps_any(_to_utc(e["start_ts"]), _to_utc(e["end_ts"]), irr_on))
@@ -310,14 +311,16 @@ def validate_detectors_against_history(
     return report
 
 
-def _on_windows(series: List[Tuple[datetime, float]], times: List[datetime]
+def _on_windows(series: List[Tuple[datetime, float]], times: List[datetime],
+                min_flow: float = MIN_FLOW_LPM
                 ) -> List[Tuple[datetime, datetime]]:
-    """Contiguous runs where flow >= MIN_FLOW_LPM → merged ``[start, end]`` intervals."""
+    """Contiguous runs where flow >= min_flow (per-circuit, 60 ÷ ppl) → merged
+    ``[start, end]`` intervals."""
     raw: List[Tuple[datetime, datetime]] = []
     start = None
     n = len(series)
     for i, (ts, f) in enumerate(series):
-        if f >= MIN_FLOW_LPM:
+        if f >= min_flow:
             if start is None:
                 start = ts
         else:
@@ -492,7 +495,9 @@ async def run_detector_validation(db: sqlite3.Connection, ha: Any, cfg: Any,
         irrig.extend(_series(e))
     flow_histories = {"main": _series(main_entity), "irrigation": irrig}
 
-    report = validate_detectors_against_history(db, circuit, flow_histories, (start, end))
+    report = validate_detectors_against_history(
+        db, circuit, flow_histories, (start, end),
+        min_flow=getattr(circuit_cfg, "min_flow_lpm", MIN_FLOW_LPM))
     report["source"] = source
     report["validated_at"] = now_utc.isoformat()
     if persist:
