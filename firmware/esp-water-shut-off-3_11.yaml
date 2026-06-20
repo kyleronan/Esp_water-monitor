@@ -51,7 +51,7 @@
 # =============================================================================
 
 substitutions:
-  flow_k_factor: "396.0"   # 6.6 pulses/litre × 60s = 396
+  flow_k_factor: "396.0"   # 396 pulses/litre (sensor: F = 6.6 Hz per L/min; 6.6 × 60s = 396)
   # §1.4 — flow-clamp bounds (lifted out of the per-circuit filter lambdas so both
   # circuits share one source of truth). Below min = ADC/float noise → 0; above max
   # = impossible (ADC overflow) → 0.
@@ -1428,7 +1428,8 @@ sensor:
   # Pulse counter connected to a turbine flow meter.
   # Converts pulse frequency to flow rate in litres per minute.
   # Formula: pulses per minute / (6.6 * 60) = L/min
-  #   where 6.6 is the sensor pulse factor (pulses per litre).
+  #   where 6.6 is the sensor frequency factor (Hz per L/min), so
+  #   6.6 * 60 = 396 pulses per litre = flow_k_factor.
   #
   # Timing strategy:
   #   update_interval: 25ms — counts pulses over a 25ms window at 40Hz internally.
@@ -1552,7 +1553,7 @@ sensor:
       sorting_group_id: group_main_status
       sorting_weight: 4
     filters:
-      # Step 1: Convert raw counts/min to L/min (flow_k_factor = 6.6 pulses/litre × 60s = 396)
+      # Step 1: Convert raw counts/min to L/min (flow_k_factor = 396 pulses/litre = 6.6 Hz/(L/min) × 60s)
       - lambda: return (x / ${flow_k_factor});
       # Step 1b: Clamp — reject garbage values before they corrupt the smoothing
       # windows. Two classes of garbage are possible:
