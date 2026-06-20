@@ -2647,11 +2647,15 @@ class FeatureExtractor:
 
     def __init__(self, event_queue: asyncio.Queue,
                  db_conn: sqlite3.Connection, alert_manager=None,
-                 ha_client=None, event_detector=None, ha_tz=None):
+                 ha_client=None, event_detector=None, ha_tz=None,
+                 is_calibrating=None):
         self._queue = event_queue
         self._db = db_conn
         self._alert_manager = alert_manager
         self._ha = ha_client
+        # Callback → True while a bucket / municipal calibration test runs on a circuit.
+        # The deliberate test draw must not trip auto-shutoff or feed training / anomaly.
+        self._is_calibrating = is_calibrating or (lambda c: False)
         # Home timezone (dev.24) — converts UTC-stored event timestamps to LOCAL
         # for the water-softener regen band match. None → compare in UTC (the
         # batch reclassify will still detect it once a tz-aware caller runs).
@@ -3014,6 +3018,22 @@ class FeatureExtractor:
                     event.circuit,
                 )
 
+            # Calibration test draw — a deliberate, known bucket / municipal run is NOT
+            # organic usage: exclude it from training + anomaly stats so it can't pollute
+            # the frozen baseline. (Notify / shut-off are separately suppressed in
+            # _apply_anomaly_response.)
+            if self._is_calibrating(event.circuit):
+                reason = features.get("match_rejection_reason") or "calibration"
+                self._db.execute(
+                    "UPDATE events SET excluded_from_training = 1, "
+                    "match_rejection_reason = ? WHERE id = ?",
+                    (reason, features["id"]),
+                )
+                features["excluded_from_training"] = 1
+                features["match_rejection_reason"] = reason
+                log.info("[%s] event excluded from training — calibration test draw",
+                         event.circuit)
+
             # Persist the hi-res waveform for the event-detail modal. Always
             # called, even for healthy events — useful diagnostic data. Skips
             # silently when readings lists are empty (historical events).
@@ -3135,6 +3155,10 @@ class FeatureExtractor:
         shut-off cap is read from the PERSISTENT ``anomaly_shutoff_log`` (it survives
         the very restart a pathological run could otherwise use to reset it).
         """
+        # A deliberate calibration test draw is not organic usage — never notify or
+        # shut off in response to it (the event is also excluded from training).
+        if self._is_calibrating(circuit):
+            return
         from .database import get_sensitivity_config
         from .anomaly_baseline import _row_get, MIN_LIVE_DAYS_FOR_SHUTOFF
         sens = get_sensitivity_config(self._db, circuit)

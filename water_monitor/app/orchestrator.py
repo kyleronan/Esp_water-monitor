@@ -53,6 +53,13 @@ def _fmt_sensor(
         return fallback
 
 
+# A flow-meter PPL change at/above this RELATIVE magnitude triggers a full re-baseline
+# (meter swap / correcting a wrong default); a smaller change is a calibration trim —
+# value + floor updated and the frozen anomaly percentiles re-scaled, with NO multi-day
+# shut-off pause. See _apply_ppl_change.
+_PPL_REBASELINE_FRACTION: float = 0.10
+
+
 class Orchestrator:
     """Top-level runtime — owns all components."""
 
@@ -80,6 +87,10 @@ class Orchestrator:
         # from the sync HA state_changed callback). Without this the only reference
         # is create_task's return value, which Python may GC before the task runs.
         self._ppl_tasks: set = set()
+        # Circuits with an active calibration session (bucket / municipal test). A
+        # deliberate calibration draw must not trip auto-shutoff or pollute training /
+        # anomaly stats — see is_calibrating + the FeatureExtractor suppression.
+        self._calibrating: set = set()
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -343,12 +354,15 @@ class Orchestrator:
             return
         cached = float(getattr(cfg, "pulses_per_litre", 396.0) or 396.0)
         if abs(new_ppl - cached) < 0.5:
-            return  # same value (NVS restore / redundant publish) — no re-baseline
+            return  # same value (NVS restore / redundant publish) — no-op
         circuit = cfg.circuit
+        frac = abs(new_ppl - cached) / cached if cached else 1.0
+        big = frac >= _PPL_REBASELINE_FRACTION
         log.warning(
-            "[%s] flow-meter PPL changed %.0f → %.0f (%s) — re-baselining; auto-shutoff "
-            "suppressed until the new baseline matures. Past event volumes are NOT recomputed.",
-            circuit, cached, new_ppl, reason)
+            "[%s] flow-meter PPL %.1f → %.1f (%s, %.1f%%) — %s. Past event volumes are NOT recomputed.",
+            circuit, cached, new_ppl, reason, frac * 100.0,
+            "re-baselining (auto-shutoff paused until matured)" if big
+            else "small trim, re-scaling anomaly thresholds (no relearn)")
         # 1) Persist to the DB cache + live config.
         try:
             from .database import set_circuit_pulses_per_litre
@@ -359,24 +373,51 @@ class Orchestrator:
         # 2) Update the live detector low-flow floor (60 ÷ ppl).
         if self._event_detector is not None:
             self._event_detector.set_min_flow(circuit, cfg.min_flow_lpm)
-        # 3) Non-destructive re-baseline (partial — keeps history; opens the
-        #    accelerated-adaptation window that blocks auto-shutoff). Full
-        #    recalibration deletes events, so it must NEVER be used here.
-        if self._training_manager is not None:
+        # 3) Re-baseline decision (relative threshold). LARGE change (meter swap /
+        #    correcting a wrong default) → non-destructive PARTIAL re-baseline (keeps
+        #    history; opens the accelerated-adaptation window that suppresses auto-shutoff;
+        #    full recalibration deletes events, so it is NEVER used here). SMALL trim (a
+        #    calibration correction) → keep the frozen anomaly thresholds aligned with the
+        #    new scale by re-scaling the volume percentiles — NO multi-day shut-off pause.
+        if big:
+            if self._training_manager is not None:
+                try:
+                    await self._training_manager.trigger_partial_recalibration(circuit)
+                except Exception as e:
+                    log.warning("[%s] PPL re-baseline trigger failed: %s", circuit, e)
+            note = ("Re-learning the baseline — automatic shut-off is paused until it "
+                    "matures. Past usage totals are unchanged.")
+        else:
+            # Adjusts forward-looking DETECTION thresholds to the new scale; does NOT
+            # recompute historical event volumes (the never-recompute invariant holds).
             try:
-                await self._training_manager.trigger_partial_recalibration(circuit)
+                from .anomaly_baseline import rescale_anomaly_percentiles
+                rescale_anomaly_percentiles(self._db, circuit, cached / new_ppl)
             except Exception as e:
-                log.warning("[%s] PPL re-baseline trigger failed: %s", circuit, e)
+                log.warning("[%s] anomaly-percentile rescale failed: %s", circuit, e)
+            note = ("Small calibration trim applied — no re-learning needed. Past usage "
+                    "totals are unchanged.")
         # 4) Surface to the user (best-effort).
         if self._ha is not None:
             try:
                 await self._ha.notify(
-                    "Flow meter changed",
-                    f"{cfg.label}: flow-meter pulses/litre set to {new_ppl:.0f}. "
-                    f"Re-learning the baseline — automatic shut-off is paused until it "
-                    f"matures. Past usage totals are unchanged.")
+                    "Flow meter updated",
+                    f"{cfg.label}: flow-meter pulses/litre set to {new_ppl:.1f}. {note}")
             except Exception as e:
                 log.debug("[%s] PPL change notify failed: %s", circuit, e)
+
+    def set_calibrating(self, circuit: str, active: bool) -> None:
+        """Mark/clear an active calibration session for a circuit (called by the
+        calibration router on start / stop / apply / cancel + stale timeout)."""
+        if active:
+            self._calibrating.add(circuit)
+        else:
+            self._calibrating.discard(circuit)
+
+    def is_calibrating(self, circuit: str) -> bool:
+        """True while a bucket / municipal calibration test runs on this circuit — the
+        detector suppresses auto-shutoff and excludes the deliberate test draw."""
+        return circuit in self._calibrating
 
     def stop(self) -> None:
         self._stop.set()
@@ -524,7 +565,8 @@ class Orchestrator:
         self._feature_extractor = FeatureExtractor(
             self._event_queue, self._db, self._alert_manager,
             ha_client=self._ha,
-            event_detector=self._event_detector)
+            event_detector=self._event_detector,
+            is_calibrating=self.is_calibrating)
 
         # Reverse link: a late-assembled ESP waveform upgrades a recent
         # software-signature event to ESP provenance (signature-only, Fix 1).

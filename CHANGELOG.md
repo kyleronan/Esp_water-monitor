@@ -13,6 +13,17 @@ script added to keep them that way.
 
 ### New Features
 
+- **Flow calibration helper (guided bucket / municipal-meter test)** — Settings → Flow Meter →
+  "Calibrate…" walks the user through measuring the meter's TRUE pulses/litre: enter a known
+  reference volume (a bucket, or the whole-house municipal-meter delta), run that fixture, and the
+  add-on derives `new_ppl = current_ppl × (measured ÷ actual)` from the cumulative volume sensor
+  (no firmware change; self-correcting even if the current PPL is far off). Runs pool by volume,
+  with a method-aware sample gate (a >3% bucket correction needs ≥3 averaged fills to cancel
+  fill error; a single ≥10-gal municipal run suffices) and a run-spread warning. Applying writes
+  the firmware PPL entity; a small trim just re-scales the frozen anomaly thresholds (no relearn),
+  a large change re-baselines. The deliberate test draw is suppressed from auto-shutoff and
+  excluded from training/anomaly so it can't trip the valve or pollute the baseline. New
+  `routers/calibration.py` + `calibration_math.py`.
 - **Runtime-configurable per-circuit flow meter (PPL)** — pulses-per-litre is now a
   per-circuit Home Assistant `number` entity (`Flow Meter PPL - <circuit>`), NVS-backed
   so it survives reboots and OTA updates. Set it to match any meter — turbine YF-B5 = 396,

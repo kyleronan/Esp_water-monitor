@@ -145,6 +145,47 @@ def freeze_usage_baselines(conn: sqlite3.Connection, circuit: str,
     return envelopes
 
 
+def rescale_anomaly_percentiles(conn: sqlite3.Connection, circuit: str,
+                                ratio: float) -> bool:
+    """Scale the frozen overall-volume anomaly percentiles (p85/p95/p99) by ``ratio``.
+
+    Used after a SMALL flow-meter PPL (calibration) trim that did not warrant a full
+    re-baseline: future volume readings shift scale by ppl_old/ppl_new, so the frozen
+    shut-off / notify thresholds are multiplied by the same factor (``ratio = ppl_old /
+    ppl_new``) to stay aligned with the new scale WITHOUT a re-learning window. This
+    adjusts forward-looking DETECTION thresholds only — it does NOT touch historical
+    event volumes (the never-recompute invariant holds). No-op on a non-finite /
+    out-of-range ratio or when no frozen percentiles exist. Returns True if it rescaled.
+    """
+    if not (0.0 < ratio < 1e6):
+        return False
+    try:
+        row = conn.execute(
+            "SELECT baseline_anomaly_p85, baseline_anomaly_p95, baseline_anomaly_p99 "
+            "FROM sensitivity_config WHERE circuit = ?", (circuit,)).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    if row is None:
+        return False
+    updates: Dict[str, Any] = {}
+    for col in ("baseline_anomaly_p85", "baseline_anomaly_p95", "baseline_anomaly_p99"):
+        v = row[col]
+        if v is not None:
+            try:
+                updates[col] = round(float(v) * ratio, 3)
+            except (TypeError, ValueError):
+                pass
+    if not updates:
+        return False
+    from .database import upsert_sensitivity_config
+    upsert_sensitivity_config(conn, circuit, **updates)
+    conn.commit()
+    invalidate_baseline_cache(circuit)
+    log.info("[%s] anomaly percentiles re-scaled ×%.4f (calibration trim, no relearn)",
+             circuit, ratio)
+    return True
+
+
 # Per-circuit cache so the live persist / reclassify hot paths don't read the DB
 # per event. The baseline only changes at freeze, which invalidates the entry.
 _baseline_cache: Dict[str, Dict[str, Any]] = {}
