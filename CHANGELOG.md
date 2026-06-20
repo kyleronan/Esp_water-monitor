@@ -16,8 +16,11 @@ script added to keep them that way.
 - **Runtime-configurable per-circuit flow meter (PPL)** — pulses-per-litre is now a
   per-circuit Home Assistant `number` entity (`Flow Meter PPL - <circuit>`), NVS-backed
   so it survives reboots and OTA updates. Set it to match any meter — turbine YF-B5 = 396,
-  oval-gear ZJ-HSM-OFZATS-06 = 72, or any datasheet / bucket-tested value — with no firmware
-  edit (replaces the old compile-time `flow_k_factor`). The firmware converts pulses→L/min
+  oval-gear ZJ-HSM-OFZATS-06 = 72, or any datasheet / bucket-tested value (replaces the old
+  compile-time `flow_k_factor`). The per-circuit default is seeded at flash time by the
+  `flow_ppl_main` / `flow_ppl_irr` substitutions, so a unit is correctly calibrated from first
+  boot with no HA; `restore_value` then keeps the value across reboots and OTA updates, and it
+  can be changed at runtime (HA / device web page) without a reflash. The firmware converts pulses→L/min
   from the live entity; the add-on reads it as the single source of truth (read-only in
   Settings) and derives each circuit's low-flow noise floor (60 ÷ ppl: ≈0.15 L/min at 396,
   ≈0.83 at 72). Changing the PPL forces a NON-destructive re-baseline of that circuit

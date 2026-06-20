@@ -51,9 +51,17 @@
 # =============================================================================
 
 substitutions:
-  # Flow-meter pulses-per-litre is a RUNTIME, per-circuit number entity
-  # (ppl_main / ppl_irr, NVS-backed) — set it in Home Assistant to match your
-  # meter (turbine YF-B5 = 396; oval-gear ZJ-HSM = 72). No firmware edit / no k-factor.
+  # FLOW METER PULSES-PER-LITRE — set per circuit to match your meter
+  # (turbine YF-B5 = 396; oval-gear ZJ-HSM = 72; any meter = its datasheet ppl, or a
+  # bucket test: counted pulses ÷ measured litres). This seeds the runtime ppl_main /
+  # ppl_irr number entities' initial_value, so the meter is set HERE at first flash and
+  # is correct from boot with no Home Assistant needed. The entities are NVS-backed
+  # (restore_value), so the value survives reboots AND OTA firmware updates — it is never
+  # lost on an update. To change the meter later (rare): set it on the device web page /
+  # in Home Assistant (persists to NVS), or clean-flash to re-apply a new value here
+  # (a plain OTA reflash keeps the saved value by design).
+  flow_ppl_main: "396"   # circuit 1 meter pulses/litre
+  flow_ppl_irr:  "396"   # circuit 2 meter pulses/litre
   # §1.4 — flow-clamp bounds (lifted out of the per-circuit filter lambdas so both
   # circuits share one source of truth). Below min = ADC/float noise → 0; above max
   # = impossible (ADC overflow) → 0.
@@ -92,7 +100,7 @@ substitutions:
 
 esphome:
   name: esp-water-shut-off-3
-  friendly_name: ESP Water Shut off 3.11
+  friendly_name: ESP Water Shut off 3.12
   min_version: 2024.6.0
   name_add_mac_suffix: false
   platformio_options:
@@ -2415,7 +2423,7 @@ number:
     min_value: 1
     max_value: 5000
     step: 1
-    initial_value: 396
+    initial_value: ${flow_ppl_main}   # seeded from the substitution; NVS keeps it after first boot
     restore_value: yes
     optimistic: true
     mode: box
@@ -2436,7 +2444,7 @@ number:
     min_value: 1
     max_value: 5000
     step: 1
-    initial_value: 396
+    initial_value: ${flow_ppl_irr}   # seeded from the substitution; NVS keeps it after first boot
     restore_value: yes
     optimistic: true
     mode: box

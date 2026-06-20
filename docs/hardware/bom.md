@@ -83,11 +83,21 @@ Pressure sensors are powered from 5 V. The sense output is scaled by a resistor 
 - Selected version: 5 V version
 - Used from the PCB 3.3 V supply because the sensor works down to 3.3 V
 
-#### Pulses per litre (PPL) — set per circuit in Home Assistant
+#### Pulses per litre (PPL) — set per circuit
 
 The firmware no longer hard-codes a flow K-factor. Each circuit exposes a
-`Flow Meter PPL - <circuit>` number entity (NVS-backed); set it to match the meter you
-installed. Conversion: `L/min = pulses_per_minute ÷ PPL`.
+`Flow Meter PPL - <circuit>` number entity (NVS-backed). Conversion:
+`L/min = pulses_per_minute ÷ PPL`.
+
+Set it to match the meter you installed in **either** of two ways:
+- **At flash time (recommended for a new build):** set the `flow_ppl_main` / `flow_ppl_irr`
+  substitutions at the top of the firmware before flashing. This seeds the entity's
+  initial value, so the unit is correctly calibrated from first boot with no HA.
+- **At runtime:** set the number entity in Home Assistant or on the device's own web page.
+
+`restore_value` keeps the value across reboots **and OTA firmware updates** — it is never
+lost on an update. A meter rarely changes; to change it later, set the runtime entity, or
+clean-flash to re-apply a new substitution (a plain OTA reflash keeps the saved value).
 
 | Meter | Type | PPL | Notes |
 | --- | --- | --- | --- |
