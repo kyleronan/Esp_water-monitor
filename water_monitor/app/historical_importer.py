@@ -329,9 +329,12 @@ class HistoricalImporter:
                 start = now - timedelta(hours=2)
 
             n, retry_from = await self._import_range(cfg, start, now)
-            # If any events were dropped due to a full queue, use the earliest
-            # dropped timestamp as the checkpoint so the next catch-up covers
-            # from that point rather than from now - 2 min (which might miss it).
+            # retry_from holds the checkpoint back when either (a) events were
+            # dropped to a full queue or (b) a flow period was still active at
+            # `now` (an event longer than the catch-up interval). Without (b) the
+            # checkpoint would advance past the in-progress event's start and only
+            # a later startup backfill could recover it. When set, the next
+            # catch-up re-covers from that point; otherwise advance to now.
             checkpoint = retry_from.isoformat() if retry_from else now.isoformat()
             update_import_state(self._db, cfg.circuit, checkpoint, n)
             if n:
@@ -395,6 +398,20 @@ class HistoricalImporter:
             except Exception:
                 pass
 
+        # Checkpoint watermark for the periodic catch-up: the start of any flow
+        # period still ON at the end of this window (onset still ON, or flow_rate
+        # still >= MIN_FLOW_LPM with no OFF transition after). _find_flow_periods
+        # correctly refuses to flush a still-active period, but the catch-up loop
+        # advances last_check_ts to `now` regardless — so an event LONGER than the
+        # catch-up interval would have its start march behind the checkpoint and
+        # could then only be recovered by a much-later startup backfill (observed:
+        # a 133-min irrigation run recovered 4 days late). Returning this start as
+        # retry_from holds the checkpoint at the event's start until it actually
+        # ends, so the next catch-up after it closes reconstructs the full period.
+        # Flow signals only (not the pressure-dip state machine) so a stuck/shifted
+        # pressure baseline can never pin the checkpoint indefinitely.
+        active_since = self._trailing_active_start(onset_hist, flow_rate_hist)
+
         # Detect flow periods — pressure_hist is passed so the state machine can
         # emit a dip-envelope period that bridges pulsed-flow bursts too far apart
         # for MERGE_GAP_SECONDS (e.g. fridge dispenser with ~40 s inter-burst gap).
@@ -405,7 +422,7 @@ class HistoricalImporter:
             using_avg_pressure=using_avg_pressure,
         )
         if not periods:
-            return 0, None
+            return 0, active_since
 
         # Belt-and-braces guard: if the live EventDetector currently has an
         # active event on this circuit, drop any candidate period that overlaps
@@ -428,7 +445,7 @@ class HistoricalImporter:
                     cfg.circuit, before - len(periods), active_start.isoformat(),
                 )
             if not periods:
-                return 0, None
+                return 0, active_since
 
         log.debug("[%s] found %d candidate period(s) in history window",
                   cfg.circuit, len(periods))
@@ -504,11 +521,57 @@ class HistoricalImporter:
                 sum(raw.flow_readings) / max(len(raw.flow_readings), 1),
             )
 
+        # Hold the catch-up checkpoint at the earliest of (a) any event dropped to
+        # a full queue and (b) a flow period still active at window end — whichever
+        # is earlier must be re-covered next cycle.
+        if active_since is not None:
+            retry_from = (active_since if retry_from is None
+                          else min(retry_from, active_since))
         return imported, retry_from
 
     # ------------------------------------------------------------------ #
     # Period detection                                                     #
     # ------------------------------------------------------------------ #
+
+    def _trailing_active_start(
+        self,
+        onset_hist: List[Dict],
+        flow_rate_hist: List[Dict],
+    ) -> Optional[datetime]:
+        """Start of a flow period still ON at the end of the fetched history.
+
+        Mirrors the still-active detection in _onset_to_periods / _rate_to_periods
+        (a trailing ON run with no closing OFF transition) but reports the run's
+        START instead of dropping it, so _import_range can hold the catch-up
+        checkpoint back. Returns the earliest such start across the onset and
+        flow-rate signals, or None if flow had clearly stopped by window end.
+        """
+        def _trailing_open(history: List[Dict], is_on) -> Optional[datetime]:
+            open_start: Optional[datetime] = None
+            for entry in history:
+                ts = _parse_ts(entry.get("last_changed"))
+                if ts is None:
+                    continue
+                if is_on(entry):
+                    if open_start is None:
+                        open_start = ts
+                else:
+                    open_start = None
+            return open_start
+
+        def _onset_on(entry: Dict) -> bool:
+            return str(entry.get("state", "")).lower() in ("on", "true", "1")
+
+        def _rate_on(entry: Dict) -> bool:
+            try:
+                return float(entry["state"]) >= self.MIN_FLOW_LPM
+            except (ValueError, TypeError, KeyError):
+                return False
+
+        starts = [s for s in (_trailing_open(onset_hist, _onset_on),
+                              _trailing_open(flow_rate_hist, _rate_on))
+                  if s is not None]
+        return min(starts) if starts else None
 
     def _find_flow_periods(
         self,

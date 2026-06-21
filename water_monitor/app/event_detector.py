@@ -390,6 +390,15 @@ class CircuitEventDetector:
     # (a multi-zone irrigation cycle) is ~2.8 h; anything past this is a missed
     # end signal, so force-close. Bounds the blast radius of ANY unclosed event.
     MAX_EVENT_DURATION_S: float = 21600.0              # 6 h
+    # Fast-close for a pure-pressure transient that never moved water. A small
+    # dip whose pressure SETTLES below the recovery line (common on the irrigation
+    # circuit when a zone solenoid shifts the steady pressure) never satisfies the
+    # recovery END, so without this it stays open until the 6 h watchdog above —
+    # and while open it blocks every new event on the circuit (the _active_event
+    # is None gate), so the next real draw / irrigation run is missed live. Real
+    # draws register flow (>= MIN_FLOW) or keep pressure actively dipping, so they
+    # are never closed here. Conservative: flow has been zero for the whole event.
+    SETTLED_NOFLOW_CLOSE_S: float = 60.0
 
     # Minimum event volume.  Events whose computed volume (avg_flow × duration)
     # is below this threshold are discarded as noise.  1 mL is a sanity floor —
@@ -655,6 +664,8 @@ class CircuitEventDetector:
             if self._maybe_finalize_held_low_flow(now):
                 return
             if self._maybe_force_close_overlong(now):    # over-long watchdog
+                return
+            if self._maybe_close_settled_noflow(now):    # stuck no-flow phantom
                 return
             elapsed_p = (now - self._active_event.start_ts).total_seconds()
             self._pressure_sample_count += 1
@@ -1039,6 +1050,51 @@ class CircuitEventDetector:
             self._end_event(now, force=True)
             return True
         return False
+
+    def _maybe_close_settled_noflow(self, now: datetime) -> bool:
+        """Close a pure-pressure transient that never moved water once pressure
+        has SETTLED (stable, even at a shifted baseline below the recovery line).
+
+        Without this, a small pressure dip that settles below the recovery line —
+        e.g. an irrigation zone solenoid that nudges the steady pressure — never
+        satisfies the recovery END and stays open until the 6 h watchdog, blinding
+        the circuit to new events the whole time (observed: chronic 6 h force-closes
+        on circuit_2 blocking irrigation starts). A real draw registers flow or
+        keeps pressure actively dipping, so it is never closed here. The closed
+        event carries ~0 volume and is discarded by _end_event. Returns True when
+        it finalized (the caller must then stop touching self._active_event)."""
+        ev = self._active_event
+        if ev is None:
+            return False
+        # Only a PURE pressure transient that never developed flow: flow-triggered
+        # and pressure+flow events had water; an onset or any flow_rate >= MIN_FLOW
+        # means water moved. All excluded.
+        if ev.start_trigger != "pressure" or ev.flow_onset_ts is not None:
+            return False
+        if self._current_flow_lpm >= self.MIN_FLOW_LPM:
+            return False
+        if ev.flow_readings and max(ev.flow_readings) >= self.MIN_FLOW_LPM:
+            return False
+        # Give a real draw time for flow to follow the pressure drop before closing.
+        if (now - ev.start_ts).total_seconds() < self.SETTLED_NOFLOW_CLOSE_S:
+            return False
+        # Pressure must have SETTLED — peak-to-peak of the recent window is small,
+        # i.e. the dip is over and not deepening, even if it never returned to the
+        # recovery line. A real ongoing draw keeps pressure depressed-and-moving.
+        if len(self._pressure_buf) < self.BASELINE_WINDOW_SAMPLES:
+            return False
+        recent = list(self._pressure_buf)[-self.BASELINE_WINDOW_SAMPLES:]
+        if max(recent) - min(recent) > self.SETTLED_STABILITY_PSI:
+            return False
+        log.info(
+            "[%s] closing settled no-flow pressure transient (open %.0fs, flow=0, "
+            "pressure stable within %.2f PSI) — phantom; freeing circuit instead "
+            "of holding it until the %.0f h watchdog",
+            self.circuit, (now - ev.start_ts).total_seconds(),
+            self.SETTLED_STABILITY_PSI, self.MAX_EVENT_DURATION_S / 3600.0,
+        )
+        self._end_event(now, force=True)
+        return True
 
     def _end_event(self, ts: datetime, force: bool = False) -> None:
         ev = self._active_event

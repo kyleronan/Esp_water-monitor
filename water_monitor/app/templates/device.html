@@ -81,9 +81,14 @@
           <span class="leak-running-etc">{{ c.leak_test_etc or "Running…" }}</span>
         </div>
         {% elif c.leak_test_result and c.leak_test_result not in ('No test run', 'unknown', 'unavailable') %}
-        <span class="pill {% if 'Passed' in c.leak_test_result %}pill-green{% else %}pill-amber{% endif %}">
-          {{ c.leak_test_result }}
-        </span>
+        {# Latest result only — links to the full log on the History page. #}
+        <a class="dev-leak-result-link" style="text-decoration:none"
+           href="{{ ingress_path }}/history#leak-test-history"
+           title="View full leak-test history">
+          <span class="pill {% if 'Passed' in c.leak_test_result %}pill-green{% else %}pill-amber{% endif %}">
+            {{ c.leak_test_result }}
+          </span>
+        </a>
         {% else %}
         <span class="pill pill-neutral">No test run</span>
         {% endif %}

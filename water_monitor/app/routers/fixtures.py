@@ -64,9 +64,23 @@ async def fixtures_page(request: Request, preview: bool = False):
         "other":           "❓",
     }
 
-    # Local-midnight UTC anchor — same helper the dashboard uses for
-    # get_daily_volume so the "today" boundary matches across pages.
-    midnight_utc = orch._local_midnight_utc(days_ago=0)
+    # Time-range selector (top of page). Each option is a rolling window back
+    # to HA-local midnight N days ago — the same helper the dashboard uses for
+    # get_daily_volume, so the "today" boundary matches across pages.
+    # "lifetime" = no lower bound (None). Unknown/hand-edited values clamp to
+    # "today" so the page never 500s. Default "today" preserves prior behaviour.
+    _RANGE_DAYS = {"today": 0, "week": 7, "month": 30, "3months": 90,
+                   "6months": 183, "year": 365, "2years": 730}
+    _RANGE_LABELS = {"today": "today", "week": "past week", "month": "past month",
+                     "3months": "past 3 months", "6months": "past 6 months",
+                     "year": "past year", "2years": "past 2 years",
+                     "lifetime": "all-time"}
+    sel_range = request.query_params.get("range", "today")
+    if sel_range not in _RANGE_DAYS and sel_range != "lifetime":
+        sel_range = "today"
+    range_start_utc = (None if sel_range == "lifetime"
+                       else orch._local_midnight_utc(days_ago=_RANGE_DAYS[sel_range]))
+    range_label = _RANGE_LABELS[sel_range]
 
     circuits_ctx = []
     for circ_cfg in orch._cfg.circuits:
@@ -89,8 +103,8 @@ async def fixtures_page(request: Request, preview: bool = False):
                 "type":                 t,
                 "label":                FIXTURE_TYPE_LABELS.get(t, t.replace("_", " ").title()),
                 "icon":                 fx_icons.get(t, "❓"),
-                "today_volume_l":       0.0,
-                "today_event_count":    0,
+                "range_volume_l":       0.0,
+                "range_event_count":    0,
                 "lifetime_volume_l":    0.0,
                 "lifetime_event_count": 0,
                 "last_seen_at":         None,
@@ -100,7 +114,7 @@ async def fixtures_page(request: Request, preview: bool = False):
         }
 
         # Pull rollup + publish gate map.
-        raw_rows = get_category_rollup(orch.db, c, midnight_utc)
+        raw_rows = get_category_rollup(orch.db, c, range_start_utc)
         publish_map = get_category_publish_map(orch.db, c)
 
         # Merge SQL rows through the normalizer so legacy / wrong-kind types
@@ -110,8 +124,8 @@ async def fixtures_page(request: Request, preview: bool = False):
             bucket = categories[typ]   # guaranteed present by seed
             bucket["lifetime_volume_l"]    += row["lifetime_volume_l"]
             bucket["lifetime_event_count"] += row["lifetime_event_count"]
-            bucket["today_volume_l"]       += row["today_volume_l"]
-            bucket["today_event_count"]    += row["today_event_count"]
+            bucket["range_volume_l"]       += row["range_volume_l"]
+            bucket["range_event_count"]    += row["range_event_count"]
             bucket["last_seen_at"] = _max_iso(bucket["last_seen_at"],
                                               row["last_seen_at"])
 
@@ -144,6 +158,8 @@ async def fixtures_page(request: Request, preview: bool = False):
         "circuits":            circuits_ctx,
         "fixture_type_labels": FIXTURE_TYPE_LABELS,
         "preview":             preview,
+        "sel_range":           sel_range,
+        "range_label":         range_label,
     })
 
 

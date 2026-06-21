@@ -87,7 +87,7 @@ def _collect_circuit_history_sync(
     import json
     from ..database import (get_recent_events, get_leak_test_history,
                             get_daily_summaries, get_home_profile)
-    from ..feature_extractor import classify_flow_shape
+    from ..feature_extractor import classify_flow_shape, classify_magnitude_tier
     # Read the "hide not-real-use events" display preference once (same for all
     # circuits). One unified toggle hides EVERY volume-zeroing verdict — phantom,
     # cross-talk, and low-flow dribble — so the single "Not real use" label maps to a
@@ -137,6 +137,15 @@ def _collect_circuit_history_sync(
                 flow_fall_rate=e.get("flow_fall_rate_lpm_s"),
                 mid_event_flow_drop=e.get("mid_event_flow_drop_lpm"),
                 peak=e.get("peak_flow_lpm"),
+            )
+            # Size tier for the sparkline's vertical scale. Use effective volume
+            # so dribble/phantom/cross-talk-zeroed events fall to 'trickle' and
+            # the tier agrees with the gal number shown in the row.
+            e["magnitude_tier"] = classify_magnitude_tier(
+                peak_flow_lpm=e.get("peak_flow_lpm"),
+                volume_litres=(e.get("volume_litres_effective")
+                               if e.get("volume_litres_effective") is not None
+                               else e.get("volume_litres")),
             )
         leak_tests = get_leak_test_history(db, circuit_cfg.circuit, limit=20)
         summaries  = get_daily_summaries(

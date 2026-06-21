@@ -180,7 +180,8 @@
 </div>
 
 {# ── Leak test history card ──────────────────────────────────────── #}
-<div class="hist-card">
+{# id is the jump target for the "latest result" pill on the Valve & Tests page. #}
+<div class="hist-card" id="leak-test-history">
   <h3 class="hist-section-title">Leak Test History</h3>
   {% if ch.leak_tests %}
   <div class="hist-table-wrap">
@@ -347,11 +348,16 @@
             {% set shape_color  = {'steady': 'pill-blue', 'rising': 'pill-amber', 'falling': 'pill-green', 'pulsed': 'pill-neutral', 'unknown': 'pill-neutral'} %}
             {% set spark_stroke = {'steady': 'oklch(55% .18 240/.85)', 'rising': 'oklch(65% .18 80/.85)', 'falling': 'oklch(50% .18 145/.85)', 'pulsed': 'oklch(55% .05 240/.85)'} %}
             {% set spark_fill   = {'steady': 'oklch(55% .18 240/.12)', 'rising': 'oklch(65% .18 80/.12)', 'falling': 'oklch(50% .18 145/.12)', 'pulsed': 'oklch(55% .05 240/.10)'} %}
+            {# Vertical band the waveform fills, by event size tier — gives the #}
+            {# sparkline a sense of scale. Read by the row canvas AND the modal #}
+            {# flow chart so they agree. unknown/missing → 1.0 (today's look). #}
+            {% set spark_scale  = {'trickle': 0.45, 'small': 0.65, 'medium': 0.82, 'large': 1.0} %}
             <div class="shape-cell">
               <span class="pill {{ shape_color.get(shape, 'pill-neutral') }}">{{ shape }}</span>
               {% if e.flow_signature_json and e.flow_signature_json not in ('null', 'None', '') %}
-              <canvas class="shape-spark" width="48" height="16"
+              <canvas class="shape-spark" width="48" height="20"
                       data-sig="{{ e.flow_signature_json }}"
+                      data-spark-scale="{{ spark_scale.get(e.magnitude_tier, 1.0) }}"
                       data-stroke="{{ spark_stroke.get(shape, 'oklch(55% .05 240/.55)') }}"
                       data-fill="{{ spark_fill.get(shape,   'oklch(55% .05 240/.08)') }}"></canvas>
               {% endif %}
@@ -1062,6 +1068,8 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const wfMeta      = document.getElementById('emd-wf-meta');
     const chartCanvas = document.getElementById('emd-wf-chart');
     const flowSig     = row.querySelector('.shape-spark')?.dataset.sig || '';
+    // Same size-tier band as the row sparkline, so the modal and the list agree.
+    const wfScale     = parseFloat(row.querySelector('.shape-spark')?.dataset.sparkScale) || 1;
     const pressSig    = row.dataset.pressureSig || '';
     const wfUsed      = row.dataset.waveformUsed === '1';
 
@@ -1089,7 +1097,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         const labels = flowPts.map((_, i) => i);
         const datasets = [{
           label: 'Flow',
-          data: flowPts,
+          data: flowPts.map(v => (Number(v) || 0) * wfScale),   // size-tier band
           borderColor: cssVar('--accent'),
           backgroundColor: mix(cssVar('--accent'), 12),
           fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
@@ -1139,7 +1147,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         wfMeta.textContent =
           `${source} · ${flowPts.length} samples · ${channels}${pkText}${dpText}`;
         const note = document.createElement('span');
-        note.textContent = 'Values show shape only, not actual flow or pressure units.';
+        note.textContent = 'Flow curve height reflects the event\'s size tier; values are normalized, not actual units.';
         wfMeta.appendChild(document.createElement('br'));
         wfMeta.appendChild(note);
       } else {
@@ -1418,10 +1426,13 @@ document.querySelectorAll('canvas.shape-spark').forEach(canvas => {
   const w = canvas.width, h = canvas.height;
   const ctx = canvas.getContext('2d');
   const max = Math.max(...sig, 0.001);
+  // Size-tier band: the waveform's peak reaches `scale` of the usable height,
+  // so bigger events draw taller. 1.0 (large/unknown) = full height as before.
+  const scale = parseFloat(canvas.dataset.sparkScale) || 1;
   const px = 1; // inset prevents 1.5 px stroke from clipping at canvas edges
   const pts = sig.map((v, i) => ({
     x: px + (i / (sig.length - 1)) * (w - 2 * px),
-    y: h - (v / max) * (h - 2) - 1,
+    y: h - (v / max) * (h - 2) * scale - 1,
   }));
   ctx.beginPath();
   ctx.moveTo(pts[0].x, h);

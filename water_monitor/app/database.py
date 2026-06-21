@@ -4169,15 +4169,24 @@ def delete_fixture_signature(
 def get_category_rollup(
     conn: sqlite3.Connection,
     circuit: str,
-    midnight_utc: str,
+    range_start_utc: Optional[str],
 ) -> List[Dict[str, Any]]:
     """Per-effective-type aggregate for one circuit.
 
-    ``midnight_utc`` is the UTC ISO timestamp of HA-local midnight (same
-    format the dashboard's get_daily_volume uses). Returned rows have raw
-    ``eff_type`` strings — the router MUST funnel each through
-    ``fixtures.normalize_fixture_type_for_circuit`` before bucketing, since
-    legacy / wrong-kind / typo strings can appear in stored data.
+    ``range_start_utc`` is the lower time bound for the *windowed* columns
+    (``range_volume_l`` / ``range_event_count``) as a UTC ISO timestamp — the
+    Fixtures-page time-range selector supplies HA-local midnight N days back
+    (same helper/format the dashboard's get_daily_volume uses). Pass ``None``
+    for the "lifetime" range: an empty-string sentinel ``''`` is then bound and,
+    because events.start_ts is always non-null UTC-ISO text that sorts after
+    ``''``, the windowed columns include every row — i.e. range == lifetime.
+
+    The ``lifetime_*`` columns and ``last_seen_at`` are always all-time,
+    independent of the range bound.
+
+    Returned rows have raw ``eff_type`` strings — the router MUST funnel each
+    through ``fixtures.normalize_fixture_type_for_circuit`` before bucketing,
+    since legacy / wrong-kind / typo strings can appear in stored data.
 
     Phantom events (is_pressure_restoration_phantom=1) are excluded — their
     effective volume is already 0 and counting them would inflate the event
@@ -4189,6 +4198,8 @@ def get_category_rollup(
     > 'other'. The k-NN match outranks the (impure) cluster suggestion so the
     classifier — not clustering — drives fixture identity on the cards.
     """
+    # None (the "lifetime" range) → '' so the windowed CASE matches every row.
+    bound = range_start_utc if range_start_utc is not None else ""
     rows = conn.execute(
         """
         SELECT
@@ -4200,8 +4211,8 @@ def get_category_rollup(
           MAX(e.start_ts)                                 AS last_seen_at,
           COALESCE(SUM(CASE WHEN e.start_ts >= ?
                       THEN COALESCE(e.volume_litres_effective, e.volume_litres, 0)
-                      ELSE 0 END), 0)                     AS today_volume_l,
-          SUM(CASE WHEN e.start_ts >= ? THEN 1 ELSE 0 END) AS today_event_count
+                      ELSE 0 END), 0)                     AS range_volume_l,
+          SUM(CASE WHEN e.start_ts >= ? THEN 1 ELSE 0 END) AS range_event_count
         FROM events e
         LEFT JOIN fixtures f          ON e.fixture_id = f.id
         LEFT JOIN fixture_clusters fc ON fc.circuit = e.circuit AND fc.id = e.cluster_id
@@ -4209,7 +4220,7 @@ def get_category_rollup(
           AND COALESCE(e.is_pressure_restoration_phantom, 0) = 0
         GROUP BY eff_type
         """,
-        (midnight_utc, midnight_utc, circuit),
+        (bound, bound, circuit),
     ).fetchall()
     return [
         {
@@ -4217,8 +4228,8 @@ def get_category_rollup(
             "lifetime_volume_l":    float(r["lifetime_volume_l"] or 0.0),
             "lifetime_event_count": int(r["lifetime_event_count"] or 0),
             "last_seen_at":         r["last_seen_at"],
-            "today_volume_l":       float(r["today_volume_l"] or 0.0),
-            "today_event_count":    int(r["today_event_count"] or 0),
+            "range_volume_l":       float(r["range_volume_l"] or 0.0),
+            "range_event_count":    int(r["range_event_count"] or 0),
         }
         for r in rows
     ]

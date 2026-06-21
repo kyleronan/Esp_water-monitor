@@ -1815,6 +1815,45 @@ def classify_flow_shape(signature, *, steady_state_fraction=None,
     return "unknown"
 
 
+# ── Sparkline size tiers ─────────────────────────────────────────────────────
+# The History sparkline (and the detail-modal flow chart) draws the peak-
+# normalised flow_signature, so every event fills the same height and conveys no
+# sense of size. These tiers scale the drawn waveform's vertical band so a
+# user can tell big draws from trickles at a glance. Defined in STORED units
+# (L/min peak flow, litres volume) so they're unit-independent; presentation
+# heuristics, tunable. Blended: an event is as big as its LARGER dimension, so a
+# brief high-flow spike and a long slow high-volume fill both read large.
+_MAG_FLOW_LPM = (2.0, 6.0, 15.0)     # trickle ≤2 < small ≤6 < medium ≤15 < large
+_MAG_VOLUME_L = (1.0, 8.0, 40.0)     # trickle ≤1 < small ≤8 < medium ≤40 < large
+_MAG_TIERS = ("trickle", "small", "medium", "large")
+
+
+def classify_magnitude_tier(peak_flow_lpm=None, volume_litres=None) -> str:
+    """4-tier event-size bucket for the History sparkline's vertical scale.
+
+    Blends peak flow and volume by taking the LARGER of the two per-dimension
+    tiers, so a high-flow-short event and a low-flow-long event both read big.
+    Inputs are in stored units (L/min, litres). Returns one of:
+    trickle | small | medium | large | unknown (when neither input is usable).
+    """
+    def _tier(val, bounds):
+        try:
+            v = float(val) if val is not None else None
+        except (TypeError, ValueError):
+            return None
+        if v is None:
+            return None
+        for i, b in enumerate(bounds):
+            if v <= b:
+                return i
+        return len(bounds)            # above the top bound → last tier index
+    idxs = [i for i in (_tier(peak_flow_lpm, _MAG_FLOW_LPM),
+                        _tier(volume_litres, _MAG_VOLUME_L)) if i is not None]
+    if not idxs:
+        return "unknown"
+    return _MAG_TIERS[max(idxs)]
+
+
 def _pressure_signature(
     pressure_readings: list,
     pre_event_pressure_psi: float,

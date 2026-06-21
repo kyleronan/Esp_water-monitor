@@ -39,10 +39,24 @@
   <strong>Your job here:</strong> check that water use looks normal — a category that's
   suddenly high can mean a leak — and help the app learn by
   <a href="{{ ingress_path }}/history">star-labeling a few events on History</a>.
-  Each card sums today's and lifetime use for one category; readings we removed as
-  not-real-water-use are excluded. Want faster, more accurate labels? Run each fixture
-  once with the <a href="{{ ingress_path }}/training">Training helper</a>.
+  Each card sums use over the time range you pick below, plus lifetime, for one
+  category; readings we removed as not-real-water-use are excluded. Want faster,
+  more accurate labels? Run each fixture once with the
+  <a href="{{ ingress_path }}/training">Training helper</a>.
 </p>
+
+{# ── Time-range selector — rescopes every card's windowed total. Reuses the #}
+{# History page's hist-range-btn styling; server-side nav via ?range=. ──── #}
+<div class="fx-range-btns hist-range-btns" role="group" aria-label="Time range"
+     style="margin:0 0 18px 0">
+  {% for r, lbl in [
+      ('today', 'Today'), ('week', 'Week'), ('month', 'Month'),
+      ('3months', '3 Months'), ('6months', '6 Months'), ('year', 'Year'),
+      ('2years', '2 Years'), ('lifetime', 'Lifetime')] %}
+  <a href="{{ ingress_path }}/fixtures?range={{ r }}"
+     class="hist-range-btn {% if sel_range == r %}active{% endif %}">{{ lbl }}</a>
+  {% endfor %}
+</div>
 
 {# ── Per-circuit sections ─────────────────────────────────────────────── #}
 {% for circ in circuits %}
@@ -124,11 +138,15 @@
     <h3 class="fx-cat-title">{{ cat.label }}</h3>
   </header>
   <div class="fx-cat-totals">
+    {# Windowed total for the selected range. Hidden for 'lifetime' since it #}
+    {# would duplicate the all-time stat below. #}
+    {% if sel_range != 'lifetime' %}
     <div class="fx-cat-stat">
-      <span class="fx-num">{{ (cat.today_volume_l * vol_factor)|round(vol_decimals) }}</span>
-      <span class="fx-unit">{{ vol_unit }} today</span>
-      <small class="muted">· {{ cat.today_event_count }} event{{ '' if cat.today_event_count == 1 else 's' }}</small>
+      <span class="fx-num">{{ (cat.range_volume_l * vol_factor)|round(vol_decimals) }}</span>
+      <span class="fx-unit">{{ vol_unit }} {{ range_label }}</span>
+      <small class="muted">· {{ cat.range_event_count }} event{{ '' if cat.range_event_count == 1 else 's' }}</small>
     </div>
+    {% endif %}
     <div class="fx-cat-stat">
       <span class="fx-num">{{ (cat.lifetime_volume_l * vol_factor)|round(vol_decimals) }}</span>
       <span class="fx-unit">{{ vol_unit }} lifetime</span>
