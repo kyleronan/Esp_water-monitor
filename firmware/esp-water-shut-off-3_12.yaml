@@ -102,7 +102,7 @@ esphome:
   name: esp-water-shut-off-3
   friendly_name: ESP Water Shut off 3.12
   min_version: 2024.6.0
-  name_add_mac_suffix: false
+  name_add_mac_suffix: true
   platformio_options:
     # DIO flash mode required for ESP32-S3
     board_build.flash_mode: dio
