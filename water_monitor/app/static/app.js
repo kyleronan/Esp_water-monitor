@@ -48,6 +48,26 @@ function toast(message, type = 'info') {
   if (type === 'success' || type === 'info') setTimeout(dismiss, 4000);
 }
 
+// dev.26 — reprocess a date range from HA history (bulk counterpart to the
+// per-event Reprocess on the History modal). Gated server-side by dev_tools.
+async function devReimportRange(circuit) {
+  const startEl = document.getElementById(`repro-start-${circuit}`);
+  const endEl   = document.getElementById(`repro-end-${circuit}`);
+  const range_start = startEl && startEl.value;
+  const range_end   = endEl && endEl.value;
+  if (!range_start || !range_end) { toast('Pick a start and end date', 'error'); return; }
+  if (!confirm(`Dev: delete "${circuit}" auto events from ${range_start} to `
+               + `${range_end} and rebuild them from HA history? `
+               + `Your labelled events are kept.`)) return;
+  toast(`Reprocessing ${circuit} ${range_start}…${range_end}`, 'info');
+  const { ok, data } = await post(`/settings/dev/reimport-range/${circuit}`,
+                                  { range_start, range_end });
+  if (!ok) { toast((data && data.error) || 'Reprocess failed', 'error'); return; }
+  toast(`Deleted ${data.deleted}, re-imported ${data.imported}`
+        + `${data.widened ? ' (range widened)' : ''} — new events appear shortly.`,
+        'success');
+}
+
 // ── Live state updater ─────────────────────────────────────────────
 // Always-on poll — reflects valve changes from HA, the ESP firmware
 // (faults, leak tests, bypass switch), or any other source.
@@ -169,10 +189,43 @@ async function fetchLiveState() {
   } catch (_) {}
 }
 
+// ── Background-job status poll → toast (§2.4) ──────────────────────
+// A job appears as 'running' first and 'done'/'error' later, so we track which
+// ids we've toasted rather than a high-water-mark. The first poll only baselines
+// existing jobs so page history doesn't toast on every load.
+const _jobsToasted = new Set();
+let _jobsInitialized = false;
+async function pollJobs() {
+  try {
+    const resp = await fetch(`${BASE}/api/jobs?since=0`,
+                             { signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) return;
+    const { jobs } = await resp.json();
+    if (!Array.isArray(jobs)) return;
+    if (!_jobsInitialized) {
+      for (const j of jobs) if (j.status !== 'running') _jobsToasted.add(j.id);
+      _jobsInitialized = true;
+      return;
+    }
+    for (const j of jobs.slice().reverse()) {        // oldest-first
+      if (j.status === 'running' || _jobsToasted.has(j.id)) continue;
+      _jobsToasted.add(j.id);
+      if (j.status === 'error') {
+        toast(j.message || 'A background job failed', 'error');
+      } else if (j.kind !== 'reclassify') {
+        // Reclassify success is silent (frequent; the label UI already updated).
+        toast(j.message || 'Done', 'success');
+      }
+    }
+  } catch (_) {}
+}
+
 // Start polling on page load — always runs
 window.addEventListener('DOMContentLoaded', () => {
   fetchLiveState();                    // immediate first update
   setInterval(fetchLiveState, 5000);  // then every 5 seconds
+  pollJobs();                          // baseline existing jobs
+  setInterval(pollJobs, 6000);        // then toast new completions
 });
 
 // Modal event wiring (only runs if the modal scaffold is present in base.html)
@@ -518,6 +571,19 @@ function startLeakTestCountdowns() {
 }
 
 document.addEventListener('DOMContentLoaded', startLeakTestCountdowns);
+
+// ── Legend deep-link (#legend) ──────────────────────────────────────
+// Other pages link to the History symbol key with #legend. The legend
+// <details id="legend"> only renders when the page has events, so we
+// null-check before touching it — a flag-free / event-free History page
+// simply has no legend and this no-ops.
+document.addEventListener('DOMContentLoaded', () => {
+  if (location.hash !== '#legend') return;
+  const el = document.getElementById('legend');
+  if (!el) return;
+  el.open = true;
+  el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
 
 // ── Connection status indicator ────────────────────────────────────
 window.addEventListener("load", () => {

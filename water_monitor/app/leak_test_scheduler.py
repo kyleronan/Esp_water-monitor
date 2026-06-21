@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from datetime import tzinfo
@@ -39,7 +38,26 @@ TERMINAL_RESULTS = {
     "Not run — valve was closed (open valve first)",
     "Not run — fault active (reset fault first)",
     "Aborted — demand detected (sudden pressure drop)",
+    "Not run — water softener regenerating (deferred)",
 }
+
+# dev.24 — water-softener regeneration blackout. A regen draws on the softener's
+# circuit (Main) and would read as a leak, so a leak test is kept out of
+# [regen_start − lead, regen_start + window] (local). In-sample placeholders: the
+# observed regen runs ~2.5 h; 210 min leaves margin. Static (deliberately NOT
+# coupled to the live softener detector) — a generous fixed window is simpler and
+# safer than per-run dynamic precision.
+_SOFTENER_REGEN_LEAD_MIN: int = 20
+_SOFTENER_REGEN_WINDOW_MIN: int = 210
+
+
+def _row_get(row, key, default=None):
+    """Safe key access for a sqlite3.Row (raises IndexError on a missing column)
+    OR a plain dict (hand-built schedules in tests / a missing key)."""
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
 
 
 class LeakTestScheduler:
@@ -123,12 +141,22 @@ class LeakTestScheduler:
 
     def learn_best_hour(self, circuit: str) -> Optional[int]:
         """
-        Analyse hourly_volume history to find the quietest local hour of day.
+        Find the quietest local hour from the last 60 days of usage.
 
-        Queries the last 60 days of data, groups by local hour (converted from
-        UTC hour_ts via self._ha_tz), and returns the local hour with the lowest
-        average volume.  Prefers 0–5 AM when two hours are equally quiet.
-        Returns None if no local hour has >= 7 data points.
+        hourly_volume only stores rows when water actually flowed
+        (database.py: "skip if zero — keeps hourly_volume clean"), so
+        hours absent from the table represent genuinely silent hours.
+        Score = (active_sample_count, avg_volume_lph, hour); lower wins
+        on every key with `hour` as a deterministic final tiebreak.
+
+        Returns None only when the table has no rows for this circuit
+        at all (no signal yet).
+
+        0–5 AM preference is a policy bias toward night-time testing:
+        pick the best-scoring 0–5 hour whose active count is within
+        +1 of the global minimum. The +1 tolerance lets a night hour
+        with one sample edge out a daytime hour with count=0 — early-
+        morning leak tests are safer for the occupants.
         """
         rows = self._db.execute("""
             SELECT hour_ts, volume_litres
@@ -140,46 +168,81 @@ class LeakTestScheduler:
         if not rows:
             return None
 
-        hour_vols: Dict[int, list] = defaultdict(list)
+        counts: Dict[int, int]   = {hr: 0   for hr in range(24)}
+        sums:   Dict[int, float] = {hr: 0.0 for hr in range(24)}
         for row in rows:
             try:
                 local_hour = _parse_utc_ts(row["hour_ts"]).astimezone(self._ha_tz).hour
-                hour_vols[local_hour].append(float(row["volume_litres"] or 0.0))
+                counts[local_hour] += 1
+                sums[local_hour]   += float(row["volume_litres"] or 0.0)
             except (ValueError, AttributeError, TypeError):
                 continue
 
-        # Two-pass selection: (1) find the global-minimum average, then
-        # (2) prefer any 0–5 AM hour that is within 5 % of that minimum.
-        # The previous single-pass tie-break re-anchored best_avg to the
-        # in-range hour, which let successive 0–5 hours monotonically drift
-        # upward (e.g. 7→2→3→5 with averages 1.00, 1.04, 1.09, 1.14 all
-        # passed the gate and ended at hour 5).
-        averages: Dict[int, float] = {}
-        for hr in sorted(hour_vols.keys()):
-            vols = hour_vols[hr]
-            if len(vols) < 7:
-                continue
-            averages[hr] = sum(vols) / len(vols)
+        def score(hr: int) -> tuple:
+            n   = counts[hr]
+            avg = sums[hr] / n if n else 0.0
+            return (n, avg, hr)
 
-        if not averages:
+        # dev.24 — never pick an hour inside the softener regen blackout (the
+        # softener runs only ~bi-weekly, so 2–3 am otherwise reads as "quiet").
+        blackout = self._softener_blackout_min(circuit)
+
+        def _blacked(hr: int) -> bool:
+            if blackout is None:
+                return False
+            lo, hi = blackout
+            return hr * 60 < hi and (hr + 1) * 60 > lo   # hour overlaps [lo, hi)
+
+        allowed = [hr for hr in range(24) if not _blacked(hr)]
+        global_min_hr  = min(allowed or list(range(24)), key=score)
+        global_min_cnt = counts[global_min_hr]
+
+        candidates = [hr for hr in range(0, 6)
+                      if not _blacked(hr) and counts[hr] <= global_min_cnt + 1]
+        best_hr = min(candidates, key=score) if candidates else global_min_hr
+
+        avg = sums[best_hr] / counts[best_hr] if counts[best_hr] else 0.0
+        log.info("[%s] learned best test hour: %02d:00 local "
+                 "(count %d, avg %.3f L/h)",
+                 circuit, best_hr, counts[best_hr], avg)
+        return best_hr
+
+    def _softener_blackout_min(self, circuit: str):
+        """Return ``(lo, hi)`` local minutes-since-midnight of the softener regen
+        blackout for ``circuit``, or None when no softener is configured here.
+        Hard-gated: ``has_water_softener`` AND this is the softener's circuit.
+        Window = ``[regen_start − lead, regen_start + window]``; callers test a
+        local minute m with ``lo <= m < hi`` (no-wrap — regen is overnight)."""
+        try:
+            from .database import get_home_profile
+            from .event_rules import parse_hhmm_to_minutes
+            prof = get_home_profile(self._db)
+            if not (prof is not None and prof["has_water_softener"]
+                    and (prof["softener_circuit"] or "main") == circuit):
+                return None
+            start = parse_hhmm_to_minutes(prof["softener_regen_start"])
+            if start is None:
+                return None
+            return (max(0, start - _SOFTENER_REGEN_LEAD_MIN),
+                    start + _SOFTENER_REGEN_WINDOW_MIN)
+        except Exception as e:
+            log.warning("[%s] softener blackout lookup failed (non-fatal): %s",
+                        circuit, e)
             return None
 
-        global_min_hr  = min(averages, key=lambda h: averages[h])
-        global_min_avg = averages[global_min_hr]
-        ceiling        = global_min_avg * 1.05
-
-        # Prefer the earliest 0–5 hour within 5 % of the global minimum.
-        best_hr  = global_min_hr
-        best_avg = global_min_avg
-        for hr in range(0, 6):
-            if hr in averages and averages[hr] <= ceiling:
-                best_hr  = hr
-                best_avg = averages[hr]
-                break
-
-        log.info("[%s] learned best test hour: %02d:00 local (avg %.3f L/h)",
-                 circuit, best_hr, best_avg)
-        return best_hr
+    def _push_past_softener_blackout(self, candidate, circuit: str):
+        """If ``candidate`` (local, tz-aware) lands in the softener regen
+        blackout, move it to just after the window the same day; no-op otherwise.
+        This keeps the scheduler from ever PLANNING a test inside the regen."""
+        window = self._softener_blackout_min(circuit)
+        if window is None:
+            return candidate
+        lo, hi = window
+        cand_min = candidate.hour * 60 + candidate.minute
+        if lo <= cand_min < hi:
+            midnight = candidate.replace(hour=0, minute=0, second=0, microsecond=0)
+            return midnight + timedelta(minutes=hi)
+        return candidate
 
     def is_running(self, circuit: str) -> bool:
         return self._running_tests.get(circuit, False)
@@ -211,6 +274,16 @@ class LeakTestScheduler:
         if not schedule or not schedule["enabled"]:
             return
 
+        # 3-port valves: silently skip scheduled checks. We don't write a
+        # skip row every cycle (would spam History); the user-facing
+        # explanation lives in Settings + Device-page UI annotations. The
+        # schedule row itself is preserved so switching back to 2_port
+        # resumes the schedule without reconfiguration. Manual triggers
+        # via run_now() DO record a skip row — see _execute_test().
+        from .database import get_valve_type
+        if get_valve_type(self._db, circuit, default="2_port") == "3_port":
+            return
+
         next_run_str = schedule["next_run_at"]
         if not next_run_str:
             await self._update_next_run(circuit, schedule)
@@ -239,9 +312,16 @@ class LeakTestScheduler:
             t = asyncio.create_task(_run_guarded())
             self._pending_scheduled.add(t)
             t.add_done_callback(self._pending_scheduled.discard)
-            await self._update_next_run(circuit, schedule)
+            # next_run_at is advanced here, immediately after dispatch —
+            # not after completion. A failed background start (rare) will
+            # still consume the slot. after_trigger=True prevents auto-
+            # learn from scheduling another run today if it picked a
+            # later hour. TODO: track dispatched vs completed if the
+            # consumed-slot edge case becomes a real problem.
+            await self._update_next_run(circuit, schedule, after_trigger=True)
 
-    async def _update_next_run(self, circuit: str, schedule: Any) -> None:
+    async def _update_next_run(self, circuit: str, schedule: Any,
+                               *, after_trigger: bool = False) -> None:
         """
         Compute and store the next run timestamp.
 
@@ -261,7 +341,14 @@ class LeakTestScheduler:
             auto_learn = True
 
         if auto_learn:
-            best_hour = self.learn_best_hour(circuit)
+            # learn_best_hour queries up to 60 days of hourly_volume and
+            # does Python-side aggregation — offload to a worker thread
+            # so the scheduler's async loop stays responsive while it
+            # runs.
+            loop = asyncio.get_running_loop()
+            best_hour = await loop.run_in_executor(
+                None, self.learn_best_hour, circuit,
+            )
             if best_hour is not None:
                 current_hour = schedule.get("run_hour") if isinstance(schedule, dict) \
                     else schedule["run_hour"]
@@ -273,7 +360,7 @@ class LeakTestScheduler:
                     schedule = dict(schedule)
                     schedule["run_hour"] = best_hour
 
-        next_run = self._compute_next_run(schedule)
+        next_run = self._compute_next_run(schedule, after_trigger=after_trigger)
         if next_run:
             upsert_leak_test_schedule(self._db, circuit,
                                       next_run_at=next_run.isoformat())
@@ -314,6 +401,48 @@ class LeakTestScheduler:
                                      None, None, None, None)
             return {"result": result, "skipped": True}
 
+        # --- Pre-check: valve type compatibility (3-port has a drain port
+        # that always reads as a leak, so the micro leak test does not
+        # apply). The Device-page button is also disabled for 3-port
+        # circuits, but the route is intentionally still reachable so
+        # automations / direct POSTs produce a visible skip row here. ---
+        from .database import get_valve_type
+        if get_valve_type(self._db, circuit, default="2_port") == "3_port":
+            log.info("[%s] leak test skipped — valve_type='3_port' "
+                     "(drain-capable; micro leak test not applicable)",
+                     circuit)
+            result = ("Not run — 3-port valve (drain-capable; "
+                      "micro leak test not applicable)")
+            await self._store_result(circuit, run_at, triggered_by, result,
+                                     None, None, None, None)
+            return {"result": result, "skipped": True}
+
+        # --- Pre-check: water-softener regeneration window (dev.24) ---
+        # A regen draws on this (Main) circuit and would read as a leak. Defer
+        # WITHOUT closing the valve, record a history row, and reschedule just
+        # past the window so the test still runs and the cadence is preserved.
+        _blackout = self._softener_blackout_min(circuit)
+        if _blackout is not None:
+            _now_local = run_at.astimezone(self._ha_tz)
+            _m = _now_local.hour * 60 + _now_local.minute
+            if _blackout[0] <= _m < _blackout[1]:
+                log.info("[%s] leak test deferred — water softener regenerating",
+                         circuit)
+                result = "Not run — water softener regenerating (deferred)"
+                await self._store_result(circuit, run_at, triggered_by, result,
+                                         None, None, None, None)
+                try:
+                    _midnight = _now_local.replace(hour=0, minute=0, second=0,
+                                                   microsecond=0)
+                    _next = (_midnight + timedelta(minutes=_blackout[1])
+                             ).astimezone(timezone.utc)
+                    upsert_leak_test_schedule(self._db, circuit,
+                                              next_run_at=_next.isoformat())
+                except Exception as _ex:
+                    log.warning("[%s] could not reschedule deferred test: %s",
+                                circuit, _ex)
+                return {"result": result, "skipped": True}
+
         # --- Baseline pressure ---
         pressure_str = await self._ha.get_state_value(
             circuit_cfg.pressure_avg_sensor, "0")
@@ -329,7 +458,10 @@ class LeakTestScheduler:
         # Wait for result — firmware takes 60s settle + up to configured duration + 2min buffer.
         # Fetch the firmware-configured test duration from the HA sensor entity.
         # (duration_minutes is NOT a DB column; it lives on the ESP firmware entity.)
-        schedule = get_leak_test_schedule(self._db, circuit)
+        # An earlier version of this function also fetched the DB
+        # leak_test_schedules row here, but never read from it — duration
+        # always comes from the live HA entity below, so the extra DB
+        # roundtrip was deleted.
         try:
             dur_str = await self._ha.get_state_value(
                 circuit_cfg.leak_test_duration_entity, "30")
@@ -340,7 +472,6 @@ class LeakTestScheduler:
         start_wait   = datetime.now(timezone.utc)
         final_result = "In progress"
         result_str   = "unknown"   # initialised before loop so timeout log is safe
-        timed_out    = False
 
         while (datetime.now(timezone.utc) - start_wait).total_seconds() < max_wait_seconds:
             try:
@@ -355,7 +486,6 @@ class LeakTestScheduler:
                 final_result = result_str
                 break
         else:
-            timed_out = True
             log.warning(
                 "[%s] leak test timed out after %.0f s — firmware result '%s' not in "
                 "TERMINAL_RESULTS. Check firmware version or update TERMINAL_RESULTS.",
@@ -424,6 +554,7 @@ class LeakTestScheduler:
 
     def _compute_next_run(
         self, schedule: Any, now: Optional[datetime] = None,
+        *, after_trigger: bool = False,
     ) -> Optional[datetime]:
         """Compute the next scheduled run datetime (returned in UTC).
 
@@ -431,6 +562,12 @@ class LeakTestScheduler:
         for naive values.  Defaults to ``datetime.now(self._ha_tz)``.
         The candidate is built in local (HA) time and converted to UTC so
         that ``run_hour=2`` always means 2 AM local, not 2 AM UTC.
+
+        ``after_trigger`` is set by ``_check_schedule`` immediately after
+        dispatching a test, so auto-learn moving ``run_hour`` to a later
+        time today can't schedule a second test on the same day. It only
+        affects the daily branch; weekly/fortnightly/monthly already have
+        ≥7-day natural gaps.
         """
         if now is None:
             now = datetime.now(self._ha_tz)
@@ -447,6 +584,10 @@ class LeakTestScheduler:
                                           second=0, microsecond=0)
             if candidate <= now_local:
                 candidate += timedelta(days=1)
+            if after_trigger and candidate - now_local < timedelta(hours=18):
+                candidate += timedelta(days=1)
+            candidate = self._push_past_softener_blackout(
+                candidate, _row_get(schedule, "circuit"))
             return candidate.astimezone(timezone.utc)
 
         target_dow = schedule["day_of_week"] or 0   # 0=Monday
@@ -480,6 +621,8 @@ class LeakTestScheduler:
                         now_local.year, now_local.month + 1, target_dow,
                         week_of_month, run_hour, run_minute, self._ha_tz)
 
+        candidate = self._push_past_softener_blackout(
+            candidate, _row_get(schedule, "circuit"))
         return candidate.astimezone(timezone.utc)
 
     async def _store_result(

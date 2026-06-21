@@ -21,6 +21,7 @@ The first rule that returns a non-None result wins.
 """
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Tuple
 
 # ── Taxonomy ──────────────────────────────────────────────────────────────
@@ -28,68 +29,110 @@ from typing import Dict, List, Optional, Tuple
 # treats them as a flat set.
 
 FIXTURE_TYPES: List[str] = [
-    # Bathroom
+    # User-selectable (household fixture circuit)
     "toilet",
-    "shower",
-    "bath",
-    "bathroom_tap",
-    "bidet",
-    # Kitchen
-    "kitchen_tap",
-    "dishwasher",
-    "ice_maker",
-    "refrigerator_water",
-    "ro_drinking_faucet",
-    # Laundry / utility
+    "shower_tub",
+    "tap",
     "washing_machine",
-    "utility_tap",
-    # Outdoor
-    "hose_bib",
-    "outdoor_tap",
-    "irrigation_zone",
-    "pool_fill",
-    # Whole-house systems
-    "humidifier",
+    "dishwasher",
     "water_softener",
-    "ro_system_whole_house",
-    "evaporative_cooler",
-    "boiler_makeup",
-    # Special / catch-all
-    "leak_test",
+    # Zone-circuit only
+    "irrigation_zone",
+    # Catch-all / internal
     "other",
+    "leak_test",
 ]
+
+# Mapping from the old 23-entry taxonomy to the new 8-entry taxonomy.
+# Used by db_migrations to rewrite stored type strings, and importable
+# by tests as a regression guard.
+LEGACY_TYPE_REMAP: Dict[str, str] = {
+    # Unchanged
+    "toilet":                "toilet",
+    "washing_machine":       "washing_machine",
+    "dishwasher":            "dishwasher",
+    "irrigation_zone":       "irrigation_zone",
+    "other":                 "other",
+    "leak_test":             "leak_test",
+    # Merged
+    "shower":                "shower_tub",
+    "bath":                  "shower_tub",
+    "bidet":                 "toilet",
+    "bathroom_tap":          "tap",
+    "kitchen_tap":           "tap",
+    "utility_tap":           "tap",
+    # Folded into other
+    "ice_maker":             "other",
+    "refrigerator_water":    "other",
+    "ro_drinking_faucet":    "other",
+    "humidifier":            "other",
+    # dev.24: water_softener is a first-class type again — preserve it through
+    # _canonical_fixture_type so user labels + session matches store correctly.
+    "water_softener":        "water_softener",
+    "ro_system_whole_house": "other",
+    "evaporative_cooler":    "other",
+    "boiler_makeup":         "other",
+    "hose_bib":              "other",
+    "outdoor_tap":           "other",
+    "pool_fill":             "other",
+}
 
 # Friendly display labels (UI shows these instead of the raw key)
 FIXTURE_TYPE_LABELS: Dict[str, str] = {
-    "toilet":                "Toilet",
-    "shower":                "Shower",
-    "bath":                  "Bath",
-    "bathroom_tap":          "Bathroom tap",
-    "bidet":                 "Bidet",
-    "kitchen_tap":           "Kitchen tap",
-    "dishwasher":            "Dishwasher",
-    "ice_maker":             "Ice maker",
-    "refrigerator_water":    "Refrigerator water",
-    "ro_drinking_faucet":    "RO drinking faucet",
-    "washing_machine":       "Washing machine",
-    "utility_tap":           "Utility tap",
-    "hose_bib":              "Hose bib",
-    "outdoor_tap":           "Outdoor tap",
-    "irrigation_zone":       "Irrigation zone",
-    "pool_fill":             "Pool fill",
-    "humidifier":            "Humidifier",
-    "water_softener":        "Water softener",
-    "ro_system_whole_house": "RO system (whole-house)",
-    "evaporative_cooler":    "Evaporative cooler",
-    "boiler_makeup":         "Boiler make-up",
-    "leak_test":             "Leak test (auto)",
-    "other":                 "Other",
+    "toilet":           "Toilet",
+    "shower_tub":       "Shower / Tub",
+    "tap":              "Tap",
+    "washing_machine":  "Washing Machine",
+    "dishwasher":       "Dishwasher",
+    "water_softener":   "Water Softener",
+    "irrigation_zone":  "Irrigation Zone",
+    "other":            "Other",
+    "leak_test":        "Leak Test (auto)",
 }
 
 # Types that are NOT user-selectable in the UI (auto-managed only).
 # The leak test scheduler tags its synthetic events with this type so
 # they never show up as a real fixture for clustering or HA publishing.
 INTERNAL_FIXTURE_TYPES: List[str] = ["leak_test"]
+
+# HA publishing categories. Each fixture type is its own category now —
+# the taxonomy IS the category set. Used only in fixture_publisher to
+# name HA entities. Never stored in the database.
+FIXTURE_CATEGORIES: Dict[str, Optional[str]] = {
+    "toilet":           "toilet",
+    "shower_tub":       "shower_tub",
+    "tap":              "tap",
+    "washing_machine":  "washing_machine",
+    "dishwasher":       "dishwasher",
+    "water_softener":   "water_softener",
+    "irrigation_zone":  "irrigation_zone",
+    "other":            "other",
+    "leak_test":        None,    # never publish
+}
+
+FIXTURE_CATEGORY_LABELS: Dict[str, str] = {
+    "toilet":           "Toilet",
+    "shower_tub":       "Shower / Tub",
+    "tap":              "Tap",
+    "washing_machine":  "Washing Machine",
+    "dishwasher":       "Dishwasher",
+    "water_softener":   "Water Softener",
+    "irrigation_zone":  "Irrigation Zone",
+    "other":            "Other",
+}
+
+
+def get_fixture_category(fixture_type: Optional[str]) -> Optional[str]:
+    """Return the HA publishing category for a fixture type.
+
+    Since the taxonomy consolidation (Sprint D) the type IS the category,
+    so this function is effectively an identity for known types.
+    Returns None for leak_test (never published).
+    Returns 'other' for None or any type not in FIXTURE_CATEGORIES.
+    """
+    if fixture_type is None:
+        return "other"
+    return FIXTURE_CATEGORIES.get(fixture_type, "other")
 
 
 def is_valid_fixture_type(name: Optional[str]) -> bool:
@@ -126,7 +169,9 @@ ZONE_ONLY_ALERT_TYPES: frozenset = frozenset({
 })
 
 # Fixture types appropriate for a zone (irrigation) circuit.
-_ZONE_FIXTURE_TYPES: List[str] = ["irrigation_zone", "hose_bib", "pool_fill", "other"]
+# hose_bib and pool_fill were folded into "other" during the Sprint D
+# taxonomy consolidation; zone circuits now offer only two choices.
+_ZONE_FIXTURE_TYPES: List[str] = ["irrigation_zone", "other"]
 
 
 def normalize_circuit_type(value: Optional[str]) -> str:
@@ -138,6 +183,65 @@ def normalize_circuit_type(value: Optional[str]) -> str:
     return "fixture"
 
 
+# ── Valve type taxonomy ───────────────────────────────────────────────────
+#
+# 2-port: standard inline ball valve (the default; micro leak test works).
+# 3-port: drain-capable valve (third port supports drain/winterization
+#         plumbing). The micro leak test is incompatible because the drain
+#         port always vents, so any test would read as a constant leak.
+#
+# Wording deliberately avoids implying the addon performs auto-drain — only
+# that the hardware supports it. Future work may add an auto-drain workflow.
+
+VALVE_TYPES: List[str] = ["2_port", "3_port"]
+DEFAULT_VALVE_TYPE: str = "2_port"
+
+VALVE_TYPE_LABELS: Dict[str, str] = {
+    "2_port": "2-port (standard)",
+    "3_port": "3-port (drain-capable)",
+}
+
+VALVE_TYPE_HELP: Dict[str, str] = {
+    "2_port": "Standard inline ball valve. Micro leak test enabled.",
+    "3_port": ("Third port supports drain/winterization plumbing. "
+               "Micro leak test is disabled because a drain port would "
+               "always read as a constant leak."),
+}
+
+
+def normalize_valve_type(value: Optional[str]) -> str:
+    """FORGIVING fallback for reads / display.
+
+    Returns one of VALVE_TYPES; coerces blanks, unknowns, and legacy values
+    to DEFAULT_VALVE_TYPE so callers can always render something without
+    crashing.
+
+    Accepts "3-port", "3_port", "3 port", "3 -PORT" etc. via the regex.
+    Use parse_valve_type() instead for POST/API writes that must reject
+    garbage rather than silently default.
+    """
+    if not value:
+        return DEFAULT_VALVE_TYPE
+    v = re.sub(r"[\s-]+", "_", str(value).strip().lower())
+    return v if v in VALVE_TYPES else DEFAULT_VALVE_TYPE
+
+
+def parse_valve_type(value: Optional[str]) -> Optional[str]:
+    """STRICT parser for form / API writes.
+
+    Returns one of VALVE_TYPES on valid input, or None on anything invalid
+    (including blanks, None, and unknown tokens).
+
+    POST handlers MUST use this rather than normalize_valve_type — otherwise
+    garbage like 'banana' would silently become '2_port' and any
+    validation error path would be unreachable.
+    """
+    if value is None:
+        return None
+    v = re.sub(r"[\s-]+", "_", str(value).strip().lower())
+    return v if v in VALVE_TYPES else None
+
+
 def zone_user_selectable_types() -> List[str]:
     """Fixture types appropriate for a zone (irrigation) circuit."""
     return [t for t in _ZONE_FIXTURE_TYPES if t not in INTERNAL_FIXTURE_TYPES]
@@ -147,6 +251,54 @@ def fixture_user_selectable_types() -> List[str]:
     """Fixture types appropriate for a household fixture circuit."""
     _zone_only = {"irrigation_zone"}
     return [t for t in FIXTURE_TYPES if t not in INTERNAL_FIXTURE_TYPES and t not in _zone_only]
+
+
+def normalize_fixture_type_for_circuit(
+    name: Optional[str],
+    circuit_kind: str,
+) -> str:
+    """Coerce any string into a canonical category for the given circuit.
+
+    Used by the Sprint F per-category rollup (Fixtures page) to ensure stored
+    type strings — which may include legacy values predating Sprint D, user
+    typos, display labels, or wrong-circuit-kind types — always collapse to a
+    valid category for the circuit being rendered.
+
+    circuit_kind: ``"fixture"`` (the default) or ``"zone"``. Anything else is
+    treated as ``"fixture"``. Unknown / blank / legacy / wrong-kind inputs all
+    collapse to ``"other"``. NEVER returns ``"leak_test"`` (internal-only).
+
+    Normalization stages, in order:
+      1. None / non-string / empty after strip → ``"other"``.
+      2. Strip whitespace, lowercase, collapse hyphens/spaces to ``_``.
+      3. Strip a trailing ``/`` and split on ``/`` — take the first segment
+         (catches display labels like ``"Shower / Tub"`` → ``"shower"``).
+      4. Look up in LEGACY_TYPE_REMAP (Sprint D alias map).
+      5. If the result is in the allowed-set for this circuit kind, return
+         it; otherwise return ``"other"``.
+    """
+    if not isinstance(name, str):
+        return "other"
+    s = name.strip().lower()
+    if not s:
+        return "other"
+    # Take the first '/'-separated segment FIRST so display labels like
+    # "Shower / Tub" canonicalize via 'shower' (and not 'shower_/_tub' after
+    # whitespace-to-underscore folding). Strip both the leading/trailing '/'
+    # and surrounding whitespace before the next stage.
+    s = s.strip("/").split("/", 1)[0].strip()
+    # Collapse hyphens / internal whitespace to underscores; strip stray
+    # leading/trailing underscores.
+    s = re.sub(r"[\s\-]+", "_", s).strip("_")
+    if not s:
+        return "other"
+    # Apply Sprint D alias map (shower→shower_tub, bathroom_tap→tap,
+    # hose_bib→other, etc.).
+    canonical = LEGACY_TYPE_REMAP.get(s, s)
+    allowed = (set(zone_user_selectable_types())
+               if circuit_kind == "zone"
+               else set(fixture_user_selectable_types()))
+    return canonical if canonical in allowed else "other"
 
 
 # ── Variance profiles for type-aware cluster matching ────────────────────
@@ -189,10 +341,14 @@ def fixture_user_selectable_types() -> List[str]:
 FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     # ── Deterministic ────────────────────────────────────────────────────
     "toilet": {
+        # Type-level weights: lowered volume/duration/flow from 3.0/3.0/2.0 to
+        # 1.5 each so that two cisterns with slightly different flush sizes both
+        # match the type centroid. Pressure-transient anchors are unchanged —
+        # these remain the sharpest cross-type discriminators.
         "anchor_weights": {
-            "volume_litres":              3.0,
-            "duration_seconds":           3.0,
-            "avg_flow_lpm":               2.0,
+            "volume_litres":              1.5,
+            "duration_seconds":           1.5,
+            "avg_flow_lpm":               1.5,
             "has_pressure_transient":     2.0,
             "resistance_curve_shape":     2.0,   # forward-looking
             "recovery_overshoot_psi":     1.5,   # water hammer on cistern snap-shut
@@ -200,50 +356,16 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
             "pressure_onset_ms":          1.0,
         },
         "float_features": {"hour_sin", "hour_cos", "day_of_week", "is_weekend"},
-        "expected_cv": {"volume_litres": 0.08, "duration_seconds": 0.10},
-        "multimodal": False,
-    },
-    "ice_maker": {
-        "anchor_weights": {
-            "volume_litres":    4.0,
-            "duration_seconds": 4.0,
-            "avg_flow_lpm":     3.0,
-        },
-        "float_features": {"hour_sin", "hour_cos", "day_of_week"},
-        "expected_cv": {"volume_litres": 0.03, "duration_seconds": 0.05},
-        "multimodal": False,
-    },
-    "refrigerator_water": {
-        "anchor_weights": {
-            "volume_litres":    2.5,
-            "duration_seconds": 2.0,
-            "avg_flow_lpm":     2.0,
-        },
-        "float_features": {"hour_sin", "hour_cos"},
-        "expected_cv": {"volume_litres": 0.10, "duration_seconds": 0.15},
-        "multimodal": False,
-    },
-    "humidifier": {
-        "anchor_weights": {
-            "volume_litres": 2.0,
-            "avg_flow_lpm":  2.5,
-        },
-        "float_features": {"duration_seconds", "hour_sin", "hour_cos"},
-        "expected_cv": {"volume_litres": 0.20, "duration_seconds": 0.20},
-        "multimodal": False,
-    },
-    "boiler_makeup": {
-        "anchor_weights": {
-            "volume_litres": 2.5,
-            "avg_flow_lpm":  2.0,
-        },
-        "float_features": {"hour_sin", "hour_cos"},
-        "expected_cv": {"volume_litres": 0.15, "duration_seconds": 0.15},
+        "expected_cv": {"volume_litres": 0.20, "duration_seconds": 0.25},
         "multimodal": False,
     },
 
     # ── User-driven ──────────────────────────────────────────────────────
-    "shower": {
+    "shower_tub": {
+        # Merged from old shower + bath profiles. Duration and volume are
+        # behavioural choices (whether the user showers or fills a tub);
+        # anchor on flow rate and pressure delta which are hydraulically
+        # stable per installation.
         "anchor_weights": {
             "avg_flow_lpm":           3.0,
             "pressure_delta_psi":     2.0,
@@ -256,16 +378,9 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         "expected_cv": {"duration_seconds": 0.45, "volume_litres": 0.45},
         "multimodal": False,
     },
-    "bath": {
-        "anchor_weights": {
-            "avg_flow_lpm":       3.0,
-            "pressure_delta_psi": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.30, "volume_litres": 0.25},
-        "multimodal": False,
-    },
-    "bathroom_tap": {
+    "tap": {
+        # Merged from old bathroom_tap + kitchen_tap + utility_tap profiles.
+        # Short, low-volume events; duration and volume vary with use.
         "anchor_weights": {
             "avg_flow_lpm":           2.5,
             "pressure_delta_psi":     1.5,
@@ -274,41 +389,6 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         },
         "float_features": {"duration_seconds", "volume_litres", "duration_log"},
         "expected_cv": {"duration_seconds": 0.60, "volume_litres": 0.60},
-        "multimodal": False,
-    },
-    "kitchen_tap": {
-        "anchor_weights": {
-            "avg_flow_lpm":           2.5,
-            "pressure_delta_psi":     1.5,
-            "recovery_overshoot_psi": 1.0,
-            "pressure_onset_ms":      1.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.55, "volume_litres": 0.55},
-        "multimodal": False,
-    },
-    "utility_tap": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.65, "volume_litres": 0.65},
-        "multimodal": False,
-    },
-    "bidet": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.50, "volume_litres": 0.50},
-        "multimodal": False,
-    },
-    "ro_drinking_faucet": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.5,
-        },
-        "float_features": {"duration_seconds", "volume_litres"},
-        "expected_cv": {"duration_seconds": 0.50, "volume_litres": 0.50},
         "multimodal": False,
     },
 
@@ -338,18 +418,8 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         "expected_cv": {"duration_seconds": 0.40, "volume_litres": 0.40},
         "multimodal": True,
     },
-    "water_softener": {
-        "anchor_weights": {
-            "avg_flow_lpm":           2.0,
-            "flow_variability":       1.5,
-            "resistance_curve_shape": 2.0,   # forward-looking
-        },
-        "float_features": {"duration_seconds", "volume_litres"},
-        "expected_cv": {"duration_seconds": 0.35, "volume_litres": 0.35},
-        "multimodal": True,
-    },
 
-    # ── Outdoor / programme-ish ──────────────────────────────────────────
+    # ── Zone / outdoor ───────────────────────────────────────────────────
     "irrigation_zone": {
         "anchor_weights": {
             "avg_flow_lpm":           2.5,
@@ -361,44 +431,15 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         "expected_cv": {"duration_seconds": 0.25, "volume_litres": 0.25},
         "multimodal": False,
     },
-    "pool_fill": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres"},
-        "expected_cv": {"duration_seconds": 0.20, "volume_litres": 0.20},
-        "multimodal": False,
-    },
-    "hose_bib": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.55, "volume_litres": 0.55},
-        "multimodal": False,
-    },
-    "outdoor_tap": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
-        "expected_cv": {"duration_seconds": 0.55, "volume_litres": 0.55},
-        "multimodal": False,
-    },
-    "evaporative_cooler": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres"},
-        "expected_cv": {"duration_seconds": 0.30, "volume_litres": 0.30},
-        "multimodal": False,
-    },
-    "ro_system_whole_house": {
-        "anchor_weights": {
-            "avg_flow_lpm": 2.0,
-        },
-        "float_features": {"duration_seconds", "volume_litres"},
-        "expected_cv": {"duration_seconds": 0.40, "volume_litres": 0.40},
+
+    "water_softener": {
+        # dev.24: detected by the SESSION detector (event_rules.detect_softener_
+        # sessions), never the k-NN — this profile only keeps the dict in lockstep
+        # with FIXTURE_TYPES. Uniform (like 'other'): the k-NN has no
+        # water_softener centroid to match against, so the values are inert.
+        "anchor_weights": {},
+        "float_features": set(),
+        "expected_cv": {},
         "multimodal": False,
     },
 
@@ -429,47 +470,21 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
 }
 
 
-# Per-fixture-type match thresholds (scaled-feature space, comparable to
-# DBSTREAM_CLUSTERING_THRESHOLD = 1.5). Lower = tighter gate.
-#
-# Tuned categorically:
-#   < 1.0  deterministic — toilets, ice makers, refrigerators
-#   1.0–2.0 mostly-deterministic — humidifiers, taps, RO
-#   2.0–3.0 user-driven — showers, baths, hose bibs, irrigation
-#   3.0+   multimodal — washing machines / dishwashers (loosest)
+# Per-fixture-type match thresholds (scaled-feature space).
+# Raised from individual-fixture values to type-level values so that two
+# fixtures of the same type (e.g., two different cisterns) both match a
+# single type centroid rather than splitting into separate clusters.
+# "other" is unchanged — it is a catch-all, not a named type.
 FIXTURE_MATCH_THRESHOLDS: Dict[str, float] = {
-    # Deterministic
-    "toilet":              0.6,
-    "ice_maker":           0.5,
-    "refrigerator_water":  0.7,
-    "humidifier":          1.0,
-    "boiler_makeup":       1.0,
-
-    # User-driven
-    "shower":              2.5,
-    "bath":                2.8,
-    "bathroom_tap":        1.8,
-    "kitchen_tap":         1.8,
-    "utility_tap":         2.0,
-    "bidet":               1.6,
-    "ro_drinking_faucet":  1.5,
-
-    # Programme-driven (multimodal — loosest)
-    "washing_machine":     3.0,
-    "dishwasher":          2.8,
-    "water_softener":      2.5,
-
-    # Outdoor / programme-ish
-    "irrigation_zone":     2.2,
-    "pool_fill":           1.8,
-    "hose_bib":            2.5,
-    "outdoor_tap":         2.5,
-    "evaporative_cooler":  1.8,
-    "ro_system_whole_house": 2.0,
-
-    # Special
-    "leak_test":           0.8,
-    "other":               1.5,   # = current DBSTREAM_CLUSTERING_THRESHOLD
+    "toilet":           3.0,
+    "shower_tub":       4.5,   # looser of old shower(4.0) + bath(4.5)
+    "tap":              3.5,   # same as old bathroom_tap / kitchen_tap
+    "washing_machine":  4.5,
+    "dishwasher":       4.5,
+    "water_softener":   1.5,   # session-detected; neutral (inert for k-NN)
+    "irrigation_zone":  3.5,
+    "leak_test":        0.8,
+    "other":            1.5,
 }
 
 
@@ -501,7 +516,9 @@ def get_match_threshold(fixture_type: Optional[str]) -> float:
 # Centroid keys are the feature names used by feature_extractor:
 #   avg_flow_lpm, peak_flow_lpm, duration_seconds, volume_litres,
 #   pressure_delta_psi, has_pressure_transient (0 or 1 average),
-#   flow_variability, hour_sin, hour_cos, ...
+#   flow_variability, hour_sin, hour_cos,
+#   cycle_pulse_count (mean # of similar-volume neighbours within ±45 min — the
+#     temporal "appliance cycle" signal; see database.recompute_cycle_pulse_counts), ...
 #
 # Confidence scoring guideline:
 #   0.90+ — extremely characteristic, multiple distinguishing features match
@@ -525,70 +542,71 @@ def _safe(centroid: Dict, key: str, default: float = 0.0) -> float:
 # Individual rules -------------------------------------------------------
 
 def _rule_toilet(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Toilet flushes: 4-9 L volume, 20-60 s duration, sharp pressure transient."""
+    """Toilet flushes: 3-10 L volume, 20-120 s fill, sharp pressure transient.
+
+    Bands widened from the originals (4-9 L / 20-60 s / 4-25 L/min) to span
+    dual-flush and slow-fill cisterns across houses (observed real fills run to
+    ~98 s and down to ~2.8 L) while keeping the has_xt transient signature that
+    separates a toilet from a tap.
+    """
     if circuit_type == "zone":
         return None
     vol      = _safe(centroid, "volume_litres")
     dur      = _safe(centroid, "duration_seconds")
     has_xt   = _safe(centroid, "has_pressure_transient")
     flow     = _safe(centroid, "avg_flow_lpm")
-    if _between(vol, 4, 9) and _between(dur, 20, 60) and has_xt > 0.5:
-        # Flow rate sanity check: ~6 L over ~30 s = ~12 L/min average
-        if _between(flow, 4, 25):
+    if _between(vol, 3, 10) and _between(dur, 20, 120) and has_xt > 0.5:
+        if _between(flow, 3, 15):
             return ("toilet", 0.90)
     return None
 
 
-def _rule_shower(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Shower: 20-80 L, 5-15 min, sustained moderate flow."""
+def _rule_shower_tub(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
+    """Shower or bath fill: 15-300 L, 3-60 min, moderate flow.
+
+    Merges shower + bath. Duration ceiling raised from 20 to 60 min (real
+    showers run past 50 min) and the flow floor lowered from 5 to 4 L/min for
+    low-flow heads.
+    """
     if circuit_type == "zone":
         return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
+    vol  = _safe(centroid, "volume_litres")
+    dur  = _safe(centroid, "duration_seconds")
     flow = _safe(centroid, "avg_flow_lpm")
-    if _between(vol, 20, 100) and _between(dur, 240, 1200) and _between(flow, 5, 15):
-        return ("shower", 0.85)
+    if _between(vol, 15, 300) and _between(dur, 180, 3600) and _between(flow, 4, 22):
+        return ("shower_tub", 0.80)
     return None
 
 
-def _rule_bath(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Bath fill: 80-200 L, 3-10 min, high flow rate."""
+def _rule_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
+    """Tap use: 0.3-6 L, 4-75 s — bathroom/kitchen/utility taps.
+
+    Deliberately kept NARROW (balanced posture): tap is the broadest, lowest-
+    confidence rule and the last in the chain, so it must not become a catch-all
+    that pulls miscellaneous small events out of 'other'.
+    """
     if circuit_type == "zone":
         return None
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
-    flow = _safe(centroid, "avg_flow_lpm")
-    if _between(vol, 80, 250) and _between(dur, 180, 600) and _between(flow, 12, 25):
-        return ("bath", 0.80)
+    if _between(vol, 0.3, 6) and _between(dur, 4, 75):
+        return ("tap", 0.65)
     return None
 
 
-def _rule_bathroom_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Bathroom tap: 0.3-3 L, 5-30 s, low flow."""
-    if circuit_type == "zone":
-        return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
-    if _between(vol, 0.3, 3) and _between(dur, 5, 30):
-        return ("bathroom_tap", 0.65)
-    return None
-
-
-def _rule_kitchen_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Kitchen tap: 0.5-8 L, 5-60 s, variable flow."""
-    if circuit_type == "zone":
-        return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
-    if _between(vol, 0.5, 8) and _between(dur, 5, 60):
-        return ("kitchen_tap", 0.60)
-    return None
+# Centroid-only appliance fallbacks (legacy clusters) require the SAME multi-pulse
+# evidence as the temporal rules below: a cluster whose mean is one isolated draw must
+# not be typed as a multi-draw appliance. STRUCTURAL — suggest_fixture_type takes no
+# calib, so this gate is unconditional (never frozen per-home).
+_FALLBACK_MIN_CYCLE_PULSES: float = 3.0
 
 
 def _rule_dishwasher(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Dishwasher fill: 8-15 L per fill, 60-180 s, repeats every ~20 min during cycle."""
     if circuit_type == "zone":
         return None
+    if _safe(centroid, "cycle_pulse_count") < _FALLBACK_MIN_CYCLE_PULSES:
+        return None                  # isolated draw — not a dishwasher cycle
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
     flow = _safe(centroid, "avg_flow_lpm")
@@ -601,6 +619,8 @@ def _rule_washing_machine(centroid: Dict, circuit_type: str) -> Optional[Tuple[s
     """Washing machine fill: 30-80 L total per cycle, 60-300 s per fill phase."""
     if circuit_type == "zone":
         return None
+    if _safe(centroid, "cycle_pulse_count") < _FALLBACK_MIN_CYCLE_PULSES:
+        return None                  # isolated draw — not a washing-machine cycle
     vol = _safe(centroid, "volume_litres")
     dur = _safe(centroid, "duration_seconds")
     flow = _safe(centroid, "avg_flow_lpm")
@@ -613,67 +633,63 @@ def _rule_irrigation_zone(centroid: Dict, circuit_type: str) -> Optional[Tuple[s
     """Irrigation: only on zone circuit. Long duration, sustained high flow."""
     if circuit_type != "zone":
         return None
-    dur = _safe(centroid, "duration_seconds")
+    dur  = _safe(centroid, "duration_seconds")
     flow = _safe(centroid, "avg_flow_lpm")
-    # Irrigation zones run 5-60 minutes at sustained flow
-    if dur >= 300 and flow >= 5:
+    # Irrigation zones run ~4-60 minutes at sustained flow
+    if dur >= 240 and flow >= 5:
         return ("irrigation_zone", 0.85)
-    # Short irrigation events might be a hose bib used outside
-    if _between(dur, 30, 300) and flow >= 3:
-        return ("hose_bib", 0.55)
+    # Short zone events fall through to 'other' (hose_bib removed from taxonomy)
     return None
 
 
-def _rule_ice_maker(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Ice maker: tiny intermittent fills, 50-300 mL, 3-15 s."""
+# Temporal appliance rules -----------------------------------------------
+# Dishwasher / washing-machine FILL PULSES look like small taps in a single
+# event; the discriminator is that they REPEAT (a cycle of similar-volume
+# pulses). ``cycle_pulse_count`` is the centroid-mean count of similar-volume
+# neighbours within ±45 min (database.recompute_cycle_pulse_counts). Both rules
+# gate on has_pressure_transient < 0.5, so a toilet's sharp transient can never
+# satisfy them, and they run BEFORE the broadened toilet/tap bands in the chain.
+
+def _rule_dishwasher_temporal(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
+    """Dishwasher fill pulse: repeated low-flow small pulses (a cycle)."""
     if circuit_type == "zone":
         return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
-    if _between(vol, 0.05, 0.4) and _between(dur, 3, 15):
-        return ("ice_maker", 0.65)
+    if (_safe(centroid, "cycle_pulse_count") >= 3
+            and _safe(centroid, "has_pressure_transient") < 0.5
+            and _between(_safe(centroid, "avg_flow_lpm"), 1, 5)
+            and _between(_safe(centroid, "volume_litres"), 0.5, 6)
+            and _between(_safe(centroid, "duration_seconds"), 20, 220)):
+        return ("dishwasher", 0.80)
     return None
 
 
-def _rule_humidifier(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Whole-house humidifier: small slow fills, 0.5-3 L, 30-180 s."""
+def _rule_washing_machine_temporal(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
+    """Washing-machine fill pulse: repeated higher-flow pulses (a cycle)."""
     if circuit_type == "zone":
         return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
-    flow = _safe(centroid, "avg_flow_lpm")
-    if _between(vol, 0.5, 3) and _between(dur, 30, 180) and _between(flow, 0.3, 1.5):
-        return ("humidifier", 0.55)
-    return None
-
-
-def _rule_water_softener(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
-    """Water softener regen: long sustained flow, 150-300 L, 30-90 minutes, scheduled."""
-    if circuit_type == "zone":
-        return None
-    vol = _safe(centroid, "volume_litres")
-    dur = _safe(centroid, "duration_seconds")
-    flow = _safe(centroid, "avg_flow_lpm")
-    if _between(vol, 100, 400) and _between(dur, 1800, 5400) and _between(flow, 3, 8):
-        return ("water_softener", 0.70)
+    if (_safe(centroid, "cycle_pulse_count") >= 3
+            and _safe(centroid, "has_pressure_transient") < 0.5
+            and _between(_safe(centroid, "avg_flow_lpm"), 5, 16)
+            and _between(_safe(centroid, "volume_litres"), 3, 40)
+            and _between(_safe(centroid, "duration_seconds"), 40, 400)):
+        return ("washing_machine", 0.80)
     return None
 
 
 # Rule chain -------------------------------------------------------------
 # Order matters: more-specific rules first.
+# shower_tub must come before tap: a bath-fill volume would also satisfy
+# the broader tap volume range if tap were checked first.
 
 _RULES = [
     _rule_irrigation_zone,
-    _rule_water_softener,    # high volume, must check before shower/bath
-    _rule_bath,              # high volume, must check before shower
-    _rule_shower,
-    _rule_washing_machine,
-    _rule_dishwasher,
-    _rule_humidifier,
-    _rule_toilet,            # very characteristic, but check after high-vol rules
-    _rule_bathroom_tap,      # before kitchen_tap because bathroom_tap has lower vol bound
-    _rule_kitchen_tap,
-    _rule_ice_maker,
+    _rule_dishwasher_temporal,       # temporal appliance cycles first — they
+    _rule_washing_machine_temporal,  # gate on has_xt<0.5 so toilets are safe
+    _rule_shower_tub,                # high volume, before tap
+    _rule_washing_machine,           # centroid-only fallback (legacy clusters)
+    _rule_dishwasher,                # centroid-only fallback (legacy clusters)
+    _rule_toilet,                    # characteristic; after high-vol/appliance
+    _rule_tap,                       # broadest, narrow band, last
 ]
 
 

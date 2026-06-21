@@ -14,6 +14,21 @@
 
 <h1 class="hist-page-title">History</h1>
 
+<p class="muted fx-page-intro" style="margin:0 0 14px 0">
+  Every burst of water use is logged here. <strong>Tap a row</strong> to inspect it,
+  and star-label a few events so the app learns your fixtures. If the app marked
+  something as <em>not real use</em> but water <strong>was</strong> running, open it
+  and relabel — your call overrides the app's.
+</p>
+
+{% if filter_param == 'degraded' %}
+{# Filter banner — explains why the list is restricted and offers a way out. #}
+<div class="hist-filter-banner" role="status" aria-live="polite">
+  <span><strong>Filtered:</strong> showing only events where the water pressure was unsteady (pulsing supply). Volume totals for these events are estimates.</span>
+  <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history">Clear filter</a>
+</div>
+{% endif %}
+
 {# ── Date range filter card ────────────────────────────────────────── #}
 <div class="hist-filter-card">
   <form method="get" action="{{ ingress_path }}/history">
@@ -53,13 +68,20 @@
 </div>
 
 {# ── Summary strip ────────────────────────────────────────────────── #}
-{% set ns = namespace(total_vol=0, total_events=0, tests_pass=0, tests_fail=0, total_alerts=0) %}
+{% set ns = namespace(total_vol=0, total_events=0, tests_pass=0, tests_fail=0, total_alerts=0,
+                      has_events=false, has_phantom=false, has_crosstalk=false,
+                      has_degraded=false, has_dribble=false) %}
 {% for ch in circuit_history %}
   {% for s in ch.summaries %}
     {% set ns.total_vol = ns.total_vol + ((s.total_volume_litres or 0) * vol_factor) %}
     {% set ns.total_alerts = ns.total_alerts + (s.alert_count or 0) %}
   {% endfor %}
   {% set ns.total_events = ns.total_events + (ch.event_count or 0) %}
+  {% if ch.events %}{% set ns.has_events = true %}{% endif %}
+  {% if ch.events | selectattr('is_pressure_restoration_phantom') | list %}{% set ns.has_phantom = true %}{% endif %}
+  {% if ch.events | selectattr('is_cross_talk') | list %}{% set ns.has_crosstalk = true %}{% endif %}
+  {% if ch.events | selectattr('degraded_supply') | list %}{% set ns.has_degraded = true %}{% endif %}
+  {% if ch.events | selectattr('is_low_flow_dribble') | list %}{% set ns.has_dribble = true %}{% endif %}
   {% for t in ch.leak_tests %}
     {% if 'Passed' in (t.result or '') %}{% set ns.tests_pass = ns.tests_pass + 1 %}
     {% elif t.result %}{% set ns.tests_fail = ns.tests_fail + 1 %}{% endif %}
@@ -90,6 +112,48 @@
   </div>
 </div>
 
+{# ── Symbol legend ────────────────────────────────────────────────── #}
+{# Always rendered (collapsed) when the page has events, so the #legend
+   deep-link target from other pages always resolves. Flag rows appear
+   only for symbols that are actually present. The phantom / other-line
+   rows deliberately say "relabel if water was running" rather than
+   "ignore" — these are the app's automatic, least-certain calls. #}
+{% if ns.has_events %}
+<details class="hist-legend" id="legend">
+  <summary>What do these symbols mean?</summary>
+  <dl class="hist-legend-dl">
+    {% if ns.has_phantom %}
+    <dt><span class="pill pill-neutral">👻 Not real use</span></dt>
+    <dd>A city water-pressure blip, not a tap or appliance — volume removed from your
+      totals. This is the app's automatic call; if water <strong>was</strong> running,
+      open the event and relabel it.</dd>
+    {% endif %}
+    {% if ns.has_crosstalk %}
+    <dt><span class="pill pill-neutral">↔ Not real use</span></dt>
+    <dd>Your other water line's draw briefly dropped this line's pressure — no real flow
+      here, so the volume was removed. If water <strong>was</strong> running here, open
+      the event and relabel it.</dd>
+    {% endif %}
+    {% if ns.has_degraded %}
+    <dt><span class="pill pill-amber">〰 Estimated</span></dt>
+    <dd>Water pressure was pulsing during the event, so its volume is an estimate, not
+      exact. Worth a glance if it happens often.</dd>
+    {% endif %}
+    {% if ns.has_dribble %}
+    <dt><span class="pill pill-neutral">Drip — not real use</span></dt>
+    <dd>A very small flow, too small to be a real tap or appliance — its volume is removed
+      from your totals. This is the app's automatic call; if water <strong>was</strong>
+      running here, open the event and relabel it.</dd>
+    {% endif %}
+    <dt class="hist-legend-fix">★ ◎ ↻ ~</dt>
+    <dd>How a fixture was labeled: <strong>★</strong> you assigned it ·
+      <strong>◎</strong> captured by the Training helper ·
+      <strong>↻</strong> auto-labeled from a known cycle ·
+      <strong>~</strong> our best guess from your past labels.</dd>
+  </dl>
+</details>
+{% endif %}
+
 {% for ch in circuit_history %}
 
 {# ── Usage chart card ────────────────────────────────────────────── #}
@@ -116,7 +180,8 @@
 </div>
 
 {# ── Leak test history card ──────────────────────────────────────── #}
-<div class="hist-card">
+{# id is the jump target for the "latest result" pill on the Valve & Tests page. #}
+<div class="hist-card" id="leak-test-history">
   <h3 class="hist-section-title">Leak Test History</h3>
   {% if ch.leak_tests %}
   <div class="hist-table-wrap">
@@ -136,16 +201,49 @@
       <tbody>
         {% for t in ch.leak_tests %}
         {% set drop_rate = (t.pressure_drop_psi / t.duration_minutes) if (t.pressure_drop_psi is not none and t.duration_minutes) else none %}
-        <tr class="{% if 'Passed' in (t.result or '') %}hist-row-pass{% elif t.result %}hist-row-fail{% endif %}">
+        {% set _r = t.result or '' %}
+        {% set lt = namespace(label='', pill='pill-neutral', row='') %}
+        {# Red badge follows leak_test_scheduler.py:525,531 — a leak failure is 'Failed' or any
+           'leak' mention, with Passed excluded. Pre-flight skips ('Not run …', incl. the 3-port
+           "micro leak test not applicable" wording) short-circuit BEFORE that check in the
+           scheduler, so we match the skip/abort prefixes FIRST and only then apply the 'leak'
+           catch-all — otherwise the benign 3-port message would read as a red leak. KEEP IN SYNC. #}
+        {% if _r.startswith('Passed') %}
+          {% set lt.label = 'Passed' %}{% set lt.pill = 'pill-green' %}{% set lt.row = 'hist-row-pass' %}
+        {% elif _r.startswith('Failed') %}
+          {% set lt.label = 'Failed' %}{% set lt.pill = 'pill-red' %}{% set lt.row = 'hist-row-fail' %}
+        {% elif _r.startswith('Aborted') %}
+          {% set lt.label = 'Aborted' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
+        {% elif _r.startswith('Timed out') %}
+          {% set lt.label = 'Timed out' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
+        {% elif _r.startswith('Not run') %}
+          {% set lt.label = 'Not run' %}{% set lt.pill = 'pill-neutral' %}{% set lt.row = 'hist-row-skip' %}
+        {% elif _r.startswith('Stopped') %}
+          {% set lt.label = 'Stopped' %}{% set lt.pill = 'pill-neutral' %}{% set lt.row = 'hist-row-skip' %}
+        {% elif _r|lower == 'cancelled' %}
+          {% set lt.label = 'Cancelled' %}{% set lt.pill = 'pill-neutral' %}{% set lt.row = 'hist-row-skip' %}
+        {% elif 'leak' in _r|lower %}
+          {# Any other wording mentioning a leak (and not a pre-flight skip) → treat as a leak. #}
+          {% set lt.label = 'Failed' %}{% set lt.pill = 'pill-red' %}{% set lt.row = 'hist-row-fail' %}
+        {% elif _r %}
+          {# Unrecognized non-empty result → AMBER (caution), never benign grey #}
+          {% set lt.label = 'Unknown' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
+        {% endif %}
+        <tr class="lt-row {{ lt.row }}{% if loop.index > 3 %} hist-extra-row{% endif %}"{% if loop.index > 3 %} style="display:none"{% endif %}
+            tabindex="0" role="button" aria-label="Leak test detail"
+            data-ts="{{ t.run_at or '' }}"
+            data-triggered="{{ t.triggered_by or '—' }}"
+            data-result="{{ t.result or '' }}"
+            data-label="{{ lt.label }}" data-pill="{{ lt.pill }}"
+            data-baseline="{{ (t.baseline_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.baseline_psi is not none else '—' }}"
+            data-final="{{ (t.final_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.final_psi is not none else '—' }}"
+            data-drop="{{ (t.pressure_drop_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.pressure_drop_psi is not none else '—' }}"
+            data-drop-rate="{{ '%.4f %s/min'|format(drop_rate * pressure_factor, pressure_unit) if drop_rate is not none else '—' }}"
+            data-duration="{{ '%.1f min'|format(t.duration_minutes) if t.duration_minutes else '—' }}">
           <td class="hist-td hist-td-mono"><time data-ts="{{ t.run_at or '' }}">{{ (t.run_at or '')[:16] }}</time></td>
           <td class="hist-td">{{ t.triggered_by or '—' }}</td>
           <td class="hist-td">
-            {% if 'Passed' in (t.result or '') %}
-            <span class="pill pill-green">Passed</span>
-            {% elif t.result %}
-            <span class="pill pill-red">Failed</span>
-            {% else %}—
-            {% endif %}
+            {% if t.result %}<span class="pill {{ lt.pill }}">{{ lt.label }}</span>{% else %}—{% endif %}
           </td>
           <td class="hist-td hist-td-mono">{{ (t.baseline_psi * pressure_factor)|round(pressure_decimals) if t.baseline_psi is not none else "—" }}</td>
           <td class="hist-td hist-td-mono">{{ (t.final_psi * pressure_factor)|round(pressure_decimals) if t.final_psi is not none else "—" }}</td>
@@ -157,6 +255,12 @@
       </tbody>
     </table>
   </div>
+  {% if ch.leak_tests|length > 3 %}
+  <div class="hist-see-more-wrap" style="margin-top:8px">
+    <button type="button" class="btn btn-ghost btn-sm hist-see-more" data-expanded="0"
+            data-more-label="See {{ ch.leak_tests|length - 3 }} more">See {{ ch.leak_tests|length - 3 }} more</button>
+  </div>
+  {% endif %}
   {% else %}
   <p class="hist-empty">No leak tests run yet.</p>
   {% endif %}
@@ -172,36 +276,50 @@
     </span>
   </h3>
   {% if ch.events %}
+  {# Single "Note" column replaces the four per-flag emoji columns. Its
+     existence is the UNION of all four flag checks, so a page with only one
+     kind of flag still gets the column; each cell stacks whichever flags the
+     row actually has (see guardrail 4). #}
+  {% set _has_flags = (ch.events|selectattr('degraded_supply')|list)
+                       or (ch.events|selectattr('is_pressure_restoration_phantom')|list)
+                       or (ch.events|selectattr('is_low_flow_dribble')|list)
+                       or (ch.events|selectattr('is_cross_talk')|list)
+                       or (ch.events|selectattr('match_rejection_reason','equalto','sparse_envelope')|list) %}
   <div class="hist-table-wrap">
     <table class="hist-table">
       <thead>
         <tr>
           <th>Time</th>
           <th>Duration</th>
-          <th>Avg flow</th>
+          <th title="Average flow while water is actually running (idle gaps excluded)">Avg flow</th>
           <th>ΔP ({{ pressure_unit }})</th>
           <th>Shape</th>
           <th>Volume ({{ vol_unit }})</th>
           <th>Fixture</th>
-          {% if ch.events | selectattr('is_composite') | list %}<th>⚡</th>{% endif %}
+          {% if _has_flags %}<th title="Notes the app added — tap a row to see details">Note</th>{% endif %}
         </tr>
       </thead>
       <tbody>
         {% for e in ch.events %}
         {% set _fix_label = fixture_type_labels.get(e.user_fixture_type, '') if e.user_fixture_type else '' %}
-        <tr class="hist-event-row{% if e.is_composite %} hist-row-composite{% endif %}{% if e.excluded_from_training %} hist-row-ignored{% endif %}"
+        {% set _disp_flow = e.true_avg_flow_lpm if e.true_avg_flow_lpm is not none else e.avg_flow_lpm %}
+        <tr class="hist-event-row{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.is_pressure_restoration_phantom %} hist-row-phantom{% endif %}{% if e.excluded_from_training and e.match_rejection_reason != 'sparse_envelope' %} hist-row-ignored{% endif %}{% if loop.index > 25 %} hist-extra-row{% endif %}"{% if loop.index > 25 %} style="display:none"{% endif %}
             tabindex="0" role="button" aria-label="Event detail"
             data-event-id="{{ e.id }}"
             data-circuit="{{ ch.circuit }}"
             data-start="{{ e.start_ts or '' }}"
             data-duration="{{ fmt_duration(e.duration_seconds) }}"
-            data-flow="{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else '—' }} {{ flow_unit }}"
+            data-flow="{{ (_disp_flow * flow_factor)|round(flow_decimals) if _disp_flow is not none else '—' }} {{ flow_unit }}"
             data-pressure="{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else '—' }}"
             data-volume="{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else '—' }} {{ vol_unit }}"
-            data-shape="{{ e.resistance_curve_shape or 'unknown' }}"
+            data-shape="{{ e.flow_shape or 'unknown' }}"
+            data-pressure-shape="{{ e.resistance_curve_shape or 'unknown' }}"
             data-cluster="{{ e.cluster_id if e.cluster_id is not none else '—' }}"
+            data-cycle-group="{{ e.cycle_group_id or '' }}"
+            data-eff-type="{{ e.user_fixture_type or e.matched_fixture_type or '' }}"
             data-user-type="{{ e.user_fixture_type or '' }}"
             data-user-label="{{ _fix_label }}"
+            data-label-source="{{ e.fixture_label_source or '' }}"
             data-excluded="{{ '1' if e.excluded_from_training else '0' }}"
             data-trigger="{{ e.start_trigger or 'unknown' }}"
             data-peak-flow="{{ (e.peak_flow_lpm * flow_factor)|round(flow_decimals) if e.peak_flow_lpm is not none else '' }}"
@@ -209,52 +327,93 @@
             data-prop-ms="{{ e.propagation_delay_ms | int if e.propagation_delay_ms else '0' }}"
             data-anomaly-score="{{ (e.anomaly_score * 100)|round(1) if e.anomaly_score is not none else '' }}"
             data-anomaly-type="{{ e.anomaly_type or '' }}"
-            data-composite="{{ '1' if e.is_composite else '0' }}"
+            data-degraded="{{ '1' if e.degraded_supply else '0' }}"
+            data-phantom="{{ '1' if e.is_pressure_restoration_phantom else '0' }}"
+            data-cross-talk="{{ '1' if e.is_cross_talk else '0' }}"
+            data-dribble="{{ '1' if e.is_low_flow_dribble else '0' }}"
+            data-classified="{{ '1' if e.user_classified else '0' }}"
+            data-volume-effective="{{ (e.volume_litres_effective * vol_factor)|round(vol_decimals) if e.volume_litres_effective is not none else '' }}"
+            data-volume-method="{{ e.volume_estimation_method or 'raw' }}"
+            data-degraded-diag="{{ e.degraded_diagnostic_json or '' }}"
             data-other-valve="{{ e.other_valve_open if e.other_valve_open is not none else '' }}"
             data-pressure-sig="{{ e.pressure_signature_json or '' }}"
             data-waveform-used="{{ e.esp_waveform_used or 0 }}"
             data-sig-source="{{ e.signature_source or 'software' }}">
           <td class="hist-td hist-td-mono hist-td-time"><time data-ts="{{ e.start_ts or '' }}">{{ (e.start_ts or '')[:16] }}</time></td>
           <td class="hist-td">{{ fmt_duration(e.duration_seconds) }}</td>
-          <td class="hist-td hist-td-mono">{{ (e.avg_flow_lpm * flow_factor)|round(flow_decimals) if e.avg_flow_lpm is not none else "—" }} {{ flow_unit }}</td>
+          <td class="hist-td hist-td-mono">{{ (_disp_flow * flow_factor)|round(flow_decimals) if _disp_flow is not none else "—" }} {{ flow_unit }}</td>
           <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else "—" }}</td>
           <td class="hist-td hist-td-shape">
-            {% set shape = e.resistance_curve_shape or 'unknown' %}
+            {% set shape = e.flow_shape or 'unknown' %}
             {% set shape_color  = {'steady': 'pill-blue', 'rising': 'pill-amber', 'falling': 'pill-green', 'pulsed': 'pill-neutral', 'unknown': 'pill-neutral'} %}
             {% set spark_stroke = {'steady': 'oklch(55% .18 240/.85)', 'rising': 'oklch(65% .18 80/.85)', 'falling': 'oklch(50% .18 145/.85)', 'pulsed': 'oklch(55% .05 240/.85)'} %}
             {% set spark_fill   = {'steady': 'oklch(55% .18 240/.12)', 'rising': 'oklch(65% .18 80/.12)', 'falling': 'oklch(50% .18 145/.12)', 'pulsed': 'oklch(55% .05 240/.10)'} %}
+            {# Vertical band the waveform fills, by event size tier — gives the #}
+            {# sparkline a sense of scale. Read by the row canvas AND the modal #}
+            {# flow chart so they agree. unknown/missing → 1.0 (today's look). #}
+            {% set spark_scale  = {'trickle': 0.45, 'small': 0.65, 'medium': 0.82, 'large': 1.0} %}
             <div class="shape-cell">
               <span class="pill {{ shape_color.get(shape, 'pill-neutral') }}">{{ shape }}</span>
               {% if e.flow_signature_json and e.flow_signature_json not in ('null', 'None', '') %}
-              <canvas class="shape-spark" width="48" height="16"
+              <canvas class="shape-spark" width="48" height="20"
                       data-sig="{{ e.flow_signature_json }}"
+                      data-spark-scale="{{ spark_scale.get(e.magnitude_tier, 1.0) }}"
                       data-stroke="{{ spark_stroke.get(shape, 'oklch(55% .05 240/.55)') }}"
                       data-fill="{{ spark_fill.get(shape,   'oklch(55% .05 240/.08)') }}"></canvas>
               {% endif %}
             </div>
           </td>
-          <td class="hist-td hist-td-mono">{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else "—" }} {{ vol_unit if e.volume_litres is not none else '' }}</td>
+          {# Volume-zeroing verdicts (phantom / cross-talk / dribble) show their
+             effective (zeroed) volume so the list doesn't display the fake reading;
+             the raw value stays in the event-detail modal, clearly labelled. Other
+             rows are unchanged. #}
+          {% set _row_vol = e.volume_litres_effective if (e.is_pressure_restoration_phantom or e.is_cross_talk or e.is_low_flow_dribble) else e.volume_litres %}
+          <td class="hist-td hist-td-mono">{{ (_row_vol * vol_factor)|round(vol_decimals) if _row_vol is not none else "—" }} {{ vol_unit if _row_vol is not none else '' }}</td>
           <td class="hist-td">
+            {# Fixture identity is driven by your labels (clustering demoted):
+               your label > confirmed fixture > label-trained match > cluster
+               suggestion. Raw cluster numbers are no longer surfaced. #}
             {% if e.user_fixture_type %}
-              <span class="pill pill-green" title="You assigned this">★ {{ fixture_type_labels.get(e.user_fixture_type, e.user_fixture_type | replace('_',' ') | title) }}</span>
+              {% set _src = e.fixture_label_source %}
+              <span class="pill pill-green"
+                    title="{% if _src == 'cycle' %}Auto-labeled from this cycle (↻) — relabel or undo to change{% elif _src == 'training' %}Captured by the training helper (◎){% else %}You assigned this (★){% endif %}">{% if _src == 'cycle' %}↻{% elif _src == 'training' %}◎{% else %}★{% endif %} {{ fixture_type_labels.get(e.user_fixture_type, e.user_fixture_type | replace('_',' ') | title) }}</span>
             {% elif e.fixture_display_name %}
-              <span class="pill pill-green">{{ e.fixture_display_name }}{% if e.cluster_id is not none %} · {{ e.cluster_id }}{% endif %}</span>
-            {% elif e.suggested_type and e.cluster_id is not none %}
-              <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }} · {{ e.cluster_id }}</span>
-            {% elif e.cluster_id is not none %}
-              <span class="pill pill-neutral">Cluster {{ e.cluster_id }}</span>
+              <span class="pill pill-green">{{ e.fixture_display_name }}</span>
+            {% elif e.matched_fixture_type %}
+              {% set _via = e.matched_via or '' %}
+              <span class="pill pill-neutral" title="{% if _via == 'washer_cycle' %}Matched by washer cycle pattern — anchor fill plus same-peak top-offs/rinses{% elif _via == 'softener_session' %}Matched by water-softener regeneration (scheduled overnight cycle){% elif _via == 'zone_default' %}Zone-circuit default — long high-flow run on an irrigation circuit{% elif _via.startswith('rule_') %}Matched by structural rule (volume/duration/pressure shape){% else %}Auto-matched from your labels{% endif %}">~ {{ fixture_type_labels.get(e.matched_fixture_type, e.matched_fixture_type | replace('_',' ') | title) }}</span>
+            {% elif e.suggested_type %}
+              <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }}</span>
             {% else %}
-              —
+              {# Unmatched → the "Other" catch-all. Its water IS counted under Other on the
+                 Water Use page (get_category_rollup's COALESCE(...,'other')); show that here
+                 rather than a blank em-dash so the catch-all is visible. Display-only — the
+                 code still never writes 'other' as a label, distinct from the user's ★ Other. #}
+              <span class="pill pill-neutral" title="Counted under “Other” — we couldn't match this to a specific fixture, but its water is still included in your totals (the Other category on the Water Use page).">Other</span>
             {% endif %}
           </td>
-          {% if ch.events | selectattr('is_composite') | list %}
-          <td class="hist-td">{% if e.is_composite %}⚡{% endif %}</td>
+          {% if _has_flags %}
+          <td class="hist-td">
+            <div class="hist-note-cell">
+              {% if e.is_pressure_restoration_phantom %}<span class="pill pill-neutral" title="Not real water use — a city water-pressure blip, not a tap or appliance. Volume removed from your totals. If water was running, open it and relabel.">👻 Not real use</span>{% endif %}
+              {% if e.is_cross_talk %}<span class="pill pill-neutral" title="Caused by the other water line — its draw briefly dropped this line's pressure; no real flow here, volume removed. If water was running here, open it and relabel.{% if e.other_valve_open %} The other line was drawing.{% endif %}">↔ Not real use</span>{% endif %}
+              {% if e.degraded_supply %}<span class="pill pill-amber" title="Unsteady water pressure — pressure was pulsing, so this volume is an estimate, not exact.">〰 Estimated</span>{% endif %}
+              {% if e.is_low_flow_dribble %}<span class="pill pill-neutral" title="Not real water use — a very small flow, too small to be a real tap or appliance. Volume removed from your totals. If water was running here, open it and relabel.">Drip — not real use</span>{% endif %}
+              {% if e.match_rejection_reason == 'sparse_envelope' %}<span class="pill pill-neutral" title="A brief use followed by a long idle stretch — the listed time is mostly no-flow. The water still counts, but it's too irregular to learn your fixtures from.">⏳ Brief use, long idle tail</span>{% endif %}
+            </div>
+          </td>
           {% endif %}
         </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+  {% if ch.events|length > 25 %}
+  <div class="hist-see-more-wrap" style="margin-top:8px">
+    <button type="button" class="btn btn-ghost btn-sm hist-see-more" data-expanded="0"
+            data-more-label="See {{ ch.events|length - 25 }} more">See {{ ch.events|length - 25 }} more</button>
+  </div>
+  {% endif %}
   {% else %}
   <p class="hist-empty">No events detected yet. Events appear once training begins.</p>
   {% endif %}
@@ -276,6 +435,8 @@
       <dt>ΔP</dt>         <dd id="emd-pressure"></dd>
       <dt>Volume</dt>     <dd id="emd-volume"></dd>
       <dt>Shape</dt>      <dd id="emd-shape"></dd>
+      <dt title="How steady the pressure-per-flow load was (ΔP ÷ flow). 'pulsed' here means an oscillating pressure load, not the flow shape.">Pressure pattern</dt>
+                          <dd id="emd-pressure-shape"></dd>
       <dt>Cluster</dt>    <dd id="emd-cluster"></dd>
       <dt>Fixture</dt>    <dd id="emd-fixture"></dd>
     </dl>
@@ -304,6 +465,40 @@
         <dt>Sig. source</dt>   <dd id="emd-sig-source"></dd>
       </dl>
     </details>
+    <section id="emd-degraded-section" class="evt-modal-degraded" hidden
+             aria-label="Unsteady water pressure">
+      <h4 class="evt-modal-degraded-title">Unsteady water pressure</h4>
+      <p>Your home's water pressure was weak or fluctuating during this event, so the
+         exact amount couldn't be measured — the volume shown is our best estimate. The
+         numbers below are the technical signals that flagged it.</p>
+      <details class="evt-modal-details">
+        <summary class="evt-modal-summary">Technical signals</summary>
+        <dl class="evt-modal-dl evt-modal-dl-extra">
+          <dt>Reason</dt>            <dd id="emd-deg-reason">—</dd>
+          <dt>Mid-event P std</dt>   <dd id="emd-deg-pstd">—</dd>
+          <dt>Pressure period</dt>   <dd id="emd-deg-pperiod">—</dd>
+          <dt>Pressure autocorr</dt> <dd id="emd-deg-pscore">—</dd>
+          <dt>Flow period</dt>       <dd id="emd-deg-fperiod">—</dd>
+          <dt>Flow autocorr</dt>     <dd id="emd-deg-fscore">—</dd>
+          <dt>Harmonic</dt>          <dd id="emd-deg-harmonic">—</dd>
+          <dt>Flow troughs</dt>      <dd id="emd-deg-troughs">—</dd>
+        </dl>
+      </details>
+    </section>
+    <section id="emd-phantom-section" class="evt-modal-degraded" hidden
+             aria-label="Removed: not real water use">
+      <h4 class="evt-modal-degraded-title">Removed: not real water use</h4>
+      <p>A long, very steady reading like this is usually your city water
+         pressure recovering after a dip — not a tap or appliance. We've removed
+         its volume from every total so it doesn't inflate your usage.
+         <strong>If water really was running, open Classification below and
+         relabel it</strong> — your label overrides this call.</p>
+      <dl class="evt-modal-dl evt-modal-dl-extra">
+        <dt>Duration</dt>           <dd id="emd-ph-duration">—</dd>
+        <dt>Pressure drop</dt>      <dd id="emd-ph-dp">—</dd>
+        <dt>Reading we ignored</dt> <dd id="emd-ph-rawvol">—</dd>
+      </dl>
+    </section>
     <hr class="evt-modal-hr">
     <div class="evt-modal-section">
       <label class="evt-modal-label" for="emd-fixture-select">Assign fixture type</label>
@@ -314,11 +509,82 @@
         {% endfor %}
       </select>
     </div>
+    <hr class="evt-modal-hr">
+    <div class="evt-modal-section">
+      <label class="evt-modal-label">Classification</label>
+      <p class="muted" style="font-size:11px;margin:.2rem 0 .5rem">
+        Override the app's automatic call. Marking <strong>Not real water use</strong>
+        removes this event's volume from all totals (you can undo this).
+      </p>
+      <div class="emd-classify-row">
+        <label class="emd-check"><input type="checkbox" id="emd-cls-phantom">
+          <span>Not real water use</span></label>
+        <label class="emd-check"><input type="checkbox" id="emd-cls-supply">
+          <span>Unsteady water pressure</span></label>
+        <label class="emd-check"><input type="checkbox" id="emd-cls-dribble">
+          <span>Drip — very low flow (removes its volume)</span></label>
+        <label class="emd-check"><input type="checkbox" id="emd-cls-crosstalk">
+          <span>Caused by the other water line</span></label>
+      </div>
+      <div style="display:flex;align-items:center;gap:.75rem;margin-top:.5rem;flex-wrap:wrap">
+        <span class="muted" style="font-size:11px">Saved with the <strong>Save</strong> button below.</span>
+        <button id="emd-classify-reset-btn" class="btn btn-ghost btn-sm" hidden>Reset to automatic</button>
+      </div>
+      <p id="emd-classify-hint" class="muted" style="font-size:11px;margin:.35rem 0 0" hidden>
+        ⓘ Manually classified — auto-detection is off for this event.
+      </p>
+    </div>
+    <hr class="evt-modal-hr">
+    <div class="evt-modal-section" id="emd-reprocess-section">
+      <label class="evt-modal-label" for="emd-reprocess-buffer">Reprocess from HA history</label>
+      <p class="muted" style="font-size:11px;margin:.15rem 0 .5rem">
+        Delete this event (and any overlapping auto events) and rebuild it from
+        Home Assistant flow history — fixes a garbled or unclosed run that absorbed
+        a whole day. Your labelled events are kept.
+      </p>
+      <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+        <label class="muted" style="font-size:11px">Pad window
+          <select id="emd-reprocess-buffer" class="evt-modal-select"
+                  style="width:auto;display:inline-block">
+            <option value="0">exact span</option>
+            <option value="5">± 5 min</option>
+            <option value="15">± 15 min</option>
+            <option value="30">± 30 min</option>
+            <option value="60">± 60 min</option>
+          </select>
+        </label>
+        <button id="emd-reprocess-btn" class="btn btn-secondary btn-sm">🔄 Reprocess event</button>
+      </div>
+    </div>
     <div id="emd-error" class="evt-modal-error" hidden></div>
     <div class="evt-modal-btns">
+      <button id="emd-undo-cycle-btn" class="btn btn-secondary btn-sm" hidden
+              title="Clear the auto labels applied to this appliance cycle">↩ Undo cycle labels</button>
       <button id="emd-ignore-btn" class="btn btn-secondary btn-sm">Ignore event</button>
       <button id="emd-save-btn"   class="btn btn-primary btn-sm">Save</button>
     </div>
+  </div>
+</div>
+
+{# ── Leak-test detail modal (read-only) ──────────────────────────── #}
+<div id="lt-modal" class="evt-modal-backdrop" aria-modal="true" role="dialog" aria-labelledby="lt-modal-title">
+  <div class="evt-modal">
+    <div class="evt-modal-header">
+      <h3 class="evt-modal-title" id="lt-modal-title">Leak test detail</h3>
+      <button id="lt-modal-close" class="icon-btn" aria-label="Close">✕</button>
+    </div>
+    <p class="lt-modal-status"><span id="ltm-badge" class="pill pill-neutral"></span></p>
+    <p id="ltm-explain" class="lt-modal-explain"></p>
+    <dl class="evt-modal-dl">
+      <dt>Time</dt>          <dd id="ltm-time"></dd>
+      <dt>Triggered by</dt>  <dd id="ltm-triggered"></dd>
+      <dt>Result</dt>        <dd id="ltm-result"></dd>
+      <dt>Baseline</dt>      <dd id="ltm-baseline"></dd>
+      <dt>Final</dt>         <dd id="ltm-final"></dd>
+      <dt>Pressure drop</dt> <dd id="ltm-drop"></dd>
+      <dt>Drop rate</dt>     <dd id="ltm-drop-rate"></dd>
+      <dt>Duration</dt>      <dd id="ltm-duration"></dd>
+    </dl>
   </div>
 </div>
 
@@ -512,6 +778,119 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   el.textContent = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 });
 
+// ── Collapsible "See more" tables — handled by the persisting block below
+// (after the cycle rollup) so the expanded state survives a modal-save reload. ─
+
+// ── dev.24 — appliance-cycle rollup: collapse a maximal run of CONSECUTIVE
+// events of the same appliance type (water softener / dishwasher / washing
+// machine) into ONE expandable parent row, so the History list stays readable.
+// Grouped by EFFECTIVE type (data-eff-type = your label OR the auto-match), so a
+// run mixes ~matched, ↻cycle and ★user-labelled rows freely — confirming an
+// event as the same type keeps it in the group; relabelling it to something else
+// changes its type and drops it out naturally. Individual fixtures (toilet, tap,
+// shower) never roll up. Members leave See-more's management (their hist-extra-
+// row class is removed) so the two toggles never conflict; the parent inherits
+// the extra-row state so See-more still reveals an off-page group. ──
+(function () {
+  const GROUPABLE = new Set(['water_softener', 'dishwasher', 'washing_machine']);
+  const prettify = t => (t || 'cycle').replace(/_/g, ' ')
+      .replace(/\b\w/g, c => c.toUpperCase());
+  const fmtLocal = ts => {
+    const d = new Date(ts);                          // UTC ISO -> local HH:MM
+    return isNaN(d.getTime()) ? '' :
+      String(d.getHours()).padStart(2, '0') + ':' +
+      String(d.getMinutes()).padStart(2, '0');
+  };
+  document.querySelectorAll('.hist-card table tbody').forEach(tbody => {
+    const rows = Array.from(tbody.querySelectorAll('tr.hist-event-row'));
+    let i = 0;
+    while (i < rows.length) {
+      const t = rows[i].getAttribute('data-eff-type');
+      if (!GROUPABLE.has(t)) { i++; continue; }
+      let j = i;                                       // maximal same-type run
+      while (j < rows.length && rows[j].getAttribute('data-eff-type') === t) j++;
+      const members = rows.slice(i, j);
+      i = j;
+      if (members.length < 2) continue;
+      const first = members[0];                        // latest (start_ts DESC)
+      let totVol = 0, unit = '';
+      members.forEach(m => {
+        const dv = (m.getAttribute('data-volume') || '').split(' ');
+        const n = parseFloat(dv[0]); if (!isNaN(n)) totVol += n;
+        if (dv[1]) unit = dv[1];
+      });
+      const tNew = fmtLocal(first.getAttribute('data-start'));
+      const tOld = fmtLocal(members[members.length - 1].getAttribute('data-start'));
+      const label = prettify(t);
+      const wasExtra = first.classList.contains('hist-extra-row');
+      const parent = document.createElement('tr');
+      parent.className = 'hist-group-parent' + (wasExtra ? ' hist-extra-row' : '');
+      if (wasExtra) parent.style.display = 'none';
+      parent.style.cursor = 'pointer';
+      parent.setAttribute('tabindex', '0');
+      parent.setAttribute('role', 'button');
+      parent.setAttribute('aria-label', label + ' — expand');
+      const td = document.createElement('td');
+      td.colSpan = first.children.length;
+      td.className = 'hist-td';
+      td.style.fontWeight = '600';
+      td.innerHTML = '<span class="hist-group-chevron">▸</span> ↻ ' + label +
+        ' · ' + members.length + ' events · ' +
+        (Math.round(totVol * 10) / 10) + (unit ? ' ' + unit : '') +
+        (tNew && tOld ? ' · ' + tOld + '–' + tNew : '');
+      parent.appendChild(td);
+      first.parentNode.insertBefore(parent, first);
+      members.forEach(m => {
+        m.classList.add('hist-group-member');
+        m.classList.remove('hist-extra-row');         // hand visibility to the group
+        m.style.display = 'none';
+      });
+      let open = false;
+      const toggle = () => {
+        open = !open;
+        members.forEach(m => { m.style.display = open ? 'table-row' : 'none'; });
+        const chev = td.querySelector('.hist-group-chevron');
+        if (chev) chev.textContent = open ? '▾' : '▸';
+      };
+      parent.addEventListener('click', toggle);
+      parent.addEventListener('keydown', ev => {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); }
+      });
+    }
+  });
+})();
+
+// ── Collapsible "See more" tables, WITH expanded-state persistence ───────────
+// A modal save reloads the page; without this the events list snaps back to 25
+// rows after every edit. Persist each card's expanded state in sessionStorage
+// (keyed by its index among the See-more buttons — stable across reloads) and
+// restore it on load. Runs AFTER the cycle rollup so group parent rows already
+// exist (and inherit the correct extra-row visibility).
+(function () {
+  const KEY = 'histSeeMore';
+  let openSet;
+  try { openSet = new Set(JSON.parse(sessionStorage.getItem(KEY) || '[]')); }
+  catch (e) { openSet = new Set(); }
+  const save = () => {
+    try { sessionStorage.setItem(KEY, JSON.stringify(Array.from(openSet))); }
+    catch (e) { /* sessionStorage unavailable — degrade to non-persistent */ }
+  };
+  document.querySelectorAll('.hist-see-more').forEach((btn, idx) => {
+    const card = btn.closest('.hist-card');
+    const setState = (expand) => {
+      if (card) card.querySelectorAll('tr.hist-extra-row').forEach(r => {
+        r.style.display = expand ? 'table-row' : 'none';
+      });
+      btn.dataset.expanded = expand ? '1' : '0';
+      btn.textContent = expand ? 'See less' : btn.dataset.moreLabel;
+      if (expand) openSet.add(idx); else openSet.delete(idx);
+      save();
+    };
+    btn.addEventListener('click', () => setState(btn.dataset.expanded !== '1'));
+    if (openSet.has(idx)) setState(true);   // restore after a modal-save reload
+  });
+})();
+
 // ── Event detail modal ──────────────────────────────────────────────────────
 (function () {
   const INGRESS   = {{ (ingress_path or '') | tojson }};
@@ -521,7 +900,23 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   const selFix  = document.getElementById('emd-fixture-select');
   const ignBtn  = document.getElementById('emd-ignore-btn');
   const saveBtn = document.getElementById('emd-save-btn');
+  const undoCycleBtn = document.getElementById('emd-undo-cycle-btn');
   const errBox  = document.getElementById('emd-error');
+  // dev.26 — reprocess-from-HA-history controls.
+  const reproSection = document.getElementById('emd-reprocess-section');
+  const reproBtn = document.getElementById('emd-reprocess-btn');
+  const reproBuf = document.getElementById('emd-reprocess-buffer');
+  // Sprint H — manual classification controls.
+  const clsPhantom  = document.getElementById('emd-cls-phantom');
+  const clsSupply   = document.getElementById('emd-cls-supply');
+  const clsDribble  = document.getElementById('emd-cls-dribble');
+  const clsCrosstalk = document.getElementById('emd-cls-crosstalk');
+  const clsResetBtn = document.getElementById('emd-classify-reset-btn');
+  const clsHint     = document.getElementById('emd-classify-hint');
+  // Initial checkbox state captured on modal open — used so the main Save
+  // only sends `classification` when the user actually changed something
+  // (labelling alone must not silently lock auto-detection off).
+  let clsInitial = { phantom: false, supply_pressure: false, dribble: false, cross_talk: false };
 
   // Startup diagnostic
   const rows = document.querySelectorAll('.hist-event-row');
@@ -543,11 +938,37 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     document.getElementById('emd-pressure').textContent = d.pressure;
     document.getElementById('emd-volume').textContent   = d.volume;
     document.getElementById('emd-shape').textContent    = d.shape;
+    document.getElementById('emd-pressure-shape').textContent = d.pressureShape || '—';
     document.getElementById('emd-cluster').textContent  = d.cluster;
     const fixLabel = d.userLabel || (d.userType ? FX_LABELS[d.userType] || d.userType : null);
     document.getElementById('emd-fixture').textContent  = fixLabel || '—';
     selFix.value   = d.userType || '';
     ignBtn.textContent = d.excluded === '1' ? 'Restore event' : 'Ignore event';
+    // Undo only shown for auto cycle-labeled events (source='cycle').
+    if (undoCycleBtn) undoCycleBtn.hidden = (d.labelSource !== 'cycle');
+    // Reprocess only for auto events — a user-labelled / classified event is
+    // preserved by the delete, so rebuilding it would be a no-op. Reset any
+    // prior success styling on the shared status box.
+    if (reproSection) reproSection.hidden = !!(d.userType || d.classified === '1');
+    errBox.style.color = '';
+
+    // Sprint H — pre-check the classification boxes from the row's flags,
+    // and remember the initial state for change-detection on Save.
+    if (clsPhantom)  clsPhantom.checked  = d.phantom === '1';
+    if (clsSupply)   clsSupply.checked   = d.degraded === '1';
+    if (clsDribble)  clsDribble.checked  = d.dribble === '1';
+    if (clsCrosstalk) clsCrosstalk.checked = d.crossTalk === '1';
+    clsInitial = {
+      phantom:         d.phantom === '1',
+      supply_pressure: d.degraded === '1',
+      dribble:         d.dribble === '1',
+      cross_talk:      d.crossTalk === '1',
+    };
+    // Sprint H.1 — the "manually classified" hint + Reset link only apply
+    // once the user has locked a manual classification.
+    const isClassified = d.classified === '1';
+    if (clsHint)     clsHint.hidden     = !isClassified;
+    if (clsResetBtn) clsResetBtn.hidden = !isClassified;
 
     // Technical details
     const TRIGGER_LABELS = { flow: 'Flow (sustained)', pressure: 'Pressure drop', 'pressure+flow': 'Pressure + flow' };
@@ -577,6 +998,65 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
 
     document.getElementById('emd-sig-source').textContent = d.sigSource || 'software';
 
+    // ── Degraded-supply diagnostic ──────────────────────────────────────
+    // Only shown when the guard flagged this event. The diag JSON carries
+    // the gate values that produced the verdict, so a viewer can spot a
+    // false positive (e.g. high autocorr but trivial trough rate).
+    const degSection = document.getElementById('emd-degraded-section');
+    if (d.degraded === '1' && d.degradedDiag) {
+      let diag = null;
+      try { diag = JSON.parse(d.degradedDiag); }
+      catch (err) { console.warn('[evt-modal] invalid degraded-diag JSON', err); }
+
+      if (diag) {
+        const fmtPeriod = (v) => (v == null ? '—' : `${(+v).toFixed(2)} s`);
+        const fmtScore  = (v) => (v == null ? '—' : (+v).toFixed(2));
+        const fmtPsi    = (v) => (v == null ? '—' : `${(+v).toFixed(2)} PSI`);
+        const fmtTrough = (cnt, rate) => {
+          if (cnt == null && rate == null) return '—';
+          const c = cnt == null ? '?' : cnt;
+          const r = rate == null ? '?' : (+rate).toFixed(3);
+          return `${c} (${r} Hz)`;
+        };
+        document.getElementById('emd-deg-reason').textContent =
+          (diag.reason || '—').replace(/_/g, ' ');
+        document.getElementById('emd-deg-pstd').textContent =
+          fmtPsi(diag.mid_pressure_std_psi);
+        document.getElementById('emd-deg-pperiod').textContent =
+          fmtPeriod(diag.pressure_dominant_period_s);
+        document.getElementById('emd-deg-pscore').textContent =
+          fmtScore(diag.pressure_autocorr_score);
+        document.getElementById('emd-deg-fperiod').textContent =
+          fmtPeriod(diag.flow_dominant_period_s);
+        document.getElementById('emd-deg-fscore').textContent =
+          fmtScore(diag.flow_autocorr_score);
+        document.getElementById('emd-deg-harmonic').textContent =
+          diag.harmonic || '—';
+        document.getElementById('emd-deg-troughs').textContent =
+          fmtTrough(diag.flow_trough_episode_count,
+                    diag.flow_trough_episode_rate_hz);
+        degSection.hidden = false;
+      } else {
+        degSection.hidden = true;
+      }
+    } else {
+      degSection.hidden = true;
+    }
+
+    // ── Pressure-restoration phantom ────────────────────────────────────
+    // Shown when the phantom guard flagged this event. Surfaces the two
+    // discriminating values plus the raw sensor volume that was discarded.
+    const phSection = document.getElementById('emd-phantom-section');
+    if (d.phantom === '1') {
+      document.getElementById('emd-ph-duration').textContent = d.duration || '—';
+      document.getElementById('emd-ph-dp').textContent =
+        (d.pressure && d.pressure !== '—') ? `${d.pressure} ${pressUnit}` : '—';
+      document.getElementById('emd-ph-rawvol').textContent = d.volume || '—';
+      phSection.hidden = false;
+    } else {
+      phSection.hidden = true;
+    }
+
     errBox.hidden = true;
     errBox.textContent = '';
     modal.classList.add('is-open');
@@ -588,6 +1068,8 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const wfMeta      = document.getElementById('emd-wf-meta');
     const chartCanvas = document.getElementById('emd-wf-chart');
     const flowSig     = row.querySelector('.shape-spark')?.dataset.sig || '';
+    // Same size-tier band as the row sparkline, so the modal and the list agree.
+    const wfScale     = parseFloat(row.querySelector('.shape-spark')?.dataset.sparkScale) || 1;
     const pressSig    = row.dataset.pressureSig || '';
     const wfUsed      = row.dataset.waveformUsed === '1';
 
@@ -615,7 +1097,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         const labels = flowPts.map((_, i) => i);
         const datasets = [{
           label: 'Flow',
-          data: flowPts,
+          data: flowPts.map(v => (Number(v) || 0) * wfScale),   // size-tier band
           borderColor: cssVar('--accent'),
           backgroundColor: mix(cssVar('--accent'), 12),
           fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
@@ -665,7 +1147,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         wfMeta.textContent =
           `${source} · ${flowPts.length} samples · ${channels}${pkText}${dpText}`;
         const note = document.createElement('span');
-        note.textContent = 'Values show shape only, not actual flow or pressure units.';
+        note.textContent = 'Flow curve height reflects the event\'s size tier; values are normalized, not actual units.';
         wfMeta.appendChild(document.createElement('br'));
         wfMeta.appendChild(note);
       } else {
@@ -725,6 +1207,27 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         errBox.hidden = false;
         return false;
       }
+      // Sprint B: log the propagation metadata so devs / power users
+      // can see in DevTools whether a label fed back into a cluster.
+      // The visible-on-Fixtures hint is the user-facing surface; this
+      // console line is the diagnostic surface.
+      let data = null;
+      try { data = await resp.json(); } catch (_) { /* tolerate parse hiccup */ }
+      if (data && data.needs_confirm) {
+        // B7 — excluding a setup training example: single confirm, then re-send.
+        saveBtn.disabled = false; ignBtn.disabled = false;
+        if (window.confirm(data.message || 'Exclude this training example?')) {
+          return await patchEvent({ ...payload, confirm_exclude: true });
+        }
+        return false;
+      }
+      if (data && data.propagation && data.propagation.cluster_id != null) {
+        console.info(
+          `[history] label saved → cluster ${data.propagation.cluster_id}` +
+          ` suggested ${data.propagation.suggested_type}` +
+          ` (${data.propagation.labelled_member_count}/${data.propagation.total_label_count} agree)`
+        );
+      }
       return true;
     } catch (err) {
       errBox.textContent = 'Network error — please try again.';
@@ -738,7 +1241,23 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
 
   saveBtn.addEventListener('click', async () => {
     if (!activeRow) return;
-    const ok = await patchEvent({ user_fixture_type: selFix.value || null });
+    const payload = { user_fixture_type: selFix.value || null };
+    // Only include classification if the user actually toggled a box — so a
+    // type-only edit never locks auto-detection off. Sending it always sets
+    // user_classified=1 (incl. all-false = "manually normal"), which sticks.
+    const cur = {
+      phantom:         !!(clsPhantom && clsPhantom.checked),
+      supply_pressure: !!(clsSupply && clsSupply.checked),
+      dribble:         !!(clsDribble && clsDribble.checked),
+      cross_talk:      !!(clsCrosstalk && clsCrosstalk.checked),
+    };
+    if (cur.phantom !== clsInitial.phantom
+        || cur.supply_pressure !== clsInitial.supply_pressure
+        || cur.dribble !== clsInitial.dribble
+        || cur.cross_talk !== clsInitial.cross_talk) {
+      payload.classification = cur;
+    }
+    const ok = await patchEvent(payload);
     if (ok) location.reload();
   });
 
@@ -747,6 +1266,155 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const excluded = activeRow.dataset.excluded !== '1';
     const ok = await patchEvent({ excluded_from_training: excluded });
     if (ok) location.reload();
+  });
+
+  // Undo the auto cycle-labels around this appliance event.
+  if (undoCycleBtn) undoCycleBtn.addEventListener('click', async () => {
+    if (!activeRow) return;
+    const { eventId, circuit } = activeRow.dataset;
+    if (!window.confirm('Clear the auto labels applied to this appliance cycle?')) return;
+    undoCycleBtn.disabled = true; errBox.hidden = true;
+    try {
+      const resp = await fetch(`${INGRESS}/history/api/events/${circuit}/undo_auto_cycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': window.CSRF_TOKEN || '' },
+        body: JSON.stringify({ event_id: eventId }),
+      });
+      if (resp.ok) { location.reload(); return; }
+    } catch (_) {}
+    undoCycleBtn.disabled = false;
+    errBox.textContent = 'Undo failed — see the addon log.';
+    errBox.hidden = false;
+  });
+
+  // dev.26 — reprocess this event from HA history (delete + re-import its span).
+  if (reproBtn) reproBtn.addEventListener('click', async () => {
+    if (!activeRow) return;
+    const { eventId, circuit } = activeRow.dataset;
+    if (!window.confirm('Delete this event and rebuild it — and any overlapping '
+      + 'auto events — from HA history? Your labelled events are kept.')) return;
+    const buffer_minutes = parseInt((reproBuf && reproBuf.value) || '0', 10) || 0;
+    reproBtn.disabled = true; errBox.hidden = true; errBox.style.color = '';
+    try {
+      const resp = await fetch(
+        `${INGRESS}/history/api/events/${circuit}/${eventId}/reprocess`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json',
+                     'X-CSRF-Token': window.CSRF_TOKEN || '' },
+          body: JSON.stringify({ buffer_minutes }),
+        });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok) {
+        errBox.style.color = 'var(--ok, #2e7d32)';
+        errBox.textContent = `✓ Deleted ${data.deleted}, re-importing ${data.imported} `
+          + `run(s)${data.widened ? ' (range widened to rebuild a long event)' : ''}`
+          + ' — new events appear shortly. Reloading…';
+        errBox.hidden = false;
+        setTimeout(() => location.reload(), 1600);
+        return;
+      }
+      errBox.textContent = data.error || `Error ${resp.status}`;
+      errBox.hidden = false;
+    } catch (_) {
+      errBox.textContent = 'Network error — please try again.';
+      errBox.hidden = false;
+    }
+    reproBtn.disabled = false;
+  });
+
+  // Sprint H.1 — reset an event back to automatic detection.
+  if (clsResetBtn) {
+    clsResetBtn.addEventListener('click', async () => {
+      if (!activeRow) return;
+      const ok = await patchEvent({ classification: { reset: true } });
+      if (ok) location.reload();
+    });
+  }
+})();
+
+// ── Leak-test detail modal (read-only) ───────────────────────────────────────
+(function () {
+  const modal = document.getElementById('lt-modal');
+  if (!modal) return;
+  const rows = document.querySelectorAll('.lt-row');
+
+  const LT_EXPLAIN = {
+    'Passed — no leak detected':
+      'No pressure loss was detected while the valve was closed. Your plumbing held steady — no sign of a leak on this circuit.',
+    'Failed — leak detected':
+      'Pressure dropped while the valve was closed, meaning water is escaping downstream. Check for running toilets, dripping fixtures, or wet spots; consider keeping the valve closed until you find the source.',
+    'Aborted — external pressure influence':
+      'Stopped because outside pressure changes (the street supply or the other circuit) made the reading unreliable. Try again during a quieter period.',
+    'Aborted — demand detected (sudden pressure drop)':
+      'Stopped because water was used during the test, causing a sudden pressure drop. Re-run it when no water is being used.',
+    'Stopped manually':
+      'The test was cancelled by hand before it finished, so there is no pass/fail result.',
+    'Not run — valve was closed (open valve first)':
+      'Skipped because the shutoff valve was already closed. Open the valve, then run the test again.',
+    'Not run — fault active (reset fault first)':
+      'Skipped because a safety fault is active. Clear the fault first, then run the test again.',
+    'Not run — water softener regenerating (deferred)':
+      'Skipped because the water softener was regenerating (it draws water and would look like a leak). It will run automatically at the next quiet period.',
+    'Not run — 3-port valve (drain-capable; micro leak test not applicable)':
+      'This circuit uses a 3-port (drain-capable) valve, which always vents a little pressure, so the micro leak test does not apply here. Expected — not a problem.',
+    'Timed out — no terminal result received':
+      'The device did not report a result in time, so the outcome is unknown. Usually a temporary communication hiccup — try running the test again.',
+    'cancelled': 'The test was cancelled before it produced a result.',
+  };
+  const LT_PREFIX = [
+    ['Passed', LT_EXPLAIN['Passed — no leak detected']],
+    ['Failed', LT_EXPLAIN['Failed — leak detected']],
+    ['Aborted', 'Stopped early because conditions made the reading unreliable. Try again during a quiet period.'],
+    ['Stopped', LT_EXPLAIN['Stopped manually']],
+    ['Timed out', LT_EXPLAIN['Timed out — no terminal result received']],
+    ['Not run', 'Skipped this time — see the Result line above for the specific reason.'],
+  ];
+  function ltExplain(r) {
+    if (!r) return 'No result was recorded for this test.';
+    if (LT_EXPLAIN[r]) return LT_EXPLAIN[r];
+    if (r.toLowerCase() === 'cancelled') return LT_EXPLAIN['cancelled'];
+    // Known prefixes (Not run / Aborted / …) first, so a pre-flight skip whose text
+    // happens to contain "leak" (the 3-port message) doesn't get the leak explanation.
+    for (const [p, m] of LT_PREFIX) if (r.startsWith(p)) return m;
+    // Any other wording that mentions a leak (and isn't a Pass) → leak explanation.
+    if (!r.startsWith('Passed') && r.toLowerCase().includes('leak')) return LT_EXPLAIN['Failed — leak detected'];
+    return r;
+  }
+  function fmtTs(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso); if (isNaN(d)) return iso;
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  function openLeakModal(row) {
+    const d = row.dataset;
+    const badge = document.getElementById('ltm-badge');
+    badge.className = 'pill ' + (d.pill || 'pill-neutral');
+    badge.textContent = d.label || 'Unknown';
+    document.getElementById('ltm-explain').textContent   = ltExplain(d.result);
+    document.getElementById('ltm-time').textContent      = fmtTs(d.ts);
+    document.getElementById('ltm-triggered').textContent = d.triggered || '—';
+    document.getElementById('ltm-result').textContent    = d.result || '—';
+    document.getElementById('ltm-baseline').textContent  = d.baseline || '—';
+    document.getElementById('ltm-final').textContent     = d.final || '—';
+    document.getElementById('ltm-drop').textContent      = d.drop || '—';
+    document.getElementById('ltm-drop-rate').textContent = d.dropRate || '—';
+    document.getElementById('ltm-duration').textContent  = d.duration || '—';
+    modal.classList.add('is-open'); modal.focus();
+  }
+  function closeLeakModal() { modal.classList.remove('is-open'); }
+
+  rows.forEach(row => {
+    row.addEventListener('click', () => openLeakModal(row));
+    row.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openLeakModal(row); }
+    });
+  });
+  document.getElementById('lt-modal-close').addEventListener('click', closeLeakModal);
+  modal.addEventListener('click', e => { if (e.target === modal) closeLeakModal(); });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && modal.classList.contains('is-open')) closeLeakModal();
   });
 })();
 
@@ -758,10 +1426,13 @@ document.querySelectorAll('canvas.shape-spark').forEach(canvas => {
   const w = canvas.width, h = canvas.height;
   const ctx = canvas.getContext('2d');
   const max = Math.max(...sig, 0.001);
+  // Size-tier band: the waveform's peak reaches `scale` of the usable height,
+  // so bigger events draw taller. 1.0 (large/unknown) = full height as before.
+  const scale = parseFloat(canvas.dataset.sparkScale) || 1;
   const px = 1; // inset prevents 1.5 px stroke from clipping at canvas edges
   const pts = sig.map((v, i) => ({
     x: px + (i / (sig.length - 1)) * (w - 2 * px),
-    y: h - (v / max) * (h - 2) - 1,
+    y: h - (v / max) * (h - 2) * scale - 1,
   }));
   ctx.beginPath();
   ctx.moveTo(pts[0].x, h);

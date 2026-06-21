@@ -1,7 +1,14 @@
 {% extends "base.html" %}
 {% block content %}
 
-<h1 class="dev-page-title">Device</h1>
+<h1 class="dev-page-title">Valve &amp; Tests</h1>
+
+<p class="muted fx-page-intro" style="margin:0 0 18px 0">
+  Control your water valve and run safety checks here. Open or close the valve for each
+  line, run the <strong>Micro Leak Test</strong> (briefly closes the valve to check for
+  tiny leaks while no water is being used), and clear a safety shut-off if one was
+  triggered.
+</p>
 
 {% for c in circuits %}
 <section class="dev-circuit-card" data-circuit="{{ c.circuit }}">
@@ -74,9 +81,14 @@
           <span class="leak-running-etc">{{ c.leak_test_etc or "Running…" }}</span>
         </div>
         {% elif c.leak_test_result and c.leak_test_result not in ('No test run', 'unknown', 'unavailable') %}
-        <span class="pill {% if 'Passed' in c.leak_test_result %}pill-green{% else %}pill-amber{% endif %}">
-          {{ c.leak_test_result }}
-        </span>
+        {# Latest result only — links to the full log on the History page. #}
+        <a class="dev-leak-result-link" style="text-decoration:none"
+           href="{{ ingress_path }}/history#leak-test-history"
+           title="View full leak-test history">
+          <span class="pill {% if 'Passed' in c.leak_test_result %}pill-green{% else %}pill-amber{% endif %}">
+            {{ c.leak_test_result }}
+          </span>
+        </a>
         {% else %}
         <span class="pill pill-neutral">No test run</span>
         {% endif %}
@@ -87,11 +99,26 @@
       {% if c.leak_test_active or c.leak_test_running %}
       <button class="btn btn-danger btn-sm"
               onclick="abortLeakTest('{{ c.circuit }}')">✕ Abort Test</button>
+      {% elif c.valve_type == "3_port" %}
+      {# 3-port drain-capable valve — leak test is automatically skipped by
+         the scheduler (see leak_test_scheduler._execute_test). We disable
+         the UI button so it's clear, but the server route stays live: a
+         direct POST will still reach the scheduler and record a skip row. #}
+      <button class="btn btn-secondary btn-sm" disabled
+              title="Disabled — 3-port drain-capable valve. Micro leak test does not apply."
+              aria-disabled="true">Run Now</button>
       {% else %}
       <button class="btn btn-secondary btn-sm"
               onclick="runLeakTest('{{ c.circuit }}')">Run Now</button>
       {% endif %}
     </div>
+    {% if c.valve_type == "3_port" %}
+    <p class="dev-schedule-note muted" style="margin-top:.5rem;font-size:.85rem">
+      Micro leak test disabled for this circuit (3-port drain-capable valve).
+      The schedule below is preserved and will resume if you switch back to
+      a 2-port valve under Settings.
+    </p>
+    {% endif %}
 
     {# Schedule settings — collapsed details ─────────────────── #}
     <details class="dev-schedule-details">
@@ -184,6 +211,100 @@
       </form>
     </details>
   </div>
+
+  {# Phase 3 — waveform-transport health #}
+  {% if c.waveform %}
+  <div class="dev-leak-card">
+    <details class="advanced-details">
+      <summary>Waveform health</summary>
+      <div class="sett-help" style="margin:.4rem 0 .6rem">
+        The high-resolution waveform stream is best-effort. A dropped/degraded
+        capture never poisons fixture training — it falls back to the software
+        signature. These counters reset when the add-on restarts.
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label">Waveforms assembled</span>
+        <span class="dev-reading-mono">{{ c.waveform.assembled }}</span>
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="Firmware self-reported the capture as incomplete or resolution-reduced; its signature was not used.">
+          Degraded captures
+        </span>
+        <span class="dev-reading-mono">{{ c.waveform.degraded }}</span>
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="The final chunk arrived but earlier chunks were lost in transport; the waveform was discarded.">
+          Transport gaps
+        </span>
+        <span class="dev-reading-mono">{{ c.waveform.gaps }}</span>
+      </div>
+      {% if c.waveform.fw_chunk_drops is not none %}
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="Firmware counter: samples dropped because its buffer filled while the previous chunk was still queued.">
+          Firmware samples dropped
+        </span>
+        <span class="dev-reading-mono">{{ c.waveform.fw_chunk_drops }}</span>
+      </div>
+      {% endif %}
+    </details>
+  </div>
+  {% endif %}
+
+  {# Phase 3 §2 — recorder volume reconciliation #}
+  {% if c.reconcile %}
+  <div class="dev-leak-card">
+    <details class="advanced-details">
+      <summary>Volume reconciliation</summary>
+      <div class="sett-help" style="margin:.4rem 0 .6rem">
+        Live event volumes are integrated from the flow stream, which can under-count when
+        samples drop. The firmware's cumulative volume sensor is the source of truth — its
+        recorder delta over each settled event is compared hourly.
+        {% if c.reconcile.auto %}Divergent volumes are corrected automatically.
+        {% else %}This circuit is in <strong>flag-only</strong> mode — divergences are
+        recorded but not changed until you apply them.{% endif %}
+        Per-circuit auto/flag is set under Settings.
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label">Mode</span>
+        <span class="dev-reading-mono">{{ "Auto-correct" if c.reconcile.auto else "Flag only" }}</span>
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="Events whose volume was corrected to the recorder value.">
+          Corrections applied
+        </span>
+        <span class="dev-reading-mono">{{ c.reconcile.corrections }}</span>
+      </div>
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="Divergent events recorded but not yet corrected (flag-only mode).">
+          Flagged for review
+        </span>
+        <span class="dev-reading-mono">{{ c.reconcile.flagged }}</span>
+      </div>
+      {% if c.reconcile.last_run %}
+      <div class="dev-sched-row">
+        <span class="dev-sched-label">Last checked</span>
+        <span class="dev-reading-mono">{{ c.reconcile.last_run }}</span>
+      </div>
+      {% endif %}
+      {% if c.reconcile.backlog %}
+      <div class="dev-sched-row">
+        <span class="dev-sched-label" title="Healthy events whose stored recorder value still diverges from their volume.">
+          Pending corrections
+        </span>
+        <span class="dev-reading-mono">{{ c.reconcile.backlog }}</span>
+      </div>
+      <form method="post" action="{{ ingress_path }}/device/reconcile/{{ c.circuit }}/apply"
+            style="margin-top:.6rem"
+            onsubmit="return confirm('Correct {{ c.reconcile.backlog }} event volume(s) to the recorder value? This is reversible (original volumes are preserved).');">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-secondary btn-sm">
+          Apply {{ c.reconcile.backlog }} recorder correction(s) now
+        </button>
+      </form>
+      {% endif %}
+    </details>
+  </div>
+  {% endif %}
 
 </section>
 {% endfor %}

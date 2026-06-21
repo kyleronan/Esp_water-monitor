@@ -31,18 +31,16 @@ import tempfile
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from ._helpers import ingress_redirect
 from ..config import DB_PATH
 from ..database import get_data_retention
 from ..restore_utils import (
     normalize_restore_row as _normalize_row,
     safe_insert_rows as _safe_insert,
-    CIRCUIT_TABLES as _CIRCUIT_TABLES,
 )
 
 log = logging.getLogger(__name__)
@@ -498,6 +496,29 @@ async def import_history_archive(
         except Exception as e:
             log.error("Import history-archive failed (transaction rolled back): %s", e)
             errors.append(str(e))
+
+        # Post-merge: re-derive exclusion verdicts (phantom + low-flow dribble)
+        # and backfill label-trained fixture types over the freshly-merged rows,
+        # so an imported archive doesn't land inert. Runs only if the import
+        # committed cleanly; best-effort, so a failure here just means the
+        # derived columns lag until the next startup pass (which repeats both).
+        if not errors:
+            try:
+                from ..feature_extractor import reprocess_event_exclusion_verdicts
+                from ..database import reclassify_all_events_from_signatures
+                vres = reprocess_event_exclusion_verdicts(orch.db)
+                matched = cleared = 0
+                for crow in orch.db.execute(
+                        "SELECT DISTINCT circuit FROM events").fetchall():
+                    r = reclassify_all_events_from_signatures(orch.db, crow[0])
+                    matched += r["events_matched"]
+                    cleared += r["events_cleared"]
+                log.info(
+                    "Import post-merge: flagged %d dribble(s); %d event(s) "
+                    "auto-typed, %d stale match(es) cleared",
+                    vres.get("dribbles_flagged", 0), matched, cleared)
+            except Exception as e:
+                log.warning("Import post-merge processing failed (non-fatal): %s", e)
 
     finally:
         if arc is not None:

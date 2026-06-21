@@ -15,8 +15,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # `river` is a runtime dependency of ClusterEngine but not of the rest of
 # the package. Import it lazily so test modules that pull in
@@ -38,7 +39,7 @@ log = logging.getLogger(__name__)
 SEQUENCE_GAP_MAX_SECONDS      = 300
 # Stage 3: multiply candidate confidence by this when cooccurrence count >= 10
 SEQUENCE_BOOST_WEIGHT         = 1.5
-DBSTREAM_CLUSTERING_THRESHOLD = 1.5
+DBSTREAM_CLUSTERING_THRESHOLD = 2.0
 FADING_FACTOR                 = 0.05
 DTW_TEMPLATE_MIN_MEMBERS      = 10   # Stage 3
 DTW_DISTANCE_WEIGHT           = 0.4  # Stage 3
@@ -144,6 +145,17 @@ class ClusterEngine:
         # Unconfirmed clusters are intentionally absent — match_and_learn
         # bypasses the type gate when the lookup returns None.
         self._type_cache: Dict[str, Dict[int, str]]            = {}
+        # Phase 1 hard lock: circuit -> frozen?  None/absent = derive lazily from
+        # the training state (frozen iff 'live'). freeze_circuit/unfreeze_circuit
+        # set it explicitly on lifecycle transitions.
+        self._frozen: Dict[str, bool]                          = {}
+        # Protects merge + rebuild sequences so concurrent executor threads
+        # cannot read stale river→DB ID maps while a merge is in progress.
+        self._merge_lock = threading.Lock()
+        # Phase 5 §2.3 — count type-gate crashes. The gate now fails CLOSED (a crash
+        # rejects the match rather than silently accepting a possibly-wrong one), so
+        # this surfaces a gate that's quietly erroring on every event.
+        self._type_gate_errors: Dict[str, int] = {}
 
         for c in cfg.circuits:
             self._init_circuit(c.circuit)
@@ -455,11 +467,16 @@ class ClusterEngine:
 
     def _run_suggest_type_if_needed(self, circuit: str, cluster_id: int,
                                     member_count: int) -> None:
-        """Call suggest_fixture_type on the centroid at event 1 and every 10 events."""
+        """Call suggest_fixture_type on the centroid at event 1 and every 10 events.
+
+        If the suggested type changes to a non-None value, schedules an
+        auto-merge pass so sibling clusters of the same type are consolidated.
+        """
         if member_count != 1 and member_count % 10 != 0:
             return
         row = self._db.execute(
-            "SELECT centroid FROM fixture_clusters WHERE circuit = ? AND id = ?",
+            "SELECT centroid, suggested_type FROM fixture_clusters "
+            "WHERE circuit = ? AND id = ?",
             (circuit, cluster_id)
         ).fetchone()
         if not row or not row["centroid"]:
@@ -475,13 +492,41 @@ class ClusterEngine:
         circuit_type = ct_row["circuit_type"] if ct_row else "fixture"
         try:
             from .fixtures import suggest_fixture_type
+            old_type = row["suggested_type"]
             suggested_type, confidence = suggest_fixture_type(centroid, circuit_type)
+            # Sprint B: only overwrite when the existing suggestion was
+            # NULL or heuristic. A user-labels suggestion is a stronger
+            # signal than the centroid heuristic and must not be silently
+            # replaced when the heuristic runs every 10 events.
+            current_src_row = self._db.execute(
+                "SELECT suggestion_source FROM fixture_clusters "
+                "WHERE circuit = ? AND id = ?",
+                (circuit, cluster_id)
+            ).fetchone()
+            current_src = current_src_row["suggestion_source"] if current_src_row else None
+            if current_src == "user_labels":
+                # Leave the user-labels suggestion in place. Skip the
+                # auto-merge trigger too — the user's call wins.
+                return
             self._db.execute(
                 """UPDATE fixture_clusters
-                   SET suggested_type = ?, suggested_confidence = ?
+                   SET suggested_type = ?, suggested_confidence = ?,
+                       suggestion_source = CASE WHEN ? IS NOT NULL
+                                                THEN 'heuristic'
+                                                ELSE NULL END
                    WHERE circuit = ? AND id = ?""",
-                (suggested_type, confidence, circuit, cluster_id)
+                (suggested_type, confidence, suggested_type,
+                 circuit, cluster_id)
             )
+            # If the type is newly assigned, try to merge sibling clusters.
+            if suggested_type and suggested_type != old_type:
+                try:
+                    self.auto_merge_same_type_clusters(circuit)
+                except Exception as merge_exc:
+                    log.warning(
+                        "[%s] auto_merge after type suggestion failed (non-fatal): %s",
+                        circuit, merge_exc,
+                    )
         except Exception as e:
             log.warning("[%s] suggest_fixture_type failed: %s", circuit, e)
 
@@ -508,6 +553,107 @@ class ClusterEngine:
             )
         except Exception as e:
             log.warning("[%s] cooccurrence update failed: %s", circuit, e)
+
+    # ── Freeze / unfreeze (Phase 1 hard lock) ───────────────────────────────────
+    # A circuit FREEZES once it reaches the 'live' training state: the reference
+    # (scaler + DBSTREAM centers + cluster centroids) stops adapting and the engine
+    # only MATCHES against the locked reference — this is what stops a post-
+    # activation event (incl. a slow leak) from being silently learned as "normal".
+    # Per the plan's state→{frozen|unfrozen} table: unfrozen for every pre-'live'
+    # state (idle / calibrating / labelling), frozen once 'live'; fault/disabled
+    # inherit (no transition ⇒ no change). freeze_circuit/unfreeze_circuit set it
+    # on lifecycle transitions; the lazy fallback reads training_state so a fresh
+    # process is correct without waiting for a transition.
+
+    def freeze_circuit(self, circuit: str) -> None:
+        """Lock the circuit: match-only, no learning (called at activation)."""
+        self._frozen[circuit] = True
+        log.info("[%s] cluster engine frozen (locked reference)", circuit)
+
+    def unfreeze_circuit(self, circuit: str) -> None:
+        """Unlock so a restarted learning period can adapt again (recalibration)."""
+        self._frozen[circuit] = False
+        log.info("[%s] cluster engine unfrozen (learning resumed)", circuit)
+
+    def type_gate_error_count(self, circuit: str) -> int:
+        """Total type-gate crashes for a circuit (fail-closed rejections, §2.3)."""
+        return self._type_gate_errors.get(circuit, 0)
+
+    def _is_frozen(self, circuit: str) -> bool:
+        cached = self._frozen.get(circuit)
+        if cached is not None:
+            return cached
+        frozen = False
+        try:
+            row = self._db.execute(
+                "SELECT state FROM training_state WHERE circuit = ?",
+                (circuit,),
+            ).fetchone()
+            frozen = bool(row and row["state"] == "live")
+        except Exception as e:
+            log.debug("[%s] freeze-state lookup failed (assuming unfrozen): %s",
+                      circuit, e)
+        self._frozen[circuit] = frozen
+        return frozen
+
+    def _match_frozen(
+        self, features: dict, circuit: str,
+    ) -> Tuple[Optional[int], float, str, Optional[str]]:
+        """Match-only path for a locked circuit: classify against the frozen
+        reference WITHOUT learning. No scaler.learn_one, no stream.learn_one, and
+        no centroid / member-count / cooccurrence writes — so a post-activation
+        event can never reshape what 'normal' means."""
+        scaler = self._scalers[circuit]
+        x = scaler.transform_one(features)          # transform only — NOT learn_one
+        stream = self._streams[circuit]
+        if not stream.centers:
+            return (None, 0.0, '', 'no_centers')
+        nearest_id, distance = self._nearest_center(stream, x)
+        if nearest_id is None:
+            return (None, 0.0, '', 'no_centers')
+
+        candidate_id = self._river_id_map.get(circuit, {}).get(nearest_id)
+        fixture_type = (
+            self._type_cache.get(circuit, {}).get(candidate_id)
+            if candidate_id is not None else None
+        )
+        if fixture_type:
+            try:
+                from .fixtures import get_match_threshold
+                row = self._db.execute(
+                    "SELECT centroid FROM fixture_clusters "
+                    "WHERE circuit = ? AND id = ?",
+                    (circuit, candidate_id),
+                ).fetchone()
+                if row and row["centroid"]:
+                    db_orig   = json.loads(row["centroid"])
+                    db_feat   = {k: float(db_orig.get(k, 0)) for k in FEATURE_KEYS}
+                    db_scaled = scaler.transform_one(db_feat)
+                    weights   = self._build_match_weights(fixture_type)
+                    wdist     = self._weighted_distance(x, db_scaled, weights)
+                    if wdist > get_match_threshold(fixture_type):
+                        return (None, 0.0, '', 'type_gate_rejected')
+            except Exception as e:
+                self._type_gate_errors[circuit] = (
+                    self._type_gate_errors.get(circuit, 0) + 1)
+                log.warning("[%s] frozen type-gate failed — rejecting (fail-closed, "
+                            "%d total): %s",
+                            circuit, self._type_gate_errors[circuit], e)
+                return (None, 0.0, '', 'type_gate_error')
+
+        confidence = math.exp(-distance / DBSTREAM_CLUSTERING_THRESHOLD)
+        member_count = 0
+        if candidate_id is not None:
+            try:
+                r = self._db.execute(
+                    "SELECT member_count FROM fixture_clusters "
+                    "WHERE circuit = ? AND id = ?",
+                    (circuit, candidate_id),
+                ).fetchone()
+                member_count = int(r["member_count"]) if r and r["member_count"] else 0
+            except Exception:
+                member_count = 0
+        return (candidate_id, confidence, self._confidence_level(member_count), None)
 
     # ── Core: match and learn ──────────────────────────────────────────────────
 
@@ -537,6 +683,11 @@ class ClusterEngine:
         features = self._extract_features(event)
         if features is None:
             return (None, 0.0, '', 'features_missing')
+
+        # Phase 1 hard lock: a frozen (live) circuit matches against the locked
+        # reference without learning — never reshaping "normal".
+        if self._is_frozen(circuit):
+            return self._match_frozen(features, circuit)
 
         scaler = self._scalers[circuit]
         scaler.learn_one(features)
@@ -591,14 +742,17 @@ class ClusterEngine:
                         # learned shape.
                         return (None, 0.0, '', 'type_gate_rejected')
             except Exception as e:
-                # Fail open: if the gate itself crashes (corrupt JSON,
-                # missing column, etc.) we'd rather match than lose the
-                # event entirely. The error is logged for follow-up.
+                # Fail CLOSED (§2.3): a crashed gate must not silently accept a
+                # possibly-wrong match. Reject + count; backfill_unmatched can retry
+                # the event later once the underlying issue is fixed.
+                self._type_gate_errors[circuit] = (
+                    self._type_gate_errors.get(circuit, 0) + 1)
                 log.warning(
-                    "[%s] type-aware gate failed for cluster %s "
-                    "(falling through to default match): %s",
-                    circuit, candidate_id, e,
+                    "[%s] type-aware gate failed for cluster %s — rejecting "
+                    "(fail-closed, %d total): %s",
+                    circuit, candidate_id, self._type_gate_errors[circuit], e,
                 )
+                return (None, 0.0, '', 'type_gate_error')
 
         confidence = math.exp(-distance / DBSTREAM_CLUSTERING_THRESHOLD)
         # Stage 3: multiply confidence by SEQUENCE_BOOST_WEIGHT when
@@ -606,6 +760,19 @@ class ClusterEngine:
 
         cluster_id   = self._upsert_cluster(circuit, nearest_id)
         member_count = self._increment_member_count(circuit, cluster_id)
+        # Attach the temporal appliance-cycle signal to the feature dict ONLY
+        # now — after clustering — so it rides into the centroid running-mean but
+        # never reaches the scaler / DBSTREAM (it is intentionally absent from
+        # FEATURE_KEYS). Best-effort past-only online; the startup / manual batch
+        # recompute fills the full ±45 min window authoritatively.
+        try:
+            from .database import cycle_pulse_count_for_event
+            features['cycle_pulse_count'] = float(cycle_pulse_count_for_event(
+                self._db, circuit, event.get('id'),
+                event.get('start_ts'), event.get('volume_litres'), past_only=True))
+        except Exception as e:
+            log.debug("[%s] online cycle_pulse_count failed: %s", circuit, e)
+            features.setdefault('cycle_pulse_count', 0.0)
         self._update_cluster_centroid(circuit, cluster_id, features, member_count)
         self._run_suggest_type_if_needed(circuit, cluster_id, member_count)
 
@@ -725,6 +892,136 @@ class ClusterEngine:
             log.info("[%s] backfill_unmatched: assigned cluster_id to %d events",
                      circuit, count)
         return count
+
+    # ── Type-level auto-merge ──────────────────────────────────────────────────
+
+    def auto_merge_same_type_clusters(self, circuit: str) -> int:
+        """Merge clusters that have converged to the same fixture type.
+
+        Conservative safety gate — all conditions must hold before merging:
+        - Effective type is not None and not 'other'
+        - Both clusters have member_count >= 5
+        - If neither is confirmed: suggested_confidence >= 0.75 for both
+        - Centroid weighted-distance <= get_match_threshold(effective_type)
+
+        Survivor selection is deterministic: confirmed fixture row first,
+        then highest member_count, then most recent last_match_at, then
+        lowest cluster_id.
+
+        Returns the number of merge operations executed.  Protected by
+        _merge_lock so concurrent executor threads see consistent state.
+        """
+        from .database import merge_clusters
+        from .fixtures import get_match_threshold
+
+        with self._merge_lock:
+            rows = self._db.execute(
+                """SELECT fc.id, fc.member_count,
+                          fc.suggested_type, fc.suggested_confidence,
+                          fc.centroid, fc.last_match_at,
+                          f.fixture_type AS user_type,
+                          CASE WHEN f.confirmed = 1 THEN 1 ELSE 0 END AS is_confirmed
+                   FROM fixture_clusters fc
+                   LEFT JOIN fixtures f ON fc.fixture_id = f.id
+                   WHERE fc.circuit = ?
+                   ORDER BY fc.id""",
+                (circuit,),
+            ).fetchall()
+
+            # Group by effective type
+            by_type: Dict[str, List[dict]] = {}
+            for r in rows:
+                eff = r["user_type"] or r["suggested_type"]
+                if not eff or eff == "other":
+                    continue
+                by_type.setdefault(eff, []).append(dict(r))
+
+            scaler = self._scalers.get(circuit)
+            merges = 0
+
+            for ftype, clusters in by_type.items():
+                if len(clusters) < 2:
+                    continue
+
+                # Apply safety gate to each cluster; collect eligible ones
+                threshold = get_match_threshold(ftype)
+                weights   = self._build_match_weights(ftype)
+                eligible: List[dict] = []
+                for cl in clusters:
+                    if (cl["member_count"] or 0) < 5:
+                        continue
+                    if not cl["is_confirmed"] and (cl["suggested_confidence"] or 0) < 0.75:
+                        continue
+                    eligible.append(cl)
+
+                if len(eligible) < 2:
+                    continue
+
+                # Check centroid distance between all pairs; only proceed if
+                # at least one pair is close enough to merge.
+                if scaler:
+                    centroids_scaled = {}
+                    for cl in eligible:
+                        try:
+                            raw = json.loads(cl["centroid"] or "{}")
+                            feat = {k: float(raw.get(k, 0)) for k in FEATURE_KEYS}
+                            centroids_scaled[cl["id"]] = scaler.transform_one(feat)
+                        except Exception:
+                            pass
+
+                    any_close = False
+                    ids = [cl["id"] for cl in eligible]
+                    for i, id_a in enumerate(ids):
+                        for id_b in ids[i + 1:]:
+                            if id_a not in centroids_scaled or id_b not in centroids_scaled:
+                                continue
+                            dist = self._weighted_distance(
+                                centroids_scaled[id_a], centroids_scaled[id_b], weights
+                            )
+                            if dist <= threshold:
+                                any_close = True
+                                break
+                        if any_close:
+                            break
+                    if not any_close:
+                        log.debug(
+                            "[%s] auto_merge: skipping '%s' — no pair within "
+                            "threshold %.2f", circuit, ftype, threshold,
+                        )
+                        continue
+
+                # Pick survivor deterministically: confirmed first, then
+                # member_count desc, then last_match_at desc, then id asc.
+                # last_match_at is a TEXT ISO-8601 timestamp — it can't be
+                # negated into a single descending tuple key, so apply
+                # staged stable sorts, least-significant key first.
+                eligible.sort(key=lambda c: c["id"])
+                eligible.sort(key=lambda c: c["last_match_at"] or "", reverse=True)
+                eligible.sort(key=lambda c: c["member_count"] or 0, reverse=True)
+                eligible.sort(key=lambda c: c["is_confirmed"], reverse=True)
+                survivor_id = eligible[0]["id"]
+                all_ids = [cl["id"] for cl in eligible]
+
+                log.info(
+                    "[%s] auto_merge: merging %d '%s' clusters → survivor=%d",
+                    circuit, len(all_ids), ftype, survivor_id,
+                )
+                try:
+                    merge_clusters(self._db, circuit, survivor_id, all_ids)
+                    merges += 1
+                except Exception as exc:
+                    log.warning(
+                        "[%s] auto_merge: merge_clusters failed for '%s': %s",
+                        circuit, ftype, exc,
+                    )
+
+            if merges > 0:
+                self._db.commit()
+                self.rebuild_from_db(circuit)
+                log.info("[%s] auto_merge: %d merge(s) completed, engine rebuilt",
+                         circuit, merges)
+
+            return merges
 
     def _rebuild_id_map_from_centroids(self, circuit: str) -> None:
         """

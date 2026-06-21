@@ -220,6 +220,40 @@ class HistoricalImporter:
                 total += n
         return total
 
+    async def count_candidate_periods(
+        self,
+        circuit: str,
+        start: datetime,
+        end: datetime,
+    ) -> list:
+        """Dry-run: return the candidate flow PERIODS the importer would reconstruct over
+        [start, end] WITHOUT deleting or storing anything. The guarded auto-split (dev.38)
+        uses the period count to decide whether ONE stored event is really several distinct
+        draws (2..K periods) vs a single draw (1) or chatter (> K). Returns a list of
+        ``(start_dt, end_dt)`` tuples; empty on an unconfigured circuit or a fetch failure
+        (fail-safe — a dry-run that can't see history must never trigger a split)."""
+        cfg = self._cfg.get_circuit(circuit)
+        if not cfg or not self._circuit_has_sensors(cfg):
+            return []
+        pressure_entity = cfg.pressure_history_sensor or cfg.pressure_avg_sensor
+        entities = [e for e in (cfg.flow_onset_sensor, cfg.flow_sensor,
+                                pressure_entity) if e]
+        if not cfg.flow_onset_sensor and not cfg.flow_sensor:
+            return []
+        try:
+            histories = await self._ha.get_history_batch(entities, start, end)
+        except Exception as exc:
+            log.warning("[%s] auto-split dry-run history fetch failed: %s", circuit, exc)
+            return []
+        onset_hist     = histories.get(cfg.flow_onset_sensor, [])
+        flow_rate_hist = histories.get(cfg.flow_sensor, [])
+        pressure_hist  = histories.get(pressure_entity, []) if pressure_entity else []
+        using_avg_pressure = (pressure_entity == cfg.pressure_avg_sensor)
+        return self._find_flow_periods(
+            onset_hist, flow_rate_hist, query_end=end,
+            pressure_hist=pressure_hist, using_avg_pressure=using_avg_pressure,
+        ) or []
+
     # ------------------------------------------------------------------ #
     # Scheduled operations                                                 #
     # ------------------------------------------------------------------ #
@@ -295,9 +329,12 @@ class HistoricalImporter:
                 start = now - timedelta(hours=2)
 
             n, retry_from = await self._import_range(cfg, start, now)
-            # If any events were dropped due to a full queue, use the earliest
-            # dropped timestamp as the checkpoint so the next catch-up covers
-            # from that point rather than from now - 2 min (which might miss it).
+            # retry_from holds the checkpoint back when either (a) events were
+            # dropped to a full queue or (b) a flow period was still active at
+            # `now` (an event longer than the catch-up interval). Without (b) the
+            # checkpoint would advance past the in-progress event's start and only
+            # a later startup backfill could recover it. When set, the next
+            # catch-up re-covers from that point; otherwise advance to now.
             checkpoint = retry_from.isoformat() if retry_from else now.isoformat()
             update_import_state(self._db, cfg.circuit, checkpoint, n)
             if n:
@@ -361,6 +398,20 @@ class HistoricalImporter:
             except Exception:
                 pass
 
+        # Checkpoint watermark for the periodic catch-up: the start of any flow
+        # period still ON at the end of this window (onset still ON, or flow_rate
+        # still >= MIN_FLOW_LPM with no OFF transition after). _find_flow_periods
+        # correctly refuses to flush a still-active period, but the catch-up loop
+        # advances last_check_ts to `now` regardless — so an event LONGER than the
+        # catch-up interval would have its start march behind the checkpoint and
+        # could then only be recovered by a much-later startup backfill (observed:
+        # a 133-min irrigation run recovered 4 days late). Returning this start as
+        # retry_from holds the checkpoint at the event's start until it actually
+        # ends, so the next catch-up after it closes reconstructs the full period.
+        # Flow signals only (not the pressure-dip state machine) so a stuck/shifted
+        # pressure baseline can never pin the checkpoint indefinitely.
+        active_since = self._trailing_active_start(onset_hist, flow_rate_hist)
+
         # Detect flow periods — pressure_hist is passed so the state machine can
         # emit a dip-envelope period that bridges pulsed-flow bursts too far apart
         # for MERGE_GAP_SECONDS (e.g. fridge dispenser with ~40 s inter-burst gap).
@@ -371,7 +422,7 @@ class HistoricalImporter:
             using_avg_pressure=using_avg_pressure,
         )
         if not periods:
-            return 0, None
+            return 0, active_since
 
         # Belt-and-braces guard: if the live EventDetector currently has an
         # active event on this circuit, drop any candidate period that overlaps
@@ -394,7 +445,7 @@ class HistoricalImporter:
                     cfg.circuit, before - len(periods), active_start.isoformat(),
                 )
             if not periods:
-                return 0, None
+                return 0, active_since
 
         log.debug("[%s] found %d candidate period(s) in history window",
                   cfg.circuit, len(periods))
@@ -470,11 +521,57 @@ class HistoricalImporter:
                 sum(raw.flow_readings) / max(len(raw.flow_readings), 1),
             )
 
+        # Hold the catch-up checkpoint at the earliest of (a) any event dropped to
+        # a full queue and (b) a flow period still active at window end — whichever
+        # is earlier must be re-covered next cycle.
+        if active_since is not None:
+            retry_from = (active_since if retry_from is None
+                          else min(retry_from, active_since))
         return imported, retry_from
 
     # ------------------------------------------------------------------ #
     # Period detection                                                     #
     # ------------------------------------------------------------------ #
+
+    def _trailing_active_start(
+        self,
+        onset_hist: List[Dict],
+        flow_rate_hist: List[Dict],
+    ) -> Optional[datetime]:
+        """Start of a flow period still ON at the end of the fetched history.
+
+        Mirrors the still-active detection in _onset_to_periods / _rate_to_periods
+        (a trailing ON run with no closing OFF transition) but reports the run's
+        START instead of dropping it, so _import_range can hold the catch-up
+        checkpoint back. Returns the earliest such start across the onset and
+        flow-rate signals, or None if flow had clearly stopped by window end.
+        """
+        def _trailing_open(history: List[Dict], is_on) -> Optional[datetime]:
+            open_start: Optional[datetime] = None
+            for entry in history:
+                ts = _parse_ts(entry.get("last_changed"))
+                if ts is None:
+                    continue
+                if is_on(entry):
+                    if open_start is None:
+                        open_start = ts
+                else:
+                    open_start = None
+            return open_start
+
+        def _onset_on(entry: Dict) -> bool:
+            return str(entry.get("state", "")).lower() in ("on", "true", "1")
+
+        def _rate_on(entry: Dict) -> bool:
+            try:
+                return float(entry["state"]) >= self.MIN_FLOW_LPM
+            except (ValueError, TypeError, KeyError):
+                return False
+
+        starts = [s for s in (_trailing_open(onset_hist, _onset_on),
+                              _trailing_open(flow_rate_hist, _rate_on))
+                  if s is not None]
+        return min(starts) if starts else None
 
     def _find_flow_periods(
         self,
@@ -564,7 +661,8 @@ class HistoricalImporter:
         """
         periods: List[Tuple[datetime, datetime]] = []
         current_start: Optional[datetime] = None
-        last_ts: Optional[datetime] = None
+        # (no last_ts tracking — see the comment in the loop body
+        # below; off-transition `ts` is used directly.)
 
         for entry in history:
             ts = _parse_ts(entry.get("last_changed"))
@@ -584,8 +682,8 @@ class HistoricalImporter:
                     # _onset_to_periods which closes at the OFF timestamp.
                     periods.append((current_start, ts))
                     current_start = None
-
-            last_ts = ts
+            # (last_ts tracking removed — the off-transition `ts` is used
+            # directly above, per the same convention as _onset_to_periods.)
 
         # Same rationale as _onset_to_periods: do NOT flush still-active
         # flow-rate periods at query_end. The live detector / next importer
@@ -850,20 +948,12 @@ class HistoricalImporter:
 
         # ── Volume from firmware integration sensor ────────────────────
         # Prefer the cumulative sensor delta over avg_flow × duration to avoid
-        # downsampling errors in long events with fill-pause-fill patterns.
-        volume_litres_measured: Optional[float] = None
-        volume_in_period = [
-            float(e["state"])
-            for e in volume_hist
-            if _is_numeric(e.get("state"))
-            and math.isfinite(float(e["state"]))
-            and start <= (_parse_ts(e.get("last_changed")) or start) <= end
-        ]
-        if len(volume_in_period) >= 2:
-            delta = volume_in_period[-1] - volume_in_period[0]
-            if 0 < delta < 10_000:   # sanity: reject resets and absurd values
-                from .ha_client import vol_to_litres as _v2l
-                volume_litres_measured = round(_v2l(delta, vol_unit), 3)
+        # downsampling errors in long events with fill-pause-fill patterns. The
+        # cumulative-delta computation is shared with the §2 recorder reconcile
+        # (single source of truth); the importer consumes only the litres.
+        from .recorder_reconcile import firmware_volume_delta
+        _vd = firmware_volume_delta(volume_hist, start, end, vol_unit)
+        volume_litres_measured: Optional[float] = _vd[0] if _vd else None
 
         # Volume floor — mirrors CircuitEventDetector._end_event
         avg_flow = sum(flow_readings) / len(flow_readings) if flow_readings else 0.0
@@ -895,6 +985,15 @@ class HistoricalImporter:
                     )
                     break
 
+        # Timestamped flow samples for the volume TIME-INTEGRAL — identical code
+        # path to the live detector (so volume + active-flow features match).
+        # Pad with the pre-start flow and an end sample so the first/last
+        # intervals integrate correctly.
+        flow_samples = [(start, flow_default)]
+        flow_samples += [(t, v) for t, v in all_flow_entries if start <= t <= end]
+        if flow_samples[-1][0] < end:
+            flow_samples.append((end, flow_samples[-1][1]))
+
         return RawEvent(
             circuit=circuit,
             start_ts=start,
@@ -909,6 +1008,7 @@ class HistoricalImporter:
             flow_onset_ts=start,
             propagation_delay_ms=propagation_delay_ms,
             flow_readings=flow_readings,
+            flow_samples=flow_samples,
             volume_litres_measured=volume_litres_measured,
             complete=True,
         )

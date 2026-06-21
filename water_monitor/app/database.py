@@ -10,10 +10,12 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any, Dict, Generator, List, Optional
 
 log = logging.getLogger(__name__)
@@ -43,6 +45,41 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     # async coroutines briefly contend for the same connection.
     conn.execute("PRAGMA busy_timeout=5000")
     return conn
+
+
+async def run_isolated_write(db_path, fn):
+    """Serialise a heavy DB-write job and run it on a fresh PRIVATE connection.
+
+    Two guarantees that make user-triggered admin writes (recompute, reclassify)
+    safe — both against each other AND against the inline writers on the shared
+    ``orch.db`` connection (the live feature extractor, the pruner, …):
+
+    * ``get_write_lock()`` is held for the whole job, so two admin writes can't
+      run concurrently. (The bug this fixes: two simultaneous /recompute requests
+      drove the *shared* connection from two worker threads → SQLite
+      ``InterfaceError`` / "cannot commit - no transaction is active".)
+    * the job runs on its OWN ``sqlite3.Connection`` (opened in the worker thread,
+      closed after), so it never shares connection state across threads. WAL +
+      ``busy_timeout`` handle writer-vs-writer between connections, and the job's
+      per-row commits release the file write-lock between rows.
+
+    ``fn`` is a sync callable taking the private connection; its return value is
+    propagated. The connection is closed even if ``fn`` raises. ``db_path`` is
+    passed in (not imported) so this module stays free of config imports.
+    """
+    import asyncio
+
+    async with get_write_lock():
+        loop = asyncio.get_running_loop()
+
+        def _run():
+            conn = get_connection(db_path)
+            try:
+                return fn(conn)
+            finally:
+                conn.close()
+
+        return await loop.run_in_executor(None, _run)
 
 
 @contextmanager
@@ -137,15 +174,44 @@ CREATE TABLE IF NOT EXISTS home_profile (
     ha_home_state           TEXT DEFAULT 'home',
     -- MQTT publishing toggle (Phase 2.1)
     mqtt_publish_enabled    INTEGER NOT NULL DEFAULT 0,
+    -- History display: hide pressure-restoration phantom events from the
+    -- History list (Sprint E). Off by default — phantoms are shown with a
+    -- flag. This is display-only; it never affects volume totals (phantom
+    -- volume is always zeroed at detection regardless of this toggle).
+    hide_pressure_artifact_events  INTEGER NOT NULL DEFAULT 0,
+    -- History display: hide cross-talk events (migration 20260540). Mirrors the
+    -- phantom toggle above; display-only — cross-talk volume is already zeroed.
+    hide_cross_talk_events         INTEGER NOT NULL DEFAULT 0,
+    -- Water softener opt-in (migration 20260542, dev.24). Off until the user
+    -- enables it at setup; regen_start is REQUIRED when enabled (HH:MM local),
+    -- circuit is which circuit the softener draws on (defaults to Main).
+    has_water_softener             INTEGER NOT NULL DEFAULT 0,
+    softener_regen_start           TEXT,
+    softener_circuit               TEXT,
+    -- Guarded auto-split opt-in (migration 20260545, dev.38). OFF by default — the
+    -- first automated, destructive pass (re-import over-merged events split) is
+    -- opt-in. User-labeled rows are never touched by the split.
+    auto_split_enabled             INTEGER NOT NULL DEFAULT 0,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 INSERT OR IGNORE INTO home_profile (id) VALUES (1);
 
--- CSRF tokens (one per browser session, rotated on use)
+-- CSRF tokens (legacy — kept for backward compat; new code uses HMAC
+-- double-submit, see csrf_server_secret below).
 CREATE TABLE IF NOT EXISTS csrf_tokens (
     token       TEXT PRIMARY KEY,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- HMAC server secret for stateless CSRF double-submit. One row
+-- (id = 1). The secret is generated once on first use and never
+-- regenerated automatically — regenerating would invalidate every
+-- in-flight browser session.
+CREATE TABLE IF NOT EXISTS csrf_server_secret (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    secret      TEXT NOT NULL,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -157,7 +223,18 @@ CREATE TABLE IF NOT EXISTS circuit_profile (
     has_drip_zones      BOOLEAN DEFAULT 0,
     initial_priors_json TEXT,
     priors_computed_at  TIMESTAMP,
-    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- Ball valve hardware type (migration 20260527).
+    -- '2_port' (default): standard inline valve, micro leak test enabled.
+    -- '3_port'         : drain-capable valve; leak test is automatically
+    --                    skipped because a drain port reads as a constant
+    --                    leak. Set per circuit during setup; editable from
+    --                    Settings behind a confirmation prompt.
+    valve_type          TEXT DEFAULT '2_port',
+    -- Flow-meter pulses-per-litre (migration 20260546). The add-on's CACHE of
+    -- the firmware's runtime PPL number entity (firmware is the source of truth);
+    -- the low-flow floor is derived as 60 ÷ ppl. Default 396 = reference turbine.
+    pulses_per_litre    REAL DEFAULT 396.0
 );
 
 -- ==========================================================================
@@ -175,6 +252,34 @@ CREATE TABLE IF NOT EXISTS training_state (
     completed_at        TIMESTAMP,
     updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ==========================================================================
+-- TRAINING-HELPER CAPTURE (2b) — a one-time "run each fixture once" wizard.
+-- One active ('armed') row per circuit; the event-completion hook records
+-- candidate event ids, the user confirms/accepts to write 'training' labels.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS training_capture (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit         TEXT NOT NULL,
+    fixture_type    TEXT NOT NULL,
+    -- armed | ready | captured | cancelled | expired | rejected
+    status          TEXT NOT NULL DEFAULT 'armed',
+    armed_at        TIMESTAMP NOT NULL,
+    expires_at      TIMESTAMP NOT NULL,
+    window_minutes  INTEGER,
+    captured_count  INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_training_capture_active
+    ON training_capture (circuit, status);
+-- Candidate events recorded by the hot-path hook (plain INSERT, no JSON).
+CREATE TABLE IF NOT EXISTS training_capture_candidates (
+    capture_id      INTEGER NOT NULL,
+    event_id        TEXT NOT NULL,
+    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_training_capture_candidates
+    ON training_capture_candidates (capture_id);
 
 -- ==========================================================================
 -- LEARNING CONFIGURATION
@@ -196,6 +301,13 @@ CREATE TABLE IF NOT EXISTS sensitivity_config (
     circuit                     TEXT PRIMARY KEY,
     mode                        TEXT DEFAULT 'simple',
     simple_level                TEXT DEFAULT 'medium',
+    -- Phase 2.3 anomaly response: 'off' | 'notify' | 'notify_shutoff_severe'
+    -- | 'shutoff_any'. Governs what happens when an event deviates from the
+    -- frozen baseline. Shut-off levels are guardrailed (see anomaly_baseline).
+    anomaly_response            TEXT DEFAULT 'notify',
+    -- Phase 3 §2: 1 = auto-correct event volume from the recorder firmware-sensor
+    -- delta, 0 = flag-only (detect + surface, don't change).
+    recorder_reconcile_auto     INTEGER DEFAULT 1,
     -- Event detection
     pressure_drop_event_psi     REAL DEFAULT 1.2,
     min_event_duration_seconds  REAL DEFAULT 3.0,
@@ -212,6 +324,9 @@ CREATE TABLE IF NOT EXISTS sensitivity_config (
     baseline_anomaly_p85        REAL,
     baseline_anomaly_p95        REAL,
     baseline_anomaly_p99        REAL,
+    -- Event count behind the percentiles — the confidence the shut-off gate
+    -- reads (a thin/default baseline must never close the valve).
+    baseline_anomaly_n          INTEGER,
     baseline_cluster_std_mean   REAL,
     baseline_computed_at        TIMESTAMP,
     updated_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -246,6 +361,10 @@ CREATE TABLE IF NOT EXISTS fixtures (
     display_name  TEXT,         -- may differ from `name` for HA entity slug
     user_locked   INTEGER DEFAULT 0,
     publish_to_ha INTEGER DEFAULT 1,
+    -- Sprint A orphan-repair flag: set to 1 when this fixture is confirmed
+    -- but no fixture_clusters row has fixture_id pointing at it. The UI
+    -- shows a relink banner so the user can pick a cluster to attach.
+    cluster_backfill_needed INTEGER DEFAULT 0,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -263,6 +382,141 @@ CREATE TABLE IF NOT EXISTS fixture_signatures (
 );
 
 -- ==========================================================================
+-- FIXTURE TYPE SIGNATURES (Sprint C) — per-(circuit, fixture_type) centroid
+-- learned from user-labelled events. The legacy fixture_signatures table
+-- above is per-(fixture_id, feature); it was never populated by any code
+-- path and is kept only for backwards-compat with backup files that
+-- include it. The matcher (cluster_engine + feature_extractor) reads from
+-- this new table, which is keyed by user-facing fixture *type* (e.g.
+-- "toilet"), not a specific fixture row — that matches how the History
+-- page's label dropdown is structured.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS fixture_type_signatures (
+    circuit       TEXT NOT NULL,
+    fixture_type  TEXT NOT NULL,
+    centroid      TEXT NOT NULL DEFAULT '{}',   -- JSON dict of feature means
+    member_count  INTEGER NOT NULL DEFAULT 0,
+    created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (circuit, fixture_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_type_signatures_circuit
+    ON fixture_type_signatures (circuit);
+
+-- ==========================================================================
+-- RULE CALIBRATION (Phase 1) — per-home fit of the structural-rules-tier bands
+-- (event_rules.py), frozen at activation. One JSON blob per circuit; the rule
+-- predicates read it via an optional `calib` dict and fall back to their shipped
+-- module defaults for any absent key. Written ONLY at activation / explicit
+-- re-train — never on ordinary reclassify or live events — so the locked
+-- reference can't drift (the basis for leak / odd-usage detection).
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS rule_calibration (
+    circuit     TEXT PRIMARY KEY,
+    params      TEXT NOT NULL DEFAULT '{}',   -- JSON dict of fitted rule bands
+    report      TEXT,                         -- JSON per-type fit-vs-fallback report
+    source      TEXT,                         -- 'activation' | 'retrain'
+    locked_at   TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
+-- USAGE BASELINE (Phase 2) — per-home "normal" envelopes, FROZEN at activation
+-- alongside rule_calibration. params is a JSON dict {fixture_type: {vol/dur/peak:
+-- [lo,hi], n}} of padded percentile bands from this home's labelled+matched
+-- events. The future leak / odd-usage detector compares a live event against its
+-- type's frozen envelope; because it's frozen, a slow leak can't drift it.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS usage_baseline (
+    circuit     TEXT PRIMARY KEY,
+    params      TEXT NOT NULL DEFAULT '{}',   -- JSON {type: {vol/dur/peak:[lo,hi], n}}
+    source      TEXT,                         -- 'activation' | 'retrain'
+    locked_at   TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
+-- ARTIFACT CALIBRATION (Phase 2.4) — per-home phantom/dribble/cross-talk detector
+-- thresholds, FROZEN at activation. Calibrates ONLY the long-quiet / dribble
+-- identifier thresholds (never the leak-safety true-flow guards) and is gated
+-- do-no-harm: a fitted threshold is applied only if it flags zero confirmed-NORMAL
+-- events (never zeros confirmed-real water). params is a JSON {threshold_key:value}.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS artifact_calibration (
+    circuit     TEXT PRIMARY KEY,
+    params      TEXT NOT NULL DEFAULT '{}',   -- JSON {threshold_key: value}
+    report      TEXT,                         -- JSON per-detector fit/fallback
+    source      TEXT,                         -- 'activation' | 'retrain'
+    locked_at   TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
+-- ANOMALY AUTO-SHUTOFF LOG (Phase 2.3) — one row per automated valve close.
+-- PERSISTENT so the per-12h rate limit survives an addon restart (an in-memory
+-- counter would reset on exactly the restart a pathological condition could
+-- cause). Queried for COUNT in the last 12h before any auto-shutoff.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS anomaly_shutoff_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit       TEXT NOT NULL,
+    event_id      TEXT,
+    anomaly_type  TEXT,
+    score         REAL,
+    closed_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_anomaly_shutoff_circuit_time
+    ON anomaly_shutoff_log (circuit, closed_at);
+
+-- ==========================================================================
+-- BACKGROUND JOB STATUS (§2.4) — one row per long-running op (reclassify,
+-- calibration/re-lock, recalibration) so the UI can poll + toast success /
+-- failure. DB-backed (not in-memory) because reclassify runs on an isolated
+-- write connection whose status must still be visible to the poll endpoint.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS jobs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit     TEXT,
+    kind        TEXT NOT NULL,                     -- 'reclassify'|'calibration'|'recalibration'
+    status      TEXT NOT NULL DEFAULT 'running',   -- 'running'|'done'|'error'
+    message     TEXT,
+    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_id ON jobs (id);
+
+-- ==========================================================================
+-- RECORDER RECONCILIATION CHECKPOINT (Phase 3 §2) — per-circuit position the
+-- hourly recorder-volume reconcile has processed up to, plus cumulative diagnostic
+-- counters. Pure checkpoint/stats (no data dependency) → created here via
+-- CREATE TABLE IF NOT EXISTS, like jobs / anomaly_shutoff_log.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS reconcile_state (
+    circuit           TEXT PRIMARY KEY,
+    through_ts        TIMESTAMP,         -- events with end_ts <= here are reconciled
+    corrections       INTEGER DEFAULT 0, -- cumulative auto-corrections applied
+    flagged           INTEGER DEFAULT 0, -- cumulative divergences flagged (flag-mode)
+    last_run_at       TIMESTAMP,
+    last_delta_litres REAL
+);
+
+-- ==========================================================================
+-- CATEGORY PUBLISH (Sprint F) — per-(circuit, fixture_type) HA publish gate.
+-- Replaces the per-fixture `fixtures.publish_to_ha` flag as the source of
+-- truth for the fixture_publisher. Each row toggles whether the HA discovery
+-- entity set for that category on that circuit is published. publish_to_ha=1
+-- by default; missing rows default to True at the caller via .get(typ, True).
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS category_publish (
+    circuit         TEXT NOT NULL,
+    fixture_type    TEXT NOT NULL,
+    publish_to_ha   INTEGER NOT NULL DEFAULT 1,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (circuit, fixture_type)
+);
+
+-- ==========================================================================
 -- FIXTURE CLUSTERS (Phase 2.1) — raw DBSTREAM clustering output
 -- ==========================================================================
 CREATE TABLE IF NOT EXISTS fixture_clusters (
@@ -274,6 +528,13 @@ CREATE TABLE IF NOT EXISTS fixture_clusters (
     member_count          INTEGER DEFAULT 0,
     suggested_type        TEXT,                 -- from fixtures.suggest_fixture_type
     suggested_confidence  REAL DEFAULT 0,
+    -- Sprint B: provenance of suggested_type. NULL = nothing suggested yet,
+    -- 'heuristic' = set by cluster_engine._run_suggest_type_if_needed
+    -- (centroid feature-range rules), 'user_labels' = set by majority vote
+    -- of events.user_fixture_type on this cluster's members. The UI uses
+    -- this to render different hint copy and treat user-labels as a
+    -- stronger signal than heuristics.
+    suggestion_source     TEXT,
     confidence_level      TEXT DEFAULT 'preliminary',  -- preliminary/learning/confirmed
     fixture_id            TEXT REFERENCES fixtures(id) ON DELETE SET NULL,
     is_compound           INTEGER DEFAULT 0,    -- 2.3 placeholder
@@ -436,8 +697,114 @@ CREATE TABLE IF NOT EXISTS events (
     waveform_overlap_score           REAL,
     -- Signature provenance — which source generated the shape signatures.
     -- 'software' (default) | 'esp_full_flow' | 'esp_full_pressure' | 'esp_full_flow_pressure'
-    signature_source                 TEXT
+    signature_source                 TEXT,
+    -- Degraded-supply guard (migration 20260526). When degraded_supply=1 the
+    -- event was captured during pulsing-supply conditions; flow data is
+    -- unreliable. volume_litres_effective is the value actually applied to
+    -- hourly_volume (raw for healthy events, envelope-smoothed for degraded).
+    -- hourly_volume_applied_litres/_bucket track exact prior contribution so
+    -- re-imports correctly subtract-then-add.
+    -- match_rejection_reason additionally accepts 'pulsing_supply'.
+    degraded_supply                  BOOLEAN DEFAULT 0,
+    volume_litres_estimated          REAL,
+    volume_litres_effective          REAL,
+    volume_estimation_method         TEXT DEFAULT 'raw',
+    -- Active-flow features (migration 20260536). Computed by time-integrating the
+    -- timestamped flow samples (flow_integral.py). NULLABLE on purpose: NULL =
+    -- unknown / not yet backfilled (NOT the same as 0 = known no flow). Drive
+    -- classification + the hardened phantom guard. integration_quality is 'ok',
+    -- 'capped' (offline-gap clamp), or 'degraded' (bad/sparse backfill history);
+    -- anything but 'ok'/NULL is kept out of classifier training.
+    flow_integral_litres             REAL,
+    active_flow_duration_seconds     REAL,
+    true_avg_flow_lpm                REAL,
+    flow_on_ratio                    REAL,
+    active_flow_segment_count        INTEGER,
+    flow_cv_on_segments              REAL,
+    integration_quality              TEXT,
+    -- Volume-recompute audit trail (Phase 2 backfill): original pre-recompute
+    -- volume + when it was last recomputed, for verification / rollback.
+    volume_litres_original           REAL,
+    volume_recomputed_at             TIMESTAMP,
+    -- Phase 3 §2: the authoritative firmware cumulative-volume-sensor delta over the
+    -- event window, from the HA recorder (NULL = not reconciled / sensor unavailable).
+    -- Audit ("recorder said X vs stored Y") + what flag-mode review/apply uses.
+    volume_recorder_litres           REAL,
+    hourly_volume_applied_litres     REAL DEFAULT 0,
+    hourly_volume_applied_bucket     TEXT,
+    degraded_diagnostic_json         TEXT,
+    -- Sprint C signature matcher: the fixture_type matched by the
+    -- fixture_type_signatures table when cluster matching couldn't
+    -- assign a cluster_id (or assigned one with low confidence).
+    -- Independent of cluster_id — a single event can have cluster_id
+    -- set AND matched_fixture_type set if the cluster matched but the
+    -- signature gave a more specific type guess.
+    matched_fixture_type             TEXT,
+    -- Match provenance (migration 20260541, dev.23 rules tier): how
+    -- matched_fixture_type was produced — 'knn' (signature k-NN),
+    -- 'washer_cycle' (anchor + same-peak family), 'rule_toilet'/
+    -- 'rule_dishwasher'/'rule_shower' (structural event rules),
+    -- 'zone_default' (zone-circuit fallback), NULL (legacy/cluster/none).
+    -- Machine-derived; recomputed by every reclassify; NEVER user-preserved.
+    matched_via                      TEXT,
+    -- History cycle-rollup grouping key (migration 20260542, dev.24): the id
+    -- members of one appliance run share so History can collapse them under one
+    -- expandable parent row — washer anchor id / softener session id / dishwasher
+    -- cycle anchor id; NULL = ungrouped singleton. Stamped by reclassify; SKIPS
+    -- user-labelled events (so a relabel pulls a member out of its group).
+    cycle_group_id                   TEXT,
+    -- Pressure-restoration phantom guard (migration 20260532). When 1, this
+    -- event matched the long-duration + near-zero-pressure-drop fingerprint
+    -- of a city-pressure-restoration artifact. Its volume_litres_effective is
+    -- forced to 0 and it is excluded_from_training. Shown in History with a
+    -- flag; volume contributes nothing to totals.
+    is_pressure_restoration_phantom  INTEGER DEFAULT 0,
+    -- Low-flow dribble guard (migration 20260535). When 1, this event is a
+    -- brief low-flow / low-volume / near-zero-pressure trickle (sensor or
+    -- pressure-equalisation noise). UNLIKE a phantom it does NOT zero volume —
+    -- it only sets excluded_from_training so the event stays out of the
+    -- classifier / clustering training set while its (tiny) volume still counts
+    -- toward totals. Auto-derived; suppressed for user_classified rows.
+    is_low_flow_dribble              INTEGER NOT NULL DEFAULT 0,
+    -- Cross-talk artifact (migration 20260540). When 1, a long event registered
+    -- via a pressure drop with essentially no real flow on THIS circuit (another
+    -- circuit's draw pulled the shared-supply pressure down). Like a phantom it
+    -- forces volume_litres_effective=0 + excluded_from_training; a distinct flag so
+    -- it can be shown / hidden separately. Auto-derived; suppressed for
+    -- user_classified rows (a peer of the phantom flag in patch_event).
+    is_cross_talk                    INTEGER NOT NULL DEFAULT 0,
+    -- Sprint H. user_ignored: explicit Ignore/Restore intent (separate from
+    -- the derived excluded_from_training, which is auto OR user_ignored OR
+    -- manual). user_classified: lock bit — when 1 the three category flags
+    -- (is_pressure_restoration_phantom / is_cross_talk / degraded_supply /
+    -- is_composite) hold the user's manual choices and auto-detection must never
+    -- overwrite them.
+    user_ignored                     INTEGER DEFAULT 0,
+    user_classified                  INTEGER DEFAULT 0,
+    -- Temporal "appliance cycle" signal: count of similar-volume neighbour
+    -- events within ±45 min (database.recompute_cycle_pulse_counts). NULL = not
+    -- yet computed, 0 = computed/no qualifying neighbours. Aggregated into the
+    -- cluster centroid for the heuristic; deliberately NOT in FEATURE_KEYS so it
+    -- never affects clustering distance.
+    cycle_pulse_count                INTEGER,
+    -- Label provenance: 'user' = explicit user label, 'cycle' = auto cycle-mate
+    -- expansion (2a), 'training' = capture wizard (2b). NULL = legacy/unlabeled
+    -- and is protected exactly like a 'user' label (auto-undo never touches it).
+    -- Preserved across event re-imports via _EVENT_USER_COLUMNS.
+    fixture_label_source             TEXT
 );
+
+-- NOTE: the partial index on (circuit, start_ts) WHERE degraded_supply = 1
+-- is created by db_migrations._apply_degraded_supply_columns() rather than
+-- inline here. Putting it in _create_schema would fail on an upgrade-from-
+-- baseline DB: CREATE TABLE IF NOT EXISTS is a no-op on existing tables,
+-- so the existing events table doesn't get the degraded_supply column
+-- added by this DDL (ALTER TABLE in the migration is what does that), but
+-- the partial-index statement would still execute and reference a column
+-- that doesn't exist yet. Order is:
+--   1. database.init_db() -> _create_schema() — must succeed on existing DB
+--   2. db_migrations.run_migrations() — adds columns AND the partial index
+-- Fresh DBs hit the same migration via the version==0 path.
 
 -- UNIQUE(circuit, start_ts) — enforces the contract the importer / dedup
 -- helpers have always assumed (see comments in dedup_events). Replaces the
@@ -462,6 +829,28 @@ CREATE TABLE IF NOT EXISTS hourly_volume (
 
 CREATE INDEX IF NOT EXISTS idx_hourly_volume_circuit_ts
     ON hourly_volume (circuit, hour_ts);
+
+-- ==========================================================================
+-- EVENT WAVEFORMS — high-resolution min/max envelopes for the event detail
+-- modal (added 20260526). The 32-point pressure_signature_json/_flow_*
+-- columns in events stay for clustering; these min/max bins are higher
+-- resolution and preserve oscillation envelopes that bin-mean would hide.
+-- Retention: WAVEFORM_RETENTION_DAYS (60 by default), purged daily by
+-- orchestrator._purge_old_waveforms. FK cascade deletes when an event is
+-- removed (foreign_keys pragma is enabled on every connection).
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS event_waveforms (
+    event_id              TEXT PRIMARY KEY
+                          REFERENCES events(id) ON DELETE CASCADE,
+    flow_min_json         TEXT NOT NULL,
+    flow_max_json         TEXT NOT NULL,
+    pressure_min_json     TEXT NOT NULL,
+    pressure_max_json     TEXT NOT NULL,
+    duration_seconds      REAL NOT NULL,
+    created_at            TEXT NOT NULL          -- ISO-8601 UTC, Python-written
+);
+CREATE INDEX IF NOT EXISTS idx_event_waveforms_created
+    ON event_waveforms (created_at);
 
 -- ==========================================================================
 -- VOLUME SNAPSHOTS (HA sensor baselines for accurate daily / weekly totals)
@@ -713,10 +1102,15 @@ def compute_daily_summary(conn: sqlite3.Connection,
     day format: 'YYYY-MM-DD'.
     Returns the summary dict, or None if no events that day.
     """
+    # Volume uses volume_litres_effective (falling back to raw) so degraded-
+    # supply estimates and zeroed pressure-restoration phantoms are reflected
+    # here exactly as they are in hourly_volume. Keeps the History charts /
+    # daily totals consistent with the dashboard cards.
     rows = conn.execute("""
         SELECT
             COUNT(*)                    AS event_count,
-            SUM(volume_litres)          AS total_volume_litres,
+            SUM(COALESCE(volume_litres_effective, volume_litres, 0))
+                                        AS total_volume_litres,
             AVG(avg_flow_lpm)           AS avg_flow_lpm,
             MAX(peak_flow_lpm)          AS peak_flow_lpm,
             AVG(pre_event_pressure_psi) AS avg_pressure_psi,
@@ -766,9 +1160,13 @@ def compute_daily_summary(conn: sqlite3.Connection,
     cols = ", ".join(summary.keys())
     ph   = ", ".join("?" for _ in summary)
     updates = ", ".join(f"{k}=excluded.{k}" for k in summary if k not in ("circuit", "day"))
+    # Future-proofing: if a refactor ever strips this dict down to just
+    # the conflict-key columns, `updates` becomes the empty string and
+    # `DO UPDATE SET ` is a SQL syntax error. Fall back to DO NOTHING.
+    on_conflict = f"DO UPDATE SET {updates}" if updates else "DO NOTHING"
     conn.execute(
         f"INSERT INTO daily_summary ({cols}) VALUES ({ph}) "
-        f"ON CONFLICT(circuit, day) DO UPDATE SET {updates}",
+        f"ON CONFLICT(circuit, day) {on_conflict}",
         list(summary.values()),
     )
     return summary
@@ -833,27 +1231,60 @@ def update_data_retention(conn: sqlite3.Connection, **kwargs) -> None:
     conn.commit()
 
 
-def generate_csrf_token(conn: sqlite3.Connection) -> str:
-    """Generate and store a new CSRF token. Cleans up tokens older than 24h."""
-    import secrets
-    conn.execute(
-        "DELETE FROM csrf_tokens WHERE created_at < datetime('now', '-1 day')")
-    token = secrets.token_hex(32)
-    conn.execute("INSERT INTO csrf_tokens (token) VALUES (?)", (token,))
-    conn.commit()
-    return token
+def get_or_create_csrf_server_secret(conn: sqlite3.Connection) -> str:
+    """Return the persistent HMAC server secret used for CSRF tokens.
 
+    Created on first use and stored in `csrf_server_secret`. Never
+    regenerated automatically — rotating it would invalidate every
+    in-flight browser form across the addon.
 
-def validate_csrf_token(conn: sqlite3.Connection, token: str) -> bool:
-    """Return True if the token exists and is less than 24h old."""
-    if not token:
-        return False
+    The secret is a 64-character hex string (256 bits of entropy).
+    """
+    import secrets as _secrets
     row = conn.execute(
-        "SELECT token FROM csrf_tokens "
-        "WHERE token = ? AND created_at >= datetime('now', '-1 day')",
-        (token,)
+        "SELECT secret FROM csrf_server_secret WHERE id = 1"
     ).fetchone()
-    return row is not None
+    if row and row["secret"]:
+        return row["secret"]
+    secret = _secrets.token_hex(32)
+    conn.execute(
+        "INSERT OR REPLACE INTO csrf_server_secret (id, secret) "
+        "VALUES (1, ?)",
+        (secret,),
+    )
+    conn.commit()
+    return secret
+
+
+def derive_csrf_token(server_secret: str, session_id: str) -> str:
+    """Compute the CSRF token for a given session_id.
+
+    Stateless HMAC double-submit pattern: the same session_id always
+    produces the same token, but the token can't be forged without the
+    server_secret. Validation just recomputes and constant-time-compares.
+    """
+    import hashlib
+    import hmac
+    return hmac.new(
+        server_secret.encode("utf-8"),
+        session_id.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def validate_csrf_token(
+    server_secret: str, session_id: str, token: str
+) -> bool:
+    """Return True if `token` matches HMAC(server_secret, session_id).
+
+    Returns False on any missing input. Uses constant-time comparison
+    to avoid timing side-channels.
+    """
+    import hmac
+    if not server_secret or not session_id or not token:
+        return False
+    expected = derive_csrf_token(server_secret, session_id)
+    return hmac.compare_digest(expected, token)
 
 
 def get_home_profile(conn: sqlite3.Connection) -> sqlite3.Row:
@@ -920,6 +1351,75 @@ def _upsert_by_circuit(
 
 def upsert_training_state(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
     _upsert_by_circuit(conn, "training_state", circuit, **kwargs)
+
+
+# ── Background job status (§2.4) ─────────────────────────────────────────────────
+
+def start_job(conn: sqlite3.Connection, kind: str, circuit: Optional[str] = None,
+              message: Optional[str] = None) -> int:
+    """Record a long-running background op as 'running'; returns its id. Also prunes
+    finished rows older than 2 days so the table stays tiny."""
+    cur = conn.execute(
+        "INSERT INTO jobs (circuit, kind, status, message) VALUES (?, ?, 'running', ?)",
+        (circuit, kind, message))
+    conn.execute("DELETE FROM jobs WHERE status <> 'running' "
+                 "AND created_at < datetime('now', '-2 days')")
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def finish_job(conn: sqlite3.Connection, job_id: int, status: str = "done",
+               message: Optional[str] = None) -> None:
+    conn.execute(
+        "UPDATE jobs SET status = ?, message = ?, finished_at = ? WHERE id = ?",
+        (status, message, datetime.now(timezone.utc).isoformat(), job_id))
+    conn.commit()
+
+
+def get_jobs_since(conn: sqlite3.Connection, since_id: int = 0,
+                   limit: int = 20) -> list:
+    """Jobs with id > ``since_id`` (newest first) for the UI poll-and-toast."""
+    try:
+        rows = conn.execute(
+            "SELECT id, circuit, kind, status, message, created_at, finished_at "
+            "FROM jobs WHERE id > ? ORDER BY id DESC LIMIT ?",
+            (since_id, limit)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [dict(r) for r in rows]
+
+
+# ── Recorder reconciliation checkpoint (Phase 3 §2) ──────────────────────────────
+
+def get_reconcile_state(conn: sqlite3.Connection,
+                        circuit: str) -> Optional[sqlite3.Row]:
+    try:
+        return conn.execute(
+            "SELECT * FROM reconcile_state WHERE circuit = ?", (circuit,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def set_reconcile_state(conn: sqlite3.Connection, circuit: str, *,
+                        through_ts: Optional[str] = None,
+                        corrections_delta: int = 0, flagged_delta: int = 0,
+                        last_delta_litres: Optional[float] = None) -> None:
+    """Advance the per-circuit checkpoint + bump cumulative counters (upsert)."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO reconcile_state "
+        "  (circuit, through_ts, corrections, flagged, last_run_at, last_delta_litres) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(circuit) DO UPDATE SET "
+        "  through_ts = COALESCE(excluded.through_ts, reconcile_state.through_ts), "
+        "  corrections = reconcile_state.corrections + ?, "
+        "  flagged = reconcile_state.flagged + ?, "
+        "  last_run_at = excluded.last_run_at, "
+        "  last_delta_litres = COALESCE(excluded.last_delta_litres, "
+        "                               reconcile_state.last_delta_litres)",
+        (circuit, through_ts, corrections_delta, flagged_delta, now, last_delta_litres,
+         corrections_delta, flagged_delta))
+    conn.commit()
 
 
 def get_sensitivity_config(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
@@ -998,14 +1498,21 @@ def set_circuit_type(
     conn: sqlite3.Connection,
     circuit: str,
     circuit_type: str,
+    commit: bool = True,
 ) -> None:
     """Persist circuit_type to circuit_profile.
 
     UPSERTs the row so it is safe to call before ensure_circuit_defaults().
     When switching to "zone", seeds any missing zone-only alert rows via
     INSERT OR IGNORE so existing user toggle state is preserved.
-    Zone alerts are never deleted when switching back to "fixture" — they are
-    simply hidden in the UI by the template filter.
+    Zone alerts are never deleted when switching back to "fixture" — they
+    are simply hidden in the UI by the template filter.
+
+    When ``commit`` is True (default) the change is committed before
+    returning. Pass ``commit=False`` when this is part of a multi-step
+    write sequence the caller wants to make atomic via ``with
+    transaction(conn):`` — see setup wizard step 3b for the canonical
+    example.
     """
     from .fixtures import normalize_circuit_type
     circuit_type = normalize_circuit_type(circuit_type)
@@ -1018,7 +1525,118 @@ def set_circuit_type(
     """, (circuit, circuit_type))
     if circuit_type == "zone":
         _seed_zone_alerts_only(conn, circuit)
-    conn.commit()
+    if commit:
+        conn.commit()
+
+
+def get_valve_type(
+    conn: sqlite3.Connection,
+    circuit: str,
+    default: str = "2_port",
+) -> str:
+    """Return the valve_type for a circuit.
+
+    Falls back to `default` if no circuit_profile row exists yet.
+    Normalises via fixtures.normalize_valve_type (forgiving) so callers
+    always get a canonical string they can render safely.
+    """
+    from .fixtures import normalize_valve_type
+    row = conn.execute(
+        "SELECT valve_type FROM circuit_profile WHERE circuit = ?",
+        (circuit,)
+    ).fetchone()
+    raw = row["valve_type"] if row and row["valve_type"] else default
+    return normalize_valve_type(raw)
+
+
+def set_valve_type(
+    conn: sqlite3.Connection,
+    circuit: str,
+    valve_type: str,
+    commit: bool = True,
+) -> None:
+    """Persist valve_type to circuit_profile.
+
+    Uses the STRICT parser. Callers are expected to present a clean value;
+    a ValueError is raised on bad input rather than silently substituting
+    the default. UI/router layers should pre-validate via parse_valve_type
+    before calling this.
+
+    UPSERT mirrors set_circuit_type — all other circuit_profile columns
+    have DEFAULTs or allow NULL so the minimal INSERT shape is safe.
+
+    Pass ``commit=False`` when this is part of a multi-step write
+    sequence the caller wants to make atomic via ``with
+    transaction(conn):`` — see setup wizard step 3b for the canonical
+    example.
+    """
+    from .fixtures import parse_valve_type
+    parsed = parse_valve_type(valve_type)
+    if parsed is None:
+        raise ValueError(f"Invalid valve_type {valve_type!r}")
+    conn.execute("""
+        INSERT INTO circuit_profile (circuit, valve_type)
+        VALUES (?, ?)
+        ON CONFLICT(circuit) DO UPDATE SET valve_type = excluded.valve_type
+    """, (circuit, parsed))
+    if commit:
+        conn.commit()
+
+
+#: Reference-turbine default pulses-per-litre (YF-B5). Mirrors the firmware
+#: ppl_main/ppl_irr number entities' initial_value, so an un-discovered circuit
+#: still has a sane low-flow floor (60 ÷ 396 ≈ 0.15 L/min).
+DEFAULT_PULSES_PER_LITRE: float = 396.0
+
+
+def get_circuit_pulses_per_litre(
+    conn: sqlite3.Connection,
+    circuit: str,
+    default: float = DEFAULT_PULSES_PER_LITRE,
+) -> float:
+    """Return the cached pulses-per-litre for a circuit.
+
+    This is the add-on's local CACHE of the firmware's runtime PPL number
+    entity (the firmware entity is the single source of truth; the add-on
+    refreshes this from the entity when HA is reachable). Falls back to
+    `default` if no circuit_profile row exists yet or the stored value is
+    unusable (NULL / non-numeric / out of range).
+    """
+    row = conn.execute(
+        "SELECT pulses_per_litre FROM circuit_profile WHERE circuit = ?",
+        (circuit,)
+    ).fetchone()
+    raw = row["pulses_per_litre"] if row else None
+    try:
+        ppl = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return ppl if 1.0 <= ppl <= 5000.0 else default
+
+
+def set_circuit_pulses_per_litre(
+    conn: sqlite3.Connection,
+    circuit: str,
+    pulses_per_litre: float,
+    commit: bool = True,
+) -> None:
+    """Persist the cached pulses-per-litre for a circuit (UPSERT).
+
+    The firmware number entity stays the source of truth; this only caches the
+    last value the add-on observed so detection keeps a sane floor when HA is
+    briefly unreachable. Rejects non-finite / out-of-range values (matches the
+    firmware entity's 1..5000 bounds).
+    """
+    ppl = float(pulses_per_litre)
+    if not (1.0 <= ppl <= 5000.0):
+        raise ValueError(f"Invalid pulses_per_litre {pulses_per_litre!r}")
+    conn.execute("""
+        INSERT INTO circuit_profile (circuit, pulses_per_litre)
+        VALUES (?, ?)
+        ON CONFLICT(circuit) DO UPDATE SET pulses_per_litre = excluded.pulses_per_litre
+    """, (circuit, ppl))
+    if commit:
+        conn.commit()
 
 
 def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) -> None:
@@ -1037,8 +1655,50 @@ def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) ->
 _EVENT_USER_COLUMNS: frozenset[str] = frozenset({
     "user_fixture_type",
     "user_reviewed",
-    "excluded_from_training",
+    # Sprint H: the explicit user intents are preserved across re-import/
+    # enrichment upserts. excluded_from_training is NO LONGER preserved here —
+    # it's a DERIVED field (auto verdicts OR user_ignored OR manual) recomputed
+    # by _finalize_derived_verdicts, so preserving it would freeze stale
+    # auto-exclusion. user_ignored carries the Ignore/Restore intent instead;
+    # user_classified locks a manual classification against auto-override.
+    "user_ignored",
+    "user_classified",
+    # Label provenance ('user'/'cycle'/'training') — preserved so a re-import
+    # never drops the auto-label source that drives the undo + exclude-warning.
+    "fixture_label_source",
 })
+
+# Columns whose values must NOT be overwritten by an event-row upsert.
+# These track the exact prior contribution applied to hourly_volume so future
+# reprocessing (re-imports etc.) can correctly subtract before re-adding.
+# Maintained ONLY by upsert_event_and_apply_hourly_volume() — never by the
+# event-feature upsert path.
+_EVENT_APPLIED_BOOKKEEPING_COLUMNS: frozenset[str] = frozenset({
+    "hourly_volume_applied_litres",
+    "hourly_volume_applied_bucket",
+})
+
+
+def _hour_bucket_for(start_ts) -> str:
+    """Return the hour_ts string in the canonical format used by
+    update_hourly_volume(): UTC-normalised '%Y-%m-%dT%H:00:00' (no tz suffix).
+    Mirrors the production format from feature_extractor.py line ~1066 so
+    aggregate queries (get_daily_volume / get_weekly_volume) keep working.
+    """
+    if start_ts is None:
+        return ""
+    if isinstance(start_ts, str):
+        try:
+            dt = datetime.fromisoformat(start_ts)
+        except ValueError:
+            return ""
+    elif isinstance(start_ts, datetime):
+        dt = start_ts
+    else:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:00:00')
 
 
 def insert_event(conn: sqlite3.Connection, event: dict) -> bool:
@@ -1066,22 +1726,41 @@ def insert_event(conn: sqlite3.Connection, event: dict) -> bool:
     longer applicable). Callers use the return value to decide whether to
     add the event's volume to hourly_volume.
     """
-    cols = list(event.keys())
-    if "id" not in cols:
-        # Defensive — without an id we can't detect conflicts; let SQLite
-        # raise on the missing PK rather than silently insert a NULL.
+    if "id" not in event:
         raise ValueError("insert_event: event dict missing 'id'")
-
     exists = conn.execute(
         "SELECT 1 FROM events WHERE id = ?", (event["id"],),
     ).fetchone() is not None
+    _do_event_upsert(conn, event)
+    conn.commit()
+    return not exists
+
+
+def _do_event_upsert(conn: sqlite3.Connection, event: dict) -> None:
+    """Run the INSERT ... ON CONFLICT(id) DO UPDATE for an event row.
+
+    The DO UPDATE SET clause refreshes measurement/system columns but
+    explicitly excludes:
+      • 'id' (the conflict target)
+      • _EVENT_USER_COLUMNS (preserve user labels/flags across re-imports)
+      • _EVENT_APPLIED_BOOKKEEPING_COLUMNS (preserve exact prior
+        hourly_volume contribution so upsert_event_and_apply_hourly_volume
+        can subtract it correctly on reprocess)
+
+    Does NOT commit; the caller controls the transaction boundary.
+    """
+    cols = list(event.keys())
+    if "id" not in cols:
+        raise ValueError("_do_event_upsert: event dict missing 'id'")
 
     col_list     = ", ".join(cols)
     placeholders = ", ".join("?" for _ in cols)
-    # Build the DO UPDATE SET clause: refresh measurement/system columns,
-    # leave id and the user-intent columns alone.
-    set_cols = [c for c in cols
-                if c != "id" and c not in _EVENT_USER_COLUMNS]
+    set_cols = [
+        c for c in cols
+        if c != "id"
+        and c not in _EVENT_USER_COLUMNS
+        and c not in _EVENT_APPLIED_BOOKKEEPING_COLUMNS
+    ]
     if set_cols:
         set_clause = ", ".join(f"{c}=excluded.{c}" for c in set_cols)
         sql = (
@@ -1089,15 +1768,405 @@ def insert_event(conn: sqlite3.Connection, event: dict) -> bool:
             f"ON CONFLICT(id) DO UPDATE SET {set_clause}"
         )
     else:
-        # The incoming dict had nothing to update beyond id / user fields —
-        # treat the existing row as authoritative.
         sql = (
             f"INSERT INTO events ({col_list}) VALUES ({placeholders}) "
             f"ON CONFLICT(id) DO NOTHING"
         )
     conn.execute(sql, list(event.values()))
-    conn.commit()
-    return not exists
+
+
+# Shared upsert that adds a signed delta to one (circuit, hour) ledger bucket.
+_HOURLY_VOLUME_DELTA_SQL = (
+    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) VALUES (?, ?, ?) "
+    "ON CONFLICT (circuit, hour_ts) "
+    "DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres"
+)
+
+
+def apply_effective_volume(
+    conn: sqlite3.Connection, event_id: str, circuit: str, start_ts,
+    new_effective: float,
+) -> float:
+    """THE single chokepoint for the hourly-volume ledger math (§2.5).
+
+    Reverses the event's PRIOR applied contribution (from its recorded bucket),
+    applies ``new_effective`` to the bucket derived from ``start_ts``, then records
+    the new applied bookkeeping (``hourly_volume_applied_litres`` / ``_bucket``). Every
+    per-event volume write — the live upsert AND every reprocess / recompute / merge
+    path — routes through here so the events ↔ hourly_volume ledger can never drift
+    (previously this reverse/apply/bookkeep math was hand-copied at ~8 sites). The
+    caller writes ``events.volume_litres_effective`` to the SAME returned value;
+    ``volume_ledger_discrepancy()`` + its test pin the invariant. Assumes a caller
+    transaction. Returns the rounded effective volume actually applied.
+    """
+    new_effective = round(float(new_effective or 0.0), 3)
+    # NULL bucket when nothing is applied (a phantom/cross-talk zero) — "no
+    # contribution lives anywhere", the convention the reprocess paths already used.
+    new_bucket = _hour_bucket_for(start_ts) if new_effective else None
+    prev = conn.execute(
+        "SELECT hourly_volume_applied_litres, hourly_volume_applied_bucket "
+        "FROM events WHERE id = ?", (event_id,),
+    ).fetchone()
+    prev_litres = float(prev["hourly_volume_applied_litres"] or 0.0) if prev else 0.0
+    prev_bucket = prev["hourly_volume_applied_bucket"] if prev else None
+    # Reverse the prior contribution, then apply the new one (handles a bucket move
+    # AND the same-bucket case — net delta — identically).
+    if prev_bucket and prev_litres:
+        conn.execute(_HOURLY_VOLUME_DELTA_SQL, (circuit, prev_bucket, -prev_litres))
+    if new_bucket and new_effective:
+        conn.execute(_HOURLY_VOLUME_DELTA_SQL, (circuit, new_bucket, new_effective))
+    conn.execute(
+        "UPDATE events SET hourly_volume_applied_litres = ?, "
+        "  hourly_volume_applied_bucket = ? WHERE id = ?",
+        (new_effective, new_bucket, event_id),
+    )
+    return new_effective
+
+
+def volume_ledger_discrepancy(conn: sqlite3.Connection,
+                              circuit: Optional[str] = None) -> float:
+    """SUM(events.hourly_volume_applied_litres) − SUM(hourly_volume.volume_litres);
+    ~0 when the ledger is consistent. Backs the §2.5 reconciliation test + is safe to
+    log as a diagnostic. Rounded to swallow float noise."""
+    where = "" if circuit is None else " WHERE circuit = ?"
+    args = () if circuit is None else (circuit,)
+    applied = conn.execute(
+        "SELECT COALESCE(SUM(hourly_volume_applied_litres), 0) FROM events" + where,
+        args).fetchone()[0]
+    ledger = conn.execute(
+        "SELECT COALESCE(SUM(volume_litres), 0) FROM hourly_volume" + where,
+        args).fetchone()[0]
+    return round(float(applied) - float(ledger), 3)
+
+
+def upsert_event_and_apply_hourly_volume(
+    conn: sqlite3.Connection,
+    event: dict,
+    new_effective_volume: float,
+) -> bool:
+    """Atomically upsert an event row AND keep hourly_volume in sync.
+
+    Replaces the previous two-step pattern (insert_event then update_hourly_volume)
+    which made it easy to lose idempotency on reprocessing. All work happens
+    inside a single transaction:
+
+      1. Read prior (litres, bucket) from the existing event row, if any.
+      2. UPSERT the event (preserving _EVENT_APPLIED_BOOKKEEPING_COLUMNS).
+      3. If a prior bucket existed: subtract the prior contribution from it.
+      4. Add new_effective_volume to the new bucket (derived from start_ts).
+      5. Update the event's applied-bookkeeping columns to (new_amount, new_bucket).
+
+    Returns True if the event was genuinely new (not a reprocess); the caller
+    can use this to decide whether to bump training_state counters.
+
+    `event` must contain 'id' and 'start_ts'. circuit is read from event['circuit'].
+    """
+    if "id" not in event or "start_ts" not in event or "circuit" not in event:
+        raise ValueError(
+            "upsert_event_and_apply_hourly_volume: event missing "
+            "id/start_ts/circuit"
+        )
+
+    event_id = event["id"]
+    circuit = event["circuit"]
+
+    with transaction(conn):
+        # is_new = no prior row at all (caller uses it to bump training counters).
+        is_new = conn.execute(
+            "SELECT 1 FROM events WHERE id = ?", (event_id,)).fetchone() is None
+        # UPSERT the event — preserves the applied-bookkeeping columns, so the
+        # chokepoint below reads the PRIOR applied state (to reverse it) correctly.
+        _do_event_upsert(conn, event)
+        apply_effective_volume(conn, event_id, circuit, event["start_ts"],
+                               new_effective_volume)
+
+    return is_new
+
+
+def snapshot_database(conn: sqlite3.Connection, db_path,
+                      label: str = "snapshot") -> Optional[str]:
+    """Write a consistent ``VACUUM INTO`` snapshot of the live DB beside
+    ``db_path`` — the recovery point taken before a destructive coalesce pass
+    (dev.24). Returns the snapshot path, or None when db_path is not a real
+    on-disk file (e.g. the ``:memory:`` databases used in tests) or the snapshot
+    could not be written. A failure is logged but never raised — it must not
+    block the user's recompute, and the coalesce is itself volume-preserving."""
+    try:
+        if str(db_path) in (":memory:", ""):
+            return None
+        p = Path(str(db_path))
+        if not p.exists():
+            return None
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        dest = p.with_name(f"{p.name}.{label}-{ts}")
+        conn.execute("VACUUM INTO ?", (str(dest),))
+        log.info("DB snapshot written before destructive pass: %s", dest)
+        return str(dest)
+    except Exception as e:
+        log.warning("DB snapshot failed (%s) — coalesce will still proceed "
+                    "(it is volume-preserving)", e)
+        return None
+
+
+def coalesce_low_flow_events(
+    conn: sqlite3.Connection, circuit: str, dry_run: bool = False,
+) -> Dict[str, int]:
+    """Merge adjacent low-flow sensor-chatter fragments into one event each (dev.24).
+
+    The turbine flow sensor can't hold a reading at very low flow, so a single
+    sustained low draw is chopped into many tiny events (the softener brine cycle:
+    ~17 fragments, median gap ~19 s). This is the one-time cleanup for PRE-EXISTING
+    history — the live detector's off-grace prevents new fragmentation. Only
+    UNLABELED, non-user-classified, non-degraded events that are low-flow per the
+    SHARED predicate (``event_rules.is_low_flow_chatter``) and within
+    LOWFLOW_OFF_GRACE_S of each other — with NO other event between them, so a real
+    flush/labelled use is never merged across — are grouped.
+
+    Per group the earliest event survives and absorbs the others' volume (exact
+    sum), end_ts/duration span, peak (max) and ΔP (max); avg = volume / duration.
+    Its dribble/exclusion verdict is RECOMPUTED from the aggregated volume via the
+    single-source ``_finalize_derived_verdicts`` — because ``reprocess_event_
+    exclusion_verdicts`` only ever FLAGS, never un-flags, a 17×0.4 L dribble train
+    that merges to one 6.8 L draw must be un-excluded HERE (this is what *improves*
+    slow-leak detectability: the sustained draw stops being dismissed as chatter).
+    ``flow_integral_litres`` is set to the merged volume so the later phantom
+    rescan never zeroes a real merged draw; cluster_id / matched_fixture_type /
+    matched_via are cleared so reclassify re-derives cleanly (match_rejection_
+    reason is set by the finalizer, never overloaded with a 'coalesced' marker).
+
+    hourly_volume is kept exact (reverse every member's applied contribution,
+    re-apply the survivor's total → net-zero); daily_summary is recomputed for
+    every affected day. Absorbed rows are deleted — cascading event_waveforms /
+    zone_flow_history (foreign_keys=ON), with training_capture_candidates cleaned
+    manually (no FK). Idempotent (a second run finds no adjacent low-flow pairs).
+
+    DESTRUCTIVE but volume-preserving — callers MUST snapshot the DB first
+    (``snapshot_database``) and run this only from the user-triggered recompute,
+    never silently at startup. ``dry_run=True`` returns the would-merge counts
+    without mutating. Returns {"groups": <merge groups>, "absorbed": <rows removed>}.
+    """
+    from .event_rules import LOWFLOW_OFF_GRACE_S, is_low_flow_chatter
+
+    def _ts(v):
+        if not v:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+    rows = conn.execute(
+        "SELECT id, start_ts, end_ts, volume_litres, volume_litres_effective, "
+        "       avg_flow_lpm, true_avg_flow_lpm, peak_flow_lpm, pressure_delta_psi, "
+        "       user_fixture_type, user_classified, user_ignored, degraded_supply, "
+        "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
+        "FROM events WHERE circuit = ? ORDER BY start_ts ASC",
+        (circuit,),
+    ).fetchall()
+
+    def _is_candidate(r) -> bool:
+        if r["user_fixture_type"] is not None or r["user_classified"]:
+            return False
+        if r["degraded_supply"]:
+            return False
+        peak = r["peak_flow_lpm"]
+        if peak is None:
+            return False
+        mean = r["true_avg_flow_lpm"]
+        mean = r["avg_flow_lpm"] if mean is None else mean
+        return is_low_flow_chatter(mean, peak)
+
+    # Build merge groups: maximal runs of consecutive CANDIDATE events each within
+    # grace of the previous, BROKEN by any non-candidate event in between (so a
+    # real flush / labelled use sitting between two trickles is never merged across).
+    groups = []
+    cur = []
+    for r in rows:
+        if _is_candidate(r):
+            s = _ts(r["start_ts"])
+            if cur:
+                prev_end = _ts(cur[-1]["end_ts"]) or _ts(cur[-1]["start_ts"])
+                if (s is not None and prev_end is not None
+                        and (s - prev_end).total_seconds() <= LOWFLOW_OFF_GRACE_S):
+                    cur.append(r)
+                    continue
+            if len(cur) >= 2:
+                groups.append(cur)
+            cur = [r]
+        else:
+            if len(cur) >= 2:
+                groups.append(cur)
+            cur = []
+    if len(cur) >= 2:
+        groups.append(cur)
+
+    absorbed_total = sum(len(g) - 1 for g in groups)
+    if dry_run or not groups:
+        return {"groups": len(groups), "absorbed": absorbed_total}
+
+    from .feature_extractor import _finalize_derived_verdicts
+    from .artifact_calibration import load_artifact_calibration
+    _acal = load_artifact_calibration(conn, circuit) or None  # Phase 2.4
+    affected_days = set()
+
+    with transaction(conn):
+        for g in groups:
+            survivor = g[0]
+            sid = survivor["id"]
+            s_start = _ts(survivor["start_ts"])
+            ends = [(_ts(m["end_ts"]) or _ts(m["start_ts"])) for m in g]
+            ends = [e for e in ends if e is not None]
+            end_ts = max(ends) if ends else s_start
+            duration = ((end_ts - s_start).total_seconds()
+                        if (end_ts and s_start) else 0.0)
+            total_vol = sum(float(m["volume_litres"] or 0.0) for m in g)
+            peak = max(float(m["peak_flow_lpm"] or 0.0) for m in g)
+            delta = max(float(m["pressure_delta_psi"] or 0.0) for m in g)
+            avg = (total_vol / (duration / 60.0)) if duration > 0 else 0.0
+
+            # Recompute the survivor's verdict from the AGGREGATED features (the
+            # single source of truth). Pass active-flow fields that reflect a REAL
+            # draw (flow_integral = merged volume) so it is never re-flagged phantom
+            # / cross-talk; the dribble verdict falls out of the summed volume.
+            feats = {
+                "volume_litres": total_vol, "volume_litres_estimated": None,
+                "avg_flow_lpm": avg, "peak_flow_lpm": peak,
+                "duration_seconds": duration, "pressure_delta_psi": delta,
+                "degraded_supply": 0, "user_ignored": bool(survivor["user_ignored"]),
+                "user_classified": 0, "integration_quality": "ok",
+                "true_avg_flow_lpm": avg, "flow_integral_litres": total_vol,
+                "flow_on_ratio": None, "is_composite": 0,
+            }
+            _finalize_derived_verdicts(feats, _acal)
+            new_eff = float(feats["volume_litres_effective"] or 0.0)
+
+            # (1) Reverse each ABSORBED member's applied contribution. The survivor's
+            # own prior contribution is reversed by the §2.5 chokepoint below, so it
+            # must NOT be double-reversed here.
+            for m in g[1:]:
+                applied = float(m["hourly_volume_applied_litres"] or 0.0)
+                bucket = m["hourly_volume_applied_bucket"]
+                if bucket and applied:
+                    conn.execute(
+                        "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                        "VALUES (?, ?, ?) ON CONFLICT (circuit, hour_ts) DO UPDATE "
+                        "SET volume_litres = volume_litres + excluded.volume_litres",
+                        (circuit, bucket, -applied),
+                    )
+            # (2) Rewrite the survivor row (verdict reset; match cleared). Volume +
+            # ledger go through the chokepoint right after.
+            conn.execute(
+                "UPDATE events SET end_ts = ?, duration_seconds = ?, "
+                "  volume_litres = ?, volume_litres_effective = ?, "
+                "  volume_estimation_method = ?, avg_flow_lpm = ?, "
+                "  true_avg_flow_lpm = ?, peak_flow_lpm = ?, flow_integral_litres = ?, "
+                "  pressure_delta_psi = ?, is_low_flow_dribble = ?, "
+                "  is_pressure_restoration_phantom = ?, is_cross_talk = ?, "
+                "  excluded_from_training = ?, match_rejection_reason = ?, "
+                "  cluster_id = NULL, matched_fixture_type = NULL, matched_via = NULL "
+                "WHERE id = ?",
+                (end_ts.isoformat() if end_ts else None, duration, total_vol, new_eff,
+                 feats["volume_estimation_method"], avg, avg, peak, total_vol, delta,
+                 feats["is_low_flow_dribble"], feats["is_pressure_restoration_phantom"],
+                 feats["is_cross_talk"], feats["excluded_from_training"],
+                 feats["match_rejection_reason"], sid),
+            )
+            apply_effective_volume(conn, sid, circuit, survivor["start_ts"], new_eff)
+            # (4) Delete absorbed rows (cascades waveforms / zone_flow_history).
+            for m in g[1:]:
+                conn.execute(
+                    "DELETE FROM training_capture_candidates WHERE event_id = ?",
+                    (m["id"],))
+                conn.execute("DELETE FROM events WHERE id = ?", (m["id"],))
+            for m in g:
+                d = _ts(m["start_ts"])
+                if d:
+                    affected_days.add(d.strftime("%Y-%m-%d"))
+            if end_ts:
+                affected_days.add(end_ts.strftime("%Y-%m-%d"))
+
+        for day in sorted(affected_days):
+            compute_daily_summary(conn, circuit, day)
+
+    return {"groups": len(groups), "absorbed": absorbed_total}
+
+
+def delete_events_in_range(
+    conn: sqlite3.Connection, circuit: str, from_ts: str, to_ts: str,
+) -> Dict[str, Any]:
+    """Delete the purely-machine-derived events that OVERLAP [from_ts, to_ts] on
+    ``circuit`` — reversing each one's hourly_volume contribution and recomputing
+    the affected daily summaries — so a range can be cleanly RE-IMPORTED from HA
+    history without orphaned bookkeeping (the remedy for a garbled stored event,
+    e.g. an irrigation run that failed to close and absorbed a whole day).
+
+    Selection is INTERVAL-OVERLAP, not start-in-window: an event counts if its
+    ``[start_ts, end_ts]`` intersects the window (``start_ts <= to_ts AND
+    COALESCE(end_ts, start_ts) >= from_ts``). This is essential — the garbled
+    27.6 h event the tool exists for *starts before* a single-day window yet spans
+    it; a start-only filter would miss it (and leave it blocking the re-import).
+    A NULL ``end_ts`` collapses to start-only, so a never-closed row is still only
+    caught when its start is in-window (live/active events are excluded upstream by
+    the write-lock guard).
+
+    PRESERVES anything the user has touched: a row with a ``user_fixture_type``,
+    OR ``user_classified``, OR ``user_ignored`` is SKIPPED — labels/intent (e.g. a
+    manually marked cross-talk event) must never be lost; the re-import's
+    overlap-dedup simply works around the kept rows. Reuses the coalesce
+    reverse-hourly + cascade-delete pattern: deleting an event cascades
+    event_waveforms / zone_flow_history (foreign_keys=ON); training_capture_
+    candidates (no FK) is cleaned manually. Single transaction.
+
+    Returns ``{"deleted": n, "span_start": <earliest start ISO or None>,
+    "span_end": <latest end ISO or None>}`` — the caller uses the true deleted span
+    to widen the re-import so an event extending beyond the window is fully rebuilt.
+    """
+    rows = conn.execute(
+        "SELECT id, start_ts, end_ts, hourly_volume_applied_litres, "
+        "       hourly_volume_applied_bucket "
+        "FROM events "
+        "WHERE circuit = ? AND start_ts <= ? "
+        "  AND COALESCE(end_ts, start_ts) >= ? "
+        "  AND user_fixture_type IS NULL "
+        "  AND COALESCE(user_classified, 0) = 0 "
+        "  AND COALESCE(user_ignored, 0) = 0 "
+        "ORDER BY start_ts ASC",
+        (circuit, to_ts, from_ts),
+    ).fetchall()
+    if not rows:
+        return {"deleted": 0, "span_start": None, "span_end": None}
+    span_start = rows[0]["start_ts"]                       # earliest (ORDER BY ASC)
+    span_end = max((r["end_ts"] or r["start_ts"]) for r in rows)
+    affected_days = set()
+    with transaction(conn):
+        for r in rows:
+            applied = float(r["hourly_volume_applied_litres"] or 0.0)
+            bucket = r["hourly_volume_applied_bucket"]
+            if bucket and applied:
+                conn.execute(
+                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                    "VALUES (?, ?, ?) ON CONFLICT (circuit, hour_ts) DO UPDATE "
+                    "SET volume_litres = volume_litres + excluded.volume_litres",
+                    (circuit, bucket, -applied),
+                )
+            conn.execute(
+                "DELETE FROM training_capture_candidates WHERE event_id = ?",
+                (r["id"],))
+            conn.execute("DELETE FROM events WHERE id = ?", (r["id"],))
+            d = (r["start_ts"] or "")[:10]
+            if d:
+                affected_days.add(d)
+        for day in sorted(affected_days):
+            # compute_daily_summary returns None (and leaves any prior row
+            # untouched) when a day has no events left — so a day emptied by the
+            # delete keeps a STALE inflated summary. Drop that row explicitly;
+            # the re-import repopulates it, or it correctly stays absent.
+            if compute_daily_summary(conn, circuit, day) is None:
+                conn.execute(
+                    "DELETE FROM daily_summary WHERE circuit = ? AND day = ?",
+                    (circuit, day))
+    return {"deleted": len(rows), "span_start": span_start, "span_end": span_end}
 
 
 def get_daily_volume(conn: sqlite3.Connection, circuit: str,
@@ -1188,15 +2257,19 @@ def _get_volume_baseline(
     ).fetchone()
 
     if row is None:
-        # No baseline yet — store 0.0 as placeholder.
-        # The orchestrator's _init_volume_baselines() will overwrite this
-        # with the real midnight reading from HA history shortly after startup.
+        # No baseline yet — seed with the CURRENT reading, NOT 0.0.
+        # A 0.0 baseline makes the period total (= current − baseline) balloon
+        # to the entire cumulative meter reading (the dashboard "today shows
+        # 1000 gal" bug). Seeding with the current value caps the worst case at
+        # ~0 for a just-started period; the orchestrator's midnight rollover
+        # (_init_volume_baselines) then force-overwrites this with the accurate
+        # midnight reading from HA history.
         conn.execute(
             "INSERT INTO volume_snapshots (circuit, period_ts, ha_volume) VALUES (?,?,?)",
-            (circuit, period_ts, 0.0),
+            (circuit, period_ts, current_ha_value),
         )
         conn.commit()
-        return 0.0
+        return current_ha_value
 
     baseline = row[0]
     if current_ha_value < baseline:
@@ -1307,22 +2380,51 @@ def patch_event(
     *,
     user_fixture_type=_PATCH_UNSET,
     excluded_from_training=_PATCH_UNSET,
+    user_ignored=_PATCH_UNSET,
 ) -> bool:
     """Update user-editable fields on a single event.
 
     Pass a value (including None) to update that field; omit a kwarg entirely
     to leave the field unchanged.  Returns False if no matching row exists.
+
+    Sprint H: ``user_ignored`` is the Ignore/Restore intent. Setting it also
+    re-derives ``excluded_from_training`` (= user_ignored OR any auto/manual
+    category flag) so the effective exclusion stays consistent. The legacy
+    ``excluded_from_training`` kwarg is still accepted for back-compat but
+    callers should prefer ``user_ignored``.
     """
     row = conn.execute(
-        "SELECT id FROM events WHERE id = ? AND circuit = ?",
+        "SELECT id, is_pressure_restoration_phantom, degraded_supply, "
+        "       is_low_flow_dribble "
+        "FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit),
     ).fetchone()
     if row is None:
         return False
     if user_fixture_type is not _PATCH_UNSET:
+        # Stamp provenance: an explicit label is 'user'; clearing resets to NULL
+        # (so a relabel always overrides an auto 'cycle'/'training' source).
+        src = "user" if user_fixture_type else None
+        # dev.24: an explicit relabel pulls the event OUT of any machine/cycle
+        # rollup group (clear cycle_group_id). For a cycle appliance the caller
+        # then runs propagate_cycle_label, which re-stamps the anchor + mates; a
+        # non-cycle relabel just stays a singleton. This is what makes a
+        # user-relabeled member "leave the group" (§7).
         conn.execute(
-            "UPDATE events SET user_fixture_type = ? WHERE id = ? AND circuit = ?",
-            (user_fixture_type, event_id, circuit),
+            "UPDATE events SET user_fixture_type = ?, fixture_label_source = ?, "
+            "cycle_group_id = NULL "
+            "WHERE id = ? AND circuit = ?",
+            (user_fixture_type, src, event_id, circuit),
+        )
+    if user_ignored is not _PATCH_UNSET:
+        ign = 1 if user_ignored else 0
+        excluded = 1 if (ign or row["is_pressure_restoration_phantom"]
+                         or row["degraded_supply"]
+                         or row["is_low_flow_dribble"]) else 0
+        conn.execute(
+            "UPDATE events SET user_ignored = ?, excluded_from_training = ? "
+            "WHERE id = ? AND circuit = ?",
+            (ign, excluded, event_id, circuit),
         )
     if excluded_from_training is not _PATCH_UNSET:
         conn.execute(
@@ -1331,6 +2433,201 @@ def patch_event(
         )
     conn.commit()
     return True
+
+
+def _apply_event_verdicts(
+    conn: sqlite3.Connection,
+    event_id: str,
+    circuit: str,
+    *,
+    new_phantom: int,
+    new_degraded: int,
+    user_classified: int,
+    new_dribble: int = 0,
+    new_cross_talk: int = 0,
+) -> bool:
+    """Shared core: write category flags + user_classified, re-derive
+    volume_litres_effective (phantom → 0; elif cross-talk → 0; elif degraded →
+    envelope estimate; elif dribble → 0; else raw), recompute
+    excluded_from_training, and resync hourly_volume + daily_summary.
+
+    Volume resync is idempotent: it reads the event's stored
+    ``hourly_volume_applied_litres`` (the prior contribution), applies
+    ``delta = new_effective − prev_applied`` to the hour bucket, then writes
+    back ``hourly_volume_applied_litres = new_effective``. Repeated toggles
+    therefore never drift. Returns False if no such event.
+    """
+    row = conn.execute(
+        "SELECT volume_litres, volume_litres_estimated, user_ignored, "
+        "       hourly_volume_applied_litres, hourly_volume_applied_bucket, start_ts "
+        "FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if row is None:
+        return False
+
+    raw = float(row["volume_litres"] or 0.0)
+    est = row["volume_litres_estimated"]
+    if new_phantom:
+        new_effective, method = 0.0, "pressure_restoration_phantom"
+    elif new_cross_talk:
+        new_effective, method = 0.0, "cross_talk"
+    elif new_degraded:
+        new_effective = float(est) if est is not None else raw
+        method = "pulsing_supply_envelope"
+    elif new_dribble:
+        # Dribble is now a volume-zeroing verdict (matches _finalize_derived_verdicts):
+        # a brief low-flow blip is removed from totals, not just excluded from training.
+        new_effective, method = 0.0, "low_flow_dribble"
+    else:
+        new_effective, method = raw, "raw"
+
+    user_ignored = int(row["user_ignored"] or 0)
+    excluded = 1 if (new_phantom or new_cross_talk or new_degraded
+                     or new_dribble or user_ignored) else 0
+    reason = (
+        "pressure_restoration_phantom" if new_phantom
+        else "cross_talk" if new_cross_talk
+        else "pulsing_supply" if new_degraded
+        else "low_flow_dribble" if new_dribble
+        else None
+    )
+
+    with transaction(conn):
+        conn.execute(
+            "UPDATE events SET "
+            "  is_pressure_restoration_phantom = ?, is_cross_talk = ?, "
+            "  degraded_supply = ?, "
+            "  user_classified = ?, is_low_flow_dribble = ?, "
+            "  volume_litres_effective = ?, volume_estimation_method = ?, "
+            "  excluded_from_training = ?, match_rejection_reason = ? "
+            "WHERE id = ? AND circuit = ?",
+            (new_phantom, new_cross_talk, new_degraded, user_classified, new_dribble,
+             round(new_effective, 3), method, excluded, reason,
+             event_id, circuit),
+        )
+        # §2.5 — the ledger reverse/apply/bookkeep goes through the one chokepoint.
+        apply_effective_volume(conn, event_id, circuit, row["start_ts"], new_effective)
+
+    day = (row["start_ts"] or "")[:10]
+    if day:
+        compute_daily_summary(conn, circuit, day)
+        conn.commit()
+    return True
+
+
+def classify_action(cls: dict):
+    """Pure dispatch for a PATCH ``classification`` payload (Sprint H.1).
+
+    Returns one of:
+      ("reset", {})                          — reset to automatic
+      ("set",   {phantom, supply_pressure})  — authoritative manual set
+      ("error", {"msg": ...})                — invalid → caller 400s
+
+    ``reset: true`` is EXCLUSIVE — combining it with any category flag is
+    rejected rather than silently picking one behaviour. Pure (no DB, no
+    request object) so it is unit-testable without the FastAPI stack; lives
+    here in database.py alongside set_/clear_event_classification for that
+    reason (routers/history.py imports fastapi, which the test env lacks).
+
+    'combined' is deprecated (2026-06-04): it is accepted but ignored, so old
+    clients don't 400; combined usage is classified as the dominant fixture.
+    """
+    cls = cls or {}
+    flags = {
+        "phantom":         bool(cls.get("phantom")),
+        "supply_pressure": bool(cls.get("supply_pressure")),
+        "dribble":         bool(cls.get("dribble")),
+        "cross_talk":      bool(cls.get("cross_talk")),
+    }
+    if cls.get("reset") is True:
+        if any(flags.values()):
+            return ("error", {"msg": "reset cannot be combined with category flags"})
+        return ("reset", {})
+    return ("set", flags)
+
+
+def set_event_classification(
+    conn: sqlite3.Connection,
+    event_id: str,
+    circuit: str,
+    *,
+    phantom: bool,
+    supply_pressure: bool,
+    dribble: bool = False,
+    cross_talk: bool = False,
+) -> bool:
+    """Apply a user's manual event classification (Sprint H, authoritative).
+
+    ALWAYS sets ``user_classified=1`` — including the all-three-false case,
+    which means "manually marked normal" and **sticks** (the
+    ``_finalize_derived_verdicts`` skip on user_classified prevents auto from
+    re-flagging it; this is what makes un-marking a phantom permanent). Use
+    ``clear_event_classification`` to return an event to automatic detection.
+
+    Returns False if no such event.
+    """
+    return _apply_event_verdicts(
+        conn, event_id, circuit,
+        new_phantom=1 if phantom else 0,
+        new_degraded=1 if supply_pressure else 0,
+        new_dribble=1 if dribble else 0,
+        new_cross_talk=1 if cross_talk else 0,
+        user_classified=1,
+    )
+
+
+def clear_event_classification(
+    conn: sqlite3.Connection,
+    event_id: str,
+    circuit: str,
+) -> bool:
+    """Reset an event to AUTOMATIC classification (Sprint H.1).
+
+    Clears ``user_classified`` and re-derives the phantom verdict from the
+    stored duration/pressure via ``_detect_pressure_restoration_phantom``.
+    degraded/composite keep their stored values (the raw readings needed to
+    recompute them aren't persisted). Volume + summaries resync. Returns
+    False if no such event.
+    """
+    from .feature_extractor import (
+        _detect_pressure_restoration_phantom, _detect_low_flow_dribble,
+    )
+    from .artifact_calibration import load_artifact_calibration
+
+    row = conn.execute(
+        "SELECT duration_seconds, pressure_delta_psi, degraded_supply, "
+        "       volume_litres, avg_flow_lpm, true_avg_flow_lpm, "
+        "       flow_integral_litres, flow_on_ratio "
+        "FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if row is None:
+        return False
+    # Apply the frozen per-home artifact calibration so a manual reset re-derives
+    # the SAME verdict the live finalizer would (Phase 2.4 consistency).
+    _acal = load_artifact_calibration(conn, circuit) or None
+    new_phantom = 1 if _detect_pressure_restoration_phantom(
+        row["duration_seconds"], row["pressure_delta_psi"],
+        true_avg_flow_lpm=row["true_avg_flow_lpm"],
+        flow_integral_litres=row["flow_integral_litres"],
+        flow_on_ratio=row["flow_on_ratio"], calib=_acal) else 0
+    new_degraded = int(row["degraded_supply"] or 0)
+    # Dribble only when not phantom and not degraded (mirrors the finalizer).
+    new_dribble = 1 if (
+        not new_phantom and not new_degraded
+        and _detect_low_flow_dribble(
+            row["volume_litres"], row["avg_flow_lpm"], row["pressure_delta_psi"],
+            calib=_acal,
+            min_flow_lpm=(60.0 / get_circuit_pulses_per_litre(conn, circuit)))
+    ) else 0
+    return _apply_event_verdicts(
+        conn, event_id, circuit,
+        new_phantom=new_phantom,
+        new_degraded=new_degraded,
+        user_classified=0,
+        new_dribble=new_dribble,
+    )
 
 
 def get_leak_test_schedule(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
@@ -1470,6 +2767,51 @@ def get_last_event_ts(conn: sqlite3.Connection, circuit: str) -> Optional[str]:
         "SELECT MAX(start_ts) FROM events WHERE circuit = ?", (circuit,)
     ).fetchone()
     return row[0] if row and row[0] else None
+
+
+def get_event_cadence_seconds(
+    conn: sqlite3.Connection,
+    circuit: str,
+    *,
+    since_iso: Optional[str] = None,
+    lookback_days: int = 60,
+    max_events: int = 50,
+    min_gaps: int = 2,
+) -> Optional[float]:
+    """Median gap (seconds) between consecutive real events for a circuit.
+
+    This is the UNCAPPED inter-event interval, unlike the stored
+    ``events.seconds_since_prev_event`` column (capped at the sequence-gap
+    limit, so it only ever measures within-burst gaps). Filters
+    ``excluded_from_training = 0`` so it reflects the same event population that
+    drives ``events_collected``. The window floor is the later of
+    ``now - lookback_days`` and ``since_iso``, so a circuit still calibrating
+    measures its CALIBRATION-period cadence and never pulls in pre-install /
+    historical-import bursts.
+
+    Returns ``None`` when fewer than ``min_gaps + 1`` qualifying events exist;
+    callers apply an explicit fallback in that case.
+    """
+    floor_iso = (datetime.now(timezone.utc)
+                 - timedelta(days=lookback_days)).isoformat()
+    if since_iso and since_iso > floor_iso:
+        floor_iso = since_iso
+    rows = conn.execute(
+        """SELECT CAST(strftime('%s', start_ts) AS INTEGER) AS ts_epoch
+             FROM events
+            WHERE circuit = ?
+              AND start_ts IS NOT NULL
+              AND COALESCE(excluded_from_training, 0) = 0
+              AND start_ts >= ?
+            ORDER BY start_ts DESC
+            LIMIT ?""",
+        (circuit, floor_iso, max_events),
+    ).fetchall()
+    epochs = sorted(r["ts_epoch"] for r in rows if r["ts_epoch"] is not None)
+    gaps = [b - a for a, b in zip(epochs, epochs[1:]) if b > a]
+    if len(gaps) < min_gaps:
+        return None
+    return float(median(gaps))
 
 
 def find_overlapping_event(
@@ -2062,6 +3404,2253 @@ def merge_clusters(
         "events_relinked": events_relinked,
         "fixtures_removed": len(fixture_ids),
         "survivor_member_count": total_n,
+    }
+
+
+# ============================================================================
+# Sprint A — orphan repair
+#
+# Three classes of cluster/fixture FK inconsistency that can leak in over a
+# product lifetime:
+#
+#   1. events.cluster_id → fixture_clusters(circuit,id) where the cluster row
+#      no longer exists (cluster was deleted/merged without cleaning up event
+#      references). Symptom in the field: events show "Cluster 26" on the
+#      History page but cluster 26 is missing from the Fixtures page.
+#
+#   2. fixtures.confirmed=1 but no fixture_clusters row has fixture_id
+#      pointing at this fixture. Symptom: a "★ Toilet" pill on history
+#      events, but the Toilet fixture is invisible on the Fixtures page and
+#      future toilet-shaped events have no cluster to land in.
+#
+#   3. fixture_clusters.fixture_id → fixtures(id) where the fixtures row no
+#      longer exists. The ON DELETE SET NULL FK should prevent this if
+#      PRAGMA foreign_keys was on when the fixture was deleted — but it
+#      isn't always (per-connection setting; old code paths may have
+#      committed without it).
+#
+# The repair is conservative: never delete user-confirmed fixtures, never
+# delete events. Class 1 nulls the event's stale cluster_id so the next
+# backfill pass can re-cluster it. Class 2 flags the fixture with
+# cluster_backfill_needed=1 so the UI shows a relink affordance. Class 3
+# nulls the cluster's dangling fixture_id (matches the FK's ON DELETE
+# SET NULL semantics retroactively).
+# ============================================================================
+
+def find_orphaned_cluster_references(
+    conn: sqlite3.Connection, *, repair: bool = False
+) -> Dict[str, int]:
+    """Detect (and optionally repair) cluster/fixture FK inconsistencies.
+
+    Returns a dict with three counts:
+
+      - events_orphaned: events.cluster_id pointing to a missing cluster
+      - fixtures_unbacked: fixtures.confirmed=1 with no cluster pointing back
+      - clusters_dangling: fixture_clusters.fixture_id pointing to a missing
+        fixture
+
+    With ``repair=False`` (default) the function only counts — used by the
+    orchestrator's startup integrity check (logs non-zero counts; never
+    mutates the DB at boot to avoid surprising side effects).
+
+    With ``repair=True`` the function applies the fixes described in the
+    module-section comment above and commits. Idempotent: running twice
+    yields zero on the second call.
+    """
+    counts: Dict[str, int] = {
+        "events_orphaned": 0,
+        "fixtures_unbacked": 0,
+        "clusters_dangling": 0,
+    }
+
+    # Class 1: events with stale cluster_id.
+    # Composite key match — cluster_id alone isn't unique across circuits.
+    orphan_events = conn.execute(
+        """SELECT e.id FROM events e
+           WHERE e.cluster_id IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM fixture_clusters fc
+               WHERE fc.circuit = e.circuit AND fc.id = e.cluster_id
+             )"""
+    ).fetchall()
+    counts["events_orphaned"] = len(orphan_events)
+
+    # Class 2: fixtures confirmed but unbacked AND not yet flagged.
+    #
+    # confirmed=1 only — unconfirmed fixtures aren't expected to have a
+    # cluster yet (they could exist transiently during cluster creation).
+    #
+    # The extra ``cluster_backfill_needed = 0`` filter makes detection
+    # match what repair actually changes (the flag), so the function is
+    # truly idempotent: once flagged, the fixture is "managed" — awaiting
+    # user action via the Fixtures page relink banner — and the integrity
+    # check stops re-reporting it on every boot. A genuine *new* orphan
+    # appearing after migration (e.g. a bug deleted the wrong cluster
+    # row) will still be detected because it won't have the flag set yet.
+    unbacked_fixtures = conn.execute(
+        """SELECT f.id FROM fixtures f
+           WHERE f.confirmed = 1
+             AND COALESCE(f.cluster_backfill_needed, 0) = 0
+             AND NOT EXISTS (
+               SELECT 1 FROM fixture_clusters fc
+               WHERE fc.fixture_id = f.id
+             )"""
+    ).fetchall()
+    counts["fixtures_unbacked"] = len(unbacked_fixtures)
+
+    # Class 3: clusters with dangling fixture_id.
+    dangling_clusters = conn.execute(
+        """SELECT fc.circuit, fc.id FROM fixture_clusters fc
+           WHERE fc.fixture_id IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM fixtures f WHERE f.id = fc.fixture_id
+             )"""
+    ).fetchall()
+    counts["clusters_dangling"] = len(dangling_clusters)
+
+    if not repair:
+        return counts
+
+    # Repair pass — single transaction so a mid-repair crash doesn't leave
+    # half-fixed state.
+    try:
+        if orphan_events:
+            ev_ids = [r["id"] for r in orphan_events]
+            ph = ",".join(["?"] * len(ev_ids))
+            conn.execute(
+                f"UPDATE events SET cluster_id = NULL, "
+                f"match_level = 'unmatched', "
+                f"match_rejection_reason = 'orphan_cluster_repair' "
+                f"WHERE id IN ({ph})",
+                tuple(ev_ids),
+            )
+
+        if unbacked_fixtures:
+            fx_ids = [r["id"] for r in unbacked_fixtures]
+            ph = ",".join(["?"] * len(fx_ids))
+            conn.execute(
+                f"UPDATE fixtures SET cluster_backfill_needed = 1 "
+                f"WHERE id IN ({ph})",
+                tuple(fx_ids),
+            )
+
+        if dangling_clusters:
+            # Composite key — iterate row-wise rather than build a huge IN
+            # clause; counts here are typically small (single-digit).
+            for r in dangling_clusters:
+                conn.execute(
+                    "UPDATE fixture_clusters SET fixture_id = NULL "
+                    "WHERE circuit = ? AND id = ?",
+                    (r["circuit"], r["id"]),
+                )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return counts
+
+
+def get_orphaned_fixtures(
+    conn: sqlite3.Connection, circuit: str,
+) -> List[Dict[str, Any]]:
+    """Return fixtures on this circuit flagged for cluster backfill.
+
+    Used by the Fixtures-page route to render the relink banner. Each row
+    has the fields the template needs (id, name, fixture_type) plus the
+    raw flag so the banner is only shown when actually needed.
+    """
+    rows = conn.execute(
+        """SELECT id, name, display_name, fixture_type,
+                  cluster_backfill_needed
+           FROM fixtures
+           WHERE circuit = ? AND confirmed = 1
+             AND cluster_backfill_needed = 1
+           ORDER BY name, id""",
+        (circuit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ============================================================================
+# Sprint B — propagate per-event labels into cluster.suggested_type
+#
+# When the user labels an event "★ Toilet" on the History page, the row update
+# in events.user_fixture_type is by itself cosmetic — only the History page
+# renders the pill. The recompute helper below closes the loop: it looks at
+# every labelled event on the cluster, takes a majority vote, and pushes the
+# winning type into the cluster row with suggestion_source='user_labels'.
+#
+# Soft-hints model: this never silently links a cluster to a fixture.
+# upsert_fixture_from_cluster (the route the Fixtures-page Confirm button
+# calls) is still the only path that sets fixture_clusters.fixture_id. The
+# helper just makes that confirmation one click away by pre-filling the
+# suggestion.
+#
+# Edge cases handled explicitly:
+#   - No labels yet → leave heuristic suggestion alone, return None
+#   - Mixed labels → majority wins; ties broken by alphabetical type
+#   - All labels removed by user → reset suggestion to NULL so the next
+#     heuristic pass (every 10 events) can repopulate
+# ============================================================================
+
+# dev.22 — cluster-suggestion gate. A mixed cluster must ABSTAIN rather than
+# broadcast its (possibly training-inflated) plurality to every unlabelled member.
+_SUGGEST_MIN_MEMBERS: int = 3       # cluster needs >=3 labelled events to define a type
+_SUGGEST_MIN_SHARE: float = 0.65    # weighted winner must hold a clear majority
+_SUGGEST_MIN_WINNER_RAW: int = 3    # the winning type needs >=3 raw labels of its own
+
+
+def _knn_usable_label_counts(conn: sqlite3.Connection, circuit: str) -> Dict[str, int]:
+    """Per-type count of kNN-usable labels on a circuit — the inverse-frequency
+    denominator for the class-balanced cluster vote (precompute once, reuse)."""
+    return {r[0]: int(r[1]) for r in conn.execute(
+        "SELECT user_fixture_type, COUNT(*) FROM events "
+        "WHERE circuit = ? AND user_fixture_type IS NOT NULL "
+        "  AND COALESCE(excluded_from_training, 0) = 0 "
+        "GROUP BY user_fixture_type", (circuit,)).fetchall()}
+
+
+def recompute_cluster_suggestion_from_user_labels(
+    conn: sqlite3.Connection,
+    circuit: str,
+    cluster_id: int,
+    global_counts: Optional[Dict[str, int]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Recompute a cluster's suggested_type from majority vote of user
+    labels on its member events.
+
+    Returns a dict ``{suggested_type, suggested_confidence,
+    suggestion_source, labelled_member_count, total_label_count}`` when
+    the cluster row was updated (or reset). Returns ``None`` when there
+    are no labels yet AND no prior user-labels suggestion is in place
+    (so the cluster row is untouched and the heuristic suggestion, if
+    any, stays valid).
+    """
+    # One row per labelled non-excluded member; MIN(capture_id) dedups the
+    # training_capture_candidates fan-out so each event is counted exactly once.
+    detail = conn.execute(
+        "SELECT e.id AS eid, e.user_fixture_type AS t, MIN(tcc.capture_id) AS cap "
+        "FROM events e "
+        "LEFT JOIN training_capture_candidates tcc ON tcc.event_id = e.id "
+        "WHERE e.circuit = ? AND e.cluster_id = ? "
+        "  AND e.user_fixture_type IS NOT NULL "
+        "  AND COALESCE(e.excluded_from_training, 0) = 0 "
+        "GROUP BY e.id, e.user_fixture_type",
+        (circuit, cluster_id),
+    ).fetchall()
+
+    if not detail:
+        # No labels on this cluster's events. If the current suggestion
+        # is from user labels (i.e. the user just *removed* every label),
+        # reset back to NULL so the heuristic pass can pick a fresh
+        # value next time it runs. Otherwise leave the row alone.
+        cur = conn.execute(
+            "SELECT suggestion_source FROM fixture_clusters "
+            "WHERE circuit = ? AND id = ?",
+            (circuit, cluster_id),
+        ).fetchone()
+        if cur and cur["suggestion_source"] == "user_labels":
+            conn.execute(
+                "UPDATE fixture_clusters SET "
+                "  suggested_type = NULL, "
+                "  suggested_confidence = 0, "
+                "  suggestion_source = NULL "
+                "WHERE circuit = ? AND id = ?",
+                (circuit, cluster_id),
+            )
+            conn.commit()
+            return {
+                "suggested_type": None,
+                "suggested_confidence": 0.0,
+                "suggestion_source": None,
+                "labelled_member_count": 0,
+                "total_label_count": 0,
+            }
+        return None
+
+    # Class-balanced, capture-collapsed weighted vote (dev.22). Each labelled
+    # member is weighted 1/global_count[type]; events sharing a training capture
+    # collapse to a single vote so one windowed capture can't manufacture a
+    # plurality. global_counts is passed in by the bulk caller (computed once).
+    if global_counts is None:
+        global_counts = _knn_usable_label_counts(conn, circuit)
+
+    raw_counts: Dict[str, int] = {}
+    vote_keys: Dict[str, set] = {}
+    for d in detail:
+        t = d["t"]
+        raw_counts[t] = raw_counts.get(t, 0) + 1
+        key = ("cap", d["cap"]) if d["cap"] is not None else ("ev", d["eid"])
+        vote_keys.setdefault(t, set()).add(key)
+    total_raw = sum(raw_counts.values())
+
+    weighted = {t: len(keys) / max(1, global_counts.get(t, 0))
+                for t, keys in vote_keys.items()}
+    # Winner = max weighted vote; deterministic alphabetical tie-break. EVERY gate
+    # below tests this same weighted winner (not the raw plurality).
+    winner_type = sorted(weighted.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    total_w = sum(weighted.values())
+    share = weighted[winner_type] / total_w if total_w > 0 else 0.0
+    winner_raw = raw_counts.get(winner_type, 0)
+
+    # Suggest the winner only if it clears all three gates; else ABSTAIN with a
+    # NULL type but source 'user_labels' (so the heuristic pass won't repopulate).
+    suggest = (winner_type != "other"
+               and total_raw >= _SUGGEST_MIN_MEMBERS
+               and share >= _SUGGEST_MIN_SHARE
+               and winner_raw >= _SUGGEST_MIN_WINNER_RAW)
+    new_type = winner_type if suggest else None
+
+    conn.execute(
+        "UPDATE fixture_clusters SET "
+        "  suggested_type = ?, "
+        "  suggested_confidence = ?, "
+        "  suggestion_source = 'user_labels' "
+        "WHERE circuit = ? AND id = ?",
+        (new_type, share, circuit, cluster_id),
+    )
+    conn.commit()
+    return {
+        "suggested_type": new_type,
+        "suggested_confidence": share,
+        "suggestion_source": "user_labels",
+        "labelled_member_count": winner_raw,
+        "total_label_count": total_raw,
+        "abstained": not suggest,
+    }
+
+
+def recompute_all_user_label_suggestions(
+    conn: sqlite3.Connection, circuit: str
+) -> Dict[str, int]:
+    """Re-run the gated user-label suggestion across every cluster that has user
+    labels (or a stale 'user_labels' suggestion). Computes the global class balance
+    ONCE and passes it into each cluster — O(clusters), not O(clusters x corpus).
+
+    This is the ONLY path that un-poisons a cluster whose suggestion was set under
+    the pre-dev.22 ungated plurality vote (``resuggest_all_clusters`` deliberately
+    skips 'user_labels' clusters). Returns ``{clusters, suggested, abstained,
+    cleared}`` (cleared = a prior non-NULL suggestion now abstained)."""
+    global_counts = _knn_usable_label_counts(conn, circuit)
+    cluster_ids = [r[0] for r in conn.execute(
+        "SELECT fc.id FROM fixture_clusters fc "
+        "WHERE fc.circuit = ? AND ("
+        "  fc.suggestion_source = 'user_labels' "
+        "  OR EXISTS (SELECT 1 FROM events e WHERE e.circuit = fc.circuit "
+        "             AND e.cluster_id = fc.id AND e.user_fixture_type IS NOT NULL "
+        "             AND COALESCE(e.excluded_from_training, 0) = 0))",
+        (circuit,)).fetchall()]
+    suggested = abstained = cleared = 0
+    for cid in cluster_ids:
+        prev = conn.execute(
+            "SELECT suggested_type FROM fixture_clusters WHERE circuit = ? AND id = ?",
+            (circuit, cid)).fetchone()
+        prev_type = prev["suggested_type"] if prev else None
+        res = recompute_cluster_suggestion_from_user_labels(
+            conn, circuit, int(cid), global_counts=global_counts)
+        new_type = res.get("suggested_type") if res else None
+        if new_type:
+            suggested += 1
+        else:
+            abstained += 1
+            if prev_type is not None:
+                cleared += 1
+    log.info("[%s] user-label resuggest: %d clusters, %d suggested, %d abstained, "
+             "%d cleared", circuit, len(cluster_ids), suggested, abstained, cleared)
+    return {"clusters": len(cluster_ids), "suggested": suggested,
+            "abstained": abstained, "cleared": cleared}
+
+
+def relink_fixture_to_cluster(
+    conn: sqlite3.Connection,
+    circuit: str,
+    fixture_id: str,
+    cluster_id: int,
+) -> None:
+    """Attach an orphaned fixture to a chosen cluster.
+
+    Validates that the fixture exists on this circuit, the cluster exists
+    on this circuit, and the cluster isn't already linked to a different
+    fixture (which would silently steal it). Atomically updates the
+    cluster's ``fixture_id`` and clears the fixture's
+    ``cluster_backfill_needed`` flag. Raises ``ValueError`` with a precise
+    message if any precondition fails, having written nothing.
+    """
+    fx = conn.execute(
+        "SELECT id FROM fixtures WHERE id = ? AND circuit = ?",
+        (fixture_id, circuit),
+    ).fetchone()
+    if not fx:
+        raise ValueError(
+            f"fixture {fixture_id!r} not found on circuit {circuit!r}"
+        )
+
+    cl = conn.execute(
+        "SELECT id, fixture_id FROM fixture_clusters "
+        "WHERE circuit = ? AND id = ?",
+        (circuit, cluster_id),
+    ).fetchone()
+    if not cl:
+        raise ValueError(
+            f"cluster {cluster_id} not found on circuit {circuit!r}"
+        )
+
+    existing = cl["fixture_id"]
+    if existing and existing != fixture_id:
+        raise ValueError(
+            f"cluster {cluster_id} is already linked to fixture "
+            f"{existing!r} — pick a different cluster"
+        )
+
+    try:
+        conn.execute(
+            "UPDATE fixture_clusters SET fixture_id = ? "
+            "WHERE circuit = ? AND id = ?",
+            (fixture_id, circuit, cluster_id),
+        )
+        conn.execute(
+            "UPDATE fixtures SET cluster_backfill_needed = 0 "
+            "WHERE id = ?",
+            (fixture_id,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# ============================================================================
+# Sprint C — fixture_type_signatures matcher
+#
+# Per-(circuit, fixture_type) centroid built from user-labelled events. The
+# matcher runs as a second-chance pass after cluster matching: if the cluster
+# matcher rejected the event (no_centers / features_missing) OR matched it
+# only at low confidence, we still want a user-facing label when the event's
+# features sit close to a fixture type the user has been training.
+#
+# The signature centroid is a simple per-feature arithmetic mean over the
+# labelled events' raw feature values (the cluster_engine's StandardScaler
+# is per-circuit and not stable across boots, so we deliberately avoid it
+# here — raw-feature Euclidean is good enough for the small feature subset
+# the matcher considers, and stays interpretable across restarts).
+#
+# The feature subset used for matching is conservative: the same first-rank
+# scalar features the cluster centroid heuristic already keys on (volume,
+# duration, flow, pressure delta). Signature shape vectors are NOT used —
+# they'd dominate the distance arithmetic and the user-labelled corpus is
+# typically too small to learn a meaningful shape centroid.
+# ============================================================================
+
+# Features the signature matcher uses. Kept small + interpretable; matches
+# the cluster_engine's first-rank features so the two centroids are
+# comparable. Update both at once if this list changes.
+_SIGNATURE_MATCH_FEATURES: tuple = (
+    "avg_flow_lpm",
+    "peak_flow_lpm",
+    "duration_seconds",
+    "volume_litres",
+    "pressure_delta_psi",
+    "steady_state_fraction",
+)
+
+# Signature matcher distance threshold — Euclidean over the feature subset
+# above. Heuristic value picked so a clear toilet-shaped event (3 gal, 60s,
+# ~2 lpm, ~5 psi drop) doesn't accidentally match a washing-machine
+# signature (~6 gal, ~3 min, ~2 lpm, ~6 psi). Compared after subtracting
+# centroid means and dividing each feature by its rough scale below.
+_SIGNATURE_MATCH_THRESHOLD: float = 1.5
+_SIGNATURE_MATCH_SCALES: dict = {
+    "avg_flow_lpm":           2.0,    # 0.5–5 gal/min typical range
+    "peak_flow_lpm":          3.0,
+    "duration_seconds":     120.0,    # 30s – several min
+    "volume_litres":         10.0,
+    "pressure_delta_psi":     5.0,
+    "steady_state_fraction":  0.5,
+}
+
+# ── Label-trained k-NN matcher (2026-05-31) ─────────────────────────────────
+# The mean-centroid matcher above scored ~70% leave-one-out on the May-2026
+# labelled archive; a weighted k-NN over the labelled events themselves scored
+# ~80% (and stays in sync with labels — no stale centroid). The k-NN is the
+# production path (live classify + backfill); the mean-centroid is retained for
+# the Signatures UI display and back-compat tests.
+#
+# Right-skewed features are log1p-compressed so the centroid + Euclidean
+# distance behave on log-normal data. The transform is applied identically to
+# the query event AND every labelled neighbour at query time, so train/serve
+# are consistent by construction (nothing log-space is persisted).
+_SIGNATURE_LOG_FEATURES: frozenset = frozenset({
+    "volume_litres", "duration_seconds", "avg_flow_lpm", "peak_flow_lpm",
+})
+
+
+def _sig_transform(feat: str, value) -> float:
+    """log1p the right-skewed signature features; identity for the rest.
+
+    MUST be applied identically in training (the labelled neighbours) and
+    serving (the query event). None / non-numeric → 0.0 in the (already
+    non-negative) transformed space.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(v):
+        return 0.0
+    if feat in _SIGNATURE_LOG_FEATURES:
+        return math.log1p(max(0.0, v))
+    return v
+
+
+# k-NN tuning. All values derived from the May-2026 labelled archive (104
+# non-excluded labelled events); re-tune as more labels accrue.
+_SIGNATURE_KNN_K: int = 5
+# Below these floors the matcher abstains rather than overfit a tiny corpus:
+_SIGNATURE_KNN_MIN_TOTAL_LABELS: int = 10     # whole circuit too sparse → None
+_SIGNATURE_KNN_MIN_LABELS_PER_CLASS: int = 2  # class too sparse → not voted
+# Accept a winner only when its summed inverse-distance vote clears an absolute
+# floor (catches out-of-distribution events whose nearest neighbours are far)
+# AND holds a clear majority share (catches genuinely ambiguous events). At
+# margin 0.6 the LOO set was 85% covered / 86% accurate on what it typed.
+_SIGNATURE_KNN_CONFIDENCE_THRESHOLD: float = 1.5
+_SIGNATURE_KNN_MARGIN_THRESHOLD: float = 0.6
+# dev.22 imbalance hardening — cap a single class to this many of the K neighbours
+# so the most-labelled class can't fill every slot in a contested region. LOCKED at
+# 4 by the LOO sweep (tools/eval_knn_classifier.py) on the labelled archive: cap<=3
+# over-restricted (coverage collapsed to ~0.47); 4 holds dishwasher/toilet recall at
+# baseline while inverse-freq weighting + the cycle feature lift tap/washing-machine.
+_SIGNATURE_KNN_MAX_PER_CLASS: int = 4
+# Per-feature scales ≈ each feature's std in log1p space on the labelled set.
+_SIGNATURE_KNN_SCALES: dict = {
+    "avg_flow_lpm":          0.70,
+    "peak_flow_lpm":         0.74,
+    "duration_seconds":      1.27,
+    "volume_litres":         1.52,
+    "pressure_delta_psi":    2.88,
+    "steady_state_fraction": 0.25,
+}
+
+# ── Active-flow feature set (preferred after the 20260536 backfill) ──────────
+# Once the backfill populates the active-flow columns on labelled events, the
+# matcher prefers these (true_avg_flow + active_flow_duration replace the
+# pressure-window-inflated avg_flow + duration; flow_on_ratio flags artifacts).
+# Until then labelled rows have NULL active features, so the matcher falls back
+# to the legacy set — this is what stops classification coverage collapsing.
+# RETUNE _SIGNATURE_KNN_ACTIVE_SCALES (LOO on the labelled archive) once backfill
+# has run; the values below are estimated from the raw-flow analysis.
+_SIGNATURE_KNN_ACTIVE_FEATURES: tuple = (
+    "true_avg_flow_lpm", "peak_flow_lpm", "active_flow_duration_seconds",
+    "volume_litres", "pressure_delta_psi", "steady_state_fraction", "flow_on_ratio",
+    # dev.22: cycle_pulse_count separates appliance fills (dishwasher ~3.5,
+    # washing-machine ~2.9 pulses) from single toilet/tap fills (<1.3). Active set
+    # only — kept out of _SIGNATURE_MATCH_FEATURES (which also feeds the stored
+    # centroid signature) to avoid changing that shape. Requires the cycle-pulse
+    # backfill to run BEFORE reclassify (orchestrator/fixtures reordered in dev.22).
+    "cycle_pulse_count",
+)
+_SIGNATURE_KNN_ACTIVE_LOG_FEATURES: frozenset = frozenset({
+    "true_avg_flow_lpm", "peak_flow_lpm", "active_flow_duration_seconds", "volume_litres",
+})
+_SIGNATURE_KNN_ACTIVE_SCALES: dict = {
+    "true_avg_flow_lpm":           0.70,
+    "peak_flow_lpm":               0.74,
+    "active_flow_duration_seconds": 1.40,
+    "volume_litres":               1.52,
+    "pressure_delta_psi":          2.88,
+    "steady_state_fraction":       0.25,
+    "flow_on_ratio":               0.25,   # linear (a 0–1 ratio), not log
+    # dev.22: cycle_pulse_count is a small integer count (0–7), linear, NOT log.
+    # Scale 0.75 LOCKED by the LOO sweep (interior optimum; 0.5 and 1.0 both
+    # slightly worse) — overall LOO accuracy 0.593→0.638, washing-machine recall
+    # 0.23→0.69, dishwasher/toilet held at baseline.
+    "cycle_pulse_count":           0.75,
+}
+
+
+def _knn_transform(feat: str, value, log_features: frozenset) -> float:
+    """log1p the right-skewed features (per ``log_features``), identity for the
+    rest. None / non-finite → 0.0. Applied identically to query + neighbours."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(v):
+        return 0.0
+    return math.log1p(max(0.0, v)) if feat in log_features else v
+
+
+def _knn_vote(labelled, event_features, features, scales, log_features):
+    """Inverse-distance weighted k-NN vote over ``labelled`` = [(canon_type, row)].
+
+    Shared by the active-flow and legacy matchers. Returns a hit dict or None
+    (abstain). 'other' wins are treated as abstention.
+    """
+    counts: Dict[str, int] = {}
+    for t, _ in labelled:
+        counts[t] = counts.get(t, 0) + 1
+    eligible = {t for t, c in counts.items()
+                if c >= _SIGNATURE_KNN_MIN_LABELS_PER_CLASS}
+    if not eligible:
+        return None
+    q = {f: _knn_transform(f, event_features.get(f), log_features) for f in features}
+    dists: list = []
+    for t, r in labelled:
+        if t not in eligible:
+            continue
+        sq = 0.0
+        for f in features:
+            scale = scales.get(f, 1.0)
+            d = (q[f] - _knn_transform(f, r[f], log_features)) / scale
+            sq += d * d
+        dists.append((math.sqrt(sq / len(features)), t))
+    if not dists:
+        return None
+    dists.sort(key=lambda x: x[0])
+    # Per-class neighbour cap (dev.22): take the K nearest, but stop adding a
+    # class once it already holds _SIGNATURE_KNN_MAX_PER_CLASS slots, so a
+    # numerically dominant class can't fill every neighbour in a contested region.
+    neighbours: list = []
+    per_class: Dict[str, int] = {}
+    for d, t in dists:
+        if per_class.get(t, 0) >= _SIGNATURE_KNN_MAX_PER_CLASS:
+            continue
+        neighbours.append((d, t))
+        per_class[t] = per_class.get(t, 0) + 1
+        if len(neighbours) >= _SIGNATURE_KNN_K:
+            break
+
+    # Two scores (dev.22): raw inverse-distance drives the absolute confidence
+    # floor (the out-of-distribution guard, calibrated at 1.5); a class-balanced
+    # score (× 1/sqrt(global count)) drives winner selection + margin so the
+    # most-labelled class can't take over the ambiguous region by sheer numbers.
+    score_raw: Dict[str, float] = {}
+    score_bal: Dict[str, float] = {}
+    for d, t in neighbours:
+        w = 1.0 / (d + 1e-6)
+        score_raw[t] = score_raw.get(t, 0.0) + w
+        score_bal[t] = score_bal.get(t, 0.0) + w / math.sqrt(counts[t])
+    total_bal = sum(score_bal.values())
+    win_t, win_bal = max(score_bal.items(), key=lambda kv: kv[1])
+    win_raw = score_raw[win_t]
+    if (win_raw < _SIGNATURE_KNN_CONFIDENCE_THRESHOLD
+            or total_bal <= 0
+            or (win_bal / total_bal) < _SIGNATURE_KNN_MARGIN_THRESHOLD):
+        return None
+    if win_t == "other":
+        return None
+    nearest = min(d for d, t in neighbours if t == win_t)
+    return {
+        "fixture_type": win_t,
+        "distance": nearest,
+        "score": win_raw,
+        "margin": win_bal / total_bal,
+        "member_count": counts[win_t],
+    }
+
+
+def upsert_fixture_signature(
+    conn: sqlite3.Connection,
+    circuit: str,
+    fixture_type: str,
+) -> Optional[Dict[str, Any]]:
+    """Recompute (or remove) the signature for one (circuit, fixture_type).
+
+    Reads every event on ``circuit`` whose ``user_fixture_type`` matches
+    ``fixture_type`` and ``excluded_from_training = 0`` (degraded /
+    composite events shouldn't pollute the type centroid), averages the
+    feature subset, and upserts the row.
+
+    Returns the upserted row as a dict on success, or ``None`` when there
+    are no eligible labelled events. In the no-eligible case the existing
+    signature is DELETED so a stale centroid doesn't keep matching after
+    the user has un-labelled their training set.
+    """
+    rows = conn.execute(
+        f"""SELECT {', '.join(_SIGNATURE_MATCH_FEATURES)}
+            FROM events
+            WHERE circuit = ?
+              AND user_fixture_type = ?
+              AND COALESCE(excluded_from_training, 0) = 0""",
+        (circuit, fixture_type),
+    ).fetchall()
+    if not rows:
+        conn.execute(
+            "DELETE FROM fixture_type_signatures "
+            "WHERE circuit = ? AND fixture_type = ?",
+            (circuit, fixture_type),
+        )
+        conn.commit()
+        return None
+
+    # Arithmetic mean per feature, ignoring NULLs in any individual row.
+    centroid: Dict[str, float] = {}
+    for feat in _SIGNATURE_MATCH_FEATURES:
+        vals = [float(r[feat]) for r in rows if r[feat] is not None]
+        if vals:
+            centroid[feat] = sum(vals) / len(vals)
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO fixture_type_signatures
+               (circuit, fixture_type, centroid, member_count,
+                created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(circuit, fixture_type) DO UPDATE SET
+               centroid     = excluded.centroid,
+               member_count = excluded.member_count,
+               updated_at   = excluded.updated_at""",
+        (circuit, fixture_type, json.dumps(centroid), len(rows), now, now),
+    )
+    conn.commit()
+    return {
+        "circuit": circuit,
+        "fixture_type": fixture_type,
+        "centroid": centroid,
+        "member_count": len(rows),
+    }
+
+
+def get_fixture_type_signatures(
+    conn: sqlite3.Connection, circuit: str,
+) -> List[Dict[str, Any]]:
+    """Return all signatures for one circuit, centroid pre-decoded.
+
+    Ordered by member_count desc so the UI lists the most-trained types
+    first. Empty list when nothing has been labelled yet.
+    """
+    rows = conn.execute(
+        "SELECT circuit, fixture_type, centroid, member_count, "
+        "       created_at, updated_at "
+        "FROM fixture_type_signatures "
+        "WHERE circuit = ? "
+        "ORDER BY member_count DESC, fixture_type",
+        (circuit,),
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            centroid = json.loads(r["centroid"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            centroid = {}
+        out.append({
+            "circuit": r["circuit"],
+            "fixture_type": r["fixture_type"],
+            "centroid": centroid,
+            "member_count": int(r["member_count"] or 0),
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        })
+    return out
+
+
+def delete_fixture_signature(
+    conn: sqlite3.Connection,
+    circuit: str,
+    fixture_type: str,
+) -> bool:
+    """Forget a signature so the user can recover from bad labels.
+
+    Returns True if a row was deleted, False if none existed.
+    """
+    cur = conn.execute(
+        "DELETE FROM fixture_type_signatures "
+        "WHERE circuit = ? AND fixture_type = ?",
+        (circuit, fixture_type),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+# ── Sprint F: Per-category Fixtures-page rollup ─────────────────────────────
+
+def get_category_rollup(
+    conn: sqlite3.Connection,
+    circuit: str,
+    range_start_utc: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Per-effective-type aggregate for one circuit.
+
+    ``range_start_utc`` is the lower time bound for the *windowed* columns
+    (``range_volume_l`` / ``range_event_count``) as a UTC ISO timestamp — the
+    Fixtures-page time-range selector supplies HA-local midnight N days back
+    (same helper/format the dashboard's get_daily_volume uses). Pass ``None``
+    for the "lifetime" range: an empty-string sentinel ``''`` is then bound and,
+    because events.start_ts is always non-null UTC-ISO text that sorts after
+    ``''``, the windowed columns include every row — i.e. range == lifetime.
+
+    The ``lifetime_*`` columns and ``last_seen_at`` are always all-time,
+    independent of the range bound.
+
+    Returned rows have raw ``eff_type`` strings — the router MUST funnel each
+    through ``fixtures.normalize_fixture_type_for_circuit`` before bucketing,
+    since legacy / wrong-kind / typo strings can appear in stored data.
+
+    Phantom events (is_pressure_restoration_phantom=1) are excluded — their
+    effective volume is already 0 and counting them would inflate the event
+    count. Degraded and composite events ARE included; the Fixtures count
+    should match what the History list shows, not the training subset.
+
+    Effective-type precedence (clustering demoted 2026-05-31): user label >
+    confirmed fixture > label-trained matched_fixture_type > cluster suggestion
+    > 'other'. The k-NN match outranks the (impure) cluster suggestion so the
+    classifier — not clustering — drives fixture identity on the cards.
+    """
+    # None (the "lifetime" range) → '' so the windowed CASE matches every row.
+    bound = range_start_utc if range_start_utc is not None else ""
+    rows = conn.execute(
+        """
+        SELECT
+          COALESCE(e.user_fixture_type, f.fixture_type, e.matched_fixture_type,
+                   fc.suggested_type, 'other') AS eff_type,
+          COALESCE(SUM(COALESCE(e.volume_litres_effective, e.volume_litres, 0)), 0)
+                                                          AS lifetime_volume_l,
+          COUNT(*)                                        AS lifetime_event_count,
+          MAX(e.start_ts)                                 AS last_seen_at,
+          COALESCE(SUM(CASE WHEN e.start_ts >= ?
+                      THEN COALESCE(e.volume_litres_effective, e.volume_litres, 0)
+                      ELSE 0 END), 0)                     AS range_volume_l,
+          SUM(CASE WHEN e.start_ts >= ? THEN 1 ELSE 0 END) AS range_event_count
+        FROM events e
+        LEFT JOIN fixtures f          ON e.fixture_id = f.id
+        LEFT JOIN fixture_clusters fc ON fc.circuit = e.circuit AND fc.id = e.cluster_id
+        WHERE e.circuit = ?
+          AND COALESCE(e.is_pressure_restoration_phantom, 0) = 0
+        GROUP BY eff_type
+        """,
+        (bound, bound, circuit),
+    ).fetchall()
+    return [
+        {
+            "eff_type":             r["eff_type"],
+            "lifetime_volume_l":    float(r["lifetime_volume_l"] or 0.0),
+            "lifetime_event_count": int(r["lifetime_event_count"] or 0),
+            "last_seen_at":         r["last_seen_at"],
+            "range_volume_l":       float(r["range_volume_l"] or 0.0),
+            "range_event_count":    int(r["range_event_count"] or 0),
+        }
+        for r in rows
+    ]
+
+
+def get_category_publish_map(
+    conn: sqlite3.Connection, circuit: str,
+) -> Dict[str, bool]:
+    """Return {fixture_type: bool} for one circuit's per-category publish gates.
+
+    Only returns rows that exist — missing keys MUST be defaulted to True
+    (publish on) at the call site via ``publish_map.get(typ, True)``. This
+    contract is pinned by ``test_category_publish_missing_row_defaults_true``.
+    """
+    rows = conn.execute(
+        "SELECT fixture_type, publish_to_ha FROM category_publish "
+        "WHERE circuit = ?",
+        (circuit,),
+    ).fetchall()
+    return {r["fixture_type"]: bool(r["publish_to_ha"]) for r in rows}
+
+
+def set_category_publish(
+    conn: sqlite3.Connection,
+    circuit: str,
+    fixture_type: str,
+    publish_to_ha: int,
+) -> None:
+    """Upsert the publish gate for one (circuit, fixture_type).
+
+    Defensive: validates ``fixture_type`` against the union of fixture-
+    selectable and zone-selectable types. Raises ``ValueError`` on unknown
+    or empty input so a stray internal caller cannot persist garbage rows
+    even if it skipped the route-level validation.
+    """
+    # Local import to avoid widening the module-load import surface.
+    from .fixtures import (fixture_user_selectable_types,
+                           zone_user_selectable_types)
+    allowed = set(fixture_user_selectable_types()) | set(zone_user_selectable_types())
+    if fixture_type not in allowed:
+        raise ValueError(
+            f"set_category_publish: unknown fixture_type {fixture_type!r}; "
+            f"expected one of {sorted(allowed)}"
+        )
+    conn.execute(
+        "INSERT INTO category_publish "
+        "  (circuit, fixture_type, publish_to_ha, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT (circuit, fixture_type) DO UPDATE SET "
+        "  publish_to_ha = excluded.publish_to_ha, "
+        "  updated_at = excluded.updated_at",
+        (circuit, fixture_type, 1 if publish_to_ha else 0,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
+    """Sprint H — un-flag events wrongly marked as pressure-restoration phantoms.
+
+    A real event can be left with a stale ``is_pressure_restoration_phantom=1``
+    when the phantom verdict was computed from the software-path pressure
+    (< 2 PSI) and a late ESP waveform then raised ``pressure_delta_psi`` to a
+    real value without re-deriving the verdict (fixed forward by
+    ``_finalize_derived_verdicts``). Such a row is internally contradictory:
+    flagged phantom yet ``pressure_delta_psi >= 2.0``. This restores it:
+    clears the flag, restores ``volume_litres_effective`` (degraded → envelope
+    estimate, else raw) and re-applies that real volume to ``hourly_volume`` +
+    ``daily_summary``.
+
+    Skips ``user_classified`` rows (manual classification is authoritative).
+    Idempotent — once repaired the WHERE clause no longer selects the row.
+
+    Scope: this contradiction-repair concerns only the LONG-DURATION
+    pressure-restoration phantom (which zeroes volume and requires
+    ``pressure_delta_psi < 2.0``). The low-flow dribble flag is unrelated — it
+    never zeroes volume and lives on low-pressure rows that can't satisfy the
+    ``pressure_delta_psi >= 2.0`` filter below, so dribbles are never touched.
+
+    Returns ``{"repaired": N, "litres_restored": L}``.
+    """
+    from .feature_extractor import _PHANTOM_MAX_DELTA_PSI
+
+    rows = conn.execute(
+        "SELECT id, circuit, start_ts, volume_litres, volume_litres_estimated, "
+        "       degraded_supply, user_ignored, "
+        "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
+        "FROM events "
+        "WHERE is_pressure_restoration_phantom = 1 "
+        "  AND pressure_delta_psi >= ? "
+        "  AND COALESCE(user_classified, 0) = 0",
+        (_PHANTOM_MAX_DELTA_PSI,),
+    ).fetchall()
+
+    repaired = 0
+    litres_restored = 0.0
+    affected_days: set = set()
+    for row in rows:
+        is_degraded = bool(row["degraded_supply"])
+        raw = float(row["volume_litres"] or 0.0)
+        est = row["volume_litres_estimated"]
+        restored = (float(est) if (is_degraded and est is not None) else raw)
+        new_method = "pulsing_supply_envelope" if is_degraded else "raw"
+        new_excluded = 1 if (
+            is_degraded or bool(row["user_ignored"])
+        ) else 0
+        new_reason = "pulsing_supply" if is_degraded else None
+
+        with transaction(conn):
+            conn.execute(
+                "UPDATE events SET "
+                "  is_pressure_restoration_phantom = 0, "
+                "  volume_litres_effective = ?, "
+                "  volume_estimation_method = ?, "
+                "  excluded_from_training = ?, "
+                "  match_rejection_reason = ? "
+                "WHERE id = ?",
+                (round(restored, 3), new_method, new_excluded, new_reason, row["id"]),
+            )
+            # §2.5 — restore the real volume to the ledger via the one chokepoint.
+            apply_effective_volume(conn, row["id"], row["circuit"], row["start_ts"],
+                                   restored)
+
+        repaired += 1
+        litres_restored += restored
+        day = (row["start_ts"] or "")[:10]
+        if day:
+            affected_days.add((row["circuit"], day))
+        log.info(
+            "phantom-repair: event %s un-flagged (restored %.3f L to bucket %s)",
+            row["id"], restored, _hour_bucket_for(row["start_ts"]),
+        )
+
+    for circ, day in affected_days:
+        compute_daily_summary(conn, circ, day)
+    if affected_days:
+        conn.commit()
+
+    if repaired:
+        log.info("phantom-repair: un-flagged %d event(s), restored %.1f L total",
+                 repaired, litres_restored)
+    return {"repaired": repaired, "litres_restored": round(litres_restored, 3)}
+
+
+def match_event_to_signature(
+    conn: sqlite3.Connection,
+    circuit: str,
+    event_features: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return the closest signature within
+    ``_SIGNATURE_MATCH_THRESHOLD`` on ``circuit``, or None.
+
+    Distance is computed in scale-normalised space:
+    sqrt(sum_i ((event_i - centroid_i) / scale_i)^2) over the matcher
+    feature subset. ``_SIGNATURE_MATCH_SCALES`` provides per-feature
+    typical ranges; the threshold is then in "rough fixture-typical-range
+    units" so it's interpretable.
+
+    Caller is responsible for deciding *when* to call this (e.g. only as
+    a fallback after cluster matching). The matcher itself doesn't gate
+    on whether the cluster matched.
+    """
+    sigs = get_fixture_type_signatures(conn, circuit)
+    if not sigs:
+        return None
+
+    best: Optional[Dict[str, Any]] = None
+    best_dist = float("inf")
+    for sig in sigs:
+        cen = sig["centroid"]
+        if not cen:
+            continue
+        sq = 0.0
+        used = 0
+        for feat in _SIGNATURE_MATCH_FEATURES:
+            ev_v = event_features.get(feat)
+            cn_v = cen.get(feat)
+            if ev_v is None or cn_v is None:
+                continue
+            scale = _SIGNATURE_MATCH_SCALES.get(feat, 1.0)
+            try:
+                delta = (float(ev_v) - float(cn_v)) / scale
+            except (TypeError, ValueError):
+                continue
+            sq += delta * delta
+            used += 1
+        if used == 0:
+            continue
+        # Normalise distance by feature count so signatures with sparse
+        # centroids (only a few features populated) aren't unfairly
+        # penalised vs full-feature ones.
+        dist = (sq / used) ** 0.5
+        if dist < best_dist:
+            best_dist = dist
+            best = sig
+
+    if best is None or best_dist > _SIGNATURE_MATCH_THRESHOLD:
+        return None
+    return {
+        "fixture_type": best["fixture_type"],
+        "distance": best_dist,
+        "member_count": best["member_count"],
+    }
+
+
+def set_event_matched_fixture_type(
+    conn: sqlite3.Connection,
+    circuit: str,
+    event_id: str,
+    fixture_type: Optional[str],
+    via: Optional[str] = None,
+    cycle_group_id: Optional[str] = None,
+) -> None:
+    """Write ``events.matched_fixture_type`` (+ its ``matched_via`` provenance and
+    ``cycle_group_id`` rollup key) for one event. ``via`` and ``cycle_group_id``
+    are forced NULL whenever the type is NULL (an abstain clears all three), so a
+    stale provenance / group can never outlive its match. ``cycle_group_id`` is
+    the History rollup key (washer anchor id / softener session id) and is NULL
+    for non-cycle matches; recomputed by every reclassify.
+
+    Does not commit — caller batches with surrounding writes (typically
+    the cluster_id update in feature_extractor._cluster_event).
+    """
+    conn.execute(
+        "UPDATE events SET matched_fixture_type = ?, matched_via = ?, "
+        "cycle_group_id = ? WHERE id = ? AND circuit = ?",
+        (fixture_type,
+         via if fixture_type is not None else None,
+         cycle_group_id if fixture_type is not None else None,
+         event_id, circuit),
+    )
+
+
+def _canonical_fixture_type(name: Optional[str]) -> Optional[str]:
+    """Collapse a fixture-type string to its canonical slug (circuit-kind
+    independent): lowercase, take the first '/'-segment, fold separators to
+    '_', then apply the Sprint-D alias remap (shower→shower_tub, etc.).
+
+    Returns None for None/blank input. Does NOT map unknowns to 'other' (that's
+    the circuit-kind-aware display layer's job) — it only unifies variants so
+    'Toilet'/'toilets'/'toilet ' all store as 'toilet'. Reused at every write
+    of user_fixture_type / matched_fixture_type so the rollup groups cleanly.
+    """
+    if not isinstance(name, str):
+        return None
+    s = name.strip().lower()
+    if not s:
+        return None
+    s = s.strip("/").split("/", 1)[0].strip()
+    s = re.sub(r"[\s\-]+", "_", s).strip("_")
+    if not s:
+        return None
+    # Lazy import — fixtures.py owns the alias map; importing at module load
+    # would be a (currently absent) cycle risk.
+    try:
+        from .fixtures import LEGACY_TYPE_REMAP
+        return LEGACY_TYPE_REMAP.get(s, s)
+    except Exception:
+        return s
+
+
+def match_event_to_signature_knn(
+    conn: sqlite3.Connection,
+    circuit: str,
+    event_features: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Inverse-distance weighted k-NN over the circuit's labelled events.
+
+    The production fixture-type matcher (replaces the mean-centroid
+    ``match_event_to_signature`` on the live + backfill paths). Pulls every
+    labelled, non-excluded event on ``circuit``, log-compresses the skewed
+    features (``_sig_transform``), and votes with weight ``1/(distance+eps)``.
+
+    Abstains (returns ``None``) when:
+      • fewer than ``_SIGNATURE_KNN_MIN_TOTAL_LABELS`` labelled events exist;
+      • no class has ``_SIGNATURE_KNN_MIN_LABELS_PER_CLASS`` members;
+      • the winner's summed vote is below ``_SIGNATURE_KNN_CONFIDENCE_THRESHOLD``
+        (out-of-distribution — nearest neighbours are far); or
+      • the winner's share of the total vote is below
+        ``_SIGNATURE_KNN_MARGIN_THRESHOLD`` (genuinely ambiguous).
+
+    On a hit returns ``{"fixture_type", "distance", "score", "margin",
+    "member_count"}``. fixture_type is canonical.
+    """
+    def _labelled(sql: str):
+        rows = conn.execute(sql, (circuit,)).fetchall()
+        out = []
+        for r in rows:
+            t = _canonical_fixture_type(r["user_fixture_type"])
+            if t:
+                out.append((t, r))
+        return out
+
+    # 1) Prefer the active-flow features — but only when the QUERY has them and
+    #    enough labelled events have been backfilled with non-NULL, non-degraded
+    #    active features. 'other' wins → abstain (handled in _knn_vote).
+    query_has_active = all(
+        event_features.get(f) is not None
+        for f in ("true_avg_flow_lpm", "active_flow_duration_seconds", "flow_on_ratio")
+    )
+    if query_has_active:
+        active = _labelled(
+            "SELECT user_fixture_type, true_avg_flow_lpm, peak_flow_lpm, "
+            "       active_flow_duration_seconds, volume_litres, pressure_delta_psi, "
+            "       steady_state_fraction, flow_on_ratio, cycle_pulse_count "
+            "FROM events "
+            "WHERE circuit = ? "
+            "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
+            "  AND COALESCE(excluded_from_training, 0) = 0 "
+            "  AND COALESCE(integration_quality, 'ok') = 'ok' "
+            "  AND true_avg_flow_lpm IS NOT NULL "
+            "  AND active_flow_duration_seconds IS NOT NULL "
+            "  AND flow_on_ratio IS NOT NULL"
+        )
+        if len(active) >= _SIGNATURE_KNN_MIN_TOTAL_LABELS:
+            hit = _knn_vote(active, event_features, _SIGNATURE_KNN_ACTIVE_FEATURES,
+                            _SIGNATURE_KNN_ACTIVE_SCALES, _SIGNATURE_KNN_ACTIVE_LOG_FEATURES)
+            if hit is not None:
+                hit["match_source"] = "active_flow"
+                return hit
+            # Active had enough labels but abstained → fall through to legacy so
+            # classification coverage never regresses below the legacy baseline.
+
+    # 2) Legacy fallback (pre-backfill, or active abstained).
+    legacy = _labelled(
+        "SELECT user_fixture_type, avg_flow_lpm, peak_flow_lpm, duration_seconds, "
+        "       volume_litres, pressure_delta_psi, steady_state_fraction "
+        "FROM events "
+        "WHERE circuit = ? "
+        "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
+        "  AND COALESCE(excluded_from_training, 0) = 0"
+    )
+    if len(legacy) < _SIGNATURE_KNN_MIN_TOTAL_LABELS:
+        return None
+    hit = _knn_vote(legacy, event_features, _SIGNATURE_MATCH_FEATURES,
+                    _SIGNATURE_KNN_SCALES, _SIGNATURE_LOG_FEATURES)
+    if hit is not None:
+        hit["match_source"] = "legacy_features"
+    return hit
+
+
+def reclassify_all_events_from_signatures(
+    conn: sqlite3.Connection,
+    circuit: str,
+    ha_tz=None,
+    since_ts: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Retrain signatures, then backfill ``matched_fixture_type`` over every
+    unlabelled event on ``circuit`` — STRUCTURAL RULES FIRST (dev.24 precedence:
+    water-softener session, then dev.23's washer-cycle sweep, then the per-event
+    toilet/dishwasher/shower/zone rules), k-NN as the residual. Each write stamps
+    ``matched_via`` and ``cycle_group_id`` (the History rollup key, §7).
+
+    ``ha_tz`` (the home timezone) is needed only for the water-softener regen-band
+    match (local clock vs UTC-stored timestamps) — pass it from EVERY caller so
+    the softener label is stable across reclassifies. Softener detection is
+    hard-gated by ``home_profile.has_water_softener`` + ``softener_circuit``.
+
+    NEVER touches user-labelled rows (WHERE user_fixture_type IS NULL). Writes
+    the canonical matched type, or NULL on abstention — writing NULL clears a
+    stale prior match (and its provenance), making the whole pass idempotent.
+    Never writes 'other' (that is a display-only fallback).
+
+    Returns counts: ``{"signatures_trained", "events_scanned", "events_matched",
+    "events_rule_matched", "events_cleared", "events_abstained"}``.
+    """
+    # 1. Retrain the per-type centroids (for the Signatures UI display). The
+    #    k-NN itself reads events directly, so this is purely cosmetic but keeps
+    #    the Signatures page in sync.
+    signatures_trained = 0
+    type_rows = conn.execute(
+        "SELECT DISTINCT user_fixture_type FROM events "
+        "WHERE circuit = ? AND user_fixture_type IS NOT NULL "
+        "  AND user_fixture_type <> ''",
+        (circuit,),
+    ).fetchall()
+    for tr in type_rows:
+        if upsert_fixture_signature(conn, circuit, tr[0]) is not None:
+            signatures_trained += 1
+
+    # 2. Backfill over unlabelled events. Query carries BOTH the legacy and the
+    #    active-flow features so the matcher uses whichever it can (active when
+    #    backfilled). An event now excluded_from_training carries no fixture
+    #    identity → its matched_fixture_type is cleared (stale-match carry-forward).
+    from .event_rules import (CYCLE_ONLY_FIXTURE_TYPES, detect_softener_sessions,
+                              detect_washer_cycles, get_home_timezone,
+                              parse_hhmm_to_minutes, rule_classify_event)
+    from .rule_calibration import load_rule_calibration
+
+    # Frozen per-home rule bands (empty dict → predicates use shipped defaults).
+    calib = load_rule_calibration(conn, circuit)
+    qfeats = tuple(dict.fromkeys(
+        _SIGNATURE_MATCH_FEATURES + _SIGNATURE_KNN_ACTIVE_FEATURES
+        + ("has_pressure_transient",)))   # the flush predicate's extra input
+    circuit_type = get_circuit_type(conn, circuit)
+    # Windowed (periodic maturity re-check): bound the expensive per-event k-NN row
+    # loop below to events >= since_ts, but give the detectors a lookback (>= the
+    # softener's max session span) so a cycle straddling the window start is still seen
+    # WHOLE — otherwise its in-window members would be wrongly retracted. since_ts=None
+    # → full circuit (startup / manual reprocess).
+    detector_since = since_ts
+    if since_ts is not None:
+        _s = _parse_event_ts(since_ts)
+        if _s is not None:
+            detector_since = (_s - timedelta(hours=4)).isoformat()
+    # One O(n) pass for the whole circuit — the per-row loop then does dict
+    # lookups, never per-event window queries.
+    washer_ids = (detect_washer_cycles(conn, circuit, since_ts=detector_since,
+                                       calib=calib)
+                  if circuit_type != "zone" else {})
+    # dev.24 — water-softener sessions (hard-gated: enabled AND this circuit).
+    softener_ids: Dict[str, Any] = {}
+    prof = get_home_profile(conn)
+    if (prof is not None and prof["has_water_softener"]
+            and (prof["softener_circuit"] or "main") == circuit):
+        band = parse_hhmm_to_minutes(prof["softener_regen_start"])
+        if band is not None:
+            tz = ha_tz if ha_tz is not None else get_home_timezone()
+            softener_ids = detect_softener_sessions(conn, circuit, band,
+                                                    since_ts=detector_since, tz=tz,
+                                                    calib=calib)
+    # Phase 2.3 — re-score each scanned event against the FROZEN baseline (storage
+    # only; reclassify NEVER notifies or shuts off). Baseline + sensitivity loaded
+    # once for the whole pass; the extra SELECT columns the scorer needs are deduped
+    # into the query so a column already in qfeats isn't selected twice.
+    from .anomaly_baseline import load_usage_baselines, score_event_anomaly
+    _baselines = load_usage_baselines(conn, circuit)
+    _sens = get_sensitivity_config(conn, circuit)
+    _SCORE_COLS = ("volume_litres_effective", "volume_litres", "duration_seconds",
+                   "peak_flow_lpm", "is_pressure_restoration_phantom", "is_cross_talk",
+                   "is_low_flow_dribble", "user_ignored")
+
+    where = "WHERE circuit = ? AND user_fixture_type IS NULL"
+    qparams: list = [circuit]
+    if since_ts is not None:
+        where += " AND start_ts >= ?"
+        qparams.append(since_ts)
+    select_cols = list(dict.fromkeys(
+        ("id", "matched_fixture_type", "matched_via", "cycle_group_id",
+         "excluded_from_training") + qfeats + _SCORE_COLS))
+    rows = conn.execute(
+        "SELECT " + ", ".join(select_cols) + " "
+        "FROM events "
+        + where + " "
+        "ORDER BY start_ts",
+        qparams,
+    ).fetchall()
+    scanned = matched = rule_matched = softener_matched = cleared = abstained = 0
+    for r in rows:
+        scanned += 1
+        new_group = None
+        if r["id"] in softener_ids:
+            # Softener is checked BEFORE the excluded gate — a deliberate exception
+            # to dev.23's "excluded → no identity": regen consumption is real, and
+            # matched_* is written separately from the volume verdict, so a
+            # dribble-flagged regen pulse keeps its verdict AND reads water_softener.
+            _role, new_group = softener_ids[r["id"]]
+            new_type, new_via = "water_softener", "softener_session"
+        elif r["excluded_from_training"]:
+            new_type, new_via = None, None   # artifacts carry no fixture identity
+        elif r["id"] in washer_ids:
+            new_type, new_via = "washing_machine", "washer_cycle"
+            new_group = washer_ids[r["id"]][1]
+        else:
+            feats = {f: r[f] for f in qfeats}
+            rule_hit = rule_classify_event(feats, circuit_type, calib=calib)
+            if rule_hit is not None:
+                new_type, new_via = rule_hit
+            else:
+                hit = match_event_to_signature_knn(conn, circuit, feats)
+                new_type = _canonical_fixture_type(hit["fixture_type"]) if hit else None
+                # Multi-fill appliances need cycle context (washer_cycle / dishwasher
+                # rule, both checked above) — a lone k-NN signature must not stamp them.
+                if new_type in CYCLE_ONLY_FIXTURE_TYPES:
+                    new_type = None
+                new_via = "knn" if new_type is not None else None
+        prev = r["matched_fixture_type"]
+        if (new_type, new_via, new_group) != (
+                prev, r["matched_via"], r["cycle_group_id"]):
+            set_event_matched_fixture_type(conn, circuit, r["id"], new_type,
+                                           via=new_via, cycle_group_id=new_group)
+            if new_type is None and prev is not None:
+                cleared += 1
+        if new_type is not None:
+            matched += 1
+            if new_via == "softener_session":
+                softener_matched += 1
+            elif new_via != "knn":
+                rule_matched += 1
+        else:
+            abstained += 1
+        # Re-score against the frozen baseline + persist (storage only — no notify /
+        # shut-off from a backfill). flagged=1 marks a genuine (non-artifact) anomaly.
+        sfeats = {c: r[c] for c in _SCORE_COLS}
+        sfeats["matched_fixture_type"] = new_type
+        av = score_event_anomaly(sfeats, _baselines, _sens)
+        conn.execute(
+            "UPDATE events SET anomaly_score = ?, anomaly_type = ?, flagged = ? "
+            "WHERE id = ?",
+            (av.get("score"), av.get("anomaly_type"),
+             1 if av.get("is_anomalous") else 0, r["id"]),
+        )
+    conn.commit()
+    result = {
+        "signatures_trained": signatures_trained,
+        "events_scanned": scanned,
+        "events_matched": matched,
+        "events_rule_matched": rule_matched,
+        "events_softener_matched": softener_matched,
+        "events_cleared": cleared,
+        "events_abstained": abstained,
+    }
+    log.info(
+        "[%s] reclassify: trained %d signature(s); scanned %d unlabelled "
+        "event(s) → %d matched (%d via rules), %d abstained (%d stale cleared)",
+        circuit, signatures_trained, scanned, matched, rule_matched, abstained,
+        cleared,
+    )
+    return result
+
+
+def cleanup_composite_flags(conn: sqlite3.Connection) -> Dict[str, int]:
+    """One-shot: composite is deprecated as an authoritative flag. Re-derive
+    ``excluded_from_training`` for events that were excluded ONLY because they
+    were composite, so they become classifiable again.
+
+    Guard (review): do NOT make an event training-eligible unless it has valid
+    (non-NULL) active-flow features AND a non-degraded integration_quality — an
+    un-backfilled composite row stays excluded until its features exist. Skips
+    user_classified rows (their verdict is authoritative). Does not touch the
+    diagnostic ``is_composite`` column. Returns counts.
+    """
+    rows = conn.execute(
+        "SELECT id, circuit, is_pressure_restoration_phantom, degraded_supply, "
+        "       is_low_flow_dribble, user_ignored, integration_quality, "
+        "       true_avg_flow_lpm, excluded_from_training "
+        "FROM events "
+        "WHERE COALESCE(is_composite, 0) = 1 AND COALESCE(user_classified, 0) = 0",
+    ).fetchall()
+    cleaned = unexcluded = 0
+    for r in rows:
+        degraded_integ = r["integration_quality"] not in (None, "ok")
+        other_excl = bool(
+            r["is_pressure_restoration_phantom"] or r["degraded_supply"]
+            or r["is_low_flow_dribble"] or r["user_ignored"] or degraded_integ
+        )
+        has_valid_features = r["true_avg_flow_lpm"] is not None and not degraded_integ
+        new_excluded = 0 if (not other_excl and has_valid_features) else 1
+        if new_excluded != (r["excluded_from_training"] or 0):
+            conn.execute(
+                "UPDATE events SET excluded_from_training = ? "
+                "WHERE id = ? AND circuit = ?",
+                (new_excluded, r["id"], r["circuit"]),
+            )
+            cleaned += 1
+            if new_excluded == 0:
+                unexcluded += 1
+    conn.commit()
+    log.info("composite cleanup: %d row(s) re-derived, %d un-excluded", cleaned, unexcluded)
+    return {"composite_rows_changed": cleaned, "unexcluded": unexcluded}
+
+
+# ── Temporal appliance-cycle signal (cycle_pulse_count) ───────────────────────
+# A dishwasher / washing-machine fill PULSE is indistinguishable from a tap in a
+# single event; the discriminator is that pulses REPEAT. cycle_pulse_count is the
+# number of same-circuit events within ±45 min whose volume is within ratio
+# [0.4, 2.5] of this event. It rides in the cluster centroid (mean over members)
+# as a heuristic-only signal — see fixtures.py temporal appliance rules.
+
+_CYCLE_PULSE_WINDOW_SECONDS: float = 2700.0      # ±45 min
+_CYCLE_PULSE_VOL_RATIO_LO: float = 0.4
+_CYCLE_PULSE_VOL_RATIO_HI: float = 2.5
+# dev.37 — a cycle PULSE must also be a STEADY fill, not just volume-similar. A real
+# dishwasher fill is a steady solenoid draw (high steady-state fraction, low on-segment
+# flow CV); repeated kitchen taps are choppy (low steady, high CV). These gate the count
+# so tap-bursts stop accumulating a dishwasher signal (the volume-only count's root flaw).
+# Eval-tuned (tools/eval_knn_classifier.py --with-rules). Legacy events with NULL shape
+# features fall back to volume-only via _is_fill_shaped, so old detections never regress.
+# LOCKED by the eval sweep over the home's labels: (0.40, 0.35) beat the volume-only
+# baseline on EVERY metric — overall LOO 0.676->0.698, dishwasher precision 0.838->0.895
+# (false dishwashers 18->11), dishwasher recall 0.921->0.931, tap recall 0.333->0.467.
+_CYCLE_PULSE_MIN_STEADY_FRAC: float = 0.40
+_CYCLE_PULSE_MAX_FLOW_CV: float = 0.35
+
+
+def _is_fill_shaped(steady_frac, flow_cv) -> bool:
+    """True when an event looks like a STEADY appliance fill (a dishwasher solenoid):
+    high steady-state fraction AND low on-segment flow CV. Legacy events with NULL shape
+    features return True so the cycle-pulse count falls back to volume-only —
+    pre-active-flow detections never regress."""
+    if steady_frac is None or flow_cv is None:
+        return True
+    try:
+        return (float(steady_frac) >= _CYCLE_PULSE_MIN_STEADY_FRAC
+                and float(flow_cv) <= _CYCLE_PULSE_MAX_FLOW_CV)
+    except (TypeError, ValueError):
+        return True
+
+
+def compute_cycle_pulse_count(this_volume, neighbours,
+                              this_steady=None, this_flow_cv=None) -> int:
+    """Count cycle PULSES near this event: neighbours whose volume is within ratio
+    [0.4, 2.5] of ``this_volume`` AND that are fill-shaped (a steady draw).
+
+    ``neighbours`` is an iterable of ``(volume, steady_state_fraction,
+    flow_cv_on_segments)`` records (the event itself already excluded); a bare float is
+    also accepted (volume with unknown shape → volume-only). A choppy event (THIS event
+    not fill-shaped) returns 0 — it is not an appliance fill, so repeated taps no longer
+    accumulate a dishwasher count. Pure (no DB). Returns 0 when ``this_volume`` is missing
+    or <= 0. Legacy rows (NULL shape) fall back to volume-only via _is_fill_shaped."""
+    try:
+        tv = float(this_volume)
+    except (TypeError, ValueError):
+        return 0
+    if tv <= 0:
+        return 0
+    if not _is_fill_shaped(this_steady, this_flow_cv):
+        return 0
+    n = 0
+    for rec in neighbours:
+        if isinstance(rec, (tuple, list)):
+            v = rec[0]
+            nsteady = rec[1] if len(rec) > 1 else None
+            ncv = rec[2] if len(rec) > 2 else None
+        else:
+            v, nsteady, ncv = rec, None, None
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if (fv > 0 and _CYCLE_PULSE_VOL_RATIO_LO <= fv / tv <= _CYCLE_PULSE_VOL_RATIO_HI
+                and _is_fill_shaped(nsteady, ncv)):
+            n += 1
+    return n
+
+
+def _parse_event_ts(s):
+    if isinstance(s, datetime):
+        return s
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _load_pulse_events(conn: sqlite3.Connection, circuit: str):
+    """Sorted ``[(epoch, id, volume, steady_state_fraction, flow_cv_on_segments)]`` for
+    same-circuit, non-excluded events with a parseable timestamp and positive volume
+    (the cycle candidates). The two shape columns feed the fill-shaped pulse gate."""
+    rows = conn.execute(
+        "SELECT id, start_ts, volume_litres, steady_state_fraction, "
+        "       flow_cv_on_segments FROM events "
+        "WHERE circuit = ? AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND start_ts IS NOT NULL AND volume_litres IS NOT NULL",
+        (circuit,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        t = _parse_event_ts(r["start_ts"])
+        if t is None:
+            continue
+        try:
+            vol = float(r["volume_litres"])
+        except (TypeError, ValueError):
+            continue
+        if vol > 0:
+            out.append((t.timestamp(), r["id"], vol,
+                        r["steady_state_fraction"], r["flow_cv_on_segments"]))
+    out.sort(key=lambda e: e[0])
+    return out
+
+
+def cycle_pulse_count_for_event(conn: sqlite3.Connection, circuit: str, event_id,
+                                start_ts, volume, past_only: bool = True) -> int:
+    """Best-effort online cycle_pulse_count for one (just-completed) event.
+
+    ``past_only`` (default) counts only earlier neighbours — there is no future at
+    event-completion time; the batch ``recompute_cycle_pulse_counts`` fills the
+    full ±45 min window later (authoritative). Uses a bounded ``LIMIT`` query so a
+    bulk import can never make this O(n²) — the most-recent rows are exactly the
+    ones inside a ±45 min window of a freshly-completed event."""
+    t = _parse_event_ts(start_ts)
+    try:
+        vol = float(volume)
+    except (TypeError, ValueError):
+        vol = 0.0
+    if t is None or vol <= 0:
+        return 0
+    center = t.timestamp()
+    me = conn.execute(
+        "SELECT steady_state_fraction, flow_cv_on_segments FROM events "
+        "WHERE id = ? AND circuit = ?", (event_id, circuit),
+    ).fetchone()
+    my_steady = me["steady_state_fraction"] if me else None
+    my_cv = me["flow_cv_on_segments"] if me else None
+    rows = conn.execute(
+        "SELECT start_ts, volume_litres, steady_state_fraction, flow_cv_on_segments "
+        "FROM events "
+        "WHERE circuit = ? AND id <> ? AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND start_ts IS NOT NULL AND volume_litres IS NOT NULL "
+        "ORDER BY start_ts DESC LIMIT 400",
+        (circuit, event_id),
+    ).fetchall()
+    nbrs = []
+    for r in rows:
+        rt = _parse_event_ts(r["start_ts"])
+        if rt is None:
+            continue
+        dt = center - rt.timestamp()
+        if (0 <= dt <= _CYCLE_PULSE_WINDOW_SECONDS) or \
+           (not past_only and -_CYCLE_PULSE_WINDOW_SECONDS <= dt < 0):
+            nbrs.append((r["volume_litres"], r["steady_state_fraction"],
+                         r["flow_cv_on_segments"]))
+    return compute_cycle_pulse_count(vol, nbrs,
+                                     this_steady=my_steady, this_flow_cv=my_cv)
+
+
+def recompute_cycle_pulse_counts(conn: sqlite3.Connection, circuit: str,
+                                 since_ts: Optional[str] = None) -> Dict[str, int]:
+    """Authoritative full-window (±45 min, past+future) backfill of
+    ``events.cycle_pulse_count``, then patch each cluster centroid's mean so the
+    heuristic sees the signal immediately. Idempotent (only changed rows written).
+    ``since_ts`` (periodic maturity re-check) restricts the WRITE-back to events at or
+    after it — older events are still loaded for neighbour context but keep their
+    already-authoritative counts. Returns ``{"scanned", "updated"}``."""
+    evs = _load_pulse_events(conn, circuit)
+    n = len(evs)
+    since_epoch = None
+    if since_ts is not None:
+        _s = _parse_event_ts(since_ts)
+        if _s is not None:
+            since_epoch = _s.timestamp()
+    stored = {
+        r["id"]: r["cycle_pulse_count"]
+        for r in conn.execute(
+            "SELECT id, cycle_pulse_count FROM events WHERE circuit = ?", (circuit,)
+        ).fetchall()
+    }
+    updated = 0
+    lo = hi = 0
+    for i in range(n):
+        center = evs[i][0]
+        while lo < n and evs[lo][0] < center - _CYCLE_PULSE_WINDOW_SECONDS:
+            lo += 1
+        while hi < n and evs[hi][0] <= center + _CYCLE_PULSE_WINDOW_SECONDS:
+            hi += 1
+        if since_epoch is not None and center < since_epoch:
+            continue                  # neighbour-only: keep its authoritative count
+        nbrs = [(evs[j][2], evs[j][3], evs[j][4])
+                for j in range(lo, hi) if j != i]
+        cnt = compute_cycle_pulse_count(evs[i][2], nbrs,
+                                        this_steady=evs[i][3], this_flow_cv=evs[i][4])
+        eid = evs[i][1]
+        if stored.get(eid) != cnt:
+            conn.execute(
+                "UPDATE events SET cycle_pulse_count = ? WHERE id = ? AND circuit = ?",
+                (cnt, eid, circuit),
+            )
+            updated += 1
+
+    # Patch cluster centroids with the member-mean so suggest_fixture_type can
+    # read the cycle signal without waiting for 10 fresh events.
+    for cr in conn.execute(
+        "SELECT cluster_id, AVG(cycle_pulse_count) AS avgc FROM events "
+        "WHERE circuit = ? AND cluster_id IS NOT NULL "
+        "  AND cycle_pulse_count IS NOT NULL GROUP BY cluster_id",
+        (circuit,),
+    ).fetchall():
+        row = conn.execute(
+            "SELECT centroid FROM fixture_clusters WHERE circuit = ? AND id = ?",
+            (circuit, cr["cluster_id"]),
+        ).fetchone()
+        if not row or not row["centroid"]:
+            continue
+        try:
+            cen = json.loads(row["centroid"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        cen["cycle_pulse_count"] = round(float(cr["avgc"] or 0.0), 4)
+        conn.execute(
+            "UPDATE fixture_clusters SET centroid = ? WHERE circuit = ? AND id = ?",
+            (json.dumps(cen), circuit, cr["cluster_id"]),
+        )
+    conn.commit()
+    log.info("[%s] cycle_pulse_count: %d scanned, %d updated", circuit, n, updated)
+    return {"scanned": n, "updated": updated}
+
+
+def resuggest_all_clusters(conn: sqlite3.Connection, circuit: str) -> Dict[str, int]:
+    """Re-run the heuristic ``suggest_fixture_type`` over each cluster centroid
+    (e.g. after a cycle_pulse_count backfill). Only touches clusters whose
+    ``suggestion_source`` is NULL or 'heuristic' — user-label votes are never
+    overwritten. Returns ``{"clusters", "updated"}``."""
+    from .fixtures import suggest_fixture_type
+    ctype = get_circuit_type(conn, circuit)
+    rows = conn.execute(
+        "SELECT id, centroid, suggested_type, suggestion_source "
+        "FROM fixture_clusters WHERE circuit = ?", (circuit,)
+    ).fetchall()
+    updated = 0
+    for r in rows:
+        if r["suggestion_source"] == "user_labels" or not r["centroid"]:
+            continue
+        try:
+            centroid = json.loads(r["centroid"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        new_type, new_conf = suggest_fixture_type(centroid, ctype)
+        if new_type != r["suggested_type"]:
+            conn.execute(
+                "UPDATE fixture_clusters SET suggested_type = ?, "
+                "  suggested_confidence = ?, suggestion_source = 'heuristic' "
+                "WHERE circuit = ? AND id = ?",
+                (new_type, new_conf if new_type else 0.0, circuit, r["id"]),
+            )
+            updated += 1
+    conn.commit()
+    log.info("[%s] resuggest: %d clusters, %d updated", circuit, len(rows), updated)
+    return {"clusters": len(rows), "updated": updated}
+
+
+# ── 2a: auto cycle-labeling + provenance-scoped undo ──────────────────────────
+# When the user labels an APPLIANCE event, its repeated fill pulses (the cycle)
+# are almost certainly the same appliance. Auto-label the vol+flow-similar mates
+# within ±45 min (source='cycle') so one label seeds several — validated 92%
+# pure. Appliances only (toilet/tap/shower aren't cyclic). Fully reversible.
+
+_CYCLE_FLOW_RATIO_LO: float = 0.5
+_CYCLE_FLOW_RATIO_HI: float = 2.0
+_CYCLE_APPLIANCE_TYPES: frozenset = frozenset({"dishwasher", "washing_machine"})
+
+
+def propagate_cycle_label(conn: sqlite3.Connection, circuit: str, event_id,
+                          fixture_type) -> int:
+    """Auto-label an appliance event's cycle-mates the same type (source='cycle').
+
+    Dishwasher: a mate is a same-circuit, currently-unlabeled, non-excluded event
+    within ±45 min whose volume AND avg flow are within ratio of the anchor.
+
+    Washing machine (dev.23): the volume-ratio gate structurally fails — a washer
+    cycle alternates ≥9 L fills with sub-1.5 L top-offs (15× spread) at ~constant
+    PEAK. So washer mates are keyed on the PEAK family instead (pk within
+    0.8–1.3× of the anchor's, vol ≥ 0.5 L, dur ≤ 400 s), excluding flush-shaped
+    events (a toilet flush during laundry stays unlabeled).
+
+    No-op for non-appliance types. Caller owns the transaction (no commit).
+    Returns the number of mates labeled.
+    """
+    if fixture_type not in _CYCLE_APPLIANCE_TYPES:
+        return 0
+    anchor = conn.execute(
+        "SELECT start_ts, volume_litres, avg_flow_lpm, peak_flow_lpm "
+        "FROM events WHERE id = ? AND circuit = ?", (event_id, circuit),
+    ).fetchone()
+    if anchor is None:
+        return 0
+    a_ts = _parse_event_ts(anchor["start_ts"])
+    washer_mode = fixture_type == "washing_machine"
+
+    def _num(v) -> float:
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    a_vol = _num(anchor["volume_litres"])
+    a_flow = _num(anchor["avg_flow_lpm"])
+    a_pk = _num(anchor["peak_flow_lpm"])
+    if a_ts is None:
+        return 0
+    if washer_mode:
+        # Peak is the washer family key; vol/avg-flow may legitimately be NULL.
+        if a_pk <= 0:
+            return 0
+    elif a_vol <= 0 or a_flow <= 0:
+        return 0
+    # Coarse time-window pre-filter (bounds the rows; the 90-min window keeps it
+    # small), then a precise parsed-timestamp check so an ISO tz-format quirk can
+    # never over-include.
+    lo_ts = (a_ts - timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
+    hi_ts = (a_ts + timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
+    a_epoch = a_ts.timestamp()
+    mates = conn.execute(
+        "SELECT id, start_ts, volume_litres, avg_flow_lpm, duration_seconds, "
+        "       peak_flow_lpm, has_pressure_transient, pressure_delta_psi "
+        "FROM events "
+        "WHERE circuit = ? AND id <> ? AND user_fixture_type IS NULL "
+        "  AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND start_ts BETWEEN ? AND ? "
+        "  AND volume_litres > 0",
+        (circuit, event_id, lo_ts, hi_ts),
+    ).fetchall()
+    from .event_rules import (_WASHER_FAMILY_PK_RATIO, _WASHER_SIBLING_MAX_DUR_S,
+                              _WASHER_SIBLING_MIN_VOL_L, is_flush_shaped)
+    n = 0
+    for mr in mates:
+        mt = _parse_event_ts(mr["start_ts"])
+        if mt is None or abs(mt.timestamp() - a_epoch) > _CYCLE_PULSE_WINDOW_SECONDS:
+            continue
+        try:
+            v = float(mr["volume_litres"])
+            f = float(mr["avg_flow_lpm"]) if mr["avg_flow_lpm"] is not None else 0.0
+            pk = (float(mr["peak_flow_lpm"])
+                  if mr["peak_flow_lpm"] is not None else 0.0)
+        except (TypeError, ValueError):
+            continue
+        if washer_mode:
+            dur = mr["duration_seconds"]
+            ok = (v >= _WASHER_SIBLING_MIN_VOL_L
+                  and (dur is None or dur <= _WASHER_SIBLING_MAX_DUR_S)
+                  and _WASHER_FAMILY_PK_RATIO[0] * a_pk <= pk
+                  <= _WASHER_FAMILY_PK_RATIO[1] * a_pk
+                  and not is_flush_shaped(dict(mr)))
+        else:
+            ok = (f > 0
+                  and _CYCLE_PULSE_VOL_RATIO_LO <= v / a_vol <= _CYCLE_PULSE_VOL_RATIO_HI
+                  and _CYCLE_FLOW_RATIO_LO <= f / a_flow <= _CYCLE_FLOW_RATIO_HI)
+        if ok:
+            conn.execute(
+                "UPDATE events SET user_fixture_type = ?, "
+                "fixture_label_source = 'cycle', cycle_group_id = ? "
+                "WHERE id = ? AND circuit = ? AND user_fixture_type IS NULL",
+                (fixture_type, str(event_id), mr["id"], circuit),
+            )
+            n += 1
+    if n:
+        # Stamp the anchor with its OWN id as the group key so the History rollup
+        # (dev.24 §7) collapses the whole cycle — anchor + cycle-mates — under one
+        # expandable parent row.
+        conn.execute(
+            "UPDATE events SET cycle_group_id = ? WHERE id = ? AND circuit = ?",
+            (str(event_id), event_id, circuit),
+        )
+    return n
+
+
+def clear_auto_labels(conn: sqlite3.Connection, circuit: str, event_ids=None,
+                      commit: bool = True) -> int:
+    """Reverse auto-applied labels: rows with `fixture_label_source IN
+    ('cycle','training')` → `user_fixture_type` + `fixture_label_source` back to
+    NULL. NEVER touches an explicit 'user' label or a NULL-source (legacy) row.
+
+    When ``event_ids`` (a list) is given, scopes to exactly those ids — so
+    rejecting one training capture can't wipe another capture's (or a cycle's)
+    labels. When None, clears all auto-source rows on the circuit. Returns the count.
+    """
+    if event_ids is not None:
+        ids = list(event_ids)
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        cur = conn.execute(
+            "UPDATE events SET user_fixture_type = NULL, fixture_label_source = NULL "
+            "WHERE circuit = ? AND fixture_label_source IN ('cycle','training') "
+            f"  AND id IN ({placeholders})",
+            (circuit, *ids),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE events SET user_fixture_type = NULL, fixture_label_source = NULL "
+            "WHERE circuit = ? AND fixture_label_source IN ('cycle','training')",
+            (circuit,),
+        )
+    if commit:
+        conn.commit()
+    return cur.rowcount
+
+
+# ── 2b: training-helper capture ───────────────────────────────────────────────
+# A one-time wizard: the user runs each fixture once, the event-completion hook
+# records candidate event ids, and the user confirms to write ~100%-pure
+# 'training' labels. Instant types capture the next event; windowed types capture
+# every event in a user-chosen monitoring window (then accept/reject the run).
+
+_TRAINING_INSTANT_TYPES: frozenset = frozenset({"toilet", "tap"})
+_TRAINING_INSTANT_WINDOW_MIN: int = 5
+# Allowed monitoring-window options per windowed type (minutes).
+_TRAINING_WINDOW_INCREMENTS: Dict[str, List[int]] = {
+    "shower_tub":      [5, 10, 15, 20, 25, 30],
+    "irrigation_zone": [5, 10, 15, 20, 30, 45, 60],
+    "washing_machine": [15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180],
+    "dishwasher":      [15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180],
+}
+
+
+def training_capturable_types() -> frozenset:
+    """Fixture types the wizard can capture (excludes 'other'/'leak_test')."""
+    return _TRAINING_INSTANT_TYPES | frozenset(_TRAINING_WINDOW_INCREMENTS)
+
+
+def training_window_options(fixture_type: str) -> List[int]:
+    """The monitoring-duration dropdown options for a windowed type ([] = instant)."""
+    return list(_TRAINING_WINDOW_INCREMENTS.get(fixture_type, []))
+
+
+def training_capture_band_match(fixture_type: str, volume_litres,
+                                duration_seconds) -> bool:
+    """Loose, named sanity band for an INSTANT capture (toilet/tap). Catches a
+    clearly-wrong fixture (e.g. a sub-litre tap during a 'toilet' capture);
+    windowed types are not gated here (the user accepts/rejects)."""
+    try:
+        v = float(volume_litres) if volume_litres is not None else 0.0
+        d = float(duration_seconds) if duration_seconds is not None else 0.0
+    except (TypeError, ValueError):
+        return False
+    if fixture_type == "toilet":
+        return v >= 2.0                      # a real flush is 3-13 L
+    if fixture_type == "tap":
+        return v <= 10.0 and d <= 180.0      # rejects shower/appliance-sized
+    return True
+
+
+def arm_training_capture(conn: sqlite3.Connection, circuit: str, fixture_type: str,
+                         window_minutes=None) -> Dict[str, Any]:
+    """Arm a capture for ``fixture_type`` on ``circuit`` (cancels any existing
+    armed/ready row — one active per circuit). ``window_minutes`` is required (and
+    validated to the per-type increments) for windowed types; instant types use a
+    fixed short window. Raises ValueError for a non-capturable type / bad window."""
+    if fixture_type in _TRAINING_INSTANT_TYPES:
+        wm = _TRAINING_INSTANT_WINDOW_MIN
+    elif fixture_type in _TRAINING_WINDOW_INCREMENTS:
+        allowed = _TRAINING_WINDOW_INCREMENTS[fixture_type]
+        if window_minutes is None:
+            wm = allowed[0]
+        elif int(window_minutes) in allowed:
+            wm = int(window_minutes)
+        else:
+            raise ValueError(
+                f"window_minutes {window_minutes} not allowed for {fixture_type}")
+    else:
+        raise ValueError(f"{fixture_type} is not capturable in the training helper")
+    conn.execute(
+        "UPDATE training_capture SET status = 'cancelled' "
+        "WHERE circuit = ? AND status IN ('armed','ready')", (circuit,))
+    cur = conn.execute(
+        "INSERT INTO training_capture (circuit, fixture_type, status, armed_at, "
+        " expires_at, window_minutes, captured_count) "
+        "VALUES (?, ?, 'armed', datetime('now'), datetime('now', ?), ?, 0)",
+        (circuit, fixture_type, f"+{wm} minutes", wm))
+    conn.commit()
+    return {"id": cur.lastrowid, "circuit": circuit, "fixture_type": fixture_type,
+            "window_minutes": wm, "status": "armed"}
+
+
+def get_active_training_capture(conn: sqlite3.Connection, circuit: str):
+    """The newest armed/ready capture on the circuit (None if none). Includes
+    `seconds_remaining` and `candidate_count`."""
+    row = conn.execute(
+        "SELECT *, CAST((julianday(expires_at) - julianday('now')) * 86400 AS INTEGER) "
+        "         AS seconds_remaining "
+        "FROM training_capture "
+        "WHERE circuit = ? AND status IN ('armed','ready') "
+        "ORDER BY id DESC LIMIT 1", (circuit,)).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d["candidate_count"] = conn.execute(
+        "SELECT COUNT(*) FROM training_capture_candidates WHERE capture_id = ?",
+        (row["id"],)).fetchone()[0]
+    return d
+
+
+def cancel_training_capture(conn: sqlite3.Connection, circuit: str) -> int:
+    """Cancel the active (armed/ready, not-yet-confirmed) capture on the circuit."""
+    cur = conn.execute(
+        "UPDATE training_capture SET status = 'cancelled' "
+        "WHERE circuit = ? AND status IN ('armed','ready')", (circuit,))
+    conn.commit()
+    return cur.rowcount
+
+
+def extend_training_capture(conn: sqlite3.Connection, circuit: str,
+                            add_minutes: int) -> Dict[str, int]:
+    """Push out a still-running windowed capture's expiry (don't strand a long cycle)."""
+    am = max(1, int(add_minutes))
+    cur = conn.execute(
+        "UPDATE training_capture SET expires_at = datetime(expires_at, ?) "
+        "WHERE circuit = ? AND status = 'armed'", (f"+{am} minutes", circuit))
+    conn.commit()
+    return {"extended": cur.rowcount, "add_minutes": am}
+
+
+def expire_stale_training_captures(conn: sqlite3.Connection) -> int:
+    """Sweep armed captures whose window has elapsed — split by TYPE, not count.
+
+    A **windowed** (non-instant) capture flips to 'ready' regardless of count, so it
+    NEVER evaporates on the timer: with events it becomes "review your N events", with
+    zero it becomes an actionable "no events captured — redo" prompt — either way the
+    user gets closure (an active item to Accept / Reject / Cancel). Only an **instant**
+    (toilet/tap) capture that never caught an event expires (an instant WITH an event is
+    already 'ready'). 'ready' captures are never touched. Called opportunistically
+    (poll + pruner). Returns the number EXPIRED.
+    """
+    instant = tuple(_TRAINING_INSTANT_TYPES)
+    ph = ",".join("?" * len(instant))
+    # Windowed (non-instant) past-due → 'ready' (review, or "no events" redo).
+    conn.execute(
+        f"UPDATE training_capture SET status = 'ready' "
+        f"WHERE status = 'armed' AND expires_at <= datetime('now') "
+        f"AND fixture_type NOT IN ({ph})", instant)
+    # Instant past-due that never caught an event → 'expired'.
+    cur = conn.execute(
+        f"UPDATE training_capture SET status = 'expired' "
+        f"WHERE status = 'armed' AND expires_at <= datetime('now') "
+        f"AND fixture_type IN ({ph})", instant)
+    conn.commit()
+    return cur.rowcount
+
+
+def confirm_training_capture(conn: sqlite3.Connection, circuit: str) -> Dict[str, Any]:
+    """Accept the active capture: write `user_fixture_type` + source='training' for
+    each candidate (only unlabeled rows), status→captured. Returns counts. Caller
+    runs the reclassify (once)."""
+    cap = conn.execute(
+        "SELECT id, fixture_type FROM training_capture "
+        "WHERE circuit = ? AND status IN ('armed','ready') "
+        "ORDER BY id DESC LIMIT 1", (circuit,)).fetchone()
+    if cap is None:
+        return {"labeled": 0}
+    ids = [r["event_id"] for r in conn.execute(
+        "SELECT event_id FROM training_capture_candidates WHERE capture_id = ?",
+        (cap["id"],)).fetchall()]
+    labeled = 0
+    for eid in ids:
+        cur = conn.execute(
+            "UPDATE events SET user_fixture_type = ?, fixture_label_source = 'training' "
+            "WHERE id = ? AND circuit = ? AND user_fixture_type IS NULL",
+            (cap["fixture_type"], eid, circuit))
+        labeled += cur.rowcount
+    conn.execute("UPDATE training_capture SET status = 'captured' WHERE id = ?",
+                 (cap["id"],))
+    conn.commit()
+    return {"capture_id": cap["id"], "fixture_type": cap["fixture_type"], "labeled": labeled}
+
+
+def reject_training_capture(conn: sqlite3.Connection, circuit: str,
+                            capture_id: int) -> Dict[str, Any]:
+    """Discard a capture (contaminated): clear ONLY this capture's 'training' labels
+    (scoped to its candidate ids), status→rejected, so the checklist item re-arms."""
+    ids = [r["event_id"] for r in conn.execute(
+        "SELECT event_id FROM training_capture_candidates WHERE capture_id = ?",
+        (capture_id,)).fetchall()]
+    cleared = clear_auto_labels(conn, circuit, event_ids=ids, commit=False) if ids else 0
+    conn.execute("UPDATE training_capture SET status = 'rejected' "
+                 "WHERE id = ? AND circuit = ?", (capture_id, circuit))
+    conn.commit()
+    return {"capture_id": capture_id, "cleared": cleared}
+
+
+def get_training_checklist(conn: sqlite3.Connection, circuit: str,
+                           applicable_types) -> Dict[str, dict]:
+    """Per-type latest capture status for the checklist (resumable)."""
+    out: Dict[str, dict] = {}
+    for t in applicable_types:
+        row = conn.execute(
+            "SELECT id, status, captured_count FROM training_capture "
+            "WHERE circuit = ? AND fixture_type = ? ORDER BY id DESC LIMIT 1",
+            (circuit, t)).fetchone()
+        out[t] = {
+            "status": row["status"] if row else "none",
+            "captured_count": row["captured_count"] if row else 0,
+            "capture_id": row["id"] if row else None,
+        }
+    return out
+
+
+def record_training_candidate(conn: sqlite3.Connection, circuit: str,
+                              event_features: dict) -> bool:
+    """HOT-PATH hook: if a capture is armed (non-expired) on the circuit, record
+    this just-completed event as a candidate. Writes NO label (labels are written
+    only on the user's confirm). Instant types flip to 'ready' after the first
+    event; windowed types stay armed and accumulate. Returns True if recorded."""
+    cap = conn.execute(
+        "SELECT id, fixture_type, captured_count FROM training_capture "
+        "WHERE circuit = ? AND status = 'armed' AND expires_at > datetime('now') "
+        "ORDER BY id DESC LIMIT 1", (circuit,)).fetchone()
+    if cap is None:
+        return False
+    eid = event_features.get("id")
+    if not eid:
+        return False
+    conn.execute(
+        "INSERT INTO training_capture_candidates (capture_id, event_id) VALUES (?, ?)",
+        (cap["id"], eid))
+    new_count = (cap["captured_count"] or 0) + 1
+    if cap["fixture_type"] in _TRAINING_INSTANT_TYPES:
+        conn.execute("UPDATE training_capture SET captured_count = ?, status = 'ready' "
+                     "WHERE id = ?", (new_count, cap["id"]))
+    else:
+        conn.execute("UPDATE training_capture SET captured_count = ? WHERE id = ?",
+                     (new_count, cap["id"]))
+    conn.commit()
+    return True
+
+
+# ── Pressure-history helpers (24 h dashboard chart) ──────────────────────────
+_BAD_PRESSURE_STATES = frozenset({"", "unavailable", "unknown", "none", "nan"})
+
+
+def coerce_pressure_state(state) -> Optional[float]:
+    """Parse a HA state to a float PSI, or None for unavailable/unknown/non-numeric
+    (those mark a recorder gap, not a reading)."""
+    if state is None:
+        return None
+    s = str(state).strip().lower()
+    if s in _BAD_PRESSURE_STATES:
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def downsample_pressure_series(states, start_epoch: float, end_epoch: float,
+                               buckets: int = 288) -> List[Dict[str, Any]]:
+    """Bucket [start,end] (epoch seconds) into `buckets` even slots for a 24 h line.
+    Each slot = mean of the numeric samples in it; an empty *quiet* slot carries the
+    last-known value forward (a recorded sensor holds its value between changes); an
+    unavailable/unknown sample breaks the carry so a real outage renders as a gap
+    (`v: None`). Leading slots before the first sample are gaps. Returns
+    [{t: epoch_ms, v: float|None}] of length `buckets` (client formats `t` → HH:MM)."""
+    span = end_epoch - start_epoch
+    if span <= 0 or buckets <= 0:
+        return []
+    width = span / buckets
+    sums = [0.0] * buckets
+    counts = [0] * buckets
+    breaks = [False] * buckets
+    for s in states:
+        ts = s.get("last_changed")
+        if ts is None:
+            continue
+        ep = ts.timestamp() if hasattr(ts, "timestamp") else float(ts)
+        offset = ep - start_epoch
+        if offset < 0:
+            offset = 0.0
+        if offset >= span:
+            continue
+        idx = int(offset / width)
+        if idx >= buckets:
+            idx = buckets - 1
+        v = coerce_pressure_state(s.get("state"))
+        if v is None:
+            breaks[idx] = True
+        else:
+            sums[idx] += v
+            counts[idx] += 1
+    out: List[Dict[str, Any]] = []
+    last: Optional[float] = None
+    for i in range(buckets):
+        t_ms = int((start_epoch + width * i) * 1000)
+        if counts[i]:
+            val: Optional[float] = round(sums[i] / counts[i], 2)
+            last = val
+        elif breaks[i]:
+            val = None
+            last = None
+        else:
+            val = last
+        out.append({"t": t_ms, "v": val})
+    return out
+
+
+def recent_pressure_baseline(conn: sqlite3.Connection, circuit: str,
+                             since_iso: str) -> Optional[float]:
+    """Typical *resting* pressure for the baseline reference line: AVG of recent
+    pre-event pressures over the window; fall back to the latest event's pre-event
+    pressure, then the latest leak-test baseline, else None. PSI."""
+    row = conn.execute(
+        "SELECT AVG(pre_event_pressure_psi) AS b FROM events "
+        "WHERE circuit = ? AND start_ts >= ? "
+        "AND pre_event_pressure_psi IS NOT NULL AND pre_event_pressure_psi > 0",
+        (circuit, since_iso)).fetchone()
+    if row and row["b"] is not None:
+        return round(row["b"], 2)
+    row = conn.execute(
+        "SELECT pre_event_pressure_psi AS b FROM events "
+        "WHERE circuit = ? AND pre_event_pressure_psi IS NOT NULL "
+        "AND pre_event_pressure_psi > 0 ORDER BY start_ts DESC LIMIT 1",
+        (circuit,)).fetchone()
+    if row and row["b"] is not None:
+        return round(row["b"], 2)
+    row = conn.execute(
+        "SELECT baseline_psi AS b FROM leak_test_history "
+        "WHERE circuit = ? AND baseline_psi IS NOT NULL "
+        "ORDER BY run_at DESC LIMIT 1", (circuit,)).fetchone()
+    if row and row["b"] is not None:
+        return round(row["b"], 2)
+    return None
+
+
+def migrate_to_type_level_clusters(
+    conn,
+    circuit: str,
+) -> Dict[str, Any]:
+    """One-shot migration: merge clusters of the same confirmed/suggested type.
+
+    Conservative safety gate:
+    - member_count >= 5 for both clusters
+    - If neither confirmed: suggested_confidence >= 0.70
+    - Centroid weighted-distance <= get_match_threshold(effective_type)
+    - 'other' clusters are never merged
+
+    Does NOT auto-confirm suggested-only clusters. Only calls
+    upsert_fixture_from_cluster for survivors that already had a confirmed
+    fixture row.
+
+    Idempotent: safe to call repeatedly; no-op when each type already has
+    exactly one cluster.
+
+    Returns {"types_merged", "clusters_removed", "survivor_ids"}.
+    """
+    # get_match_threshold was removed from the import — see the comment
+    # inside the per-type loop below explaining the simplified gate.
+    from .fixtures import FIXTURE_TYPE_LABELS
+
+    rows = conn.execute(
+        """SELECT fc.id, fc.member_count,
+                  fc.suggested_type, fc.suggested_confidence,
+                  fc.centroid, fc.last_match_at,
+                  f.fixture_type AS user_type,
+                  CASE WHEN f.confirmed = 1 THEN 1 ELSE 0 END AS is_confirmed,
+                  f.id AS fixture_row_id
+           FROM fixture_clusters fc
+           LEFT JOIN fixtures f ON fc.fixture_id = f.id
+           WHERE fc.circuit = ?
+           ORDER BY fc.id""",
+        (circuit,),
+    ).fetchall()
+
+    by_type: Dict[str, List[dict]] = {}
+    for r in rows:
+        eff = r["user_type"] or r["suggested_type"]
+        if not eff or eff == "other":
+            continue
+        by_type.setdefault(eff, []).append(dict(r))
+
+    types_merged    = 0
+    clusters_removed = 0
+    survivor_ids: List[int] = []
+
+    for ftype, clusters in by_type.items():
+        # NOTE: an earlier version of this migration used
+        # get_match_threshold(ftype) to gate which clusters could
+        # merge by per-type centroid distance. That gate was replaced
+        # by the simpler "any 2+ eligible clusters merge into one"
+        # logic below (centroid-distance approximation at the
+        # eligible_close filter, then deterministic survivor pick).
+        # The migration is one-shot; users have already run it. The
+        # threshold call is removed because it had no effect — but
+        # this comment documents the design simplification in case
+        # the rigorous gate is ever wanted back.
+
+        # Apply safety gate
+        eligible = [
+            cl for cl in clusters
+            if (cl["member_count"] or 0) >= 5
+            and (cl["is_confirmed"] or (cl["suggested_confidence"] or 0) >= 0.70)
+        ]
+
+        # Centroid distance gate (requires at least 2 eligible clusters)
+        if len(eligible) >= 2:
+            # Try to filter pairs by centroid similarity
+            # We do a simple Euclidean distance on raw centroid values here
+            # (scaler state is not available in the DB layer); this is an
+            # approximation sufficient for a one-shot migration.
+            eligible_close: List[dict] = []
+            for cl in eligible:
+                try:
+                    raw = json.loads(cl["centroid"] or "{}")
+                    cl["_centroid_raw"] = raw
+                    eligible_close.append(cl)
+                except Exception:
+                    pass
+            eligible = eligible_close
+
+        if len(eligible) < 2:
+            if eligible:
+                survivor_ids.append(eligible[0]["id"])
+            continue
+
+        # Deterministic survivor: confirmed first, then member_count desc,
+        # then last_match_at desc, then id asc.  last_match_at is a TEXT
+        # ISO-8601 timestamp — it can't be negated into a single descending
+        # tuple key, so apply staged stable sorts, least-significant first.
+        eligible.sort(key=lambda c: c["id"])
+        eligible.sort(key=lambda c: c["last_match_at"] or "", reverse=True)
+        eligible.sort(key=lambda c: c["member_count"] or 0, reverse=True)
+        eligible.sort(key=lambda c: c["is_confirmed"], reverse=True)
+        survivor = eligible[0]
+        all_ids  = [cl["id"] for cl in eligible]
+
+        try:
+            result = merge_clusters(conn, circuit, survivor["id"], all_ids)
+            clusters_removed += result["fixtures_removed"]
+            types_merged     += 1
+        except Exception as exc:
+            log.warning(
+                "[%s] migrate: merge_clusters failed for '%s': %s",
+                circuit, ftype, exc,
+            )
+            survivor_ids.append(survivor["id"])
+            continue
+
+        survivor_ids.append(survivor["id"])
+
+        # Only update/create a confirmed fixture row if the survivor already
+        # had one; do not auto-confirm suggested-only clusters.
+        if survivor["is_confirmed"] and survivor["fixture_row_id"]:
+            auto_name = FIXTURE_TYPE_LABELS.get(ftype, ftype.replace("_", " ").title())
+            upsert_fixture_from_cluster(
+                conn, circuit, survivor["id"],
+                name=auto_name,
+                fixture_type=ftype,
+                publish_to_ha=1,
+            )
+
+    return {
+        "types_merged":     types_merged,
+        "clusters_removed": clusters_removed,
+        "survivor_ids":     survivor_ids,
     }
 
 

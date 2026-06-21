@@ -26,7 +26,8 @@ from typing import Any, Dict, Optional
 
 from .config import AddonConfig, compute_suggested_calibration_days, compute_minimum_events
 from .database import (get_training_state, upsert_training_state,
-                       get_home_profile, ensure_circuit_defaults)
+                       get_home_profile, ensure_circuit_defaults,
+                       get_circuit_type, get_event_cadence_seconds)
 from .ha_client import HaClient
 
 log = logging.getLogger(__name__)
@@ -35,6 +36,27 @@ log = logging.getLogger(__name__)
 # user inaction, so anomaly detection isn't blocked indefinitely waiting
 # for the user to review clusters.
 LABELLING_AUTO_TIMEOUT_DAYS = 7
+
+# When a circuit has passed its calibration deadline but hasn't collected enough
+# events, re-checking happens every 60 s poll — but re-warning that often is
+# pointless for a sparse circuit (e.g. irrigation that only runs every few days).
+# Instead, stay quiet for roughly one observed inter-event interval between
+# warnings. These bound that quiet period.
+RECHECK_GAP_FACTOR       = 1.25        # head-room past the median inter-event gap
+RECHECK_MIN_SECONDS      = 3600        # 1 h  — hard anti-spam floor
+RECHECK_MAX_SECONDS      = 7 * 86400   # 7 d  — cap on the quiet period
+RECHECK_FALLBACK_SECONDS = 12 * 3600   # 12 h — cold start (< 3 prior events)
+
+
+def _compute_recheck_interval(cadence_seconds: Optional[float]) -> timedelta:
+    """Quiet period before re-warning an under-target calibration, derived from
+    the circuit's observed inter-event cadence and clamped to sane bounds."""
+    if cadence_seconds is None:
+        secs: float = float(RECHECK_FALLBACK_SECONDS)
+    else:
+        secs = cadence_seconds * RECHECK_GAP_FACTOR
+    secs = max(float(RECHECK_MIN_SECONDS), min(secs, float(RECHECK_MAX_SECONDS)))
+    return timedelta(seconds=secs)
 
 
 class TrainingManager:
@@ -49,6 +71,11 @@ class TrainingManager:
         self._db = db
         self._ha = ha
         self._stop = asyncio.Event()
+        # Per-circuit timestamp of the last "under target" calibration warning,
+        # so a circuit past its deadline but short on events isn't re-warned on
+        # every 60 s poll (see _compute_recheck_interval). In-memory by design:
+        # one warning after a restart is fine, so this resets on restart.
+        self._last_undertarget_warn: Dict[str, datetime] = {}
         # Set by orchestrator after ClusterEngine is initialised
         self.cluster_engine = None
 
@@ -61,6 +88,10 @@ class TrainingManager:
         for circuit_cfg in self._cfg.circuits:
             ensure_circuit_defaults(
                 self._db, circuit_cfg.circuit, circuit_cfg.circuit_type)
+
+        # Lower stale whole-home event targets for in-progress zone
+        # calibrations so they aren't stuck forever (see method docstring).
+        self._reconcile_calibration_thresholds()
 
         # Initial publish
         for circuit_cfg in self._cfg.circuits:
@@ -80,6 +111,41 @@ class TrainingManager:
                 except Exception as e:
                     log.error("[%s] training manager error: %s",
                               circuit_cfg.circuit, e)
+
+    def _reconcile_calibration_thresholds(self) -> None:
+        """Lower stale ``minimum_events`` for in-progress calibrations.
+
+        Earlier builds applied the whole-home event target to every
+        circuit, leaving low-traffic zone (irrigation) circuits unable to
+        ever reach it — they froze at a time-capped 100% forever. For any
+        circuit still ``calibrating``, recompute the type-aware target and
+        lower the stored value if it now sits below the old one. Only ever
+        lower it, never raise, so a mid-run fixture circuit can't be
+        re-stuck. ``started_at``/``calibration_ends_at``/``events_collected``
+        are left untouched; the next ``_check_progress`` tick completes any
+        circuit whose time has already elapsed.
+        """
+        profile = get_home_profile(self._db)
+        for circuit_cfg in self._cfg.circuits:
+            circuit = circuit_cfg.circuit
+            state_row = get_training_state(self._db, circuit)
+            if not state_row or state_row["state"] != "calibrating":
+                continue
+            circuit_kind = get_circuit_type(
+                self._db, circuit, default=circuit_cfg.circuit_type)
+            new_min = compute_minimum_events(
+                profile["bathrooms_full"] or 2,
+                profile["bathrooms_half"] or 0,
+                profile["floors"] or 1,
+                circuit_kind=circuit_kind,
+            )
+            current_min = state_row["minimum_events"] or 0
+            if new_min < current_min:
+                upsert_training_state(
+                    self._db, circuit, minimum_events=new_min)
+                log.info(
+                    "[%s] lowered calibration target %d → %d (%s circuit)",
+                    circuit, current_min, new_min, circuit_kind)
 
     async def start_calibration(self, circuit: str,
                                 calibration_days: int) -> bool:
@@ -110,10 +176,15 @@ class TrainingManager:
             return True
 
         profile = get_home_profile(self._db)
+        circuit_cfg = self._cfg.get_circuit(circuit)
+        circuit_kind = get_circuit_type(
+            self._db, circuit,
+            default=circuit_cfg.circuit_type if circuit_cfg else "fixture")
         minimum_events = compute_minimum_events(
             profile["bathrooms_full"] or 2,
             profile["bathrooms_half"] or 0,
             profile["floors"] or 1,
+            circuit_kind=circuit_kind,
         )
 
         now = datetime.now(timezone.utc)
@@ -149,6 +220,9 @@ class TrainingManager:
         if self.cluster_engine is not None:
             try:
                 self.cluster_engine.reset_circuit(circuit)
+                # A (re)calibration re-opens learning — unfreeze so the new period
+                # adapts again until it re-locks at the next activation.
+                self.cluster_engine.unfreeze_circuit(circuit)
             except Exception as e:
                 log.warning("[%s] reset_circuit failed (non-fatal): %s",
                             circuit, e)
@@ -204,6 +278,21 @@ class TrainingManager:
                 log.warning("[%s] post-calibration backfill failed (non-fatal): %s",
                             circuit, e)
 
+        # Merge same-type clusters so the labelling page shows one card per type
+        if self.cluster_engine is not None:
+            try:
+                import asyncio as _asyncio, functools
+                loop = _asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        self.cluster_engine.auto_merge_same_type_clusters, circuit
+                    ),
+                )
+            except Exception as e:
+                log.warning("[%s] post-calibration type-merge failed (non-fatal): %s",
+                            circuit, e)
+
         circuit_cfg = self._cfg.get_circuit(circuit)
         if circuit_cfg:
             await self._ha.notify(
@@ -241,8 +330,186 @@ class TrainingManager:
             completed_at=now.isoformat(),
         )
         await self._publish_status(circuit)
-        log.info("[%s] fixtures activated — now live", circuit)
+        # Phase 1: fit the per-home rule bands off this home's labels and FREEZE
+        # them + the cluster engine. The reference is now locked — live events match
+        # against it but never reshape it (the basis for leak / odd-usage detection).
+        report = await self._fit_and_lock(circuit, source="activation")
+        await self._notify_calibration_report(circuit, report)
+        log.info("[%s] fixtures activated — now live (locked)", circuit)
         return True
+
+    # ── Fit + freeze (Phase 1) ──────────────────────────────────────────────────
+
+    def _fit_and_lock_sync(self, circuit: str, source: str) -> Dict[str, Any]:
+        """Shared fit → sanity-gate → freeze path (sync; run via executor). Used by
+        BOTH activation and the dev ``retrain`` so the activation sanity gate (in
+        rule_calibration.fit_and_freeze) can never be skipped."""
+        from .rule_calibration import fit_and_freeze
+        from .database import reclassify_all_events_from_signatures
+        report = fit_and_freeze(self._db, circuit, source=source)
+        # Re-type events with the freshly-frozen rules so matched_* reflects the fit.
+        try:
+            reclassify_all_events_from_signatures(self._db, circuit)
+        except Exception as e:
+            log.warning("[%s] post-lock reclassify failed (non-fatal): %s",
+                        circuit, e)
+        # Phase 2: freeze the per-home usage baselines (envelopes + overall volume
+        # percentiles) AFTER reclassify so matched types are fresh. Frozen reference
+        # for future leak / odd-usage detection.
+        try:
+            from .anomaly_baseline import freeze_usage_baselines
+            freeze_usage_baselines(self._db, circuit, source=source)
+        except Exception as e:
+            log.warning("[%s] usage-baseline freeze failed (non-fatal): %s",
+                        circuit, e)
+        # Phase 2.4: freeze the per-home artifact-detector thresholds (phantom /
+        # cross-talk / dribble identifiers), safety-gated so a calibration can never
+        # zero a confirmed-real event. Applies to new events + future recomputes.
+        try:
+            from .artifact_calibration import freeze_artifact_thresholds
+            freeze_artifact_thresholds(self._db, circuit, source=source)
+        except Exception as e:
+            log.warning("[%s] artifact-threshold freeze failed (non-fatal): %s",
+                        circuit, e)
+        # Phase 2.3: re-score anomalies now the baseline is frozen. The FIRST
+        # reclassify ran before the baseline existed (it had to — the baseline is fit
+        # FROM its matched types), so its anomaly verdicts were inert. This second
+        # pass scores history against the freshly-frozen baseline (the freeze
+        # invalidated the cache; invalidate again defensively). Idempotent on types.
+        try:
+            from .anomaly_baseline import invalidate_baseline_cache
+            invalidate_baseline_cache(circuit)
+            reclassify_all_events_from_signatures(self._db, circuit)
+        except Exception as e:
+            log.warning("[%s] post-baseline anomaly rescore failed (non-fatal): %s",
+                        circuit, e)
+        if self.cluster_engine is not None:
+            try:
+                self.cluster_engine.freeze_circuit(circuit)
+            except Exception as e:
+                log.warning("[%s] freeze_circuit failed (non-fatal): %s",
+                            circuit, e)
+        return report
+
+    async def _fit_and_lock(self, circuit: str, source: str) -> Dict[str, Any]:
+        import functools
+        from .database import start_job, finish_job
+        circuit_cfg = self._cfg.get_circuit(circuit)
+        label = circuit_cfg.label if circuit_cfg else circuit
+        # §2.4 — track the (slow) re-lock so the UI can toast its success/failure.
+        # Covers BOTH activation and the dev retrain (both route through here).
+        job = start_job(self._db, "calibration", circuit, f"Calibrating {label}…")
+        loop = asyncio.get_running_loop()
+        try:
+            report = await loop.run_in_executor(
+                None, functools.partial(self._fit_and_lock_sync, circuit, source))
+            n_fit = sum(1 for r in report.values()
+                        if isinstance(r, dict) and r.get("status") == "fit")
+            finish_job(self._db, job, "done",
+                       f"{label}: calibration locked ({n_fit} home-fit)")
+            # P6: validate the just-frozen detectors against HA history (diagnostic
+            # only — never writes a threshold). Best-effort; a failure must not affect
+            # the freeze.
+            try:
+                from .detector_validation import run_detector_validation
+                await run_detector_validation(
+                    self._db, self._ha, self._cfg, circuit,
+                    datetime.now(timezone.utc), source=source)
+            except Exception as e:
+                log.warning("[%s] detector self-validation failed (non-fatal): %s",
+                            circuit, e)
+            return report
+        except Exception as e:
+            log.error("[%s] fit-and-lock failed: %s", circuit, e)
+            finish_job(self._db, job, "error", f"{label}: calibration failed")
+            return {}
+
+    async def validate_detectors(self, circuit: str) -> Dict[str, Any]:
+        """Run the detector self-validation against HA history on demand (dev tab).
+        Diagnostic only — writes no thresholds. Returns the report dict."""
+        from .detector_validation import run_detector_validation
+        return await run_detector_validation(
+            self._db, self._ha, self._cfg, circuit,
+            datetime.now(timezone.utc), source="manual")
+
+    async def _maybe_interim_validation(self, circuit: str, state_row,
+                                        now: datetime) -> None:
+        """Fire the ~day-7 advisory once per learning period (keyed by started_at)."""
+        from .detector_validation import (INTERIM_VALIDATION_DAY, build_interim_advisory,
+                                          interim_already_sent, mark_interim_sent,
+                                          run_detector_validation)
+        started_str = state_row["started_at"]
+        if not started_str:
+            return
+        try:
+            started = datetime.fromisoformat(started_str.replace("Z", "+00:00"))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return
+        if (now - started).days < INTERIM_VALIDATION_DAY:
+            return
+        if interim_already_sent(self._db, circuit, started_str):
+            return
+        try:
+            report = await run_detector_validation(
+                self._db, self._ha, self._cfg, circuit, now, source="interim")
+            if report.get("error"):
+                return
+            title, message = build_interim_advisory(self._db, circuit, report)
+            await self._ha.notify(
+                title=title, message=message,
+                notification_id=f"water_interim_validate_{circuit}")
+            # Mark sent only AFTER a successful notify, so a transient failure retries.
+            mark_interim_sent(self._db, circuit, started_str)
+            log.info("[%s] interim (day-%d) detector advisory sent",
+                     circuit, INTERIM_VALIDATION_DAY)
+        except Exception as e:
+            log.warning("[%s] interim validation advisory failed (non-fatal): %s",
+                        circuit, e)
+
+    async def _notify_calibration_report(self, circuit: str,
+                                         report: Dict[str, Any]) -> None:
+        """Surface the per-type fit-vs-fallback so a sparse/bad fit is visible, not
+        silent — the signal to watch on the first real activation."""
+        if not report:
+            return
+        fit = [t for t, r in report.items() if r.get("status") == "fit"]
+        fell = [t for t, r in report.items() if r.get("status") != "fit"]
+        circuit_cfg = self._cfg.get_circuit(circuit)
+        label = circuit_cfg.label if circuit_cfg else circuit
+        msg = (f"{label}: rule calibration locked. "
+               f"Home-fit: {', '.join(sorted(fit)) or 'none'}. "
+               f"Using defaults: {', '.join(sorted(fell)) or 'none'}.")
+        log.info("[%s] calibration report — %s", circuit, msg)
+        try:
+            await self._ha.notify(
+                title=f"Water Monitor — {label} calibration locked",
+                message=msg,
+                notification_id=f"water_calibration_locked_{circuit}")
+        except Exception as e:
+            log.warning("[%s] calibration report notify failed: %s", circuit, e)
+
+    async def retrain(self, circuit: str) -> Dict[str, Any]:
+        """DEV/testing only: re-fit + re-lock immediately against CURRENT labels —
+        no new learning period. Reuses the shared fit+freeze path (so the sanity
+        gate applies). Exposed only behind the feature-flagged Settings → Dev tab;
+        recalibration remains the normal long-term mechanism."""
+        if self.cluster_engine is not None:
+            import functools
+            loop = asyncio.get_running_loop()
+            try:
+                self.cluster_engine.unfreeze_circuit(circuit)
+                await loop.run_in_executor(
+                    None,
+                    functools.partial(self.cluster_engine.rebuild_from_db, circuit))
+            except Exception as e:
+                log.warning("[%s] retrain rebuild failed (non-fatal): %s",
+                            circuit, e)
+        report = await self._fit_and_lock(circuit, source="retrain")
+        await self._notify_calibration_report(circuit, report)
+        log.info("[%s] dev retrain complete — reference re-locked", circuit)
+        return report
 
     async def trigger_full_recalibration(self, circuit: str,
                                          days: int) -> bool:
@@ -362,6 +629,10 @@ class TrainingManager:
 
         now = datetime.now(timezone.utc)
 
+        # P6: one-time interim (~day 7) self-validation ADVISORY so the user can label
+        # better before the freeze locks calibration. Best-effort, diagnostic only.
+        await self._maybe_interim_validation(circuit, state_row, now)
+
         # Check time elapsed
         ends_at_str = state_row["calibration_ends_at"]
         if ends_at_str:
@@ -380,25 +651,40 @@ class TrainingManager:
                      circuit)
             await self.complete_calibration(circuit)
         elif time_elapsed and not events_ok:
-            # Extend calibration — notify user
-            log.warning(
-                "[%s] calibration time elapsed but only %d/%d events collected — extending",
-                circuit,
-                state_row["events_collected"],
-                state_row["minimum_events"],
-            )
-            circuit_cfg = self._cfg.get_circuit(circuit)
-            if circuit_cfg:
-                await self._ha.notify(
-                    title=f"Water Monitor — Training extended",
-                    message=(
-                        f"{circuit_cfg.label}: training period elapsed but only "
-                        f"{state_row['events_collected']} of "
-                        f"{state_row['minimum_events']} events collected. "
-                        f"Training continues automatically."
-                    ),
-                    notification_id=f"water_training_extended_{circuit}",
+            # Past the deadline but short on events. Don't re-warn on every 60 s
+            # poll — for a sparse circuit (e.g. irrigation that only runs every
+            # few days) stay quiet for roughly one observed inter-event interval
+            # between warnings. Completion still fires promptly: the deadline is
+            # already in the past, so the next events_ok tick completes on the
+            # branch above. The deadline itself is intentionally NOT moved.
+            last = self._last_undertarget_warn.get(circuit)
+            cadence = get_event_cadence_seconds(
+                self._db, circuit, since_iso=state_row["started_at"])
+            interval = _compute_recheck_interval(cadence)
+            if last is None or (now - last) >= interval:
+                self._last_undertarget_warn[circuit] = now
+                log.warning(
+                    "[%s] calibration under target (%d/%d events) — sparse "
+                    "circuit; next notice in ~%.1f h (cadence=%s)",
+                    circuit,
+                    state_row["events_collected"],
+                    state_row["minimum_events"],
+                    interval.total_seconds() / 3600.0,
+                    f"{cadence / 3600.0:.1f}h" if cadence else "unknown",
                 )
+                circuit_cfg = self._cfg.get_circuit(circuit)
+                if circuit_cfg:
+                    await self._ha.notify(
+                        title="Water Monitor — Training extended",
+                        message=(
+                            f"{circuit_cfg.label}: training period elapsed but only "
+                            f"{state_row['events_collected']} of "
+                            f"{state_row['minimum_events']} events collected. "
+                            f"Training continues automatically."
+                        ),
+                        notification_id=f"water_training_extended_{circuit}",
+                    )
+            # else: under target but still within the quiet interval — stay silent.
 
     async def _publish_status(self, circuit: str) -> None:
         """Publish training status sensor to HA."""
@@ -435,11 +721,10 @@ class TrainingManager:
                 remaining_hours = remaining_td.seconds // 3600
                 total_days = state_row["calibration_days"] or 14
                 time_pct = min(100, int(elapsed_days / max(total_days, 1) * 100))
-                event_pct = min(100, int(
-                    (state_row["events_collected"] or 0) /
-                    max(state_row["minimum_events"] or 1, 1) * 100
-                ))
-                # Progress is purely time-based for user-facing display
+                # Progress is purely time-based for user-facing display.
+                # An earlier hybrid scheme also computed event_pct from
+                # events_collected / minimum_events, but the events
+                # metric is internal only and is no longer surfaced.
                 pct = time_pct
             else:
                 remaining_days  = 0
@@ -492,15 +777,13 @@ class TrainingManager:
             else:
                 time_pct = 0
 
-            event_pct = min(100, int(
-                (state_row["events_collected"] or 0) /
-                max(state_row["minimum_events"] or 1, 1) * 100
-            ))
             remaining_td = max(ends_at - now, timedelta(0))
             result["days_remaining"]  = remaining_td.days
             result["hours_remaining"] = remaining_td.seconds // 3600
-            # Percent complete is purely time-based — events are an internal
-            # metric and don't affect the displayed progress.
+            # Percent complete is purely time-based — events_collected
+            # / minimum_events is an internal metric and doesn't affect
+            # the displayed progress. (Earlier code computed an event_pct
+            # here and discarded it.)
             result["percent_complete"] = time_pct
         else:
             # 'labelling' is post-calibration review — calibration itself

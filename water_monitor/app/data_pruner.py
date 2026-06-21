@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -42,13 +41,20 @@ class DataPruner:
         """
         On first start: run a full backfill immediately if daily_summary is empty.
         Then wait until 03:00 and run the full nightly job daily.
+
+        prune_now() and _startup_backfill() do many sync SQLite operations
+        (DELETEs + daily-summary computation across all events) which can
+        block the event loop for several seconds on a populated DB. They're
+        offloaded to a worker thread via run_in_executor so the rest of the
+        addon stays responsive to ingress requests.
         """
-        await self._startup_backfill()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._startup_backfill_sync)
 
         await self._wait_until_3am()
         while not self._stop.is_set():
             try:
-                self.prune_now()
+                await loop.run_in_executor(None, self.prune_now)
                 await self._run_auto_backup()
             except Exception as e:
                 log.error("Data pruner nightly error: %s", e, exc_info=True)
@@ -59,10 +65,14 @@ class DataPruner:
 
     # ── Startup backfill ────────────────────────────────────────────────────
 
-    async def _startup_backfill(self) -> None:
-        """
-        If daily_summary is empty (first install or fresh DB), compute summaries
-        for all historical events immediately so the history chart isn't blank.
+    def _startup_backfill_sync(self) -> None:
+        """Synchronous variant of the startup backfill — invoked from
+        run() via run_in_executor so the heavy summary computation
+        doesn't block the event loop.
+
+        If daily_summary is empty (first install or fresh DB), compute
+        summaries for all historical events immediately so the history
+        chart isn't blank.
         """
         try:
             count = self._db.execute(
@@ -78,6 +88,13 @@ class DataPruner:
             # Also catch any days missed since last run (e.g. after an update)
             self._compute_missing_summaries(now)
         self._compute_fixture_daily_summaries(now)
+
+    async def _startup_backfill(self) -> None:
+        """Async wrapper kept for any external callers that expect the
+        original signature. Delegates to the sync variant via the loop's
+        default executor so the heavy work happens off the event loop."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._startup_backfill_sync)
 
     # ── Nightly job ─────────────────────────────────────────────────────────
 
@@ -187,6 +204,19 @@ class DataPruner:
         except Exception as e:
             log.error("Pruning circuit_exclusion_windows: %s", e)
             deleted["circuit_exclusion_windows"] = 0
+
+        # training_capture — transient wizard state, keep 30 days. Orphaned
+        # candidate rows (parent pruned) are swept too.
+        try:
+            cur = self._db.execute(
+                "DELETE FROM training_capture WHERE created_at < ?", (excl_cutoff,))
+            deleted["training_capture"] = cur.rowcount
+            self._db.execute(
+                "DELETE FROM training_capture_candidates WHERE capture_id NOT IN "
+                "(SELECT id FROM training_capture)")
+        except Exception as e:
+            log.error("Pruning training_capture: %s", e)
+            deleted["training_capture"] = 0
 
         # Step 5: compute per-fixture daily summaries for any gaps
         self._compute_fixture_daily_summaries(now)
@@ -302,7 +332,9 @@ class DataPruner:
                     SELECT circuit, fixture_id,
                            date(start_ts)    AS day,
                            COUNT(*)          AS event_count,
-                           COALESCE(SUM(volume_litres), 0) AS total_volume_litres,
+                           COALESCE(SUM(COALESCE(volume_litres_effective,
+                                                 volume_litres, 0)), 0)
+                                             AS total_volume_litres,
                            AVG(avg_flow_lpm)               AS avg_flow_lpm,
                            MAX(peak_flow_lpm)              AS peak_flow_lpm
                     FROM events
@@ -341,7 +373,7 @@ class DataPruner:
 
         try:
             from .routers.backup import (
-                QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT, QUICK_RESTORE_DAYS)
+                QUICK_RESTORE_TABLES, QUICK_RESTORE_DAYS)
             from datetime import timedelta
 
             cutoff = (datetime.now(timezone.utc)

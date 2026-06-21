@@ -57,6 +57,10 @@ OPTIONAL_ROLES = {
     "trickle_max_flow",
     "trickle_duration",
     "leak_test_duration_number",  # preferred name; leak_test_duration_sensor is the compat alias
+    # Runtime per-circuit flow-meter pulses-per-litre (firmware 3.12.0+). Optional so
+    # older firmware (compile-time k-factor) still adopts; the add-on falls back to its
+    # cached pulses_per_litre / 396 default when this role is unmatched.
+    "flow_meter_ppl",
     # Waveform diagnostic counters (firmware 3.7.0+ / 3.9.0+, circuit_1 only).
     # The 5 chunked text sensors were replaced by an HA event in firmware 3.8.0.
     # Chunk drop count was added in 3.9.0 when chunked streaming replaced the
@@ -126,6 +130,8 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "trickle_max_flow":           (r"trickle flow max threshold.*main",            "number"),
         "trickle_duration":           (r"trickle flow alert duration.*main",           "number"),
         "leak_test_duration_number":  (r"leak test duration.*main",                    "number"),
+        # Runtime per-circuit flow-meter pulses-per-litre (firmware 3.12.0+).
+        "flow_meter_ppl":             (r"flow meter ppl.*main",                        "number"),
         # Waveform diagnostic counters (firmware 3.7.0+ / 3.9.0+, circuit_1 only).
         # The 5 chunked text sensors were replaced by an HA event in firmware 3.8.0;
         # chunk drop count was added in 3.9.0 alongside the chunked streaming transport.
@@ -165,6 +171,8 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "trickle_max_flow":           (r"trickle flow max threshold.*irrigation|trickle_max_flow_irr\b",       "number"),
         "trickle_duration":           (r"trickle flow alert duration.*irrigation|trickle_duration_irr\b",      "number"),
         "leak_test_duration_number":  (r"leak test duration.*irrigation|leak_duration_irr\b",                  "number"),
+        # Runtime per-circuit flow-meter pulses-per-litre (firmware 3.12.0+).
+        "flow_meter_ppl":             (r"flow meter ppl.*irrigation|ppl_irr\b",                                "number"),
     },
 }
 

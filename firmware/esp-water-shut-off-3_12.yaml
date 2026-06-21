@@ -51,21 +51,64 @@
 # =============================================================================
 
 substitutions:
-  flow_k_factor: "396.0"   # 6.6 pulses/litre × 60s = 396
+  # FLOW METER PULSES-PER-LITRE — set per circuit to match your meter
+  # (turbine YF-B5 = 396; oval-gear ZJ-HSM = 72; any meter = its datasheet ppl, or a
+  # bucket test: counted pulses ÷ measured litres). This seeds the runtime ppl_main /
+  # ppl_irr number entities' initial_value, so the meter is set HERE at first flash and
+  # is correct from boot with no Home Assistant needed. The entities are NVS-backed
+  # (restore_value), so the value survives reboots AND OTA firmware updates — it is never
+  # lost on an update. To change the meter later (rare): set it on the device web page /
+  # in Home Assistant (persists to NVS), or clean-flash to re-apply a new value here
+  # (a plain OTA reflash keeps the saved value by design).
+  flow_ppl_main: "396"   # circuit 1 meter pulses/litre
+  flow_ppl_irr:  "396"   # circuit 2 meter pulses/litre
+  # §1.4 — flow-clamp bounds (lifted out of the per-circuit filter lambdas so both
+  # circuits share one source of truth). Below min = ADC/float noise → 0; above max
+  # = impossible (ADC overflow) → 0.
+  flow_min_lpm: "0.01"
+  flow_max_lpm: "200.0"
   circuit_1_name: "Main"        # Display name for circuit 1 — change to suit your install
   circuit_2_name: "Irrigation"  # Display name for circuit 2 — change to suit your install
 
+  # ---------------------------------------------------------------------------
+  # PRESSURE TRANSDUCER CALIBRATION — per-circuit two-point linear fit.
+  # Defaults below are the factory-typical fit for a 0.5–4.5 V / 100 PSI
+  # transducer; identical defaults on both circuits so existing flashes
+  # behave exactly as before this block was parametrised.
+  #
+  # To recalibrate one circuit:
+  #   1. Disconnect (or ground) the transducer signal and read the raw
+  #      ADC voltage from HA — that's your zero_raw.
+  #   2. Apply a known reference pressure (e.g. a hand pump with an
+  #      analogue gauge), read the raw ADC voltage — that's your max_raw.
+  #   3. zero_psi is the calibrated PSI at zero_raw (typically slightly
+  #      negative; the transducer's lowest output rarely lines up with
+  #      0 PSI exactly). max_psi is the corresponding gauge reading.
+  #   4. Override the four substitutions below per circuit. The pair of
+  #      (raw, psi) datapoints feeds ESPHome's calibrate_linear filter.
+  #
+  # See docs/hardware/bring-up-checklist.md for the full procedure.
+  # ---------------------------------------------------------------------------
+  pressure_cal_main_zero_raw: "0.0"
+  pressure_cal_main_zero_psi: "-9.4359"
+  pressure_cal_main_max_raw:  "3.1"
+  pressure_cal_main_max_psi:  "104.1172"
+  pressure_cal_irr_zero_raw:  "0.0"
+  pressure_cal_irr_zero_psi:  "-9.4359"
+  pressure_cal_irr_max_raw:   "3.1"
+  pressure_cal_irr_max_psi:   "104.1172"
+
 esphome:
   name: esp-water-shut-off-3
-  friendly_name: ESP Water Shut off 3.10
+  friendly_name: ESP Water Shut off 3.12
   min_version: 2024.6.0
-  name_add_mac_suffix: false
+  name_add_mac_suffix: true
   platformio_options:
     # DIO flash mode required for ESP32-S3
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.10.0"
+    version: "3.12.0"   # runtime per-circuit Flow Meter PPL number entities (ppl_main / ppl_irr)
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -149,24 +192,32 @@ esp32:
 logger:      # Enable serial logging for debugging
   level: WARN
 
-api:         # Encryption disabled for now — re-add an `encryption:` block before release
+api:
+  # ESPHome native API — encrypted. Key lives in secrets.yaml.
+  # Generate once with `esphome wizard` or `openssl rand -base64 32`,
+  # then DO NOT regenerate or every HA integration must re-pair.
+  encryption:
+    key: !secret api_encryption_key
 
 ota:         # Enable over-the-air firmware updates
   - platform: esphome
-    # OTA password disabled for now — re-add `password:` before release
+    password: !secret ota_password
 
 improv_serial:   # Allows Wi-Fi provisioning via USB serial on first setup
 
 wifi:
-  ap:   # Fallback hotspot — open network for now; re-add `password:` before release
+  ap:
+    # Fallback hotspot — protected. Password lives in secrets.yaml.
+    password: !secret fallback_ap_password
 
 captive_portal:  # Serves a Wi-Fi setup page when connected to the fallback AP
 
 dashboard_import:
   # Allows this device to appear in the ESPHome dashboard for adoption.
-  # RELEASE BLOCKER: replace @main with an immutable version tag before publishing
-  #   e.g.  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_6.yaml@v3.6.0
-  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_6.yaml@main
+  # IMPORTANT: this URL must point at an immutable tag (e.g. @v3.10.0)
+  # before each release. scripts/check_firmware_release.py enforces this
+  # — it fails the release if the ref ends with @main or any branch ref.
+  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_10.yaml@v3.10.0
   import_full_config: true
 
 esp32_improv:
@@ -175,7 +226,9 @@ esp32_improv:
 
 web_server:
   version: 3  # Required for sorting_groups support
-  # Web UI auth disabled for now — re-add an `auth:` block before release
+  auth:
+    username: !secret web_username
+    password: !secret web_password
   # Organises the built-in web UI into collapsible sections per valve.
   # Each entity is assigned to a group via its web_server: sorting_group_id.
   sorting_groups:
@@ -592,14 +645,14 @@ globals:
     initial_value: '""'
 
   # ---------------------------------------------------------------------------
-  # WAVEFORM CAPTURE GLOBALS — Per-circuit chunked streaming (firmware 3.10.0+)
+  # WAVEFORM CAPTURE GLOBALS — Per-circuit chunked streaming
   #
   # Per-event flow + pressure waveform capture for the water-signature add-on,
   # delivered as a stream of esphome.water_monitor_waveform_chunk events.
   # A new chunk fires every 30 s of capture (or whenever the 1500-sample
   # buffer fills) and the add-on accumulates + stitches them on the final
-  # chunk. This replaces the slot+decimation design used through 3.8.x —
-  # native cadence is preserved regardless of event length.
+  # chunk. Native cadence is preserved regardless of event length; no
+  # decimation.
   #
   # STRICTLY ADDITIVE to safety: no safety, ADC, valve, or leak-test path
   # reads or writes any global below. All capture work runs in the dedicated
@@ -874,8 +927,8 @@ sensor:
       - calibrate_linear:
           method: least_squares
           datapoints:
-            - 0.0 -> -9.4359
-            - 3.1 -> 104.1172
+            - ${pressure_cal_main_zero_raw} -> ${pressure_cal_main_zero_psi}
+            - ${pressure_cal_main_max_raw} -> ${pressure_cal_main_max_psi}
       - clamp:
           min_value: 0
           max_value: 104
@@ -893,8 +946,8 @@ sensor:
       - calibrate_linear:
           method: least_squares
           datapoints:
-            - 0.0 -> -9.4359
-            - 3.1 -> 104.1172
+            - ${pressure_cal_irr_zero_raw} -> ${pressure_cal_irr_zero_psi}
+            - ${pressure_cal_irr_max_raw} -> ${pressure_cal_irr_max_psi}
       - clamp:
           min_value: 0
           max_value: 104
@@ -1384,8 +1437,9 @@ sensor:
   # FLOW SENSOR 1 — Main line (GPIO39)
   # Pulse counter connected to a turbine flow meter.
   # Converts pulse frequency to flow rate in litres per minute.
-  # Formula: pulses per minute / (6.6 * 60) = L/min
-  #   where 6.6 is the sensor pulse factor (pulses per litre).
+  # Formula: L/min = pulses_per_minute / ppl, where ppl is the runtime per-circuit
+  #   pulses-per-litre number entity (ppl_main / ppl_irr). No ÷60 — the pulse
+  #   counter already reports counts per minute.
   #
   # Timing strategy:
   #   update_interval: 25ms — counts pulses over a 25ms window at 40Hz internally.
@@ -1440,13 +1494,15 @@ sensor:
     on_value:
       then:
         # --- Instant burst detection ---
-        # x is raw pulses/min. x/396 = instantaneous L/min.
+        # x is raw pulses/min. x / ppl_main = instantaneous L/min (no ÷60).
         # 1.5× multiplier compensates for single-second window variability —
         # a genuine burst at 25 L/min still reads >>37.5 on the raw counter.
         # Gated by the open end stop so this only fires while the valve is open
         # and the system is in normal operation.
         - lambda: |-
-            float instant_lpm = x / ${flow_k_factor}f;
+            float ppl = id(ppl_main).state;
+            if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
+            float instant_lpm = x / ppl;
             if (!id(fault_main)
                 && id(alert_high_flow_main)
                 && id(open_end_stop_valve1).state
@@ -1509,8 +1565,12 @@ sensor:
       sorting_group_id: group_main_status
       sorting_weight: 4
     filters:
-      # Step 1: Convert raw counts/min to L/min (flow_k_factor = 6.6 pulses/litre × 60s = 396)
-      - lambda: return (x / ${flow_k_factor});
+      # Step 1: Convert raw counts/min to L/min via the runtime ppl_main number entity
+      # (pulses/litre). L/min = pulses/min ÷ ppl — no ÷60 (counter already reports /min).
+      - lambda: |-
+          float ppl = id(ppl_main).state;
+          if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
+          return x / ppl;
       # Step 1b: Clamp — reject garbage values before they corrupt the smoothing
       # windows. Two classes of garbage are possible:
       #   HIGH: ADC float overflow produces values like 1.58e+36 L/min.
@@ -1521,7 +1581,7 @@ sensor:
       # Returning 0.0 keeps the smoothed output well-behaved and prevents
       # open-forever event detection bugs in the companion addon.
       - lambda: |-
-          if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
+          if (!std::isfinite(x) || x < ${flow_min_lpm}f || x > ${flow_max_lpm}f) return 0.0f;
           return x;
       # Step 2: 0.5-second sliding window (20 samples × 25ms = 500ms). send_every: 1
       # publishes at 40Hz (every 25ms). Shorter window reduces the stepped
@@ -1650,7 +1710,9 @@ sensor:
         # Same logic as flow_base_main — see comments above.
         # Irrigation auto-shutoff fires on the irrigation valve only.
         - lambda: |-
-            float instant_lpm = x / ${flow_k_factor}f;
+            float ppl = id(ppl_irr).state;
+            if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
+            float instant_lpm = x / ppl;
             if (!id(fault_irrigation)
                 && id(alert_high_flow_irr)
                 && id(open_end_stop_valve2).state
@@ -1703,10 +1765,14 @@ sensor:
       sorting_group_id: group_irr_status
       sorting_weight: 4
     filters:
-      - lambda: return (x / ${flow_k_factor});
+      # Convert raw counts/min to L/min via the runtime ppl_irr number entity (no ÷60).
+      - lambda: |-
+          float ppl = id(ppl_irr).state;
+          if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
+          return x / ppl;
       # Clamp — same guard as water_usage1; see comments there.
       - lambda: |-
-          if (!std::isfinite(x) || x < 0.01f || x > 200.0f) return 0.0f;
+          if (!std::isfinite(x) || x < ${flow_min_lpm}f || x > ${flow_max_lpm}f) return 0.0f;
           return x;
       # 0.5-second sliding window — matches water_usage1; see comments there.
       - sliding_window_moving_average:
@@ -2338,6 +2404,56 @@ output:
 # =============================================================================
 number:
   # ---------------------------------------------------------------------------
+  # FLOW METER PULSES-PER-LITRE (PPL) — runtime, per circuit, NVS-backed.
+  # Single source of truth for the pulses→L/min conversion. Set in HA to match
+  # each circuit's meter: turbine YF-B5 = 396; oval-gear ZJ-HSM = 72; any other
+  # meter = its datasheet ppl (or bucket-test: counted pulses ÷ measured litres).
+  # restore_value keeps it across reboots/OTA. Changing it makes the add-on
+  # re-baseline that circuit; past event volumes are NOT recomputed.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Flow Meter PPL - ${circuit_1_name}"
+    id: ppl_main
+    entity_category: config
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 0
+    icon: mdi:counter
+    unit_of_measurement: "ppl"
+    min_value: 1
+    max_value: 5000
+    step: 0.1                          # 0.1-ppl granularity so a future "match reality" calibration value (e.g. 72.4) can be set
+    initial_value: ${flow_ppl_main}   # seeded from the substitution; NVS keeps it after first boot
+    restore_value: yes
+    optimistic: true
+    mode: box
+    set_action:
+      - logger.log:
+          format: "Main flow meter PPL set to %.0f pulses/litre"
+          args: ['x']
+
+  - platform: template
+    name: "Flow Meter PPL - ${circuit_2_name}"
+    id: ppl_irr
+    entity_category: config
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 0
+    icon: mdi:counter
+    unit_of_measurement: "ppl"
+    min_value: 1
+    max_value: 5000
+    step: 0.1                          # 0.1-ppl granularity so a future "match reality" calibration value (e.g. 72.4) can be set
+    initial_value: ${flow_ppl_irr}   # seeded from the substitution; NVS keeps it after first boot
+    restore_value: yes
+    optimistic: true
+    mode: box
+    set_action:
+      - logger.log:
+          format: "Irrigation flow meter PPL set to %.0f pulses/litre"
+          args: ['x']
+
+  # ---------------------------------------------------------------------------
   # BURST PIPE HIGH FLOW THRESHOLD
   # ---------------------------------------------------------------------------
   - platform: template
@@ -2380,6 +2496,55 @@ number:
     set_action:
       - logger.log:
           format: "Irrigation burst pipe flow threshold set to %.1f L/min"
+          args: ['x']
+
+  # ---------------------------------------------------------------------------
+  # §1.4 VALVE-TRAVEL TIMEOUT — how long to wait for the motor to reach its end
+  # stop before declaring a motor/wiring fault. Per-circuit + configurable so a
+  # slow motor / low supply voltage no longer latches a FALSE motor fault. The
+  # default 15000 ms is the historical hardcoded value (zero behaviour change on
+  # an existing install); raise it for a slower valve. The travel lambdas fall
+  # back to 15000 ms if the value is unset/NaN, so the fault logic is never
+  # disabled by a bad number.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Valve Travel Timeout - ${circuit_1_name}"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 2
+    id: valve_travel_ms_main
+    icon: mdi:timer-cog-outline
+    unit_of_measurement: "ms"
+    min_value: 3000
+    max_value: 30000
+    step: 500
+    initial_value: 15000
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Main valve travel timeout set to %.0f ms"
+          args: ['x']
+
+  - platform: template
+    name: "Valve Travel Timeout - ${circuit_2_name}"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 2
+    id: valve_travel_ms_irr
+    icon: mdi:timer-cog-outline
+    unit_of_measurement: "ms"
+    min_value: 3000
+    max_value: 30000
+    step: 500
+    initial_value: 15000
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Irrigation valve travel timeout set to %.0f ms"
           args: ['x']
 
   # ---------------------------------------------------------------------------
@@ -3655,9 +3820,11 @@ script:
 #   2. De-energise RESET (close) coil — ensures it is fully off
 #   3. Wait 20ms — mandatory inter-coil gap (2x the RT424F12 max operate time)
 #   4. Pulse SET coil 15ms then de-energise — relay latches, motor starts
-#   5. Wait 15000ms — allow time for full valve travel
-#      (increase if spurious end-stop-timeout faults occur at low temperature
-#      or low supply voltage; decrease if your motor travels much faster)
+#   5. Wait the configurable "Valve Travel Timeout" (§1.4 number entity, default
+#      15000ms) — allow time for full valve travel. Raise it via the entity if
+#      spurious end-stop-timeout faults occur at low temperature / low supply
+#      voltage; lower it if your motor travels much faster. (Falls back to 15000ms
+#      if the value is unset/NaN, so the fault logic is never disabled.)
 #   6. Check open end stop — if not active, raise fault, publish CLOSED
 #
 # Close action (always permitted — safety action, no fault check):
@@ -3709,7 +3876,7 @@ valve:
                   - switch.turn_on: relay_open_valve1
                   - delay: 15ms
                   - switch.turn_off: relay_open_valve1
-                  - delay: 15000ms
+                  - delay: !lambda 'float t = id(valve_travel_ms_main).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
                   - if:
                       condition:
                         # Check both: guard still set (open truly in flight) AND end stop not reached.
@@ -3722,7 +3889,7 @@ valve:
                             id(fault_reason_main_str) = "Motor fault — open end stop not reached";
                             id(fault_reason_main).publish_state(id(fault_reason_main_str));
                             id(open_in_flight_main) = false;
-                            ESP_LOGE("valve", "MAIN: open end stop not reached after 15000ms — motor/wiring fault");
+                            ESP_LOGE("valve", "MAIN: open end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_main).state);
     close_action:
       # Guard against repeated valve.close calls while a close is already
       # in flight. The guard is set on first entry, cleared when the open
@@ -3747,7 +3914,7 @@ valve:
             - switch.turn_on: relay_closed_valve1
             - delay: 15ms
             - switch.turn_off: relay_closed_valve1
-            - delay: 15000ms
+            - delay: !lambda 'float t = id(valve_travel_ms_main).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
             - if:
                 condition:
                   binary_sensor.is_off: closed_end_stop_valve1
@@ -3756,7 +3923,7 @@ valve:
                       id(fault_main) = true;
                       id(fault_reason_main_str) = "Motor fault — closed end stop not reached";
                       id(fault_reason_main).publish_state(id(fault_reason_main_str));
-                      ESP_LOGE("valve", "MAIN: closed end stop not reached after 15000ms — motor/wiring fault");
+                      ESP_LOGE("valve", "MAIN: closed end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_main).state);
 
   - platform: template
     name: "${circuit_2_name} Water Valve"
@@ -3797,7 +3964,7 @@ valve:
                   - switch.turn_on: relay_open_valve2
                   - delay: 15ms
                   - switch.turn_off: relay_open_valve2
-                  - delay: 15000ms
+                  - delay: !lambda 'float t = id(valve_travel_ms_irr).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
                   - if:
                       condition:
                         # Same guard-check pattern as main valve — see main open_action comment.
@@ -3808,7 +3975,7 @@ valve:
                             id(fault_reason_irr_str) = "Motor fault — open end stop not reached";
                             id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
                             id(open_in_flight_irr) = false;
-                            ESP_LOGE("valve", "IRRIGATION: open end stop not reached after 15000ms — motor/wiring fault");
+                            ESP_LOGE("valve", "IRRIGATION: open end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_irr).state);
     close_action:
       # See main valve close_action for explanation of the close-in-flight guard.
       - if:
@@ -3829,7 +3996,7 @@ valve:
             - switch.turn_on: relay_closed_valve2
             - delay: 15ms
             - switch.turn_off: relay_closed_valve2
-            - delay: 15000ms
+            - delay: !lambda 'float t = id(valve_travel_ms_irr).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
             - if:
                 condition:
                   binary_sensor.is_off: closed_end_stop_valve2
@@ -3838,4 +4005,4 @@ valve:
                       id(fault_irrigation) = true;
                       id(fault_reason_irr_str) = "Motor fault — closed end stop not reached";
                       id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
-                      ESP_LOGE("valve", "IRRIGATION: closed end stop not reached after 15000ms — motor/wiring fault");
+                      ESP_LOGE("valve", "IRRIGATION: closed end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_irr).state);

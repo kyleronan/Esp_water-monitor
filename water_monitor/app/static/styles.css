@@ -37,6 +37,7 @@
   --red:            oklch(55% 0.22 25);
   --red-bg:         oklch(96% 0.05 25);
   --red-text:       oklch(35% 0.16 25);
+  --violet-bg:      oklch(95% 0.04 300);
   --red-border:     oklch(82% 0.12 25);
   --accent-border:  oklch(82% 0.10 240);
   --accent-text:    oklch(35% 0.14 240);
@@ -95,6 +96,7 @@
     --red:            oklch(68% 0.22 25);
     --red-bg:         oklch(28% 0.08 25);
     --red-text:       oklch(85% 0.16 25);
+    --violet-bg:      oklch(28% 0.06 300);
     --red-border:     oklch(45% 0.14 25);
 
     /* Shadows — stronger blacks read better on dark surfaces */
@@ -280,7 +282,7 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .toggle-label { font-size: .82rem; }
 .toggle-desc  { font-size: .72rem; color: var(--muted); display: block; }
 
-.toggle { position: relative; display: inline-block; width: 36px; height: 20px; }
+.toggle { position: relative; display: inline-block; width: 36px; height: 20px; flex-shrink: 0; }
 .toggle input { position: absolute; opacity: 0; width: 0; height: 0; -webkit-appearance: none; appearance: none; }
 .toggle-slider {
   position: absolute; cursor: pointer; inset: 0;
@@ -688,6 +690,18 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   display: block;
 }
 
+/* "What to do next" chip under the dashboard subtitle */
+.dash-next-chip {
+  display: inline-block; margin-top: 6px;
+  font-size: 12px; padding: 3px 10px; border-radius: 999px;
+  background: var(--surface-2); color: var(--text-2);
+  border: 1px solid var(--border); text-decoration: none;
+}
+a.dash-next-chip:hover { text-decoration: underline; }
+.dash-next-chip.is-alert { background: var(--amber-bg); color: var(--amber-text); border-color: var(--amber); }
+.dash-next-chip.is-ok    { color: var(--text-3); }
+.dash-alert-help { font-size: 11px; text-decoration: underline; margin-left: 6px; white-space: nowrap; }
+
 /* Away pill toggle — pill-shaped button, top-right of dashboard ──── */
 .dash-away-toggle-form { margin: 0; }
 .dash-away-toggle {
@@ -770,8 +784,9 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   display: flex; align-items: center; justify-content: space-between;
   gap: 8px; margin-bottom: 12px;
 }
-.dash-alert-fault   { border-left-color: var(--red);   background: var(--red-bg); }
-.dash-alert-trickle { border-left-color: var(--amber); background: var(--amber-bg); color: var(--amber-text); font-size: 12px; padding: 6px 12px; }
+.dash-alert-fault    { border-left-color: var(--red);   background: var(--red-bg); }
+.dash-alert-trickle  { border-left-color: var(--amber); background: var(--amber-bg); color: var(--amber-text); font-size: 12px; padding: 6px 12px; }
+.dash-alert-degraded { border-left-color: var(--amber); background: var(--amber-bg); color: var(--amber-text); }
 .dash-alert-body {
   display: flex; flex-direction: column; gap: 2px;
 }
@@ -923,6 +938,11 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   background: var(--accent);
   border-radius: 999px;
 }
+.dash-training-next {
+  font-size: 12px; color: var(--text-2);
+  margin: 8px 0 0; line-height: 1.45;
+}
+.dash-training-next a { color: var(--accent); }
 @media (prefers-reduced-motion: no-preference) {
   .dash-training-fill { transition: width .4s ease; }
 }
@@ -1407,12 +1427,58 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .hist-row-pass { background: var(--green-bg); }
 .hist-row-fail { background: var(--red-bg); }
 .hist-row-composite { background: var(--accent-bg); }
+.hist-row-degraded  { background: var(--amber-bg); }
+.hist-row-phantom   { background: var(--violet-bg); }
+.hist-row-skip      { background: var(--surface-2); }   /* leak test not-run / stopped / cancelled */
+
+.hist-filter-banner {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 12px; padding: 10px 14px;
+  background: var(--amber-bg); color: var(--amber-text);
+  border-left: 3px solid var(--amber); border-radius: 0 6px 6px 0;
+  font-size: 13px;
+}
+
+/* ── Symbol legend (collapsible key above the events tables) ──────── */
+.hist-legend {
+  margin: 0 0 16px; padding: 8px 14px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 8px; font-size: 13px;
+}
+.hist-legend > summary {
+  cursor: pointer; user-select: none; list-style: none;
+  font-weight: 600; color: var(--text-2);
+}
+.hist-legend > summary::-webkit-details-marker { display: none; }
+.hist-legend > summary::before { content: '▶ '; font-size: 9px; }
+.hist-legend[open] > summary::before { content: '▼ '; }
+.hist-legend-dl {
+  display: grid; grid-template-columns: auto 1fr;
+  gap: 8px 14px; margin: 12px 0 4px; align-items: start;
+}
+.hist-legend-dl dt { white-space: nowrap; }
+.hist-legend-dl dd { margin: 0; color: var(--text-2); line-height: 1.45; }
+.hist-legend-fix   { color: var(--text-2); font-weight: 600; letter-spacing: 2px; }
+
+/* Note column — stacked word-pills for the per-event flags */
+.hist-note-cell        { display: flex; flex-wrap: wrap; gap: 4px; }
+.hist-note-cell .pill  { font-size: 11px; }
 
 /* Event rows — clickable + hover highlight */
 .hist-event-row        { cursor: pointer; }
 .hist-event-row:hover  { background: var(--surface-2); }
 .hist-event-row:focus  { outline: 2px solid var(--accent); outline-offset: -2px; }
 .hist-row-ignored      { opacity: 0.4; }
+
+/* Leak-test rows — clickable. Hover is a translucent overlay (background-image
+   layers over background-color) so every category, including grey skip rows,
+   shows a visible hover while keeping its category color. */
+.lt-row { cursor: pointer; }
+.lt-row:hover { background-image: linear-gradient(rgba(128,128,128,.15), rgba(128,128,128,.15)); }
+.lt-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.lt-modal-status { margin: 0 0 14px; }
+.lt-modal-status .pill { font-size: 13px; padding: 4px 12px; }
+.lt-modal-explain { font-size: 13px; line-height: 1.5; color: var(--text-2); margin: 0 0 16px; }
 
 /* ── Event detail modal ──────────────────────────────────────────── */
 .evt-modal-backdrop {
@@ -1421,12 +1487,24 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
   background: rgba(0,0,0,.45);
   align-items: center; justify-content: center;
   z-index: 500;
+  padding: 16px;            /* breathing room so the modal never hugs edges */
+  box-sizing: border-box;
 }
 .evt-modal-backdrop.is-open { display: flex; }
 .evt-modal {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 10px; padding: 24px; width: 600px; max-width: 95vw;
   box-shadow: 0 8px 32px rgba(0,0,0,.25);
+  /* Scroll the modal body when it's taller than the viewport (mobile),
+     so the action row and close button stay reachable. dvh accounts for
+     the mobile browser chrome; the vh line is the older-browser fallback. */
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+@media (max-width: 480px) {
+  .evt-modal { padding: 16px; }
 }
 .evt-modal-header {
   display: flex; align-items: center; justify-content: space-between;
@@ -1456,13 +1534,50 @@ h1, h2, h3, h4 { letter-spacing: -.02em; }
 .evt-modal-summary::before { content: '▶ '; font-size: 9px; }
 details[open] .evt-modal-summary::before { content: '▼ '; }
 .evt-modal-dl-extra { margin-top: 10px; }
+.evt-modal-degraded {
+  margin: 10px 0 4px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--amber);
+  background: var(--amber-bg);
+  border-radius: 4px;
+}
+.evt-modal-degraded-title {
+  font-size: 12px; font-weight: 600; color: var(--amber-text);
+  margin: 0 0 6px; text-transform: uppercase; letter-spacing: 0.4px;
+}
+.evt-modal-degraded .evt-modal-dl-extra { margin-top: 0; }
 .evt-modal-error {
   font-size: 12px; color: var(--red, oklch(55% .22 25));
   margin-bottom: 8px; padding: 6px 8px;
   background: var(--red-bg, oklch(97% .02 25));
   border-radius: 4px;
 }
-.evt-modal-btns { display: flex; gap: 8px; justify-content: flex-end; }
+.evt-modal-btns {
+  display: flex; gap: 8px; justify-content: flex-end;
+  /* Keep Save / Ignore reachable while the modal body scrolls. The footer
+     bg is the modal's own surface colour, so the side-padding gaps show no
+     seam — breakpoint-safe, no negative-margin trick needed. */
+  position: sticky; bottom: 0;
+  background: var(--surface);
+  margin-top: 12px; padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+/* Sprint H — manual classification checkboxes in the event-detail modal */
+.emd-classify-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.emd-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.emd-check input { cursor: pointer; }
 
 .evt-modal-wf {
   padding: 0.5rem 1rem 0.25rem;
@@ -1903,6 +2018,14 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 .sett-nav-icon { font-size: 14px; width: 18px; text-align: center; flex-shrink: 0; }
 .sett-nav-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Group headers in the settings sidebar (visual structure only) */
+.sett-nav-group {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-3);
+  padding: 4px 10px; margin-top: 12px;
+}
+.sett-nav-group:first-child { margin-top: 0; }
+
 /* Training state badges on sidebar */
 .sett-nav-badge {
   font-size: 9px; font-weight: 700;
@@ -1936,6 +2059,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   }
   .sett-nav-label { white-space: nowrap; overflow: visible; }
   .sett-nav-badge { display: none; } /* hide state badges on mobile */
+  .sett-nav-group { display: none; } /* group headers don't fit the horizontal strip */
 }
 
 /* ── Content area ────────────────────────────────────────────────── */
@@ -2038,7 +2162,8 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   transition: border-color .1s, background .1s, color .1s;
 }
 .sett-sens-btn input[type=radio] { display: none; }
-.sett-sens-btn.active,
+/* Highlight follows the live :checked radio (not a server-rendered class), so
+   picking a different level updates immediately without a save/reload. */
 .sett-sens-btn:has(input:checked) {
   border: 2px solid var(--accent);
   background: var(--accent-bg2);
@@ -2109,6 +2234,15 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   .dev-circuit-card  { padding: 14px 16px; }
   .hist-card         { padding: 14px 16px; }
   .bk-tier           { padding: 16px; }
+}
+
+/* 6a. Dashboard per-circuit card header stacks on tiny phones so a
+   long display name can't crash into the valve-state pill. The
+   device-card header already stacks at 520px; this is the same
+   treatment for the dashboard, deferred lower because the dashboard
+   header is shorter (no readings row). */
+@media (max-width: 480px) {
+  .dash-card-header { flex-direction: column; align-items: flex-start; gap: 6px; }
 }
 
 /* 7. History range buttons wrap cleanly */
@@ -2244,6 +2378,85 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 14px;
   margin-bottom: 24px;
+}
+
+/* ── Sprint F: per-category rollup cards ───────────────────────────────── */
+.fx-page-intro {
+  font-size: 13px;
+  max-width: 720px;
+}
+.fx-cat-empty-note {
+  font-size: 12px; margin: 0 0 8px; line-height: 1.4;
+}
+.fx-cat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 16px;
+  margin-bottom: 28px;
+}
+.fx-cat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-shadow: var(--shadow);
+}
+.fx-cat-card.fx-cat-empty {
+  opacity: 0.55;
+}
+.fx-cat-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.fx-cat-icon { font-size: 22px; line-height: 1; }
+.fx-cat-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -.01em;
+  color: var(--text);
+}
+.fx-cat-totals {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fx-cat-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.fx-cat-stat .fx-num {
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.fx-cat-stat .fx-unit {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.fx-cat-stat small {
+  font-size: 11px;
+}
+.fx-cat-last-seen {
+  font-size: 11px;
+}
+.fx-cat-publish {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.fx-cat-publish-label {
+  font-size: 12px;
+  color: var(--text-2);
 }
 
 /* Individual cluster card */

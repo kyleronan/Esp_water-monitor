@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from .config import AddonConfig, SENSITIVITY_PRESETS, DB_PATH
@@ -31,6 +31,7 @@ from .alert_manager import AlertManager
 from .presence_watcher import PresenceWatcher
 from .historical_importer import HistoricalImporter
 from .cluster_metrics import ClusterMetrics
+from .maturity_recheck import MaturityRecheck
 from .fixture_publisher import FixturePublisher
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,13 @@ def _fmt_sensor(
         return fallback
 
 
+# A flow-meter PPL change at/above this RELATIVE magnitude triggers a full re-baseline
+# (meter swap / correcting a wrong default); a smaller change is a calibration trim —
+# value + floor updated and the frozen anomaly percentiles re-scaled, with NO multi-day
+# shut-off pause. See _apply_ppl_change.
+_PPL_REBASELINE_FRACTION: float = 0.10
+
+
 class Orchestrator:
     """Top-level runtime — owns all components."""
 
@@ -70,10 +78,19 @@ class Orchestrator:
         self._historical_importer: Optional[HistoricalImporter] = None
         self._cluster_engine = None
         self._cluster_metrics: Optional[ClusterMetrics] = None
+        self._maturity_recheck: Optional[MaturityRecheck] = None
         self._fixture_publisher: Optional[FixturePublisher] = None
         self._stop = asyncio.Event()
         self._live_state_cache: Dict[str, Any] = {}
         self._ha_tz = timezone.utc
+        # Strong refs for fire-and-forget PPL-change re-baseline tasks (scheduled
+        # from the sync HA state_changed callback). Without this the only reference
+        # is create_task's return value, which Python may GC before the task runs.
+        self._ppl_tasks: set = set()
+        # Circuits with an active calibration session (bucket / municipal test). A
+        # deliberate calibration draw must not trip auto-shutoff or pollute training /
+        # anomaly stats — see is_calibrating + the FeatureExtractor suppression.
+        self._calibrating: set = set()
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -149,13 +166,18 @@ class Orchestrator:
             except Exception as e:
                 log.warning("Away-mode calibration extension failed: %s", e)
 
+        # Explicit `? = 1` comparison rather than relying on SQLite's
+        # implicit truthiness of Python bool bindings — same behaviour,
+        # but makes the intent unambiguous and survives any future
+        # binding-type changes.
+        enabled_int = 1 if enabled else 0
         self._db.execute("""
             UPDATE home_profile SET
                 away_mode  = ?,
-                away_since = CASE WHEN ? THEN ? ELSE NULL END,
+                away_since = CASE WHEN ? = 1 THEN ? ELSE NULL END,
                 updated_at = ?
             WHERE id = 1
-        """, (1 if enabled else 0, enabled, now_iso, now_iso))
+        """, (enabled_int, enabled_int, now_iso, now_iso))
         self._db.commit()
 
         if self._alert_manager and enabled:
@@ -227,6 +249,7 @@ class Orchestrator:
             circuit_cfg.leak_test_result_sensor = entities.get(
                 "leak_test_result_sensor", "")
             circuit_cfg.volume_sensor = entities.get("volume_sensor", "")
+            circuit_cfg.flow_meter_ppl_entity = entities.get("flow_meter_ppl", "")
             # Waveforms now arrive via chunked HA events (firmware 3.9.0+).
             # Only diagnostic counters remain as discoverable entities.
             circuit_cfg.wf_overflow_count_sensor = entities.get("wf_overflow_count_sensor", "")
@@ -260,13 +283,141 @@ class Orchestrator:
         """
         if not self._db:
             return
-        from .database import get_circuit_type
+        from .database import get_circuit_type, get_circuit_pulses_per_litre
         for circuit_cfg in self._cfg.circuits:
             circuit_cfg.circuit_type = get_circuit_type(
                 self._db,
                 circuit_cfg.circuit,
                 default=circuit_cfg.circuit_type,
             )
+            # Cached pulses-per-litre. The firmware number entity is the source of
+            # truth; the async refresh (_refresh_ppl_from_entities) updates both this
+            # field and the DB cache when HA is reachable. This sync read keeps a sane
+            # floor (min_flow_lpm = 60 ÷ ppl) when HA/firmware is briefly unavailable.
+            circuit_cfg.pulses_per_litre = get_circuit_pulses_per_litre(
+                self._db,
+                circuit_cfg.circuit,
+                default=circuit_cfg.pulses_per_litre,
+            )
+
+    async def _sync_ppl_and_watch(self) -> None:
+        """Sync each circuit's runtime flow-meter PPL from its HA number entity and
+        subscribe for changes. The firmware number entity is the single source of
+        truth; circuit_profile.pulses_per_litre is the local cache."""
+        if not self._ha:
+            return
+        watched = False
+        for cfg in self._cfg.circuits:
+            entity = getattr(cfg, "flow_meter_ppl_entity", "")
+            if not entity:
+                continue
+            raw = await self._ha.get_state_value(entity, None)
+            await self._apply_ppl_change(cfg, raw, reason="startup")
+            self._ha.subscribe_entity(
+                entity,
+                lambda eid, state, attrs, c=cfg.circuit: self._on_ppl_state(c, state),
+            )
+            watched = True
+        if watched:
+            # Pick up the new subscriptions on the already-running WS connection.
+            self._ha.request_reconnect()
+
+    def _on_ppl_state(self, circuit: str, state: Any) -> None:
+        """Sync HA state_changed callback → schedule the async PPL-change handler.
+
+        PPL is read-only in the add-on, so the HA number entity is the ONLY write
+        path: this subscription is the complete re-baseline trigger surface."""
+        cfg = self._cfg.get_circuit(circuit)
+        if cfg is None:
+            return
+        task = asyncio.create_task(
+            self._apply_ppl_change(cfg, state, reason="runtime"))
+        self._ppl_tasks.add(task)
+        task.add_done_callback(self._ppl_tasks.discard)
+
+    async def _apply_ppl_change(self, cfg: Any, raw_value: Any, *,
+                                reason: str) -> None:
+        """Apply an observed flow-meter PPL for a circuit.
+
+        Re-baseline IFF the value differs from the cached one, so an NVS-restore of
+        the same value on a firmware reboot is a no-op (debounce). On a genuine
+        change: update the cache + the live detector floor, then force a
+        NON-DESTRUCTIVE partial recalibration (keeps history + opens the
+        accelerated-adaptation window that suppresses auto-shutoff). NEVER recomputes
+        historical volumes and NEVER uses full recalibration (which deletes events).
+        """
+        try:
+            new_ppl = float(raw_value)
+        except (TypeError, ValueError):
+            return  # 'unknown' / 'unavailable' / None — ignore
+        if not (1.0 <= new_ppl <= 5000.0):
+            return
+        cached = float(getattr(cfg, "pulses_per_litre", 396.0) or 396.0)
+        if abs(new_ppl - cached) < 0.5:
+            return  # same value (NVS restore / redundant publish) — no-op
+        circuit = cfg.circuit
+        frac = abs(new_ppl - cached) / cached if cached else 1.0
+        big = frac >= _PPL_REBASELINE_FRACTION
+        log.warning(
+            "[%s] flow-meter PPL %.1f → %.1f (%s, %.1f%%) — %s. Past event volumes are NOT recomputed.",
+            circuit, cached, new_ppl, reason, frac * 100.0,
+            "re-baselining (auto-shutoff paused until matured)" if big
+            else "small trim, re-scaling anomaly thresholds (no relearn)")
+        # 1) Persist to the DB cache + live config.
+        try:
+            from .database import set_circuit_pulses_per_litre
+            set_circuit_pulses_per_litre(self._db, circuit, new_ppl)
+        except Exception as e:
+            log.warning("[%s] PPL cache write failed: %s", circuit, e)
+        cfg.pulses_per_litre = new_ppl
+        # 2) Update the live detector low-flow floor (60 ÷ ppl).
+        if self._event_detector is not None:
+            self._event_detector.set_min_flow(circuit, cfg.min_flow_lpm)
+        # 3) Re-baseline decision (relative threshold). LARGE change (meter swap /
+        #    correcting a wrong default) → non-destructive PARTIAL re-baseline (keeps
+        #    history; opens the accelerated-adaptation window that suppresses auto-shutoff;
+        #    full recalibration deletes events, so it is NEVER used here). SMALL trim (a
+        #    calibration correction) → keep the frozen anomaly thresholds aligned with the
+        #    new scale by re-scaling the volume percentiles — NO multi-day shut-off pause.
+        if big:
+            if self._training_manager is not None:
+                try:
+                    await self._training_manager.trigger_partial_recalibration(circuit)
+                except Exception as e:
+                    log.warning("[%s] PPL re-baseline trigger failed: %s", circuit, e)
+            note = ("Re-learning the baseline — automatic shut-off is paused until it "
+                    "matures. Past usage totals are unchanged.")
+        else:
+            # Adjusts forward-looking DETECTION thresholds to the new scale; does NOT
+            # recompute historical event volumes (the never-recompute invariant holds).
+            try:
+                from .anomaly_baseline import rescale_anomaly_percentiles
+                rescale_anomaly_percentiles(self._db, circuit, cached / new_ppl)
+            except Exception as e:
+                log.warning("[%s] anomaly-percentile rescale failed: %s", circuit, e)
+            note = ("Small calibration trim applied — no re-learning needed. Past usage "
+                    "totals are unchanged.")
+        # 4) Surface to the user (best-effort).
+        if self._ha is not None:
+            try:
+                await self._ha.notify(
+                    "Flow meter updated",
+                    f"{cfg.label}: flow-meter pulses/litre set to {new_ppl:.1f}. {note}")
+            except Exception as e:
+                log.debug("[%s] PPL change notify failed: %s", circuit, e)
+
+    def set_calibrating(self, circuit: str, active: bool) -> None:
+        """Mark/clear an active calibration session for a circuit (called by the
+        calibration router on start / stop / apply / cancel + stale timeout)."""
+        if active:
+            self._calibrating.add(circuit)
+        else:
+            self._calibrating.discard(circuit)
+
+    def is_calibrating(self, circuit: str) -> bool:
+        """True while a bucket / municipal calibration test runs on this circuit — the
+        detector suppresses auto-shutoff and excludes the deliberate test draw."""
+        return circuit in self._calibrating
 
     def stop(self) -> None:
         self._stop.set()
@@ -276,6 +427,8 @@ class Orchestrator:
             self._training_manager.stop()
         if self._data_pruner:
             self._data_pruner.stop()
+        if self._maturity_recheck:
+            self._maturity_recheck.stop()
         if self._leak_test_scheduler:
             self._leak_test_scheduler.stop()
         if self._ha:
@@ -290,6 +443,31 @@ class Orchestrator:
         for circuit_cfg in self._cfg.circuits:
             ensure_circuit_defaults(
                 self._db, circuit_cfg.circuit, circuit_cfg.circuit_type)
+
+        # Sprint A — boot-time orphan-reference integrity check.
+        # Migration 20260528 already ran the repair once. This pass is
+        # READ-ONLY (repair=False) — it only logs when something has
+        # drifted since (e.g. user restored an older backup, or future
+        # bugs introduce new orphans). The fix-at-boot button is left
+        # off intentionally so a surprising DB state stays observable
+        # rather than getting silently mutated; the Fixtures-page banner
+        # is the user-facing fix path.
+        try:
+            from .database import find_orphaned_cluster_references
+            _orphans = find_orphaned_cluster_references(self._db, repair=False)
+            if any(_orphans.values()):
+                log.warning(
+                    "Orphan-reference integrity check: events_orphaned=%d "
+                    "fixtures_unbacked=%d clusters_dangling=%d — see "
+                    "Fixtures page for relink affordance",
+                    _orphans["events_orphaned"],
+                    _orphans["fixtures_unbacked"],
+                    _orphans["clusters_dangling"],
+                )
+        except Exception as _e:
+            log.warning(
+                "Orphan-reference integrity check failed (non-fatal): %s", _e
+            )
 
         # HA client
         self._ha = HaClient()
@@ -346,6 +524,15 @@ class Orchestrator:
             self._cfg, self._db, self._ha, self._alert_manager,
             ha_tz=self._ha_tz)
 
+        # Recompute every enabled leak-test schedule on startup so that
+        # stale next_run_at values (from prior bad scheduler state,
+        # timezone changes, or the same-day-duplicate bug) are corrected
+        # before the scheduler task starts polling.
+        try:
+            await self._recompute_leak_test_schedules()
+        except Exception as e:
+            log.warning("Leak-test schedule recompute failed (non-fatal): %s", e)
+
         # Historical importer — backfills missed events and runs periodic catch-up.
         # Pass `self` so the importer can consult the live EventDetector and skip
         # candidate periods that overlap a currently-active event (C0 guard).
@@ -364,6 +551,13 @@ class Orchestrator:
         if self.setup_complete:
             self._event_detector.setup()
             log.info("Event detection active")
+            # Runtime per-circuit flow-meter PPL: sync current values from the firmware
+            # number entities (the source of truth) into the cache + detector floor, and
+            # watch for changes. A change forces a non-destructive re-baseline.
+            try:
+                await self._sync_ppl_and_watch()
+            except Exception as e:
+                log.warning("Flow-meter PPL sync/watch failed (non-fatal): %s", e)
         else:
             log.info("Setup not complete — event detection paused until wizard finishes")
 
@@ -371,7 +565,15 @@ class Orchestrator:
         self._feature_extractor = FeatureExtractor(
             self._event_queue, self._db, self._alert_manager,
             ha_client=self._ha,
-            event_detector=self._event_detector)
+            event_detector=self._event_detector,
+            is_calibrating=self.is_calibrating)
+
+        # Reverse link: a late-assembled ESP waveform upgrades a recent
+        # software-signature event to ESP provenance (signature-only, Fix 1).
+        # Optional sink → a no-op until both sides exist.
+        self._event_detector._waveform_upgrade_sink = (
+            self._feature_extractor.handle_late_waveform
+        )
 
         # Cluster engine — instantiate and rebuild state from the last 60 days
         # of already-matched events so DBSTREAM + scaler are warm on startup.
@@ -399,10 +601,71 @@ class Orchestrator:
         except Exception as e:
             log.error("ClusterEngine init failed (non-fatal): %s", e, exc_info=True)
 
+        # Auto-exclusion verdicts + label-trained fixture typing. Runs after the
+        # cluster engine so matched_fixture_type reflects the newest user labels.
+        # Both passes are idempotent and best-effort — a failure must not block
+        # boot. The 20260535 migration only adds the dribble column (lightweight
+        # DDL); the verdict + typing backfill lands here.
+        try:
+            loop = asyncio.get_running_loop()
+            from .feature_extractor import reprocess_event_exclusion_verdicts
+            res = await loop.run_in_executor(
+                None, reprocess_event_exclusion_verdicts, self._db)
+            if res.get("dribbles_flagged"):
+                log.info("startup: flagged %d low-flow dribble event(s)",
+                         res["dribbles_flagged"])
+            from .database import (reclassify_all_events_from_signatures,
+                                   recompute_cycle_pulse_counts,
+                                   resuggest_all_clusters,
+                                   recompute_all_user_label_suggestions)
+            for c in self._cfg.circuits:
+                # dev.22: cycle-pulse backfill MUST precede reclassify so the
+                # matcher's cycle_pulse_count feature is populated before it types.
+                cyc = await loop.run_in_executor(
+                    None, recompute_cycle_pulse_counts, self._db, c.circuit)
+                r = await loop.run_in_executor(
+                    None, reclassify_all_events_from_signatures,
+                    self._db, c.circuit)
+                if r.get("events_matched") or r.get("events_cleared"):
+                    log.info(
+                        "[%s] startup reclassify: %d matched, %d abstained, "
+                        "%d stale cleared", c.circuit, r["events_matched"],
+                        r["events_abstained"], r["events_cleared"])
+                # dev.37 — backfill cluster_id over events the reprocess just
+                # un-excluded (capped-rescued) and any accumulated NULL backlog. The
+                # ~line-440 backfill ran BEFORE reprocess, so those events never got a
+                # cluster and user labels on them had nothing to propagate into. This
+                # pass assigns them. Idempotent: backfill_unmatched only touches
+                # cluster_id IS NULL rows, so it skips everything already clustered.
+                if self._cluster_engine is not None:
+                    bf = await loop.run_in_executor(
+                        None, self._cluster_engine.backfill_unmatched, c.circuit)
+                    if bf:
+                        log.info("[%s] startup post-reprocess backfill: "
+                                 "%d event(s) clustered", c.circuit, bf)
+                # Re-run the heuristic suggestion over the patched centroids, then
+                # the GATED user-label suggestion to un-poison mixed clusters
+                # (dev.22) — the only path that clears a stale 'user_labels' vote.
+                rs = await loop.run_in_executor(
+                    None, resuggest_all_clusters, self._db, c.circuit)
+                ul = await loop.run_in_executor(
+                    None, recompute_all_user_label_suggestions, self._db, c.circuit)
+                if cyc.get("updated") or rs.get("updated") or ul.get("cleared"):
+                    log.info("[%s] startup reprocess: %d cycle events, %d heuristic "
+                             "+ %d user-label suggestion(s) re-derived (%d cleared)",
+                             c.circuit, cyc["updated"], rs["updated"],
+                             ul["suggested"] + ul["abstained"], ul["cleared"])
+        except Exception as e:
+            log.warning("startup reclassify/reprocess failed (non-fatal): %s", e)
+
         # Initialise daily/weekly volume baselines from HA history so that
         # the dashboard shows accurate totals from the first page load.
+        # force=True so a restart/redeploy re-derives the midnight readings and
+        # CORRECTS a stale or wrong-but-nonzero baseline immediately, instead of
+        # leaving the dashboard inflated until the next midnight rollover. When
+        # HA history is unavailable the existing value is left untouched.
         try:
-            await self._init_volume_baselines()
+            await self._init_volume_baselines(force=True)
         except Exception as e:
             log.warning("Volume baseline init failed (non-fatal): %s", e)
 
@@ -415,6 +678,11 @@ class Orchestrator:
 
         # Cluster quality metrics — background task writing to cluster_metrics_history
         self._cluster_metrics = ClusterMetrics(self._db, self._cfg)
+
+        # Maturity re-check — periodically confirms/retracts provisional appliance
+        # labels once an event's cycle-mates have had time to occur (Branch-2.2).
+        self._maturity_recheck = MaturityRecheck(self._db, self._cfg, self._ha,
+                                                 orch=self)
 
         # Fixture publisher — MQTT Discovery for confirmed fixtures
         self._fixture_publisher = FixturePublisher(self._db, self._cfg, self._ha)
@@ -435,6 +703,10 @@ class Orchestrator:
                 self._supervise("leak_test_scheduler", self._leak_test_scheduler.run),
                 self._supervise("historical_importer", self._historical_importer.run),
                 self._supervise("cluster_metrics",     self._cluster_metrics.run),
+                self._supervise("maturity_recheck",    self._maturity_recheck.run),
+                self._supervise("waveform_purger",     self._run_waveform_purger),
+                self._supervise("volume_baseline_rollover",
+                                self._run_volume_baseline_rollover),
             )
         except asyncio.CancelledError:
             pass
@@ -555,6 +827,7 @@ class Orchestrator:
             from zoneinfo import ZoneInfo
         except ImportError:
             from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+        from .event_rules import set_home_timezone
         try:
             ha_cfg = await self._ha.get_ha_config()
             tz_name = ha_cfg.get("time_zone") or "UTC"
@@ -564,6 +837,9 @@ class Orchestrator:
             from datetime import timezone as _tz
             self._ha_tz = _tz.utc
             log.warning("Could not determine HA timezone (%s) — using UTC", e)
+        # dev.24 — cache for the softener regen-band match (reclassify + live path
+        # read this without threading a tzinfo through every caller).
+        set_home_timezone(self._ha_tz)
 
     def _local_midnight_utc(self, days_ago: int = 0) -> str:
         """Return the UTC equivalent of local midnight (or N days ago) as a naive ISO string.
@@ -579,14 +855,34 @@ class Orchestrator:
         midnight_utc = midnight_local.astimezone(_tz.utc).replace(tzinfo=None)
         return midnight_utc.isoformat(timespec="seconds")
 
-    async def _init_volume_baselines(self) -> None:
+    def _seconds_until_next_local_midnight(self) -> float:
+        """Seconds from now until the next local midnight (DST-aware)."""
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        ha_tz = getattr(self, "_ha_tz", _tz.utc)
+        now_local = _dt.now(ha_tz)
+        next_midnight_local = now_local.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) + _td(days=1)
+        delta = next_midnight_local.astimezone(_tz.utc) - _dt.now(_tz.utc)
+        return max(0.0, delta.total_seconds())
+
+    async def _init_volume_baselines(self, force: bool = False) -> None:
         """
         Query HA history to set accurate midnight baselines for daily/weekly
-        volume calculations.  Called once at startup before the main loop.
+        volume calculations.  Called once at startup, then again after every
+        local-midnight rollover (with ``force=True``) by
+        ``_run_volume_baseline_rollover``.
 
-        Without this, _get_volume_baseline() uses 0.0 as a placeholder on
-        the first call, which causes the dashboard to show the full cumulative
-        sensor total rather than just today's volume.
+        Without a per-day refresh, after the local day ticks over the "today"
+        baseline key has no snapshot; _get_volume_baseline() then seeds it from
+        the current reading, which is only accurate for the just-started "today"
+        period — the rolling 7-day baseline must come from HA history. This is
+        why the rollover re-derives both, force-overwriting stale values.
+
+        ``force``: when False (startup) an existing non-zero baseline is left
+        untouched. When True (rollover) the freshly-fetched HA-history value
+        overwrites whatever is there, so a value lazily seeded by
+        _get_volume_baseline (current reading) is corrected to the real midnight.
 
         period_ts keys are the UTC equivalent of local midnight, stored as naive
         ISO strings, matching the keys produced by compute_ha_daily/weekly_volume.
@@ -601,25 +897,42 @@ class Orchestrator:
         today_midnight_dt   = datetime.fromisoformat(today_midnight_ts).replace(tzinfo=_utc)
         seven_days_ago_dt   = datetime.fromisoformat(seven_days_ago_ts).replace(tzinfo=_utc)
 
+        from .ha_client import vol_to_litres as _v2l
+
         for cfg in self._cfg.circuits:
             if not cfg.volume_sensor:
                 continue
 
             circuit = cfg.circuit
 
+            # get_history() is fetched with no_attributes=True, so historical
+            # readings carry NO unit_of_measurement. Converting them with that
+            # empty unit left a gallon reading UNCONVERTED in the litres column,
+            # so "today" (= meter_litres − baseline_gallons) inflated ~3.8x. The
+            # sensor's unit doesn't change over time, so fetch the current unit
+            # and convert the historical readings with it.
+            sensor_unit = ""
+            try:
+                cur_state = await self._ha.get_state(cfg.volume_sensor)
+                sensor_unit = ((cur_state or {}).get("attributes") or {}).get(
+                    "unit_of_measurement", "")
+            except Exception as e:
+                log.debug("[%s] could not fetch volume sensor unit: %s", circuit, e)
+
             for period_start, period_ts, label in [
                 (today_midnight_dt,  today_midnight_ts,  "today"),
                 (seven_days_ago_dt,  seven_days_ago_ts,  "past 7 days"),
             ]:
 
-                # Only fix baselines that are still at the 0.0 placeholder
+                # At startup only fix baselines still at the 0.0 placeholder; on
+                # a forced rollover always re-derive from HA history.
                 row = self._db.execute(
                     "SELECT ha_volume FROM volume_snapshots "
                     "WHERE circuit=? AND period_ts=?",
                     (circuit, period_ts),
                 ).fetchone()
 
-                if row is not None and row[0] != 0.0:
+                if not force and row is not None and row[0] != 0.0:
                     continue   # already set to a real value
 
                 # Query HA history for the earliest reading at/after midnight
@@ -630,13 +943,16 @@ class Orchestrator:
                         period_start + timedelta(hours=2),
                     )
                     if hist:
-                        from .ha_client import vol_to_litres as _v2l
                         first = hist[0]
-                        midnight_val = float(first["state"])
-                        mid_unit = (first.get("attributes") or {}).get("unit_of_measurement", "")
-                        midnight_val = _v2l(midnight_val, mid_unit)
+                        # Convert with the sensor's real unit (the historical
+                        # entry has none — see sensor_unit above).
+                        midnight_val = _v2l(float(first["state"]), sensor_unit)
                     else:
-                        midnight_val = 0.0
+                        # No HA history for this window — do NOT write a 0.0
+                        # baseline (that resurrects the full-cumulative-total
+                        # bug). Leave the row absent so _get_volume_baseline
+                        # seeds it safely from the current reading instead.
+                        continue
                 except Exception as e:
                     log.debug("[%s] could not fetch volume history for %s: %s",
                               circuit, label, e)
@@ -651,6 +967,58 @@ class Orchestrator:
                 self._db.commit()
                 log.info("[%s] volume baseline set for %s: %.2f L",
                          circuit, label, midnight_val)
+
+    async def _recompute_leak_test_schedules(self) -> None:
+        """Recompute next_run_at for every enabled leak-test schedule.
+
+        Called once on startup so stale next_run_at values — from prior
+        bad scheduler state, timezone changes, or the auto-learn same-
+        day-duplicate bug — are corrected before the scheduler task
+        starts polling. Unconditional by design: the cost (one
+        learn_best_hour pass per circuit) is small and the upside
+        (deterministic, predictable next-run after boot) is worth it.
+
+        Invalid or unparsable existing values are logged and overwritten;
+        naive datetimes are treated as UTC for the diff log.
+        """
+        from .database import get_leak_test_schedule
+
+        for circuit_cfg in self._cfg.circuits:
+            circuit = circuit_cfg.circuit
+            try:
+                schedule = get_leak_test_schedule(self._db, circuit)
+            except Exception as e:
+                log.warning("[%s] could not read leak_test_schedule: %s",
+                            circuit, e)
+                continue
+            if not schedule or not schedule["enabled"]:
+                continue
+
+            prior_str = schedule["next_run_at"]
+            prior_dt: Optional[datetime] = None
+            if prior_str:
+                try:
+                    prior_dt = datetime.fromisoformat(
+                        prior_str.replace("Z", "+00:00"))
+                    if prior_dt.tzinfo is None:
+                        prior_dt = prior_dt.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    log.warning("[%s] unparsable next_run_at %r — recomputing",
+                                circuit, prior_str)
+
+            try:
+                await self._leak_test_scheduler._update_next_run(
+                    circuit, schedule)
+            except Exception as e:
+                log.warning("[%s] startup next-run recompute failed: %s",
+                            circuit, e)
+                continue
+
+            new_row = get_leak_test_schedule(self._db, circuit)
+            new_str = new_row["next_run_at"] if new_row else None
+            if new_str and new_str != prior_str:
+                log.info("[%s] startup recompute: next_run_at %s → %s",
+                         circuit, prior_str or "(none)", new_str)
 
     async def _fetch_live_state(self, circuit: str) -> Dict[str, Any]:
         circuit_cfg = self._cfg.get_circuit(circuit)
@@ -788,7 +1156,117 @@ class Orchestrator:
             "leak_test_running": self._leak_test_scheduler.is_running(circuit)
             if self._leak_test_scheduler else False,
             "setup_complete": self.setup_complete,
+            # Valve type for this circuit; the device template uses it to
+            # disable the manual leak-test button for 3-port valves.
+            "valve_type": self._valve_type_for(circuit),
+            # Degraded-supply guard status. Python-computed UTC ISO cutoffs
+            # so the comparison format matches stored start_ts exactly.
+            **self._degraded_state_for(circuit),
         }
+
+    def _valve_type_for(self, circuit: str) -> str:
+        """Return the current valve_type for a circuit (forgiving)."""
+        try:
+            from .database import get_valve_type
+            return get_valve_type(self._db, circuit)
+        except Exception as e:
+            log.warning("[%s] valve_type lookup failed: %s", circuit, e)
+            return "2_port"
+
+    def _degraded_state_for(self, circuit: str) -> Dict[str, Any]:
+        """Return {degraded_active, degraded_events_24h} for the dashboard."""
+        try:
+            now = datetime.now(timezone.utc)
+            cutoff_30min = (now - timedelta(minutes=30)).isoformat()
+            cutoff_24h   = (now - timedelta(hours=24)).isoformat()
+            active = self._db.execute(
+                "SELECT 1 FROM events WHERE circuit = ? "
+                "AND degraded_supply = 1 AND start_ts >= ? LIMIT 1",
+                (circuit, cutoff_30min),
+            ).fetchone()
+            day_row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM events WHERE circuit = ? "
+                "AND degraded_supply = 1 AND start_ts >= ?",
+                (circuit, cutoff_24h),
+            ).fetchone()
+            return {
+                "degraded_active":     bool(active),
+                "degraded_events_24h": int(day_row["n"] or 0) if day_row else 0,
+            }
+        except Exception as e:
+            log.warning("[%s] degraded-state query failed: %s", circuit, e)
+            return {"degraded_active": False, "degraded_events_24h": 0}
+
+    async def _run_volume_baseline_rollover(self) -> None:
+        """Re-capture the daily + weekly volume baselines at each local midnight.
+
+        ``_init_volume_baselines`` runs once at startup; without a rollover, after
+        the local day ticks over the dashboard's "today" baseline key has no
+        snapshot and the per-day volume balloons toward the full cumulative meter
+        total. This re-derives both baselines (force-overwriting) from HA history
+        shortly after each local midnight so the daily / 7-day figures stay
+        accurate without a restart.
+        """
+        while not self._stop.is_set():
+            # Sleep until just after the next local midnight (+120s so HA's
+            # recorder has the post-midnight reading on hand). Interruptible by
+            # the stop event so shutdown isn't blocked for hours.
+            delay = self._seconds_until_next_local_midnight() + 120.0
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                return  # stop requested during the wait
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._init_volume_baselines(force=True)
+                log.info("Volume baselines refreshed after local-midnight rollover")
+            except Exception as e:
+                log.warning("Volume baseline rollover failed (non-fatal): %s", e)
+
+    async def _run_waveform_purger(self) -> None:
+        """Daily housekeeping: drop event_waveforms rows older than 60 days.
+
+        The full-resolution flow/pressure waveforms are kept for the event
+        detail modal but cost ~28 KB/event. Retention bounds storage. The
+        underlying event row is untouched (cascade is from event to waveform,
+        not the other way).
+
+        DELETE is offloaded to a worker thread — on a populated DB it can
+        touch thousands of rows in one shot, which would otherwise stall
+        every other ingress request for the duration.
+        """
+        WAVEFORM_RETENTION_DAYS = 60
+        # Wait ~30s after startup so the rest of the boot sequence finishes
+        # before the first purge runs.
+        await asyncio.sleep(30)
+        loop = asyncio.get_running_loop()
+        while not self._stop.is_set():
+            try:
+                cutoff = (datetime.now(timezone.utc)
+                          - timedelta(days=WAVEFORM_RETENTION_DAYS)).isoformat()
+                rowcount = await loop.run_in_executor(
+                    None, self._purge_waveforms_sync, cutoff,
+                )
+                if rowcount:
+                    log.info("Purged %d waveform row(s) older than %d days",
+                             rowcount, WAVEFORM_RETENTION_DAYS)
+            except Exception as e:
+                log.warning("Waveform purge failed (non-fatal): %s", e)
+            # Sleep 24h, exiting promptly if stop is signaled.
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=24 * 3600)
+            except asyncio.TimeoutError:
+                pass
+
+    def _purge_waveforms_sync(self, cutoff: str) -> int:
+        """DELETE old event_waveforms rows. Runs in a worker thread —
+        only the calling async wrapper uses run_in_executor."""
+        cur = self._db.execute(
+            "DELETE FROM event_waveforms WHERE created_at < ?",
+            (cutoff,),
+        )
+        self._db.commit()
+        return cur.rowcount
 
     async def _compute_leak_test_etc(
         self,

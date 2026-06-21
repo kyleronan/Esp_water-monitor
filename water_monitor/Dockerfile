@@ -24,4 +24,4 @@ LABEL \
     io.hass.name="Water Monitor" \
     io.hass.description="Intelligent water monitoring with fixture signature recognition" \
     io.hass.type="addon" \
-    io.hass.version="0.2.1"
+    io.hass.version="0.2.2"

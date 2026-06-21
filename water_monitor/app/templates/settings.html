@@ -6,12 +6,14 @@
   {# ── Sidebar nav ──────────────────────────────────────────────────── #}
   <nav class="sett-sidebar">
 
+    <div class="sett-nav-group">Your home</div>
     <button class="sett-nav-btn" id="sett-btn-profile"
             onclick="settNav('profile')">
       <span class="sett-nav-icon">🏠</span>
       <span class="sett-nav-label">Home Profile</span>
     </button>
 
+    <div class="sett-nav-group">Water circuits</div>
     {% for c in circuits %}
     <button class="sett-nav-btn" id="sett-btn-circuit-{{ c.circuit }}"
             onclick="settNav('circuit-{{ c.circuit }}')">
@@ -39,6 +41,7 @@
     </button>
     {% endif %}
 
+    <div class="sett-nav-group">Preferences</div>
     <button class="sett-nav-btn" id="sett-btn-away"
             onclick="settNav('away')">
       <span class="sett-nav-icon">✈️</span>
@@ -55,6 +58,12 @@
             onclick="settNav('units')">
       <span class="sett-nav-icon">📏</span>
       <span class="sett-nav-label">Display Units</span>
+    </button>
+
+    <button class="sett-nav-btn" id="sett-btn-water-softener"
+            onclick="settNav('water-softener')">
+      <span class="sett-nav-icon">🧂</span>
+      <span class="sett-nav-label">Water Softener</span>
     </button>
 
     <button class="sett-nav-btn sett-nav-adv" id="sett-btn-integrations"
@@ -75,6 +84,14 @@
       <span class="sett-nav-label">Re-run Setup</span>
     </button>
 
+    {% if dev_tools %}
+    <button class="sett-nav-btn" id="sett-btn-dev"
+            onclick="settNav('dev')">
+      <span class="sett-nav-icon">🛠</span>
+      <span class="sett-nav-label">Dev Tools</span>
+    </button>
+    {% endif %}
+
     <div class="sett-mode-divider">
       <button class="sett-mode-btn" id="sett-mode-btn" onclick="toggleSettMode()">
         ⚙ Show Advanced
@@ -89,7 +106,11 @@
     {# ── Home Profile ─────────────────────────────────────────────── #}
     <div class="sett-section" id="sett-profile">
       <h2 class="sett-section-title">Home Profile</h2>
-      <p class="sett-section-desc">Used to suggest calibration duration and initialise thresholds.</p>
+      <p class="sett-section-desc">Tell us a bit about your home so the monitor can set
+        smarter starting defaults. More bathrooms and occupants mean more normal water use,
+        so this helps it learn what's typical for you and how long the initial learning
+        period should run. You can change these anytime — it only affects starting estimates,
+        never your live alerts.</p>
 
       <div class="sett-card">
         <form method="post" action="{{ ingress_path }}/settings/profile/update">
@@ -156,7 +177,10 @@
               else c.training.state | title -}}
         </span>
       </div>
-      <p class="sett-section-desc">Circuit-specific detection and alert settings.</p>
+      <p class="sett-section-desc">Settings for this water line. For most homes the only
+        control you'll ever touch is <strong>Detection sensitivity</strong> (Low / Medium /
+        High) under the Advanced tab — everything else is set automatically during the
+        learning period.</p>
 
       {# Sub-tab strip — use loop.index as a safe DOM key #}
       {% set circ_idx = loop.index %}
@@ -240,6 +264,79 @@
            style="display:none;color:var(--color-warn);margin-top:.5rem">Saving…</p>
       </div>
 
+      {# Valve type #}
+      <div class="sett-card">
+        <h3 class="sett-card-title">Valve type</h3>
+        <p class="sett-card-desc">
+          Hardware shape of the ball valve installed for this circuit. This
+          is primarily a setup-time decision — a confirmation prompt appears
+          before any change here takes effect.
+        </p>
+        {% for vt in valve_types %}
+        <label style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem;cursor:pointer">
+          <input type="radio"
+                 name="valve_type_{{ c.circuit }}"
+                 value="{{ vt }}"
+                 data-current="{{ c.valve_type }}"
+                 {% if vt == c.valve_type %}checked{% endif %}
+                 onchange="settingsValveTypeUpdate('{{ c.circuit }}', '{{ vt }}', this)"
+                 style="margin-top:3px;flex-shrink:0">
+          <span>
+            <strong>{{ valve_type_labels[vt] }}</strong>
+            <span class="muted" style="font-size:.8125rem;display:block">{{ valve_type_help[vt] }}</span>
+          </span>
+        </label>
+        {% endfor %}
+        <p class="sett-card-desc" id="valve-type-saving-{{ c.circuit }}"
+           style="display:none;color:var(--color-warn);margin-top:.5rem">Saving…</p>
+        {% if c.valve_type == "3_port" %}
+        <p class="sett-card-desc" style="margin-top:.5rem;color:var(--color-warn)">
+          <strong>Note:</strong> Micro leak test is disabled for this circuit —
+          3-port drain-capable valves are not compatible with the test (the
+          drain port would always read as a constant leak). The existing
+          leak-test schedule is preserved and will resume automatically if
+          you switch back to 2-port later.
+        </p>
+        {% endif %}
+      </div>
+
+      {# ── Flow Meter (read-only; the PPL is set in Home Assistant) ── #}
+      <div class="sett-card">
+        <h3 class="sett-card-title">Flow Meter</h3>
+        <p class="sett-card-desc">
+          Pulses per litre for this circuit's meter, read from the device — the
+          <code>Flow Meter PPL</code> number entity in Home Assistant is the single
+          source of truth. Set it there to match your meter (e.g. turbine YF-B5 = 396,
+          oval-gear ZJ-HSM = 72). Changing it makes the monitor re-learn the baseline
+          (automatic shut-off pauses until it matures); past usage totals are
+          <strong>not</strong> recalculated.
+        </p>
+        <p class="sett-card-desc" style="margin-top:.25rem">
+          <strong>{{ c.pulses_per_litre }}</strong> pulses/litre
+          <span class="muted">· smallest detectable flow ≈ {{ c.min_flow_lpm }} L/min</span>
+          {% if c.flow_meter_ppl_entity %}
+          <span class="muted" style="display:block;font-size:.8125rem">
+            Entity: <code>{{ c.flow_meter_ppl_entity }}</code>
+          </span>
+          {% else %}
+          <span class="muted" style="display:block;font-size:.8125rem">
+            Firmware PPL entity not detected — using the cached/default value
+            (update firmware to 3.12.0+ for runtime control).
+          </span>
+          {% endif %}
+        </p>
+        {% if c.flow_meter_ppl_entity and c.has_volume_sensor %}
+        <button class="btn btn-secondary" style="margin-top:.5rem"
+                onclick="calOpen('{{ c.circuit }}', '{{ c.display_name }}')">
+          Calibrate…
+        </button>
+        {% elif c.flow_meter_ppl_entity %}
+        <p class="muted" style="font-size:.8125rem;margin-top:.5rem">
+          Calibration needs the cumulative “Water Volume Total” sensor — not detected for this circuit.
+        </p>
+        {% endif %}
+      </div>
+
       </div>{# /Config panel #}
 
       {# ── Advanced tab: recal + learning + sensitivity + ESP device ── #}
@@ -248,11 +345,18 @@
 
       {# Recalibration #}
       <div class="sett-card sett-adv-card">
-        <h3 class="sett-card-title">Recalibration <span class="sett-installer-badge">⚠ Installer</span></h3>
+        <h3 class="sett-card-title">Recalibration <span class="sett-installer-badge" title="Advanced step — usually done by your installer. Safe to use, but only recalibrate when your home or plumbing has genuinely changed.">⚠ Installer</span></h3>
         <p class="sett-card-desc">
-          Recalibrate if you've renovated, added appliances, or your household
-          has changed significantly.
+          Recalibrate if you've renovated, added appliances, or your household has changed
+          significantly. The monitor re-learns your home's normal water use over a few weeks
+          (a “learning period”). <strong>Leak and anomaly protection stay fully active the
+          whole time — nothing is turned off.</strong>
         </p>
+        {% if c.last_completed %}
+        <p class="sett-card-desc muted" style="margin-top:-.25rem">
+          Last learning period completed: <strong>{{ c.last_completed }}</strong>
+        </p>
+        {% endif %}
         {% if c.training.state == 'calibrating' %}
         <div style="margin-bottom:.75rem">
           <span class="muted">
@@ -304,34 +408,14 @@
         <p class="sett-cal-warning">⚠ Incorrect calibration values may cause false shutoffs or missed leaks.</p>
       </div>
 
-      {# Learning mode #}
-      <div class="sett-card sett-adv-card">
-        <h3 class="sett-card-title">Learning Mode</h3>
-        <form method="post" action="{{ ingress_path }}/settings/learning/{{ c.circuit }}/update">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-          <label class="sett-radio-card">
-            <input type="radio" name="learning_mode" value="adaptive"
-                   {% if c.learning.learning_mode != 'static' %}checked{% endif %}>
-            <div>
-              <div class="sett-radio-label">Adaptive <span style="font-weight:400;color:var(--text-3)">(recommended)</span></div>
-              <div class="sett-radio-desc">Usage patterns update automatically as your household evolves. Fixture signatures never change.</div>
-            </div>
-          </label>
-          <label class="sett-radio-card">
-            <input type="radio" name="learning_mode" value="static"
-                   {% if c.learning.learning_mode == 'static' %}checked{% endif %}>
-            <div>
-              <div class="sett-radio-label">Static</div>
-              <div class="sett-radio-desc">Everything fixed as learned during calibration. Recalibrate manually when needed.</div>
-            </div>
-          </label>
-          <button type="submit" class="btn btn-primary btn-sm" style="margin-top:8px">Save</button>
-        </form>
-      </div>
-
       {# Sensitivity #}
       <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Detection Sensitivity</h3>
+        <p class="sett-help" style="margin:.25rem 0 .6rem">
+          Also tunes anomaly detection against your frozen baseline: <strong>Low</strong>
+          alerts only on the most extreme events (p99), <strong>High</strong> is the most
+          sensitive (p85). Lower this if you get too many false alarms.
+        </p>
         <form method="post" action="{{ ingress_path }}/settings/sensitivity/{{ c.circuit }}/update"
               id="sens-form-{{ c.circuit }}">
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -339,7 +423,10 @@
 
           <div class="sett-sens-grid">
             {% for level in ['low', 'medium', 'high'] %}
-            <label class="sett-sens-btn {% if c.sensitivity.simple_level == level %}active{% endif %}">
+            {# Highlight is driven purely by the radio :checked state (see
+               .sett-sens-btn:has(input:checked)). A server-rendered `active` class
+               would linger on the saved value when the user picks another. #}
+            <label class="sett-sens-btn">
               <input type="radio" name="simple_level" value="{{ level }}"
                      {% if c.sensitivity.simple_level == level %}checked{% endif %}>
               {{ level | title }}
@@ -352,34 +439,39 @@
                 this.closest('form').querySelector('[name=mode]').value = 'advanced';
               }">
             <summary>Advanced settings</summary>
+            <p class="sett-help" style="margin:.5rem 0">
+              These raw values are set automatically by the Low / Medium / High picker
+              above. Only change them if you know exactly what you're tuning — the picker
+              covers almost every home.
+            </p>
             <div class="sett-form-grid" style="margin-top:.75rem">
               <div class="sett-form-group">
-                <label>Pressure drop to detect event ({{ pressure_unit }})</label>
+                <label title="How big a pressure dip starts watching an event. Lower = catches smaller draws (and more noise).">Pressure drop to detect event ({{ pressure_unit }})</label>
                 <input type="number" name="pressure_drop_event_psi" step="0.1" min="0.5" max="10"
                        value="{{ c.sensitivity.pressure_drop_event_psi or 1.2 }}">
               </div>
               <div class="sett-form-group">
-                <label>Min event duration (seconds)</label>
+                <label title="How long flow must last to count as an event. Higher = ignores very brief blips.">Min event duration (seconds)</label>
                 <input type="number" name="min_event_duration_seconds" step="0.5" min="1" max="30"
                        value="{{ c.sensitivity.min_event_duration_seconds or 3.0 }}">
               </div>
               <div class="sett-form-group">
-                <label>Anomaly score to alert (0–1)</label>
+                <label title="How unusual an event must be before you get a notification. Lower = more alerts (more false alarms); higher = fewer.">Anomaly score to alert (0–1)</label>
                 <input type="number" name="score_alert" step="0.05" min="0.1" max="1"
                        value="{{ c.sensitivity.score_alert or 0.6 }}">
               </div>
               <div class="sett-form-group">
-                <label>Anomaly score to auto-shutoff (0–1)</label>
+                <label title="How unusual an event must be before the valve auto-closes (once auto-shutoff is trusted). Higher = only the most extreme events.">Anomaly score to auto-shutoff (0–1)</label>
                 <input type="number" name="score_shutoff" step="0.05" min="0.1" max="1"
                        value="{{ c.sensitivity.score_shutoff or 0.8 }}">
               </div>
               <div class="sett-form-group">
-                <label>Flow tolerance (%)</label>
+                <label title="How far flow can drift from normal before it counts as off. Higher = more forgiving.">Flow tolerance (%)</label>
                 <input type="number" name="flow_tolerance_pct" step="1" min="5" max="80"
                        value="{{ c.sensitivity.flow_tolerance_pct or 20 }}">
               </div>
               <div class="sett-form-group">
-                <label>Alert sustained duration (min)</label>
+                <label title="How long an unusual flow must persist before alerting. Higher = waits longer before flagging.">Alert sustained duration (min)</label>
                 <input type="number" name="sustained_alert_minutes" step="1" min="1" max="60"
                        value="{{ c.sensitivity.sustained_alert_minutes or 10 }}">
               </div>
@@ -389,6 +481,94 @@
           <button type="submit" class="btn btn-primary btn-sm" style="margin-top:12px">Save Sensitivity</button>
         </form>
       </div>
+
+      {# Anomaly response #}
+      <div class="sett-card sett-adv-card">
+        <h3 class="sett-card-title">Anomaly Response</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          What happens when an event deviates from your home's frozen baseline.
+          Detection Sensitivity (above) controls <em>how much</em> deviation counts;
+          this controls the <em>response</em>.
+        </p>
+        <form method="post" action="{{ ingress_path }}/settings/anomaly/{{ c.circuit }}/update">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          {% set ar = c.anomaly_response or 'notify' %}
+          <label class="sett-radio-card">
+            <input type="radio" name="anomaly_response" value="off"
+                   {% if ar == 'off' %}checked{% endif %}>
+            <div>
+              <div class="sett-radio-label">Off</div>
+              <div class="sett-radio-desc">Do nothing. The unusual-usage sensor still
+                updates for your own automations.</div>
+            </div>
+          </label>
+          <label class="sett-radio-card">
+            <input type="radio" name="anomaly_response" value="notify"
+                   {% if ar == 'notify' %}checked{% endif %}>
+            <div>
+              <div class="sett-radio-label">Notify <span style="font-weight:400;color:var(--text-3)">(recommended)</span></div>
+              <div class="sett-radio-desc">Send a notification. Never closes your water.</div>
+            </div>
+          </label>
+          <label class="sett-radio-card">
+            <input type="radio" name="anomaly_response" value="notify_shutoff_severe"
+                   {% if ar == 'notify_shutoff_severe' %}checked{% endif %}>
+            <div>
+              <div class="sett-radio-label">⚠ Notify + shut off on severe</div>
+              <div class="sett-radio-desc">Notify on any anomaly; automatically close the
+                water valve only on a <strong>severe</strong> one. This can close your
+                water on a false positive.</div>
+            </div>
+          </label>
+          <label class="sett-radio-card">
+            <input type="radio" name="anomaly_response" value="shutoff_any"
+                   {% if ar == 'shutoff_any' %}checked{% endif %}>
+            <div>
+              <div class="sett-radio-label">⚠⚠ Shut off on any anomaly</div>
+              <div class="sett-radio-desc">Close the water valve at the first sign of
+                <strong>any</strong> anomaly. Most aggressive — this <strong>will</strong>
+                close your water on a false positive eventually.</div>
+            </div>
+          </label>
+          {% if ar in ('notify_shutoff_severe', 'shutoff_any') and not c.anomaly_shutoff_ready %}
+          <div class="sett-help" style="margin-top:.5rem;color:#b8860b">
+            ⓘ Auto-shutoff is held back (currently notify-only): the baseline must be fit
+            from ≥{{ c.anomaly_shutoff_min_n }} events and run for
+            ~{{ c.anomaly_shutoff_min_days }} days before it can close your water. It
+            activates automatically once that trust is earned.
+          </div>
+          {% endif %}
+          <button type="submit" class="btn btn-primary btn-sm" style="margin-top:8px">Save</button>
+        </form>
+      </div>
+
+      {# Phase 3 §2 — recorder volume reconciliation (only when a cumulative volume sensor exists) #}
+      {% if c.has_volume_sensor %}
+      <div class="sett-card sett-adv-card">
+        <h3 class="sett-card-title">Volume reconciliation</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Live event volumes are integrated from the flow stream, which can under-count when
+          samples drop. The firmware's cumulative volume sensor is the source of truth.
+          When on, a settled event whose volume diverges from the recorder is corrected
+          automatically (originals are preserved). When off, divergences are recorded only —
+          review and apply them from the Valve &amp; Tests page.
+        </p>
+        <form method="post" action="{{ ingress_path }}/settings/reconcile/{{ c.circuit }}/update">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <label class="sett-radio-card" style="align-items:center">
+            <input type="checkbox" name="recorder_reconcile_auto"
+                   {% if c.recorder_reconcile_auto %}checked{% endif %}>
+            <div>
+              <div class="sett-radio-label">Auto-correct volumes from recorder
+                <span style="font-weight:400;color:var(--text-3)">(recommended)</span></div>
+              <div class="sett-radio-desc">Uncheck to flag divergences for review instead of
+                correcting them automatically.</div>
+            </div>
+          </label>
+          <button type="submit" class="btn btn-primary btn-sm" style="margin-top:8px">Save</button>
+        </form>
+      </div>
+      {% endif %}
 
       {# ESP device entities for this circuit #}
       {% if c.device_entities %}
@@ -572,7 +752,7 @@
     <div class="sett-section" id="sett-away" style="display:none">
       <h2 class="sett-section-title">Away / Vacation Mode</h2>
       <p class="sett-section-desc">
-        Pauses baseline learning while you're away. Leak tests, valve control, and fault detection continue normally.
+        Pauses learning your normal usage while you're away (so a quiet house isn't mistaken for a change). Leak tests, valve control, and fault detection continue normally.
       </p>
 
       <div class="sett-card">
@@ -703,11 +883,101 @@
               </select>
             </div>
           </div>
+          <div class="sett-toggle-row" style="margin-bottom:14px;padding-top:.75rem;border-top:1px solid var(--border)">
+            <div class="sett-toggle-info">
+              <span class="sett-toggle-label">Hide not-real-use events from History</span>
+              <span class="sett-toggle-desc">
+                The monitor automatically flags readings that aren't real water use —
+                city water-pressure blips (👻), draws on your <em>other</em> water line
+                (↔), and tiny drips or sensor noise (Drip). Their volume is always
+                removed from your totals; turn this on to also hide those rows from the
+                list. Off by default — they stay visible with their flag so you can
+                relabel any that really were water.
+              </span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" name="hide_pressure_artifact_events" value="1"
+                     {% if profile.hide_pressure_artifact_events or profile.hide_cross_talk_events %}checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="sett-toggle-row" style="margin-bottom:14px;padding-top:.75rem;border-top:1px solid var(--border)">
+            <div class="sett-toggle-info">
+              <span class="sett-toggle-label">Automatically split merged events</span>
+              <span class="sett-toggle-desc">
+                Sometimes several quick uses close together get recorded as one long
+                event. When on, the monitor rebuilds those into the separate uses once an
+                hour (the same thing the “Reprocess” button does). Off by default — only
+                unlabelled, clearly-merged events are touched; your labels and water
+                totals are always preserved.
+              </span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" name="auto_split_enabled" value="1"
+                     {% if profile.auto_split_enabled %}checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
           <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
             <button type="submit" class="btn btn-primary btn-sm">Save</button>
             <button type="button" class="btn btn-secondary btn-sm"
                     onclick="autoDetectUnits(this)">Re-detect from HA</button>
           </div>
+        </form>
+      </div>
+    </div>
+
+    {# ── Water Softener ────────────────────────────────────────────── #}
+    <div class="sett-section" id="sett-water-softener" style="display:none">
+      <h2 class="sett-section-title">Water Softener</h2>
+      <p class="sett-section-desc">
+        If you have a water softener, tell us when it regenerates. The monitor
+        labels those overnight cycles as “Water Softener” and skips scheduled
+        leak tests during the regeneration window (so a regen never trips a
+        false leak alert).
+      </p>
+      <div class="sett-card">
+        <form method="post" action="{{ ingress_path }}/settings/water-softener/update">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <div class="sett-toggle-row" style="margin-bottom:14px">
+            <div class="sett-toggle-info">
+              <span class="sett-toggle-label">I have a water softener</span>
+              <span class="sett-toggle-desc">
+                Off by default. When on, set the regeneration start time below —
+                it is required so the monitor knows the nightly window.
+              </span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" name="has_water_softener" value="1"
+                     onchange="document.getElementById('sett-softener-cfg').style.display = this.checked ? '' : 'none'"
+                     {% if profile.has_water_softener %}checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div id="sett-softener-cfg"
+               style="{% if not profile.has_water_softener %}display:none{% endif %}">
+            <div class="sett-form-grid" style="margin-bottom:14px">
+              <div class="sett-form-group">
+                <label for="sett_softener_regen_start">Regeneration start (24-hour)</label>
+                <input type="time" id="sett_softener_regen_start"
+                       name="softener_regen_start"
+                       value="{{ profile.softener_regen_start or '' }}">
+              </div>
+              <div class="sett-form-group">
+                <label for="sett_softener_circuit">Softener circuit</label>
+                <select id="sett_softener_circuit" name="softener_circuit">
+                  {% for c in circuits %}
+                  <option value="{{ c.circuit }}"
+                    {% if profile.softener_circuit == c.circuit
+                          or (not profile.softener_circuit and loop.first) %}selected{% endif %}>
+                    {{ c.display_name }}
+                  </option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+          </div>
+          <button type="submit" class="btn btn-primary btn-sm">Save</button>
         </form>
       </div>
     </div>
@@ -877,6 +1147,21 @@
           </div>
         </form>
       </div>
+
+      <div class="sett-card">
+        <h3 class="sett-card-title">Re-evaluate unsteady-pressure events</h3>
+        <p class="sett-card-desc">
+          Re-applies the current unsteady-pressure (pulsing-supply) thresholds to every
+          past event that has a stored diagnostic. Use after the detector is re-tuned so
+          historical events (and the daily-volume totals they feed) match the new policy.
+          Events captured before the detector was deployed have no stored diagnostic and
+          are skipped.
+        </p>
+        <div style="display:flex;gap:.5rem;margin-top:.5rem;flex-wrap:wrap">
+          <button type="button" class="btn btn-secondary btn-sm"
+                  onclick="reprocessDegraded(event)">Re-evaluate now</button>
+        </div>
+      </div>
     </div>
 
     {# ── Re-run Setup ──────────────────────────────────────────────── #}
@@ -922,6 +1207,175 @@
         </div>
       </div>
     </div>
+
+    {% if dev_tools %}
+    {# ── Dev Tools (gated by the dev_tools add-on option) ──────────── #}
+    <div class="sett-section" id="sett-dev" style="display:none">
+      <h2 class="sett-section-title">🛠 Dev Tools</h2>
+      <p class="sett-section-desc">
+        Testing-only utilities, hidden unless the <code>dev_tools</code> add-on
+        option is enabled. Recalibration (per circuit, above) remains the normal
+        long-term mechanism.
+      </p>
+      <div class="sett-card">
+        <h3 class="sett-card-title">Re-train rule calibration</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Instantly re-fit + re-lock the per-home rule bands from the CURRENT
+          labels — no new learning period. Runs the same activation fit+freeze
+          (sanity gate included) and re-types events. The fit-vs-fallback result
+          is shown as a toast.
+        </p>
+        {% for c in circuits %}
+        <div class="dev-retrain-row"
+             style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
+          <div>
+            <strong>{{ c.display_name }}</strong>
+            <div class="muted" style="font-size:.85em">
+              Learning completed: {{ c.last_completed or '—' }}
+              {% if c.calibration %}
+                · Locked {{ c.calibration.locked_at or '—' }}
+                ({{ c.calibration.source or '—' }},
+                {{ c.calibration.fit_count }} band{{ '' if c.calibration.fit_count == 1 else 's' }} fit)
+              {% else %}
+                · not yet locked
+              {% endif %}
+            </div>
+          </div>
+          <form method="post"
+                action="{{ ingress_path }}/settings/dev/retrain/{{ c.circuit }}"
+                style="margin:0">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">Re-train now</button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+
+      <div class="sett-card">
+        <h3 class="sett-card-title">Artifact-detector calibration</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Per-home phantom / cross-talk / dribble thresholds, frozen at activation
+          (and re-frozen by Re-train above). Each is applied only if it would flag
+          <em>none</em> of your confirmed-real events — otherwise it keeps the safe
+          default. The leak-safety true-flow guards are never calibrated.
+        </p>
+        {% for c in circuits %}
+        <div style="margin:.6rem 0">
+          <strong>{{ c.display_name }}</strong>
+          {% if c.artifact_calibration %}
+            <span class="muted" style="font-size:.85em">
+              · Locked {{ c.artifact_calibration.locked_at or '—' }}
+              ({{ c.artifact_calibration.source or '—' }},
+              {{ c.artifact_calibration.count }}
+              threshold{{ '' if c.artifact_calibration.count == 1 else 's' }} calibrated)
+            </span>
+            <ul class="muted" style="font-size:.85em;margin:.3rem 0 0;padding-left:1.2rem">
+              {% for d in c.artifact_calibration.detectors %}
+              <li>{{ d.label }}: {{ d.summary }}</li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <span class="muted" style="font-size:.85em">· not yet locked</span>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+
+      <div class="sett-card">
+        <h3 class="sett-card-title">Detector self-validation</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Reconciles detected events against the raw flow re-scraped from HA (the last
+          ≤10 days of high-fidelity history) to confirm the phantom / cross-talk / dribble
+          settings behave. Runs automatically at activation / re-train.
+          <strong>Diagnostic only — never changes a threshold.</strong>
+        </p>
+        {% for c in circuits %}
+        <div class="dev-retrain-row"
+             style="display:flex;gap:.5rem;align-items:flex-start;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
+          <div style="min-width:60%">
+            <strong>{{ c.display_name }}</strong>
+            {% set dv = c.detector_validation %}
+            {% if dv and dv.volume %}
+              {% set warn = dv.overall == 'warn' %}
+              <span class="muted" style="font-size:.85em">
+                · <span style="font-weight:600;color:{{ '#c0392b' if warn else '#27ae60' }}">{{ 'NEEDS REVIEW' if warn else 'OK' }}</span>
+                · validated {{ dv.validated_at_local or '—' }}{% if dv.window and dv.window.days %} (last {{ dv.window.days }} d){% endif %}
+              </span>
+              <ul class="muted" style="font-size:.85em;margin:.3rem 0 0;padding-left:1.2rem">
+                <li>{{ dv.volume.summary }}</li>
+                {% if dv.detectors %}
+                  {% for key, label in [('phantom','Phantom'), ('cross_talk','Cross-talk'), ('dribble','Dribble')] %}
+                    {% set d = dv.detectors[key] %}
+                    {% if d %}<li>{{ label }}: {{ d.summary }}</li>{% endif %}
+                  {% endfor %}
+                {% endif %}
+                <li>Leak-safety: {{ dv.suspect_zeroings|length }} zeroed event(s) that moved real water{{ ' ⚠ review' if dv.suspect_zeroings|length else ' — none' }}
+                  {% if dv.suspect_zeroings %}
+                  <ul style="margin:.15rem 0;padding-left:1.1rem">
+                    {% for s in dv.suspect_zeroings[:10] %}
+                    <li>{{ s.time_local or s.start_ts }} · {{ s.kind|replace('_',' ') }} · {{ '%.2f'|format(s.raw_litres) }} L</li>
+                    {% endfor %}
+                    {% if dv.suspect_zeroings|length > 10 %}<li>+{{ dv.suspect_zeroings|length - 10 }} more</li>{% endif %}
+                  </ul>
+                  {% endif %}
+                </li>
+                <li>Unflagged no-flow (gap sentinel): {{ dv.unflagged_no_flow.count if dv.unflagged_no_flow else 0 }}
+                  {% if dv.unflagged_no_flow and dv.unflagged_no_flow.events %}
+                  <ul style="margin:.15rem 0;padding-left:1.1rem">
+                    {% for s in dv.unflagged_no_flow.events[:10] %}
+                    <li>{{ s.time_local or s.start_ts }} · {{ (s.duration_s / 60)|round(1) }} min · ΔP {{ '%.1f'|format(s.delta_psi) if s.delta_psi is not none else '—' }}</li>
+                    {% endfor %}
+                    {% if dv.unflagged_no_flow.events|length > 10 %}<li>+{{ dv.unflagged_no_flow.events|length - 10 }} more</li>{% endif %}
+                  </ul>
+                  {% endif %}
+                </li>
+                {% if dv.suspect_zeroings or (dv.unflagged_no_flow and dv.unflagged_no_flow.events) %}
+                <li style="margin-top:.2rem">Open these in <strong>History</strong> to confirm, or mark them <em>Not real water use</em>.</li>
+                {% endif %}
+              </ul>
+            {% elif dv %}
+              <span class="muted" style="font-size:.85em">· could not validate ({{ dv.error or 'unknown' }}){% if dv.validated_at_local %} at {{ dv.validated_at_local }}{% endif %}</span>
+            {% else %}
+              <span class="muted" style="font-size:.85em">· not yet validated — runs at activation / re-train, or click →</span>
+            {% endif %}
+          </div>
+          <form method="post"
+                action="{{ ingress_path }}/settings/dev/validate-detectors/{{ c.circuit }}"
+                style="margin:0">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">Run validation now</button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+
+      <div class="sett-card">
+        <h3 class="sett-card-title">Reprocess range</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Delete a circuit's auto events in a date range and rebuild them from HA
+          flow history — the bulk counterpart to the per-event <em>Reprocess</em>
+          on the History event modal. Fixes a garbled/unclosed event that absorbed
+          a whole day. Your labelled / classified / ignored events are kept, and
+          re-imported events appear shortly as they finish processing.
+        </p>
+        {% for c in circuits %}
+        <div class="dev-retrain-row"
+             style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
+          <strong>{{ c.display_name }}</strong>
+          <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">
+            <input type="date" id="repro-start-{{ c.circuit }}"
+                   aria-label="Range start" style="font-size:.85em;padding:2px 4px">
+            <span class="muted">→</span>
+            <input type="date" id="repro-end-{{ c.circuit }}"
+                   aria-label="Range end" style="font-size:.85em;padding:2px 4px">
+            <button type="button" class="btn btn-secondary btn-sm"
+                    onclick="devReimportRange('{{ c.circuit }}')">🔄 Reprocess range</button>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
 
   </div>{# /sett-content #}
 </div>{# /sett-layout #}
@@ -991,11 +1445,237 @@
   </div>
 </div>
 
+<!-- ── Flow-meter calibration helper ──────────────────────────────────────── -->
+<div id="cal-modal" class="modal-overlay" style="display:none"
+     onclick="if(event.target===this) calCancel()">
+  <div class="modal-box">
+    <h3>Calibrate Flow Meter — <span id="cal-circuit-label"></span></h3>
+
+    <div id="cal-step-method">
+      <p class="sett-card-desc">Measure the true pulses/litre by comparing a known volume
+        against the meter. Pick a method:</p>
+      <label style="display:block;margin:.3rem 0">
+        <input type="radio" name="cal-method" value="bucket" checked onchange="calMethod('bucket')">
+        <strong>Bucket</strong> — a container of known volume (precise; average 3 fills for a big change)
+      </label>
+      <label style="display:block;margin:.3rem 0">
+        <input type="radio" name="cal-method" value="municipal" onchange="calMethod('municipal')">
+        <strong>Municipal meter</strong> — your whole-house water meter (run ≥10 gal on this circuit only)
+      </label>
+
+      <div id="cal-bucket-inputs" style="margin-top:.5rem">
+        <label>Container volume (<span class="cal-unit">L</span>):
+          <input type="number" id="cal-known-volume" step="0.1" min="0" style="width:6rem">
+        </label>
+        <p class="muted" style="font-size:.8rem">Container empty at Start, full at Stop. ~5 gal is ideal.</p>
+      </div>
+      <div id="cal-muni-inputs" style="display:none;margin-top:.5rem">
+        <label>Starting meter reading:
+          <input type="number" id="cal-meter-start" step="any" style="width:8rem"></label>
+        <label style="margin-left:.5rem">Unit:
+          <select id="cal-meter-unit">
+            <option value="gal">gal</option><option value="ft³">ft³</option>
+            <option value="m³">m³</option><option value="L">L</option>
+          </select></label>
+        <p class="muted" style="font-size:.8rem">
+          <strong>Read the meter, then immediately press Start.</strong> Run ≥10 gal on this
+          circuit only (read the sweep hand). On the Main circuit, ensure no other water runs.
+        </p>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn btn-primary" onclick="calStart()">Start</button>
+        <button class="btn btn-secondary" onclick="calCancel()">Cancel</button>
+      </div>
+    </div>
+
+    <div id="cal-step-measure" style="display:none">
+      <p>Measuring… <strong id="cal-measured">0</strong> <span class="cal-unit">L</span> so far.</p>
+      <p class="muted" id="cal-measure-hint" style="font-size:.85rem"></p>
+      <div class="modal-actions">
+        <button class="btn btn-primary" onclick="calStop()">Stop</button>
+        <button class="btn btn-secondary" onclick="calCancel()">Cancel</button>
+      </div>
+    </div>
+
+    <div id="cal-step-result" style="display:none">
+      <p>Apply <input type="number" id="cal-newppl-input" step="0.1" min="1" max="5000"
+           style="width:6rem" oninput="_calReeval()"> pulses/litre
+         <span class="muted">(suggested <span id="cal-suggested"></span> · current
+         <span id="cal-curppl"></span> · <span id="cal-corr"></span>% change)</span>.</p>
+      <p class="muted" style="font-size:.85rem">
+        Samples (<span id="cal-runcount">0</span>): <span id="cal-run-history">—</span> pulses/litre<span
+        id="cal-run-stats"></span>. You can edit the value above before applying.</p>
+      <p id="cal-spread-warn" class="muted" style="font-size:.85rem;display:none"></p>
+      <p id="cal-gate-warn" class="muted" style="font-size:.85rem;display:none"></p>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="calAgain()">Run again</button>
+        <button class="btn btn-primary" id="cal-apply-btn" onclick="calApply()">Use new calibration</button>
+        <button class="btn btn-secondary" onclick="calCancel()">Cancel</button>
+      </div>
+    </div>
+
+    <p id="cal-error" style="color:var(--color-warn);font-size:.85rem;display:none"></p>
+  </div>
+</div>
+
 {% endblock %}
 
 
 {% block scripts %}
 <script>
+// ── Flow-meter calibration helper ──────────────────────────────────────────
+let _calCircuit = null, _calMethod = 'bucket', _calPollTimer = null;
+const _calBase = '{{ ingress_path }}/calibrate';
+function _calVolUnit() {
+  const fu = (document.getElementById('flow_unit') || {}).value || 'L/min';
+  return {'gal/min':'gal','ft³/min':'ft³','m³/min':'m³','L/min':'L'}[fu] || 'L';
+}
+function _calShow(step) {
+  ['method','measure','result'].forEach(s =>
+    document.getElementById('cal-step-'+s).style.display = (s===step) ? '' : 'none');
+}
+function _calErr(msg) {
+  const e = document.getElementById('cal-error');
+  e.textContent = msg || ''; e.style.display = msg ? '' : 'none';
+}
+function calMethod(m) {
+  _calMethod = m;
+  document.getElementById('cal-bucket-inputs').style.display = m==='bucket' ? '' : 'none';
+  document.getElementById('cal-muni-inputs').style.display = m==='municipal' ? '' : 'none';
+}
+function calOpen(circuit, label) {
+  _calCircuit = circuit;
+  document.getElementById('cal-circuit-label').textContent = label || circuit;
+  document.querySelectorAll('.cal-unit').forEach(e => e.textContent = _calVolUnit());
+  _calErr(''); calMethod('bucket');
+  document.querySelector('input[name=cal-method][value=bucket]').checked = true;
+  document.getElementById('cal-known-volume').value = '';
+  document.getElementById('cal-meter-start').value = '';
+  _calShow('method');
+  document.getElementById('cal-modal').style.display = 'flex';
+}
+async function _calPost(path, body) {
+  const r = await fetch(_calBase + '/' + _calCircuit + path, {
+    method:'POST',
+    headers:{'Content-Type':'application/json', 'X-CSRF-Token': window.CSRF_TOKEN || ''},
+    body: JSON.stringify(body || {})});
+  return r.json();
+}
+async function calStart() {
+  _calErr('');
+  const body = {method:_calMethod};
+  if (_calMethod==='bucket') {
+    const v = document.getElementById('cal-known-volume').value;
+    if (!v) { _calErr('Enter the container volume'); return; }
+    body.known_volume = parseFloat(v);
+  } else {
+    const ms = document.getElementById('cal-meter-start').value;
+    if (ms==='') { _calErr('Enter the starting meter reading'); return; }
+    body.meter_start = parseFloat(ms);
+    body.meter_unit = document.getElementById('cal-meter-unit').value;
+  }
+  const res = await _calPost('/start', body);
+  if (!res.ok) { _calErr(res.error); return; }
+  document.querySelectorAll('.cal-unit').forEach(e => e.textContent = res.vol_unit || 'L');
+  document.getElementById('cal-measure-hint').textContent = _calMethod==='municipal'
+    ? 'Run at least ~10 gal on this circuit only, then press Stop and re-read the meter immediately.'
+    : 'Fill the container, then press Stop.';
+  _calShow('measure'); _calPoll();
+  _calPollTimer = setInterval(_calPoll, 1500);
+}
+async function _calPoll() {
+  try {
+    const r = await fetch(_calBase + '/' + _calCircuit + '/poll');
+    const res = await r.json();
+    if (res.ok) document.getElementById('cal-measured').textContent = res.measured_display;
+  } catch(e) {}
+}
+function _calStopPoll() { if (_calPollTimer) { clearInterval(_calPollTimer); _calPollTimer = null; } }
+async function calStop() {
+  _calStopPoll(); _calErr('');
+  const body = {};
+  if (_calMethod==='municipal') {
+    const me = prompt('Final meter reading:');
+    if (me===null || me==='') { _calErr('Enter the final meter reading'); _calShow('measure'); return; }
+    body.meter_end = parseFloat(me);
+  }
+  const res = await _calPost('/stop', body);
+  if (!res.ok) { _calErr(res.error); _calShow('measure'); return; }
+  _calResult(res);
+}
+let _calLast = null;
+function _calResult(res) {
+  _calLast = res;
+  document.getElementById('cal-runcount').textContent = res.run_count;
+  const ppls = res.run_ppls || [];
+  document.getElementById('cal-run-history').textContent = ppls.length ? ppls.join(', ') : '—';
+  const stats = document.getElementById('cal-run-stats');
+  if (ppls.length >= 2) {
+    const avg = Math.round(ppls.reduce((a, b) => a + b, 0) / ppls.length * 10) / 10;
+    stats.textContent = ' · average ' + avg + ' · range ' +
+      Math.min(...ppls) + '–' + Math.max(...ppls);
+  } else stats.textContent = '';
+  document.getElementById('cal-suggested').textContent = res.new_ppl;
+  document.getElementById('cal-curppl').textContent = res.current_ppl;
+  document.getElementById('cal-newppl-input').value = res.new_ppl;
+  const sw = document.getElementById('cal-spread-warn');
+  if (res.spread_pct >= 3 && res.run_count > 1) {
+    sw.textContent = '⚠ Your runs disagree by ' + res.spread_pct +
+      '% — consider another run or check fill consistency.';
+    sw.style.display = '';
+  } else sw.style.display = 'none';
+  _calReeval();              // gate + correction reflect the (editable) value
+  _calShow('result');
+}
+// Re-evaluate the gate against the user-EDITED value (gated on its own correction).
+function _calReeval() {
+  if (!_calLast) return;
+  const cur = _calLast.current_ppl, runs = _calLast.run_count;
+  const val = parseFloat(document.getElementById('cal-newppl-input').value);
+  const gw = document.getElementById('cal-gate-warn');
+  const applyBtn = document.getElementById('cal-apply-btn');
+  if (!(val >= 1 && val <= 5000)) {
+    gw.textContent = 'Enter a value between 1 and 5000.'; gw.style.display = '';
+    applyBtn.disabled = true; return;
+  }
+  const corr = Math.round(Math.abs(val - cur) / cur * 1000) / 10;
+  document.getElementById('cal-corr').textContent = corr;
+  const needsRuns = (corr > 3 && _calMethod === 'bucket') ? Math.max(0, 3 - runs) : 0;
+  if (needsRuns > 0) {
+    gw.textContent = 'This is a ' + corr + '% change — run at least ' + needsRuns +
+      ' more bucket sample(s) to confirm (averages out fill error).';
+    gw.style.display = ''; applyBtn.disabled = true;
+  } else { gw.style.display = 'none'; applyBtn.disabled = false; }
+}
+function calAgain() {
+  _calErr('');
+  if (_calMethod==='municipal') {
+    document.getElementById('cal-meter-start').value = '';
+    _calShow('method');                 // re-enter a fresh start reading
+  } else { calStart(); }                // bucket reuses the same volume
+}
+async function calApply() {
+  const val = parseFloat(document.getElementById('cal-newppl-input').value);
+  const res = await _calPost('/apply', {ppl: val});
+  if (!res.ok) { _calErr(res.error); return; }
+  _calClose();
+  alert('Calibration applied: ' + res.new_ppl + ' pulses/litre.' + (res.rebaselined
+    ? ' Re-learning the baseline — automatic shut-off is paused until it matures.'
+    : ' Small trim — no re-learning needed.'));
+  location.reload();
+}
+async function calCancel() {
+  _calStopPoll();
+  try { await _calPost('/cancel', {}); } catch(e) {}
+  _calClose();
+}
+function _calClose() {
+  _calStopPoll();
+  document.getElementById('cal-modal').style.display = 'none';
+  _calCircuit = null;
+}
+
 // ── Circuit sub-tab navigation ─────────────────────────────────────────────
 function settSubNav(circIdx, tab) {
   ['config', 'detection', 'advanced'].forEach(t => {
@@ -1115,6 +1795,60 @@ async function settingsCircuitTypeUpdate(circuit, circuitType) {
   }
 }
 
+async function settingsValveTypeUpdate(circuit, valveType, radio) {
+  // Confirm prompt: switching to 3_port disables the micro leak test;
+  // switching to 2_port re-enables it. Bail (and un-check the radio) if
+  // the user cancels so the UI doesn't show a state that didn't save.
+  let msg;
+  if (valveType === '3_port') {
+    msg = "Switching to a 3-port valve will DISABLE the micro leak test "
+        + "for this circuit. The existing leak-test schedule is preserved "
+        + "and will resume if you switch back to 2-port later.\n\nContinue?";
+  } else {
+    msg = "Switching to a 2-port valve will re-enable the micro leak test "
+        + "for this circuit. Make sure the installed valve really has only "
+        + "two ports — running the leak test on a 3-port valve will always "
+        + "fail.\n\nContinue?";
+  }
+  if (!window.confirm(msg)) {
+    // Revert UI: re-check whatever was selected before (data-current
+    // attribute reflects the value at page render).
+    if (radio) {
+      const previous = radio.dataset.current;
+      document.querySelectorAll(`input[name="valve_type_${circuit}"]`)
+        .forEach(r => { r.checked = (r.value === previous); });
+    }
+    return;
+  }
+  const note = document.getElementById(`valve-type-saving-${circuit}`);
+  if (note) note.style.display = 'block';
+  try {
+    const resp = await fetch(`${window.INGRESS_PATH}/settings/circuit/${circuit}/valve-type`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&valve_type=${encodeURIComponent(valveType)}`,
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (data.status === 'updated') {
+      // Reload to surface the conditional "leak test disabled" note,
+      // and so Device-page button state recomputes on next visit.
+      window.location.reload();
+    } else if (data.status === 'no_change') {
+      // Nothing to do — user picked the same value they already had.
+    } else {
+      toast('Could not update valve type: ' + (data.message || 'unknown error'), 'error');
+      // Revert the radio to data-current.
+      if (radio) {
+        const previous = radio.dataset.current;
+        document.querySelectorAll(`input[name="valve_type_${circuit}"]`)
+          .forEach(r => { r.checked = (r.value === previous); });
+      }
+    }
+  } finally {
+    if (note) note.style.display = 'none';
+  }
+}
+
 async function settingsAlertToggle(alertId, enabled) {
   const parts = alertId.split('_');
   const circuit = parts[parts.length - 1];
@@ -1175,7 +1909,8 @@ async function pruneNow(evt) {
   btn.textContent = 'Pruning…';
   try {
     const resp = await fetch(`${window.INGRESS_PATH}/settings/retention/prune-now`, {
-      method: 'POST'
+      method: 'POST',
+      headers: { 'X-CSRF-Token': window.CSRF_TOKEN || '' },
     });
     const data = await resp.json();
     const total = Object.values(data.deleted || {}).reduce((a, b) => a + b, 0);
@@ -1185,6 +1920,32 @@ async function pruneNow(evt) {
   } finally {
     btn.disabled = false;
     btn.textContent = 'Run pruning now';
+  }
+}
+
+async function reprocessDegraded(evt) {
+  if (!confirm('Re-evaluate degraded-supply verdicts on all past events with stored diagnostics? Volume totals will be adjusted to match the new verdicts.')) return;
+  const btn = evt.target;
+  btn.disabled = true;
+  btn.textContent = 'Re-evaluating…';
+  try {
+    const resp = await fetch(`${window.INGRESS_PATH}/settings/reprocess/degraded-supply`, {
+      method: 'POST',
+      headers: { 'X-CSRF-Token': window.CSRF_TOKEN || '' },
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'unknown error');
+    const flipped = (data.flipped_to_degraded || 0) + (data.flipped_to_clean || 0);
+    toast(
+      `Re-evaluated ${data.evaluated} events — ${data.flipped_to_clean} flipped to clean, `
+      + `${data.flipped_to_degraded} flipped to degraded (${data.skipped_legacy} legacy rows skipped).`,
+      flipped > 0 ? 'success' : 'info'
+    );
+  } catch (e) {
+    toast('Re-evaluation failed: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Re-evaluate now';
   }
 }
 

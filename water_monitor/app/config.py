@@ -14,6 +14,28 @@ OPTIONS_PATH = Path(os.environ.get("OPTIONS_PATH", "/data/options.json"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "water_monitor.db"
 
+# Phase 1 dev/testing tools (e.g. instant rule-calibration re-fit, bypassing the
+# weeks-long recalibration). Gated OFF by default; the whole Settings → Dev tab and
+# its routes are hidden unless enabled. Controlled by the `dev_tools` add-on option
+# (settable from the HA add-on Configuration UI) with a WM_DEV_TOOLS env override
+# for local/dev runs. Read once at import — flip the option then restart the add-on.
+def _read_dev_tools() -> bool:
+    env = os.environ.get("WM_DEV_TOOLS", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    try:
+        if OPTIONS_PATH.exists():
+            with OPTIONS_PATH.open() as f:
+                return bool(json.load(f).get("dev_tools", False))
+    except Exception:
+        pass
+    return False
+
+
+DEV_TOOLS = _read_dev_tools()
+
 
 @dataclass
 class CircuitConfig:
@@ -40,6 +62,8 @@ class CircuitConfig:
     leak_test_switch: str = ""
     leak_test_result_sensor: str = ""
     volume_sensor: str = ""
+    # Runtime per-circuit flow-meter pulses-per-litre number entity (firmware 3.12.0+).
+    flow_meter_ppl_entity: str = ""
     # Waveform diagnostic counters — the only wf_* entities after the 3.8.0
     # HA-event transport migration removed the 5 chunked text sensors.
     # Chunk drop count was added in 3.9.0 with chunked streaming.
@@ -47,9 +71,25 @@ class CircuitConfig:
     wf_chunk_drop_count_sensor: str = ""
     esp_device_prefix: str = ""
 
+    # Cached pulses-per-litre for this circuit's flow meter. Refreshed at runtime
+    # from flow_meter_ppl_entity (the firmware number entity is the source of
+    # truth); the circuit_profile.pulses_per_litre DB column is the fallback cache.
+    # Default 396 = reference turbine (YF-B5).
+    pulses_per_litre: float = 396.0
+
     @property
     def is_zone_circuit(self) -> bool:
         return self.circuit_type == "zone"
+
+    @property
+    def min_flow_lpm(self) -> float:
+        """Meter-derived low-flow noise floor: 1 pulse/second = 60 ÷ ppl L/min.
+        (≈0.15 for a 396-ppl turbine; ≈0.83 for a 72-ppl oval gear.) Guards a
+        bad cached ppl by falling back to the reference-turbine floor."""
+        ppl = self.pulses_per_litre
+        if not (ppl and ppl >= 1.0):
+            ppl = 396.0
+        return 60.0 / ppl
 
     @property
     def label(self) -> str:
@@ -196,12 +236,27 @@ def compute_suggested_calibration_days(
     return min(base_days, 35), tier
 
 
+# Zone (irrigation) circuits see only a handful of repetitive cycles per
+# day, so the whole-home fixture target below is unreachable for them. A
+# small fixed target is enough to characterise their flow signature.
+# Tunable.
+ZONE_MINIMUM_EVENTS = 20
+
+
 def compute_minimum_events(
     bathrooms_full: int,
     bathrooms_half: int,
     floors: int,
+    circuit_kind: str = "fixture",
 ) -> int:
-    """Minimum event count before calibration can complete."""
+    """Minimum event count before calibration can complete.
+
+    ``circuit_kind`` is the circuit taxonomy value ('fixture' or 'zone').
+    Zone/irrigation circuits use a small fixed target since they generate
+    far fewer discrete events than the whole-home main shutoff.
+    """
+    if circuit_kind == "zone":
+        return ZONE_MINIMUM_EVENTS
     estimated_fixtures = (
         bathrooms_full * 3.2
         + bathrooms_half * 1.2

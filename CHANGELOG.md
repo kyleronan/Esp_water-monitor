@@ -1,5 +1,157 @@
 # Changelog
 
+## [0.2.2] — 2026-06-21
+
+A features + correctness + hardening release. Headlines: runtime per-circuit
+flow-meter pulses-per-litre as a Home Assistant number entity (any meter, no
+firmware edit) with a guided bucket / municipal-meter calibration helper;
+a degraded-supply guard so events captured during pulsing municipal pressure
+are flagged and stop poisoning clustering / hourly volume; a per-circuit
+valve-type setting
+(2-port / 3-port) so micro leak tests are correctly disabled on
+drain-capable hardware; and a round of security and robustness work
+covering CSRF, the autocorrelation primitive behind the supply detector,
+and migration safety. Firmware credentials restored and a release-check
+script added to keep them that way.
+
+### New Features
+
+- **Flow calibration helper (guided bucket / municipal-meter test)** — Settings → Flow Meter →
+  "Calibrate…" walks the user through measuring the meter's TRUE pulses/litre: enter a known
+  reference volume (a bucket, or the whole-house municipal-meter delta), run that fixture, and the
+  add-on derives `new_ppl = current_ppl × (measured ÷ actual)` from the cumulative volume sensor
+  (no firmware change; self-correcting even if the current PPL is far off). Runs pool by volume,
+  with a method-aware sample gate (a >3% bucket correction needs ≥3 averaged fills to cancel
+  fill error; a single ≥10-gal municipal run suffices) and a run-spread warning. Applying writes
+  the firmware PPL entity; a small trim just re-scales the frozen anomaly thresholds (no relearn),
+  a large change re-baselines. The deliberate test draw is suppressed from auto-shutoff and
+  excluded from training/anomaly so it can't trip the valve or pollute the baseline. The
+  result lists each run plus their average + range, and the suggested value is editable
+  (re-gated on its own correction) before applying. New `routers/calibration.py` +
+  `calibration_math.py`.
+- **Runtime-configurable per-circuit flow meter (PPL)** — pulses-per-litre is now a
+  per-circuit Home Assistant `number` entity (`Flow Meter PPL - <circuit>`), NVS-backed
+  so it survives reboots and OTA updates. Set it to match any meter — turbine YF-B5 = 396,
+  oval-gear ZJ-HSM-OFZATS-06 = 72, or any datasheet / bucket-tested value (replaces the old
+  compile-time `flow_k_factor`). The per-circuit default is seeded at flash time by the
+  `flow_ppl_main` / `flow_ppl_irr` substitutions, so a unit is correctly calibrated from first
+  boot with no HA; `restore_value` then keeps the value across reboots and OTA updates, and it
+  can be changed at runtime (HA / device web page) without a reflash. The firmware converts pulses→L/min
+  from the live entity; the add-on reads it as the single source of truth (read-only in
+  Settings) and derives each circuit's low-flow noise floor (60 ÷ ppl: ≈0.15 L/min at 396,
+  ≈0.83 at 72). Changing the PPL forces a NON-destructive re-baseline of that circuit
+  (auto-shutoff degrades to notify until the new baseline matures); historical event volumes
+  are never recomputed. A coarse positive-displacement meter's small real draws are protected
+  from the low-flow dribble-zeroing heuristic (which was tuned for the turbine). DB migration
+  20260546 adds the `circuit_profile.pulses_per_litre` cache (default 396).
+- **Degraded-supply guard** — when the municipal supply pulses, the
+  paddlewheel flow sensor produces chaotic readings (forward and
+  reverse pulses both count positive; brief zero-velocity transitions
+  read as 0 L/min). Events captured during these conditions are now
+  detected via pressure-band autocorrelation + flow-rectification
+  signatures, flagged with `degraded_supply=1`, given an
+  envelope-smoothed `volume_litres_effective` so daily totals stay
+  sensible, and excluded from clustering. Surfaces in the History
+  page with a filter, in the dashboard as a banner, and as a
+  rate-limited HA notification.
+- **Per-circuit valve type** — Setup wizard step 3b and Settings now
+  ask whether each circuit is wired for a 2-port (standard) or 3-port
+  (drain-capable, winterization-friendly) ball valve. 3-port circuits
+  automatically skip the micro leak test (the drain port would always
+  read as a constant leak); the schedule is preserved so switching
+  back to 2-port resumes it. UI shows the reason on both the Device
+  and Settings pages.
+
+### Security
+
+- **Per-session CSRF tokens** — the previous implementation cached a
+  single token per process for an hour, so every browser session
+  shared the same token. Replaced with stateless HMAC double-submit:
+  a persistent server secret (generated once, never auto-rotated) +
+  a per-browser `wm_session` cookie + `csrf_token = HMAC(secret,
+  session_id)`. Setup-wizard POSTs are no longer CSRF-exempt (the
+  earlier `startswith("/setup")` check let every `POST /setup/...`
+  through with no token). Path-prefix exemptions replaced with
+  exact-match for `/health` so `/health-anything` no longer slips
+  past ingress checks.
+- **Firmware credentials restored** — API encryption, OTA password,
+  fallback-AP password and web-server auth are no longer commented
+  out in the firmware YAML; all four read from `secrets.yaml` (see
+  `firmware/secrets.yaml.example`). `dashboard_import` URL pinned
+  to `@v3.10.0`. A new `scripts/check_firmware_release.py` script
+  parses the YAML (not greps — commented examples don't fool it)
+  and fails the release if any of those are missing or if the
+  `dashboard_import` ref is mutable.
+
+### Bug Fixes
+
+- **Autocorrelation normalisation bug** — `_autocorr_at_lag` in the
+  degraded-supply detector mismatched its numerator and denominator
+  sample windows. The fix is a proper overlap-weighted Pearson
+  correlation: each window centred by its own mean, normalised by
+  `sqrt(var_head * var_tail)`, then scaled by sample overlap so the
+  peak-pick prefers the fundamental over harmonics. The 12 existing
+  degraded-supply tests still pass; 14 new tests in
+  `test_autocorr.py` cover the primitive directly.
+- **Migration rebuild safety** — the 20260526 migration's
+  `hourly_volume` rebuild (DELETE + INSERT/SELECT from `events`) now
+  uses a temp-table swap pattern wrapped in `try/except + rollback()`,
+  so a Python-level exception mid-rebuild leaves the original table
+  intact (previously safe only against process death, via SQLite's
+  transaction durability). Eight new migration round-trip tests cover
+  forward migration from every historical schema version,
+  idempotency, rebuild correctness, and failure-injection.
+- **Daily-summary UPSERT future-proofing** — `compute_daily_summary`
+  now emits `ON CONFLICT … DO NOTHING` if the column-update list is
+  ever empty (currently 12 columns; a future trim could make this a
+  SQL syntax error otherwise).
+- **Catch-up orphaned events longer than the check interval** — the
+  periodic `historical_importer` catch-up advanced `last_check_ts` to
+  `now` even while a flow period was still active, so an event longer
+  than `CHECK_INTERVAL_MINUTES` had its start slide behind the checkpoint
+  and could then only be recovered by a much-later startup backfill (a
+  133-min irrigation run surfaced ~4 days late). `_import_range` now
+  reports the trailing still-active flow start and folds it into
+  `retry_from`, holding the checkpoint there until the event ends so the
+  next catch-up after it closes reconstructs the full period. The overlap
+  / UUID5 dedup keeps this from double-counting. New tests in
+  `test_historical_importer_active_event.py`.
+- **No-flow pressure phantoms blocked a circuit for hours** — a pure
+  pressure transient whose pressure SETTLED below the recovery line (e.g.
+  an irrigation zone solenoid nudging the steady pressure) never satisfied
+  the pressure-recovery END and stayed open until the 6 h over-long
+  watchdog; while open it blocked every new event on that circuit (the
+  `_active_event is None` start gate), so the next irrigation run was
+  missed by live detection. New `_maybe_close_settled_noflow`
+  (`SETTLED_NOFLOW_CLOSE_S = 60 s`) closes such an event once pressure
+  settles and flow has been zero ≥ 60 s; flow-triggered, pulsed, and
+  ongoing draws are excluded so a real run is never cut short. New tests
+  in `test_event_detector_pressure_recovery.py`.
+
+### Performance
+
+- **Async / blocking-SQLite audit** — `data_pruner.run` (nightly
+  prune + daily-summary computation), `_run_waveform_purger` (daily
+  DELETE), and `learn_best_hour` (60-day usage analysis for leak-test
+  scheduling) are now offloaded via `loop.run_in_executor()` rather
+  than running directly on the asyncio event loop. The orchestrator's
+  `rebuild_from_db` / `backfill_unmatched` were already wrapped.
+
+### Internal
+
+- **Migration sequence** updated to schema version 20260527 (added
+  `circuit_profile.valve_type` with a defensive backfill). Migration
+  20260526 added 7 columns on `events`, the `event_waveforms` table,
+  and rebuilt `hourly_volume` from events as the source of truth.
+- **Set away mode** — `CASE WHEN ?` rewritten to explicit
+  `CASE WHEN ? = 1` for clarity (same behaviour).
+- **_enrich_from_waveform** docstring now lists the four A/B tracking
+  fields it sets.
+- **Firmware globals comment** stripped of stale 3.8.x slot+decimation
+  history.
+
+---
+
 ## [0.2.1] — 2026-05-24
 
 A refinement release of the 0.2.x fixture-identification line. Headlines:

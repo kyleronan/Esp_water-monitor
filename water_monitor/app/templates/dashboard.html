@@ -4,7 +4,7 @@
 {# ── Away mode banner (only when active) ─────────────────────────── #}
 {% if away_mode %}
 <div class="dash-away-banner">
-  <span>🏖 <strong>Away mode active</strong> — baseline learning paused.
+  <span>🏖 <strong>Away mode active</strong> — learning your normal usage is paused.
     Leak tests and valve control still running.</span>
   <form method="post" action="{{ ingress_path }}/settings/away-mode/toggle"
         style="margin:0">
@@ -14,11 +14,33 @@
 </div>
 {% endif %}
 
+{# Compute a single page-level "what to do next" hint from state already in
+   context (no new backend data). Branch on training.state first, then events —
+   so live-with-no-events reads differently from a circuit still calibrating. #}
+{% set ds = namespace(fault=false, labelling=false, calibrating=false, live_zero=false) %}
+{% for c in circuits %}
+  {% if c.fault_active %}{% set ds.fault = true %}{% endif %}
+  {% if c.training.state == 'labelling' %}{% set ds.labelling = true %}{% endif %}
+  {% if c.training.state == 'calibrating' %}{% set ds.calibrating = true %}{% endif %}
+  {% if c.training.state == 'live' and (c.training.events_collected or 0) == 0 %}{% set ds.live_zero = true %}{% endif %}
+{% endfor %}
+
 {# ── Title row with Home/Away pill toggle on the right ──────────── #}
 <div class="dash-title-row">
   <div>
     <h1 class="dash-title">Dashboard</h1>
     <span class="dash-subtitle">Live readings · updated every 5s</span>
+    {% if ds.fault %}
+    <span class="dash-next-chip is-alert">⚠ Action needed — reset the safety fault on the affected line below.</span>
+    {% elif ds.labelling %}
+    <a class="dash-next-chip" href="{{ ingress_path }}/fixtures">👉 Last step: activate your line on Water Use →</a>
+    {% elif ds.calibrating %}
+    <a class="dash-next-chip" href="{{ ingress_path }}/training">👉 While it learns: run your fixtures in the Training helper →</a>
+    {% elif ds.live_zero %}
+    <span class="dash-next-chip">Run some water to get started — your first events will appear here.</span>
+    {% else %}
+    <span class="dash-next-chip is-ok">✅ All set — monitoring for leaks.</span>
+    {% endif %}
   </div>
   <form method="post" action="{{ ingress_path }}/settings/away-mode/toggle"
         class="dash-away-toggle-form">
@@ -101,9 +123,29 @@
     </div>
     {% endif %}
 
+    {# Degraded-supply banner — orthogonal to fault/trickle. Shown when at
+       least one event in the past 30 min was captured during pulsing
+       supply conditions and flagged as degraded by the guard. Click View
+       opens the history page filtered to degraded events. #}
+    {% if c.degraded_active %}
+    <div class="dash-alert dash-alert-degraded" aria-live="polite">
+      <div class="dash-alert-body">
+        <span class="dash-alert-title">⚠ Unsteady water pressure</span>
+        <span class="dash-alert-detail">
+          {{ c.degraded_events_24h }} affected event{% if c.degraded_events_24h != 1 %}s{% endif %} in past 24h — usage totals here are estimates.
+          <a class="dash-alert-help" href="{{ ingress_path }}/history?filter=degraded&circuit={{ c.circuit }}#legend">What's this?</a>
+        </span>
+      </div>
+      <a class="btn btn-secondary btn-sm"
+         href="{{ ingress_path }}/history?filter=degraded&circuit={{ c.circuit }}">View</a>
+    </div>
+    {% endif %}
+
     {# Live readings — pressure & flow on surface-2 inset cards #}
     <div class="dash-readings">
-      <div class="dash-reading">
+      <div class="dash-reading dash-pressure-trigger" role="button" tabindex="0"
+           data-circuit="{{ c.circuit }}" data-name="{{ c.display_name }}"
+           title="View last 24 h of pressure" style="cursor:pointer">
         <div class="dash-reading-label">Pressure</div>
         <div class="dash-reading-value">
           <span id="pressure-{{ c.circuit }}">{{ c.pressure }}</span><span class="dash-reading-unit">{{ pressure_unit }}</span>
@@ -183,7 +225,9 @@
       {% endif %}
     </div>
 
-    {# Training progress — visible only while calibrating #}
+    {# Training progress + a guided next step — the dashboard is the first
+       thing seen post-setup, so the learn → train → label → activate path
+       must be visible here, not only on other pages. #}
     {% if c.training.state == 'calibrating' %}
     <div class="dash-training">
       <div class="dash-training-row">
@@ -193,6 +237,21 @@
       <div class="dash-training-bar">
         <div class="dash-training-fill" style="width: {{ c.training.percent_complete }}%"></div>
       </div>
+      <p class="dash-training-next">
+        While it learns, you can speed things up:
+        <a href="{{ ingress_path }}/training">run each fixture once in the Training helper</a>,
+        or <a href="{{ ingress_path }}/history">label a few events on History</a>.
+      </p>
+    </div>
+    {% elif c.training.state == 'labelling' %}
+    <div class="dash-training">
+      <div class="dash-training-row">
+        <span class="dash-training-label">✅ Learning complete</span>
+      </div>
+      <p class="dash-training-next">
+        Last step — <a href="{{ ingress_path }}/fixtures">activate this line on the Water Use page</a>
+        to turn on leak &amp; anomaly detection.
+      </p>
     </div>
     {% endif %}
 
@@ -215,6 +274,22 @@
   </div>
 </section>
 {% endfor %}
+
+{# 24h pressure-history modal — opened by clicking a circuit's current pressure #}
+<div id="pressure-modal" class="modal-overlay" style="display:none"
+     role="dialog" aria-modal="true" aria-labelledby="pressure-modal-title">
+  <div class="modal-box" style="max-width:680px">
+    <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:4px">
+      <h3 id="pressure-modal-title" style="margin:0;flex:1">Pressure — last 24 h</h3>
+      <button id="pressure-modal-close" class="btn btn-secondary btn-sm" aria-label="Close">✕</button>
+    </div>
+    <p id="pressure-modal-caption" class="muted" style="margin:0;font-size:12px"></p>
+    <div style="position:relative;height:300px;margin-top:10px">
+      <canvas id="pressure-chart"></canvas>
+    </div>
+    <p id="pressure-modal-msg" class="muted" style="display:none;margin:18px 0;text-align:center"></p>
+  </div>
+</div>
 
 {% endblock %}
 
@@ -300,6 +375,103 @@ const mix    = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparen
   });
 })();
 {% endfor %}
+
+// ── 24h pressure-history modal (opened from a circuit's current pressure) ────
+(function () {
+  const modal = document.getElementById("pressure-modal");
+  if (!modal) return;
+  const titleEl = document.getElementById("pressure-modal-title");
+  const capEl   = document.getElementById("pressure-modal-caption");
+  const msgEl   = document.getElementById("pressure-modal-msg");
+  const canvas  = document.getElementById("pressure-chart");
+  const INGRESS = window.INGRESS_PATH || "";
+  const ERR = {
+    no_entity:      "No pressure sensor is configured for this circuit.",
+    ha_unreachable: "Couldn't reach Home Assistant — try again in a moment.",
+    no_history:     "No pressure history recorded in the last 24 hours.",
+  };
+  let chart = null;
+
+  function close() {
+    modal.style.display = "none";
+    if (chart) { chart.destroy(); chart = null; }
+  }
+  function showMsg(t) {
+    msgEl.textContent = t; msgEl.style.display = "block"; canvas.style.display = "none";
+  }
+
+  async function open(circuit, name) {
+    titleEl.textContent = `${name || "Pressure"} — last 24 h`;
+    capEl.textContent = "";
+    msgEl.style.display = "none";
+    canvas.style.display = "";
+    modal.style.display = "";            // CSS .modal-overlay → flex-centered
+    if (chart) { chart.destroy(); chart = null; }
+
+    let d;
+    try {
+      const r = await fetch(`${INGRESS}/api/dashboard/pressure/${circuit}`, { signal: AbortSignal.timeout(10000) });
+      d = await r.json();
+    } catch (_) { showMsg(ERR.ha_unreachable); return; }
+    if (!d || !d.available) { showMsg((d && ERR[d.error]) || "No pressure history available."); return; }
+
+    const pf = window.UNITS.pressure_factor, pd = window.UNITS.pressure_decimals, pu = window.UNITS.pressure_unit;
+    const labels = d.points.map(p => {
+      const t = new Date(p.t);
+      return `${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")}`;
+    });
+    const series = d.points.map(p => p.v == null ? null : +(p.v * pf).toFixed(pd));
+    const datasets = [{
+      label: `Pressure (${pu})`,
+      data: series,
+      borderColor: mix(cssVar("--accent"), 90),
+      backgroundColor: mix(cssVar("--accent"), 12),
+      fill: true, tension: 0.25, pointRadius: 0, borderWidth: 1.5, spanGaps: false,
+    }];
+    if (d.baseline_psi != null) {
+      const b = +(d.baseline_psi * pf).toFixed(pd);
+      datasets.push({
+        label: "normal resting pressure",
+        data: series.map(() => b),
+        borderColor: mix(cssVar("--text-3"), 80),
+        borderDash: [5, 4], fill: false, pointRadius: 0, borderWidth: 1,
+      });
+      capEl.textContent = `Normal resting pressure ≈ ${b} ${pu} — what your pipes sit at between water use.`;
+    }
+    chart = new Chart(canvas, {
+      type: "line",
+      data: { labels, datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { intersect: false, mode: "index" },
+        plugins: {
+          legend: { display: true, labels: { font: { family: "DM Sans", size: 11 }, color: cssVar("--text-3"), boxWidth: 12 } },
+          tooltip: {
+            callbacks: { label: c => c.parsed.y == null ? "" : `${c.dataset.label}: ${c.parsed.y.toFixed(pd)} ${pu}` },
+            backgroundColor: cssVar("--surface-2"), titleColor: cssVar("--text"),
+            bodyColor: cssVar("--text"), borderColor: cssVar("--border"), borderWidth: 1,
+            titleFont: { family: "DM Sans", size: 11 }, bodyFont: { family: "JetBrains Mono", size: 12 },
+            padding: 8, cornerRadius: 6,
+          },
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: { family: "DM Sans", size: 10 }, color: cssVar("--text-3"), maxRotation: 0, maxTicksLimit: 8 } },
+          y: { grid: { color: cssVar("--border") }, ticks: { font: { family: "DM Sans", size: 10 }, color: cssVar("--text-3") } },
+        },
+      },
+    });
+  }
+
+  document.querySelectorAll(".dash-pressure-trigger").forEach(el => {
+    el.addEventListener("click", () => open(el.dataset.circuit, el.dataset.name));
+    el.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(el.dataset.circuit, el.dataset.name); }
+    });
+  });
+  document.getElementById("pressure-modal-close").addEventListener("click", close);
+  modal.addEventListener("click", e => { if (e.target === modal) close(); });
+  document.addEventListener("keydown", e => { if (e.key === "Escape" && modal.style.display !== "none") close(); });
+})();
 
 // Tiny sparkline drawer — Canvas, matching the design prototype
 function drawSparkline(canvas, data) {

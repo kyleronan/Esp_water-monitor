@@ -50,6 +50,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Deque, List, Literal, Optional, Tuple
 
+from .event_rules import LOWFLOW_OFF_GRACE_S, is_low_flow_chatter
+
 log = logging.getLogger(__name__)
 
 StartTrigger = Literal["flow", "pressure", "pressure+flow"]
@@ -85,6 +87,12 @@ class RawEvent:
     # 1Hz flow readings collected during the event
     flow_readings: List[float] = field(default_factory=list)
 
+    # Coalesced timestamped flow samples (ts, L/min) for the volume TIME-INTEGRAL
+    # (flow_integral.integrate_litres / active_flow_features). Distinct from the
+    # downsampled flow_readings used for the 32-pt signature: volume must be a
+    # time-integral, not mean(flow) × pressure-window duration.
+    flow_samples: List[Tuple[datetime, float]] = field(default_factory=list)
+
     # True if any other circuit's valve was open when this event started.
     # Helps distinguish main-circuit irrigation bleed-through from household demand.
     other_valve_open: Optional[bool] = None
@@ -96,6 +104,12 @@ class RawEvent:
 
     is_composite: bool = False
     complete: bool = False
+
+    # dev.24 low-flow off-grace: when a sustained low draw dips below MIN_FLOW,
+    # the event is held open until this deadline instead of finalizing, so the
+    # turbine's low-flow chatter doesn't fragment one draw into many events.
+    # Cleared by on_flow_rate the instant flow resumes (bridging the dip).
+    low_flow_hold_until: Optional[datetime] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -323,7 +337,9 @@ class CircuitEventDetector:
     BASELINE_LOOKBACK_SAMPLES: int = 120    # 3 s lookback
     BASELINE_WINDOW_SAMPLES: int = 80       # 2 s averaging window
 
-    # Minimum flow rate considered real flow (filters ADC noise)
+    # Minimum flow rate considered real flow (filters ADC noise). This CLASS value
+    # is the 396-ppl turbine default (60 ÷ 396 ≈ 0.15 L/min); __init__ overrides it
+    # per circuit with the meter-derived floor (60 ÷ ppl) — see CircuitConfig.min_flow_lpm.
     MIN_FLOW_LPM: float = 0.15
 
     # Maximum physically plausible flow rate for any residential/light-commercial
@@ -334,13 +350,19 @@ class CircuitEventDetector:
 
     # Minimum physically meaningful flow rate from this sensor.
     # The pulse counter cannot produce a non-zero value below 1 pulse/second,
-    # which converts to 60 counts/min / 396 ≈ 0.15 L/min.  Values in the
-    # range (0, MIN_NOISE_LPM) are floating-point noise (e.g. 1.58e-36 L/min
-    # from ESPHome ADC underflow) and should be treated as zero.
+    # which converts to 60 counts/min ÷ ppl (≈0.15 L/min at 396 ppl, ≈0.83 at
+    # 72 ppl) — that floor is the per-circuit MIN_FLOW_LPM. MIN_NOISE_LPM below is a
+    # meter-independent float-underflow guard: values in (0, MIN_NOISE_LPM) are
+    # noise (e.g. 1.58e-36 L/min from ESPHome ADC underflow) and are treated as zero.
     MIN_NOISE_LPM: float = 0.05
 
     # Seconds of sustained flow required to open a flow-triggered event
     FLOW_START_SECONDS: float = 2.0
+
+    # Consecutive sub-MIN_FLOW samples tolerated mid-formation before the sustain
+    # timer is abandoned. The turbine chatters / drops out for a sample or two on a
+    # slow ramp-up, and a single glitch must not reset a nearly-complete timer.
+    FLOW_START_DIP_TOLERANCE: int = 2
 
     # Composite: second transient must be >= this multiple of primary threshold
     COMPOSITE_TRANSIENT_MULTIPLIER: float = 1.5
@@ -356,6 +378,27 @@ class CircuitEventDetector:
     # dip has recovered to ≤ FRACTION of its starting magnitude for this many seconds.
     PRESSURE_RECOVERY_FRACTION: float = 0.5
     PRESSURE_RECOVERY_DURATION_S: float = 10.0
+    # Flow-override END: if pressure has been recovered for this much longer, end
+    # the event REGARDLESS of the flow reading. Covers a flow sensor that reports
+    # high while flowing but never reports 0 when it stops, leaving
+    # _current_flow_lpm stale-high so the flow<MIN gate never fires — the cause of
+    # the 27.6 h irrigation event. Pressure (40 Hz) is the authority once it has
+    # sat at baseline this long; a real run keeps pressure DROPPED so the timer
+    # only completes when the draw is genuinely over.
+    PRESSURE_RECOVERY_FLOW_OVERRIDE_S: float = 300.0   # 5 min
+    # Absolute hard cap on event duration (watchdog). The longest legitimate run
+    # (a multi-zone irrigation cycle) is ~2.8 h; anything past this is a missed
+    # end signal, so force-close. Bounds the blast radius of ANY unclosed event.
+    MAX_EVENT_DURATION_S: float = 21600.0              # 6 h
+    # Fast-close for a pure-pressure transient that never moved water. A small
+    # dip whose pressure SETTLES below the recovery line (common on the irrigation
+    # circuit when a zone solenoid shifts the steady pressure) never satisfies the
+    # recovery END, so without this it stays open until the 6 h watchdog above —
+    # and while open it blocks every new event on the circuit (the _active_event
+    # is None gate), so the next real draw / irrigation run is missed live. Real
+    # draws register flow (>= MIN_FLOW) or keep pressure actively dipping, so they
+    # are never closed here. Conservative: flow has been zero for the whole event.
+    SETTLED_NOFLOW_CLOSE_S: float = 60.0
 
     # Minimum event volume.  Events whose computed volume (avg_flow × duration)
     # is below this threshold are discarded as noise.  1 mL is a sanity floor —
@@ -386,10 +429,15 @@ class CircuitEventDetector:
         get_other_valve_open: Optional[Callable[[], Optional[bool]]] = None,
         flow_onset_entity: Optional[str] = None,
         debug_capture_propagation: bool = False,
+        min_flow_lpm: float = 0.15,
     ) -> None:
         self.circuit = circuit
         self.pressure_drop_threshold = pressure_drop_threshold_psi
         self.min_event_duration = min_event_duration_seconds
+        # Per-circuit meter-derived low-flow floor (60 ÷ ppl), overriding the class
+        # default. A coarser meter (72-ppl oval gear → 0.83) must not treat
+        # single-pulse quantization as real flow; the 396-ppl turbine stays at 0.15.
+        self.MIN_FLOW_LPM = min_flow_lpm
         self._event_queue = event_queue
         self._flow_onset_entity: Optional[str] = flow_onset_entity
         # Callable provided by parent EventDetector to read other-circuit valve states
@@ -408,6 +456,7 @@ class CircuitEventDetector:
         self._active_event: Optional[RawEvent] = None
         self._current_flow_lpm: float = 0.0
         self._flow_sustained_since: Optional[datetime] = None
+        self._flow_start_dips: int = 0   # consecutive sub-threshold samples mid-start
         self._pressure_recovered_since: Optional[datetime] = None
 
         # Downsampling: keep all readings for the first N seconds, then every Kth.
@@ -417,12 +466,32 @@ class CircuitEventDetector:
         self._flow_sample_count: int = 0
         self._pressure_sample_count: int = 0
 
+        # Coalescing for the timestamped flow_samples (volume integral): keep a
+        # sample only when the flow changes by > delta, crosses the on/off
+        # threshold, or a heartbeat elapses. The heartbeat (< the integrator's
+        # 120s dt cap) guarantees a steady flow never trips the offline-gap cap,
+        # while bounding memory to ~O(seconds of change) instead of O(callbacks).
+        self._FLOW_SAMPLE_MIN_DELTA_LPM: float = 0.2
+        self._FLOW_SAMPLE_HEARTBEAT_S: float = 30.0
+
+        # Pre-trigger onset buffer: idle (ts, flow_lpm) kept for ~5 s so the
+        # opening ramp the FLOW_START_SECONDS sustain trigger discards can seed
+        # flow_readings at event start. SIGNATURE-ONLY — it never feeds
+        # flow_samples, so the volume integral is byte-identical with/without it.
+        # The deque maxlen is the hard count cap; the time-trim keeps only ~5 s.
+        self._PRETRIGGER_WINDOW_S: float = 5.0
+        self._pretrigger_flow: Deque[Tuple[datetime, float]] = deque(maxlen=64)
+
     # ------------------------------------------------------------------ #
     # Public                                                               #
     # ------------------------------------------------------------------ #
 
     def update_threshold(self, threshold_psi: float) -> None:
         self.pressure_drop_threshold = threshold_psi
+
+    def update_min_flow(self, min_flow_lpm: float) -> None:
+        """Update the meter-derived low-flow floor live (after a PPL change)."""
+        self.MIN_FLOW_LPM = min_flow_lpm
 
     # ------------------------------------------------------------------ #
     # HA state_changed callbacks                                           #
@@ -459,26 +528,65 @@ class CircuitEventDetector:
         now = datetime.now(timezone.utc)
 
         if self._active_event is not None:
+            ev = self._active_event
+            # dev.24 low-flow off-grace: flow resuming bridges a held dip (the
+            # same event continues); a hold whose grace expired with no resume
+            # finalizes here. Otherwise fall through and record as before.
+            if ev.low_flow_hold_until is not None and self._current_flow_lpm >= self.MIN_FLOW_LPM:
+                ev.low_flow_hold_until = None
+                log.debug("[%s] low-flow hold released — flow resumed (%.3f L/min)",
+                          self.circuit, self._current_flow_lpm)
+            elif self._maybe_finalize_held_low_flow(now):
+                return
+            if self._maybe_force_close_overlong(now):        # over-long watchdog
+                return
             elapsed = (now - self._active_event.start_ts).total_seconds()
             self._flow_sample_count += 1
             if elapsed < self._DOWNSAMPLE_AFTER_SECONDS or self._flow_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.flow_readings.append(self._current_flow_lpm)
+            # Coalesced timestamped capture for the volume integral.
+            fs = self._active_event.flow_samples
+            v = self._current_flow_lpm
+            if not fs:
+                fs.append((now, v))
+            else:
+                lt, lv = fs[-1]
+                crossed = (lv > self.MIN_FLOW_LPM) != (v > self.MIN_FLOW_LPM)
+                if (crossed
+                        or abs(v - lv) > self._FLOW_SAMPLE_MIN_DELTA_LPM
+                        or (now - lt).total_seconds() >= self._FLOW_SAMPLE_HEARTBEAT_S):
+                    fs.append((now, v))
             self._flow_sustained_since = None
             return
 
-        # No active event — manage flow start timer
+        # No active event — manage flow start timer.
+        # Pre-trigger onset buffer (signature-only): record idle flow regardless
+        # of the MIN_FLOW gate so the sub-threshold opening ramp — lost to the
+        # FLOW_START_SECONDS sustain delay — can seed flow_readings. NEVER touches
+        # flow_samples (the volume integral).
+        self._pretrigger_flow.append((now, self._current_flow_lpm))
+        _pt_cutoff = now - timedelta(seconds=self._PRETRIGGER_WINDOW_S)
+        while self._pretrigger_flow and self._pretrigger_flow[0][0] < _pt_cutoff:
+            self._pretrigger_flow.popleft()
+
         if self._current_flow_lpm >= self.MIN_FLOW_LPM:
+            self._flow_start_dips = 0
             if self._flow_sustained_since is None:
                 self._flow_sustained_since = now
                 log.debug("[%s] flow start timer begins (%.3f L/min)",
                           self.circuit, self._current_flow_lpm)
             elif (now - self._flow_sustained_since).total_seconds() >= self.FLOW_START_SECONDS:
                 self._start_flow_event(now)
-        else:
-            if self._flow_sustained_since is not None:
-                log.debug("[%s] flow start timer reset (%.3f L/min)",
-                          self.circuit, self._current_flow_lpm)
-            self._flow_sustained_since = None
+        elif self._flow_sustained_since is not None:
+            # Tolerate a few consecutive sub-threshold samples mid-formation: a dip
+            # does NOT advance the timer, but it must not reset a nearly-complete one
+            # either, until the tolerance is exceeded.
+            self._flow_start_dips += 1
+            if self._flow_start_dips > self.FLOW_START_DIP_TOLERANCE:
+                log.debug("[%s] flow start timer reset after %d dip(s) (%.3f L/min)",
+                          self.circuit, self._flow_start_dips, self._current_flow_lpm)
+                self._flow_sustained_since = None
+                self._flow_start_dips = 0
 
     def on_pressure_fast(self, entity_id: str, state: str, attributes: dict) -> None:
         """
@@ -550,6 +658,15 @@ class CircuitEventDetector:
                 else:
                     self._start_pressure_event(now, baseline, pressure)
         else:
+            # dev.24 low-flow off-grace backstop: flow_rate can stop ticking at 0
+            # during a dip, but the fast-pressure sensor keeps sampling — so a
+            # held event whose grace expired is finalized here too.
+            if self._maybe_finalize_held_low_flow(now):
+                return
+            if self._maybe_force_close_overlong(now):    # over-long watchdog
+                return
+            if self._maybe_close_settled_noflow(now):    # stuck no-flow phantom
+                return
             elapsed_p = (now - self._active_event.start_ts).total_seconds()
             self._pressure_sample_count += 1
             # Track max on every sample (before downsample gate).
@@ -566,20 +683,28 @@ class CircuitEventDetector:
                 if pressure >= recovery_line:
                     if self._pressure_recovered_since is None:
                         self._pressure_recovered_since = now
-                    elif (
-                        (now - self._pressure_recovered_since).total_seconds()
-                        >= self.PRESSURE_RECOVERY_DURATION_S
-                        and self._current_flow_lpm < self.MIN_FLOW_LPM
-                    ):
-                        log.debug(
-                            "[%s] pressure recovered (>= %.2f PSI for %.1f s, flow=%.3f) "
-                            "— ending pressure-triggered event",
-                            self.circuit, recovery_line,
-                            (now - self._pressure_recovered_since).total_seconds(),
-                            self._current_flow_lpm,
-                        )
-                        self._end_event(now)
-                        return
+                    else:
+                        rec_secs = (now - self._pressure_recovered_since).total_seconds()
+                        flow_stopped = self._current_flow_lpm < self.MIN_FLOW_LPM
+                        # Normal END: pressure back >= 10 s AND flow has stopped.
+                        # Flow-override END: pressure back for a LONG time regardless
+                        # of the flow value — a flow sensor that never reports 0 on
+                        # stop leaves _current_flow_lpm stale-high so flow<MIN never
+                        # fires (the 27.6 h irrigation event). Pressure is the
+                        # authority once it has sat at baseline this long.
+                        if ((rec_secs >= self.PRESSURE_RECOVERY_DURATION_S
+                             and flow_stopped)
+                                or rec_secs >= self.PRESSURE_RECOVERY_FLOW_OVERRIDE_S):
+                            log.info(
+                                "[%s] pressure recovered (>= %.2f PSI for %.0f s, "
+                                "flow=%.3f%s) — ending pressure-triggered event",
+                                self.circuit, recovery_line, rec_secs,
+                                self._current_flow_lpm,
+                                "" if flow_stopped else " [flow-override]",
+                            )
+                            # Definitive "draw is over" — bypasses the off-grace hold.
+                            self._end_event(now, force=True)
+                            return
                 else:
                     self._pressure_recovered_since = None
 
@@ -724,7 +849,14 @@ class CircuitEventDetector:
             pre_event_pressure_psi=baseline,
             min_pressure_psi=baseline if baseline is not None else 0.0,
             max_pressure_psi=baseline if baseline is not None else 0.0,
-            flow_readings=[self._current_flow_lpm],
+            # Seed the signature series with the recovered pre-onset ramp
+            # (samples strictly before start_ts) so the "front" the sustain
+            # trigger cut off is restored. flow_samples (volume) is untouched.
+            flow_readings=(
+                [v for (t, v) in self._pretrigger_flow if t < start_ts]
+                + [self._current_flow_lpm]
+            ),
+            flow_samples=[(start_ts, self._current_flow_lpm)],
             other_valve_open=self._get_other_valve_open(),
         )
 
@@ -842,6 +974,7 @@ class CircuitEventDetector:
             max_pressure_psi=current_pressure,
             pressure_delta_psi=drop,
             pressure_readings=[current_pressure],
+            flow_samples=[(now, self._current_flow_lpm)],
             flow_onset_entity=self._flow_onset_entity,
             other_valve_open=self._get_other_valve_open(),
         )
@@ -866,9 +999,117 @@ class CircuitEventDetector:
         log.debug("[%s] pressure transient enriched active event — %.1f PSI drop",
                   self.circuit, drop)
 
-    def _end_event(self, ts: datetime) -> None:
+    def _is_low_flow_event(self, ev: RawEvent) -> bool:
+        """Low-flow per the shared chatter predicate, measured over the ACTIVE
+        flow readings (v >= MIN_FLOW_LPM). Filtering to active flow excludes both
+        the sub-threshold pre-trigger ramp and any mid-event zero-flow dips — the
+        coalesced flow_samples' sparse leading/trailing zeros would otherwise
+        skew the mean (a steady 1.6 L/min event with one trailing 0 sample would
+        average to ~0.5 and read as low-flow)."""
+        active = [v for v in ev.flow_readings if v >= self.MIN_FLOW_LPM]
+        if not active:
+            return False
+        return is_low_flow_chatter(sum(active) / len(active), max(active))
+
+    def _should_hold_low_flow(self, ev: RawEvent, ts: datetime) -> bool:
+        """Whether to hold a low-flow event open through a sub-threshold dip.
+        Returns False once the grace deadline passes (-> finalize) and for
+        normal-flow events (which end immediately, exactly as before dev.24)."""
+        if ev.low_flow_hold_until is not None and ts >= ev.low_flow_hold_until:
+            return False
+        return self._is_low_flow_event(ev)
+
+    def _maybe_finalize_held_low_flow(self, now: datetime) -> bool:
+        """Finalize a held low-flow event whose grace expired with no resume.
+        end_ts is the dip time (deadline - grace), not ``now``, so the trailing
+        grace wait never inflates the event's duration/volume. Returns True when
+        it finalized (the caller must then stop touching self._active_event)."""
+        ev = self._active_event
+        if (ev is not None and ev.low_flow_hold_until is not None
+                and self._current_flow_lpm < self.MIN_FLOW_LPM
+                and now >= ev.low_flow_hold_until):
+            dip_ts = ev.low_flow_hold_until - timedelta(seconds=LOWFLOW_OFF_GRACE_S)
+            self._end_event(dip_ts, force=True)
+            return True
+        return False
+
+    def _maybe_force_close_overlong(self, now: datetime) -> bool:
+        """Watchdog: force-close an event that has exceeded MAX_EVENT_DURATION_S —
+        a missed end signal (e.g. a flow sensor that never reports 0 on stop, or a
+        stuck zone valve) must never leave an event open for hours/days. Returns
+        True when it finalized (caller must stop touching self._active_event)."""
+        ev = self._active_event
+        if (ev is not None
+                and (now - ev.start_ts).total_seconds() > self.MAX_EVENT_DURATION_S):
+            log.warning(
+                "[%s] force-closing over-long event: %.1f h > %.1f h cap "
+                "(missed end signal — e.g. flow sensor not reporting 0 on stop)",
+                self.circuit, (now - ev.start_ts).total_seconds() / 3600.0,
+                self.MAX_EVENT_DURATION_S / 3600.0,
+            )
+            self._end_event(now, force=True)
+            return True
+        return False
+
+    def _maybe_close_settled_noflow(self, now: datetime) -> bool:
+        """Close a pure-pressure transient that never moved water once pressure
+        has SETTLED (stable, even at a shifted baseline below the recovery line).
+
+        Without this, a small pressure dip that settles below the recovery line —
+        e.g. an irrigation zone solenoid that nudges the steady pressure — never
+        satisfies the recovery END and stays open until the 6 h watchdog, blinding
+        the circuit to new events the whole time (observed: chronic 6 h force-closes
+        on circuit_2 blocking irrigation starts). A real draw registers flow or
+        keeps pressure actively dipping, so it is never closed here. The closed
+        event carries ~0 volume and is discarded by _end_event. Returns True when
+        it finalized (the caller must then stop touching self._active_event)."""
         ev = self._active_event
         if ev is None:
+            return False
+        # Only a PURE pressure transient that never developed flow: flow-triggered
+        # and pressure+flow events had water; an onset or any flow_rate >= MIN_FLOW
+        # means water moved. All excluded.
+        if ev.start_trigger != "pressure" or ev.flow_onset_ts is not None:
+            return False
+        if self._current_flow_lpm >= self.MIN_FLOW_LPM:
+            return False
+        if ev.flow_readings and max(ev.flow_readings) >= self.MIN_FLOW_LPM:
+            return False
+        # Give a real draw time for flow to follow the pressure drop before closing.
+        if (now - ev.start_ts).total_seconds() < self.SETTLED_NOFLOW_CLOSE_S:
+            return False
+        # Pressure must have SETTLED — peak-to-peak of the recent window is small,
+        # i.e. the dip is over and not deepening, even if it never returned to the
+        # recovery line. A real ongoing draw keeps pressure depressed-and-moving.
+        if len(self._pressure_buf) < self.BASELINE_WINDOW_SAMPLES:
+            return False
+        recent = list(self._pressure_buf)[-self.BASELINE_WINDOW_SAMPLES:]
+        if max(recent) - min(recent) > self.SETTLED_STABILITY_PSI:
+            return False
+        log.info(
+            "[%s] closing settled no-flow pressure transient (open %.0fs, flow=0, "
+            "pressure stable within %.2f PSI) — phantom; freeing circuit instead "
+            "of holding it until the %.0f h watchdog",
+            self.circuit, (now - ev.start_ts).total_seconds(),
+            self.SETTLED_STABILITY_PSI, self.MAX_EVENT_DURATION_S / 3600.0,
+        )
+        self._end_event(now, force=True)
+        return True
+
+    def _end_event(self, ts: datetime, force: bool = False) -> None:
+        ev = self._active_event
+        if ev is None:
+            return
+        # dev.24 low-flow off-grace: a sustained low draw the turbine chatters on
+        # must not finalize on a brief sub-threshold dip. Hold the event open
+        # until the grace deadline; on_flow_rate clears the hold the instant flow
+        # resumes, bridging the dip into one event. force=True (grace expired)
+        # skips the hold so the held event actually finalizes.
+        if not force and self._should_hold_low_flow(ev, ts):
+            if ev.low_flow_hold_until is None:
+                ev.low_flow_hold_until = ts + timedelta(seconds=LOWFLOW_OFF_GRACE_S)
+                log.debug("[%s] low-flow event held open at dip %s (grace %.0f s)",
+                          self.circuit, ts.isoformat(), LOWFLOW_OFF_GRACE_S)
             return
         self._pressure_recovered_since = None
 
@@ -883,6 +1124,10 @@ class CircuitEventDetector:
             return
 
         ev.end_ts = ts
+        # Close the timestamped flow series with an end sample so the final
+        # interval to end_ts is integrated at the real (low) end flow. The end
+        # condition guarantees flow < MIN_FLOW here, so the tail integrates to ~0.
+        ev.flow_samples.append((ts, self._current_flow_lpm))
         # Use `is not None` — pre_event_pressure_psi defaults to 0.0,
         # which is falsy but valid for zero-baseline (unpressurised) systems.
         if ev.pressure_readings:
@@ -896,10 +1141,22 @@ class CircuitEventDetector:
         self._flow_sample_count = 0
         self._pressure_sample_count = 0
 
-        avg_flow = (
-            sum(ev.flow_readings) / len(ev.flow_readings) if ev.flow_readings else 0.0
-        )
-        volume_l = avg_flow * duration / 60.0
+        # Discard gate uses the TIME-INTEGRAL of the timestamped flow samples,
+        # not mean(flow_readings) × duration (which over-counts brief bursts in
+        # long pressure-defined events). The stored volume is recomputed the same
+        # way in feature_extractor.
+        from .flow_integral import integrate_litres
+        volume_l, _capped = integrate_litres(ev.flow_samples)
+        # Degenerate-timestamp guard: if every flow sample shares ~one instant
+        # (synthetic/test injection — live on-change samples always span the
+        # event), fall back to the duration estimate for the DISCARD decision
+        # only, so a real event isn't dropped. Stored volume still uses the
+        # integral. Inert in production (span is always >> 1s for a real event).
+        if (len(ev.flow_samples) >= 2
+                and (ev.flow_samples[-1][0] - ev.flow_samples[0][0]).total_seconds() < 1.0
+                and ev.flow_readings):
+            est = (sum(ev.flow_readings) / len(ev.flow_readings)) * (duration / 60.0)
+            volume_l = max(volume_l, est)
         if volume_l < self.MIN_EVENT_VOLUME_L:
             log.debug(
                 "[%s] discarding near-zero-volume event (%.5f L < %.3f L)",
@@ -927,10 +1184,10 @@ class CircuitEventDetector:
                 return
 
         log.info(
-            "[%s] event complete — trigger=%s duration=%.1f s avg_flow=%.3f L/min "
-            "pressure_drop=%.1f PSI has_transient=%s composite=%s",
-            self.circuit, ev.start_trigger, duration, avg_flow,
-            ev.pressure_delta_psi, ev.has_pressure_transient, ev.is_composite,
+            "[%s] event complete — trigger=%s duration=%.1f s volume=%.2f L "
+            "(%d flow samples) pressure_drop=%.1f PSI has_transient=%s",
+            self.circuit, ev.start_trigger, duration, volume_l,
+            len(ev.flow_samples), ev.pressure_delta_psi, ev.has_pressure_transient,
         )
         try:
             self._event_queue.put_nowait(ev)
@@ -953,6 +1210,7 @@ class CircuitEventDetector:
         self._pressure_recovered_since = None
         self._settled_pressure_psi = None
         self._settled_pressure_since = None
+        self._pretrigger_flow.clear()
 
 
 # ------------------------------------------------------------------------------- #
@@ -971,6 +1229,11 @@ _WF_START_SAMPLES: int = 150            # first slice of full_flow used as start
 _WF_MAX_RECORDS: int = 30               # max assembled records kept per circuit
 _WF_FLAG_VALID_MASK: int = 0x7F         # bits 0-6 only; bit 7 must be 0
 _WF_INFLIGHT_TTL_S: float = 7200.0      # 2 h — absolute upper bound on supported event length
+# Phase 3 — once the FINAL chunk has arrived (so `total` is known), a set still
+# missing chunks is a transport GAP: give up after this grace (rather than holding
+# memory for the full 2 h TTL) and count it. Generous enough for a delayed chunk.
+_WF_FINAL_GAP_TIMEOUT_S: float = 120.0
+_WF_FL_RESOLUTION_REDUCED: int = 0x04   # firmware dropped/decimated samples (a hole)
 _WF_MAX_CHUNK_SAMPLES: int = 1500       # firmware buffer cap; bound decoded-payload length defensively
 _WF_MAX_TOTAL_CHUNKS: int = 600         # bound for the 'total' field (~5 hour event at 30s cadence)
 
@@ -1244,12 +1507,23 @@ class WaveformChunkAccumulator:
     public accessors are a thin pass-through (see EventDetector below).
     """
 
-    def __init__(self, circuit: str, expected_node: str) -> None:
+    def __init__(self, circuit: str, expected_node: str,
+                 on_record_assembled: Optional[Callable[[WaveformRecord], None]] = None) -> None:
         self._circuit = circuit
         # Normalize once so every comparison is cheap.
         self._expected_node = _normalize_node_name(expected_node)
         self._inflight: Dict[Tuple[int, int], _InflightChunkSet] = {}
         self._records: List[WaveformRecord] = []
+        # Phase 3 transport-health counters (since boot/restart): total assembled,
+        # assembled-but-firmware-flagged-degraded (quality / resolution-reduced), and
+        # transport GAPS (final arrived but chunks lost → waveform discarded).
+        self._n_assembled = 0
+        self._n_degraded = 0
+        self._n_gaps = 0
+        # Optional sink fired once a record finishes assembling (late-waveform
+        # upgrade, Fix 1). Kept DB-free; invoked in a try/except in _assemble so a
+        # sink bug can never corrupt assembly. None in most tests.
+        self._on_record_assembled = on_record_assembled
 
     # ------------------------------------------------------------------
     # Public callback
@@ -1480,6 +1754,11 @@ class WaveformChunkAccumulator:
         self._records.append(record)
         if len(self._records) > _WF_MAX_RECORDS:
             self._records = self._records[-_WF_MAX_RECORDS:]
+        # Phase 3 — count it; flag if the firmware self-reported a degraded capture
+        # (these still assemble, but their SIGNATURE is gated in _enrich_from_waveform).
+        self._n_assembled += 1
+        if meta.quality != 0 or (meta.flags & _WF_FL_RESOLUTION_REDUCED):
+            self._n_degraded += 1
 
         # Done — remove the in-flight entry so late stray chunks for this
         # event_id don't keep growing memory.
@@ -1494,22 +1773,55 @@ class WaveformChunkAccumulator:
             meta.peak_flow, meta.pressure_delta, meta.propagation_delay_ms,
         )
 
+        # Notify the optional sink (late-waveform upgrade). Wrapped so a sink
+        # error can never corrupt assembly or escape the WS callback.
+        if self._on_record_assembled is not None:
+            try:
+                self._on_record_assembled(record)
+            except Exception as e:
+                log.warning("waveform[%s]: on_record_assembled sink raised "
+                            "(non-fatal): %s", self._circuit, e)
+
     # ------------------------------------------------------------------
     # TTL eviction
     # ------------------------------------------------------------------
 
     def _evict_stale(self, now: float) -> None:
-        stale = [
-            k for k, cs in self._inflight.items()
-            if (now - cs.first_received_at) > _WF_INFLIGHT_TTL_S
-        ]
-        for k in stale:
+        # A set whose FINAL chunk has arrived (total known) but is still incomplete
+        # is a transport GAP — evict it after a short grace and COUNT it. A set still
+        # awaiting its final chunk uses the long TTL (the event may still be running).
+        stale: List[Tuple[Tuple[int, int], bool]] = []
+        for k, cs in self._inflight.items():
+            final_incomplete = cs.final_metadata is not None
+            ttl = _WF_FINAL_GAP_TIMEOUT_S if final_incomplete else _WF_INFLIGHT_TTL_S
+            if (now - cs.first_received_at) > ttl:
+                stale.append((k, final_incomplete))
+        for k, final_incomplete in stale:
             cs = self._inflight.pop(k, None)
-            if cs is not None:
+            if cs is None:
+                continue
+            if final_incomplete:
+                self._n_gaps += 1
+                missing = ([s for s in range(cs.total) if s not in cs.chunks]
+                           if cs.total else [])
+                log.info(
+                    "waveform[%s]: GAP — event %d lost %d/%s chunk(s) in transport "
+                    "(missing seqs %s); waveform discarded",
+                    self._circuit, k[1], len(missing), cs.total, missing,
+                )
+            else:
                 log.debug(
                     "waveform[%s]: in-flight chunk set evicted (boot=%d id=%d, %d chunk(s), total=%s)",
                     self._circuit, k[0], k[1], len(cs.chunks), cs.total,
                 )
+
+    def transport_stats(self) -> Dict[str, int]:
+        """Phase 3 waveform-transport health since boot: how many waveforms
+        assembled, how many were firmware-flagged degraded, and how many were lost
+        to transport gaps (a final chunk arrived but predecessors never did)."""
+        return {"assembled": self._n_assembled,
+                "degraded": self._n_degraded,
+                "gaps": self._n_gaps}
 
     # ------------------------------------------------------------------
     # Lookup interface
@@ -1557,6 +1869,22 @@ class EventDetector:
         self._chunk_accumulators: Dict[str, WaveformChunkAccumulator] = {}
         self._wf_event_subscribed: bool = False
         self._is_configured = False
+        # Optional sink for late-assembled waveforms (signature upgrade, Fix 1).
+        # Wired by the orchestrator to FeatureExtractor.handle_late_waveform;
+        # left None in tests / import → assembly notifies nothing.
+        self._waveform_upgrade_sink: Optional[Callable[[str, WaveformRecord], None]] = None
+
+    def min_flow_for(self, circuit: str) -> float:
+        """Per-circuit meter-derived low-flow floor (60 ÷ ppl). Falls back to the
+        396-ppl turbine default if the circuit's detector isn't built yet."""
+        det = self._detectors.get(circuit)
+        return det.MIN_FLOW_LPM if det is not None else 0.15
+
+    def set_min_flow(self, circuit: str, min_flow_lpm: float) -> None:
+        """Update a circuit detector's low-flow floor live (after a PPL change)."""
+        det = self._detectors.get(circuit)
+        if det is not None:
+            det.update_min_flow(min_flow_lpm)
 
     def setup(self) -> None:
         """Instantiate detectors and register HA entity subscriptions.
@@ -1581,6 +1909,7 @@ class EventDetector:
                 ),
                 flow_onset_entity=cfg.flow_onset_sensor,
                 debug_capture_propagation=self._debug_capture_propagation,
+                min_flow_lpm=getattr(cfg, "min_flow_lpm", 0.15),
             )
             self._detectors[cfg.circuit] = detector
 
@@ -1604,7 +1933,10 @@ class EventDetector:
             # rstrip("_") was over-eager and would strip multiple if a
             # prefix were ever configured with a double-underscore tail.
             expected_node = cfg.esp_device_prefix.removesuffix("_")
-            accumulator = WaveformChunkAccumulator(cfg.circuit, expected_node=expected_node)
+            accumulator = WaveformChunkAccumulator(
+                cfg.circuit, expected_node=expected_node,
+                on_record_assembled=self._on_waveform_assembled,
+            )
             self._chunk_accumulators[cfg.circuit] = accumulator
 
             # Register the HA event subscription once (shared across all circuits).
@@ -1646,6 +1978,19 @@ class EventDetector:
             accumulator.on_waveform_chunk(data)
         # Wrong or missing circuit is handled silently by the accumulator itself.
 
+    def _on_waveform_assembled(self, record: WaveformRecord) -> None:
+        """Forward a freshly-assembled waveform to the late-upgrade sink (if wired).
+        Runs on the event loop (WS callback); the sink schedules its own background
+        write. Wrapped so a sink error can't escape into assembly."""
+        sink = self._waveform_upgrade_sink
+        if sink is None:
+            return
+        try:
+            sink(record.circuit, record)
+        except Exception as e:
+            log.warning("[%s] late-waveform sink raised (non-fatal): %s",
+                        record.circuit, e)
+
     def _on_valve_state(self, circuit: str, state: str) -> None:
         """Update tracked valve state for cross-circuit feature."""
         self._valve_open[circuit] = state in ("open", "on")
@@ -1681,6 +2026,13 @@ class EventDetector:
         """Return the most-recently assembled WaveformRecord for a circuit, or None."""
         accumulator = self._chunk_accumulators.get(circuit)
         return accumulator.latest_record() if accumulator else None
+
+    def waveform_transport_stats(self, circuit: str) -> Dict[str, int]:
+        """Phase 3 — per-circuit waveform-transport health counters (or zeros)."""
+        accumulator = self._chunk_accumulators.get(circuit)
+        if accumulator is None:
+            return {"assembled": 0, "degraded": 0, "gaps": 0}
+        return accumulator.transport_stats()
 
     def pop_waveform_record(
         self,

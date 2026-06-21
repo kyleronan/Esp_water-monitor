@@ -15,7 +15,7 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from ._helpers import ingress_redirect
+from ._helpers import coerce_int, ingress_redirect
 
 from ..device_discovery import (
     find_matching_devices,
@@ -24,7 +24,6 @@ from ..device_discovery import (
     save_discovery,
     mark_setup_complete,
     get_device_config,
-    DiscoveryResult,
     DiscoveredDevice,
 )
 
@@ -65,13 +64,16 @@ def _block_if_setup_complete(request: Request):
         initial_name = (
             device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
         )
+        # 409 Conflict — request well-formed, but current state forbids
+        # it (initial setup already complete; rerun goes through
+        # Settings → Advanced → Re-run Setup).
         return _tmpl(request).TemplateResponse("setup.html", {
             "request": request,
             "step": 0,
             "initial_name": initial_name,
             "setup_locked": True,
             "page": "setup",
-        }, status_code=403)
+        }, status_code=409)
     return None
 
 
@@ -125,7 +127,6 @@ async def setup_restore(request: Request):
         return blocked
     import json as _json
     from urllib.parse import quote_plus as _qp
-    from fastapi import File, UploadFile
     from ..routers.backup import (
         QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT, MAX_BACKUP_BYTES,
     )
@@ -464,94 +465,152 @@ async def setup_confirm(device_id: str, request: Request):
 # Step 3b — circuit display names
 # ------------------------------------------------------------------
 
-@router.get("/circuit-names", response_class=HTMLResponse)
-async def setup_circuit_names(request: Request):
-    """Step 3b — let the user name and classify their circuits."""
-    orch = _orch(request)
-    from ..database import get_circuit_type
-    from ..fixtures import CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP
+def _step3b_template_context(orch, **extra):
+    """Build the per-circuit context dict for setup step 3b.
+
+    Pulls current values from circuit_profile so the form pre-fills
+    correctly on re-render (initial load AND validation-error re-render).
+    """
+    from ..database import get_circuit_type, get_valve_type
+    from ..fixtures import (CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS,
+                            CIRCUIT_TYPE_HELP,
+                            VALVE_TYPES, VALVE_TYPE_LABELS, VALVE_TYPE_HELP)
     circuits = [
         {
             "circuit":      c.circuit,
             "display_name": c.label,
             "circuit_type": get_circuit_type(orch.db, c.circuit, default=c.circuit_type),
+            "valve_type":   get_valve_type(orch.db, c.circuit),
         }
         for c in orch._cfg.circuits
     ]
-    return _tmpl(request).TemplateResponse("setup.html", {
-        "request":             request,
+    ctx = {
         "step":                "3b",
         "circuits":            circuits,
         "circuit_types":       CIRCUIT_TYPES,
         "circuit_type_labels": CIRCUIT_TYPE_LABELS,
         "circuit_type_help":   CIRCUIT_TYPE_HELP,
+        "valve_types":         VALVE_TYPES,
+        "valve_type_labels":   VALVE_TYPE_LABELS,
+        "valve_type_help":     VALVE_TYPE_HELP,
         "page":                "setup",
-    })
+    }
+    ctx.update(extra)
+    return ctx
+
+
+@router.get("/circuit-names", response_class=HTMLResponse)
+async def setup_circuit_names(request: Request):
+    """Step 3b — let the user name and classify their circuits."""
+    orch = _orch(request)
+    ctx = _step3b_template_context(orch)
+    ctx["request"] = request
+    return _tmpl(request).TemplateResponse("setup.html", ctx)
 
 
 @router.post("/circuit-names")
 async def setup_circuit_names_save(request: Request):
-    """Save circuit display names and types, then advance to unit selection."""
+    """Save circuit display name, type, and valve type per circuit.
+
+    Validates ALL inputs first; bails out before any write if any input
+    is invalid. After validation passes, writes everything. Note that
+    each setter commits internally so a runtime DB error between writes
+    can still partially persist — this is the same residual risk the
+    pre-refactor handler had. Validation errors are now fully atomic.
+    """
     blocked = _block_if_setup_complete(request)
     if blocked is not None:
         return blocked
     from ..circuit_compat import validate_display_name
-    from ..database import upsert_circuit_label, set_circuit_type, get_circuit_type
-    from ..fixtures import normalize_circuit_type, CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP
+    from ..database import (upsert_circuit_label, set_circuit_type,
+                            set_valve_type)
+    from ..fixtures import (normalize_circuit_type, CIRCUIT_TYPES,
+                            parse_valve_type)
     orch = _orch(request)
     form = await request.form()
 
     errors = []
+    pending = []  # one entry per circuit, populated with validated values only
 
-    # Save display names
+    # ── (1) Collect & validate ALL per-circuit fields first ──
     for c in orch._cfg.circuits:
-        raw = form.get(f"label_{c.circuit}", "").strip()
-        if not raw:
-            continue
-        try:
-            display_name = validate_display_name(raw)
-        except ValueError as exc:
-            errors.append(f"{c.circuit}: {exc}")
-            continue
-        upsert_circuit_label(orch.db, c.circuit, display_name)
+        raw_label = form.get(f"label_{c.circuit}", "").strip()
+        raw_type  = form.get(f"type_{c.circuit}", "").strip()
+        raw_vt    = form.get(f"valve_type_{c.circuit}", "").strip()
 
-    # Save circuit types
-    for c in orch._cfg.circuits:
-        raw_type = form.get(f"type_{c.circuit}", "").strip()
-        if not raw_type:
-            continue
-        normalised = normalize_circuit_type(raw_type)
-        if normalised not in CIRCUIT_TYPES:
-            errors.append(f"{c.circuit}: invalid circuit type {raw_type!r}")
-            continue
-        try:
-            set_circuit_type(orch.db, c.circuit, normalised)
-        except Exception as exc:
-            errors.append(f"{c.circuit}: could not save circuit type: {exc}")
+        entry = {"circuit": c.circuit}
+
+        if raw_label:
+            try:
+                entry["display_name"] = validate_display_name(raw_label)
+            except ValueError as exc:
+                errors.append(f"{c.circuit}: {exc}")
+
+        if raw_type:
+            normalised = normalize_circuit_type(raw_type)
+            if normalised not in CIRCUIT_TYPES:
+                errors.append(f"{c.circuit}: invalid circuit type {raw_type!r}")
+            else:
+                entry["circuit_type"] = normalised
+
+        if raw_vt:
+            # STRICT parser — None on garbage. Use this instead of the
+            # forgiving normalize_valve_type so bad input surfaces an
+            # error rather than silently defaulting to 2_port.
+            parsed_vt = parse_valve_type(raw_vt)
+            if parsed_vt is None:
+                errors.append(f"{c.circuit}: invalid valve type {raw_vt!r}")
+            else:
+                entry["valve_type"] = parsed_vt
+
+        pending.append(entry)
+
+    # ── (2) Bail BEFORE any write if validation failed ──
+    if errors:
+        ctx = _step3b_template_context(orch, errors=errors)
+        ctx["request"] = request
+        return _tmpl(request).TemplateResponse("setup.html", ctx)
+
+    # ── (3) Write everything in ONE transaction ──
+    # All three setters accept commit=False, so we control the
+    # commit boundary here. A runtime DB error mid-chain rolls back
+    # every prior write — no more partial-commit risk where a circuit
+    # ends up with the new display_name but the old circuit_type.
+    from ..database import transaction
+    try:
+        with transaction(orch.db):
+            for entry in pending:
+                if "display_name" in entry:
+                    upsert_circuit_label(
+                        orch.db, entry["circuit"], entry["display_name"],
+                        commit=False,
+                    )
+                if "circuit_type" in entry:
+                    set_circuit_type(
+                        orch.db, entry["circuit"], entry["circuit_type"],
+                        commit=False,
+                    )
+                if "valve_type" in entry:
+                    set_valve_type(
+                        orch.db, entry["circuit"], entry["valve_type"],
+                        commit=False,
+                    )
+    except Exception as exc:
+        log.error("Setup step 3b save failed (rolled back): %s",
+                  exc, exc_info=True)
+        errors.append(
+            "Could not save changes — all fields were rolled back. "
+            f"Details: {exc}"
+        )
 
     if errors:
-        circuits = [
-            {
-                "circuit":      c.circuit,
-                "display_name": c.label,
-                "circuit_type": get_circuit_type(orch.db, c.circuit, default=c.circuit_type),
-            }
-            for c in orch._cfg.circuits
-        ]
-        return _tmpl(request).TemplateResponse("setup.html", {
-            "request":             request,
-            "step":                "3b",
-            "circuits":            circuits,
-            "errors":              errors,
-            "circuit_types":       CIRCUIT_TYPES,
-            "circuit_type_labels": CIRCUIT_TYPE_LABELS,
-            "circuit_type_help":   CIRCUIT_TYPE_HELP,
-            "page":                "setup",
-        })
+        ctx = _step3b_template_context(orch, errors=errors)
+        ctx["request"] = request
+        return _tmpl(request).TemplateResponse("setup.html", ctx)
 
     orch.reload_circuit_labels()
     orch.reload_circuit_profiles()
-    log.info("Setup: circuit names and types saved")
+    log.info("Setup: circuit names, types, and valve types saved")
     return ingress_redirect(request, "/setup/units")
 
 
@@ -613,6 +672,7 @@ async def setup_home_details(request: Request):
         "request": request,
         "step": 5,
         "profile": profile,
+        "circuits": [c.circuit for c in orch._cfg.circuits],
         "page": "setup",
     })
 
@@ -628,15 +688,42 @@ async def setup_home_details_save(request: Request):
     from ..database import update_home_profile
     from ..config import compute_suggested_calibration_days
 
-    bathrooms_full             = int(form.get("bathrooms_full", 1) or 1)
-    bathrooms_half             = int(form.get("bathrooms_half", 0) or 0)
-    floors                     = int(form.get("floors", 1) or 1)
-    occupants                  = int(form.get("occupants", 2) or 2)
+    # Bounded coercion — out-of-range submissions (negative bathrooms,
+    # occupants=0, sqft=-1, build_year=99999) fall back to the listed
+    # default rather than being persisted as garbage. Bounds chosen as
+    # "absurd-to-reach" limits; downstream heuristics clamp tighter.
+    bathrooms_full             = coerce_int(form.get("bathrooms_full"), lo=0, hi=20, default=1)
+    bathrooms_half             = coerce_int(form.get("bathrooms_half"), lo=0, hi=20, default=0)
+    floors                     = coerce_int(form.get("floors"),         lo=1, hi=10, default=1)
+    occupants                  = coerce_int(form.get("occupants"),      lo=1, hi=30, default=2)
     supply_type                = form.get("supply_type", "mains")
-    build_year_raw             = form.get("build_year", "")
-    build_year                 = int(build_year_raw) if build_year_raw.strip().isdigit() else None
-    sqft                       = int(form.get("sqft", 0) or 0)
+    # build_year stays as Optional[int]: a missing/blank field is None
+    # (no override), but a present-but-garbage value falls back to None
+    # rather than persisting nonsense like 99999.
+    build_year_raw             = form.get("build_year", "").strip()
+    if build_year_raw:
+        build_year = coerce_int(build_year_raw, lo=1800, hi=2100, default=0) or None
+    else:
+        build_year = None
+    sqft                       = coerce_int(form.get("sqft"),           lo=0, hi=100000, default=0)
     historical_import_enabled  = form.get("historical_import_enabled") == "1"
+
+    # dev.24 water softener (opt-in). The regen start time is REQUIRED when
+    # enabled — the session detector and the leak-test blackout both key on it,
+    # so re-prompt rather than silently persist has_water_softener=1 with no time.
+    from ..event_rules import parse_hhmm_to_minutes
+    has_softener = form.get("has_water_softener") == "1"
+    softener_start = (form.get("softener_regen_start") or "").strip()
+    softener_circuit = (form.get("softener_circuit") or "").strip() or None
+    if has_softener and parse_hhmm_to_minutes(softener_start) is None:
+        from ..database import get_home_profile
+        return _tmpl(request).TemplateResponse("setup.html", {
+            "request": request, "step": 5, "page": "setup",
+            "profile": dict(get_home_profile(orch.db) or {}),
+            "circuits": [c.circuit for c in orch._cfg.circuits],
+            "error": "Enter the water softener's regeneration start time "
+                     "(HH:MM, 24-hour).",
+        })
 
     update_home_profile(
         orch.db,
@@ -647,6 +734,9 @@ async def setup_home_details_save(request: Request):
         occupants=occupants,
         build_year=build_year,
         supply_type=supply_type,
+        has_water_softener=1 if has_softener else 0,
+        softener_regen_start=softener_start if has_softener else None,
+        softener_circuit=softener_circuit if has_softener else None,
         setup_complete=1,
     )
 
@@ -777,8 +867,10 @@ async def setup_complete(request: Request):
 async def rediscover_circuit(device_id: str, circuit: str, request: Request):
     blocked = _block_if_setup_complete(request)
     if blocked is not None:
-        # Same JSON shape as the error branch below — keep the client happy.
-        return JSONResponse({"error": "setup already complete"}, status_code=403)
+        # Same JSON shape as the error branch below — keep the client
+        # happy. 409 Conflict — state forbids the operation; not an
+        # auth failure.
+        return JSONResponse({"error": "setup already complete"}, status_code=409)
     from ..circuit_compat import resolve_circuit
     circuit = resolve_circuit(circuit)
     orch = _orch(request)

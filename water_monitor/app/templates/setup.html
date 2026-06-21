@@ -353,6 +353,23 @@
         </label>
         {% endfor %}
       </fieldset>
+
+      <fieldset style="border:none;padding:0;margin:1rem 0 0 0">
+        <legend style="font-weight:600;font-size:.875rem;margin-bottom:.5rem">Valve type</legend>
+        {% for vt in valve_types %}
+        <label style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem;cursor:pointer">
+          <input type="radio"
+                 name="valve_type_{{ c.circuit }}"
+                 value="{{ vt }}"
+                 {% if vt == c.valve_type %}checked{% endif %}
+                 style="margin-top:3px;flex-shrink:0">
+          <span>
+            <strong>{{ valve_type_labels[vt] }}</strong>
+            <span class="muted" style="font-size:.8125rem;display:block">{{ valve_type_help[vt] }}</span>
+          </span>
+        </label>
+        {% endfor %}
+      </fieldset>
     </div>
     {% endfor %}
 
@@ -506,6 +523,47 @@
               {% if profile.supply_type == 'well' %}selected{% endif %}>
               Private well or pump
             </option>
+          </select>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="form-section" style="margin-top:1.5rem">
+      <legend>Water softener</legend>
+      {% if error %}
+      <p class="form-hint" style="color:#c0392b">{{ error }}</p>
+      {% endif %}
+      <div class="form-group form-group--checkbox">
+        <label class="checkbox-label">
+          <input type="checkbox" id="has_water_softener" name="has_water_softener"
+                 value="1"
+                 onchange="document.getElementById('softener-cfg').style.display = this.checked ? '' : 'none'"
+                 {% if profile.has_water_softener %}checked{% endif %}>
+          <span>I have a water softener</span>
+        </label>
+        <p class="form-hint" style="margin-left:1.6rem">
+          A softener regenerates on a schedule — a long overnight low-flow cycle.
+          Telling us when it starts lets the monitor label those cycles and avoid
+          running a leak test during them.
+        </p>
+      </div>
+      <div id="softener-cfg"
+           style="{% if not profile.has_water_softener %}display:none{% endif %}">
+        <div class="form-group">
+          <label for="softener_regen_start">Regeneration start time (24-hour)</label>
+          <input type="time" id="softener_regen_start" name="softener_regen_start"
+                 value="{{ profile.softener_regen_start or '' }}">
+        </div>
+        <div class="form-group">
+          <label for="softener_circuit">Softener circuit</label>
+          <select id="softener_circuit" name="softener_circuit">
+            {% for c in circuits %}
+            <option value="{{ c }}"
+              {% if profile.softener_circuit == c
+                    or (not profile.softener_circuit and loop.first) %}selected{% endif %}>
+              {{ c }}
+            </option>
+            {% endfor %}
           </select>
         </div>
       </div>

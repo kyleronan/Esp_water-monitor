@@ -5,11 +5,11 @@ import logging
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from ._helpers import ingress_redirect
+from ._helpers import coerce_int, ingress_redirect
 
 from ..circuit_compat import resolve_circuit
 from ..config import SENSITIVITY_PRESETS
-from ..database import get_data_retention, update_data_retention, get_home_profile
+from ..database import get_data_retention, update_data_retention
 
 log = logging.getLogger(__name__)
 
@@ -24,12 +24,72 @@ def _tmpl(request: Request):
     return request.app.state.templates
 
 
+def _fmt_local_ts(iso, tz) -> "str | None":
+    """ISO-UTC timestamp → 'YYYY-MM-DD HH:MM' in the home timezone (or UTC if none).
+    Returns None for blank/unparseable input."""
+    if not iso:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if tz is not None:
+        try:
+            dt = dt.astimezone(tz)
+        except Exception:
+            pass
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _localize_validation(dv: dict, tz) -> dict:
+    """Shallow-copy a detector-validation report with local-time strings added so the
+    Settings panel can list the flagged events: ``validated_at_local`` plus a
+    ``time_local`` on each leak-safety suspect and gap-sentinel event. Never mutates
+    the cached/stored report dict."""
+    out = dict(dv)
+    out["validated_at_local"] = _fmt_local_ts(dv.get("validated_at"), tz)
+
+    def _stamp(items):
+        return [{**it, "time_local": _fmt_local_ts(it.get("start_ts"), tz)}
+                for it in (items or [])]
+
+    out["suspect_zeroings"] = _stamp(dv.get("suspect_zeroings"))
+    unf = dv.get("unflagged_no_flow") or {}
+    out["unflagged_no_flow"] = {**unf, "events": _stamp(unf.get("events"))}
+    return out
+
+
+def _anomaly_shutoff_ready(sdict: dict) -> bool:
+    """Display helper (Phase 2.3): is auto-shutoff currently ARMED, or held back
+    (degraded to notify) until the baseline earns trust? Mirrors the feature_extractor
+    guardrails — fit from enough events AND seasoned long enough. Display-only; the
+    real gate lives in _process."""
+    from datetime import datetime, timezone
+    from ..anomaly_baseline import MIN_N_FOR_SHUTOFF, MIN_LIVE_DAYS_FOR_SHUTOFF
+    n = sdict.get("baseline_anomaly_n")
+    if n is None or n < MIN_N_FOR_SHUTOFF:
+        return False
+    ts = sdict.get("baseline_computed_at")
+    if not ts:
+        return False
+    try:
+        frozen = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    if frozen.tzinfo is None:
+        frozen = frozen.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - frozen).days >= MIN_LIVE_DAYS_FOR_SHUTOFF
+
+
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def settings_page(request: Request):
     orch = _orch(request)
     from ..database import (get_home_profile, get_sensitivity_config,
-                            get_learning_config, get_alert_configs)
+                            get_alert_configs)
     from ..device_discovery import get_device_config
 
 
@@ -190,11 +250,17 @@ async def settings_page(request: Request):
         enriched = _enrich_entity(e, prefix, circ)
         entities_by_circuit.setdefault(circ, []).append(enriched)
 
+    from ..event_rules import get_home_timezone
+    from ..rule_calibration import get_rule_calibration_meta
+    from ..artifact_calibration import get_artifact_calibration_meta
+    from ..detector_validation import load_validation_report
+    from ..anomaly_baseline import MIN_N_FOR_SHUTOFF, MIN_LIVE_DAYS_FOR_SHUTOFF
+    _home_tz = get_home_timezone()
     circuits = []
     for circuit_cfg in orch._cfg.circuits:
         c = circuit_cfg.circuit
         sens = get_sensitivity_config(orch.db, c)
-        learn = get_learning_config(orch.db, c)
+        sdict = dict(sens) if sens else {}
         alerts = [dict(a) for a in get_alert_configs(orch.db, c)]
         training = (
             orch.training_manager.get_training_info(c)
@@ -204,16 +270,57 @@ async def settings_page(request: Request):
                 "percent_complete": 0,
             }
         )
+        cal_meta = get_rule_calibration_meta(orch.db, c)
+        art_meta = get_artifact_calibration_meta(orch.db, c)
+        dv = load_validation_report(orch.db, c)
 
-        from ..database import get_active_exclusion_window
+        from ..database import get_active_exclusion_window, get_valve_type
         circuits.append({
             "circuit": c,
             "display_name": circuit_cfg.label,
             "circuit_type": circuit_cfg.circuit_type,
-            "sensitivity": dict(sens) if sens else {},
-            "learning": dict(learn) if learn else {},
+            "valve_type": get_valve_type(orch.db, c),
+            # Runtime per-circuit flow meter (read-only). The firmware "Flow Meter PPL"
+            # number entity is the source of truth; the add-on caches it and derives the
+            # low-flow floor (60 ÷ ppl). Read from the LIVE config so the display reflects
+            # the latest value (the subscription updates it before this page renders).
+            "pulses_per_litre": round(
+                getattr(circuit_cfg, "pulses_per_litre", 396.0) or 396.0),
+            "min_flow_lpm": round(getattr(circuit_cfg, "min_flow_lpm", 0.15), 2),
+            "flow_meter_ppl_entity": getattr(circuit_cfg, "flow_meter_ppl_entity", ""),
+            "sensitivity": sdict,
+            # Phase 2.3 anomaly response level + whether auto-shutoff is currently
+            # armed or held back (degraded to notify until the baseline earns trust).
+            "anomaly_response": sdict.get("anomaly_response") or "notify",
+            "anomaly_shutoff_ready": _anomaly_shutoff_ready(sdict),
+            "anomaly_shutoff_min_n": MIN_N_FOR_SHUTOFF,
+            "anomaly_shutoff_min_days": MIN_LIVE_DAYS_FOR_SHUTOFF,
+            # Phase 3 §2 — recorder volume reconciliation. Auto-correct is the default
+            # (NULL ⇒ on); the toggle only renders when a cumulative volume sensor exists.
+            "has_volume_sensor": bool(getattr(circuit_cfg, "volume_sensor", "")),
+            "recorder_reconcile_auto": (
+                0 if sdict.get("recorder_reconcile_auto") == 0 else 1),
             "alerts": alerts,
             "training": training,
+            # When the last learning period completed (UTC→local). After activation
+            # this is the go-live time; while 'labelling' it's when learning ended.
+            "last_completed": _fmt_local_ts(
+                (training or {}).get("completed_at"), _home_tz),
+            # When the per-home rule reference was last frozen (activation/retrain).
+            "calibration": {
+                "locked_at": _fmt_local_ts(cal_meta["locked_at"], _home_tz),
+                "source": cal_meta["source"],
+                "fit_count": cal_meta["fit_count"],
+            } if cal_meta else None,
+            # Phase 2.4 artifact-detector calibration lock status (Dev Tools).
+            "artifact_calibration": {
+                "locked_at": _fmt_local_ts(art_meta["locked_at"], _home_tz),
+                "source": art_meta["source"],
+                "count": art_meta["count"],
+                "detectors": art_meta["detectors"],
+            } if art_meta else None,
+            # P6 detector self-validation against HA history (Dev Tools, diagnostic).
+            "detector_validation": _localize_validation(dv, _home_tz) if dv else None,
             "device_entities": entities_by_circuit.get(c, []),
             "active_exclusion": get_active_exclusion_window(orch.db, c),
         })
@@ -224,9 +331,13 @@ async def settings_page(request: Request):
     if fp is not None:
         mqtt_status = fp.status()
 
-    from ..fixtures import CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP, ZONE_ONLY_ALERT_TYPES
+    from ..fixtures import (CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP,
+                            ZONE_ONLY_ALERT_TYPES,
+                            VALVE_TYPES, VALVE_TYPE_LABELS, VALVE_TYPE_HELP)
+    from ..config import DEV_TOOLS
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
+        "dev_tools": DEV_TOOLS,
         "profile": dict(get_home_profile(orch.db) or {}),
         "circuits": circuits,
         "general_entities": entities_by_circuit.get("general", []),
@@ -236,6 +347,9 @@ async def settings_page(request: Request):
         "circuit_types": CIRCUIT_TYPES,
         "circuit_type_labels": CIRCUIT_TYPE_LABELS,
         "circuit_type_help": CIRCUIT_TYPE_HELP,
+        "valve_types": VALVE_TYPES,
+        "valve_type_labels": VALVE_TYPE_LABELS,
+        "valve_type_help": VALVE_TYPE_HELP,
         "zone_only_alert_types": ZONE_ONLY_ALERT_TYPES,
         "page": "settings",
     })
@@ -249,19 +363,24 @@ async def profile_update(request: Request):
     form = await request.form()
     orch = _orch(request)
 
-    try:
-        build_year = int(form.get("build_year", "") or 0) or None
-    except (ValueError, TypeError):
+    # Bounds match the setup wizard's home-details form (see setup.py).
+    # Out-of-range values fall back to the listed default instead of
+    # poisoning the DB; build_year is Optional[int] so a blank field
+    # stays None.
+    build_year_raw = form.get("build_year", "").strip()
+    if build_year_raw:
+        build_year = coerce_int(build_year_raw, lo=1800, hi=2100, default=0) or None
+    else:
         build_year = None
 
     from ..database import update_home_profile
     update_home_profile(
         orch.db,
-        bathrooms_full=int(form.get("bathrooms_full", 1) or 1),
-        bathrooms_half=int(form.get("bathrooms_half", 0) or 0),
-        sqft=int(form.get("sqft", 0) or 0),
-        floors=int(form.get("floors", 1) or 1),
-        occupants=int(form.get("occupants", 2) or 2),
+        bathrooms_full=coerce_int(form.get("bathrooms_full"), lo=0, hi=20, default=1),
+        bathrooms_half=coerce_int(form.get("bathrooms_half"), lo=0, hi=20, default=0),
+        sqft=coerce_int(form.get("sqft"),                     lo=0, hi=100000, default=0),
+        floors=coerce_int(form.get("floors"),                 lo=1, hi=10, default=1),
+        occupants=coerce_int(form.get("occupants"),           lo=1, hi=30, default=2),
         build_year=build_year,
         supply_type=form.get("supply_type", "mains"),
         setup_complete=1,
@@ -322,19 +441,36 @@ async def sensitivity_update(circuit: str, request: Request):
 
 
 # ------------------------------------------------------------------
-# Learning mode
+# Anomaly response (Phase 2.3)
 # ------------------------------------------------------------------
-@router.post("/learning/{circuit}/update")
-async def learning_update(circuit: str, request: Request):
+_ANOMALY_RESPONSE_LEVELS = {"off", "notify", "notify_shutoff_severe", "shutoff_any"}
+
+
+@router.post("/anomaly/{circuit}/update")
+async def anomaly_update(circuit: str, request: Request):
     circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
-    from ..database import upsert_learning_config
+    from ..database import upsert_sensitivity_config
 
-    upsert_learning_config(
-        orch.db, circuit,
-        learning_mode=form.get("learning_mode", "adaptive"),
-    )
+    level = form.get("anomaly_response", "notify")
+    if level not in _ANOMALY_RESPONSE_LEVELS:
+        level = "notify"
+    upsert_sensitivity_config(orch.db, circuit, anomaly_response=level)
+    return ingress_redirect(request, f"/settings#circuit-{circuit}")
+
+
+@router.post("/reconcile/{circuit}/update")
+async def reconcile_update(circuit: str, request: Request):
+    """Phase 3 §2 — per-circuit recorder reconciliation mode. Checkbox present ⇒
+    auto-correct; absent ⇒ flag-only (record divergences, don't change volumes)."""
+    circuit = resolve_circuit(circuit)
+    form = await request.form()
+    orch = _orch(request)
+    from ..database import upsert_sensitivity_config
+
+    auto = 1 if form.get("recorder_reconcile_auto") == "on" else 0
+    upsert_sensitivity_config(orch.db, circuit, recorder_reconcile_auto=auto)
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
@@ -349,10 +485,11 @@ async def recalibrate(circuit: str, request: Request):
 
     fixtures_changed = form.get("fixtures_changed") == "yes"
     occupants_changed = form.get("occupants_changed") == "yes"
-    try:
-        calibration_days = int(form.get("calibration_days", 14))
-    except (ValueError, TypeError):
-        calibration_days = 14
+    # 1..365 days — anything outside that range almost certainly a typo
+    # or stale form; default-back rather than persist an absurd window.
+    calibration_days = coerce_int(
+        form.get("calibration_days"), lo=1, hi=365, default=14,
+    )
 
     if not orch.training_manager:
         return JSONResponse(
@@ -360,6 +497,7 @@ async def recalibrate(circuit: str, request: Request):
             status_code=503,
         )
 
+    kind = "full" if fixtures_changed else "partial"
     if fixtures_changed:
         # Full recalibration — wipe events and restart from scratch
         await orch.training_manager.trigger_full_recalibration(
@@ -376,7 +514,95 @@ async def recalibrate(circuit: str, request: Request):
             await orch.training_manager.start_calibration(
                 circuit, calibration_days)
 
+    # §2.4 — confirm the (fast) recalibration trigger; the slow re-lock at the next
+    # activation is tracked separately by _fit_and_lock.
+    from ..database import start_job, finish_job
+    job = start_job(orch.db, "recalibration", circuit, "Recalibration…")
+    finish_job(orch.db, job, "done",
+               f"{circuit}: {kind} recalibration started — new learning period")
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
+
+
+@router.post("/dev/retrain/{circuit}")
+async def dev_retrain(circuit: str, request: Request):
+    """DEV/testing only — instant rule-calibration re-fit + re-lock against the
+    CURRENT labels (no new learning period), reusing the shared activation
+    fit+freeze path (so the sanity gate still applies). Gated behind the
+    ``dev_tools`` add-on option. Plain form POST → redirects back to the Dev tab;
+    the reloaded page shows the updated 'Locked …' status. The per-type
+    fit/fallback is surfaced via the HA 'calibration locked' notification + log
+    (kept off the JS path so a stale app.js can't break the button)."""
+    from ..config import DEV_TOOLS
+    if not DEV_TOOLS:
+        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    if orch.training_manager:
+        await orch.training_manager.retrain(circuit)
+    return ingress_redirect(request, "/settings#sett-dev")
+
+
+@router.post("/dev/validate-detectors/{circuit}")
+async def dev_validate_detectors(circuit: str, request: Request):
+    """DEV/testing only — run the detector self-validation (P6) against HA history on
+    demand, WITHOUT re-freezing. Reconciles detected events vs the raw flow the addon
+    re-scrapes from HA to confirm the phantom / cross-talk / dribble settings behave.
+    Diagnostic only — writes no thresholds. Returns the report JSON. Gated behind
+    ``dev_tools``."""
+    from ..config import DEV_TOOLS
+    if not DEV_TOOLS:
+        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    if orch.training_manager:
+        # Persists a single latest-per-circuit report; the reloaded page renders it
+        # (plain form POST → redirect, like dev_retrain — kept off the JS path).
+        await orch.training_manager.validate_detectors(circuit)
+    return ingress_redirect(request, "/settings#sett-dev")
+
+
+@router.post("/dev/reimport-range/{circuit}")
+async def dev_reimport_range(circuit: str, request: Request):
+    """DEV/testing only — delete this circuit's purely-machine-derived events in a
+    LOCAL date range and rebuild them from HA flow history. The bulk counterpart to
+    the per-event Reprocess on the History modal (both share ``reprocess_window``);
+    fixes a garbled/unclosed event that absorbed a whole day. User-labelled /
+    classified / ignored events are preserved. Gated behind ``dev_tools``."""
+    from ..config import DEV_TOOLS
+    if not DEV_TOOLS:
+        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+    from datetime import datetime, timezone
+    from ..reprocess import reprocess_window
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    # The date inputs are LOCAL calendar days — span them in the home tz, then to
+    # UTC so the window matches the user's day (and the stored UTC timestamps).
+    tz = getattr(orch, "_ha_tz", timezone.utc) or timezone.utc
+    try:
+        from_dt = (datetime.fromisoformat((payload.get("range_start") or "") + "T00:00:00")
+                   .replace(tzinfo=tz).astimezone(timezone.utc))
+        to_dt = (datetime.fromisoformat((payload.get("range_end") or "") + "T23:59:59")
+                 .replace(tzinfo=tz).astimezone(timezone.utc))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "Invalid date range"}, status_code=400)
+    if to_dt < from_dt:
+        return JSONResponse({"error": "End date is before start date"},
+                            status_code=400)
+    try:
+        result = await reprocess_window(orch, circuit, from_dt, to_dt)
+    except Exception as e:
+        log.error("[%s] dev_reimport_range failed: %s", circuit, e, exc_info=True)
+        return JSONResponse({"error": "Reprocess failed — see addon log."},
+                            status_code=500)
+    if result.get("busy"):
+        return JSONResponse(
+            {"error": "Another volume operation is running — try again shortly."},
+            status_code=409)
+    return JSONResponse({"ok": True, **result})
 
 
 @router.get("/recalibrate/{circuit}/suggest")
@@ -450,10 +676,11 @@ async def device_entity_update(request: Request):
         )
 
     if domain != "number":
+        # 400 not 403 — domain mismatch is input validation, not auth.
         return JSONResponse(
             {"status": "error",
              "message": "Only ESPHome number.* entities are accepted"},
-            status_code=403,
+            status_code=400,
         )
 
     # Build the allowlist from discovered entities in mutable roles only.
@@ -464,9 +691,12 @@ async def device_entity_update(request: Request):
         allowed.update(v for k, v in ents.items() if k in _SETTINGS_MUTABLE_ROLES and v)
 
     if entity_id not in allowed:
+        # 400 not 403 — entity_id failed enum validation against the
+        # discovered allowlist. The request is well-formed; the value
+        # is just not in the accepted set.
         return JSONResponse(
             {"status": "error", "message": "Entity not in allowed set for this device"},
-            status_code=403,
+            status_code=400,
         )
 
     native_step = form.get("native_step", "").strip()
@@ -548,6 +778,29 @@ async def retention_prune_now(request: Request):
     return JSONResponse({"ok": True, "deleted": deleted})
 
 
+@router.post("/reprocess/degraded-supply")
+async def reprocess_degraded_supply(request: Request):
+    """Re-apply current degraded-supply thresholds to every event with
+    stored diagnostics. Used after the guard's gates are tuned so past
+    verdicts (and the daily-volume totals derived from them) match the
+    new policy without waiting for new traffic."""
+    import asyncio
+    from ..feature_extractor import reprocess_degraded_supply_verdicts
+
+    orch = _orch(request)
+    loop = asyncio.get_running_loop()
+    summary = await loop.run_in_executor(
+        None, reprocess_degraded_supply_verdicts, orch.db
+    )
+    log.info(
+        "Degraded-supply reprocess: evaluated=%d flipped_to_degraded=%d "
+        "flipped_to_clean=%d skipped_legacy=%d",
+        summary["evaluated"], summary["flipped_to_degraded"],
+        summary["flipped_to_clean"], summary["skipped_legacy"],
+    )
+    return JSONResponse({"ok": True, **summary})
+
+
 # ── Re-run setup wizard ────────────────────────────────────────────────────
 # Flips home_profile.setup_complete back to 0 so the setup wizard's
 # state-mutating endpoints (guarded by _block_if_setup_complete()) accept
@@ -627,14 +880,52 @@ async def units_update(request: Request):
         flow_key = "L/min"
     if pressure_key not in PRESSURE_OPTIONS:
         pressure_key = "psi"
+    # History display: one unified "Hide not-real-use events" toggle hides every
+    # volume-zeroing verdict (phantom / cross-talk / dribble). Display-only — never
+    # affects totals (their volume is zeroed at detection regardless of this flag).
+    # The single checkbox drives BOTH legacy columns in lockstep so any reader stays
+    # consistent and a legacy split state is normalised on first save.
+    hide_not_real = 1 if form.get("hide_pressure_artifact_events") == "1" else 0
+    hide_phantoms = hide_not_real
+    hide_cross_talk = hide_not_real
+    # dev.38 — guarded auto-split opt-in (read fresh by the periodic maturity pass).
+    auto_split = 1 if form.get("auto_split_enabled") == "1" else 0
     orch.db.execute(
-        "UPDATE home_profile SET flow_unit=?, pressure_unit=? WHERE id=1",
-        (flow_key, pressure_key),
+        "UPDATE home_profile SET flow_unit=?, pressure_unit=?, "
+        "hide_pressure_artifact_events=?, hide_cross_talk_events=?, "
+        "auto_split_enabled=? WHERE id=1",
+        (flow_key, pressure_key, hide_phantoms, hide_cross_talk, auto_split),
     )
     orch.db.commit()
     from ..units import invalidate_unit_cache
     invalidate_unit_cache()
     return ingress_redirect(request, "/settings#units")
+
+
+@router.post("/water-softener/update")
+async def water_softener_update(request: Request):
+    """dev.24 — persist the opt-in water-softener config. The regen start time is
+    REQUIRED when enabled (the session detector + leak-test blackout key on it),
+    so an enabled-but-invalid submission is rejected rather than stored blank.
+    The live path reads this profile FRESH per event, so the toggle takes effect
+    on the next event with no restart."""
+    from ..event_rules import parse_hhmm_to_minutes
+    from ..database import update_home_profile
+    orch = _orch(request)
+    form = await request.form()
+    enabled = form.get("has_water_softener") == "1"
+    start = (form.get("softener_regen_start") or "").strip()
+    circuit = (form.get("softener_circuit") or "").strip() or None
+    if enabled and parse_hhmm_to_minutes(start) is None:
+        return ingress_redirect(
+            request, "/settings?msg=softener_time_required#water-softener")
+    update_home_profile(
+        orch.db,
+        has_water_softener=1 if enabled else 0,
+        softener_regen_start=start if enabled else None,
+        softener_circuit=circuit if enabled else None,
+    )
+    return ingress_redirect(request, "/settings#water-softener")
 
 
 @router.post("/integrations/update")
@@ -666,7 +957,7 @@ async def circuit_rename(circuit: str, request: Request):
     if not circuit_cfg:
         return JSONResponse(
             {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=400,
+            status_code=404,
         )
 
     from ..circuit_compat import validate_display_name
@@ -697,11 +988,13 @@ async def circuit_type_update(circuit: str, request: Request):
     if not orch._cfg.get_circuit(circuit):
         return JSONResponse(
             {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=400,
+            status_code=404,
         )
 
     form = await request.form()
-    from ..fixtures import normalize_circuit_type, CIRCUIT_TYPES
+    from ..fixtures import (
+        normalize_circuit_type, CIRCUIT_TYPES, zone_user_selectable_types,
+    )
     from ..database import set_circuit_type
 
     raw_type = form.get("circuit_type", "").strip()
@@ -712,6 +1005,54 @@ async def circuit_type_update(circuit: str, request: Request):
              "message": f"Invalid circuit_type {raw_type!r}. Must be one of: {', '.join(sorted(CIRCUIT_TYPES))}"},
             status_code=400,
         )
+
+    # When switching to 'zone', refuse if the circuit already has
+    # confirmed fixtures whose type is not appropriate for a zone
+    # (e.g. toilet, shower, kitchen_tap). Otherwise the type system
+    # silently goes inconsistent — a "zone" circuit with toilet
+    # fixtures attached. Suggested types from clustering are NOT
+    # blockers: only user-confirmed `fixtures.fixture_type` counts.
+    # Zone → fixture is always allowed (zone alert rows are preserved
+    # and just hidden by the template filter).
+    if circuit_type == "zone":
+        allowed_zone_types = set(zone_user_selectable_types())
+        rows = orch.db.execute(
+            """SELECT f.id, f.fixture_type, COALESCE(f.display_name, f.name) AS name
+               FROM fixture_clusters fc
+               JOIN fixtures f ON fc.fixture_id = f.id
+              WHERE fc.circuit = ?
+                AND f.fixture_type IS NOT NULL
+                AND f.fixture_type != ''""",
+            (circuit,),
+        ).fetchall()
+        conflicts = [
+            dict(r) for r in rows
+            if r["fixture_type"] not in allowed_zone_types
+        ]
+        if conflicts:
+            # Summarise per type so the message stays short when many
+            # fixtures share a non-zone type (e.g. 4 toilets).
+            from collections import Counter
+            type_counts = Counter(c["fixture_type"] for c in conflicts)
+            summary = ", ".join(
+                f"{count}× {t}" if count > 1 else t
+                for t, count in sorted(type_counts.items())
+            )
+            log.info(
+                "[%s] zone-flip refused — %d non-zone fixture(s): %s",
+                circuit, len(conflicts), summary,
+            )
+            return JSONResponse(
+                {"status": "error",
+                 "message": (
+                     f"Cannot switch to zone — this circuit has "
+                     f"{len(conflicts)} confirmed fixture(s) with "
+                     f"non-zone types ({summary}). Reassign or delete "
+                     f"them under Fixtures first."
+                 ),
+                 "conflicts": conflicts},
+                status_code=409,  # 409 Conflict — request well-formed but state forbids
+            )
 
     try:
         set_circuit_type(orch.db, circuit, circuit_type)
@@ -729,6 +1070,64 @@ async def circuit_type_update(circuit: str, request: Request):
     })
 
 
+@router.post("/circuit/{circuit}/valve-type")
+async def circuit_valve_type_update(circuit: str, request: Request):
+    """Update the valve_type for a circuit.
+
+    Strict validation: invalid input returns HTTP 400. Mirrors the
+    circuit_type endpoint's CSRF behavior (the project uses
+    middleware-driven CSRF on the settings router — see main.py).
+    Switching to '3_port' disables the micro leak test for this circuit
+    (see leak_test_scheduler._execute_test and _check_schedule); the
+    existing leak-test schedule row is preserved so switching back to
+    '2_port' resumes the prior schedule without reconfiguration.
+    """
+    from ..circuit_compat import resolve_circuit
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+
+    if not orch._cfg.get_circuit(circuit):
+        return JSONResponse(
+            {"status": "error", "message": f"Unknown circuit: {circuit}"},
+            status_code=404,
+        )
+
+    form = await request.form()
+    from ..fixtures import parse_valve_type
+    from ..database import set_valve_type, get_valve_type
+
+    raw_vt = form.get("valve_type", "").strip()
+    parsed = parse_valve_type(raw_vt)
+    if parsed is None:
+        return JSONResponse(
+            {"status": "error",
+             "message": f"Invalid valve_type {raw_vt!r}. Must be '2_port' or '3_port'."},
+            status_code=400,
+        )
+
+    # No-change short-circuit — keeps the log clean on idempotent posts.
+    current = get_valve_type(orch.db, circuit)
+    if current == parsed:
+        return JSONResponse({
+            "status": "no_change",
+            "circuit": circuit,
+            "valve_type": parsed,
+        })
+
+    try:
+        set_valve_type(orch.db, circuit, parsed)
+    except Exception as exc:
+        log.error("[%s] set_valve_type failed: %s", circuit, exc)
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+    log.info("[%s] valve_type changed to %r", circuit, parsed)
+    return JSONResponse({
+        "status": "updated",
+        "circuit": circuit,
+        "valve_type": parsed,
+    })
+
+
 # ------------------------------------------------------------------
 # Plumbing-event exclusion windows
 # ------------------------------------------------------------------
@@ -740,8 +1139,10 @@ async def start_exclusion_window(request: Request, circuit: str):
     circuit = resolve_circuit(circuit)
     from ..database import create_exclusion_window
     form    = await request.form()
-    minutes = int(form.get("minutes") or 15)
-    minutes = max(5, min(60, minutes))
+    # 5..60 minutes — same clamp the old code applied, now expressed
+    # as one helper call so out-of-range AND malformed inputs both
+    # fall back to the 15 minute default.
+    minutes = coerce_int(form.get("minutes"), lo=5, hi=60, default=15)
     reason  = (form.get("reason") or "plumbing").strip() or "plumbing"
     create_exclusion_window(_orch(request).db, circuit, minutes, reason)
     log.info("[%s] exclusion window started — %d min (%s)", circuit, minutes, reason)
