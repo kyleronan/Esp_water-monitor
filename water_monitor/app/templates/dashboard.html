@@ -416,11 +416,9 @@ const mix    = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparen
     if (!d || !d.available) { showMsg((d && ERR[d.error]) || "No pressure history available."); return; }
 
     const pf = window.UNITS.pressure_factor, pd = window.UNITS.pressure_decimals, pu = window.UNITS.pressure_unit;
-    const labels = d.points.map(p => {
-      const t = new Date(p.t);
-      return `${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")}`;
-    });
-    const series = d.points.map(p => p.v == null ? null : +(p.v * pf).toFixed(pd));
+    // {x: epoch-ms, y: value} so the x-axis is a real time scale with round-hour
+    // ticks — raw bucket timestamps are anchored to the open-time minute (e.g. :56).
+    const series = d.points.map(p => ({ x: p.t, y: p.v == null ? null : +(p.v * pf).toFixed(pd) }));
     const datasets = [{
       label: `Pressure (${pu})`,
       data: series,
@@ -432,7 +430,7 @@ const mix    = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparen
       const b = +(d.baseline_psi * pf).toFixed(pd);
       datasets.push({
         label: "normal resting pressure",
-        data: series.map(() => b),
+        data: d.points.map(p => ({ x: p.t, y: b })),
         borderColor: mix(cssVar("--text-3"), 80),
         borderDash: [5, 4], fill: false, pointRadius: 0, borderWidth: 1,
       });
@@ -440,7 +438,7 @@ const mix    = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparen
     }
     chart = new Chart(canvas, {
       type: "line",
-      data: { labels, datasets },
+      data: { datasets },
       options: {
         responsive: true, maintainAspectRatio: false,
         interaction: { intersect: false, mode: "index" },
@@ -455,8 +453,13 @@ const mix    = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparen
           },
         },
         scales: {
-          x: { grid: { display: false }, ticks: { font: { family: "DM Sans", size: 10 }, color: cssVar("--text-3"), maxRotation: 0, maxTicksLimit: 8 } },
-          y: { grid: { color: cssVar("--border") }, ticks: { font: { family: "DM Sans", size: 10 }, color: cssVar("--text-3") } },
+          x: {
+            type: "time",
+            time: { unit: "hour", stepSize: 3, displayFormats: { hour: "HH:mm" }, tooltipFormat: "MMM d, HH:mm" },
+            grid: { display: false },
+            ticks: { font: { family: "DM Sans", size: 10 }, color: cssVar("--text-3"), maxRotation: 0 },
+          },
+          y: { beginAtZero: true, grid: { color: cssVar("--border") }, ticks: { font: { family: "DM Sans", size: 10 }, color: cssVar("--text-3") } },
         },
       },
     });
