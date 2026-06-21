@@ -192,7 +192,7 @@ points at a mutable branch ref.
 | **0.1.x** | Core monitoring, leak detection, calibration, display units | Shipped |
 | **0.2.0** | Fixture identification — clustering engine live, naming UI complete | Shipped |
 | **0.2.1** | ESP-side waveform capture & feature enrichment, event detail modal, merge-clusters UI, Basic/Advanced settings split, auto dark mode, hardware docs (PCB v1.2a) | Shipped |
-| **0.2.2-dev** | Runtime per-circuit flow-meter PPL + guided flow-calibration helper (bucket / municipal), Phase 2.3 anomaly detection, degraded-supply guard, per-circuit valve type (2-port / 3-port), per-session CSRF refactor, autocorrelation correctness fix, firmware release-gate script, migration transaction safety, async/blocking SQLite audit | In development |
+| **0.2.2** | Runtime per-circuit flow-meter PPL + guided flow-calibration helper (bucket / municipal), Phase 2.3 anomaly detection, degraded-supply guard, per-circuit valve type (2-port / 3-port), per-session CSRF refactor, autocorrelation correctness fix, firmware release-gate script, migration transaction safety, async/blocking SQLite audit, live-capture reliability fixes (importer catch-up checkpoint + stuck no-flow phantom close) | Shipped |
 | **0.3.x** | Per-circuit pressure-sensor calibration, esp_idf framework migration with proper task watchdog | Planned |
 | **0.4.x** | Native Home Assistant integration (alongside the addon, eventually replacing the WebSocket bridge for users who prefer pip-installable components) | Planned |
 
