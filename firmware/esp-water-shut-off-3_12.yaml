@@ -99,9 +99,9 @@ substitutions:
   pressure_cal_irr_max_psi:   "104.1172"
 
 esphome:
-  name: esp-water-shut-off-3
+  name: esp-water-shut-off
   friendly_name: ESP Water Shut off 3.12
-  min_version: 2024.6.0
+  min_version: 2026.6.1
   name_add_mac_suffix: true
   platformio_options:
     # DIO flash mode required for ESP32-S3
@@ -214,10 +214,10 @@ captive_portal:  # Serves a Wi-Fi setup page when connected to the fallback AP
 
 dashboard_import:
   # Allows this device to appear in the ESPHome dashboard for adoption.
-  # IMPORTANT: this URL must point at an immutable tag (e.g. @v3.10.0)
+  # IMPORTANT: this URL must point at an immutable tag (e.g. @v3.12.0)
   # before each release. scripts/check_firmware_release.py enforces this
   # — it fails the release if the ref ends with @main or any branch ref.
-  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_10.yaml@v3.10.0
+  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_12.yaml@v3.12.0
   import_full_config: true
 
 esp32_improv:
