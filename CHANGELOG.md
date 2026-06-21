@@ -2,9 +2,12 @@
 
 ## [0.2.2-dev] — in development
 
-A correctness + hardening release. Headlines: a degraded-supply guard so
-events captured during pulsing municipal pressure are flagged and stop
-poisoning clustering / hourly volume; a per-circuit valve-type setting
+A features + correctness + hardening release. Headlines: runtime per-circuit
+flow-meter pulses-per-litre as a Home Assistant number entity (any meter, no
+firmware edit) with a guided bucket / municipal-meter calibration helper;
+a degraded-supply guard so events captured during pulsing municipal pressure
+are flagged and stop poisoning clustering / hourly volume; a per-circuit
+valve-type setting
 (2-port / 3-port) so micro leak tests are correctly disabled on
 drain-capable hardware; and a round of security and robustness work
 covering CSRF, the autocorrelation primitive behind the supply detector,
@@ -22,8 +25,10 @@ script added to keep them that way.
   fill error; a single ≥10-gal municipal run suffices) and a run-spread warning. Applying writes
   the firmware PPL entity; a small trim just re-scales the frozen anomaly thresholds (no relearn),
   a large change re-baselines. The deliberate test draw is suppressed from auto-shutoff and
-  excluded from training/anomaly so it can't trip the valve or pollute the baseline. New
-  `routers/calibration.py` + `calibration_math.py`.
+  excluded from training/anomaly so it can't trip the valve or pollute the baseline. The
+  result lists each run plus their average + range, and the suggested value is editable
+  (re-gated on its own correction) before applying. New `routers/calibration.py` +
+  `calibration_math.py`.
 - **Runtime-configurable per-circuit flow meter (PPL)** — pulses-per-litre is now a
   per-circuit Home Assistant `number` entity (`Flow Meter PPL - <circuit>`), NVS-backed
   so it survives reboots and OTA updates. Set it to match any meter — turbine YF-B5 = 396,

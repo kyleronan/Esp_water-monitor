@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 from ..circuit_compat import resolve_circuit
 from ..units import load_unit_context
 from ..calibration_math import (
-    BUCKET_MIN_L, MUNICIPAL_MIN_L, METER_UNIT_FACTORS, pooled, run_ppl, to_litres,
+    BUCKET_MIN_L, MUNICIPAL_MIN_L, METER_UNIT_FACTORS, gate, pooled, run_ppl, to_litres,
 )
 
 log = logging.getLogger(__name__)
@@ -202,11 +202,22 @@ async def apply(circuit: str, request: Request):
     sess = _session(circuit) if cfg is not None else None
     if sess is None or not sess.get("runs"):
         return _err("session expired — start over", 409)
-    result = pooled(sess["runs"], sess["current_ppl"], sess["method"])
-    if not result["apply_allowed"]:
-        return _err(f"Run at least {result['runs_needed']} more sample(s) for a "
-                    f"{result['correction_pct']}% correction.")
-    new_ppl = result["new_ppl"]
+    body = await _json(request)
+    # The user may adjust the suggested value before applying; else use the pooled value.
+    if body.get("ppl") not in (None, ""):
+        try:
+            new_ppl = round(float(body.get("ppl")), 1)
+        except (TypeError, ValueError):
+            return _err("Enter a valid pulses/litre value")
+        if not (1.0 <= new_ppl <= 5000.0):
+            return _err("Pulses/litre must be between 1 and 5000")
+    else:
+        new_ppl = pooled(sess["runs"], sess["current_ppl"], sess["method"])["new_ppl"]
+    # Gate the EFFECTIVE value (override or suggestion) on its OWN correction.
+    g = gate(new_ppl, sess["current_ppl"], sess["method"], len(sess["runs"]))
+    if not g["apply_allowed"]:
+        return _err(f"Run at least {g['runs_needed']} more sample(s) for a "
+                    f"{g['correction_pct']}% change.")
     entity = getattr(cfg, "flow_meter_ppl_entity", "")
     ok = await orch.ha.set_number(entity, new_ppl) if (entity and orch.ha) else False
     if not ok:
@@ -220,7 +231,7 @@ async def apply(circuit: str, request: Request):
     _sessions.pop(circuit, None)
     orch.set_calibrating(circuit, False)
     return JSONResponse({"ok": True, "new_ppl": new_ppl,
-                         "rebaselined": result["will_rebaseline"]})
+                         "rebaselined": g["will_rebaseline"]})
 
 
 @router.post("/{circuit}/cancel")

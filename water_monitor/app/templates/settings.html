@@ -1499,10 +1499,13 @@
     </div>
 
     <div id="cal-step-result" style="display:none">
-      <p>Run <strong id="cal-runcount">1</strong> · suggested
-         <strong id="cal-newppl"></strong> pulses/litre
-         <span class="muted">(current <span id="cal-curppl"></span>,
-         <span id="cal-corr"></span>% change)</span>.</p>
+      <p>Apply <input type="number" id="cal-newppl-input" step="0.1" min="1" max="5000"
+           style="width:6rem" oninput="_calReeval()"> pulses/litre
+         <span class="muted">(suggested <span id="cal-suggested"></span> · current
+         <span id="cal-curppl"></span> · <span id="cal-corr"></span>% change)</span>.</p>
+      <p class="muted" style="font-size:.85rem">
+        Samples (<span id="cal-runcount">0</span>): <span id="cal-run-history">—</span> pulses/litre<span
+        id="cal-run-stats"></span>. You can edit the value above before applying.</p>
       <p id="cal-spread-warn" class="muted" style="font-size:.85rem;display:none"></p>
       <p id="cal-gate-warn" class="muted" style="font-size:.85rem;display:none"></p>
       <div class="modal-actions">
@@ -1601,25 +1604,49 @@ async function calStop() {
   if (!res.ok) { _calErr(res.error); _calShow('measure'); return; }
   _calResult(res);
 }
+let _calLast = null;
 function _calResult(res) {
+  _calLast = res;
   document.getElementById('cal-runcount').textContent = res.run_count;
-  document.getElementById('cal-newppl').textContent = res.new_ppl;
+  const ppls = res.run_ppls || [];
+  document.getElementById('cal-run-history').textContent = ppls.length ? ppls.join(', ') : '—';
+  const stats = document.getElementById('cal-run-stats');
+  if (ppls.length >= 2) {
+    const avg = Math.round(ppls.reduce((a, b) => a + b, 0) / ppls.length * 10) / 10;
+    stats.textContent = ' · average ' + avg + ' · range ' +
+      Math.min(...ppls) + '–' + Math.max(...ppls);
+  } else stats.textContent = '';
+  document.getElementById('cal-suggested').textContent = res.new_ppl;
   document.getElementById('cal-curppl').textContent = res.current_ppl;
-  document.getElementById('cal-corr').textContent = res.correction_pct;
+  document.getElementById('cal-newppl-input').value = res.new_ppl;
   const sw = document.getElementById('cal-spread-warn');
   if (res.spread_pct >= 3 && res.run_count > 1) {
     sw.textContent = '⚠ Your runs disagree by ' + res.spread_pct +
       '% — consider another run or check fill consistency.';
     sw.style.display = '';
   } else sw.style.display = 'none';
+  _calReeval();              // gate + correction reflect the (editable) value
+  _calShow('result');
+}
+// Re-evaluate the gate against the user-EDITED value (gated on its own correction).
+function _calReeval() {
+  if (!_calLast) return;
+  const cur = _calLast.current_ppl, runs = _calLast.run_count;
+  const val = parseFloat(document.getElementById('cal-newppl-input').value);
   const gw = document.getElementById('cal-gate-warn');
   const applyBtn = document.getElementById('cal-apply-btn');
-  if (!res.apply_allowed) {
-    gw.textContent = 'This is a ' + res.correction_pct + '% correction — run at least ' +
-      res.runs_needed + ' more sample(s) to confirm (averages out bucket-fill error).';
+  if (!(val >= 1 && val <= 5000)) {
+    gw.textContent = 'Enter a value between 1 and 5000.'; gw.style.display = '';
+    applyBtn.disabled = true; return;
+  }
+  const corr = Math.round(Math.abs(val - cur) / cur * 1000) / 10;
+  document.getElementById('cal-corr').textContent = corr;
+  const needsRuns = (corr > 3 && _calMethod === 'bucket') ? Math.max(0, 3 - runs) : 0;
+  if (needsRuns > 0) {
+    gw.textContent = 'This is a ' + corr + '% change — run at least ' + needsRuns +
+      ' more bucket sample(s) to confirm (averages out fill error).';
     gw.style.display = ''; applyBtn.disabled = true;
   } else { gw.style.display = 'none'; applyBtn.disabled = false; }
-  _calShow('result');
 }
 function calAgain() {
   _calErr('');
@@ -1629,7 +1656,8 @@ function calAgain() {
   } else { calStart(); }                // bucket reuses the same volume
 }
 async function calApply() {
-  const res = await _calPost('/apply', {});
+  const val = parseFloat(document.getElementById('cal-newppl-input').value);
+  const res = await _calPost('/apply', {ppl: val});
   if (!res.ok) { _calErr(res.error); return; }
   _calClose();
   alert('Calibration applied: ' + res.new_ppl + ' pulses/litre.' + (res.rebaselined

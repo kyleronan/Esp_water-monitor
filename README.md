@@ -95,8 +95,17 @@ that's great. I'm probably not going to build another one for myself.
   winterization). 3-port circuits automatically skip the micro leak test
   (the drain port reads as a constant leak); the schedule is preserved
   if you ever switch back.
-- **Anomaly detection** — flags events that don't match learned patterns,
-  catches running toilets, slow leaks, and unusual usage. Planned for v0.3.x.
+- **Runtime flow-meter calibration** (v0.2.2) — pulses-per-litre is a
+  per-circuit Home Assistant number entity (NVS-backed, survives OTA), so
+  any flow meter works without a firmware edit. A guided **calibration
+  helper** (Settings → Flow Meter → Calibrate) measures the true
+  pulses-per-litre from a bucket test or a whole-house municipal-meter
+  reading — showing each run, their average and range, with an editable,
+  safety-gated value before you apply.
+- **Anomaly detection** (v0.2.2, Phase 2.3) — flags events that deviate from
+  the learned baseline (volume percentiles + per-fixture envelopes) and can
+  notify or auto-shut-off, guarded so a thin/young baseline degrades to
+  notify-only.
 - **Away mode** — pauses learning while unoccupied, automatically toggled
   from your existing HA presence entities
 - **Mobile push notifications** for all alerts via HA's `notify.mobile_app_*`
@@ -165,7 +174,7 @@ PCB design files (KiCad + Gerbers), bill of materials, build guide, and bring-up
    password, web UI username + password). See
    [`firmware/README.md`](firmware/README.md) for the key-generation
    snippet and the security model.
-2. Flash `firmware/esp-water-shut-off-3_10.yaml` (v3.10.0) to your
+2. Flash `firmware/esp-water-shut-off-3_12.yaml` (v3.12.0) to your
    ESP32-S3-WROOM-1 using ESPHome.
 3. Make sure the device is added to Home Assistant before installing the
    addon.
@@ -183,8 +192,8 @@ points at a mutable branch ref.
 | **0.1.x** | Core monitoring, leak detection, calibration, display units | Shipped |
 | **0.2.0** | Fixture identification — clustering engine live, naming UI complete | Shipped |
 | **0.2.1** | ESP-side waveform capture & feature enrichment, event detail modal, merge-clusters UI, Basic/Advanced settings split, auto dark mode, hardware docs (PCB v1.2a) | Shipped |
-| **0.2.2-dev** | Degraded-supply guard, per-circuit valve type (2-port / 3-port), per-session CSRF refactor, autocorrelation correctness fix, firmware release-gate script, migration transaction safety, async/blocking SQLite audit | In development |
-| **0.3.x** | Anomaly detection (the original v0.3 target), per-circuit pressure-sensor calibration, esp_idf framework migration with proper task watchdog | Planned |
+| **0.2.2-dev** | Runtime per-circuit flow-meter PPL + guided flow-calibration helper (bucket / municipal), Phase 2.3 anomaly detection, degraded-supply guard, per-circuit valve type (2-port / 3-port), per-session CSRF refactor, autocorrelation correctness fix, firmware release-gate script, migration transaction safety, async/blocking SQLite audit | In development |
+| **0.3.x** | Per-circuit pressure-sensor calibration, esp_idf framework migration with proper task watchdog | Planned |
 | **0.4.x** | Native Home Assistant integration (alongside the addon, eventually replacing the WebSocket bridge for users who prefer pip-installable components) | Planned |
 
 See `CHANGELOG.md` for detailed release notes, and

@@ -36,32 +36,43 @@ def run_ppl(current_ppl: float, measured_l: float, actual_l: float) -> float:
     return current_ppl * measured_l / actual_l if actual_l > 0 else current_ppl
 
 
-def pooled(runs: List[Dict[str, float]], current_ppl: float, method: str) -> Dict[str, Any]:
-    """Volume-pool the runs and apply the method-aware sample-count gate + run spread.
+def clamp_ppl(value: float) -> float:
+    return max(PPL_MIN, min(PPL_MAX, value))
 
-    Each run is ``{measured_l, actual_l, run_ppl}``. Gate: a >3% pooled correction needs
-    ≥3 BUCKET runs (averages out fill error); the MUNICIPAL method is satisfied by one run
-    (its ≥10-gal minimum beats meter resolution by volume); a ≤3% correction needs one run.
-    """
-    sm = sum(r["measured_l"] for r in runs)
-    sa = sum(r["actual_l"] for r in runs)
-    new_ppl = current_ppl * sm / sa if sa > 0 else current_ppl
-    new_ppl = max(PPL_MIN, min(PPL_MAX, new_ppl))
-    ppls = [r["run_ppl"] for r in runs]
-    spread_pct = ((max(ppls) - min(ppls)) / current_ppl * 100.0) if (ppls and current_ppl) else 0.0
+
+def gate(new_ppl: float, current_ppl: float, method: str, run_count: int) -> Dict[str, Any]:
+    """The method-aware sample-count gate + correction + re-baseline flag for an EFFECTIVE
+    pulses/litre value. Used both for the pooled suggestion and for a user's manual override
+    at apply time, so an edited value is gated on ITS OWN correction: a >3% bucket change
+    needs ≥3 runs (averages out fill error); MUNICIPAL is satisfied by one ≥10-gal run; a
+    ≤3% change needs one run. (Editing a noisy big suggestion down to a small change unblocks
+    apply; editing it up re-blocks.)"""
     corr_pct = (abs(new_ppl - current_ppl) / current_ppl * 100.0) if current_ppl else 0.0
     if corr_pct > LARGE_CORRECTION_PCT and method == "bucket":
-        runs_needed = max(0, MIN_RUNS_FOR_LARGE - len(runs))
+        runs_needed = max(0, MIN_RUNS_FOR_LARGE - run_count)
     else:
         runs_needed = 0
     return {
-        "current_ppl": round(current_ppl, 1),
-        "new_ppl": round(new_ppl, 1),
         "correction_pct": round(corr_pct, 1),
-        "spread_pct": round(spread_pct, 1),
-        "run_ppls": [round(p, 1) for p in ppls],
-        "run_count": len(runs),
         "apply_allowed": runs_needed == 0,
         "runs_needed": runs_needed,
         "will_rebaseline": corr_pct >= REBASELINE_PCT,
+    }
+
+
+def pooled(runs: List[Dict[str, float]], current_ppl: float, method: str) -> Dict[str, Any]:
+    """Volume-pool the runs (current_ppl × Σmeasured ÷ Σactual) + per-run PPLs + spread +
+    the sample-count gate. Each run is ``{measured_l, actual_l, run_ppl}``."""
+    sm = sum(r["measured_l"] for r in runs)
+    sa = sum(r["actual_l"] for r in runs)
+    new_ppl = clamp_ppl(current_ppl * sm / sa) if sa > 0 else current_ppl
+    ppls = [r["run_ppl"] for r in runs]
+    spread_pct = ((max(ppls) - min(ppls)) / current_ppl * 100.0) if (ppls and current_ppl) else 0.0
+    return {
+        "current_ppl": round(current_ppl, 1),
+        "new_ppl": round(new_ppl, 1),
+        "spread_pct": round(spread_pct, 1),
+        "run_ppls": [round(p, 1) for p in ppls],
+        "run_count": len(runs),
+        **gate(new_ppl, current_ppl, method, len(runs)),
     }
