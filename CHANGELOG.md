@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.2-dev] — in development
+## [0.2.2] — 2026-06-21
 
 A features + correctness + hardening release. Headlines: runtime per-circuit
 flow-meter pulses-per-litre as a Home Assistant number entity (any meter, no
@@ -105,6 +105,28 @@ script added to keep them that way.
   now emits `ON CONFLICT … DO NOTHING` if the column-update list is
   ever empty (currently 12 columns; a future trim could make this a
   SQL syntax error otherwise).
+- **Catch-up orphaned events longer than the check interval** — the
+  periodic `historical_importer` catch-up advanced `last_check_ts` to
+  `now` even while a flow period was still active, so an event longer
+  than `CHECK_INTERVAL_MINUTES` had its start slide behind the checkpoint
+  and could then only be recovered by a much-later startup backfill (a
+  133-min irrigation run surfaced ~4 days late). `_import_range` now
+  reports the trailing still-active flow start and folds it into
+  `retry_from`, holding the checkpoint there until the event ends so the
+  next catch-up after it closes reconstructs the full period. The overlap
+  / UUID5 dedup keeps this from double-counting. New tests in
+  `test_historical_importer_active_event.py`.
+- **No-flow pressure phantoms blocked a circuit for hours** — a pure
+  pressure transient whose pressure SETTLED below the recovery line (e.g.
+  an irrigation zone solenoid nudging the steady pressure) never satisfied
+  the pressure-recovery END and stayed open until the 6 h over-long
+  watchdog; while open it blocked every new event on that circuit (the
+  `_active_event is None` start gate), so the next irrigation run was
+  missed by live detection. New `_maybe_close_settled_noflow`
+  (`SETTLED_NOFLOW_CLOSE_S = 60 s`) closes such an event once pressure
+  settles and flow has been zero ≥ 60 s; flow-triggered, pulsed, and
+  ongoing draws are excluded so a real run is never cut short. New tests
+  in `test_event_detector_pressure_recovery.py`.
 
 ### Performance
 
