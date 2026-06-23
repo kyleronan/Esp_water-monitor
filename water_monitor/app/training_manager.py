@@ -340,16 +340,22 @@ class TrainingManager:
 
     # ── Fit + freeze (Phase 1) ──────────────────────────────────────────────────
 
-    def _fit_and_lock_sync(self, circuit: str, source: str) -> Dict[str, Any]:
-        """Shared fit → sanity-gate → freeze path (sync; run via executor). Used by
-        BOTH activation and the dev ``retrain`` so the activation sanity gate (in
-        rule_calibration.fit_and_freeze) can never be skipped."""
+    def _fit_and_lock_sync(self, conn: sqlite3.Connection, circuit: str,
+                           source: str) -> Dict[str, Any]:
+        """Shared fit → sanity-gate → freeze path (sync; runs on a PRIVATE connection
+        via run_isolated_write). Used by BOTH activation and the dev ``retrain`` so the
+        activation sanity gate (in rule_calibration.fit_and_freeze) can never be skipped.
+
+        The private ``conn`` (never the shared orch.db) keeps these heavy reclassify /
+        freeze writes off the live async writers — sharing the orchestrator connection
+        across this executor thread was the SQLITE_MISUSE ("bad parameter or other API
+        misuse") that silently skipped post-lock reclassify + anomaly rescore."""
         from .rule_calibration import fit_and_freeze
         from .database import reclassify_all_events_from_signatures
-        report = fit_and_freeze(self._db, circuit, source=source)
+        report = fit_and_freeze(conn, circuit, source=source)
         # Re-type events with the freshly-frozen rules so matched_* reflects the fit.
         try:
-            reclassify_all_events_from_signatures(self._db, circuit)
+            reclassify_all_events_from_signatures(conn, circuit)
         except Exception as e:
             log.warning("[%s] post-lock reclassify failed (non-fatal): %s",
                         circuit, e)
@@ -358,7 +364,7 @@ class TrainingManager:
         # for future leak / odd-usage detection.
         try:
             from .anomaly_baseline import freeze_usage_baselines
-            freeze_usage_baselines(self._db, circuit, source=source)
+            freeze_usage_baselines(conn, circuit, source=source)
         except Exception as e:
             log.warning("[%s] usage-baseline freeze failed (non-fatal): %s",
                         circuit, e)
@@ -367,7 +373,7 @@ class TrainingManager:
         # zero a confirmed-real event. Applies to new events + future recomputes.
         try:
             from .artifact_calibration import freeze_artifact_thresholds
-            freeze_artifact_thresholds(self._db, circuit, source=source)
+            freeze_artifact_thresholds(conn, circuit, source=source)
         except Exception as e:
             log.warning("[%s] artifact-threshold freeze failed (non-fatal): %s",
                         circuit, e)
@@ -379,7 +385,7 @@ class TrainingManager:
         try:
             from .anomaly_baseline import invalidate_baseline_cache
             invalidate_baseline_cache(circuit)
-            reclassify_all_events_from_signatures(self._db, circuit)
+            reclassify_all_events_from_signatures(conn, circuit)
         except Exception as e:
             log.warning("[%s] post-baseline anomaly rescore failed (non-fatal): %s",
                         circuit, e)
@@ -392,17 +398,22 @@ class TrainingManager:
         return report
 
     async def _fit_and_lock(self, circuit: str, source: str) -> Dict[str, Any]:
-        import functools
-        from .database import start_job, finish_job
+        from .config import DB_PATH
+        from .database import start_job, finish_job, run_isolated_write
         circuit_cfg = self._cfg.get_circuit(circuit)
         label = circuit_cfg.label if circuit_cfg else circuit
         # §2.4 — track the (slow) re-lock so the UI can toast its success/failure.
         # Covers BOTH activation and the dev retrain (both route through here).
         job = start_job(self._db, "calibration", circuit, f"Calibrating {label}…")
-        loop = asyncio.get_running_loop()
         try:
-            report = await loop.run_in_executor(
-                None, functools.partial(self._fit_and_lock_sync, circuit, source))
+            # Private connection + write lock (run_isolated_write) so the fit /
+            # reclassify / freeze writes never share the orchestrator connection with
+            # the live async writers — the SQLITE_MISUSE that silently skipped
+            # post-lock reclassify + anomaly rescore. Mirrors feature_extractor /
+            # maturity_recheck, which use the same helper for the same reason.
+            report = await run_isolated_write(
+                DB_PATH,
+                lambda conn: self._fit_and_lock_sync(conn, circuit, source))
             n_fit = sum(1 for r in report.values()
                         if isinstance(r, dict) and r.get("status") == "fit")
             finish_job(self._db, job, "done",

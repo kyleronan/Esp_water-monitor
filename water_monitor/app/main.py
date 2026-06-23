@@ -60,6 +60,23 @@ def _is_secure_request(request: Request) -> bool:
     return True
 
 
+def _set_session_cookie(response, request: Request, session_id: str) -> None:
+    """Attach the session cookie. Shared by the normal new-session response and the
+    CSRF-reject 403 so a cookie-less client always leaves with a session it can reuse.
+    The reject path returns before the normal cookie-set, so without this a client
+    whose cookie never round-trips could never present a matching token — the frontend
+    reloads on 403, which then derives a valid token for this same session."""
+    response.set_cookie(
+        SESSION_COOKIE,
+        session_id,
+        httponly=True,
+        samesite="lax",
+        secure=_is_secure_request(request),
+        max_age=SESSION_COOKIE_MAX_AGE,
+        path="/",
+    )
+
+
 def _is_health_path(path: str) -> bool:
     """Exact-match /health (with optional trailing slash). Prefix
     `/health-anything` is NOT exempt — that was the old startswith bug.
@@ -351,11 +368,17 @@ async def ingress_middleware(request: Request, call_next):
 
         if not validate_csrf_token(server_secret, session_id, token):
             log.warning("CSRF invalid on %s %s", request.method, path)
-            return HTMLResponse(
+            resp = HTMLResponse(
                 "<h1>403 — Invalid or missing security token</h1>"
                 "<p>Please reload the page and try again.</p>",
                 status_code=403,
             )
+            # A cookie-less client (new_session) must still leave with a session,
+            # else it can never present a matching token on retry. The frontend
+            # reloads on 403, which then derives a valid token for this session.
+            if new_session:
+                _set_session_cookie(resp, request, session_id)
+            return resp
 
     # ----- Setup-complete redirect -----------------------------------
     # First-run users get bounced to the setup wizard until it's done.
@@ -392,15 +415,7 @@ async def ingress_middleware(request: Request, call_next):
     # Attach it to every response shape (template, redirect, JSON, 4xx)
     # so the next request always carries it.
     if new_session:
-        response.set_cookie(
-            SESSION_COOKIE,
-            session_id,
-            httponly=True,
-            samesite="lax",
-            secure=_is_secure_request(request),
-            max_age=SESSION_COOKIE_MAX_AGE,
-            path="/",
-        )
+        _set_session_cookie(response, request, session_id)
     return response
 
 

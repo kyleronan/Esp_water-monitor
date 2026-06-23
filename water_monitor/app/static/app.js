@@ -10,6 +10,13 @@ async function post(url, body = {}) {
     },
     body: JSON.stringify(body),
   });
+  if (resp.status === 403) {
+    // Stale CSRF token (e.g. the add-on restarted/updated while this tab was open).
+    // The 403 refreshed our session cookie; reload to derive a fresh token rather
+    // than fail silently.
+    location.reload();
+    return new Promise(() => {});  // never resolves — the page is reloading
+  }
   let data = null;
   try { data = await resp.json(); } catch {}
   return { ok: resp.ok, status: resp.status, data };

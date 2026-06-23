@@ -245,7 +245,9 @@ def event_novelty(features: Dict[str, Any],
     for ekey, fkey in checks:
         band = env.get(ekey)
         val = features.get(fkey)
-        if band is None or val is None:
+        # len(band) < 2 guard: a malformed/partial stored envelope band (e.g. an
+        # empty list) must skip, not raise IndexError on band[0]/band[1] below.
+        if band is None or len(band) < 2 or val is None:
             continue
         checked += 1
         if not (band[0] <= float(val) <= band[1]):

@@ -1560,6 +1560,13 @@ async function _calPost(path, body) {
     method:'POST',
     headers:{'Content-Type':'application/json', 'X-CSRF-Token': window.CSRF_TOKEN || ''},
     body: JSON.stringify(body || {})});
+  if (r.status === 403) {
+    // Stale CSRF token (add-on restarted/updated while this tab was open). The 403
+    // refreshed our session cookie; reload to pick up a fresh token instead of
+    // failing silently and leaving the user re-clicking.
+    location.reload();
+    return new Promise(() => {});  // never resolves — the page is reloading
+  }
   return r.json();
 }
 async function calStart() {
