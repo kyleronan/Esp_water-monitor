@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.3.0] — 2026-06-27
+
+Role-based access. The add-on UI is no longer all-or-nothing: non-admin Home
+Assistant users can now open the panel, with least-privilege roles enforced
+server-side.
+
+### New Features
+
+- **Three access tiers (viewer / operator / admin).** `panel_admin` is now
+  `false`, so any logged-in HA user can open the panel, but what they can do is
+  gated by role:
+  - **admin** — every HA administrator (detected automatically from HA's user
+    list). Full control, exactly as before.
+  - **operator** — a non-admin you explicitly add on the new **Settings →
+    Access** page. Read-only **plus** opening/closing the main water valve — so a
+    household member home alone can shut water off (or back on) in an emergency
+    without an admin. No settings, backup, labeling, leak tests, or scheduling.
+  - **viewer** — every other HA user. Read-only: Dashboard, History, Water Use,
+    and live Device status.
+- **Access management page (Settings → Access, admin-only)** lists HA users with
+  their resolved role and a one-click operator grant/revoke.
+
+### How it works / security
+
+- Roles derive from the Supervisor's `X-Remote-User-Id` ingress header, which is
+  trustworthy because the add-on already rejects any request not from the ingress
+  proxy IP (it's ingress-only, no exposed port). Default-deny: an unknown user is
+  a viewer.
+- Enforcement is server-side at a single chokepoint in the ingress middleware (no
+  mutating route can be missed); the admin-only routers (settings, backup, setup,
+  calibration, training, access) additionally require admin on their GET pages.
+  Templates merely hide controls a role can't use.
+- Admins are cached (last-known-good) and refreshed from HA every 10 min, with an
+  early refresh at startup; a transient HA hiccup can never downgrade a real admin
+  to viewer. New optional `bootstrap_admin_user_id` add-on option is an escape
+  hatch that always grants admin to one HA user id if the user-list lookup is ever
+  unavailable.
+- Schema migration **20260547** adds `operator_users`, `admin_ids_cache`, and
+  `seen_users` (DDL only).
+
 ## [0.2.2] — 2026-06-21
 
 A features + correctness + hardening release. Headlines: runtime per-circuit

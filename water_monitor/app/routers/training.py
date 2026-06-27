@@ -11,9 +11,10 @@ from __future__ import annotations
 import logging
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from ..auth import require_admin
 from ..fixtures import (FIXTURE_TYPE_LABELS, fixture_user_selectable_types,
                         zone_user_selectable_types)
 from ..database import (
@@ -25,7 +26,8 @@ from ..database import (
 )
 
 log = logging.getLogger(__name__)
-router = APIRouter(prefix="/training")
+# Admin-only router: the training helper writes model-training labels.
+router = APIRouter(prefix="/training", dependencies=[Depends(require_admin)])
 
 # Per-circuit last monotonic time live flow was seen > floor — lets the poll
 # endpoint distinguish 'waiting' from 'processing'. Process-local (single-instance

@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Access &amp; roles</h2>
+  <p class="muted">
+    Admins (full control) are set automatically from Home Assistant — anyone who is
+    an HA administrator is an admin here. Below you choose which other HA users are
+    <strong>operators</strong> (can open/close the main water valve in an emergency,
+    but can't change settings or labels). Everyone else is a read-only
+    <strong>viewer</strong>.
+  </p>
+
+  {% if ha_error %}
+  <div class="banner banner-warn">
+    Couldn't read the Home Assistant user list ({{ ha_error }}). Showing users who
+    have opened this add-on instead. Admins are still recognised from the cached
+    HA admin set.
+  </div>
+  {% endif %}
+
+  <table class="data-table">
+    <thead>
+      <tr><th>User</th><th>HA user id</th><th>Role</th><th>Operator</th></tr>
+    </thead>
+    <tbody>
+      {% for u in users %}
+      <tr>
+        <td>{{ u.name }}</td>
+        <td><code>{{ u.id }}</code></td>
+        <td>
+          <span class="role-badge role-{{ u.role }}">{{ u.role }}</span>
+        </td>
+        <td>
+          {% if u.role == 'admin' %}
+            <span class="muted">always (HA admin)</span>
+          {% elif u.role == 'operator' %}
+            <form method="post" action="{{ ingress_path }}/access/operator/revoke" style="margin:0">
+              <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+              <input type="hidden" name="user_id" value="{{ u.id }}">
+              <button type="submit" class="btn btn-secondary btn-sm">Remove operator</button>
+            </form>
+          {% else %}
+            <form method="post" action="{{ ingress_path }}/access/operator/grant" style="margin:0">
+              <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+              <input type="hidden" name="user_id" value="{{ u.id }}">
+              <input type="hidden" name="display_name" value="{{ u.name }}">
+              <button type="submit" class="btn btn-primary btn-sm">Make operator</button>
+            </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4" class="muted">No users found yet. When other Home
+        Assistant users open the add-on they'll appear here.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <p class="muted" style="margin-top:1rem">
+    {{ admin_count }} admin(s) · {{ operator_count }} operator(s). Changes take
+    effect immediately — no restart needed.
+  </p>
+</section>
+{% endblock %}

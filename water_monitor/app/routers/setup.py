@@ -13,9 +13,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from ._helpers import coerce_int, ingress_redirect
+from ..auth import require_admin
 
 from ..device_discovery import (
     find_matching_devices,
@@ -28,7 +29,11 @@ from ..device_discovery import (
 )
 
 log = logging.getLogger(__name__)
-router = APIRouter(prefix="/setup")
+# Admin-only router: the first-run / re-run wizard discovers devices and writes
+# the core device config. The early admin-set refresh in orchestrator.run() makes
+# admins recognised before traffic, so the genuine admin isn't locked out of
+# first-run setup; a bootstrap_admin_user_id option is the ultimate fallback.
+router = APIRouter(prefix="/setup", dependencies=[Depends(require_admin)])
 
 
 def _orch(r: Request):

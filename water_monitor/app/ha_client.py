@@ -371,6 +371,39 @@ class HaClient:
         result = await self.ws_request("config/entity_registry/list")
         return result or []
 
+    async def get_users(self) -> List[Dict[str, Any]]:
+        """Return HA users normalised for RBAC: ``[{id, name, is_admin}]``.
+
+        Source is the ``config/auth/list`` WS command. Admin status is derived
+        from ``is_owner`` OR membership of the built-in ``system-admin`` group
+        (``group_ids``); some HA versions also expose ``is_admin`` directly, which
+        is honoured if present. System-generated users (the Supervisor / add-on
+        tokens themselves) are filtered out — they never log into the UI.
+
+        Raises on transport / permission failure (``ws_request`` raises); the
+        caller (orchestrator role-sync) treats that as "keep the cached set".
+        """
+        result = await self.ws_request("config/auth/list")
+        out: List[Dict[str, Any]] = []
+        for u in (result or []):
+            if u.get("system_generated"):
+                continue
+            uid = u.get("id")
+            if not uid:
+                continue
+            groups = u.get("group_ids") or []
+            is_admin = bool(
+                u.get("is_owner")
+                or u.get("is_admin")
+                or ("system-admin" in groups)
+            )
+            out.append({
+                "id": uid,
+                "name": u.get("name") or u.get("username") or uid,
+                "is_admin": is_admin,
+            })
+        return out
+
     # ------------------------------------------------------------------
     # History queries (short-lived WS connections)
     # ------------------------------------------------------------------

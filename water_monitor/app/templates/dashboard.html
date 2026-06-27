@@ -6,11 +6,13 @@
 <div class="dash-away-banner">
   <span>🏖 <strong>Away mode active</strong> — learning your normal usage is paused.
     Leak tests and valve control still running.</span>
+  {% if is_admin %}
   <form method="post" action="{{ ingress_path }}/settings/away-mode/toggle"
         style="margin:0">
     <input type="hidden" name="enabled" value="0">
     <button type="submit" class="btn btn-warning btn-sm">I'm back home</button>
   </form>
+  {% endif %}
 </div>
 {% endif %}
 
@@ -35,13 +37,18 @@
     {% elif ds.labelling %}
     <a class="dash-next-chip" href="{{ ingress_path }}/fixtures">👉 Last step: activate your line on Water Use →</a>
     {% elif ds.calibrating %}
+    {% if is_admin %}
     <a class="dash-next-chip" href="{{ ingress_path }}/training">👉 While it learns: run your fixtures in the Training helper →</a>
+    {% else %}
+    <span class="dash-next-chip">Still learning your normal water use…</span>
+    {% endif %}
     {% elif ds.live_zero %}
     <span class="dash-next-chip">Run some water to get started — your first events will appear here.</span>
     {% else %}
     <span class="dash-next-chip is-ok">✅ All set — monitoring for leaks.</span>
     {% endif %}
   </div>
+  {% if is_admin %}
   <form method="post" action="{{ ingress_path }}/settings/away-mode/toggle"
         class="dash-away-toggle-form">
     <input type="hidden" name="enabled" value="{% if away_mode %}0{% else %}1{% endif %}">
@@ -53,6 +60,13 @@
       </span>
     </button>
   </form>
+  {% else %}
+  {# Read-only state for non-admins (toggling away mode is an admin action). #}
+  <span class="dash-away-toggle {% if away_mode %}is-away{% endif %}" aria-disabled="true">
+    <span class="dash-away-toggle-icon">{% if away_mode %}🏖{% else %}🏠{% endif %}</span>
+    <span class="dash-away-toggle-label">{% if away_mode %}Away{% else %}Home{% endif %}</span>
+  </span>
+  {% endif %}
 </div>
 
 {# ── Circuit cards ──────────────────────────────────────────────── #}
@@ -114,12 +128,16 @@
         <span class="dash-alert-detail">{{ c.fault_reason }}</span>
         {% endif %}
       </div>
+      {% if is_admin %}
       <button class="btn btn-secondary btn-sm" onclick="resetFault('{{ c.circuit }}')">Reset</button>
+      {% endif %}
     </div>
     {% elif c.trickle_active %}
     <div class="dash-alert dash-alert-trickle">
       <span>⚠ Trickle flow detected</span>
+      {% if is_admin %}
       <button class="btn btn-secondary btn-sm" onclick="resetTrickle('{{ c.circuit }}')">Reset</button>
+      {% endif %}
     </div>
     {% endif %}
 
@@ -179,6 +197,7 @@
          data-fault="{{ 'true' if c.fault_active else 'false' }}"
          data-fault-reason="{{ c.fault_reason or '' }}"
          data-display-name="{{ c.display_name }}">
+      {% if can_control_valve %}
       {% if c.valve_state == 'open' %}
       <button class="btn btn-danger btn-sm" onclick="valveCloseModal('{{ c.circuit }}', this)">Close Valve</button>
       {% elif c.valve_state == 'closed' %}
@@ -192,6 +211,9 @@
         {% endif %}
       {% else %}
       <button class="btn btn-secondary btn-sm" disabled>{{ c.valve_state | title }}</button>
+      {% endif %}
+      {% else %}
+      <span class="muted" style="font-size:.85rem">View only — ask an admin for valve-control access.</span>
       {% endif %}
     </div>
 
@@ -219,7 +241,7 @@
         <span class="dash-leak-next">Next {{ c.next_leak_test[:10] }}</span>
         {% endif %}
       </div>
-      {% if c.leak_test_active or c.leak_test_running %}
+      {% if (c.leak_test_active or c.leak_test_running) and is_admin %}
       <button class="btn btn-danger btn-sm"
               onclick="abortLeakTest('{{ c.circuit }}')">✕ Abort</button>
       {% endif %}
@@ -237,21 +259,25 @@
       <div class="dash-training-bar">
         <div class="dash-training-fill" style="width: {{ c.training.percent_complete }}%"></div>
       </div>
+      {% if is_admin %}
       <p class="dash-training-next">
         While it learns, you can speed things up:
         <a href="{{ ingress_path }}/training">run each fixture once in the Training helper</a>,
         or <a href="{{ ingress_path }}/history">label a few events on History</a>.
       </p>
+      {% endif %}
     </div>
     {% elif c.training.state == 'labelling' %}
     <div class="dash-training">
       <div class="dash-training-row">
         <span class="dash-training-label">✅ Learning complete</span>
       </div>
+      {% if is_admin %}
       <p class="dash-training-next">
         Last step — <a href="{{ ingress_path }}/fixtures">activate this line on the Water Use page</a>
         to turn on leak &amp; anomaly detection.
       </p>
+      {% endif %}
     </div>
     {% endif %}
 

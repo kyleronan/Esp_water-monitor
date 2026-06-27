@@ -37,15 +37,20 @@
       <div class="dev-fault-detail dev-fault-muted">Reason not available — check device log or HA logbook</div>
       {% endif %}
     </div>
+    {% if is_admin %}
     <button class="btn btn-secondary btn-sm" onclick="resetFault('{{ c.circuit }}')">Reset Fault</button>
+    {% endif %}
   </div>
   {% endif %}
 
   {# ── Valve control — single contextual button ───────────────── #}
+  {# Open/close is available to operators + admins (emergency shutoff/restore);
+     viewers see status only. Fault-reset / trickle-reset stay admin-only. #}
   <div class="dev-valve-controls" id="valve-controls-{{ c.circuit }}"
        data-fault="{{ 'true' if c.fault_active else 'false' }}"
        data-fault-reason="{{ c.fault_reason or '' }}"
        data-display-name="{{ c.display_name }}">
+    {% if can_control_valve %}
     {% if c.valve_state == 'open' %}
     <button class="btn btn-danger btn-sm" onclick="valveCloseModal('{{ c.circuit }}', this)">Close Valve</button>
     {% elif c.valve_state == 'closed' %}
@@ -60,8 +65,11 @@
     {% else %}
     <button class="btn btn-secondary btn-sm" disabled>{{ c.valve_state | title }}</button>
     {% endif %}
-    {% if c.trickle_active %}
+    {% if c.trickle_active and is_admin %}
     <button class="btn btn-warning btn-sm" onclick="resetTrickle('{{ c.circuit }}')">Reset Trickle</button>
+    {% endif %}
+    {% else %}
+    <span class="muted" style="font-size:.85rem">View only — ask an admin for valve-control access.</span>
     {% endif %}
   </div>
 
@@ -95,6 +103,7 @@
       </div>
     </div>
 
+    {% if is_admin %}
     <div class="dev-leak-actions">
       {% if c.leak_test_active or c.leak_test_running %}
       <button class="btn btn-danger btn-sm"
@@ -210,6 +219,7 @@
         <button type="submit" class="btn btn-primary btn-sm dev-schedule-save">Save Schedule</button>
       </form>
     </details>
+    {% endif %}{# is_admin — leak-test actions + schedule #}
   </div>
 
   {# Phase 3 — waveform-transport health #}
@@ -293,6 +303,7 @@
         </span>
         <span class="dev-reading-mono">{{ c.reconcile.backlog }}</span>
       </div>
+      {% if is_admin %}
       <form method="post" action="{{ ingress_path }}/device/reconcile/{{ c.circuit }}/apply"
             style="margin-top:.6rem"
             onsubmit="return confirm('Correct {{ c.reconcile.backlog }} event volume(s) to the recorder value? This is reversible (original volumes are preserved).');">
@@ -301,6 +312,7 @@
           Apply {{ c.reconcile.backlog }} recorder correction(s) now
         </button>
       </form>
+      {% endif %}
       {% endif %}
     </details>
   </div>

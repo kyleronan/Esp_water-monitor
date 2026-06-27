@@ -91,6 +91,14 @@ class Orchestrator:
         # deliberate calibration draw must not trip auto-shutoff or pollute training /
         # anomaly stats — see is_calibrating + the FeatureExtractor suppression.
         self._calibrating: set = set()
+        # RBAC role sets, read by ingress_middleware on every request (membership
+        # test only — no per-request HA call / DB read). admin_ids = last-known-good
+        # HA admin set (refreshed by _run_role_sync); operator_ids = the allow-list.
+        # Both populated at startup via load_roles_from_db(). _seen_uids is the
+        # in-memory first-sight guard so seen_users is logged once per user/process.
+        self.admin_ids: set = set()
+        self.operator_ids: set = set()
+        self._seen_uids: set = set()
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -273,6 +281,74 @@ class Orchestrator:
             circuit_cfg.display_name = labels.get(circuit_cfg.circuit, "")
             log.debug("[%s] display_name loaded: %r",
                       circuit_cfg.circuit, circuit_cfg.display_name)
+
+    def load_roles_from_db(self, db) -> None:
+        """Populate admin_ids (last-known-good cache) + operator_ids from the DB.
+
+        Unions the configured ``bootstrap_admin_user_id`` so a misconfigured /
+        unreachable ``config/auth/list`` can never lock the admin out. Called at
+        lifespan startup (with the migration connection, so the sets are ready
+        before serving) and again inside ``run()`` once the orchestrator's own
+        connection is open.
+        """
+        from .database import load_operator_ids, load_cached_admin_ids
+        try:
+            self.operator_ids = load_operator_ids(db)
+            admins = load_cached_admin_ids(db)
+        except Exception as e:  # pragma: no cover - defensive
+            log.warning("load_roles_from_db failed (keeping current sets): %s", e)
+            return
+        boot = (getattr(self._cfg, "bootstrap_admin_user_id", "") or "").strip()
+        self.admin_ids = (admins | {boot}) if boot else admins
+        log.info("RBAC roles loaded — %d admin(s) cached, %d operator(s)",
+                 len(self.admin_ids), len(self.operator_ids))
+
+    def reload_operator_ids(self) -> None:
+        """Refresh the operator allow-list from the DB into the live set.
+
+        Called by the Access page after an admin grants/revokes operator so the
+        middleware sees the change immediately (no restart)."""
+        from .database import load_operator_ids
+        if self._db:
+            self.operator_ids = load_operator_ids(self._db)
+
+    async def _refresh_admin_ids_once(self) -> bool:
+        """One HA admin-set refresh from ``config/auth/list``; persists a
+        last-known-good cache. Returns True if it updated the live set.
+
+        Never raises and never clears: on transport/permission failure OR an empty
+        result the existing cached ``admin_ids`` is kept, so a transient HA hiccup
+        or a token without user-list access can never downgrade a real admin to
+        viewer."""
+        try:
+            users = await self._ha.get_users()
+        except Exception as e:
+            log.warning("role-sync fetch failed (keeping cached admin set): %s", e)
+            return False
+        from .database import save_admin_ids_cache
+        from .auth import admin_ids_from_users
+        new_ids = admin_ids_from_users(users)
+        if not new_ids:
+            log.warning("role-sync: config/auth/list returned no admins — keeping "
+                        "cached set (%d)", len(self.admin_ids))
+            return False
+        boot = (getattr(self._cfg, "bootstrap_admin_user_id", "") or "").strip()
+        self.admin_ids = (new_ids | {boot}) if boot else new_ids
+        save_admin_ids_cache(self._db, [u for u in users if u.get("is_admin")])
+        log.info("role-sync: cached %d HA admin(s)", len(new_ids))
+        return True
+
+    async def _run_role_sync(self) -> None:
+        """Keep the HA admin set fresh (every 10 min). Runs under ``_supervise``
+        (returns only on stop). The FIRST refresh is kicked off early in ``run()``
+        so the admin set is ready before normal traffic, not after full startup."""
+        while not self._stop.is_set():
+            await self._refresh_admin_ids_once()
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=600)
+                return
+            except asyncio.TimeoutError:
+                pass
 
     def reload_circuit_profiles(self) -> None:
         """Re-read circuit_type from circuit_profile into the live CircuitConfig objects.
@@ -477,6 +553,18 @@ class Orchestrator:
         self.reload_circuit_entities()
         self.reload_circuit_labels()
         self.reload_circuit_profiles()
+        # RBAC role sets from the orchestrator's own DB connection (the lifespan
+        # pre-loaded them from the migration connection; this refreshes against
+        # self._db and re-applies the bootstrap admin).
+        self.load_roles_from_db(self._db)
+        # Kick off the FIRST HA admin-set fetch NOW (right after the HA client is
+        # up), before the heavy startup work below, so admins are recognised before
+        # normal traffic rather than only after _run_role_sync's first tick at the
+        # end of startup. Best-effort — keeps the cached set on failure.
+        try:
+            await self._refresh_admin_ids_once()
+        except Exception as e:  # pragma: no cover - defensive
+            log.warning("initial role refresh failed (non-fatal): %s", e)
 
         # On already-configured systems, scan for optional roles that may have appeared
         # after a firmware upgrade (e.g. waveform entities added in 3.7.0).
@@ -707,6 +795,7 @@ class Orchestrator:
                 self._supervise("waveform_purger",     self._run_waveform_purger),
                 self._supervise("volume_baseline_rollover",
                                 self._run_volume_baseline_rollover),
+                self._supervise("role_sync",           self._run_role_sync),
             )
         except asyncio.CancelledError:
             pass

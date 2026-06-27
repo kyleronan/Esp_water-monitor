@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, Iterable, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -213,6 +213,37 @@ CREATE TABLE IF NOT EXISTS csrf_server_secret (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     secret      TEXT NOT NULL,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
+-- ROLE-BASED ACCESS (RBAC) — viewer / operator / admin (migration 20260547).
+-- operator_users:  HA user ids granted the operator tier (read + valve control),
+--                  managed by an admin on the Settings → Access page.
+-- admin_ids_cache: last-known-good HA admin set (from config/auth/list) so a
+--                  transient lookup failure can never lock admins out — see
+--                  auth.py + the orchestrator role-sync loop.
+-- seen_users:      every HA user that has opened the add-on (first-sight upsert
+--                  only — never a per-request write), a fallback pick-list for the
+--                  Access page when config/auth/list is unavailable to the add-on.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS operator_users (
+    user_id       TEXT PRIMARY KEY,
+    display_name  TEXT,
+    added_by      TEXT,
+    added_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS admin_ids_cache (
+    user_id       TEXT PRIMARY KEY,
+    display_name  TEXT,
+    cached_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS seen_users (
+    user_id       TEXT PRIMARY KEY,
+    display_name  TEXT,
+    first_seen    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS circuit_profile (
@@ -5759,6 +5790,122 @@ def extend_exclusion_window(conn, circuit: str, extra_minutes: int = 15) -> None
         (modifier, circuit),
     )
     conn.commit()
+
+
+# ------------------------------------------------------------------
+# RBAC helpers — operator allow-list, admin-set cache, seen-users log
+# ------------------------------------------------------------------
+
+def load_operator_ids(db: sqlite3.Connection) -> set:
+    """Return the set of HA user ids granted the operator tier.
+
+    Returns an empty set (default-deny) if the table is absent (pre-migration DB).
+    """
+    try:
+        rows = db.execute("SELECT user_id FROM operator_users").fetchall()
+        return {r["user_id"] for r in rows if r["user_id"]}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def list_operator_users(db: sqlite3.Connection) -> List[dict]:
+    """Return all operator allow-list rows (for the Access page)."""
+    try:
+        rows = db.execute(
+            "SELECT user_id, display_name, added_by, added_at "
+            "FROM operator_users ORDER BY display_name, user_id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
+
+
+def add_operator(db: sqlite3.Connection, user_id: str,
+                 display_name: str = "", added_by: str = "") -> None:
+    """Grant the operator tier to a HA user id (idempotent upsert)."""
+    if not user_id:
+        return
+    with db:
+        db.execute(
+            "INSERT INTO operator_users (user_id, display_name, added_by) "
+            "VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+            "display_name = excluded.display_name, added_by = excluded.added_by",
+            (user_id, display_name or "", added_by or ""),
+        )
+
+
+def remove_operator(db: sqlite3.Connection, user_id: str) -> None:
+    """Revoke the operator tier from a HA user id."""
+    if not user_id:
+        return
+    with db:
+        db.execute("DELETE FROM operator_users WHERE user_id = ?", (user_id,))
+
+
+def load_cached_admin_ids(db: sqlite3.Connection) -> set:
+    """Return the last-known-good HA admin user-id set (empty if none cached)."""
+    try:
+        rows = db.execute("SELECT user_id FROM admin_ids_cache").fetchall()
+        return {r["user_id"] for r in rows if r["user_id"]}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def save_admin_ids_cache(db: sqlite3.Connection,
+                         users: "Iterable[dict]") -> None:
+    """Replace the admin-id cache with the current admin users.
+
+    ``users`` are normalised dicts (``id`` + optional ``name``) for the users that
+    are admins. A NO-OP when the input is empty so a failed/empty ``config/auth/list``
+    can never wipe the last-known-good set (the safety property that keeps admins
+    from being locked out).
+    """
+    admins = [u for u in (users or []) if u.get("id")]
+    if not admins:
+        return
+    with db:
+        db.execute("DELETE FROM admin_ids_cache")
+        db.executemany(
+            "INSERT OR REPLACE INTO admin_ids_cache (user_id, display_name) "
+            "VALUES (?, ?)",
+            [(u["id"], u.get("name") or "") for u in admins],
+        )
+
+
+def record_seen_user(db: sqlite3.Connection, user_id: str,
+                     display_name: str = "") -> None:
+    """Upsert a user into the seen-users log (first_seen kept, last_seen bumped).
+
+    Best-effort and cheap; the middleware only calls this on the FIRST sighting of
+    a user id this process-lifetime, so it is not a per-request write.
+    """
+    if not user_id:
+        return
+    try:
+        with db:
+            db.execute(
+                "INSERT INTO seen_users (user_id, display_name) VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET "
+                "  display_name = COALESCE(NULLIF(excluded.display_name, ''), "
+                "                          seen_users.display_name), "
+                "  last_seen = CURRENT_TIMESTAMP",
+                (user_id, display_name or ""),
+            )
+    except sqlite3.Error:
+        # Best-effort diagnostic write — never let it disrupt the request.
+        pass
+
+
+def list_seen_users(db: sqlite3.Connection) -> List[dict]:
+    """Return the seen-users log (for the Access page fallback pick-list)."""
+    try:
+        rows = db.execute(
+            "SELECT user_id, display_name, first_seen, last_seen "
+            "FROM seen_users ORDER BY last_seen DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
 
 
 # ------------------------------------------------------------------

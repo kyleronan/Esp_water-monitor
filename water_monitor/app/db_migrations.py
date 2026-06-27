@@ -94,7 +94,12 @@ _BASELINE_VERSION: int = 20260523
 #              (REAL DEFAULT 396.0) — add-on cache of the firmware PPL number
 #              entity; the low-flow floor is derived (60 ÷ ppl). DDL only; the
 #              DEFAULT is correct for existing rows (reference turbine).
-_CURRENT_VERSION: int = 20260546
+#   20260547 — RBAC (viewer/operator/admin): operator_users (operator allow-list),
+#              admin_ids_cache (last-known-good HA admin set), seen_users (Access
+#              page fallback pick-list). DDL only — CREATE TABLE IF NOT EXISTS,
+#              idempotent; no backfill (empty allow-list = everyone non-admin is a
+#              viewer until promoted).
+_CURRENT_VERSION: int = 20260547
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -837,6 +842,42 @@ def _apply_ppl_column(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _apply_rbac_tables(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260547 — role-based access (RBAC).
+
+    Creates the three RBAC tables (``operator_users``, ``admin_ids_cache``,
+    ``seen_users``). DDL only, all ``CREATE TABLE IF NOT EXISTS`` so it is
+    idempotent and a no-op on a fresh DB (where ``_create_schema`` already made
+    them). No backfill — an empty operator allow-list means every non-admin HA
+    user is a viewer until an admin promotes them on the Access page.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS operator_users (
+            user_id       TEXT PRIMARY KEY,
+            display_name  TEXT,
+            added_by      TEXT,
+            added_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS admin_ids_cache (
+            user_id       TEXT PRIMARY KEY,
+            display_name  TEXT,
+            cached_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS seen_users (
+            user_id       TEXT PRIMARY KEY,
+            display_name  TEXT,
+            first_seen    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    log.info("Migration 20260547: RBAC tables ready")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -1162,6 +1203,18 @@ def _missing_ppl_columns(conn: sqlite3.Connection) -> set[str]:
     return set()
 
 
+def _missing_rbac_tables(conn: sqlite3.Connection) -> set[str]:
+    """Return any of the 20260547 RBAC tables that are absent."""
+    needed = {"operator_users", "admin_ids_cache", "seen_users"}
+    present = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('operator_users','admin_ids_cache','seen_users')"
+        ).fetchall()
+    }
+    return needed - present
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -1273,6 +1326,7 @@ def _run_migrations_impl(
             | _missing_recorder_reconcile_columns(conn)
             | _missing_dev38_columns(conn)
             | _missing_ppl_columns(conn)
+            | _missing_rbac_tables(conn)
         )
         if missing:
             raise RuntimeError(
@@ -1283,9 +1337,17 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260546:
+        # DB has the per-circuit pulses_per_litre column but lacks the RBAC tables.
+        _apply_rbac_tables(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260546 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260545:
         # DB has the dev.38 auto-split flag but lacks the per-circuit pulses_per_litre column.
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260545 → %d", _CURRENT_VERSION)
         return
@@ -1294,6 +1356,7 @@ def _run_migrations_impl(
         # DB has the recorder-reconcile columns but lacks the dev.38 auto-split flag.
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260544 → %d", _CURRENT_VERSION)
         return
@@ -1304,6 +1367,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260543 → %d", _CURRENT_VERSION)
         return
@@ -1314,6 +1378,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260542 → %d", _CURRENT_VERSION)
         return
@@ -1326,6 +1391,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260541 → %d", _CURRENT_VERSION)
         return
@@ -1338,6 +1404,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260540 → %d", _CURRENT_VERSION)
         return
@@ -1351,6 +1418,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260539 → %d", _CURRENT_VERSION)
         return
@@ -1365,6 +1433,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260538 → %d", _CURRENT_VERSION)
         return
@@ -1380,6 +1449,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260537 → %d", _CURRENT_VERSION)
         return
@@ -1396,6 +1466,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260536 → %d", _CURRENT_VERSION)
         return
@@ -1413,6 +1484,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260535 → %d", _CURRENT_VERSION)
         return
@@ -1432,6 +1504,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
         return
@@ -1452,6 +1525,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
         return
@@ -1472,6 +1546,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
@@ -1494,6 +1569,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
@@ -1517,6 +1593,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -1562,6 +1639,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -1589,6 +1667,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -1617,6 +1696,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -1644,6 +1724,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -1670,6 +1751,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -1694,6 +1776,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -1718,6 +1801,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -1778,6 +1862,7 @@ def _run_migrations_impl(
         _apply_recorder_reconcile_columns(conn)
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
+        _apply_rbac_tables(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

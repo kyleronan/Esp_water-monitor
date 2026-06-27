@@ -17,9 +17,10 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
+from ..auth import require_admin
 from ..circuit_compat import resolve_circuit
 from ..units import load_unit_context
 from ..calibration_math import (
@@ -27,7 +28,8 @@ from ..calibration_math import (
 )
 
 log = logging.getLogger(__name__)
-router = APIRouter(prefix="/calibrate")
+# Admin-only router: calibration writes the firmware PPL entity + re-baselines.
+router = APIRouter(prefix="/calibrate", dependencies=[Depends(require_admin)])
 
 _SESSION_TTL_S = 1800.0      # stale-session auto-expiry (30 min)
 _sessions: Dict[str, Dict[str, Any]] = {}   # per-circuit, never persisted

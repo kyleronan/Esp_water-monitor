@@ -1,5 +1,5 @@
 name: "Water Monitor"
-version: "0.2.2"
+version: "0.3.0"
 slug: water_monitor
 description: >-
   Intelligent water monitoring with fixture signature recognition,
@@ -23,7 +23,11 @@ ingress: true
 ingress_port: 8765
 panel_icon: mdi:water-check
 panel_title: "Water Monitor"
-panel_admin: true
+# false so NON-admin HA users can open the panel too. The add-on enforces its own
+# roles (viewer / operator / admin): admins come from HA admin status, operators
+# are an in-app allow-list (Settings → Access), everyone else is read-only. Set
+# back to true to hard-restrict the whole UI to HA admins again.
+panel_admin: false
 ports:
   8765/tcp: null
 ports_description:
@@ -33,6 +37,10 @@ options:
   esp_device_name: "ESP Water Shut off"
   debug_capture_propagation: false
   dev_tools: false
+  # Optional RBAC escape hatch: a HA user id ALWAYS treated as an add-on admin,
+  # even if the add-on can't read HA's user list. Leave blank normally — admins
+  # are detected from HA admin status automatically.
+  bootstrap_admin_user_id: ""
   circuits:
     - circuit: "main"
       circuit_type: "fixture"
@@ -43,6 +51,7 @@ schema:
   esp_device_name: "str"
   debug_capture_propagation: "bool"
   dev_tools: "bool?"
+  bootstrap_admin_user_id: "str?"
   circuits:
     - circuit: "str"
       circuit_type: "list(fixture|zone)"

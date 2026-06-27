@@ -33,9 +33,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from ..auth import require_admin
 from ..config import DB_PATH
 from ..database import get_data_retention
 from ..restore_utils import (
@@ -44,7 +45,8 @@ from ..restore_utils import (
 )
 
 log = logging.getLogger(__name__)
-router = APIRouter(prefix="/backup")
+# Admin-only router: exports contain the entire database; imports overwrite it.
+router = APIRouter(prefix="/backup", dependencies=[Depends(require_admin)])
 MAX_BACKUP_BYTES = 50 * 1024 * 1024  # 50 MB hard limit
 
 

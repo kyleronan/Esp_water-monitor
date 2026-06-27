@@ -29,13 +29,20 @@
     <a href="{{ ingress_path }}/history"  class="nav-item {% if page == 'history' %}active{% endif %}">History</a>
     <a href="{{ ingress_path }}/fixtures" class="nav-item {% if page == 'fixtures' %}active{% endif %}"
        title="See how much water each category (shower, toilet, irrigation…) uses today and over time">Water Use</a>
-    {% if setup_complete %}
+    {% if setup_complete and is_admin %}
     <a href="{{ ingress_path }}/training" class="nav-item {% if page == 'training' %}active{% endif %}">Training</a>
     {% endif %}
+    {% if is_admin %}
     <a href="{{ ingress_path }}/settings" class="nav-item {% if page == 'settings' %}active{% endif %}">Settings</a>
     <a href="{{ ingress_path }}/backup"   class="nav-item {% if page == 'backup'   %}active{% endif %}">Backup</a>
-    {% if not setup_complete %}
+    <a href="{{ ingress_path }}/access"    class="nav-item {% if page == 'access'   %}active{% endif %}"
+       title="Manage who can control the valve (operators) vs view only">Access</a>
+    {% endif %}
+    {% if not setup_complete and is_admin %}
     <a href="{{ ingress_path }}/setup"    class="nav-item {% if page == 'setup'    %}active{% endif %}">Setup</a>
+    {% endif %}
+    {% if not is_admin %}
+    <span class="nav-role-badge" title="Your access level">{{ role }}</span>
     {% endif %}
   </nav>
 

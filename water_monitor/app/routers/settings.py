@@ -3,17 +3,21 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from ._helpers import coerce_int, ingress_redirect
 
+from ..auth import require_admin
 from ..circuit_compat import resolve_circuit
 from ..config import SENSITIVITY_PRESETS
 from ..database import get_data_retention, update_data_retention
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/settings")
+# Admin-only router: settings expose device config, secrets/targets, calibration,
+# and destructive maintenance. Enforced here (covers GET pages the method-based
+# mutation gate can't catch) and again by the central gate for the POSTs.
+router = APIRouter(prefix="/settings", dependencies=[Depends(require_admin)])
 
 
 def _orch(request: Request):

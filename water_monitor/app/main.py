@@ -8,17 +8,28 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import select_autoescape
 
 import os as _os
 
+from .auth import (
+    ADMIN,
+    OPERATOR,
+    REMOTE_USER_ID_HEADER,
+    REMOTE_USER_NAME_HEADER,
+    VIEWER,
+    is_mutation_allowed,
+    role_for_request,
+)
 from .config import load_config
 from .database import (
     derive_csrf_token,
     get_or_create_csrf_server_secret,
+    record_seen_user,
+    run_isolated_write,
     validate_csrf_token,
 )
 
@@ -93,7 +104,7 @@ def _is_static_path(path: str) -> bool:
 from .db_migrations import run_migrations
 from .orchestrator import Orchestrator
 from .routers import (dashboard, device, history, fixtures, settings, setup,
-                      backup, training, calibration)
+                      backup, training, calibration, access)
 from .units import build_unit_context, load_unit_context
 
 APP_DIR = Path(__file__).resolve().parent
@@ -140,6 +151,12 @@ class IngressTemplates(Jinja2Templates):
                 "csrf_token",
                 getattr(request.state, "csrf_token", ""),
             )
+            # RBAC role flags — templates use these to hide controls the current
+            # role can't use (enforcement is server-side; this is presentation).
+            _role = getattr(request.state, "role", VIEWER)
+            context.setdefault("role", _role)
+            context.setdefault("is_admin", _role == ADMIN)
+            context.setdefault("can_control_valve", _role in (ADMIN, OPERATOR))
             # Static-asset cache-buster (see _read_addon_version). Defaults to
             # 'dev' before lifespan sets it / outside the app context.
             context.setdefault(
@@ -186,6 +203,14 @@ async def lifespan(app: FastAPI):
     log = logging.getLogger(__name__)
     log.info("Water Monitor starting — %d circuits configured",
              len(cfg.circuits))
+    # RBAC trusts the ingress X-Remote-User-Id header ONLY because the ingress-IP
+    # guard rejects non-Supervisor clients. If that guard is disabled in production
+    # (INGRESS_ALLOWED_IP cleared while DEV_MODE is off), the header could be forged
+    # to claim any role — loudly flag the misconfiguration.
+    if not _DEV_MODE and not _INGRESS_IP:
+        log.critical("SECURITY: ingress-IP guard is DISABLED (INGRESS_ALLOWED_IP "
+                     "empty) but DEV_MODE is off — X-Remote-User-Id can be spoofed "
+                     "to gain any role. Restore INGRESS_ALLOWED_IP or set DEV_MODE.")
 
     orch = Orchestrator(cfg)
     app.state.orchestrator = orch
@@ -205,6 +230,13 @@ async def lifespan(app: FastAPI):
         # doesn't hit the DB on every request. The orchestrator's own
         # connection will be used for any post-startup reads.
         app.state.csrf_server_secret = get_or_create_csrf_server_secret(_db)
+        # Pre-load RBAC role sets from the migration connection so the middleware
+        # has them BEFORE serving (orchestrator.run() refreshes them again against
+        # its own connection, then _run_role_sync keeps the admin set current).
+        try:
+            orch.load_roles_from_db(_db)
+        except Exception as e:
+            log.warning("RBAC role pre-load failed (non-fatal): %s", e)
     except Exception as e:
         log.critical("DB migration failed — cannot start: %s", e)
         raise
@@ -331,6 +363,51 @@ async def ingress_middleware(request: Request, call_next):
         derive_csrf_token(server_secret, session_id)
         if server_secret else ""
     )
+
+    # ----- Role resolution + RBAC mutation gate ----------------------
+    # Resolve the caller's role from the trusted ingress user header (see auth.py)
+    # against the orchestrator's cached admin/operator sets. Membership test only —
+    # no HA call or DB read on the hot path.
+    admin_ids = getattr(orch, "admin_ids", frozenset())
+    operator_ids = getattr(orch, "operator_ids", frozenset())
+    role = role_for_request(request, admin_ids, operator_ids)
+    request.state.role = role
+
+    # First-sight seen-user log: once per user id per process (NOT per request), so
+    # the Access page can list everyone who's opened the add-on even when the
+    # config/auth/list lookup isn't available to the add-on token.
+    uid = request.headers.get(REMOTE_USER_ID_HEADER, "").strip()
+    if uid and orch is not None and getattr(orch, "db", None) is not None:
+        seen = getattr(orch, "_seen_uids", None)
+        if seen is not None and uid not in seen:
+            seen.add(uid)
+            # Write on a PRIVATE connection via the serialized writer — never on
+            # the shared orch.db from the request path (that risks a transaction
+            # clash with the orchestrator's inline writers). First-sight only, so
+            # this runs at most once per user per process.
+            _uname = request.headers.get(REMOTE_USER_NAME_HEADER, "")
+            try:
+                from .config import DB_PATH
+                await run_isolated_write(
+                    DB_PATH, lambda c: record_seen_user(c, uid, _uname))
+            except Exception:
+                pass
+
+    # Central mutation gate: reject any state-changing request the role isn't
+    # allowed to make (viewer: none; operator: valve open/close only; admin: all).
+    # Single chokepoint — no mutating route can be missed. Runs BEFORE CSRF so a
+    # denied role gets a clean 403 without the form body-replay dance.
+    if not (_is_health_path(path) or _is_static_path(path)) and \
+            not is_mutation_allowed(role, request.method, path):
+        log.warning("RBAC denied role=%s on %s %s", role, request.method, path)
+        resp = JSONResponse(
+            {"status": "error", "error": "forbidden",
+             "message": "You don't have permission to do that."},
+            status_code=403,
+        )
+        if new_session:
+            _set_session_cookie(resp, request, session_id)
+        return resp
 
     # ----- CSRF validation -------------------------------------------
     # Only state-changing methods need a token. Exempt:
@@ -480,6 +557,7 @@ app.include_router(settings.router)
 app.include_router(backup.router)
 app.include_router(training.router)
 app.include_router(calibration.router)
+app.include_router(access.router)
 
 
 @app.get("/health")

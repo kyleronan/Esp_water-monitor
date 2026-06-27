@@ -68,6 +68,7 @@
     awaiting activation
   </span>
   {% endif %}
+  {% if is_admin %}
   <form method="post"
         action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/reclassify"
         style="display:inline;margin-left:10px"
@@ -82,6 +83,7 @@
     <input type="hidden" name="_csrf" value="{{ csrf_token }}">
     <button type="submit" class="btn btn-ghost btn-sm">⟳ Fix volume totals</button>
   </form>
+  {% endif %}
 </h2>
 
 {% if circ.training_state == 'labelling' %}
@@ -90,6 +92,7 @@
       <strong>Training complete.</strong> Activate this circuit to start
       anomaly detection.
     </p>
+    {% if is_admin %}
     <form method="post"
           action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/activate"
           style="display:inline">
@@ -98,6 +101,7 @@
         Activate fixtures →
       </button>
     </form>
+    {% endif %}
     <span class="muted" style="font-size:11px;margin-left:10px">
       Auto-activates after 7 days.
     </span>
@@ -163,6 +167,7 @@
   <p class="fx-cat-empty-note muted">No water use recorded here yet — this fills in once
     the app sees it. If you don't have this fixture, you can ignore the card.</p>
   {% endif %}
+  {% if is_admin %}
   <form method="post" class="fx-cat-publish"
         action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/category/{{ cat.type }}/publish">
     <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -174,6 +179,7 @@
     </label>
     <span class="fx-cat-publish-label">Publish to Home Assistant</span>
   </form>
+  {% endif %}
 </div>
 {% endfor %}
 </div>

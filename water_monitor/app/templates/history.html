@@ -499,6 +499,10 @@
         <dt>Reading we ignored</dt> <dd id="emd-ph-rawvol">—</dd>
       </dl>
     </section>
+    {# Editing controls — kept in the DOM (the modal JS requires these elements,
+       and bails out entirely if they're missing) but hidden for non-admins. The
+       server also blocks the underlying PATCH/POST via the central mutation gate. #}
+    <div id="emd-edit-region"{% if not is_admin %} hidden{% endif %}>
     <hr class="evt-modal-hr">
     <div class="evt-modal-section">
       <label class="evt-modal-label" for="emd-fixture-select">Assign fixture type</label>
@@ -563,6 +567,7 @@
       <button id="emd-ignore-btn" class="btn btn-secondary btn-sm">Ignore event</button>
       <button id="emd-save-btn"   class="btn btn-primary btn-sm">Save</button>
     </div>
+    </div>{# #emd-edit-region #}
   </div>
 </div>
 

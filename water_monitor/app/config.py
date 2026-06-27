@@ -122,6 +122,12 @@ class AddonConfig:
     # event so the propagation scan can be replayed offline. Off by default.
     debug_capture_propagation: bool = False
 
+    # RBAC escape hatch (optional). A HA user id that is ALWAYS treated as an
+    # add-on admin, even if config/auth/list is unreachable / returns no admins.
+    # Prevents an admin lockout when the supervisor token can't read the user
+    # list. Empty by default — admins normally come from HA admin status.
+    bootstrap_admin_user_id: str = ""
+
     def get_circuit(self, name: str) -> Optional[CircuitConfig]:
         return next((c for c in self.circuits if c.circuit == name), None)
 
@@ -148,11 +154,18 @@ def load_config() -> AddonConfig:
             CircuitConfig(circuit="circuit_2", circuit_type="zone"),
         ]
 
+    # RBAC bootstrap admin — env override wins (local/dev), else the add-on option.
+    bootstrap_admin = (
+        os.environ.get("WM_BOOTSTRAP_ADMIN", "").strip()
+        or str(raw.get("bootstrap_admin_user_id", "") or "").strip()
+    )
+
     return AddonConfig(
         log_level=raw.get("log_level", "info"),
         esp_device_name=raw.get("esp_device_name", ""),
         circuits=circuits,
         debug_capture_propagation=bool(raw.get("debug_capture_propagation", False)),
+        bootstrap_admin_user_id=bootstrap_admin,
     )
 
 
