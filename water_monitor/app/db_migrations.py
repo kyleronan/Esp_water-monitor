@@ -108,7 +108,7 @@ _BASELINE_VERSION: int = 20260523
 #              home_profile.auto_split_enabled = 1 (the background over-merged/inflated
 #              event re-import, now safe to run by default: reprocess is atomic +
 #              dry-run-gated). Value backfill only; no DDL (column exists since 20260545).
-_CURRENT_VERSION: int = 20260549
+_CURRENT_VERSION: int = 20260550
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -927,6 +927,50 @@ def _apply_auto_split_default(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260549: auto-hygiene enabled by default")
 
 
+def _apply_cross_talk_audit_table(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260550 — irrigation zone-switch cross-talk.
+
+    Creates ``cross_talk_audit`` — the evidence trail the importer's reconciliation
+    pass (``historical_importer._reconcile_irrigation_cross_talk``) writes BEFORE it
+    zeroes a main event it has identified as irrigation zone-switch cross-talk. One
+    row per action records the pre-zero volume + the pressure-swing evidence so a
+    false positive is auditable and reversible. DDL is ``CREATE TABLE IF NOT EXISTS``
+    so it is idempotent and a no-op on a fresh DB (``_create_schema`` already made it).
+
+    Also flips ``home_profile.hide_cross_talk_events`` on by default (value backfill,
+    one-time): the user opted into hiding zone-switch cross-talk from History, and the
+    same toggle already governs the long-no-flow cross-talk category. Guarded so it
+    only flips an unset (0) value.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cross_talk_audit (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id        TEXT NOT NULL,
+            circuit         TEXT NOT NULL,
+            reconciled_at   TEXT NOT NULL,
+            interval_start  TEXT,
+            interval_end    TEXT,
+            main_delta_psi  REAL,
+            other_delta_psi REAL,
+            ratio           REAL,
+            volume_litres   REAL,
+            action          TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cross_talk_audit_event "
+        "ON cross_talk_audit(event_id)")
+    has_profile = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='home_profile'"
+    ).fetchone()
+    if has_profile and _has_column(conn, "home_profile", "hide_cross_talk_events"):
+        conn.execute(
+            "UPDATE home_profile SET hide_cross_talk_events = 1 "
+            "WHERE COALESCE(hide_cross_talk_events, 0) = 0")
+    conn.commit()
+    log.info("Migration 20260550: cross_talk_audit table ready + cross-talk hidden")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -1271,6 +1315,14 @@ def _missing_embedded_fixtures_columns(conn: sqlite3.Connection) -> set[str]:
     return set()
 
 
+def _missing_cross_talk_audit_table(conn: sqlite3.Connection) -> set[str]:
+    """Return the 20260550 cross_talk_audit table if absent."""
+    present = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cross_talk_audit'"
+    ).fetchone()
+    return set() if present else {"cross_talk_audit"}
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -1384,6 +1436,7 @@ def _run_migrations_impl(
             | _missing_ppl_columns(conn)
             | _missing_rbac_tables(conn)
             | _missing_embedded_fixtures_columns(conn)
+            | _missing_cross_talk_audit_table(conn)
         )
         if missing:
             raise RuntimeError(
@@ -1394,9 +1447,17 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260549:
+        # DB has auto-hygiene defaulted on but lacks the cross_talk_audit table.
+        _apply_cross_talk_audit_table(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260549 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260548:
         # DB has embedded_fixtures_json but auto-hygiene not yet defaulted on.
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260548 → %d", _CURRENT_VERSION)
         return
@@ -1405,6 +1466,7 @@ def _run_migrations_impl(
         # DB has the RBAC tables but lacks the embedded_fixtures_json column.
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260547 → %d", _CURRENT_VERSION)
         return
@@ -1414,6 +1476,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260546 → %d", _CURRENT_VERSION)
         return
@@ -1424,6 +1487,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260545 → %d", _CURRENT_VERSION)
         return
@@ -1435,6 +1499,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260544 → %d", _CURRENT_VERSION)
         return
@@ -1448,6 +1513,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260543 → %d", _CURRENT_VERSION)
         return
@@ -1461,6 +1527,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260542 → %d", _CURRENT_VERSION)
         return
@@ -1476,6 +1543,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260541 → %d", _CURRENT_VERSION)
         return
@@ -1491,6 +1559,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260540 → %d", _CURRENT_VERSION)
         return
@@ -1507,6 +1576,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260539 → %d", _CURRENT_VERSION)
         return
@@ -1524,6 +1594,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260538 → %d", _CURRENT_VERSION)
         return
@@ -1542,6 +1613,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260537 → %d", _CURRENT_VERSION)
         return
@@ -1561,6 +1633,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260536 → %d", _CURRENT_VERSION)
         return
@@ -1581,6 +1654,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260535 → %d", _CURRENT_VERSION)
         return
@@ -1603,6 +1677,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
         return
@@ -1626,6 +1701,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
         return
@@ -1649,6 +1725,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
@@ -1674,6 +1751,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
@@ -1700,6 +1778,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -1748,6 +1827,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -1778,6 +1858,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -1809,6 +1890,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -1839,6 +1921,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -1868,6 +1951,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -1895,6 +1979,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -1922,6 +2007,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -1985,6 +2071,7 @@ def _run_migrations_impl(
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
         _apply_auto_split_default(conn)
+        _apply_cross_talk_audit_table(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

@@ -916,6 +916,29 @@ CREATE TABLE IF NOT EXISTS import_state (
 );
 
 -- ==========================================================================
+-- IRRIGATION CROSS-TALK AUDIT (migration 20260550)
+-- Evidence trail written by the historical importer's reconciliation pass
+-- BEFORE it zeroes a main event identified as irrigation zone-switch cross-talk
+-- (water hammer from a zone valve switching, not real water). One row per
+-- action so a false positive is auditable + reversible.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS cross_talk_audit (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id        TEXT NOT NULL,
+    circuit         TEXT NOT NULL,
+    reconciled_at   TEXT NOT NULL,   -- ISO timestamp the reconciler acted
+    interval_start  TEXT,            -- irrigation-active interval bounds (UTC ISO)
+    interval_end    TEXT,
+    main_delta_psi  REAL,            -- main-circuit pressure swing over the window
+    other_delta_psi REAL,            -- irrigation-circuit pressure swing
+    ratio           REAL,            -- other_delta / main_delta
+    volume_litres   REAL,            -- pre-zero raw volume
+    action          TEXT NOT NULL    -- 'flagged' | 'reverted'
+);
+CREATE INDEX IF NOT EXISTS idx_cross_talk_audit_event
+    ON cross_talk_audit(event_id);
+
+-- ==========================================================================
 -- DAILY SUMMARY (pre-aggregated from events, calculated nightly)
 -- Kept indefinitely — drives history charts and year-over-year views.
 -- One row per circuit per calendar day.
@@ -2740,6 +2763,123 @@ def clear_event_classification(
         user_classified=0,
         new_dribble=new_dribble,
     )
+
+
+def mark_event_irrigation_cross_talk(
+    conn: sqlite3.Connection,
+    event_id: str,
+    circuit: str,
+    *,
+    reconciled_at: str,
+    interval_start: Optional[str] = None,
+    interval_end: Optional[str] = None,
+    main_delta_psi: Optional[float] = None,
+    other_delta_psi: Optional[float] = None,
+    ratio: Optional[float] = None,
+) -> bool:
+    """Flag a main event as irrigation zone-switch cross-talk (2026-06-28).
+
+    Applied OUT-OF-BAND by the historical importer's reconciliation pass, NOT a
+    user action — so ``user_classified`` stays 0 (this keeps the row out of the
+    long-no-flow cross-talk CALIBRATION positives, which key on user_classified).
+    Durability against a later main-only reprocess comes from the DISTINCT
+    ``match_rejection_reason`` (= feature_extractor._IRRIGATION_XTALK_REASON), which
+    ``_finalize_derived_verdicts`` preserves.
+
+    Writes a ``cross_talk_audit`` row (action='flagged') with the pre-zero volume +
+    pressure-swing evidence BEFORE zeroing, then zeroes effective volume + excludes
+    from training via the §2.5 ledger chokepoint. No-op (returns False) if the event
+    is gone, already user-classified, already cross-talk, or carries a user fixture
+    type — real water always wins.
+    """
+    from .feature_extractor import _IRRIGATION_XTALK_REASON
+
+    row = conn.execute(
+        "SELECT volume_litres, start_ts, user_classified, is_cross_talk, "
+        "       user_fixture_type "
+        "FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if row is None:
+        return False
+    if (row["user_classified"] or row["is_cross_talk"]
+            or str(row["user_fixture_type"] or "").strip()):
+        return False
+
+    raw_volume = float(row["volume_litres"] or 0.0)
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO cross_talk_audit "
+            "  (event_id, circuit, reconciled_at, interval_start, interval_end, "
+            "   main_delta_psi, other_delta_psi, ratio, volume_litres, action) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'flagged')",
+            (event_id, circuit, reconciled_at, interval_start, interval_end,
+             main_delta_psi, other_delta_psi, ratio, raw_volume),
+        )
+        conn.execute(
+            "UPDATE events SET "
+            "  is_cross_talk = 1, is_pressure_restoration_phantom = 0, "
+            "  is_low_flow_dribble = 0, excluded_from_training = 1, "
+            "  volume_litres_effective = 0.0, volume_estimation_method = 'cross_talk', "
+            "  match_rejection_reason = ? "
+            "WHERE id = ? AND circuit = ?",
+            (_IRRIGATION_XTALK_REASON, event_id, circuit),
+        )
+        apply_effective_volume(conn, event_id, circuit, row["start_ts"], 0.0)
+
+    day = (row["start_ts"] or "")[:10]
+    if day:
+        compute_daily_summary(conn, circuit, day)
+        conn.commit()
+    return True
+
+
+def revert_irrigation_cross_talk(
+    conn: sqlite3.Connection, event_id: str, circuit: str,
+) -> bool:
+    """Undo an automatic irrigation cross-talk flag (false-positive recovery).
+
+    Restores the raw volume + clears the verdict, but ONLY for rows the auto pass
+    set (match_rejection_reason = _IRRIGATION_XTALK_REASON, user_classified 0) — a
+    user-classified cross-talk is left untouched. Records an audit row
+    (action='reverted'). Returns False if there is nothing to revert.
+    """
+    from .feature_extractor import _IRRIGATION_XTALK_REASON
+
+    row = conn.execute(
+        "SELECT volume_litres, start_ts, match_rejection_reason, user_classified "
+        "FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if row is None or row["user_classified"]:
+        return False
+    if row["match_rejection_reason"] != _IRRIGATION_XTALK_REASON:
+        return False
+
+    raw_volume = float(row["volume_litres"] or 0.0)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO cross_talk_audit "
+            "  (event_id, circuit, reconciled_at, volume_litres, action) "
+            "VALUES (?, ?, ?, ?, 'reverted')",
+            (event_id, circuit, now_iso, raw_volume),
+        )
+        conn.execute(
+            "UPDATE events SET "
+            "  is_cross_talk = 0, excluded_from_training = 0, "
+            "  volume_litres_effective = ?, volume_estimation_method = 'raw', "
+            "  match_rejection_reason = NULL "
+            "WHERE id = ? AND circuit = ?",
+            (round(raw_volume, 3), event_id, circuit),
+        )
+        apply_effective_volume(conn, event_id, circuit, row["start_ts"], raw_volume)
+
+    day = (row["start_ts"] or "")[:10]
+    if day:
+        compute_daily_summary(conn, circuit, day)
+        conn.commit()
+    return True
 
 
 def get_leak_test_schedule(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:

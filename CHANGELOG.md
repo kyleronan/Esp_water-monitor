@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.3.1-dev5] — 2026-06-28 — irrigation zone-switch cross-talk cleanup
+
+When irrigation runs, every zone-valve switch fires a water-hammer transient through
+the shared supply manifold that briefly spins the **main** flow impeller — logging a
+flurry of tiny `~Tap` / `Other` main events (1–11 s, ≤~0.8 L) that aren't real
+household water. A deep dive on the raw HA history (`water_history.db`) found a clean,
+physically-grounded discriminator and this release acts on it.
+
+- **The discriminator is the pressure-swing ratio `PiΔ / PmΔ`** — the irrigation-circuit
+  pressure swing over the event window ÷ the main-circuit swing. A zone-switch transient
+  originates on the irrigation branch, so its swing **dominates** (ratio ≥ 1.3, typically
+  1.7–3.2); a genuine main draw pulls the **main** branch down (ratio ≤ ~1.1). Validated
+  across **all 12 irrigation days** in the May–Jun 2026 history: it flags the zone-switch
+  bursts and keeps every real draw, including a 123 L/25-min dawn shower and toilets that
+  overlapped irrigation.
+- **Reconciliation lives in the historical importer, not the live detector.** The live
+  per-circuit detector only sees its own circuit's pressure (and `other_valve_open` is
+  NULL on ~92 % of main events here — flaky valve entity). The importer can pull the
+  irrigation pressure sensor from HA history, so a periodic pass (plus a one-time backfill
+  over the recorder-retention window) computes `PiΔ`/`PmΔ` from one history batch and flags
+  qualifying events. Self-healing + idempotent (candidates exclude already-flagged rows).
+- **Safety-first gating.** A flag requires irrigation concurrently flowing **and** a hard,
+  structurally-frozen volume cap (`≤ 1.5 L` — a larger draw is never zeroed, whatever the
+  ratio) **and** a real main swing (`≥ 2.0 PSI`) **and** the ratio ≥ 1.3. The empirical
+  danger band (small volume, real ΔP, ratio 1.0–1.6) holds exactly one event in 12 days.
+- **Durable + calibration-safe.** Flagged events reuse `is_cross_talk` (volume zeroed,
+  excluded from training, hidden from History) but carry a distinct
+  `match_rejection_reason = "irrigation_cross_talk"` so they (a) never pollute the
+  long-no-flow cross-talk calibration, and (b) survive a main-only reprocess —
+  `_finalize_derived_verdicts` preserves the verdict instead of clearing it.
+- **Auditable + reversible.** New `cross_talk_audit` table (migration **20260550**)
+  records the pre-zero volume + pressure-swing evidence for every action before zeroing;
+  `revert_irrigation_cross_talk` restores a false positive. The same migration enables
+  `home_profile.hide_cross_talk_events` so these drop out of History.
+
+No event-table schema change (audit is a new side table). 902 tests pass.
+
 ## [0.3.1-dev4] — 2026-06-28 — self-healing event hygiene (atomic, on by default)
 
 Toward "you should never have to hit Reprocess by hand." The add-on already had a

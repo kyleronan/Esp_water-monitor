@@ -129,7 +129,7 @@ def recompute_volume_and_active_flow(
         "       volume_recorder_litres, "
         "       degraded_supply, is_composite, user_classified, user_ignored, "
         "       is_pressure_restoration_phantom, is_cross_talk, is_low_flow_dribble, "
-        "       excluded_from_training, "
+        "       excluded_from_training, match_rejection_reason, "
         "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
         "FROM events WHERE circuit = ? ORDER BY start_ts",
         (circuit,),
@@ -200,6 +200,10 @@ def recompute_volume_and_active_flow(
                 "flow_integral_litres": new_litres,
                 "flow_on_ratio": af["flow_on_ratio"],
                 "integration_quality": quality,
+                # Carry the provenance so a durable irrigation zone-switch cross-talk
+                # verdict survives a manual full recompute (else _finalize would clear
+                # it — the main-only detector can't reproduce a short event).
+                "match_rejection_reason": r["match_rejection_reason"],
             }
             _finalize_derived_verdicts(feat, _acal)
             eff = feat["volume_litres_effective"]

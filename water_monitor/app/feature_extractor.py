@@ -311,6 +311,43 @@ _DRIBBLE_MAX_DELTA_PSI: float = 1.5
 # is unchanged. Tune with real positive-displacement data.
 _DRIBBLE_RELIABLE_METER_FLOOR_LPM: float = 0.5
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Irrigation zone-switch cross-talk (2026-06-28)
+#
+# A SECOND, distinct cross-talk phenomenon from the long-no-flow rule above. When
+# irrigation is running, every zone-valve switch fires a water-hammer transient
+# through the shared supply manifold that briefly spins the MAIN flow impeller —
+# logging a flurry of tiny ~Tap / Other main events (1–11 s, ≤~0.8 L) that are NOT
+# real household water. The fingerprint that separates these from a genuine main
+# draw that merely overlaps irrigation is the PRESSURE-SWING RATIO: a zone-switch
+# transient originates on the irrigation branch, so the irrigation-circuit pressure
+# swing is LARGER than the main-circuit swing (ratio ≥ 1.3, typically 1.7–3.2),
+# whereas a real main draw pulls the MAIN branch down (ratio ≤ ~1.1, shared ≈ 1.0).
+# Validated across all 12 irrigation days in the May–Jun 2026 raw HA history: the
+# rule flags the zone-switch bursts and keeps every real draw, incl. a 123 L/25-min
+# dawn shower and toilets that overlapped irrigation.
+#
+# This verdict is applied OUT-OF-BAND by the historical importer's reconciliation
+# pass (historical_importer._reconcile_irrigation_cross_talk), NOT the live
+# per-circuit detector — the live detector has only ITS circuit's pressure buffer,
+# while the importer can pull the irrigation pressure sensor from HA history. It
+# reuses the is_cross_talk flag (hide + volume-zeroing + training-exclusion) but
+# carries a DISTINCT match_rejection_reason (_IRRIGATION_XTALK_REASON) so:
+#   • it never pollutes the long-no-flow cross-talk calibration (uc=0 → not a
+#     fit positive), and
+#   • _finalize_derived_verdicts can PRESERVE it across a reprocess (the main-only
+#     _detect_cross_talk can't reproduce a short event), instead of clobbering it.
+#
+# All four thresholds are FROZEN module constants (none are _ac-calibratable). The
+# volume cap is the hard "never make real water invisible" guard — a draw above it
+# is never zeroed regardless of ratio. The ratio is frozen for v1: the verdict is
+# automatic (uc=0) so there are no user-confirmed positives to fit it from.
+_XTALK_IRR_MAX_VOLUME_L:      float = 1.5   # hard safety cap — never zero a larger draw
+_XTALK_IRR_MIN_MAIN_DELTA_PSI: float = 2.0  # need a real main pressure swing to compare
+_XTALK_IRR_PRESSURE_RATIO:    float = 1.3   # irrigation swing ≥ 1.3× main swing
+_XTALK_IRR_MIN_FLOW_LPM:      float = 5.0   # irrigation "running" flow floor (interval build)
+_IRRIGATION_XTALK_REASON: str = "irrigation_cross_talk"
+
 
 # ── Per-home artifact-detector calibration (Phase 2.4) ──────────────────────────
 # A frozen per-home calib (artifact_calibration.py) may override ONLY the cross-talk
@@ -835,6 +872,49 @@ def _detect_cross_talk(duration_s, pressure_delta_psi,
     )
 
 
+def _detect_irrigation_cross_talk(volume_litres, duration_s,
+                                  main_pressure_delta_psi,
+                                  other_pressure_delta_psi,
+                                  irrigation_active) -> bool:
+    """True when a MAIN event is an irrigation zone-switch water-hammer transient,
+    not real water — see the _XTALK_IRR_* constants block for the physics.
+
+    Fingerprint (ALL required):
+      • ``irrigation_active`` — the event window overlaps a run of irrigation flow;
+      • ``volume_litres <= _XTALK_IRR_MAX_VOLUME_L`` — the HARD safety cap: a larger
+        draw is never zeroed, whatever the ratio (protects the dawn shower / toilet
+        that overlap irrigation);
+      • ``main_pressure_delta_psi >= _XTALK_IRR_MIN_MAIN_DELTA_PSI`` — a real swing to
+        measure the ratio against (a near-zero-ΔP blip is a dribble/phantom, handled
+        elsewhere); AND
+      • ``other_pressure_delta_psi >= ratio * main_pressure_delta_psi`` — the
+        irrigation-branch swing dominates, the signature of a manifold transient
+        rather than a main-branch draw.
+
+    ``duration_s`` is accepted for symmetry / future use but the volume cap + ratio
+    are the discriminators. Returns False on any None / non-numeric / non-finite
+    input — conservative, so a parse error never zeroes a real event.
+    """
+    if not irrigation_active:
+        return False
+    if (volume_litres is None or main_pressure_delta_psi is None
+            or other_pressure_delta_psi is None):
+        return False
+    try:
+        vol = float(volume_litres)
+        pmain = float(main_pressure_delta_psi)
+        pother = float(other_pressure_delta_psi)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(vol) and math.isfinite(pmain) and math.isfinite(pother)):
+        return False
+    return (
+        vol <= _XTALK_IRR_MAX_VOLUME_L
+        and pmain >= _XTALK_IRR_MIN_MAIN_DELTA_PSI
+        and pother >= _XTALK_IRR_PRESSURE_RATIO * pmain
+    )
+
+
 def _is_sparse_envelope(duration_s, flow_on_ratio, is_phantom: bool) -> bool:
     """True when a LONG event is almost entirely idle — a brief real draw plus a long
     no-flow tail the pressure-defined boundary never closed (the 37-min envelope around a
@@ -883,6 +963,23 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     """
     if features.get("user_classified"):
         return  # manual classification wins — never auto-override
+
+    # Durable irrigation zone-switch cross-talk (set out-of-band by the importer's
+    # reconciliation pass). The main-only detectors below CANNOT reproduce it (it is
+    # a short event identified via the IRRIGATION circuit's pressure, which this
+    # function never sees), so a recompute would wrongly clear it and restore the
+    # false volume. Preserve it here — unless the user has since given it a real
+    # fixture type, in which case real water wins and the verdict is dropped.
+    if (features.get("match_rejection_reason") == _IRRIGATION_XTALK_REASON
+            and not str(features.get("user_fixture_type") or "").strip()):
+        features["is_cross_talk"] = 1
+        features["volume_litres_effective"] = 0.0
+        features["volume_estimation_method"] = "cross_talk"
+        features["excluded_from_training"] = 1
+        features["match_rejection_reason"] = _IRRIGATION_XTALK_REASON
+        features["is_pressure_restoration_phantom"] = 0
+        features["is_low_flow_dribble"] = 0
+        return
 
     is_degraded  = bool(features.get("degraded_supply"))
     user_ignored = bool(features.get("user_ignored"))

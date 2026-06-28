@@ -66,6 +66,10 @@ from .event_detector import RawEvent, CircuitEventDetector as _CED
 from .database import (
     get_import_state, update_import_state,
     get_last_event_ts, find_overlapping_event,
+    mark_event_irrigation_cross_talk,
+)
+from .feature_extractor import (
+    _detect_irrigation_cross_talk, _XTALK_IRR_MIN_FLOW_LPM, _XTALK_IRR_MAX_VOLUME_L,
 )
 
 log = logging.getLogger(__name__)
@@ -91,6 +95,73 @@ def _clamp_pressure(v: float) -> float:
     if not math.isfinite(v) or v < 0.0 or v > 500.0:
         return 0.0
     return v
+
+
+# ── Irrigation cross-talk reconcile helpers (module-level so they are pure +
+#    unit-testable without an importer instance) ──────────────────────────────
+def _numeric_series(entries, clamp) -> List[Tuple[datetime, float]]:
+    """Parse an HA history list ([{state,last_changed}]) into a sorted, clamped
+    (ts, value) series, dropping unparseable / non-numeric rows."""
+    out: List[Tuple[datetime, float]] = []
+    for e in entries or []:
+        ts = _parse_ts(e.get("last_changed"))
+        if ts is None or not _is_numeric(e.get("state")):
+            continue
+        out.append((ts, clamp(float(e["state"]))))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _merge_active_intervals(
+    series: List[Tuple[datetime, float]],
+    threshold: float,
+    gap_s: float,
+    min_block_s: float,
+) -> List[Tuple[datetime, datetime]]:
+    """Merged [start, end] intervals where ``value > threshold``, bridging gaps
+    shorter than ``gap_s`` and keeping only blocks lasting >= ``min_block_s``."""
+    raw: List[List[datetime]] = []
+    cur: Optional[List[datetime]] = None
+    for ts, val in series:
+        if val > threshold:
+            if cur is None:
+                cur = [ts, ts]
+            else:
+                cur[1] = ts
+        elif cur is not None:
+            raw.append(cur)
+            cur = None
+    if cur is not None:
+        raw.append(cur)
+    merged: List[List[datetime]] = []
+    for s, e in raw:
+        if merged and (s - merged[-1][1]).total_seconds() < gap_s:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged
+            if (e - s).total_seconds() >= min_block_s]
+
+
+def _overlaps_any(s: datetime, e: datetime,
+                  intervals: List[Tuple[datetime, datetime]]) -> bool:
+    return any(s <= ie and e >= is_ for is_, ie in intervals)
+
+
+def _containing_interval(
+    s: datetime, e: datetime, intervals: List[Tuple[datetime, datetime]],
+) -> Optional[Tuple[datetime, datetime]]:
+    for is_, ie in intervals:
+        if s <= ie and e >= is_:
+            return (is_, ie)
+    return None
+
+
+def _pressure_swing(series: List[Tuple[datetime, float]],
+                    t0: datetime, t1: datetime) -> float:
+    """max − min of the values whose timestamp falls in [t0, t1]; 0.0 if none."""
+    vals = [v for ts, v in series if t0 <= ts <= t1]
+    return (max(vals) - min(vals)) if vals else 0.0
 
 
 def _parse_ts(ts_value: Any) -> Optional[datetime]:
@@ -119,6 +190,17 @@ class HistoricalImporter:
     MIN_EVENT_VOLUME_L: float = _CED.MIN_EVENT_VOLUME_L
     PRE_PRESSURE_WINDOW_SECONDS: int = 30   # look-back for baseline pressure
     MIN_PRESSURE_DROP_PSI: float = 0.8      # min drop to flag has_pressure_transient
+
+    # ── Irrigation zone-switch cross-talk reconciliation (2026-06-28) ──────────
+    # Bounded by HA recorder retention: the reconciler needs the IRRIGATION
+    # pressure history to compute the swing ratio, so it can only reach as far back
+    # as MAX_BACKFILL_DAYS (older addon events can't be re-fetched). Self-healing &
+    # idempotent — candidates exclude already-flagged rows, so the rolling overlap
+    # never double-acts and a clobbered verdict re-applies on the next pass.
+    XTALK_RECONCILE_GAP_S: float = 120.0          # merge irrigation flow bursts < this
+    XTALK_RECONCILE_MIN_BLOCK_S: float = 300.0    # a real irrigation run is >= 5 min
+    XTALK_RECONCILE_PRESSURE_PAD_S: float = 2.0   # widen the swing window each side
+    XTALK_RECONCILE_MARGIN_HOURS: float = 6.0     # watermark lag (>= one irrigation block)
 
     # Pressure-dip-as-period-source constants.
     # The state machine below emits a (start, end) period for each contiguous
@@ -183,11 +265,21 @@ class HistoricalImporter:
             log.error("Historical importer startup backfill failed: %s", e,
                       exc_info=True)
 
+        # One-time-ish irrigation cross-talk backfill over the retention window
+        # (separate try so an import failure above doesn't skip it, and vice versa).
+        try:
+            await self._reconcile_cross_talk_backfill()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.error("Irrigation cross-talk backfill failed: %s", e, exc_info=True)
+
         # Periodic catch-up loop
         while self._running:
             try:
                 await asyncio.sleep(self.CHECK_INTERVAL_MINUTES * 60)
                 await self._catch_up()
+                await self._reconcile_cross_talk_catch_up()
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -357,6 +449,152 @@ class HistoricalImporter:
             if n:
                 log.info("[%s] catch-up: imported %d new event(s)",
                          cfg.circuit, n)
+
+    # ------------------------------------------------------------------ #
+    # Irrigation zone-switch cross-talk reconciliation                     #
+    # ------------------------------------------------------------------ #
+
+    def _xtalk_watermark_key(self, main_circuit: str) -> str:
+        """Synthetic import_state key for the per-main-circuit reconcile watermark
+        (kept distinct from the real import checkpoint)."""
+        return f"__xtalk::{main_circuit}"
+
+    def _irrigation_circuit(self) -> Optional[CircuitConfig]:
+        """The zone circuit whose pressure transients alias onto the main meter."""
+        for cfg in self._cfg.circuits:
+            if cfg.is_zone_circuit and self._circuit_has_sensors(cfg):
+                if cfg.pressure_history_sensor or cfg.pressure_avg_sensor:
+                    return cfg
+        return None
+
+    async def _reconcile_cross_talk_backfill(self) -> None:
+        """One-time-ish backfill: reconcile the whole HA-retention window in daily
+        chunks (a full-day 4 Hz pressure pull would overflow the WS frame). Runs only
+        when no watermark exists yet; thereafter the periodic catch-up keeps it fresh.
+        """
+        irr = self._irrigation_circuit()
+        if irr is None:
+            return
+        now = datetime.now(timezone.utc)
+        for cfg in self._cfg.circuits:
+            if cfg.is_zone_circuit or not self._circuit_has_sensors(cfg):
+                continue
+            if not (cfg.pressure_history_sensor or cfg.pressure_avg_sensor):
+                continue
+            state = get_import_state(self._db, self._xtalk_watermark_key(cfg.circuit))
+            if state and state.get("last_check_ts"):
+                continue  # already initialised — catch-up owns it from here
+            start = now - timedelta(days=self.MAX_BACKFILL_DAYS)
+            total = 0
+            window_start = start
+            while window_start < now:
+                window_end = min(window_start + timedelta(days=1), now)
+                total += await self._reconcile_irrigation_cross_talk(
+                    cfg, irr, window_start, window_end)
+                window_start = window_end
+            wm = (now - timedelta(hours=self.XTALK_RECONCILE_MARGIN_HOURS)).isoformat()
+            update_import_state(self._db, self._xtalk_watermark_key(cfg.circuit), wm, total)
+            if total:
+                log.info("[%s] cross-talk backfill: flagged %d zone-switch event(s)",
+                         cfg.circuit, total)
+
+    async def _reconcile_cross_talk_catch_up(self) -> None:
+        """Periodic: re-reconcile a rolling window [watermark − margin, now]. The
+        overlap past the watermark closes the boundary blind spot (events still being
+        written near the trailing edge); idempotent because candidates exclude
+        already-flagged rows."""
+        irr = self._irrigation_circuit()
+        if irr is None:
+            return
+        now = datetime.now(timezone.utc)
+        margin = timedelta(hours=self.XTALK_RECONCILE_MARGIN_HOURS)
+        for cfg in self._cfg.circuits:
+            if cfg.is_zone_circuit or not self._circuit_has_sensors(cfg):
+                continue
+            if not (cfg.pressure_history_sensor or cfg.pressure_avg_sensor):
+                continue
+            key = self._xtalk_watermark_key(cfg.circuit)
+            state = get_import_state(self._db, key)
+            wm = _parse_ts(state.get("last_check_ts")) if state else None
+            start = (wm - margin) if wm else (now - timedelta(hours=2) - margin)
+            n = await self._reconcile_irrigation_cross_talk(cfg, irr, start, now)
+            update_import_state(self._db, key, (now - margin).isoformat(), n)
+            if n:
+                log.info("[%s] cross-talk catch-up: flagged %d zone-switch event(s)",
+                         cfg.circuit, n)
+
+    async def _reconcile_irrigation_cross_talk(
+        self,
+        main_cfg: CircuitConfig,
+        irr_cfg: CircuitConfig,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        """Flag main events in [start, end] that are irrigation zone-switch cross-talk.
+
+        Single coherent activity definition (merged irrigation-flow intervals) is used
+        for BOTH candidate selection and the detector's ``irrigation_active``; PiΔ and
+        PmΔ are computed from ONE history batch over the SAME padded window per event.
+        Returns the count flagged.
+        """
+        main_press_e = main_cfg.pressure_history_sensor or main_cfg.pressure_avg_sensor
+        irr_press_e = irr_cfg.pressure_history_sensor or irr_cfg.pressure_avg_sensor
+        irr_flow_e = irr_cfg.flow_sensor
+        if not (main_press_e and irr_press_e and irr_flow_e):
+            return 0
+        try:
+            hist = await self._ha.get_history_batch(
+                [main_press_e, irr_press_e, irr_flow_e], start, end)
+        except Exception as exc:
+            log.warning("cross-talk reconcile history fetch failed: %s", exc)
+            return 0
+
+        irr_flow = _numeric_series(hist.get(irr_flow_e, []), _clamp_flow)
+        intervals = _merge_active_intervals(
+            irr_flow, _XTALK_IRR_MIN_FLOW_LPM,
+            self.XTALK_RECONCILE_GAP_S, self.XTALK_RECONCILE_MIN_BLOCK_S)
+        if not intervals:
+            return 0
+        main_press = _numeric_series(hist.get(main_press_e, []), _clamp_pressure)
+        irr_press = _numeric_series(hist.get(irr_press_e, []), _clamp_pressure)
+
+        rows = self._db.execute(
+            "SELECT id, start_ts, end_ts, duration_seconds, volume_litres "
+            "FROM events "
+            "WHERE circuit = ? AND COALESCE(is_cross_talk,0) = 0 "
+            "  AND COALESCE(user_classified,0) = 0 "
+            "  AND COALESCE(excluded_from_training,0) = 0 "
+            "  AND COALESCE(volume_litres,0) <= ? "
+            "  AND start_ts >= ? AND start_ts < ?",
+            (main_cfg.circuit, _XTALK_IRR_MAX_VOLUME_L,
+             start.isoformat(), end.isoformat()),
+        ).fetchall()
+
+        pad = timedelta(seconds=self.XTALK_RECONCILE_PRESSURE_PAD_S)
+        flagged = 0
+        for ev in rows:
+            s = _parse_ts(ev["start_ts"])
+            if s is None:
+                continue
+            e = _parse_ts(ev["end_ts"]) or s
+            if not _overlaps_any(s, e, intervals):
+                continue
+            pmd = _pressure_swing(main_press, s - pad, e + pad)
+            pid = _pressure_swing(irr_press, s - pad, e + pad)
+            if not _detect_irrigation_cross_talk(
+                    ev["volume_litres"], ev["duration_seconds"],
+                    pmd, pid, irrigation_active=True):
+                continue
+            iv = _containing_interval(s, e, intervals)
+            if mark_event_irrigation_cross_talk(
+                    self._db, ev["id"], main_cfg.circuit,
+                    reconciled_at=datetime.now(timezone.utc).isoformat(),
+                    interval_start=iv[0].isoformat() if iv else None,
+                    interval_end=iv[1].isoformat() if iv else None,
+                    main_delta_psi=round(pmd, 3), other_delta_psi=round(pid, 3),
+                    ratio=round(pid / pmd, 3) if pmd > 0 else None):
+                flagged += 1
+        return flagged
 
     # ------------------------------------------------------------------ #
     # Core import logic                                                    #
