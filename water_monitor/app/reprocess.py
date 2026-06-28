@@ -159,10 +159,14 @@ async def auto_split_merged_events(
     gap (likely several distinct draws welded into one envelope), confirms each via a
     DRY-RUN reconstruction (``importer.count_candidate_periods`` — the importer's
     15 s-granular period detection, no delete/store), and only then re-imports it split
-    via ``reprocess_window``. Guards: user-labelled / user-classified / user-ignored and
-    softener-brine (``softener_session`` / ``water_softener``) events are never candidates;
-    the dry-run gate (``_SPLIT_MIN_PERIODS..._SPLIT_MAX_PERIODS``) skips single draws and
-    many-pulse chatter; volume stays balanced through ``reprocess_window``'s ledger
+    via ``reprocess_window``. Candidates include inflated ``sparse_envelope`` singles (the
+    "brief use, long idle tail" events — excluded_from_training=1 but exactly what this
+    cleans). Guards: user-labelled / user-classified / user-ignored, ARTIFACT verdicts
+    (phantom / cross-talk / dribble — never reprocessed, they may carry a zeroed volume),
+    anomaly-flagged, and softener-brine (``softener_session`` / ``water_softener``) events
+    are never candidates; the dry-run gate (split ``_SPLIT_MIN_PERIODS..._SPLIT_MAX_PERIODS``
+    or a single-draw SHRINK) skips clean singles and many-pulse chatter; volume stays
+    balanced through ``reprocess_window``'s ledger
     chokepoint. Re-imported sub-draws are single-segment, so they never re-trigger
     (no oscillation — structural, restart-safe). ``checked`` (an in-memory id set the
     caller carries across passes) avoids re-fetching a settled non-split candidate every
@@ -184,7 +188,19 @@ async def auto_split_merged_events(
             "WHERE circuit = ? AND end_ts >= ? AND end_ts <= ? "
             "  AND user_fixture_type IS NULL AND COALESCE(user_classified, 0) = 0 "
             "  AND COALESCE(user_ignored, 0) = 0 "
-            "  AND COALESCE(excluded_from_training, 0) = 0 "
+            # dev.40: the inflated "brief use, long idle tail" events this hygiene was
+            # built to clean are flagged sparse_envelope, which sets
+            # excluded_from_training=1 — so the old `excluded_from_training = 0` filter
+            # screened out the very events it targets. Let sparse_envelope back in, but
+            # keep benching the real ARTIFACT verdicts that excluded_from_training=0 used
+            # to cover — phantom / cross-talk / dribble — via explicit flags, so we never
+            # auto-reprocess a zeroed or artifact event. sparse_envelope keeps its volume,
+            # so this stays volume- and leak-neutral; the dry-run gate still decides.
+            "  AND (COALESCE(excluded_from_training, 0) = 0 "
+            "       OR COALESCE(match_rejection_reason, '') = 'sparse_envelope') "
+            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+            "  AND COALESCE(is_cross_talk, 0) = 0 "
+            "  AND COALESCE(is_low_flow_dribble, 0) = 0 "
             # dev.39 LEAK-SAFETY (adversarial-review fix): never auto-reprocess an event
             # the anomaly detector has FLAGGED. Splitting/shrinking a flagged event could
             # strip its leak signal (a long, unusual-duration event becomes several

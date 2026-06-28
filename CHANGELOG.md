@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.3.1-dev6] — 2026-06-28 — auto-hygiene reaches the inflated events it was built for
+
+dev4 added a SHRINK path to the background hygiene pass to fix "the two-blips-welded-into-
+20-minutes case" — but it never actually reached those events. They are flagged
+`sparse_envelope` ("brief use, long idle tail"), which sets `excluded_from_training=1`, and
+the candidate query screened out **every** excluded event (`excluded_from_training = 0`).
+So the exact inflated singles the shrink logic targets were filtered out before the gate
+ever saw them. This release fixes that.
+
+- **The candidate filter now admits `sparse_envelope` events** while still benching the real
+  artifact verdicts that `excluded_from_training = 0` used to cover. The clause became
+  `(excluded_from_training = 0 OR match_rejection_reason = 'sparse_envelope')` plus explicit
+  `is_pressure_restoration_phantom = 0 AND is_cross_talk = 0 AND is_low_flow_dribble = 0`.
+- **Volume- and leak-neutral.** `sparse_envelope` keeps the event's raw volume (it only
+  excludes from training), so admitting it carries no zeroed volume into reprocess. The three
+  verdicts that *do* zero volume are explicitly re-gated — and an event that reads
+  `sparse_envelope` yet *also* carries one of those flags is still benched.
+- **Every prior guard intact.** User-labelled / classified / ignored, anomaly-`flagged`, and
+  softener-brine events are still never candidates; the dry-run SPLIT/SHRINK gate still
+  decides; reprocess is still exception-atomic (delete + verbatim restore through the volume
+  ledger). A shrunk event becomes a short, mostly-active draw, so it can never re-qualify as
+  `sparse_envelope` → no churn.
+- **Adversarial-reviewed (ship, no holes).** The headline reassurance: running-toilet / trickle
+  leak detection is a **firmware** binary-sensor, independent of the stored-event envelope this
+  pass rewrites — so re-importing a historical event cannot silence a leak alarm. (Deferred,
+  non-leak-safety: a durable HA-history outage mid-reprocess can re-attempt the same event on
+  later passes — log-spam only, no water lost; optionally dampen later with a per-event
+  `last_auto_split_attempt_ts` grace window.)
+
+No schema change. 904 tests pass.
+
 ## [0.3.1-dev5] — 2026-06-28 — irrigation zone-switch cross-talk cleanup
 
 When irrigation runs, every zone-valve switch fires a water-hammer transient through
