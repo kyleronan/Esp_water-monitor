@@ -338,6 +338,7 @@
             data-other-valve="{{ e.other_valve_open if e.other_valve_open is not none else '' }}"
             data-pressure-sig="{{ e.pressure_signature_json or '' }}"
             data-waveform-used="{{ e.esp_waveform_used or 0 }}"
+            data-embedded="{{ e.embedded_label }}"
             data-sig-source="{{ e.signature_source or 'software' }}">
           <td class="hist-td hist-td-mono hist-td-time"><time data-ts="{{ e.start_ts or '' }}">{{ (e.start_ts or '')[:16] }}</time></td>
           <td class="hist-td">{{ fmt_duration(e.duration_seconds) }}</td>
@@ -439,6 +440,8 @@
                           <dd id="emd-pressure-shape"></dd>
       <dt>Cluster</dt>    <dd id="emd-cluster"></dd>
       <dt>Fixture</dt>    <dd id="emd-fixture"></dd>
+      <dt id="emd-embedded-dt" title="Fixtures detected running inside this event — e.g. a toilet flushed during a shower. The event's volume and label are unchanged." hidden>Contains</dt>
+                          <dd id="emd-embedded" hidden></dd>
     </dl>
     <div id="emd-wf-section" class="evt-modal-wf" hidden>
       <div class="evt-modal-wf-hdr">
@@ -947,6 +950,12 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     document.getElementById('emd-cluster').textContent  = d.cluster;
     const fixLabel = d.userLabel || (d.userType ? FX_LABELS[d.userType] || d.userType : null);
     document.getElementById('emd-fixture').textContent  = fixLabel || '—';
+    // Embedded fixtures detected inside this event (e.g. a toilet mid-shower).
+    const embDt = document.getElementById('emd-embedded-dt');
+    const embDd = document.getElementById('emd-embedded');
+    const embText = (d.embedded || '').trim();
+    embDt.hidden = embDd.hidden = !embText;
+    embDd.textContent = embText;
     selFix.value   = d.userType || '';
     ignBtn.textContent = d.excluded === '1' ? 'Restore event' : 'Ignore event';
     // Undo only shown for auto cycle-labeled events (source='cycle').

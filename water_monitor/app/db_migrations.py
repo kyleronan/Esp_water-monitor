@@ -99,7 +99,12 @@ _BASELINE_VERSION: int = 20260523
 #              page fallback pick-list). DDL only — CREATE TABLE IF NOT EXISTS,
 #              idempotent; no backfill (empty allow-list = everyone non-admin is a
 #              viewer until promoted).
-_CURRENT_VERSION: int = 20260547
+#   20260548 — composite labeling: events.embedded_fixtures_json (nullable TEXT —
+#              JSON array of fixtures found superimposed on a sustained event's
+#              waveform by composite_detector; metadata only, never alters volume
+#              or the primary label). DDL only; the annotation backfill runs from
+#              the startup / manual reprocess reclassify path after migration.
+_CURRENT_VERSION: int = 20260548
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -878,6 +883,26 @@ def _apply_rbac_tables(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260547: RBAC tables ready")
 
 
+def _apply_embedded_fixtures_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260548 — composite (embedded-fixture) labeling.
+
+    Adds ``events.embedded_fixtures_json`` (nullable TEXT). The reclassify path
+    populates it with a JSON array of draws found superimposed on a sustained
+    event's stored waveform (a toilet flushed mid-shower). Metadata ONLY — it
+    never alters the parent event's volume or primary label. Idempotent — the
+    column add is guarded by ``_has_column``; no backfill here (the annotation is
+    written by ``recompute_embedded_fixtures`` on the next reclassify pass, which
+    needs the event_waveforms rows the bare DDL step doesn't touch).
+    """
+    if not _has_column(conn, "events", "embedded_fixtures_json"):
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN embedded_fixtures_json TEXT"
+        )
+        log.info("Added events.embedded_fixtures_json (TEXT, NULL)")
+    conn.commit()
+    log.info("Migration 20260548: embedded_fixtures_json column ready")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -1215,6 +1240,13 @@ def _missing_rbac_tables(conn: sqlite3.Connection) -> set[str]:
     return needed - present
 
 
+def _missing_embedded_fixtures_columns(conn: sqlite3.Connection) -> set[str]:
+    """Return the 20260548 embedded_fixtures_json column if absent from events."""
+    if not _has_column(conn, "events", "embedded_fixtures_json"):
+        return {"events.embedded_fixtures_json"}
+    return set()
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -1327,6 +1359,7 @@ def _run_migrations_impl(
             | _missing_dev38_columns(conn)
             | _missing_ppl_columns(conn)
             | _missing_rbac_tables(conn)
+            | _missing_embedded_fixtures_columns(conn)
         )
         if missing:
             raise RuntimeError(
@@ -1337,9 +1370,17 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260547:
+        # DB has the RBAC tables but lacks the embedded_fixtures_json column.
+        _apply_embedded_fixtures_column(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260547 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260546:
         # DB has the per-circuit pulses_per_litre column but lacks the RBAC tables.
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260546 → %d", _CURRENT_VERSION)
         return
@@ -1348,6 +1389,7 @@ def _run_migrations_impl(
         # DB has the dev.38 auto-split flag but lacks the per-circuit pulses_per_litre column.
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260545 → %d", _CURRENT_VERSION)
         return
@@ -1357,6 +1399,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260544 → %d", _CURRENT_VERSION)
         return
@@ -1368,6 +1411,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260543 → %d", _CURRENT_VERSION)
         return
@@ -1379,6 +1423,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260542 → %d", _CURRENT_VERSION)
         return
@@ -1392,6 +1437,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260541 → %d", _CURRENT_VERSION)
         return
@@ -1405,6 +1451,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260540 → %d", _CURRENT_VERSION)
         return
@@ -1419,6 +1466,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260539 → %d", _CURRENT_VERSION)
         return
@@ -1434,6 +1482,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260538 → %d", _CURRENT_VERSION)
         return
@@ -1450,6 +1499,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260537 → %d", _CURRENT_VERSION)
         return
@@ -1467,6 +1517,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260536 → %d", _CURRENT_VERSION)
         return
@@ -1485,6 +1536,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260535 → %d", _CURRENT_VERSION)
         return
@@ -1505,6 +1557,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
         return
@@ -1526,6 +1579,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
         return
@@ -1547,6 +1601,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
@@ -1570,6 +1625,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
@@ -1594,6 +1650,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -1640,6 +1697,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -1668,6 +1726,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -1697,6 +1756,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -1725,6 +1785,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -1752,6 +1813,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -1777,6 +1839,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -1802,6 +1865,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -1863,6 +1927,7 @@ def _run_migrations_impl(
         _apply_dev38_columns(conn)
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
+        _apply_embedded_fixtures_column(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return

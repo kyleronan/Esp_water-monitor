@@ -784,6 +784,12 @@ CREATE TABLE IF NOT EXISTS events (
     -- cycle anchor id; NULL = ungrouped singleton. Stamped by reclassify; SKIPS
     -- user-labelled events (so a relabel pulls a member out of its group).
     cycle_group_id                   TEXT,
+    -- Embedded-fixture annotation (migration 20260548). JSON array of draws
+    -- found superimposed on a sustained event's waveform (a toilet flushed
+    -- mid-shower) by composite_detector. Metadata ONLY — never changes the
+    -- parent's volume or primary label; surfaced in the History modal. NULL =
+    -- not analysed / no usable waveform / nothing embedded.
+    embedded_fixtures_json           TEXT,
     -- Pressure-restoration phantom guard (migration 20260532). When 1, this
     -- event matched the long-duration + near-zero-pressure-drop fingerprint
     -- of a city-pressure-restoration artifact. Its volume_litres_effective is
@@ -3980,6 +3986,13 @@ _SIGNATURE_KNN_ACTIVE_FEATURES: tuple = (
     # centroid signature) to avoid changing that shape. Requires the cycle-pulse
     # backfill to run BEFORE reclassify (orchestrator/fixtures reordered in dev.22).
     "cycle_pulse_count",
+    # dev.39 (step 2): time-of-day as a cyclic (sin, cos) pair so 23:00 and 01:00 sit
+    # adjacent. Separates fixtures that share a flow shape but run at different times
+    # (a daytime tap vs an evening dishwasher fill). The columns already exist and are
+    # populated at feature-extraction time (feature_extractor) and used by the cluster
+    # engine at weight 0.2; dev.39 wires them into the k-NN matcher too. Active set
+    # only — kept out of _SIGNATURE_MATCH_FEATURES so the stored centroid is unchanged.
+    "hour_sin", "hour_cos",
 )
 _SIGNATURE_KNN_ACTIVE_LOG_FEATURES: frozenset = frozenset({
     "true_avg_flow_lpm", "peak_flow_lpm", "active_flow_duration_seconds", "volume_litres",
@@ -3997,6 +4010,12 @@ _SIGNATURE_KNN_ACTIVE_SCALES: dict = {
     # slightly worse) — overall LOO accuracy 0.593→0.638, washing-machine recall
     # 0.23→0.69, dishwasher/toilet held at baseline.
     "cycle_pulse_count":           0.75,
+    # dev.39 (step 2): hour_sin/hour_cos are linear in [-1, 1] (NOT log). Scale 0.35
+    # makes time-of-day a strong tiebreaker without dominating the flow features —
+    # the interior optimum of the confidence-weighted LOO sweep (0.821→0.837 overall,
+    # tap recall 0.46→0.57; 0.1–0.7 all beat baseline, 0.35 the peak).
+    "hour_sin":                    0.35,
+    "hour_cos":                    0.35,
 }
 
 
@@ -4565,7 +4584,8 @@ def match_event_to_signature_knn(
         active = _labelled(
             "SELECT user_fixture_type, true_avg_flow_lpm, peak_flow_lpm, "
             "       active_flow_duration_seconds, volume_litres, pressure_delta_psi, "
-            "       steady_state_fraction, flow_on_ratio, cycle_pulse_count "
+            "       steady_state_fraction, flow_on_ratio, cycle_pulse_count, "
+            "       hour_sin, hour_cos "
             "FROM events "
             "WHERE circuit = ? "
             "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
@@ -4764,6 +4784,29 @@ def reclassify_all_events_from_signatures(
              1 if av.get("is_anomalous") else 0, r["id"]),
         )
     conn.commit()
+    # ── Composite annotation (dev.39, step 1) ────────────────────────────────
+    # Annotate sustained events with fixtures hidden inside them (a toilet flushed
+    # mid-shower), then upgrade events that abstained but clearly contain a second
+    # draw from "(none)" to "other"/composite. Wrapped so a waveform/JSON hiccup
+    # can never undo the classification that already committed above.
+    embedded_annotated = embedded_other = 0
+    try:
+        emb = recompute_embedded_fixtures(conn, circuit, since_ts=since_ts)
+        embedded_annotated = emb["annotated"]
+        for eid in emb.get("toilet_ids", ()):
+            row = conn.execute(
+                "SELECT 1 FROM events WHERE id = ? AND circuit = ? "
+                "AND user_fixture_type IS NULL AND matched_fixture_type IS NULL",
+                (eid, circuit),
+            ).fetchone()
+            if row is not None:
+                set_event_matched_fixture_type(conn, circuit, eid, "other",
+                                               via="composite")
+                embedded_other += 1
+        conn.commit()
+    except Exception:                       # pragma: no cover - defensive
+        log.exception("[%s] embedded-fixture annotation failed (classification "
+                      "already committed)", circuit)
     result = {
         "signatures_trained": signatures_trained,
         "events_scanned": scanned,
@@ -4772,6 +4815,8 @@ def reclassify_all_events_from_signatures(
         "events_softener_matched": softener_matched,
         "events_cleared": cleared,
         "events_abstained": abstained,
+        "events_embedded_annotated": embedded_annotated,
+        "events_composite_other": embedded_other,
     }
     log.info(
         "[%s] reclassify: trained %d signature(s); scanned %d unlabelled "
@@ -4780,6 +4825,74 @@ def reclassify_all_events_from_signatures(
         cleared,
     )
     return result
+
+
+_EMBEDDED_MIN_PARENT_DURATION_S: float = 300.0   # only sustained events can hide a draw
+
+
+def recompute_embedded_fixtures(
+    conn: sqlite3.Connection,
+    circuit: str,
+    since_ts: Optional[str] = None,
+) -> Dict[str, int]:
+    """Annotate sustained events with the fixtures hidden inside them.
+
+    For every sustained event on ``circuit`` that has a usable stored waveform
+    (``event_waveforms.flow_max``), run ``composite_detector.detect_from_envelope``
+    and write the result to ``events.embedded_fixtures_json`` — a JSON array of
+    the draws superimposed on the event's baseline (a toilet flushed mid-shower).
+
+    ANNOTATE-ONLY: this never touches ``volume_litres*`` or
+    ``matched_fixture_type`` — it is pure display/metadata, so it cannot affect
+    leak-safety or volume totals. Events whose waveform is too coarse to resolve
+    a draw get ``embedded_fixtures_json = NULL`` (detector abstains). Idempotent.
+
+    Returns ``{"scanned", "annotated", "with_toilet", "toilet_ids"}`` —
+    ``toilet_ids`` is the list of event ids that gained a toilet-class embedded
+    draw, for the caller's optional ``other`` relabel of abstained events.
+    """
+    from .composite_detector import detect_from_envelope, summarize_embedded
+
+    where = ("WHERE e.circuit = ? AND COALESCE(e.duration_seconds, 0) >= ? "
+             "AND COALESCE(e.user_classified, 0) = 0")
+    params: list = [circuit, _EMBEDDED_MIN_PARENT_DURATION_S]
+    if since_ts is not None:
+        where += " AND e.start_ts >= ?"
+        params.append(since_ts)
+    rows = conn.execute(
+        "SELECT e.id AS id, w.flow_max_json AS flow_max_json, "
+        "       w.duration_seconds AS wf_duration, "
+        "       e.embedded_fixtures_json AS prev "
+        "FROM events e JOIN event_waveforms w ON w.event_id = e.id "
+        + where, params,
+    ).fetchall()
+
+    scanned = annotated = with_toilet = 0
+    toilet_ids: set = set()
+    for r in rows:
+        scanned += 1
+        try:
+            flow_max = json.loads(r["flow_max_json"]) if r["flow_max_json"] else None
+        except (ValueError, TypeError):
+            flow_max = None
+        embedded = detect_from_envelope(flow_max, r["wf_duration"])
+        # abstain (None) or empty → store NULL so the modal shows nothing.
+        new_json = json.dumps(embedded) if embedded else None
+        if new_json != r["prev"]:
+            conn.execute(
+                "UPDATE events SET embedded_fixtures_json = ? WHERE id = ?",
+                (new_json, r["id"]),
+            )
+        if embedded:
+            annotated += 1
+            if summarize_embedded(embedded).get("toilet"):
+                with_toilet += 1
+                toilet_ids.add(r["id"])
+    conn.commit()
+    log.info("[%s] embedded-fixture scan: %d sustained event(s), %d annotated "
+             "(%d with an embedded toilet)", circuit, scanned, annotated, with_toilet)
+    return {"scanned": scanned, "annotated": annotated, "with_toilet": with_toilet,
+            "toilet_ids": sorted(toilet_ids)}
 
 
 def cleanup_composite_flags(conn: sqlite3.Connection) -> Dict[str, int]:

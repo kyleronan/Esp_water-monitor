@@ -88,6 +88,7 @@ def _collect_circuit_history_sync(
     from ..database import (get_recent_events, get_leak_test_history,
                             get_daily_summaries, get_home_profile)
     from ..feature_extractor import classify_flow_shape, classify_magnitude_tier
+    from ..composite_detector import summarize_embedded
     # Read the "hide not-real-use events" display preference once (same for all
     # circuits). One unified toggle hides EVERY volume-zeroing verdict — phantom,
     # cross-talk, and low-flow dribble — so the single "Not real use" label maps to a
@@ -147,6 +148,13 @@ def _collect_circuit_history_sync(
                                if e.get("volume_litres_effective") is not None
                                else e.get("volume_litres")),
             )
+            # Embedded fixtures hidden inside this event (a toilet flushed mid-shower).
+            # Display-only; the parent's volume/label are unchanged.
+            try:
+                _emb = json.loads(e.get("embedded_fixtures_json") or "[]")
+            except (ValueError, TypeError):
+                _emb = []
+            e["embedded_label"] = summarize_embedded(_emb)["label"] if _emb else ""
         leak_tests = get_leak_test_history(db, circuit_cfg.circuit, limit=20)
         summaries  = get_daily_summaries(
             db, circuit_cfg.circuit,

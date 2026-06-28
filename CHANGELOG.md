@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.3.1] — 2026-06-28 — smarter fixture labeling
+
+Acting on the full-record labeling audit: the classifier now recognises fixtures
+hidden *inside* other events and can say "this is more than one thing." Every
+change is gated by a confidence-weighted test harness scored against verified
+ground truth (not the classifier's own past output), so accuracy can't silently
+regress. Volume totals and leak-safety are untouched.
+
+### New Features
+
+- **Embedded-fixture (composite) detection.** A sustained event — a long shower —
+  is now scanned for draws superimposed on its baseline (a toilet flushed
+  mid-shower). The History event modal shows them as **"Contains: toilet ×2
+  (~9 L)"**. Detection runs on the high-resolution waveform the add-on already
+  stores; when the waveform is too coarse to resolve a draw it abstains rather
+  than guess. **Annotate-only** — the parent event's volume and primary label are
+  never changed (verified byte-identical), so this cannot affect water totals or
+  leak detection.
+- **The classifier can now emit `other`.** An event that abstained from every
+  single-fixture rule but clearly contains a second draw is labelled `other`
+  (composite) instead of being left blank — so genuinely multi-fixture events
+  read as such instead of vanishing.
+- **Time-of-day now informs the fixture matcher.** The k-NN signature matcher now
+  considers when an event happened (cyclic hour-of-day), so fixtures that share a
+  flow shape but run at different times — a daytime tap vs an evening dishwasher
+  fill — separate better. Overall labeling accuracy +1 pt, tap recall +6, with no
+  loss elsewhere. (Tested: letting time override the washer/dishwasher *rules* hurt
+  accuracy, so the rules still own appliance grouping — only the residual k-NN gained
+  the time signal.)
+
+### Under the hood
+
+- New `app/composite_detector.py` (pure, unit-tested): rolling-baseline excursion
+  integration over the flow waveform, classing each embedded draw toilet- vs
+  tap-sized.
+- New `events.embedded_fixtures_json` column (schema migration **20260548**);
+  populated by `recompute_embedded_fixtures` on the reclassify path. Metadata only.
+- Time-of-day: `hour_sin`/`hour_cos` (already computed per event and used by the
+  cluster engine) added to `_SIGNATURE_KNN_ACTIVE_FEATURES` at scale 0.35 (interior
+  optimum of the confidence-weighted LOO sweep). No schema change — the columns
+  already exist and are populated at feature extraction.
+- New labeling test harness: `tools/eval_labeling.py` grades labels against a
+  **confidence-weighted** ground-truth set (verified anchors > physics-consistent
+  user labels > propagated/conflicting > over-applied `other`), with metrics for
+  embedded recall, softener-regen recall + dawn-shower false positives, and
+  washer-window recall. `tools/eval_knn_classifier.py` gained `--dump-predictions`
+  to feed it. On the audit backup, embedded-toilet recall rose from 0.68 to 0.84
+  and overall confidence-weighted type accuracy from 0.72 to 0.73 (tap recall
+  +6), with no regression elsewhere.
+
+### Evaluated and deferred (the harness said no)
+
+Two audit follow-ups were prototyped against the same harness and **not shipped** —
+the data didn't justify the risk:
+
+- **Metered softener-regen model.** The existing schedule-anchored detector already
+  catches 3 of 4 validated regens with **zero** false positives. The 4th is masked
+  by a long dawn shower; a cumulative "regen-due" prior can't recover it, because the
+  measured inter-regen soft-water (697 / 1019 / 980 gal) is too inconsistent for any
+  threshold that wouldn't also misfire. Reliable counting of a shower-masked regen
+  needs the softener's own meter signal — left as a known limitation.
+- **Waveform shape in the type k-NN.** Adding an L2/DTW distance over the stored 32-pt
+  flow signature moved leave-one-out accuracy by at most one event (noise): the k-NN
+  residual is a small slice already resolved by the rule/cycle tiers, so shape had
+  nothing to act on. Left off; documented.
+
 ## [0.3.0] — 2026-06-27
 
 Role-based access. The add-on UI is no longer all-or-nothing: non-admin Home
