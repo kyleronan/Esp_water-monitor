@@ -4783,6 +4783,13 @@ def reclassify_all_events_from_signatures(
             (av.get("score"), av.get("anomaly_type"),
              1 if av.get("is_anomalous") else 0, r["id"]),
         )
+        # Release the SQLite write lock periodically so a concurrent user
+        # label-save isn't starved into "database is locked" — reclassify is
+        # storage-only + idempotent, so a batched commit is safe (this is the
+        # "per-row commits release the file write-lock" behaviour run_isolated_write
+        # documents; a single end-of-loop commit held it for the whole scan).
+        if scanned % 300 == 0:
+            conn.commit()
     conn.commit()
     # ── Composite annotation (dev.39, step 1) ────────────────────────────────
     # Annotate sustained events with fixtures hidden inside them (a toilet flushed
@@ -4793,16 +4800,19 @@ def reclassify_all_events_from_signatures(
     try:
         emb = recompute_embedded_fixtures(conn, circuit, since_ts=since_ts)
         embedded_annotated = emb["annotated"]
-        for eid in emb.get("toilet_ids", ()):
-            row = conn.execute(
-                "SELECT 1 FROM events WHERE id = ? AND circuit = ? "
-                "AND user_fixture_type IS NULL AND matched_fixture_type IS NULL",
-                (eid, circuit),
-            ).fetchone()
-            if row is not None:
-                set_event_matched_fixture_type(conn, circuit, eid, "other",
-                                               via="composite")
-                embedded_other += 1
+        # Re-promote abstained events that hide a real second draw to "other"/
+        # composite, reading the STORED annotation (a cheap LIKE) so this re-applies
+        # every run — the main loop above just cleared these to NULL, and the
+        # embedded scan is incremental (won't re-report an already-annotated event).
+        relabel = ("UPDATE events SET matched_fixture_type = 'other', "
+                   "matched_via = 'composite' WHERE circuit = ? "
+                   "AND user_fixture_type IS NULL AND matched_fixture_type IS NULL "
+                   "AND embedded_fixtures_json LIKE '%\"toilet\"%'")
+        rparams: list = [circuit]
+        if since_ts is not None:
+            relabel += " AND start_ts >= ?"
+            rparams.append(since_ts)
+        embedded_other = conn.execute(relabel, rparams).rowcount
         conn.commit()
     except Exception:                       # pragma: no cover - defensive
         log.exception("[%s] embedded-fixture annotation failed (classification "
@@ -4844,31 +4854,37 @@ def recompute_embedded_fixtures(
 
     ANNOTATE-ONLY: this never touches ``volume_litres*`` or
     ``matched_fixture_type`` — it is pure display/metadata, so it cannot affect
-    leak-safety or volume totals. Events whose waveform is too coarse to resolve
-    a draw get ``embedded_fixtures_json = NULL`` (detector abstains). Idempotent.
+    leak-safety or volume totals.
 
-    Returns ``{"scanned", "annotated", "with_toilet", "toilet_ids"}`` —
-    ``toilet_ids`` is the list of event ids that gained a toilet-class embedded
-    draw, for the caller's optional ``other`` relabel of abstained events.
+    INCREMENTAL: only sustained events whose ``embedded_fixtures_json`` is still
+    NULL are scanned, and every scanned event is then stamped — ``'[]'`` when its
+    waveform yields nothing or is too coarse to resolve a draw, the JSON array when
+    it does. So after the first full backfill this is a near-no-op (it does NOT
+    re-decompose the whole history on every label-triggered reclassify, which would
+    hold the write lock long enough to starve a concurrent user save). Idempotent.
+    (Edge case: an event scanned while its waveform was coarse won't be re-scanned
+    if a finer waveform arrives later — acceptable; the waveform is effectively
+    final by the time reclassify runs.)
+
+    Returns ``{"scanned", "annotated", "with_toilet"}``.
     """
     from .composite_detector import detect_from_envelope, summarize_embedded
 
     where = ("WHERE e.circuit = ? AND COALESCE(e.duration_seconds, 0) >= ? "
-             "AND COALESCE(e.user_classified, 0) = 0")
+             "AND COALESCE(e.user_classified, 0) = 0 "
+             "AND e.embedded_fixtures_json IS NULL")
     params: list = [circuit, _EMBEDDED_MIN_PARENT_DURATION_S]
     if since_ts is not None:
         where += " AND e.start_ts >= ?"
         params.append(since_ts)
     rows = conn.execute(
         "SELECT e.id AS id, w.flow_max_json AS flow_max_json, "
-        "       w.duration_seconds AS wf_duration, "
-        "       e.embedded_fixtures_json AS prev "
+        "       w.duration_seconds AS wf_duration "
         "FROM events e JOIN event_waveforms w ON w.event_id = e.id "
         + where, params,
     ).fetchall()
 
     scanned = annotated = with_toilet = 0
-    toilet_ids: set = set()
     for r in rows:
         scanned += 1
         try:
@@ -4876,23 +4892,23 @@ def recompute_embedded_fixtures(
         except (ValueError, TypeError):
             flow_max = None
         embedded = detect_from_envelope(flow_max, r["wf_duration"])
-        # abstain (None) or empty → store NULL so the modal shows nothing.
-        new_json = json.dumps(embedded) if embedded else None
-        if new_json != r["prev"]:
-            conn.execute(
-                "UPDATE events SET embedded_fixtures_json = ? WHERE id = ?",
-                (new_json, r["id"]),
-            )
+        # Stamp every scanned event so it isn't re-scanned next pass: '[]' when
+        # nothing embedded (or the waveform was too coarse), the JSON otherwise.
+        conn.execute(
+            "UPDATE events SET embedded_fixtures_json = ? WHERE id = ?",
+            (json.dumps(embedded) if embedded else "[]", r["id"]),
+        )
         if embedded:
             annotated += 1
             if summarize_embedded(embedded).get("toilet"):
                 with_toilet += 1
-                toilet_ids.add(r["id"])
+        if scanned % 300 == 0:
+            conn.commit()                 # release the write lock periodically
     conn.commit()
-    log.info("[%s] embedded-fixture scan: %d sustained event(s), %d annotated "
-             "(%d with an embedded toilet)", circuit, scanned, annotated, with_toilet)
-    return {"scanned": scanned, "annotated": annotated, "with_toilet": with_toilet,
-            "toilet_ids": sorted(toilet_ids)}
+    if scanned:
+        log.info("[%s] embedded-fixture scan: %d new sustained event(s), %d annotated "
+                 "(%d with an embedded toilet)", circuit, scanned, annotated, with_toilet)
+    return {"scanned": scanned, "annotated": annotated, "with_toilet": with_toilet}
 
 
 def cleanup_composite_flags(conn: sqlite3.Connection) -> Dict[str, int]:

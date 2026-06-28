@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.3.1] — 2026-06-28 — smarter fixture labeling
+## [0.3.1-dev1] — 2026-06-28 — smarter fixture labeling
 
 Acting on the full-record labeling audit: the classifier now recognises fixtures
 hidden *inside* other events and can say "this is more than one thing." Every
@@ -37,6 +37,10 @@ regress. Volume totals and leak-safety are untouched.
   tap-sized.
 - New `events.embedded_fixtures_json` column (schema migration **20260548**);
   populated by `recompute_embedded_fixtures` on the reclassify path. Metadata only.
+  The scan is **incremental** (only un-annotated events) and the reclassify loop now
+  **commits in batches**, so a label-save no longer waits on a full-history rescan and
+  hits "database is locked" — the long single transaction was the lock that starved
+  concurrent user writes.
 - Time-of-day: `hour_sin`/`hour_cos` (already computed per event and used by the
   cluster engine) added to `_SIGNATURE_KNN_ACTIVE_FEATURES` at scale 0.35 (interior
   optimum of the confidence-weighted LOO sweep). No schema change — the columns
