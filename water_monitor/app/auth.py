@@ -31,10 +31,20 @@ from __future__ import annotations
 
 import os
 import re
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
-if TYPE_CHECKING:  # import only for type hints — keeps this module importable
-    from fastapi import Request  # (and unit-testable) without FastAPI installed.
+try:
+    # Runtime import (NOT TYPE_CHECKING-only): FastAPI resolves the
+    # `request: Request` annotation on require_admin/require_operator via
+    # get_type_hints at request time. With `from __future__ import annotations`
+    # the hint is a string, so `Request` MUST exist in this module's runtime
+    # globals — otherwise FastAPI can't recognise it as the request object and
+    # mis-reads `request` as a required query param (HTTP 422 "Field required").
+    # The except keeps the module importable (and the pure role functions
+    # unit-testable) in environments without FastAPI, where the deps are unused.
+    from fastapi import Request
+except ImportError:  # pragma: no cover
+    Request = None  # type: ignore
 
 # Role names (also used as the WM_DEV_ROLE values and template strings).
 ADMIN = "admin"
@@ -75,7 +85,7 @@ def resolve_role(user_id: str,
     return VIEWER
 
 
-def role_for_request(request: "Request",
+def role_for_request(request: Request,
                      admin_ids: Iterable[str],
                      operator_ids: Iterable[str]) -> str:
     """Resolve the role for an incoming request.
@@ -126,14 +136,14 @@ def admin_ids_from_users(users: Iterable[dict]) -> set:
 # HTTPException is imported lazily so this module stays importable (and the pure
 # role functions stay unit-testable) in environments without FastAPI installed.
 
-def require_admin(request: "Request") -> None:
+def require_admin(request: Request) -> None:
     """Dependency: 403 unless the request's resolved role is admin."""
     if getattr(request.state, "role", VIEWER) != ADMIN:
         from fastapi import HTTPException
         raise HTTPException(status_code=403, detail="Admin access required.")
 
 
-def require_operator(request: "Request") -> None:
+def require_operator(request: Request) -> None:
     """Dependency: 403 unless the request's role can control the valve
     (operator or admin)."""
     if getattr(request.state, "role", VIEWER) not in (ADMIN, OPERATOR):
