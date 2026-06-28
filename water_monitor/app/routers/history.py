@@ -28,12 +28,22 @@ async def _bg_reclassify(circuit: str) -> None:
     Runs on a private connection under the write lock (dev.8 run_isolated_write),
     so it never races live writes. §2.4 — tracked as a job so a FAILURE is surfaced
     to the UI (success is silent; the label change already gave instant feedback).
-    The user's own label + any cycle-mates are applied synchronously before this."""
-    from ..database import (reclassify_all_events_from_signatures,
+    The user's own label + any cycle-mates are applied synchronously before this.
+
+    Skipped once the baseline is LOCKED (training/labelling window closed, no active
+    recalibration): the classifier is fit-once-at-activation then hard-locked, so a
+    relabel after the window must not re-walk history — it spreads only to the event's
+    own cycle-mates (already applied synchronously). The full reclassify runs during the
+    training window, at startup, and on explicit recalibration — not on a stray label."""
+    from ..database import (reclassify_all_events_from_signatures, is_baseline_locked,
                             run_isolated_write, start_job, finish_job)
     from ..config import DB_PATH
 
     def _work(c):
+        if is_baseline_locked(c, circuit):
+            log.info("[%s] label-triggered reclassify skipped — baseline locked "
+                     "(training window closed); relabel stays local", circuit)
+            return
         job = start_job(c, "reclassify", circuit, "Reclassifying events…")
         try:
             reclassify_all_events_from_signatures(c, circuit)
@@ -46,6 +56,35 @@ async def _bg_reclassify(circuit: str) -> None:
         await run_isolated_write(DB_PATH, _work)
     except Exception as e:
         log.warning("[%s] background reclassify failed: %s", circuit, e)
+
+
+# Debounce state: coalesce a burst of label saves into ONE reclassify after a
+# quiet period. Without this, each save fired a full ~10s background reclassify;
+# rapid labelling stacked them and held the write lock continuously, so the next
+# save's own write timed out ("database is locked"). A monotonic generation per
+# circuit means only the LAST save in a burst actually runs the reclassify — and
+# we never cancel an already-running one (idempotent, but cancellation mid-write
+# is messy), we just let superseded delays no-op.
+_RECLASSIFY_DEBOUNCE_S: float = 8.0
+_reclassify_gen: dict = {}
+
+
+def _schedule_reclassify(circuit: str) -> None:
+    """Schedule a debounced background reclassify for ``circuit`` (see above)."""
+    import asyncio
+    gen = _reclassify_gen.get(circuit, 0) + 1
+    _reclassify_gen[circuit] = gen
+
+    async def _delayed() -> None:
+        try:
+            await asyncio.sleep(_RECLASSIFY_DEBOUNCE_S)
+        except asyncio.CancelledError:
+            return
+        if _reclassify_gen.get(circuit) != gen:
+            return                      # a newer save superseded this one
+        await _bg_reclassify(circuit)
+
+    asyncio.create_task(_delayed())
 
 
 @router.get("", response_class=HTMLResponse)
@@ -477,10 +516,10 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
 
             # Re-run the label-trained k-NN over unlabelled events so the new label
             # spreads + stale matched_fixture_type clears. Offloaded to the background
-            # so the POST returns immediately (the user's own label + cycle-mates are
-            # already applied synchronously above).
-            import asyncio
-            asyncio.create_task(_bg_reclassify(circuit))
+            # AND debounced (the user's own label + cycle-mates are already applied
+            # synchronously above) so a burst of labels doesn't stack reclassifies and
+            # starve the next save's write lock.
+            _schedule_reclassify(circuit)
         except Exception as e:
             # Propagation is best-effort. A failure here must not block
             # the label save the user already saw succeed.
@@ -544,8 +583,7 @@ async def undo_auto_cycle_api(circuit: str, request: Request):
         ).fetchall()]
     cleared = clear_auto_labels(db, circuit, event_ids=ids) if ids else 0
     if cleared:
-        import asyncio
-        asyncio.create_task(_bg_reclassify(circuit))
+        _schedule_reclassify(circuit)
     return JSONResponse({"ok": True, "cleared": cleared})
 
 

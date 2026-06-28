@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional, Set, Tuple
 
 from .config import DB_PATH
 from .database import (delete_events_in_range, get_home_profile, get_write_lock,
-                       run_isolated_write)
+                       restore_deleted_events, run_isolated_write)
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +84,14 @@ async def reprocess_window(
     ``{"busy": True}`` when another admin write is already running. Deliberately
     does NOT call ``update_import_state`` — re-importing a past range must never
     move the catch-up checkpoint backward.
+
+    Atomicity: EXCEPTION-atomic. A re-import failure (incl. an HA history-fetch error,
+    surfaced by ``import_range(strict=True)``) restores the deleted events verbatim, so
+    no water is lost. It is NOT crash-atomic: a hard process kill in the (sub-second)
+    window between the committed delete and the re-import would leave the events deleted
+    (volume under-counted) with no restore. Full crash recovery (a durable pending-
+    reprocess journal replayed at startup) is deliberate future work — the window is
+    tiny and the auto-hygiene only targets low-value garbled events.
     """
     importer = getattr(orch, "historical_importer", None)
     if importer is None:
@@ -94,14 +102,28 @@ async def reprocess_window(
 
     from_iso, to_iso = from_dt.isoformat(), to_dt.isoformat()
     # 1) Delete the window's machine events under the write lock (sync, isolated).
+    #    capture=True snapshots the deleted rows so step 2 can restore them if the
+    #    re-import fails — making delete-then-import atomic (no lost water).
     res = await run_isolated_write(
-        DB_PATH, lambda c: delete_events_in_range(c, circuit, from_iso, to_iso))
+        DB_PATH,
+        lambda c: delete_events_in_range(c, circuit, from_iso, to_iso, capture=True))
     # 2) Widen the import to the true deleted span, then reconstruct from HA. The
     #    reconstructed events queue onto the live pipeline; the FeatureExtractor
-    #    worker stores + classifies them.
+    #    worker stores + classifies them. strict=True so a history-fetch failure
+    #    RAISES (instead of silently returning 0) — we then restore the deleted
+    #    events so the reprocess is all-or-nothing.
     imp_from, imp_to, widened = compute_widened_window(
         from_dt, to_dt, res["span_start"], res["span_end"])
-    imported = await importer.import_range(circuit, imp_from, imp_to)
+    try:
+        imported = await importer.import_range(circuit, imp_from, imp_to, strict=True)
+    except Exception:
+        deleted_rows = res.get("deleted_rows") or []
+        if deleted_rows:
+            restored = await run_isolated_write(
+                DB_PATH, lambda c: restore_deleted_events(c, deleted_rows))
+            log.error("[%s] reprocess re-import FAILED after delete — restored %d "
+                      "event(s); no data lost", circuit, restored)
+        raise
     log.info(
         "[%s] reprocess %s..%s (widened=%s → %s..%s): deleted %d, re-imported %d",
         circuit, from_iso, to_iso, widened,
@@ -163,7 +185,17 @@ async def auto_split_merged_events(
             "  AND user_fixture_type IS NULL AND COALESCE(user_classified, 0) = 0 "
             "  AND COALESCE(user_ignored, 0) = 0 "
             "  AND COALESCE(excluded_from_training, 0) = 0 "
-            "  AND COALESCE(active_flow_segment_count, 0) >= 2 "
+            # dev.39 LEAK-SAFETY (adversarial-review fix): never auto-reprocess an event
+            # the anomaly detector has FLAGGED. Splitting/shrinking a flagged event could
+            # strip its leak signal (a long, unusual-duration event becomes several
+            # individually-normal fragments). A flagged event is left exactly as-is; only
+            # unremarkable, un-flagged garbled events are auto-cleaned.
+            "  AND COALESCE(flagged, 0) = 0 "
+            # dev.39: >=1 (was >=2) so an INFLATED single event — one short draw a
+            # spurious pressure-dip envelope stretched across a long idle (the 20-min /
+            # 0.3 L-blips bug) — is a candidate too, not just multi-draw merges. The
+            # big idle gap below is the real selector; the dry-run gate decides.
+            "  AND COALESCE(active_flow_segment_count, 0) >= 1 "
             "  AND (duration_seconds - COALESCE(active_flow_duration_seconds, 0)) >= ? "
             "  AND COALESCE(matched_via, '') <> 'softener_session' "
             "  AND COALESCE(matched_fixture_type, '') <> 'water_softener' "
@@ -184,9 +216,21 @@ async def auto_split_merged_events(
         scanned += 1
         s_dt = _parse_utc(r["start_ts"])
         e_dt = _parse_utc(r["end_ts"] or r["start_ts"])
-        # Dry-run: how many distinct draws does the importer reconstruct here?
+        # Dry-run: what does the importer reconstruct here (with the dev.39 gate)?
         periods = await importer.count_candidate_periods(circuit, s_dt, e_dt)
-        if not (_SPLIT_MIN_PERIODS <= len(periods) <= _SPLIT_MAX_PERIODS):
+        stored_dur = (e_dt - s_dt).total_seconds()
+        biggest = max(((pe - ps).total_seconds() for ps, pe in periods), default=0.0)
+        # Reprocess when the re-import would meaningfully DE-BLOAT this event:
+        #   • SPLIT  — 2..K reconstructed draws (the original merged case), OR
+        #   • SHRINK — exactly 1 reconstructed draw that is >= _SPLIT_MIN_IDLE_S shorter
+        #     than the stored span (an inflated single event — e.g. two blips a spurious
+        #     pressure-dip welded into one long event — collapses to its real use).
+        # > K draws is chatter (skip). A clean event reconstructs to ~itself (1 draw,
+        # biggest ≈ stored) → skipped, no churn. Volume is preserved by reprocess_window's
+        # atomic re-import either way.
+        is_split = _SPLIT_MIN_PERIODS <= len(periods) <= _SPLIT_MAX_PERIODS
+        is_shrink = (len(periods) == 1 and biggest <= stored_dur - _SPLIT_MIN_IDLE_S)
+        if not (is_split or is_shrink):
             skipped += 1
             continue
         res = await reprocess_window(orch, circuit, s_dt, e_dt)

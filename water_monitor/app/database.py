@@ -12,6 +12,7 @@ import logging
 import math
 import re
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -188,10 +189,11 @@ CREATE TABLE IF NOT EXISTS home_profile (
     has_water_softener             INTEGER NOT NULL DEFAULT 0,
     softener_regen_start           TEXT,
     softener_circuit               TEXT,
-    -- Guarded auto-split opt-in (migration 20260545, dev.38). OFF by default — the
-    -- first automated, destructive pass (re-import over-merged events split) is
-    -- opt-in. User-labeled rows are never touched by the split.
-    auto_split_enabled             INTEGER NOT NULL DEFAULT 0,
+    -- Auto-hygiene of over-merged / inflated events (dev.38 + dev.39). DEFAULT 1
+    -- since dev.39: the background pass re-imports such events split/shrunk, and is
+    -- now safe to run by default — the reprocess is ATOMIC (delete is restored if the
+    -- re-import fails) and dry-run-gated. User-labeled rows are never touched.
+    auto_split_enabled             INTEGER NOT NULL DEFAULT 1,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -1357,6 +1359,36 @@ def get_training_state(conn: sqlite3.Connection, circuit: str) -> Optional[sqlit
     ).fetchone()
 
 
+def is_baseline_locked(conn: sqlite3.Connection, circuit: str) -> bool:
+    """True when the circuit's reference baseline is FROZEN — i.e. the training/labelling
+    window has closed and no (re)calibration is in flight: ``training_state.state ==
+    'live'`` AND no active ``learning_config.accelerated_adaptation_until`` window.
+
+    The fixture classifier is fit-once-at-activation then hard-locked (see the
+    locked-baseline design): once locked, a user relabel must NOT re-walk history. So a
+    label change spreads only to the event's own cycle-mates (applied synchronously) —
+    the full label-triggered reclassify is skipped. Mirrors the anomaly-shutoff state
+    gate so the two notions of 'locked' can't drift."""
+    row = conn.execute(
+        "SELECT state FROM training_state WHERE circuit = ?", (circuit,)).fetchone()
+    if not row or row["state"] != "live":
+        return False
+    lc = conn.execute(
+        "SELECT accelerated_adaptation_until FROM learning_config WHERE circuit = ?",
+        (circuit,)).fetchone()
+    until = lc["accelerated_adaptation_until"] if lc else None
+    if until:
+        try:
+            t = datetime.fromisoformat(str(until).replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            if t > datetime.now(timezone.utc):
+                return False   # active (re)calibration / adaptation window
+        except (ValueError, TypeError):
+            pass
+    return True
+
+
 def _upsert_by_circuit(
     conn: sqlite3.Connection, table: str, circuit: str, **kwargs
 ) -> None:
@@ -2131,6 +2163,7 @@ def coalesce_low_flow_events(
 
 def delete_events_in_range(
     conn: sqlite3.Connection, circuit: str, from_ts: str, to_ts: str,
+    capture: bool = False,
 ) -> Dict[str, Any]:
     """Delete the purely-machine-derived events that OVERLAP [from_ts, to_ts] on
     ``circuit`` — reversing each one's hourly_volume contribution and recomputing
@@ -2158,6 +2191,10 @@ def delete_events_in_range(
     Returns ``{"deleted": n, "span_start": <earliest start ISO or None>,
     "span_end": <latest end ISO or None>}`` — the caller uses the true deleted span
     to widen the re-import so an event extending beyond the window is fully rebuilt.
+    When ``capture=True``, also returns ``"deleted_rows"``: the full row dicts of every
+    deleted event, so an atomic caller (reprocess_window) can RESTORE them verbatim if
+    the subsequent re-import fails — guaranteeing a delete-then-failed-import never
+    loses water.
     """
     rows = conn.execute(
         "SELECT id, start_ts, end_ts, hourly_volume_applied_litres, "
@@ -2172,7 +2209,14 @@ def delete_events_in_range(
         (circuit, to_ts, from_ts),
     ).fetchall()
     if not rows:
-        return {"deleted": 0, "span_start": None, "span_end": None}
+        return {"deleted": 0, "span_start": None, "span_end": None,
+                **({"deleted_rows": []} if capture else {})}
+    captured_rows = []
+    if capture:
+        ids = [r["id"] for r in rows]
+        captured_rows = [dict(fr) for fr in conn.execute(
+            "SELECT * FROM events WHERE id IN (%s)" % ",".join("?" * len(ids)), ids
+        ).fetchall()]
     span_start = rows[0]["start_ts"]                       # earliest (ORDER BY ASC)
     span_end = max((r["end_ts"] or r["start_ts"]) for r in rows)
     affected_days = set()
@@ -2203,7 +2247,38 @@ def delete_events_in_range(
                 conn.execute(
                     "DELETE FROM daily_summary WHERE circuit = ? AND day = ?",
                     (circuit, day))
-    return {"deleted": len(rows), "span_start": span_start, "span_end": span_end}
+    return {"deleted": len(rows), "span_start": span_start, "span_end": span_end,
+            **({"deleted_rows": captured_rows} if capture else {})}
+
+
+def restore_deleted_events(
+    conn: sqlite3.Connection, rows: List[Dict[str, Any]],
+) -> int:
+    """Re-insert events captured by ``delete_events_in_range(capture=True)`` and
+    re-apply their hourly-volume contribution — the rollback for an atomic reprocess
+    whose re-import failed AFTER the delete committed. Each row is restored verbatim
+    via the volume-ledger chokepoint so totals end exactly where they began. Returns
+    the count restored. (Cascade-only children — event_waveforms — are display-derived
+    and regenerate; not restored.)"""
+    restored = 0
+    for r in rows:
+        ev = dict(r)
+        eid = ev.get("id")
+        if not eid or not ev.get("start_ts") or not ev.get("circuit"):
+            continue
+        vol = ev.get("volume_litres_effective")
+        if vol is None:
+            vol = ev.get("volume_litres") or 0.0
+        # Clear the applied-bookkeeping the captured row carries: the original
+        # contribution was already reversed out of hourly_volume by the delete, so the
+        # restore must look like a FRESH apply. Leaving the stale (litres, bucket) makes
+        # apply_effective_volume reverse-then-reapply → a net-zero no-op (the volume
+        # would not come back).
+        ev["hourly_volume_applied_litres"] = 0.0
+        ev["hourly_volume_applied_bucket"] = None
+        upsert_event_and_apply_hourly_volume(conn, ev, float(vol))
+        restored += 1
+    return restored
 
 
 def get_daily_volume(conn: sqlite3.Connection, circuit: str,
@@ -4665,9 +4740,10 @@ def reclassify_all_events_from_signatures(
     #    active-flow features so the matcher uses whichever it can (active when
     #    backfilled). An event now excluded_from_training carries no fixture
     #    identity → its matched_fixture_type is cleared (stale-match carry-forward).
-    from .event_rules import (CYCLE_ONLY_FIXTURE_TYPES, detect_softener_sessions,
-                              detect_washer_cycles, get_home_timezone,
-                              parse_hhmm_to_minutes, rule_classify_event)
+    from .event_rules import (CYCLE_ONLY_FIXTURE_TYPES, detect_dishwasher_cycles,
+                              detect_softener_sessions, detect_washer_cycles,
+                              get_home_timezone, parse_hhmm_to_minutes,
+                              rule_classify_event)
     from .rule_calibration import load_rule_calibration
 
     # Frozen per-home rule bands (empty dict → predicates use shipped defaults).
@@ -4702,6 +4778,13 @@ def reclassify_all_events_from_signatures(
             softener_ids = detect_softener_sessions(conn, circuit, band,
                                                     since_ts=detector_since, tz=tz,
                                                     calib=calib)
+    # dev.39 — dishwasher cycles: a chain of gentle small fills the per-event
+    # cycle-pulse rule misses. Exclude ids the washer/softener detectors already
+    # claimed so a brine chain / laundry top-off can't be re-read as a dishwasher.
+    dishwasher_ids = (
+        detect_dishwasher_cycles(conn, circuit, since_ts=detector_since, calib=calib,
+                                 exclude_ids=set(washer_ids) | set(softener_ids))
+        if circuit_type != "zone" else {})
     # Phase 2.3 — re-score each scanned event against the FROZEN baseline (storage
     # only; reclassify NEVER notifies or shuts off). Baseline + sensitivity loaded
     # once for the whole pass; the extra SELECT columns the scorer needs are deduped
@@ -4744,6 +4827,9 @@ def reclassify_all_events_from_signatures(
         elif r["id"] in washer_ids:
             new_type, new_via = "washing_machine", "washer_cycle"
             new_group = washer_ids[r["id"]][1]
+        elif r["id"] in dishwasher_ids:
+            new_type, new_via = "dishwasher", "dishwasher_cycle"
+            new_group = dishwasher_ids[r["id"]][1]
         else:
             feats = {f: r[f] for f in qfeats}
             rule_hit = rule_classify_event(feats, circuit_type, calib=calib)
@@ -4787,9 +4873,13 @@ def reclassify_all_events_from_signatures(
         # label-save isn't starved into "database is locked" — reclassify is
         # storage-only + idempotent, so a batched commit is safe (this is the
         # "per-row commits release the file write-lock" behaviour run_isolated_write
-        # documents; a single end-of-loop commit held it for the whole scan).
+        # documents; a single end-of-loop commit held it for the whole scan). The
+        # brief sleep widens the release window — a bare commit re-acquires within
+        # microseconds, too fast for a waiting writer to win; ~30 ms lets it in.
+        # Runs in a worker thread (executor), so it never blocks the event loop.
         if scanned % 300 == 0:
             conn.commit()
+            time.sleep(0.03)
     conn.commit()
     # ── Composite annotation (dev.39, step 1) ────────────────────────────────
     # Annotate sustained events with fixtures hidden inside them (a toilet flushed
@@ -4904,6 +4994,7 @@ def recompute_embedded_fixtures(
                 with_toilet += 1
         if scanned % 300 == 0:
             conn.commit()                 # release the write lock periodically
+            time.sleep(0.03)              # widen the window so a waiting save wins
     conn.commit()
     if scanned:
         log.info("[%s] embedded-fixture scan: %d new sustained event(s), %d annotated "

@@ -3423,11 +3423,12 @@ class FeatureExtractor:
         cycle_group_id: Optional[str] = None
         washer_members: dict = {}
         softener_members: dict = {}
+        dishwasher_members: dict = {}
         try:
             from .event_rules import (
-                WASHER_FAMILY_PK_ENVELOPE, detect_softener_sessions,
-                detect_washer_cycles, get_home_timezone, parse_hhmm_to_minutes,
-                rule_classify_event,
+                WASHER_FAMILY_PK_ENVELOPE, detect_dishwasher_cycles,
+                detect_softener_sessions, detect_washer_cycles, get_home_timezone,
+                parse_hhmm_to_minutes, rule_classify_event,
             )
             from .database import get_home_profile
             from .rule_calibration import load_rule_calibration
@@ -3460,6 +3461,20 @@ class FeatureExtractor:
                          - timedelta(minutes=50)).isoformat()
                 washer_members = detect_washer_cycles(
                     self._db, circuit, since_ts=since, limit=400, calib=calib)
+            # dev.39 — dishwasher cycle: only worth scanning when THIS event is a
+            # gentle small fill (a cheap, deliberately-loose pre-gate; the detector
+            # then applies the precise calib-aware band AND needs >=3 such fills
+            # chained). Span covers a full cycle (~2.5h lookback).
+            vol = features.get("volume_litres")
+            if (ctype != "zone" and event_id not in softener_members
+                    and event_id not in washer_members
+                    and pk is not None and pk <= 5.0
+                    and vol is not None and 0.0 < vol <= 5.0):
+                dw_since = (datetime.now(timezone.utc)
+                            - timedelta(hours=2.5)).isoformat()
+                dishwasher_members = detect_dishwasher_cycles(
+                    self._db, circuit, since_ts=dw_since, calib=calib,
+                    exclude_ids=set(washer_members) | set(softener_members))
             if event_id in softener_members:
                 matched_fixture_type, matched_via = ("water_softener",
                                                      "softener_session")
@@ -3468,6 +3483,10 @@ class FeatureExtractor:
                 matched_fixture_type, matched_via = ("washing_machine",
                                                      "washer_cycle")
                 cycle_group_id = washer_members[event_id][1]
+            elif event_id in dishwasher_members:
+                matched_fixture_type, matched_via = ("dishwasher",
+                                                     "dishwasher_cycle")
+                cycle_group_id = dishwasher_members[event_id][1]
             else:
                 rule_hit = rule_classify_event(features, ctype, calib=calib)
                 if rule_hit is not None:
@@ -3550,16 +3569,17 @@ class FeatureExtractor:
              event_id)
         )
 
-        # dev.23/dev.24 — trailing retro-scan: a washer cycle (~45 min) and a
-        # softener session (~3 h) COMPLETE over time, so earlier members were
-        # classified before the family existed (there is no periodic reprocess).
-        # Retro-stamp the window's members now WITH their cycle_group_id. Cycle/
-        # session context outranks a per-event machine match, so this MAY overwrite
-        # a prior knn/rule_* match (e.g. a backwash mis-typed shower_tub); user
-        # labels are never touched.
+        # dev.23/dev.24/dev.39 — trailing retro-scan: a washer cycle (~45 min), a
+        # softener session (~3 h), and a dishwasher cycle (~2 h) COMPLETE over time,
+        # so earlier members were classified before the family reached its >=3-fill
+        # threshold (there is no periodic reprocess on the live path). Retro-stamp the
+        # window's members now WITH their cycle_group_id. Cycle/session context outranks
+        # a per-event machine match, so this MAY overwrite a prior knn/rule_* match
+        # (e.g. a backwash mis-typed shower_tub); user labels are never touched.
         for _members, _mtype, _mvia in (
                 (softener_members, "water_softener", "softener_session"),
-                (washer_members, "washing_machine", "washer_cycle")):
+                (washer_members, "washing_machine", "washer_cycle"),
+                (dishwasher_members, "dishwasher", "dishwasher_cycle")):
             for _eid, _rolegid in _members.items():
                 if _eid == event_id:
                     continue

@@ -1,5 +1,108 @@
 # Changelog
 
+## [0.3.1-dev4] — 2026-06-28 — self-healing event hygiene (atomic, on by default)
+
+Toward "you should never have to hit Reprocess by hand." The add-on already had a
+background pass (`auto_split_merged_events`) that re-imports garbled events — it was
+opt-in/off and only caught multi-draw merges. This release makes it safe to run for
+real and turns it on.
+
+- **Reprocess is now atomic.** It deletes a window's machine events then re-imports
+  them from history; if the re-import fails (e.g. HA history briefly unavailable), the
+  deleted events are now **restored verbatim** (re-inserted + hourly-volume re-applied),
+  so a failure can never lose water. `import_range(strict=True)` surfaces a fetch
+  failure instead of silently returning 0; `delete_events_in_range(capture=True)`
+  snapshots the rows; `restore_deleted_events` rolls them back. Benefits the manual
+  Reprocess button too.
+- **The hygiene pass now also fixes inflated single events** — not just multi-draw
+  merges. An event whose stored span is mostly idle (e.g. the two-blips-welded-into-
+  20-minutes case) is re-imported and **shrunk** to its real use. The dry-run gate
+  accepts a split (≥2 draws) *or* a shrink (1 draw ≥1 min shorter than stored); a clean
+  event reconstructs to itself and is left alone (no churn).
+- **On by default** (`home_profile.auto_split_enabled` now defaults 1; migration
+  **20260549** backfills existing installs). Still dry-run-gated, label-preserving,
+  loop-safe (re-imported draws are single-segment so they don't re-trigger), rate-
+  limited, and runs in the periodic maturity pass. You can still turn it off in
+  Settings.
+- **Leak-safety guard (from an adversarial review):** the pass **never touches an
+  anomaly-flagged event**. Splitting/shrinking a flagged event could strip its leak
+  signal (an unusual long event becomes several individually-normal fragments) even
+  though volume is preserved — so a flagged event is left exactly as-is; only
+  unremarkable, un-flagged garbled events are auto-cleaned. (Known limitation,
+  documented: reprocess is exception-atomic, not crash-atomic — a hard kill in the
+  sub-second delete→import window isn't yet journalled; future work.)
+
+No event-table schema change. 885 tests pass.
+
+## [0.3.1-dev3] — 2026-06-28 — dishwasher-cycle detection + locked-baseline relabel gate
+
+### A relabel no longer re-walks history once the baseline is locked
+
+The classifier is **fit-once-at-activation, then hard-locked** — after the training/
+labelling window closes, the reference is frozen and live events match against it.
+But a label change was still firing a full-history background reclassify every time,
+long after that window had closed. Fixed: the label-triggered reclassify is now
+**skipped when the baseline is locked** (`training_state = 'live'` with no active
+recalibration). A relabel still applies instantly and still propagates to the event's
+own cycle-mates; it just no longer re-scans the whole history. The full reclassify
+runs where it should — during the training window, at startup, and on explicit
+recalibration. (New `is_baseline_locked`, mirroring the anomaly-shutoff state gate.)
+
+### Dishwasher-cycle detection
+
+The original complaint: a dishwasher running concurrent with the washer left its
+gentle fills unlabelled (`(none)`). Root cause — the per-event dishwasher rule needs
+`cycle_pulse_count ≥ 3`, but gentle fills fail the "fill-shaped" gate inside that
+counter and sit at cpc=2, so they never qualify.
+
+- **New dishwasher-cycle detector** (`detect_dishwasher_cycles`, companion to the
+  washer detector): a chain of ≥3 small, gentle fills (≤3.5 L, peak ≤3.6, not
+  flush-shaped) within 30 min of each other is a dishwasher run. It bypasses the
+  fragile per-event shape gate and rolls the fills up under one History row. Wired
+  into reclassify and the live path, after the washer/softener detectors (so a
+  laundry top-off or brine pulse can't be re-read as a dishwasher). The live path's
+  trailing retro-scan now re-stamps a cycle's earlier fills once the 3rd arrives, so a
+  freshly-completing cycle doesn't leave its first fills sitting unlabelled.
+- **Result** (audit backup, confidence-weighted harness): dishwasher recall
+  **66% → 91%**, overall weighted type accuracy **0.73 → 0.83**, with no other class
+  regressing (tap held; one labelled-tap reclassified to dishwasher). The 7:08 PM
+  washer+dishwasher overlap now separates correctly.
+
+### Importer no longer fabricates long events from noise
+
+A long pressure-dip envelope that contained almost no flow was stitching unrelated
+trivial blips into one bogus multi-minute event (observed: two ~0.3 L blips 20 min
+apart fused into one 20-minute "event" with a flat, meaningless waveform). The importer
+now **drops a pressure-dip bridge only when it is provably noise**: (a) long (≥5 min),
+(b) trivial flow inside (<2 L), (c) there IS real flow inside, and (d) **every** flow
+fragment inside already survives on its own (≥ the min-duration floor). So the gate only
+ever removes the empty *span between* fragments that stand alone — it can never orphan,
+lose, or under-count flow. A pure-pressure dip with no flow is kept (handled by the
+phantom guard); a sub-floor fragment keeps its bridge. **Leak-safe by construction:** a
+real draw or slow/intermittent leak is flow, so it's always a surviving flow period,
+never only an empty envelope. (Hardened after a 3-lens adversarial leak-safety review;
+volume integration is left-hold step, not trapezoidal, so a no-flow gap can't invent
+phantom volume.)
+
+No schema change. 880 tests pass (+6 dishwasher detector, +5 lock gate, +6 importer gate).
+
+## [0.3.1-dev2] — 2026-06-28 — fix label-save lock contention
+
+Follow-up to dev1: labelling/reprocessing an event while a background reclassify
+was running still returned **500 (`database is locked`)**. Root cause: every label
+save fired a full ~10s background reclassify, and rapid labelling stacked them so
+the write lock was held almost continuously — the next save's own write timed out.
+
+- **Debounced the background reclassify** — a burst of label saves now coalesces
+  into a single reclassify ~8s after the last save, so active labelling no longer
+  competes with a long-running reclassify (the user's label + cycle-mates are still
+  applied synchronously and shown immediately).
+- **The reclassify now yields the write lock** — a brief pause after each batched
+  commit widens the release window so a waiting save acquires the lock within the
+  busy-timeout instead of erroring (a bare commit re-acquires too fast to hand off).
+
+No schema change. All 863 tests pass.
+
 ## [0.3.1-dev1] — 2026-06-28 — smarter fixture labeling
 
 Acting on the full-record labeling audit: the classifier now recognises fixtures

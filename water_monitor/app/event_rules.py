@@ -138,6 +138,17 @@ _DW_MIN_CYCLE_PULSES: int = 3   # >=3 similar-volume neighbours in ±45 min == a
 #                                 shape-aware count is the root fix (see plan follow-up).
 #                                 STRUCTURAL gate — never add to RULE_DEFAULTS.
 
+# dev.39 — dishwasher CYCLE detector (companion to detect_washer_cycles). The per-event
+# rule above needs cycle_pulse_count >= 3, but gentle dishwasher fills FAIL the
+# fill-shaped gate inside that counter and sit at cpc<3 — so a real cycle (e.g. a
+# dishwasher run concurrent with a washer) goes unlabelled. This detector instead chains
+# a run of >=_DW_CYCLE_MIN_MEMBERS small, gentle fills (vol in _DW_VOL_L, peak <=
+# _DW_MAX_PK_LPM, not flush-shaped), each within _DW_CYCLE_CHAIN_GAP_MIN of the previous
+# and the whole run within _DW_CYCLE_MAX_SPAN_MIN. STRUCTURAL — never in RULE_DEFAULTS.
+_DW_CYCLE_CHAIN_GAP_MIN: float = 30.0   # consecutive fills <= this apart chain together
+_DW_CYCLE_MAX_SPAN_MIN: float = 180.0   # cap a session — a cycle isn't all afternoon
+_DW_CYCLE_MIN_MEMBERS: int = 3          # >=3 chained gentle fills == a cycle
+
 _SHOWER_BIG_VOL_L: float = 30.0
 _SHOWER_BIG_DUR_S: float = 300.0
 _SHOWER_BIG_MIN_PK: float = 6.0
@@ -313,6 +324,85 @@ def detect_washer_cycles(
             if is_flush_shaped(feats, calib):
                 continue                   # flush during laundry — leave it alone
             out.setdefault(o["id"], ("member", a["id"]))
+    return out
+
+
+def detect_dishwasher_cycles(
+    conn: sqlite3.Connection,
+    circuit: str,
+    since_ts: Optional[str] = None,
+    limit: int = 4000,
+    calib: Optional[Dict[str, Any]] = None,
+    exclude_ids: Optional[set] = None,
+) -> Dict[str, Tuple[str, str]]:
+    """Find dishwasher-cycle members on ``circuit``: a chain of >= _DW_CYCLE_MIN_MEMBERS
+    small, gentle fills (vol in ``DW_VOL_L``, peak <= ``DW_MAX_PK_LPM``, not flush-shaped),
+    each within ``_DW_CYCLE_CHAIN_GAP_MIN`` of the previous and the whole run within
+    ``_DW_CYCLE_MAX_SPAN_MIN``. Returns ``{event_id: (role, group_id)}`` where role is
+    ``'anchor'``/``'member'`` and group_id is the session's first event id (the History
+    cycle-rollup key, like the washer detector).
+
+    Catches dishwasher runs the per-event cycle-pulse rule misses: gentle fills fail the
+    fill-shaped gate inside ``cycle_pulse_count`` and sit at cpc<3, so a real cycle (e.g.
+    running concurrent with a washer) goes unlabelled. Reads ONLY feature/timestamp
+    columns — never a label — so the eval harness's leave-one-out stays honest. Skips
+    artifact-flagged events (phantom / cross-talk / dribble / excluded) and any id in
+    ``exclude_ids`` (the washer/softener members the caller already claimed)."""
+    where = ("WHERE circuit = ? AND COALESCE(excluded_from_training, 0) = 0 "
+             "AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+             "AND COALESCE(is_cross_talk, 0) = 0 "
+             "AND COALESCE(is_low_flow_dribble, 0) = 0")
+    params: list = [circuit]
+    if since_ts is not None:
+        where += " AND start_ts >= ?"
+        params.append(since_ts)
+    params.append(limit)
+    rows = conn.execute(
+        "SELECT id, start_ts, duration_seconds, volume_litres, peak_flow_lpm, "
+        "       has_pressure_transient, pressure_delta_psi "
+        f"FROM events {where} ORDER BY start_ts LIMIT ?",
+        params,
+    ).fetchall()
+
+    dw_vol = _cv(calib, "DW_VOL_L")
+    dw_pk = _cv(calib, "DW_MAX_PK_LPM")
+    exclude_ids = exclude_ids or set()
+    cand = []
+    for r in rows:
+        if r["id"] in exclude_ids:
+            continue                       # already a washer/softener member
+        v, pk = r["volume_litres"], r["peak_flow_lpm"]
+        if v is None or pk is None or not (dw_vol[0] <= v <= dw_vol[1]) or pk > dw_pk:
+            continue
+        feats = {"volume_litres": v, "duration_seconds": r["duration_seconds"],
+                 "peak_flow_lpm": pk, "has_pressure_transient": r["has_pressure_transient"],
+                 "pressure_delta_psi": r["pressure_delta_psi"]}
+        if is_flush_shaped(feats, calib):
+            continue                       # a quick flush, not a gentle appliance fill
+        try:
+            ts = datetime.fromisoformat(r["start_ts"])
+        except (TypeError, ValueError):
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        cand.append((ts, r["id"]))
+
+    out: Dict[str, Tuple[str, str]] = {}
+    chain_gap = _DW_CYCLE_CHAIN_GAP_MIN * 60.0
+    max_span = _DW_CYCLE_MAX_SPAN_MIN * 60.0
+    i, n = 0, len(cand)
+    while i < n:
+        j = i + 1
+        while (j < n
+               and (cand[j][0] - cand[j - 1][0]).total_seconds() <= chain_gap
+               and (cand[j][0] - cand[i][0]).total_seconds() <= max_span):
+            j += 1
+        members = cand[i:j]
+        if len(members) >= _DW_CYCLE_MIN_MEMBERS:
+            gid = members[0][1]
+            for k, (_, eid) in enumerate(members):
+                out[eid] = ("anchor" if k == 0 else "member", gid)
+        i = j
     return out
 
 

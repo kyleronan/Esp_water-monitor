@@ -135,6 +135,18 @@ class HistoricalImporter:
     # from only one or two pre-dip samples and triggering a spurious period.
     PRESSURE_DIP_MIN_BASELINE_SAMPLES: int = 3
     PRESSURE_DIP_MIN_BASELINE_SPAN_S: float = 5.0
+    # dev.39 — anti-noise bridge gate. The pressure-dip source exists to BRIDGE the
+    # gaps between real flow bursts (pulsed irrigation). But a LONG dip envelope that
+    # contains almost NO flow just stitches unrelated trivial blips into one bogus
+    # multi-minute event (observed: two ~0.3 L blips 20 min apart fused into a 20 min
+    # event). So a dip period only earns its bridge when (a) it is long AND (b) the
+    # real flow volume inside it is trivial → drop it; the underlying flow fragments
+    # still import on their own (subject to MIN_DURATION). Leak-safe: a real draw or a
+    # running-toilet leak's fills carry real volume and never trip this; we never drop
+    # flow, only an empty pressure envelope. Short dips and dips with real flow are
+    # untouched.
+    PRESSURE_DIP_BRIDGE_LONG_SPAN_S: float = 300.0   # "long" envelope (5 min)
+    PRESSURE_DIP_BRIDGE_MIN_VOLUME_L: float = 2.0    # real flow needed to earn a long bridge
 
     def __init__(
         self,
@@ -194,17 +206,22 @@ class HistoricalImporter:
         circuit: str,
         start: datetime,
         end: datetime,
+        strict: bool = False,
     ) -> int:
         """
         Import events for one circuit over an arbitrary date range.
         Returns count of events imported.
         Called from the settings UI manual import trigger.
+
+        ``strict=True`` re-raises a history-fetch failure instead of swallowing it
+        (the default returns 0). The atomic reprocess path uses it so a fetch failure
+        AFTER the delete is detectable and the deleted events can be restored.
         """
         cfg = self._cfg.get_circuit(circuit)
         if not cfg or not self._circuit_has_sensors(cfg):
             log.warning("[%s] import_range: circuit not configured", circuit)
             return 0
-        n, _ = await self._import_range(cfg, start, end)
+        n, _ = await self._import_range(cfg, start, end, strict=strict)
         return n
 
     async def import_all_circuits_range(
@@ -350,6 +367,7 @@ class HistoricalImporter:
         cfg: CircuitConfig,
         start: datetime,
         end: datetime,
+        strict: bool = False,
     ) -> Tuple[int, Optional[datetime]]:
         """
         Fetch HA history for [start, end] and import any missing events.
@@ -381,6 +399,8 @@ class HistoricalImporter:
             histories = await self._ha.get_history_batch(entities_to_fetch, start, end)
         except Exception as exc:
             log.warning("[%s] history batch fetch failed: %s", cfg.circuit, exc)
+            if strict:
+                raise            # atomic reprocess needs to know the import didn't happen
             return 0, None
 
         onset_hist     = histories.get(cfg.flow_onset_sensor, [])
@@ -596,6 +616,41 @@ class HistoricalImporter:
             pressure_hist or [], query_end=query_end,
             using_avg_pressure=using_avg_pressure,
         )
+        # dev.39 — drop long pressure-dip envelopes that only bridge trivial noise
+        # (the bug: two ~0.3 L blips 20 min apart fused into one 20-min event).
+        # PROVABLY LEAK-NEUTRAL (hardened after an adversarial review): a dip is
+        # dropped ONLY when every condition holds, so dropping it can NEVER lose or
+        # under-count flow —
+        #   (a) it is long (>= LONG_SPAN), and
+        #   (b) the measured flow inside is trivial (< MIN_VOLUME), and
+        #   (c) there IS real flow inside (>=1 overlapping rate/onset period), and
+        #   (d) EVERY overlapping flow fragment already survives on its own
+        #       (>= MIN_DURATION_SECONDS) once the bridge is removed.
+        # So we only ever remove the empty *span between* fragments that stand alone.
+        # A pure-pressure dip with no flow (c fails) is KEPT → handled by the phantom
+        # guard at feature extraction, never silently dropped. A fragment too short to
+        # survive un-bridged (d fails) KEEPS its bridge, so it is never orphaned —
+        # closing the "sub-MIN_DURATION blip vanishes" and "recorder-gap masks a leak"
+        # holes the review raised (a real leak is flow >= MIN_FLOW → a surviving rate
+        # period, never only an empty envelope).
+        flow_only = onset_periods + rate_periods
+        kept_dips = []
+        for s, e in pressure_periods:
+            overlap = [(fs, fe) for fs, fe in flow_only if fe > s and fs < e]
+            if ((e - s).total_seconds() >= self.PRESSURE_DIP_BRIDGE_LONG_SPAN_S
+                    and self._flow_volume_in_period(flow_rate_hist, s, e)
+                    < self.PRESSURE_DIP_BRIDGE_MIN_VOLUME_L
+                    and overlap
+                    and all((fe - fs).total_seconds() >= self.MIN_DURATION_SECONDS
+                            for fs, fe in overlap)):
+                log.info("[importer] dropping %.0f-min pressure-dip bridge with only "
+                         "%.2f L flow across %d self-standing fragment(s) — noise, not "
+                         "a real bridged event",
+                         (e - s).total_seconds() / 60.0,
+                         self._flow_volume_in_period(flow_rate_hist, s, e), len(overlap))
+                continue
+            kept_dips.append((s, e))
+        pressure_periods = kept_dips
 
         all_periods = onset_periods + rate_periods + pressure_periods
         if not all_periods:
@@ -604,6 +659,34 @@ class HistoricalImporter:
         merged = _merge_periods(sorted(all_periods), self.MERGE_GAP_SECONDS)
         return [(s, e) for s, e in merged
                 if (e - s).total_seconds() >= self.MIN_DURATION_SECONDS]
+
+    def _flow_volume_in_period(
+        self, flow_rate_hist: List[Dict], start: datetime, end: datetime,
+    ) -> float:
+        """Integrate flow_rate (L/min) over [start, end] from history → litres. Used
+        only to decide whether a long pressure-dip envelope contains real flow (so it
+        can earn its bridge). LEFT-HOLD step integration, NOT trapezoidal: HA logs on
+        change, so a reading holds until the next change — a value of 0 logged after a
+        blip means zero flow across the whole gap until the next change, NOT a ramp.
+        (Trapezoidal would interpolate a phantom ramp across a long no-flow gap and
+        invent volume — the exact noise this gate must reject.)"""
+        prev_ts: Optional[datetime] = None
+        prev_rate = 0.0
+        vol = 0.0
+        for entry in flow_rate_hist:
+            ts = _parse_ts(entry.get("last_changed"))
+            if ts is None or ts < start or ts > end:
+                continue
+            try:
+                rate = float(entry["state"])
+            except (ValueError, TypeError, KeyError):
+                rate = 0.0
+            if prev_ts is not None:
+                dt_s = (ts - prev_ts).total_seconds()
+                if dt_s > 0:
+                    vol += prev_rate * dt_s / 60.0   # prev value held until this change
+            prev_ts, prev_rate = ts, rate
+        return vol
 
     def _onset_to_periods(
         self,

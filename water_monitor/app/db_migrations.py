@@ -104,7 +104,11 @@ _BASELINE_VERSION: int = 20260523
 #              waveform by composite_detector; metadata only, never alters volume
 #              or the primary label). DDL only; the annotation backfill runs from
 #              the startup / manual reprocess reclassify path after migration.
-_CURRENT_VERSION: int = 20260548
+#   20260549 — dev.39: enable auto-hygiene by default — backfill
+#              home_profile.auto_split_enabled = 1 (the background over-merged/inflated
+#              event re-import, now safe to run by default: reprocess is atomic +
+#              dry-run-gated). Value backfill only; no DDL (column exists since 20260545).
+_CURRENT_VERSION: int = 20260549
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -903,6 +907,26 @@ def _apply_embedded_fixtures_column(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260548: embedded_fixtures_json column ready")
 
 
+def _apply_auto_split_default(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260549 — enable auto-hygiene by default.
+
+    Sets ``home_profile.auto_split_enabled = 1`` on existing rows so the background
+    over-merged/inflated-event re-import runs without the user flipping a toggle. It is
+    safe to default on as of dev.39: the reprocess is ATOMIC (a failed re-import restores
+    the deleted events) and dry-run-gated, and user-labelled events are never touched.
+    Value backfill only — the column has existed since 20260545; idempotent.
+    """
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='home_profile'"
+    ).fetchone()
+    if has_table and _has_column(conn, "home_profile", "auto_split_enabled"):
+        conn.execute(
+            "UPDATE home_profile SET auto_split_enabled = 1 "
+            "WHERE COALESCE(auto_split_enabled, 0) = 0")
+    conn.commit()
+    log.info("Migration 20260549: auto-hygiene enabled by default")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -1370,9 +1394,17 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
+    if version == 20260548:
+        # DB has embedded_fixtures_json but auto-hygiene not yet defaulted on.
+        _apply_auto_split_default(conn)
+        _set_version(conn, _CURRENT_VERSION)
+        log.info("Database upgraded 20260548 → %d", _CURRENT_VERSION)
+        return
+
     if version == 20260547:
         # DB has the RBAC tables but lacks the embedded_fixtures_json column.
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260547 → %d", _CURRENT_VERSION)
         return
@@ -1381,6 +1413,7 @@ def _run_migrations_impl(
         # DB has the per-circuit pulses_per_litre column but lacks the RBAC tables.
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260546 → %d", _CURRENT_VERSION)
         return
@@ -1390,6 +1423,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260545 → %d", _CURRENT_VERSION)
         return
@@ -1400,6 +1434,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260544 → %d", _CURRENT_VERSION)
         return
@@ -1412,6 +1447,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260543 → %d", _CURRENT_VERSION)
         return
@@ -1424,6 +1460,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260542 → %d", _CURRENT_VERSION)
         return
@@ -1438,6 +1475,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260541 → %d", _CURRENT_VERSION)
         return
@@ -1452,6 +1490,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260540 → %d", _CURRENT_VERSION)
         return
@@ -1467,6 +1506,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260539 → %d", _CURRENT_VERSION)
         return
@@ -1483,6 +1523,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260538 → %d", _CURRENT_VERSION)
         return
@@ -1500,6 +1541,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260537 → %d", _CURRENT_VERSION)
         return
@@ -1518,6 +1560,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260536 → %d", _CURRENT_VERSION)
         return
@@ -1537,6 +1580,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260535 → %d", _CURRENT_VERSION)
         return
@@ -1558,6 +1602,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
         return
@@ -1580,6 +1625,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
         return
@@ -1602,6 +1648,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
         return
@@ -1626,6 +1673,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
         return
@@ -1651,6 +1699,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
         return
@@ -1698,6 +1747,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
         return
@@ -1727,6 +1777,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
@@ -1757,6 +1808,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded %d → %d",
                  _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
@@ -1786,6 +1838,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
         return
@@ -1814,6 +1867,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
         return
@@ -1840,6 +1894,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
         return
@@ -1866,6 +1921,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
         return
@@ -1928,6 +1984,7 @@ def _run_migrations_impl(
         _apply_ppl_column(conn)
         _apply_rbac_tables(conn)
         _apply_embedded_fixtures_column(conn)
+        _apply_auto_split_default(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return
