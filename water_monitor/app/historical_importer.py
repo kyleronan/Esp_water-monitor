@@ -54,6 +54,7 @@ Scheduling
 from __future__ import annotations
 
 import asyncio
+import bisect
 import logging
 import math
 import sqlite3
@@ -88,6 +89,16 @@ def _clamp_flow(v: float) -> float:
     if not math.isfinite(v) or v > 200.0 or (0 < v < 0.01):
         return 0.0
     return v
+
+
+_GAP_MARKER_STATES = frozenset({"unavailable", "unknown", "none", ""})
+
+
+def _is_gap_marker(entry: Dict) -> bool:
+    """True when an HA history entry marks a recorder/sensor gap rather than a
+    reading ('unavailable' at HA restarts, 'unknown' on dropouts). Windows holding
+    these must not be trusted to reproduce live-recorded water (dev.41)."""
+    return str(entry.get("state", "")).strip().lower() in _GAP_MARKER_STATES
 
 
 def _clamp_pressure(v: float) -> float:
@@ -159,9 +170,18 @@ def _containing_interval(
 
 def _pressure_swing(series: List[Tuple[datetime, float]],
                     t0: datetime, t1: datetime) -> float:
-    """max − min of the values whose timestamp falls in [t0, t1]; 0.0 if none."""
-    vals = [v for ts, v in series if t0 <= ts <= t1]
-    return (max(vals) - min(vals)) if vals else 0.0
+    """max − min of the values whose timestamp falls in [t0, t1]; 0.0 if none.
+
+    ``series`` is sorted (``_numeric_series``), so the window is located with
+    bisect — a day of 4 Hz pressure logging is easily 10⁵ samples and this runs
+    twice per candidate event on the event loop; a linear scan per call stalls
+    the UI during backfills."""
+    lo = bisect.bisect_left(series, t0, key=lambda x: x[0])
+    hi = bisect.bisect_right(series, t1, lo=lo, key=lambda x: x[0])
+    if lo >= hi:
+        return 0.0
+    vals = [v for _, v in series[lo:hi]]
+    return max(vals) - min(vals)
 
 
 def _parse_ts(ts_value: Any) -> Optional[datetime]:
@@ -265,10 +285,10 @@ class HistoricalImporter:
             log.error("Historical importer startup backfill failed: %s", e,
                       exc_info=True)
 
-        # One-time-ish irrigation cross-talk backfill over the retention window
+        # Irrigation cross-talk reconcile — first pass doubles as the backfill
         # (separate try so an import failure above doesn't skip it, and vice versa).
         try:
-            await self._reconcile_cross_talk_backfill()
+            await self._reconcile_cross_talk()
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -279,7 +299,7 @@ class HistoricalImporter:
             try:
                 await asyncio.sleep(self.CHECK_INTERVAL_MINUTES * 60)
                 await self._catch_up()
-                await self._reconcile_cross_talk_catch_up()
+                await self._reconcile_cross_talk()
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -298,22 +318,21 @@ class HistoricalImporter:
         circuit: str,
         start: datetime,
         end: datetime,
-        strict: bool = False,
     ) -> int:
         """
         Import events for one circuit over an arbitrary date range.
         Returns count of events imported.
-        Called from the settings UI manual import trigger.
-
-        ``strict=True`` re-raises a history-fetch failure instead of swallowing it
-        (the default returns 0). The atomic reprocess path uses it so a fetch failure
-        AFTER the delete is detectable and the deleted events can be restored.
+        Called from the settings UI manual import trigger and the atomic
+        reprocess. RAISES on a history-fetch failure — so a fetch failure after
+        the reprocess delete is detectable and the deleted events restored (the
+        old default silently returned 0, indistinguishable from "nothing to
+        import").
         """
         cfg = self._cfg.get_circuit(circuit)
         if not cfg or not self._circuit_has_sensors(cfg):
             log.warning("[%s] import_range: circuit not configured", circuit)
             return 0
-        n, _ = await self._import_range(cfg, start, end, strict=strict)
+        n, _ = await self._import_range(cfg, start, end)
         return n
 
     async def import_all_circuits_range(
@@ -321,47 +340,69 @@ class HistoricalImporter:
         start: datetime,
         end: datetime,
     ) -> int:
-        """Import for all circuits over a date range. Returns total count."""
+        """Import for all circuits over a date range. Returns total count.
+        Best-effort per circuit: one circuit's fetch failure doesn't skip the rest."""
         total = 0
         for cfg in self._cfg.circuits:
-            if self._circuit_has_sensors(cfg):
+            if not self._circuit_has_sensors(cfg):
+                continue
+            try:
                 n, _ = await self._import_range(cfg, start, end)
-                total += n
+            except Exception as exc:
+                log.warning("[%s] range import fetch failed: %s", cfg.circuit, exc)
+                continue
+            total += n
         return total
 
-    async def count_candidate_periods(
+    async def dry_run_reconstruction(
         self,
         circuit: str,
         start: datetime,
         end: datetime,
-    ) -> list:
-        """Dry-run: return the candidate flow PERIODS the importer would reconstruct over
-        [start, end] WITHOUT deleting or storing anything. The guarded auto-split (dev.38)
-        uses the period count to decide whether ONE stored event is really several distinct
-        draws (2..K periods) vs a single draw (1) or chatter (> K). Returns a list of
-        ``(start_dt, end_dt)`` tuples; empty on an unconfigured circuit or a fetch failure
-        (fail-safe — a dry-run that can't see history must never trigger a split)."""
+    ) -> dict:
+        """Dry-run: what would the importer reconstruct over [start, end], WITHOUT
+        deleting or storing anything. The guarded auto-split (dev.38/41) uses this to
+        decide whether ONE stored event is really several distinct draws — and, dev.41,
+        whether the window's history can be TRUSTED to reproduce the stored water.
+
+        Returns ``{"periods": [(start_dt, end_dt), ...],
+                   "flow_volume_l": <integrated flow over the window>,
+                   "fetch_failed": bool,   # transient — retry next pass
+                   "gappy": bool}``        # 'unavailable'/'unknown' samples in window
+        On an unconfigured circuit or a fetch failure the periods are empty and
+        ``fetch_failed`` is set (fail-safe — a dry-run that can't see history must
+        never trigger a split)."""
         cfg = self._cfg.get_circuit(circuit)
-        if not cfg or not self._circuit_has_sensors(cfg):
-            return []
-        pressure_entity = cfg.pressure_history_sensor or cfg.pressure_avg_sensor
+        pressure_entity = cfg and (cfg.pressure_history_sensor or cfg.pressure_avg_sensor)
+        if (not cfg or not self._circuit_has_sensors(cfg)
+                or not (cfg.flow_onset_sensor or cfg.flow_sensor)):
+            return {"periods": [], "flow_volume_l": 0.0,
+                    "fetch_failed": True, "gappy": False}
         entities = [e for e in (cfg.flow_onset_sensor, cfg.flow_sensor,
                                 pressure_entity) if e]
-        if not cfg.flow_onset_sensor and not cfg.flow_sensor:
-            return []
         try:
             histories = await self._ha.get_history_batch(entities, start, end)
         except Exception as exc:
             log.warning("[%s] auto-split dry-run history fetch failed: %s", circuit, exc)
-            return []
+            return {"periods": [], "flow_volume_l": 0.0,
+                    "fetch_failed": True, "gappy": False}
         onset_hist     = histories.get(cfg.flow_onset_sensor, [])
         flow_rate_hist = histories.get(cfg.flow_sensor, [])
         pressure_hist  = histories.get(pressure_entity, []) if pressure_entity else []
         using_avg_pressure = (pressure_entity == cfg.pressure_avg_sensor)
-        return self._find_flow_periods(
+        periods = self._find_flow_periods(
             onset_hist, flow_rate_hist, query_end=end,
             pressure_hist=pressure_hist, using_avg_pressure=using_avg_pressure,
         ) or []
+        # dev.41: recorder-gap markers ('unavailable'/'unknown' at HA restarts, sensor
+        # dropouts) mean the window's history is INCOMPLETE — a reconstruction from it
+        # would read the gap as flow-off and shrink/split away real recorded water.
+        gappy = any(_is_gap_marker(e) for h in (onset_hist, flow_rate_hist,
+                                                pressure_hist) for e in h)
+        return {"periods": periods,
+                "flow_volume_l": self._flow_volume_in_period(
+                    flow_rate_hist, start, end),
+                "fetch_failed": False, "gappy": gappy}
 
     # ------------------------------------------------------------------ #
     # Scheduled operations                                                 #
@@ -412,7 +453,15 @@ class HistoricalImporter:
             window_start = start
             while window_start < now:
                 window_end = min(window_start + timedelta(days=1), now)
-                n, _ = await self._import_range(cfg, window_start, window_end)
+                try:
+                    n, _ = await self._import_range(cfg, window_start, window_end)
+                except Exception as exc:
+                    # Best-effort per chunk (the backfill keeps no checkpoint to
+                    # hold); the periodic catch-up / next restart re-covers it.
+                    log.warning("[%s] backfill chunk %s..%s fetch failed: %s",
+                                cfg.circuit, window_start.isoformat(),
+                                window_end.isoformat(), exc)
+                    n = 0
                 total += n
                 window_start = window_end
             if total:
@@ -437,7 +486,15 @@ class HistoricalImporter:
             else:
                 start = now - timedelta(hours=2)
 
-            n, retry_from = await self._import_range(cfg, start, now)
+            try:
+                n, retry_from = await self._import_range(cfg, start, now)
+            except Exception as exc:
+                # Checkpoint deliberately NOT advanced: the unfetched window is
+                # re-covered next tick (a swallowed failure used to advance it
+                # to `now`, permanently skipping the outage window).
+                log.warning("[%s] catch-up fetch failed (checkpoint held): %s",
+                            cfg.circuit, exc)
+                continue
             # retry_from holds the checkpoint back when either (a) events were
             # dropped to a full queue or (b) a flow period was still active at
             # `now` (an event longer than the catch-up interval). Without (b) the
@@ -467,42 +524,20 @@ class HistoricalImporter:
                     return cfg
         return None
 
-    async def _reconcile_cross_talk_backfill(self) -> None:
-        """One-time-ish backfill: reconcile the whole HA-retention window in daily
-        chunks (a full-day 4 Hz pressure pull would overflow the WS frame). Runs only
-        when no watermark exists yet; thereafter the periodic catch-up keeps it fresh.
-        """
-        irr = self._irrigation_circuit()
-        if irr is None:
-            return
-        now = datetime.now(timezone.utc)
-        for cfg in self._cfg.circuits:
-            if cfg.is_zone_circuit or not self._circuit_has_sensors(cfg):
-                continue
-            if not (cfg.pressure_history_sensor or cfg.pressure_avg_sensor):
-                continue
-            state = get_import_state(self._db, self._xtalk_watermark_key(cfg.circuit))
-            if state and state.get("last_check_ts"):
-                continue  # already initialised — catch-up owns it from here
-            start = now - timedelta(days=self.MAX_BACKFILL_DAYS)
-            total = 0
-            window_start = start
-            while window_start < now:
-                window_end = min(window_start + timedelta(days=1), now)
-                total += await self._reconcile_irrigation_cross_talk(
-                    cfg, irr, window_start, window_end)
-                window_start = window_end
-            wm = (now - timedelta(hours=self.XTALK_RECONCILE_MARGIN_HOURS)).isoformat()
-            update_import_state(self._db, self._xtalk_watermark_key(cfg.circuit), wm, total)
-            if total:
-                log.info("[%s] cross-talk backfill: flagged %d zone-switch event(s)",
-                         cfg.circuit, total)
+    async def _reconcile_cross_talk(self) -> None:
+        """Irrigation cross-talk reconciliation — ONE watermark-driven pass that is
+        both the backfill and the periodic catch-up (dev.41: they were two
+        near-identical methods whose watermark advanced even when every history
+        fetch failed, permanently skipping outage windows).
 
-    async def _reconcile_cross_talk_catch_up(self) -> None:
-        """Periodic: re-reconcile a rolling window [watermark − margin, now]. The
-        overlap past the watermark closes the boundary blind spot (events still being
-        written near the trailing edge); idempotent because candidates exclude
-        already-flagged rows."""
+        Per eligible main circuit: reconcile [watermark − margin, now] — or the full
+        HA-retention window when no watermark exists yet — in ≤1-day chunks (a
+        full-day 4 Hz pressure pull would overflow the WS frame). The watermark
+        advances ONLY past chunks whose history fetch succeeded
+        (``_reconcile_irrigation_cross_talk`` returns None on a failed fetch); a
+        failure stops the pass so the remaining window is retried next tick, never
+        recorded as done. Idempotent: candidates exclude already-flagged rows, so
+        the margin overlap re-scans harmlessly."""
         irr = self._irrigation_circuit()
         if irr is None:
             return
@@ -516,12 +551,30 @@ class HistoricalImporter:
             key = self._xtalk_watermark_key(cfg.circuit)
             state = get_import_state(self._db, key)
             wm = _parse_ts(state.get("last_check_ts")) if state else None
-            start = (wm - margin) if wm else (now - timedelta(hours=2) - margin)
-            n = await self._reconcile_irrigation_cross_talk(cfg, irr, start, now)
-            update_import_state(self._db, key, (now - margin).isoformat(), n)
-            if n:
-                log.info("[%s] cross-talk catch-up: flagged %d zone-switch event(s)",
-                         cfg.circuit, n)
+            start = (wm - margin) if wm else (
+                now - timedelta(days=self.MAX_BACKFILL_DAYS))
+            total = 0
+            window_start = start
+            while window_start < now:
+                window_end = min(window_start + timedelta(days=1), now)
+                n = await self._reconcile_irrigation_cross_talk(
+                    cfg, irr, window_start, window_end)
+                if n is None:
+                    log.warning("[%s] cross-talk reconcile: fetch failed for "
+                                "%s..%s — will retry from here next pass",
+                                cfg.circuit, window_start.isoformat(),
+                                window_end.isoformat())
+                    break
+                total += n
+                # Watermark = end of the last SUCCESSFULLY fetched chunk, lagged by
+                # the margin so the trailing edge (events still being written) is
+                # re-scanned next pass. Never past `now − margin`.
+                wm_out = max(window_end - margin, start)
+                update_import_state(self._db, key, wm_out.isoformat(), total)
+                window_start = window_end
+            if total:
+                log.info("[%s] cross-talk reconcile: flagged %d zone-switch "
+                         "event(s)", cfg.circuit, total)
 
     async def _reconcile_irrigation_cross_talk(
         self,
@@ -529,34 +582,24 @@ class HistoricalImporter:
         irr_cfg: CircuitConfig,
         start: datetime,
         end: datetime,
-    ) -> int:
+    ) -> Optional[int]:
         """Flag main events in [start, end] that are irrigation zone-switch cross-talk.
 
         Single coherent activity definition (merged irrigation-flow intervals) is used
         for BOTH candidate selection and the detector's ``irrigation_active``; PiΔ and
-        PmΔ are computed from ONE history batch over the SAME padded window per event.
-        Returns the count flagged.
-        """
+        PmΔ are computed from one history batch over the SAME padded window per event.
+        Returns the count flagged — or **None on a history-fetch failure**, so the
+        caller can hold the watermark and retry (a swallowed failure used to be
+        recorded as "reconciled", permanently skipping outage windows).
+
+        Cheapest checks first (this runs every catch-up tick, mostly finding
+        nothing): the local candidate SQL, then the small irrigation-flow series,
+        and only when both hit does it pull the two heavy 4 Hz pressure series."""
         main_press_e = main_cfg.pressure_history_sensor or main_cfg.pressure_avg_sensor
         irr_press_e = irr_cfg.pressure_history_sensor or irr_cfg.pressure_avg_sensor
         irr_flow_e = irr_cfg.flow_sensor
         if not (main_press_e and irr_press_e and irr_flow_e):
             return 0
-        try:
-            hist = await self._ha.get_history_batch(
-                [main_press_e, irr_press_e, irr_flow_e], start, end)
-        except Exception as exc:
-            log.warning("cross-talk reconcile history fetch failed: %s", exc)
-            return 0
-
-        irr_flow = _numeric_series(hist.get(irr_flow_e, []), _clamp_flow)
-        intervals = _merge_active_intervals(
-            irr_flow, _XTALK_IRR_MIN_FLOW_LPM,
-            self.XTALK_RECONCILE_GAP_S, self.XTALK_RECONCILE_MIN_BLOCK_S)
-        if not intervals:
-            return 0
-        main_press = _numeric_series(hist.get(main_press_e, []), _clamp_pressure)
-        irr_press = _numeric_series(hist.get(irr_press_e, []), _clamp_pressure)
 
         rows = self._db.execute(
             "SELECT id, start_ts, end_ts, duration_seconds, volume_litres "
@@ -569,16 +612,45 @@ class HistoricalImporter:
             (main_cfg.circuit, _XTALK_IRR_MAX_VOLUME_L,
              start.isoformat(), end.isoformat()),
         ).fetchall()
+        if not rows:
+            return 0
 
-        pad = timedelta(seconds=self.XTALK_RECONCILE_PRESSURE_PAD_S)
-        flagged = 0
+        try:
+            hist = await self._ha.get_history_batch([irr_flow_e], start, end)
+        except Exception as exc:
+            log.warning("cross-talk reconcile irrigation-flow fetch failed: %s", exc)
+            return None
+        irr_flow = _numeric_series(hist.get(irr_flow_e, []), _clamp_flow)
+        intervals = _merge_active_intervals(
+            irr_flow, _XTALK_IRR_MIN_FLOW_LPM,
+            self.XTALK_RECONCILE_GAP_S, self.XTALK_RECONCILE_MIN_BLOCK_S)
+        if not intervals:
+            return 0
+
+        cands = []
         for ev in rows:
             s = _parse_ts(ev["start_ts"])
             if s is None:
                 continue
             e = _parse_ts(ev["end_ts"]) or s
-            if not _overlaps_any(s, e, intervals):
-                continue
+            if _overlaps_any(s, e, intervals):
+                cands.append((ev, s, e))
+        if not cands:
+            return 0
+
+        try:
+            hist = await self._ha.get_history_batch(
+                [main_press_e, irr_press_e], start, end)
+        except Exception as exc:
+            log.warning("cross-talk reconcile pressure fetch failed: %s", exc)
+            return None
+        main_press = _numeric_series(hist.get(main_press_e, []), _clamp_pressure)
+        irr_press = _numeric_series(hist.get(irr_press_e, []), _clamp_pressure)
+
+        pad = timedelta(seconds=self.XTALK_RECONCILE_PRESSURE_PAD_S)
+        flagged = 0
+        affected_days: set = set()
+        for ev, s, e in cands:
             pmd = _pressure_swing(main_press, s - pad, e + pad)
             pid = _pressure_swing(irr_press, s - pad, e + pad)
             if not _detect_irrigation_cross_talk(
@@ -592,8 +664,19 @@ class HistoricalImporter:
                     interval_start=iv[0].isoformat() if iv else None,
                     interval_end=iv[1].isoformat() if iv else None,
                     main_delta_psi=round(pmd, 3), other_delta_psi=round(pid, 3),
-                    ratio=round(pid / pmd, 3) if pmd > 0 else None):
+                    ratio=round(pid / pmd, 3) if pmd > 0 else None,
+                    recompute_summary=False):
                 flagged += 1
+                day = (ev["start_ts"] or "")[:10]
+                if day:
+                    affected_days.add(day)
+        # One daily-summary recompute per affected DAY, not per event (the backfill
+        # flagged 185 events over 12 days — 185 full-table scans where 12 do).
+        if affected_days:
+            from .database import compute_daily_summary
+            for day in sorted(affected_days):
+                compute_daily_summary(self._db, main_cfg.circuit, day)
+            self._db.commit()
         return flagged
 
     # ------------------------------------------------------------------ #
@@ -605,13 +688,15 @@ class HistoricalImporter:
         cfg: CircuitConfig,
         start: datetime,
         end: datetime,
-        strict: bool = False,
     ) -> Tuple[int, Optional[datetime]]:
         """
         Fetch HA history for [start, end] and import any missing events.
         Returns (count_queued, retry_from) where retry_from is the earliest
         dropped event start if any events were lost to QueueFull — the caller
         should use it as the next catch-up checkpoint so those events are retried.
+        RAISES on a history-fetch failure (see the fetch note below) — callers
+        that loop over circuits/chunks catch per iteration and hold their
+        checkpoint so the window is retried, never silently skipped.
         """
         # Choose the best available pressure sensor for history
         pressure_entity = cfg.pressure_history_sensor or cfg.pressure_avg_sensor
@@ -632,14 +717,14 @@ class HistoricalImporter:
                         cfg.circuit)
             return 0, None
 
-        # Single WS request/connection for all entities in this window.
-        try:
-            histories = await self._ha.get_history_batch(entities_to_fetch, start, end)
-        except Exception as exc:
-            log.warning("[%s] history batch fetch failed: %s", cfg.circuit, exc)
-            if strict:
-                raise            # atomic reprocess needs to know the import didn't happen
-            return 0, None
+        # Single WS request/connection for all entities in this window. A fetch
+        # failure RAISES — one error contract for every caller. The old
+        # `strict` flag made silent-swallow (`return 0, None`) the default,
+        # which is exactly the bug class the atomic reprocess fixed: "imported
+        # 0" after a failed fetch reads as "nothing to import" and, worse, let
+        # the catch-up advance its checkpoint past an unfetched window. Loop
+        # callers catch per circuit/chunk and hold their checkpoints.
+        histories = await self._ha.get_history_batch(entities_to_fetch, start, end)
 
         onset_hist     = histories.get(cfg.flow_onset_sensor, [])
         flow_rate_hist = histories.get(cfg.flow_sensor, [])
@@ -875,17 +960,18 @@ class HistoricalImporter:
         kept_dips = []
         for s, e in pressure_periods:
             overlap = [(fs, fe) for fs, fe in flow_only if fe > s and fs < e]
-            if ((e - s).total_seconds() >= self.PRESSURE_DIP_BRIDGE_LONG_SPAN_S
-                    and self._flow_volume_in_period(flow_rate_hist, s, e)
-                    < self.PRESSURE_DIP_BRIDGE_MIN_VOLUME_L
+            span_vol = (self._flow_volume_in_period(flow_rate_hist, s, e)
+                        if (e - s).total_seconds()
+                        >= self.PRESSURE_DIP_BRIDGE_LONG_SPAN_S else None)
+            if (span_vol is not None
+                    and span_vol < self.PRESSURE_DIP_BRIDGE_MIN_VOLUME_L
                     and overlap
                     and all((fe - fs).total_seconds() >= self.MIN_DURATION_SECONDS
                             for fs, fe in overlap)):
                 log.info("[importer] dropping %.0f-min pressure-dip bridge with only "
                          "%.2f L flow across %d self-standing fragment(s) — noise, not "
                          "a real bridged event",
-                         (e - s).total_seconds() / 60.0,
-                         self._flow_volume_in_period(flow_rate_hist, s, e), len(overlap))
+                         (e - s).total_seconds() / 60.0, span_vol, len(overlap))
                 continue
             kept_dips.append((s, e))
         pressure_periods = kept_dips
@@ -902,29 +988,39 @@ class HistoricalImporter:
         self, flow_rate_hist: List[Dict], start: datetime, end: datetime,
     ) -> float:
         """Integrate flow_rate (L/min) over [start, end] from history → litres. Used
-        only to decide whether a long pressure-dip envelope contains real flow (so it
-        can earn its bridge). LEFT-HOLD step integration, NOT trapezoidal: HA logs on
-        change, so a reading holds until the next change — a value of 0 logged after a
-        blip means zero flow across the whole gap until the next change, NOT a ramp.
-        (Trapezoidal would interpolate a phantom ramp across a long no-flow gap and
-        invent volume — the exact noise this gate must reject.)"""
-        prev_ts: Optional[datetime] = None
-        prev_rate = 0.0
-        vol = 0.0
+        to decide whether a long pressure-dip envelope contains real flow (bridge
+        gate) and whether a dry-run reconstruction can account for a stored event's
+        volume (auto-split trust gate).
+
+        Delegates to ``flow_integral.integrate_litres`` — the shared integrator the
+        live detector and volume recompute already use — so the semantics can't
+        drift: LEFT-HOLD step integration (HA logs on change; trapezoidal would
+        invent volume across no-flow gaps) plus the 120 s offline-gap clamp (a
+        recorder outage can't fabricate held-flow volume). The history is clipped
+        to the window, carrying the pre-window held rate in at ``start`` and
+        holding the last rate out to ``end``."""
+        from .flow_integral import integrate_litres
+
+        samples: List[Tuple[datetime, float]] = []
+        pre: Optional[Tuple[datetime, float]] = None
         for entry in flow_rate_hist:
             ts = _parse_ts(entry.get("last_changed"))
-            if ts is None or ts < start or ts > end:
+            if ts is None:
                 continue
             try:
                 rate = float(entry["state"])
             except (ValueError, TypeError, KeyError):
                 rate = 0.0
-            if prev_ts is not None:
-                dt_s = (ts - prev_ts).total_seconds()
-                if dt_s > 0:
-                    vol += prev_rate * dt_s / 60.0   # prev value held until this change
-            prev_ts, prev_rate = ts, rate
-        return vol
+            if ts < start:
+                pre = (start, rate)      # last change before the window, held into it
+            elif ts <= end:
+                samples.append((ts, rate))
+        if pre is not None:
+            samples.insert(0, pre)
+        if samples:
+            samples.append((end, 0.0))   # close the window so the last hold counts
+        litres, _capped = integrate_litres(samples)
+        return litres
 
     def _onset_to_periods(
         self,

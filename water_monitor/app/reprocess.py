@@ -22,6 +22,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Set, Tuple
 
 from .config import DB_PATH
+from .event_rules import NOT_ARTIFACT_SQL
+from .feature_extractor import SPARSE_ENVELOPE_REASON
 from .database import (delete_events_in_range, get_home_profile, get_write_lock,
                        restore_deleted_events, run_isolated_write)
 
@@ -37,6 +39,9 @@ _SPLIT_MAX_PERIODS: int = 10      # ...and <= K — more is chatter (e.g. soften
 _SPLIT_LOOKBACK_H: int = 24       # only scan recently-settled events (bounds re-checks)
 _SPLIT_SETTLE_MIN: int = 60       # ...older than this, so the event is done being extended
 _SPLIT_DEFAULT_LIMIT: int = 20    # per-pass cap (HA-history rate-limit)
+_SPLIT_MIN_VOLUME_COVERAGE: float = 0.9   # dev.41: reconstructed flow must account for
+                                          # this share of the stored volume, else the
+                                          # window's history can't be trusted (skip)
 
 
 def _parse_utc(value: str) -> datetime:
@@ -86,7 +91,7 @@ async def reprocess_window(
     move the catch-up checkpoint backward.
 
     Atomicity: EXCEPTION-atomic. A re-import failure (incl. an HA history-fetch error,
-    surfaced by ``import_range(strict=True)``) restores the deleted events verbatim, so
+    surfaced by ``import_range`` raising) restores the deleted events verbatim, so
     no water is lost. It is NOT crash-atomic: a hard process kill in the (sub-second)
     window between the committed delete and the re-import would leave the events deleted
     (volume under-counted) with no restore. Full crash recovery (a durable pending-
@@ -102,20 +107,20 @@ async def reprocess_window(
 
     from_iso, to_iso = from_dt.isoformat(), to_dt.isoformat()
     # 1) Delete the window's machine events under the write lock (sync, isolated).
-    #    capture=True snapshots the deleted rows so step 2 can restore them if the
+    #    The returned deleted_rows snapshot lets step 2 restore them if the
     #    re-import fails — making delete-then-import atomic (no lost water).
     res = await run_isolated_write(
         DB_PATH,
-        lambda c: delete_events_in_range(c, circuit, from_iso, to_iso, capture=True))
+        lambda c: delete_events_in_range(c, circuit, from_iso, to_iso))
     # 2) Widen the import to the true deleted span, then reconstruct from HA. The
     #    reconstructed events queue onto the live pipeline; the FeatureExtractor
-    #    worker stores + classifies them. strict=True so a history-fetch failure
-    #    RAISES (instead of silently returning 0) — we then restore the deleted
-    #    events so the reprocess is all-or-nothing.
+    #    worker stores + classifies them. import_range RAISES on a history-fetch
+    #    failure (never a silent 0) — we then restore the deleted events so the
+    #    reprocess is all-or-nothing.
     imp_from, imp_to, widened = compute_widened_window(
         from_dt, to_dt, res["span_start"], res["span_end"])
     try:
-        imported = await importer.import_range(circuit, imp_from, imp_to, strict=True)
+        imported = await importer.import_range(circuit, imp_from, imp_to)
     except Exception:
         deleted_rows = res.get("deleted_rows") or []
         if deleted_rows:
@@ -157,7 +162,7 @@ async def auto_split_merged_events(
 
     Scans recently-settled, UNLABELLED, multi-segment events with a large internal idle
     gap (likely several distinct draws welded into one envelope), confirms each via a
-    DRY-RUN reconstruction (``importer.count_candidate_periods`` — the importer's
+    DRY-RUN reconstruction (``importer.dry_run_reconstruction`` — the importer's
     15 s-granular period detection, no delete/store), and only then re-imports it split
     via ``reprocess_window``. Candidates include inflated ``sparse_envelope`` singles (the
     "brief use, long idle tail" events — excluded_from_training=1 but exactly what this
@@ -165,12 +170,16 @@ async def auto_split_merged_events(
     (phantom / cross-talk / dribble — never reprocessed, they may carry a zeroed volume),
     anomaly-flagged, and softener-brine (``softener_session`` / ``water_softener``) events
     are never candidates; the dry-run gate (split ``_SPLIT_MIN_PERIODS..._SPLIT_MAX_PERIODS``
-    or a single-draw SHRINK) skips clean singles and many-pulse chatter; volume stays
-    balanced through ``reprocess_window``'s ledger
-    chokepoint. Re-imported sub-draws are single-segment, so they never re-trigger
-    (no oscillation — structural, restart-safe). ``checked`` (an in-memory id set the
-    caller carries across passes) avoids re-fetching a settled non-split candidate every
-    pass. Best-effort. Returns ``{"scanned","split","skipped","disabled?"}``."""
+    or a single-draw SHRINK) skips clean singles and many-pulse chatter; and — dev.41 —
+    a window whose history is UNTRUSTWORTHY (gap markers, or a reconstructed flow volume
+    that can't account for ~90% of the stored volume) is never reprocessed, so incomplete
+    recorder data can never shrink away real recorded water. Volume stays balanced
+    through ``reprocess_window``'s ledger chokepoint. Re-imported sub-draws are
+    single-segment, so they never re-trigger (no oscillation — structural, restart-safe).
+    ``checked`` (an in-memory id set the caller carries across passes) avoids re-fetching
+    a SETTLED decision every pass; transient outcomes (fetch failure, writer busy) are
+    deliberately NOT added, so they retry on the next pass.
+    Best-effort. Returns ``{"scanned","split","skipped","disabled?"}``."""
     importer = getattr(orch, "historical_importer", None)
     if importer is None:
         return {"scanned": 0, "split": 0, "skipped": 0}
@@ -184,7 +193,7 @@ async def auto_split_merged_events(
         lo = (now - timedelta(hours=_SPLIT_LOOKBACK_H)).isoformat()
         hi = (now - timedelta(minutes=_SPLIT_SETTLE_MIN)).isoformat()
         rows = conn.execute(
-            "SELECT id, start_ts, end_ts FROM events "
+            "SELECT id, start_ts, end_ts, volume_litres FROM events "
             "WHERE circuit = ? AND end_ts >= ? AND end_ts <= ? "
             "  AND user_fixture_type IS NULL AND COALESCE(user_classified, 0) = 0 "
             "  AND COALESCE(user_ignored, 0) = 0 "
@@ -197,10 +206,8 @@ async def auto_split_merged_events(
             # auto-reprocess a zeroed or artifact event. sparse_envelope keeps its volume,
             # so this stays volume- and leak-neutral; the dry-run gate still decides.
             "  AND (COALESCE(excluded_from_training, 0) = 0 "
-            "       OR COALESCE(match_rejection_reason, '') = 'sparse_envelope') "
-            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
-            "  AND COALESCE(is_cross_talk, 0) = 0 "
-            "  AND COALESCE(is_low_flow_dribble, 0) = 0 "
+            "       OR COALESCE(match_rejection_reason, '') = ?) "
+            "  AND " + NOT_ARTIFACT_SQL + " "
             # dev.39 LEAK-SAFETY (adversarial-review fix): never auto-reprocess an event
             # the anomaly detector has FLAGGED. Splitting/shrinking a flagged event could
             # strip its leak signal (a long, unusual-duration event becomes several
@@ -216,7 +223,7 @@ async def auto_split_merged_events(
             "  AND COALESCE(matched_via, '') <> 'softener_session' "
             "  AND COALESCE(matched_fixture_type, '') <> 'water_softener' "
             "ORDER BY start_ts ASC LIMIT ?",
-            (circuit, lo, hi, _SPLIT_MIN_IDLE_S, limit),
+            (circuit, lo, hi, SPARSE_ENVELOPE_REASON, _SPLIT_MIN_IDLE_S, limit),
         ).fetchall()
     finally:
         conn.close()
@@ -228,12 +235,15 @@ async def auto_split_merged_events(
         eid = r["id"]
         if eid in checked:
             continue
-        checked.add(eid)
         scanned += 1
         s_dt = _parse_utc(r["start_ts"])
         e_dt = _parse_utc(r["end_ts"] or r["start_ts"])
         # Dry-run: what does the importer reconstruct here (with the dev.39 gate)?
-        periods = await importer.count_candidate_periods(circuit, s_dt, e_dt)
+        dry = await importer.dry_run_reconstruction(circuit, s_dt, e_dt)
+        if dry.get("fetch_failed"):
+            skipped += 1
+            continue                    # transient — NOT checked; retry next pass
+        periods = dry["periods"]
         stored_dur = (e_dt - s_dt).total_seconds()
         biggest = max(((pe - ps).total_seconds() for ps, pe in periods), default=0.0)
         # Reprocess when the re-import would meaningfully DE-BLOAT this event:
@@ -242,16 +252,29 @@ async def auto_split_merged_events(
         #     than the stored span (an inflated single event — e.g. two blips a spurious
         #     pressure-dip welded into one long event — collapses to its real use).
         # > K draws is chatter (skip). A clean event reconstructs to ~itself (1 draw,
-        # biggest ≈ stored) → skipped, no churn. Volume is preserved by reprocess_window's
-        # atomic re-import either way.
+        # biggest ≈ stored) → skipped, no churn.
         is_split = _SPLIT_MIN_PERIODS <= len(periods) <= _SPLIT_MAX_PERIODS
         is_shrink = (len(periods) == 1 and biggest <= stored_dur - _SPLIT_MIN_IDLE_S)
-        if not (is_split or is_shrink):
+        # dev.41 VOLUME-SAFETY: reprocess_window is only exception-atomic — a re-import
+        # that SUCCEEDS on thin history silently under-counts. So the window's history
+        # must also prove it can reproduce the stored water: no recorder-gap markers,
+        # and the re-integrated flow accounts for >= ~90% of the stored volume. An
+        # untrustworthy window is a SETTLED skip (the gap markers are in the recorded
+        # history forever), not a retry.
+        stored_vol = float(r["volume_litres"] or 0.0)
+        trustworthy = (not dry.get("gappy")
+                       and (stored_vol <= 0.0
+                            or dry.get("flow_volume_l", 0.0)
+                            >= _SPLIT_MIN_VOLUME_COVERAGE * stored_vol))
+        if not (is_split or is_shrink) or not trustworthy:
+            checked.add(eid)
             skipped += 1
             continue
         res = await reprocess_window(orch, circuit, s_dt, e_dt)
         if res.get("busy"):
-            break                       # another admin write is mid-flight; retry next pass
+            break                       # another admin write is mid-flight; retry next
+                                        # pass — eid deliberately NOT in checked
+        checked.add(eid)
         split += 1
         log.info("[%s] auto-split: event %s (%s..%s) → %d draws, re-imported %d",
                  circuit, eid, r["start_ts"][:19], (r["end_ts"] or "")[:19],

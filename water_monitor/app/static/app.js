@@ -10,15 +10,22 @@ async function post(url, body = {}) {
     },
     body: JSON.stringify(body),
   });
+  let data = null;
+  try { data = await resp.json(); } catch {}
   if (resp.status === 403) {
-    // Stale CSRF token (e.g. the add-on restarted/updated while this tab was open).
-    // The 403 refreshed our session cookie; reload to derive a fresh token rather
-    // than fail silently.
+    // Two DIFFERENT 403s share the status code:
+    //  - RBAC denial (JSON {"error":"forbidden"}) — the user's role may not do
+    //    this. Show the server's message; reloading would just loop silently.
+    //  - Stale CSRF token (e.g. the add-on restarted/updated while this tab was
+    //    open). The 403 refreshed our session cookie; reload to derive a fresh
+    //    token rather than fail silently.
+    if (data && data.error === "forbidden") {
+      toast(data.message || "You don't have permission to do that.", "error");
+      return { ok: false, status: 403, data };
+    }
     location.reload();
     return new Promise(() => {});  // never resolves — the page is reloading
   }
-  let data = null;
-  try { data = await resp.json(); } catch {}
   return { ok: resp.ok, status: resp.status, data };
 }
 

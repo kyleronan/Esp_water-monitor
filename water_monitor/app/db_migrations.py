@@ -1378,6 +1378,48 @@ def _log_schema_state(conn: sqlite3.Connection) -> None:
         log.info("Schema diagnostic failed (non-fatal): %s", exc)
 
 
+# ── Ordered forward-migration chain ────────────────────────────────────────────
+# (introduced_in_version, apply_fn): a DB stamped at version V already HAS every
+# step with introduced <= V and needs exactly the steps with introduced > V,
+# applied in this order. Every apply fn is idempotent, so the whole dispatch is
+# one loop — adding a migration is ONE line here (plus bumping _CURRENT_VERSION),
+# not an edit to ~28 hand-maintained per-version branches (the old ladder, where
+# one missed branch stamped a DB current while silently missing a table).
+_MIGRATIONS: tuple = (
+    (20260524, _drop_retired_wf_entity_map_rows),
+    (20260525, _apply_unique_events_index),
+    (20260526, _apply_degraded_supply_columns),
+    (20260527, _apply_valve_type_column),
+    (20260528, _apply_orphan_repair),
+    (20260529, _apply_suggestion_source_column),
+    (20260530, _apply_signature_matcher),
+    (20260531, _apply_fixture_taxonomy_consolidation),
+    (20260532, _apply_phantom_event_column),
+    (20260533, _apply_category_publish_table),
+    (20260534, _apply_manual_classification_columns),
+    (20260535, _apply_low_flow_dribble_column),
+    (20260536, _apply_active_flow_columns),
+    (20260537, _apply_cycle_pulse_column),
+    (20260538, _apply_label_source_column),
+    (20260539, _apply_training_capture_tables),
+    (20260540, _apply_cross_talk_columns),
+    (20260541, _apply_matched_via_column),
+    (20260542, _apply_dev24_columns),
+    (20260543, _apply_anomaly_response_columns),
+    (20260544, _apply_recorder_reconcile_columns),
+    (20260545, _apply_dev38_columns),
+    (20260546, _apply_ppl_column),
+    (20260547, _apply_rbac_tables),
+    (20260548, _apply_embedded_fixtures_column),
+    (20260549, _apply_auto_split_default),
+    (20260550, _apply_cross_talk_audit_table),
+)
+
+# Versions a DB may legitimately be stamped with and still be upgradeable.
+_UPGRADEABLE_VERSIONS: frozenset = frozenset(
+    {_BASELINE_VERSION} | {v for v, _ in _MIGRATIONS})
+
+
 def run_migrations(
     conn: sqlite3.Connection,
     db_path: Optional[Path] = None,
@@ -1447,571 +1489,6 @@ def _run_migrations_impl(
         log.debug("Database at schema version %d", _CURRENT_VERSION)
         return
 
-    if version == 20260549:
-        # DB has auto-hygiene defaulted on but lacks the cross_talk_audit table.
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260549 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260548:
-        # DB has embedded_fixtures_json but auto-hygiene not yet defaulted on.
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260548 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260547:
-        # DB has the RBAC tables but lacks the embedded_fixtures_json column.
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260547 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260546:
-        # DB has the per-circuit pulses_per_litre column but lacks the RBAC tables.
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260546 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260545:
-        # DB has the dev.38 auto-split flag but lacks the per-circuit pulses_per_litre column.
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260545 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260544:
-        # DB has the recorder-reconcile columns but lacks the dev.38 auto-split flag.
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260544 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260543:
-        # DB has the anomaly-response columns but lacks the Phase 3 §2 recorder-reconcile
-        # columns.
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260543 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260542:
-        # DB has the dev.24 columns but lacks the Phase 2.3 anomaly-response columns.
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260542 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260541:
-        # DB has the matched_via column but lacks the dev.24 columns
-        # (water-softener config + cycle_group_id rollup key).
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260541 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260540:
-        # DB has the cross-talk columns but lacks the matched_via provenance column.
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260540 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260539:
-        # DB has the training_capture tables but lacks the cross-talk columns.
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260539 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260538:
-        # DB has fixture_label_source but lacks the training_capture tables.
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260538 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260537:
-        # DB has cycle_pulse_count but lacks fixture_label_source.
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260537 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260536:
-        # DB has the active-flow columns but lacks cycle_pulse_count.
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260536 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260535:
-        # DB has the low-flow-dribble column but lacks the active-flow columns.
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260535 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260534:
-        # DB has the manual-classification columns but lacks the low-flow
-        # dribble exclusion column + reclassify indexes.
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260534 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260533:
-        # DB has category_publish but lacks the manual-classification columns
-        # + the phantom-misflag repair.
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260533 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260532:
-        # DB has the phantom guard but lacks category_publish + manual class.
-        _apply_category_publish_table(conn)
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260532 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260531:
-        # DB has the taxonomy consolidation but lacks the phantom guard +
-        # category_publish + manual class.
-        _apply_phantom_event_column(conn)
-        _apply_category_publish_table(conn)
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260531 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260530:
-        # DB has signature-matcher infrastructure but hasn't had the taxonomy
-        # consolidation, phantom guard, category_publish, or manual class.
-        _apply_fixture_taxonomy_consolidation(conn)
-        _apply_phantom_event_column(conn)
-        _apply_category_publish_table(conn)
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260530 → %d", _CURRENT_VERSION)
-        return
-
-    if version == _BASELINE_VERSION:
-        # Forward step 1: drop retired text-sensor waveform roles.
-        missing = _missing_baseline_columns(conn)
-        if missing:
-            raise RuntimeError(
-                "Database claims baseline schema version but is missing required "
-                f"columns: {', '.join(sorted(missing))}. "
-                f"Delete the database file and restart the add-on.{_db_hint}"
-            )
-        _drop_retired_wf_entity_map_rows(conn)
-        # Forward step 2: dedup events and apply the unique index.
-        _apply_unique_events_index(conn)
-        # Forward step 3: degraded-supply columns + waveform table + rebuild.
-        _apply_degraded_supply_columns(conn)
-        # Forward step 4: per-circuit valve_type column.
-        _apply_valve_type_column(conn)
-        # Forward step 5: orphan repair.
-        _apply_orphan_repair(conn)
-        # Forward step 6: suggestion_source column.
-        _apply_suggestion_source_column(conn)
-        # Forward step 7: signature-matcher table + column.
-        _apply_signature_matcher(conn)
-        # Forward step 8: taxonomy consolidation (23 → 8 types).
-        _apply_fixture_taxonomy_consolidation(conn)
-        # Forward step 9: phantom guard columns + reprocess.
-        _apply_phantom_event_column(conn)
-        # Forward step 10: category_publish table + seed.
-        _apply_category_publish_table(conn)
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded %d → %d", _BASELINE_VERSION, _CURRENT_VERSION)
-        return
-
-    if version == _VERSION_PRE_UNIQUE_INDEX:
-        _apply_unique_events_index(conn)
-        _apply_degraded_supply_columns(conn)
-        _apply_valve_type_column(conn)
-        _apply_orphan_repair(conn)
-        _apply_suggestion_source_column(conn)
-        _apply_signature_matcher(conn)
-        _apply_fixture_taxonomy_consolidation(conn)
-        _apply_phantom_event_column(conn)
-        _apply_category_publish_table(conn)
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded %d → %d",
-                 _VERSION_PRE_UNIQUE_INDEX, _CURRENT_VERSION)
-        return
-
-    if version == _VERSION_PRE_DEGRADED:
-        # DB has the unique index but lacks the degraded-supply columns.
-        _apply_degraded_supply_columns(conn)
-        _apply_valve_type_column(conn)
-        _apply_orphan_repair(conn)
-        _apply_suggestion_source_column(conn)
-        _apply_signature_matcher(conn)
-        _apply_fixture_taxonomy_consolidation(conn)
-        _apply_phantom_event_column(conn)
-        _apply_category_publish_table(conn)
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded %d → %d",
-                 _VERSION_PRE_DEGRADED, _CURRENT_VERSION)
-        return
-
-    if version == 20260526:
-        # DB has the degraded-supply migration but lacks valve_type.
-        _apply_valve_type_column(conn)
-        _apply_orphan_repair(conn)
-        _apply_suggestion_source_column(conn)
-        _apply_signature_matcher(conn)
-        _apply_fixture_taxonomy_consolidation(conn)
-        _apply_phantom_event_column(conn)
-        _apply_category_publish_table(conn)
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260526 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260527:
-        # DB has the valve_type column but lacks the orphan-repair column
-        # and hasn't run the one-shot orphan cleanup yet.
-        _apply_orphan_repair(conn)
-        _apply_suggestion_source_column(conn)
-        _apply_signature_matcher(conn)
-        _apply_fixture_taxonomy_consolidation(conn)
-        _apply_phantom_event_column(conn)
-        _apply_category_publish_table(conn)
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260527 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260528:
-        # DB has the orphan-repair column but lacks suggestion_source.
-        _apply_suggestion_source_column(conn)
-        _apply_signature_matcher(conn)
-        _apply_fixture_taxonomy_consolidation(conn)
-        _apply_phantom_event_column(conn)
-        _apply_category_publish_table(conn)
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260528 → %d", _CURRENT_VERSION)
-        return
-
-    if version == 20260529:
-        # DB has suggestion_source but lacks the signature-matcher
-        # infrastructure (table + matched_fixture_type column).
-        _apply_signature_matcher(conn)
-        _apply_fixture_taxonomy_consolidation(conn)
-        _apply_phantom_event_column(conn)
-        _apply_category_publish_table(conn)
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
-        _set_version(conn, _CURRENT_VERSION)
-        log.info("Database upgraded 20260529 → %d", _CURRENT_VERSION)
-        return
-
     if version == 0:
         # Distinguish fresh DB from pre-squash DB via baseline columns.
         missing = _missing_baseline_columns(conn)
@@ -2031,54 +1508,43 @@ def _run_migrations_impl(
                 f"{', '.join(sorted(missing_deg))}. "
                 f"Schema definition is out of sync.{_db_hint}"
             )
-        # The degraded-supply partial index isn't in _create_schema (would
-        # fail on existing-DB upgrades — see comment there). Apply the full
-        # migration step here too; idempotent and a no-op on empty tables.
-        _apply_degraded_supply_columns(conn)
-        # Same pattern for valve_type — idempotent, ensures the column and
-        # the defensive backfill ran even on fresh DBs.
-        _apply_valve_type_column(conn)
-        # Same pattern for orphan-repair — column add is guarded, and the
-        # repair scan finds nothing on an empty DB.
-        _apply_orphan_repair(conn)
-        # Same pattern for suggestion_source — column add guarded, backfill
-        # only touches non-NULL suggestion rows.
-        _apply_suggestion_source_column(conn)
-        # Same pattern for signature-matcher — CREATE TABLE IF NOT EXISTS
-        # and the column-add guard mean this is a no-op on fresh DBs.
-        _apply_signature_matcher(conn)
-        # Taxonomy consolidation is a data-only pass; no-op on empty DBs.
-        _apply_fixture_taxonomy_consolidation(conn)
-        # Phantom guard — columns guarded by _has_column; reprocess scan
-        # finds nothing on an empty DB.
-        _apply_phantom_event_column(conn)
-        # Category publish table — CREATE IF NOT EXISTS, seed pulls from
-        # empty fixtures table on a fresh DB so no rows are inserted.
-        _apply_category_publish_table(conn)
-        _apply_manual_classification_columns(conn)
-        _apply_low_flow_dribble_column(conn)
-        _apply_active_flow_columns(conn)
-        _apply_cycle_pulse_column(conn)
-        _apply_label_source_column(conn)
-        _apply_training_capture_tables(conn)
-        _apply_cross_talk_columns(conn)
-        _apply_matched_via_column(conn)
-        _apply_dev24_columns(conn)
-        _apply_anomaly_response_columns(conn)
-        _apply_recorder_reconcile_columns(conn)
-        _apply_dev38_columns(conn)
-        _apply_ppl_column(conn)
-        _apply_rbac_tables(conn)
-        _apply_embedded_fixtures_column(conn)
-        _apply_auto_split_default(conn)
-        _apply_cross_talk_audit_table(conn)
+        # Run the chain anyway (idempotent, near-no-op on an empty DB): a few
+        # steps create things _create_schema deliberately omits (partial
+        # indexes, one-shot backfills). _apply_unique_events_index is skipped —
+        # the fresh schema already ships the unique index and the dedup scan
+        # would only rescan an empty table.
+        for _v, _fn in _MIGRATIONS:
+            if _fn is not _apply_unique_events_index:
+                _fn(conn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return
 
-    # Any version 1–31: old incremental migration DB.
-    raise RuntimeError(
-        f"Database schema version {version} is a pre-squash version. "
-        f"Delete the database file and restart the add-on to create a fresh "
-        f"schema. (Expected {_CURRENT_VERSION}, found {version}.){_db_hint}"
-    )
+    if version not in _UPGRADEABLE_VERSIONS:
+        # Any version 1–31 (or an unknown stamp): old incremental pre-squash DB.
+        raise RuntimeError(
+            f"Database schema version {version} is a pre-squash version. "
+            f"Delete the database file and restart the add-on to create a fresh "
+            f"schema. (Expected {_CURRENT_VERSION}, found {version}.){_db_hint}"
+        )
+
+    if version == _BASELINE_VERSION:
+        # Baseline sanity check before the chain runs (the chain itself starts
+        # with the drop-retired-waveform-roles step this version predates).
+        missing = _missing_baseline_columns(conn)
+        if missing:
+            raise RuntimeError(
+                "Database claims baseline schema version but is missing required "
+                f"columns: {', '.join(sorted(missing))}. "
+                f"Delete the database file and restart the add-on.{_db_hint}"
+            )
+
+    # Ordered chain: apply exactly the steps this version predates (see
+    # _MIGRATIONS — every fn is idempotent, so a re-run after a mid-chain
+    # crash is safe).
+    steps = [fn for v, fn in _MIGRATIONS if v > version]
+    for fn in steps:
+        fn(conn)
+    _set_version(conn, _CURRENT_VERSION)
+    log.info("Database upgraded %d → %d (%d forward step(s))",
+             version, _CURRENT_VERSION, len(steps))

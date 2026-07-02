@@ -188,6 +188,18 @@ RULE_DEFAULTS: Dict[str, Any] = {
 }
 
 
+# The volume-ZEROING artifact verdicts as one "not an artifact" SQL fragment.
+# Any query that chains or reprocesses events must exclude these (their stored
+# volume may be zeroed — chaining one into a cycle or re-importing it would
+# resurrect false water). When a NEW zeroing flag column is added, extend THIS
+# fragment — the pattern so far (phantom, cross-talk, dribble) each grew its own
+# column, and hand-copied flag lists are how the dev6 hygiene pass went stale.
+NOT_ARTIFACT_SQL: str = (
+    "COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+    "AND COALESCE(is_cross_talk, 0) = 0 "
+    "AND COALESCE(is_low_flow_dribble, 0) = 0")
+
+
 def _cv(calib: Optional[Dict[str, Any]], key: str) -> Any:
     """Resolve a rule constant: the per-home calibrated value if the frozen
     ``calib`` carries it, else the shipped default. Tuples round-trip through JSON
@@ -349,9 +361,7 @@ def detect_dishwasher_cycles(
     artifact-flagged events (phantom / cross-talk / dribble / excluded) and any id in
     ``exclude_ids`` (the washer/softener members the caller already claimed)."""
     where = ("WHERE circuit = ? AND COALESCE(excluded_from_training, 0) = 0 "
-             "AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
-             "AND COALESCE(is_cross_talk, 0) = 0 "
-             "AND COALESCE(is_low_flow_dribble, 0) = 0")
+             "AND " + NOT_ARTIFACT_SQL)
     params: list = [circuit]
     if since_ts is not None:
         where += " AND start_ts >= ?"

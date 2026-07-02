@@ -890,9 +890,10 @@
                 The monitor automatically flags readings that aren't real water use —
                 city water-pressure blips (👻), draws on your <em>other</em> water line
                 (↔), and tiny drips or sensor noise (Drip). Their volume is always
-                removed from your totals; turn this on to also hide those rows from the
-                list. Off by default — they stay visible with their flag so you can
-                relabel any that really were water.
+                removed from your totals; this toggle only controls whether the rows
+                also disappear from the list (on by default). Turn it off to see every
+                flagged row so you can relabel any that really were water — relabeling
+                one restores its volume.
               </span>
             </div>
             <label class="toggle">
@@ -1561,9 +1562,16 @@ async function _calPost(path, body) {
     headers:{'Content-Type':'application/json', 'X-CSRF-Token': window.CSRF_TOKEN || ''},
     body: JSON.stringify(body || {})});
   if (r.status === 403) {
-    // Stale CSRF token (add-on restarted/updated while this tab was open). The 403
-    // refreshed our session cookie; reload to pick up a fresh token instead of
-    // failing silently and leaving the user re-clicking.
+    // RBAC denial (JSON {"error":"forbidden"}) → surface the message; only a
+    // stale CSRF token (add-on restarted/updated while this tab was open) gets
+    // the reload-to-refresh-token treatment — reloading on a role denial would
+    // just loop silently.
+    let d = null;
+    try { d = await r.json(); } catch {}
+    if (d && d.error === 'forbidden') {
+      _calErr(d.message || "You don't have permission to do that.");
+      return d;
+    }
     location.reload();
     return new Promise(() => {});  // never resolves — the page is reloading
   }

@@ -383,15 +383,22 @@ async def ingress_middleware(request: Request, call_next):
             seen.add(uid)
             # Write on a PRIVATE connection via the serialized writer — never on
             # the shared orch.db from the request path (that risks a transaction
-            # clash with the orchestrator's inline writers). First-sight only, so
-            # this runs at most once per user per process.
+            # clash with the orchestrator's inline writers). Fire-and-forget: the
+            # serialized writer queues on the global admin write lock, which long
+            # jobs (fit + reclassify) can hold for minutes — the page request must
+            # NOT wait on it. On failure the uid is put back so a later request
+            # retries. First-sight only → at most one task per user per process.
             _uname = request.headers.get(REMOTE_USER_NAME_HEADER, "")
-            try:
-                from .config import DB_PATH
-                await run_isolated_write(
-                    DB_PATH, lambda c: record_seen_user(c, uid, _uname))
-            except Exception:
-                pass
+
+            async def _log_seen_user(u: str, name: str) -> None:
+                try:
+                    from .config import DB_PATH
+                    await run_isolated_write(
+                        DB_PATH, lambda c: record_seen_user(c, u, name))
+                except Exception:
+                    seen.discard(u)   # retry on a later request
+
+            asyncio.get_running_loop().create_task(_log_seen_user(uid, _uname))
 
     # Central mutation gate: reject any state-changing request the role isn't
     # allowed to make (viewer: none; operator: valve open/close only; admin: all).

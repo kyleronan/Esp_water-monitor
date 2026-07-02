@@ -334,8 +334,16 @@ class Orchestrator:
             return False
         boot = (getattr(self._cfg, "bootstrap_admin_user_id", "") or "").strip()
         self.admin_ids = (new_ids | {boot}) if boot else new_ids
-        save_admin_ids_cache(self._db, [u for u in users if u.get("is_admin")])
-        log.info("role-sync: cached %d HA admin(s)", len(new_ids))
+        # Persist only on CHANGE: the sync runs every 10 min forever and the
+        # admin set almost never changes — an unconditional DELETE+INSERT is
+        # ~144 pointless write transactions/day of SD-card/eMMC wear plus write-
+        # lock churn on the shared connection.
+        admins = [(u.get("id"), u.get("name") or "")
+                  for u in users if u.get("is_admin")]
+        if admins != getattr(self, "_last_saved_admins", None):
+            save_admin_ids_cache(self._db, [u for u in users if u.get("is_admin")])
+            self._last_saved_admins = admins
+            log.info("role-sync: cached %d HA admin(s)", len(new_ids))
         return True
 
     async def _run_role_sync(self) -> None:

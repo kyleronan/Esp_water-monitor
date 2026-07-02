@@ -16,7 +16,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from ._helpers import coerce_int, ingress_redirect
-from ..auth import require_admin
+from ..auth import require_admin_or_bootstrap
 
 from ..device_discovery import (
     find_matching_devices,
@@ -29,11 +29,14 @@ from ..device_discovery import (
 )
 
 log = logging.getLogger(__name__)
-# Admin-only router: the first-run / re-run wizard discovers devices and writes
-# the core device config. The early admin-set refresh in orchestrator.run() makes
-# admins recognised before traffic, so the genuine admin isn't locked out of
-# first-run setup; a bootstrap_admin_user_id option is the ultimate fallback.
-router = APIRouter(prefix="/setup", dependencies=[Depends(require_admin)])
+# Admin-only router — with a fresh-install bootstrap carve-out: while setup is
+# incomplete AND no admin is known at all (admin cache empty, config/auth/list
+# not yet fetched or unreadable by the token, no bootstrap_admin_user_id), the
+# wizard stays reachable so the first run can't 403 the genuine HA admin. The
+# carve-out closes as soon as any admin is known or setup completes; a
+# bootstrap_admin_user_id option remains the ultimate fallback for later.
+router = APIRouter(prefix="/setup",
+                   dependencies=[Depends(require_admin_or_bootstrap)])
 
 
 def _orch(r: Request):

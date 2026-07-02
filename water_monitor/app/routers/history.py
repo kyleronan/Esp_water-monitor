@@ -450,6 +450,21 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
         if not found:
             return JSONResponse({"error": "Event not found"}, status_code=404)
 
+    # A real fixture label = "confirmed real water" — it must also undo an
+    # automatic irrigation cross-talk zeroing, restoring the event's volume
+    # (the UI frames these flags as "relabel if wrong", so relabeling IS the
+    # recovery path). revert_irrigation_cross_talk self-guards: it only touches
+    # rows the auto pass flagged (never a user-classified cross-talk) and
+    # audits the revert.
+    if kwargs.get("user_fixture_type"):
+        try:
+            from ..database import revert_irrigation_cross_talk
+            if revert_irrigation_cross_talk(db, event_id, circuit):
+                log.info("[%s] relabel to %r reverted auto cross-talk on %s",
+                         circuit, kwargs["user_fixture_type"], event_id)
+        except Exception:
+            log.exception("cross-talk revert on relabel failed (label saved)")
+
     # Sprint B — if the patch touched user_fixture_type, propagate the
     # signal into the cluster's suggested_type (soft hint; never silently
     # links a cluster to a fixture). When the event has no cluster_id we

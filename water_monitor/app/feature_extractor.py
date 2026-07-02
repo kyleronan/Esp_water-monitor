@@ -347,6 +347,10 @@ _XTALK_IRR_MIN_MAIN_DELTA_PSI: float = 2.0  # need a real main pressure swing to
 _XTALK_IRR_PRESSURE_RATIO:    float = 1.3   # irrigation swing ≥ 1.3× main swing
 _XTALK_IRR_MIN_FLOW_LPM:      float = 5.0   # irrigation "running" flow floor (interval build)
 _IRRIGATION_XTALK_REASON: str = "irrigation_cross_talk"
+# The "brief use, long idle tail" inflated-envelope reason. ONE constant for every
+# writer/matcher (finalizer, sparse-reprocess scan, capped re-include, auto-split
+# candidate query) — the dev6 bug was one predicate not knowing this string.
+SPARSE_ENVELOPE_REASON: str = "sparse_envelope"
 
 
 # ── Per-home artifact-detector calibration (Phase 2.4) ──────────────────────────
@@ -1077,7 +1081,7 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         else "cross_talk" if is_cross_talk
         else "pulsing_supply" if is_degraded
         else "low_flow_dribble" if is_dribble
-        else "sparse_envelope" if is_sparse_envelope
+        else SPARSE_ENVELOPE_REASON if is_sparse_envelope
         else None
     )
 
@@ -1528,9 +1532,9 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                 continue
             conn.execute(
                 "UPDATE events SET excluded_from_training = 1, "
-                "  match_rejection_reason = 'sparse_envelope' "
+                "  match_rejection_reason = ? "
                 "WHERE id = ?",
-                (row["id"],),
+                (SPARSE_ENVELOPE_REASON, row["id"]),
             )
             sparse_flagged += 1
         if sparse_flagged:
@@ -1557,8 +1561,9 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "  AND COALESCE(user_ignored, 0) = 0 "
             "  AND COALESCE(user_classified, 0) = 0 "
             "  AND (match_rejection_reason IS NULL "
-            "       OR match_rejection_reason <> 'sparse_envelope') "
-            "  AND true_avg_flow_lpm IS NOT NULL"
+            "       OR match_rejection_reason <> ?) "
+            "  AND true_avg_flow_lpm IS NOT NULL",
+            (SPARSE_ENVELOPE_REASON,),
         )
         capped_reincluded = cur.rowcount or 0
         if capped_reincluded:
@@ -3351,25 +3356,13 @@ class FeatureExtractor:
         adaptation window. Blocks auto-shutoff during setup, learning, labelling, and
         BOTH full recalibration (state ≠ 'live') and partial recalibration (stays
         'live' but opens a 14-day adaptation window): the system must never cut the
-        user's water while it is still (re)learning what normal looks like."""
-        row = self._db.execute(
-            "SELECT state FROM training_state WHERE circuit = ?", (circuit,)).fetchone()
-        if not row or row["state"] != "live":
-            return False
-        lc = self._db.execute(
-            "SELECT accelerated_adaptation_until FROM learning_config WHERE circuit = ?",
-            (circuit,)).fetchone()
-        until = lc["accelerated_adaptation_until"] if lc else None
-        if until:
-            try:
-                t = datetime.fromisoformat(str(until).replace("Z", "+00:00"))
-                if t.tzinfo is None:
-                    t = t.replace(tzinfo=timezone.utc)
-                if t > datetime.now(timezone.utc):
-                    return False   # active recalibration / adaptation window
-            except (ValueError, TypeError):
-                pass
-        return True
+        user's water while it is still (re)learning what normal looks like.
+
+        Delegates to ``database.is_baseline_locked`` — the ONE definition of
+        "baseline locked", shared with the label-reclassify skip gate, so the two
+        notions of locked can't drift (they used to be line-for-line copies)."""
+        from .database import is_baseline_locked
+        return is_baseline_locked(self._db, circuit)
 
     def _resolve_valve_entity(self, circuit: str) -> Optional[str]:
         row = self._db.execute(
@@ -3561,12 +3554,19 @@ class FeatureExtractor:
             # dev.39 — dishwasher cycle: only worth scanning when THIS event is a
             # gentle small fill (a cheap, deliberately-loose pre-gate; the detector
             # then applies the precise calib-aware band AND needs >=3 such fills
-            # chained). Span covers a full cycle (~2.5h lookback).
+            # chained). Span covers a full cycle (~2.5h lookback). The loose bounds
+            # are DERIVED from the same calib values the detector uses (×1.4
+            # slack) — hardcoded 5.0s silently stopped invoking the detector for
+            # homes whose fitted DW_* band was calibrated wider, flipping labels
+            # between the live path and batch reclassify.
+            from .event_rules import _cv as _rule_cv
+            _dw_vol_hi = float(_rule_cv(calib, "DW_VOL_L")[1]) * 1.4
+            _dw_pk_hi = float(_rule_cv(calib, "DW_MAX_PK_LPM")) * 1.4
             vol = features.get("volume_litres")
             if (ctype != "zone" and event_id not in softener_members
                     and event_id not in washer_members
-                    and pk is not None and pk <= 5.0
-                    and vol is not None and 0.0 < vol <= 5.0):
+                    and pk is not None and pk <= max(5.0, _dw_pk_hi)
+                    and vol is not None and 0.0 < vol <= max(5.0, _dw_vol_hi)):
                 dw_since = (datetime.now(timezone.utc)
                             - timedelta(hours=2.5)).isoformat()
                 dishwasher_members = detect_dishwasher_cycles(

@@ -83,6 +83,20 @@ async def run_isolated_write(db_path, fn):
         return await loop.run_in_executor(None, _run)
 
 
+def yield_write_lock(conn: sqlite3.Connection, scanned: int,
+                     every: int = 300) -> None:
+    """Anti-starvation yield for long storage-only write loops (reclassify,
+    embedded-fixture scan): every ``every`` rows, commit (releasing the SQLite
+    file write-lock — a single end-of-loop commit holds it for the whole scan)
+    and sleep ~30 ms so a concurrently waiting writer (a user label save) can
+    win the lock — a bare commit re-acquires within microseconds, too fast for
+    the waiter. ONE definition so the load-bearing cadence/sleep tuning can't
+    drift between loops. Call from executor threads only (it sleeps)."""
+    if scanned % every == 0:
+        conn.commit()
+        time.sleep(0.03)
+
+
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Generator:
     try:
@@ -2186,7 +2200,6 @@ def coalesce_low_flow_events(
 
 def delete_events_in_range(
     conn: sqlite3.Connection, circuit: str, from_ts: str, to_ts: str,
-    capture: bool = False,
 ) -> Dict[str, Any]:
     """Delete the purely-machine-derived events that OVERLAP [from_ts, to_ts] on
     ``circuit`` — reversing each one's hourly_volume contribution and recomputing
@@ -2212,17 +2225,16 @@ def delete_events_in_range(
     candidates (no FK) is cleaned manually. Single transaction.
 
     Returns ``{"deleted": n, "span_start": <earliest start ISO or None>,
-    "span_end": <latest end ISO or None>}`` — the caller uses the true deleted span
-    to widen the re-import so an event extending beyond the window is fully rebuilt.
-    When ``capture=True``, also returns ``"deleted_rows"``: the full row dicts of every
-    deleted event, so an atomic caller (reprocess_window) can RESTORE them verbatim if
-    the subsequent re-import fails — guaranteeing a delete-then-failed-import never
-    loses water.
+    "span_end": <latest end ISO or None>, "deleted_rows": [<full row dicts>]}`` —
+    the caller uses the true deleted span to widen the re-import so an event
+    extending beyond the window is fully rebuilt, and an atomic caller
+    (reprocess_window) RESTORES ``deleted_rows`` verbatim if the subsequent
+    re-import fails — guaranteeing a delete-then-failed-import never loses water.
+    (Always captured: the windows are small, and a conditional ``capture=`` flag
+    meant two return shapes and two SELECTs that could drift.)
     """
     rows = conn.execute(
-        "SELECT id, start_ts, end_ts, hourly_volume_applied_litres, "
-        "       hourly_volume_applied_bucket "
-        "FROM events "
+        "SELECT * FROM events "
         "WHERE circuit = ? AND start_ts <= ? "
         "  AND COALESCE(end_ts, start_ts) >= ? "
         "  AND user_fixture_type IS NULL "
@@ -2233,13 +2245,8 @@ def delete_events_in_range(
     ).fetchall()
     if not rows:
         return {"deleted": 0, "span_start": None, "span_end": None,
-                **({"deleted_rows": []} if capture else {})}
-    captured_rows = []
-    if capture:
-        ids = [r["id"] for r in rows]
-        captured_rows = [dict(fr) for fr in conn.execute(
-            "SELECT * FROM events WHERE id IN (%s)" % ",".join("?" * len(ids)), ids
-        ).fetchall()]
+                "deleted_rows": []}
+    captured_rows = [dict(r) for r in rows]
     span_start = rows[0]["start_ts"]                       # earliest (ORDER BY ASC)
     span_end = max((r["end_ts"] or r["start_ts"]) for r in rows)
     affected_days = set()
@@ -2271,13 +2278,13 @@ def delete_events_in_range(
                     "DELETE FROM daily_summary WHERE circuit = ? AND day = ?",
                     (circuit, day))
     return {"deleted": len(rows), "span_start": span_start, "span_end": span_end,
-            **({"deleted_rows": captured_rows} if capture else {})}
+            "deleted_rows": captured_rows}
 
 
 def restore_deleted_events(
     conn: sqlite3.Connection, rows: List[Dict[str, Any]],
 ) -> int:
-    """Re-insert events captured by ``delete_events_in_range(capture=True)`` and
+    """Re-insert events captured by ``delete_events_in_range`` and
     re-apply their hourly-volume contribution — the rollback for an atomic reprocess
     whose re-import failed AFTER the delete committed. Each row is restored verbatim
     via the volume-ledger chokepoint so totals end exactly where they began. Returns
@@ -2301,6 +2308,14 @@ def restore_deleted_events(
         ev["hourly_volume_applied_bucket"] = None
         upsert_event_and_apply_hourly_volume(conn, ev, float(vol))
         restored += 1
+    # Rebuild the daily rollups the delete recomputed/dropped — without this the
+    # restored events exist but their days read ~0 L until something else happens
+    # to recompute those (possibly old) days.
+    pairs = {(dict(r).get("circuit"), (dict(r).get("start_ts") or "")[:10])
+             for r in rows}
+    for circuit, day in sorted(p for p in pairs if p[0] and p[1]):
+        compute_daily_summary(conn, circuit, day)
+    conn.commit()
     return restored
 
 
@@ -2776,8 +2791,13 @@ def mark_event_irrigation_cross_talk(
     main_delta_psi: Optional[float] = None,
     other_delta_psi: Optional[float] = None,
     ratio: Optional[float] = None,
+    recompute_summary: bool = True,
 ) -> bool:
     """Flag a main event as irrigation zone-switch cross-talk (2026-06-28).
+
+    ``recompute_summary=False`` lets a batch caller (the importer's reconcile
+    loop) skip the per-event daily-summary recompute and do ONE per affected day
+    after the loop instead.
 
     Applied OUT-OF-BAND by the historical importer's reconciliation pass, NOT a
     user action — so ``user_classified`` stays 0 (this keeps the row out of the
@@ -2828,7 +2848,7 @@ def mark_event_irrigation_cross_talk(
         apply_effective_volume(conn, event_id, circuit, row["start_ts"], 0.0)
 
     day = (row["start_ts"] or "")[:10]
-    if day:
+    if day and recompute_summary:
         compute_daily_summary(conn, circuit, day)
         conn.commit()
     return True
@@ -5011,15 +5031,9 @@ def reclassify_all_events_from_signatures(
         )
         # Release the SQLite write lock periodically so a concurrent user
         # label-save isn't starved into "database is locked" — reclassify is
-        # storage-only + idempotent, so a batched commit is safe (this is the
-        # "per-row commits release the file write-lock" behaviour run_isolated_write
-        # documents; a single end-of-loop commit held it for the whole scan). The
-        # brief sleep widens the release window — a bare commit re-acquires within
-        # microseconds, too fast for a waiting writer to win; ~30 ms lets it in.
-        # Runs in a worker thread (executor), so it never blocks the event loop.
-        if scanned % 300 == 0:
-            conn.commit()
-            time.sleep(0.03)
+        # storage-only + idempotent, so a batched commit is safe. Runs in a
+        # worker thread (executor), so the sleep never blocks the event loop.
+        yield_write_lock(conn, scanned)
     conn.commit()
     # ── Composite annotation (dev.39, step 1) ────────────────────────────────
     # Annotate sustained events with fixtures hidden inside them (a toilet flushed
@@ -5030,22 +5044,23 @@ def reclassify_all_events_from_signatures(
     try:
         emb = recompute_embedded_fixtures(conn, circuit, since_ts=since_ts)
         embedded_annotated = emb["annotated"]
-        # Re-promote abstained events that hide a real second draw to "other"/
-        # composite, reading the STORED annotation (a cheap LIKE) so this re-applies
-        # every run — the main loop above just cleared these to NULL, and the
-        # embedded scan is incremental (won't re-report an already-annotated event).
-        relabel = ("UPDATE events SET matched_fixture_type = 'other', "
-                   "matched_via = 'composite' WHERE circuit = ? "
-                   "AND user_fixture_type IS NULL AND matched_fixture_type IS NULL "
-                   "AND embedded_fixtures_json LIKE '%\"toilet\"%'")
-        rparams: list = [circuit]
-        if since_ts is not None:
-            relabel += " AND start_ts >= ?"
-            rparams.append(since_ts)
-        embedded_other = conn.execute(relabel, rparams).rowcount
-        conn.commit()
     except Exception:                       # pragma: no cover - defensive
         log.exception("[%s] embedded-fixture annotation failed (classification "
+                      "already committed)", circuit)
+    # Re-promote abstained events that hide a real second draw (ANY embedded kind
+    # — toilet, tap, …) to "other"/composite, from the STORED annotation so this
+    # re-applies every run — the main loop above just cleared these to NULL, and
+    # the embedded scan is incremental (won't re-report an already-annotated
+    # event). Separate try from the scan above: a waveform hiccup there must not
+    # also skip the re-promotion (that left prior 'other' events flickering to
+    # NULL until the next reclassify). Decided from the PARSED JSON, not a LIKE,
+    # so it can't drift from the detector's serialization or kind set.
+    try:
+        embedded_other = promote_embedded_composites(conn, circuit,
+                                                     since_ts=since_ts)
+        conn.commit()
+    except Exception:                       # pragma: no cover - defensive
+        log.exception("[%s] composite re-promotion failed (classification "
                       "already committed)", circuit)
     result = {
         "signatures_trained": signatures_trained,
@@ -5068,6 +5083,45 @@ def reclassify_all_events_from_signatures(
 
 
 _EMBEDDED_MIN_PARENT_DURATION_S: float = 300.0   # only sustained events can hide a draw
+
+
+def promote_embedded_composites(
+    conn: sqlite3.Connection,
+    circuit: str,
+    since_ts: Optional[str] = None,
+) -> int:
+    """Promote abstained events whose stored ``embedded_fixtures_json`` annotation
+    holds at least one embedded draw (any kind) to ``matched_fixture_type='other'``
+    / ``matched_via='composite'``. Re-applied after every reclassify (the main loop
+    clears abstained events to NULL). Decides from the parsed annotation — a LIKE
+    on the serialized JSON silently missed tap-only composites and coupled the rule
+    to the exact serialization. Returns the promoted count."""
+    where = ("WHERE circuit = ? AND user_fixture_type IS NULL "
+             "AND matched_fixture_type IS NULL "
+             "AND embedded_fixtures_json IS NOT NULL "
+             "AND embedded_fixtures_json <> '[]'")
+    params: list = [circuit]
+    if since_ts is not None:
+        where += " AND start_ts >= ?"
+        params.append(since_ts)
+    rows = conn.execute(
+        "SELECT id, embedded_fixtures_json FROM events " + where, params,
+    ).fetchall()
+    promoted = 0
+    for r in rows:
+        try:
+            embedded = json.loads(r["embedded_fixtures_json"])
+        except (ValueError, TypeError):
+            continue
+        if not (isinstance(embedded, list) and embedded):
+            continue
+        conn.execute(
+            "UPDATE events SET matched_fixture_type = 'other', "
+            "matched_via = 'composite' WHERE id = ?",
+            (r["id"],),
+        )
+        promoted += 1
+    return promoted
 
 
 def recompute_embedded_fixtures(
@@ -5132,9 +5186,7 @@ def recompute_embedded_fixtures(
             annotated += 1
             if summarize_embedded(embedded).get("toilet"):
                 with_toilet += 1
-        if scanned % 300 == 0:
-            conn.commit()                 # release the write lock periodically
-            time.sleep(0.03)              # widen the window so a waiting save wins
+        yield_write_lock(conn, scanned)   # let a waiting user save win the lock
     conn.commit()
     if scanned:
         log.info("[%s] embedded-fixture scan: %d new sustained event(s), %d annotated "

@@ -143,6 +143,29 @@ def require_admin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Admin access required.")
 
 
+def require_admin_or_bootstrap(request: Request) -> None:
+    """Dependency for the setup wizard: 403 unless admin — EXCEPT in the
+    fresh-install bootstrap state, where nobody CAN be admin yet.
+
+    Bootstrap state = setup is not complete AND the add-on knows of no admin at
+    all (empty ``orch.admin_ids``: fresh ``admin_ids_cache``, first
+    ``config/auth/list`` fetch not yet landed — or never landing because the
+    token can't read the user list — and no ``bootstrap_admin_user_id``).
+    Without this carve-out the first-run wizard 403s for everyone, including
+    the genuine HA admin, and the add-on is dead on arrival. The window closes
+    the moment any admin becomes known or setup completes; every later visit is
+    admin-gated as normal."""
+    if getattr(request.state, "role", VIEWER) == ADMIN:
+        return
+    orch = getattr(request.app.state, "orchestrator", None)
+    if (orch is not None
+            and not getattr(orch, "setup_complete", True)
+            and not getattr(orch, "admin_ids", None)):
+        return
+    from fastapi import HTTPException
+    raise HTTPException(status_code=403, detail="Admin access required.")
+
+
 def require_operator(request: Request) -> None:
     """Dependency: 403 unless the request's role can control the valve
     (operator or admin)."""

@@ -129,7 +129,7 @@ def recompute_volume_and_active_flow(
         "       volume_recorder_litres, "
         "       degraded_supply, is_composite, user_classified, user_ignored, "
         "       is_pressure_restoration_phantom, is_cross_talk, is_low_flow_dribble, "
-        "       excluded_from_training, match_rejection_reason, "
+        "       excluded_from_training, match_rejection_reason, user_fixture_type, "
         "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
         "FROM events WHERE circuit = ? ORDER BY start_ts",
         (circuit,),
@@ -204,6 +204,10 @@ def recompute_volume_and_active_flow(
                 # verdict survives a manual full recompute (else _finalize would clear
                 # it — the main-only detector can't reproduce a short event).
                 "match_rejection_reason": r["match_rejection_reason"],
+                # ...and the user's label, so _finalize's "a real fixture label wins
+                # over the cross-talk zeroing" escape hatch can actually fire here
+                # (without it a recompute re-zeroed a user-corrected event).
+                "user_fixture_type": r["user_fixture_type"],
             }
             _finalize_derived_verdicts(feat, _acal)
             eff = feat["volume_litres_effective"]
@@ -224,6 +228,7 @@ def recompute_volume_and_active_flow(
                 "  volume_litres_effective = ?, volume_estimation_method = ? "
                 + ("" if feat is None else
                    ", is_pressure_restoration_phantom = ?, is_low_flow_dribble = ?, "
+                   "is_cross_talk = ?, "
                    "excluded_from_training = ?, match_rejection_reason = ?")
                 + " WHERE id = ? AND circuit = ?",
                 (
@@ -236,6 +241,12 @@ def recompute_volume_and_active_flow(
                     *(() if feat is None else (
                         feat["is_pressure_restoration_phantom"],
                         feat["is_low_flow_dribble"],
+                        # write is_cross_talk back too: _finalize either preserves
+                        # the durable irrigation verdict (=1) or, when a user label
+                        # confirms real water, drops it (=0) — without this column
+                        # the flag stayed 1 while the volume was restored, a
+                        # half-reverted row (hidden in History, counted in totals).
+                        feat["is_cross_talk"],
                         feat["excluded_from_training"],
                         feat["match_rejection_reason"],
                     )),

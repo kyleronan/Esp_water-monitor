@@ -15,7 +15,8 @@ import logging
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse
 
-from ..auth import ADMIN, OPERATOR, VIEWER, REMOTE_USER_ID_HEADER, require_admin
+from ..auth import (ADMIN, OPERATOR, REMOTE_USER_ID_HEADER, require_admin,
+                    resolve_role)
 from ..database import (
     add_operator,
     list_seen_users,
@@ -35,15 +36,6 @@ def _orch(request: Request):
 
 def _templates(request: Request):
     return request.app.state.templates
-
-
-def _role_for(uid: str, is_ha_admin: bool, admin_ids: set,
-              operator_ids: set) -> str:
-    if is_ha_admin or uid in admin_ids:
-        return ADMIN
-    if uid in operator_ids:
-        return OPERATOR
-    return VIEWER
 
 
 @router.get("", response_class=HTMLResponse)
@@ -67,6 +59,12 @@ async def access_page(request: Request):
             ha_error = str(e)
             log.warning("Access page: config/auth/list failed: %s", e)
 
+    # ONE role decision (auth.resolve_role — the same precedence the middleware
+    # enforces; a private copy here could drift and display roles the mutation
+    # gate doesn't actually grant). Live HA admins are unioned into the set the
+    # same way the role-sync does before the middleware ever sees them.
+    admin_ids |= {u["id"] for u in ha_users if u.get("is_admin") and u.get("id")}
+
     users = []
     if ha_users:
         for u in ha_users:
@@ -75,18 +73,17 @@ async def access_page(request: Request):
                 "id": uid,
                 "name": u.get("name") or uid,
                 "is_ha_admin": bool(u.get("is_admin")),
-                "role": _role_for(uid, u.get("is_admin"), admin_ids, operator_ids),
+                "role": resolve_role(uid, admin_ids, operator_ids),
             })
     else:
         # Fallback: users we've actually seen open the add-on.
         for s in list_seen_users(db):
             uid = s["user_id"]
-            is_admin = uid in admin_ids
             users.append({
                 "id": uid,
                 "name": s.get("display_name") or uid,
-                "is_ha_admin": is_admin,
-                "role": _role_for(uid, is_admin, admin_ids, operator_ids),
+                "is_ha_admin": uid in admin_ids,
+                "role": resolve_role(uid, admin_ids, operator_ids),
             })
         # Make sure current operators always show even if never "seen".
         shown = {u["id"] for u in users}
