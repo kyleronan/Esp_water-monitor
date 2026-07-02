@@ -126,13 +126,15 @@
     <dt><span class="pill pill-neutral">👻 Not real use</span></dt>
     <dd>A city water-pressure blip, not a tap or appliance — volume removed from your
       totals. This is the app's automatic call; if water <strong>was</strong> running,
-      open the event and relabel it.</dd>
+      {% if is_admin %}open the event and relabel it{% else %}an admin can open the
+      event and relabel it{% endif %}.</dd>
     {% endif %}
     {% if ns.has_crosstalk %}
     <dt><span class="pill pill-neutral">↔ Not real use</span></dt>
     <dd>Your other water line's draw briefly dropped this line's pressure — no real flow
-      here, so the volume was removed. If water <strong>was</strong> running here, open
-      the event and relabel it.</dd>
+      here, so the volume was removed. If water <strong>was</strong> running here,
+      {% if is_admin %}open the event and relabel it{% else %}an admin can open the
+      event and relabel it{% endif %}.</dd>
     {% endif %}
     {% if ns.has_degraded %}
     <dt><span class="pill pill-amber">〰 Estimated</span></dt>
@@ -143,7 +145,8 @@
     <dt><span class="pill pill-neutral">Drip — not real use</span></dt>
     <dd>A very small flow, too small to be a real tap or appliance — its volume is removed
       from your totals. This is the app's automatic call; if water <strong>was</strong>
-      running here, open the event and relabel it.</dd>
+      running here, {% if is_admin %}open the event and relabel it{% else %}an admin can
+      open the event and relabel it{% endif %}.</dd>
     {% endif %}
     <dt class="hist-legend-fix">★ ◎ ↻ ~</dt>
     <dd>How a fixture was labeled: <strong>★</strong> you assigned it ·
@@ -275,6 +278,20 @@
       {% if not using_range %}(most recent {{ default_limit }}){% endif %}
     </span>
   </h3>
+  {# Rows the "Hide not-real-use events" setting removed never vanish without a
+     trace — say how many and offer a one-click peek (presentation-only). #}
+  {% if ch.hidden_not_real %}
+  <p class="muted" style="margin:.25rem 0 .5rem;font-size:.85em">
+    {{ ch.hidden_not_real }} not-real-use event{{ 's' if ch.hidden_not_real != 1 else '' }}
+    hidden —
+    <a href="{{ ingress_path }}/history?show_hidden=1{% if date_from %}&from={{ date_from }}{% endif %}{% if date_to %}&to={{ date_to }}{% endif %}{% if chart_range %}&range={{ chart_range }}{% endif %}">show them</a>
+  </p>
+  {% elif show_hidden %}
+  <p class="muted" style="margin:.25rem 0 .5rem;font-size:.85em">
+    Showing not-real-use events —
+    <a href="{{ ingress_path }}/history{% if date_from or date_to or chart_range %}?{% endif %}{% if date_from %}from={{ date_from }}&{% endif %}{% if date_to %}to={{ date_to }}&{% endif %}{% if chart_range %}range={{ chart_range }}{% endif %}">hide them again</a>
+  </p>
+  {% endif %}
   {% if ch.events %}
   {# Single "Note" column replaces the four per-flag emoji columns. Its
      existence is the UNION of all four flag checks, so a page with only one
@@ -391,6 +408,12 @@
                  rather than a blank em-dash so the catch-all is visible. Display-only — the
                  code still never writes 'other' as a label, distinct from the user's ★ Other. #}
               <span class="pill pill-neutral" title="Counted under “Other” — we couldn't match this to a specific fixture, but its water is still included in your totals (the Other category on the Water Use page).">Other</span>
+            {% endif %}
+            {# Embedded-fixture hint — this info otherwise only appears inside the
+               modal, so surface a nudge on the row itself. #}
+            {% if e.embedded_label %}
+              <span class="hist-contains-hint muted"
+                    title="Contains {{ e.embedded_label }} — open for details">contains ▸</span>
             {% endif %}
           </td>
           {% if _has_flags %}

@@ -7,7 +7,9 @@ import re as _re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import (
+    http_exception_handler as fastapi_http_exception_handler)
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -565,6 +567,28 @@ app.include_router(backup.router)
 app.include_router(training.router)
 app.include_router(calibration.router)
 app.include_router(access.router)
+
+
+@app.exception_handler(HTTPException)
+async def _http_403_html(request: Request, exc: HTTPException):
+    """Browser-friendly 403 for page GETs.
+
+    require_admin/require_operator raise plain HTTPExceptions, whose default
+    rendering is raw JSON ``{"detail": "..."}`` — what a viewer hits from a
+    bookmark, a stale tab, or (pre-setup) the wizard redirect. Render the small
+    403 page instead, but ONLY for GETs that want HTML: API calls and the
+    middleware's mutation-gate JSON (which the frontend keys on) are untouched.
+    """
+    if (exc.status_code == 403 and request.method == "GET"
+            and "text/html" in (request.headers.get("accept") or "")):
+        orch = getattr(request.app.state, "orchestrator", None)
+        return request.app.state.templates.TemplateResponse("403.html", {
+            "request": request,
+            "page": "403",
+            "detail": exc.detail,
+            "setup_pending": not bool(getattr(orch, "setup_complete", True)),
+        }, status_code=403)
+    return await fastapi_http_exception_handler(request, exc)
 
 
 @app.get("/health")

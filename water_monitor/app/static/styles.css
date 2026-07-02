@@ -2855,3 +2855,20 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   border: 1px solid var(--amber-border, #f0d3a0);
   color: var(--amber-text, #8a5a00);
 }
+
+/* ── Access page (RBAC) ─────────────────────────────────────────────── */
+/* The HA sidebar iframe is narrow; a 4-column table with ids needs its own
+   scroll context rather than overflowing the card. */
+.table-scroll { overflow-x: auto; }
+.user-id-stub { cursor: pointer; white-space: nowrap; }
+.user-id-stub:hover { text-decoration: underline dotted; }
+
+/* Non-admin away-mode state: informational, not a control. */
+.dash-away-static { cursor: default; opacity: .75; border-style: dashed; }
+.dash-away-static:hover { filter: none; transform: none; box-shadow: none; }
+
+/* Row-level nudge that an event has embedded fixtures (details in the modal). */
+.hist-contains-hint { font-size: .72rem; white-space: nowrap; margin-left: .3rem; }
+
+/* Hint shown only in basic mode, where the installer cards are hidden. */
+.sett-layout[data-sett-mode="advanced"] .sett-adv-hint { display: none; }

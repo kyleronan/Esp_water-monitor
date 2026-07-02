@@ -106,6 +106,34 @@ async def history_page(request: Request):
         )
 
 
+_EMBEDDED_KIND_PHRASES = {
+    "toilet": ("toilet flush", "toilet flushes"),
+    "tap":    ("tap use", "tap uses"),
+}
+
+
+def _embedded_display_label(embedded: list, vol_factor: float,
+                            vol_unit: str) -> str:
+    """Homeowner-facing 'Contains' text in DISPLAY units, e.g.
+    ``"2 toilet flushes + 1 tap use (~2.4 gal)"``. Unknown kinds fall back to
+    the raw kind name so a new detector kind still reads sensibly."""
+    counts: dict = {}
+    total_l = 0.0
+    for item in embedded:
+        counts[item.get("kind") or "draw"] = counts.get(item.get("kind") or "draw", 0) + 1
+        total_l += float(item.get("excess_litres") or 0.0)
+    parts = []
+    for kind, n in counts.items():
+        one, many = _EMBEDDED_KIND_PHRASES.get(
+            kind, (kind.replace("_", " "), kind.replace("_", " ") + "s"))
+        parts.append(f"{n} {one if n == 1 else many}")
+    if not parts:
+        return ""
+    vol = total_l * (vol_factor or 1.0)
+    vol_txt = f"{vol:.1f}".rstrip("0").rstrip(".")
+    return " + ".join(parts) + f" (~{vol_txt} {vol_unit or 'L'})"
+
+
 def _collect_circuit_history_sync(
     db,
     circuits,
@@ -116,6 +144,7 @@ def _collect_circuit_history_sync(
     filter_param: str,
     filter_circuit: str,
     today,
+    show_hidden: bool = False,
 ) -> list[dict]:
     """Synchronous bundle of the history page's per-circuit DB work.
 
@@ -127,7 +156,8 @@ def _collect_circuit_history_sync(
     from ..database import (get_recent_events, get_leak_test_history,
                             get_daily_summaries, get_home_profile)
     from ..feature_extractor import classify_flow_shape, classify_magnitude_tier
-    from ..composite_detector import summarize_embedded
+    from ..units import load_unit_context
+    _units = load_unit_context(db)
     # Read the "hide not-real-use events" display preference once (same for all
     # circuits). One unified toggle hides EVERY volume-zeroing verdict — phantom,
     # cross-talk, and low-flow dribble — so the single "Not real use" label maps to a
@@ -155,12 +185,17 @@ def _collect_circuit_history_sync(
             events = [e for e in events if dict(e).get("degraded_supply")]
         # Settings "Hide not-real-use events" toggle — hides every volume-zeroing
         # verdict (phantom / cross-talk / dribble) so the one "Not real use" label
-        # maps to one switch.
-        if hide_not_real:
-            events = [e for e in events
-                      if not (dict(e).get("is_pressure_restoration_phantom")
-                              or dict(e).get("is_cross_talk")
-                              or dict(e).get("is_low_flow_dribble"))]
+        # maps to one switch. The count of hidden rows is surfaced so the list
+        # never silently loses rows ("N hidden — show them"); ?show_hidden=1
+        # bypasses the filter for one render (presentation-only, viewer-safe).
+        hidden_not_real = 0
+        if hide_not_real and not show_hidden:
+            visible = [e for e in events
+                       if not (dict(e).get("is_pressure_restoration_phantom")
+                               or dict(e).get("is_cross_talk")
+                               or dict(e).get("is_low_flow_dribble"))]
+            hidden_not_real = len(events) - len(visible)
+            events = visible
         # Display-time FLOW-shape label so the History "Shape" word matches the flow
         # sparkline it sits next to (the stored resistance_curve_shape describes the
         # ΔP/Q pressure load, which can read "pulsed" over a flat-flow rectangle).
@@ -188,12 +223,16 @@ def _collect_circuit_history_sync(
                                else e.get("volume_litres")),
             )
             # Embedded fixtures hidden inside this event (a toilet flushed mid-shower).
-            # Display-only; the parent's volume/label are unchanged.
+            # Display-only; the parent's volume/label are unchanged. The label is
+            # built here (not summarize_embedded's internal one) so it speaks the
+            # homeowner's language and uses their display units — the raw form
+            # ("toilet ×2 (~9 L)") showed litres to gallon homes.
             try:
                 _emb = json.loads(e.get("embedded_fixtures_json") or "[]")
             except (ValueError, TypeError):
                 _emb = []
-            e["embedded_label"] = summarize_embedded(_emb)["label"] if _emb else ""
+            e["embedded_label"] = _embedded_display_label(
+                _emb, _units["vol_factor"], _units["vol_unit"]) if _emb else ""
         leak_tests = get_leak_test_history(db, circuit_cfg.circuit, limit=20)
         summaries  = get_daily_summaries(
             db, circuit_cfg.circuit,
@@ -233,6 +272,7 @@ def _collect_circuit_history_sync(
             "events":          events,
             "leak_tests":      leak_tests,
             "event_count":     len(events),
+            "hidden_not_real": hidden_not_real,
             "summaries":       summaries,
             "prior_summaries": prior_summaries,
             "hv_daily":        hv_daily,
@@ -252,6 +292,8 @@ async def _history_page(request: Request):
     # degraded-supply rows; `circuit=...` further scopes to one circuit.
     filter_param  = request.query_params.get("filter",  "").strip().lower()
     filter_circuit = resolve_circuit(request.query_params.get("circuit", "").strip())
+    # "N hidden — show them" escape hatch for the Settings hide toggle.
+    show_hidden = request.query_params.get("show_hidden", "") == "1"
     # 30d | 6m | 1y | all | monthly | yearly | yoy
     using_range = bool(date_from or date_to)
 
@@ -281,6 +323,7 @@ async def _history_page(request: Request):
         date_from, date_to, chart_range, chart_from,
         filter_param, filter_circuit,
         today,
+        show_hidden,
     )
 
     fixture_type_options = [
@@ -301,6 +344,7 @@ async def _history_page(request: Request):
         "fixture_type_labels":  FIXTURE_TYPE_LABELS,
         "filter_param":         filter_param,
         "filter_circuit":       filter_circuit,
+        "show_hidden":          show_hidden,
     })
 
 

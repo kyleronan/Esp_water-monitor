@@ -42,7 +42,12 @@
     <a href="{{ ingress_path }}/setup"    class="nav-item {% if page == 'setup'    %}active{% endif %}">Setup</a>
     {% endif %}
     {% if not is_admin %}
-    <span class="nav-role-badge" title="Your access level">{{ role }}</span>
+    {# Plain language for non-admins (tooltips don't exist on touch, so the
+       label itself must carry the meaning). #}
+    <span class="nav-role-badge"
+          title="{% if role == 'operator' %}You can view everything and open/close the water valves. Settings and labels are managed by an admin.{% else %}You can view everything. Controls and settings are managed by an admin.{% endif %}">
+      {{- 'Valve control' if role == 'operator' else 'View only' -}}
+    </span>
     {% endif %}
   </nav>
 

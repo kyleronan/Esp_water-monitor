@@ -884,26 +884,42 @@ async def units_update(request: Request):
         flow_key = "L/min"
     if pressure_key not in PRESSURE_OPTIONS:
         pressure_key = "psi"
-    # History display: one unified "Hide not-real-use events" toggle hides every
-    # volume-zeroing verdict (phantom / cross-talk / dribble). Display-only — never
-    # affects totals (their volume is zeroed at detection regardless of this flag).
-    # The single checkbox drives BOTH legacy columns in lockstep so any reader stays
-    # consistent and a legacy split state is normalised on first save.
-    hide_not_real = 1 if form.get("hide_pressure_artifact_events") == "1" else 0
-    hide_phantoms = hide_not_real
-    hide_cross_talk = hide_not_real
-    # dev.38 — guarded auto-split opt-in (read fresh by the periodic maturity pass).
-    auto_split = 1 if form.get("auto_split_enabled") == "1" else 0
     orch.db.execute(
-        "UPDATE home_profile SET flow_unit=?, pressure_unit=?, "
-        "hide_pressure_artifact_events=?, hide_cross_talk_events=?, "
-        "auto_split_enabled=? WHERE id=1",
-        (flow_key, pressure_key, hide_phantoms, hide_cross_talk, auto_split),
+        "UPDATE home_profile SET flow_unit=?, pressure_unit=? WHERE id=1",
+        (flow_key, pressure_key),
     )
     orch.db.commit()
     from ..units import invalidate_unit_cache
     invalidate_unit_cache()
     return ingress_redirect(request, "/settings#units")
+
+
+@router.post("/history-events/update")
+async def history_events_update(request: Request):
+    """Settings → History & Events — the two event-behavior toggles.
+
+    Separate from /units/update on purpose: these used to ride inside the units
+    form (nobody looked for them there), and the shared UPDATE meant a
+    toggles-only save would clobber the unit selection. Writes ONLY the toggle
+    columns.
+    """
+    orch = _orch(request)
+    form = await request.form()
+    # One unified "Hide not-real-use events" toggle hides every volume-zeroing
+    # verdict (phantom / cross-talk / dribble). Display-only — never affects
+    # totals (their volume is zeroed at detection regardless of this flag). The
+    # single checkbox drives BOTH legacy columns in lockstep so any reader stays
+    # consistent and a legacy split state is normalised on save.
+    hide_not_real = 1 if form.get("hide_pressure_artifact_events") == "1" else 0
+    # dev.38 — guarded auto-split (read fresh by the periodic maturity pass).
+    auto_split = 1 if form.get("auto_split_enabled") == "1" else 0
+    orch.db.execute(
+        "UPDATE home_profile SET hide_pressure_artifact_events=?, "
+        "hide_cross_talk_events=?, auto_split_enabled=? WHERE id=1",
+        (hide_not_real, hide_not_real, auto_split),
+    )
+    orch.db.commit()
+    return ingress_redirect(request, "/settings#history-events")
 
 
 @router.post("/water-softener/update")

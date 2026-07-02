@@ -12,6 +12,12 @@
       <span class="sett-nav-icon">🏠</span>
       <span class="sett-nav-label">Home Profile</span>
     </button>
+    {# Home equipment, not a preference — lives beside Home Profile. #}
+    <button class="sett-nav-btn" id="sett-btn-water-softener"
+            onclick="settNav('water-softener')">
+      <span class="sett-nav-icon">🧂</span>
+      <span class="sett-nav-label">Water Softener</span>
+    </button>
 
     <div class="sett-nav-group">Water circuits</div>
     {% for c in circuits %}
@@ -60,10 +66,10 @@
       <span class="sett-nav-label">Display Units</span>
     </button>
 
-    <button class="sett-nav-btn" id="sett-btn-water-softener"
-            onclick="settNav('water-softener')">
-      <span class="sett-nav-icon">🧂</span>
-      <span class="sett-nav-label">Water Softener</span>
+    <button class="sett-nav-btn" id="sett-btn-history-events"
+            onclick="settNav('history-events')">
+      <span class="sett-nav-icon">📋</span>
+      <span class="sett-nav-label">History &amp; Events</span>
     </button>
 
     <button class="sett-nav-btn sett-nav-adv" id="sett-btn-integrations"
@@ -179,7 +185,7 @@
       </div>
       <p class="sett-section-desc">Settings for this water line. For most homes the only
         control you'll ever touch is <strong>Detection sensitivity</strong> (Low / Medium /
-        High) under the Advanced tab — everything else is set automatically during the
+        High) under the Detection tab — everything else is set automatically during the
         learning period.</p>
 
       {# Sub-tab strip — use loop.index as a safe DOM key #}
@@ -237,8 +243,15 @@
         </form>
       </div>
 
+      {# Installer-grade Config cards (circuit/valve type are set at install and
+         rarely touched) stay behind ⚙ Show Advanced; a one-line hint says so. #}
+      <p class="sett-help sett-adv-hint muted" style="margin:.25rem 0 .75rem">
+        Installer settings (circuit type, valve type) are hidden — use
+        <strong>⚙ Show Advanced</strong> below the menu to see them.
+      </p>
+
       {# Circuit type #}
-      <div class="sett-card">
+      <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Circuit type</h3>
         <p class="sett-card-desc">
           Controls which fixture types are suggested and which alert categories
@@ -265,7 +278,7 @@
       </div>
 
       {# Valve type #}
-      <div class="sett-card">
+      <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Valve type</h3>
         <p class="sett-card-desc">
           Hardware shape of the ball valve installed for this circuit. This
@@ -409,85 +422,12 @@
       </div>
 
       {# Sensitivity #}
-      <div class="sett-card sett-adv-card">
-        <h3 class="sett-card-title">Detection Sensitivity</h3>
-        <p class="sett-help" style="margin:.25rem 0 .6rem">
-          Also tunes anomaly detection against your frozen baseline: <strong>Low</strong>
-          alerts only on the most extreme events (p99), <strong>High</strong> is the most
-          sensitive (p85). Lower this if you get too many false alarms.
-        </p>
-        <form method="post" action="{{ ingress_path }}/settings/sensitivity/{{ c.circuit }}/update"
-              id="sens-form-{{ c.circuit }}">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-          <input type="hidden" name="mode" id="sens-mode-{{ c.circuit }}" value="simple">
-
-          <div class="sett-sens-grid">
-            {% for level in ['low', 'medium', 'high'] %}
-            {# Highlight is driven purely by the radio :checked state (see
-               .sett-sens-btn:has(input:checked)). A server-rendered `active` class
-               would linger on the saved value when the user picks another. #}
-            <label class="sett-sens-btn">
-              <input type="radio" name="simple_level" value="{{ level }}"
-                     {% if c.sensitivity.simple_level == level %}checked{% endif %}>
-              {{ level | title }}
-            </label>
-            {% endfor %}
-          </div>
-
-          <details class="advanced-details" onToggle="
-              if(this.open) {
-                this.closest('form').querySelector('[name=mode]').value = 'advanced';
-              }">
-            <summary>Advanced settings</summary>
-            <p class="sett-help" style="margin:.5rem 0">
-              These raw values are set automatically by the Low / Medium / High picker
-              above. Only change them if you know exactly what you're tuning — the picker
-              covers almost every home.
-            </p>
-            <div class="sett-form-grid" style="margin-top:.75rem">
-              <div class="sett-form-group">
-                <label title="How big a pressure dip starts watching an event. Lower = catches smaller draws (and more noise).">Pressure drop to detect event ({{ pressure_unit }})</label>
-                <input type="number" name="pressure_drop_event_psi" step="0.1" min="0.5" max="10"
-                       value="{{ c.sensitivity.pressure_drop_event_psi or 1.2 }}">
-              </div>
-              <div class="sett-form-group">
-                <label title="How long flow must last to count as an event. Higher = ignores very brief blips.">Min event duration (seconds)</label>
-                <input type="number" name="min_event_duration_seconds" step="0.5" min="1" max="30"
-                       value="{{ c.sensitivity.min_event_duration_seconds or 3.0 }}">
-              </div>
-              <div class="sett-form-group">
-                <label title="How unusual an event must be before you get a notification. Lower = more alerts (more false alarms); higher = fewer.">Anomaly score to alert (0–1)</label>
-                <input type="number" name="score_alert" step="0.05" min="0.1" max="1"
-                       value="{{ c.sensitivity.score_alert or 0.6 }}">
-              </div>
-              <div class="sett-form-group">
-                <label title="How unusual an event must be before the valve auto-closes (once auto-shutoff is trusted). Higher = only the most extreme events.">Anomaly score to auto-shutoff (0–1)</label>
-                <input type="number" name="score_shutoff" step="0.05" min="0.1" max="1"
-                       value="{{ c.sensitivity.score_shutoff or 0.8 }}">
-              </div>
-              <div class="sett-form-group">
-                <label title="How far flow can drift from normal before it counts as off. Higher = more forgiving.">Flow tolerance (%)</label>
-                <input type="number" name="flow_tolerance_pct" step="1" min="5" max="80"
-                       value="{{ c.sensitivity.flow_tolerance_pct or 20 }}">
-              </div>
-              <div class="sett-form-group">
-                <label title="How long an unusual flow must persist before alerting. Higher = waits longer before flagging.">Alert sustained duration (min)</label>
-                <input type="number" name="sustained_alert_minutes" step="1" min="1" max="60"
-                       value="{{ c.sensitivity.sustained_alert_minutes or 10 }}">
-              </div>
-            </div>
-          </details>
-
-          <button type="submit" class="btn btn-primary btn-sm" style="margin-top:12px">Save Sensitivity</button>
-        </form>
-      </div>
-
       {# Anomaly response #}
       <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Anomaly Response</h3>
         <p class="sett-help" style="margin:.25rem 0 .75rem">
           What happens when an event deviates from your home's frozen baseline.
-          Detection Sensitivity (above) controls <em>how much</em> deviation counts;
+          Detection Sensitivity (on the Detection tab) controls <em>how much</em> deviation counts;
           this controls the <em>response</em>.
         </p>
         <form method="post" action="{{ ingress_path }}/settings/anomaly/{{ c.circuit }}/update">
@@ -618,9 +558,82 @@
 
       </div>{# /Advanced panel #}
 
-      {# ── Detection tab: alerts + plumbing events ───────────────────── #}
+      {# ── Detection tab: sensitivity + alerts + plumbing events ───────── #}
       <div class="sett-subtab-panel" id="sttab-{{ circ_idx }}-detection"
            style="display:none" role="tabpanel">
+
+      <div class="sett-card">
+        <h3 class="sett-card-title">Detection Sensitivity</h3>
+        <p class="sett-help" style="margin:.25rem 0 .6rem">
+          Also tunes anomaly detection against your frozen baseline: <strong>Low</strong>
+          alerts only on the most extreme events (p99), <strong>High</strong> is the most
+          sensitive (p85). Lower this if you get too many false alarms.
+        </p>
+        <form method="post" action="{{ ingress_path }}/settings/sensitivity/{{ c.circuit }}/update"
+              id="sens-form-{{ c.circuit }}">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <input type="hidden" name="mode" id="sens-mode-{{ c.circuit }}" value="simple">
+
+          <div class="sett-sens-grid">
+            {% for level in ['low', 'medium', 'high'] %}
+            {# Highlight is driven purely by the radio :checked state (see
+               .sett-sens-btn:has(input:checked)). A server-rendered `active` class
+               would linger on the saved value when the user picks another. #}
+            <label class="sett-sens-btn">
+              <input type="radio" name="simple_level" value="{{ level }}"
+                     {% if c.sensitivity.simple_level == level %}checked{% endif %}>
+              {{ level | title }}
+            </label>
+            {% endfor %}
+          </div>
+
+          <details class="advanced-details" onToggle="
+              if(this.open) {
+                this.closest('form').querySelector('[name=mode]').value = 'advanced';
+              }">
+            <summary>Advanced settings</summary>
+            <p class="sett-help" style="margin:.5rem 0">
+              These raw values are set automatically by the Low / Medium / High picker
+              above. Only change them if you know exactly what you're tuning — the picker
+              covers almost every home.
+            </p>
+            <div class="sett-form-grid" style="margin-top:.75rem">
+              <div class="sett-form-group">
+                <label title="How big a pressure dip starts watching an event. Lower = catches smaller draws (and more noise).">Pressure drop to detect event ({{ pressure_unit }})</label>
+                <input type="number" name="pressure_drop_event_psi" step="0.1" min="0.5" max="10"
+                       value="{{ c.sensitivity.pressure_drop_event_psi or 1.2 }}">
+              </div>
+              <div class="sett-form-group">
+                <label title="How long flow must last to count as an event. Higher = ignores very brief blips.">Min event duration (seconds)</label>
+                <input type="number" name="min_event_duration_seconds" step="0.5" min="1" max="30"
+                       value="{{ c.sensitivity.min_event_duration_seconds or 3.0 }}">
+              </div>
+              <div class="sett-form-group">
+                <label title="How unusual an event must be before you get a notification. Lower = more alerts (more false alarms); higher = fewer.">Anomaly score to alert (0–1)</label>
+                <input type="number" name="score_alert" step="0.05" min="0.1" max="1"
+                       value="{{ c.sensitivity.score_alert or 0.6 }}">
+              </div>
+              <div class="sett-form-group">
+                <label title="How unusual an event must be before the valve auto-closes (once auto-shutoff is trusted). Higher = only the most extreme events.">Anomaly score to auto-shutoff (0–1)</label>
+                <input type="number" name="score_shutoff" step="0.05" min="0.1" max="1"
+                       value="{{ c.sensitivity.score_shutoff or 0.8 }}">
+              </div>
+              <div class="sett-form-group">
+                <label title="How far flow can drift from normal before it counts as off. Higher = more forgiving.">Flow tolerance (%)</label>
+                <input type="number" name="flow_tolerance_pct" step="1" min="5" max="80"
+                       value="{{ c.sensitivity.flow_tolerance_pct or 20 }}">
+              </div>
+              <div class="sett-form-group">
+                <label title="How long an unusual flow must persist before alerting. Higher = waits longer before flagging.">Alert sustained duration (min)</label>
+                <input type="number" name="sustained_alert_minutes" step="1" min="1" max="60"
+                       value="{{ c.sensitivity.sustained_alert_minutes or 10 }}">
+              </div>
+            </div>
+          </details>
+
+          <button type="submit" class="btn btn-primary btn-sm" style="margin-top:12px">Save Sensitivity</button>
+        </form>
+      </div>
 
       {# Alerts #}
       <div class="sett-card">
@@ -883,7 +896,31 @@
               </select>
             </div>
           </div>
-          <div class="sett-toggle-row" style="margin-bottom:14px;padding-top:.75rem;border-top:1px solid var(--border)">
+          <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+            <button type="submit" class="btn btn-primary btn-sm">Save</button>
+            <button type="button" class="btn btn-secondary btn-sm"
+                    onclick="autoDetectUnits(this)">Re-detect from HA</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    {# ── History & Events ──────────────────────────────────────────── #}
+    {# These control what the History LIST shows and the background event
+       hygiene — they used to hide inside the Display Units form, where nobody
+       thought to look for them. Own form + endpoint so saving them can't
+       touch the unit selection. #}
+    <div class="sett-section" id="sett-history-events" style="display:none">
+      <h2 class="sett-section-title">History &amp; Events</h2>
+      <p class="sett-section-desc">
+        How recorded water events are shown and tidied. These never change your
+        water totals — only what the History list displays and how merged
+        recordings are cleaned up.
+      </p>
+      <div class="sett-card">
+        <form method="post" action="{{ ingress_path }}/settings/history-events/update">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <div class="sett-toggle-row" style="margin-bottom:14px">
             <div class="sett-toggle-info">
               <span class="sett-toggle-label">Hide not-real-use events from History</span>
               <span class="sett-toggle-desc">
@@ -891,9 +928,9 @@
                 city water-pressure blips (👻), draws on your <em>other</em> water line
                 (↔), and tiny drips or sensor noise (Drip). Their volume is always
                 removed from your totals; this toggle only controls whether the rows
-                also disappear from the list (on by default). Turn it off to see every
-                flagged row so you can relabel any that really were water — relabeling
-                one restores its volume.
+                also disappear from the list (on by default). History always says how
+                many are hidden, and relabeling a wrongly-flagged event restores its
+                volume.
               </span>
             </div>
             <label class="toggle">
@@ -907,10 +944,10 @@
               <span class="sett-toggle-label">Automatically split merged events</span>
               <span class="sett-toggle-desc">
                 Sometimes several quick uses close together get recorded as one long
-                event. When on, the monitor rebuilds those into the separate uses once an
-                hour (the same thing the “Reprocess” button does). Off by default — only
-                unlabelled, clearly-merged events are touched; your labels and water
-                totals are always preserved.
+                event. When on (the default), the monitor rebuilds those into the
+                separate uses once an hour (the same thing the “Reprocess” button
+                does). Only unlabelled, clearly-merged events are touched; your labels
+                and water totals are always preserved.
               </span>
             </div>
             <label class="toggle">
@@ -919,11 +956,7 @@
               <span class="toggle-slider"></span>
             </label>
           </div>
-          <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
-            <button type="submit" class="btn btn-primary btn-sm">Save</button>
-            <button type="button" class="btn btn-secondary btn-sm"
-                    onclick="autoDetectUnits(this)">Re-detect from HA</button>
-          </div>
+          <button type="submit" class="btn btn-primary btn-sm">Save</button>
         </form>
       </div>
     </div>

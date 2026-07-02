@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card" style="max-width:520px;margin:3rem auto;text-align:center">
+  {% if setup_pending %}
+  <h2>Almost ready</h2>
+  <p class="muted" style="margin:1rem 0 1.5rem">
+    This water monitor hasn't been set up yet. An administrator needs to finish
+    the setup wizard first — once that's done, you'll see your home's water
+    activity here.
+  </p>
+  {% else %}
+  <h2>You don't have access to this page</h2>
+  <p class="muted" style="margin:1rem 0 1.5rem">
+    {{ detail or "This page is only available to administrators." }}
+    If you think you should have access, ask your home's administrator —
+    roles are managed from their Access page.
+  </p>
+  <p>
+    <a class="btn btn-primary" href="{{ ingress_path }}/">Back to Dashboard</a>
+  </p>
+  {% endif %}
+</section>
+{% endblock %}

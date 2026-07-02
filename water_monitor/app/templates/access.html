@@ -5,7 +5,7 @@
   <p class="muted">
     Admins (full control) are set automatically from Home Assistant — anyone who is
     an HA administrator is an admin here. Below you choose which other HA users are
-    <strong>operators</strong> (can open/close the main water valve in an emergency,
+    <strong>operators</strong> (can open/close the water valves in an emergency,
     but can't change settings or labels). Everyone else is a read-only
     <strong>viewer</strong>.
   </p>
@@ -14,10 +14,14 @@
   <div class="banner banner-warn">
     Couldn't read the Home Assistant user list ({{ ha_error }}). Showing users who
     have opened this add-on instead. Admins are still recognised from the cached
-    HA admin set.
+    HA admin set. If you ever lose admin access, set
+    <code>bootstrap_admin_user_id</code> to your HA user id in the add-on's
+    configuration (Home Assistant → Settings → Add-ons → Water Monitor →
+    Configuration) — that user is always treated as an admin.
   </div>
   {% endif %}
 
+  <div class="table-scroll">
   <table class="data-table">
     <thead>
       <tr><th>User</th><th>HA user id</th><th>Role</th><th>Operator</th></tr>
@@ -26,7 +30,13 @@
       {% for u in users %}
       <tr>
         <td>{{ u.name }}</td>
-        <td><code>{{ u.id }}</code></td>
+        {# Full UUIDs overflow the narrow HA-iframe; show a stub, keep the full
+           id one click away (needed verbatim for bootstrap_admin_user_id). #}
+        <td>
+          <code class="user-id-stub" title="{{ u.id }} — click to copy"
+                onclick="navigator.clipboard && navigator.clipboard.writeText({{ u.id|tojson }}).then(() => toast('User id copied'))"
+                >{{ u.id[:8] }}{% if u.id|length > 8 %}…{% endif %}</code>
+        </td>
         <td>
           <span class="role-badge role-{{ u.role }}">{{ u.role }}</span>
         </td>
@@ -55,6 +65,7 @@
       {% endfor %}
     </tbody>
   </table>
+  </div>
 
   <p class="muted" style="margin-top:1rem">
     {{ admin_count }} admin(s) · {{ operator_count }} operator(s). Changes take

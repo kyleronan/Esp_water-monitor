@@ -61,8 +61,11 @@
     </button>
   </form>
   {% else %}
-  {# Read-only state for non-admins (toggling away mode is an admin action). #}
-  <span class="dash-away-toggle {% if away_mode %}is-away{% endif %}" aria-disabled="true">
+  {# Read-only state for non-admins (toggling away mode is an admin action).
+     dash-away-static strips the button affordance — same info, visibly not a
+     control, so it doesn't invite a dead click. #}
+  <span class="dash-away-toggle dash-away-static {% if away_mode %}is-away{% endif %}"
+        title="Away mode is set by an admin">
     <span class="dash-away-toggle-icon">{% if away_mode %}🏖{% else %}🏠{% endif %}</span>
     <span class="dash-away-toggle-label">{% if away_mode %}Away{% else %}Home{% endif %}</span>
   </span>
