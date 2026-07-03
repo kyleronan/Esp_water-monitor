@@ -29,7 +29,14 @@
 </div>
 {% elif filter_param == 'anomaly' %}
 <div class="hist-filter-banner" role="status" aria-live="polite">
-  <span><strong>Filtered:</strong> showing only unusual events — water use that didn't fit your home's learned pattern. Open one to review it; if it was normal use, mark it reviewed.</span>
+  <span><strong>Filtered:</strong> showing all unusual events — including ones you've already reviewed. Open one to review it and pick a verdict.</span>
+  <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history?filter=anomaly_unreviewed{% if filter_circuit %}&amp;circuit={{ filter_circuit }}{% endif %}">Only unreviewed</a>
+  <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history">Clear filter</a>
+</div>
+{% elif filter_param == 'anomaly_unreviewed' %}
+<div class="hist-filter-banner" role="status" aria-live="polite">
+  <span><strong>Filtered:</strong> showing unusual events still waiting for your review — the ones the dashboard card counts. Open one and pick a verdict; it leaves this list once reviewed.</span>
+  <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history?filter=anomaly{% if filter_circuit %}&amp;circuit={{ filter_circuit }}{% endif %}">Show all unusual</a>
   <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history">Clear filter</a>
 </div>
 {% endif %}
@@ -366,6 +373,7 @@
             data-pressure-sig="{{ e.pressure_signature_json or '' }}"
             data-waveform-used="{{ e.esp_waveform_used or 0 }}"
             data-embedded="{{ e.embedded_label }}"
+            data-corr="{{ e.flow_pressure_corr if e.flow_pressure_corr is not none else '' }}"
             data-sig-source="{{ e.signature_source or 'software' }}">
           <td class="hist-td hist-td-mono hist-td-time"><time data-ts="{{ e.start_ts or '' }}">{{ (e.start_ts or '')[:16] }}</time></td>
           <td class="hist-td">{{ fmt_duration(e.duration_seconds) }}</td>
@@ -511,6 +519,8 @@
         <dt>Prop. delay</dt>   <dd id="emd-prop-delay"></dd>
         <dt>Anomaly</dt>       <dd id="emd-anomaly"></dd>
         <dt>Other valve</dt>   <dd id="emd-other-valve"></dd>
+        <dt title="How the flow tracked line pressure during this event. Strongly negative = normal demand (running water pulls pressure down). Positive = the flow rode a rise in city pressure — the signal behind the automatic 'not real use' call on small bursts.">Flow–pressure corr.</dt>
+                               <dd id="emd-corr"></dd>
         <dt>Sig. source</dt>   <dd id="emd-sig-source"></dd>
       </dl>
     </details>
@@ -1069,6 +1079,11 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const ov = d.otherValve;
     document.getElementById('emd-other-valve').textContent =
       ov === '1' ? 'Yes (open)' : ov === '0' ? 'No' : '—';
+
+    // Flow–pressure correlation (dev14) — signed, 2 dp; '—' when not computed.
+    const corrV = parseFloat(d.corr);
+    document.getElementById('emd-corr').textContent =
+      Number.isFinite(corrV) ? (corrV > 0 ? '+' : '') + corrV.toFixed(2) : '—';
 
     document.getElementById('emd-sig-source').textContent = d.sigSource || 'software';
 

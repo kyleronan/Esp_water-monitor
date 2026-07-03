@@ -213,6 +213,10 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- USER-labeled events (matched_via='fingerprint'). Measured 96% precision
     -- at ~30% coverage on this home's data; threshold self-calibrates.
     fingerprint_labeling_enabled   INTEGER NOT NULL DEFAULT 1,
+    -- One-shot stamp for the rising-pressure-corr backfill worker (migration
+    -- 20260554, dev14): 1 = the historical flow_pressure_corr sweep finished
+    -- (or found nothing computable) — the worker never runs again.
+    rise_corr_backfill_done        INTEGER NOT NULL DEFAULT 0,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -731,6 +735,11 @@ CREATE TABLE IF NOT EXISTS events (
     flow_signature_json              TEXT,
     -- Pressure drop signature (migration 029)
     pressure_signature_json          TEXT,
+    -- Flow-vs-pressure Pearson correlation over the event window (migration
+    -- 20260554, dev14). Strongly negative = real demand (flow pulls pressure
+    -- DOWN); positive = flow rode a city-pressure RISE (rising-pressure
+    -- phantom discriminator). NULL = not computed (short waveforms / legacy).
+    flow_pressure_corr               REAL,
     positive_edge_count              INTEGER DEFAULT 0,
     negative_edge_count              INTEGER DEFAULT 0,
     flow_edge_count                  INTEGER DEFAULT 0,
@@ -2506,6 +2515,7 @@ def get_recent_events(
     date_to: str = None,
     flagged_only: bool = False,
     degraded_only: bool = False,
+    unreviewed_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Return events for a circuit ordered newest first.
@@ -2517,7 +2527,9 @@ def get_recent_events(
     (?filter=anomaly / ?filter=degraded). They must live in the WHERE
     clause so the recency limit applies to MATCHING rows — a Python
     post-filter over the newest `limit` events silently drops every
-    match older than the `limit`-th event.
+    match older than the `limit`-th event. unreviewed_only composes with
+    flagged_only for ?filter=anomaly_unreviewed — the "which ones still
+    need my eyes" view matching the dashboard card's count.
     """
     _select = """
         SELECT e.*,
@@ -2537,6 +2549,8 @@ def get_recent_events(
         conditions.append("e.flagged = 1")
     if degraded_only:
         conditions.append("e.degraded_supply = 1")
+    if unreviewed_only:
+        conditions.append("COALESCE(e.user_reviewed, 0) = 0")
     if date_from:
         conditions.append("e.start_ts >= ?")
         params.append(date_from)

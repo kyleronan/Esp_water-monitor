@@ -173,29 +173,33 @@ def _collect_circuit_history_sync(
         if filter_circuit and circuit_cfg.circuit != filter_circuit:
             continue
         # Dashboard "Degraded supply" / "Unusual events" links arrive as
-        # ?filter=degraded / ?filter=anomaly. The filter is pushed into the
-        # SQL WHERE (not a Python post-filter) so the recency limit counts
-        # MATCHING events — otherwise a flagged event older than the newest
-        # `limit` rows silently vanishes from the very view meant to surface
-        # it. The anomaly view shows every flagged event, INCLUDING
-        # volume-zeroed ones — an anomaly on a zeroed event is exactly the
-        # case that must not stay hidden.
+        # ?filter=degraded / ?filter=anomaly / ?filter=anomaly_unreviewed.
+        # The filter is pushed into the SQL WHERE (not a Python post-filter)
+        # so the recency limit counts MATCHING events — otherwise a flagged
+        # event older than the newest `limit` rows silently vanishes from the
+        # very view meant to surface it. The anomaly views show every flagged
+        # event, INCLUDING volume-zeroed ones — an anomaly on a zeroed event
+        # is exactly the case that must not stay hidden. anomaly_unreviewed
+        # (the dashboard card's Review link) further restricts to events
+        # awaiting triage, matching the card's count.
+        _anomaly_view = filter_param in ("anomaly", "anomaly_unreviewed")
         events = get_recent_events(
             db, circuit_cfg.circuit,
             limit=DEFAULT_EVENT_LIMIT,
             date_from=date_from or None,
             date_to=date_to or None,
-            flagged_only=(filter_param == "anomaly"),
+            flagged_only=_anomaly_view,
             degraded_only=(filter_param == "degraded"),
+            unreviewed_only=(filter_param == "anomaly_unreviewed"),
         )
         # Settings "Hide not-real-use events" toggle — hides every volume-zeroing
         # verdict (phantom / cross-talk / dribble) so the one "Not real use" label
         # maps to one switch. The count of hidden rows is surfaced so the list
         # never silently loses rows ("N hidden — show them"); ?show_hidden=1
         # bypasses the filter for one render (presentation-only, viewer-safe).
-        # The anomaly filter bypasses hiding for the same must-not-vanish reason.
+        # The anomaly filters bypass hiding for the same must-not-vanish reason.
         hidden_not_real = 0
-        if hide_not_real and not show_hidden and filter_param != "anomaly":
+        if hide_not_real and not show_hidden and not _anomaly_view:
             visible = [e for e in events
                        if not (dict(e).get("is_pressure_restoration_phantom")
                                or dict(e).get("is_cross_talk")

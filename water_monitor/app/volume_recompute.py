@@ -126,7 +126,7 @@ def recompute_volume_and_active_flow(
     rows = conn.execute(
         "SELECT id, start_ts, end_ts, duration_seconds, pressure_delta_psi, "
         "       volume_litres, volume_litres_estimated, volume_litres_original, "
-        "       volume_recorder_litres, "
+        "       volume_recorder_litres, flow_pressure_corr, "
         "       degraded_supply, is_composite, user_classified, user_ignored, "
         "       is_pressure_restoration_phantom, is_cross_talk, is_low_flow_dribble, "
         "       excluded_from_training, match_rejection_reason, user_fixture_type, "
@@ -204,6 +204,11 @@ def recompute_volume_and_active_flow(
                 # verdict survives a manual full recompute (else _finalize would clear
                 # it — the main-only detector can't reproduce a short event).
                 "match_rejection_reason": r["match_rejection_reason"],
+                # Carry the stored correlation (dev14) — waveforms are gone at
+                # recompute time, so without this the rise-phantom verdict would
+                # silently clear (corr None ⇒ detector can't fire) and the false
+                # volume would return. _finalize re-derives the verdict from it.
+                "flow_pressure_corr": r["flow_pressure_corr"],
                 # ...and the user's label, so _finalize's "a real fixture label wins
                 # over the cross-talk zeroing" escape hatch can actually fire here
                 # (without it a recompute re-zeroed a user-corrected event).

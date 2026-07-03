@@ -164,7 +164,9 @@
 
     {# Unreviewed-anomalies card — flagged events awaiting a look. Passive
        triage surface (no push): stays until each event is marked reviewed
-       or relabeled. Review opens History filtered to unusual events. #}
+       or relabeled. Review opens History filtered to UNREVIEWED unusual
+       events — the exact set this card counts (the banner there offers the
+       all-unusual view). #}
     {% if c.anomalies_unreviewed %}
     <div class="dash-alert dash-alert-degraded" aria-live="polite">
       <div class="dash-alert-body">
@@ -174,7 +176,7 @@
         </span>
       </div>
       <a class="btn btn-secondary btn-sm"
-         href="{{ ingress_path }}/history?filter=anomaly&circuit={{ c.circuit }}">Review</a>
+         href="{{ ingress_path }}/history?filter=anomaly_unreviewed&circuit={{ c.circuit }}">Review</a>
     </div>
     {% endif %}
 

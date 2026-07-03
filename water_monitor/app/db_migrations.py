@@ -121,7 +121,13 @@ _BASELINE_VERSION: int = 20260523
 #              anomaly triage. 'unknown' events are held out of anomaly-baseline
 #              refits (fit_usage_baselines). DDL only; existing user_reviewed=1
 #              rows keep NULL (= reviewed before verdicts existed).
-_CURRENT_VERSION: int = 20260553
+#   20260554 — rising-pressure phantom detector (dev14): events.flow_pressure_corr
+#              (REAL, nullable — Pearson r of flow vs index-binned pressure over the
+#              event window; the rise-phantom discriminator) + home_profile.
+#              rise_corr_backfill_done (one-shot stamp for the HA-history corr
+#              backfill worker). DDL only; the column backfill is the
+#              rise_corr_backfill worker, NOT a migration (needs HA fetches).
+_CURRENT_VERSION: int = 20260554
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1071,6 +1077,34 @@ def _apply_review_verdict_column(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260553: events.review_verdict ready")
 
 
+def _apply_flow_pressure_corr(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260554 — rising-pressure phantom (dev14).
+
+    Adds ``events.flow_pressure_corr`` (REAL, nullable): Pearson correlation of
+    the event's flow readings against its index-binned pressure readings —
+    strongly negative for real demand (flow pulls pressure DOWN), positive when
+    a city-pressure RISE pushed a slug through the turbine (the rise phantom).
+    NULL = not computed (pre-dev14 event, or waveforms too short).
+
+    Adds ``home_profile.rise_corr_backfill_done`` (INTEGER NOT NULL DEFAULT 0):
+    one-shot stamp for the backfill worker that computes the correlation for
+    historical candidate events from HA history. DDL only — the backfill itself
+    is a supervised worker (needs HA fetches), never a migration.
+    Guarded + idempotent.
+    """
+    if not _has_column(conn, "events", "flow_pressure_corr"):
+        conn.execute("ALTER TABLE events ADD COLUMN flow_pressure_corr REAL")
+    has_profile = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='home_profile'"
+    ).fetchone()
+    if has_profile and not _has_column(conn, "home_profile",
+                                       "rise_corr_backfill_done"):
+        conn.execute("ALTER TABLE home_profile ADD COLUMN "
+                     "rise_corr_backfill_done INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+    log.info("Migration 20260554: flow_pressure_corr + rise_corr_backfill_done ready")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -1423,6 +1457,16 @@ def _missing_cross_talk_audit_table(conn: sqlite3.Connection) -> set[str]:
     return set() if present else {"cross_talk_audit"}
 
 
+def _missing_flow_pressure_corr_columns(conn: sqlite3.Connection) -> set[str]:
+    """Return the 20260554 rise-phantom columns absent (events + home_profile)."""
+    missing: set[str] = set()
+    if not _has_column(conn, "events", "flow_pressure_corr"):
+        missing.add("events.flow_pressure_corr")
+    if not _has_column(conn, "home_profile", "rise_corr_backfill_done"):
+        missing.add("home_profile.rise_corr_backfill_done")
+    return missing
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -1516,6 +1560,7 @@ _MIGRATIONS: tuple = (
     (20260551, _apply_phantom_suppression_averted),
     (20260552, _apply_fingerprint_labeling_flag),
     (20260553, _apply_review_verdict_column),
+    (20260554, _apply_flow_pressure_corr),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -1582,6 +1627,7 @@ def _run_migrations_impl(
             | _missing_rbac_tables(conn)
             | _missing_embedded_fixtures_columns(conn)
             | _missing_cross_talk_audit_table(conn)
+            | _missing_flow_pressure_corr_columns(conn)
         )
         if missing:
             raise RuntimeError(

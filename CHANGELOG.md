@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.3.1-dev14] — 2026-07-03 — rising-pressure phantom detector + historical backfill
+
+Short (3–50 s) flow bursts driven by a **city-pressure RISE** were being counted
+as real water: climbing supply pressure pushes a slug through the turbine, and
+the burst clears every existing detector (the phantom needs ≥ 120 s, dribble
+needs flow < 1 L/min). Confirmed from raw HA history on the 07-02 14:01 event —
+79 mL "real" while pressure climbed ~2 PSI and never dipped below rest.
+
+The separator is the **flow↔pressure Pearson correlation** over the event:
+real demand pulls pressure DOWN while flow runs (audited real draws −0.88 /
+−0.24); a rise phantom's flow TRACKS the pressure ramp (+0.67). Validated over
+the full 05-17→07-03 history against 551 labelled events — 0 specifically-
+labelled real draws flagged at the shipped thresholds
+(`tools/validate_rising_pressure_phantom.py` is the offline reference harness).
+
+- **`events.flow_pressure_corr`** (migration 20260554): stored on every new
+  event (index-binned pressure vs 1 Hz flow); recomputed from the firmware
+  arrays when a quality-gated ESP waveform upgrades an event. Shown in the
+  event modal under Technical details ("Flow–pressure corr.").
+- **Detector** (`_detect_rising_pressure_phantom`): fires at corr ≥ 0.6 AND
+  volume strictly < 1.0 L AND duration ≤ 120 s — all frozen; the volume cap
+  keeps every zeroed event under detector_validation's `SUSPECT_ZERO_LITRES`
+  leak bar, and corr = None (no pressure signal) can never fire. Verdict joins
+  `_finalize_derived_verdicts` (priority phantom → rise → cross-talk →
+  dribble), reusing `is_pressure_restoration_phantom` + the existing
+  "👻 Not real use" presentation with distinct provenance
+  `match_rejection_reason='rising_pressure_phantom'`. Leak-safe by
+  construction: a leak is sustained flow + pressure DROP — the opposite sign.
+- **Repair pass** `reprocess_rising_pressure_phantoms` (scan 3b of the
+  exclusion reprocess): applies the verdict to stored corrs through the §2.5
+  `apply_effective_volume` ledger chokepoint (hourly reversed, daily summaries
+  recomputed). Manual Recompute carries the stored corr so the verdict
+  survives (waveforms are gone at recompute time).
+- **One-time backfill** (`rise_corr_backfill` worker): historical candidate
+  events (short, small, un-labelled, un-flagged — the detector's exact scope;
+  ~920 events ≈ 51 L on this home) get their correlation computed from HA
+  recorder history (stored signatures were validated unusable — the [0,1]
+  drop-clamp erases rises). Paced batches, fetch-error retry, and a
+  `home_profile.rise_corr_backfill_done` stamp once a clean sweep finishes;
+  uncomputable events stay counted.
+- Flag-collision repair (Fix B) understands the new provenance; calibration
+  exposes `RISE_PHANTOM_MIN_CORR` as a default WITHOUT fit bounds (frozen v1 —
+  the nearest labelled real draw sat at +0.48, too close to hand a fit
+  loosening rights).
+
 ## [0.3.1-dev13] — 2026-07-03 — two-option anomaly review: Normal use / Don't recognize it
 
 "Mark reviewed" collapsed two opposite meanings — "that was normal" and
@@ -31,6 +76,11 @@ meant:
   'unknown' only gates which events the NEXT deliberate refit may learn from.
 - Tests: 6 new in `test_anomaly_surfacing.py` (verdict semantics, relabel/
   un-review clearing, baseline hold-out both directions).
+- **?filter=anomaly_unreviewed** — the dashboard card's Review link now
+  opens exactly the events it counts (flagged AND awaiting review), so
+  finished verdicts don't bury the open ones. The History banner toggles
+  between "Only unreviewed" and "Show all unusual"; both variants keep the
+  reach-past-the-recency-limit SQL semantics and the hide-not-real bypass.
 
 ## [0.3.1-dev12] — 2026-07-03 — fix: unusual-events Review list truncated by recency limit
 

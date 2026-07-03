@@ -32,6 +32,7 @@ from .presence_watcher import PresenceWatcher
 from .historical_importer import HistoricalImporter
 from .cluster_metrics import ClusterMetrics
 from .maturity_recheck import MaturityRecheck
+from .rise_corr_backfill import RiseCorrBackfill
 from .fixture_publisher import FixturePublisher
 
 log = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ class Orchestrator:
         self._cluster_engine = None
         self._cluster_metrics: Optional[ClusterMetrics] = None
         self._maturity_recheck: Optional[MaturityRecheck] = None
+        self._rise_corr_backfill: Optional[RiseCorrBackfill] = None
         self._fixture_publisher: Optional[FixturePublisher] = None
         self._stop = asyncio.Event()
         self._live_state_cache: Dict[str, Any] = {}
@@ -513,6 +515,8 @@ class Orchestrator:
             self._data_pruner.stop()
         if self._maturity_recheck:
             self._maturity_recheck.stop()
+        if self._rise_corr_backfill:
+            self._rise_corr_backfill.stop()
         if self._leak_test_scheduler:
             self._leak_test_scheduler.stop()
         if self._ha:
@@ -780,6 +784,10 @@ class Orchestrator:
         self._maturity_recheck = MaturityRecheck(self._db, self._cfg, self._ha,
                                                  orch=self)
 
+        # One-shot rise-corr backfill (dev14) — fills flow_pressure_corr for
+        # historical candidate events from HA history, then stamps itself done.
+        self._rise_corr_backfill = RiseCorrBackfill(self._db, self._cfg, self._ha)
+
         # Fixture publisher — MQTT Discovery for confirmed fixtures
         self._fixture_publisher = FixturePublisher(self._db, self._cfg, self._ha)
         try:
@@ -800,6 +808,7 @@ class Orchestrator:
                 self._supervise("historical_importer", self._historical_importer.run),
                 self._supervise("cluster_metrics",     self._cluster_metrics.run),
                 self._supervise("maturity_recheck",    self._maturity_recheck.run),
+                self._supervise("rise_corr_backfill",  self._rise_corr_backfill.run),
                 self._supervise("waveform_purger",     self._run_waveform_purger),
                 self._supervise("volume_baseline_rollover",
                                 self._run_volume_baseline_rollover),

@@ -134,6 +134,80 @@ def _safe_std(values: list) -> float:
     return statistics.stdev(valid)
 
 
+def _bin_pressure_to_flow(flow_readings: List[float],
+                          pressure_readings: List[float]) -> List[float]:
+    """Index-bin the denser pressure series down to the flow sample count.
+
+    pressure_readings run at 40 Hz (live) / 1–2 Hz (importer), flow_readings at
+    1 Hz — pairing by raw index would match the first ~0.75 s of pressure
+    against the whole event. Each flow sample instead gets the MEAN of its
+    corresponding pressure bin, so the two series are time-aligned by position.
+    A pressure series no longer than flow is returned as-is (already aligned).
+    """
+    if not flow_readings or not pressure_readings:
+        return list(pressure_readings or [])
+    if len(pressure_readings) <= len(flow_readings):
+        return list(pressure_readings)
+    n_flow = len(flow_readings)
+    n_pres = len(pressure_readings)
+    step = n_pres / n_flow              # fractional step to stay evenly spaced
+    binned: List[float] = []
+    for i in range(n_flow):
+        lo = int(round(i * step))
+        hi = int(round((i + 1) * step))
+        hi = max(hi, lo + 1)            # guarantee at least one sample per bin
+        seg = pressure_readings[lo:hi]
+        binned.append(sum(seg) / len(seg))
+    return binned
+
+
+# Minimum aligned samples before the correlation is meaningful; below this the
+# rise-phantom discriminator returns None = NO VERDICT (leak-safe default: an
+# event without pressure signal is always kept as real water).
+_CORR_MIN_SAMPLES: int = 4
+
+
+def _flow_pressure_correlation(flow_readings: Optional[List[float]],
+                               pressure_readings: Optional[List[float]],
+                               ) -> Optional[float]:
+    """Pearson correlation of flow vs (index-binned) pressure over the event.
+
+    The rising-pressure phantom discriminator (dev14, validated over the full
+    2026-05-17..07-03 history against 551 labelled events): real demand pulls
+    pressure DOWN while flow runs (strongly negative r; audited real draws sat
+    at −0.88/−0.24), while a city-pressure RISE that spins the turbine shows
+    flow tracking the pressure ramp (positive r; the audited 07-02 14:01
+    phantom was +0.67). Index-binned alignment agreed with timestamp-aligned
+    correlation on 92% of bursts, so no RawEvent timestamp change is needed.
+
+    Returns None (= no verdict, never a 0.0 that could look meaningful) when
+    either series is missing/short (< ``_CORR_MIN_SAMPLES`` finite pairs) or
+    has zero variance (flat line — undefined correlation).
+    """
+    if not flow_readings or not pressure_readings:
+        return None
+    press = _bin_pressure_to_flow(flow_readings, pressure_readings)
+    pairs = []
+    for f, p in zip(flow_readings, press):
+        try:
+            fx, px = float(f), float(p)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fx) and math.isfinite(px):
+            pairs.append((fx, px))
+    n = len(pairs)
+    if n < _CORR_MIN_SAMPLES:
+        return None
+    mean_f = sum(f for f, _ in pairs) / n
+    mean_p = sum(p for _, p in pairs) / n
+    var_f = sum((f - mean_f) ** 2 for f, _ in pairs)
+    var_p = sum((p - mean_p) ** 2 for _, p in pairs)
+    if var_f <= 0.0 or var_p <= 0.0:
+        return None
+    cov = sum((f - mean_f) * (p - mean_p) for f, p in pairs)
+    return cov / math.sqrt(var_f * var_p)
+
+
 def _classify_resistance_shape(
     pressure_readings: List[float],
     flow_readings: List[float],
@@ -331,6 +405,36 @@ _DRIBBLE_MAX_DELTA_PSI: float = 1.5
 _DRIBBLE_RELIABLE_METER_FLOOR_LPM: float = 0.5
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Rising-pressure phantom (dev14, 2026-07-03)
+#
+# A SHORT small burst whose flow TRACKED a city-pressure RISE: the supply
+# pressure climbs, the expanding line pushes a slug through the turbine, and a
+# 3–50 s "real" draw is logged. Physically the opposite of demand — a real draw
+# pulls pressure DOWN while flow runs — so the flow↔pressure Pearson correlation
+# (events.flow_pressure_corr) separates them cleanly. Validated over the full
+# 2026-05-17..07-03 HA history against 551 labelled events (0 hard FPs at these
+# thresholds; hand-audited anchors: real draws −0.88/−0.24, the 07-02 14:01 rise
+# phantom +0.67; the closest SPECIFIC-fixture-labelled real event sat at +0.48,
+# hence the 0.6 cutoff). Complements — never overlaps — the existing detectors:
+# the long phantom needs >= _PHANTOM_NOFLOW_MIN_DURATION_S (120 s) while this
+# caps AT 120 s (the two partition the duration axis); dribble needs
+# flow < 1 L/min while these bursts peak well above it.
+#
+# LEAK-SAFETY (frozen, never calibrated):
+#   • volume cap is STRICT < 1.0 L — a zeroed rise phantom can never reach
+#     detector_validation's SUSPECT_ZERO_LITRES (1.0 L) leak bar;
+#   • a leak is sustained flow + sustained pressure DROP (strongly negative
+#     corr) — the corr >= 0.6 gate is the opposite signature by construction;
+#   • corr is None (no/short pressure signal) ⇒ NO verdict — the water stays
+#     counted. Degraded-supply events are skipped (their pressure is unreliable).
+_RISE_PHANTOM_MIN_CORR:       float = 0.6    # calibratable KEY exists; default frozen
+_RISE_PHANTOM_MAX_VOLUME_L:   float = 1.0    # STRICT < ; frozen leak guard
+_RISE_PHANTOM_MAX_DURATION_S: float = 120.0  # frozen; pairs with the 120 s phantom floor
+# match_rejection_reason value — distinct provenance while the flag/method reuse
+# the pressure_restoration_phantom family (same UI pill, hide-toggle, guards).
+RISE_PHANTOM_REASON: str = "rising_pressure_phantom"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Irrigation zone-switch cross-talk (2026-06-28)
 #
 # A SECOND, distinct cross-talk phenomenon from the long-no-flow rule above. When
@@ -391,6 +495,11 @@ ARTIFACT_DEFAULTS: Dict[str, float] = {
     "DRIBBLE_MAX_VOLUME_L":   _DRIBBLE_MAX_VOLUME_L,
     "DRIBBLE_MAX_FLOW_LPM":   _DRIBBLE_MAX_FLOW_LPM,
     "DRIBBLE_MAX_DELTA_PSI":  _DRIBBLE_MAX_DELTA_PSI,
+    # dev14 rise phantom. In DEFAULTS for _ac() consistency but deliberately NOT
+    # in artifact_calibration._BOUNDS (frozen v1 — the PHANTOM_MAX_DELTA_PSI
+    # precedent): the validation margin to the nearest labelled real draw
+    # (+0.48 vs 0.6) is too thin to hand a fit loosening rights.
+    "RISE_PHANTOM_MIN_CORR":  _RISE_PHANTOM_MIN_CORR,
 }
 
 
@@ -843,6 +952,39 @@ def _detect_low_flow_dribble(volume_litres, avg_flow_lpm, pressure_delta_psi,
     )
 
 
+def _detect_rising_pressure_phantom(duration_s, volume_litres,
+                                    flow_pressure_corr, calib=None) -> bool:
+    """True when a SHORT small burst's flow TRACKED a pressure RISE — i.e. the
+    turbine was spun by climbing supply pressure, not by demand (dev14).
+
+    Fingerprint: flow↔pressure correlation at/above the validated cutoff
+    (``RISE_PHANTOM_MIN_CORR``; a real draw is strongly NEGATIVE), volume
+    STRICTLY under ``_RISE_PHANTOM_MAX_VOLUME_L`` (frozen — keeps every zeroed
+    event below detector_validation's SUSPECT_ZERO_LITRES leak bar), and
+    duration at/under ``_RISE_PHANTOM_MAX_DURATION_S`` (frozen — the long
+    phantom owns >= 120 s).
+
+    Bad/missing inputs (None / non-numeric / NaN / inf) → False: an event with
+    no computable correlation keeps its water. Zero/negative volume → False
+    (nothing to remove — don't claim identity over a no-water row).
+    """
+    if duration_s is None or volume_litres is None or flow_pressure_corr is None:
+        return False
+    try:
+        duration = float(duration_s)
+        vol = float(volume_litres)
+        corr = float(flow_pressure_corr)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(duration) and math.isfinite(vol) and math.isfinite(corr)):
+        return False
+    return (
+        corr >= _ac(calib, "RISE_PHANTOM_MIN_CORR")
+        and 0.0 < vol < _RISE_PHANTOM_MAX_VOLUME_L
+        and duration <= _RISE_PHANTOM_MAX_DURATION_S
+    )
+
+
 def _circuit_min_flow(conn, circuit: str) -> float:
     """Per-circuit meter-derived low-flow floor (60 ÷ ppl) from the cached PPL.
     Feeds the coarse-meter dribble guard on reprocess paths. Falls back to the
@@ -1079,6 +1221,18 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         if _measured_l >= _PHANTOM_REVIEW_FLAG_LITRES:
             is_phantom = False
             phantom_averted = True
+    # Rising-pressure phantom (dev14): a SHORT small burst whose flow TRACKED a
+    # city-pressure RISE (positive flow↔pressure correlation) — the turbine spun
+    # on climbing supply pressure, not demand. Same zeroing family as the long
+    # phantom (shares the flag/method; distinct match_rejection_reason keeps the
+    # provenance). Gated off degraded (pressure unreliable) and user labels like
+    # every zeroing verdict; a None correlation can never fire it.
+    is_rise_phantom = (
+        not is_phantom and not is_degraded and not has_user_type
+        and _detect_rising_pressure_phantom(
+            features.get("duration_seconds"), features.get("volume_litres"),
+            features.get("flow_pressure_corr"), calib=calib)
+    )
     # Low-flow dribble: only for events that are NOT a phantom and NOT degraded
     # (a degraded event's low flow is a measurement artifact, not a true
     # trickle, and is already excluded). Folds into the exclusion set WITHOUT
@@ -1088,14 +1242,16 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     # phantom (ΔP < 2.0). Gated off degraded events (their flow metrics are unreliable,
     # so the no-flow signal can't be trusted). Zeroes volume + excludes, like a phantom.
     is_cross_talk = (
-        not is_phantom and not is_degraded and not has_user_type
+        not is_phantom and not is_rise_phantom and not is_degraded
+        and not has_user_type
         and _detect_cross_talk(
             features.get("duration_seconds"), features.get("pressure_delta_psi"),
             features.get("flow_integral_litres"), features.get("flow_on_ratio"),
             calib=calib)
     )
     is_dribble = (
-        not is_phantom and not is_cross_talk and not is_degraded
+        not is_phantom and not is_rise_phantom and not is_cross_talk
+        and not is_degraded
         and _detect_low_flow_dribble(
             features.get("volume_litres"), features.get("avg_flow_lpm"),
             features.get("pressure_delta_psi"), calib=calib,
@@ -1114,7 +1270,7 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     # draws (icemaker / fridge dispenser run ~3 L·min⁻¹) out of this branch. A
     # sustained slow flow accumulates past 0.5 L and never reaches here (it stays a
     # counted long event), so this cannot silently zero a continuous leak.
-    if is_phantom:
+    if is_phantom or is_rise_phantom:
         features["volume_litres_effective"]  = 0.0
         features["volume_estimation_method"] = "pressure_restoration_phantom"
     elif is_cross_talk:
@@ -1146,24 +1302,29 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     # is kept), but duration/shape are unreliable: out of training, no identity. A short event
     # or a continuously-flowing draw (high on-ratio, or a NULL/legacy ratio) is exempt.
     is_sparse_envelope = _is_sparse_envelope(
-        features.get("duration_seconds"), features.get("flow_on_ratio"), is_phantom)
-    features["is_pressure_restoration_phantom"] = 1 if is_phantom else 0
+        features.get("duration_seconds"), features.get("flow_on_ratio"),
+        is_phantom or is_rise_phantom)
+    features["is_pressure_restoration_phantom"] = (
+        1 if (is_phantom or is_rise_phantom) else 0)
     features["is_cross_talk"] = 1 if is_cross_talk else 0
     features["is_low_flow_dribble"] = 1 if is_dribble else 0
     # Kept-but-questioned draw: volume kept (raw/degraded branch above), out of
     # training until reviewed, surfaced via score_event_anomaly.
     features["phantom_suppression_averted"] = 1 if phantom_averted else 0
     features["excluded_from_training"] = (
-        1 if (is_degraded or is_phantom or is_cross_talk or is_dribble
-              or user_ignored or integration_unusable or is_sparse_envelope
-              or phantom_averted)
+        1 if (is_degraded or is_phantom or is_rise_phantom or is_cross_talk
+              or is_dribble or user_ignored or integration_unusable
+              or is_sparse_envelope or phantom_averted)
         else 0
     )
     # Upstream rejection reason (cluster-engine reasons are written separately).
     # is_low_flow_dribble is the authoritative dribble state; this reason string
-    # is a secondary signal kept consistent with the live finalizer.
+    # is a secondary signal kept consistent with the live finalizer. The rise
+    # phantom shares the flag but keeps its own reason — the only place its
+    # provenance is recorded.
     features["match_rejection_reason"] = (
         "pressure_restoration_phantom" if is_phantom
+        else RISE_PHANTOM_REASON if is_rise_phantom
         else "cross_talk" if is_cross_talk
         else "pulsing_supply" if is_degraded
         else "low_flow_dribble" if is_dribble
@@ -1218,6 +1379,10 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
     excluded_fixed = cur.rowcount or 0
 
     # ── B: resolve mutually-exclusive flag collisions by recorded effect ────────
+    # flow_pressure_corr is column-guarded (added 20260554, after ct/dr in a
+    # sequential upgrade) — without it the rise re-detect below simply can't fire.
+    has_corr = _events_has_column(conn, "flow_pressure_corr")
+    corr_select = ", flow_pressure_corr" if has_corr else ""
     rows = conn.execute(
         "SELECT id, user_ignored AS ui, COALESCE(user_classified,0) AS uc, "
         "  match_rejection_reason AS mrr, "
@@ -1227,8 +1392,9 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
         "  COALESCE(degraded_supply,0) AS dg, "
         "  duration_seconds, pressure_delta_psi, true_avg_flow_lpm, "
         "  flow_integral_litres, flow_on_ratio, avg_flow_lpm, "
-        "  volume_litres, volume_litres_estimated, volume_litres_effective AS veff "
-        "FROM events "
+        "  volume_litres, volume_litres_estimated, volume_litres_effective AS veff"
+        + corr_select +
+        " FROM events "
         "WHERE (COALESCE(is_pressure_restoration_phantom,0) "
         "     + COALESCE(is_cross_talk,0) "
         "     + COALESCE(is_low_flow_dribble,0)) >= 2"
@@ -1247,6 +1413,7 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
                 # to flag-priority only if it names no zeroing verdict.
                 mrr = r["mrr"]
                 keep = ("phantom"    if mrr == "pressure_restoration_phantom"
+                        else "rise"       if mrr == RISE_PHANTOM_REASON
                         else "cross_talk" if mrr == "cross_talk"
                         else "dribble"    if mrr == "low_flow_dribble"
                         else "phantom"    if r["ph"]
@@ -1254,15 +1421,20 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
                         else "dribble")
             else:
                 # Auto row: keep the verdict the CURRENT detectors produce (priority
-                # phantom > cross-talk > dribble), not the fossilised flag bits — a
-                # stale bit can never win over the live verdict. calib=None (shipped
-                # defaults) is enough to pick the category for a rare collision row.
+                # phantom > rise > cross-talk > dribble), not the fossilised flag
+                # bits — a stale bit can never win over the live verdict. calib=None
+                # (shipped defaults) is enough to pick the category for a rare
+                # collision row.
                 if _detect_pressure_restoration_phantom(
                         r["duration_seconds"], r["pressure_delta_psi"],
                         true_avg_flow_lpm=r["true_avg_flow_lpm"],
                         flow_integral_litres=r["flow_integral_litres"],
                         flow_on_ratio=r["flow_on_ratio"]):
                     keep = "phantom"
+                elif has_corr and _detect_rising_pressure_phantom(
+                        r["duration_seconds"], r["volume_litres"],
+                        r["flow_pressure_corr"]):
+                    keep = "rise"
                 elif _detect_cross_talk(
                         r["duration_seconds"], r["pressure_delta_psi"],
                         r["flow_integral_litres"], r["flow_on_ratio"]):
@@ -1293,11 +1465,12 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
                         r["id"], r["ph"], r["ct"], r["dr"], veff, raw, est)
             continue
 
-        new_ph = 1 if keep == "phantom" else 0
+        new_ph = 1 if keep in ("phantom", "rise") else 0
         new_ct = 1 if keep == "cross_talk" else 0
         new_dr = 1 if keep == "dribble" else 0
         new_excluded = 1 if (new_ph or new_ct or new_dr or r["dg"] or r["ui"]) else 0
-        reason = ("pressure_restoration_phantom" if new_ph
+        reason = (RISE_PHANTOM_REASON if keep == "rise"
+                  else "pressure_restoration_phantom" if new_ph
                   else "cross_talk" if new_ct
                   else "pulsing_supply" if r["dg"]
                   else "low_flow_dribble" if new_dr
@@ -1592,6 +1765,14 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             log.info("cross-talk-reprocess: flagged %d event(s) across %d day(s)",
                      cross_talk_flagged, len(xt_days))
 
+    # ── Scan 3b: rising-pressure phantoms (dev14) ─────────────────────────────
+    # Applies the corr-gated verdict wherever a stored flow_pressure_corr exists
+    # (new events store it at extraction; historical events get it from the
+    # rise_corr_backfill worker; late ESP waveforms may refresh it). Runs from
+    # every existing caller of this function, so late-waveform verdict drift and
+    # backfilled corrs reconcile on the same cadence as the other scans.
+    rise = reprocess_rising_pressure_phantoms(conn)
+
     # ── Scan 4: sparse envelopes (Fix 4) ─────────────────────────────────────
     # A long event almost entirely idle (a brief draw + a long no-flow tail). Real water
     # moved (NOT a phantom — volume is PRESERVED, so no hourly/daily resync, like the
@@ -1659,11 +1840,100 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
 
     return {"flagged": flagged, "dribbles_flagged": dribbles_flagged,
             "cross_talk_flagged": cross_talk_flagged,
+            "rise_flagged": rise["rise_flagged"],
             "sparse_flagged": sparse_flagged,
             "capped_reincluded": capped_reincluded,
             "excluded_fixed": repair["excluded_fixed"],
             "flag_pairs_resolved": repair["pairs_resolved"],
             "flag_pairs_unresolved": repair["unresolved"]}
+
+
+def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
+    """Apply the rising-pressure phantom verdict to stored events (dev14).
+
+    Scans events carrying a stored ``flow_pressure_corr`` that the canonical
+    ``_detect_rising_pressure_phantom`` fires on, and — mirroring the phantom /
+    dribble / cross-talk scans in ``reprocess_event_exclusion_verdicts`` —
+    flags them, ZEROES ``volume_litres_effective`` through the §2.5
+    ``apply_effective_volume`` chokepoint (hourly ledger reversed), excludes
+    them from training, and stamps ``match_rejection_reason =
+    'rising_pressure_phantom'``. Affected days get their daily_summary
+    recomputed.
+
+    Guards (all mirrored from the live finalizer): user-classified rows, real
+    fixture labels, degraded supply, and rows already carrying any zeroing
+    verdict are never touched; the detector's own frozen caps (< 1.0 L,
+    <= 120 s, corr >= 0.6) bound what can be zeroed. Column-guarded so the
+    pre-20260554 back-compat wrapper path stays safe mid-upgrade. Idempotent —
+    a flagged row no longer matches the WHERE. Standalone (not folded into the
+    caller's loop) because the rise_corr_backfill worker also calls it directly
+    after each batch of freshly computed correlations.
+
+    Returns ``{"rise_flagged": <n>}``.
+    """
+    from .database import transaction, compute_daily_summary, apply_effective_volume
+
+    if not _events_has_column(conn, "flow_pressure_corr"):
+        return {"rise_flagged": 0}
+
+    rows = conn.execute(
+        "SELECT id, circuit, start_ts, duration_seconds, volume_litres, "
+        "       flow_pressure_corr "
+        "FROM events "
+        "WHERE flow_pressure_corr IS NOT NULL "
+        "  AND flow_pressure_corr >= ? "
+        "  AND duration_seconds <= ? "
+        "  AND volume_litres > 0 AND volume_litres < ? "
+        "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+        "  AND COALESCE(is_cross_talk, 0) = 0 "
+        "  AND COALESCE(is_low_flow_dribble, 0) = 0 "
+        "  AND COALESCE(degraded_supply, 0) = 0 "
+        "  AND COALESCE(user_classified, 0) = 0 "
+        "  AND (user_fixture_type IS NULL OR user_fixture_type = '')",
+        (_RISE_PHANTOM_MIN_CORR, _RISE_PHANTOM_MAX_DURATION_S,
+         _RISE_PHANTOM_MAX_VOLUME_L),
+    ).fetchall()
+
+    rise_flagged = 0
+    days: set = set()
+    for row in rows:
+        # Re-run the canonical detector (SQL is only a prefilter) — single
+        # source of truth for the thresholds, and it re-rejects bad data.
+        if not _detect_rising_pressure_phantom(
+                row["duration_seconds"], row["volume_litres"],
+                row["flow_pressure_corr"]):
+            continue
+        with transaction(conn):
+            conn.execute(
+                "UPDATE events SET "
+                "  is_pressure_restoration_phantom = 1, "
+                "  is_cross_talk = 0, is_low_flow_dribble = 0, "
+                "  volume_litres_effective = 0, "
+                "  volume_estimation_method = 'pressure_restoration_phantom', "
+                "  excluded_from_training = 1, "
+                "  match_rejection_reason = ? "
+                "WHERE id = ?",
+                (RISE_PHANTOM_REASON, row["id"]),
+            )
+            # §2.5 — zero the ledger contribution via the one chokepoint.
+            apply_effective_volume(conn, row["id"], row["circuit"],
+                                   row["start_ts"], 0)
+        rise_flagged += 1
+        day = (row["start_ts"] or "")[:10]
+        if day:
+            days.add((row["circuit"], day))
+        log.info("rise-phantom-reprocess: event %s flagged "
+                 "(corr=%+.2f dur=%.0fs vol=%.3f L)",
+                 row["id"], row["flow_pressure_corr"] or 0.0,
+                 row["duration_seconds"] or 0.0, row["volume_litres"] or 0.0)
+
+    for circ, day in days:
+        compute_daily_summary(conn, circ, day)
+    if rise_flagged:
+        conn.commit()
+        log.info("rise-phantom-reprocess: flagged %d event(s) across %d day(s)",
+                 rise_flagged, len(days))
+    return {"rise_flagged": rise_flagged}
 
 
 def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
@@ -2507,6 +2777,19 @@ def _enrich_from_waveform(
                 _press_sig_overridden = True
                 any_wf_used = True
 
+    # Rise-phantom discriminator recomputed from the firmware arrays (dev14) —
+    # same train-on-a-hole quality gate as the signatures: a lossy/partial
+    # waveform must never overwrite the software-computed correlation. The
+    # firmware pair is time-aligned at source, so this is the highest-fidelity
+    # corr available; _finalize_derived_verdicts re-runs after enrich and keeps
+    # the verdict in sync. Deliberately does NOT flip any_wf_used — A/B
+    # provenance tracks the signatures only.
+    if record.full_flow and record.full_pressure and _sig_usable:
+        _wf_corr = _flow_pressure_correlation(record.full_flow,
+                                              record.full_pressure)
+        if _wf_corr is not None:
+            features["flow_pressure_corr"] = round(_wf_corr, 4)
+
     # Set granular signature_source — reflects exactly what was overridden.
     if _flow_sig_overridden and _press_sig_overridden:
         features["signature_source"] = "esp_full_flow_pressure"
@@ -2546,6 +2829,10 @@ _WF_UPGRADE_COLUMNS = (
     "flow_rise_rate_lpm_s", "time_to_90pct_flow_seconds", "opening_step_lpm",
     "pressure_onset_ms", "steady_state_fraction", "flow_variability",
     "recovery_overshoot_psi",
+    # dev14 — recomputed from the firmware flow+pressure arrays under the same
+    # quality gate as the signatures; the periodic exclusion reprocess (rise
+    # scan) reconciles any verdict drift, exactly like the other columns here.
+    "flow_pressure_corr",
 )
 
 
@@ -2687,24 +2974,11 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15) -> Dict[str
         resistance = event.pressure_delta_psi / avg_flow
 
     # Resistance curve shape — uses corrected ΔP/Q formula.
-    # pressure_readings are at 40 Hz, flow_readings at 1 Hz.  Pair them by
-    # averaging each pressure bin that corresponds to one flow sample so the
-    # resistance values are time-aligned.  Without downsampling, index-pairing
-    # would match the first ~0.75 s of pressure against the full event duration
-    # of flow, making every result meaningless.
-    pressure_for_shape = event.pressure_readings
-    if (event.flow_readings and event.pressure_readings
-            and len(event.pressure_readings) > len(event.flow_readings)):
-        n_flow = len(event.flow_readings)
-        n_pres = len(event.pressure_readings)
-        step = n_pres / n_flow          # fractional step to stay evenly spaced
-        pressure_for_shape = []
-        for i in range(n_flow):
-            lo = int(round(i * step))
-            hi = int(round((i + 1) * step))
-            hi = max(hi, lo + 1)        # guarantee at least one sample per bin
-            bin_samples = event.pressure_readings[lo:hi]
-            pressure_for_shape.append(sum(bin_samples) / len(bin_samples))
+    # pressure_readings are at 40 Hz, flow_readings at 1 Hz — index-bin the
+    # pressure down to the flow sample count so the resistance values are
+    # time-aligned (see _bin_pressure_to_flow).
+    pressure_for_shape = _bin_pressure_to_flow(
+        event.flow_readings, event.pressure_readings or [])
 
     shape = _classify_resistance_shape(
         pressure_for_shape,
@@ -2712,6 +2986,12 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15) -> Dict[str
         pre_event_pressure,
         min_flow=min_flow_lpm,
     )
+
+    # Rising-pressure phantom discriminator (dev14): Pearson r of flow vs the
+    # same binned pressure. Stored on every event (NULL when uncomputable) —
+    # the verdict itself is decided in _finalize_derived_verdicts.
+    flow_pressure_corr = _flow_pressure_correlation(
+        event.flow_readings, event.pressure_readings or [])
 
     # ── Degraded-supply guard ─────────────────────────────────────────────
     # Detect supply-pulsation during this event. When detected, substitute
@@ -2776,6 +3056,9 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15) -> Dict[str
         "min_pressure_psi": round(event.min_pressure_psi, 2),
         "hydraulic_resistance": round(resistance, 3) if resistance is not None else None,
         "resistance_curve_shape": shape,
+        # Rise-phantom discriminator (dev14) — NULL when uncomputable, never 0.
+        "flow_pressure_corr": (round(flow_pressure_corr, 4)
+                               if flow_pressure_corr is not None else None),
         "volume_litres": round(volume_litres, 3),
 
         # Active-flow features (timestamped-flow integral). Drive classification
