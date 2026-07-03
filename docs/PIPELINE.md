@@ -7,6 +7,9 @@ Every step below names the responsible **file/function**, the **gates with their
 the **DB columns written**, and an **"if it breaks here"** symptom so you can jump from a wrong number
 straight to the code that produced it.
 
+> Thresholds verified against commit `f2afa1a` (0.3.1-dev11). If you touch the pipeline, re-check the
+> constants cited here against the code before trusting them.
+
 Two invariants hold the whole thing together:
 
 1. **The leak alarm is firmware-side and reads live flow.** Nothing in the database — no split, zero,
@@ -31,11 +34,12 @@ flowchart TD
     DISCARD["Discarded<br/>< 1 mL · surge phantom"]
     FEAT["6 · Features<br/>volume integral, signatures, active-flow metrics"]
     BACKFILL["Backfill importer<br/>replays recorder history"]
-    VERDICT{"7 · Real water?<br/>user-lock → xtalk → phantom → cross-talk<br/>→ dribble → degraded → sparse"}
+    VERDICT{"7 · Real water?<br/>user-lock → xtalk → phantom → cross-talk<br/>→ dribble → degraded (cap) → sparse"}
     ZERO["0 L + excluded<br/>phantom / cross-talk / dribble"]
+    KEEP["Kept + flagged<br/>big phantom ≥10 L → review"]
     STORE["9 · Row stored<br/>events table + hour ledger"]
     HYGIENE["Hygiene auto-split<br/>reprocess inflated events"]
-    LADDER{"10 · Labeling ladder<br/>softener → washer → dishwasher<br/>→ rules → k-NN → composite"}
+    LADDER{"10 · Labeling ladder<br/>softener → washer → dishwasher →<br/>rules → fingerprint → k-NN → composite"}
     ANOM["11 · Anomaly score<br/>vs frozen baseline"]
     CHOKE["12 · apply_effective_volume()<br/>THE chokepoint — reverse old, post new"]
     AUDIT["Meter audit<br/>recorder_reconcile.py"]
@@ -53,6 +57,7 @@ flowchart TD
     FEAT --> VERDICT
     VERDICT -->|not real| ZERO --> STORE
     VERDICT -->|real| STORE
+    VERDICT -->|"big phantom (≥10 L)"| KEEP --> STORE
     STORE -.-> HYGIENE -.-> FEAT
     STORE --> LADDER --> ANOM --> CHOKE
     AUDIT -.-> CHOKE
@@ -190,13 +195,27 @@ first match wins and sets the effective volume.
 | 7c | **Phantom (pressure restoration)** | duration ≥120 s (`_PHANTOM_NOFLOW_MIN_DURATION_S`; a legacy event with no active-flow metrics needs the frozen 30-min floor instead) ∧ ΔP < 2.0 psi (frozen — leak safety) ∧ `flow_integral` < 1.0 L ∧ `flow_on_ratio` < 0.05. Rescue: true avg flow ≥ 2.0 L/min → real brief draw, not phantom | `is_pressure_restoration_phantom = 1`, `veff = 0`, excluded |
 | 7d | **Cross-talk (other circuit's draw)** | same no-flow ceilings (`flow_integral` < 1.0 L, `flow_on_ratio` < 0.05), but a real drop: ΔP ≥ 2.0 psi ∧ duration ≥ 120 s (`_XTALK_MIN_DURATION_S`, calib-overridable). The ΔP floor separates it from 7c | `is_cross_talk = 1`, `veff = 0`, excluded |
 | 7e | **Dribble (sensor trickle)** | volume < 0.5 L ∧ avg flow < 1.0 L/min ∧ ΔP < 1.5 psi (defaults, per-home calibrated). Guard: coarse meter (60 ÷ PPL floor ≥ 0.5 L/min — e.g. an oval-gear meter) measures low flow reliably → never dribble | `is_low_flow_dribble = 1`, `veff = 0`, excluded |
-| 7f | **Degraded supply (pulsing water)** | `degraded_supply = 1` — flow reading unreliable | `veff = volume_litres_estimated` (envelope), method `'pulsing_supply_envelope'`, excluded |
+| 7f | **Degraded supply (pulsing water)** | `degraded_supply = 1` — flow reading unreliable | `veff = volume_litres_estimated`, **capped** (see below), method `'pulsing_supply_envelope'`, excluded |
 | 7g | **Sparse envelope (brief use, long idle tail)** | duration ≥ 10 min (`_SPARSE_ENVELOPE_MIN_DURATION_S = 600 s`) ∧ flow on ≤ 10% of it | **litres kept**, `mrr = 'sparse_envelope'`, excluded from training; targeted by the hygiene loop |
 | 8 | **Real use** | none of the above | `volume_litres_effective = volume_litres`, method `'raw'`, eligible for training + totals |
 
+**Envelope cap (dev10, guards 7f).** A degraded/pulsing envelope estimate can badly over-read, so
+`_cap_envelope_estimate()` limits it to `max(1.5 × flow_integral_litres, 2.0 L)`
+(`_ENVELOPE_CAP_FLOW_MULT = 1.5`, `_ENVELOPE_CAP_FLOOR_L = 2.0`). The uncapped value and the cap base
+are recorded in `degraded_diagnostic_json` (`envelope_cap_applied`, `envelope_uncapped_litres`) for
+audit. Applies inside the degraded branch before the effective volume is written.
+
+**Suppression-averted backstop (dev10, wraps 7c).** A leak-safety guard: when the phantom rule would
+fire but the event actually **measured `volume_litres ≥ 10 L`** (`_PHANTOM_REVIEW_FLAG_LITRES = 10.0`),
+the phantom verdict is *averted* — the volume is **kept, not zeroed** — and the event is surfaced for
+review (`phantom_suppression_averted = 1`, `anomaly_type = 'suppression_averted'`, `flagged = 1`; still
+`excluded_from_training`). Rationale: silently zeroing 10 L+ is riskier than showing a "please review"
+draw. Migration `20260551` restored already-zeroed large phantoms through the ledger.
+
 > **If it breaks here:** real water zeroed (or noise surviving to step 8) → read
-> `volume_estimation_method` and the three `is_*` flags on the row to see which check fired. Relabeling
-> the event re-runs the cascade with your label winning.
+> `volume_estimation_method` and the three `is_*` flags on the row to see which check fired. A big draw
+> unexpectedly flagged rather than counted-clean → check `phantom_suppression_averted`. Relabeling the
+> event re-runs the cascade with your label winning.
 
 ### 9 · Row stored + hour ledger posted
 **`app/database.py · upsert_event_and_apply_hourly_volume()`**
@@ -230,8 +249,9 @@ get a `cycle_group_id` (the History rollup key).
 | 10b | **Washer cycle** (`detect_washer_cycles`) | anchor fill ≥9 L, 80–400 s, peak 7.5–15 L/min; siblings at 0.8–1.3× anchor peak, 2–45 min away, ≥0.5 L, ≤400 s, not flush-shaped; needs anchor + **≥2** siblings. Live path retro-stamps mates from the trailing 50 min | `washing_machine`, `matched_via='washer_cycle'` |
 | 10c | **Dishwasher cycle** (`detect_dishwasher_cycles`) | ≥3 chained gentle fills: 0.2–3.5 L, peak ≤3.6 L/min, not flush-shaped; consecutive fills ≤30 min apart, whole run ≤180 min; skips artifacts + washer/softener members | `dishwasher`, `matched_via='dishwasher_cycle'` |
 | 10d | **Per-event rules** (`rule_classify_event`) | first hit wins — see below | fixture type, `matched_via='rule_*'` / `'zone_default'` |
-| 10e | **k-NN residual** | only if the rules abstain — see below | fixture type, `matched_via='knn'` |
-| 10f | **Composite** (`composite_detector.py`) | sustained ≥300 s + usable waveform (≥30 bins, ≤15 s/bin); embedded toilet = 3–8 L excess at ≥3 L/min over a rolling 35th-percentile baseline | promotes unlabeled → `other`, `matched_via='composite'`; writes `embedded_fixtures_json` |
+| 10e | **Fingerprint tier** (`fingerprint_matcher.py`) | only if rules abstain, *before* k-NN — see below | fixture type, `matched_via='fingerprint'` |
+| 10f | **k-NN residual** | only if the fingerprint tier also abstains — see below | fixture type, `matched_via='knn'` |
+| 10g | **Composite** (`composite_detector.py`) | sustained ≥300 s + usable waveform (≥30 bins, ≤15 s/bin); embedded toilet = 3–8 L excess at ≥3 L/min over a rolling 35th-percentile baseline | promotes unlabeled → `other`, `matched_via='composite'`; writes `embedded_fixtures_json` |
 
 **10d · Per-event rules** (first hit wins):
 
@@ -245,7 +265,27 @@ capped at ≤2× the default span, do-no-harm k-fold validation — a fit that r
 discarded and the default kept). A PPL change triggers *partial* recalibration of artifact thresholds
 only, never these rule bands.
 
-**10e · k-NN residual:**
+**10e · Fingerprint tier** (dev11, `fingerprint_matcher.py`):
+
+A whole-waveform nearest-neighbour match — much stronger evidence than k-NN's scalar summaries, so it
+runs *ahead* of k-NN and short-circuits it on a hit.
+
+- **Fingerprint:** the event's un-normalised waveform trio — absolute-time flow (L/min), cumulative
+  volume (L), and pressure drop below baseline (psi) — sampled on a 4 s grid, 64 cells (first 256 s).
+  Built only when the waveform supports it: ≥10 s, ≥4 bins, peak ≥0.3 L/min.
+- **Library:** **user-labeled events only** (`user`/`training`/`cycle` sources — all carry
+  `user_fixture_type`). Fingerprint labels are never added to the library, so there is no
+  fingerprint→fingerprint chaining and no drift.
+- **Gates:** ≥10 library labels total (`MIN_LIBRARY_N`), ≥5 per class (`MIN_CLASS_LIBRARY`). The
+  accept distance is **self-calibrating** — a percentile of the library's own nearest-neighbour
+  distance distribution, recomputed at load: 30th percentile once mature (≥100 labels,
+  `THRESHOLD_PCTL_MATURE`), tightened to the 15th below that (`THRESHOLD_PCTL_TIGHT`).
+- **CYCLE_ONLY exception:** unlike k-NN, this tier *may* inherit `washing_machine` / `dishwasher` — a
+  full-waveform match against a user-confirmed example is trusted (measured 83/83 dishwashers correct).
+- Measured on this home: ~30% coverage at ~97% precision; ~29% of the events the rest of the pipeline
+  declined, at ~94%. Per-circuit 5-min library cache, invalidated when you save a label.
+
+**10f · k-NN residual:**
 
 - **Pool:** your labeled events with `excluded_from_training = 0`; needs ≥10 labels total and ≥2 per class.
 - **Distance:** the active-flow scale set (preferred once events are backfilled) — log-scaled
@@ -256,18 +296,27 @@ only, never these rule bands.
 - **Abstains when:** total score < 1.5 (out-of-distribution), winner's share < 0.6 (ambiguous), or the
   winner is `other`.
 - **CYCLE_ONLY guard:** a lone k-NN vote can never stamp `washing_machine` / `dishwasher` /
-  `water_softener` — only their cycle detectors may. A suppressed real member is re-stamped by its
-  detector on the next sweep.
+  `water_softener` — only their cycle detectors (or the fingerprint tier above) may. A suppressed real
+  member is re-stamped by its detector on the next sweep.
 
 > **If it breaks here:** a wrong fixture name → read `matched_via` first; it names the exact rung that
 > claimed the event, so you know which thresholds to compare against the event's volume / duration / peak.
 
-### 11 · Anomaly score (every event)
-**`app/anomaly_baseline.py`**
+### 11 · Anomaly score + surfacing (every event)
+**`app/anomaly_baseline.py`, `app/alert_manager.py`, `app/routers/history.py`**
 
 Scored against the frozen per-home baseline (fit at activation, never online-adapted): volume, type,
-and time-of-day pattern → `anomaly_score` / `anomaly_type`. Only a genuine anomaly (never an artifact)
-sets `flagged = 1`, which gates alerts.
+and time-of-day pattern → `anomaly_score` / `anomaly_type`, setting `flagged = 1`. The core scoring is
+unchanged, but dev9 wired up the surfacing that was previously dead:
+
+- **Suppression-averted override:** a `phantom_suppression_averted` event (step 7c backstop) is forced
+  anomalous *before* the artifact gate, so an excluded-from-training big draw still shows up for review.
+- **`triggered_alert`** is now stamped `1` when `alert_manager.fire()` actually sends a notification —
+  an audit trail of "this event alerted" (previously never populated).
+- **History surfacing:** a `?filter=anomaly` view lists every `flagged` event (bypassing the "hide
+  not-real" toggle); a display-time `anomaly_reason` splits the flag into user-facing badges —
+  `review_draw` (suppression-averted), `estimated` (degraded/envelope), `high_usage` (rest). Marking an
+  event reviewed sets `user_reviewed = 1` and clears it from the dashboard's unreviewed-anomaly count.
 
 ---
 
@@ -346,4 +395,7 @@ settle once cycle-mates exist. Any volume change re-enters at step 12.
 | Event volume ≠ physical meter | step 12 branch | `volume_litres_effective` vs `volume_recorder_litres`, then `reconcile_state` |
 | Event missing / merged / split | Part 1 | restart timestamps (websocket), the 120 s coalesce grace, or force-close lines (stuck event) |
 | Real water shows as 0 L | step 7 | the three `is_*` flags + `volume_estimation_method` |
+| Big draw flagged "review" not counted-clean | step 7c backstop | `phantom_suppression_averted` (≥10 L phantom kept + flagged on purpose) |
+| Degraded volume looks capped/too low | step 7f | `degraded_diagnostic_json` (`envelope_cap_applied`, `envelope_uncapped_litres`) |
+| Label came from `fingerprint` and looks wrong | step 10e | library size / self-calibrated threshold; save a correct label to re-seed |
 | A label won't stick | step 13 branch | whether the ID changed (reprocess) — user rows are never overwritten |
