@@ -162,6 +162,22 @@
     </div>
     {% endif %}
 
+    {# Unreviewed-anomalies card — flagged events awaiting a look. Passive
+       triage surface (no push): stays until each event is marked reviewed
+       or relabeled. Review opens History filtered to unusual events. #}
+    {% if c.anomalies_unreviewed %}
+    <div class="dash-alert dash-alert-degraded" aria-live="polite">
+      <div class="dash-alert-body">
+        <span class="dash-alert-title">🔍 Unusual events</span>
+        <span class="dash-alert-detail">
+          {{ c.anomalies_unreviewed }} event{% if c.anomalies_unreviewed != 1 %}s{% endif %} didn't fit your home's usual pattern — worth a quick look.
+        </span>
+      </div>
+      <a class="btn btn-secondary btn-sm"
+         href="{{ ingress_path }}/history?filter=anomaly&circuit={{ c.circuit }}">Review</a>
+    </div>
+    {% endif %}
+
     {# Live readings — pressure & flow on surface-2 inset cards #}
     <div class="dash-readings">
       <div class="dash-reading dash-pressure-trigger" role="button" tabindex="0"

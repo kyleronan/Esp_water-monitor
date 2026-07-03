@@ -1,5 +1,123 @@
 # Changelog
 
+## [0.3.1-dev11] — 2026-07-03 — fingerprint label propagator (waveform-match tier)
+
+Phase 3 of the 2026-07 reality audit. An event's fully un-normalized stored
+waveform — absolute-time flow + cumulative volume + pressure-drop-below-
+baseline — acts as a fingerprint: when a new event's nearest neighbor among
+the USER-labeled events is close enough, it inherits that label. Validated on
+two backups of this home's data and re-verified with the shipped code:
+**30% standalone coverage at 97% precision (LOO), dishwasher 81/81, and it
+labels 63 of the 221 events the full production pipeline declined, at 94%.**
+
+- **New `app/fingerprint_matcher.py`** (pure module): 64×4 s absolute-time
+  grid over `event_waveforms` (flow_max + pressure_min + `pre_event_pressure_psi`);
+  per-channel std scaling from the library itself; **self-calibrating
+  threshold** = a percentile of the library's own NN-distance distribution
+  (30th pctl; tightens to 15th below 100 labels — cold-start precision
+  measured to dip otherwise). Guards: ≥10 labels overall, ≥5 per class;
+  library = user-labeled events only (no fingerprint→fingerprint chaining, so
+  no drift). CYCLE_ONLY types may inherit at the standard threshold — a
+  whole-waveform match is dispositive, unlike the lone scalar k-NN vote that
+  guard exists for (an extra tightening was tried: half the coverage, zero
+  precision gain).
+- **New match tier in both pipelines**, after rules/cycles, before the k-NN:
+  the reclassify loop (fresh library per run) and the live `_cluster_event`
+  path (TTL-cached library, invalidated on every label save). Stamped
+  `matched_via='fingerprint'` via the standard chokepoint — auditable, and
+  revertible like any auto label. Waveform-missing / tiny-library / any
+  failure degrades silently to the k-NN. History shows a dedicated tooltip
+  on fingerprint-matched fixtures.
+- **Migration 20260552**: `home_profile.fingerprint_labeling_enabled`
+  (default ON — shipped eval-gated). No backfill; the next reclassify pass
+  spreads existing labels.
+- Uses numpy (already in the container via river/dtaidistance), lazily
+  imported.
+- Deferred (noted, not shipped): raising the training wizard's capture goal
+  to 5 per fixture would arm this tier on day 1 of a fresh install (the
+  wizard's checklist semantics are built around one-capture-per-fixture; a
+  UX pass, not a constant tweak).
+- Tests: `test_fingerprint_matcher.py` (13) — fingerprint construction,
+  library/threshold policy incl. maturity tightening, min-class guard,
+  tier precedence in reclassify (stamps / declines / toggle-off), cache
+  invalidation. Full suite **952 passed / 1 skipped**.
+
+## [0.3.1-dev10] — 2026-07-03 — volume guardrails: envelope cap + never silently zero a big draw
+
+Phase 2 of the 2026-07 reality audit. The audit measured two volume-estimation
+defects against 45M raw HA readings: `pulsing_supply_envelope` inflating
+**2.86×** (336 L claimed for 2 L real), and `pressure_restoration_phantom`
+silently zeroing a real **141 L** draw through a NULL-metrics hole (legacy
+events skip the frozen no-flow guards entirely).
+
+- **Envelope cap (2a).** A degraded event's envelope estimate is now capped at
+  `max(1.5 × flow-integral, 2 L)` (falls back to raw volume; no evidence → the
+  estimate stands). The clamp is audited in `degraded_diagnostic_json`
+  (`envelope_cap_applied`, uncapped value, cap base) so it's explainable.
+  Because anomaly scoring reads the capped effective volume, the 336 L artifact
+  can no longer trip a false "high volume" alert either.
+- **Suppression-averted guard (2b).** A would-be phantom carrying
+  ≥ 10 L of measured volume is never zeroed: volume KEPT, event excluded from
+  training, and flagged `suppression_averted` (score 1.0, never authorises
+  shut-off) — it lands in the new Unusual-events view as "Large draw — review".
+  A manual classification or a real label resolves the review (marker cleared,
+  relabel also counts as reviewed). Leak-safety: keeping volume can never mask
+  a leak (only zeroing could), and trickle detection is firmware, independent
+  of stored events.
+- **Migration 20260551** adds `events.phantom_suppression_averted` and
+  re-examines already-zeroed phantoms: large ones get their measured volume
+  restored **through `apply_effective_volume`** (hourly ledger reversed and
+  re-applied) + flagged for review. User-classified phantoms are never touched.
+  On this home's data that restores the 141 L draw from 2026-05-26.
+- Updated the two tests that pinned the old silent-zeroing on large events
+  (248.7 L / 1089 L) to pin the new keep-and-flag behavior, with small-volume
+  variants preserving the original regressions verbatim.
+- Tests: `test_volume_guardrails.py` (12) — cap math incl. the audit's worst
+  cases, averted guard both sides of the threshold, scorer short-circuit,
+  ledger-correct migration backfill (idempotent), relabel-resolves-review.
+  Full suite 938 passed / 1 skipped.
+- **Display honesty (audit Phase 4, folded in):** a zeroed not-real-use event
+  (phantom / cross-talk / dribble) no longer renders a medium/large sparkline
+  next to its "0 gal" number — the tier's peak-flow dimension (pressure-window
+  noise on those events) is suppressed so they draw at trickle height (246
+  events affected). An `unknown`-size event now renders at small height
+  instead of full-height large.
+
+## [0.3.1-dev9] — 2026-07-03 — anomalies finally surface (History filter, reason badges, triage)
+
+The 2026-07 reality audit found that anomaly detection worked but nothing ever
+reached the user: 91 flagged events, zero visible anywhere, `triggered_alert`
+a dead column, and the live notification pointed at a History view that didn't
+exist. This release is Phase 1 of the audit plan — surfacing, not detection
+changes.
+
+- **History `?filter=anomaly`** — mirrors the degraded filter; shows every
+  flagged event and deliberately bypasses the "hide not-real-use" toggle (an
+  anomaly on a zeroed event is exactly what must not stay hidden).
+- **Reason badges** split the one internal `flagged` bit into what it means to
+  a homeowner: **⚠ Unusual — high use** (trustworthy measurement, genuinely
+  big), **⚠ Unusual (estimated)** (the flag fired on a pulsing-supply
+  ESTIMATE — the number itself may be wrong), and **⚠ Large draw — review**
+  (reserved for Phase 2's phantom guard keep-and-flag).
+- **Event modal triage** — flagged events get an "Unusual event" section with
+  a plain-language explanation per reason and a **Mark reviewed** button
+  (admin-gated, PATCH `user_reviewed`), which clears it from the dashboard.
+- **Dashboard "Unusual events" card** — count of `flagged AND NOT
+  user_reviewed` per circuit with a Review link into the filter. No time
+  window: an unreviewed anomaly cannot silently age out. Passive UI — push
+  behavior and its cooldown are unchanged.
+- **`triggered_alert` wired** (was dead since the column was added):
+  `AlertManager.fire()` now reports dispatched-vs-suppressed and
+  `alert_unusual_usage` stamps the event, best-effort, only when a
+  notification actually went out — a real audit trail of what notified.
+- The unusual-usage push message now points at the Unusual events filter
+  instead of the bare History page.
+- Tests: `test_anomaly_surfacing.py` (10) — review patch, dispatch/suppress
+  return, stamp-on-fire (incl. critical shut-off bypass), dashboard count
+  shape. Full suite 924 passed / 1 skipped.
+- (Bookkeeping: dev7/dev8 shipped in commits e3a7116/dd46c63 without a
+  config/CHANGELOG bump — this entry jumps dev6 → dev9 to match.)
+
 ## [0.3.1-dev6] — 2026-06-28 — auto-hygiene reaches the inflated events it was built for
 
 dev4 added a SHRINK path to the background hygiene pass to fix "the two-blips-welded-into-

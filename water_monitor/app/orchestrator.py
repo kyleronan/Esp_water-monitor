@@ -1259,6 +1259,8 @@ class Orchestrator:
             # Degraded-supply guard status. Python-computed UTC ISO cutoffs
             # so the comparison format matches stored start_ts exactly.
             **self._degraded_state_for(circuit),
+            # Unreviewed-anomaly triage count for the dashboard card.
+            **self._anomaly_state_for(circuit),
         }
 
     def _valve_type_for(self, circuit: str) -> str:
@@ -1293,6 +1295,24 @@ class Orchestrator:
         except Exception as e:
             log.warning("[%s] degraded-state query failed: %s", circuit, e)
             return {"degraded_active": False, "degraded_events_24h": 0}
+
+    def _anomaly_state_for(self, circuit: str) -> Dict[str, Any]:
+        """Return {anomalies_unreviewed} — flagged events awaiting triage.
+
+        No time window: an unreviewed anomaly stays on the card until the user
+        marks it reviewed (or relabels it), so nothing flagged can silently
+        age out unseen. Mirrors _degraded_state_for's forgiving error shape.
+        """
+        try:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM events WHERE circuit = ? "
+                "AND flagged = 1 AND COALESCE(user_reviewed, 0) = 0",
+                (circuit,),
+            ).fetchone()
+            return {"anomalies_unreviewed": int(row["n"] or 0) if row else 0}
+        except Exception as e:
+            log.warning("[%s] anomaly-state query failed: %s", circuit, e)
+            return {"anomalies_unreviewed": 0}
 
     async def _run_volume_baseline_rollover(self) -> None:
         """Re-capture the daily + weekly volume baselines at each local midnight.

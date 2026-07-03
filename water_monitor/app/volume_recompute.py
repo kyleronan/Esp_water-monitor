@@ -228,7 +228,7 @@ def recompute_volume_and_active_flow(
                 "  volume_litres_effective = ?, volume_estimation_method = ? "
                 + ("" if feat is None else
                    ", is_pressure_restoration_phantom = ?, is_low_flow_dribble = ?, "
-                   "is_cross_talk = ?, "
+                   "is_cross_talk = ?, phantom_suppression_averted = ?, "
                    "excluded_from_training = ?, match_rejection_reason = ?")
                 + " WHERE id = ? AND circuit = ?",
                 (
@@ -247,6 +247,7 @@ def recompute_volume_and_active_flow(
                         # the flag stayed 1 while the volume was restored, a
                         # half-reverted row (hidden in History, counted in totals).
                         feat["is_cross_talk"],
+                        feat.get("phantom_suppression_averted", 0),
                         feat["excluded_from_training"],
                         feat["match_rejection_reason"],
                     )),

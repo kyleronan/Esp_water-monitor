@@ -300,6 +300,16 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
     baseline exists for the event. NEVER raises an alert or closes a valve — the
     response policy in feature_extractor does that, behind a 'live' state gate.
     """
+    # Suppression-averted (Phase 2b): the phantom guard would have zeroed a
+    # LARGE measured draw; the volume was kept and the event needs the user's
+    # eyes. Checked BEFORE the artifact gate (the event is excluded_from_training
+    # until reviewed, which would otherwise make it inert) and deterministic
+    # across every rescore (column-driven). Never authorises a shut-off — the
+    # draw is presumed real use pending review.
+    if features.get("phantom_suppression_averted"):
+        return {"score": 1.0, "anomaly_type": "suppression_averted",
+                "is_anomalous": True, "is_severe": False,
+                "shutoff_ok_severe": False, "shutoff_ok_any": False}
     if _is_artifact(features):
         return dict(_INERT)
 

@@ -208,6 +208,11 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- now safe to run by default — the reprocess is ATOMIC (delete is restored if the
     -- re-import fails) and dry-run-gated. User-labeled rows are never touched.
     auto_split_enabled             INTEGER NOT NULL DEFAULT 1,
+    -- Fingerprint label tier (migration 20260552, 2026-07 audit Phase 3): a new
+    -- event may inherit the label of its tightest whole-waveform match among
+    -- USER-labeled events (matched_via='fingerprint'). Measured 96% precision
+    -- at ~30% coverage on this home's data; threshold self-calibrates.
+    fingerprint_labeling_enabled   INTEGER NOT NULL DEFAULT 1,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -812,6 +817,13 @@ CREATE TABLE IF NOT EXISTS events (
     -- forced to 0 and it is excluded_from_training. Shown in History with a
     -- flag; volume contributes nothing to totals.
     is_pressure_restoration_phantom  INTEGER DEFAULT 0,
+    -- Suppression-averted (migration 20260551, 2026-07 audit Phase 2b). When 1,
+    -- the phantom guard matched this event BUT it carried a large measured
+    -- volume (>= _PHANTOM_REVIEW_FLAG_LITRES), so instead of silently zeroing
+    -- it the volume was KEPT and the event flagged for review
+    -- (anomaly_type 'suppression_averted'). Excluded from training until the
+    -- user reviews/relabels. Survives rescores (score_event_anomaly reads it).
+    phantom_suppression_averted      INTEGER DEFAULT 0,
     -- Low-flow dribble guard (migration 20260535). When 1, this event is a
     -- brief low-flow / low-volume / near-zero-pressure trickle (sensor or
     -- pressure-equalisation noise). UNLIKE a phantom it does NOT zero volume —
@@ -2169,13 +2181,16 @@ def coalesce_low_flow_events(
                 "  true_avg_flow_lpm = ?, peak_flow_lpm = ?, flow_integral_litres = ?, "
                 "  pressure_delta_psi = ?, is_low_flow_dribble = ?, "
                 "  is_pressure_restoration_phantom = ?, is_cross_talk = ?, "
+                "  phantom_suppression_averted = ?, "
                 "  excluded_from_training = ?, match_rejection_reason = ?, "
                 "  cluster_id = NULL, matched_fixture_type = NULL, matched_via = NULL "
                 "WHERE id = ?",
                 (end_ts.isoformat() if end_ts else None, duration, total_vol, new_eff,
                  feats["volume_estimation_method"], avg, avg, peak, total_vol, delta,
                  feats["is_low_flow_dribble"], feats["is_pressure_restoration_phantom"],
-                 feats["is_cross_talk"], feats["excluded_from_training"],
+                 feats["is_cross_talk"],
+                 feats.get("phantom_suppression_averted", 0),
+                 feats["excluded_from_training"],
                  feats["match_rejection_reason"], sid),
             )
             apply_effective_volume(conn, sid, circuit, survivor["start_ts"], new_eff)
@@ -2531,6 +2546,7 @@ def patch_event(
     user_fixture_type=_PATCH_UNSET,
     excluded_from_training=_PATCH_UNSET,
     user_ignored=_PATCH_UNSET,
+    user_reviewed=_PATCH_UNSET,
 ) -> bool:
     """Update user-editable fields on a single event.
 
@@ -2560,9 +2576,14 @@ def patch_event(
         # then runs propagate_cycle_label, which re-stamps the anchor + mates; a
         # non-cycle relabel just stays a singleton. This is what makes a
         # user-relabeled member "leave the group" (§7).
+        # A real label also RESOLVES a pending suppression-averted review (the
+        # user has looked at it and decided) — clear the marker and count the
+        # event as reviewed so it leaves the dashboard's anomaly card.
+        _resolve_review = ", phantom_suppression_averted = 0" + (
+            ", user_reviewed = 1" if user_fixture_type else "")
         conn.execute(
             "UPDATE events SET user_fixture_type = ?, fixture_label_source = ?, "
-            "cycle_group_id = NULL "
+            "cycle_group_id = NULL" + _resolve_review + " "
             "WHERE id = ? AND circuit = ?",
             (user_fixture_type, src, event_id, circuit),
         )
@@ -2580,6 +2601,13 @@ def patch_event(
         conn.execute(
             "UPDATE events SET excluded_from_training = ? WHERE id = ? AND circuit = ?",
             (1 if excluded_from_training else 0, event_id, circuit),
+        )
+    if user_reviewed is not _PATCH_UNSET:
+        # Anomaly triage: "I looked at this flagged event" — clears it from the
+        # dashboard's unreviewed-anomalies count. Display/triage state only.
+        conn.execute(
+            "UPDATE events SET user_reviewed = ? WHERE id = ? AND circuit = ?",
+            (1 if user_reviewed else 0, event_id, circuit),
         )
     conn.commit()
     return True
@@ -2650,7 +2678,10 @@ def _apply_event_verdicts(
             "  degraded_supply = ?, "
             "  user_classified = ?, is_low_flow_dribble = ?, "
             "  volume_litres_effective = ?, volume_estimation_method = ?, "
-            "  excluded_from_training = ?, match_rejection_reason = ? "
+            "  excluded_from_training = ?, match_rejection_reason = ?, "
+            # A manual classification RESOLVES a pending suppression-averted
+            # review — the user has decided what this event is.
+            "  phantom_suppression_averted = 0 "
             "WHERE id = ? AND circuit = ?",
             (new_phantom, new_cross_talk, new_degraded, user_classified, new_dribble,
              round(new_effective, 3), method, excluded, reason,
@@ -4954,7 +4985,26 @@ def reclassify_all_events_from_signatures(
     _sens = get_sensitivity_config(conn, circuit)
     _SCORE_COLS = ("volume_litres_effective", "volume_litres", "duration_seconds",
                    "peak_flow_lpm", "is_pressure_restoration_phantom", "is_cross_talk",
-                   "is_low_flow_dribble", "user_ignored")
+                   "is_low_flow_dribble", "user_ignored",
+                   "phantom_suppression_averted")
+
+    # Fingerprint tier library (2026-07 audit Phase 3) — built ONCE per run,
+    # fresh (no cache; a reclassify usually follows a label change). Gated by
+    # the home_profile toggle; any failure just disables the tier for this run.
+    _fp_library = None
+    try:
+        _fp_row = conn.execute(
+            "SELECT fingerprint_labeling_enabled FROM home_profile WHERE id = 1"
+        ).fetchone()
+        _fp_enabled = bool(_fp_row["fingerprint_labeling_enabled"]) if _fp_row else True
+    except sqlite3.OperationalError:
+        _fp_enabled = True   # column mid-migration → schema default is ON
+    if _fp_enabled:
+        try:
+            from .fingerprint_matcher import FingerprintLibrary
+            _fp_library = FingerprintLibrary.load(conn, circuit)
+        except Exception as e:  # noqa: BLE001 — tier is optional, never fatal
+            log.warning("[%s] fingerprint library unavailable: %s", circuit, e)
 
     where = "WHERE circuit = ? AND user_fixture_type IS NULL"
     qparams: list = [circuit]
@@ -4996,13 +5046,32 @@ def reclassify_all_events_from_signatures(
             if rule_hit is not None:
                 new_type, new_via = rule_hit
             else:
-                hit = match_event_to_signature_knn(conn, circuit, feats)
-                new_type = _canonical_fixture_type(hit["fixture_type"]) if hit else None
-                # Multi-fill appliances need cycle context (washer_cycle / dishwasher
-                # rule, both checked above) — a lone k-NN signature must not stamp them.
-                if new_type in CYCLE_ONLY_FIXTURE_TYPES:
-                    new_type = None
-                new_via = "knn" if new_type is not None else None
+                # Fingerprint tier (2026-07 audit Phase 3) — whole-waveform NN
+                # against USER-labeled events, tight-threshold only. Sits between
+                # the structural rules and the scalar k-NN: stronger evidence
+                # than a scalar vote, weaker than cycle/session context above.
+                fp_hit = None
+                if _fp_library is not None:
+                    from .fingerprint_matcher import match_event_fingerprint
+                    try:
+                        fp_hit = match_event_fingerprint(
+                            conn, circuit, r["id"], library=_fp_library)
+                    except Exception as e:  # noqa: BLE001 — never break reclassify
+                        log.debug("[%s] fingerprint match failed for %s: %s",
+                                  circuit, r["id"], e)
+                if fp_hit is not None:
+                    new_type = _canonical_fixture_type(fp_hit["fixture_type"])
+                    new_via = "fingerprint" if new_type is not None else None
+                else:
+                    hit = match_event_to_signature_knn(conn, circuit, feats)
+                    new_type = _canonical_fixture_type(hit["fixture_type"]) if hit else None
+                    # Multi-fill appliances need cycle context (washer_cycle / dishwasher
+                    # rule, both checked above) — a lone k-NN signature must not stamp them.
+                    # (The fingerprint tier MAY name them: whole-waveform evidence at the
+                    # tight threshold, enforced inside FingerprintLibrary.match.)
+                    if new_type in CYCLE_ONLY_FIXTURE_TYPES:
+                        new_type = None
+                    new_via = "knn" if new_type is not None else None
         prev = r["matched_fixture_type"]
         if (new_type, new_via, new_group) != (
                 prev, r["matched_via"], r["cycle_group_id"]):

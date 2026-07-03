@@ -257,6 +257,25 @@ _PHANTOM_MAX_TRUE_FLOW_LPM:   float = 2.0
 _PHANTOM_MAX_FLOW_INTEGRAL_L: float = 1.0
 _PHANTOM_MAX_FLOW_ON_RATIO:   float = 0.05
 
+# Suppression-averted guard (2026-07 audit, Phase 2b — FROZEN, never calibrated).
+# The no-flow leak-safety ceilings above only run when the flow metrics are
+# non-NULL; a legacy/import event with NULL metrics used to sail past them and
+# could zero a large REAL draw (observed: a 141 L shower zeroed as a phantom).
+# Backstop at the verdict site: a would-be phantom whose measured volume_litres
+# is at/above this threshold is NOT zeroed — the volume is KEPT and the event is
+# flagged for review (anomaly_type 'suppression_averted'). Keeping volume can
+# never mask a leak (only zeroing could), so this is strictly leak-safer.
+_PHANTOM_REVIEW_FLAG_LITRES:  float = 10.0
+
+# Pulsing-supply envelope cap (2026-07 audit, Phase 2a). The envelope estimate
+# measured 2.86x reality in aggregate (worst single case: 336 L claimed for 2 L
+# real). Cap it against the best available measured-flow evidence: the estimate
+# may exceed the flow integral (the flow meter under-reads during pulsing —
+# that's why the envelope estimator exists) but not by more than the multiplier;
+# the floor keeps tiny events from being clamped into meaninglessness.
+_ENVELOPE_CAP_FLOW_MULT: float = 1.5
+_ENVELOPE_CAP_FLOOR_L:   float = 2.0
+
 # Sparse envelope (Fix 4): a LONG event that is almost entirely idle — a brief real draw
 # followed by a long no-flow tail the pressure-defined boundary never closed. Real water
 # moved (so NOT a phantom — its volume is kept), but the envelope's duration/shape are
@@ -942,6 +961,47 @@ def _is_sparse_envelope(duration_s, flow_on_ratio, is_phantom: bool) -> bool:
             and 0 < onr <= _SPARSE_ENVELOPE_MAX_FLOW_ON_RATIO)
 
 
+def _cap_envelope_estimate(est: float, features: dict):
+    """Cap a pulsing-supply envelope estimate against measured-flow evidence.
+
+    Returns ``(capped_litres, diag_or_None)``. Cap base = flow_integral_litres
+    when usable, else raw volume_litres; cap = max(mult × base, floor). When
+    neither base exists (fully degraded capture) the estimate stands uncapped —
+    better an honest estimate than a made-up clamp. diag carries the audit
+    trail merged into degraded_diagnostic_json.
+    """
+    base = None
+    for key in ("flow_integral_litres", "volume_litres"):
+        v = features.get(key)
+        try:
+            v = float(v) if v is not None else None
+        except (TypeError, ValueError):
+            v = None
+        if v is not None and math.isfinite(v) and v > 0:
+            base = v
+            break
+    if base is None:
+        return est, None
+    cap = max(_ENVELOPE_CAP_FLOW_MULT * base, _ENVELOPE_CAP_FLOOR_L)
+    if est <= cap:
+        return est, None
+    return cap, {"envelope_cap_applied": True,
+                 "envelope_uncapped_litres": round(float(est), 3),
+                 "envelope_cap_base_litres": round(base, 3)}
+
+
+def _merge_degraded_diag(features: dict, extra: dict) -> None:
+    """Merge keys into degraded_diagnostic_json (tolerant of absent/bad JSON)."""
+    try:
+        diag = json.loads(features.get("degraded_diagnostic_json") or "{}")
+        if not isinstance(diag, dict):
+            diag = {}
+    except (TypeError, ValueError):
+        diag = {}
+    diag.update(extra)
+    features["degraded_diagnostic_json"] = json.dumps(diag, allow_nan=False)
+
+
 def _finalize_derived_verdicts(features: dict, calib=None,
                                min_flow_lpm: float = 0.15) -> None:
     """Single source of truth for the phantom verdict + its dependent fields.
@@ -983,6 +1043,7 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         features["match_rejection_reason"] = _IRRIGATION_XTALK_REASON
         features["is_pressure_restoration_phantom"] = 0
         features["is_low_flow_dribble"] = 0
+        features["phantom_suppression_averted"] = 0
         return
 
     is_degraded  = bool(features.get("degraded_supply"))
@@ -1003,6 +1064,21 @@ def _finalize_derived_verdicts(features: dict, calib=None,
             flow_integral_litres=features.get("flow_integral_litres"),
             flow_on_ratio=features.get("flow_on_ratio"), calib=calib)
     )
+    # Suppression-averted backstop (Phase 2b): a would-be phantom carrying a
+    # LARGE measured volume is never silently zeroed. This closes the
+    # NULL-metrics hole (legacy/import events skip the frozen no-flow guards
+    # entirely) — the volume is KEPT (falls through to the raw/degraded branch
+    # below) and score_event_anomaly surfaces it as 'suppression_averted' for
+    # review. Excluded from training until the user weighs in.
+    phantom_averted = False
+    if is_phantom:
+        try:
+            _measured_l = float(features.get("volume_litres") or 0.0)
+        except (TypeError, ValueError):
+            _measured_l = 0.0
+        if _measured_l >= _PHANTOM_REVIEW_FLAG_LITRES:
+            is_phantom = False
+            phantom_averted = True
     # Low-flow dribble: only for events that are NOT a phantom and NOT degraded
     # (a degraded event's low flow is a measurement artifact, not a true
     # trickle, and is already excluded). Folds into the exclusion set WITHOUT
@@ -1045,8 +1121,14 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         features["volume_litres_effective"]  = 0.0
         features["volume_estimation_method"] = "cross_talk"
     elif is_degraded:
-        features["volume_litres_effective"]  = round(est, 3)
+        # Phase 2a: cap the envelope estimate against measured-flow evidence
+        # (measured 2.86x inflation uncapped). The cap decision is audited in
+        # degraded_diagnostic_json so a clamped event is explainable.
+        _capped, _cap_diag = _cap_envelope_estimate(est, features)
+        features["volume_litres_effective"]  = round(_capped, 3)
         features["volume_estimation_method"] = "pulsing_supply_envelope"
+        if _cap_diag:
+            _merge_degraded_diag(features, _cap_diag)
     elif is_dribble:
         features["volume_litres_effective"]  = 0.0
         features["volume_estimation_method"] = "low_flow_dribble"
@@ -1068,9 +1150,13 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     features["is_pressure_restoration_phantom"] = 1 if is_phantom else 0
     features["is_cross_talk"] = 1 if is_cross_talk else 0
     features["is_low_flow_dribble"] = 1 if is_dribble else 0
+    # Kept-but-questioned draw: volume kept (raw/degraded branch above), out of
+    # training until reviewed, surfaced via score_event_anomaly.
+    features["phantom_suppression_averted"] = 1 if phantom_averted else 0
     features["excluded_from_training"] = (
         1 if (is_degraded or is_phantom or is_cross_talk or is_dribble
-              or user_ignored or integration_unusable or is_sparse_envelope)
+              or user_ignored or integration_unusable or is_sparse_envelope
+              or phantom_averted)
         else 0
     )
     # Upstream rejection reason (cluster-engine reasons are written separately).
@@ -3364,6 +3450,20 @@ class FeatureExtractor:
         from .database import is_baseline_locked
         return is_baseline_locked(self._db, circuit)
 
+    def _fingerprint_enabled(self) -> bool:
+        """home_profile toggle for the fingerprint label tier (default ON).
+        A mid-migration DB without the column reads as ON (the schema default);
+        any other failure disables the tier for this event (never fatal)."""
+        try:
+            row = self._db.execute(
+                "SELECT fingerprint_labeling_enabled FROM home_profile "
+                "WHERE id = 1").fetchone()
+            return bool(row["fingerprint_labeling_enabled"]) if row else True
+        except sqlite3.OperationalError:
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def _resolve_valve_entity(self, circuit: str) -> Optional[str]:
         row = self._db.execute(
             "SELECT entity_id FROM circuit_entity_map "
@@ -3600,6 +3700,30 @@ class FeatureExtractor:
             cluster_id_result is None
             or (match_confidence is not None and match_confidence < 0.5)
         )
+        # Fingerprint tier (2026-07 audit Phase 3) — whole-waveform NN against
+        # USER-labeled events at a tight self-calibrated threshold. Runs under
+        # the same condition as the k-NN residual and outranks it (stronger
+        # evidence); a fingerprint hit short-circuits the k-NN below. The
+        # event's waveform was stored just before _cluster_event, so it is
+        # readable here. Never fatal.
+        if matched_fixture_type is None and weak_match \
+                and self._fingerprint_enabled():
+            try:
+                from .fingerprint_matcher import match_event_fingerprint
+                fp_hit = match_event_fingerprint(self._db, circuit, event_id)
+                if fp_hit is not None:
+                    matched_fixture_type = fp_hit["fixture_type"]
+                    matched_via = "fingerprint"
+                    log.info(
+                        "[%s] event %s fingerprint-matched %s "
+                        "(dist=%.3f <= thr=%.3f, neighbor %s)",
+                        circuit, event_id, matched_fixture_type,
+                        fp_hit["distance"], fp_hit["threshold"],
+                        fp_hit["neighbor_event_id"],
+                    )
+            except Exception as e:
+                log.warning("[%s] fingerprint tier failed (non-fatal): %s",
+                            circuit, e)
         if matched_fixture_type is None and weak_match:
             try:
                 from .database import match_event_to_signature_knn

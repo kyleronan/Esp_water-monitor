@@ -27,6 +27,11 @@
   <span><strong>Filtered:</strong> showing only events where the water pressure was unsteady (pulsing supply). Volume totals for these events are estimates.</span>
   <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history">Clear filter</a>
 </div>
+{% elif filter_param == 'anomaly' %}
+<div class="hist-filter-banner" role="status" aria-live="polite">
+  <span><strong>Filtered:</strong> showing only unusual events — water use that didn't fit your home's learned pattern. Open one to review it; if it was normal use, mark it reviewed.</span>
+  <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history">Clear filter</a>
+</div>
 {% endif %}
 
 {# ── Date range filter card ────────────────────────────────────────── #}
@@ -301,6 +306,7 @@
                        or (ch.events|selectattr('is_pressure_restoration_phantom')|list)
                        or (ch.events|selectattr('is_low_flow_dribble')|list)
                        or (ch.events|selectattr('is_cross_talk')|list)
+                       or (ch.events|selectattr('flagged')|list)
                        or (ch.events|selectattr('match_rejection_reason','equalto','sparse_envelope')|list) %}
   <div class="hist-table-wrap">
     <table class="hist-table">
@@ -344,6 +350,9 @@
             data-prop-ms="{{ e.propagation_delay_ms | int if e.propagation_delay_ms else '0' }}"
             data-anomaly-score="{{ (e.anomaly_score * 100)|round(1) if e.anomaly_score is not none else '' }}"
             data-anomaly-type="{{ e.anomaly_type or '' }}"
+            data-flagged="{{ '1' if e.flagged else '0' }}"
+            data-anomaly-reason="{{ e.anomaly_reason or '' }}"
+            data-reviewed="{{ '1' if e.user_reviewed else '0' }}"
             data-degraded="{{ '1' if e.degraded_supply else '0' }}"
             data-phantom="{{ '1' if e.is_pressure_restoration_phantom else '0' }}"
             data-cross-talk="{{ '1' if e.is_cross_talk else '0' }}"
@@ -368,14 +377,15 @@
             {% set spark_fill   = {'steady': 'oklch(55% .18 240/.12)', 'rising': 'oklch(65% .18 80/.12)', 'falling': 'oklch(50% .18 145/.12)', 'pulsed': 'oklch(55% .05 240/.10)'} %}
             {# Vertical band the waveform fills, by event size tier — gives the #}
             {# sparkline a sense of scale. Read by the row canvas AND the modal #}
-            {# flow chart so they agree. unknown/missing → 1.0 (today's look). #}
+            {# flow chart so they agree. unknown/missing → 0.65 (small): an     #}
+            {# unsized event must not masquerade as a full-height large draw.   #}
             {% set spark_scale  = {'trickle': 0.45, 'small': 0.65, 'medium': 0.82, 'large': 1.0} %}
             <div class="shape-cell">
               <span class="pill {{ shape_color.get(shape, 'pill-neutral') }}">{{ shape }}</span>
               {% if e.flow_signature_json and e.flow_signature_json not in ('null', 'None', '') %}
               <canvas class="shape-spark" width="48" height="20"
                       data-sig="{{ e.flow_signature_json }}"
-                      data-spark-scale="{{ spark_scale.get(e.magnitude_tier, 1.0) }}"
+                      data-spark-scale="{{ spark_scale.get(e.magnitude_tier, 0.65) }}"
                       data-stroke="{{ spark_stroke.get(shape, 'oklch(55% .05 240/.55)') }}"
                       data-fill="{{ spark_fill.get(shape,   'oklch(55% .05 240/.08)') }}"></canvas>
               {% endif %}
@@ -399,7 +409,7 @@
               <span class="pill pill-green">{{ e.fixture_display_name }}</span>
             {% elif e.matched_fixture_type %}
               {% set _via = e.matched_via or '' %}
-              <span class="pill pill-neutral" title="{% if _via == 'washer_cycle' %}Matched by washer cycle pattern — anchor fill plus same-peak top-offs/rinses{% elif _via == 'softener_session' %}Matched by water-softener regeneration (scheduled overnight cycle){% elif _via == 'zone_default' %}Zone-circuit default — long high-flow run on an irrigation circuit{% elif _via.startswith('rule_') %}Matched by structural rule (volume/duration/pressure shape){% else %}Auto-matched from your labels{% endif %}">~ {{ fixture_type_labels.get(e.matched_fixture_type, e.matched_fixture_type | replace('_',' ') | title) }}</span>
+              <span class="pill pill-neutral" title="{% if _via == 'washer_cycle' %}Matched by washer cycle pattern — anchor fill plus same-peak top-offs/rinses{% elif _via == 'softener_session' %}Matched by water-softener regeneration (scheduled overnight cycle){% elif _via == 'zone_default' %}Zone-circuit default — long high-flow run on an irrigation circuit{% elif _via == 'fingerprint' %}Waveform fingerprint — this event's flow/pressure trace closely matches an event you labeled{% elif _via.startswith('rule_') %}Matched by structural rule (volume/duration/pressure shape){% else %}Auto-matched from your labels{% endif %}">~ {{ fixture_type_labels.get(e.matched_fixture_type, e.matched_fixture_type | replace('_',' ') | title) }}</span>
             {% elif e.suggested_type %}
               <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }}</span>
             {% else %}
@@ -424,6 +434,9 @@
               {% if e.degraded_supply %}<span class="pill pill-amber" title="Unsteady water pressure — pressure was pulsing, so this volume is an estimate, not exact.">〰 Estimated</span>{% endif %}
               {% if e.is_low_flow_dribble %}<span class="pill pill-neutral" title="Not real water use — a very small flow, too small to be a real tap or appliance. Volume removed from your totals. If water was running here, open it and relabel.">Drip — not real use</span>{% endif %}
               {% if e.match_rejection_reason == 'sparse_envelope' %}<span class="pill pill-neutral" title="A brief use followed by a long idle stretch — the listed time is mostly no-flow. The water still counts, but it's too irregular to learn your fixtures from.">⏳ Brief use, long idle tail</span>{% endif %}
+              {% if e.anomaly_reason == 'high_usage' %}<span class="pill pill-amber" title="Unusually large water use for your home's learned pattern. The measurement itself is trustworthy — open it and mark reviewed if this was normal (a long shower, guests, etc.).">⚠ Unusual — high use</span>
+              {% elif e.anomaly_reason == 'estimated' %}<span class="pill pill-amber" title="Flagged as unusual, but the volume is an ESTIMATE (pressure was unsteady) — the big number may not be real water. Open it to review.">⚠ Unusual (estimated)</span>
+              {% elif e.anomaly_reason == 'review_draw' %}<span class="pill pill-amber" title="This looked like a pressure blip, but it carried too much measured water to dismiss — the volume was KEPT and it needs your eyes. If it was real use, relabel it; if not, relabel as Not real use.">⚠ Large draw — review</span>{% endif %}
             </div>
           </td>
           {% endif %}
@@ -524,6 +537,15 @@
         <dt>Pressure drop</dt>      <dd id="emd-ph-dp">—</dd>
         <dt>Reading we ignored</dt> <dd id="emd-ph-rawvol">—</dd>
       </dl>
+    </section>
+    <section id="emd-anomaly-section" class="evt-modal-degraded" hidden
+             aria-label="Unusual event">
+      <h4 class="evt-modal-degraded-title">⚠ Unusual event</h4>
+      <p id="emd-anomaly-reason-text"></p>
+      <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+        <button id="emd-mark-reviewed-btn" class="btn btn-secondary btn-sm"{% if not is_admin %} hidden{% endif %}>Mark reviewed</button>
+        <span id="emd-reviewed-badge" class="muted" style="font-size:11px" hidden>✓ Reviewed</span>
+      </div>
     </section>
     {# Editing controls — kept in the DOM (the modal JS requires these elements,
        and bails out entirely if they're missing) but hidden for non-admins. The
@@ -1094,6 +1116,35 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       phSection.hidden = true;
     }
 
+    // ── Unusual-event (anomaly) triage ──────────────────────────────────
+    // Shown for flagged events. The reason text explains what KIND of
+    // unusual this is (real big use vs estimated number vs kept-draw), and
+    // "Mark reviewed" clears it from the dashboard's unreviewed count.
+    const anSection = document.getElementById('emd-anomaly-section');
+    if (d.flagged === '1') {
+      const REASON_TEXT = {
+        high_usage: 'This event used much more water than your home’s ' +
+          'learned pattern. The measurement itself is trustworthy — if this ' +
+          'was normal use (a long shower, guests, filling something), mark it reviewed.',
+        estimated: 'Flagged as unusual, but the volume shown is an ESTIMATE ' +
+          'taken while the water pressure was unsteady — the big number may ' +
+          'not be real water. Review it, then mark reviewed.',
+        review_draw: 'This looked like a pressure blip, but it carried too much ' +
+          'measured water to dismiss, so the volume was KEPT. If it wasn’t ' +
+          'real use, open Classification below and mark it Not real water use; ' +
+          'otherwise mark it reviewed.',
+      };
+      document.getElementById('emd-anomaly-reason-text').textContent =
+        REASON_TEXT[d.anomalyReason] ||
+        'This event didn’t fit your home’s learned pattern. Review it, then mark reviewed.';
+      document.getElementById('emd-mark-reviewed-btn').hidden = (d.reviewed === '1')
+        || document.getElementById('emd-edit-region')?.hidden === true;
+      document.getElementById('emd-reviewed-badge').hidden = (d.reviewed !== '1');
+      anSection.hidden = false;
+    } else {
+      anSection.hidden = true;
+    }
+
     errBox.hidden = true;
     errBox.textContent = '';
     modal.classList.add('is-open');
@@ -1365,6 +1416,21 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       if (!activeRow) return;
       const ok = await patchEvent({ classification: { reset: true } });
       if (ok) location.reload();
+    });
+  }
+
+  // Anomaly triage — mark a flagged event as reviewed (clears it from the
+  // dashboard's unreviewed-anomalies count). No reload: update in place.
+  const markReviewedBtn = document.getElementById('emd-mark-reviewed-btn');
+  if (markReviewedBtn) {
+    markReviewedBtn.addEventListener('click', async () => {
+      if (!activeRow) return;
+      const ok = await patchEvent({ user_reviewed: true });
+      if (ok) {
+        activeRow.dataset.reviewed = '1';
+        markReviewedBtn.hidden = true;
+        document.getElementById('emd-reviewed-badge').hidden = false;
+      }
     });
   }
 })();

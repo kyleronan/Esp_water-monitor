@@ -183,13 +183,19 @@ def _collect_circuit_history_sync(
         # the rendering machinery doesn't need to change.
         if filter_param == "degraded":
             events = [e for e in events if dict(e).get("degraded_supply")]
+        elif filter_param == "anomaly":
+            # Dashboard "unusual events" card links here. Shows every flagged
+            # event, INCLUDING volume-zeroed ones — an anomaly on a zeroed
+            # event is exactly the case that must not stay hidden.
+            events = [e for e in events if dict(e).get("flagged")]
         # Settings "Hide not-real-use events" toggle — hides every volume-zeroing
         # verdict (phantom / cross-talk / dribble) so the one "Not real use" label
         # maps to one switch. The count of hidden rows is surfaced so the list
         # never silently loses rows ("N hidden — show them"); ?show_hidden=1
         # bypasses the filter for one render (presentation-only, viewer-safe).
+        # The anomaly filter bypasses hiding for the same must-not-vanish reason.
         hidden_not_real = 0
-        if hide_not_real and not show_hidden:
+        if hide_not_real and not show_hidden and filter_param != "anomaly":
             visible = [e for e in events
                        if not (dict(e).get("is_pressure_restoration_phantom")
                                or dict(e).get("is_cross_talk")
@@ -215,12 +221,24 @@ def _collect_circuit_history_sync(
             )
             # Size tier for the sparkline's vertical scale. Use effective volume
             # so dribble/phantom/cross-talk-zeroed events fall to 'trickle' and
-            # the tier agrees with the gal number shown in the row.
+            # the tier agrees with the gal number shown in the row. The tier
+            # blends peak flow and volume via MAX, so on a ZEROED event the
+            # peak-flow dimension must be suppressed too — a phantom's peak
+            # reflects pressure-window noise, not real flow, and 246 zeroed
+            # events were rendering medium/large next to "0 gal" (2026-07 audit).
+            _tier_vol = (e.get("volume_litres_effective")
+                         if e.get("volume_litres_effective") is not None
+                         else e.get("volume_litres"))
+            _tier_peak = e.get("peak_flow_lpm")
+            if (e.get("volume_litres_effective") is not None
+                    and float(e.get("volume_litres_effective") or 0.0) < 0.1
+                    and (e.get("is_pressure_restoration_phantom")
+                         or e.get("is_cross_talk")
+                         or e.get("is_low_flow_dribble"))):
+                _tier_peak = None
             e["magnitude_tier"] = classify_magnitude_tier(
-                peak_flow_lpm=e.get("peak_flow_lpm"),
-                volume_litres=(e.get("volume_litres_effective")
-                               if e.get("volume_litres_effective") is not None
-                               else e.get("volume_litres")),
+                peak_flow_lpm=_tier_peak,
+                volume_litres=_tier_vol,
             )
             # Embedded fixtures hidden inside this event (a toilet flushed mid-shower).
             # Display-only; the parent's volume/label are unchanged. The label is
@@ -233,6 +251,23 @@ def _collect_circuit_history_sync(
                 _emb = []
             e["embedded_label"] = _embedded_display_label(
                 _emb, _units["vol_factor"], _units["vol_unit"]) if _emb else ""
+            # Homeowner-facing anomaly reason for flagged events. Splits the one
+            # internal "flagged" bit into the three cases that mean different
+            # things to the user: a genuinely big real draw, a flag raised on an
+            # ESTIMATED number (pulsing supply — the number itself may be wrong),
+            # and a large draw the phantom guard kept-but-questioned
+            # (anomaly_type 'suppression_averted'). Presentation-only.
+            if e.get("flagged"):
+                _at = e.get("anomaly_type") or ""
+                _vem = e.get("volume_estimation_method") or "raw"
+                if "suppression_averted" in _at:
+                    e["anomaly_reason"] = "review_draw"
+                elif _vem == "pulsing_supply_envelope" or e.get("degraded_supply"):
+                    e["anomaly_reason"] = "estimated"
+                else:
+                    e["anomaly_reason"] = "high_usage"
+            else:
+                e["anomaly_reason"] = ""
         leak_tests = get_leak_test_history(db, circuit_cfg.circuit, limit=20)
         summaries  = get_daily_summaries(
             db, circuit_cfg.circuit,
@@ -465,6 +500,9 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
         # Ignore/Restore — route to the explicit user_ignored intent (Sprint H);
         # patch_event re-derives effective excluded_from_training.
         kwargs["user_ignored"] = bool(payload["excluded_from_training"])
+    if "user_reviewed" in payload:
+        # Anomaly triage: mark a flagged event as looked-at (dashboard count).
+        kwargs["user_reviewed"] = bool(payload["user_reviewed"])
 
     # B7 — guard against accidentally EXCLUDING a sparse 'training' anchor: that
     # silently unseeds the class from the k-NN, and in History the event looks
@@ -572,6 +610,12 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
             if cycle_propagated:
                 db.commit()
                 propagation_meta["cycle_propagated"] = cycle_propagated
+
+            # The label changed the fingerprint library too — drop the live
+            # matcher's cache so the next event sees the new label at once
+            # (reclassify below loads its own fresh library anyway).
+            from ..fingerprint_matcher import invalidate_library_cache
+            invalidate_library_cache(circuit)
 
             # Re-run the label-trained k-NN over unlabelled events so the new label
             # spreads + stale matched_fixture_type clears. Offloaded to the background

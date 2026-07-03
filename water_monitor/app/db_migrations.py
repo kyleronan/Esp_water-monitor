@@ -108,7 +108,16 @@ _BASELINE_VERSION: int = 20260523
 #              home_profile.auto_split_enabled = 1 (the background over-merged/inflated
 #              event re-import, now safe to run by default: reprocess is atomic +
 #              dry-run-gated). Value backfill only; no DDL (column exists since 20260545).
-_CURRENT_VERSION: int = 20260550
+#   20260551 — 2026-07 audit Phase 2b: events.phantom_suppression_averted column +
+#              one-time re-evaluation of already-zeroed LARGE phantom draws
+#              (>= 10 L measured): volume restored through apply_effective_volume,
+#              flagged 'suppression_averted' for review. User-classified phantoms
+#              are never touched.
+#   20260552 — 2026-07 audit Phase 3: home_profile.fingerprint_labeling_enabled
+#              (DEFAULT 1) — the tight-fingerprint label-propagation tier toggle.
+#              DDL only; the tier reads live labels, no backfill needed (the next
+#              reclassify pass stamps matched_via='fingerprint' hits).
+_CURRENT_VERSION: int = 20260552
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -971,6 +980,77 @@ def _apply_cross_talk_audit_table(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260550: cross_talk_audit table ready + cross-talk hidden")
 
 
+def _apply_phantom_suppression_averted(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260551 — 2026-07 audit Phase 2b.
+
+    1. Adds ``events.phantom_suppression_averted`` (guarded, idempotent).
+    2. One-time re-evaluation of ALREADY-zeroed phantom events that carried a
+       large measured volume (the silent-suppression case the audit found: a
+       real 141 L draw zeroed to 0). Those events get their measured volume
+       back — routed through ``apply_effective_volume`` so the hourly ledger
+       reverses the zero and applies the restore correctly — and are flagged
+       ``suppression_averted`` for review. Mirrors the live guard in
+       ``_finalize_derived_verdicts`` (threshold `_PHANTOM_REVIEW_FLAG_LITRES`).
+       User-classified phantoms are the user's decision — never touched.
+    Leak-safety: restoring volume can never mask a leak (only zeroing could),
+    and the firmware trickle sensor is independent of stored events anyway.
+    """
+    if not _has_column(conn, "events", "phantom_suppression_averted"):
+        conn.execute("ALTER TABLE events "
+                     "ADD COLUMN phantom_suppression_averted INTEGER DEFAULT 0")
+    # Backfill needs the modern event shape; a stub/ancient DB (pre-verdict
+    # columns) has no phantom-zeroed rows to restore — DDL above is enough.
+    for _needed in ("circuit", "start_ts", "volume_litres",
+                    "volume_estimation_method", "user_classified", "flagged"):
+        if not _has_column(conn, "events", _needed):
+            conn.commit()
+            log.info("Migration 20260551: column added; backfill skipped "
+                     "(events table lacks %r)", _needed)
+            return
+    from .database import apply_effective_volume
+    from .feature_extractor import _PHANTOM_REVIEW_FLAG_LITRES
+    rows = conn.execute(
+        "SELECT id, circuit, start_ts, volume_litres FROM events "
+        "WHERE volume_estimation_method = 'pressure_restoration_phantom' "
+        "  AND COALESCE(user_classified, 0) = 0 "
+        "  AND COALESCE(volume_litres, 0) >= ?",
+        (_PHANTOM_REVIEW_FLAG_LITRES,)).fetchall()
+    for r in rows:
+        vol = float(r["volume_litres"])
+        conn.execute(
+            "UPDATE events SET volume_litres_effective = ?, "
+            "  volume_estimation_method = 'raw', "
+            "  is_pressure_restoration_phantom = 0, "
+            "  phantom_suppression_averted = 1, "
+            "  flagged = 1, anomaly_type = 'suppression_averted', "
+            "  anomaly_score = 1.0, match_rejection_reason = NULL, "
+            "  excluded_from_training = 1 "
+            "WHERE id = ?",
+            (round(vol, 3), r["id"]))
+        apply_effective_volume(conn, r["id"], r["circuit"], r["start_ts"], vol)
+    conn.commit()
+    log.info("Migration 20260551: phantom_suppression_averted ready; "
+             "%d zeroed large draw(s) restored + flagged for review", len(rows))
+
+
+def _apply_fingerprint_labeling_flag(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260552 — 2026-07 audit Phase 3.
+
+    Adds ``home_profile.fingerprint_labeling_enabled`` (DEFAULT 1 — the tier
+    shipped eval-gated at 96% measured precision). Guarded + idempotent; a
+    stub DB without home_profile just gets the version stamp.
+    """
+    has_profile = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='home_profile'"
+    ).fetchone()
+    if has_profile and not _has_column(conn, "home_profile",
+                                       "fingerprint_labeling_enabled"):
+        conn.execute("ALTER TABLE home_profile ADD COLUMN "
+                     "fingerprint_labeling_enabled INTEGER NOT NULL DEFAULT 1")
+    conn.commit()
+    log.info("Migration 20260552: fingerprint_labeling_enabled ready (default ON)")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -1413,6 +1493,8 @@ _MIGRATIONS: tuple = (
     (20260548, _apply_embedded_fixtures_column),
     (20260549, _apply_auto_split_default),
     (20260550, _apply_cross_talk_audit_table),
+    (20260551, _apply_phantom_suppression_averted),
+    (20260552, _apply_fingerprint_labeling_flag),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

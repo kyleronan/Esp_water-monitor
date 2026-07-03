@@ -105,17 +105,21 @@ class AlertManager:
         message: str,
         notification_id: Optional[str] = None,
         critical: bool = False,
-    ) -> None:
+    ) -> bool:
         """
         Send a notification if alert_type is enabled for circuit.
 
         critical=True bypasses the enabled check — used for safety shutoffs
         where we always want to notify regardless of user preference.
+
+        Returns True when the notification was dispatched, False when it was
+        suppressed by the per-type enable config — so callers can record
+        "this event actually notified" (events.triggered_alert).
         """
         if not critical and not self._is_enabled(circuit, alert_type):
             log.debug("[%s] alert '%s' suppressed (disabled in config)",
                       circuit, alert_type)
-            return
+            return False
 
         nid = notification_id or f"water_{alert_type}_{circuit}"
 
@@ -131,6 +135,7 @@ class AlertManager:
                     "tag":             nid,
                 },
             )
+        return True
 
     async def _send_mobile_push(
         self,
@@ -290,7 +295,7 @@ class AlertManager:
         if shutoff:
             where = (f"open “{valve_entity}” in Home Assistant"
                      if valve_entity else "open your main water valve in Home Assistant")
-            await self.fire(
+            dispatched = await self.fire(
                 circuit, "unusual_usage",
                 title=f"\U0001f6b1 Water shut off — {circuit_name}",
                 message=(f"Automatic shut-off: {reason} (anomaly score {score:.0%}). "
@@ -302,13 +307,24 @@ class AlertManager:
                 critical=True,
             )
         else:
-            await self.fire(
+            dispatched = await self.fire(
                 circuit, "unusual_usage",
                 title=f"\U0001f50d Unusual water usage — {circuit_name}",
                 message=(f"{reason} (anomaly score {score:.0%}). This did not fit "
                          f"{circuit_name}'s learned pattern — review the History "
-                         f"page. Lower Detection Sensitivity if these are false alarms."),
+                         f"page, under the Unusual events filter. Lower Detection "
+                         f"Sensitivity if these are false alarms."),
             )
+        # Audit trail: record that this event actually notified. Best-effort —
+        # a DB hiccup must never fail (or retry-spam) the alert itself.
+        if dispatched and event_id:
+            try:
+                self._db.execute(
+                    "UPDATE events SET triggered_alert = 1 WHERE id = ?",
+                    (event_id,))
+                self._db.commit()
+            except Exception as e:  # noqa: BLE001 — audit write is non-critical
+                log.warning("triggered_alert stamp failed for %s: %s", event_id, e)
 
     async def alert_pulsing_supply(self, circuit: str,
                                     circuit_name: str,
