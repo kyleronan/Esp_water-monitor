@@ -353,6 +353,7 @@
             data-flagged="{{ '1' if e.flagged else '0' }}"
             data-anomaly-reason="{{ e.anomaly_reason or '' }}"
             data-reviewed="{{ '1' if e.user_reviewed else '0' }}"
+            data-review-verdict="{{ e.review_verdict or '' }}"
             data-degraded="{{ '1' if e.degraded_supply else '0' }}"
             data-phantom="{{ '1' if e.is_pressure_restoration_phantom else '0' }}"
             data-cross-talk="{{ '1' if e.is_cross_talk else '0' }}"
@@ -434,9 +435,18 @@
               {% if e.degraded_supply %}<span class="pill pill-amber" title="Unsteady water pressure — pressure was pulsing, so this volume is an estimate, not exact.">〰 Estimated</span>{% endif %}
               {% if e.is_low_flow_dribble %}<span class="pill pill-neutral" title="Not real water use — a very small flow, too small to be a real tap or appliance. Volume removed from your totals. If water was running here, open it and relabel.">Drip — not real use</span>{% endif %}
               {% if e.match_rejection_reason == 'sparse_envelope' %}<span class="pill pill-neutral" title="A brief use followed by a long idle stretch — the listed time is mostly no-flow. The water still counts, but it's too irregular to learn your fixtures from.">⏳ Brief use, long idle tail</span>{% endif %}
-              {% if e.anomaly_reason == 'high_usage' %}<span class="pill pill-amber" title="Unusually large water use for your home's learned pattern. The measurement itself is trustworthy — open it and mark reviewed if this was normal (a long shower, guests, etc.).">⚠ Unusual — high use</span>
-              {% elif e.anomaly_reason == 'estimated' %}<span class="pill pill-amber" title="Flagged as unusual, but the volume is an ESTIMATE (pressure was unsteady) — the big number may not be real water. Open it to review.">⚠ Unusual (estimated)</span>
-              {% elif e.anomaly_reason == 'review_draw' %}<span class="pill pill-amber" title="This looked like a pressure blip, but it carried too much measured water to dismiss — the volume was KEPT and it needs your eyes. If it was real use, relabel it; if not, relabel as Not real use.">⚠ Large draw — review</span>{% endif %}
+              {# Reviewed anomalies keep a pill rather than losing it: the event
+                 stays findable in ?filter=anomaly, so its row should still say
+                 why it's there — just no longer as a call to action. Verdicts:
+                 'normal' (neutral), 'unknown' (amber — still worth an eye),
+                 NULL = reviewed before verdicts existed (neutral, generic). #}
+              {% if e.anomaly_reason and e.user_reviewed %}
+                {%- if e.review_verdict == 'unknown' %}<span class="pill pill-amber js-anomaly-pill" title="You reviewed this but didn't recognize it. It's kept out of the app's learned idea of normal, so it can never widen your baseline. If you later figure out what it was, open it and label it.">❓ Reviewed — unrecognized</span>
+                {%- elif e.review_verdict == 'normal' %}<span class="pill pill-neutral js-anomaly-pill" title="You confirmed this was normal use (a long shower, guests, filling something). It no longer counts toward the dashboard's unusual-events card.">✓ Reviewed — normal use</span>
+                {%- else %}<span class="pill pill-neutral js-anomaly-pill" title="Flagged as unusual for your home's pattern, and you've reviewed it. It no longer counts toward the dashboard's unusual-events card.">✓ Reviewed — was unusual</span>{% endif %}
+              {% elif e.anomaly_reason == 'high_usage' %}<span class="pill pill-amber js-anomaly-pill" title="Unusually large water use for your home's learned pattern. The measurement itself is trustworthy — open it and mark reviewed if this was normal (a long shower, guests, etc.).">⚠ Unusual — high use</span>
+              {% elif e.anomaly_reason == 'estimated' %}<span class="pill pill-amber js-anomaly-pill" title="Flagged as unusual, but the volume is an ESTIMATE (pressure was unsteady) — the big number may not be real water. Open it to review.">⚠ Unusual (estimated)</span>
+              {% elif e.anomaly_reason == 'review_draw' %}<span class="pill pill-amber js-anomaly-pill" title="This looked like a pressure blip, but it carried too much measured water to dismiss — the volume was KEPT and it needs your eyes. If it was real use, relabel it; if not, relabel as Not real use.">⚠ Large draw — review</span>{% endif %}
             </div>
           </td>
           {% endif %}
@@ -543,7 +553,12 @@
       <h4 class="evt-modal-degraded-title">⚠ Unusual event</h4>
       <p id="emd-anomaly-reason-text"></p>
       <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
-        <button id="emd-mark-reviewed-btn" class="btn btn-secondary btn-sm"{% if not is_admin %} hidden{% endif %}>Mark reviewed</button>
+        <span id="emd-review-btns" style="display:inline-flex;gap:.5rem;flex-wrap:wrap"{% if not is_admin %} hidden{% endif %}>
+          <button id="emd-review-normal-btn" class="btn btn-secondary btn-sm"
+                  title="This was legitimate water use — a long shower, guests, filling something.">✓ Normal use</button>
+          <button id="emd-review-unknown-btn" class="btn btn-secondary btn-sm"
+                  title="I looked, but I don't know what this was. The app keeps it out of its learned idea of normal.">❓ Don't recognize it</button>
+        </span>
         <span id="emd-reviewed-badge" class="muted" style="font-size:11px" hidden>✓ Reviewed</span>
       </div>
     </section>
@@ -1118,28 +1133,36 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
 
     // ── Unusual-event (anomaly) triage ──────────────────────────────────
     // Shown for flagged events. The reason text explains what KIND of
-    // unusual this is (real big use vs estimated number vs kept-draw), and
-    // "Mark reviewed" clears it from the dashboard's unreviewed count.
+    // unusual this is (real big use vs estimated number vs kept-draw); the
+    // two verdict buttons ("Normal use" / "Don't recognize it") both clear
+    // it from the dashboard's unreviewed count — "Don't recognize it" also
+    // keeps the event out of future anomaly-baseline refits.
     const anSection = document.getElementById('emd-anomaly-section');
     if (d.flagged === '1') {
       const REASON_TEXT = {
         high_usage: 'This event used much more water than your home’s ' +
           'learned pattern. The measurement itself is trustworthy — if this ' +
-          'was normal use (a long shower, guests, filling something), mark it reviewed.',
+          'was a long shower, guests, or filling something, mark it Normal use; ' +
+          'if you can’t place it, mark Don’t recognize it.',
         estimated: 'Flagged as unusual, but the volume shown is an ESTIMATE ' +
           'taken while the water pressure was unsteady — the big number may ' +
-          'not be real water. Review it, then mark reviewed.',
+          'not be real water. Review it, then pick a verdict below.',
         review_draw: 'This looked like a pressure blip, but it carried too much ' +
           'measured water to dismiss, so the volume was KEPT. If it wasn’t ' +
           'real use, open Classification below and mark it Not real water use; ' +
-          'otherwise mark it reviewed.',
+          'otherwise pick a verdict below.',
       };
       document.getElementById('emd-anomaly-reason-text').textContent =
         REASON_TEXT[d.anomalyReason] ||
-        'This event didn’t fit your home’s learned pattern. Review it, then mark reviewed.';
-      document.getElementById('emd-mark-reviewed-btn').hidden = (d.reviewed === '1')
+        'This event didn’t fit your home’s learned pattern. Review it, then pick a verdict below.';
+      const reviewed = d.reviewed === '1';
+      document.getElementById('emd-review-btns').hidden = reviewed
         || document.getElementById('emd-edit-region')?.hidden === true;
-      document.getElementById('emd-reviewed-badge').hidden = (d.reviewed !== '1');
+      const badge = document.getElementById('emd-reviewed-badge');
+      badge.textContent = d.reviewVerdict === 'normal' ? '✓ Reviewed — normal use'
+        : d.reviewVerdict === 'unknown' ? '❓ Reviewed — unrecognized'
+        : '✓ Reviewed';
+      badge.hidden = !reviewed;
       anSection.hidden = false;
     } else {
       anSection.hidden = true;
@@ -1419,19 +1442,44 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     });
   }
 
-  // Anomaly triage — mark a flagged event as reviewed (clears it from the
-  // dashboard's unreviewed-anomalies count). No reload: update in place.
-  const markReviewedBtn = document.getElementById('emd-mark-reviewed-btn');
-  if (markReviewedBtn) {
-    markReviewedBtn.addEventListener('click', async () => {
-      if (!activeRow) return;
-      const ok = await patchEvent({ user_reviewed: true });
-      if (ok) {
-        activeRow.dataset.reviewed = '1';
-        markReviewedBtn.hidden = true;
-        document.getElementById('emd-reviewed-badge').hidden = false;
+  // Anomaly triage — two verdicts, both count as reviewed (clears the
+  // dashboard's unreviewed-anomalies count). 'unknown' additionally keeps
+  // the event out of anomaly-baseline refits. No reload: update in place,
+  // mirroring what the template renders on the next full load.
+  const reviewBtnWrap = document.getElementById('emd-review-btns');
+  async function submitReviewVerdict(verdict) {
+    if (!activeRow) return;
+    const ok = await patchEvent({ review_verdict: verdict });
+    if (!ok) return;
+    activeRow.dataset.reviewed = '1';
+    activeRow.dataset.reviewVerdict = verdict;
+    reviewBtnWrap.hidden = true;
+    const badge = document.getElementById('emd-reviewed-badge');
+    badge.textContent = verdict === 'normal'
+      ? '✓ Reviewed — normal use' : '❓ Reviewed — unrecognized';
+    badge.hidden = false;
+    const pill = activeRow.querySelector('.js-anomaly-pill');
+    if (pill) {
+      if (verdict === 'normal') {
+        pill.className = 'pill pill-neutral js-anomaly-pill';
+        pill.textContent = '✓ Reviewed — normal use';
+        pill.title = 'You confirmed this was normal use (a long shower, ' +
+          'guests, filling something). It no longer counts toward the ' +
+          "dashboard's unusual-events card.";
+      } else {
+        pill.className = 'pill pill-amber js-anomaly-pill';
+        pill.textContent = '❓ Reviewed — unrecognized';
+        pill.title = "You reviewed this but didn't recognize it. It's kept " +
+          "out of the app's learned idea of normal, so it can never widen " +
+          'your baseline. If you later figure out what it was, open it and label it.';
       }
-    });
+    }
+  }
+  if (reviewBtnWrap) {
+    document.getElementById('emd-review-normal-btn')
+      .addEventListener('click', () => submitReviewVerdict('normal'));
+    document.getElementById('emd-review-unknown-btn')
+      .addEventListener('click', () => submitReviewVerdict('unknown'));
   }
 })();
 

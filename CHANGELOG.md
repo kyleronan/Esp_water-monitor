@@ -1,5 +1,58 @@
 # Changelog
 
+## [0.3.1-dev13] — 2026-07-03 — two-option anomaly review: Normal use / Don't recognize it
+
+"Mark reviewed" collapsed two opposite meanings — "that was normal" and
+"I have no idea what that was" — into one bit, and an unrecognized draw
+with a machine-matched label would still stretch the anomaly baseline's
+idea of "normal" at the next retrain. Reviewing now records which one you
+meant:
+
+- **✓ Normal use** — confirmed legitimate (long shower, guests, filling
+  something). Clears the dashboard card; participates in baseline refits
+  as before.
+- **❓ Don't recognize it** — you looked but couldn't place it. Clears the
+  card too, but the event is **held out of every future anomaly-baseline
+  refit** (`fit_usage_baselines` skips `review_verdict='unknown'`), so an
+  unidentified draw can never widen a fixture envelope or the overall
+  volume percentiles toward "normal". The row keeps an amber
+  "❓ Reviewed — unrecognized" pill so it stays visible.
+- A later **relabel clears the verdict** — identifying the draw supersedes
+  "unknown" and readmits the event under its new label. Un-reviewing also
+  wipes the verdict (a verdict can't outlive its review).
+- **Migration 20260553**: `events.review_verdict` (TEXT, nullable). Events
+  reviewed before verdicts existed stay NULL — their intent wasn't recorded
+  and isn't invented; they keep the generic "✓ Reviewed — was unusual" pill
+  and keep participating in refits (old behavior).
+- `review_verdict` joins the user-intent columns preserved across
+  re-imports/reprocess. PATCH API accepts `review_verdict`
+  ('normal'/'unknown'/null); plain `user_reviewed` still works (legacy).
+- The frozen-baseline invariant is untouched: verdicts change nothing live —
+  'unknown' only gates which events the NEXT deliberate refit may learn from.
+- Tests: 6 new in `test_anomaly_surfacing.py` (verdict semantics, relabel/
+  un-review clearing, baseline hold-out both directions).
+
+## [0.3.1-dev12] — 2026-07-03 — fix: unusual-events Review list truncated by recency limit
+
+- **Bug:** the dashboard "Unusual events" card counts every unreviewed
+  flagged event (no time window), but History's `?filter=anomaly` view
+  filtered in Python AFTER fetching only the newest 100 events — so any
+  flagged event older than the 100th most recent row silently vanished
+  from the very list meant to surface it (card said 95, Review showed 2).
+  The `?filter=degraded` view had the same defect.
+- **Fix:** both filters now live in `get_recent_events`' SQL WHERE
+  (`flagged_only` / `degraded_only`), so the recency limit applies to
+  *matching* events — the Review list shows the newest 100 flagged events
+  regardless of how much unflagged use came after them. Date-range
+  filtering composes with the flag filters unchanged.
+- Tests: 3 regressions in `test_anomaly_surfacing.py` (flagged/degraded
+  reach past the recency limit; date-range + flag AND).
+- **Also fixed:** the History Note pill ignored review state — after "Mark
+  reviewed" the row kept shouting "⚠ Unusual — high use" forever. Reviewed
+  anomalies now render a neutral "✓ Reviewed — was unusual" pill (kept, not
+  removed, so rows in the unusual-events view still say why they're there),
+  and the mark-reviewed button swaps the pill in place without a reload.
+
 ## [0.3.1-dev11] — 2026-07-03 — fingerprint label propagator (waveform-match tier)
 
 Phase 3 of the 2026-07 reality audit. An event's fully un-normalized stored

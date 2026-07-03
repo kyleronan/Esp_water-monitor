@@ -75,14 +75,21 @@ def fit_usage_baselines(
         conn: sqlite3.Connection,
         circuit: str) -> Tuple[Dict[str, Any], Dict[str, float]]:
     """Compute (per-type envelopes, overall volume percentiles) from this circuit's
-    labelled + matched, non-excluded events. Pure read — does not persist."""
+    labelled + matched, non-excluded events. Pure read — does not persist.
+
+    Events the user reviewed as 'unknown' ("I don't recognise this") are held
+    out: a draw the user couldn't identify must never stretch a fixture
+    envelope or the overall percentiles toward "normal", even when a machine
+    label matched it. A later relabel clears the verdict and readmits it.
+    """
     rows = conn.execute(
         "SELECT COALESCE(user_fixture_type, matched_fixture_type) AS t, "
         "       volume_litres, duration_seconds, peak_flow_lpm, "
         "       COALESCE(volume_litres_effective, volume_litres) AS eff_vol "
         "FROM events WHERE circuit = ? "
         "  AND COALESCE(user_fixture_type, matched_fixture_type) IS NOT NULL "
-        "  AND COALESCE(excluded_from_training, 0) = 0",
+        "  AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND COALESCE(review_verdict, '') <> 'unknown'",
         (circuit,),
     ).fetchall()
 

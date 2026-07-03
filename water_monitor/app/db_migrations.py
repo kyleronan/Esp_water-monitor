@@ -117,7 +117,11 @@ _BASELINE_VERSION: int = 20260523
 #              (DEFAULT 1) — the tight-fingerprint label-propagation tier toggle.
 #              DDL only; the tier reads live labels, no backfill needed (the next
 #              reclassify pass stamps matched_via='fingerprint' hits).
-_CURRENT_VERSION: int = 20260552
+#   20260553 — events.review_verdict (TEXT: 'normal'/'unknown'/NULL) — two-option
+#              anomaly triage. 'unknown' events are held out of anomaly-baseline
+#              refits (fit_usage_baselines). DDL only; existing user_reviewed=1
+#              rows keep NULL (= reviewed before verdicts existed).
+_CURRENT_VERSION: int = 20260553
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1051,6 +1055,22 @@ def _apply_fingerprint_labeling_flag(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260552: fingerprint_labeling_enabled ready (default ON)")
 
 
+def _apply_review_verdict_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260553 — two-option anomaly triage.
+
+    Adds ``events.review_verdict`` (TEXT, nullable): 'normal' — the user
+    confirmed legitimate use; 'unknown' — the user looked but didn't
+    recognise the draw (held out of anomaly-baseline refits so it can never
+    teach "normal"); NULL — unreviewed, or reviewed before verdicts existed
+    (existing user_reviewed=1 rows deliberately keep NULL — their intent
+    wasn't recorded and must not be invented). Guarded + idempotent.
+    """
+    if not _has_column(conn, "events", "review_verdict"):
+        conn.execute("ALTER TABLE events ADD COLUMN review_verdict TEXT")
+    conn.commit()
+    log.info("Migration 20260553: events.review_verdict ready")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -1495,6 +1515,7 @@ _MIGRATIONS: tuple = (
     (20260550, _apply_cross_talk_audit_table),
     (20260551, _apply_phantom_suppression_averted),
     (20260552, _apply_fingerprint_labeling_flag),
+    (20260553, _apply_review_verdict_column),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

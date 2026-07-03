@@ -716,6 +716,13 @@ CREATE TABLE IF NOT EXISTS events (
     anomaly_type                TEXT,
     flagged                     BOOLEAN DEFAULT 0,
     user_reviewed               BOOLEAN DEFAULT 0,
+    -- Anomaly-triage verdict (migration 20260553): 'normal' — user confirmed
+    -- legitimate use; 'unknown' — user looked but didn't recognise it (the
+    -- event is then held out of future anomaly-baseline refits so an
+    -- unidentified draw can never teach "normal"); NULL — unreviewed, or
+    -- reviewed before verdicts existed. A real relabel clears it: identifying
+    -- the draw supersedes "unknown".
+    review_verdict              TEXT,
     user_fixture_type           TEXT,              -- user-assigned fixture type (overrides clustering)
     triggered_alert             BOOLEAN DEFAULT 0,
     volume_litres               REAL DEFAULT 0,
@@ -1773,6 +1780,9 @@ def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) ->
 _EVENT_USER_COLUMNS: frozenset[str] = frozenset({
     "user_fixture_type",
     "user_reviewed",
+    # Anomaly-triage verdict ('normal'/'unknown') — user intent like the
+    # reviewed bit itself; 'unknown' additionally gates baseline refits.
+    "review_verdict",
     # Sprint H: the explicit user intents are preserved across re-import/
     # enrichment upserts. excluded_from_training is NO LONGER preserved here —
     # it's a DERIVED field (auto verdicts OR user_ignored OR manual) recomputed
@@ -2494,12 +2504,20 @@ def get_recent_events(
     limit: int = 100,
     date_from: str = None,
     date_to: str = None,
+    flagged_only: bool = False,
+    degraded_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Return events for a circuit ordered newest first.
     If date_from / date_to are provided (ISO strings) they act as a
     range filter and limit is ignored so the full range is returned.
     Otherwise returns the most recent `limit` rows.
+
+    flagged_only / degraded_only back the History filter views
+    (?filter=anomaly / ?filter=degraded). They must live in the WHERE
+    clause so the recency limit applies to MATCHING rows — a Python
+    post-filter over the newest `limit` events silently drops every
+    match older than the `limit`-th event.
     """
     _select = """
         SELECT e.*,
@@ -2513,25 +2531,23 @@ def get_recent_events(
                ON fc.circuit = e.circuit AND fc.id = e.cluster_id
         LEFT JOIN fixtures f ON f.id = e.fixture_id
     """
-    if date_from or date_to:
-        conditions = ["e.circuit = ?"]
-        params: list = [circuit]
-        if date_from:
-            conditions.append("e.start_ts >= ?")
-            params.append(date_from)
-        if date_to:
-            conditions.append("e.start_ts <= ?")
-            params.append(date_to + "T23:59:59")
-        where = " AND ".join(conditions)
-        rows = conn.execute(
-            f"{_select} WHERE {where} ORDER BY e.start_ts DESC",
-            params,
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            f"{_select} WHERE e.circuit = ? ORDER BY e.start_ts DESC LIMIT ?",
-            (circuit, limit),
-        ).fetchall()
+    conditions = ["e.circuit = ?"]
+    params: list = [circuit]
+    if flagged_only:
+        conditions.append("e.flagged = 1")
+    if degraded_only:
+        conditions.append("e.degraded_supply = 1")
+    if date_from:
+        conditions.append("e.start_ts >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("e.start_ts <= ?")
+        params.append(date_to + "T23:59:59")
+    sql = f"{_select} WHERE {' AND '.join(conditions)} ORDER BY e.start_ts DESC"
+    if not (date_from or date_to):
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -2547,6 +2563,7 @@ def patch_event(
     excluded_from_training=_PATCH_UNSET,
     user_ignored=_PATCH_UNSET,
     user_reviewed=_PATCH_UNSET,
+    review_verdict=_PATCH_UNSET,
 ) -> bool:
     """Update user-editable fields on a single event.
 
@@ -2558,7 +2575,16 @@ def patch_event(
     category flag) so the effective exclusion stays consistent. The legacy
     ``excluded_from_training`` kwarg is still accepted for back-compat but
     callers should prefer ``user_ignored``.
+
+    ``review_verdict`` ('normal' | 'unknown' | None) is the two-option anomaly
+    triage. Setting either verdict also stamps ``user_reviewed = 1`` (the
+    dashboard-count bit); passing None clears the verdict only. 'unknown'
+    events are held out of anomaly-baseline refits by fit_usage_baselines —
+    the verdict column itself is the whole mechanism, nothing else changes.
     """
+    if review_verdict is not _PATCH_UNSET and review_verdict not in (
+            None, "normal", "unknown"):
+        raise ValueError(f"invalid review_verdict: {review_verdict!r}")
     row = conn.execute(
         "SELECT id, is_pressure_restoration_phantom, degraded_supply, "
         "       is_low_flow_dribble "
@@ -2578,9 +2604,13 @@ def patch_event(
         # user-relabeled member "leave the group" (§7).
         # A real label also RESOLVES a pending suppression-averted review (the
         # user has looked at it and decided) — clear the marker and count the
-        # event as reviewed so it leaves the dashboard's anomaly card.
+        # event as reviewed so it leaves the dashboard's anomaly card. It also
+        # clears any 'unknown' review verdict: identifying the draw supersedes
+        # "I don't recognise it" (and lets the event back into baseline refits
+        # under its new label).
         _resolve_review = ", phantom_suppression_averted = 0" + (
-            ", user_reviewed = 1" if user_fixture_type else "")
+            ", user_reviewed = 1, review_verdict = NULL"
+            if user_fixture_type else "")
         conn.execute(
             "UPDATE events SET user_fixture_type = ?, fixture_label_source = ?, "
             "cycle_group_id = NULL" + _resolve_review + " "
@@ -2605,10 +2635,30 @@ def patch_event(
     if user_reviewed is not _PATCH_UNSET:
         # Anomaly triage: "I looked at this flagged event" — clears it from the
         # dashboard's unreviewed-anomalies count. Display/triage state only.
+        # Un-reviewing also wipes any verdict: the verdict is a property of a
+        # review, so it can't outlive one.
         conn.execute(
-            "UPDATE events SET user_reviewed = ? WHERE id = ? AND circuit = ?",
+            "UPDATE events SET user_reviewed = ?"
+            + (", review_verdict = NULL" if not user_reviewed else "")
+            + " WHERE id = ? AND circuit = ?",
             (1 if user_reviewed else 0, event_id, circuit),
         )
+    if review_verdict is not _PATCH_UNSET:
+        # Setting a verdict IS a review — stamp both together so a verdict can
+        # never exist on an unreviewed event. Clearing (None) leaves the
+        # reviewed bit alone (use user_reviewed=False to fully un-review).
+        if review_verdict is None:
+            conn.execute(
+                "UPDATE events SET review_verdict = NULL "
+                "WHERE id = ? AND circuit = ?",
+                (event_id, circuit),
+            )
+        else:
+            conn.execute(
+                "UPDATE events SET review_verdict = ?, user_reviewed = 1 "
+                "WHERE id = ? AND circuit = ?",
+                (review_verdict, event_id, circuit),
+            )
     conn.commit()
     return True
 

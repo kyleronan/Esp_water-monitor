@@ -172,22 +172,22 @@ def _collect_circuit_history_sync(
     for circuit_cfg in circuits:
         if filter_circuit and circuit_cfg.circuit != filter_circuit:
             continue
+        # Dashboard "Degraded supply" / "Unusual events" links arrive as
+        # ?filter=degraded / ?filter=anomaly. The filter is pushed into the
+        # SQL WHERE (not a Python post-filter) so the recency limit counts
+        # MATCHING events — otherwise a flagged event older than the newest
+        # `limit` rows silently vanishes from the very view meant to surface
+        # it. The anomaly view shows every flagged event, INCLUDING
+        # volume-zeroed ones — an anomaly on a zeroed event is exactly the
+        # case that must not stay hidden.
         events = get_recent_events(
             db, circuit_cfg.circuit,
             limit=DEFAULT_EVENT_LIMIT,
             date_from=date_from or None,
             date_to=date_to or None,
+            flagged_only=(filter_param == "anomaly"),
+            degraded_only=(filter_param == "degraded"),
         )
-        # Dashboard "Degraded supply" View-link uses ?filter=degraded.
-        # Post-filter rather than a dedicated SQL path so the rest of
-        # the rendering machinery doesn't need to change.
-        if filter_param == "degraded":
-            events = [e for e in events if dict(e).get("degraded_supply")]
-        elif filter_param == "anomaly":
-            # Dashboard "unusual events" card links here. Shows every flagged
-            # event, INCLUDING volume-zeroed ones — an anomaly on a zeroed
-            # event is exactly the case that must not stay hidden.
-            events = [e for e in events if dict(e).get("flagged")]
         # Settings "Hide not-real-use events" toggle — hides every volume-zeroing
         # verdict (phantom / cross-talk / dribble) so the one "Not real use" label
         # maps to one switch. The count of hidden rows is surfaced so the list
@@ -503,6 +503,15 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
     if "user_reviewed" in payload:
         # Anomaly triage: mark a flagged event as looked-at (dashboard count).
         kwargs["user_reviewed"] = bool(payload["user_reviewed"])
+    if "review_verdict" in payload:
+        # Two-option triage: 'normal' (confirmed legitimate use) or 'unknown'
+        # (looked, didn't recognise it — held out of baseline refits). Either
+        # verdict implies user_reviewed=1; null clears the verdict.
+        verdict = payload["review_verdict"] or None
+        if verdict not in (None, "normal", "unknown"):
+            return JSONResponse({"error": "invalid review_verdict"},
+                                status_code=400)
+        kwargs["review_verdict"] = verdict
 
     # B7 — guard against accidentally EXCLUDING a sparse 'training' anchor: that
     # silently unseeds the class from the k-NN, and in History the event looks
