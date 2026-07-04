@@ -3317,6 +3317,57 @@ button:
 # =============================================================================
 interval:
   # ---------------------------------------------------------------------------
+  # FLOW FAST-ZERO (3.13) — adaptive early zero of the flow-rate sensors.
+  #
+  # pulse_meter holds the last computed rate until its 10s timeout, so a
+  # closed tap leaves a flat "square tail" at the final inter-pulse rate on
+  # dashboards, in the waveform capture (which gates on water_usage > 0.10
+  # L/min), and in the add-on's event-end timing.
+  #
+  # Fix: at the current rate we know the expected pulse interval
+  # (60000 / pulses_per_min ms). If ~2.5 expected intervals pass with no
+  # pulse, the draw is over — publish 0 through the normal filter chain
+  # without waiting for the timeout.
+  #   @ 7.5 L/min (72 ppl): expected 111ms → zero after the 600ms floor.
+  #   @ 2.0 L/min:          expected 417ms → zero after ~1s.
+  #   @ 0.1 L/min:          expected 8.3s  → cutoff 20.8s > the 10s timeout,
+  #     so the timeout still governs — slow-drip visibility is unchanged.
+  # The 600ms floor absorbs pulse jitter at high rates (PD meters are
+  # regular; turbines jitter slightly — 2.5× + floor covers both).
+  # The pulse_meter's own timeout zero later is a harmless duplicate.
+  # ---------------------------------------------------------------------------
+  - interval: 250ms
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          // --- Main ---
+          {
+            float ppm = id(flow_base_main).state;   // pulses/min (rate sensor)
+            uint32_t last = id(last_pulse_ms_main);
+            if (std::isfinite(ppm) && ppm > 0.0f && last != 0) {
+              float expected_ms = 60000.0f / ppm;
+              float cutoff_ms = 2.5f * expected_ms;
+              if (cutoff_ms < 600.0f) cutoff_ms = 600.0f;
+              if ((now - last) > (uint32_t) cutoff_ms) {
+                id(flow_base_main).publish_state(0.0f);   // → water_usage1 copies + zeroes
+              }
+            }
+          }
+          // --- Irrigation ---
+          {
+            float ppm = id(flow_base_irr).state;
+            uint32_t last = id(last_pulse_ms_irr);
+            if (std::isfinite(ppm) && ppm > 0.0f && last != 0) {
+              float expected_ms = 60000.0f / ppm;
+              float cutoff_ms = 2.5f * expected_ms;
+              if (cutoff_ms < 600.0f) cutoff_ms = 600.0f;
+              if ((now - last) > (uint32_t) cutoff_ms) {
+                id(flow_base_irr).publish_state(0.0f);
+              }
+            }
+          }
+
+  # ---------------------------------------------------------------------------
   # VALVE SEAL CHECKS (3.13) — pulse-age based, 1s cadence, per circuit.
   #
   # Replaces the pre-3.13 checks that lived in the flow sensors' on_value
