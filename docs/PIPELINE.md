@@ -7,8 +7,10 @@ Every step below names the responsible **file/function**, the **gates with their
 the **DB columns written**, and an **"if it breaks here"** symptom so you can jump from a wrong number
 straight to the code that produced it.
 
-> Thresholds verified against commit `f2afa1a` (0.3.1-dev11). If you touch the pipeline, re-check the
-> constants cited here against the code before trusting them.
+> Verified against the **0.3.1-dev14 working tree** — committed through `e9a846f` (dev13: review
+> verdicts + unusual-events fixes), plus the uncommitted dev14 rising-pressure phantom detector
+> (`rise_corr_backfill.py`, migration `20260554`). If you touch the pipeline, re-check the constants
+> cited here against the code before trusting them.
 
 Two invariants hold the whole thing together:
 
@@ -34,7 +36,7 @@ flowchart TD
     DISCARD["Discarded<br/>< 1 mL · surge phantom"]
     FEAT["6 · Features<br/>volume integral, signatures, active-flow metrics"]
     BACKFILL["Backfill importer<br/>replays recorder history"]
-    VERDICT{"7 · Real water?<br/>user-lock → xtalk → phantom → cross-talk<br/>→ dribble → degraded (cap) → sparse"}
+    VERDICT{"7 · Real water?<br/>user-lock → xtalk → phantom (drop/rise) → cross-talk<br/>→ dribble → degraded (cap) → sparse"}
     ZERO["0 L + excluded<br/>phantom / cross-talk / dribble"]
     KEEP["Kept + flagged<br/>big phantom ≥10 L → review"]
     STORE["9 · Row stored<br/>events table + hour ledger"]
@@ -193,10 +195,11 @@ first match wins and sets the effective volume.
 | 7a | **You already classified it** | `user_classified = 1` | your verdict stands; auto-detection never re-flags |
 | 7b | **Durable irrigation cross-talk** | `match_rejection_reason = 'irrigation_cross_talk'` (from the importer) | `veff = 0`; survives every reprocess unless you relabel it real |
 | 7c | **Phantom (pressure restoration)** | duration ≥120 s (`_PHANTOM_NOFLOW_MIN_DURATION_S`; a legacy event with no active-flow metrics needs the frozen 30-min floor instead) ∧ ΔP < 2.0 psi (frozen — leak safety) ∧ `flow_integral` < 1.0 L ∧ `flow_on_ratio` < 0.05. Rescue: true avg flow ≥ 2.0 L/min → real brief draw, not phantom | `is_pressure_restoration_phantom = 1`, `veff = 0`, excluded |
-| 7d | **Cross-talk (other circuit's draw)** | same no-flow ceilings (`flow_integral` < 1.0 L, `flow_on_ratio` < 0.05), but a real drop: ΔP ≥ 2.0 psi ∧ duration ≥ 120 s (`_XTALK_MIN_DURATION_S`, calib-overridable). The ΔP floor separates it from 7c | `is_cross_talk = 1`, `veff = 0`, excluded |
-| 7e | **Dribble (sensor trickle)** | volume < 0.5 L ∧ avg flow < 1.0 L/min ∧ ΔP < 1.5 psi (defaults, per-home calibrated). Guard: coarse meter (60 ÷ PPL floor ≥ 0.5 L/min — e.g. an oval-gear meter) measures low flow reliably → never dribble | `is_low_flow_dribble = 1`, `veff = 0`, excluded |
-| 7f | **Degraded supply (pulsing water)** | `degraded_supply = 1` — flow reading unreliable | `veff = volume_litres_estimated`, **capped** (see below), method `'pulsing_supply_envelope'`, excluded |
-| 7g | **Sparse envelope (brief use, long idle tail)** | duration ≥ 10 min (`_SPARSE_ENVELOPE_MIN_DURATION_S = 600 s`) ∧ flow on ≤ 10% of it | **litres kept**, `mrr = 'sparse_envelope'`, excluded from training; targeted by the hygiene loop |
+| 7d | **Rising-pressure phantom** (dev14) | the *opposite* of 7c — flow **tracked a pressure rise** (the turbine spun on climbing city pressure, not demand; a real draw pulls pressure *down*). Fires when the flow↔pressure Pearson correlation `flow_pressure_corr` ≥ 0.6 (`_RISE_PHANTOM_MIN_CORR`) ∧ 0 < volume < 1.0 L (strict, frozen leak guard) ∧ duration ≤ 120 s. `corr = None` (no/short pressure signal) → never fires; skips degraded/user-typed | reuses `is_pressure_restoration_phantom = 1`, `veff = 0`; distinct `mrr = 'rising_pressure_phantom'`; excluded |
+| 7e | **Cross-talk (other circuit's draw)** | same no-flow ceilings (`flow_integral` < 1.0 L, `flow_on_ratio` < 0.05), but a real drop: ΔP ≥ 2.0 psi ∧ duration ≥ 120 s (`_XTALK_MIN_DURATION_S`, calib-overridable). The ΔP floor separates it from 7c | `is_cross_talk = 1`, `veff = 0`, excluded |
+| 7f | **Dribble (sensor trickle)** | volume < 0.5 L ∧ avg flow < 1.0 L/min ∧ ΔP < 1.5 psi (defaults, per-home calibrated). Guard: coarse meter (60 ÷ PPL floor ≥ 0.5 L/min — e.g. an oval-gear meter) measures low flow reliably → never dribble | `is_low_flow_dribble = 1`, `veff = 0`, excluded |
+| 7g | **Degraded supply (pulsing water)** | `degraded_supply = 1` — flow reading unreliable | `veff = volume_litres_estimated`, **capped** (see below), method `'pulsing_supply_envelope'`, excluded |
+| 7h | **Sparse envelope (brief use, long idle tail)** | duration ≥ 10 min (`_SPARSE_ENVELOPE_MIN_DURATION_S = 600 s`) ∧ flow on ≤ 10% of it | **litres kept**, `mrr = 'sparse_envelope'`, excluded from training; targeted by the hygiene loop |
 | 8 | **Real use** | none of the above | `volume_litres_effective = volume_litres`, method `'raw'`, eligible for training + totals |
 
 **Envelope cap (dev10, guards 7f).** A degraded/pulsing envelope estimate can badly over-read, so
@@ -212,10 +215,31 @@ review (`phantom_suppression_averted = 1`, `anomaly_type = 'suppression_averted'
 `excluded_from_training`). Rationale: silently zeroing 10 L+ is riskier than showing a "please review"
 draw. Migration `20260551` restored already-zeroed large phantoms through the ledger.
 
+**Where `flow_pressure_corr` comes from (7d).** The correlation is computed live from the event's
+waveform (`_flow_pressure_correlation` over the full flow + pressure series) and stored on the row
+(column added by migration `20260554`). Stored 32-point signatures **cannot** reconstruct it — the
+pressure signature clamps drop-fraction to [0, 1], erasing the above-baseline rises the discriminator
+depends on — so historical events are handled by a one-shot backfill worker (see the branch below).
+The verdict is (re-)applied to any event carrying a stored `corr` by `reprocess_rising_pressure_phantoms()`,
+part of the same repair chain as the phantom/cross-talk/dribble passes.
+
 > **If it breaks here:** real water zeroed (or noise surviving to step 8) → read
 > `volume_estimation_method` and the three `is_*` flags on the row to see which check fired. A big draw
-> unexpectedly flagged rather than counted-clean → check `phantom_suppression_averted`. Relabeling the
+> unexpectedly flagged rather than counted-clean → check `phantom_suppression_averted`. A small burst
+> zeroed as a rising-pressure phantom → check `flow_pressure_corr` (≥ 0.6 fired it). Relabeling the
 > event re-runs the cascade with your label winning.
+
+#### Branch · Rising-corr backfill (dev14, one-shot)
+**`app/rise_corr_backfill.py`**
+
+Events predating the `flow_pressure_corr` column can't have it re-derived from their stored signatures,
+so this worker computes it the trustworthy way: it re-fetches each candidate's flow + pressure history
+from the HA recorder, resamples both onto the importer's 1 Hz grid, runs the same
+`_flow_pressure_correlation`, then applies the verdict through the shared repair pass (one ledger path).
+**Candidates** are only events the live detector *could* have caught: ≤120 s, 0 < vol < 1 L, unlabeled,
+unflagged, non-degraded, no artifact verdict, no stored corr. It sweeps oldest-first; a clean sweep sets
+`home_profile.rise_corr_backfill_done = 1` and never runs again (events whose history is gone stay
+counted — leak-safe default).
 
 ### 9 · Row stored + hour ledger posted
 **`app/database.py · upsert_event_and_apply_hourly_volume()`**
@@ -317,6 +341,18 @@ unchanged, but dev9 wired up the surfacing that was previously dead:
   not-real" toggle); a display-time `anomaly_reason` splits the flag into user-facing badges —
   `review_draw` (suppression-averted), `estimated` (degraded/envelope), `high_usage` (rest). Marking an
   event reviewed sets `user_reviewed = 1` and clears it from the dashboard's unreviewed-anomaly count.
+- **Review verdicts (dev13):** the review records *why* — `review_verdict` (column added by migration
+  `20260553`) is `normal` (confirmed legit use) or `unknown` (looked, didn't recognise it). Both stamp
+  `user_reviewed = 1`. The verdict is **display + training-workflow only** — it never touches
+  `volume_litres_effective` or the live (frozen-baseline) anomaly score. Its one job: `fit_usage_baselines()`
+  **holds `unknown` events out** of the next deliberate baseline refit (`WHERE COALESCE(review_verdict,'')
+  <> 'unknown'`), so an unidentified draw can never stretch a fixture envelope toward "normal". Labeling
+  the event later clears an `unknown` verdict (identifying it supersedes "don't know").
+- **Unusual-events list fix (dev12):** the anomaly filter was applied in Python *after* the newest-100
+  fetch, so a flagged event older than the 100th row vanished from the very view meant to surface it
+  (card said 95, list showed 2). The `flagged_only` / `degraded_only` filters now run **inside the SQL
+  `WHERE`** in `get_recent_events()`, so the recency limit applies to matching rows and the card count
+  agrees with the list.
 
 ---
 
@@ -395,6 +431,7 @@ settle once cycle-mates exist. Any volume change re-enters at step 12.
 | Event volume ≠ physical meter | step 12 branch | `volume_litres_effective` vs `volume_recorder_litres`, then `reconcile_state` |
 | Event missing / merged / split | Part 1 | restart timestamps (websocket), the 120 s coalesce grace, or force-close lines (stuck event) |
 | Real water shows as 0 L | step 7 | the three `is_*` flags + `volume_estimation_method` |
+| Small burst zeroed as a phantom during a pressure rise | step 7d | `flow_pressure_corr` ≥ 0.6 fired the rising-pressure phantom |
 | Big draw flagged "review" not counted-clean | step 7c backstop | `phantom_suppression_averted` (≥10 L phantom kept + flagged on purpose) |
 | Degraded volume looks capped/too low | step 7f | `degraded_diagnostic_json` (`envelope_cap_applied`, `envelope_uncapped_litres`) |
 | Label came from `fingerprint` and looks wrong | step 10e | library size / self-calibrated threshold; save a correct label to re-seed |
