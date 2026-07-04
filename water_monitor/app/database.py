@@ -2507,6 +2507,36 @@ def compute_ha_weekly_volume(
     return round(max(0.0, current_ha_value - baseline), 1)
 
 
+# Fixture filter: the row's EFFECTIVE label, matching the History display chain
+# (user label > confirmed fixture record's type > k-NN match > cluster suggestion).
+# NULLIF guards empty-string user labels; a NULL chain renders as the "Other"
+# fallback pill and is selectable via fixture_type='unlabelled'.
+_EFFECTIVE_FIXTURE_SQL = ("COALESCE(NULLIF(e.user_fixture_type, ''), "
+                          "f.fixture_type, e.matched_fixture_type, "
+                          "fc.suggested_type)")
+
+# Note filter: categorical over the pill kinds the History "Note" column renders.
+# Each entry is a self-contained predicate; 'none' = a row with no pills at all.
+_NOTE_KIND_SQL: Dict[str, str] = {
+    "unusual":   "e.flagged = 1",
+    "estimated": ("(e.degraded_supply = 1 "
+                  "OR e.volume_estimation_method = 'pulsing_supply_envelope')"),
+    "not_real":  ("(COALESCE(e.is_pressure_restoration_phantom, 0) = 1 "
+                  "OR COALESCE(e.is_cross_talk, 0) = 1 "
+                  "OR COALESCE(e.is_low_flow_dribble, 0) = 1)"),
+    "sparse":    "e.match_rejection_reason = 'sparse_envelope'",
+    "none":      ("(COALESCE(e.flagged, 0) = 0 "
+                  "AND COALESCE(e.degraded_supply, 0) = 0 "
+                  "AND COALESCE(e.volume_estimation_method, 'raw') "
+                  "    <> 'pulsing_supply_envelope' "
+                  "AND COALESCE(e.is_pressure_restoration_phantom, 0) = 0 "
+                  "AND COALESCE(e.is_cross_talk, 0) = 0 "
+                  "AND COALESCE(e.is_low_flow_dribble, 0) = 0 "
+                  "AND COALESCE(e.match_rejection_reason, '') <> 'sparse_envelope' "
+                  "AND COALESCE(e.user_reviewed, 0) = 0)"),
+}
+
+
 def get_recent_events(
     conn: sqlite3.Connection,
     circuit: str,
@@ -2516,6 +2546,14 @@ def get_recent_events(
     flagged_only: bool = False,
     degraded_only: bool = False,
     unreviewed_only: bool = False,
+    dur_min_s: Optional[float] = None,
+    dur_max_s: Optional[float] = None,
+    dp_min: Optional[float] = None,
+    dp_max: Optional[float] = None,
+    vol_min_l: Optional[float] = None,
+    vol_max_l: Optional[float] = None,
+    fixture_type: Optional[str] = None,
+    note_kind: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Return events for a circuit ordered newest first.
@@ -2530,6 +2568,17 @@ def get_recent_events(
     match older than the `limit`-th event. unreviewed_only composes with
     flagged_only for ?filter=anomaly_unreviewed — the "which ones still
     need my eyes" view matching the dashboard card's count.
+
+    The dev15 History filter-bar pushdowns follow the same rule:
+      • dur_min_s/dur_max_s — duration bounds (SECONDS, storage units);
+      • dp_min/dp_max — pressure_delta bounds (PSI, storage units);
+      • vol_min_l/vol_max_l — volume bounds (LITRES) on the DISPLAYED number,
+        COALESCE(volume_litres_effective, volume_litres), so a zeroed phantom
+        is a 0-volume row exactly as the user sees it;
+      • fixture_type — a canonical type matched against the effective-label
+        chain (_EFFECTIVE_FIXTURE_SQL), or 'unlabelled' for a NULL chain;
+      • note_kind — one of _NOTE_KIND_SQL's pill categories.
+    Callers pass STORAGE units — display-unit conversion is the router's job.
     """
     _select = """
         SELECT e.*,
@@ -2557,6 +2606,33 @@ def get_recent_events(
     if date_to:
         conditions.append("e.start_ts <= ?")
         params.append(date_to + "T23:59:59")
+    if dur_min_s is not None:
+        conditions.append("e.duration_seconds >= ?")
+        params.append(dur_min_s)
+    if dur_max_s is not None:
+        conditions.append("e.duration_seconds <= ?")
+        params.append(dur_max_s)
+    if dp_min is not None:
+        conditions.append("COALESCE(e.pressure_delta_psi, 0) >= ?")
+        params.append(dp_min)
+    if dp_max is not None:
+        conditions.append("COALESCE(e.pressure_delta_psi, 0) <= ?")
+        params.append(dp_max)
+    if vol_min_l is not None:
+        conditions.append(
+            "COALESCE(e.volume_litres_effective, e.volume_litres, 0) >= ?")
+        params.append(vol_min_l)
+    if vol_max_l is not None:
+        conditions.append(
+            "COALESCE(e.volume_litres_effective, e.volume_litres, 0) <= ?")
+        params.append(vol_max_l)
+    if fixture_type == "unlabelled":
+        conditions.append(f"{_EFFECTIVE_FIXTURE_SQL} IS NULL")
+    elif fixture_type:
+        conditions.append(f"{_EFFECTIVE_FIXTURE_SQL} = ?")
+        params.append(fixture_type)
+    if note_kind in _NOTE_KIND_SQL:
+        conditions.append(_NOTE_KIND_SQL[note_kind])
     sql = f"{_select} WHERE {' AND '.join(conditions)} ORDER BY e.start_ts DESC"
     if not (date_from or date_to):
         sql += " LIMIT ?"

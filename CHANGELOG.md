@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.3.1-dev15] — 2026-07-04 — History filter bar: date · duration · ΔP · volume · fixture · note
+
+One filter bar above the History event lists covering every column: the
+existing From/To dates plus **duration, ΔP, and volume dual min/max sliders**
+(display units — minutes / home's pressure & volume units), a **fixture**
+dropdown (canonical types + Unlabelled, matched against the same effective-
+label chain the rows display), and a **note** dropdown over the pill kinds the
+Note column renders (⚠ Unusual / 〰 Estimated / Not real use / Brief use —
+long idle tail / No notes).
+
+- All filters are pushed into the SQL WHERE (`get_recent_events` pushdowns) —
+  same rule as the anomaly views, so the recency limit counts MATCHING rows
+  and an old match can never silently vanish. Charts are unaffected.
+- Volume filters the DISPLAYED number
+  (`COALESCE(volume_litres_effective, volume_litres)`), so a zeroed phantom is
+  a 0-volume row exactly as shown.
+- Note = "Not real use" bypasses the hide-not-real-use setting for that render
+  (the user asked for exactly those rows), like the anomaly views do.
+- Sliders are progressive enhancement over plain min/max number inputs
+  (no-JS still works); untouched filters emit no query params, so filtered
+  URLs stay clean and shareable. Slider tops come from per-circuit maxima.
+- The "N hidden — show them" link carries active filters.
+- Router converts display units → storage before SQL (`_filters_to_storage`,
+  pure + unit-tested); unknown fixture/note values are dropped, never trusted
+  into SQL.
+- Tests: tests/test_history_filters.py (pushdowns, fixture chain, note kinds,
+  unit conversion, LIMIT semantics).
+- **Shape column removed** from the events table (the steady/pulsed word
+  wasn't earning its width). The mini waveform sparkline moved into the
+  Volume cell — the at-a-glance shape survives, colors still keyed to the
+  flow shape, and the modal still shows the Shape/Pressure-pattern fields.
+
 ## [0.3.1-dev14] — 2026-07-03 — rising-pressure phantom detector + historical backfill
 
 Short (3–50 s) flow bursts driven by a **city-pressure RISE** were being counted

@@ -134,6 +134,63 @@ def _embedded_display_label(embedded: list, vol_factor: float,
     return " + ".join(parts) + f" (~{vol_txt} {vol_unit or 'L'})"
 
 
+# Filter-bar query-param names (dev15). Raw display-unit strings from the GET
+# form; _filters_to_storage validates + converts them for the SQL pushdown.
+FILTER_BAR_PARAMS = ("dur_min", "dur_max", "dp_min", "dp_max",
+                     "vol_min", "vol_max", "fixture", "note")
+
+
+def _parse_float(value) -> float | None:
+    """Lenient positive-float parse for filter inputs; garbage/blank → None."""
+    import math
+    try:
+        v = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v >= 0 else None
+
+
+def _filters_to_storage(raw: dict, vol_factor: float,
+                        pressure_factor: float) -> dict:
+    """Convert the filter bar's display-unit values to get_recent_events
+    kwargs in STORAGE units (litres / PSI / seconds). Pure — unit-tested.
+
+    Inputs arrive as the user typed/slid them: duration in MINUTES, volume in
+    the home's display volume unit, ΔP in the display pressure unit. The
+    factors are the storage→display multipliers from units.build_unit_context,
+    so storage = display / factor. Unknown fixture/note values are dropped
+    (never trusted into SQL); blanks/garbage are ignored.
+    """
+    from ..database import _NOTE_KIND_SQL
+    from ..fixtures import FIXTURE_TYPE_LABELS
+    out: dict = {}
+    dur_min = _parse_float(raw.get("dur_min"))
+    dur_max = _parse_float(raw.get("dur_max"))
+    if dur_min is not None:
+        out["dur_min_s"] = dur_min * 60.0
+    if dur_max is not None:
+        out["dur_max_s"] = dur_max * 60.0
+    dp_min = _parse_float(raw.get("dp_min"))
+    dp_max = _parse_float(raw.get("dp_max"))
+    if dp_min is not None and pressure_factor:
+        out["dp_min"] = dp_min / pressure_factor
+    if dp_max is not None and pressure_factor:
+        out["dp_max"] = dp_max / pressure_factor
+    vol_min = _parse_float(raw.get("vol_min"))
+    vol_max = _parse_float(raw.get("vol_max"))
+    if vol_min is not None and vol_factor:
+        out["vol_min_l"] = vol_min / vol_factor
+    if vol_max is not None and vol_factor:
+        out["vol_max_l"] = vol_max / vol_factor
+    fixture = (raw.get("fixture") or "").strip()
+    if fixture == "unlabelled" or fixture in FIXTURE_TYPE_LABELS:
+        out["fixture_type"] = fixture
+    note = (raw.get("note") or "").strip()
+    if note in _NOTE_KIND_SQL:
+        out["note_kind"] = note
+    return out
+
+
 def _collect_circuit_history_sync(
     db,
     circuits,
@@ -145,6 +202,7 @@ def _collect_circuit_history_sync(
     filter_circuit: str,
     today,
     show_hidden: bool = False,
+    filter_bar_raw: dict | None = None,
 ) -> list[dict]:
     """Synchronous bundle of the history page's per-circuit DB work.
 
@@ -168,6 +226,10 @@ def _collect_circuit_history_sync(
     _profile = get_home_profile(db)
     hide_not_real = bool(_profile and (_profile["hide_pressure_artifact_events"]
                                        or _profile["hide_cross_talk_events"]))
+    # dev15 filter bar: convert the raw display-unit params ONCE (same units
+    # for every circuit) into storage-unit pushdown kwargs.
+    bar_filters = _filters_to_storage(
+        filter_bar_raw or {}, _units["vol_factor"], _units["pressure_factor"])
     out: list[dict] = []
     for circuit_cfg in circuits:
         if filter_circuit and circuit_cfg.circuit != filter_circuit:
@@ -191,15 +253,19 @@ def _collect_circuit_history_sync(
             flagged_only=_anomaly_view,
             degraded_only=(filter_param == "degraded"),
             unreviewed_only=(filter_param == "anomaly_unreviewed"),
+            **bar_filters,
         )
         # Settings "Hide not-real-use events" toggle — hides every volume-zeroing
         # verdict (phantom / cross-talk / dribble) so the one "Not real use" label
         # maps to one switch. The count of hidden rows is surfaced so the list
         # never silently loses rows ("N hidden — show them"); ?show_hidden=1
         # bypasses the filter for one render (presentation-only, viewer-safe).
-        # The anomaly filters bypass hiding for the same must-not-vanish reason.
+        # The anomaly filters bypass hiding for the same must-not-vanish reason,
+        # and so does the filter bar's Note = "Not real use" — the user just
+        # asked for exactly those rows (hiding them would render an empty list).
         hidden_not_real = 0
-        if hide_not_real and not show_hidden and not _anomaly_view:
+        if (hide_not_real and not show_hidden and not _anomaly_view
+                and bar_filters.get("note_kind") != "not_real"):
             visible = [e for e in events
                        if not (dict(e).get("is_pressure_restoration_phantom")
                                or dict(e).get("is_cross_talk")
@@ -305,6 +371,24 @@ def _collect_circuit_history_sync(
             """, (circuit_cfg.circuit, chart_from, chart_from)).fetchall()
             hv_daily = {r["day"]: r["vol"] for r in hv_rows}
 
+        # dev15 filter-bar slider bounds — per-circuit maxima in DISPLAY units
+        # (minutes / display-ΔP / display-volume), ceil'd to whole numbers so
+        # the sliders get stable, friendly tops. The page aggregates across
+        # circuits (one shared bar filters every circuit's list).
+        import math as _math
+        _b = db.execute(
+            "SELECT MAX(duration_seconds) AS d, "
+            "       MAX(COALESCE(pressure_delta_psi, 0)) AS p, "
+            "       MAX(COALESCE(volume_litres_effective, volume_litres, 0)) AS v "
+            "FROM events WHERE circuit = ?", (circuit_cfg.circuit,)).fetchone()
+        filter_bounds = {
+            "dur_max": max(1, _math.ceil(float(_b["d"] or 0.0) / 60.0)),
+            "dp_max":  max(1, _math.ceil(
+                float(_b["p"] or 0.0) * _units["pressure_factor"])),
+            "vol_max": max(1, _math.ceil(
+                float(_b["v"] or 0.0) * _units["vol_factor"])),
+        }
+
         out.append({
             "circuit":         circuit_cfg.circuit,
             "display_name":    circuit_cfg.label,
@@ -315,6 +399,7 @@ def _collect_circuit_history_sync(
             "summaries":       summaries,
             "prior_summaries": prior_summaries,
             "hv_daily":        hv_daily,
+            "filter_bounds":   filter_bounds,
         })
     return out
 
@@ -333,6 +418,16 @@ async def _history_page(request: Request):
     filter_circuit = resolve_circuit(request.query_params.get("circuit", "").strip())
     # "N hidden — show them" escape hatch for the Settings hide toggle.
     show_hidden = request.query_params.get("show_hidden", "") == "1"
+    # dev15 filter bar — raw display-unit values; validated/converted in the
+    # sync collector (_filters_to_storage). Kept raw here for the form echo.
+    filter_bar_raw = {k: request.query_params.get(k, "").strip()
+                      for k in FILTER_BAR_PARAMS}
+    filters_active = any(filter_bar_raw.values())
+    # Canonical query-string fragment ("&dur_min=2&fixture=toilet…") appended to
+    # self-links that must preserve the active filters (show-hidden link etc.).
+    from urllib.parse import urlencode
+    filter_qs = urlencode({k: v for k, v in filter_bar_raw.items() if v})
+    filter_qs = ("&" + filter_qs) if filter_qs else ""
     # 30d | 6m | 1y | all | monthly | yearly | yoy
     using_range = bool(date_from or date_to)
 
@@ -363,12 +458,24 @@ async def _history_page(request: Request):
         filter_param, filter_circuit,
         today,
         show_hidden,
+        filter_bar_raw,
     )
 
     fixture_type_options = [
         {"value": k, "label": FIXTURE_TYPE_LABELS.get(k, k.replace("_", " ").title())}
         for k in user_selectable_types()
     ]
+
+    # One shared filter bar drives every circuit's list → slider tops are the
+    # max across circuits (each ch carries its own per-circuit bounds).
+    filter_bounds = {
+        "dur_max": max((ch["filter_bounds"]["dur_max"]
+                        for ch in circuit_history), default=1),
+        "dp_max":  max((ch["filter_bounds"]["dp_max"]
+                        for ch in circuit_history), default=1),
+        "vol_max": max((ch["filter_bounds"]["vol_max"]
+                        for ch in circuit_history), default=1),
+    }
 
     return _tmpl(request).TemplateResponse("history.html", {
         "request":              request,
@@ -384,6 +491,10 @@ async def _history_page(request: Request):
         "filter_param":         filter_param,
         "filter_circuit":       filter_circuit,
         "show_hidden":          show_hidden,
+        "filter_bar":           filter_bar_raw,
+        "filters_active":       filters_active,
+        "filter_qs":            filter_qs,
+        "filter_bounds":        filter_bounds,
     })
 
 

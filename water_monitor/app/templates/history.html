@@ -7,9 +7,41 @@
   {%- endif -%}
 {%- endmacro -%}
 <style>
-.hist-td-shape { white-space: nowrap; }
-.shape-cell    { display: flex; align-items: center; gap: 6px; }
+.shape-cell    { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .shape-spark   { display: block; flex-shrink: 0; opacity: .85; }
+
+/* dev15 filter bar — dual-range sliders (no deps). The number inputs are the
+   real named form fields; JS overlays the sliders and keeps them in sync, so
+   no-JS still gets working min/max boxes. */
+.hf-range      { min-width: 170px; }
+.hf-fallback   { display: flex; align-items: center; gap: 4px; }
+.hf-num        { width: 64px; }
+.hf-js .hf-fallback { position: absolute; width: 1px; height: 1px;
+                      overflow: hidden; clip: rect(0 0 0 0); }
+.hf-slider     { position: relative; height: 24px; width: 100%; }
+.hf-slider input[type=range] {
+  position: absolute; left: 0; top: 0; width: 100%; height: 24px; margin: 0;
+  background: none; -webkit-appearance: none; appearance: none;
+  pointer-events: none;
+}
+.hf-slider input[type=range]::-webkit-slider-runnable-track { background: none; }
+.hf-slider input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; pointer-events: auto; cursor: pointer;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: oklch(65% .15 240); border: 2px solid oklch(20% .02 240);
+  margin-top: 5px;
+}
+.hf-slider input[type=range]::-moz-range-track { background: none; }
+.hf-slider input[type=range]::-moz-range-thumb {
+  pointer-events: auto; cursor: pointer; width: 12px; height: 12px;
+  border-radius: 50%; background: oklch(65% .15 240);
+  border: 2px solid oklch(20% .02 240);
+}
+.hf-rail { position: absolute; top: 10px; left: 0; right: 0; height: 4px;
+           border-radius: 2px; background: oklch(40% .02 240 / .45); }
+.hf-fill { position: absolute; height: 100%; border-radius: 2px;
+           background: oklch(65% .15 240 / .6); }
+.hf-readout { display: block; font-size: .78em; margin-top: 2px; }
 </style>
 
 <h1 class="hist-page-title">History</h1>
@@ -41,9 +73,12 @@
 </div>
 {% endif %}
 
-{# ── Date range filter card ────────────────────────────────────────── #}
+{# ── Filter bar (dev15): date · duration · ΔP · volume · fixture · note ── #}
+{# Filters the event lists below (pushed into SQL, so the recency limit counts
+   MATCHING rows); the daily charts are unaffected. Sliders are progressive
+   enhancement over plain min/max number inputs. #}
 <div class="hist-filter-card">
-  <form method="get" action="{{ ingress_path }}/history">
+  <form method="get" action="{{ ingress_path }}/history" id="hist-filter-form">
     <div class="hist-filter-row">
       <div class="hist-filter-group">
         <label class="hist-filter-label" for="from">From</label>
@@ -57,27 +92,201 @@
                value="{{ date_to }}"
                min="{{ date_from or '' }}">
       </div>
+
+      <div class="hist-filter-group hf-range"
+           data-hf-max="{{ filter_bounds.dur_max }}" data-hf-step="0.5">
+        <label class="hist-filter-label">Duration (min)</label>
+        <div class="hf-fallback">
+          <input type="number" class="hf-num hf-num-lo" name="dur_min" min="0"
+                 step="any" inputmode="decimal" placeholder="min"
+                 value="{{ filter_bar.dur_min }}"
+                 aria-label="Minimum duration in minutes">
+          <span>–</span>
+          <input type="number" class="hf-num hf-num-hi" name="dur_max" min="0"
+                 step="any" inputmode="decimal" placeholder="max"
+                 value="{{ filter_bar.dur_max }}"
+                 aria-label="Maximum duration in minutes">
+        </div>
+        <div class="hf-slider" hidden>
+          <div class="hf-rail"><div class="hf-fill"></div></div>
+          <input type="range" class="hf-lo" aria-label="Minimum duration slider">
+          <input type="range" class="hf-hi" aria-label="Maximum duration slider">
+        </div>
+        <span class="hf-readout muted" data-hf-unit="min"></span>
+      </div>
+
+      <div class="hist-filter-group hf-range"
+           data-hf-max="{{ filter_bounds.dp_max }}" data-hf-step="0.1">
+        <label class="hist-filter-label">ΔP ({{ pressure_unit }})</label>
+        <div class="hf-fallback">
+          <input type="number" class="hf-num hf-num-lo" name="dp_min" min="0"
+                 step="any" inputmode="decimal" placeholder="min"
+                 value="{{ filter_bar.dp_min }}"
+                 aria-label="Minimum pressure drop">
+          <span>–</span>
+          <input type="number" class="hf-num hf-num-hi" name="dp_max" min="0"
+                 step="any" inputmode="decimal" placeholder="max"
+                 value="{{ filter_bar.dp_max }}"
+                 aria-label="Maximum pressure drop">
+        </div>
+        <div class="hf-slider" hidden>
+          <div class="hf-rail"><div class="hf-fill"></div></div>
+          <input type="range" class="hf-lo" aria-label="Minimum pressure-drop slider">
+          <input type="range" class="hf-hi" aria-label="Maximum pressure-drop slider">
+        </div>
+        <span class="hf-readout muted" data-hf-unit="{{ pressure_unit }}"></span>
+      </div>
+
+      <div class="hist-filter-group hf-range"
+           data-hf-max="{{ filter_bounds.vol_max }}" data-hf-step="0.1">
+        <label class="hist-filter-label">Volume ({{ vol_unit }})</label>
+        <div class="hf-fallback">
+          <input type="number" class="hf-num hf-num-lo" name="vol_min" min="0"
+                 step="any" inputmode="decimal" placeholder="min"
+                 value="{{ filter_bar.vol_min }}"
+                 aria-label="Minimum volume">
+          <span>–</span>
+          <input type="number" class="hf-num hf-num-hi" name="vol_max" min="0"
+                 step="any" inputmode="decimal" placeholder="max"
+                 value="{{ filter_bar.vol_max }}"
+                 aria-label="Maximum volume">
+        </div>
+        <div class="hf-slider" hidden>
+          <div class="hf-rail"><div class="hf-fill"></div></div>
+          <input type="range" class="hf-lo" aria-label="Minimum volume slider">
+          <input type="range" class="hf-hi" aria-label="Maximum volume slider">
+        </div>
+        <span class="hf-readout muted" data-hf-unit="{{ vol_unit }}"></span>
+      </div>
+
+      <div class="hist-filter-group">
+        <label class="hist-filter-label" for="hf-fixture">Fixture</label>
+        <select id="hf-fixture" name="fixture">
+          <option value="">Any</option>
+          {% for o in fixture_type_options %}
+          <option value="{{ o.value }}"
+                  {% if filter_bar.fixture == o.value %}selected{% endif %}>{{ o.label }}</option>
+          {% endfor %}
+          <option value="unlabelled"
+                  {% if filter_bar.fixture == 'unlabelled' %}selected{% endif %}>Unlabelled</option>
+        </select>
+      </div>
+
+      <div class="hist-filter-group">
+        <label class="hist-filter-label" for="hf-note"
+               title="The pills the app adds in the Note column">Note</label>
+        <select id="hf-note" name="note">
+          <option value="">Any</option>
+          <option value="unusual"   {% if filter_bar.note == 'unusual' %}selected{% endif %}>⚠ Unusual</option>
+          <option value="estimated" {% if filter_bar.note == 'estimated' %}selected{% endif %}>〰 Estimated</option>
+          <option value="not_real"  {% if filter_bar.note == 'not_real' %}selected{% endif %}>Not real use</option>
+          <option value="sparse"    {% if filter_bar.note == 'sparse' %}selected{% endif %}>Brief use — long idle tail</option>
+          <option value="none"      {% if filter_bar.note == 'none' %}selected{% endif %}>No notes</option>
+        </select>
+      </div>
+
       <div class="hist-filter-actions">
         <button type="submit" class="btn btn-primary btn-sm">Filter</button>
-        {% if using_range %}
+        {% if using_range or filters_active %}
         <a href="{{ ingress_path }}/history" class="btn btn-ghost btn-sm">Clear</a>
         {% endif %}
       </div>
     </div>
-    {% if using_range %}
+    {% if using_range or filters_active %}
     <p class="hist-filter-hint">
-      Showing all events
-      {% if date_from %}from <strong>{{ date_from }}</strong>{% endif %}
-      {% if date_to %}to <strong>{{ date_to }}</strong>{% endif %}
+      Showing events
+      {%- if date_from %} from <strong>{{ date_from }}</strong>{% endif %}
+      {%- if date_to %} to <strong>{{ date_to }}</strong>{% endif %}
+      {%- if filter_bar.dur_min or filter_bar.dur_max %} ·
+        duration <strong>{{ filter_bar.dur_min or '0' }}–{{ filter_bar.dur_max or '∞' }} min</strong>{% endif %}
+      {%- if filter_bar.dp_min or filter_bar.dp_max %} ·
+        ΔP <strong>{{ filter_bar.dp_min or '0' }}–{{ filter_bar.dp_max or '∞' }} {{ pressure_unit }}</strong>{% endif %}
+      {%- if filter_bar.vol_min or filter_bar.vol_max %} ·
+        volume <strong>{{ filter_bar.vol_min or '0' }}–{{ filter_bar.vol_max or '∞' }} {{ vol_unit }}</strong>{% endif %}
+      {%- if filter_bar.fixture %} ·
+        <strong>{{ 'Unlabelled' if filter_bar.fixture == 'unlabelled'
+                   else fixture_type_labels.get(filter_bar.fixture, filter_bar.fixture) }}</strong>{% endif %}
+      {%- if filter_bar.note %} ·
+        note: <strong>{{ {'unusual': '⚠ Unusual', 'estimated': '〰 Estimated',
+                          'not_real': 'Not real use',
+                          'sparse': 'Brief use — long idle tail',
+                          'none': 'No notes'}.get(filter_bar.note, filter_bar.note) }}</strong>{% endif %}
+      — the charts are unaffected.
     </p>
     {% else %}
     <p class="hist-filter-hint">
       Showing the most recent <strong>{{ default_limit }}</strong> events per circuit.
-      Use the date filter to view any stored range.
+      Filter by date, duration, pressure drop, volume, fixture, or note.
     </p>
     {% endif %}
   </form>
 </div>
+
+<script>
+/* dev15 filter bar: dual-range slider enhancement.
+   The number inputs are the real named form fields (no-JS fallback). Each
+   .hf-range gets two overlaid range inputs synced to them; on submit, values
+   still at the full range are blanked and every empty field is disabled so
+   untouched filters emit no query params (clean, shareable URLs). */
+(function () {
+  const form = document.getElementById('hist-filter-form');
+  if (!form) return;
+
+  form.querySelectorAll('.hf-range').forEach(function (group) {
+    const max  = parseFloat(group.dataset.hfMax || '1') || 1;
+    const step = parseFloat(group.dataset.hfStep || '0.1') || 0.1;
+    const numLo = group.querySelector('.hf-num-lo');
+    const numHi = group.querySelector('.hf-num-hi');
+    const slider = group.querySelector('.hf-slider');
+    const lo = group.querySelector('.hf-lo');
+    const hi = group.querySelector('.hf-hi');
+    const fill = group.querySelector('.hf-fill');
+    const readout = group.querySelector('.hf-readout');
+    const unit = readout ? (readout.dataset.hfUnit || '') : '';
+
+    [lo, hi].forEach(function (r) { r.min = 0; r.max = max; r.step = step; });
+    lo.value = numLo.value !== '' ? Math.min(parseFloat(numLo.value), max) : 0;
+    hi.value = numHi.value !== '' ? Math.min(parseFloat(numHi.value), max) : max;
+
+    function fmt(v) { return (Math.round(v * 10) / 10).toString(); }
+    function sync(from) {
+      let a = parseFloat(lo.value), b = parseFloat(hi.value);
+      if (a > b) {                       // thumbs push each other, never cross
+        if (from === lo) { b = a; hi.value = b; } else { a = b; lo.value = a; }
+      }
+      numLo.value = a > 0 ? fmt(a) : '';
+      numHi.value = b < max ? fmt(b) : '';
+      fill.style.left  = (a / max * 100) + '%';
+      fill.style.right = (100 - b / max * 100) + '%';
+      readout.textContent = (a <= 0 && b >= max)
+        ? 'any'
+        : fmt(a) + ' – ' + (b >= max ? fmt(max) + '+' : fmt(b)) + ' ' + unit;
+    }
+    lo.addEventListener('input', function () { sync(lo); });
+    hi.addEventListener('input', function () { sync(hi); });
+    // Typing in the (visually hidden but focusable) number inputs still works.
+    [numLo, numHi].forEach(function (n) {
+      n.addEventListener('input', function () {
+        lo.value = numLo.value !== '' ? numLo.value : 0;
+        hi.value = numHi.value !== '' ? numHi.value : max;
+        sync(null);
+      });
+    });
+
+    group.classList.add('hf-js');
+    slider.hidden = false;
+    sync(null);
+  });
+
+  form.addEventListener('submit', function () {
+    // Blank-at-default already handled by sync(); now drop EVERY empty field
+    // (dates, selects, numbers) from the query string.
+    form.querySelectorAll('input[name], select[name]').forEach(function (el) {
+      if (el.value === '') el.disabled = true;
+    });
+  });
+})();
+</script>
 
 {# ── Summary strip ────────────────────────────────────────────────── #}
 {% set ns = namespace(total_vol=0, total_events=0, tests_pass=0, tests_fail=0, total_alerts=0,
@@ -296,7 +505,7 @@
   <p class="muted" style="margin:.25rem 0 .5rem;font-size:.85em">
     {{ ch.hidden_not_real }} not-real-use event{{ 's' if ch.hidden_not_real != 1 else '' }}
     hidden —
-    <a href="{{ ingress_path }}/history?show_hidden=1{% if date_from %}&from={{ date_from }}{% endif %}{% if date_to %}&to={{ date_to }}{% endif %}{% if chart_range %}&range={{ chart_range }}{% endif %}">show them</a>
+    <a href="{{ ingress_path }}/history?show_hidden=1{% if date_from %}&from={{ date_from }}{% endif %}{% if date_to %}&to={{ date_to }}{% endif %}{% if chart_range %}&range={{ chart_range }}{% endif %}{{ filter_qs }}">show them</a>
   </p>
   {% elif show_hidden %}
   <p class="muted" style="margin:.25rem 0 .5rem;font-size:.85em">
@@ -323,7 +532,6 @@
           <th>Duration</th>
           <th title="Average flow while water is actually running (idle gaps excluded)">Avg flow</th>
           <th>ΔP ({{ pressure_unit }})</th>
-          <th>Shape</th>
           <th>Volume ({{ vol_unit }})</th>
           <th>Fixture</th>
           {% if _has_flags %}<th title="Notes the app added — tap a row to see details">Note</th>{% endif %}
@@ -379,18 +587,24 @@
           <td class="hist-td">{{ fmt_duration(e.duration_seconds) }}</td>
           <td class="hist-td hist-td-mono">{{ (_disp_flow * flow_factor)|round(flow_decimals) if _disp_flow is not none else "—" }} {{ flow_unit }}</td>
           <td class="hist-td hist-td-mono">{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else "—" }}</td>
-          <td class="hist-td hist-td-shape">
-            {% set shape = e.flow_shape or 'unknown' %}
-            {% set shape_color  = {'steady': 'pill-blue', 'rising': 'pill-amber', 'falling': 'pill-green', 'pulsed': 'pill-neutral', 'unknown': 'pill-neutral'} %}
-            {% set spark_stroke = {'steady': 'oklch(55% .18 240/.85)', 'rising': 'oklch(65% .18 80/.85)', 'falling': 'oklch(50% .18 145/.85)', 'pulsed': 'oklch(55% .05 240/.85)'} %}
-            {% set spark_fill   = {'steady': 'oklch(55% .18 240/.12)', 'rising': 'oklch(65% .18 80/.12)', 'falling': 'oklch(50% .18 145/.12)', 'pulsed': 'oklch(55% .05 240/.10)'} %}
-            {# Vertical band the waveform fills, by event size tier — gives the #}
-            {# sparkline a sense of scale. Read by the row canvas AND the modal #}
-            {# flow chart so they agree. unknown/missing → 0.65 (small): an     #}
-            {# unsized event must not masquerade as a full-height large draw.   #}
-            {% set spark_scale  = {'trickle': 0.45, 'small': 0.65, 'medium': 0.82, 'large': 1.0} %}
+          {# Volume-zeroing verdicts (phantom / cross-talk / dribble) show their
+             effective (zeroed) volume so the list doesn't display the fake reading;
+             the raw value stays in the event-detail modal, clearly labelled. Other
+             rows are unchanged. The mini waveform (formerly the Shape column —
+             the word pill was dropped as unhelpful, dev15) rides along so the
+             at-a-glance flow shape survives; colors still key off flow_shape. #}
+          {% set _row_vol = e.volume_litres_effective if (e.is_pressure_restoration_phantom or e.is_cross_talk or e.is_low_flow_dribble) else e.volume_litres %}
+          {% set shape = e.flow_shape or 'unknown' %}
+          {% set spark_stroke = {'steady': 'oklch(55% .18 240/.85)', 'rising': 'oklch(65% .18 80/.85)', 'falling': 'oklch(50% .18 145/.85)', 'pulsed': 'oklch(55% .05 240/.85)'} %}
+          {% set spark_fill   = {'steady': 'oklch(55% .18 240/.12)', 'rising': 'oklch(65% .18 80/.12)', 'falling': 'oklch(50% .18 145/.12)', 'pulsed': 'oklch(55% .05 240/.10)'} %}
+          {# Vertical band the waveform fills, by event size tier — gives the #}
+          {# sparkline a sense of scale. Read by the row canvas AND the modal #}
+          {# flow chart so they agree. unknown/missing → 0.65 (small): an     #}
+          {# unsized event must not masquerade as a full-height large draw.   #}
+          {% set spark_scale  = {'trickle': 0.45, 'small': 0.65, 'medium': 0.82, 'large': 1.0} %}
+          <td class="hist-td hist-td-mono">
             <div class="shape-cell">
-              <span class="pill {{ shape_color.get(shape, 'pill-neutral') }}">{{ shape }}</span>
+              <span>{{ (_row_vol * vol_factor)|round(vol_decimals) if _row_vol is not none else "—" }} {{ vol_unit if _row_vol is not none else '' }}</span>
               {% if e.flow_signature_json and e.flow_signature_json not in ('null', 'None', '') %}
               <canvas class="shape-spark" width="48" height="20"
                       data-sig="{{ e.flow_signature_json }}"
@@ -400,12 +614,6 @@
               {% endif %}
             </div>
           </td>
-          {# Volume-zeroing verdicts (phantom / cross-talk / dribble) show their
-             effective (zeroed) volume so the list doesn't display the fake reading;
-             the raw value stays in the event-detail modal, clearly labelled. Other
-             rows are unchanged. #}
-          {% set _row_vol = e.volume_litres_effective if (e.is_pressure_restoration_phantom or e.is_cross_talk or e.is_low_flow_dribble) else e.volume_litres %}
-          <td class="hist-td hist-td-mono">{{ (_row_vol * vol_factor)|round(vol_decimals) if _row_vol is not none else "—" }} {{ vol_unit if _row_vol is not none else '' }}</td>
           <td class="hist-td">
             {# Fixture identity is driven by your labels (clustering demoted):
                your label > confirmed fixture > label-trained match > cluster
