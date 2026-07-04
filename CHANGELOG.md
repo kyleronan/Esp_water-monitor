@@ -11,6 +11,12 @@ both flags (new `unmark_setup_complete()` in `device_discovery.py`); the
 wizard's final step re-sets both on completion, unchanged. Regression test
 added (`test_setup_unlock.py`).
 
+Also fixes the next failure in the same flow: `save_discovery()` deleted
+`fixtures` before nulling `events.fixture_id` (FK with no ON DELETE action),
+so re-discovery on a DB with labelled events crashed with
+`sqlite3.IntegrityError: FOREIGN KEY constraint failed` at `/setup/select`.
+The events unlink now runs before the fixture delete.
+
 ## [0.3.1-dev15] — 2026-07-04 — History filter bar: date · duration · ΔP · volume · fixture · note
 
 One filter bar above the History event lists covering every column: the

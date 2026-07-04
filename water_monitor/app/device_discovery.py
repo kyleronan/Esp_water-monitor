@@ -543,8 +543,10 @@ def save_discovery(
         # — the setup wizard does not perform HA teardown on reset.
         db.execute("DELETE FROM fixture_ha_entity_map")
         db.execute("DELETE FROM fixture_daily_summary")
-        db.execute("DELETE FROM fixtures")
+        # events.fixture_id references fixtures(id) with no ON DELETE action,
+        # so events must be unlinked BEFORE fixtures are deleted.
         db.execute("UPDATE events SET cluster_id = NULL, fixture_id = NULL")
+        db.execute("DELETE FROM fixtures")
         db.execute("UPDATE training_state SET state = 'idle'")
 
         for circuit, matches in result.circuit_matches.items():
