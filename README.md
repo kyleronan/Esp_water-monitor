@@ -174,7 +174,7 @@ PCB design files (KiCad + Gerbers), bill of materials, build guide, and bring-up
    password, web UI username + password). See
    [`firmware/README.md`](firmware/README.md) for the key-generation
    snippet and the security model.
-2. Flash `firmware/esp-water-shut-off-3_12.yaml` (v3.12.0) to your
+2. Flash `firmware/esp-water-shut-off-3_13.yaml` (v3.13.0) to your
    ESP32-S3-WROOM-1 using ESPHome.
 3. Make sure the device is added to Home Assistant before installing the
    addon.

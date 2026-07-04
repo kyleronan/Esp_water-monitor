@@ -44,10 +44,10 @@
 #     entity_category: diagnostic (not recorded). Used by the add-on for
 #     live pressure transient detection and resistance curve computation.
 #   flow_pulse_onset_main / flow_pulse_onset_irr
-#     Template binary sensors derived from the raw base pulse counters
-#     (flow_base_main / flow_base_irr). Transition ON when any pulse
-#     arrives in the 1s window, delayed_off: 8s prevents fragmentation.
-#     ~1s onset latency (ESPHome 2026.4+ prevents GPIO pin sharing).
+#     Template binary sensors keyed off last-pulse age (last_pulse_ms_*,
+#     stamped per pulse by the pulse_meter total sub-sensors). Transition ON
+#     within ~16-32ms of the first pulse, delayed_off: 8s prevents
+#     fragmentation. (ESPHome 2026.4+ prevents GPIO pin sharing.)
 # =============================================================================
 
 substitutions:
@@ -62,6 +62,12 @@ substitutions:
   # (a plain OTA reflash keeps the saved value by design).
   flow_ppl_main: "396"   # circuit 1 meter pulses/litre
   flow_ppl_irr:  "396"   # circuit 2 meter pulses/litre
+  # 3.13: both circuits measure flow with pulse_meter (edge-period timing) instead of
+  # pulse_counter (windowed counting). Rate resolution floor = 60 / (ppl × timeout_s)
+  # = 0.083 L/min @ 72 ppl, 0.015 L/min @ 396 ppl with the 10s timeout. Note for
+  # turbine meters: readings below the turbine's mechanical spool-up (~1 L/min for
+  # YF-B5-class) are indicative, not metered — a positive-displacement meter (oval
+  # gear) is metered all the way down.
   # §1.4 — flow-clamp bounds (lifted out of the per-circuit filter lambdas so both
   # circuits share one source of truth). Below min = ADC/float noise → 0; above max
   # = impossible (ADC overflow) → 0.
@@ -100,7 +106,7 @@ substitutions:
 
 esphome:
   name: esp-water-shut-off
-  friendly_name: ESP Water Shut off 3.12
+  friendly_name: ESP Water Shut off 3.13
   min_version: 2026.6.1
   name_add_mac_suffix: true
   platformio_options:
@@ -108,7 +114,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.12.0"   # runtime per-circuit Flow Meter PPL number entities (ppl_main / ppl_irr)
+    version: "3.13.0"   # pulse_meter flow measurement (edge-period timing) on both circuits
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -214,10 +220,10 @@ captive_portal:  # Serves a Wi-Fi setup page when connected to the fallback AP
 
 dashboard_import:
   # Allows this device to appear in the ESPHome dashboard for adoption.
-  # IMPORTANT: this URL must point at an immutable tag (e.g. @v3.12.0)
+  # IMPORTANT: this URL must point at an immutable tag (e.g. @v3.13.0)
   # before each release. scripts/check_firmware_release.py enforces this
   # — it fails the release if the ref ends with @main or any branch ref.
-  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_12.yaml@v3.12.0
+  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_13.yaml@v3.13.0
   import_full_config: true
 
 esp32_improv:
@@ -442,6 +448,73 @@ globals:
     initial_value: '0.0'
 
   # ---------------------------------------------------------------------------
+  # 3.13 PULSE_METER GLOBALS — per circuit
+  # pulse_meter publishes per pulse (not per fixed window), so onset detection,
+  # seal checks, and the pressure-drop flow gate key off "age of the last pulse"
+  # instead of the rate sensor, and volume accumulates from pulse-count deltas
+  # instead of integrating the rate (which would overcount each event's tail by
+  # last_rate × timeout).
+  # ---------------------------------------------------------------------------
+
+  # millis() of the most recent pulse. 0 = no pulse since boot.
+  # uint32 subtraction is rollover-safe (49.7-day wrap).
+  - id: last_pulse_ms_main
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_pulse_ms_irr
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # Timestamp of the previous in-band trickle sample (0 = not in band).
+  # Lets the trickle timer accumulate true wall-clock seconds between the
+  # flow-dependent per-pulse publishes.
+  - id: trickle_last_ms_main
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: trickle_last_ms_irr
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # Lifetime volume accumulator (litres). double: float32 loses single-pulse
+  # increments (0.014 L @ 72 ppl) above ~100,000 L. NVS-backed like the old
+  # integration sensor's restore:true (writes coalesced by the default 60s
+  # flash interval — worst-case power-cut loss is <60s of flow).
+  - id: water_total_l_main
+    type: double
+    restore_value: yes
+    initial_value: '0.0'
+  - id: water_total_l_irr
+    type: double
+    restore_value: yes
+    initial_value: '0.0'
+
+  # Last processed pulse_meter total (delta accumulation across on_value calls).
+  - id: flow_total_prev_main
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: flow_total_prev_irr
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # Consecutive over-threshold samples for the instant burst check. A single
+  # bounced edge produces one absurd period-derived rate sample; requiring two
+  # in a row is glitch immunity at ~22ms extra latency at burst flow rates.
+  - id: burst_hits_main
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: burst_hits_irr
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # ---------------------------------------------------------------------------
   # CLOSE-IN-FLIGHT GUARD GLOBALS
   #
   # When a fault, trickle alert, or rapid pressure drop fires while the valve
@@ -657,7 +730,7 @@ globals:
   # STRICTLY ADDITIVE to safety: no safety, ADC, valve, or leak-test path
   # reads or writes any global below. All capture work runs in the dedicated
   # `waveform_capture` interval (~50 Hz) — never in the 200 Hz ADC loop, the
-  # pulse-counter ISR, or any safety lambda. Storage is fully preallocated
+  # pulse-meter ISR, or any safety lambda. Storage is fully preallocated
   # (no runtime allocation).
   #
   # int16 wire scaling:  flow = L/min x 100,  pressure = PSI x 100.
@@ -1051,7 +1124,11 @@ sensor:
                     // Only raise a burst fault if flow is confirmed.
                     // A pressure drop with no flow is almost certainly water
                     // hammer or a supply fluctuation — not a burst pipe.
-                    if (id(flow_base_main).state > 0) {
+                    // 3.13: gate on last-pulse age (1s), not the pulse_meter
+                    // rate — the rate holds nonzero for the 10s timeout after
+                    // flow stops, which would widen the water-hammer false-
+                    // positive window from ~25ms to 10s.
+                    if (id(last_pulse_ms_main) != 0 && (millis() - id(last_pulse_ms_main)) < 1000) {
                       id(fault_main) = true;
                       id(fault_reason_main_str) = "Rapid pressure drop — possible burst pipe";
                       id(fault_reason_main).publish_state(id(fault_reason_main_str));
@@ -1215,7 +1292,8 @@ sensor:
                   return;
                 } else if (!id(fault_irrigation)) {
                   if (id(alert_pressure_drop_irr)) {
-                    if (id(flow_base_irr).state > 0) {
+                    // 3.13: last-pulse-age gate — see main-circuit comment.
+                    if (id(last_pulse_ms_irr) != 0 && (millis() - id(last_pulse_ms_irr)) < 1000) {
                       id(fault_irrigation) = true;
                       id(fault_reason_irr_str) = "Rapid pressure drop — possible burst pipe";
                       id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
@@ -1435,82 +1513,103 @@ sensor:
 
   # ---------------------------------------------------------------------------
   # FLOW SENSOR 1 — Main line (GPIO39)
-  # Pulse counter connected to a turbine flow meter.
-  # Converts pulse frequency to flow rate in litres per minute.
+  # pulse_meter (3.13) connected to the flow meter: measures the time between
+  # pulse edges instead of counting pulses per window, so the reported rate is
+  # smooth and accurate at low pulse frequencies — essential for low-ppl
+  # positive-displacement meters (oval gear @ 72 ppl: windowed counting
+  # quantized flow to 1.67 L/min steps; period timing does not).
   # Formula: L/min = pulses_per_minute / ppl, where ppl is the runtime per-circuit
-  #   pulses-per-litre number entity (ppl_main / ppl_irr). No ÷60 — the pulse
-  #   counter already reports counts per minute.
+  #   pulses-per-litre number entity (ppl_main / ppl_irr). No ÷60 — pulse_meter
+  #   reports pulses per minute.
   #
-  # Timing strategy:
-  #   update_interval: 25ms — counts pulses over a 25ms window at 40Hz internally.
-  #     Matches the fast pressure sensor sample rate so flow_pulse_onset fires
-  #     within ~41ms of the first pulse (25ms window + ~16ms ESP loop).
-  #     HA history records the server-side last_changed timestamp for accurate
-  #     propagation delay calculation via the HA history API.
-  #   Filter chain (applied in order):
-  #     1. lambda — converts raw counts/min to L/min
-  #     2. sliding_window_moving_average (window_size 40 × 25ms = 1s, send_every 2)
-  #        — 1s smoothing window; sends every 2nd result → 20 HA updates/second.
+  # pulse_meter semantics that shape everything below:
+  #   - The rate publishes per pulse, from the SECOND pulse onward (the first
+  #     pulse after idle only arms the period measurement). Onset detection
+  #     therefore keys off the total sub-sensor (fires on the FIRST pulse) via
+  #     the last_pulse_ms_* globals — not off rate > 0.
+  #   - After the last pulse the rate holds until `timeout` (10s), then
+  #     publishes a single 0 and goes silent. Rate floor = 60/timeout
+  #     = 6 pulses/min (0.083 L/min @ 72 ppl, 0.015 @ 396).
+  #   - No sample-window smoothing may follow it: a window fed one final 0
+  #     would freeze at a nonzero remnant forever.
+  #   - Bounce is hazardous to period math (a 1ms bounce gap reads as
+  #     833 L/min @ 72 ppl): internal_filter 100us in PULSE mode requires a
+  #     stable level for the filter duration; transparent up to >2kHz
+  #     (>1,600 L/min @ 72 ppl).
   #
-  # Safety checks on every reported value:
-  #   1. Burst pipe — high flow above threshold triggers safety fault
-  #   2. Trickle flow — low but sustained flow triggers trickle alert
+  # Volume accumulates from total-pulse deltas (exact for a displacement
+  # meter), NOT by integrating the rate — integration would overcount every
+  # event tail by last_rate × timeout (~0.33 L per 2 L/min tap event).
   #
-  # Note on trickle detection and the 1s sliding window:
-  #   The window averages forty 25ms readings (= 1s), reducing pulse noise while
-  #   adding only ~1s of lag. Trickle detection is reliable for flows above
-  #   ~0.15 L/min (~1 pulse/s); below that, readings are noisier but the timer
-  #   still accumulates correctly over the multi-minute alert duration.
+  # Safety checks:
+  #   1. INSTANT BURST (rate on_value, per pulse) — 1.5× threshold with a
+  #      2-consecutive-sample guard (single-glitch immunity; ~22ms extra
+  #      latency at burst rates).
+  #   2. Burst/trickle on the smoothed water_usage1 (below).
+  #   3. Valve seal checks moved to the 1s interval block near the end of the
+  #      file (pulse-age based — drip rates sit below the rate floor and are
+  #      invisible to the rate sensor).
   # ---------------------------------------------------------------------------
-  # FLOW SENSOR 1 BASE — Main line (GPIO39)
-  # Single pulse_counter on this GPIO — the only component on GPIO39.
-  # Reports raw pulses/min (x). internal: true — not exposed to HA.
-  # Derived sensors below convert to L/min and detect flow onset.
-  #
-  # on_value runs two safety checks that benefit from the raw 1s pulse count
-  # rather than the 2s-smoothed water_usage1:
-  #
-  #   1. INSTANT BURST — catches a burst pipe within 1-2 seconds rather than
-  #      waiting for the smoothing window to fill. Uses 1.5× the configured
-  #      burst threshold to tolerate 1s window variability while still catching
-  #      genuinely large bursts immediately.
-  #
-  #   2. FAST VALVE SEAL — detects flow pulses within 10s of the closed end
-  #      stop activating. The existing slow seal check (water_usage1, 90s)
-  #      was originally padded for the old 30s window; the 2s window now drains
-  #      quickly but the raw check remains the fastest signal.
-  #      Clearing the alert is handled by water_usage1 when flow stops.
-  # ---------------------------------------------------------------------------
-  - platform: pulse_counter
+  - platform: pulse_meter
     pin:
       number: GPIO39
       mode:
         input: true
         pulldown: true    # pulldown prevents floating input causing false counts
-    internal_filter: 13us  # debounce — suppresses RF noise from valve motor inductance
+    internal_filter: 100us          # bounce guard — see block comment above
+    internal_filter_mode: PULSE     # level must be stable for the filter duration
+    timeout: 10s                    # rate → 0 within 10s of the last pulse
     id: flow_base_main
     internal: true
-    update_interval: 25ms
+    unit_of_measurement: 'pulse/min'
+    total:
+      id: flow_total_pulses_main
+      internal: true
+      unit_of_measurement: 'pulses'
+      accuracy_decimals: 0
+      on_value:
+        # Fires on EVERY loop that saw >= 1 new pulse — including the very
+        # first pulse after idle (the rate sensor needs a 2nd pulse). This is
+        # the canonical "water is moving" signal: stamps last_pulse_ms_main
+        # (onset binaries, pressure gate, seal checks) and accumulates volume.
+        - lambda: |-
+            uint32_t total = (uint32_t) x;
+            uint32_t prev  = id(flow_total_prev_main);
+            if (total > prev) {
+              id(last_pulse_ms_main) = millis();
+              float ppl = id(ppl_main).state;
+              if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
+              id(water_total_l_main) += (double)(total - prev) / (double) ppl;
+              id(flow_total_prev_main) = total;
+              id(water_volume_total_main).update();
+            } else if (total < prev) {
+              id(flow_total_prev_main) = total;   // component reset guard
+            }
     on_value:
       then:
         # --- Instant burst detection ---
-        # x is raw pulses/min. x / ppl_main = instantaneous L/min (no ÷60).
-        # 1.5× multiplier compensates for single-second window variability —
-        # a genuine burst at 25 L/min still reads >>37.5 on the raw counter.
+        # x = pulses/min from edge-period timing (per-pulse, 2nd pulse onward).
+        # x / ppl_main = instantaneous L/min (no ÷60). 1.5× multiplier keeps
+        # headroom over per-pulse jitter. 2-strike guard: a single bounced
+        # edge produces one absurd period-derived sample; at a genuine
+        # 37.5 L/min burst (45 pulses/s @ 72 ppl) the confirming 2nd sample
+        # lands ~22ms later.
         # Gated by the open end stop so this only fires while the valve is open
         # and the system is in normal operation.
         - lambda: |-
             float ppl = id(ppl_main).state;
             if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
             float instant_lpm = x / ppl;
+            bool over = instant_lpm > id(burst_threshold_main).state * 1.5f;
+            if (over) id(burst_hits_main) += 1; else id(burst_hits_main) = 0;
             if (!id(fault_main)
                 && id(alert_high_flow_main)
                 && id(open_end_stop_valve1).state
-                && instant_lpm > id(burst_threshold_main).state * 1.5f) {
+                && id(burst_hits_main) >= 2) {
               id(fault_main) = true;
               id(fault_reason_main_str) = "High flow — burst pipe (instant)";
               id(fault_reason_main).publish_state(id(fault_reason_main_str));
-              ESP_LOGW("safety", "MAIN: instant burst detected — %.2f L/min (1s raw) "
+              ESP_LOGW("safety", "MAIN: instant burst detected — %.2f L/min (per-pulse) "
                 "exceeds %.1f L/min × 1.5 — closing valve",
                 instant_lpm, id(burst_threshold_main).state);
             }
@@ -1522,36 +1621,12 @@ sensor:
             then:
               - valve.close: main_water_valve
 
-        # --- Fast valve seal check ---
-        # If the closed end stop is active but the raw pulse counter is still
-        # non-zero, the valve has not fully sealed. 20s threshold — tight
-        # because raw pulse data has no smoothing lag unlike water_usage1.
-        # Alert cleared by water_usage1 when flow drops to zero (the smoothed
-        # sensor is the right place to confirm sustained zero-flow).
-        - lambda: |-
-            if (id(closed_end_stop_valve1).state) {
-              if (x > 0) {
-                id(valve_seal_fast_elapsed_main) += 1.0f;
-                if (!id(valve_seal_alert_main)
-                    && id(valve_seal_fast_elapsed_main) >= 20.0f) {
-                  id(valve_seal_alert_main) = true;
-                  ESP_LOGW("seal", "MAIN: pulses detected %.0fs after valve closed "
-                    "(raw check) — possible valve seal failure",
-                    id(valve_seal_fast_elapsed_main));
-                }
-              } else {
-                // No pulses — reset fast timer. Alert cleared by water_usage1.
-                id(valve_seal_fast_elapsed_main) = 0.0f;
-              }
-            } else {
-              // Valve open — reset fast seal timer silently.
-              id(valve_seal_fast_elapsed_main) = 0.0f;
-            }
-
   # ---------------------------------------------------------------------------
   # FLOW SENSOR 1 — Main line (GPIO39, via flow_base_main)
-  # Copy of the base pulse counter. Applies unit conversion and smoothing.
-  # All safety on_value logic runs here at the smoothed 1s publish rate.
+  # Copy of the base pulse_meter rate. Applies unit conversion; no smoothing
+  # window (see pulse_meter semantics above). Burst + trickle checks run here
+  # at the throttled publish rate; valve seal checks live in the 1s interval
+  # block (pulse-age based).
   # ---------------------------------------------------------------------------
   - platform: copy
     source_id: flow_base_main
@@ -1565,34 +1640,31 @@ sensor:
       sorting_group_id: group_main_status
       sorting_weight: 4
     filters:
-      # Step 1: Convert raw counts/min to L/min via the runtime ppl_main number entity
-      # (pulses/litre). L/min = pulses/min ÷ ppl — no ÷60 (counter already reports /min).
+      # Step 1: Convert pulses/min to L/min via the runtime ppl_main number entity
+      # (pulses/litre). L/min = pulses/min ÷ ppl — no ÷60 (pulse_meter reports /min).
       - lambda: |-
           float ppl = id(ppl_main).state;
           if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
           return x / ppl;
-      # Step 1b: Clamp — reject garbage values before they corrupt the smoothing
-      # windows. Two classes of garbage are possible:
-      #   HIGH: ADC float overflow produces values like 1.58e+36 L/min.
-      #   LOW:  ADC/ESPHome floating-point noise produces tiny non-zero
-      #         values like 1.58e-36 that should be zero. The minimum
-      #         physically meaningful reading is 1 pulse/s = 60 counts/min
-      #         / 396 ≈ 0.15 L/min, so anything below 0.01 is garbage.
-      # Returning 0.0 keeps the smoothed output well-behaved and prevents
-      # open-forever event detection bugs in the companion addon.
+      # Step 1b: Clamp — reject garbage values. Two classes are possible:
+      #   HIGH: float overflow / bounced-edge period garbage → impossible rates.
+      #   LOW:  floating-point noise producing tiny non-zero values that
+      #         should be zero. The minimum pulse_meter can report is the
+      #         timeout floor (0.083 L/min @ 72 ppl, 0.015 @ 396), so anything
+      #         below 0.01 is garbage.
+      # Returning 0.0 keeps the output well-behaved and prevents open-forever
+      # event detection bugs in the companion addon.
       - lambda: |-
           if (!std::isfinite(x) || x < ${flow_min_lpm}f || x > ${flow_max_lpm}f) return 0.0f;
           return x;
-      # Step 2: 0.5-second sliding window (20 samples × 25ms = 500ms). send_every: 1
-      # publishes at 40Hz (every 25ms). Shorter window reduces the stepped
-      # appearance in the HA history graph while keeping the same average volume.
-      - sliding_window_moving_average:
-          window_size: 20
-          send_every: 1
+      # NO smoothing window (3.13): pulse_meter's rate is already period-derived
+      # and smooth. A sample-window filter here would freeze at a nonzero
+      # remnant forever after pulse_meter's single timeout zero (it publishes
+      # one 0 and then goes silent).
       # Throttle to 4Hz for downstream consumers (HA recorder, web dashboard,
       # add-on event_detector — which is documented as 1Hz). Avoids flooding
-      # the web_server SSE stream and HA. on_value safety checks below run at
-      # the throttled rate; the fast burst path is on flow_base_main at 25ms.
+      # the web_server SSE stream and HA at high pulse rates. The timeout zero
+      # always passes the throttle (it arrives ≥10s after the prior publish).
       - throttle: 250ms
     on_value:
       then:
@@ -1618,10 +1690,18 @@ sensor:
 
         # --- Check 2: Trickle flow detection ---
         # Detects a running toilet, dripping faucet, or tap not fully closed.
-        # Fires when the smoothed flow stays within the trickle band (between
+        # Fires when the flow stays within the trickle band (between
         # trickle_min and trickle_max thresholds) continuously for the full
         # alert duration. Any reading outside the band resets the elapsed timer
         # — the flow must be sustained without interruption to trigger an alert.
+        #
+        # 3.13: elapsed time accumulates as true wall-clock deltas between
+        # in-band samples (pulse_meter publishes per pulse, so tick counting
+        # would be flow-dependent). Deltas are bounded: in-band flow
+        # (≥0.1 L/min = a pulse every ≤8.3s @ 72 ppl) publishes before the 10s
+        # timeout, and a stop always injects an out-of-band 0 within 10s.
+        # This also fixes a pre-3.13 bug where the timer counted 4Hz publishes
+        # as seconds — alerts fired at 1/4 of the configured duration.
         #
         # Trickle alert is separate from the safety fault — a running toilet is
         # not an emergency. The valve can be re-opened after a trickle shutoff
@@ -1633,13 +1713,18 @@ sensor:
             if (!id(trickle_alert_main) && id(alert_trickle_main)) {
               float min_flow = id(trickle_min_flow_main).state;
               float max_flow = id(trickle_max_flow_main).state;
+              uint32_t now = millis();
               if (x >= min_flow && x <= max_flow) {
-                // Flow is in the trickle band — accumulate elapsed time
-                id(trickle_elapsed_main) += 1.0f;
+                // Flow is in the trickle band — accumulate true elapsed time
+                if (id(trickle_last_ms_main) != 0) {
+                  id(trickle_elapsed_main) += (now - id(trickle_last_ms_main)) / 1000.0f;
+                }
+                id(trickle_last_ms_main) = now;
                 float threshold_secs = id(trickle_duration_main).state * 60.0f;
                 if (id(trickle_elapsed_main) >= threshold_secs) {
                   id(trickle_alert_main) = true;
                   id(trickle_elapsed_main) = 0.0f;
+                  id(trickle_last_ms_main) = 0;
                   ESP_LOGW("trickle", "MAIN: sustained low flow alert — %.2f L/min for %.0f min "
                     "(band: %.2f–%.2f L/min)",
                     x, id(trickle_duration_main).state, min_flow, max_flow);
@@ -1648,9 +1733,8 @@ sensor:
                 // Flow left the trickle band — reset timer.
                 // The flow must be continuously sustained; intermittent flow
                 // (e.g. a toilet refill then idle) will not trigger the alert.
-                if (id(trickle_elapsed_main) > 0.0f) {
-                  id(trickle_elapsed_main) = 0.0f;
-                }
+                id(trickle_elapsed_main) = 0.0f;
+                id(trickle_last_ms_main) = 0;
               }
             }
         - if:
@@ -1659,51 +1743,52 @@ sensor:
             then:
               - valve.close: main_water_valve
 
-        # --- Check 3: Valve seal check ---
-        # If the closed end stop is active but flow is still detected, the valve
-        # has not fully seated. Accumulates elapsed time. After 90 seconds raises
-        # an informational alert. Auto-clears when flow drops to zero with a log
-        # message. Resets silently when the valve opens.
-        # Threshold: 0.02 L/min — below this the pulse counter is effectively silent.
-        - lambda: |-
-            if (id(closed_end_stop_valve1).state) {
-              if (x > 0.02f) {
-                // Closed end stop active but flow still detected
-                id(valve_seal_elapsed_main) += 1.0f;
-                if (!id(valve_seal_alert_main) && id(valve_seal_elapsed_main) >= 90.0f) {
-                  id(valve_seal_alert_main) = true;
-                  ESP_LOGW("seal", "MAIN: flow detected %.0fs after valve closed — "
-                    "possible valve seal failure (%.2f L/min)",
-                    id(valve_seal_elapsed_main), x);
-                }
-              } else {
-                // Flow has stopped — reset timer and clear alert if active
-                if (id(valve_seal_alert_main)) {
-                  id(valve_seal_alert_main) = false;
-                  ESP_LOGI("seal", "MAIN: valve seal alert cleared — flow has stopped");
-                }
-                id(valve_seal_elapsed_main) = 0.0f;
-              }
-            } else {
-              // Valve open — reset silently
-              id(valve_seal_elapsed_main) = 0.0f;
-              id(valve_seal_alert_main) = false;
-            }
+        # (3.13) The slow valve-seal check moved to the 1s interval block:
+        # its 0.02 L/min drip threshold sits below the pulse_meter rate floor
+        # (0.083 L/min @ 72 ppl) — drip-rate pulses never publish a nonzero
+        # rate here, so the check now keys off last-pulse age instead.
 
   # ---------------------------------------------------------------------------
   # FLOW SENSOR 2 BASE — Irrigation line (GPIO38)
-  # Same architecture as flow_base_main — see comments above.
+  # Same pulse_meter architecture as flow_base_main — see comments above.
+  # Turbine-meter note (YF-B5-class): readings below the turbine's mechanical
+  # spool-up (~1 L/min) are indicative, not metered — the rotor under-spins or
+  # stalls at drip rates. A lone stray pulse adds 1/ppl L to the total
+  # (~2.5 mL @ 396) and cannot publish a rate (rate needs two pulses inside
+  # the timeout).
   # ---------------------------------------------------------------------------
-  - platform: pulse_counter
+  - platform: pulse_meter
     pin:
       number: GPIO38
       mode:
         input: true
         pulldown: true
-    internal_filter: 13us  # debounce — suppresses RF noise from valve motor inductance
+    internal_filter: 100us          # bounce guard — see flow_base_main
+    internal_filter_mode: PULSE
+    timeout: 10s
     id: flow_base_irr
     internal: true
-    update_interval: 25ms
+    unit_of_measurement: 'pulse/min'
+    total:
+      id: flow_total_pulses_irr
+      internal: true
+      unit_of_measurement: 'pulses'
+      accuracy_decimals: 0
+      on_value:
+        # Per-pulse — see flow_total_pulses_main above.
+        - lambda: |-
+            uint32_t total = (uint32_t) x;
+            uint32_t prev  = id(flow_total_prev_irr);
+            if (total > prev) {
+              id(last_pulse_ms_irr) = millis();
+              float ppl = id(ppl_irr).state;
+              if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
+              id(water_total_l_irr) += (double)(total - prev) / (double) ppl;
+              id(flow_total_prev_irr) = total;
+              id(water_volume_total_irr).update();
+            } else if (total < prev) {
+              id(flow_total_prev_irr) = total;   // component reset guard
+            }
     on_value:
       then:
         # --- Instant burst detection (Irrigation) ---
@@ -1713,14 +1798,16 @@ sensor:
             float ppl = id(ppl_irr).state;
             if (!(ppl >= 1.0f)) ppl = 396.0f;   // NaN/garbage-safe (false when NaN)
             float instant_lpm = x / ppl;
+            bool over = instant_lpm > id(burst_threshold_irr).state * 1.5f;
+            if (over) id(burst_hits_irr) += 1; else id(burst_hits_irr) = 0;
             if (!id(fault_irrigation)
                 && id(alert_high_flow_irr)
                 && id(open_end_stop_valve2).state
-                && instant_lpm > id(burst_threshold_irr).state * 1.5f) {
+                && id(burst_hits_irr) >= 2) {
               id(fault_irrigation) = true;
               id(fault_reason_irr_str) = "High flow — burst pipe (instant)";
               id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
-              ESP_LOGW("safety", "IRRIGATION: instant burst detected — %.2f L/min (1s raw) "
+              ESP_LOGW("safety", "IRRIGATION: instant burst detected — %.2f L/min (per-pulse) "
                 "exceeds %.1f L/min × 1.5 — closing valve",
                 instant_lpm, id(burst_threshold_irr).state);
             }
@@ -1729,25 +1816,6 @@ sensor:
               lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
             then:
               - valve.close: irrigation_water_valve
-
-        # --- Fast valve seal check (Irrigation) ---
-        - lambda: |-
-            if (id(closed_end_stop_valve2).state) {
-              if (x > 0) {
-                id(valve_seal_fast_elapsed_irr) += 1.0f;
-                if (!id(valve_seal_alert_irr)
-                    && id(valve_seal_fast_elapsed_irr) >= 20.0f) {
-                  id(valve_seal_alert_irr) = true;
-                  ESP_LOGW("seal", "IRRIGATION: pulses detected %.0fs after valve closed "
-                    "(raw check) — possible valve seal failure",
-                    id(valve_seal_fast_elapsed_irr));
-                }
-              } else {
-                id(valve_seal_fast_elapsed_irr) = 0.0f;
-              }
-            } else {
-              id(valve_seal_fast_elapsed_irr) = 0.0f;
-            }
 
   # ---------------------------------------------------------------------------
   # FLOW SENSOR 2 — Irrigation line (GPIO38, via flow_base_irr)
@@ -1774,10 +1842,7 @@ sensor:
       - lambda: |-
           if (!std::isfinite(x) || x < ${flow_min_lpm}f || x > ${flow_max_lpm}f) return 0.0f;
           return x;
-      # 0.5-second sliding window — matches water_usage1; see comments there.
-      - sliding_window_moving_average:
-          window_size: 20
-          send_every: 1
+      # NO smoothing window (3.13) — matches water_usage1; see comments there.
       # Throttle to 4Hz — see water_usage1 comment.
       - throttle: 250ms
     on_value:
@@ -1803,25 +1868,30 @@ sensor:
               - valve.close: irrigation_water_valve
 
         # --- Check 2: Trickle flow detection ---
-        # Same logic as main circuit — operates independently on irrigation line.
+        # Same time-based logic as main circuit (see comments there) —
+        # operates independently on the irrigation line.
         - lambda: |-
             if (!id(trickle_alert_irr) && id(alert_trickle_irr)) {
               float min_flow = id(trickle_min_flow_irr).state;
               float max_flow = id(trickle_max_flow_irr).state;
+              uint32_t now = millis();
               if (x >= min_flow && x <= max_flow) {
-                id(trickle_elapsed_irr) += 1.0f;
+                if (id(trickle_last_ms_irr) != 0) {
+                  id(trickle_elapsed_irr) += (now - id(trickle_last_ms_irr)) / 1000.0f;
+                }
+                id(trickle_last_ms_irr) = now;
                 float threshold_secs = id(trickle_duration_irr).state * 60.0f;
                 if (id(trickle_elapsed_irr) >= threshold_secs) {
                   id(trickle_alert_irr) = true;
                   id(trickle_elapsed_irr) = 0.0f;
+                  id(trickle_last_ms_irr) = 0;
                   ESP_LOGW("trickle", "IRRIGATION: sustained low flow alert — %.2f L/min for %.0f min "
                     "(band: %.2f–%.2f L/min)",
                     x, id(trickle_duration_irr).state, min_flow, max_flow);
                 }
               } else {
-                if (id(trickle_elapsed_irr) > 0.0f) {
-                  id(trickle_elapsed_irr) = 0.0f;
-                }
+                id(trickle_elapsed_irr) = 0.0f;
+                id(trickle_last_ms_irr) = 0;
               }
             }
         - if:
@@ -1830,76 +1900,62 @@ sensor:
             then:
               - valve.close: irrigation_water_valve
 
-        # --- Check 3: Valve seal check ---
-        # Same logic as main circuit — operates independently on irrigation line.
-        - lambda: |-
-            if (id(closed_end_stop_valve2).state) {
-              if (x > 0.02f) {
-                id(valve_seal_elapsed_irr) += 1.0f;
-                if (!id(valve_seal_alert_irr) && id(valve_seal_elapsed_irr) >= 90.0f) {
-                  id(valve_seal_alert_irr) = true;
-                  ESP_LOGW("seal", "IRRIGATION: flow detected %.0fs after valve closed — "
-                    "possible valve seal failure (%.2f L/min)",
-                    id(valve_seal_elapsed_irr), x);
-                }
-              } else {
-                if (id(valve_seal_alert_irr)) {
-                  id(valve_seal_alert_irr) = false;
-                  ESP_LOGI("seal", "IRRIGATION: valve seal alert cleared — flow has stopped");
-                }
-                id(valve_seal_elapsed_irr) = 0.0f;
-              }
-            } else {
-              id(valve_seal_elapsed_irr) = 0.0f;
-              id(valve_seal_alert_irr) = false;
-            }
+        # (3.13) Slow valve-seal check moved to the 1s interval block —
+        # see the main-circuit note above.
 
 
 # =============================================================================
 # WATER VOLUME SENSORS — Cumulative consumption per circuit
 #
-# The integration platform converts flow rate (L/min) to cumulative volume (L)
-# by integrating over time. Two sensors per circuit:
+# 3.13: volume comes from pulse-count deltas (water_total_l_* globals,
+# accumulated in the pulse_meter total on_value), not from integrating the
+# flow rate. Pulse deltas are exact for a displacement meter; integrating a
+# pulse_meter rate would overcount every event tail by last_rate × timeout.
+#
 #   _total  — monotonically increasing lifetime total (never resets on the ESP)
 #             state_class: total_increasing makes HA treat it as a utility meter,
 #             enabling the Energy dashboard and long-term statistics.
 #             HA utility_meter helpers (configured separately in HA) derive the
 #             daily and weekly reset totals from this entity.
 #
-# time_unit: min — because flow rate is in L/min, integration over minutes
-# gives litres directly (L/min × min = L).
+# Restore: the water_total_l_* globals are NVS-backed (restore_value: yes) —
+# writes coalesced by the default 60s flash interval, so worst-case power-cut
+# loss is under 60s of flow (same class as the old integration restore: true).
+# NOTE (3.12→3.13 upgrade): the old integration sensor's NVS slot is not
+# readable by the new accumulator, so the lifetime total resets to 0 once on
+# first boot of 3.13. HA treats it as a utility-meter reset — long-term
+# statistics and utility_meter helpers survive.
 #
-# restore: true — the running total survives ESP reboots via NVS flash.
+# Publishing: .update() is called per pulse batch (throttled to 1s below) plus
+# a 60s heartbeat so HA has the value after a reconnect.
 # accuracy_decimals: 2 — 10mL resolution, sufficient for household tracking.
-#
-# device_class: water + state_class: total_increasing — exposes these to the
-# HA Energy dashboard and enables long-term statistics (daily/monthly/yearly
-# totals that survive recorder purge cycles).
 # =============================================================================
-  - platform: integration
+  - platform: template
     name: "Water Volume Total - ${circuit_1_name}"
     id: water_volume_total_main
-    sensor: water_usage1
-    time_unit: min
+    lambda: 'return (float) id(water_total_l_main);'
+    update_interval: 60s
     unit_of_measurement: "L"
     device_class: water
     state_class: total_increasing
     accuracy_decimals: 2
-    restore: true
+    filters:
+      - throttle: 1s   # cap publish rate during high flow (per-pulse .update() calls)
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 49
 
-  - platform: integration
+  - platform: template
     name: "Water Volume Total - ${circuit_2_name}"
     id: water_volume_total_irr
-    sensor: water_usage2
-    time_unit: min
+    lambda: 'return (float) id(water_total_l_irr);'
+    update_interval: 60s
     unit_of_measurement: "L"
     device_class: water
     state_class: total_increasing
     accuracy_decimals: 2
-    restore: true
+    filters:
+      - throttle: 1s
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 49
@@ -2104,18 +2160,18 @@ binary_sensor:
   # FLOW ONSET SENSORS — Main and Irrigation
   #
   # ESPHome 2026.4+ no longer allows multiple components on the same physical
-  # GPIO pin. The previous GPIO binary sensor approach (sharing GPIO38/39 with
-  # the pulse counters) no longer compiles.
+  # GPIO pin, so these are template binary sensors, not GPIO sensors.
   #
-  # Replacement: template binary sensors derived from the smoothed flow rate.
-  # These transition ON when the flow rate exceeds the noise floor (0.02 L/min)
-  # and stay ON for 8 seconds after the last above-threshold reading.
+  # 3.13: keyed off the last_pulse_ms_* globals (stamped by the pulse_meter
+  # total sub-sensor on the FIRST pulse). ON while a pulse arrived within the
+  # last 1s, then delayed_off holds the state.
   #
-  # Timing note: flow_pulse_onset fires within ~41ms of the first pulse —
-  # the template lambda evaluates on each ESP main loop cycle (~16ms) against
-  # flow_base_main/irr which updates every 25ms. HA records the server-side
-  # last_changed timestamp; the app queries this via the HA history API after
-  # each pressure-triggered event to compute propagation_delay_ms accurately.
+  # Timing note: flow_pulse_onset fires within ~16-32ms of the first pulse —
+  # the template lambda evaluates on each ESP main loop cycle (~16ms) and the
+  # total sub-sensor publishes on the loop that saw the pulse. HA records the
+  # server-side last_changed timestamp; the app queries this via the HA
+  # history API after each pressure-triggered event to compute
+  # propagation_delay_ms accurately.
   # ---------------------------------------------------------------------------
   - platform: template
     id: flow_pulse_onset_main
@@ -2124,11 +2180,13 @@ binary_sensor:
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 46
-    # Uses the raw base pulse counter (> 0 means at least one pulse in the
-    # last 1s window) rather than the smoothed flow rate. This gives a
-    # cleaner onset signal — a single pulse definitely registers, with no
-    # risk of the smoothing window masking a low-flow event.
-    lambda: 'return id(flow_base_main).state > 0;'
+    # 3.13: keys off last-pulse age, not the pulse_meter rate — the rate only
+    # publishes from the SECOND pulse and holds nonzero for the 10s timeout
+    # after flow stops (which would stack with delayed_off). last_pulse_ms_*
+    # is stamped by the total sub-sensor on the FIRST pulse, so this fires
+    # within ~1-2 ESP loop cycles (~16-32ms) of water moving — better than
+    # the old 25ms-window ~41ms — and the OFF envelope stays 1s + delayed_off.
+    lambda: 'return id(last_pulse_ms_main) != 0 && (millis() - id(last_pulse_ms_main)) < 1000;'
     filters:
       - delayed_off: 8s
 
@@ -2139,18 +2197,18 @@ binary_sensor:
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 46
-    lambda: 'return id(flow_base_irr).state > 0;'
+    lambda: 'return id(last_pulse_ms_irr) != 0 && (millis() - id(last_pulse_ms_irr)) < 1000;'
     filters:
       - delayed_off: 8s
 
   # ---------------------------------------------------------------------------
   # FLOW INDICATORS
-  # Boolean "is water flowing right now?" — derived from the raw pulse counter
-  # (same source as flow_pulse_onset) rather than the smoothed water_usage
-  # sensor. This gives a near-instant OFF response (~1s) when flow stops,
-  # independent of the 2s smoothing window on the flow-rate sensor.
+  # Boolean "is water flowing right now?" — keyed off last-pulse age (same
+  # source as flow_pulse_onset) rather than the pulse_meter rate, which holds
+  # its last value for the 10s timeout after flow stops. This gives a
+  # near-instant OFF response (~1s + delayed_off) when flow stops.
   #
-  # delayed_off: 2s debounces brief zero-pulse gaps at very low flow rates
+  # delayed_off: 2s debounces brief pulse gaps at very low flow rates
   # (< 1 pulse/s) without adding meaningful latency on flow stop.
   #
   # entity_category: diagnostic — tucked away from default dashboards because
@@ -2163,7 +2221,7 @@ binary_sensor:
     web_server:
       sorting_group_id: group_main_status
       sorting_weight: 45
-    lambda: 'return id(flow_base_main).state > 0;'
+    lambda: 'return id(last_pulse_ms_main) != 0 && (millis() - id(last_pulse_ms_main)) < 1000;'
     filters:
       - delayed_off: 2s
 
@@ -2174,7 +2232,7 @@ binary_sensor:
     web_server:
       sorting_group_id: group_irr_status
       sorting_weight: 45
-    lambda: 'return id(flow_base_irr).state > 0;'
+    lambda: 'return id(last_pulse_ms_irr) != 0 && (millis() - id(last_pulse_ms_irr)) < 1000;'
     filters:
       - delayed_off: 2s
 
@@ -2771,7 +2829,10 @@ number:
     min_value: 1
     max_value: 120
     step: 1
-    initial_value: 90
+    # 3.13: default lowered 90 → 30. Pre-3.13 the timer counted 4Hz publishes
+    # as seconds, so the "90 min" dial actually alerted at ~22.5 min; now that
+    # the timer is true wall-clock, 30 min keeps the response users are used to.
+    initial_value: 30
     restore_value: yes
     optimistic: true
     set_action:
@@ -2844,7 +2905,8 @@ number:
     min_value: 1
     max_value: 120
     step: 1
-    initial_value: 90
+    initial_value: 30   # 3.13: lowered 90 → 30 — see trickle_duration_main
+
     restore_value: yes
     optimistic: true
     set_action:
@@ -3204,6 +3266,7 @@ button:
       - lambda: |-
           id(trickle_alert_main) = false;
           id(trickle_elapsed_main) = 0.0f;
+          id(trickle_last_ms_main) = 0;
           ESP_LOGI("trickle", "Main trickle flow alert manually reset");
 
   - platform: template
@@ -3216,6 +3279,7 @@ button:
       - lambda: |-
           id(trickle_alert_irr) = false;
           id(trickle_elapsed_irr) = 0.0f;
+          id(trickle_last_ms_irr) = 0;
           ESP_LOGI("trickle", "Irrigation trickle flow alert manually reset");
 
 # =============================================================================
@@ -3224,7 +3288,7 @@ button:
 # A single ~50 Hz interval drives the whole waveform-capture engine. STRICTLY
 # ADDITIVE — it only READS already-published sensor states (water_usage1,
 # pressure_main_fast) and writes its own wf_* globals. It never touches the
-# 200 Hz ADC loop, the pulse-counter ISR, the safety lambdas, or any valve
+# 200 Hz ADC loop, the pulse-meter ISR, the safety lambdas, or any valve
 # action, so it cannot regress the shut-off device.
 #
 # Each captured event is delivered as a sequence of
@@ -3252,6 +3316,103 @@ button:
 # and the wire-format table in plans/i-would-like-to-snug-lerdorf.md.
 # =============================================================================
 interval:
+  # ---------------------------------------------------------------------------
+  # VALVE SEAL CHECKS (3.13) — pulse-age based, 1s cadence, per circuit.
+  #
+  # Replaces the pre-3.13 checks that lived in the flow sensors' on_value
+  # handlers. Two reasons they moved:
+  #   1. pulse_meter publishes per pulse, so on_value cadence is flow-dependent
+  #      — tick-counting accumulators would run at drip speed for drips.
+  #      (The old code also counted 40Hz/4Hz publishes as seconds — the "20s"
+  #      fast check really fired at 0.5s and only for torrents, and the "90s"
+  #      slow check at 22.5s.)
+  #   2. Drip rates sit below the pulse_meter rate floor (6 pulses/min) — the
+  #      rate sensor never reports them, but every pulse still stamps
+  #      last_pulse_ms_* via the total sub-sensor.
+  #
+  # FAST: pulse within the last 2s (≥0.4 L/min @ 72 ppl) sustained for 20
+  #       consecutive seconds while the closed end stop is active — real flow
+  #       past a closed valve.
+  # SLOW: pulse within the last 45s (≥1.33 pulses/min ≈ 0.019 L/min @ 72 ppl,
+  #       matching the old 0.02 L/min intent) sustained for 90s — a drip past
+  #       the seat. Auto-clears once no pulse arrives for 45s.
+  # Known small artifact: a pulse up to 45s BEFORE the close keeps the slow
+  # window "warm" briefly after closing; bounded well under the 90s threshold,
+  # so real pulses must continue for the alert to fire.
+  # ---------------------------------------------------------------------------
+  - interval: 1s
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          // --- Main circuit ---
+          if (id(closed_end_stop_valve1).state) {
+            uint32_t last = id(last_pulse_ms_main);
+            bool pulse_2s  = last != 0 && (now - last) < 2000;
+            bool pulse_45s = last != 0 && (now - last) < 45000;
+            if (pulse_2s) {
+              id(valve_seal_fast_elapsed_main) += 1.0f;
+              if (!id(valve_seal_alert_main) && id(valve_seal_fast_elapsed_main) >= 20.0f) {
+                id(valve_seal_alert_main) = true;
+                ESP_LOGW("seal", "MAIN: pulses %.0fs after valve closed (fast check) — "
+                  "possible valve seal failure", id(valve_seal_fast_elapsed_main));
+              }
+            } else {
+              id(valve_seal_fast_elapsed_main) = 0.0f;
+            }
+            if (pulse_45s) {
+              id(valve_seal_elapsed_main) += 1.0f;
+              if (!id(valve_seal_alert_main) && id(valve_seal_elapsed_main) >= 90.0f) {
+                id(valve_seal_alert_main) = true;
+                ESP_LOGW("seal", "MAIN: drip-rate pulses %.0fs after valve closed — "
+                  "possible valve seal failure", id(valve_seal_elapsed_main));
+              }
+            } else {
+              if (id(valve_seal_alert_main)) {
+                id(valve_seal_alert_main) = false;
+                ESP_LOGI("seal", "MAIN: valve seal alert cleared — flow has stopped");
+              }
+              id(valve_seal_elapsed_main) = 0.0f;
+            }
+          } else {
+            id(valve_seal_fast_elapsed_main) = 0.0f;
+            id(valve_seal_elapsed_main) = 0.0f;
+            id(valve_seal_alert_main) = false;
+          }
+          // --- Irrigation circuit ---
+          if (id(closed_end_stop_valve2).state) {
+            uint32_t last = id(last_pulse_ms_irr);
+            bool pulse_2s  = last != 0 && (now - last) < 2000;
+            bool pulse_45s = last != 0 && (now - last) < 45000;
+            if (pulse_2s) {
+              id(valve_seal_fast_elapsed_irr) += 1.0f;
+              if (!id(valve_seal_alert_irr) && id(valve_seal_fast_elapsed_irr) >= 20.0f) {
+                id(valve_seal_alert_irr) = true;
+                ESP_LOGW("seal", "IRRIGATION: pulses %.0fs after valve closed (fast check) — "
+                  "possible valve seal failure", id(valve_seal_fast_elapsed_irr));
+              }
+            } else {
+              id(valve_seal_fast_elapsed_irr) = 0.0f;
+            }
+            if (pulse_45s) {
+              id(valve_seal_elapsed_irr) += 1.0f;
+              if (!id(valve_seal_alert_irr) && id(valve_seal_elapsed_irr) >= 90.0f) {
+                id(valve_seal_alert_irr) = true;
+                ESP_LOGW("seal", "IRRIGATION: drip-rate pulses %.0fs after valve closed — "
+                  "possible valve seal failure", id(valve_seal_elapsed_irr));
+              }
+            } else {
+              if (id(valve_seal_alert_irr)) {
+                id(valve_seal_alert_irr) = false;
+                ESP_LOGI("seal", "IRRIGATION: valve seal alert cleared — flow has stopped");
+              }
+              id(valve_seal_elapsed_irr) = 0.0f;
+            }
+          } else {
+            id(valve_seal_fast_elapsed_irr) = 0.0f;
+            id(valve_seal_elapsed_irr) = 0.0f;
+            id(valve_seal_alert_irr) = false;
+          }
+
   - interval: 20ms
     then:
       - lambda: |-

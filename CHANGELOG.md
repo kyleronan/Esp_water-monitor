@@ -1,5 +1,36 @@
 # Changelog
 
+## [firmware 3.13.0] — 2026-07-04 — pulse_meter flow measurement (edge-period timing), both circuits
+
+Motivated by the main circuit's new positive-displacement oval-gear meter
+(K≈72 ppl): `pulse_counter`'s windowed counting quantized flow to 1.67 L/min
+steps at low ppl. `pulse_meter` times pulse edges instead — smooth traces and
+a low-flow floor of 60/(ppl×10s timeout) = 0.083 L/min @ 72 ppl. Both
+circuits migrate (meter type is now the end user's choice per circuit;
+runtime PPL entities unchanged).
+
+- **Volume from pulse totals**, not rate integration (integration would
+  overcount each event tail by last_rate × timeout). NVS-backed double
+  accumulator; one-time `total_increasing` meter reset on first 3.13 boot
+  (HA long-term statistics survive).
+- **Onset/pressure-drop gates re-keyed to last-pulse age** (the pulse_meter
+  rate needs a 2nd pulse and holds nonzero until timeout): flow_pulse_onset
+  latency improves ~41ms → ~16-32ms; the water-hammer false-positive window
+  stays ~1s instead of widening to 10s.
+- **Valve-seal checks moved to a 1s interval block** (pulse-age based): fast
+  = pulse within 2s sustained 20s; slow = pulse within 45s (≈0.019 L/min @
+  72 ppl) sustained 90s.
+- **Fixed pre-existing timer bugs**: trickle + slow-seal accumulators counted
+  4Hz publishes as seconds (90 min dial fired at ~22.5 min; 90s seal at
+  ~22.5s); fast seal counted 40Hz ticks ("20s" = 0.5s) and was inert for real
+  seal leaks. All are true wall-clock now. Trickle duration default lowered
+  90 → 30 min to match the effective response users are used to.
+- Instant burst adds a 2-consecutive-sample guard (bounce immunity);
+  internal_filter 100us PULSE mode (a 1ms bounce gap would read as
+  833 L/min @ 72 ppl under period timing).
+- `esphome config` validates clean; bench checklist in the plan before
+  trusting safety paths on water.
+
 ## [0.3.1-dev16] — 2026-07-04 — Fix: Re-run Setup unlock never actually unlocked the wizard
 
 `Settings → Re-run Setup → Unlock & open wizard` cleared
