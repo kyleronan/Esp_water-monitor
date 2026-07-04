@@ -566,6 +566,21 @@ def mark_setup_complete(db: sqlite3.Connection) -> None:
     db.commit()
 
 
+def unmark_setup_complete(db: sqlite3.Connection) -> None:
+    """Re-open the setup wizard (Settings → Re-run Setup).
+
+    is_setup_complete() reads device_config.setup_complete — home_profile
+    has its own setup_complete column, but the wizard lock only looks here.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    db.execute("""
+        UPDATE device_config SET setup_complete = 0, updated_at = ?
+        WHERE id = 1
+    """, (now,))
+    db.commit()
+
+
 def load_circuit_entities(
     db: sqlite3.Connection,
     circuit: str,

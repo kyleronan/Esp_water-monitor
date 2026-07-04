@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.1-dev16] — 2026-07-04 — Fix: Re-run Setup unlock never actually unlocked the wizard
+
+`Settings → Re-run Setup → Unlock & open wizard` cleared
+`home_profile.setup_complete`, but the wizard's mutation guard
+(`_block_if_setup_complete`) reads `device_config.setup_complete` via
+`is_setup_complete()` — so every `/setup/*` POST (e.g. device Search) still
+bounced back to the "Setup is locked" page. The unlock endpoint now clears
+both flags (new `unmark_setup_complete()` in `device_discovery.py`); the
+wizard's final step re-sets both on completion, unchanged. Regression test
+added (`test_setup_unlock.py`).
+
 ## [0.3.1-dev15] — 2026-07-04 — History filter bar: date · duration · ΔP · volume · fixture · note
 
 One filter bar above the History event lists covering every column: the

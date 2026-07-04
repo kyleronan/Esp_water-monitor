@@ -816,8 +816,12 @@ async def reprocess_degraded_supply(request: Request):
 @router.post("/setup/unlock")
 async def setup_unlock(request: Request):
     from ..database import update_home_profile
+    from ..device_discovery import unmark_setup_complete
     orch = _orch(request)
+    # Both flags: the wizard lock (_block_if_setup_complete → orch.setup_complete)
+    # reads device_config.setup_complete; home_profile mirrors it for the UI.
     update_home_profile(orch.db, setup_complete=0)
+    unmark_setup_complete(orch.db)
     log.warning("Setup wizard unlocked via Settings → Advanced — /setup/* mutators are open until the wizard completes again")
     return ingress_redirect(request, "/setup")
 
