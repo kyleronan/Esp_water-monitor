@@ -51,8 +51,9 @@ The events unlink now runs before the fixture delete.
 ## [0.3.1-dev15] — 2026-07-04 — History filter bar: date · duration · ΔP · volume · fixture · note
 
 One filter bar above the History event lists covering every column: the
-existing From/To dates plus **duration, ΔP, and volume dual min/max sliders**
-(display units — minutes / home's pressure & volume units), a **fixture**
+existing From/To dates plus **duration, avg flow, ΔP, and volume dual min/max
+sliders** (display units — minutes / home's flow, pressure & volume units; avg
+flow matches the displayed idle-gap-excluded number), a **fixture**
 dropdown (canonical types + Unlabelled, matched against the same effective-
 label chain the rows display), and a **note** dropdown over the pill kinds the
 Note column renders (⚠ Unusual / 〰 Estimated / Not real use / Brief use —

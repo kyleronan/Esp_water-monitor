@@ -2552,6 +2552,8 @@ def get_recent_events(
     dp_max: Optional[float] = None,
     vol_min_l: Optional[float] = None,
     vol_max_l: Optional[float] = None,
+    flow_min_lpm: Optional[float] = None,
+    flow_max_lpm: Optional[float] = None,
     fixture_type: Optional[str] = None,
     note_kind: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
@@ -2575,6 +2577,9 @@ def get_recent_events(
       • vol_min_l/vol_max_l — volume bounds (LITRES) on the DISPLAYED number,
         COALESCE(volume_litres_effective, volume_litres), so a zeroed phantom
         is a 0-volume row exactly as the user sees it;
+      • flow_min_lpm/flow_max_lpm — average-flow bounds (L/min) on the
+        DISPLAYED number, COALESCE(true_avg_flow_lpm, avg_flow_lpm) — the
+        idle-gap-excluded average when available, same as the Avg flow column;
       • fixture_type — a canonical type matched against the effective-label
         chain (_EFFECTIVE_FIXTURE_SQL), or 'unlabelled' for a NULL chain;
       • note_kind — one of _NOTE_KIND_SQL's pill categories.
@@ -2626,6 +2631,14 @@ def get_recent_events(
         conditions.append(
             "COALESCE(e.volume_litres_effective, e.volume_litres, 0) <= ?")
         params.append(vol_max_l)
+    if flow_min_lpm is not None:
+        conditions.append(
+            "COALESCE(e.true_avg_flow_lpm, e.avg_flow_lpm, 0) >= ?")
+        params.append(flow_min_lpm)
+    if flow_max_lpm is not None:
+        conditions.append(
+            "COALESCE(e.true_avg_flow_lpm, e.avg_flow_lpm, 0) <= ?")
+        params.append(flow_max_lpm)
     if fixture_type == "unlabelled":
         conditions.append(f"{_EFFECTIVE_FIXTURE_SQL} IS NULL")
     elif fixture_type:

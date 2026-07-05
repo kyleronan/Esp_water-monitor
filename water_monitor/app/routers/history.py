@@ -137,7 +137,8 @@ def _embedded_display_label(embedded: list, vol_factor: float,
 # Filter-bar query-param names (dev15). Raw display-unit strings from the GET
 # form; _filters_to_storage validates + converts them for the SQL pushdown.
 FILTER_BAR_PARAMS = ("dur_min", "dur_max", "dp_min", "dp_max",
-                     "vol_min", "vol_max", "fixture", "note")
+                     "vol_min", "vol_max", "flow_min", "flow_max",
+                     "fixture", "note")
 
 
 def _parse_float(value) -> float | None:
@@ -151,14 +152,16 @@ def _parse_float(value) -> float | None:
 
 
 def _filters_to_storage(raw: dict, vol_factor: float,
-                        pressure_factor: float) -> dict:
+                        pressure_factor: float,
+                        flow_factor: float = 1.0) -> dict:
     """Convert the filter bar's display-unit values to get_recent_events
-    kwargs in STORAGE units (litres / PSI / seconds). Pure — unit-tested.
+    kwargs in STORAGE units (litres / PSI / L·min⁻¹ / seconds). Pure —
+    unit-tested.
 
-    Inputs arrive as the user typed/slid them: duration in MINUTES, volume in
-    the home's display volume unit, ΔP in the display pressure unit. The
-    factors are the storage→display multipliers from units.build_unit_context,
-    so storage = display / factor. Unknown fixture/note values are dropped
+    Inputs arrive as the user typed/slid them: duration in MINUTES, volume /
+    ΔP / avg flow in the home's display units. The factors are the
+    storage→display multipliers from units.build_unit_context, so
+    storage = display / factor. Unknown fixture/note values are dropped
     (never trusted into SQL); blanks/garbage are ignored.
     """
     from ..database import _NOTE_KIND_SQL
@@ -182,6 +185,12 @@ def _filters_to_storage(raw: dict, vol_factor: float,
         out["vol_min_l"] = vol_min / vol_factor
     if vol_max is not None and vol_factor:
         out["vol_max_l"] = vol_max / vol_factor
+    flow_min = _parse_float(raw.get("flow_min"))
+    flow_max = _parse_float(raw.get("flow_max"))
+    if flow_min is not None and flow_factor:
+        out["flow_min_lpm"] = flow_min / flow_factor
+    if flow_max is not None and flow_factor:
+        out["flow_max_lpm"] = flow_max / flow_factor
     fixture = (raw.get("fixture") or "").strip()
     if fixture == "unlabelled" or fixture in FIXTURE_TYPE_LABELS:
         out["fixture_type"] = fixture
@@ -230,7 +239,8 @@ def _collect_circuit_history_sync(
     # dev15 filter bar: convert the raw display-unit params ONCE (same units
     # for every circuit) into storage-unit pushdown kwargs.
     bar_filters = _filters_to_storage(
-        filter_bar_raw or {}, _units["vol_factor"], _units["pressure_factor"])
+        filter_bar_raw or {}, _units["vol_factor"], _units["pressure_factor"],
+        _units["flow_factor"])
     out: list[dict] = []
     for circuit_cfg in circuits:
         if filter_circuit and circuit_cfg.circuit != filter_circuit:
@@ -421,7 +431,8 @@ def _collect_circuit_history_sync(
         _b = db.execute(
             "SELECT MAX(duration_seconds) AS d, "
             "       MAX(COALESCE(pressure_delta_psi, 0)) AS p, "
-            "       MAX(COALESCE(volume_litres_effective, volume_litres, 0)) AS v "
+            "       MAX(COALESCE(volume_litres_effective, volume_litres, 0)) AS v, "
+            "       MAX(COALESCE(true_avg_flow_lpm, avg_flow_lpm, 0)) AS f "
             "FROM events WHERE circuit = ?", (circuit_cfg.circuit,)).fetchone()
         filter_bounds = {
             "dur_max": max(1, _math.ceil(float(_b["d"] or 0.0) / 60.0)),
@@ -429,6 +440,8 @@ def _collect_circuit_history_sync(
                 float(_b["p"] or 0.0) * _units["pressure_factor"])),
             "vol_max": max(1, _math.ceil(
                 float(_b["v"] or 0.0) * _units["vol_factor"])),
+            "flow_max": max(1, _math.ceil(
+                float(_b["f"] or 0.0) * _units["flow_factor"])),
         }
 
         out.append({
@@ -517,6 +530,8 @@ async def _history_page(request: Request):
                         for ch in circuit_history), default=1),
         "vol_max": max((ch["filter_bounds"]["vol_max"]
                         for ch in circuit_history), default=1),
+        "flow_max": max((ch["filter_bounds"]["flow_max"]
+                         for ch in circuit_history), default=1),
     }
 
     return _tmpl(request).TemplateResponse("history.html", {

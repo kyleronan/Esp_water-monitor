@@ -116,6 +116,28 @@
       </div>
 
       <div class="hist-filter-group hf-range"
+           data-hf-max="{{ filter_bounds.flow_max }}" data-hf-step="0.1">
+        <label class="hist-filter-label">Avg flow ({{ flow_unit }})</label>
+        <div class="hf-fallback">
+          <input type="number" class="hf-num hf-num-lo" name="flow_min" min="0"
+                 step="any" inputmode="decimal" placeholder="min"
+                 value="{{ filter_bar.flow_min }}"
+                 aria-label="Minimum average flow">
+          <span>–</span>
+          <input type="number" class="hf-num hf-num-hi" name="flow_max" min="0"
+                 step="any" inputmode="decimal" placeholder="max"
+                 value="{{ filter_bar.flow_max }}"
+                 aria-label="Maximum average flow">
+        </div>
+        <div class="hf-slider" hidden>
+          <div class="hf-rail"><div class="hf-fill"></div></div>
+          <input type="range" class="hf-lo" aria-label="Minimum average-flow slider">
+          <input type="range" class="hf-hi" aria-label="Maximum average-flow slider">
+        </div>
+        <span class="hf-readout muted" data-hf-unit="{{ flow_unit }}"></span>
+      </div>
+
+      <div class="hist-filter-group hf-range"
            data-hf-max="{{ filter_bounds.dp_max }}" data-hf-step="0.1">
         <label class="hist-filter-label">ΔP ({{ pressure_unit }})</label>
         <div class="hf-fallback">
@@ -199,6 +221,8 @@
       {%- if date_to %} to <strong>{{ date_to }}</strong>{% endif %}
       {%- if filter_bar.dur_min or filter_bar.dur_max %} ·
         duration <strong>{{ filter_bar.dur_min or '0' }}–{{ filter_bar.dur_max or '∞' }} min</strong>{% endif %}
+      {%- if filter_bar.flow_min or filter_bar.flow_max %} ·
+        avg flow <strong>{{ filter_bar.flow_min or '0' }}–{{ filter_bar.flow_max or '∞' }} {{ flow_unit }}</strong>{% endif %}
       {%- if filter_bar.dp_min or filter_bar.dp_max %} ·
         ΔP <strong>{{ filter_bar.dp_min or '0' }}–{{ filter_bar.dp_max or '∞' }} {{ pressure_unit }}</strong>{% endif %}
       {%- if filter_bar.vol_min or filter_bar.vol_max %} ·
