@@ -1836,6 +1836,13 @@ class WaveformChunkAccumulator:
     def latest_record(self) -> Optional[WaveformRecord]:
         return self._records[-1] if self._records else None
 
+    def recent_records(self) -> List[WaveformRecord]:
+        """All buffered records, newest last. The caller filters by recency/
+        overlap — a burst of short ESP captures (e.g. washer fill pauses
+        splitting one add-on event into several firmware events) means the
+        newest record is often NOT the one that matches."""
+        return list(self._records)
+
     def pop_record(self, boot_id: int, event_id: int) -> Optional[WaveformRecord]:
         for i in range(len(self._records) - 1, -1, -1):
             if self._records[i].boot_id == boot_id and self._records[i].event_id == event_id:
@@ -2026,6 +2033,11 @@ class EventDetector:
         """Return the most-recently assembled WaveformRecord for a circuit, or None."""
         accumulator = self._chunk_accumulators.get(circuit)
         return accumulator.latest_record() if accumulator else None
+
+    def get_recent_waveforms(self, circuit: str) -> "List[WaveformRecord]":
+        """Return all buffered WaveformRecords for a circuit, newest last."""
+        accumulator = self._chunk_accumulators.get(circuit)
+        return accumulator.recent_records() if accumulator else []
 
     def waveform_transport_stats(self, circuit: str) -> Dict[str, int]:
         """Phase 3 — per-circuit waveform-transport health counters (or zeros)."""

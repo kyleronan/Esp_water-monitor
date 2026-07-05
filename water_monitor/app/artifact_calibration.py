@@ -62,7 +62,8 @@ def _load_rows(conn: sqlite3.Connection, circuit: str) -> List[sqlite3.Row]:
         "  COALESCE(is_pressure_restoration_phantom,0) AS ph, "
         "  COALESCE(is_cross_talk,0) AS ct, COALESCE(is_low_flow_dribble,0) AS dr, "
         "  duration_seconds, pressure_delta_psi, true_avg_flow_lpm, "
-        "  flow_integral_litres, flow_on_ratio, volume_litres, avg_flow_lpm "
+        "  peak_flow_lpm, flow_integral_litres, flow_on_ratio, "
+        "  volume_litres, avg_flow_lpm "
         "FROM events WHERE circuit = ?", (circuit,),
     ).fetchall()
 
@@ -90,8 +91,12 @@ def _xtalk(r, calib):
 
 
 def _dribble(r, calib):
+    # Below-meter-floor rule (2026-07-05): calib no longer influences it; kept
+    # for the report's positive/negative counting. Turbine-class floor default
+    # (the conservative smaller one) — this eval has no circuit meter context.
     return _detect_low_flow_dribble(
-        r["volume_litres"], r["avg_flow_lpm"], r["pressure_delta_psi"], calib=calib)
+        r["volume_litres"], r["avg_flow_lpm"], r["pressure_delta_psi"], calib=calib,
+        true_avg_flow_lpm=r["true_avg_flow_lpm"], peak_flow_lpm=r["peak_flow_lpm"])
 
 
 def _fit_one(rows, flag, detect, fit_keys) -> Tuple[Dict[str, float], Dict[str, Any]]:
@@ -164,10 +169,12 @@ def fit_artifact_thresholds(
         ("phantom", "ph", _phantom, {}),
         ("cross_talk", "ct", _xtalk,
          {"XTALK_MIN_DURATION_S": ("min", "duration_seconds")}),
-        ("dribble", "dr", _dribble,
-         {"DRIBBLE_MAX_VOLUME_L": ("max", "volume_litres"),
-          "DRIBBLE_MAX_FLOW_LPM": ("max", "avg_flow_lpm"),
-          "DRIBBLE_MAX_DELTA_PSI": ("max", "pressure_delta_psi")}),
+        # Dribble is no longer calibratable (2026-07-05): the below-meter-floor
+        # rule replaced the volume/flow/ΔP triple-gate with frozen physical
+        # registration floors (see feature_extractor's registration-floor
+        # block). Empty fit_keys keeps the report's confirmed-positive count
+        # for the UI, like phantom.
+        ("dribble", "dr", _dribble, {}),
     ):
         accepted, rep = _fit_one(rows, flag, detect, fit_keys)
         calib.update(accepted)

@@ -391,18 +391,81 @@ _XTALK_MIN_DURATION_S: float = 120.0
 # dribbles moved >= SUSPECT_ZERO_LITRES of real HA flow). detector_validation now
 # holds dribble to the same suspect-zeroing leak-safety bar as phantom/cross-talk.
 # Re-tune here as more labelled data arrives.
-_DRIBBLE_MAX_VOLUME_L:  float = 0.5
-_DRIBBLE_MAX_FLOW_LPM:  float = 1.0
-_DRIBBLE_MAX_DELTA_PSI: float = 1.5
+_DRIBBLE_MAX_VOLUME_L:  float = 0.5   # legacy calib key — no longer read by the detector
+_DRIBBLE_MAX_FLOW_LPM:  float = 1.0   # legacy calib key — no longer read by the detector
+_DRIBBLE_MAX_DELTA_PSI: float = 1.5   # legacy calib key — no longer read by the detector
 
-# Coarse-meter safety guard (runtime-PPL meters). When a circuit's meter-derived
-# low-flow floor (60 ÷ ppl) is at/above this, the meter measures sub-1-L/min flows
-# RELIABLY (e.g. a 72-ppl oval gear → 0.83 L/min), so a low-flow reading is real
-# water — NOT the turbine quantization-noise the dribble heuristic suppresses.
-# Above this floor we never dribble-zero (bias conservative: "never make real water
-# invisible"). The 396-ppl turbine floor (0.15) is far below, so turbine behaviour
-# is unchanged. Tune with real positive-displacement data.
-_DRIBBLE_RELIABLE_METER_FLOOR_LPM: float = 0.5
+# ─────────────────────────────────────────────────────────────────────────────
+# Meter registration floor (2026-07-05) — REPLACES the dribble triple-gate.
+#
+# Every flow meter has a PHYSICAL registration threshold, distinct from its
+# 60÷ppl pulse-resolution floor: below some rate the water passes UNMETERED —
+# through gear running-clearance on a positive-displacement meter (no perfect
+# seals), or past a friction/magnetic-drag-stalled rotor on a turbine. Readings
+# an event produced entirely below that floor are outside the meter's valid
+# operating regime and are FALSE INFORMATION whether or not real water was
+# behind them. Controlled ground-truth tests on this install (2026-07-05):
+# the K=72 oval gear registered ~2% of 2.0 L drawn across three sub-floor
+# draws and was fully SILENT at a sustained 1.11 L/min — while the pressure
+# sensors resolved every draw. Keeping such values (e.g. 0.04 L of a 500 ml
+# dispense) is false precision; an honest "below meter floor" zero+badge wins.
+# Some real water in this band is deliberately miscounted — accepted tradeoff
+# (the band already under-registers ~90%, trivial vs daily usage), and drip/
+# leak duty lives in the pressure-decay leak test + firmware trickle sensor,
+# both independent of events (standing leak-safety invariant).
+#
+# PD floor = demonstrated (meter silent at 1.11 L/min); turbine floor = YF-B5
+# spec startup flow (~1 L/min; untested here, and equal to the archive-
+# calibrated 1.0 dribble gate it replaces). Meter class is selected by the
+# same resolution predicate the old coarse-meter guard used: a 60÷ppl floor
+# >= 0.5 L/min (ppl <= 120) means a positive-displacement meter in this
+# product line.
+_METER_FLOOR_PD_LPM:      float = 1.1
+_METER_FLOOR_TURBINE_LPM: float = 1.0
+_PD_CLASS_MIN_FLOW_FLOOR_LPM: float = 0.5
+BELOW_METER_FLOOR_REASON: str = "below_meter_floor"
+
+
+def _meter_registration_floor(min_flow_lpm: float) -> float:
+    """Physical registration floor for the circuit's meter class."""
+    return (_METER_FLOOR_PD_LPM
+            if (min_flow_lpm or 0.0) >= _PD_CLASS_MIN_FLOW_FLOOR_LPM
+            else _METER_FLOOR_TURBINE_LPM)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pressure-silent flow phantom (2026-07-05)
+#
+# Flow the meter registered IN its valid regime, with NO supply response — a
+# physical impossibility for a real draw on this class of system: ground truth
+# shows even 0.75 L/min real flow dips this home 1.57 PSI, and the weakest real
+# draw ever measured (1.03 L/min) dipped 1.85 PSI. The signature is air purge /
+# valve-test shuttle / transient jiggle spinning the meter after line work
+# (observed cluster: board-swap install afternoon 2026-07-04 — sporadic pulse
+# bursts at 3–17 L/min with pressure FLAT within 0.6 PSI for minutes).
+#
+# LEAK-SAFETY (frozen, never calibrated):
+#   • ΔP gate < 0.8 PSI sits > 2× below the weakest measured real-draw dip
+#     (1.2 PSI at 1.6 L/min); a real leak at meterable rates always dips more;
+#   • corr is REQUIRED (< _PSILENT_MAX_CORR) — None (no/short pressure signal,
+#     flow-only imports) can never fire the verdict, mirroring the rise
+#     phantom's None-is-safe rule; a real draw's corr is strongly negative;
+#   • has_pressure_transient must be unset — a detected transient means the
+#     supply responded;
+#   • volume cap <= 5 L bounds the blast radius of any misfire;
+#   • duration cap <= 300 s — observed artifacts are 20–160 s.
+_PSILENT_MAX_DELTA_PSI:  float = 0.8
+_PSILENT_MAX_CORR:       float = 0.3
+_PSILENT_MAX_DURATION_S: float = 300.0
+_PSILENT_MAX_VOLUME_L:   float = 5.0
+PRESSURE_SILENT_REASON: str = "pressure_silent_flow"
+
+# Rise-phantom volume cap on positive-displacement meters. The 1.0 L turbine
+# cap was frozen against turbine-era archive data; a PD meter registers MORE of
+# a pressure-rise slug (it meters everything the clearance doesn't bypass), so
+# its rise phantoms are bigger. corr / rising-pressure / duration gates stay
+# frozen and identical.
+_RISE_PHANTOM_MAX_VOLUME_PD_L: float = 2.5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Rising-pressure phantom (dev14, 2026-07-03)
@@ -916,53 +979,112 @@ def _detect_pressure_restoration_phantom(
 
 
 def _detect_low_flow_dribble(volume_litres, avg_flow_lpm, pressure_delta_psi,
-                             calib=None, min_flow_lpm: float = 0.15) -> bool:
-    """True when an event is a brief low-flow trickle (sensor / pressure-
-    equalisation noise) rather than real water use.
+                             calib=None, min_flow_lpm: float = 0.15,
+                             true_avg_flow_lpm=None, peak_flow_lpm=None) -> bool:
+    """True when the meter never operated in its valid regime during the event
+    — the below-meter-floor rule (2026-07-05, replaces the old volume/flow/ΔP
+    triple-gate on ALL meter classes; see the registration-floor block above).
 
-    Fingerprint: tiny volume AND low average flow AND near-zero pressure drop
-    (all three below their thresholds). Distinct from the long-duration
-    pressure-restoration phantom — these are short blips. Calibrated from the
-    May-2026 labelled export (see the constants above).
+    The rate test uses ACTIVE-flow metrics (true_avg_flow_lpm, peak) — never
+    the zero-diluted whole-event average. Canonical framing: 0.5 L in 10 s
+    (3 L/min) = real; 0.5 L spread continuously over 2 min (0.25 L/min) =
+    false data; a 10 s / 3 L/min burst inside a 2-min zero-padded event window
+    has the same whole-event average as the false case but was validly metered
+    while flowing → kept. The verdict fires only when EVERY available active
+    metric sits below the floor (max of them < floor), so one valid-regime
+    burst anywhere in the event vetoes it. Volume, ΔP, and duration are
+    deliberately NOT gates: crossing 0.5 L doesn't make sub-floor readings
+    real, and pressure corroboration proves water moved, not how much.
 
-    Returns False if ANY input is None / non-numeric / non-finite. That keeps
-    the verdict conservative: a parse error never excludes a real event, and a
-    legacy caller that passes nothing (e.g. the phantom-only repair path) gets
-    a clean False rather than a spurious dribble flag.
+    ``volume_litres`` / ``pressure_delta_psi`` are retained in the signature
+    for caller compatibility and the None-guard only. Legacy callers that pass
+    no active metrics fall back to the whole-event average — conservative in
+    the only risky direction (padding can only make avg LOWER, and those
+    callers re-derive properly on the next full reprocess).
     """
-    if volume_litres is None or avg_flow_lpm is None or pressure_delta_psi is None:
+    if avg_flow_lpm is None and true_avg_flow_lpm is None and peak_flow_lpm is None:
         return False
-    try:
-        vol = float(volume_litres)
-        flow = float(avg_flow_lpm)
-        delta = float(pressure_delta_psi)
-    except (TypeError, ValueError):
+    rates = []
+    for v in (true_avg_flow_lpm, peak_flow_lpm):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f):
+            rates.append(f)
+    if not rates:
+        try:
+            f = float(avg_flow_lpm)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(f):
+            return False
+        rates = [f]
+    return max(rates) < _meter_registration_floor(min_flow_lpm)
+
+
+def _detect_pressure_silent_flow(duration_s, volume_litres, pressure_delta_psi,
+                                 flow_pressure_corr, has_pressure_transient,
+                                 true_avg_flow_lpm=None, peak_flow_lpm=None,
+                                 avg_flow_lpm=None,
+                                 min_flow_lpm: float = 0.15) -> bool:
+    """True when validly-metered flow produced NO supply response — physically
+    impossible for a real draw (see the pressure-silent constants block).
+
+    Requires ALL of: an active-flow metric at/above the meter registration
+    floor (below-floor events belong to _detect_low_flow_dribble), ΔP under
+    the frozen 0.8 PSI gate, no detected pressure transient, a PRESENT
+    flow↔pressure correlation under 0.3 (None = no pressure evidence = never
+    fires), duration <= 300 s, and volume in (0, 5] L. Every input None-safe
+    in the conservative direction.
+    """
+    vals = {}
+    for name, v in (("dur", duration_s), ("vol", volume_litres),
+                    ("dp", pressure_delta_psi), ("corr", flow_pressure_corr)):
+        if v is None:
+            return False
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(f):
+            return False
+        vals[name] = f
+    if has_pressure_transient:
         return False
-    if not (math.isfinite(vol) and math.isfinite(flow) and math.isfinite(delta)):
-        return False
-    # Coarse-meter safety: a meter that reliably measures down to min_flow_lpm
-    # (high resolution floor) produces real low-flow readings, not the quantization
-    # noise this heuristic suppresses — never dribble-zero on such a meter.
-    if min_flow_lpm >= _DRIBBLE_RELIABLE_METER_FLOOR_LPM:
+    rates = []
+    for v in (true_avg_flow_lpm, peak_flow_lpm, avg_flow_lpm):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f):
+            rates.append(f)
+    if not rates or max(rates) < _meter_registration_floor(min_flow_lpm):
         return False
     return (
-        vol < _ac(calib, "DRIBBLE_MAX_VOLUME_L")
-        and flow < _ac(calib, "DRIBBLE_MAX_FLOW_LPM")
-        and delta < _ac(calib, "DRIBBLE_MAX_DELTA_PSI")
+        vals["dur"] <= _PSILENT_MAX_DURATION_S
+        and 0.0 < vals["vol"] <= _PSILENT_MAX_VOLUME_L
+        and vals["dp"] < _PSILENT_MAX_DELTA_PSI
+        and vals["corr"] < _PSILENT_MAX_CORR
     )
 
 
 def _detect_rising_pressure_phantom(duration_s, volume_litres,
-                                    flow_pressure_corr, calib=None) -> bool:
+                                    flow_pressure_corr, calib=None,
+                                    min_flow_lpm: float = 0.15) -> bool:
     """True when a SHORT small burst's flow TRACKED a pressure RISE — i.e. the
-    turbine was spun by climbing supply pressure, not by demand (dev14).
+    meter was spun by climbing supply pressure, not by demand (dev14).
 
     Fingerprint: flow↔pressure correlation at/above the validated cutoff
     (``RISE_PHANTOM_MIN_CORR``; a real draw is strongly NEGATIVE), volume
-    STRICTLY under ``_RISE_PHANTOM_MAX_VOLUME_L`` (frozen — keeps every zeroed
-    event below detector_validation's SUSPECT_ZERO_LITRES leak bar), and
-    duration at/under ``_RISE_PHANTOM_MAX_DURATION_S`` (frozen — the long
-    phantom owns >= 120 s).
+    STRICTLY under the meter-class cap (frozen — turbine 1.0 L keeps every
+    zeroed event below detector_validation's SUSPECT_ZERO_LITRES leak bar;
+    PD meters use 2.5 L because they register more of a pressure-rise slug —
+    see _RISE_PHANTOM_MAX_VOLUME_PD_L), and duration at/under
+    ``_RISE_PHANTOM_MAX_DURATION_S`` (frozen — the long phantom owns >= 120 s).
+    Callers that don't know the circuit (legacy/repair paths) default to the
+    turbine cap — the conservative smaller one.
 
     Bad/missing inputs (None / non-numeric / NaN / inf) → False: an event with
     no computable correlation keeps its water. Zero/negative volume → False
@@ -978,9 +1100,12 @@ def _detect_rising_pressure_phantom(duration_s, volume_litres,
         return False
     if not (math.isfinite(duration) and math.isfinite(vol) and math.isfinite(corr)):
         return False
+    vol_cap = (_RISE_PHANTOM_MAX_VOLUME_PD_L
+               if (min_flow_lpm or 0.0) >= _PD_CLASS_MIN_FLOW_FLOOR_LPM
+               else _RISE_PHANTOM_MAX_VOLUME_L)
     return (
         corr >= _ac(calib, "RISE_PHANTOM_MIN_CORR")
-        and 0.0 < vol < _RISE_PHANTOM_MAX_VOLUME_L
+        and 0.0 < vol < vol_cap
         and duration <= _RISE_PHANTOM_MAX_DURATION_S
     )
 
@@ -1231,12 +1356,9 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         not is_phantom and not is_degraded and not has_user_type
         and _detect_rising_pressure_phantom(
             features.get("duration_seconds"), features.get("volume_litres"),
-            features.get("flow_pressure_corr"), calib=calib)
+            features.get("flow_pressure_corr"), calib=calib,
+            min_flow_lpm=min_flow_lpm)
     )
-    # Low-flow dribble: only for events that are NOT a phantom and NOT degraded
-    # (a degraded event's low flow is a measurement artifact, not a true
-    # trickle, and is already excluded). Folds into the exclusion set WITHOUT
-    # zeroing volume — see the constants block.
     # Cross-talk: a long no-flow event with a REAL pressure drop (ΔP >= 2.0) — the
     # other circuit's draw pulled this circuit's pressure down. ΔP-exclusive with the
     # phantom (ΔP < 2.0). Gated off degraded events (their flow metrics are unreliable,
@@ -1249,12 +1371,36 @@ def _finalize_derived_verdicts(features: dict, calib=None,
             features.get("flow_integral_litres"), features.get("flow_on_ratio"),
             calib=calib)
     )
+    # Below-meter-floor (2026-07-05, replaces the dribble triple-gate): the
+    # meter never operated in its valid regime during the event — the reading
+    # is false information regardless of ΔP, volume, or duration. Zeroes +
+    # excludes. Reuses the is_low_flow_dribble flag/UI plumbing with a
+    # distinct reason. Gated off user types like every zeroing verdict.
     is_dribble = (
         not is_phantom and not is_rise_phantom and not is_cross_talk
-        and not is_degraded
+        and not is_degraded and not has_user_type
         and _detect_low_flow_dribble(
             features.get("volume_litres"), features.get("avg_flow_lpm"),
             features.get("pressure_delta_psi"), calib=calib,
+            min_flow_lpm=min_flow_lpm,
+            true_avg_flow_lpm=features.get("true_avg_flow_lpm"),
+            peak_flow_lpm=features.get("peak_flow_lpm"))
+    )
+    # Pressure-silent flow (2026-07-05): validly-metered flow with NO supply
+    # response — physically impossible as a real draw (see constants block).
+    # Partition: below-floor owns rates under the registration floor; this
+    # verdict owns rates at/above it.
+    is_pressure_silent = (
+        not is_phantom and not is_rise_phantom and not is_cross_talk
+        and not is_dribble and not is_degraded and not has_user_type
+        and _detect_pressure_silent_flow(
+            features.get("duration_seconds"), features.get("volume_litres"),
+            features.get("pressure_delta_psi"),
+            features.get("flow_pressure_corr"),
+            features.get("has_pressure_transient"),
+            true_avg_flow_lpm=features.get("true_avg_flow_lpm"),
+            peak_flow_lpm=features.get("peak_flow_lpm"),
+            avg_flow_lpm=features.get("avg_flow_lpm"),
             min_flow_lpm=min_flow_lpm)
     )
 
@@ -1262,17 +1408,20 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     est = features.get("volume_litres_estimated")
     est = float(est) if est is not None else raw
 
-    # Effective volume: phantom → 0 (false water); cross-talk → 0; degraded →
-    # envelope estimate; low-flow dribble → 0; else raw. Phantom takes precedence
-    # over degraded. A dribble (brief sub-0.5 L / sub-1 L·min⁻¹ blip at ~0 ΔP) is
-    # sensor / pressure-equalisation noise, not real use, so its volume is removed
-    # from totals like a phantom's — and the flow<1 L·min⁻¹ gate keeps real small
-    # draws (icemaker / fridge dispenser run ~3 L·min⁻¹) out of this branch. A
-    # sustained slow flow accumulates past 0.5 L and never reaches here (it stays a
-    # counted long event), so this cannot silently zero a continuous leak.
+    # Effective volume: phantom family → 0 (false water); cross-talk → 0;
+    # below-meter-floor → 0 (sub-floor readings are outside the meter's valid
+    # regime — false information whether or not real water was behind them;
+    # 2026-07-05 registration-floor doctrine); pressure-silent → 0 (physically
+    # impossible as a real draw); degraded → envelope estimate; else raw.
+    # Leak-safety for the zeroing branches lives in the detectors' frozen
+    # gates plus the standing invariant: drip/leak duty is the firmware
+    # trickle sensor + pressure-decay leak test, independent of events.
     if is_phantom or is_rise_phantom:
         features["volume_litres_effective"]  = 0.0
         features["volume_estimation_method"] = "pressure_restoration_phantom"
+    elif is_pressure_silent:
+        features["volume_litres_effective"]  = 0.0
+        features["volume_estimation_method"] = PRESSURE_SILENT_REASON
     elif is_cross_talk:
         features["volume_litres_effective"]  = 0.0
         features["volume_estimation_method"] = "cross_talk"
@@ -1287,7 +1436,7 @@ def _finalize_derived_verdicts(features: dict, calib=None,
             _merge_degraded_diag(features, _cap_diag)
     elif is_dribble:
         features["volume_litres_effective"]  = 0.0
-        features["volume_estimation_method"] = "low_flow_dribble"
+        features["volume_estimation_method"] = BELOW_METER_FLOOR_REASON
     else:
         features["volume_litres_effective"]  = round(raw, 3)
         features["volume_estimation_method"] = "raw"
@@ -1305,29 +1454,31 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         features.get("duration_seconds"), features.get("flow_on_ratio"),
         is_phantom or is_rise_phantom)
     features["is_pressure_restoration_phantom"] = (
-        1 if (is_phantom or is_rise_phantom) else 0)
+        1 if (is_phantom or is_rise_phantom or is_pressure_silent) else 0)
     features["is_cross_talk"] = 1 if is_cross_talk else 0
     features["is_low_flow_dribble"] = 1 if is_dribble else 0
     # Kept-but-questioned draw: volume kept (raw/degraded branch above), out of
     # training until reviewed, surfaced via score_event_anomaly.
     features["phantom_suppression_averted"] = 1 if phantom_averted else 0
     features["excluded_from_training"] = (
-        1 if (is_degraded or is_phantom or is_rise_phantom or is_cross_talk
-              or is_dribble or user_ignored or integration_unusable
-              or is_sparse_envelope or phantom_averted)
+        1 if (is_degraded or is_phantom or is_rise_phantom or is_pressure_silent
+              or is_cross_talk or is_dribble or user_ignored
+              or integration_unusable or is_sparse_envelope or phantom_averted)
         else 0
     )
     # Upstream rejection reason (cluster-engine reasons are written separately).
     # is_low_flow_dribble is the authoritative dribble state; this reason string
     # is a secondary signal kept consistent with the live finalizer. The rise
-    # phantom shares the flag but keeps its own reason — the only place its
-    # provenance is recorded.
+    # and pressure-silent phantoms share the phantom flag but keep their own
+    # reasons — the only place their provenance is recorded; below_meter_floor
+    # likewise shares the dribble flag with a distinct reason.
     features["match_rejection_reason"] = (
         "pressure_restoration_phantom" if is_phantom
         else RISE_PHANTOM_REASON if is_rise_phantom
+        else PRESSURE_SILENT_REASON if is_pressure_silent
         else "cross_talk" if is_cross_talk
         else "pulsing_supply" if is_degraded
-        else "low_flow_dribble" if is_dribble
+        else BELOW_METER_FLOOR_REASON if is_dribble
         else SPARSE_ENVELOPE_REASON if is_sparse_envelope
         else None
     )
@@ -1391,7 +1542,7 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
         "  COALESCE(is_low_flow_dribble,0) AS dr, "
         "  COALESCE(degraded_supply,0) AS dg, "
         "  duration_seconds, pressure_delta_psi, true_avg_flow_lpm, "
-        "  flow_integral_litres, flow_on_ratio, avg_flow_lpm, "
+        "  flow_integral_litres, flow_on_ratio, avg_flow_lpm, peak_flow_lpm, "
         "  volume_litres, volume_litres_estimated, volume_litres_effective AS veff"
         + corr_select +
         " FROM events "
@@ -1414,8 +1565,10 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
                 mrr = r["mrr"]
                 keep = ("phantom"    if mrr == "pressure_restoration_phantom"
                         else "rise"       if mrr == RISE_PHANTOM_REASON
+                        else "psilent"    if mrr == PRESSURE_SILENT_REASON
                         else "cross_talk" if mrr == "cross_talk"
-                        else "dribble"    if mrr == "low_flow_dribble"
+                        else "dribble"    if mrr in ("low_flow_dribble",
+                                                     BELOW_METER_FLOOR_REASON)
                         else "phantom"    if r["ph"]
                         else "cross_talk" if r["ct"]
                         else "dribble")
@@ -1441,7 +1594,9 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
                     keep = "cross_talk"
                 elif _detect_low_flow_dribble(
                         r["volume_litres"], r["avg_flow_lpm"],
-                        r["pressure_delta_psi"]):
+                        r["pressure_delta_psi"],
+                        true_avg_flow_lpm=r["true_avg_flow_lpm"],
+                        peak_flow_lpm=r["peak_flow_lpm"]):
                     keep = "dribble"
                 else:
                     # veff==0 but no current detector fires (stale/legacy zeroing):
@@ -1465,15 +1620,16 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
                         r["id"], r["ph"], r["ct"], r["dr"], veff, raw, est)
             continue
 
-        new_ph = 1 if keep in ("phantom", "rise") else 0
+        new_ph = 1 if keep in ("phantom", "rise", "psilent") else 0
         new_ct = 1 if keep == "cross_talk" else 0
         new_dr = 1 if keep == "dribble" else 0
         new_excluded = 1 if (new_ph or new_ct or new_dr or r["dg"] or r["ui"]) else 0
         reason = (RISE_PHANTOM_REASON if keep == "rise"
+                  else PRESSURE_SILENT_REASON if keep == "psilent"
                   else "pressure_restoration_phantom" if new_ph
                   else "cross_talk" if new_ct
                   else "pulsing_supply" if r["dg"]
-                  else "low_flow_dribble" if new_dr
+                  else BELOW_METER_FLOOR_REASON if new_dr
                   else None)
         conn.execute(
             "UPDATE events SET is_pressure_restoration_phantom = ?, "
@@ -1642,71 +1798,115 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
         log.info("phantom-reprocess: flagged %d event(s) total across %d day(s)",
                  flagged, len(affected_days))
 
-    # ── Scan 2: low-flow dribbles ────────────────────────────────────────────
-    # ZEROES volume + excludes, reversing any prior hourly contribution via the
-    # §2.5 chokepoint — same shape as the cross-talk scan below. A brief sub-0.5 L
-    # / sub-1 L·min⁻¹ blip at ~0 ΔP is sensor / pressure-equalisation noise, not
-    # real use, so it is removed from totals like a phantom. The flow<1 L·min⁻¹
-    # gate keeps real small draws (icemaker / dispenser ~3 L·min⁻¹) counted, and a
-    # sustained slow flow exceeds 0.5 L so it never matches here (it stays a counted
-    # long event) — a continuous leak cannot be silently zeroed. ΔP<1.5 also makes
-    # this disjoint from cross-talk (ΔP>=2.0). Guarded by the column check so the
-    # phantom-only wrapper stays safe mid-upgrade (column added later in the chain).
-    #
-    # The row filter selects an event when it is EITHER not yet flagged a dribble OR
-    # flagged but still carrying volume (volume_litres_effective > 0). The second arm
-    # is the one-time self-healing backfill for the 2026-06-19 semantics change
-    # (dribble used to keep its volume): on the next startup reprocess, every
-    # already-flagged dribble gets its volume zeroed + ledger reversed. Idempotent —
-    # once veff is 0 the row no longer matches, so re-runs are no-ops.
+    # ── Scan 2: below-meter-floor (2026-07-05 — replaces the dribble triple-gate)
+    # An event whose ACTIVE flow never reached the circuit meter's registration
+    # floor is zeroed + excluded regardless of ΔP, volume, or duration: the
+    # reading is outside the meter's valid operating regime and is false
+    # information either way (see the registration-floor constants block).
+    # BIDIRECTIONAL (retroactive-backfill semantics, user-approved): rows the
+    # OLD triple-gate flagged that the floor rule does NOT match (e.g. a brief
+    # valid-regime burst that averaged low) are UN-flagged and their raw volume
+    # restored through the same ledger chokepoint. user_classified rows and
+    # user_fixture_type rows are never touched. Idempotent both directions.
     dribbles_flagged = 0
+    dribbles_restored = 0
+    litres_zeroed = 0.0
     dr_days: set = set()
     if _events_has_column(conn, "is_low_flow_dribble"):
+        af_cols = (", true_avg_flow_lpm" if has_af else "")
+        # Loose SQL prefilter (1.2 covers both class floors); the canonical
+        # detector decides exactly, per-circuit. Arms: (a) not-yet-flagged
+        # sub-floor candidates, (b) every currently-flagged auto dribble —
+        # for re-zeroing (veff>0 self-heal) or restoration under the new rule.
         drows = conn.execute(
-            "SELECT id, circuit, start_ts, duration_seconds, pressure_delta_psi, "
-            "       volume_litres, avg_flow_lpm "
-            "FROM events "
-            "WHERE (is_low_flow_dribble = 0 OR is_low_flow_dribble IS NULL "
-            "       OR COALESCE(volume_litres_effective, volume_litres, 0) > 0) "
-            "  AND COALESCE(user_classified, 0) = 0 "
+            "SELECT id, circuit, start_ts, volume_litres, avg_flow_lpm, "
+            "       peak_flow_lpm, pressure_delta_psi, integration_quality, "
+            "       COALESCE(user_ignored, 0) AS ui, "
+            "       COALESCE(is_low_flow_dribble, 0) AS dr, "
+            "       COALESCE(volume_litres_effective, volume_litres, 0) AS veff"
+            + af_cols +
+            " FROM events "
+            "WHERE COALESCE(user_classified, 0) = 0 "
+            + uft_guard +
             "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
             "  AND COALESCE(is_cross_talk, 0) = 0 "
             "  AND COALESCE(degraded_supply, 0) = 0 "
-            "  AND volume_litres < ? AND avg_flow_lpm < ? "
-            "  AND pressure_delta_psi < ?",
-            (_DRIBBLE_MAX_VOLUME_L, _DRIBBLE_MAX_FLOW_LPM, _DRIBBLE_MAX_DELTA_PSI),
+            "  AND (COALESCE(is_low_flow_dribble, 0) = 1 "
+            "       OR (COALESCE(peak_flow_lpm, avg_flow_lpm, 0) < 1.2 "
+            "           AND COALESCE(true_avg_flow_lpm, avg_flow_lpm, 0) < 1.2))"
+            if has_af else
+            "SELECT id, circuit, start_ts, volume_litres, avg_flow_lpm, "
+            "       peak_flow_lpm, pressure_delta_psi, integration_quality, "
+            "       COALESCE(user_ignored, 0) AS ui, "
+            "       COALESCE(is_low_flow_dribble, 0) AS dr, "
+            "       COALESCE(volume_litres_effective, volume_litres, 0) AS veff "
+            "FROM events "
+            "WHERE COALESCE(user_classified, 0) = 0 "
+            + uft_guard +
+            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+            "  AND COALESCE(is_cross_talk, 0) = 0 "
+            "  AND COALESCE(degraded_supply, 0) = 0 "
+            "  AND (COALESCE(is_low_flow_dribble, 0) = 1 "
+            "       OR COALESCE(peak_flow_lpm, avg_flow_lpm, 0) < 1.2)"
         ).fetchall()
         for row in drows:
-            # Re-run the canonical detector (SQL is only a prefilter).
-            if not _detect_low_flow_dribble(
-                row["volume_litres"], row["avg_flow_lpm"], row["pressure_delta_psi"],
-                min_flow_lpm=_circuit_min_flow(conn, row["circuit"])
-            ):
+            below = _detect_low_flow_dribble(
+                row["volume_litres"], row["avg_flow_lpm"],
+                row["pressure_delta_psi"],
+                min_flow_lpm=_circuit_min_flow(conn, row["circuit"]),
+                true_avg_flow_lpm=(row["true_avg_flow_lpm"] if has_af else None),
+                peak_flow_lpm=row["peak_flow_lpm"],
+            )
+            if below and (not row["dr"] or float(row["veff"] or 0.0) > 0.0):
+                with transaction(conn):
+                    conn.execute(
+                        "UPDATE events SET "
+                        "  is_low_flow_dribble = 1, "
+                        "  volume_litres_effective = 0, "
+                        "  volume_estimation_method = ?, "
+                        "  excluded_from_training = 1, "
+                        "  match_rejection_reason = ? "
+                        "WHERE id = ?",
+                        (BELOW_METER_FLOOR_REASON, BELOW_METER_FLOOR_REASON,
+                         row["id"]),
+                    )
+                    # §2.5 — zero the ledger contribution via the one chokepoint.
+                    apply_effective_volume(conn, row["id"], row["circuit"],
+                                           row["start_ts"], 0)
+                dribbles_flagged += 1
+                litres_zeroed += float(row["veff"] or 0.0)
+            elif not below and row["dr"]:
+                # Old-rule dribble the floor rule does not match — restore.
+                raw_vol = float(row["volume_litres"] or 0.0)
+                restored_excluded = 1 if (
+                    row["ui"] or row["integration_quality"] == "degraded") else 0
+                with transaction(conn):
+                    conn.execute(
+                        "UPDATE events SET "
+                        "  is_low_flow_dribble = 0, "
+                        "  volume_litres_effective = ?, "
+                        "  volume_estimation_method = 'raw', "
+                        "  excluded_from_training = ?, "
+                        "  match_rejection_reason = NULL "
+                        "WHERE id = ?",
+                        (round(raw_vol, 3), restored_excluded, row["id"]),
+                    )
+                    apply_effective_volume(conn, row["id"], row["circuit"],
+                                           row["start_ts"], raw_vol)
+                dribbles_restored += 1
+            else:
                 continue
-            with transaction(conn):
-                conn.execute(
-                    "UPDATE events SET "
-                    "  is_low_flow_dribble = 1, "
-                    "  volume_litres_effective = 0, "
-                    "  volume_estimation_method = 'low_flow_dribble', "
-                    "  excluded_from_training = 1, "
-                    "  match_rejection_reason = 'low_flow_dribble' "
-                    "WHERE id = ?",
-                    (row["id"],),
-                )
-                # §2.5 — zero the ledger contribution via the one chokepoint.
-                apply_effective_volume(conn, row["id"], row["circuit"],
-                                       row["start_ts"], 0)
-            dribbles_flagged += 1
             day = (row["start_ts"] or "")[:10]
             if day:
                 dr_days.add((row["circuit"], day))
         for circ, day in dr_days:
             compute_daily_summary(conn, circ, day)
-        if dribbles_flagged:
+        if dribbles_flagged or dribbles_restored:
             conn.commit()
-            log.info("dribble-reprocess: flagged %d low-flow dribble event(s) "
-                     "across %d day(s)", dribbles_flagged, len(dr_days))
+            log.info("below-meter-floor reprocess: %d event(s) zeroed "
+                     "(%.2f L removed), %d old-rule dribble(s) restored, "
+                     "across %d day(s)", dribbles_flagged, litres_zeroed,
+                     dribbles_restored, len(dr_days))
 
     # ── Scan 3: cross-talk (no real flow + a REAL pressure drop ≥ 2.0) ────────
     # Another circuit's draw pulled this circuit's pressure down — registered but
@@ -1772,6 +1972,77 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     # every existing caller of this function, so late-waveform verdict drift and
     # backfilled corrs reconcile on the same cadence as the other scans.
     rise = reprocess_rising_pressure_phantoms(conn)
+
+    # ── Scan 3c: pressure-silent flow (2026-07-05) ────────────────────────────
+    # Validly-metered flow with NO supply response — physically impossible as a
+    # real draw (see the pressure-silent constants block). Same zeroing family
+    # as the phantom (shares the flag, distinct reason). corr is REQUIRED so
+    # flow-only imports (no pressure evidence) can never be zeroed. Idempotent:
+    # a flagged row fails the phantom=0 filter on the next run.
+    psilent_flagged = 0
+    ps_litres = 0.0
+    ps_days: set = set()
+    if has_af and _events_has_column(conn, "flow_pressure_corr"):
+        psrows = conn.execute(
+            "SELECT id, circuit, start_ts, duration_seconds, volume_litres, "
+            "       pressure_delta_psi, flow_pressure_corr, "
+            "       COALESCE(has_pressure_transient, 0) AS hpt, "
+            "       true_avg_flow_lpm, peak_flow_lpm, avg_flow_lpm, "
+            "       COALESCE(volume_litres_effective, volume_litres, 0) AS veff "
+            "FROM events "
+            "WHERE COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+            "  AND COALESCE(is_cross_talk, 0) = 0 "
+            "  AND COALESCE(is_low_flow_dribble, 0) = 0 "
+            "  AND COALESCE(degraded_supply, 0) = 0 "
+            "  AND flow_pressure_corr IS NOT NULL AND flow_pressure_corr < ? "
+            "  AND pressure_delta_psi IS NOT NULL AND pressure_delta_psi < ? "
+            "  AND COALESCE(has_pressure_transient, 0) = 0 "
+            "  AND duration_seconds <= ? "
+            "  AND volume_litres > 0 AND volume_litres <= ?"
+            + uc_guard + uft_guard,
+            (_PSILENT_MAX_CORR, _PSILENT_MAX_DELTA_PSI,
+             _PSILENT_MAX_DURATION_S, _PSILENT_MAX_VOLUME_L),
+        ).fetchall()
+        for row in psrows:
+            # Re-run the canonical detector (SQL is only a prefilter) — it adds
+            # the registration-floor requirement the SQL can't express per-circuit.
+            if not _detect_pressure_silent_flow(
+                row["duration_seconds"], row["volume_litres"],
+                row["pressure_delta_psi"], row["flow_pressure_corr"],
+                row["hpt"],
+                true_avg_flow_lpm=row["true_avg_flow_lpm"],
+                peak_flow_lpm=row["peak_flow_lpm"],
+                avg_flow_lpm=row["avg_flow_lpm"],
+                min_flow_lpm=_circuit_min_flow(conn, row["circuit"]),
+            ):
+                continue
+            with transaction(conn):
+                conn.execute(
+                    "UPDATE events SET "
+                    "  is_pressure_restoration_phantom = 1, "
+                    "  is_cross_talk = 0, is_low_flow_dribble = 0, "
+                    "  volume_litres_effective = 0, "
+                    "  volume_estimation_method = ?, "
+                    "  excluded_from_training = 1, "
+                    "  match_rejection_reason = ? "
+                    "WHERE id = ?",
+                    (PRESSURE_SILENT_REASON, PRESSURE_SILENT_REASON, row["id"]),
+                )
+                # §2.5 — zero the ledger contribution via the one chokepoint.
+                apply_effective_volume(conn, row["id"], row["circuit"],
+                                       row["start_ts"], 0)
+            psilent_flagged += 1
+            ps_litres += float(row["veff"] or 0.0)
+            day = (row["start_ts"] or "")[:10]
+            if day:
+                ps_days.add((row["circuit"], day))
+        for circ, day in ps_days:
+            compute_daily_summary(conn, circ, day)
+        if psilent_flagged:
+            conn.commit()
+            log.info("pressure-silent reprocess: flagged %d event(s) "
+                     "(%.2f L removed) across %d day(s)",
+                     psilent_flagged, ps_litres, len(ps_days))
 
     # ── Scan 4: sparse envelopes (Fix 4) ─────────────────────────────────────
     # A long event almost entirely idle (a brief draw + a long no-flow tail). Real water
@@ -1839,6 +2110,8 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                      capped_reincluded)
 
     return {"flagged": flagged, "dribbles_flagged": dribbles_flagged,
+            "dribbles_restored": dribbles_restored,
+            "psilent_flagged": psilent_flagged,
             "cross_talk_flagged": cross_talk_flagged,
             "rise_flagged": rise["rise_flagged"],
             "sparse_flagged": sparse_flagged,
@@ -1891,7 +2164,8 @@ def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
         "  AND COALESCE(user_classified, 0) = 0 "
         "  AND (user_fixture_type IS NULL OR user_fixture_type = '')",
         (_RISE_PHANTOM_MIN_CORR, _RISE_PHANTOM_MAX_DURATION_S,
-         _RISE_PHANTOM_MAX_VOLUME_L),
+         _RISE_PHANTOM_MAX_VOLUME_PD_L),   # loose prefilter = the larger PD cap;
+                                           # the detector applies the per-circuit one
     ).fetchall()
 
     rise_flagged = 0
@@ -1899,9 +2173,11 @@ def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
     for row in rows:
         # Re-run the canonical detector (SQL is only a prefilter) — single
         # source of truth for the thresholds, and it re-rejects bad data.
+        # min_flow selects the meter-class volume cap (PD 2.5 L / turbine 1.0 L).
         if not _detect_rising_pressure_phantom(
                 row["duration_seconds"], row["volume_litres"],
-                row["flow_pressure_corr"]):
+                row["flow_pressure_corr"],
+                min_flow_lpm=_circuit_min_flow(conn, row["circuit"])):
             continue
         with transaction(conn):
             conn.execute(
@@ -2153,12 +2429,24 @@ def _bin_min_max(values: list, n_bins: int):
     return mins, maxs
 
 
+def _wf_full_res_usable(record: "Optional[WaveformRecord]") -> bool:
+    """True when the record's full-window arrays are display-trustworthy —
+    same complete/not-reduced/quality gate as the signature override."""
+    if record is None or not record.full_flow:
+        return False
+    fl = record.metadata.flags
+    return (bool(fl & _WF_FL_FULL_COMPLETE)
+            and not (fl & _WF_FL_RESOLUTION_REDUCED)
+            and record.metadata.quality == 0)
+
+
 def _persist_waveform(
     db,
     event_id: str,
     flow_readings: list,
     pressure_readings: list,
     duration_s: float,
+    esp_record: "Optional[WaveformRecord]" = None,
 ) -> None:
     """Write a min/max-binned waveform to event_waveforms.
 
@@ -2166,7 +2454,17 @@ def _persist_waveform(
     The 32-point pressure_signature_json / flow_signature_json on the events
     row stays for clustering — these min/max envelopes are display-only.
     Skips silently if both reading lists are empty (historical events).
+
+    When a usable ESP capture matched the event, its full-window arrays
+    (200 Hz onboard, ~thousands of points) replace the add-on's HA-sampled
+    readings — the detector series is ~5 s cadence and every-5th downsampled
+    past 120 s, which erases short pulses (washer fill pauses) that the ESP
+    capture resolves.
     """
+    if _wf_full_res_usable(esp_record):
+        flow_readings = esp_record.full_flow
+        if esp_record.full_pressure:
+            pressure_readings = esp_record.full_pressure
     flow_min, flow_max = _bin_min_max(flow_readings, MAX_WAVEFORM_BINS)
     pres_min, pres_max = _bin_min_max(pressure_readings, MAX_WAVEFORM_BINS)
     if not flow_min and not pres_min:
@@ -2917,6 +3215,13 @@ def _late_waveform_upgrade_job(conn, circuit: str, record: WaveformRecord):
         f"UPDATE events SET {set_clause} WHERE id = ? AND signature_source = 'software'",
         params,
     )
+    if cur.rowcount > 0 and _wf_full_res_usable(record):
+        # Bring the display envelope along with the signature upgrade — empty
+        # reading lists are replaced by the record's full-res arrays inside.
+        _persist_waveform(
+            conn, best["id"], [], [],
+            float(best["duration_seconds"] or 0), esp_record=record,
+        )
     conn.commit()
     return best["id"] if cur.rowcount > 0 else None
 
@@ -3297,47 +3602,59 @@ class FeatureExtractor:
 
     def _find_waveform(self, event: RawEvent) -> "Optional[WaveformRecord]":
         """
-        Look up the most-recently assembled WaveformRecord for this circuit and
-        check whether it correlates with the given RawEvent.
+        Find the buffered WaveformRecord that best correlates with this RawEvent.
 
-        Returns the record when both the duration-overlap score exceeds
-        _WF_MATCH_MIN_SCORE and the record was assembled within
-        _WF_MATCH_WINDOW_S seconds of now; otherwise None.
+        Scans ALL buffered records for the circuit (not just the latest): a
+        pulsed fixture (washer fill pauses) splits one add-on event into
+        several firmware captures, and a tiny trailing capture can land AFTER
+        the one that actually spans the event — picking "latest" would discard
+        the real match (observed 2026-07-05: washer fw-event 21, full=7249,
+        superseded by 9-second fw-event 23 five seconds before completion).
+
+        Returns the record with the highest duration-overlap score among those
+        assembled within _WF_MATCH_WINDOW_S, when that score reaches
+        _WF_MATCH_MIN_SCORE; otherwise None.
         """
         import time as _time
 
         if self._event_detector is None:
             return None
         try:
-            record = self._event_detector.get_latest_waveform(event.circuit)
+            records = self._event_detector.get_recent_waveforms(event.circuit)
         except Exception:
             return None
-        if record is None:
+        if not records:
             return None
-        # Recency guard: if the record was assembled too long ago it belongs to
-        # a previous event, not this one.
-        age_s = _time.monotonic() - record.received_at
-        if age_s > _WF_MATCH_WINDOW_S:
+        now_mono = _time.monotonic()
+        best: Optional[WaveformRecord] = None
+        best_score = -1.0
+        for record in records:
+            # Recency guard: a record assembled too long ago belongs to a
+            # previous event, not this one.
+            if now_mono - record.received_at > _WF_MATCH_WINDOW_S:
+                continue
+            score = _wf_overlap_score(event, record)
+            if score > best_score:
+                best, best_score = record, score
+        if best is None:
             log.debug(
-                "[%s] waveform skip — event_id=%d stale (age=%.1fs > %.0fs)",
-                event.circuit, record.metadata.event_id, age_s, _WF_MATCH_WINDOW_S,
+                "[%s] waveform skip — %d buffered record(s), none within %.0fs",
+                event.circuit, len(records), _WF_MATCH_WINDOW_S,
             )
             return None
-        # Duration overlap guard.
-        score = _wf_overlap_score(event, record)
-        if score < _WF_MATCH_MIN_SCORE:
+        if best_score < _WF_MATCH_MIN_SCORE:
             log.debug(
-                "[%s] waveform skip — event_id=%d overlap=%.2f < %.2f "
+                "[%s] waveform skip — best event_id=%d overlap=%.2f < %.2f "
                 "(event=%.1fs fw=%.1fs)",
-                event.circuit, record.metadata.event_id, score, _WF_MATCH_MIN_SCORE,
+                event.circuit, best.metadata.event_id, best_score, _WF_MATCH_MIN_SCORE,
                 (event.end_ts - event.start_ts).total_seconds() if event.end_ts else 0.0,
                 (
-                    _wf_millis_sub(record.metadata.end_ms, record.metadata.start_ms)
-                    + record.metadata.tail_ms
+                    _wf_millis_sub(best.metadata.end_ms, best.metadata.start_ms)
+                    + best.metadata.tail_ms
                 ) / 1000.0,
             )
             return None
-        return record
+        return best
 
     def handle_late_waveform(self, circuit: str, record: WaveformRecord) -> None:
         """Sink (wired by the orchestrator to EventDetector) for a freshly-assembled
@@ -3565,6 +3882,7 @@ class FeatureExtractor:
                 event.flow_readings,
                 event.pressure_readings,
                 float(features.get("duration_seconds") or 0),
+                esp_record=wf_record,
             )
 
             if is_new_event and not features.get("excluded_from_training"):

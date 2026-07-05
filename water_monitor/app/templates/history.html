@@ -646,10 +646,10 @@
           {% if _has_flags %}
           <td class="hist-td">
             <div class="hist-note-cell">
-              {% if e.is_pressure_restoration_phantom %}<span class="pill pill-neutral" title="Not real water use — a city water-pressure blip, not a tap or appliance. Volume removed from your totals. If water was running, open it and relabel.">👻 Not real use</span>{% endif %}
+              {% if e.is_pressure_restoration_phantom %}<span class="pill pill-neutral" title="{% if e.match_rejection_reason == 'pressure_silent_flow' %}Not real water use — the meter registered flow but the water pressure never responded, which is physically impossible for a real draw (usually air in the line or a valve test spinning the meter). Volume removed from your totals. If water was running, open it and relabel.{% else %}Not real water use — a city water-pressure blip, not a tap or appliance. Volume removed from your totals. If water was running, open it and relabel.{% endif %}">👻 Not real use</span>{% endif %}
               {% if e.is_cross_talk %}<span class="pill pill-neutral" title="Caused by the other water line — its draw briefly dropped this line's pressure; no real flow here, volume removed. If water was running here, open it and relabel.{% if e.other_valve_open %} The other line was drawing.{% endif %}">↔ Not real use</span>{% endif %}
               {% if e.degraded_supply %}<span class="pill pill-amber" title="Unsteady water pressure — pressure was pulsing, so this volume is an estimate, not exact.">〰 Estimated</span>{% endif %}
-              {% if e.is_low_flow_dribble %}<span class="pill pill-neutral" title="Not real water use — a very small flow, too small to be a real tap or appliance. Volume removed from your totals. If water was running here, open it and relabel.">Drip — not real use</span>{% endif %}
+              {% if e.is_low_flow_dribble %}<span class="pill pill-neutral" title="Not real water use — the flow stayed below what this water meter can reliably measure, so the reading is sensor noise rather than a real tap or appliance. Volume removed from your totals. If water was running here, open it and relabel.">Drip — not real use</span>{% endif %}
               {% if e.match_rejection_reason == 'sparse_envelope' %}<span class="pill pill-neutral" title="A brief use followed by a long idle stretch — the listed time is mostly no-flow. The water still counts, but it's too irregular to learn your fixtures from.">⏳ Brief use, long idle tail</span>{% endif %}
               {# Reviewed anomalies keep a pill rather than losing it: the event
                  stays findable in ?filter=anomaly, so its row should still say
@@ -1421,28 +1421,30 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       try { pressPts = pressSig ? JSON.parse(pressSig) : []; }
       catch (err) { console.warn('[evt-modal] invalid pressure signature JSON', err); }
 
-      const pressHasData = pressPts.some(v => Math.abs(Number(v) || 0) > 0.01);
-      const hasFlow = flowPts.length > 0;
+      const renderWf = (fPts, pPts, hiRes) => {
+        const pressHasData = pPts.some(v => Math.abs(Number(v) || 0) > 0.01);
+        const hasFlow = fPts.length > 0;
 
-      wfSection.hidden = !hasFlow;
-      espBadge.hidden  = !wfUsed;
+        wfSection.hidden = !hasFlow;
+        espBadge.hidden  = !wfUsed;
+        if (!hasFlow) { wfMeta.textContent = ''; return; }
 
-      if (hasFlow) {
-        const labels = flowPts.map((_, i) => i);
+        if (wfChart) { wfChart.destroy(); wfChart = null; }
+        const labels = fPts.map((_, i) => i);
         const datasets = [{
           label: 'Flow',
-          data: flowPts.map(v => (Number(v) || 0) * wfScale),   // size-tier band
+          data: fPts.map(v => (Number(v) || 0) * wfScale),   // size-tier band
           borderColor: cssVar('--accent'),
           backgroundColor: mix(cssVar('--accent'), 12),
-          fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
+          fill: true, tension: hiRes ? 0 : 0.3, pointRadius: 0, borderWidth: 1.5,
         }];
         if (pressHasData) {
           datasets.push({
             label: 'Pressure',
-            data: pressPts,
+            data: pPts,
             borderColor: cssVar('--red'),
             backgroundColor: 'transparent',
-            fill: false, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
+            fill: false, tension: hiRes ? 0 : 0.3, pointRadius: 0, borderWidth: 1.5,
           });
         }
 
@@ -1469,24 +1471,49 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         const channels = pressHasData ? 'flow + pressure' : 'flow only';
         chartCanvas.setAttribute(
           'aria-label',
-          `Normalized ${channels} waveform, ${flowPts.length} samples`
+          `Normalized ${channels} waveform, ${fPts.length} samples`
         );
 
         const source  = wfUsed ? 'ESP captured' : 'event computed';
+        const resText = hiRes ? ' · hi-res' : '';
         const pkText  = d.peakFlow ? ` · peak ${d.peakFlow} ${flowUnit}` : '';
         const pressureNum = Number.parseFloat(d.pressure);
         const dpText  = Number.isFinite(pressureNum) && Math.abs(pressureNum) > 0.01
           ? ` · drop ${d.pressure} ${pressUnit}`
           : '';
         wfMeta.textContent =
-          `${source} · ${flowPts.length} samples · ${channels}${pkText}${dpText}`;
+          `${source}${resText} · ${fPts.length} samples · ${channels}${pkText}${dpText}`;
         const note = document.createElement('span');
         note.textContent = 'Flow curve height reflects the event\'s size tier; values are normalized, not actual units.';
         wfMeta.appendChild(document.createElement('br'));
         wfMeta.appendChild(note);
-      } else {
-        wfMeta.textContent = '';
-      }
+      };
+
+      renderWf(flowPts, pressPts, false);
+
+      // Upgrade to the hi-res min/max envelope when the add-on stored one
+      // (event_waveforms). 404 → keep the 32-pt signature already rendered.
+      const wfEventId = row.dataset.eventId;
+      fetch(`${INGRESS}/history/api/event/${wfEventId}/waveform`)
+        .then(r => (r.ok ? r.json() : null))
+        .then(w => {
+          if (!w || activeRow !== row) return;   // modal closed / row changed
+          const fMax = Array.isArray(w.flow_max) ? w.flow_max.map(Number) : [];
+          if (fMax.length <= flowPts.length) return;   // no more detail than the sig
+          const fPeak = Math.max(...fMax, 0);
+          if (fPeak <= 0) return;
+          const fPts = fMax.map(v => Math.min(Math.max(v / fPeak, 0), 1));
+          // Pressure: normalize the min-envelope into 0–1 over its own range
+          // so the dip shape matches the signature view's semantics.
+          let pPts = [];
+          const pMin = Array.isArray(w.pressure_min) ? w.pressure_min.map(Number) : [];
+          if (pMin.length >= 2) {
+            const lo = Math.min(...pMin), hi = Math.max(...pMin);
+            if (hi - lo > 0.05) pPts = pMin.map(v => (v - lo) / (hi - lo));
+          }
+          renderWf(fPts, pPts, true);
+        })
+        .catch(err => console.debug('[evt-modal] hi-res waveform unavailable', err));
     }
   }
 
