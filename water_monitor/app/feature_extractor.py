@@ -2194,10 +2194,22 @@ def _persist_waveform(
 
 
 def _flow_signature(flow_readings: list, peak: float, n: int = 32) -> list:
-    """Resample flow_readings to n points, normalize by peak (0–1)."""
+    """Resample flow_readings to n points, normalize by peak (0–1).
+
+    The series is anchored to start from no-flow: every stored event begins
+    with the fixture closed, but firmware 3.13's pulse_meter publishes a full
+    instantaneous rate on the first pulse period (no windowed ramp-up), and
+    idle 0.0 rarely republishes so the detector's pre-trigger seed ages out —
+    the raw series then OPENS at peak and the sparkline draws a vertical wall
+    with the onset "clipped off". Prepending the physical 0 restores the
+    onset. Safe for consumers: peak/low-flow features are computed from the
+    raw readings upstream, and classify_flow_shape drops the leading 20%.
+    """
     if not flow_readings or peak <= 0:
         return [0.0] * n
     src = flow_readings
+    if src[0] > 0:
+        src = [0.0] + list(src)
     if len(src) == 1:
         return [min(src[0] / peak, 1.0)] * n
     result = []

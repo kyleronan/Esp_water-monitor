@@ -467,25 +467,34 @@ def _derive_prefix(entities: List[Dict[str, Any]]) -> str:
     e.g. from 'sensor.esp_water_shut_off_3_water_flow_rate_main'
     extracts 'esp_water_shut_off_3_'
     """
-    # Known suffixes used to strip the device prefix from entity IDs.
+    # Known suffixes used to strip the device prefix from entity IDs, in
+    # PREFERENCE order. Each suffix is tried against ALL entities before
+    # falling through to the next — iterating entities first made the result
+    # depend on registry order: `button.<prefix>reset_safety_fault_main` also
+    # ends with "safety_fault_main", and when the registry yielded it before
+    # the real fault binary_sensor the derived prefix gained a bogus
+    # "reset_" tail. That wrong prefix then broke the waveform accumulator's
+    # expected-node check (chunk rejected — node != expected) and any other
+    # prefix consumer. "water_flow_rate_*" have no such trap variants, so
+    # they are tried first and effectively always win.
     # If the firmware adds new entity types, extend this list or switch to
     # a longest-common-prefix approach across all device entity IDs.
     known_suffixes = [
         "water_flow_rate_main",
         "water_flow_rate_irrigation",
+        "water_volume_total_main",
         "safety_fault_main",
         "safety_fault_irrigation",
-        "water_volume_total_main",
     ]
 
-    for entity in entities:
-        eid = entity.get("entity_id", "")
-        # Strip domain prefix (sensor., binary_sensor., etc.)
-        if "." not in eid:
-            continue
-        local = eid.split(".", 1)[1]  # e.g. esp_water_shut_off_3_water_flow_rate_main
-
-        for suffix in known_suffixes:
+    locals_ = [
+        eid.split(".", 1)[1]
+        for eid in (e.get("entity_id", "") for e in entities)
+        if "." in eid  # strip domain prefix (sensor., binary_sensor., etc.)
+    ]
+    for suffix in known_suffixes:
+        for local in locals_:
+            # e.g. esp_water_shut_off_3_water_flow_rate_main
             if local.endswith(suffix) and len(local) > len(suffix):
                 prefix = local[: len(local) - len(suffix)]
                 if prefix:

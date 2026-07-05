@@ -872,6 +872,21 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  # Pipeline-stage diagnostic counters (3.13 esp_waveform_used=0 investigation):
+  # captures started → chunks staged → HA events fired. Comparing the three in
+  # HA localises a silent waveform failure without serial-log access.
+  - id: wf_diag_captures          # capture state machine entered CAPTURING
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_diag_staged            # stage_chunk() succeeded (wf_ev_pending set)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: wf_diag_fired             # homeassistant.event action completed + cleared
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
 
   # HA-event staging globals — single shared in-flight chunk (only one
   # esphome.water_monitor_waveform_chunk event may be queued at a time).
@@ -2005,6 +2020,43 @@ sensor:
       sorting_weight: 48
     update_interval: 60s
     lambda: 'return (float) id(wf_chunk_drop_count);'
+
+  # ---------------------------------------------------------------------------
+  # WAVEFORM PIPELINE DIAGNOSTICS (3.13) — three stage counters that localise a
+  # silent chunked-streaming failure from HA alone: a draw should advance ALL
+  # THREE (captures started → chunks staged → HA events fired). The first
+  # counter that stops advancing names the broken stage. Cheap (one uint32
+  # increment per stage); kept permanently as deployment health signals.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Waveform Captures Started"
+    id: waveform_diag_captures
+    entity_category: diagnostic
+    icon: mdi:waveform
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: 10s
+    lambda: 'return (float) id(wf_diag_captures);'
+
+  - platform: template
+    name: "Waveform Chunks Staged"
+    id: waveform_diag_staged
+    entity_category: diagnostic
+    icon: mdi:waveform
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: 10s
+    lambda: 'return (float) id(wf_diag_staged);'
+
+  - platform: template
+    name: "Waveform Events Fired"
+    id: waveform_diag_fired
+    entity_category: diagnostic
+    icon: mdi:waveform
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: 10s
+    lambda: 'return (float) id(wf_diag_fired);'
 
 # =============================================================================
 # TEXT SENSORS — Leak test results
@@ -3282,6 +3334,32 @@ button:
           id(trickle_last_ms_irr) = 0;
           ESP_LOGI("trickle", "Irrigation trickle flow alert manually reset");
 
+  # ---------------------------------------------------------------------------
+  # WAVEFORM TRANSPORT TEST (3.13 diagnostic) — fires one minimal
+  # esphome.water_monitor_waveform_chunk event with schema "transport_test".
+  # End-to-end probe of device → HA event bus → add-on delivery with zero
+  # data pollution: the add-on's accumulator rejects the unknown schema and
+  # logs `waveform[...]: chunk rejected — unexpected schema 'transport_test'`
+  # at DEBUG, which is the success signal. If the button doesn't produce that
+  # line (or the event in HA Developer Tools → Events), the HA-actions
+  # permission / event transport is broken independent of the capture engine.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Waveform Transport Test"
+    entity_category: diagnostic
+    icon: mdi:waveform
+    on_press:
+      - homeassistant.event:
+          event: esphome.water_monitor_waveform_chunk
+          data_template:
+            schema:  "transport_test"
+            node:    "{{ node }}"
+            circuit: "circuit_1"
+          variables:
+            node: !lambda 'return App.get_name();'
+      - lambda: |-
+          ESP_LOGW("wfdiag", "transport test event fired (schema=transport_test)");
+
 # =============================================================================
 # INTERVALS — Per-event waveform capture (firmware 3.10.0+, dual-circuit chunked streaming)
 #
@@ -3575,6 +3653,7 @@ interval:
               id(wf_ev_pd) = -1; id(wf_ev_q) = 0; id(wf_ev_fl) = 0;
             }
             id(wf_ev_pending) = true;
+            id(wf_diag_staged) = id(wf_diag_staged) + 1;
             return true;
           };
 
@@ -3687,6 +3766,7 @@ interval:
               id(wf_press_onset_seq)[c] = (po >= 0) ? 0 : -1;
               id(wf_press_onset_idx)[c] = po;
               id(wf_capturing)[c] = true;
+              id(wf_diag_captures) = id(wf_diag_captures) + 1;
               continue;
             }
 
@@ -3831,6 +3911,7 @@ interval:
                   fl:                !lambda 'return std::to_string(id(wf_ev_fl));'
             - lambda: |-
                 id(wf_ev_pending) = false;
+                id(wf_diag_fired) = id(wf_diag_fired) + 1;
                 // Drop large staging strings to free heap promptly.
                 id(wf_ev_flow_b64).clear();
                 id(wf_ev_press_b64).clear();
