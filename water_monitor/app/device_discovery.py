@@ -708,6 +708,7 @@ class OptionalRoleRescanResult:
     per_circuit: Dict[str, int]
     fw_version_updated: bool = False
     fw_version: Optional[str] = None
+    prefix_updated: bool = False
 
 
 async def rescan_optional_roles(
@@ -772,6 +773,25 @@ async def rescan_optional_roles(
         ha_device_id, device_entities, circuits, labels=diag_labels
     )
 
+    # Heal a stale/mis-derived esp_device_prefix. The prefix is only otherwise
+    # written by save_discovery (setup wizard), so a bad stored value — e.g.
+    # the registry-order bug that glued "reset_" onto the prefix — persisted
+    # across restarts and kept the waveform accumulator rejecting every chunk
+    # (expected-node check). Same pattern as the fw_version heal below.
+    prefix_updated = False
+    stored_prefix = (cfg.get("esp_device_prefix") or "").strip()
+    if _prefix and _prefix != stored_prefix:
+        db.execute(
+            "UPDATE device_config SET esp_device_prefix=? WHERE id=1",
+            (_prefix,),
+        )
+        db.commit()
+        prefix_updated = True
+        log.info(
+            "rescan_optional_roles: esp_device_prefix updated %r → %r",
+            stored_prefix, _prefix,
+        )
+
     # Merge optional roles per circuit, counting new rows
     per_circuit: Dict[str, int] = {}
     total_changed = 0
@@ -810,4 +830,5 @@ async def rescan_optional_roles(
         per_circuit=per_circuit,
         fw_version_updated=fw_version_updated,
         fw_version=new_fw,
+        prefix_updated=prefix_updated,
     )

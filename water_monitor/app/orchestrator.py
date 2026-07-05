@@ -590,10 +590,11 @@ class Orchestrator:
                     self._db,
                     [c.circuit for c in self._cfg.circuits],
                 )
-                if _rescan.total_changed:
+                if _rescan.total_changed or _rescan.prefix_updated:
                     log.info(
-                        "Optional-role rescan: %d new entity mapping(s) added — reloading",
-                        _rescan.total_changed,
+                        "Optional-role rescan: %d new entity mapping(s), "
+                        "prefix_updated=%s — reloading",
+                        _rescan.total_changed, _rescan.prefix_updated,
                     )
                     self.reload_circuit_entities()
             except Exception as _e:
