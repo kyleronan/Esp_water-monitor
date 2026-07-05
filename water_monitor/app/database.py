@@ -2919,7 +2919,7 @@ def clear_event_classification(
     row = conn.execute(
         "SELECT duration_seconds, pressure_delta_psi, degraded_supply, "
         "       volume_litres, avg_flow_lpm, true_avg_flow_lpm, "
-        "       flow_integral_litres, flow_on_ratio "
+        "       peak_flow_lpm, flow_integral_litres, flow_on_ratio "
         "FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit),
     ).fetchone()
@@ -2940,7 +2940,9 @@ def clear_event_classification(
         and _detect_low_flow_dribble(
             row["volume_litres"], row["avg_flow_lpm"], row["pressure_delta_psi"],
             calib=_acal,
-            min_flow_lpm=(60.0 / get_circuit_pulses_per_litre(conn, circuit)))
+            min_flow_lpm=(60.0 / get_circuit_pulses_per_litre(conn, circuit)),
+            true_avg_flow_lpm=row["true_avg_flow_lpm"],
+            peak_flow_lpm=row["peak_flow_lpm"])
     ) else 0
     return _apply_event_verdicts(
         conn, event_id, circuit,

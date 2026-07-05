@@ -297,6 +297,13 @@ VOLUME_ENVELOPE_WINDOW_S     = 5.0
 FIXTURE_CYCLE_PERIOD_MAX_S   = 30.0
 MAX_WAVEFORM_BINS            = 1000
 
+# Points in the stored flow/pressure shape signatures (events.flow_signature_json
+# / pressure_signature_json). 32 → 64 (2026-07-05) so short pulses (washer fill
+# pauses) survive into the sparkline and the cluster feature vector. Historical
+# 32-pt rows are NOT recomputed — every consumer (sparkline, classify_flow_shape,
+# cluster_engine's resample-on-expand) is length-agnostic.
+SIGNATURE_POINTS             = 64
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Pressure-restoration phantom guard (added 2026-05-28)
 #
@@ -2491,7 +2498,7 @@ def _persist_waveform(
         log.warning("event_waveforms insert failed for %s: %s", event_id, e)
 
 
-def _flow_signature(flow_readings: list, peak: float, n: int = 32) -> list:
+def _flow_signature(flow_readings: list, peak: float, n: int = SIGNATURE_POINTS) -> list:
     """Resample flow_readings to n points, normalize by peak (0–1).
 
     The series is anchored to start from no-flow: every stored event begins
@@ -2626,9 +2633,9 @@ def _pressure_signature(
     pressure_readings: list,
     pre_event_pressure_psi: float,
     pressure_delta_psi: float,
-    n: int = 32,
+    n: int = SIGNATURE_POINTS,
 ) -> list:
-    """32-point normalized pressure drop (0 = no drop, 1 = full drop at delta_psi)."""
+    """Normalized pressure drop, n points (0 = no drop, 1 = full drop at delta_psi)."""
     if pressure_delta_psi <= 0:
         return [0.0] * n
     drops = []

@@ -213,7 +213,8 @@ def _collect_circuit_history_sync(
     import json
     from ..database import (get_recent_events, get_leak_test_history,
                             get_daily_summaries, get_home_profile)
-    from ..feature_extractor import classify_flow_shape, classify_magnitude_tier
+    from ..feature_extractor import (SIGNATURE_POINTS, _wf_resample,
+                                     classify_flow_shape, classify_magnitude_tier)
     from ..units import load_unit_context
     _units = load_unit_context(db)
     # Read the "hide not-real-use events" display preference once (same for all
@@ -272,6 +273,47 @@ def _collect_circuit_history_sync(
                                or dict(e).get("is_low_flow_dribble"))]
             hidden_not_real = len(events) - len(visible)
             events = visible
+        # Display-time signature upgrade: historical events store a 32-pt
+        # signature, but many carry a hi-res event_waveforms envelope with real
+        # pulse detail. When the envelope is finer than the stored signature,
+        # rebuild a SIGNATURE_POINTS display signature from the per-bin peak
+        # envelope (same normalization + onset anchor as _flow_signature).
+        # Presentation-only — the stored flow_signature_json is a cluster
+        # feature and is never rewritten; the flow_shape word below derives
+        # from the same upgraded array the sparkline draws, so they agree.
+        _ids = [e["id"] for e in events if e.get("id")]
+        _envelopes: dict = {}
+        if _ids:
+            _ph = ",".join("?" * len(_ids))
+            for _row in db.execute(
+                    f"SELECT event_id, flow_max_json FROM event_waveforms "
+                    f"WHERE event_id IN ({_ph})", _ids).fetchall():
+                _envelopes[_row["event_id"]] = _row["flow_max_json"]
+        for e in events:
+            try:
+                _sig = json.loads(e.get("flow_signature_json") or "[]")
+            except (ValueError, TypeError):
+                _sig = []
+            if len(_sig) >= SIGNATURE_POINTS:
+                continue
+            _env_json = _envelopes.get(e.get("id"))
+            if not _env_json:
+                continue
+            try:
+                _env = [float(v) for v in json.loads(_env_json)]
+            except (ValueError, TypeError):
+                continue
+            if len(_env) <= len(_sig):
+                continue        # envelope no finer than the stored signature
+            _peak = max(_env)
+            if _peak <= 0:
+                continue
+            if _env[0] > 0:
+                _env = [0.0] + _env     # onset anchor, as in _flow_signature
+            e["flow_signature_json"] = json.dumps([
+                round(min(max(v / _peak, 0.0), 1.0), 4)
+                for v in _wf_resample(_env, SIGNATURE_POINTS)
+            ])
         # Display-time FLOW-shape label so the History "Shape" word matches the flow
         # sparkline it sits next to (the stored resistance_curve_shape describes the
         # ΔP/Q pressure load, which can read "pulsed" over a flat-flow rectangle).

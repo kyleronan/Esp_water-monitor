@@ -55,21 +55,22 @@ METRICS_WINDOW_HOURS          = 24
 #                       + DTW_DISTANCE_WEIGHT * exp(-dtw_dist / scale)
 # Nothing below touches dtaidistance yet.
 
+# Points in the signature feature block. Matches feature_extractor's
+# SIGNATURE_POINTS for NEW events; stored signatures of any other length
+# (historical 32-pt rows) are linearly resampled to this length at feature-
+# expansion time, so old and new events remain directly comparable.
+SIG_POINTS = 64
+
 FEATURE_KEYS = [
     # Core hydraulic scalars
     'avg_flow_lpm', 'peak_flow_lpm', 'duration_seconds',
     'volume_litres', 'pressure_delta_psi', 'has_pressure_transient',
     'flow_variability', 'hour_sin', 'hour_cos',
     'propagation_delay_ms',
-    # Flow shape — 32-point normalized signature
-    'flow_sig_00', 'flow_sig_01', 'flow_sig_02', 'flow_sig_03',
-    'flow_sig_04', 'flow_sig_05', 'flow_sig_06', 'flow_sig_07',
-    'flow_sig_08', 'flow_sig_09', 'flow_sig_10', 'flow_sig_11',
-    'flow_sig_12', 'flow_sig_13', 'flow_sig_14', 'flow_sig_15',
-    'flow_sig_16', 'flow_sig_17', 'flow_sig_18', 'flow_sig_19',
-    'flow_sig_20', 'flow_sig_21', 'flow_sig_22', 'flow_sig_23',
-    'flow_sig_24', 'flow_sig_25', 'flow_sig_26', 'flow_sig_27',
-    'flow_sig_28', 'flow_sig_29', 'flow_sig_30', 'flow_sig_31',
+] + [
+    # Flow shape — SIG_POINTS-point normalized signature
+    f'flow_sig_{i:02d}' for i in range(SIG_POINTS)
+] + [
     # Edge complexity
     'flow_edge_count',
     # Open/close dynamics
@@ -86,23 +87,19 @@ FEATURE_KEYS = [
     'pressure_transient_energy', 'pressure_transient_duration_ms',
     # Pressure transient shape features
     'pressure_onset_ms', 'recovery_overshoot_psi', 'pressure_oscillation_count',
-    # Pressure drop signature — 32-point normalized drop curve
-    'pressure_sig_00', 'pressure_sig_01', 'pressure_sig_02', 'pressure_sig_03',
-    'pressure_sig_04', 'pressure_sig_05', 'pressure_sig_06', 'pressure_sig_07',
-    'pressure_sig_08', 'pressure_sig_09', 'pressure_sig_10', 'pressure_sig_11',
-    'pressure_sig_12', 'pressure_sig_13', 'pressure_sig_14', 'pressure_sig_15',
-    'pressure_sig_16', 'pressure_sig_17', 'pressure_sig_18', 'pressure_sig_19',
-    'pressure_sig_20', 'pressure_sig_21', 'pressure_sig_22', 'pressure_sig_23',
-    'pressure_sig_24', 'pressure_sig_25', 'pressure_sig_26', 'pressure_sig_27',
-    'pressure_sig_28', 'pressure_sig_29', 'pressure_sig_30', 'pressure_sig_31',
+] + [
+    # Pressure drop signature — SIG_POINTS-point normalized drop curve
+    f'pressure_sig_{i:02d}' for i in range(SIG_POINTS)
 ]
 
 # Per-dimension weights for weighted Euclidean distance.
-# Pressure shape (0.8) > flow shape (0.4); scalars default 1.0; hour sinusoids 0.2.
+# Pressure shape > flow shape; scalars default 1.0; hour sinusoids 0.2.
+# Per-dim values are halved from the 32-pt era (0.4/0.8 → 0.2/0.4) so the
+# TOTAL shape weight in the distance is unchanged at 64 dims.
 BASE_FEATURE_WEIGHTS: Dict[str, float] = {k: 1.0 for k in FEATURE_KEYS}
-for _i in range(32):
-    BASE_FEATURE_WEIGHTS[f'flow_sig_{_i:02d}']     = 0.4
-    BASE_FEATURE_WEIGHTS[f'pressure_sig_{_i:02d}'] = 0.8
+for _i in range(SIG_POINTS):
+    BASE_FEATURE_WEIGHTS[f'flow_sig_{_i:02d}']     = 0.2
+    BASE_FEATURE_WEIGHTS[f'pressure_sig_{_i:02d}'] = 0.4
 BASE_FEATURE_WEIGHTS['hour_sin'] = 0.2
 BASE_FEATURE_WEIGHTS['hour_cos'] = 0.2
 
@@ -116,6 +113,43 @@ BASE_FEATURE_WEIGHTS['peak_flow_lpm']              = 2.0
 BASE_FEATURE_WEIGHTS['time_to_90pct_flow_seconds'] = 1.5
 BASE_FEATURE_WEIGHTS['flow_edge_count']            = 1.5
 BASE_FEATURE_WEIGHTS['propagation_delay_ms']       = 0.1
+
+
+def _resample_sig(points, n):
+    """Linearly resample a signature to exactly n points (identity if already n)."""
+    if len(points) == n:
+        return points
+    if not points:
+        return [0.0] * n
+    if len(points) == 1:
+        return [points[0]] * n
+    out = []
+    for i in range(n):
+        pos = i * (len(points) - 1) / (n - 1)
+        lo = int(pos)
+        hi = min(lo + 1, len(points) - 1)
+        out.append(points[lo] * (1 - (pos - lo)) + points[hi] * (pos - lo))
+    return out
+
+
+def _load_centroid(text) -> dict:
+    """json.loads a stored centroid and resample its sig blocks to SIG_POINTS.
+
+    Centroids written before the 32→64 signature change carry flow_sig_00..31 /
+    pressure_sig_00..31; comparing them raw against a 64-pt event would zero-
+    fill dims 32..63 and inflate the distance. Raises on invalid JSON — callers
+    keep their existing error handling."""
+    centroid = json.loads(text)
+    for prefix in ('flow_sig', 'pressure_sig'):
+        keys = sorted(k for k in centroid if k.startswith(prefix + '_'))
+        if len(keys) == SIG_POINTS:
+            continue
+        vals = _resample_sig([float(centroid[k]) for k in keys], SIG_POINTS)
+        for k in keys:
+            del centroid[k]
+        for i, v in enumerate(vals):
+            centroid[f'{prefix}_{i:02d}'] = v
+    return centroid
 
 
 class ClusterEngine:
@@ -284,29 +318,21 @@ class ClusterEngine:
             'pressure_oscillation_count':    float(event.get('pressure_oscillation_count')    or 0),
         }
 
-        # Expand JSON signature → flow_sig_00 … flow_sig_31
-        sig_json = event.get('flow_signature_json')
-        if sig_json:
-            try:
-                sig = json.loads(sig_json)
-                for i, v in enumerate(sig[:32]):
-                    features[f'flow_sig_{i:02d}'] = float(v)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
-        for i in range(32):
-            features.setdefault(f'flow_sig_{i:02d}', 0.0)
-
-        # Expand pressure signature → pressure_sig_00 … pressure_sig_31
-        p_sig_json = event.get('pressure_signature_json')
-        if p_sig_json:
-            try:
-                p_sig = json.loads(p_sig_json)
-                for i, v in enumerate(p_sig[:32]):
-                    features[f'pressure_sig_{i:02d}'] = float(v)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
-        for i in range(32):
-            features.setdefault(f'pressure_sig_{i:02d}', 0.0)
+        # Expand JSON signatures → flow_sig_* / pressure_sig_* (SIG_POINTS each).
+        # Stored signatures may be any length (historical rows are 32-pt) —
+        # resample to SIG_POINTS so old and new events share one feature space.
+        for prefix, col in (('flow_sig', 'flow_signature_json'),
+                            ('pressure_sig', 'pressure_signature_json')):
+            sig_json = event.get(col)
+            if sig_json:
+                try:
+                    sig = [float(v) for v in json.loads(sig_json)]
+                    for i, v in enumerate(_resample_sig(sig, SIG_POINTS)):
+                        features[f'{prefix}_{i:02d}'] = v
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+            for i in range(SIG_POINTS):
+                features.setdefault(f'{prefix}_{i:02d}', 0.0)
 
         return features
 
@@ -453,7 +479,7 @@ class ClusterEngine:
                 (circuit, cluster_id)
             ).fetchone()
             try:
-                old_centroid = json.loads(row["centroid"]) if row and row["centroid"] else {}
+                old_centroid = _load_centroid(row["centroid"]) if row and row["centroid"] else {}
             except (json.JSONDecodeError, TypeError):
                 old_centroid = {}
             new_centroid = {
@@ -482,7 +508,7 @@ class ClusterEngine:
         if not row or not row["centroid"]:
             return
         try:
-            centroid = json.loads(row["centroid"])
+            centroid = _load_centroid(row["centroid"])
         except (json.JSONDecodeError, TypeError):
             return
         ct_row = self._db.execute(
@@ -626,7 +652,7 @@ class ClusterEngine:
                     (circuit, candidate_id),
                 ).fetchone()
                 if row and row["centroid"]:
-                    db_orig   = json.loads(row["centroid"])
+                    db_orig   = _load_centroid(row["centroid"])
                     db_feat   = {k: float(db_orig.get(k, 0)) for k in FEATURE_KEYS}
                     db_scaled = scaler.transform_one(db_feat)
                     weights   = self._build_match_weights(fixture_type)
@@ -721,7 +747,7 @@ class ClusterEngine:
                     (circuit, candidate_id),
                 ).fetchone()
                 if row and row["centroid"]:
-                    db_orig   = json.loads(row["centroid"])
+                    db_orig   = _load_centroid(row["centroid"])
                     db_feat   = {k: float(db_orig.get(k, 0)) for k in FEATURE_KEYS}
                     db_scaled = scaler.transform_one(db_feat)
                     weights   = self._build_match_weights(fixture_type)
@@ -963,7 +989,7 @@ class ClusterEngine:
                     centroids_scaled = {}
                     for cl in eligible:
                         try:
-                            raw = json.loads(cl["centroid"] or "{}")
+                            raw = _load_centroid(cl["centroid"] or "{}")
                             feat = {k: float(raw.get(k, 0)) for k in FEATURE_KEYS}
                             centroids_scaled[cl["id"]] = scaler.transform_one(feat)
                         except Exception:
@@ -1058,7 +1084,7 @@ class ClusterEngine:
             best_db_id, best_dist = None, float('inf')
             for db_row in db_rows:
                 try:
-                    db_orig = json.loads(db_row["centroid"])
+                    db_orig = _load_centroid(db_row["centroid"])
                     db_feat = {k: float(db_orig.get(k, 0)) for k in FEATURE_KEYS}
                     db_scaled = scaler.transform_one(db_feat)
                 except Exception:
