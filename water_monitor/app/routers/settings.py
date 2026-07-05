@@ -387,6 +387,8 @@ async def profile_update(request: Request):
         occupants=coerce_int(form.get("occupants"),           lo=1, hi=30, default=2),
         build_year=build_year,
         supply_type=form.get("supply_type", "mains"),
+        # Unchecked checkboxes are absent from the form body — absence = off.
+        epa_flush_cap_enabled=1 if form.get("epa_flush_cap_enabled") else 0,
         setup_complete=1,
     )
     return ingress_redirect(request, "/settings#profile")

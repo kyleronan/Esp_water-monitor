@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.3.1-dev17] — 2026-07-05 — Toilet physics veto: no more impossible "Toilet" labels
+
+On a fresh install, physically-impossible events (a 0.1 gal spiky trickle, a
+pulsing two-hump draw) rendered as "Toilet". Root cause: the cluster
+suggestion is computed on the cluster CENTROID and every member event
+inherits it at display/rollup time with no per-event check; the k-NN and
+rule tiers had guards, the inheritance path had none.
+
+- **New veto** (`event_rules.toilet_physics_veto`): a toilet label — from any
+  tier (rule / fingerprint / k-NN) or inherited from a cluster suggestion —
+  is dropped to an abstention when the EVENT cannot be a single cistern
+  refill: volume below 2.8 L (smallest flush ever manufactured is 0.8 gpf ≈
+  3.0 L, minus a rating-vs-metered margin), volume above the home's era cap,
+  peak flow < 3 L/min, or > 2 debounced active-flow segments (a flush is one
+  continuous refill). Missing features never veto; vetoed events fall to the
+  "Other" catch-all, never to a different guess.
+- **EPA/era flush cap** from `home_profile.build_year`: pre-1982 ≈ 7 gpf,
+  1982–1993 ≈ 3.5 gpf, 1994+ (Energy Policy Act of 1992) ≈ 1.6 gpf, each
+  ×1.15 for bowl-refill + rating tolerance. New Settings → Home Profile
+  toggle "Use home age to size toilet flushes" (`epa_flush_cap_enabled`,
+  default ON; migration 20260555); off or year-unknown falls back to the
+  pre-1982 bound, so the floor/shape veto still applies.
+- Applied at: live classify (feature_extractor), reclassify backfill,
+  History list + fixture filter (`get_recent_events` — pill and filter can
+  never disagree), and the Water Use rollup (`get_category_rollup` — vetoed
+  water counts under Other, not Toilet).
+- 13 new tests (test_toilet_veto.py); full suite 1049 green.
+
 ## [firmware 3.13.0] — 2026-07-04 — pulse_meter flow measurement (edge-period timing), both circuits
 
 Motivated by the main circuit's new positive-displacement oval-gear meter

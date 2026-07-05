@@ -158,6 +158,72 @@ _SHOWER_SMALL_DUR_S: float = 240.0
 _ZONE_MIN_DUR_S: float = 240.0
 _ZONE_MIN_PK_LPM: float = 5.0
 
+# ── Toilet physics veto (dev17) ─────────────────────────────────────────────────
+# A toilet flush is a SINGLE continuous cistern refill with a hard physical
+# volume floor and an era-bounded ceiling. Any tier proposing 'toilet' for an
+# event that violates these bounds is wrong by construction — the veto turns
+# that proposal into an abstention (the event falls to the "Other" catch-all,
+# never to a different fixture guess). STRUCTURAL — never in RULE_DEFAULTS:
+# these are manufacturing/regulatory facts, not per-home behaviour to calibrate.
+#
+# Floor: the smallest flush ever manufactured is 0.8 gpf ≈ 3.0 L (ultra-high-
+# efficiency full flush; dual-flush half-flush bottoms out at the same 0.8 gal).
+# 2.8 L = that floor minus a margin for mfg-rating-vs-metered mismatch.
+#
+# Era ceilings (US federal/EPA history), applied from home_profile.build_year
+# when the epa_flush_cap_enabled toggle is on:
+#   pre-1982 homes ..... conventional cisterns up to 7 gpf (26.5 L)
+#   1982–1993 .......... 3.5 gpf (13.2 L) reduced-flush era
+#   1994+ .............. Energy Policy Act of 1992: 1.6 gpf (6.1 L) legal max
+# Each ceiling gets a margin for bowl-refill draw + rating tolerance. A home
+# older than its toilets only over-allows (never vetoes a real flush), so the
+# build year is a safe upper-bound proxy; renovated homes can turn the cap off.
+TOILET_MIN_FLUSH_L: float = 2.8
+TOILET_VETO_MIN_PK_LPM: float = 3.0     # matches the cluster toilet rule's flow floor
+TOILET_VETO_MAX_SEGMENTS: int = 2       # one refill; allow 2 for sampling jitter
+_TOILET_CAP_MARGIN: float = 1.15        # bowl refill + mfg rating tolerance
+_TOILET_ERA_CAPS_L: Tuple[Tuple[int, float], ...] = (
+    (1994, 6.1),    # 1.6 gpf — Energy Policy Act of 1992 (effective 1994)
+    (1982, 13.2),   # 3.5 gpf era
+)
+_TOILET_CAP_FALLBACK_L: float = 26.5    # 7 gpf — pre-1982 / year unknown / cap off
+
+
+def toilet_flush_cap_litres(build_year: Optional[int] = None,
+                            cap_enabled: bool = True) -> float:
+    """Upper bound (litres, margin included) a single flush can meter in this home.
+
+    ``cap_enabled`` off, or an unknown/implausible ``build_year``, falls back to
+    the pre-1982 ceiling — the veto then only rejects events no toilet in
+    history could produce.
+    """
+    if cap_enabled and build_year:
+        for year, cap in _TOILET_ERA_CAPS_L:
+            if build_year >= year:
+                return cap * _TOILET_CAP_MARGIN
+    return _TOILET_CAP_FALLBACK_L * _TOILET_CAP_MARGIN
+
+
+def toilet_physics_veto(features: Dict[str, Any], cap_litres: float) -> bool:
+    """True = this event physically cannot be a single toilet flush.
+
+    Reads ``volume_litres``, ``peak_flow_lpm`` and ``active_flow_segment_count``
+    from ``features``; a missing/None value never vetoes (no evidence, no veto).
+    Deliberately NOT symmetric with is_flush_shaped: that rule says "looks like
+    a flush", this one says "cannot be a flush" — only the latter may override
+    another tier's positive evidence (e.g. a k-NN vote).
+    """
+    vol = _f(features, "volume_litres")
+    if vol is not None and (vol < TOILET_MIN_FLUSH_L or vol > cap_litres):
+        return True
+    pk = _f(features, "peak_flow_lpm")
+    if pk is not None and pk < TOILET_VETO_MIN_PK_LPM:
+        return True
+    seg = _f(features, "active_flow_segment_count")
+    if seg is not None and seg > TOILET_VETO_MAX_SEGMENTS:
+        return True
+    return False
+
 
 # ── Per-home calibration plumbing (Phase 1) ─────────────────────────────────────
 # event_rules ships the defaults above; a frozen per-home fit (rule_calibration.py)

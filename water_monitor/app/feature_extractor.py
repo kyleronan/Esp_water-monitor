@@ -4374,6 +4374,27 @@ class FeatureExtractor:
                     circuit, e,
                 )
 
+        # Toilet physics veto (dev17): whatever tier proposed 'toilet' (rule /
+        # fingerprint / k-NN), the event must be physically able to BE a single
+        # cistern refill — hard volume floor, era-capped ceiling (EPA flush
+        # standards keyed on home_profile.build_year), peak floor, one segment.
+        # Vetoed → abstain (never re-guess another type). Never fatal.
+        if matched_fixture_type == "toilet":
+            try:
+                from .database import get_toilet_flush_cap_litres
+                from .event_rules import toilet_physics_veto
+                cap = get_toilet_flush_cap_litres(self._db)
+                if toilet_physics_veto(features, cap):
+                    log.info("[%s] event %s: toilet match (%s) vetoed by flush "
+                             "physics (vol=%s L, peak=%s lpm, cap=%.1f L)",
+                             circuit, event_id, matched_via,
+                             features.get("volume_litres"),
+                             features.get("peak_flow_lpm"), cap)
+                    matched_fixture_type, matched_via = None, None
+            except Exception as e:
+                log.warning("[%s] toilet physics veto failed (non-fatal): %s",
+                            circuit, e)
+
         # Phase 2.3 — score the event against the FROZEN baseline now that its type
         # is known, and persist the verdict (reviving the dormant anomaly columns +
         # the daily anomaly_count rollup). Stash it on `features` so the _process

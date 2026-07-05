@@ -127,7 +127,12 @@ _BASELINE_VERSION: int = 20260523
 #              rise_corr_backfill_done (one-shot stamp for the HA-history corr
 #              backfill worker). DDL only; the column backfill is the
 #              rise_corr_backfill worker, NOT a migration (needs HA fetches).
-_CURRENT_VERSION: int = 20260554
+#   20260555 — toilet physics veto (dev17): home_profile.epa_flush_cap_enabled
+#              (DEFAULT 1) — derive the veto's flush-volume ceiling from
+#              build_year via the EPA/federal flush-standard eras. DDL only; the
+#              veto applies at display/rollup/classify time, no backfill (the
+#              next reclassify pass clears vetoed stored toilet matches).
+_CURRENT_VERSION: int = 20260555
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1105,6 +1110,28 @@ def _apply_flow_pressure_corr(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260554: flow_pressure_corr + rise_corr_backfill_done ready")
 
 
+def _apply_epa_flush_cap_flag(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260555 — toilet physics veto (dev17).
+
+    Adds ``home_profile.epa_flush_cap_enabled`` (INTEGER NOT NULL DEFAULT 1):
+    when 1, the toilet veto's flush-volume ceiling is derived from
+    ``home_profile.build_year`` via the EPA/federal flush-standard eras
+    (pre-1982 ≈ 7 gpf, 1982–1993 ≈ 3.5 gpf, 1994+ ≈ 1.6 gpf); when 0 the
+    ceiling falls back to the pre-1982 bound. The 2.8 L floor and the
+    single-refill shape veto are structural and unaffected by this flag.
+    DDL only. Guarded + idempotent.
+    """
+    has_profile = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='home_profile'"
+    ).fetchone()
+    if has_profile and not _has_column(conn, "home_profile",
+                                       "epa_flush_cap_enabled"):
+        conn.execute("ALTER TABLE home_profile ADD COLUMN "
+                     "epa_flush_cap_enabled INTEGER NOT NULL DEFAULT 1")
+    conn.commit()
+    log.info("Migration 20260555: epa_flush_cap_enabled ready")
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -1467,6 +1494,13 @@ def _missing_flow_pressure_corr_columns(conn: sqlite3.Connection) -> set[str]:
     return missing
 
 
+def _missing_epa_flush_cap_columns(conn: sqlite3.Connection) -> set[str]:
+    """Return the 20260555 epa_flush_cap_enabled column if absent."""
+    if not _has_column(conn, "home_profile", "epa_flush_cap_enabled"):
+        return {"home_profile.epa_flush_cap_enabled"}
+    return set()
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -1561,6 +1595,7 @@ _MIGRATIONS: tuple = (
     (20260552, _apply_fingerprint_labeling_flag),
     (20260553, _apply_review_verdict_column),
     (20260554, _apply_flow_pressure_corr),
+    (20260555, _apply_epa_flush_cap_flag),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -1628,6 +1663,7 @@ def _run_migrations_impl(
             | _missing_embedded_fixtures_columns(conn)
             | _missing_cross_talk_audit_table(conn)
             | _missing_flow_pressure_corr_columns(conn)
+            | _missing_epa_flush_cap_columns(conn)
         )
         if missing:
             raise RuntimeError(

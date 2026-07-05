@@ -162,6 +162,24 @@
               </select>
             </div>
           </div>
+          <div class="sett-toggle-row" style="margin:10px 0 14px">
+            <div class="sett-toggle-info">
+              <span class="sett-toggle-label">Use home age to size toilet flushes</span>
+              <span class="sett-toggle-desc">
+                US flush standards changed over time (up to 7 gal before 1982,
+                3.5 gal through 1993, 1.6 gal since 1994 — EPA/federal rules).
+                When on (the default), the year built above sets the largest
+                volume the monitor will ever call a toilet flush, so oversized
+                draws aren't mislabeled “Toilet”. Turn off if your toilets are
+                older than the home (e.g. reinstalled fixtures).
+              </span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" name="epa_flush_cap_enabled" value="1"
+                     {% if profile.epa_flush_cap_enabled %}checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
           <button type="submit" class="btn btn-primary btn-sm">Save Profile</button>
         </form>
       </div>

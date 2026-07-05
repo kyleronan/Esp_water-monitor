@@ -217,6 +217,12 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- 20260554, dev14): 1 = the historical flow_pressure_corr sweep finished
     -- (or found nothing computable) — the worker never runs again.
     rise_corr_backfill_done        INTEGER NOT NULL DEFAULT 0,
+    -- Toilet physics veto era cap (migration 20260555, dev17): when 1, the
+    -- veto's flush-volume ceiling derives from build_year via the EPA/federal
+    -- flush-standard eras (event_rules.toilet_flush_cap_litres); when 0 (or
+    -- build_year unknown) the ceiling falls back to the pre-1982 7 gpf bound.
+    -- The 2.8 L floor + single-refill shape veto are structural and always on.
+    epa_flush_cap_enabled          INTEGER NOT NULL DEFAULT 1,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -2507,13 +2513,61 @@ def compute_ha_weekly_volume(
     return round(max(0.0, current_ha_value - baseline), 1)
 
 
+def get_toilet_flush_cap_litres(conn: sqlite3.Connection) -> float:
+    """Per-home flush-volume ceiling for the toilet physics veto (dev17).
+
+    Reads ``home_profile.build_year`` + ``epa_flush_cap_enabled`` and maps them
+    through the EPA/federal era table in event_rules. Missing column (mid-
+    migration) or missing profile row degrades to the generous pre-1982 bound.
+    """
+    from .event_rules import toilet_flush_cap_litres
+    build_year, enabled = None, True
+    try:
+        row = conn.execute(
+            "SELECT build_year, epa_flush_cap_enabled FROM home_profile "
+            "WHERE id = 1").fetchone()
+        if row is not None:
+            build_year = row["build_year"]
+            enabled = bool(row["epa_flush_cap_enabled"])
+    except sqlite3.OperationalError:     # column mid-migration
+        pass
+    return toilet_flush_cap_litres(build_year, enabled)
+
+
+def _suggested_type_vetoed_sql(cap_litres: float) -> str:
+    """SQL for the cluster suggestion with the toilet physics veto applied.
+
+    A cluster's 'toilet' suggestion describes the CENTROID; the event itself
+    inherits it at display/rollup time with no per-event check, which is how a
+    0.4 L trickle can render as "Toilet". This CASE nulls the inherited
+    suggestion when the EVENT violates flush physics (below the manufactured
+    floor, above the home's era cap, peak too low, or a multi-segment draw —
+    a cistern refill is one continuous segment). NULL-safe: a missing feature
+    never vetoes. Mirrors event_rules.toilet_physics_veto — keep in sync.
+    Numeric literals are inlined (module constants, never user input).
+    """
+    from .event_rules import (TOILET_MIN_FLUSH_L, TOILET_VETO_MAX_SEGMENTS,
+                              TOILET_VETO_MIN_PK_LPM)
+    return (
+        "CASE WHEN fc.suggested_type = 'toilet' AND ("
+        f"COALESCE(e.volume_litres, {TOILET_MIN_FLUSH_L}) < {TOILET_MIN_FLUSH_L} "
+        f"OR COALESCE(e.volume_litres, 0) > {cap_litres:.3f} "
+        f"OR COALESCE(e.peak_flow_lpm, {TOILET_VETO_MIN_PK_LPM}) "
+        f"   < {TOILET_VETO_MIN_PK_LPM} "
+        f"OR COALESCE(e.active_flow_segment_count, 1) > {TOILET_VETO_MAX_SEGMENTS}"
+        ") THEN NULL ELSE fc.suggested_type END"
+    )
+
+
 # Fixture filter: the row's EFFECTIVE label, matching the History display chain
 # (user label > confirmed fixture record's type > k-NN match > cluster suggestion).
 # NULLIF guards empty-string user labels; a NULL chain renders as the "Other"
-# fallback pill and is selectable via fixture_type='unlabelled'.
-_EFFECTIVE_FIXTURE_SQL = ("COALESCE(NULLIF(e.user_fixture_type, ''), "
-                          "f.fixture_type, e.matched_fixture_type, "
-                          "fc.suggested_type)")
+# fallback pill and is selectable via fixture_type='unlabelled'. The cluster-
+# suggestion leg carries the toilet physics veto (format with
+# _suggested_type_vetoed_sql(cap) before use).
+_EFFECTIVE_FIXTURE_SQL_TMPL = ("COALESCE(NULLIF(e.user_fixture_type, ''), "
+                               "f.fixture_type, e.matched_fixture_type, "
+                               "{suggested})")
 
 # Note filter: categorical over the pill kinds the History "Note" column renders.
 # Each entry is a self-contained predicate; 'none' = a row with no pills at all.
@@ -2581,13 +2635,19 @@ def get_recent_events(
         DISPLAYED number, COALESCE(true_avg_flow_lpm, avg_flow_lpm) — the
         idle-gap-excluded average when available, same as the Avg flow column;
       • fixture_type — a canonical type matched against the effective-label
-        chain (_EFFECTIVE_FIXTURE_SQL), or 'unlabelled' for a NULL chain;
+        chain (_EFFECTIVE_FIXTURE_SQL_TMPL), or 'unlabelled' for a NULL chain;
       • note_kind — one of _NOTE_KIND_SQL's pill categories.
     Callers pass STORAGE units — display-unit conversion is the router's job.
     """
-    _select = """
+    # Toilet physics veto (dev17): the suggestion an event INHERITS from its
+    # cluster is nulled when the event itself cannot be a flush — both in the
+    # returned suggested_type (the History pill) and in the fixture filter, so
+    # the filter can never surface a row the pill would not show as toilet.
+    _suggested_sql = _suggested_type_vetoed_sql(get_toilet_flush_cap_litres(conn))
+    _effective_sql = _EFFECTIVE_FIXTURE_SQL_TMPL.format(suggested=_suggested_sql)
+    _select = f"""
         SELECT e.*,
-               fc.suggested_type,
+               {_suggested_sql}      AS suggested_type,
                fc.suggested_confidence,
                fc.confidence_level   AS cluster_confidence_level,
                f.display_name        AS fixture_display_name,
@@ -2640,9 +2700,9 @@ def get_recent_events(
             "COALESCE(e.true_avg_flow_lpm, e.avg_flow_lpm, 0) <= ?")
         params.append(flow_max_lpm)
     if fixture_type == "unlabelled":
-        conditions.append(f"{_EFFECTIVE_FIXTURE_SQL} IS NULL")
+        conditions.append(f"{_effective_sql} IS NULL")
     elif fixture_type:
-        conditions.append(f"{_EFFECTIVE_FIXTURE_SQL} = ?")
+        conditions.append(f"{_effective_sql} = ?")
         params.append(fixture_type)
     if note_kind in _NOTE_KIND_SQL:
         conditions.append(_NOTE_KIND_SQL[note_kind])
@@ -4671,11 +4731,14 @@ def get_category_rollup(
     """
     # None (the "lifetime" range) → '' so the windowed CASE matches every row.
     bound = range_start_utc if range_start_utc is not None else ""
+    # Toilet physics veto (dev17) on the cluster-suggestion leg — an event that
+    # cannot be a flush must not roll its water into the Toilet card either.
+    _suggested_sql = _suggested_type_vetoed_sql(get_toilet_flush_cap_litres(conn))
     rows = conn.execute(
-        """
+        f"""
         SELECT
           COALESCE(e.user_fixture_type, f.fixture_type, e.matched_fixture_type,
-                   fc.suggested_type, 'other') AS eff_type,
+                   {_suggested_sql}, 'other') AS eff_type,
           COALESCE(SUM(COALESCE(e.volume_litres_effective, e.volume_litres, 0)), 0)
                                                           AS lifetime_volume_l,
           COUNT(*)                                        AS lifetime_event_count,
@@ -5161,6 +5224,10 @@ def reclassify_all_events_from_signatures(
         except Exception as e:  # noqa: BLE001 — tier is optional, never fatal
             log.warning("[%s] fingerprint library unavailable: %s", circuit, e)
 
+    # Toilet physics veto (dev17) — cap computed once for the whole pass.
+    from .event_rules import toilet_physics_veto
+    _toilet_cap = get_toilet_flush_cap_litres(conn)
+
     where = "WHERE circuit = ? AND user_fixture_type IS NULL"
     qparams: list = [circuit]
     if since_ts is not None:
@@ -5168,7 +5235,8 @@ def reclassify_all_events_from_signatures(
         qparams.append(since_ts)
     select_cols = list(dict.fromkeys(
         ("id", "matched_fixture_type", "matched_via", "cycle_group_id",
-         "excluded_from_training") + qfeats + _SCORE_COLS))
+         "excluded_from_training", "active_flow_segment_count")
+        + qfeats + _SCORE_COLS))
     rows = conn.execute(
         "SELECT " + ", ".join(select_cols) + " "
         "FROM events "
@@ -5227,6 +5295,17 @@ def reclassify_all_events_from_signatures(
                     if new_type in CYCLE_ONLY_FIXTURE_TYPES:
                         new_type = None
                     new_via = "knn" if new_type is not None else None
+            # Toilet physics veto (dev17): whatever tier proposed 'toilet'
+            # (rule / fingerprint / k-NN), the event must be physically able
+            # to BE a flush. Vetoed → abstain (never re-guess another type).
+            if new_type == "toilet":
+                vfeats = dict(feats)
+                vfeats["active_flow_segment_count"] = r["active_flow_segment_count"]
+                if toilet_physics_veto(vfeats, _toilet_cap):
+                    log.info("[%s] event %s: toilet match (%s) vetoed by flush "
+                             "physics (vol=%s L, cap=%.1f L)", circuit, r["id"],
+                             new_via, r["volume_litres"], _toilet_cap)
+                    new_type, new_via = None, None
         prev = r["matched_fixture_type"]
         if (new_type, new_via, new_group) != (
                 prev, r["matched_via"], r["cycle_group_id"]):
