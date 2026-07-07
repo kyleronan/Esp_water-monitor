@@ -68,6 +68,30 @@ landed without a version bump; per-build details are in git history.)
   `home_profile.build_year` (EPA 1994 / 1982 / pre-1982 tiers, new Settings
   toggle), peak-flow floor, segment count. Applied at classify, backfill,
   History, and rollups (migration 20260555).
+- **256-point signatures** — the stored flow/pressure shape signatures widen
+  64 → 256 points so long events stop collapsing into rectangles (at 64 pts a
+  45-min shower got one point per ~42 s; valve ramps and fill tapers vanished).
+  Cluster per-dim weights rescaled so total shape weight is unchanged; every
+  consumer already resamples on load, and migration 20260556 regenerates
+  stored signatures from each event's hi-res waveform envelope where finer
+  (measured ~4 s for 3.3k events; no-waveform rows keep their shorter sigs).
+  Also adds `tools/validate_edge_signatures.py` — an offline LOO k-NN A/B
+  harness for the proposed fixed-time onset/offset "edge signature" matcher
+  block (validate-first; production wiring is a separate step).
+- **Edge signatures in the k-NN matcher** — every event now stores fixed-TIME
+  onset/offset shape vectors (32 cells × 1 s each end, absolute grid,
+  zero-padded; `events.onset/offset_signature_json`). Unlike the proportional
+  signatures, these align valve ramps and fill tapers across event durations —
+  a new first matcher tier (`match_source='active_flow_edges'`) uses them when
+  both the query and enough labelled neighbours carry them, falling back to
+  the existing tiers otherwise. Config chosen by a two-round LOO sweep over
+  344 labelled events (32×1 s beat 16-cell and 0.5 s-cell variants; the wider
+  32 s window is what catches toilet fill-tapers): toilet recall 0.783→0.870,
+  shower 0.878→0.927, tap 0.429→0.486. ESP-captured events recompute edges
+  from the firmware array under the same quality gate as the signatures;
+  migration 20260557 backfills historical events from their waveform
+  envelopes (coarse envelopes smear onto the grid — the configuration the
+  study validated). `tools/eval_knn_classifier.py` mirrors the new tier.
 
 ### Bug Fixes
 

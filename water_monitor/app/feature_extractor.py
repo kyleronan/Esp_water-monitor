@@ -299,10 +299,14 @@ MAX_WAVEFORM_BINS            = 1000
 
 # Points in the stored flow/pressure shape signatures (events.flow_signature_json
 # / pressure_signature_json). 32 → 64 (2026-07-05) so short pulses (washer fill
-# pauses) survive into the sparkline and the cluster feature vector. Historical
-# 32-pt rows are NOT recomputed — every consumer (sparkline, classify_flow_shape,
-# cluster_engine's resample-on-expand) is length-agnostic.
-SIGNATURE_POINTS             = 64
+# pauses) survive; 64 → 256 (2026-07-06) so LONG events stop collapsing into
+# rectangles (at 64 pts a 45-min shower gets one point per ~42 s — valve ramps
+# and fill tapers vanish; at 256 it's ~10.5 s/pt, matching the software capture
+# cadence). Every consumer (sparkline, classify_flow_shape, cluster_engine's
+# resample-on-expand, the History display-upgrade path) is length-agnostic, so
+# historical shorter rows keep working; the dev18 one-shot backfill regenerates
+# them at 256 from event_waveforms where a finer envelope exists.
+SIGNATURE_POINTS             = 256
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pressure-restoration phantom guard (added 2026-05-28)
@@ -2526,6 +2530,200 @@ def _flow_signature(flow_readings: list, peak: float, n: int = SIGNATURE_POINTS)
     return result
 
 
+# ── Edge signatures (dev19) ──────────────────────────────────────────────────
+# Fixed-TIME onset/offset shape vectors for the k-NN matcher. Unlike the
+# PROPORTIONAL 256-pt signature (point i = i/256 through the event — a 45-min
+# shower still gets ~10 s/pt), each edge cell is exactly EDGE_SIG_CELL_SECONDS
+# of absolute time anchored at the event's start (onset) or end (offset), so
+# valve ramps / closing steps / toilet fill-tapers align across durations.
+# Validated LOO over 344 labelled events (see tools/validate_edge_signatures):
+# 32 cells × 1 s (a 32 s window each end — wide enough for toilet fill-tapers,
+# which is where the win came from: toilet recall 0.783→0.870, shower
+# 0.878→0.927, tap 0.429→0.486) beat 16-cell and 0.5 s-cell variants; finer
+# cells added nothing even on ESP-captured events. Zero-padding past a short
+# event's extent mirrors the fingerprint grid's convention.
+EDGE_SIG_CELLS: int = 32
+EDGE_SIG_CELL_SECONDS: float = 1.0
+
+
+def resample_absolute(values, duration_s: float, cell_s: float, n_cells: int,
+                      from_end: bool = False) -> Optional[list]:
+    """Mean-pool a uniform-grid series onto an ABSOLUTE-time cell grid anchored
+    at the series start (or end). Cells past the series' extent are zero-filled.
+    Returns None on unusable input. Pure — shared by the live extractor, the
+    waveform backfill, and the offline validation harness."""
+    if not values or duration_s <= 0:
+        return None
+    n = len(values)
+    dt = duration_s / n
+    out = []
+    for k in range(n_cells):
+        if from_end:
+            t1 = duration_s - k * cell_s
+            t0 = t1 - cell_s
+        else:
+            t0 = k * cell_s
+            t1 = t0 + cell_s
+        i0 = max(0, int(math.floor(t0 / dt)))
+        i1 = min(n, int(math.ceil(t1 / dt)))
+        if i1 <= i0 or t0 >= duration_s or t1 <= 0:
+            out.append(0.0)
+        else:
+            seg = values[i0:i1]
+            out.append(sum(seg) / len(seg))
+    if from_end:
+        out.reverse()               # chronological order within the tail window
+    return out
+
+
+def _edge_signature_pair(flow_values, duration_s: float,
+                         ) -> "Optional[Tuple[list, list]]":
+    """(onset, offset) edge signatures from a uniform-grid flow series —
+    peak-normalized to [0, 1] like _flow_signature (shape, not magnitude),
+    rounded for storage. None when the series can't support them."""
+    vals = []
+    for v in flow_values or []:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            f = 0.0
+        vals.append(f if math.isfinite(f) else 0.0)
+    peak = max(vals, default=0.0)
+    if peak <= 0 or duration_s <= 0:
+        return None
+    norm = [max(0.0, min(1.0, v / peak)) for v in vals]
+    on = resample_absolute(norm, duration_s, EDGE_SIG_CELL_SECONDS,
+                           EDGE_SIG_CELLS)
+    off = resample_absolute(norm, duration_s, EDGE_SIG_CELL_SECONDS,
+                            EDGE_SIG_CELLS, from_end=True)
+    if on is None or off is None:
+        return None
+    return ([round(v, 4) for v in on], [round(v, 4) for v in off])
+
+
+def rebuild_edge_signatures_from_waveforms(conn) -> dict:
+    """dev19 one-shot: backfill onset/offset edge signatures from each event's
+    ``event_waveforms`` envelope (migration 20260557; version stamp = the
+    one-shot guard; the function is idempotent — rows with edges are skipped).
+
+    Only fills NULLs. Deliberately NO envelope-coarseness gate: the validated
+    LOO study computed edges from every stored envelope, including the coarse
+    ones long events get (a 1000-bin envelope on a 45-min event is ~2.7 s/bin —
+    mean-pooling those bins onto the 1 s grid smears, it doesn't fabricate, and
+    the study's numbers INCLUDE that smearing). Gating them out was measured to
+    cost accuracy (production-path eval 0.663 vs 0.677) because it disengaged
+    the tier on the long events the feature targets. Events whose envelope
+    can't produce a pair at all stay NULL and never engage the tier.
+    Returns ``{"scanned", "edges_filled"}``.
+    """
+    rows = conn.execute(
+        "SELECT e.id, w.flow_max_json, w.duration_seconds AS wf_dur "
+        "FROM events e JOIN event_waveforms w ON w.event_id = e.id "
+        "WHERE e.onset_signature_json IS NULL"
+    ).fetchall()
+    scanned = filled = 0
+    for r in rows:
+        scanned += 1
+        try:
+            bins = json.loads(r["flow_max_json"] or "[]")
+            wf_dur = float(r["wf_dur"] or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not bins or wf_dur <= 0:
+            continue
+        pair = _edge_signature_pair(bins, wf_dur)
+        if pair is None:
+            continue
+        conn.execute(
+            "UPDATE events SET onset_signature_json = ?, "
+            "offset_signature_json = ? WHERE id = ?",
+            (json.dumps(pair[0]), json.dumps(pair[1]), r["id"]))
+        filled += 1
+    conn.commit()
+    if filled:
+        log.info("edge-signature backfill: %d/%d events filled "
+                 "(%d cells × %.1f s)", filled, scanned,
+                 EDGE_SIG_CELLS, EDGE_SIG_CELL_SECONDS)
+    return {"scanned": scanned, "edges_filled": filled}
+
+
+def rebuild_signatures_from_waveforms(conn) -> dict:
+    """dev18 one-shot: regenerate stored flow/pressure signatures at the current
+    SIGNATURE_POINTS from each event's ``event_waveforms`` envelope.
+
+    Called by migration 20260556 (the version stamp is the one-shot guard;
+    the function itself is idempotent — an already-current signature is
+    skipped). Only upgrades: the stored signature must be SHORTER than
+    SIGNATURE_POINTS and the waveform envelope FINER than the stored signature,
+    so a rebuild can never degrade fidelity. Flow rebuilds from ``flow_max_json``
+    (peak-normalized, `_flow_signature`); pressure rebuilds from
+    ``pressure_min_json`` (deepest drop per bin) with the event's stored
+    baseline/delta (`_pressure_signature`) — both the exact production
+    functions, so rebuilt rows are indistinguishable from natively-256 ones.
+    ``signature_source`` is untouched: the envelope was written from the same
+    source the provenance already names. Events with no waveform row (pre-
+    retention-window) keep their shorter signatures — every consumer resamples
+    on load, so mixed lengths remain fine.
+
+    Returns ``{"scanned", "flow_upgraded", "pressure_upgraded"}``.
+    """
+    rows = conn.execute(
+        "SELECT e.id, e.flow_signature_json, e.pressure_signature_json, "
+        "       e.pre_event_pressure_psi, e.pressure_delta_psi, "
+        "       w.flow_max_json, w.pressure_min_json "
+        "FROM events e JOIN event_waveforms w ON w.event_id = e.id"
+    ).fetchall()
+
+    def _arr(text):
+        try:
+            v = json.loads(text or "[]")
+            return v if isinstance(v, list) else []
+        except (TypeError, ValueError):
+            return []
+
+    scanned = flow_up = press_up = 0
+    for r in rows:
+        scanned += 1
+        updates: dict = {}
+        cur = _arr(r["flow_signature_json"])
+        bins = _arr(r["flow_max_json"])
+        if len(cur) < SIGNATURE_POINTS and len(bins) > len(cur):
+            try:
+                peak = max(float(v) for v in bins)
+            except (TypeError, ValueError):
+                peak = 0.0
+            if peak > 0:
+                updates["flow_signature_json"] = json.dumps(
+                    _flow_signature(bins, peak))
+        pcur = _arr(r["pressure_signature_json"])
+        pbins = _arr(r["pressure_min_json"])
+        try:
+            pre = float(r["pre_event_pressure_psi"] or 0.0)
+            delta = float(r["pressure_delta_psi"] or 0.0)
+        except (TypeError, ValueError):
+            pre = delta = 0.0
+        if (len(pcur) < SIGNATURE_POINTS and len(pbins) > len(pcur)
+                and pre > 0 and delta > 0):
+            updates["pressure_signature_json"] = json.dumps(
+                _pressure_signature(pbins, pre, delta))
+        if updates:
+            conn.execute(
+                "UPDATE events SET "
+                + ", ".join(f"{k} = ?" for k in updates)
+                + " WHERE id = ?",
+                (*updates.values(), r["id"]),
+            )
+            flow_up += 1 if "flow_signature_json" in updates else 0
+            press_up += 1 if "pressure_signature_json" in updates else 0
+    conn.commit()
+    if flow_up or press_up:
+        log.info("signature rebuild: %d scanned, %d flow / %d pressure "
+                 "signatures regenerated at %d pts",
+                 scanned, flow_up, press_up, SIGNATURE_POINTS)
+    return {"scanned": scanned, "flow_upgraded": flow_up,
+            "pressure_upgraded": press_up}
+
+
 def classify_flow_shape(signature, *, steady_state_fraction=None,
                         flow_rise_rate=None, flow_fall_rate=None,
                         mid_event_flow_drop=None, peak=None) -> str:
@@ -3048,6 +3246,14 @@ def _enrich_from_waveform(
             features["flow_signature_json"] = json.dumps(
                 _flow_signature(record.full_flow, peak_fw)
             )
+            # dev19 — edge signatures ride the same quality gate: the firmware
+            # array is the finest onset/offset source available, and the
+            # uniform-grid assumption holds (fixed onboard sample cadence).
+            _dur = float(features.get("duration_seconds") or 0.0)
+            _edges = _edge_signature_pair(record.full_flow, _dur)
+            if _edges is not None:
+                features["onset_signature_json"] = json.dumps(_edges[0])
+                features["offset_signature_json"] = json.dumps(_edges[1])
             _flow_sig_overridden = True
             any_wf_used = True
 
@@ -3150,6 +3356,9 @@ _WF_UPGRADE_COLUMNS = (
     # quality gate as the signatures; the periodic exclusion reprocess (rise
     # scan) reconciles any verdict drift, exactly like the other columns here.
     "flow_pressure_corr",
+    # dev19 — edge signatures recomputed from the firmware flow array under the
+    # same quality gate as flow_signature_json.
+    "onset_signature_json", "offset_signature_json",
 )
 
 
@@ -3264,6 +3473,11 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15) -> Dict[str
         pre_event_pressure,
         pressure_delta_psi,
     )
+    # dev19 — fixed-time onset/offset edge signatures for the k-NN matcher.
+    # flow_readings are the 1 Hz uniform series (live + importer), so the
+    # absolute grid maps directly; None when the series can't support them
+    # (the matcher's edge tier then simply doesn't engage for this event).
+    edge_pair    = _edge_signature_pair(event.flow_readings, duration)
     pos_edges, neg_edges = _flow_edges(event.flow_readings, peak_flow)
     dynamics     = _flow_dynamics(event.flow_readings, peak_flow)
     mid_drop     = _mid_event_flow_drop(event.flow_readings, peak_flow)
@@ -3436,6 +3650,11 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15) -> Dict[str
         # Flow shape features
         "flow_signature_json":    json.dumps(sig),
         "pressure_signature_json": json.dumps(p_sig),
+        # dev19 edge signatures (absolute-time onset/offset; NULL = uncomputable)
+        "onset_signature_json":   (json.dumps(edge_pair[0])
+                                   if edge_pair else None),
+        "offset_signature_json":  (json.dumps(edge_pair[1])
+                                   if edge_pair else None),
         "positive_edge_count":    pos_edges,
         "negative_edge_count":    neg_edges,
         "flow_edge_count":        pos_edges + neg_edges,

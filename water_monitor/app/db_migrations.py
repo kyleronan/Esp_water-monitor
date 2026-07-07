@@ -132,7 +132,16 @@ _BASELINE_VERSION: int = 20260523
 #              build_year via the EPA/federal flush-standard eras. DDL only; the
 #              veto applies at display/rollup/classify time, no backfill (the
 #              next reclassify pass clears vetoed stored toilet matches).
-_CURRENT_VERSION: int = 20260555
+#   20260556 — dev18: 256-pt signatures. No DDL; one-shot rebuild of stored
+#              flow/pressure signatures from event_waveforms envelopes where the
+#              envelope is finer than the stored signature (long events stop
+#              collapsing to rectangles). No-waveform rows keep shorter sigs
+#              (all consumers resample on load).
+#   20260557 — dev19: edge signatures. events.onset_signature_json /
+#              offset_signature_json (TEXT — 32×1 s fixed-time shape cells for
+#              the k-NN edge tier) + one-shot backfill from every
+#              event_waveforms envelope (the validated configuration).
+_CURRENT_VERSION: int = 20260557
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1132,6 +1141,56 @@ def _apply_epa_flush_cap_flag(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260555: epa_flush_cap_enabled ready")
 
 
+def _apply_sig256_rebuild(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260556 — 256-pt signatures (dev18).
+
+    No DDL. One-shot data pass: regenerate stored flow/pressure signatures at
+    the new SIGNATURE_POINTS (256) from each event's ``event_waveforms``
+    envelope where the envelope is finer than the stored signature — long
+    events stop rendering/clustering as rectangles. Events without a waveform
+    row keep their shorter signatures (every consumer resamples on load).
+    Idempotent (already-256 rows are skipped); measured ~seconds on a
+    3.6k-event home. Guarded for stub DBs without the tables.
+    """
+    has_wf = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_waveforms'"
+    ).fetchone()
+    if has_wf:
+        from .feature_extractor import rebuild_signatures_from_waveforms
+        res = rebuild_signatures_from_waveforms(conn)
+        log.info("Migration 20260556: signatures rebuilt at 256 pts "
+                 "(%d flow / %d pressure of %d scanned)",
+                 res["flow_upgraded"], res["pressure_upgraded"], res["scanned"])
+    else:
+        log.info("Migration 20260556: no event_waveforms table — nothing to rebuild")
+    conn.commit()
+
+
+def _apply_edge_signatures(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260557 — edge signatures (dev19).
+
+    Adds ``events.onset_signature_json`` / ``offset_signature_json`` (TEXT,
+    nullable): fixed-time onset/offset shape vectors (32 cells × 1 s) feeding
+    the k-NN matcher's new edge tier. Then one-shot backfills them from every
+    ``event_waveforms`` envelope (coarse envelopes smear onto the grid — the
+    validated configuration). Guarded + idempotent.
+    """
+    for col in ("onset_signature_json", "offset_signature_json"):
+        if not _has_column(conn, "events", col):
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    has_wf = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_waveforms'"
+    ).fetchone()
+    if has_wf:
+        from .feature_extractor import rebuild_edge_signatures_from_waveforms
+        res = rebuild_edge_signatures_from_waveforms(conn)
+        log.info("Migration 20260557: edge signatures ready (%d/%d backfilled)",
+                 res["edges_filled"], res["scanned"])
+    else:
+        log.info("Migration 20260557: edge-signature columns ready (no waveforms)")
+    conn.commit()
+
+
 def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260529 — Sprint B label propagation.
 
@@ -1484,6 +1543,15 @@ def _missing_cross_talk_audit_table(conn: sqlite3.Connection) -> set[str]:
     return set() if present else {"cross_talk_audit"}
 
 
+def _missing_edge_signature_columns(conn: sqlite3.Connection) -> set[str]:
+    """Return the 20260557 edge-signature columns absent from events."""
+    return {
+        f"events.{col}"
+        for col in ("onset_signature_json", "offset_signature_json")
+        if not _has_column(conn, "events", col)
+    }
+
+
 def _missing_flow_pressure_corr_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the 20260554 rise-phantom columns absent (events + home_profile)."""
     missing: set[str] = set()
@@ -1596,6 +1664,8 @@ _MIGRATIONS: tuple = (
     (20260553, _apply_review_verdict_column),
     (20260554, _apply_flow_pressure_corr),
     (20260555, _apply_epa_flush_cap_flag),
+    (20260556, _apply_sig256_rebuild),
+    (20260557, _apply_edge_signatures),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -1664,6 +1734,7 @@ def _run_migrations_impl(
             | _missing_cross_talk_audit_table(conn)
             | _missing_flow_pressure_corr_columns(conn)
             | _missing_epa_flush_cap_columns(conn)
+            | _missing_edge_signature_columns(conn)
         )
         if missing:
             raise RuntimeError(

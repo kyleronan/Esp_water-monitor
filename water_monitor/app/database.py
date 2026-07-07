@@ -746,6 +746,13 @@ CREATE TABLE IF NOT EXISTS events (
     -- DOWN); positive = flow rode a city-pressure RISE (rising-pressure
     -- phantom discriminator). NULL = not computed (short waveforms / legacy).
     flow_pressure_corr               REAL,
+    -- Edge signatures (migration 20260557, dev19): fixed-TIME onset/offset
+    -- shape vectors (EDGE_SIG_CELLS × EDGE_SIG_CELL_SECONDS absolute grid,
+    -- peak-normalized, zero-padded past the event's extent). Feed the k-NN
+    -- matcher's edge tier — unlike the proportional signatures above, these
+    -- align valve/fill dynamics across event durations. NULL = uncomputable.
+    onset_signature_json             TEXT,
+    offset_signature_json            TEXT,
     positive_edge_count              INTEGER DEFAULT 0,
     negative_edge_count              INTEGER DEFAULT 0,
     flow_edge_count                  INTEGER DEFAULT 0,
@@ -4499,6 +4506,44 @@ _SIGNATURE_KNN_ACTIVE_SCALES: dict = {
     "hour_cos":                    0.35,
 }
 
+# ── Edge-signature k-NN tier (dev19) ─────────────────────────────────────────
+# Fixed-time onset/offset shape cells (events.onset_signature_json /
+# offset_signature_json) as an EXTRA feature block on top of the active-flow
+# tier. Cell count/size pinned to feature_extractor.EDGE_SIG_CELLS /
+# EDGE_SIG_CELL_SECONDS (32 × 1 s — asserted equal by test_edge_signatures);
+# duplicated here to avoid a module-level import cycle. Per-dim scale 1.0 and
+# the 32×1 s grid are the LOO-sweep optimum (tools/validate_edge_signatures on
+# 344 labelled events: toilet recall 0.783→0.870, shower 0.878→0.927, tap
+# 0.429→0.486; wider window beat finer cells — the toilet fill-taper needs
+# ~30 s of tail). Cells are linear in [0, 1], never log-compressed.
+_EDGE_SIG_CELLS: int = 32
+_SIGNATURE_KNN_EDGE_SCALE: float = 1.0
+_SIGNATURE_KNN_EDGE_FEATURES: tuple = tuple(
+    f"onset_{i:02d}" for i in range(_EDGE_SIG_CELLS)) + tuple(
+    f"offset_{i:02d}" for i in range(_EDGE_SIG_CELLS))
+
+
+def _expand_edge_features(d: dict) -> bool:
+    """Expand onset/offset_signature_json into the per-cell keys the k-NN
+    distance reads (``onset_00``..``offset_31``), IN PLACE. Returns True only
+    when both decode to exactly ``_EDGE_SIG_CELLS`` numeric cells — the edge
+    tier's engagement test for queries and neighbours alike."""
+    try:
+        on = json.loads(d.get("onset_signature_json") or "null")
+        off = json.loads(d.get("offset_signature_json") or "null")
+    except (TypeError, ValueError):
+        return False
+    if (not isinstance(on, list) or not isinstance(off, list)
+            or len(on) != _EDGE_SIG_CELLS or len(off) != _EDGE_SIG_CELLS):
+        return False
+    try:
+        for i in range(_EDGE_SIG_CELLS):
+            d[f"onset_{i:02d}"] = float(on[i])
+            d[f"offset_{i:02d}"] = float(off[i])
+    except (TypeError, ValueError):
+        return False
+    return True
+
 
 def _knn_transform(feat: str, value, log_features: frozenset) -> float:
     """log1p the right-skewed features (per ``log_features``), identity for the
@@ -5065,6 +5110,57 @@ def match_event_to_signature_knn(
         for f in ("true_avg_flow_lpm", "active_flow_duration_seconds", "flow_on_ratio")
     )
     if query_has_active:
+        # 1a) Edge tier (dev19): active features + the fixed-time onset/offset
+        #     shape cells. Gated exactly like the active tier itself: the QUERY
+        #     must carry decodable edge signatures AND enough labelled
+        #     neighbours must too (no zero-filling absent edges — a missing
+        #     signature is missing data, not a flat shape).
+        #
+        #     LADDER SHAPE IS LOAD-BEARING: when the edge vote ABSTAINS, fall
+        #     straight to LEGACY — do NOT retry with the plain active tier.
+        #     The LOO study validated exactly this shape; a plain-active retry
+        #     was measured to flip the sign of the whole feature (production-
+        #     path eval 240/362 with the retry vs 245 baseline — it converts
+        #     the edge tier's deliberate abstentions on ambiguous events into
+        #     lower-information guesses). The plain active tier below serves
+        #     only queries that CANNOT use edges.
+        q_edges = dict(event_features)
+        if _expand_edge_features(q_edges):
+            edge_rows = _labelled(
+                "SELECT user_fixture_type, true_avg_flow_lpm, peak_flow_lpm, "
+                "       active_flow_duration_seconds, volume_litres, "
+                "       pressure_delta_psi, steady_state_fraction, flow_on_ratio, "
+                "       cycle_pulse_count, hour_sin, hour_cos, "
+                "       onset_signature_json, offset_signature_json "
+                "FROM events "
+                "WHERE circuit = ? "
+                "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
+                "  AND COALESCE(excluded_from_training, 0) = 0 "
+                "  AND COALESCE(integration_quality, 'ok') = 'ok' "
+                "  AND true_avg_flow_lpm IS NOT NULL "
+                "  AND active_flow_duration_seconds IS NOT NULL "
+                "  AND flow_on_ratio IS NOT NULL "
+                "  AND onset_signature_json IS NOT NULL "
+                "  AND offset_signature_json IS NOT NULL"
+            )
+            edge_labelled = []
+            for t, r in edge_rows:
+                rd = dict(r)
+                if _expand_edge_features(rd):
+                    edge_labelled.append((t, rd))
+            if len(edge_labelled) >= _SIGNATURE_KNN_MIN_TOTAL_LABELS:
+                hit = _knn_vote(
+                    edge_labelled, q_edges,
+                    _SIGNATURE_KNN_ACTIVE_FEATURES + _SIGNATURE_KNN_EDGE_FEATURES,
+                    {**_SIGNATURE_KNN_ACTIVE_SCALES,
+                     **{f: _SIGNATURE_KNN_EDGE_SCALE
+                        for f in _SIGNATURE_KNN_EDGE_FEATURES}},
+                    _SIGNATURE_KNN_ACTIVE_LOG_FEATURES)
+                if hit is not None:
+                    hit["match_source"] = "active_flow_edges"
+                    return hit
+                return _legacy_knn_fallback(_labelled, event_features)
+
         active = _labelled(
             "SELECT user_fixture_type, true_avg_flow_lpm, peak_flow_lpm, "
             "       active_flow_duration_seconds, volume_litres, pressure_delta_psi, "
@@ -5088,7 +5184,15 @@ def match_event_to_signature_knn(
             # Active had enough labels but abstained → fall through to legacy so
             # classification coverage never regresses below the legacy baseline.
 
-    # 2) Legacy fallback (pre-backfill, or active abstained).
+    # 2) Legacy fallback (pre-backfill, active abstained, or the edge tier
+    #    abstained — see the ladder-shape note above).
+    return _legacy_knn_fallback(_labelled, event_features)
+
+
+def _legacy_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any]]:
+    """The 6-scalar legacy k-NN tier — the shared final rung of the matcher
+    ladder (factored out so the edge tier can reach it directly on abstention
+    without re-voting the plain active tier)."""
     legacy = _labelled(
         "SELECT user_fixture_type, avg_flow_lpm, peak_flow_lpm, duration_seconds, "
         "       volume_litres, pressure_delta_psi, steady_state_fraction "
@@ -5159,7 +5263,10 @@ def reclassify_all_events_from_signatures(
     calib = load_rule_calibration(conn, circuit)
     qfeats = tuple(dict.fromkeys(
         _SIGNATURE_MATCH_FEATURES + _SIGNATURE_KNN_ACTIVE_FEATURES
-        + ("has_pressure_transient",)))   # the flush predicate's extra input
+        + ("has_pressure_transient",)     # the flush predicate's extra input
+        # dev19: the edge tier reads these off the query dict (expanded inside
+        # match_event_to_signature_knn); harmless extras for the rules tier.
+        + ("onset_signature_json", "offset_signature_json")))
     circuit_type = get_circuit_type(conn, circuit)
     # Windowed (periodic maturity re-check): bound the expensive per-event k-NN row
     # loop below to events >= since_ts, but give the detectors a lookback (>= the

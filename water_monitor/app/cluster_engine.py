@@ -57,9 +57,9 @@ METRICS_WINDOW_HOURS          = 24
 
 # Points in the signature feature block. Matches feature_extractor's
 # SIGNATURE_POINTS for NEW events; stored signatures of any other length
-# (historical 32-pt rows) are linearly resampled to this length at feature-
+# (historical 32/64-pt rows) are linearly resampled to this length at feature-
 # expansion time, so old and new events remain directly comparable.
-SIG_POINTS = 64
+SIG_POINTS = 256
 
 FEATURE_KEYS = [
     # Core hydraulic scalars
@@ -94,12 +94,13 @@ FEATURE_KEYS = [
 
 # Per-dimension weights for weighted Euclidean distance.
 # Pressure shape > flow shape; scalars default 1.0; hour sinusoids 0.2.
-# Per-dim values are halved from the 32-pt era (0.4/0.8 → 0.2/0.4) so the
-# TOTAL shape weight in the distance is unchanged at 64 dims.
+# Per-dim values scale inversely with SIG_POINTS so the TOTAL shape weight in
+# the distance is unchanged across the 32→64→256 widenings: 32-pt era 0.4/0.8,
+# 64-pt 0.2/0.4, 256-pt 0.05/0.1 (×4 dims ⇒ ÷4 per dim).
 BASE_FEATURE_WEIGHTS: Dict[str, float] = {k: 1.0 for k in FEATURE_KEYS}
 for _i in range(SIG_POINTS):
-    BASE_FEATURE_WEIGHTS[f'flow_sig_{_i:02d}']     = 0.2
-    BASE_FEATURE_WEIGHTS[f'pressure_sig_{_i:02d}'] = 0.4
+    BASE_FEATURE_WEIGHTS[f'flow_sig_{_i:02d}']     = 0.05
+    BASE_FEATURE_WEIGHTS[f'pressure_sig_{_i:02d}'] = 0.1
 BASE_FEATURE_WEIGHTS['hour_sin'] = 0.2
 BASE_FEATURE_WEIGHTS['hour_cos'] = 0.2
 
