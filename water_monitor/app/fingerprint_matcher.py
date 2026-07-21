@@ -21,6 +21,13 @@ Design points (all measured, see scratchpad REALITY_VS_ADDON.md §1c Q7-Q8):
     whole-waveform match against a user-confirmed example, much stronger than
     a lone scalar k-NN vote — but only at the TIGHT (immature) threshold.
     Measured: dishwasher 83/83 correct at the standard threshold.
+  * VOLUME FLOOR (post-3.13 era correction): the numbers above were measured
+    on coarse-meter data whose sub-2 L draws never became events. The
+    pulse_meter firmware DOES eventize them, and the first fresh-DB review
+    (2026-07-08) overturned every fingerprint stamp — all 46 were sub-2 L
+    micro-draws (0/11 on the reviewed subset). Events under
+    MIN_MATCH_VOLUME_L effective litres neither join the library nor get
+    matched, restoring the event population the validation actually covered.
 
 Pure module: no DB writes, no asyncio. Callers (database.reclassify tier loop,
 feature_extractor live path) stamp results via set_event_matched_fixture_type
@@ -50,6 +57,11 @@ MATURE_LIBRARY_N: int = 100       # below this, use the tight percentile
 THRESHOLD_PCTL_MATURE: float = 30.0
 THRESHOLD_PCTL_TIGHT: float = 15.0
 MIN_LIBRARY_N: int = 10           # below this the matcher abstains entirely
+# Micro-draws are noise-alike: they cluster tightly, drag the self-calibrated
+# threshold down, and inherit each other's labels. Both library membership and
+# query events must carry at least this much EFFECTIVE volume (falls back to
+# raw volume when no ledger verdict exists yet).
+MIN_MATCH_VOLUME_L: float = 2.0
 
 
 def _np():
@@ -145,8 +157,9 @@ class FingerprintLibrary:
             "       w.flow_max_json, w.pressure_min_json, w.duration_seconds "
             "FROM events e JOIN event_waveforms w ON w.event_id = e.id "
             "WHERE e.circuit = ? AND e.user_fixture_type IS NOT NULL "
-            "  AND e.duration_seconds >= ?",
-            (circuit, MIN_EVENT_SECONDS)).fetchall()
+            "  AND e.duration_seconds >= ? "
+            "  AND COALESCE(e.volume_litres_effective, e.volume_litres) >= ?",
+            (circuit, MIN_EVENT_SECONDS, MIN_MATCH_VOLUME_L)).fetchall()
         fps, labels, ids = [], [], []
         for r in rows:
             fp = build_fingerprint(r["flow_max_json"], r["pressure_min_json"],
@@ -265,17 +278,22 @@ def match_event_fingerprint(conn: sqlite3.Connection, circuit: str,
                             library: Optional[FingerprintLibrary] = None,
                             ) -> Optional[Dict[str, Any]]:
     """Convenience: load the event's stored waveform, build its fingerprint,
-    match against the (given or cached) library. None on any miss."""
+    match against the (given or cached) library. None on any miss, including
+    events below MIN_MATCH_VOLUME_L effective litres (the tier's floor —
+    every production call path routes through here)."""
     lib = library if library is not None else get_library(conn, circuit)
     if lib is None:
         return None
     row = conn.execute(
         "SELECT e.pre_event_pressure_psi, w.flow_max_json, "
-        "       w.pressure_min_json, w.duration_seconds "
+        "       w.pressure_min_json, w.duration_seconds, "
+        "       COALESCE(e.volume_litres_effective, e.volume_litres) AS vol_eff "
         "FROM events e JOIN event_waveforms w ON w.event_id = e.id "
         "WHERE e.id = ? AND e.circuit = ?", (event_id, circuit)).fetchone()
     if row is None:
         return None
+    if row["vol_eff"] is None or row["vol_eff"] < MIN_MATCH_VOLUME_L:
+        return None   # micro-draw below the tier's floor — abstain
     fp = build_fingerprint(row["flow_max_json"], row["pressure_min_json"],
                            row["duration_seconds"],
                            row["pre_event_pressure_psi"])

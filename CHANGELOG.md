@@ -46,7 +46,11 @@ landed without a version bump; per-build details are in git history.)
   k-NN: an event whose un-normalized stored waveform closely matches a
   user-labeled event inherits that label (self-calibrating threshold,
   user-labels-only library so no drift; `app/fingerprint_matcher.py`;
-  migration 20260552).
+  migration 20260552). Applies only to events ≥ 2 L effective (dev20): the
+  tier was validated on coarse-meter data whose sub-2 L draws never became
+  events, and the first post-pulse-meter review overturned every fingerprint
+  stamp — all were micro-draws. Below the floor the tier abstains and such
+  events don't join the match library.
 - **Two-option anomaly review** — "Mark reviewed" now records intent:
   ✓ Normal use (participates in future baseline refits) vs ❓ Don't recognize
   it (held out of every future refit so an unidentified draw can't widen

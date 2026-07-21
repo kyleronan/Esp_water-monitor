@@ -211,7 +211,10 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- Fingerprint label tier (migration 20260552, 2026-07 audit Phase 3): a new
     -- event may inherit the label of its tightest whole-waveform match among
     -- USER-labeled events (matched_via='fingerprint'). Measured 96% precision
-    -- at ~30% coverage on this home's data; threshold self-calibrates.
+    -- at ~30% coverage on this home's data; threshold self-calibrates. Applies
+    -- only to events >= 2 L effective (fingerprint_matcher.MIN_MATCH_VOLUME_L)
+    -- — the validation predates pulse_meter micro-draw events, which defeated
+    -- the matcher outright (0/11 on the 2026-07-08 production review).
     fingerprint_labeling_enabled   INTEGER NOT NULL DEFAULT 1,
     -- One-shot stamp for the rising-pressure-corr backfill worker (migration
     -- 20260554, dev14): 1 = the historical flow_pressure_corr sweep finished
