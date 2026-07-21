@@ -1565,12 +1565,27 @@ sensor:
   #      file (pulse-age based — drip rates sit below the rate floor and are
   #      invisible to the rate sensor).
   # ---------------------------------------------------------------------------
+  # WIRING — two flow-sensor hardware variants exist (bench-tested 2026-07-15):
+  #   A) Original sensors (installed on the deployed board): active-high output
+  #      that idles low; runs at 3.3V. Needs `pulldown: true` and no external parts.
+  #   B) Newer models (YF-B5 new rev, ZJ-HSM-OFZATS-06, OF06ZAT — bench stock):
+  #      hall IC requires a 5V supply (dead at 3.3V). Output is open-collector —
+  #      fit an external 4.7k-10k pullup from OUT to 3.3V (NOT 5V) so the signal
+  #      swings 0-3.3V and stays ESP32-S3-safe, and set the pin to plain
+  #      `input: true` (no internal pull needed with the external pullup).
+  #      Per-unit sanity check before connecting to the GPIO: power at 5V with
+  #      the 3.3V pullup fitted and verify idle-high ≤ 3.3V on a meter — one
+  #      bench unit sourced current high (~10k equivalent to the 5V rail) and
+  #      such a unit would idle ~3.8V with a 3.3V pullup; that type needs a 20k
+  #      pulldown to GND instead (divider high ≈ 0.66 × rail).
+  # The config below is variant A (matches the deployed board). If a variant-B
+  # sensor is ever installed, flip that pin per the note above.
   - platform: pulse_meter
     pin:
       number: GPIO39
       mode:
         input: true
-        pulldown: true    # pulldown prevents floating input causing false counts
+        pulldown: true    # variant A sensor — see WIRING above before reflashing new hardware
     internal_filter: 100us          # bounce guard — see block comment above
     internal_filter_mode: PULSE     # level must be stable for the filter duration
     timeout: 10s                    # rate → 0 within 10s of the last pulse
