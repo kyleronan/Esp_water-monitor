@@ -226,6 +226,33 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- build_year unknown) the ceiling falls back to the pre-1982 7 gpf bound.
     -- The 2.8 L floor + single-refill shape veto are structural and always on.
     epa_flush_cap_enabled          INTEGER NOT NULL DEFAULT 1,
+    -- Pump-aware detection (migration 20260558, dev21 Phase 1). The home may be
+    -- pressurized by a pump (city booster or well pump) whose recharge cycling
+    -- violates the static-supply assumptions of the pressure detectors.
+    -- pump_mode_detected/_at: nightly regime-detector verdict (Phase 3 writes).
+    -- pump_detect_period_s: last measured recharge period (refreshed on every
+    --   detected night — a stale period drifts exactly when the leak-trend
+    --   trigger cares).
+    -- pump_mode_ack: user response to the detection banner — NULL (unanswered),
+    --   'confirmed', 'dismissed'. Unconfirmed detection NEVER activates
+    --   behavior (banner+confirm); it only banners.
+    -- pump_profile: 'vfd_constant_pressure' | 'switch_tank' | NULL. NULL on a
+    --   well home resolves to switch_tank AT READ TIME (config.
+    --   pump_mode_effective) — the default is never written, so nightly
+    --   detection may later write the VFD profile for a constant-pressure well.
+    -- supply_type_set_at: answer provenance for the alert arming rule — set
+    --   ONLY when the submitted supply_type DIFFERS from stored (plus wizard
+    --   completion / banner-Yes). NULL = pre-feature answer, which alert
+    --   arming must not trust.
+    -- pump_alert_armed_at: persisted arming stamp (recomputing from HA history
+    --   would silently disarm when the ~10-day fidelity window ages out).
+    pump_mode_detected             INTEGER NOT NULL DEFAULT 0,
+    pump_mode_detected_at          TEXT,
+    pump_detect_period_s           REAL,
+    pump_mode_ack                  TEXT,
+    pump_profile                   TEXT,
+    supply_type_set_at             TEXT,
+    pump_alert_armed_at            TEXT,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -394,6 +421,14 @@ CREATE TABLE IF NOT EXISTS sensitivity_config (
     baseline_anomaly_n          INTEGER,
     baseline_cluster_std_mean   REAL,
     baseline_computed_at        TIMESTAMP,
+    -- Pump-aware detection (migration 20260558, dev21). Per-circuit override of
+    -- the home-level pump resolution: 'auto' (follow supply_type / confirmed
+    -- detection), 'on' (force), 'off' (force off — also suppresses the
+    -- detection banner: an explicit off is a stronger answer than a dismissal).
+    pump_mode                   TEXT NOT NULL DEFAULT 'auto',
+    -- Irrigation low-pressure-under-load alert floor (Phase 6a): sustained
+    -- pressure below this while a zone is flowing → heads may not pop up.
+    low_pressure_alert_psi      REAL NOT NULL DEFAULT 25.0,
     updated_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

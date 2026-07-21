@@ -156,9 +156,11 @@
               <label>Water supply</label>
               <select name="supply_type">
                 <option value="mains" {% if profile.supply_type == 'mains' %}selected{% endif %}>
-                  Mains / Municipal</option>
+                  City / municipal water</option>
+                <option value="city_pump" {% if profile.supply_type == 'city_pump' %}selected{% endif %}>
+                  City water with a booster pump</option>
                 <option value="well" {% if profile.supply_type == 'well' %}selected{% endif %}>
-                  Private well or pump</option>
+                  Private well</option>
               </select>
             </div>
           </div>

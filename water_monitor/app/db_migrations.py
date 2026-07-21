@@ -141,7 +141,15 @@ _BASELINE_VERSION: int = 20260523
 #              offset_signature_json (TEXT — 32×1 s fixed-time shape cells for
 #              the k-NN edge tier) + one-shot backfill from every
 #              event_waveforms envelope (the validated configuration).
-_CURRENT_VERSION: int = 20260557
+#   20260558 — dev21: pump-aware detection Phase 1 (plan
+#              yes-write-up-the-elegant-kettle). home_profile: pump_mode_detected
+#              /_at, pump_detect_period_s, pump_mode_ack, pump_profile,
+#              supply_type_set_at (answer provenance — the alert arming rule
+#              must not trust pre-feature supply answers), pump_alert_armed_at
+#              (persisted arming stamp). sensitivity_config: pump_mode
+#              ('auto'|'on'|'off' per-circuit override), low_pressure_alert_psi
+#              (irrigation under-load floor, default 25). DDL only, no backfill.
+_CURRENT_VERSION: int = 20260558
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1569,6 +1577,60 @@ def _missing_epa_flush_cap_columns(conn: sqlite3.Connection) -> set[str]:
     return set()
 
 
+# 20260558 (dev21) — pump-aware detection Phase 1 columns. Single source for
+# the apply fn AND the verifier so the two can never drift apart.
+_PUMP_MODE_HOME_COLUMNS: tuple = (
+    ("pump_mode_detected",    "INTEGER NOT NULL DEFAULT 0"),
+    ("pump_mode_detected_at", "TEXT"),
+    ("pump_detect_period_s",  "REAL"),
+    ("pump_mode_ack",         "TEXT"),
+    ("pump_profile",          "TEXT"),
+    ("supply_type_set_at",    "TEXT"),
+    ("pump_alert_armed_at",   "TEXT"),
+)
+_PUMP_MODE_SENS_COLUMNS: tuple = (
+    ("pump_mode",              "TEXT NOT NULL DEFAULT 'auto'"),
+    ("low_pressure_alert_psi", "REAL NOT NULL DEFAULT 25.0"),
+)
+
+
+def _apply_pump_mode_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260558 — dev21 pump-aware Phase 1.
+
+    Home may be pressurized by a booster/well pump (2026-07-19 ESYBOX incident:
+    recharge cycling violated every static-supply pressure assumption). Adds the
+    profile/ack/provenance plumbing; detection + gating land in later phases.
+    DDL only, guarded + idempotent; stub DBs just get the version stamp.
+    NOTE: supply_type_set_at stays NULL for every migrated row by design — a
+    pre-feature supply answer must never read as post-feature consent.
+    """
+    for table, cols in (("home_profile", _PUMP_MODE_HOME_COLUMNS),
+                        ("sensitivity_config", _PUMP_MODE_SENS_COLUMNS)):
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,)).fetchone()
+        if not has_table:
+            continue
+        for col, ddl in cols:
+            if not _has_column(conn, table, col):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+    conn.commit()
+    log.info("Migration 20260558: pump-mode columns ready (profile/ack/"
+             "provenance plumbing; detection ships separately)")
+
+
+def _missing_pump_mode_columns(conn: sqlite3.Connection) -> set[str]:
+    """Return the 20260558 pump-mode columns absent (home_profile +
+    sensitivity_config)."""
+    missing: set[str] = set()
+    for table, cols in (("home_profile", _PUMP_MODE_HOME_COLUMNS),
+                        ("sensitivity_config", _PUMP_MODE_SENS_COLUMNS)):
+        for col, _ddl in cols:
+            if not _has_column(conn, table, col):
+                missing.add(f"{table}.{col}")
+    return missing
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -1666,6 +1728,7 @@ _MIGRATIONS: tuple = (
     (20260555, _apply_epa_flush_cap_flag),
     (20260556, _apply_sig256_rebuild),
     (20260557, _apply_edge_signatures),
+    (20260558, _apply_pump_mode_columns),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -1735,6 +1798,7 @@ def _run_migrations_impl(
             | _missing_flow_pressure_corr_columns(conn)
             | _missing_epa_flush_cap_columns(conn)
             | _missing_edge_signature_columns(conn)
+            | _missing_pump_mode_columns(conn)
         )
         if missing:
             raise RuntimeError(

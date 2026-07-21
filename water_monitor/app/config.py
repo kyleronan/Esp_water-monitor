@@ -243,10 +243,82 @@ def compute_suggested_calibration_days(
     elif occupants >= 4 and tier in ("large", "mansion"):
         base_days = min(base_days + 3, 28)
 
-    if supply_type == "well":
+    if supply_type in ("well", "city_pump"):
+        # Pump-pressurized supply (well pump or city booster): oscillating
+        # pressure slows the pressure-baseline learning either way.
         base_days = min(base_days + 7, 35)
 
     return min(base_days, 35), tier
+
+
+# ── Pump-aware detection (dev21 Phase 1) ───────────────────────────────────────
+
+# Valid home_profile.supply_type values. Routers validate against this — the
+# field previously accepted any string.
+SUPPLY_TYPES: frozenset = frozenset({"mains", "well", "city_pump"})
+# supply_type values that mean "this home is pressurized by a pump".
+PUMP_SUPPLY_TYPES: frozenset = frozenset({"well", "city_pump"})
+
+PUMP_PROFILE_VFD = "vfd_constant_pressure"
+PUMP_PROFILE_SWITCH_TANK = "switch_tank"
+
+
+def pump_mode_effective(conn, circuit: str) -> dict:
+    """Resolve whether pump-aware behavior is active for ``circuit``.
+
+    Returns ``{"active": bool, "profile": str|None, "source": str}`` where
+    source is ``"override"`` (sensitivity_config.pump_mode 'on'/'off'),
+    ``"user"`` (supply_type says pump), ``"auto"`` (regime detection confirmed
+    via the banner), or ``"none"``.
+
+    Precedence: per-circuit override → supply_type ('city_pump' → profile
+    default vfd_constant_pressure; 'well' → profile default switch_tank — a
+    well IS a pump home) → detected+confirmed → inactive. The well/city
+    defaults are RESOLVE-TIME only: home_profile.pump_profile stays NULL until
+    detection or the user writes it, so nightly evidence can later identify a
+    constant-pressure well pump.
+
+    v1 ENUMERATION — consumers must NOT assume active ⇒ vfd semantics.
+    "Active" with profile 'switch_tank' enables almost nothing in v1: the
+    Phase 4 detector gating, the 5b cross-circuit leak-test verdict, and the
+    6b pump-failure alert ALL additionally require profile ==
+    'vfd_constant_pressure' (a tank system's cycle math and failure signatures
+    are different instruments — see the pump plan). Unconfirmed auto-detection
+    never activates anything (banner+confirm).
+    """
+    profile_row = conn.execute(
+        "SELECT supply_type, pump_profile, pump_mode_detected, pump_mode_ack "
+        "FROM home_profile WHERE id = 1").fetchone()
+    stored_profile = profile_row["pump_profile"] if profile_row else None
+
+    sens = conn.execute(
+        "SELECT pump_mode FROM sensitivity_config WHERE circuit = ?",
+        (circuit,)).fetchone()
+    override = (sens["pump_mode"] if sens is not None else None) or "auto"
+    if override == "off":
+        return {"active": False, "profile": None, "source": "override"}
+    if override == "on":
+        return {"active": True,
+                "profile": stored_profile or PUMP_PROFILE_VFD,
+                "source": "override"}
+
+    supply = (profile_row["supply_type"] if profile_row else None) or "mains"
+    if supply == "city_pump":
+        return {"active": True,
+                "profile": stored_profile or PUMP_PROFILE_VFD,
+                "source": "user"}
+    if supply == "well":
+        return {"active": True,
+                "profile": stored_profile or PUMP_PROFILE_SWITCH_TANK,
+                "source": "user"}
+
+    if (profile_row is not None and profile_row["pump_mode_detected"]
+            and profile_row["pump_mode_ack"] == "confirmed"):
+        return {"active": True,
+                "profile": stored_profile or PUMP_PROFILE_VFD,
+                "source": "auto"}
+
+    return {"active": False, "profile": None, "source": "none"}
 
 
 # Zone (irrigation) circuits see only a handful of repetitive cycles per

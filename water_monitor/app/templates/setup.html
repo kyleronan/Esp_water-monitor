@@ -517,11 +517,15 @@
           <select id="supply_type" name="supply_type">
             <option value="mains"
               {% if (profile.supply_type or 'mains') == 'mains' %}selected{% endif %}>
-              Mains / Municipal
+              City / municipal water
+            </option>
+            <option value="city_pump"
+              {% if profile.supply_type == 'city_pump' %}selected{% endif %}>
+              City water with a booster pump
             </option>
             <option value="well"
               {% if profile.supply_type == 'well' %}selected{% endif %}>
-              Private well or pump
+              Private well
             </option>
           </select>
         </div>

@@ -704,7 +704,10 @@ async def setup_home_details_save(request: Request):
     bathrooms_half             = coerce_int(form.get("bathrooms_half"), lo=0, hi=20, default=0)
     floors                     = coerce_int(form.get("floors"),         lo=1, hi=10, default=1)
     occupants                  = coerce_int(form.get("occupants"),      lo=1, hi=30, default=2)
+    from ..config import SUPPLY_TYPES
     supply_type                = form.get("supply_type", "mains")
+    if supply_type not in SUPPLY_TYPES:
+        supply_type = "mains"   # wizard has no prior value to preserve
     # build_year stays as Optional[int]: a missing/blank field is None
     # (no override), but a present-but-garbage value falls back to None
     # rather than persisting nonsense like 99999.
@@ -733,6 +736,7 @@ async def setup_home_details_save(request: Request):
                      "(HH:MM, 24-hour).",
         })
 
+    from datetime import datetime as _dt, timezone as _tzinfo
     update_home_profile(
         orch.db,
         bathrooms_full=bathrooms_full,
@@ -742,6 +746,9 @@ async def setup_home_details_save(request: Request):
         occupants=occupants,
         build_year=build_year,
         supply_type=supply_type,
+        # Wizard completion is an explicit post-feature answer — always stamp
+        # provenance (the pump-alert arming rule trusts only stamped answers).
+        supply_type_set_at=_dt.now(_tzinfo.utc).isoformat(),
         has_water_softener=1 if has_softener else 0,
         softener_regen_start=softener_start if has_softener else None,
         softener_circuit=softener_circuit if has_softener else None,

@@ -9,6 +9,19 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Pump-aware supply profile — Phase 1 plumbing (dev21)** — homes pressurized
+  by a pump (city booster or well pump) violate the static-supply assumptions
+  behind the pressure detectors (seen live 2026-07-19: a booster-pump install
+  turned static ~43 PSI into a 53–65 PSI recharge sawtooth and an event storm).
+  The setup/settings supply question gains "City water with a booster pump"
+  (`city_pump`), which also gets the well home's +7 calibration days. New
+  resolver `config.pump_mode_effective` (per-circuit override → supply answer →
+  banner-confirmed detection; a well IS a pump home, defaulting to the
+  switch+tank profile at read time). Answer provenance (`supply_type_set_at`)
+  is stamped only on real changes so future pump alerts can distinguish a
+  post-feature answer from a migrated one, and moving off a pump supply
+  disarms/unconfirms pump state. Detection, detector gating, and the
+  pump-assisted leak tests build on this in later phases (migration 20260558).
 - **Embedded-fixture (composite) detection** — sustained events (long showers)
   are scanned for draws superimposed on their baseline (a mid-shower toilet
   flush) and annotated "Contains: toilet ×2 (~9 L)" in the event modal.

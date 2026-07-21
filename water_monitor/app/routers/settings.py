@@ -377,7 +377,33 @@ async def profile_update(request: Request):
     else:
         build_year = None
 
-    from ..database import update_home_profile
+    from ..database import update_home_profile, get_home_profile
+    from ..config import SUPPLY_TYPES, PUMP_SUPPLY_TYPES
+
+    # Supply type: invalid submissions fall back to the EXISTING stored value,
+    # never to 'mains' — a failed validation must not silently downgrade a
+    # 'well' home (which would shift calibration-day suggestions as a side
+    # effect). Provenance (supply_type_set_at) is stamped ONLY when the value
+    # actually changes: settings forms re-post every field on save, and an
+    # unchanged pre-feature answer must not launder into post-feature consent
+    # for the pump-alert arming rule.
+    prev = get_home_profile(orch.db)
+    prev_supply = ((prev["supply_type"] if prev else None) or "mains")
+    supply_type = form.get("supply_type", prev_supply)
+    if supply_type not in SUPPLY_TYPES:
+        supply_type = prev_supply
+
+    pump_fields: dict = {}
+    if supply_type != prev_supply:
+        from datetime import datetime as _dt, timezone as _tzinfo
+        pump_fields["supply_type_set_at"] = _dt.now(_tzinfo.utc).isoformat()
+        if prev_supply in PUMP_SUPPLY_TYPES and supply_type not in PUMP_SUPPLY_TYPES:
+            # Leaving the pump world: a confirmed banner must not keep pump
+            # mode welded on via the auto path, and a later re-answer must not
+            # instantly re-arm the pump alert from a stale stamp.
+            pump_fields["pump_mode_ack"] = None
+            pump_fields["pump_alert_armed_at"] = None
+
     update_home_profile(
         orch.db,
         bathrooms_full=coerce_int(form.get("bathrooms_full"), lo=0, hi=20, default=1),
@@ -386,10 +412,11 @@ async def profile_update(request: Request):
         floors=coerce_int(form.get("floors"),                 lo=1, hi=10, default=1),
         occupants=coerce_int(form.get("occupants"),           lo=1, hi=30, default=2),
         build_year=build_year,
-        supply_type=form.get("supply_type", "mains"),
+        supply_type=supply_type,
         # Unchecked checkboxes are absent from the form body — absence = off.
         epa_flush_cap_enabled=1 if form.get("epa_flush_cap_enabled") else 0,
         setup_complete=1,
+        **pump_fields,
     )
     return ingress_redirect(request, "/settings#profile")
 
