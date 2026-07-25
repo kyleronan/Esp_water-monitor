@@ -256,6 +256,18 @@ def _collect_circuit_history_sync(
         # (the dashboard card's Review link) further restricts to events
         # awaiting triage, matching the card's count.
         _anomaly_view = filter_param in ("anomaly", "anomaly_unreviewed")
+        # Settings "Hide not-real-use events" toggle — hides every volume-zeroing
+        # verdict (phantom / cross-talk / dribble) so the one "Not real use" label
+        # maps to one switch. Pushed into the SQL WHERE (not a Python post-filter)
+        # so the recency limit counts VISIBLE rows — during the 2026-07 pump-
+        # cycling storm ~82 of the newest 100 rows were hidden artifacts and the
+        # post-filter starved the page down to ~18 events. The anomaly filters
+        # bypass hiding for the must-not-vanish reason, and so does the filter
+        # bar's Note = "Not real use" — the user just asked for exactly those
+        # rows (hiding them would render an empty list). ?show_hidden=1 bypasses
+        # for one render (presentation-only, viewer-safe).
+        _hiding_active = (hide_not_real and not show_hidden and not _anomaly_view
+                          and bar_filters.get("note_kind") != "not_real")
         events = get_recent_events(
             db, circuit_cfg.circuit,
             limit=DEFAULT_EVENT_LIMIT,
@@ -264,25 +276,22 @@ def _collect_circuit_history_sync(
             flagged_only=_anomaly_view,
             degraded_only=(filter_param == "degraded"),
             unreviewed_only=(filter_param == "anomaly_unreviewed"),
+            exclude_not_real=_hiding_active,
             **bar_filters,
         )
-        # Settings "Hide not-real-use events" toggle — hides every volume-zeroing
-        # verdict (phantom / cross-talk / dribble) so the one "Not real use" label
-        # maps to one switch. The count of hidden rows is surfaced so the list
-        # never silently loses rows ("N hidden — show them"); ?show_hidden=1
-        # bypasses the filter for one render (presentation-only, viewer-safe).
-        # The anomaly filters bypass hiding for the same must-not-vanish reason,
-        # and so does the filter bar's Note = "Not real use" — the user just
-        # asked for exactly those rows (hiding them would render an empty list).
+        # "N hidden — show them" badge: count the hidden rows within the time
+        # span the visible list covers (oldest displayed row onward), so the
+        # badge keeps meaning "hidden among what you're looking at".
         hidden_not_real = 0
-        if (hide_not_real and not show_hidden and not _anomaly_view
-                and bar_filters.get("note_kind") != "not_real"):
-            visible = [e for e in events
-                       if not (dict(e).get("is_pressure_restoration_phantom")
-                               or dict(e).get("is_cross_talk")
-                               or dict(e).get("is_low_flow_dribble"))]
-            hidden_not_real = len(events) - len(visible)
-            events = visible
+        if _hiding_active:
+            from ..database import count_not_real_events
+            hidden_not_real = count_not_real_events(
+                db, circuit_cfg.circuit,
+                date_from=date_from or None,
+                date_to=date_to or None,
+                since_ts=(events[-1]["start_ts"] if events
+                          and not (date_from or date_to) else None),
+            )
         # Display-time signature upgrade: historical events store a 32-pt
         # signature, but many carry a hi-res event_waveforms envelope with real
         # pulse detail. When the envelope is finer than the stored signature,

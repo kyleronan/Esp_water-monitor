@@ -2655,6 +2655,7 @@ def get_recent_events(
     flow_max_lpm: Optional[float] = None,
     fixture_type: Optional[str] = None,
     note_kind: Optional[str] = None,
+    exclude_not_real: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Return events for a circuit ordered newest first.
@@ -2683,6 +2684,14 @@ def get_recent_events(
         chain (_EFFECTIVE_FIXTURE_SQL_TMPL), or 'unlabelled' for a NULL chain;
       • note_kind — one of _NOTE_KIND_SQL's pill categories.
     Callers pass STORAGE units — display-unit conversion is the router's job.
+
+    exclude_not_real pushes the "Hide not-real-use events" toggle into the
+    WHERE clause for the same must-not-vanish reason as flagged_only: it used
+    to be a Python post-filter over the newest `limit` rows, so a pump-cycling
+    artifact storm (2026-07: ~82 of the newest 100 rows were zeroed
+    artifacts) starved the History page down to a handful of visible events.
+    In SQL, the recency limit counts VISIBLE rows. The companion badge count
+    comes from count_not_real_events (same filters).
     """
     # Toilet physics veto (dev17): the suggestion an event INHERITS from its
     # cluster is nulled when the event itself cannot be a flush — both in the
@@ -2751,12 +2760,54 @@ def get_recent_events(
         params.append(fixture_type)
     if note_kind in _NOTE_KIND_SQL:
         conditions.append(_NOTE_KIND_SQL[note_kind])
+    if exclude_not_real:
+        conditions.append(_NOT_REAL_SQL + " = 0")
     sql = f"{_select} WHERE {' AND '.join(conditions)} ORDER BY e.start_ts DESC"
     if not (date_from or date_to):
         sql += " LIMIT ?"
         params.append(limit)
     rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+# One expression for "this row is a volume-zeroed not-real-use verdict"
+# (phantom / cross-talk / below-meter-floor dribble) — shared by the
+# exclude_not_real pushdown and the hidden-count badge so they can never
+# disagree with each other or with the router's per-row display logic.
+_NOT_REAL_SQL = (
+    "(COALESCE(e.is_pressure_restoration_phantom, 0) = 1 "
+    " OR COALESCE(e.is_cross_talk, 0) = 1 "
+    " OR COALESCE(e.is_low_flow_dribble, 0) = 1)"
+)
+
+
+def count_not_real_events(
+    conn: sqlite3.Connection,
+    circuit: str,
+    date_from: str = None,
+    date_to: str = None,
+    since_ts: str = None,
+) -> int:
+    """Count hidden not-real-use rows for the History badge ("N hidden —
+    show them"). ``since_ts`` bounds the count to the time span the visible
+    list actually covers (the oldest displayed row's start_ts) so the badge
+    keeps its original meaning — hidden rows among what you're looking at —
+    now that the visible list is SQL-limited to matching rows."""
+    conditions = ["e.circuit = ?", _NOT_REAL_SQL]
+    params: list = [circuit]
+    if date_from:
+        conditions.append("e.start_ts >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("e.start_ts <= ?")
+        params.append(date_to + "T23:59:59")
+    if since_ts:
+        conditions.append("e.start_ts >= ?")
+        params.append(since_ts)
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM events e WHERE {' AND '.join(conditions)}",
+        params).fetchone()
+    return int(row[0])
 
 
 _PATCH_UNSET = object()

@@ -22,6 +22,14 @@ landed without a version bump; per-build details are in git history.)
   post-feature answer from a migrated one, and moving off a pump supply
   disarms/unconfirms pump state. Detection, detector gating, and the
   pump-assisted leak tests build on this in later phases (migration 20260558).
+- **History no longer starves when hidden artifacts dominate (dev22)** — the
+  "Hide not-real-use events" toggle was a post-filter applied AFTER the
+  100-row recency limit, so a burst of artifact events (booster-pump recharge
+  cycling) crowded real events out of the page (~18 visible). The exclusion
+  now lives in the SQL WHERE, so the page always shows the most recent 100
+  VISIBLE events; the "N hidden" badge counts hidden rows within the span the
+  visible list covers (`get_recent_events(exclude_not_real=)` +
+  `count_not_real_events`).
 - **Embedded-fixture (composite) detection** — sustained events (long showers)
   are scanned for draws superimposed on their baseline (a mid-shower toilet
   flush) and annotated "Contains: toilet ×2 (~9 L)" in the event modal.
