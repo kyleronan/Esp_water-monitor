@@ -9,6 +9,22 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Same-circuit overlap guard + one-shot cleanup (dev28)** — one circuit
+  can only have one event at a time; overlapping same-circuit events mean
+  the same water was recorded twice (live blip-opened "wrapper" events vs
+  the importer's tight reconstruction — verified against raw meter flow).
+  A guard at the single event-write chokepoint now resolves any overlap a
+  new event creates: a wrapper whose span (≥70%) contains the other
+  member(s) and whose volume reconciles with theirs (±40%) is zeroed
+  through the volume ledger with a new "⧉ Duplicate — not extra water"
+  verdict (`overlap_duplicate`); user-labeled wrappers and ambiguous
+  partial overlaps are kept and audit-flagged only (over-count + flag
+  beats silently dropping real water). Migration 20260561 sweeps existing
+  history once (this home: 64 wrappers, ~3.7 kL of double-counted water
+  recovered — dominated by a 2.5 h irrigation mega-wrapper whose zone
+  events were also recorded individually). Every decision lands in the new
+  `overlap_audit` table; the verdict is recompute-durable (same carve-out
+  as irrigation cross-talk) and a user relabel restores the water.
 - **Pump-aware supply profile — Phase 1 plumbing (dev21)** — homes pressurized
   by a pump (city booster or well pump) violate the static-supply assumptions
   behind the pressure detectors (seen live 2026-07-19: a booster-pump install
