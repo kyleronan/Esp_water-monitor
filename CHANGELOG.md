@@ -22,6 +22,21 @@ landed without a version bump; per-build details are in git history.)
   post-feature answer from a migrated one, and moving off a pump supply
   disarms/unconfirms pump state. Detection, detector gating, and the
   pump-assisted leak tests build on this in later phases (migration 20260558).
+- **Nightly pump-regime detection + confirmation banner (dev23, pump plan
+  Phase 3)** — a supervised background worker analyzes each circuit's
+  quiet-hour pressure/flow window from HA history with the study-validated
+  cycling detector (`app/pump_regime_math.py`; offline study: 13/13
+  pre-install nights negative incl. softener regens, 2/2 positive) and
+  records per-night verdicts in `pump_regime_nightly`. Home flag uses
+  2-of-3-evaluated-nights hysteresis (7 quiet nights to clear; skipped
+  nights invisible) with ANY-circuit aggregation. Detection NEVER silently
+  changes behavior: a dashboard banner asks "Booster pump detected — is
+  that right?" and only confirming (or the supply-type answer) activates
+  pump mode. Dismissals re-prompt only after 30+ evaluated nights of
+  continued detection. Quiet-hour inference is shared with the leak-test
+  scheduler (`learn_quiet_hour`). Street-meter calibration captured during
+  the incident: the home meter registers ~half of each recharge slug
+  (factor 1.9), feeding the Phase 5 leak estimator.
 - **History no longer starves when hidden artifacts dominate (dev22)** — the
   "Hide not-real-use events" toggle was a post-filter applied AFTER the
   100-row recency limit, so a burst of artifact events (booster-pump recharge

@@ -60,6 +60,67 @@ def _row_get(row, key, default=None):
         return default
 
 
+def learn_quiet_hour(db, circuit: str, ha_tz,
+                     blackout_min=None) -> "Optional[int]":
+    """Quietest local hour from the last 60 days of hourly_volume.
+
+    Shared inference (leak-test scheduling AND the pump-regime detector's
+    nightly analysis window — do not duplicate). hourly_volume only stores
+    rows when water actually flowed, so hours absent from the table are
+    genuinely silent. Score = (active_sample_count, avg_volume_lph, hour);
+    lower wins, `hour` as deterministic tiebreak. Returns None when the
+    table has no rows for this circuit (no signal yet).
+
+    0–5 AM preference: pick the best-scoring night hour whose active count
+    is within +1 of the global minimum. ``blackout_min`` is an optional
+    (lo, hi) local-minutes window (softener regen) never to pick from.
+    """
+    rows = db.execute("""
+        SELECT hour_ts, volume_litres
+        FROM hourly_volume
+        WHERE circuit = ?
+          AND hour_ts >= datetime('now', '-60 days')
+    """, (circuit,)).fetchall()
+
+    if not rows:
+        return None
+
+    counts = {hr: 0 for hr in range(24)}
+    sums = {hr: 0.0 for hr in range(24)}
+    for row in rows:
+        try:
+            local_hour = _parse_utc_ts(row["hour_ts"]).astimezone(ha_tz).hour
+            counts[local_hour] += 1
+            sums[local_hour] += float(row["volume_litres"] or 0.0)
+        except (ValueError, AttributeError, TypeError):
+            continue
+
+    def score(hr: int) -> tuple:
+        n = counts[hr]
+        avg = sums[hr] / n if n else 0.0
+        return (n, avg, hr)
+
+    def _blacked(hr: int) -> bool:
+        if blackout_min is None:
+            return False
+        lo, hi = blackout_min
+        return hr * 60 < hi and (hr + 1) * 60 > lo   # hour overlaps [lo, hi)
+
+    allowed = [hr for hr in range(24) if not _blacked(hr)]
+    global_min_hr = min(allowed or list(range(24)), key=score)
+    global_min_cnt = counts[global_min_hr]
+
+    candidates = [hr for hr in range(0, 6)
+                  if not _blacked(hr) and counts[hr] <= global_min_cnt + 1]
+    best_hr = min(candidates, key=score) if candidates else global_min_hr
+
+    avg = sums[best_hr] / counts[best_hr] if counts[best_hr] else 0.0
+    log.info("[%s] learned best test hour: %02d:00 local "
+             "(count %d, avg %.3f L/h)",
+             circuit, best_hr, counts[best_hr], avg)
+    return best_hr
+
+
 class LeakTestScheduler:
     """Manages scheduled and on-demand leak tests for all circuits."""
 
@@ -140,72 +201,11 @@ class LeakTestScheduler:
         return result
 
     def learn_best_hour(self, circuit: str) -> Optional[int]:
-        """
-        Find the quietest local hour from the last 60 days of usage.
-
-        hourly_volume only stores rows when water actually flowed
-        (database.py: "skip if zero — keeps hourly_volume clean"), so
-        hours absent from the table represent genuinely silent hours.
-        Score = (active_sample_count, avg_volume_lph, hour); lower wins
-        on every key with `hour` as a deterministic final tiebreak.
-
-        Returns None only when the table has no rows for this circuit
-        at all (no signal yet).
-
-        0–5 AM preference is a policy bias toward night-time testing:
-        pick the best-scoring 0–5 hour whose active count is within
-        +1 of the global minimum. The +1 tolerance lets a night hour
-        with one sample edge out a daytime hour with count=0 — early-
-        morning leak tests are safer for the occupants.
-        """
-        rows = self._db.execute("""
-            SELECT hour_ts, volume_litres
-            FROM hourly_volume
-            WHERE circuit = ?
-              AND hour_ts >= datetime('now', '-60 days')
-        """, (circuit,)).fetchall()
-
-        if not rows:
-            return None
-
-        counts: Dict[int, int]   = {hr: 0   for hr in range(24)}
-        sums:   Dict[int, float] = {hr: 0.0 for hr in range(24)}
-        for row in rows:
-            try:
-                local_hour = _parse_utc_ts(row["hour_ts"]).astimezone(self._ha_tz).hour
-                counts[local_hour] += 1
-                sums[local_hour]   += float(row["volume_litres"] or 0.0)
-            except (ValueError, AttributeError, TypeError):
-                continue
-
-        def score(hr: int) -> tuple:
-            n   = counts[hr]
-            avg = sums[hr] / n if n else 0.0
-            return (n, avg, hr)
-
-        # dev.24 — never pick an hour inside the softener regen blackout (the
-        # softener runs only ~bi-weekly, so 2–3 am otherwise reads as "quiet").
-        blackout = self._softener_blackout_min(circuit)
-
-        def _blacked(hr: int) -> bool:
-            if blackout is None:
-                return False
-            lo, hi = blackout
-            return hr * 60 < hi and (hr + 1) * 60 > lo   # hour overlaps [lo, hi)
-
-        allowed = [hr for hr in range(24) if not _blacked(hr)]
-        global_min_hr  = min(allowed or list(range(24)), key=score)
-        global_min_cnt = counts[global_min_hr]
-
-        candidates = [hr for hr in range(0, 6)
-                      if not _blacked(hr) and counts[hr] <= global_min_cnt + 1]
-        best_hr = min(candidates, key=score) if candidates else global_min_hr
-
-        avg = sums[best_hr] / counts[best_hr] if counts[best_hr] else 0.0
-        log.info("[%s] learned best test hour: %02d:00 local "
-                 "(count %d, avg %.3f L/h)",
-                 circuit, best_hr, counts[best_hr], avg)
-        return best_hr
+        """Quietest local hour for this circuit (shared helper — see
+        ``learn_quiet_hour``; the pump-regime detector uses the same
+        inference, so the logic lives once at module level)."""
+        return learn_quiet_hour(self._db, circuit, self._ha_tz,
+                                self._softener_blackout_min(circuit))
 
     def _softener_blackout_min(self, circuit: str):
         """Return ``(lo, hi)`` local minutes-since-midnight of the softener regen

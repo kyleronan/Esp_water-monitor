@@ -60,6 +60,15 @@ async def dashboard(request: Request):
     templates = request.app.state.templates
 
     from ..fixtures import CIRCUIT_TYPE_LABELS
+    # Pump-regime detection banner (dev23) — banner+confirm: shows only while
+    # detection is unacknowledged; confirming is the sole auto-path into pump
+    # mode. Best-effort; a failure must never break the dashboard.
+    try:
+        from ..pump_regime_detector import pump_banner_state
+        pump_banner = pump_banner_state(orch.db)
+    except Exception:
+        pump_banner = {"show": False}
+
     return templates.TemplateResponse("dashboard.html", {
         "request":             request,
         "circuits":            circuit_states,
@@ -68,6 +77,7 @@ async def dashboard(request: Request):
         "profile":             profile,
         "away_mode":           profile.get("away_mode", False),
         "circuit_type_labels": CIRCUIT_TYPE_LABELS,
+        "pump_banner":         pump_banner,
     })
 
 

@@ -16,6 +16,34 @@
 </div>
 {% endif %}
 
+{# ── Pump-regime detection banner (dev23, banner+confirm) ─────────
+   Home-level: shows only while nightly detection is unacknowledged and no
+   supply answer / override already settles the question. Confirming is the
+   ONLY auto-path into pump-aware behavior. #}
+{% if pump_banner and pump_banner.show %}
+<div class="dash-alert dash-alert-degraded" aria-live="polite">
+  <div class="dash-alert-body">
+    <span class="dash-alert-title">🔄 Booster pump detected?</span>
+    <span class="dash-alert-detail">
+      Your water pressure rises and falls in a steady rhythm
+      {% if pump_banner.period_min %}(about every {{ pump_banner.period_min }}
+      minutes overnight){% endif %} — that usually means a booster or well
+      pump is installed. Is that right?
+    </span>
+  </div>
+  {% if is_admin %}
+  <form method="post" action="{{ ingress_path }}/settings/pump-banner/confirm"
+        style="margin:0">
+    <button type="submit" class="btn btn-primary btn-sm">Yes, I have a pump</button>
+  </form>
+  <form method="post" action="{{ ingress_path }}/settings/pump-banner/dismiss"
+        style="margin:0">
+    <button type="submit" class="btn btn-secondary btn-sm">No / dismiss</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
 {# Compute a single page-level "what to do next" hint from state already in
    context (no new backend data). Branch on training.state first, then events —
    so live-with-no-events reads differently from a circuit still calibrating. #}

@@ -1136,6 +1136,29 @@ CREATE TABLE IF NOT EXISTS zone_flow_history (
 );
 
 -- ==========================================================================
+-- PUMP REGIME NIGHTLY (dev23, pump plan Phase 3)
+-- One row per circuit per EVALUATED night (no row = skipped night: HA outage
+-- or no usable quiet window — invisible to the hysteresis counters by
+-- design). detected = the cycling signature verdict from the validated
+-- pump_regime_math module; ramp diagnostics ride along but never set it.
+-- est_leak_lpd stays NULL until Phase 5a fills it.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS pump_regime_nightly (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit       TEXT NOT NULL,
+    night_date    TEXT NOT NULL,      -- local calendar date of the quiet window
+    detected      INTEGER NOT NULL DEFAULT 0,
+    period_s      REAL,
+    amplitude_psi REAL,
+    sd_psi        REAL,
+    cycles        INTEGER,
+    window_s      INTEGER,
+    est_leak_lpd  REAL,
+    created_ts    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (circuit, night_date)
+);
+
+-- ==========================================================================
 -- DATA RETENTION CONFIGURATION
 -- Controls how aggressively old history is pruned.
 -- Training-era data is always protected regardless of these settings.
@@ -2779,6 +2802,42 @@ _NOT_REAL_SQL = (
     " OR COALESCE(e.is_cross_talk, 0) = 1 "
     " OR COALESCE(e.is_low_flow_dribble, 0) = 1)"
 )
+
+
+def upsert_pump_regime_night(conn: sqlite3.Connection, circuit: str,
+                             night_date: str, **cols) -> None:
+    """Idempotent per-(circuit, night) upsert for the nightly regime row."""
+    fields = {"circuit": circuit, "night_date": night_date, **cols}
+    keys = ", ".join(fields)
+    ph = ", ".join("?" for _ in fields)
+    sets = ", ".join(f"{k}=excluded.{k}" for k in cols) or "detected=detected"
+    conn.execute(
+        f"INSERT INTO pump_regime_nightly ({keys}) VALUES ({ph}) "
+        f"ON CONFLICT(circuit, night_date) DO UPDATE SET {sets}",
+        list(fields.values()))
+    conn.commit()
+
+
+def get_pump_regime_nights(conn: sqlite3.Connection,
+                           limit: int = 40) -> List[Dict[str, Any]]:
+    """Home-level nightly aggregation, newest first: one dict per EVALUATED
+    night with any_detected = ANY-circuit rule (the pump is upstream of every
+    circuit), and the detecting circuit's period (circuit_1 preferred when
+    both detect — deterministic)."""
+    rows = conn.execute(
+        """SELECT night_date,
+                  MAX(detected) AS any_detected,
+                  COALESCE(
+                      MAX(CASE WHEN detected = 1 AND circuit = 'circuit_1'
+                               THEN period_s END),
+                      MAX(CASE WHEN detected = 1 THEN period_s END)
+                  ) AS period_s,
+                  MAX(CASE WHEN detected = 1 THEN amplitude_psi END)
+                      AS amplitude_psi
+           FROM pump_regime_nightly
+           GROUP BY night_date ORDER BY night_date DESC LIMIT ?""",
+        (limit,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def count_not_real_events(

@@ -422,6 +422,45 @@ async def profile_update(request: Request):
 
 
 # ------------------------------------------------------------------
+# Pump-regime detection banner (dev23, pump plan Phase 3)
+# ------------------------------------------------------------------
+@router.post("/pump-banner/confirm")
+async def pump_banner_confirm(request: Request):
+    """User confirmed the detected booster pump. This is the ONLY auto-path
+    into pump mode (banner+confirm): sets supply_type='city_pump', stamps
+    answer provenance (a banner-Yes is an explicit post-feature answer — the
+    alert arming rule may trust it), and records the ack."""
+    orch = _orch(request)
+    from datetime import datetime as _dt, timezone as _tzinfo
+    from ..database import update_home_profile
+    update_home_profile(
+        orch.db,
+        supply_type="city_pump",
+        supply_type_set_at=_dt.now(_tzinfo.utc).isoformat(),
+        pump_mode_ack="confirmed",
+    )
+    log.info("pump banner: user CONFIRMED booster pump — supply_type set to "
+             "city_pump, pump mode active")
+    return ingress_redirect(request, "/settings#profile")
+
+
+@router.post("/pump-banner/dismiss")
+async def pump_banner_dismiss(request: Request):
+    """User dismissed the detection banner. Nothing activates; the dismissal
+    night rides inside the ack value ('dismissed:<date>') so the recurring
+    re-banner (>=30 evaluated nights of continued detection) has an anchor
+    without a schema change."""
+    orch = _orch(request)
+    from datetime import datetime as _dt, timezone as _tzinfo
+    from ..database import update_home_profile
+    today = _dt.now(_tzinfo.utc).date().isoformat()
+    update_home_profile(orch.db, pump_mode_ack=f"dismissed:{today}")
+    log.info("pump banner: dismissed (re-banner only if detection persists "
+             "30+ evaluated nights)")
+    return ingress_redirect(request, "/settings#profile")
+
+
+# ------------------------------------------------------------------
 # Sensitivity
 # ------------------------------------------------------------------
 @router.post("/sensitivity/{circuit}/update")

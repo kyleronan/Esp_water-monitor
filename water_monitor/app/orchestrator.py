@@ -789,6 +789,15 @@ class Orchestrator:
         # historical candidate events from HA history, then stamps itself done.
         self._rise_corr_backfill = RiseCorrBackfill(self._db, self._cfg, self._ha)
 
+        # Nightly pump-regime detector (dev23, pump plan Phase 3) — analyzes
+        # the quiet-hour pressure/flow window with the study-validated math
+        # and maintains the banner+confirm home flag. Detection only; no
+        # detector behavior changes until the user confirms (Phase 4 gates on
+        # pump_mode_effective, which ignores unconfirmed detection).
+        from .pump_regime_detector import PumpRegimeDetector
+        self._pump_regime = PumpRegimeDetector(self._db, self._cfg, self._ha,
+                                               ha_tz=self._ha_tz)
+
         # Fixture publisher — MQTT Discovery for confirmed fixtures
         self._fixture_publisher = FixturePublisher(self._db, self._cfg, self._ha)
         try:
@@ -810,6 +819,7 @@ class Orchestrator:
                 self._supervise("cluster_metrics",     self._cluster_metrics.run),
                 self._supervise("maturity_recheck",    self._maturity_recheck.run),
                 self._supervise("rise_corr_backfill",  self._rise_corr_backfill.run),
+                self._supervise("pump_regime_detector", self._pump_regime.run),
                 self._supervise("waveform_purger",     self._run_waveform_purger),
                 self._supervise("volume_baseline_rollover",
                                 self._run_volume_baseline_rollover),
