@@ -290,7 +290,8 @@ def _f(features: Dict[str, Any], key: str) -> Optional[float]:
 
 
 def is_flush_shaped(features: Dict[str, Any],
-                    calib: Optional[Dict[str, Any]] = None) -> bool:
+                    calib: Optional[Dict[str, Any]] = None,
+                    pump_mode: bool = False) -> bool:
     """THE shared flush predicate — both the toilet rule's positive match AND the
     washer sweep's exclusion. Single-sourcing it makes the invariant structural:
     the washer family can never claim an event the toilet rule would claim (a
@@ -311,6 +312,12 @@ def is_flush_shaped(features: Dict[str, Any],
         return False
     transient = features.get("has_pressure_transient")
     delta = _f(features, "pressure_delta_psi")
+    if pump_mode:
+        # dev24 (pump plan Phase 4): under a booster pump the flush's pressure
+        # signature rides the recharge sawtooth — the delta depends on where in
+        # the cycle the flush lands, so the pressure corroboration requirement
+        # is waived and the flow-only shape gates above decide.
+        return True
     return bool(transient) or (delta is not None and delta >= _FLUSH_MIN_DELTA_PSI)
 
 
@@ -485,10 +492,17 @@ def detect_dishwasher_cycles(
 def rule_classify_event(
     features: Dict[str, Any], circuit_type: str = "fixture",
     calib: Optional[Dict[str, Any]] = None,
+    pump_mode: bool = False,
 ) -> Optional[Tuple[str, str]]:
     """Ordered structural rules — first hit wins; None = no rule claims the event
     (falls through to the k-NN residual). Washer is deliberately NOT here: it
-    requires cycle context and comes only from ``detect_washer_cycles``."""
+    requires cycle context and comes only from ``detect_washer_cycles``.
+
+    ``pump_mode`` (dev24, confirmed vfd pump homes only): waives the toilet
+    rule's pressure-corroboration requirement — under a recharge sawtooth a
+    flush's pressure delta depends on where in the pump cycle it lands, so
+    only the flow-shape gates decide. Fitting/calibration paths keep the
+    default False (era-agnostic fits stay conservative)."""
     vol = _f(features, "volume_litres")
     dur = _f(features, "duration_seconds")
     pk = _f(features, "peak_flow_lpm")
@@ -502,7 +516,7 @@ def rule_classify_event(
             return "irrigation_zone", "zone_default"
         return None
 
-    if is_flush_shaped(features, calib):
+    if is_flush_shaped(features, calib, pump_mode=pump_mode):
         return "toilet", "rule_toilet"
 
     dw_vol = _cv(calib, "DW_VOL_L")

@@ -1081,6 +1081,56 @@ def _detect_pressure_silent_flow(duration_s, volume_litres, pressure_delta_psi,
     )
 
 
+# ── Pump-recharge absorber (dev24, pump plan Phase 4 — vfd profile only) ──────
+# A booster pump's recharge slug: a brief, small metered burst pushed toward a
+# downstream leak while supply pressure RISES. Only active when pump mode is
+# confirmed with the vfd profile (config.pump_gates_active). The 2026-07 storm
+# scattered these across four artifact classes (below_meter_floor /
+# pressure_silent_flow / rising_pressure_phantom / pulsing_supply); this class
+# names them and replaces the two whose static-supply premises are false under
+# a sawtooth. NOTE: the metered slug is ~half the true slug (street-meter
+# calibration factor 1.9) — PUMP_SLUG_MAX_L bounds the METERED number.
+PUMP_RECHARGE_REASON = "pump_recharge"
+PUMP_SLUG_MAX_L: float = 0.6          # metered; 2x the largest observed slug
+_PUMP_SLUG_MAX_DURATION_S: float = 60.0
+_PUMP_SLUG_MIN_CORR: float = 0.5      # flow-during-rise (phase-aligned)
+_PUMP_SLUG_SILENT_DP_PSI: float = 0.8 # or: too brief for a pressure verdict
+
+
+def _detect_pump_recharge(duration_s, volume_litres, flow_pressure_corr,
+                          pressure_delta_psi) -> bool:
+    """True = this event is a pump recharge slug (pump mode only — caller
+    gates). Two signatures, matching how the storm actually presented:
+      * phase-aligned: flow coincided with the pressure RISE (corr >= 0.5 —
+        the same signal the rise-phantom detector reads, but under a pump the
+        physical cause is the pump pushing water, and the water is real);
+      * pressure-quiet: the slug is too brief/small for a meaningful supply
+        response (|dP| <= 0.8 — the pressure_silent signature).
+    A short small draw with a REAL pressure dip and negative correlation (an
+    icemaker fill between recharges) matches neither and stays a normal
+    event. Known v1 limitation: a micro-draw that TRIGGERS a recharge merges
+    with it and classifies half-wrong either way (plan round-4 #8)."""
+    try:
+        dur = float(duration_s or 0.0)
+        vol = float(volume_litres or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if not (0.0 < vol <= PUMP_SLUG_MAX_L and 0.0 < dur <= _PUMP_SLUG_MAX_DURATION_S):
+        return False
+    corr = flow_pressure_corr
+    if corr is not None:
+        try:
+            if float(corr) >= _PUMP_SLUG_MIN_CORR:
+                return True
+        except (TypeError, ValueError):
+            corr = None
+    try:
+        dp = abs(float(pressure_delta_psi)) if pressure_delta_psi is not None else None
+    except (TypeError, ValueError):
+        dp = None
+    return dp is not None and dp <= _PUMP_SLUG_SILENT_DP_PSI
+
+
 def _detect_rising_pressure_phantom(duration_s, volume_litres,
                                     flow_pressure_corr, calib=None,
                                     min_flow_lpm: float = 0.15) -> bool:
@@ -1281,7 +1331,8 @@ def _merge_degraded_diag(features: dict, extra: dict) -> None:
 
 
 def _finalize_derived_verdicts(features: dict, calib=None,
-                               min_flow_lpm: float = 0.15) -> None:
+                               min_flow_lpm: float = 0.15,
+                               pump_gates: bool = False) -> None:
     """Single source of truth for the phantom verdict + its dependent fields.
 
     ``calib`` is the frozen per-home artifact-detector calibration (Phase 2.4) —
@@ -1363,8 +1414,26 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     # phantom (shares the flag/method; distinct match_rejection_reason keeps the
     # provenance). Gated off degraded (pressure unreliable) and user labels like
     # every zeroing verdict; a None correlation can never fire it.
+    # Pump-recharge absorber (dev24, ``pump_gates`` = confirmed vfd pump mode):
+    # runs FIRST among the small-event verdicts and REPLACES the two detectors
+    # whose static-supply premises are false under a pump sawtooth
+    # (rising_pressure_phantom: real draws coinciding with a recharge upswing
+    # get positive corr; pressure_silent_flow: a real draw during the upswing
+    # can look pressure-silent). Skipping them can only ADD events — zeroing
+    # never expands — so the swap is leak-safe. The recharge water is real
+    # (it feeds the leak) but is not fixture usage: zero effective volume like
+    # the artifact family; leak ACCOUNTING lives in the street-calibrated
+    # Phase 5 estimator, not the usage totals.
+    is_pump_recharge = (
+        pump_gates and not is_phantom and not is_degraded and not has_user_type
+        and _detect_pump_recharge(
+            features.get("duration_seconds"), features.get("volume_litres"),
+            features.get("flow_pressure_corr"),
+            features.get("pressure_delta_psi"))
+    )
     is_rise_phantom = (
-        not is_phantom and not is_degraded and not has_user_type
+        not pump_gates
+        and not is_phantom and not is_degraded and not has_user_type
         and _detect_rising_pressure_phantom(
             features.get("duration_seconds"), features.get("volume_litres"),
             features.get("flow_pressure_corr"), calib=calib,
@@ -1375,7 +1444,8 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     # phantom (ΔP < 2.0). Gated off degraded events (their flow metrics are unreliable,
     # so the no-flow signal can't be trusted). Zeroes volume + excludes, like a phantom.
     is_cross_talk = (
-        not is_phantom and not is_rise_phantom and not is_degraded
+        not is_phantom and not is_rise_phantom and not is_pump_recharge
+        and not is_degraded
         and not has_user_type
         and _detect_cross_talk(
             features.get("duration_seconds"), features.get("pressure_delta_psi"),
@@ -1388,7 +1458,8 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     # excludes. Reuses the is_low_flow_dribble flag/UI plumbing with a
     # distinct reason. Gated off user types like every zeroing verdict.
     is_dribble = (
-        not is_phantom and not is_rise_phantom and not is_cross_talk
+        not is_phantom and not is_rise_phantom and not is_pump_recharge
+        and not is_cross_talk
         and not is_degraded and not has_user_type
         and _detect_low_flow_dribble(
             features.get("volume_litres"), features.get("avg_flow_lpm"),
@@ -1402,7 +1473,8 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     # Partition: below-floor owns rates under the registration floor; this
     # verdict owns rates at/above it.
     is_pressure_silent = (
-        not is_phantom and not is_rise_phantom and not is_cross_talk
+        not pump_gates
+        and not is_phantom and not is_rise_phantom and not is_cross_talk
         and not is_dribble and not is_degraded and not has_user_type
         and _detect_pressure_silent_flow(
             features.get("duration_seconds"), features.get("volume_litres"),
@@ -1430,6 +1502,9 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     if is_phantom or is_rise_phantom:
         features["volume_litres_effective"]  = 0.0
         features["volume_estimation_method"] = "pressure_restoration_phantom"
+    elif is_pump_recharge:
+        features["volume_litres_effective"]  = 0.0
+        features["volume_estimation_method"] = PUMP_RECHARGE_REASON
     elif is_pressure_silent:
         features["volume_litres_effective"]  = 0.0
         features["volume_estimation_method"] = PRESSURE_SILENT_REASON
@@ -1464,8 +1539,11 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     is_sparse_envelope = _is_sparse_envelope(
         features.get("duration_seconds"), features.get("flow_on_ratio"),
         is_phantom or is_rise_phantom)
+    # pump_recharge joins the phantom FLAG family so the hide-toggle / zeroing
+    # plumbing applies unchanged; its distinct reason keeps provenance.
     features["is_pressure_restoration_phantom"] = (
-        1 if (is_phantom or is_rise_phantom or is_pressure_silent) else 0)
+        1 if (is_phantom or is_rise_phantom or is_pressure_silent
+              or is_pump_recharge) else 0)
     features["is_cross_talk"] = 1 if is_cross_talk else 0
     features["is_low_flow_dribble"] = 1 if is_dribble else 0
     # Kept-but-questioned draw: volume kept (raw/degraded branch above), out of
@@ -1473,6 +1551,7 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     features["phantom_suppression_averted"] = 1 if phantom_averted else 0
     features["excluded_from_training"] = (
         1 if (is_degraded or is_phantom or is_rise_phantom or is_pressure_silent
+              or is_pump_recharge
               or is_cross_talk or is_dribble or user_ignored
               or integration_unusable or is_sparse_envelope or phantom_averted)
         else 0
@@ -1486,6 +1565,7 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     features["match_rejection_reason"] = (
         "pressure_restoration_phantom" if is_phantom
         else RISE_PHANTOM_REASON if is_rise_phantom
+        else PUMP_RECHARGE_REASON if is_pump_recharge
         else PRESSURE_SILENT_REASON if is_pressure_silent
         else "cross_talk" if is_cross_talk
         else "pulsing_supply" if is_degraded
@@ -4042,9 +4122,15 @@ class FeatureExtractor:
                     int(existing["user_ignored"] or 0) if existing is not None else 0
                 )
                 from .artifact_calibration import load_artifact_calibration
+                from .config import pump_gates_active
                 _acal = load_artifact_calibration(self._db, features.get("circuit"))
+                try:
+                    _pump = pump_gates_active(self._db, features.get("circuit"))
+                except Exception:
+                    _pump = False
                 _finalize_derived_verdicts(features, _acal or None,
-                                           min_flow_lpm=min_flow_lpm)
+                                           min_flow_lpm=min_flow_lpm,
+                                           pump_gates=_pump)
 
             # Atomic upsert + hourly_volume update. Uses
             # volume_litres_effective (which is volume_litres for healthy
@@ -4524,7 +4610,13 @@ class FeatureExtractor:
                                                      "dishwasher_cycle")
                 cycle_group_id = dishwasher_members[event_id][1]
             else:
-                rule_hit = rule_classify_event(features, ctype, calib=calib)
+                from .config import pump_gates_active as _pga
+                try:
+                    _pump = _pga(self._db, circuit)
+                except Exception:
+                    _pump = False
+                rule_hit = rule_classify_event(features, ctype, calib=calib,
+                                               pump_mode=_pump)
                 if rule_hit is not None:
                     matched_fixture_type, matched_via = rule_hit
         except Exception as e:

@@ -22,6 +22,22 @@ landed without a version bump; per-build details are in git history.)
   post-feature answer from a migrated one, and moving off a pump supply
   disarms/unconfirms pump state. Detection, detector gating, and the
   pump-assisted leak tests build on this in later phases (migration 20260558).
+- **Pump-recharge storm absorber (dev24, pump plan Phase 4 — first half)** —
+  on homes with CONFIRMED pump mode (vfd profile), a new `pump_recharge`
+  artifact class claims the brief recharge slugs ("🔄 Pump top-up — not real
+  use"): flow-during-rise (positive flow↔pressure correlation) or
+  pressure-quiet blips ≤0.6 L / ≤60 s. It REPLACES the two detectors whose
+  static-supply premises are false under a pump sawtooth
+  (`rising_pressure_phantom`, `pressure_silent_flow`) — a real draw
+  coinciding with a recharge upswing can no longer be wrongly zeroed
+  (skipping them only ADDS events; leak-safe). The toilet rule's pressure-
+  corroboration requirement is waived in pump mode (a flush's ΔP depends on
+  where in the pump cycle it lands). Flag resolution: event paths read
+  `pump_mode_effective` through a 60 s TTL cache invalidated by the banner/
+  supply routes; everything is inert until the user confirms. Offline replay
+  on the captured storm: 85–88% event-count reduction with zero labeled-real
+  events lost. (Second half — pressure-start suppression during oscillation
+  in the live detector — lands separately.)
 - **Nightly pump-regime detection + confirmation banner (dev23, pump plan
   Phase 3)** — a supervised background worker analyzes each circuit's
   quiet-hour pressure/flow window from HA history with the study-validated

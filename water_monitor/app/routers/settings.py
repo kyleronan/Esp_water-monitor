@@ -418,6 +418,9 @@ async def profile_update(request: Request):
         setup_complete=1,
         **pump_fields,
     )
+    if supply_type != prev_supply:
+        from ..config import invalidate_pump_mode_cache
+        invalidate_pump_mode_cache()
     return ingress_redirect(request, "/settings#profile")
 
 
@@ -439,6 +442,8 @@ async def pump_banner_confirm(request: Request):
         supply_type_set_at=_dt.now(_tzinfo.utc).isoformat(),
         pump_mode_ack="confirmed",
     )
+    from ..config import invalidate_pump_mode_cache
+    invalidate_pump_mode_cache()
     log.info("pump banner: user CONFIRMED booster pump — supply_type set to "
              "city_pump, pump mode active")
     return ingress_redirect(request, "/settings#profile")

@@ -321,6 +321,41 @@ def pump_mode_effective(conn, circuit: str) -> dict:
     return {"active": False, "profile": None, "source": "none"}
 
 
+# Per-invocation TTL cache for pump_mode_effective (pump plan round-1 #15):
+# feature_extractor and event_rules resolve the flag on EVERY event, so a raw
+# 2-query resolve per finalize is wasteful — but the flag must also flip
+# everywhere within ~one TTL of a banner confirm / override change, or the
+# event detector (build-time resolution + live reload) and the extractor
+# would disagree until restart. Routes that change pump state call
+# invalidate_pump_mode_cache() explicitly.
+_PUMP_MODE_CACHE: dict = {}
+_PUMP_MODE_CACHE_TTL_S = 60.0
+
+
+def pump_mode_effective_cached(conn, circuit: str) -> dict:
+    import time as _time
+    now = _time.monotonic()
+    hit = _PUMP_MODE_CACHE.get(circuit)
+    if hit is not None and (now - hit[0]) < _PUMP_MODE_CACHE_TTL_S:
+        return hit[1]
+    result = pump_mode_effective(conn, circuit)
+    _PUMP_MODE_CACHE[circuit] = (now, result)
+    return result
+
+
+def invalidate_pump_mode_cache() -> None:
+    _PUMP_MODE_CACHE.clear()
+
+
+def pump_gates_active(conn, circuit: str) -> bool:
+    """True when the vfd-profile Phase 4 detector gates apply to ``circuit``.
+    v1 scope: pump-aware detection adjustments require the vfd profile —
+    switch_tank homes' oscillation is NOT confined to quiet windows, so these
+    gates would misfire there (see the pump plan's Architecture section)."""
+    r = pump_mode_effective_cached(conn, circuit)
+    return bool(r["active"] and r["profile"] == PUMP_PROFILE_VFD)
+
+
 # Zone (irrigation) circuits see only a handful of repetitive cycles per
 # day, so the whole-home fixture target below is unreachable for them. A
 # small fixed target is enough to characterise their flow signature.

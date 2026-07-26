@@ -214,7 +214,12 @@ def recompute_volume_and_active_flow(
                 # (without it a recompute re-zeroed a user-corrected event).
                 "user_fixture_type": r["user_fixture_type"],
             }
-            _finalize_derived_verdicts(feat, _acal)
+            from .config import pump_gates_active as _pga
+            try:
+                _pump = _pga(conn, circuit)
+            except Exception:
+                _pump = False
+            _finalize_derived_verdicts(feat, _acal, pump_gates=_pump)
             eff = feat["volume_litres_effective"]
             method = feat["volume_estimation_method"]
 

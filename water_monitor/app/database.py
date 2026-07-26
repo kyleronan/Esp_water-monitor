@@ -2249,7 +2249,12 @@ def coalesce_low_flow_events(
                 "true_avg_flow_lpm": avg, "flow_integral_litres": total_vol,
                 "flow_on_ratio": None, "is_composite": 0,
             }
-            _finalize_derived_verdicts(feats, _acal)
+            from .config import pump_gates_active as _pga
+            try:
+                _pump = _pga(conn, circuit)
+            except Exception:
+                _pump = False
+            _finalize_derived_verdicts(feats, _acal, pump_gates=_pump)
             new_eff = float(feats["volume_litres_effective"] or 0.0)
 
             # (1) Reverse each ABSORBED member's applied contribution. The survivor's
@@ -5520,7 +5525,13 @@ def reclassify_all_events_from_signatures(
             new_group = dishwasher_ids[r["id"]][1]
         else:
             feats = {f: r[f] for f in qfeats}
-            rule_hit = rule_classify_event(feats, circuit_type, calib=calib)
+            from .config import pump_gates_active as _pga
+            try:
+                _pump = _pga(conn, circuit)
+            except Exception:
+                _pump = False
+            rule_hit = rule_classify_event(feats, circuit_type, calib=calib,
+                                           pump_mode=_pump)
             if rule_hit is not None:
                 new_type, new_via = rule_hit
             else:
