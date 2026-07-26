@@ -447,6 +447,28 @@ class CircuitEventDetector:
 
         self._debug_capture_propagation: bool = debug_capture_propagation
 
+        # dev25 (pump plan Phase 4b) — pump-mode oscillation gate. None = off.
+        # When set (confirmed vfd pump mode), PRESSURE-initiated event starts
+        # are suppressed while the rolling 60 s pressure peak-to-peak exceeds
+        # this gate: a recharge sawtooth crosses the 1.2 PSI drop trigger on
+        # every cycle and each blip-opened event can swallow a real draw that
+        # starts before the 60 s settled-noflow close (the 2026-07-20 10:03
+        # double-counted flush). The FLOW path is untouched and remains the
+        # primary detector; firmware trickle detection is independent → the
+        # suppression can never mask a leak. The gate value is amplitude-
+        # derived by the parent (max(2.0, 0.15 × measured band)) so a milder
+        # pump than the incident's 12 PSI band still gates correctly.
+        self.pump_osc_gate_psi: Optional[float] = None
+        # Surge-phantom rejection threshold as an INSTANCE attr: in pump mode
+        # a recharge upswing during a real event is exactly the "max pressure
+        # rose above baseline" pattern this rejects, so the gate is widened to
+        # effectively-off (20 PSI > any recharge band) instead of 0.5.
+        self.pressure_surge_phantom_psi: float = self.PRESSURE_SURGE_PHANTOM_PSI
+        # Rolling ~60 s of (ts, psi) for the oscillation gate. At 40 Hz this
+        # is ~2400 entries; p2p is only computed when a pressure start would
+        # otherwise fire, so the steady-state cost is just the appends.
+        self._minute_pressure: Deque[Tuple[datetime, float]] = deque(maxlen=2600)
+
         self._pressure_buf: Deque[float] = deque(maxlen=self.PRESSURE_BUFFER_SIZE)
         # Per-sample arrival timestamps, kept exactly parallel to _pressure_buf
         # (same maxlen, appended/cleared together) — diagnostic use only.
@@ -488,6 +510,24 @@ class CircuitEventDetector:
 
     def update_threshold(self, threshold_psi: float) -> None:
         self.pressure_drop_threshold = threshold_psi
+
+    def update_pump_gate(self, gate_psi: Optional[float]) -> None:
+        """Set/clear the pump-mode oscillation gate (dev25). Also widens the
+        surge-phantom rejection to effectively-off while pump mode is on."""
+        self.pump_osc_gate_psi = gate_psi
+        self.pressure_surge_phantom_psi = (
+            20.0 if gate_psi is not None else self.PRESSURE_SURGE_PHANTOM_PSI)
+
+    def _minute_p2p(self, now: datetime) -> float:
+        """Peak-to-peak PSI over the trailing 60 s (prunes in place)."""
+        cutoff = now - timedelta(seconds=60)
+        buf = self._minute_pressure
+        while buf and buf[0][0] < cutoff:
+            buf.popleft()
+        if len(buf) < 2:
+            return 0.0
+        vals = [p for _, p in buf]
+        return max(vals) - min(vals)
 
     def update_min_flow(self, min_flow_lpm: float) -> None:
         """Update the meter-derived low-flow floor live (after a PPL change)."""
@@ -620,6 +660,8 @@ class CircuitEventDetector:
         now = datetime.now(timezone.utc)
         self._pressure_buf.append(pressure)
         self._pressure_ts_buf.append(now)
+        if self.pump_osc_gate_psi is not None:
+            self._minute_pressure.append((now, pressure))
 
         # Need LOOKBACK + WINDOW samples before baseline is meaningful.
         # At 40 Hz this is ~5 seconds — well inside the firmware grace period.
@@ -654,6 +696,18 @@ class CircuitEventDetector:
                         "[%s] pressure drop %.1f PSI suppressed — baseline not yet stable "
                         "(%.1fs < %.1fs required)",
                         self.circuit, drop, stable_secs, self.PRESSURE_STABLE_DURATION_S,
+                    )
+                elif (self.pump_osc_gate_psi is not None
+                        and self._minute_p2p(now) > self.pump_osc_gate_psi):
+                    # dev25 pump-mode oscillation gate: the supply is mid-
+                    # sawtooth — a pressure-only start here is a recharge
+                    # artifact wrapper waiting to swallow a real draw. Flow
+                    # starts are unaffected.
+                    log.debug(
+                        "[%s] pressure start suppressed — pump oscillation "
+                        "(60 s p2p %.1f > %.1f PSI gate)",
+                        self.circuit, self._minute_p2p(now),
+                        self.pump_osc_gate_psi,
                     )
                 else:
                     self._start_pressure_event(now, baseline, pressure)
@@ -1172,8 +1226,10 @@ class CircuitEventDetector:
             and ev.pre_event_pressure_psi > 0
             and ev.max_pressure_psi > 0
         ):
+            # Instance attr (dev25): widened to effectively-off in pump mode —
+            # a recharge upswing during a real event is exactly this pattern.
             pressure_rise = ev.max_pressure_psi - ev.pre_event_pressure_psi
-            if pressure_rise > self.PRESSURE_SURGE_PHANTOM_PSI and ev.pressure_delta_psi <= 0:
+            if pressure_rise > self.pressure_surge_phantom_psi and ev.pressure_delta_psi <= 0:
                 log.info(
                     "[%s] rejecting pressure-surge phantom: rose %.2f PSI "
                     "(max=%.1f baseline=%.1f delta=%.2f) duration=%.1f s",
@@ -1863,11 +1919,16 @@ class EventDetector:
         event_queue: asyncio.Queue,
         sensitivity_getter: Callable[[str], dict],
         debug_capture_propagation: bool = False,
+        pump_gate_getter: Optional[Callable[[str], Optional[float]]] = None,
     ) -> None:
         self._circuits = circuits
         self._ha = ha_client
         self._queue = event_queue
         self._sensitivity_getter = sensitivity_getter
+        # dev25: returns the pump-mode oscillation gate (PSI) for a circuit,
+        # or None when pump-aware suppression is off. Wired by the
+        # orchestrator; None default keeps tests/imports gate-free.
+        self._pump_gate_getter = pump_gate_getter or (lambda _c: None)
         self._debug_capture_propagation = debug_capture_propagation
         self._detectors: Dict[str, CircuitEventDetector] = {}
         # Tracks live valve open/closed state per circuit for cross-circuit feature
@@ -1919,6 +1980,11 @@ class EventDetector:
                 min_flow_lpm=getattr(cfg, "min_flow_lpm", 0.15),
             )
             self._detectors[cfg.circuit] = detector
+            try:
+                detector.update_pump_gate(self._pump_gate_getter(cfg.circuit))
+            except Exception as e:
+                log.warning("[%s] pump-gate resolve failed (non-fatal): %s",
+                            cfg.circuit, e)
 
             if cfg.flow_sensor:
                 self._ha.subscribe_entity(cfg.flow_sensor,          detector.on_flow_rate)
@@ -1971,11 +2037,18 @@ class EventDetector:
         )
 
     def update_thresholds(self) -> None:
-        """Reload thresholds from config after sensitivity settings change."""
+        """Reload thresholds from config after sensitivity settings change
+        (also re-resolves the pump-mode oscillation gate — the banner-confirm
+        route calls this so pump suppression flips without a restart)."""
         for circuit, detector in self._detectors.items():
             sens = self._sensitivity_getter(circuit)
             detector.update_threshold(sens.get("pressure_drop_event_psi", 1.2))
             detector.min_event_duration = sens.get("min_event_duration_seconds", 3.0)
+            try:
+                detector.update_pump_gate(self._pump_gate_getter(circuit))
+            except Exception as e:
+                log.warning("[%s] pump-gate resolve failed (non-fatal): %s",
+                            circuit, e)
 
     def _on_waveform_chunk(self, data: dict) -> None:
         """Route an esphome.water_monitor_waveform_chunk event to the correct circuit."""

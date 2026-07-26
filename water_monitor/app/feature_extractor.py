@@ -2095,6 +2095,16 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
              _PSILENT_MAX_DURATION_S, _PSILENT_MAX_VOLUME_L),
         ).fetchall()
         for row in psrows:
+            # dev25: in confirmed vfd pump mode this detector's premise is
+            # false (a real draw during a recharge upswing can look
+            # pressure-silent) — the live path skips it, so the sweep must
+            # not re-apply it out-of-band.
+            try:
+                from .config import pump_gates_active as _pga_sweep
+                if _pga_sweep(conn, row["circuit"]):
+                    continue
+            except Exception:
+                pass
             # Re-run the canonical detector (SQL is only a prefilter) — it adds
             # the registration-floor requirement the SQL can't express per-circuit.
             if not _detect_pressure_silent_flow(
@@ -2262,6 +2272,16 @@ def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
     rise_flagged = 0
     days: set = set()
     for row in rows:
+        # dev25: sweep must not re-apply the rise-phantom verdict to circuits
+        # in confirmed vfd pump mode — the live path routes these through the
+        # pump_recharge absorber instead (a real draw on a recharge upswing
+        # earns positive corr and would be wrongly zeroed here).
+        try:
+            from .config import pump_gates_active as _pga_sweep
+            if _pga_sweep(conn, row["circuit"]):
+                continue
+        except Exception:
+            pass
         # Re-run the canonical detector (SQL is only a prefilter) — single
         # source of truth for the thresholds, and it re-rejects bad data.
         # min_flow selects the meter-class volume cap (PD 2.5 L / turbine 1.0 L).

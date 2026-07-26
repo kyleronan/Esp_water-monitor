@@ -648,6 +648,7 @@ class Orchestrator:
             event_queue=self._event_queue,
             sensitivity_getter=self._get_sensitivity,
             debug_capture_propagation=self._cfg.debug_capture_propagation,
+            pump_gate_getter=self._get_pump_osc_gate,
         )
         if self.setup_complete:
             self._event_detector.setup()
@@ -844,6 +845,27 @@ class Orchestrator:
                     return
                 except asyncio.TimeoutError:
                     pass
+
+    def _get_pump_osc_gate(self, circuit: str):
+        """Pump-mode oscillation gate for the live detector (dev25), or None.
+
+        Active only under confirmed vfd pump mode. Amplitude-derived
+        (plan round-1 #14): max(2.0, 0.15 × latest measured sawtooth band)
+        from pump_regime_nightly, fallback 2.0 when detection hasn't measured
+        a band yet (setup-declared pump homes)."""
+        try:
+            from .config import pump_gates_active
+            if not pump_gates_active(self._db, circuit):
+                return None
+            from .database import get_pump_regime_nights
+            nights = get_pump_regime_nights(self._db, limit=10)
+            amp = next((n["amplitude_psi"] for n in nights
+                        if n["any_detected"] and n["amplitude_psi"]), None)
+            return max(2.0, 0.15 * float(amp)) if amp else 2.0
+        except Exception as e:
+            log.warning("[%s] pump-gate resolution failed (non-fatal): %s",
+                        circuit, e)
+            return None
 
     def _get_sensitivity(self, circuit: str) -> dict:
         """Return effective sensitivity settings for a circuit."""

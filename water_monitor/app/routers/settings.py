@@ -421,6 +421,12 @@ async def profile_update(request: Request):
     if supply_type != prev_supply:
         from ..config import invalidate_pump_mode_cache
         invalidate_pump_mode_cache()
+        if getattr(orch, "event_detector", None):
+            try:
+                orch.event_detector.update_thresholds()
+            except Exception as e:
+                log.warning("supply change: detector threshold reload failed "
+                            "(non-fatal): %s", e)
     return ingress_redirect(request, "/settings#profile")
 
 
@@ -444,6 +450,13 @@ async def pump_banner_confirm(request: Request):
     )
     from ..config import invalidate_pump_mode_cache
     invalidate_pump_mode_cache()
+    # dev25: flip the live detector's oscillation gate immediately too.
+    if getattr(orch, "event_detector", None):
+        try:
+            orch.event_detector.update_thresholds()
+        except Exception as e:
+            log.warning("pump banner: detector threshold reload failed "
+                        "(non-fatal): %s", e)
     log.info("pump banner: user CONFIRMED booster pump — supply_type set to "
              "city_pump, pump mode active")
     return ingress_redirect(request, "/settings#profile")

@@ -22,6 +22,23 @@ landed without a version bump; per-build details are in git history.)
   post-feature answer from a migrated one, and moving off a pump supply
   disarms/unconfirms pump state. Detection, detector gating, and the
   pump-assisted leak tests build on this in later phases (migration 20260558).
+- **Pump-mode live-detector gates (dev25, Phase 4b)** — in confirmed vfd
+  pump mode the live detector stops opening PRESSURE-initiated events while
+  the supply is mid-sawtooth: a rolling 60 s peak-to-peak above an
+  amplitude-derived gate (max(2.0, 0.15 × the nightly-measured band))
+  suppresses pressure starts, killing the blip-opened "wrapper" events that
+  swallowed real draws and double-counted their water (the 7/20 10:03
+  duplicated flush). Flow starts are untouched and remain the primary
+  trigger; firmware trickle detection is independent, so nothing here can
+  mask a leak. The pressure-surge phantom rejection is widened to
+  effectively-off in pump mode (a recharge upswing during a real event is
+  exactly that pattern), and the historical rise-phantom /
+  pressure-silent reprocess sweeps now skip pump-mode circuits so they
+  can't re-apply verdicts the live path retired. The banner-confirm and
+  supply-type routes reload detector gates immediately — no restart. The
+  k-NN pressure-feature down-weight stays DEFERRED per the plan (the fit
+  paths are era-agnostic and Phase 2c showed no material k-NN regression
+  on the labeled set).
 - **Pump-recharge storm absorber (dev24, pump plan Phase 4 — first half)** —
   on homes with CONFIRMED pump mode (vfd profile), a new `pump_recharge`
   artifact class claims the brief recharge slugs ("🔄 Pump top-up — not real
