@@ -22,6 +22,23 @@ landed without a version bump; per-build details are in git history.)
   post-feature answer from a migrated one, and moving off a pump supply
   disarms/unconfirms pump state. Detection, detector gating, and the
   pump-assisted leak tests build on this in later phases (migration 20260558).
+- **Pump-assisted leak detection (dev26, pump plan Phase 5)** — the pump is
+  now a leak sensor. 5a: on detected nights the regime worker estimates the
+  leak rate from recharge cycles (median slug × spacing, scaled by the
+  street-meter calibration factor 1.9 — the home meter registers ~half of
+  each slug), stores it in `pump_regime_nightly.est_leak_lpd`, shows a
+  dashboard "💧 Leak watch — ~X gal/day" tile, and fires a notify-only
+  `pump_leak` alert (new per-type toggle) when the estimate holds ≥20 L/day
+  for 3 consecutive evaluated nights or the cycle period shrinks >30%
+  week-over-week (leak growing). Transition-only — a persistent leak alerts
+  once, not nightly. The copy teaches the valve-bisect that located the
+  2026-07 zone-valve leak. 5b: after every valve-closed leak test (pump mode
+  only), the add-on checks whether the UNTESTED circuit's pressure kept
+  recharge-cycling while this line was isolated — "main passed, but the pump
+  kept topping up → the leak is on the other line, upstream of the valve, or
+  inside the pump's own check valve" — stored on `leak_test_history`
+  (migration 20260559) and shown as a "Pump check" verdict pill in the Leak
+  Test History table. A 5b failure can never affect the test's own result.
 - **Pump-mode live-detector gates (dev25, Phase 4b)** — in confirmed vfd
   pump mode the live detector stops opening PRESSURE-initiated events while
   the supply is mid-sawtooth: a rolling 60 s peak-to-peak above an

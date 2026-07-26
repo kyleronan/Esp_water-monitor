@@ -797,7 +797,8 @@ class Orchestrator:
         # pump_mode_effective, which ignores unconfirmed detection).
         from .pump_regime_detector import PumpRegimeDetector
         self._pump_regime = PumpRegimeDetector(self._db, self._cfg, self._ha,
-                                               ha_tz=self._ha_tz)
+                                               ha_tz=self._ha_tz,
+                                               alert_manager=self._alert_manager)
 
         # Fixture publisher — MQTT Discovery for confirmed fixtures
         self._fixture_publisher = FixturePublisher(self._db, self._cfg, self._ha)

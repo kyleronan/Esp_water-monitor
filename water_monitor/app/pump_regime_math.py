@@ -418,6 +418,36 @@ def estimate_leak_rate_lph(pressure_1hz: Sequence[float],
     }
 
 
+def classify_cross_circuit(pressure_1hz: Sequence[float],
+                           flow_1hz_lpm: Sequence[float],
+                           ) -> Tuple[str, int, Optional[float]]:
+    """Phase 5b — verdict for the UNTESTED circuit's window while its sibling
+    ran a valve-closed leak test. Returns (verdict, cycles, period_s).
+
+    Any registered flow on this circuit demotes to 'not_applicable' (an
+    icemaker fill / softener pulse here produces cycling that says nothing
+    about a leak — plan round-1 #3). With flow silent, recharge rises are
+    counted WITHOUT the flow-phase alignment test: the leak's slugs meter
+    through the OTHER (tested) circuit's meter or below this one's floor, so
+    this circuit sees the pressure sawtooth with zero flow — pressure-only
+    cycling here is exactly the signal. >=3 in-band-spaced rises =>
+    'untested_side'; else 'quiet'.
+    """
+    f = np.asarray(flow_1hz_lpm, dtype=float)
+    if f.size and bool((f > 0.0).any()):
+        return "not_applicable", 0, None
+    p = np.asarray(pressure_1hz, dtype=float)
+    rises = segment_recharge_rises(p)
+    spacings = [float(b.start_idx - a.start_idx)
+                for a, b in zip(rises, rises[1:])]
+    in_band = [s for s in spacings
+               if PUMP_PERIOD_MIN_S <= s <= PUMP_PERIOD_MAX_S]
+    if len(rises) >= 3 and len(in_band) >= 2:
+        return ("untested_side", len(rises),
+                float(np.median(in_band)))
+    return "quiet", len(rises), None
+
+
 # ── Synthetic traces (2a switch_tank sweep + tests) ────────────────────────────
 
 def synth_vfd_sawtooth(hours: float, period_s: float, low_psi: float,

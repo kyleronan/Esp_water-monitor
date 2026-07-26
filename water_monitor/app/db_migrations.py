@@ -141,6 +141,12 @@ _BASELINE_VERSION: int = 20260523
 #              offset_signature_json (TEXT — 32×1 s fixed-time shape cells for
 #              the k-NN edge tier) + one-shot backfill from every
 #              event_waveforms envelope (the validated configuration).
+#   20260559 — dev26: pump plan Phase 5b. leak_test_history gains the
+#              cross-circuit pump verdict columns (other_circuit_cycles,
+#              other_circuit_period_s, pump_verdict) — during a valve-closed
+#              leak test on circuit A, recharge cycling observed on the
+#              UNTESTED circuit B means the leak is on the other line /
+#              upstream / inside the pump's own check valve. DDL only.
 #   20260558 — dev21: pump-aware detection Phase 1 (plan
 #              yes-write-up-the-elegant-kettle). home_profile: pump_mode_detected
 #              /_at, pump_detect_period_s, pump_mode_ack, pump_profile,
@@ -149,7 +155,7 @@ _BASELINE_VERSION: int = 20260523
 #              (persisted arming stamp). sensitivity_config: pump_mode
 #              ('auto'|'on'|'off' per-circuit override), low_pressure_alert_psi
 #              (irrigation under-load floor, default 25). DDL only, no backfill.
-_CURRENT_VERSION: int = 20260558
+_CURRENT_VERSION: int = 20260559
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1619,6 +1625,35 @@ def _apply_pump_mode_columns(conn: sqlite3.Connection) -> None:
              "provenance plumbing; detection ships separately)")
 
 
+# 20260559 (dev26) — Phase 5b cross-circuit leak-test verdict columns.
+_LEAK_TEST_PUMP_COLUMNS: tuple = (
+    ("other_circuit_cycles",   "INTEGER"),
+    ("other_circuit_period_s", "REAL"),
+    ("pump_verdict",           "TEXT"),
+)
+
+
+def _apply_leak_test_pump_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260559 — dev26 pump plan Phase 5b.
+    Guarded + idempotent; stub DBs just get the version stamp."""
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+        "name='leak_test_history'").fetchone()
+    if has_table:
+        for col, ddl in _LEAK_TEST_PUMP_COLUMNS:
+            if not _has_column(conn, "leak_test_history", col):
+                conn.execute(
+                    f"ALTER TABLE leak_test_history ADD COLUMN {col} {ddl}")
+    conn.commit()
+    log.info("Migration 20260559: leak-test pump-verdict columns ready")
+
+
+def _missing_leak_test_pump_columns(conn: sqlite3.Connection) -> set[str]:
+    return {f"leak_test_history.{col}"
+            for col, _ddl in _LEAK_TEST_PUMP_COLUMNS
+            if not _has_column(conn, "leak_test_history", col)}
+
+
 def _missing_pump_mode_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the 20260558 pump-mode columns absent (home_profile +
     sensitivity_config)."""
@@ -1729,6 +1764,7 @@ _MIGRATIONS: tuple = (
     (20260556, _apply_sig256_rebuild),
     (20260557, _apply_edge_signatures),
     (20260558, _apply_pump_mode_columns),
+    (20260559, _apply_leak_test_pump_columns),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -1799,6 +1835,7 @@ def _run_migrations_impl(
             | _missing_epa_flush_cap_columns(conn)
             | _missing_edge_signature_columns(conn)
             | _missing_pump_mode_columns(conn)
+            | _missing_leak_test_pump_columns(conn)
         )
         if missing:
             raise RuntimeError(

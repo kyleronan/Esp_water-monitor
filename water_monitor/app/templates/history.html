@@ -444,6 +444,7 @@
           <th>Drop</th>
           <th>Drop rate</th>
           <th>Duration</th>
+          <th>Pump check</th>
         </tr>
       </thead>
       <tbody>
@@ -498,6 +499,16 @@
           <td class="hist-td hist-td-mono">{{ (t.pressure_drop_psi * pressure_factor)|round(pressure_decimals) if t.pressure_drop_psi is not none else "—" }}</td>
           <td class="hist-td hist-td-mono">{{ "%.4f %s/min"|format(drop_rate * pressure_factor, pressure_unit) if drop_rate is not none else "—" }}</td>
           <td class="hist-td">{{ "%.1f min"|format(t.duration_minutes) if t.duration_minutes else "—" }}</td>
+          {# Pump plan 5b — cross-circuit verdict while this line was isolated. #}
+          <td class="hist-td">
+            {% if t.pump_verdict == 'untested_side' %}
+              <span class="pill pill-amber" title="While this line was shut off for the test, the booster pump kept topping the system up ({{ t.other_circuit_cycles }} cycles) — the leak is likely on the other line, between the pump and this valve, or inside the pump's own check valve.">⚠ Leak elsewhere?</span>
+            {% elif t.pump_verdict == 'quiet' %}
+              <span class="pill pill-green" title="The booster pump stayed quiet while this line was isolated — no sign of a leak anywhere during the test.">Pump quiet</span>
+            {% elif t.pump_verdict == 'unavailable' %}
+              <span class="pill pill-neutral" title="Couldn't read the other line's pressure history for this test window.">—</span>
+            {% else %}—{% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>

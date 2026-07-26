@@ -359,6 +359,35 @@ class AlertManager:
             notification_id=f"water_pulsing_supply_{circuit}",
         )
 
+    async def alert_pump_leak_suspected(self, circuit: str, lpd: float,
+                                        period_min: Optional[float],
+                                        circuit_name: str) -> None:
+        """Pump plan Phase 5a — recharge-cycle slow-leak alert. NOTIFY-ONLY
+        by standing user decision (never shutoff: the leak is below both home
+        meters' floors, so the firmware cannot corroborate). The copy teaches
+        the valve bisect that located the 2026-07 zone-valve leak."""
+        from .units import load_unit_context
+        uc = load_unit_context(self._db)
+        gal = lpd / 3.785
+        vol_txt = (f"{gal:.0f} gallons" if uc.get("vol_unit") == "gal"
+                   else f"{lpd:.0f} liters")
+        every = (f"about every {period_min:.0f} minutes"
+                 if period_min else "repeatedly")
+        await self.fire(
+            circuit, "pump_leak",
+            title="💧 Possible slow leak — pump keeps topping up",
+            message=(
+                f"Your booster pump is re-pressurizing {every} overnight, "
+                f"when nothing should be running — roughly {vol_txt} a day "
+                "is leaking somewhere. Tip: closing shut-off valves one at a "
+                "time and watching whether the cycling stops can locate it "
+                "(if it keeps cycling with a line closed, the leak is on the "
+                "other line, upstream of that valve, or inside the pump's "
+                "own check valve)."
+            ),
+            notification_id="water_pump_leak_watch",
+        )
+
     async def alert_leak_test_failed(self, circuit: str,
                                       pressure_drop_psi: float,
                                       circuit_name: str) -> None:

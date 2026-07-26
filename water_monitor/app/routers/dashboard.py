@@ -69,6 +69,31 @@ async def dashboard(request: Request):
     except Exception:
         pump_banner = {"show": False}
 
+    # Phase 5a leak-watch tile: latest nightly street-calibrated estimate,
+    # shown only when pump mode is armed and the last evaluated night carried
+    # an estimate. Best-effort.
+    leak_watch = None
+    try:
+        from ..config import pump_gates_active
+        from ..database import get_pump_regime_nights
+        if any(pump_gates_active(orch.db, c.circuit) for c in cfg.circuits):
+            nights = get_pump_regime_nights(orch.db, limit=14)
+            latest = next((n for n in nights if n.get("est_leak_lpd")), None)
+            if latest:
+                leak_watch = {
+                    "lpd": latest["est_leak_lpd"],
+                    "gpd": round(latest["est_leak_lpd"] / 3.785, 1),
+                    "night": latest["night_date"],
+                    "period_min": (round(latest["period_s"] / 60.0, 1)
+                                   if latest.get("period_s") else None),
+                    "nights": [
+                        {"night_date": n["night_date"],
+                         "est": n.get("est_leak_lpd")}
+                        for n in nights],
+                }
+    except Exception:
+        leak_watch = None
+
     return templates.TemplateResponse("dashboard.html", {
         "request":             request,
         "circuits":            circuit_states,
@@ -78,6 +103,7 @@ async def dashboard(request: Request):
         "away_mode":           profile.get("away_mode", False),
         "circuit_type_labels": CIRCUIT_TYPE_LABELS,
         "pump_banner":         pump_banner,
+        "leak_watch":          leak_watch,
     })
 
 

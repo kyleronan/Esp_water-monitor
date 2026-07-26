@@ -1096,7 +1096,16 @@ CREATE TABLE IF NOT EXISTS leak_test_history (
     duration_minutes    REAL,
     baseline_psi        REAL,
     final_psi           REAL,
-    pressure_drop_psi   REAL
+    pressure_drop_psi   REAL,
+    -- Pump plan Phase 5b (migration 20260559): cross-circuit verdict — did
+    -- the UNTESTED circuit show pump recharge cycling while this circuit was
+    -- isolated? 'untested_side' = leak on the other line / upstream / pump
+    -- check valve; 'quiet' = no cycling anywhere; 'not_applicable' = pump
+    -- mode off or the other circuit had real flow; 'unavailable' = HA fetch
+    -- failed (never affects the test's own result).
+    other_circuit_cycles   INTEGER,
+    other_circuit_period_s REAL,
+    pump_verdict           TEXT
 );
 
 -- ==========================================================================
@@ -2838,7 +2847,8 @@ def get_pump_regime_nights(conn: sqlite3.Connection,
                       MAX(CASE WHEN detected = 1 THEN period_s END)
                   ) AS period_s,
                   MAX(CASE WHEN detected = 1 THEN amplitude_psi END)
-                      AS amplitude_psi
+                      AS amplitude_psi,
+                  MAX(est_leak_lpd) AS est_leak_lpd
            FROM pump_regime_nightly
            GROUP BY night_date ORDER BY night_date DESC LIMIT ?""",
         (limit,)).fetchall()
@@ -3393,6 +3403,9 @@ def _seed_alert_configs(conn: sqlite3.Connection, circuit: str,
          "Alert on sustained low flow — possible running toilet or dripping tap"),
         ("flow_anomaly", "Flow Anomaly",
          "Alert when flow pattern doesn't match any known fixture"),
+        ("pump_leak", "Pump Leak Watch",
+         "Alert when the booster pump keeps re-pressurizing overnight with "
+         "no water in use — a slow leak below the meters' sensitivity"),
         ("schedule_deviation", "Schedule Deviation",
          "Alert when flow occurs outside expected time patterns"),
     ]

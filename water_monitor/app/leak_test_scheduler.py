@@ -517,6 +517,20 @@ class LeakTestScheduler:
             duration_minutes, baseline_psi, final_psi, pressure_drop,
         )
 
+        # --- Pump plan Phase 5b: cross-circuit verdict (vfd pump mode only).
+        # While this circuit's valve was closed, did the UNTESTED circuit's
+        # pressure show pump recharge cycling? If yes, the leak feeding the
+        # pump is on the other line / upstream of this valve / inside the
+        # pump's own check valve. STRICT invariant: a 5b failure must never
+        # affect the leak test's own result — everything is best-effort and
+        # writes only the annotation columns.
+        try:
+            await self._pump_cross_check(
+                circuit, run_at, datetime.now(timezone.utc))
+        except Exception as e:
+            log.warning("[%s] pump cross-check failed (non-fatal): %s",
+                        circuit, e)
+
         upsert_leak_test_schedule(self._db, circuit,
                                   last_run_at=run_at.isoformat(),
                                   last_result=final_result)
@@ -551,6 +565,50 @@ class LeakTestScheduler:
             "pressure_drop_psi": pressure_drop,
             "passed":           passed,
         }
+
+    async def _pump_cross_check(self, tested_circuit: str,
+                                start_dt, end_dt) -> None:
+        """Phase 5b (dev26): annotate the just-stored leak-test row with the
+        UNTESTED circuit's pump verdict. Runs only under confirmed vfd pump
+        mode; fetches the sibling circuit's pressure AND flow for the test
+        window (any registered flow there demotes to 'not_applicable' — an
+        icemaker fill would fake cycling). Writes 'unavailable' on fetch
+        failure so a blank column is distinguishable from "never ran"."""
+        from .config import pump_gates_active
+        if not pump_gates_active(self._db, tested_circuit):
+            return
+        other = next((c for c in self._cfg.circuits
+                      if c.circuit != tested_circuit), None)
+        if other is None:
+            return
+        pressure_entity = (getattr(other, "pressure_history_sensor", None)
+                           or getattr(other, "pressure_avg_sensor", None))
+        flow_entity = getattr(other, "flow_sensor", None)
+        verdict, cycles, period = "unavailable", None, None
+        if pressure_entity and flow_entity:
+            try:
+                hist = await self._ha.get_history_batch(
+                    [pressure_entity, flow_entity], start_dt, end_dt)
+                from .pump_regime_detector import _ffill_1hz
+                from .pump_regime_math import classify_cross_circuit
+                n = max(int((end_dt - start_dt).total_seconds()), 60)
+                pres = _ffill_1hz(hist.get(pressure_entity) or [], start_dt, n)
+                flow = _ffill_1hz(hist.get(flow_entity) or [], start_dt, n,
+                                  default=0.0)
+                if (hist.get(pressure_entity) or []):
+                    verdict, cycles, period = classify_cross_circuit(pres, flow)
+            except Exception as e:
+                log.warning("[%s] pump cross-check fetch failed: %s",
+                            tested_circuit, e)
+        self._db.execute(
+            "UPDATE leak_test_history SET other_circuit_cycles = ?, "
+            "  other_circuit_period_s = ?, pump_verdict = ? "
+            "WHERE id = (SELECT MAX(id) FROM leak_test_history "
+            "            WHERE circuit = ?)",
+            (cycles, period, verdict, tested_circuit))
+        self._db.commit()
+        log.info("[%s] pump cross-check: %s (%s cycles on %s)",
+                 tested_circuit, verdict, cycles, other.circuit)
 
     def _compute_next_run(
         self, schedule: Any, now: Optional[datetime] = None,

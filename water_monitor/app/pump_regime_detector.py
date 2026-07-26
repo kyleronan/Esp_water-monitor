@@ -47,6 +47,59 @@ _SET_REQUIRED = 2
 _CLEAR_QUIET_NIGHTS = 7     # consecutive evaluated quiet nights to clear
 _REBANNER_EVALUATED_NIGHTS = 30   # recurring re-banner cadence post-dismissal
 
+# ── Phase 5a leak estimation + alert ──────────────────────────────────────────
+# Street-meter calibration (2026-07-25, same-window iPERL vs home estimator):
+# the oval-gear registers ~half of each recharge slug, so metered estimates
+# scale by 1.9 to report TRUE leak rate. Per-installation constant; re-derive
+# if the meter changes.
+PUMP_SLUG_CALIBRATION_FACTOR: float = 1.9
+PUMP_LEAK_ALERT_LPD: float = 20.0   # calibrated L/day threshold
+_ALERT_CONSEC_NIGHTS = 3            # evaluated nights at/above threshold
+_PERIOD_SHRINK_RATIO = 0.7          # last-7 vs prev-7 evaluated median
+_PERIOD_TREND_NIGHTS = 14
+
+
+def evaluate_leak_alert(nights: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Alert decision from home-level EVALUATED nights (newest first, each
+    carrying est_leak_lpd + period_s). TRANSITION-ONLY: fires when the
+    condition holds now but did NOT hold one night earlier, so a persistent
+    leak alerts once instead of nightly (the HA notification_id keeps the
+    sidebar entry alive regardless). Two triggers (plan 5a):
+      * threshold: est >= PUMP_LEAK_ALERT_LPD on 3 consecutive evaluated
+        nights;
+      * period-shrink: median period over the last 7 evaluated nights < 0.7 x
+        the previous 7 (the leak is growing) — "week" = evaluated nights
+        (plan round-1 #21).
+    """
+    def _threshold_at(offset: int) -> bool:
+        window = nights[offset:offset + _ALERT_CONSEC_NIGHTS]
+        return (len(window) >= _ALERT_CONSEC_NIGHTS
+                and all((n.get("est_leak_lpd") or 0) >= PUMP_LEAK_ALERT_LPD
+                        for n in window))
+
+    def _shrink_at(offset: int) -> bool:
+        window = nights[offset:offset + _PERIOD_TREND_NIGHTS]
+        periods = [n.get("period_s") for n in window if n.get("period_s")]
+        if len(window) < _PERIOD_TREND_NIGHTS or len(periods) < 10:
+            return False
+        recent = sorted(p for n in window[:7] if (p := n.get("period_s")))
+        prior = sorted(p for n in window[7:14] if (p := n.get("period_s")))
+        if len(recent) < 4 or len(prior) < 4:
+            return False
+        med_r = recent[len(recent) // 2]
+        med_p = prior[len(prior) // 2]
+        return med_r < _PERIOD_SHRINK_RATIO * med_p
+
+    if _threshold_at(0) and not _threshold_at(1):
+        lpd = float(nights[0].get("est_leak_lpd") or 0.0)
+        return {"reason": "threshold", "lpd": lpd,
+                "period_s": nights[0].get("period_s")}
+    if _shrink_at(0) and not _shrink_at(1):
+        lpd = float(nights[0].get("est_leak_lpd") or 0.0)
+        return {"reason": "period_shrink", "lpd": lpd,
+                "period_s": nights[0].get("period_s")}
+    return None
+
 
 def evaluate_hysteresis(nights: List[Dict[str, Any]],
                         currently_detected: bool) -> Optional[str]:
@@ -114,11 +167,13 @@ class PumpRegimeDetector:
     quiet-hour window ends; also runs a catch-up pass at boot when last
     night was never evaluated (deploys shouldn't wait a day)."""
 
-    def __init__(self, db: sqlite3.Connection, cfg, ha, ha_tz=None):
+    def __init__(self, db: sqlite3.Connection, cfg, ha, ha_tz=None,
+                 alert_manager=None):
         self._db = db
         self._cfg = cfg
         self._ha = ha
         self._ha_tz = ha_tz or timezone.utc
+        self._alert_manager = alert_manager   # Phase 5a; None in tests
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -211,11 +266,43 @@ class PumpRegimeDetector:
                 ok = False
         if wrote_any:
             self._apply_hysteresis()
+            await self._maybe_leak_alert()
         return ok
+
+    async def _maybe_leak_alert(self) -> None:
+        """Phase 5a: transition-only slow-leak alert. Gated on ARMED pump
+        mode (the arming rule — a confirmed/post-feature answer or observed
+        evidence; pump_gates_active implies the confirmed half) and
+        notify-only by standing decision."""
+        if self._alert_manager is None:
+            return
+        try:
+            from .config import pump_gates_active
+            from .database import get_pump_regime_nights
+            circuits = [c.circuit for c in self._cfg.circuits]
+            if not any(pump_gates_active(self._db, c) for c in circuits):
+                return
+            nights = get_pump_regime_nights(self._db, limit=40)
+            verdict = evaluate_leak_alert(nights)
+            if verdict is None:
+                return
+            period_min = (verdict["period_s"] / 60.0
+                          if verdict.get("period_s") else None)
+            circuit = circuits[0] if circuits else "circuit_1"
+            cfg = self._cfg.get_circuit(circuit) if hasattr(
+                self._cfg, "get_circuit") else None
+            name = cfg.label if cfg else circuit
+            await self._alert_manager.alert_pump_leak_suspected(
+                circuit, verdict["lpd"], period_min, name)
+            log.info("pump-leak alert fired (%s): ~%.0f L/day",
+                     verdict["reason"], verdict["lpd"])
+        except Exception as e:
+            log.warning("pump-leak alert evaluation failed (non-fatal): %s", e)
 
     async def _analyze_circuit_night(self, circuit_cfg, night: str) -> bool:
         import numpy as np
-        from .pump_regime_math import detect_pump_regime, quiet_windows
+        from .pump_regime_math import (detect_pump_regime,
+                                       estimate_leak_rate_lph, quiet_windows)
 
         pressure_entity = (getattr(circuit_cfg, "pressure_history_sensor", None)
                            or getattr(circuit_cfg, "pressure_avg_sensor", None))
@@ -254,11 +341,19 @@ class PumpRegimeDetector:
         # autocorr peak locked onto a 62 s sub-harmonic on the first
         # production night while the actual rises were ~259 s apart.
         period = v.reported_period_s
+        # Phase 5a: leak estimate on detected nights only, scaled by the
+        # street-meter calibration (the home meter registers ~half of each
+        # slug) so the stored/alerted number is the TRUE rate.
+        est_lpd = None
+        if v.detected:
+            est = estimate_leak_rate_lph(pres[s:e], flow[s:e])
+            est_lpd = round(
+                est["cycle_lph"] * 24.0 * PUMP_SLUG_CALIBRATION_FACTOR, 1)
         upsert_pump_regime_night(
             self._db, circuit_cfg.circuit, night,
             detected=1 if v.detected else 0,
             period_s=period, amplitude_psi=v.p2p_psi, sd_psi=v.sd_psi,
-            cycles=v.cycles, window_s=int(e - s))
+            cycles=v.cycles, window_s=int(e - s), est_leak_lpd=est_lpd)
         log.info("[%s] pump-regime night %s: %s (period=%s cycles=%d "
                  "p2p=%.1f window=%dm)",
                  circuit_cfg.circuit, night,

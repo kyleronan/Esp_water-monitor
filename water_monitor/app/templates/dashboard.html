@@ -44,6 +44,26 @@
 </div>
 {% endif %}
 
+{# ── Pump leak-watch (Phase 5a) — nightly recharge-derived leak estimate,
+   street-meter calibrated. Shows while pump mode is armed and the leak is
+   measurable; disappears when the pump stops cycling overnight (leak fixed). #}
+{% if leak_watch %}
+<div class="dash-alert dash-alert-degraded" aria-live="polite">
+  <div class="dash-alert-body">
+    <span class="dash-alert-title">💧 Leak watch</span>
+    <span class="dash-alert-detail">
+      Your booster pump topped the system up
+      {% if leak_watch.period_min %}about every {{ leak_watch.period_min }}
+      minutes{% else %}repeatedly{% endif %} overnight ({{ leak_watch.night }})
+      with nothing running — roughly
+      <strong>{{ leak_watch.gpd }} gal/day ({{ leak_watch.lpd }} L/day)</strong>
+      is leaking somewhere. Closing shut-off valves one at a time and watching
+      whether the cycling stops can locate it.
+    </span>
+  </div>
+</div>
+{% endif %}
+
 {# Compute a single page-level "what to do next" hint from state already in
    context (no new backend data). Branch on training.state first, then events —
    so live-with-no-events reads differently from a circuit still calibrating. #}
