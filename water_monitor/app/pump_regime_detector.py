@@ -250,16 +250,20 @@ class PumpRegimeDetector:
         v = detect_pump_regime(pres[s:e], flow[s:e])
 
         from .database import upsert_pump_regime_night
+        # Store the ROBUST period (median inter-rise spacing) — the raw
+        # autocorr peak locked onto a 62 s sub-harmonic on the first
+        # production night while the actual rises were ~259 s apart.
+        period = v.reported_period_s
         upsert_pump_regime_night(
             self._db, circuit_cfg.circuit, night,
             detected=1 if v.detected else 0,
-            period_s=v.period_s, amplitude_psi=v.p2p_psi, sd_psi=v.sd_psi,
+            period_s=period, amplitude_psi=v.p2p_psi, sd_psi=v.sd_psi,
             cycles=v.cycles, window_s=int(e - s))
         log.info("[%s] pump-regime night %s: %s (period=%s cycles=%d "
                  "p2p=%.1f window=%dm)",
                  circuit_cfg.circuit, night,
                  "DETECTED" if v.detected else "quiet",
-                 f"{v.period_s:.0f}s" if v.period_s else "-",
+                 f"{period:.0f}s" if period else "-",
                  v.cycles, v.p2p_psi, (e - s) // 60)
         return True
 

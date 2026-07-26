@@ -143,6 +143,17 @@ class RegimeVerdict:
     # Ramp diagnostics — NEVER part of `detected` (v1 scope).
     ramp_slope_psi_per_hr: float
     ramp_r2: float
+    # Median spacing between consecutive (aligned) recharge rises. PREFER this
+    # over period_s for reporting/trending: production night 2026-07-25 showed
+    # the autocorrelation locking onto a strong 62 s sub-harmonic while the 18
+    # actual rises were ~259 s apart — detection was unaffected (cycles +
+    # prominence carried it) but the raw autocorr period would have corrupted
+    # the banner copy and the Phase 5 period-shrink trend.
+    cycle_spacing_s: Optional[float] = None
+
+    @property
+    def reported_period_s(self) -> Optional[float]:
+        return self.cycle_spacing_s or self.period_s
 
 
 def find_dominant_period(pressure_1hz: Sequence[float],
@@ -302,6 +313,9 @@ def detect_pump_regime(pressure_1hz: Sequence[float],
         rises = all_rises
         aligned_ok = True
     cycles = len(rises)
+    spacings = [float(b.start_idx - a.start_idx)
+                for a, b in zip(rises, rises[1:])]
+    cycle_spacing = float(np.median(spacings)) if spacings else None
     slope, r2 = fit_decay_ramp(x)
 
     detected = (
@@ -317,7 +331,7 @@ def detect_pump_regime(pressure_1hz: Sequence[float],
     return RegimeVerdict(detected=detected, period_s=period,
                          prominence=prominence, sd_psi=sd, p2p_psi=p2p,
                          cycles=cycles, ramp_slope_psi_per_hr=slope,
-                         ramp_r2=r2)
+                         ramp_r2=r2, cycle_spacing_s=cycle_spacing)
 
 
 # ── Leak estimation (2b) ───────────────────────────────────────────────────────
