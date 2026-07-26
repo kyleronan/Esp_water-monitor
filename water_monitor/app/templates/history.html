@@ -459,6 +459,10 @@
            catch-all — otherwise the benign 3-port message would read as a red leak. KEEP IN SYNC. #}
         {% if _r.startswith('Passed') %}
           {% set lt.label = 'Passed' %}{% set lt.pill = 'pill-green' %}{% set lt.row = 'hist-row-pass' %}
+        {% elif _r.startswith('Failed') and t.user_dismissed %}
+          {# dev30 — user acknowledged this failure as benign (interrupted by
+             an update, known coincident draw): amber, not red. #}
+          {% set lt.label = 'Failed — ignored' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
         {% elif _r.startswith('Failed') %}
           {% set lt.label = 'Failed' %}{% set lt.pill = 'pill-red' %}{% set lt.row = 'hist-row-fail' %}
         {% elif _r.startswith('Aborted') %}
@@ -493,6 +497,17 @@
           <td class="hist-td">{{ t.triggered_by or '—' }}</td>
           <td class="hist-td">
             {% if t.result %}<span class="pill {{ lt.pill }}">{{ lt.label }}</span>{% else %}—{% endif %}
+            {# dev30 — acknowledge a benign failure (or undo). Display-only. #}
+            {% if _r.startswith('Failed') and is_admin %}
+            <form method="post" action="{{ ingress_path }}/history/api/leak-tests/{{ t.id }}/dismiss"
+                  style="display:inline;margin:0 0 0 6px"
+                  onclick="event.stopPropagation()">
+              <button type="submit" class="btn btn-ghost btn-sm"
+                      title="{% if t.user_dismissed %}Restore this failure to red{% else %}Mark this failure as known/benign (e.g. the test was interrupted by an update or someone ran water) — it turns amber instead of red{% endif %}">
+                {% if t.user_dismissed %}Un-ignore{% else %}Ignore{% endif %}
+              </button>
+            </form>
+            {% endif %}
           </td>
           <td class="hist-td hist-td-mono">{{ (t.baseline_psi * pressure_factor)|round(pressure_decimals) if t.baseline_psi is not none else "—" }}</td>
           <td class="hist-td hist-td-mono">{{ (t.final_psi * pressure_factor)|round(pressure_decimals) if t.final_psi is not none else "—" }}</td>

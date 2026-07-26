@@ -141,6 +141,10 @@ _BASELINE_VERSION: int = 20260523
 #              offset_signature_json (TEXT — 32×1 s fixed-time shape cells for
 #              the k-NN edge tier) + one-shot backfill from every
 #              event_waveforms envelope (the validated configuration).
+#   20260562 — dev30: leak_test_history.user_dismissed — user-acknowledged
+#              failed leak tests (benign causes: update interrupted the
+#              test, known coincident draw) render amber instead of red.
+#              Display-only flag; DDL only.
 #   20260561 — dev28: overlap-guard cleanup (plan overlap-guard-invariant).
 #              One-shot sweep over history for same-circuit overlapping
 #              events (same water recorded twice — ~127 L in the 2026-07
@@ -171,7 +175,7 @@ _BASELINE_VERSION: int = 20260523
 #              (persisted arming stamp). sensitivity_config: pump_mode
 #              ('auto'|'on'|'off' per-circuit override), low_pressure_alert_psi
 #              (irrigation under-load floor, default 25). DDL only, no backfill.
-_CURRENT_VERSION: int = 20260561
+_CURRENT_VERSION: int = 20260562
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1670,6 +1674,24 @@ def _missing_leak_test_pump_columns(conn: sqlite3.Connection) -> set[str]:
             if not _has_column(conn, "leak_test_history", col)}
 
 
+# 20260562 (dev30) — dismissible failed leak tests.
+def _apply_leak_test_dismissed_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260562. Guarded + idempotent."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                    "name='leak_test_history'").fetchone():
+        if not _has_column(conn, "leak_test_history", "user_dismissed"):
+            conn.execute("ALTER TABLE leak_test_history ADD COLUMN "
+                         "user_dismissed INTEGER DEFAULT 0")
+    conn.commit()
+    log.info("Migration 20260562: leak-test dismissed flag ready")
+
+
+def _missing_leak_test_dismissed_column(conn: sqlite3.Connection) -> set[str]:
+    if not _has_column(conn, "leak_test_history", "user_dismissed"):
+        return {"leak_test_history.user_dismissed"}
+    return set()
+
+
 # 20260561 (dev28) — one-shot overlap cleanup.
 def _apply_overlap_cleanup(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260561 — resolve historical
@@ -1841,6 +1863,7 @@ _MIGRATIONS: tuple = (
     (20260559, _apply_leak_test_pump_columns),
     (20260560, _apply_pump_low_pressure_column),
     (20260561, _apply_overlap_cleanup),
+    (20260562, _apply_leak_test_dismissed_column),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -1914,6 +1937,7 @@ def _run_migrations_impl(
             | _missing_leak_test_pump_columns(conn)
             | _missing_pump_low_pressure_columns(conn)
             | _missing_overlap_audit_table(conn)
+            | _missing_leak_test_dismissed_column(conn)
         )
         if missing:
             raise RuntimeError(

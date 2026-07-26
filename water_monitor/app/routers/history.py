@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from ..circuit_compat import resolve_circuit
 from ..fixtures import FIXTURE_TYPE_LABELS, user_selectable_types
 from ..database import patch_event as _patch_event
-from ._helpers import run_blocking
+from ._helpers import ingress_redirect, run_blocking
 
 _VALID_USER_FIXTURE_TYPES: frozenset = frozenset(user_selectable_types())
 
@@ -878,6 +878,28 @@ async def undo_auto_cycle_api(circuit: str, request: Request):
     if cleared:
         _schedule_reclassify(circuit)
     return JSONResponse({"ok": True, "cleared": cleared})
+
+
+@router.post("/api/leak-tests/{test_id}/dismiss")
+async def dismiss_leak_test(test_id: int, request: Request):
+    """dev30 — toggle a failed leak test's user-dismissed flag. Display-only
+    acknowledgement ("I know why this failed — update interrupted it, someone
+    ran water"): the row renders amber instead of red; the record itself is
+    never altered and future tests are unaffected."""
+    db = _orch(request).db
+    row = db.execute(
+        "SELECT user_dismissed FROM leak_test_history WHERE id = ?",
+        (test_id,)).fetchone()
+    if row is None:
+        return JSONResponse({"status": "error", "error": "not_found"},
+                            status_code=404)
+    new_val = 0 if row["user_dismissed"] else 1
+    db.execute("UPDATE leak_test_history SET user_dismissed = ? WHERE id = ?",
+               (new_val, test_id))
+    db.commit()
+    log.info("leak test %d %s by user", test_id,
+             "dismissed" if new_val else "un-dismissed")
+    return ingress_redirect(request, "/history")
 
 
 @router.post("/api/events/{circuit}/{event_id}/reprocess")

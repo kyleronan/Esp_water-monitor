@@ -9,6 +9,15 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Dismissible failed leak tests + observer-valve guard (dev30)** — a
+  failed leak test the user has reviewed and judged benign (test
+  interrupted by an add-on update, known coincident draw) can be marked
+  "Ignore": it renders amber ("Failed — ignored") instead of red, is
+  reversible, and never alters the record (migration 20260562). Also
+  hardens the Phase 5b pump cross-check: the observer circuit's sensors
+  only see the shared supply while its own valve is open, so if BOTH
+  valves are closed the verdict is `not_applicable` — never a false
+  "pump quiet / no leak anywhere".
 - **Same-circuit overlap guard + one-shot cleanup (dev28)** — one circuit
   can only have one event at a time; overlapping same-circuit events mean
   the same water was recorded twice (live blip-opened "wrapper" events vs

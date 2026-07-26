@@ -1110,7 +1110,12 @@ CREATE TABLE IF NOT EXISTS leak_test_history (
     -- failed (never affects the test's own result).
     other_circuit_cycles   INTEGER,
     other_circuit_period_s REAL,
-    pump_verdict           TEXT
+    pump_verdict           TEXT,
+    -- User acknowledgement (migration 20260562): a failed test the user has
+    -- reviewed and judged benign (test interrupted by an update, known
+    -- coincident draw). Display-only — renders amber instead of red; the
+    -- record itself is never altered.
+    user_dismissed         INTEGER DEFAULT 0
 );
 
 -- ==========================================================================

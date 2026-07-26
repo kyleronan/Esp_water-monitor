@@ -581,6 +581,28 @@ class LeakTestScheduler:
                       if c.circuit != tested_circuit), None)
         if other is None:
             return
+        # The observer circuit's sensors sit DOWNSTREAM of its own valve —
+        # they only see the shared supply (and therefore the pump) while that
+        # valve is open. If it's closed too (safety fault, manual shutoff),
+        # both circuits are isolated and a flat trace would read as a false
+        # "pump quiet / no leak anywhere" — demote to not_applicable instead.
+        other_valve = getattr(other, "valve_entity", None)
+        if other_valve:
+            try:
+                vstate = await self._ha.get_state_value(other_valve, "")
+                if str(vstate).lower() in ("closed", "closing"):
+                    self._db.execute(
+                        "UPDATE leak_test_history SET pump_verdict = "
+                        "'not_applicable' WHERE id = (SELECT MAX(id) FROM "
+                        "leak_test_history WHERE circuit = ?)",
+                        (tested_circuit,))
+                    self._db.commit()
+                    log.info("[%s] pump cross-check skipped — observer "
+                             "circuit %s valve is closed (both sides "
+                             "isolated)", tested_circuit, other.circuit)
+                    return
+            except Exception:
+                pass    # unknown valve state → proceed; fetch guards remain
         pressure_entity = (getattr(other, "pressure_history_sensor", None)
                            or getattr(other, "pressure_avg_sensor", None))
         flow_entity = getattr(other, "flow_sensor", None)
