@@ -649,6 +649,9 @@ class Orchestrator:
             sensitivity_getter=self._get_sensitivity,
             debug_capture_propagation=self._cfg.debug_capture_propagation,
             pump_gate_getter=self._get_pump_osc_gate,
+            low_pressure_getter=self._get_low_pressure_floors,
+            low_pressure_cb=self._on_low_pressure_alert,
+            pump_fail_cb=self._on_pump_fail_alert,
         )
         if self.setup_complete:
             self._event_detector.setup()
@@ -867,6 +870,68 @@ class Orchestrator:
             log.warning("[%s] pump-gate resolution failed (non-fatal): %s",
                         circuit, e)
             return None
+
+    def _get_low_pressure_floors(self, circuit: str):
+        """Phase 6 (dev27): (zone_floor_psi|None, pump_fail_floor_psi|None).
+
+        6a zone floor: zone circuits only, from sensitivity_config (default
+        25). 6b pump-fail floor: the FIRST fixture circuit only (shared
+        supply — ANY-circuit resolution), and only when vfd pump mode is
+        active AND the alert is ARMED (post-feature supply answer or
+        persisted evidence stamp — the arming rule). NULL user floor resolves
+        the per-supply default (city_pump 40) at read time."""
+        zone_floor = None
+        pump_floor = None
+        try:
+            from .database import get_circuit_type, get_home_profile
+            sens = self._get_sensitivity(circuit)
+            if get_circuit_type(self._db, circuit, default="fixture") == "zone":
+                zone_floor = float(
+                    sens.get("low_pressure_alert_psi") or 25.0)
+            else:
+                fixture_circuits = [
+                    c.circuit for c in self._cfg.circuits
+                    if get_circuit_type(self._db, c.circuit,
+                                        default=c.circuit_type) == "fixture"]
+                if fixture_circuits and circuit == fixture_circuits[0]:
+                    from .config import pump_gates_active
+                    if pump_gates_active(self._db, circuit):
+                        prof = get_home_profile(self._db)
+                        armed = bool(prof and (
+                            prof["pump_alert_armed_at"]
+                            or (prof["supply_type"] == "city_pump"
+                                and prof["supply_type_set_at"])))
+                        if armed:
+                            user_floor = sens.get("pump_low_pressure_alert_psi")
+                            pump_floor = (float(user_floor)
+                                          if user_floor is not None else 40.0)
+        except Exception as e:
+            log.warning("[%s] low-pressure floor resolve failed: %s",
+                        circuit, e)
+        return zone_floor, pump_floor
+
+    def _on_low_pressure_alert(self, circuit: str, psi: float) -> None:
+        """6a callback (runs on the event loop from the WS callback)."""
+        if self._alert_manager is None:
+            return
+        from .config import pump_mode_effective_cached
+        try:
+            pump_active = pump_mode_effective_cached(self._db, circuit)["active"]
+        except Exception:
+            pump_active = False
+        name = self.get_display_name(circuit) if hasattr(
+            self, "get_display_name") else circuit
+        asyncio.ensure_future(self._alert_manager.alert_low_pressure_supply(
+            circuit, psi, name, pump_active))
+
+    def _on_pump_fail_alert(self, circuit: str, psi: float, kind: str) -> None:
+        """6b callback (runs on the event loop from the WS callback)."""
+        if self._alert_manager is None:
+            return
+        name = self.get_display_name(circuit) if hasattr(
+            self, "get_display_name") else circuit
+        asyncio.ensure_future(self._alert_manager.alert_pump_low_pressure(
+            circuit, psi, kind, name))
 
     def _get_sensitivity(self, circuit: str) -> dict:
         """Return effective sensitivity settings for a circuit."""

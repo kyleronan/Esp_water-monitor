@@ -339,9 +339,25 @@ async def settings_page(request: Request):
                             ZONE_ONLY_ALERT_TYPES,
                             VALVE_TYPES, VALVE_TYPE_LABELS, VALVE_TYPE_HELP)
     from ..config import DEV_TOOLS
+    # Phase 6b: derived pump-failure floor hint (one-tap apply). Shown only
+    # for pump homes with nightly data; never auto-applied.
+    pump_floor = {"hint": None, "current": None}
+    try:
+        from ..config import pump_mode_effective_cached
+        if pump_mode_effective_cached(orch.db, "circuit_1")["active"]:
+            from ..pump_regime_detector import pump_floor_hint
+            pump_floor["hint"] = pump_floor_hint(orch.db)
+            row = orch.db.execute(
+                "SELECT pump_low_pressure_alert_psi FROM sensitivity_config "
+                "WHERE pump_low_pressure_alert_psi IS NOT NULL LIMIT 1"
+            ).fetchone()
+            pump_floor["current"] = row[0] if row else None
+    except Exception:
+        pass
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
         "dev_tools": DEV_TOOLS,
+        "pump_floor": pump_floor,
         "profile": dict(get_home_profile(orch.db) or {}),
         "circuits": circuits,
         "general_entities": entities_by_circuit.get("general", []),
@@ -427,6 +443,33 @@ async def profile_update(request: Request):
             except Exception as e:
                 log.warning("supply change: detector threshold reload failed "
                             "(non-fatal): %s", e)
+    return ingress_redirect(request, "/settings#profile")
+
+
+# ------------------------------------------------------------------
+# Pump-failure alert floor — one-tap hint apply (dev27, Phase 6b)
+# ------------------------------------------------------------------
+@router.post("/pump-floor/apply")
+async def pump_floor_apply(request: Request):
+    """Apply the derived pump-failure floor (quiet-window cut-in − 5 PSI) to
+    every circuit. Writing a value also satisfies the arming rule's
+    'explicit user-set floor' clause. Never applied automatically."""
+    orch = _orch(request)
+    from ..pump_regime_detector import pump_floor_hint
+    hint = pump_floor_hint(orch.db)
+    if hint is None:
+        return ingress_redirect(request, "/settings#profile")
+    from ..database import upsert_sensitivity_config
+    for c in orch._cfg.circuits:
+        upsert_sensitivity_config(orch.db, c.circuit,
+                                  pump_low_pressure_alert_psi=hint)
+    if getattr(orch, "event_detector", None):
+        try:
+            orch.event_detector.update_thresholds()
+        except Exception as e:
+            log.warning("pump-floor apply: threshold reload failed "
+                        "(non-fatal): %s", e)
+    log.info("pump-failure alert floor applied from hint: %.1f PSI", hint)
     return ingress_redirect(request, "/settings#profile")
 
 

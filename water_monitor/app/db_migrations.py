@@ -141,6 +141,13 @@ _BASELINE_VERSION: int = 20260523
 #              offset_signature_json (TEXT — 32×1 s fixed-time shape cells for
 #              the k-NN edge tier) + one-shot backfill from every
 #              event_waveforms envelope (the validated configuration).
+#   20260560 — dev27: pump plan Phase 6b. sensitivity_config.
+#              pump_low_pressure_alert_psi (DEFAULT NULL — NULL resolves the
+#              per-supply default at read time; only explicit user action
+#              writes a value, which doubles as the arming rule's
+#              "user-set floor" signal) + pump_regime_nightly.min_psi (the
+#              quiet-window pressure floor ≈ pump cut-in — feeds the
+#              suggested-floor hint). DDL only.
 #   20260559 — dev26: pump plan Phase 5b. leak_test_history gains the
 #              cross-circuit pump verdict columns (other_circuit_cycles,
 #              other_circuit_period_s, pump_verdict) — during a valve-closed
@@ -155,7 +162,7 @@ _BASELINE_VERSION: int = 20260523
 #              (persisted arming stamp). sensitivity_config: pump_mode
 #              ('auto'|'on'|'off' per-circuit override), low_pressure_alert_psi
 #              (irrigation under-load floor, default 25). DDL only, no backfill.
-_CURRENT_VERSION: int = 20260559
+_CURRENT_VERSION: int = 20260560
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1654,6 +1661,35 @@ def _missing_leak_test_pump_columns(conn: sqlite3.Connection) -> set[str]:
             if not _has_column(conn, "leak_test_history", col)}
 
 
+# 20260560 (dev27) — Phase 6b pump-failure alert columns.
+def _apply_pump_low_pressure_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260560 — dev27 pump plan Phase 6b.
+    Guarded + idempotent; stub DBs just get the version stamp."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                    "name='sensitivity_config'").fetchone():
+        if not _has_column(conn, "sensitivity_config",
+                           "pump_low_pressure_alert_psi"):
+            conn.execute("ALTER TABLE sensitivity_config ADD COLUMN "
+                         "pump_low_pressure_alert_psi REAL")
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                    "name='pump_regime_nightly'").fetchone():
+        if not _has_column(conn, "pump_regime_nightly", "min_psi"):
+            conn.execute("ALTER TABLE pump_regime_nightly ADD COLUMN "
+                         "min_psi REAL")
+    conn.commit()
+    log.info("Migration 20260560: pump low-pressure alert columns ready")
+
+
+def _missing_pump_low_pressure_columns(conn: sqlite3.Connection) -> set[str]:
+    missing: set[str] = set()
+    if not _has_column(conn, "sensitivity_config",
+                       "pump_low_pressure_alert_psi"):
+        missing.add("sensitivity_config.pump_low_pressure_alert_psi")
+    if not _has_column(conn, "pump_regime_nightly", "min_psi"):
+        missing.add("pump_regime_nightly.min_psi")
+    return missing
+
+
 def _missing_pump_mode_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the 20260558 pump-mode columns absent (home_profile +
     sensitivity_config)."""
@@ -1765,6 +1801,7 @@ _MIGRATIONS: tuple = (
     (20260557, _apply_edge_signatures),
     (20260558, _apply_pump_mode_columns),
     (20260559, _apply_leak_test_pump_columns),
+    (20260560, _apply_pump_low_pressure_column),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -1836,6 +1873,7 @@ def _run_migrations_impl(
             | _missing_edge_signature_columns(conn)
             | _missing_pump_mode_columns(conn)
             | _missing_leak_test_pump_columns(conn)
+            | _missing_pump_low_pressure_columns(conn)
         )
         if missing:
             raise RuntimeError(

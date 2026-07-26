@@ -429,6 +429,11 @@ CREATE TABLE IF NOT EXISTS sensitivity_config (
     -- Irrigation low-pressure-under-load alert floor (Phase 6a): sustained
     -- pressure below this while a zone is flowing → heads may not pop up.
     low_pressure_alert_psi      REAL NOT NULL DEFAULT 25.0,
+    -- Pump-failure alert floor (Phase 6b, migration 20260560). NULL = resolve
+    -- the per-supply default at read time (city_pump 40); only explicit user
+    -- action (incl. the one-tap hint apply) writes a value — non-NULL doubles
+    -- as the arming rule's "explicit user-set floor" signal.
+    pump_low_pressure_alert_psi REAL,
     updated_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -1163,6 +1168,9 @@ CREATE TABLE IF NOT EXISTS pump_regime_nightly (
     cycles        INTEGER,
     window_s      INTEGER,
     est_leak_lpd  REAL,
+    -- Quiet-window pressure floor ≈ pump cut-in (migration 20260560) — feeds
+    -- the Phase 6b suggested-floor hint (cut-in − 5).
+    min_psi       REAL,
     created_ts    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (circuit, night_date)
 );
@@ -3406,6 +3414,12 @@ def _seed_alert_configs(conn: sqlite3.Connection, circuit: str,
         ("pump_leak", "Pump Leak Watch",
          "Alert when the booster pump keeps re-pressurizing overnight with "
          "no water in use — a slow leak below the meters' sensitivity"),
+        ("low_pressure_supply", "Low Pressure While Running",
+         "Alert when pressure stays low while water is flowing — sprinkler "
+         "heads may not pop up fully"),
+        ("pump_low_pressure", "Pump Health",
+         "Alert when pressure stays below the pump's normal range — the pump "
+         "may have lost power, faulted, or can't keep up"),
         ("schedule_deviation", "Schedule Deviation",
          "Alert when flow occurs outside expected time patterns"),
     ]

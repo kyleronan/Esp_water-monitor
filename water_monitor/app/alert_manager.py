@@ -359,6 +359,50 @@ class AlertManager:
             notification_id=f"water_pulsing_supply_{circuit}",
         )
 
+    async def alert_low_pressure_supply(self, circuit: str, psi: float,
+                                        circuit_name: str,
+                                        pump_active: bool) -> None:
+        """Phase 6a — sustained low pressure while a zone is flowing."""
+        from .units import load_unit_context, convert_pressure
+        uc = load_unit_context(self._db)
+        val = convert_pressure(psi, uc)
+        pump_note = (" If this is new, the pump may need attention."
+                     if pump_active else "")
+        await self.fire(
+            circuit, "low_pressure_supply",
+            title=f"📉 Low pressure while running — {circuit_name}",
+            message=(f"Water pressure stayed around {val} "
+                     f"{uc['pressure_unit']} while irrigation was running — "
+                     f"sprinkler heads may not pop up fully.{pump_note}"),
+            notification_id=f"water_low_pressure_{circuit}",
+        )
+
+    async def alert_pump_low_pressure(self, circuit: str, psi: float,
+                                      kind: str, circuit_name: str) -> None:
+        """Phase 6b — pressure sustained below the pump's normal band.
+        kind='failure' (low/zero flow, no recharge rise) vs 'overload' (a
+        maxed-out VFD serving heavy demand — NOT a dead pump)."""
+        from .units import load_unit_context, convert_pressure
+        uc = load_unit_context(self._db)
+        val = convert_pressure(psi, uc)
+        if kind == "overload":
+            msg = (f"Water pressure has stayed around {val} "
+                   f"{uc['pressure_unit']} — below your pump's normal range — "
+                   "while a lot of water is running. The pump can't keep up "
+                   "with current demand; pressure should recover when demand "
+                   "drops.")
+        else:
+            msg = (f"Water pressure has stayed around {val} "
+                   f"{uc['pressure_unit']} for over 5 minutes — below your "
+                   "pump's normal range. The pump may have lost power, "
+                   "faulted, or been switched off.")
+        await self.fire(
+            circuit, "pump_low_pressure",
+            title="🚱 Pump pressure low",
+            message=msg,
+            notification_id="water_pump_low_pressure",
+        )
+
     async def alert_pump_leak_suspected(self, circuit: str, lpd: float,
                                         period_min: Optional[float],
                                         circuit_name: str) -> None:
@@ -378,12 +422,13 @@ class AlertManager:
             title="💧 Possible slow leak — pump keeps topping up",
             message=(
                 f"Your booster pump is re-pressurizing {every} overnight, "
-                f"when nothing should be running — roughly {vol_txt} a day "
-                "is leaking somewhere. Tip: closing shut-off valves one at a "
-                "time and watching whether the cycling stops can locate it "
-                "(if it keeps cycling with a line closed, the leak is on the "
-                "other line, upstream of that valve, or inside the pump's "
-                "own check valve)."
+                f"when nothing should be running — an estimated ~{vol_txt} "
+                "a day is leaking somewhere (inferred from pump activity — "
+                "an estimate, not a direct measurement). Tip: closing "
+                "shut-off valves one at a time and watching whether the "
+                "cycling stops can locate it (if it keeps cycling with a "
+                "line closed, the leak is on the other line, upstream of "
+                "that valve, or inside the pump's own check valve)."
             ),
             notification_id="water_pump_leak_watch",
         )

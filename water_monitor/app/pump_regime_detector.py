@@ -162,6 +162,24 @@ def pump_banner_state(db: sqlite3.Connection) -> Dict[str, Any]:
     }
 
 
+def pump_floor_hint(db: sqlite3.Connection) -> Optional[float]:
+    """Phase 6b suggested pump-failure floor: median quiet-window minimum
+    pressure (≈ pump cut-in on leak nights; the bottom of the normal band on
+    healthy nights) minus 5 PSI. Uses ANY historical evaluated nights —
+    detected nights preferred — so a home that fixes its leak early still
+    gets a hint (plan round-1 #18 / round-5 #3). Never auto-applied; the
+    settings page offers it as a one-tap apply."""
+    rows = db.execute(
+        "SELECT min_psi, detected FROM pump_regime_nightly "
+        "WHERE min_psi IS NOT NULL ORDER BY night_date DESC LIMIT 30"
+    ).fetchall()
+    if not rows:
+        return None
+    detected = sorted(float(r[0]) for r in rows if r[1])
+    pool = detected or sorted(float(r[0]) for r in rows)
+    return round(pool[len(pool) // 2] - 5.0, 1)
+
+
 class PumpRegimeDetector:
     """Supervised nightly worker. One pass per local day, shortly after the
     quiet-hour window ends; also runs a catch-up pass at boot when last
@@ -353,7 +371,11 @@ class PumpRegimeDetector:
             self._db, circuit_cfg.circuit, night,
             detected=1 if v.detected else 0,
             period_s=period, amplitude_psi=v.p2p_psi, sd_psi=v.sd_psi,
-            cycles=v.cycles, window_s=int(e - s), est_leak_lpd=est_lpd)
+            cycles=v.cycles, window_s=int(e - s), est_leak_lpd=est_lpd,
+            # Quiet-window pressure floor ≈ pump cut-in — feeds the Phase 6b
+            # suggested-floor hint (works on healthy homes too: the quiet
+            # minimum is the bottom of the normal band).
+            min_psi=round(float(pres[s:e].min()), 2))
         log.info("[%s] pump-regime night %s: %s (period=%s cycles=%d "
                  "p2p=%.1f window=%dm)",
                  circuit_cfg.circuit, night,
@@ -381,6 +403,20 @@ class PumpRegimeDetector:
         updates: Dict[str, Any] = {}
         if latest and latest["any_detected"] and latest["period_s"]:
             updates["pump_detect_period_s"] = float(latest["period_s"])
+
+        # Phase 6b arming stamp (persisted — recomputing from history would
+        # silently disarm when the HA fidelity window ages out): evidence =
+        # any detected night, or a post-feature pump supply answer.
+        if not prof["pump_alert_armed_at"]:
+            has_evidence = any(n["any_detected"] for n in nights)
+            post_feature_answer = (
+                prof["supply_type"] in ("city_pump", "well")
+                and bool(prof["supply_type_set_at"]))
+            if has_evidence or post_feature_answer:
+                updates["pump_alert_armed_at"] = now_iso
+                log.info("pump alerts ARMED (%s)",
+                         "detected-night evidence" if has_evidence
+                         else "post-feature supply answer")
 
         if action == "set":
             updates.update(pump_mode_detected=1, pump_mode_detected_at=now_iso)

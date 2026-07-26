@@ -469,6 +469,38 @@ class CircuitEventDetector:
         # otherwise fire, so the steady-state cost is just the appends.
         self._minute_pressure: Deque[Tuple[datetime, float]] = deque(maxlen=2600)
 
+        # ── dev27 (Phase 6) low-pressure alert state machines ────────────────
+        # 6a zone under-load floor (zone circuits only; None = off): sustained
+        # low pressure WHILE a zone is flowing — heads may not pop up. Two-
+        # stage timing: fill grace after run start AND after any significant
+        # flow step (multi-zone controllers transition zones without flow
+        # hitting zero), then a multi-minute sustain.
+        self.zone_low_floor_psi: Optional[float] = None
+        self.LOW_PSI_FILL_GRACE_S: float = 120.0
+        self.LOW_PSI_SUSTAIN_S: float = 180.0
+        self.LOW_PSI_STEP_FRACTION: float = 0.30
+        self._lp_run_started: Optional[datetime] = None
+        self._lp_grace_until: Optional[datetime] = None
+        self._lp_below_since: Optional[datetime] = None
+        self._lp_fired_this_run: bool = False
+        self._lp_prev_flow: float = 0.0
+        self._lp_flow_low_since: Optional[datetime] = None
+        self.low_pressure_cb: Optional[Callable[[str, float], None]] = None
+
+        # 6b pump-failure floor (armed vfd pump homes, main circuit; None =
+        # off): pressure sustained below the pump's normal band. A recharge
+        # rise inside the window resets it (pump alive); at fire time the
+        # current flow branches failure vs overload copy (a maxed-out VFD
+        # serving heavy demand is NOT a dead pump).
+        self.pump_fail_floor_psi: Optional[float] = None
+        self.PUMP_FAIL_SUSTAIN_S: float = 300.0
+        self.PUMP_FAIL_RISE_RESET_PSI: float = 2.0
+        self.PUMP_FAIL_OVERLOAD_FLOW_LPM: float = 2.0
+        self._pf_below_since: Optional[datetime] = None
+        self._pf_window_min: Optional[float] = None
+        self._pf_fired: bool = False
+        self.pump_fail_cb: Optional[Callable[[str, float, str], None]] = None
+
         self._pressure_buf: Deque[float] = deque(maxlen=self.PRESSURE_BUFFER_SIZE)
         # Per-sample arrival timestamps, kept exactly parallel to _pressure_buf
         # (same maxlen, appended/cleared together) — diagnostic use only.
@@ -518,6 +550,99 @@ class CircuitEventDetector:
         self.pressure_surge_phantom_psi = (
             20.0 if gate_psi is not None else self.PRESSURE_SURGE_PHANTOM_PSI)
 
+    def update_low_pressure_config(self, zone_floor_psi: Optional[float],
+                                   pump_fail_floor_psi: Optional[float]) -> None:
+        """Set/clear the Phase 6 low-pressure floors (dev27)."""
+        self.zone_low_floor_psi = zone_floor_psi
+        self.pump_fail_floor_psi = pump_fail_floor_psi
+
+    def _track_zone_flow(self, now: datetime, flow: float) -> None:
+        """6a run/grace bookkeeping, called from on_flow_rate on zone
+        circuits. A run starts at the first above-floor flow after idle; the
+        fill grace re-arms on any >=30% flow step (zone transition)."""
+        if flow >= self.MIN_FLOW_LPM:
+            self._lp_flow_low_since = None
+            if self._lp_run_started is None:
+                self._lp_run_started = now
+                self._lp_grace_until = now + timedelta(
+                    seconds=self.LOW_PSI_FILL_GRACE_S)
+                self._lp_below_since = None
+                self._lp_fired_this_run = False
+            elif (self._lp_prev_flow >= self.MIN_FLOW_LPM
+                    and abs(flow - self._lp_prev_flow)
+                    >= self.LOW_PSI_STEP_FRACTION
+                    * max(self._lp_prev_flow, 0.001)):
+                self._lp_grace_until = now + timedelta(
+                    seconds=self.LOW_PSI_FILL_GRACE_S)
+                self._lp_below_since = None
+            self._lp_prev_flow = flow
+        else:
+            self._lp_prev_flow = flow
+            if self._lp_run_started is not None:
+                if self._lp_flow_low_since is None:
+                    self._lp_flow_low_since = now
+                elif (now - self._lp_flow_low_since).total_seconds() >= 60:
+                    self._lp_run_started = None      # run over
+                    self._lp_below_since = None
+
+    def _eval_zone_low_pressure(self, now: datetime, pressure: float) -> None:
+        """6a: floor check while a zone run is active and past its grace."""
+        if (self.zone_low_floor_psi is None or self._lp_run_started is None
+                or self._lp_fired_this_run):
+            return
+        if self._lp_grace_until is not None and now < self._lp_grace_until:
+            return
+        if pressure >= self.zone_low_floor_psi:
+            self._lp_below_since = None              # excursion resets sustain
+            return
+        if self._lp_below_since is None:
+            self._lp_below_since = now
+            return
+        if ((now - self._lp_below_since).total_seconds()
+                >= self.LOW_PSI_SUSTAIN_S):
+            self._lp_fired_this_run = True           # one alert per zone run
+            if self.low_pressure_cb is not None:
+                try:
+                    self.low_pressure_cb(self.circuit, pressure)
+                except Exception as e:
+                    log.warning("[%s] low-pressure callback failed: %s",
+                                self.circuit, e)
+
+    def _eval_pump_fail(self, now: datetime, pressure: float) -> None:
+        """6b: sustained sub-floor pressure = pump failed/off/overloaded."""
+        floor = self.pump_fail_floor_psi
+        if floor is None:
+            return
+        if pressure >= floor:
+            self._pf_below_since = None
+            self._pf_window_min = None
+            if pressure >= floor + self.PUMP_FAIL_RISE_RESET_PSI:
+                self._pf_fired = False               # recovered — re-arm
+            return
+        if self._pf_below_since is None:
+            self._pf_below_since = now
+            self._pf_window_min = pressure
+            return
+        self._pf_window_min = min(self._pf_window_min, pressure)
+        if pressure - self._pf_window_min >= self.PUMP_FAIL_RISE_RESET_PSI:
+            # Recharge rise inside the window — the pump is alive; restart.
+            self._pf_below_since = now
+            self._pf_window_min = pressure
+            return
+        if (not self._pf_fired
+                and (now - self._pf_below_since).total_seconds()
+                >= self.PUMP_FAIL_SUSTAIN_S):
+            self._pf_fired = True
+            kind = ("overload"
+                    if self._current_flow_lpm >= self.PUMP_FAIL_OVERLOAD_FLOW_LPM
+                    else "failure")
+            if self.pump_fail_cb is not None:
+                try:
+                    self.pump_fail_cb(self.circuit, pressure, kind)
+                except Exception as e:
+                    log.warning("[%s] pump-fail callback failed: %s",
+                                self.circuit, e)
+
     def _minute_p2p(self, now: datetime) -> float:
         """Peak-to-peak PSI over the trailing 60 s (prunes in place)."""
         cutoff = now - timedelta(seconds=60)
@@ -566,6 +691,10 @@ class CircuitEventDetector:
         self._current_flow_lpm = raw_flow
 
         now = datetime.now(timezone.utc)
+
+        # Phase 6a zone-run bookkeeping (no-op unless a zone floor is set).
+        if self.zone_low_floor_psi is not None:
+            self._track_zone_flow(now, raw_flow)
 
         if self._active_event is not None:
             ev = self._active_event
@@ -662,6 +791,9 @@ class CircuitEventDetector:
         self._pressure_ts_buf.append(now)
         if self.pump_osc_gate_psi is not None:
             self._minute_pressure.append((now, pressure))
+        # Phase 6 low-pressure monitors (no-ops unless a floor is configured).
+        self._eval_zone_low_pressure(now, pressure)
+        self._eval_pump_fail(now, pressure)
 
         # Need LOOKBACK + WINDOW samples before baseline is meaningful.
         # At 40 Hz this is ~5 seconds — well inside the firmware grace period.
@@ -1920,6 +2052,9 @@ class EventDetector:
         sensitivity_getter: Callable[[str], dict],
         debug_capture_propagation: bool = False,
         pump_gate_getter: Optional[Callable[[str], Optional[float]]] = None,
+        low_pressure_getter: Optional[Callable[[str], tuple]] = None,
+        low_pressure_cb: Optional[Callable[[str, float], None]] = None,
+        pump_fail_cb: Optional[Callable[[str, float, str], None]] = None,
     ) -> None:
         self._circuits = circuits
         self._ha = ha_client
@@ -1929,6 +2064,13 @@ class EventDetector:
         # or None when pump-aware suppression is off. Wired by the
         # orchestrator; None default keeps tests/imports gate-free.
         self._pump_gate_getter = pump_gate_getter or (lambda _c: None)
+        # dev27 (Phase 6): returns (zone_floor_psi|None, pump_fail_floor|None)
+        # per circuit; the callbacks fire the alerts (orchestrator wires them
+        # to AlertManager via create_task).
+        self._low_pressure_getter = low_pressure_getter or (
+            lambda _c: (None, None))
+        self._low_pressure_cb = low_pressure_cb
+        self._pump_fail_cb = pump_fail_cb
         self._debug_capture_propagation = debug_capture_propagation
         self._detectors: Dict[str, CircuitEventDetector] = {}
         # Tracks live valve open/closed state per circuit for cross-circuit feature
@@ -1984,6 +2126,14 @@ class EventDetector:
                 detector.update_pump_gate(self._pump_gate_getter(cfg.circuit))
             except Exception as e:
                 log.warning("[%s] pump-gate resolve failed (non-fatal): %s",
+                            cfg.circuit, e)
+            detector.low_pressure_cb = self._low_pressure_cb
+            detector.pump_fail_cb = self._pump_fail_cb
+            try:
+                zf, pf = self._low_pressure_getter(cfg.circuit)
+                detector.update_low_pressure_config(zf, pf)
+            except Exception as e:
+                log.warning("[%s] low-pressure resolve failed (non-fatal): %s",
                             cfg.circuit, e)
 
             if cfg.flow_sensor:
@@ -2048,6 +2198,12 @@ class EventDetector:
                 detector.update_pump_gate(self._pump_gate_getter(circuit))
             except Exception as e:
                 log.warning("[%s] pump-gate resolve failed (non-fatal): %s",
+                            circuit, e)
+            try:
+                zf, pf = self._low_pressure_getter(circuit)
+                detector.update_low_pressure_config(zf, pf)
+            except Exception as e:
+                log.warning("[%s] low-pressure resolve failed (non-fatal): %s",
                             circuit, e)
 
     def _on_waveform_chunk(self, data: dict) -> None:

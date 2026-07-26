@@ -162,6 +162,22 @@
                 <option value="well" {% if profile.supply_type == 'well' %}selected{% endif %}>
                   Private well</option>
               </select>
+              {# Phase 6b — derived pump-failure alert floor (one-tap apply;
+                 never automatic). Shown only for pump homes with nightly
+                 pressure data. #}
+              {% if pump_floor and pump_floor.hint %}
+              <p class="form-hint" style="margin-top:6px">
+                Pump health alert floor:
+                {% if pump_floor.current %}currently {{ pump_floor.current }} PSI —{% endif %}
+                measured suggestion <strong>{{ pump_floor.hint }} PSI</strong>
+                (your pump's observed low point minus a margin).
+              </p>
+              <form method="post" action="{{ ingress_path }}/settings/pump-floor/apply"
+                    style="margin:4px 0 0">
+                <button type="submit" class="btn btn-secondary btn-sm">
+                  Use {{ pump_floor.hint }} PSI</button>
+              </form>
+              {% endif %}
             </div>
           </div>
           <div class="sett-toggle-row" style="margin:10px 0 14px">

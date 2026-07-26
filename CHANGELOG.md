@@ -22,6 +22,24 @@ landed without a version bump; per-build details are in git history.)
   post-feature answer from a migrated one, and moving off a pump supply
   disarms/unconfirms pump state. Detection, detector gating, and the
   pump-assisted leak tests build on this in later phases (migration 20260558).
+- **Low-pressure alerts (dev27, pump plan Phase 6)** — 6a: while an
+  irrigation zone is flowing, pressure sustained below a per-circuit floor
+  (default 25 PSI) for 3 minutes alerts "sprinkler heads may not pop up
+  fully" — with a fill grace after zone start AND after any ≥30% flow step
+  (multi-zone transitions never hit zero flow), sustain reset on any
+  recovery above the floor, and one alert per zone run. Not pump-gated
+  (low pressure under load matters on any supply); the "pump may need
+  attention" sentence renders only on pump homes. 6b: on ARMED vfd pump
+  homes (post-feature supply answer or detected-night evidence — a stored
+  pre-feature answer never arms an alert), pressure sustained 5 minutes
+  below the pump's floor (user value, or 40 PSI read-time default) fires
+  "pump may have lost power/faulted" — unless heavy flow is running, which
+  branches to "pump can't keep up with demand" (a maxed-out VFD is not a
+  dead pump). A recharge rise inside the window resets it (pump alive).
+  The floor gets a measured one-tap suggestion in Settings (quiet-window
+  cut-in − 5, from nightly min_psi — works on healthy homes too).
+  Migration 20260560; two new alert toggles (Low Pressure While Running,
+  Pump Health).
 - **Pump-assisted leak detection (dev26, pump plan Phase 5)** — the pump is
   now a leak sensor. 5a: on detected nights the regime worker estimates the
   leak rate from recharge cycles (median slug × spacing, scaled by the

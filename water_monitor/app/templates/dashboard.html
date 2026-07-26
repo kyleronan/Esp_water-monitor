@@ -55,10 +55,12 @@
       Your booster pump topped the system up
       {% if leak_watch.period_min %}about every {{ leak_watch.period_min }}
       minutes{% else %}repeatedly{% endif %} overnight ({{ leak_watch.night }})
-      with nothing running — roughly
-      <strong>{{ leak_watch.gpd }} gal/day ({{ leak_watch.lpd }} L/day)</strong>
-      is leaking somewhere. Closing shut-off valves one at a time and watching
-      whether the cycling stops can locate it.
+      with nothing running — an estimated
+      <strong>~{{ leak_watch.gpd }} gal/day (~{{ leak_watch.lpd }} L/day)</strong>
+      is leaking somewhere. This is an <em>estimate</em> inferred from pump
+      activity, not a direct measurement — treat it as a size class, not an
+      exact number. Closing shut-off valves one at a time and watching
+      whether the cycling stops can locate the leak.
     </span>
   </div>
 </div>
