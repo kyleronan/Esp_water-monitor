@@ -2,6 +2,39 @@
 
 This page summarizes the important board connector pinouts.
 
+## ESP32-S3 GPIO assignments
+
+| Function | Valve 1 (Main) | Valve 2 (Irrigation) |
+| --- | --- | --- |
+| Relay coil — drive OPEN | `GPIO48` | `GPIO21` |
+| Relay coil — drive CLOSE | `GPIO47` | `GPIO14` |
+| End stop — fully open | `GPIO16` | `GPIO18` |
+| End stop — fully closed | `GPIO15` | `GPIO17` |
+| Panel LED — open | `GPIO07` | `GPIO06` |
+| Panel LED — closed | `GPIO04` | `GPIO05` |
+| Pressure sense (ADC) | `GPIO1` | `GPIO2` |
+| Flow pulse | `GPIO39` | `GPIO38` |
+
+> **Corrected 2026-07-26:** the irrigation relay coil pins are `GPIO21` = open,
+> `GPIO14` = close. Firmware before 3.13.1 had them swapped.
+
+### Motor drive model (firmware 3.13.1+)
+
+The motor moves only **while** its relay coil GPIO is held high; the motor cuts
+its own power at end of travel. The firmware holds the coil until the target
+end stop fires (90 s timeout), then releases. Coil pulses do not move the
+valve on this board.
+
+### End-stop signal conditioning
+
+The end-stop feedback lines are **active-high**: the valve's feedback contact
+feeds the line when closed, and it passes through a 10 K series / 20 K
+pulldown divider (same topology as the pressure inputs) before reaching the
+GPIO — idle reads ~0 V, pressed reads ~3.3 V at the GPIO. The firmware
+configures these inputs with **no internal pull** (3.13.1): enabling the
+internal pullup fights the onboard 20 K pulldown into a ~1.3–1.4 V divider,
+which sits in the ESP32-S3's undefined logic band and makes reads unreliable.
+
 ## Valve connectors
 
 | Connector | Channel | Use |

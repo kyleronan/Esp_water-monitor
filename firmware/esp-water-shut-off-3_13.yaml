@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # ESP Smart Water Shut-Off Controller
 # Device: ESP32-S3-DevKitC-1
 # Controls two motorized ball valves:
@@ -7,9 +7,12 @@
 #
 # Each valve is driven by a gear motor with a built-in motor controller that
 # cuts power automatically when the valve reaches end of travel. Direction is
-# set by dual-coil latching relays — one coil latches the relay OPEN (drives
-# motor to open position), the other latches it CLOSED (drives motor to close).
-# The relay holds its position mechanically with no power after latching.
+# selected per relay coil: one coil drives the motor toward OPEN, the other
+# toward CLOSED. DRIVE MODEL (3.13.1, field-derived 2026-07-26 on the rebuilt
+# board): the motor moves only WHILE a coil is driven — coil pulses do NOT
+# work on this board. Each open/close sequence therefore HOLDS the coil until
+# the target end stop fires (or a 90 s timeout), then releases it; the motor
+# self-stops at end of travel, so the extra held time is harmless.
 #
 # Physical end stop switches confirm when each valve has fully opened or closed.
 # These are used to:
@@ -114,7 +117,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.13.0"   # pulse_meter flow measurement (edge-period timing) on both circuits
+    version: "3.13.1"   # relay-drive fixes: ALWAYS_OFF coil restore, uninterruptible pulses, self-clearing guards, leak test verifies valve closed
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -515,65 +518,21 @@ globals:
     initial_value: '0'
 
   # ---------------------------------------------------------------------------
-  # CLOSE-IN-FLIGHT GUARD GLOBALS
-  #
-  # When a fault, trickle alert, or rapid pressure drop fires while the valve
-  # is open, the on_value handler runs once per second and would call
-  # valve.close on every tick until the closed end stop activates (~7 seconds).
-  # ESPHome doesn't preempt running actions, so each extra invocation either
-  # queues another full close sequence or fires concurrently — both noisy.
-  #
-  # The guard is set inside close_action when the close starts, and cleared by
-  # the end-stop on_press handlers — closed end stop on a successful close,
-  # open end stop if the valve is later reopened (e.g. after a failed close
-  # leaves the guard stuck). A duplicate valve.close while the guard is set
-  # logs a debug message and exits without re-pulsing the relays.
-  #
-  # RECOVERY FROM A FAILED CLOSE
-  # If a close fails (motor/wiring fault, debris, low voltage), the closed end
-  # stop never activates, so the guard stays set AND a safety fault is raised.
-  # The system is now in a state where future close requests are silently
-  # ignored — they hit the guard and exit.
-  #
-  # After fixing the underlying hardware problem, recover with BOTH steps in
-  # order — neither alone is sufficient:
-  #   1. Reset the safety fault (the "Reset Safety Fault" button in HA).
-  #      The open_action checks the fault flag, so without this step the
-  #      valve cannot be opened.
-  #   2. Open the valve from HA. The open_action runs, the valve travels
-  #      open, and the open end stop on_press clears the close-in-flight
-  #      guard. Only after this can future close requests proceed.
-  # Skipping step 2 leaves the guard set, so a subsequent close request
-  # (manual or automatic from a fault) will appear to do nothing.
-  # ---------------------------------------------------------------------------
-  - id: close_in_flight_main
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-
-  - id: close_in_flight_irr
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-
-  # ---------------------------------------------------------------------------
-  # OPEN-IN-FLIGHT GUARD GLOBALS
-  #
-  # Mirrors the close_in_flight guard. Set when open_action starts pulsing the
-  # relay; cleared by the open end stop on_press (success) or inside the
-  # motor-fault lambda (failure — so the next open attempt is not silently
-  # ignored after fault reset).
-  # ---------------------------------------------------------------------------
-  - id: open_in_flight_main
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-
-  - id: open_in_flight_irr
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-
+  # NOTE (3.13.1): the former open/close "in-flight guard" globals are GONE.
+  # They were added 2026-05-23 (787ef71) to stop the level-triggered fault
+  # handlers re-calling valve.close every sensor tick, but the hand-managed
+  # latch could only be cleared by an end-stop EDGE — so any close where the
+  # valve never physically moved latched the guard forever and every later
+  # command was silently swallowed until a reboot (field-found 2026-07-26
+  # after a week of silently-ignored closes). Their two jobs are now done by
+  # native ESPHome primitives that cannot wedge:
+  #   - duplicate suppression: the open/close sequences are mode: single
+  #     scripts — a re-trigger while running is IGNORED, never restarted.
+  #   - tick-handler gating: the fault/trickle auto-close conditions check
+  #     !id(close_sequence_X).is_running() instead of a guard flag. After a
+  #     failed close the script simply ends, so the auto-close naturally
+  #     RETRIES once per travel window while the fault persists — bounded,
+  #     logged, and self-recovering.
   # ---------------------------------------------------------------------------
   # RAPID PRESSURE DROP DETECTION GLOBALS
   #
@@ -685,6 +644,8 @@ globals:
   #   7 — Not run — fault active (reset fault first)
   #   8 — Preparing — closing valve and settling
   #   9 — Aborted — demand detected (sudden pressure drop)
+  #  10 — Aborted — valve failed to close (closed end stop never reached;
+  #       motor/relay fault — measuring would produce a false pass/fail)
   # ---------------------------------------------------------------------------
   - id: leak_test_result_main
     type: int
@@ -1233,14 +1194,14 @@ sensor:
             }
 
         # --- Fault response: close the main valve ---
-        # Gated on close_in_flight_main so valve.close is requested exactly
+        # Gated on close_sequence not-running so valve.close is requested at most
         # once per fault event — not on every sensor tick during the 15s
         # travel window (or while waiting for an end stop after a failed
         # close). The closed end stop alone is not sufficient: it stays off
         # for the full travel time and indefinitely after a motor fault.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running();'
             then:
               - valve.close: main_water_valve
 
@@ -1382,14 +1343,14 @@ sensor:
               ESP_LOGI("leak_test", "IRRIGATION: leak test complete — no leak detected after %.0f minutes",
                 id(leak_duration_irr).state);
             }
-        # Gated on close_in_flight_irr so valve.close is requested exactly
+        # Gated on close_sequence not-running so valve.close is requested at most
         # once per fault event — not on every sensor tick during the 15s
         # travel window (or while waiting for an end stop after a failed
         # close). The closed end stop alone is not sufficient: it stays off
         # for the full travel time and indefinitely after a motor fault.
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running();'
             then:
               - valve.close: irrigation_water_valve
 
@@ -1644,10 +1605,10 @@ sensor:
                 instant_lpm, id(burst_threshold_main).state);
             }
         # Fault response — close valve if not already closing.
-        # close_in_flight_main is the one-shot; see leak-test handler above.
+        # close_sequence_main not-running is the gate; see leak-test handler above.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running();'
             then:
               - valve.close: main_water_valve
 
@@ -1711,10 +1672,10 @@ sensor:
                 ESP_LOGD("safety", "MAIN: high flow detected (%.2f L/min) — alert disabled", x);
               }
             }
-        # Gated on close_in_flight_main so valve.close fires once per fault.
+        # Gated on close_sequence_main not-running: retries at most once per travel window.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running();'
             then:
               - valve.close: main_water_valve
 
@@ -1769,7 +1730,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(trickle_alert_main) && id(trickle_shutoff_main) && !id(closed_end_stop_valve1).state && !id(close_in_flight_main);'
+              lambda: 'return id(trickle_alert_main) && id(trickle_shutoff_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running();'
             then:
               - valve.close: main_water_valve
 
@@ -1843,7 +1804,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running();'
             then:
               - valve.close: irrigation_water_valve
 
@@ -1890,10 +1851,10 @@ sensor:
                 ESP_LOGD("safety", "IRRIGATION: high flow detected (%.2f L/min) — alert disabled", x);
               }
             }
-        # Gated on close_in_flight_irr so valve.close fires once per fault.
+        # Gated on close_sequence_irr not-running: retries at most once per travel window.
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running();'
             then:
               - valve.close: irrigation_water_valve
 
@@ -1926,7 +1887,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(trickle_alert_irr) && id(trickle_shutoff_irr) && !id(closed_end_stop_valve2).state && !id(close_in_flight_irr);'
+              lambda: 'return id(trickle_alert_irr) && id(trickle_shutoff_irr) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running();'
             then:
               - valve.close: irrigation_water_valve
 
@@ -2102,6 +2063,7 @@ text_sensor:
         case 7: return {"Not run — fault active (reset fault first)"};
         case 8: return {"Preparing — closing valve and settling"};
         case 9: return {"Aborted — demand detected (sudden pressure drop)"};
+        case 10: return {"Aborted — valve failed to close"};
         default: return {"No test run"};
       }
 
@@ -2125,6 +2087,7 @@ text_sensor:
         case 7: return {"Not run — fault active (reset fault first)"};
         case 8: return {"Preparing — closing valve and settling"};
         case 9: return {"Aborted — demand detected (sudden pressure drop)"};
+        case 10: return {"Aborted — valve failed to close"};
         default: return {"No test run"};
       }
 
@@ -2397,12 +2360,16 @@ binary_sensor:
   # fully closed position. Pins use internal pullup — switch closes to GND.
   # on_press fires only on the leading edge (valve arriving at position).
   # ---------------------------------------------------------------------------
+  # End stops are ACTIVE-HIGH with an ONBOARD ~10 k pulldown (3.13.1 field
+  # fix 2026-07-26): the switch feeds 3.3 V when pressed; the board holds the
+  # line low otherwise. NO internal pull — the internal pullup previously
+  # enabled here fought the onboard pulldown into a ~1.3-1.4 V divider, the
+  # ESP32-S3's undefined logic band, making end-stop reads unreliable.
   - platform: gpio
     pin:
       number: GPIO16
       mode:
         input: true
-        pullup: true
     id: open_end_stop_valve1
     name: "Open End Stop - ${circuit_1_name}"
     entity_category: diagnostic
@@ -2416,19 +2383,12 @@ binary_sensor:
         - valve.template.publish:
             id: main_water_valve
             state: OPEN
-        # Valve has reached the open position — clear both in-flight guards.
-        # close_in_flight: any prior failed close is resolved; future closes proceed.
-        # open_in_flight: open sequence completed successfully.
-        - lambda: |-
-            id(close_in_flight_main) = false;
-            id(open_in_flight_main) = false;
 
   - platform: gpio
     pin:
       number: GPIO15
       mode:
         input: true
-        pullup: true
     id: closed_end_stop_valve1
     name: "Closed End Stop - ${circuit_1_name}"
     entity_category: diagnostic
@@ -2442,14 +2402,6 @@ binary_sensor:
         - valve.template.publish:
             id: main_water_valve
             state: CLOSED
-        # Valve has reached the closed position — clear both in-flight guards.
-        # close_in_flight: close sequence completed successfully.
-        # open_in_flight: clears any open that was interrupted mid-travel by
-        # this close (e.g. safety-fault auto-close arriving during the 15s
-        # open-action delay), preventing a spurious motor fault at timeout.
-        - lambda: |-
-            id(close_in_flight_main) = false;
-            id(open_in_flight_main) = false;
 
   # ---------------------------------------------------------------------------
   # END STOP SWITCHES — Valve 2 (Irrigation)
@@ -2460,7 +2412,6 @@ binary_sensor:
       number: GPIO18
       mode:
         input: true
-        pullup: true
     id: open_end_stop_valve2
     name: "Open End Stop - ${circuit_2_name}"
     entity_category: diagnostic
@@ -2474,16 +2425,12 @@ binary_sensor:
         - valve.template.publish:
             id: irrigation_water_valve
             state: OPEN
-        - lambda: |-
-            id(close_in_flight_irr) = false;
-            id(open_in_flight_irr) = false;
 
   - platform: gpio
     pin:
       number: GPIO17
       mode:
         input: true
-        pullup: true
     id: closed_end_stop_valve2
     name: "Closed End Stop - ${circuit_2_name}"
     entity_category: diagnostic
@@ -2497,11 +2444,6 @@ binary_sensor:
         - valve.template.publish:
             id: irrigation_water_valve
             state: CLOSED
-        # Mirror the main-circuit closed end-stop: clear both guards.
-        # See closed_end_stop_valve1.on_press comment for rationale.
-        - lambda: |-
-            id(close_in_flight_irr) = false;
-            id(open_in_flight_irr) = false;
 
 # =============================================================================
 # OUTPUTS — Panel indicator LEDs
@@ -2987,57 +2929,63 @@ number:
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# RELAY COIL SWITCHES — Two-coil polarized bistable (latching) relays
+# RELAY COIL SWITCHES — one coil per motor direction
 #
-# Relay type: two-coil, polarized, bistable
+# DRIVE MODEL (3.13.1, field-derived 2026-07-26 on the rebuilt board): the
+# valve motor moves only WHILE its coil GPIO is driven — coil pulses (15 ms,
+# 100 ms, 1 s all field-tested) do NOT move the valve; a held coil does. The
+# open/close sequences therefore HOLD the coil until the target end stop
+# fires (90 s timeout), then release. The motor self-stops at end of travel.
+# (The original board used true bistable latching relays driven by 15 ms
+# pulses; that drive model does not work on this board.)
 #
-#   "Two-coil"   — separate SET and RESET coils; one drives the relay to its
-#                  OPEN contact, the other drives it to its CLOSED contact.
+# *** CRITICAL: Both coils of one valve must NEVER be energised together. ***
+# Every sequence turns the opposite coil off, waits 20 ms, then drives.
 #
-#   "Polarized"  — each coil requires current in the correct direction.
-#                  Reversing polarity or cross-energising both coils
-#                  simultaneously can burn out the windings.
-#
-#   "Bistable"   — the relay holds its contact position mechanically with no
-#                  continuous power until the opposite coil is pulsed.
-#
-# *** CRITICAL: Both coils must NEVER be energised at the same time. ***
-# The valve action sequences enforce this with a mandatory inter-coil gap:
-#   turn_off opposite coil → delay 20ms → turn_on drive coil → delay 15ms → turn_off
-#
-# Timing derived from TE RT424F12 datasheet:
-#   Operate time (SET coil):   max 10ms
-#   Reset time (RESET coil):   max  5ms
-#   Inter-coil gap used:            20ms — 2x operate time
-#   Coil pulse used:                15ms — satisfies both specs with margin
-#
-# No restore_mode set: GPIO state is irrelevant after a power cycle —
-# the bistable relay stays latched in its last position regardless.
+# restore_mode: ALWAYS_OFF is LOAD-BEARING (3.13.1 field fix, 2026-07-26).
+# ESPHome's switch default is RESTORE_DEFAULT_OFF — it saves the last switch
+# state to flash and RESTORES it at boot. If a coil pin is ever caught ON at
+# the wrong instant (reboot/OTA/cancelled automation landing inside the 15 ms
+# pulse), the ON state is persisted and every subsequent boot drives that coil
+# HIGH continuously. A dual-coil latching relay cannot transfer while its
+# opposing coil is energized, so every later pulse on the other coil becomes a
+# silent no-op (no click, no movement) — surviving reboots, invisible in HA
+# (switches are internal). ALWAYS_OFF guarantees all four coils start LOW.
 # ---------------------------------------------------------------------------
+# 3.13.1: switches are exposed as DIAGNOSTIC entities (were internal) so a
+# stuck-ON coil is visible in the web UI / HA instead of invisible. They are
+# pulse-driven by the valve actions — do not hold one ON manually except while
+# bench-testing, and never both coils of the same relay together.
 switch:
   - platform: gpio
     pin: GPIO48
-    name: "Relay Open Valve 1"
+    name: "Relay Open Coil - ${circuit_1_name}"
     id: relay_open_valve1
-    internal: true
+    entity_category: diagnostic
+    restore_mode: ALWAYS_OFF
 
   - platform: gpio
     pin: GPIO47
-    name: "Relay Closed Valve 1"
+    name: "Relay Close Coil - ${circuit_1_name}"
     id: relay_closed_valve1
-    internal: true
+    entity_category: diagnostic
+    restore_mode: ALWAYS_OFF
+
+  # Irrigation coil pins corrected 2026-07-26: GPIO21 = OPEN, GPIO14 = CLOSE
+  # (they were swapped relative to the physical board wiring).
+  - platform: gpio
+    pin: GPIO21
+    name: "Relay Open Coil - ${circuit_2_name}"
+    id: relay_open_valve2
+    entity_category: diagnostic
+    restore_mode: ALWAYS_OFF
 
   - platform: gpio
     pin: GPIO14
-    name: "Relay Open Valve 2"
-    id: relay_open_valve2
-    internal: true
-
-  - platform: gpio
-    pin: GPIO21
-    name: "Relay Closed Valve 2"
+    name: "Relay Close Coil - ${circuit_2_name}"
     id: relay_closed_valve2
-    internal: true
+    entity_category: diagnostic
+    restore_mode: ALWAYS_OFF
 
   # ---------------------------------------------------------------------------
   # MICRO LEAK TEST — Main circuit
@@ -3945,6 +3893,125 @@ interval:
 # =============================================================================
 script:
   # ---------------------------------------------------------------------------
+  # RELAY COIL PULSE SCRIPTS (3.13.1) — mode: single makes each pulse
+  # uninterruptible: a re-trigger while running is IGNORED instead of
+  # restarting the sequence. Inline pulses inside valve open/close actions
+  # were cancellable — any re-trigger of the same action mid-pulse cancelled
+  # the pending switch.turn_off, leaving the coil GPIO latched HIGH (which
+  # RESTORE_DEFAULT_OFF then persisted across reboots — see the relay switch
+  # comment). Each script also force-drops the opposing coil first, so no
+  # code path can ever energize both coils of one relay together.
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # VALVE DRIVE SEQUENCES (3.13.1 — HOLD-TO-DRIVE)
+  #
+  # FIELD-DERIVED DRIVE MODEL (2026-07-26): on this board the motor moves only
+  # WHILE its relay coil is driven, and the motor cuts its own power at end of
+  # travel. Coil PULSES (15 ms, 100 ms, 1 s — all tried) do NOT move the
+  # valve; a coil held for the travel duration does. Therefore each sequence
+  # HOLDS the coil until the target end stop fires (or the timeout), then
+  # releases it. Holding a few extra ms past the end stop is harmless — the
+  # motor has already self-stopped.
+  #
+  # mode: single makes each sequence uninterruptible: a re-trigger while
+  # running is IGNORED (never restarted/cancelled), so a double-press can
+  # never cancel the coil release or the fault check. (The pre-3.13.1 inline
+  # actions were restartable, which wedged the old in-flight guards and
+  # silently swallowed commands — that whole guard system is removed.)
+  #
+  # The motor-fault check stays quiet when the OPPOSITE sequence is running:
+  # a safety close legitimately overriding an in-progress open means the
+  # open's end stop won't be reached — not a motor fault.
+  # ---------------------------------------------------------------------------
+  - id: open_sequence_main
+    mode: single
+    then:
+      - logger.log: { level: INFO, tag: valve, format: "MAIN: driving OPEN (GPIO48 held until end stop)" }
+      - switch.turn_off: relay_closed_valve1
+      - delay: 20ms
+      - switch.turn_on: relay_open_valve1
+      - wait_until:
+          condition:
+            binary_sensor.is_on: open_end_stop_valve1
+          timeout: 90s
+      - switch.turn_off: relay_open_valve1
+      - if:
+          condition:
+            lambda: 'return !id(open_end_stop_valve1).state && !id(close_sequence_main).is_running();'
+          then:
+            - lambda: |-
+                id(fault_main) = true;
+                id(fault_reason_main_str) = "Motor fault — open end stop not reached";
+                id(fault_reason_main).publish_state(id(fault_reason_main_str));
+                ESP_LOGE("valve", "MAIN: open end stop not reached within 90s — motor/wiring fault");
+
+  - id: close_sequence_main
+    mode: single
+    then:
+      - logger.log: { level: INFO, tag: valve, format: "MAIN: driving CLOSE (GPIO47 held until end stop)" }
+      - switch.turn_off: relay_open_valve1
+      - delay: 20ms
+      - switch.turn_on: relay_closed_valve1
+      - wait_until:
+          condition:
+            binary_sensor.is_on: closed_end_stop_valve1
+          timeout: 90s
+      - switch.turn_off: relay_closed_valve1
+      - if:
+          condition:
+            lambda: 'return !id(closed_end_stop_valve1).state && !id(open_sequence_main).is_running();'
+          then:
+            - lambda: |-
+                id(fault_main) = true;
+                id(fault_reason_main_str) = "Motor fault — closed end stop not reached";
+                id(fault_reason_main).publish_state(id(fault_reason_main_str));
+                ESP_LOGE("valve", "MAIN: closed end stop not reached within 90s — motor/wiring fault");
+
+  - id: open_sequence_irr
+    mode: single
+    then:
+      - logger.log: { level: INFO, tag: valve, format: "IRRIGATION: driving OPEN (GPIO21 held until end stop)" }
+      - switch.turn_off: relay_closed_valve2
+      - delay: 20ms
+      - switch.turn_on: relay_open_valve2
+      - wait_until:
+          condition:
+            binary_sensor.is_on: open_end_stop_valve2
+          timeout: 90s
+      - switch.turn_off: relay_open_valve2
+      - if:
+          condition:
+            lambda: 'return !id(open_end_stop_valve2).state && !id(close_sequence_irr).is_running();'
+          then:
+            - lambda: |-
+                id(fault_irrigation) = true;
+                id(fault_reason_irr_str) = "Motor fault — open end stop not reached";
+                id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+                ESP_LOGE("valve", "IRRIGATION: open end stop not reached within 90s — motor/wiring fault");
+
+  - id: close_sequence_irr
+    mode: single
+    then:
+      - logger.log: { level: INFO, tag: valve, format: "IRRIGATION: driving CLOSE (GPIO14 held until end stop)" }
+      - switch.turn_off: relay_open_valve2
+      - delay: 20ms
+      - switch.turn_on: relay_closed_valve2
+      - wait_until:
+          condition:
+            binary_sensor.is_on: closed_end_stop_valve2
+          timeout: 90s
+      - switch.turn_off: relay_closed_valve2
+      - if:
+          condition:
+            lambda: 'return !id(closed_end_stop_valve2).state && !id(open_sequence_irr).is_running();'
+          then:
+            - lambda: |-
+                id(fault_irrigation) = true;
+                id(fault_reason_irr_str) = "Motor fault — closed end stop not reached";
+                id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
+                ESP_LOGE("valve", "IRRIGATION: closed end stop not reached within 90s — motor/wiring fault");
+
+  # ---------------------------------------------------------------------------
   # LEAK TEST RUN — Main circuit
   # Pre-checks valve state and fault, closes valve, waits 60s for EMA to settle,
   # then activates monitoring. If cancelled during settle, restore is called by
@@ -3997,6 +4064,18 @@ script:
                         # leak threshold comparison undefined or always-pass.
                         - lambda: |-
                             if (!id(leak_test_preparing_main)) return;
+                            // 3.13.1: verify the valve PHYSICALLY closed before measuring.
+                            // A stuck-open valve on a static supply produces a rock-steady
+                            // line — i.e. a false PASS. Field-found 2026-07-26: every test
+                            // for a week ran open and passed/failed on supply behavior.
+                            if (!id(closed_end_stop_valve1).state) {
+                              id(leak_test_result_main) = 10;  // Aborted — valve failed to close
+                              id(leak_test_preparing_main) = false;
+                              id(leak_test_active_main) = false;
+                              ESP_LOGE("leak_test", "MAIN: valve did not reach the closed end stop — "
+                                "aborting test (motor/relay fault?). Result would be meaningless.");
+                              return;
+                            }
                             float baseline = id(pressure_main).state;
                             if (isnan(baseline) || baseline < 1.0f) {
                               id(leak_test_result_main) = 6;  // Not run — sensor not ready
@@ -4077,6 +4156,15 @@ script:
                         - delay: 60s
                         - lambda: |-
                             if (!id(leak_test_preparing_irr)) return;
+                            // 3.13.1: verify the valve physically closed — see main circuit.
+                            if (!id(closed_end_stop_valve2).state) {
+                              id(leak_test_result_irr) = 10;  // Aborted — valve failed to close
+                              id(leak_test_preparing_irr) = false;
+                              id(leak_test_active_irr) = false;
+                              ESP_LOGE("leak_test", "IRRIGATION: valve did not reach the closed end stop — "
+                                "aborting test (motor/relay fault?). Result would be meaningless.");
+                              return;
+                            }
                             float baseline = id(pressure_irrigation).state;
                             if (isnan(baseline) || baseline < 1.0f) {
                               id(leak_test_result_irr) = 6;  // Not run — sensor not ready
@@ -4123,24 +4211,14 @@ script:
 #   - Returns unknown {} if neither end stop is active (mid-travel or
 #     position not yet confirmed after boot)
 #
-# Open action sequence:
-#   1. Check fault flag — block open if fault active, log a warning
-#   2. De-energise RESET (close) coil — ensures it is fully off
-#   3. Wait 20ms — mandatory inter-coil gap (2x the RT424F12 max operate time)
-#   4. Pulse SET coil 15ms then de-energise — relay latches, motor starts
-#   5. Wait the configurable "Valve Travel Timeout" (§1.4 number entity, default
-#      15000ms) — allow time for full valve travel. Raise it via the entity if
-#      spurious end-stop-timeout faults occur at low temperature / low supply
-#      voltage; lower it if your motor travels much faster. (Falls back to 15000ms
-#      if the value is unset/NaN, so the fault logic is never disabled.)
-#   6. Check open end stop — if not active, raise fault, publish CLOSED
-#
-# Close action (always permitted — safety action, no fault check):
-#   Same sequence in reverse. Fault raised if closed end stop not reached.
-#
-# Relay coil timing (TE RT424F12):
-#   SET operate time: max 10ms  |  RESET time: max 5ms
-#   Pulse used: 15ms  |  Inter-coil gap: 20ms
+# Actions are thin dispatchers (3.13.1): open_action checks the fault flag
+# (open blocked during fault; close never blocked — it is the safety action)
+# and executes the matching mode: single sequence script, which:
+#   1. Turns the opposite coil off, waits the 20 ms inter-coil gap
+#   2. HOLDS the drive coil until the target end stop fires (90 s timeout)
+#   3. Releases the coil, then raises a motor fault if the end stop was not
+#      reached and no opposite sequence overrode this one
+# See the RELAY COIL SWITCHES comment for the field-derived drive model.
 # =============================================================================
 valve:
   - platform: template
@@ -4161,6 +4239,11 @@ valve:
       if (id(closed_end_stop_valve1).state) return VALVE_CLOSED;
       return {};
     open_action:
+      # 3.13.1: the action body is a THIN dispatcher — the whole sequence lives
+      # in a mode: single script so a re-triggered action can never cancel the
+      # in-progress run's pending steps (the pre-3.13.1 wedge: a double-press
+      # cancelled the trailing guard-clear and every later press was silently
+      # swallowed until reboot).
       - if:
           condition:
             lambda: 'return id(fault_main);'
@@ -4169,69 +4252,13 @@ valve:
                 level: WARN
                 format: "Main valve open blocked — safety fault active. Reset fault first."
           else:
-            - if:
-                condition:
-                  lambda: 'return id(open_in_flight_main);'
-                then:
-                  - logger.log:
-                      level: DEBUG
-                      tag: valve
-                      format: "MAIN: open already in flight — ignoring duplicate request"
-                else:
-                  - lambda: 'id(open_in_flight_main) = true;'
-                  - switch.turn_off: relay_closed_valve1
-                  - delay: 20ms
-                  - switch.turn_on: relay_open_valve1
-                  - delay: 15ms
-                  - switch.turn_off: relay_open_valve1
-                  - delay: !lambda 'float t = id(valve_travel_ms_main).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
-                  - if:
-                      condition:
-                        # Check both: guard still set (open truly in flight) AND end stop not reached.
-                        # Without the guard check, a close that completes during the 15s travel window
-                        # deactivates the end stop — triggering a false motor fault.
-                        lambda: 'return id(open_in_flight_main) && !id(open_end_stop_valve1).state;'
-                      then:
-                        - lambda: |-
-                            id(fault_main) = true;
-                            id(fault_reason_main_str) = "Motor fault — open end stop not reached";
-                            id(fault_reason_main).publish_state(id(fault_reason_main_str));
-                            id(open_in_flight_main) = false;
-                            ESP_LOGE("valve", "MAIN: open end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_main).state);
+            - script.execute: open_sequence_main
     close_action:
-      # Guard against repeated valve.close calls while a close is already
-      # in flight. The guard is set on first entry, cleared when the open
-      # or closed end stop fires (see end stop on_press handlers above).
-      # If a close fails (end stop never reached) the guard stays set —
-      # opening the valve later clears it via the open end stop on_press.
-      - if:
-          condition:
-            lambda: 'return id(close_in_flight_main);'
-          then:
-            - lambda: |-
-                if (id(fault_main)) {
-                  ESP_LOGW("valve", "MAIN: fault-triggered close requested but close-in-flight guard is set "
-                    "— valve may be mid-travel or in recovery after a failed close. Close will execute once the open end stop fires.");
-                } else {
-                  ESP_LOGD("valve", "MAIN: close already in flight — ignoring duplicate request");
-                }
-          else:
-            - lambda: 'id(close_in_flight_main) = true;'
-            - switch.turn_off: relay_open_valve1
-            - delay: 20ms
-            - switch.turn_on: relay_closed_valve1
-            - delay: 15ms
-            - switch.turn_off: relay_closed_valve1
-            - delay: !lambda 'float t = id(valve_travel_ms_main).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
-            - if:
-                condition:
-                  binary_sensor.is_off: closed_end_stop_valve1
-                then:
-                  - lambda: |-
-                      id(fault_main) = true;
-                      id(fault_reason_main_str) = "Motor fault — closed end stop not reached";
-                      id(fault_reason_main).publish_state(id(fault_reason_main_str));
-                      ESP_LOGE("valve", "MAIN: closed end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_main).state);
+      # Thin dispatcher (3.13.1) — the full sequence lives in a mode: single
+      # script, so duplicates are ignored (never restarted/cancelled) and the
+      # sequence always runs to completion. Closes are never fault-gated:
+      # closing is the safety action.
+      - script.execute: close_sequence_main
 
   - platform: template
     name: "${circuit_2_name} Water Valve"
@@ -4249,6 +4276,7 @@ valve:
       if (id(closed_end_stop_valve2).state) return VALVE_CLOSED;
       return {};
     open_action:
+      # Thin dispatcher (3.13.1) — see main valve open_action comment.
       - if:
           condition:
             lambda: 'return id(fault_irrigation);'
@@ -4257,60 +4285,7 @@ valve:
                 level: WARN
                 format: "Irrigation valve open blocked — safety fault active. Reset fault first."
           else:
-            - if:
-                condition:
-                  lambda: 'return id(open_in_flight_irr);'
-                then:
-                  - logger.log:
-                      level: DEBUG
-                      tag: valve
-                      format: "IRRIGATION: open already in flight — ignoring duplicate request"
-                else:
-                  - lambda: 'id(open_in_flight_irr) = true;'
-                  - switch.turn_off: relay_closed_valve2
-                  - delay: 20ms
-                  - switch.turn_on: relay_open_valve2
-                  - delay: 15ms
-                  - switch.turn_off: relay_open_valve2
-                  - delay: !lambda 'float t = id(valve_travel_ms_irr).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
-                  - if:
-                      condition:
-                        # Same guard-check pattern as main valve — see main open_action comment.
-                        lambda: 'return id(open_in_flight_irr) && !id(open_end_stop_valve2).state;'
-                      then:
-                        - lambda: |-
-                            id(fault_irrigation) = true;
-                            id(fault_reason_irr_str) = "Motor fault — open end stop not reached";
-                            id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
-                            id(open_in_flight_irr) = false;
-                            ESP_LOGE("valve", "IRRIGATION: open end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_irr).state);
+            - script.execute: open_sequence_irr
     close_action:
-      # See main valve close_action for explanation of the close-in-flight guard.
-      - if:
-          condition:
-            lambda: 'return id(close_in_flight_irr);'
-          then:
-            - lambda: |-
-                if (id(fault_irrigation)) {
-                  ESP_LOGW("valve", "IRRIGATION: fault-triggered close requested but close-in-flight guard is set "
-                    "— valve may be mid-travel or in recovery after a failed close. Close will execute once the open end stop fires.");
-                } else {
-                  ESP_LOGD("valve", "IRRIGATION: close already in flight — ignoring duplicate request");
-                }
-          else:
-            - lambda: 'id(close_in_flight_irr) = true;'
-            - switch.turn_off: relay_open_valve2
-            - delay: 20ms
-            - switch.turn_on: relay_closed_valve2
-            - delay: 15ms
-            - switch.turn_off: relay_closed_valve2
-            - delay: !lambda 'float t = id(valve_travel_ms_irr).state; return (uint32_t)((std::isfinite(t) && t >= 1000.0f) ? t : 15000.0f);'
-            - if:
-                condition:
-                  binary_sensor.is_off: closed_end_stop_valve2
-                then:
-                  - lambda: |-
-                      id(fault_irrigation) = true;
-                      id(fault_reason_irr_str) = "Motor fault — closed end stop not reached";
-                      id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
-                      ESP_LOGE("valve", "IRRIGATION: closed end stop not reached after %.0fms — motor/wiring fault", id(valve_travel_ms_irr).state);
+      # Thin dispatcher (3.13.1) — see main valve close_action comment.
+      - script.execute: close_sequence_irr

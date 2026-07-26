@@ -40,7 +40,7 @@ Paste the output into `secrets.yaml` as the value for `api_encryption_key`.
 Both pressure transducers default to a shared factory-typical linear
 fit. After bench measurement, override the per-circuit calibration via
 the `substitutions:` block at the top of
-`esp-water-shut-off-3_10.yaml` — eight values
+`esp-water-shut-off-3_13.yaml` — eight values
 (`pressure_cal_main_zero_raw / _psi`, `pressure_cal_main_max_raw /
 _psi`, plus the irrigation counterparts). See
 [`docs/hardware/bring-up-checklist.md`](../docs/hardware/bring-up-checklist.md)
@@ -60,7 +60,7 @@ python scripts/check_firmware_release.py
 ```
 
 It fails (non-zero exit) when any of these are missing or wrong in
-`firmware/esp-water-shut-off-3_10.yaml`:
+`firmware/esp-water-shut-off-3_13.yaml`:
 
 - `api.encryption.key`
 - `ota[*].password`

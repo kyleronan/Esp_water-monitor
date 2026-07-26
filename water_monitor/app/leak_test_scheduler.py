@@ -39,6 +39,7 @@ TERMINAL_RESULTS = {
     "Not run — fault active (reset fault first)",
     "Aborted — demand detected (sudden pressure drop)",
     "Not run — water softener regenerating (deferred)",
+    "Aborted — valve failed to close",  # firmware 3.13.1: closed end stop never reached
 }
 
 # dev.24 — water-softener regeneration blackout. A regen draws on the softener's
