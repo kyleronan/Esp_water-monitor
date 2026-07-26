@@ -1150,6 +1150,30 @@ CREATE TABLE IF NOT EXISTS zone_flow_history (
 );
 
 -- ==========================================================================
+-- OVERLAP AUDIT (dev28, overlap-guard plan)
+-- One row per overlap resolution: the same-circuit-overlap invariant was
+-- violated (same water recorded twice) and the guard/cleanup decided whose
+-- volume counts. Revertible/auditable, cross_talk_audit precedent.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS overlap_audit (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit          TEXT NOT NULL,
+    wrapper_event_id TEXT NOT NULL,
+    kept_event_ids   TEXT,             -- JSON list
+    vol_zeroed       REAL,
+    resolution       TEXT NOT NULL,    -- wrapper_zeroed | user_labeled_flag_only
+                                       -- | flagged_ambiguous
+    source           TEXT NOT NULL,    -- live_guard | cleanup_migration
+    created_ts       TIMESTAMP,
+    UNIQUE (wrapper_event_id, resolution)
+);
+
+-- The overlap guard queries same-circuit span intersections on every NEW
+-- event write; this index keeps that O(log n).
+CREATE INDEX IF NOT EXISTS idx_events_circuit_span
+    ON events (circuit, start_ts, end_ts);
+
+-- ==========================================================================
 -- PUMP REGIME NIGHTLY (dev23, pump plan Phase 3)
 -- One row per circuit per EVALUATED night (no row = skipped night: HA outage
 -- or no usable quiet window — invisible to the hysteresis counters by
@@ -2107,6 +2131,20 @@ def upsert_event_and_apply_hourly_volume(
         _do_event_upsert(conn, event)
         apply_effective_volume(conn, event_id, circuit, event["start_ts"],
                                new_effective_volume)
+
+    # Overlap guard (dev28): a genuinely-new event that intersects an existing
+    # same-circuit event means the same water was recorded twice (live blip
+    # wrapper vs import, ~127 L in the 2026-07 incident). The guard resolves
+    # whose volume counts — insertion is never blocked, and a guard failure
+    # must never break the write path.
+    if is_new:
+        try:
+            from .overlap_guard import guard_new_event
+            guard_new_event(conn, event_id, circuit, event["start_ts"],
+                            event.get("end_ts"))
+        except Exception as e:
+            log.warning("[%s] overlap guard failed (non-fatal): %s",
+                        circuit, e)
 
     return is_new
 

@@ -364,6 +364,18 @@ class CircuitEventDetector:
     # slow ramp-up, and a single glitch must not reset a nearly-complete timer.
     FLOW_START_DIP_TOLERANCE: int = 2
 
+    # Maximum silent gap between flow samples an armed sustain timer survives.
+    # The dip tolerance counts SAMPLES, but flow_rate can simply stop ticking
+    # after a brief burst (fewer zero samples arrive than the tolerance), so a
+    # timer armed by a ~10 s slug can stay armed for minutes; the NEXT burst
+    # then instantly satisfies FLOW_START_SECONDS and _start_flow_event
+    # backdates start_ts across the whole quiet gap, and the volume integral
+    # forward-fills that gap at the old burst's flow (observed: booster-pump
+    # top-up slugs ~5 min apart merging into one ~300 s / ~5.4 L event). The
+    # firmware pulse_meter reports within 10 s of flow stopping, so a 30 s
+    # sample gap while the timer is armed can only mean the sensor went quiet.
+    FLOW_START_STALE_GAP_S: float = 30.0
+
     # Composite: second transient must be >= this multiple of primary threshold
     COMPOSITE_TRANSIENT_MULTIPLIER: float = 1.5
 
@@ -511,6 +523,7 @@ class CircuitEventDetector:
         self._current_flow_lpm: float = 0.0
         self._flow_sustained_since: Optional[datetime] = None
         self._flow_start_dips: int = 0   # consecutive sub-threshold samples mid-start
+        self._last_flow_sample_ts: Optional[datetime] = None  # any flow_rate sample
         self._pressure_recovered_since: Optional[datetime] = None
 
         # Downsampling: keep all readings for the first N seconds, then every Kth.
@@ -691,6 +704,23 @@ class CircuitEventDetector:
         self._current_flow_lpm = raw_flow
 
         now = datetime.now(timezone.utc)
+
+        # Stale-timer guard: an armed sustain timer must not survive a silent
+        # sensor gap (see FLOW_START_STALE_GAP_S). Reset it so this sample is
+        # judged as a fresh start instead of "sustained" since minutes ago.
+        if (self._flow_sustained_since is not None
+                and self._last_flow_sample_ts is not None
+                and (now - self._last_flow_sample_ts).total_seconds()
+                > self.FLOW_START_STALE_GAP_S):
+            log.debug(
+                "[%s] flow start timer reset — stale (%.0f s since last flow "
+                "sample, armed %s)", self.circuit,
+                (now - self._last_flow_sample_ts).total_seconds(),
+                self._flow_sustained_since.isoformat(),
+            )
+            self._flow_sustained_since = None
+            self._flow_start_dips = 0
+        self._last_flow_sample_ts = now
 
         # Phase 6a zone-run bookkeeping (no-op unless a zone floor is set).
         if self.zone_low_floor_psi is not None:

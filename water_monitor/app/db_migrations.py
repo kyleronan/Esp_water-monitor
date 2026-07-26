@@ -141,6 +141,15 @@ _BASELINE_VERSION: int = 20260523
 #              offset_signature_json (TEXT — 32×1 s fixed-time shape cells for
 #              the k-NN edge tier) + one-shot backfill from every
 #              event_waveforms envelope (the validated configuration).
+#   20260561 — dev28: overlap-guard cleanup (plan overlap-guard-invariant).
+#              One-shot sweep over history for same-circuit overlapping
+#              events (same water recorded twice — ~127 L in the 2026-07
+#              pump incident): wrapper events whose span+volume reconcile
+#              with their contained members are zeroed through the ledger
+#              chokepoint with mrr='overlap_duplicate'; user-labeled and
+#              ambiguous cases are audit-flagged only. overlap_audit table +
+#              the (circuit, start_ts, end_ts) index ship via _create_schema
+#              (new objects need no DDL migration); idempotent.
 #   20260560 — dev27: pump plan Phase 6b. sensitivity_config.
 #              pump_low_pressure_alert_psi (DEFAULT NULL — NULL resolves the
 #              per-supply default at read time; only explicit user action
@@ -162,7 +171,7 @@ _BASELINE_VERSION: int = 20260523
 #              (persisted arming stamp). sensitivity_config: pump_mode
 #              ('auto'|'on'|'off' per-circuit override), low_pressure_alert_psi
 #              (irrigation under-load floor, default 25). DDL only, no backfill.
-_CURRENT_VERSION: int = 20260560
+_CURRENT_VERSION: int = 20260561
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1661,6 +1670,35 @@ def _missing_leak_test_pump_columns(conn: sqlite3.Connection) -> set[str]:
             if not _has_column(conn, "leak_test_history", col)}
 
 
+# 20260561 (dev28) — one-shot overlap cleanup.
+def _apply_overlap_cleanup(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260561 — resolve historical
+    same-circuit event overlaps (idempotent: already-zeroed wrappers no-op
+    and audit rows are INSERT OR IGNORE). Guarded for stub DBs."""
+    has_events = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+    ).fetchone()
+    has_audit = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+        "name='overlap_audit'").fetchone()
+    if not (has_events and has_audit):
+        conn.commit()
+        return
+    from .overlap_guard import cleanup_all_overlaps
+    totals = cleanup_all_overlaps(conn, source="cleanup_migration")
+    log.info("Migration 20260561: overlap cleanup done (%d group(s), "
+             "%.1f L recovered)", totals["groups"],
+             totals["litres_recovered"])
+
+
+def _missing_overlap_audit_table(conn: sqlite3.Connection) -> set[str]:
+    if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+            "name='overlap_audit'").fetchone():
+        return {"overlap_audit (table)"}
+    return set()
+
+
 # 20260560 (dev27) — Phase 6b pump-failure alert columns.
 def _apply_pump_low_pressure_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260560 — dev27 pump plan Phase 6b.
@@ -1802,6 +1840,7 @@ _MIGRATIONS: tuple = (
     (20260558, _apply_pump_mode_columns),
     (20260559, _apply_leak_test_pump_columns),
     (20260560, _apply_pump_low_pressure_column),
+    (20260561, _apply_overlap_cleanup),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -1874,6 +1913,7 @@ def _run_migrations_impl(
             | _missing_pump_mode_columns(conn)
             | _missing_leak_test_pump_columns(conn)
             | _missing_pump_low_pressure_columns(conn)
+            | _missing_overlap_audit_table(conn)
         )
         if missing:
             raise RuntimeError(

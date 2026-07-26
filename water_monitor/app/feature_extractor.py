@@ -1375,6 +1375,24 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         features["phantom_suppression_averted"] = 0
         return
 
+    # Durable overlap-duplicate verdict (dev28, overlap_guard) — set
+    # out-of-band by the overlap guard from CROSS-EVENT evidence (another
+    # event on the same circuit already counts this water). The single-event
+    # detectors below cannot reproduce it, so a recompute would wrongly
+    # restore the double-counted volume. Preserve — unless the user has
+    # since applied a real fixture label (real water wins).
+    if (features.get("match_rejection_reason") == "overlap_duplicate"
+            and not str(features.get("user_fixture_type") or "").strip()):
+        features["is_pressure_restoration_phantom"] = 1
+        features["volume_litres_effective"] = 0.0
+        features["volume_estimation_method"] = "overlap_duplicate"
+        features["excluded_from_training"] = 1
+        features["match_rejection_reason"] = "overlap_duplicate"
+        features["is_cross_talk"] = 0
+        features["is_low_flow_dribble"] = 0
+        features["phantom_suppression_averted"] = 0
+        return
+
     is_degraded  = bool(features.get("degraded_supply"))
     user_ignored = bool(features.get("user_ignored"))
     # A user-applied fixture type means "confirmed real water" (mirrors
