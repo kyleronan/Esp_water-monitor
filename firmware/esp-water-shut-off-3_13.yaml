@@ -117,7 +117,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.13.1"   # relay-drive fixes: ALWAYS_OFF coil restore, uninterruptible pulses, self-clearing guards, leak test verifies valve closed
+    version: "3.13.2"   # leak test: no fault on failure, flow pre-check, settle after seal, fall-rate demand classifier, baseline/close-pressure sensors
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -226,7 +226,7 @@ dashboard_import:
   # IMPORTANT: this URL must point at an immutable tag (e.g. @v3.13.0)
   # before each release. scripts/check_firmware_release.py enforces this
   # — it fails the release if the ref ends with @main or any branch ref.
-  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_13.yaml@v3.13.0
+  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_13.yaml@v3.13.2
   import_full_config: true
 
 esp32_improv:
@@ -344,6 +344,58 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+
+  # 3.13.2: pressure captured the instant the valve reaches its closed end
+  # stop, BEFORE the settle. baseline - closed = settle-phase loss, the water
+  # that escaped while the test was still getting ready. Measured 2026-07-26:
+  # 0.7 PSI with no leak, 25 PSI with a 214 mL/min drip on a 60s settle.
+  - id: leak_test_closed_psi_main
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: leak_test_closed_psi_irr
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # 3.13.2: pulse total snapshot taken when the prepare phase begins. Any
+  # pulses accumulated before the valve seals mean a fixture was opened after
+  # the test started — the only window in which demand is directly observable
+  # (once the valve is shut the meter is blind by construction).
+  - id: leak_test_prep_pulses_main
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: leak_test_prep_pulses_irr
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # 3.13.2: previous decay sample (value + millis) so the fall RATE can be
+  # computed when the leak threshold is crossed. Measured 2026-07-26:
+  # flapper 0.04 PSI/s, a real 214 mL/min leak 0.37 PSI/s, a toilet flush
+  # 5-12 PSI/s. Rate — not magnitude — is what separates demand from a leak.
+  - id: leak_test_prev_psi_main
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: leak_test_prev_psi_irr
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: leak_test_prev_ms_main
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: leak_test_prev_ms_irr
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
 
   # ---------------------------------------------------------------------------
   # TRICKLE FLOW GLOBALS — Main circuit
@@ -1145,6 +1197,18 @@ sensor:
 
             float drop = id(leak_test_baseline_main) - x;  // positive = pressure fell, negative = pressure rose
 
+            // 3.13.2: fall rate since the previous sample, in PSI/s. Magnitude
+            // alone cannot separate demand from a leak (a real 214 mL/min leak
+            // and a toilet flush both blow past the threshold) — rate can.
+            float fall_rate = 0.0f;
+            uint32_t now_ms = millis();
+            uint32_t dt_ms  = now_ms - id(leak_test_prev_ms_main);
+            if (id(leak_test_prev_ms_main) != 0 && dt_ms > 0) {
+              fall_rate = (id(leak_test_prev_psi_main) - x) * 1000.0f / (float) dt_ms;
+            }
+            id(leak_test_prev_psi_main) = x;
+            id(leak_test_prev_ms_main)  = now_ms;
+
             // --- Pressure increase detected ---
             // A rising pressure with the valve closed means something external is
             // influencing the system (thermal expansion, water hammer, upstream pump,
@@ -1162,22 +1226,41 @@ sensor:
               return;
             }
 
-            // --- Pressure drop: leak detected ---
+            // --- Pressure drop: leak, or a fixture running? ---
+            // 3.13.2: classify by fall RATE before calling it a leak. Result 9
+            // was previously unreachable here — the rapid-drop rule above needs
+            // the burst threshold (~10 PSI over 5s) while this needs only
+            // leak_threshold (~3 PSI) against the same falling pressure, so the
+            // smaller number always tripped first and demand read as a leak.
+            // Measured 2026-07-26: flapper 0.04 PSI/s, a real 214 mL/min leak
+            // 0.37 PSI/s, a toilet flush 5-12 PSI/s. 2.0 PSI/s sits an order of
+            // magnitude above the worst real leak and well below the slowest
+            // demand observed.
+            //
+            // A leak-test failure NEVER raises a safety fault: the test is
+            // informational (go find the drip), and the system returns to
+            // normal service on every outcome. Auto-shutoff for a sustained
+            // real leak remains with the trickle detector. alert_leak_test_*
+            // now only selects the log level — the add-on owns notification.
             if (drop > id(leak_threshold_psi_main).state) {
               id(leak_test_active_main) = false;
               id(leak_test_elapsed_main) = 0.0f;
-              id(leak_test_result_main) = 3;  // Failed — leak detected
-              id(leak_test_restore_main).execute();
-              if (id(alert_leak_test_main)) {
-                id(fault_main) = true;
-                id(fault_reason_main_str) = "Leak test failed — pressure decay detected";
-                id(fault_reason_main).publish_state(id(fault_reason_main_str));
-                ESP_LOGW("safety", "MAIN: leak detected — %.1f PSI drop exceeds %.1f PSI threshold",
-                  drop, id(leak_threshold_psi_main).state);
+              if (fall_rate >= 2.0f) {
+                id(leak_test_result_main) = 9;  // Aborted — demand detected
+                ESP_LOGW("leak_test", "MAIN: leak test aborted — pressure falling at %.1f PSI/s "
+                  "(%.1f PSI below baseline). That is a fixture running, not a micro leak. Retry the test.",
+                  fall_rate, drop);
               } else {
-                ESP_LOGW("leak_test", "MAIN: leak detected — %.1f PSI drop exceeds threshold — alert disabled, no fault raised",
-                  drop);
+                id(leak_test_result_main) = 3;  // Failed — leak detected
+                if (id(alert_leak_test_main)) {
+                  ESP_LOGW("leak_test", "MAIN: leak detected — %.1f PSI drop exceeds %.1f PSI threshold "
+                    "(falling at %.2f PSI/s)", drop, id(leak_threshold_psi_main).state, fall_rate);
+                } else {
+                  ESP_LOGD("leak_test", "MAIN: leak detected — %.1f PSI drop exceeds threshold "
+                    "(falling at %.2f PSI/s) — alert disabled", drop, fall_rate);
+                }
               }
+              id(leak_test_restore_main).execute();
               return;
             }
 
@@ -1304,6 +1387,16 @@ sensor:
 
             float drop = id(leak_test_baseline_irr) - x;  // positive = pressure fell, negative = pressure rose
 
+            // 3.13.2: fall rate since the previous sample — see main circuit.
+            float fall_rate = 0.0f;
+            uint32_t now_ms = millis();
+            uint32_t dt_ms  = now_ms - id(leak_test_prev_ms_irr);
+            if (id(leak_test_prev_ms_irr) != 0 && dt_ms > 0) {
+              fall_rate = (id(leak_test_prev_psi_irr) - x) * 1000.0f / (float) dt_ms;
+            }
+            id(leak_test_prev_psi_irr) = x;
+            id(leak_test_prev_ms_irr)  = now_ms;
+
             if (drop < -id(leak_threshold_psi_irr).state) {
               id(leak_test_active_irr) = false;
               id(leak_test_elapsed_irr) = 0.0f;
@@ -1316,21 +1409,26 @@ sensor:
               return;
             }
 
+            // 3.13.2: rate classifier + no safety fault — see main circuit.
             if (drop > id(leak_threshold_psi_irr).state) {
               id(leak_test_active_irr) = false;
               id(leak_test_elapsed_irr) = 0.0f;
-              id(leak_test_result_irr) = 3;  // Failed — leak detected
-              id(leak_test_restore_irr).execute();
-              if (id(alert_leak_test_irr)) {
-                id(fault_irrigation) = true;
-                id(fault_reason_irr_str) = "Leak test failed — pressure decay detected";
-                id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
-                ESP_LOGW("safety", "IRRIGATION: leak detected — %.1f PSI drop exceeds %.1f PSI threshold",
-                  drop, id(leak_threshold_psi_irr).state);
+              if (fall_rate >= 2.0f) {
+                id(leak_test_result_irr) = 9;  // Aborted — demand detected
+                ESP_LOGW("leak_test", "IRRIGATION: leak test aborted — pressure falling at %.1f PSI/s "
+                  "(%.1f PSI below baseline). That is a fixture running, not a micro leak. Retry the test.",
+                  fall_rate, drop);
               } else {
-                ESP_LOGW("leak_test", "IRRIGATION: leak detected — %.1f PSI drop exceeds threshold — alert disabled, no fault raised",
-                  drop);
+                id(leak_test_result_irr) = 3;  // Failed — leak detected
+                if (id(alert_leak_test_irr)) {
+                  ESP_LOGW("leak_test", "IRRIGATION: leak detected — %.1f PSI drop exceeds %.1f PSI threshold "
+                    "(falling at %.2f PSI/s)", drop, id(leak_threshold_psi_irr).state, fall_rate);
+                } else {
+                  ESP_LOGD("leak_test", "IRRIGATION: leak detected — %.1f PSI drop exceeds threshold "
+                    "(falling at %.2f PSI/s) — alert disabled", drop, fall_rate);
+                }
               }
+              id(leak_test_restore_irr).execute();
               return;
             }
 
@@ -2034,6 +2132,60 @@ sensor:
     update_interval: 10s
     lambda: 'return (float) id(wf_diag_fired);'
 
+  # ---------------------------------------------------------------------------
+  # LEAK TEST MEASUREMENT SENSORS (3.13.2)
+  # The add-on previously recorded baseline_psi from a read taken BEFORE the
+  # valve closed, so every stored row carried the close transient and the whole
+  # settle-phase loss. These publish what the test actually judged against:
+  # the post-settle baseline, and the pressure at the moment the valve sealed.
+  # baseline - closed = water lost while the test was still getting ready.
+  # Deliberately named so they can't collide with the add-on's pressure-sensor
+  # discovery patterns ("water pressure …") or "leak test pressure threshold".
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Leak Test Baseline - ${circuit_1_name}"
+    id: leak_test_baseline_sensor_main
+    entity_category: diagnostic
+    device_class: pressure
+    unit_of_measurement: "PSI"
+    icon: mdi:gauge
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: 'return id(leak_test_baseline_main);'
+
+  - platform: template
+    name: "Leak Test Baseline - ${circuit_2_name}"
+    id: leak_test_baseline_sensor_irr
+    entity_category: diagnostic
+    device_class: pressure
+    unit_of_measurement: "PSI"
+    icon: mdi:gauge
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: 'return id(leak_test_baseline_irr);'
+
+  - platform: template
+    name: "Leak Test Close Pressure - ${circuit_1_name}"
+    id: leak_test_closed_sensor_main
+    entity_category: diagnostic
+    device_class: pressure
+    unit_of_measurement: "PSI"
+    icon: mdi:gauge
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: 'return id(leak_test_closed_psi_main);'
+
+  - platform: template
+    name: "Leak Test Close Pressure - ${circuit_2_name}"
+    id: leak_test_closed_sensor_irr
+    entity_category: diagnostic
+    device_class: pressure
+    unit_of_measurement: "PSI"
+    icon: mdi:gauge
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: 'return id(leak_test_closed_psi_irr);'
+
 # =============================================================================
 # TEXT SENSORS — Leak test results
 # Persists the last result of each leak test as a human-readable string.
@@ -2064,6 +2216,8 @@ text_sensor:
         case 8: return {"Preparing — closing valve and settling"};
         case 9: return {"Aborted — demand detected (sudden pressure drop)"};
         case 10: return {"Aborted — valve failed to close"};
+        case 11: return {"Not run — water in use"};
+        case 12: return {"Aborted — water used while closing"};
         default: return {"No test run"};
       }
 
@@ -2088,6 +2242,8 @@ text_sensor:
         case 8: return {"Preparing — closing valve and settling"};
         case 9: return {"Aborted — demand detected (sudden pressure drop)"};
         case 10: return {"Aborted — valve failed to close"};
+        case 11: return {"Not run — water in use"};
+        case 12: return {"Aborted — water used while closing"};
         default: return {"No test run"};
       }
 
@@ -2716,6 +2872,54 @@ number:
     set_action:
       - logger.log:
           format: "Irrigation leak pressure threshold set to %.1f PSI"
+          args: ['x']
+
+  # 3.13.2 — settle time between the valve SEALING and the baseline reading.
+  # Previously a flat 60s delay that also had to cover ~13s of valve travel,
+  # which meant a leak kept draining the line for a full minute before the
+  # baseline existed (measured 2026-07-26: 25 of a failing test's 27 PSI went
+  # in that window, invisible to the test). The script now waits on the closed
+  # end stop, so this is pure settling. 5s is ~3.5x the pressure_main filter
+  # window (275 samples at ~200Hz = 1.4s) — long enough to flush pre-close
+  # values, short enough that little is lost unmeasured.
+  - platform: template
+    name: "Leak Test Settle Time - ${circuit_1_name}"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_main_settings
+      sorting_weight: 8
+    id: leak_settle_s_main
+    icon: mdi:timer-sand
+    unit_of_measurement: "s"
+    min_value: 2
+    max_value: 120
+    step: 1
+    initial_value: 5
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Main leak test settle time set to %.0f s"
+          args: ['x']
+
+  - platform: template
+    name: "Leak Test Settle Time - ${circuit_2_name}"
+    entity_category: config
+    web_server:
+      sorting_group_id: group_irr_settings
+      sorting_weight: 8
+    id: leak_settle_s_irr
+    icon: mdi:timer-sand
+    unit_of_measurement: "s"
+    min_value: 2
+    max_value: 120
+    step: 1
+    initial_value: 5
+    restore_value: yes
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "Irrigation leak test settle time set to %.0f s"
           args: ['x']
 
   - platform: template
@@ -4013,9 +4217,11 @@ script:
 
   # ---------------------------------------------------------------------------
   # LEAK TEST RUN — Main circuit
-  # Pre-checks valve state and fault, closes valve, waits 60s for EMA to settle,
-  # then activates monitoring. If cancelled during settle, restore is called by
-  # the turn_off_action which stops this script before calling restore.
+  # Pre-checks valve state, fault and live flow; closes the valve; waits for the
+  # closed end stop; checks whether the meter saw a fixture open during travel;
+  # settles for leak_settle_s; then activates monitoring. If cancelled during
+  # settle, restore is called by the turn_off_action which stops this script
+  # before calling restore.
   # ---------------------------------------------------------------------------
   - id: leak_test_run_main
     then:
@@ -4046,56 +4252,108 @@ script:
                             ESP_LOGW("leak_test", "MAIN: test not started — safety fault is active. "
                               "Reset the fault first.");
                       else:
-                        # Pre-checks passed — begin sequence
-                        - lambda: |-
-                            id(leak_test_preparing_main) = true;
-                            id(leak_test_result_main) = 8;  // Preparing
-                            ESP_LOGI("leak_test", "MAIN: closing valve and waiting 60s for pressure to settle...");
-                        - valve.close: main_water_valve
-                        # 60-second settle — allows residual pressure dynamics
-                        # (water hammer, thermal expansion, residual flow) to
-                        # dissipate after the valve closes, so the baseline reading
-                        # captured next is stable and noise-free.
-                        - delay: 60s
-                        # Guard: if cancelled during settle, preparing will be false.
-                        # Also validates the baseline reading is a sane pressure value —
-                        # the ADC-backed EMA sensor can return NaN or 0.0 on cold boot
-                        # before the first valid sample arrives, which would make the
-                        # leak threshold comparison undefined or always-pass.
-                        - lambda: |-
-                            if (!id(leak_test_preparing_main)) return;
-                            // 3.13.1: verify the valve PHYSICALLY closed before measuring.
-                            // A stuck-open valve on a static supply produces a rock-steady
-                            // line — i.e. a false PASS. Field-found 2026-07-26: every test
-                            // for a week ran open and passed/failed on supply behavior.
-                            if (!id(closed_end_stop_valve1).state) {
-                              id(leak_test_result_main) = 10;  // Aborted — valve failed to close
-                              id(leak_test_preparing_main) = false;
-                              id(leak_test_active_main) = false;
-                              ESP_LOGE("leak_test", "MAIN: valve did not reach the closed end stop — "
-                                "aborting test (motor/relay fault?). Result would be meaningless.");
-                              return;
-                            }
-                            float baseline = id(pressure_main).state;
-                            if (isnan(baseline) || baseline < 1.0f) {
-                              id(leak_test_result_main) = 6;  // Not run — sensor not ready
-                              id(leak_test_preparing_main) = false;
-                              id(leak_test_active_main) = false;
-                              ESP_LOGW("leak_test", "MAIN: baseline invalid (%.1f PSI) — "
-                                "ADC not settled after close, aborting test", baseline);
-                              return;
-                            }
-                            id(leak_test_preparing_main) = false;
-                            id(leak_test_elapsed_main) = 0.0f;
-                            id(leak_test_start_ms_main) = millis();
-                            id(leak_test_baseline_main) = baseline;
-                            id(leak_test_active_main) = true;
-                            id(leak_test_result_main) = 1;  // In progress
-                            ESP_LOGI("leak_test", "MAIN: test started. Baseline: %.1f PSI, "
-                              "Threshold: %.1f PSI, Duration: %.0f min",
-                              id(leak_test_baseline_main),
-                              id(leak_threshold_psi_main).state,
-                              id(leak_duration_main).state);
+                        - if:
+                            # 3.13.2: don't start a test while water is running.
+                            # Uses last-pulse AGE, not the pulse_meter rate — the
+                            # rate holds nonzero for its full 10s timeout after
+                            # flow stops, which would defer tests spuriously.
+                            condition:
+                              lambda: 'return id(last_pulse_ms_main) != 0 && (millis() - id(last_pulse_ms_main)) < 1000;'
+                            then:
+                              - lambda: |-
+                                  id(leak_test_result_main) = 11;  // Not run — water in use
+                                  ESP_LOGW("leak_test", "MAIN: test not started — water is flowing right now. "
+                                    "The test needs a quiet line to measure against.");
+                            else:
+                              # Pre-checks passed — begin sequence
+                              - lambda: |-
+                                  id(leak_test_preparing_main) = true;
+                                  id(leak_test_result_main) = 8;  // Preparing
+                                  id(leak_test_prep_pulses_main) = id(flow_total_prev_main);
+                                  ESP_LOGI("leak_test", "MAIN: closing valve, then settling %.0fs before the baseline...",
+                                    id(leak_settle_s_main).state);
+                              - valve.close: main_water_valve
+                              # 3.13.2: wait for the valve to actually SEAL rather
+                              # than assuming travel fits inside a fixed delay. The
+                              # old flat 60s covered ~13s of travel AND the settle,
+                              # and a leak kept being fed from the supply the whole
+                              # time — measured 2026-07-26, 25 of a failing test's
+                              # 27 PSI went before the baseline even existed.
+                              - wait_until:
+                                  condition:
+                                    binary_sensor.is_on: closed_end_stop_valve1
+                                  timeout: 90s
+                              # 3.13.2: the meter can still see a running fixture
+                              # until the valve seals — the only window in which
+                              # demand is directly observable. Checked here, after
+                              # close_sequence has finished, so an abort can never
+                              # collide with in-flight travel. >=3 pulses (~40 mL
+                              # at K=72) ignores a stray tick.
+                              - lambda: |-
+                                  if (!id(leak_test_preparing_main)) return;
+                                  if (!id(closed_end_stop_valve1).state) return;  // result 10 handled below
+                                  id(leak_test_closed_psi_main) = id(pressure_main).state;
+                                  uint32_t pulses = id(flow_total_prev_main) - id(leak_test_prep_pulses_main);
+                                  if (pulses >= 3) {
+                                    id(leak_test_preparing_main) = false;
+                                    id(leak_test_active_main) = false;
+                                    id(leak_test_result_main) = 12;  // Aborted — water used while closing
+                                    id(leak_test_restore_main).execute();
+                                    ESP_LOGW("leak_test", "MAIN: leak test aborted — %u meter pulses while the valve "
+                                      "was closing. A fixture was opened; the result would have read as a leak.",
+                                      (unsigned) pulses);
+                                  }
+                              # Settle — lets residual pressure dynamics (hammer,
+                              # thermal, residual flow) dissipate so the baseline
+                              # is stable. Default 5s is ~3.5x the pressure_main
+                              # filter window (275 samples at ~200Hz = 1.4s).
+                              - delay: !lambda 'return (uint32_t) (id(leak_settle_s_main).state * 1000.0f);'
+                              # Guard: if cancelled during settle, preparing will be false.
+                              # Also validates the baseline reading is a sane pressure value —
+                              # the ADC-backed EMA sensor can return NaN or 0.0 on cold boot
+                              # before the first valid sample arrives, which would make the
+                              # leak threshold comparison undefined or always-pass.
+                              - lambda: |-
+                                  if (!id(leak_test_preparing_main)) return;
+                                  // 3.13.1: verify the valve PHYSICALLY closed before measuring.
+                                  // A stuck-open valve on a static supply produces a rock-steady
+                                  // line — i.e. a false PASS. Field-found 2026-07-26: every test
+                                  // for a week ran open and passed/failed on supply behavior.
+                                  if (!id(closed_end_stop_valve1).state) {
+                                    id(leak_test_result_main) = 10;  // Aborted — valve failed to close
+                                    id(leak_test_preparing_main) = false;
+                                    id(leak_test_active_main) = false;
+                                    ESP_LOGE("leak_test", "MAIN: valve did not reach the closed end stop — "
+                                      "aborting test (motor/relay fault?). Result would be meaningless.");
+                                    return;
+                                  }
+                                  float baseline = id(pressure_main).state;
+                                  if (isnan(baseline) || baseline < 1.0f) {
+                                    id(leak_test_result_main) = 6;  // Not run — sensor not ready
+                                    id(leak_test_preparing_main) = false;
+                                    id(leak_test_active_main) = false;
+                                    ESP_LOGW("leak_test", "MAIN: baseline invalid (%.1f PSI) — "
+                                      "ADC not settled after close, aborting test", baseline);
+                                    return;
+                                  }
+                                  id(leak_test_preparing_main) = false;
+                                  id(leak_test_elapsed_main) = 0.0f;
+                                  id(leak_test_start_ms_main) = millis();
+                                  id(leak_test_baseline_main) = baseline;
+                                  // 3.13.2: seed the rate tracker so the first decay sample
+                                  // yields a real PSI/s figure instead of a spurious spike.
+                                  id(leak_test_prev_psi_main) = baseline;
+                                  id(leak_test_prev_ms_main)  = millis();
+                                  id(leak_test_active_main) = true;
+                                  id(leak_test_result_main) = 1;  // In progress
+                                  ESP_LOGI("leak_test", "MAIN: test started. Baseline: %.1f PSI "
+                                    "(%.1f PSI at valve close, %.1f PSI lost while settling), "
+                                    "Threshold: %.1f PSI, Duration: %.0f min",
+                                    id(leak_test_baseline_main),
+                                    id(leak_test_closed_psi_main),
+                                    id(leak_test_closed_psi_main) - id(leak_test_baseline_main),
+                                    id(leak_threshold_psi_main).state,
+                                    id(leak_duration_main).state);
 
   # ---------------------------------------------------------------------------
   # LEAK TEST RESTORE — Main circuit
@@ -4148,43 +4406,79 @@ script:
                             ESP_LOGW("leak_test", "IRRIGATION: test not started — safety fault is active. "
                               "Reset the fault first.");
                       else:
-                        - lambda: |-
-                            id(leak_test_preparing_irr) = true;
-                            id(leak_test_result_irr) = 8;  // Preparing
-                            ESP_LOGI("leak_test", "IRRIGATION: closing valve and waiting 60s for pressure to settle...");
-                        - valve.close: irrigation_water_valve
-                        - delay: 60s
-                        - lambda: |-
-                            if (!id(leak_test_preparing_irr)) return;
-                            // 3.13.1: verify the valve physically closed — see main circuit.
-                            if (!id(closed_end_stop_valve2).state) {
-                              id(leak_test_result_irr) = 10;  // Aborted — valve failed to close
-                              id(leak_test_preparing_irr) = false;
-                              id(leak_test_active_irr) = false;
-                              ESP_LOGE("leak_test", "IRRIGATION: valve did not reach the closed end stop — "
-                                "aborting test (motor/relay fault?). Result would be meaningless.");
-                              return;
-                            }
-                            float baseline = id(pressure_irrigation).state;
-                            if (isnan(baseline) || baseline < 1.0f) {
-                              id(leak_test_result_irr) = 6;  // Not run — sensor not ready
-                              id(leak_test_preparing_irr) = false;
-                              id(leak_test_active_irr) = false;
-                              ESP_LOGW("leak_test", "IRRIGATION: baseline invalid (%.1f PSI) — "
-                                "ADC not settled after close, aborting test", baseline);
-                              return;
-                            }
-                            id(leak_test_preparing_irr) = false;
-                            id(leak_test_elapsed_irr) = 0.0f;
-                            id(leak_test_start_ms_irr) = millis();
-                            id(leak_test_baseline_irr) = baseline;
-                            id(leak_test_active_irr) = true;
-                            id(leak_test_result_irr) = 1;  // In progress
-                            ESP_LOGI("leak_test", "IRRIGATION: test started. Baseline: %.1f PSI, "
-                              "Threshold: %.1f PSI, Duration: %.0f min",
-                              id(leak_test_baseline_irr),
-                              id(leak_threshold_psi_irr).state,
-                              id(leak_duration_irr).state);
+                        - if:
+                            # 3.13.2: don't start while water is running — see main.
+                            condition:
+                              lambda: 'return id(last_pulse_ms_irr) != 0 && (millis() - id(last_pulse_ms_irr)) < 1000;'
+                            then:
+                              - lambda: |-
+                                  id(leak_test_result_irr) = 11;  // Not run — water in use
+                                  ESP_LOGW("leak_test", "IRRIGATION: test not started — water is flowing right now. "
+                                    "The test needs a quiet line to measure against.");
+                            else:
+                              - lambda: |-
+                                  id(leak_test_preparing_irr) = true;
+                                  id(leak_test_result_irr) = 8;  // Preparing
+                                  id(leak_test_prep_pulses_irr) = id(flow_total_prev_irr);
+                                  ESP_LOGI("leak_test", "IRRIGATION: closing valve, then settling %.0fs before the baseline...",
+                                    id(leak_settle_s_irr).state);
+                              - valve.close: irrigation_water_valve
+                              # 3.13.2: wait for the seal, then check for demand — see main.
+                              - wait_until:
+                                  condition:
+                                    binary_sensor.is_on: closed_end_stop_valve2
+                                  timeout: 90s
+                              - lambda: |-
+                                  if (!id(leak_test_preparing_irr)) return;
+                                  if (!id(closed_end_stop_valve2).state) return;  // result 10 handled below
+                                  id(leak_test_closed_psi_irr) = id(pressure_irrigation).state;
+                                  uint32_t pulses = id(flow_total_prev_irr) - id(leak_test_prep_pulses_irr);
+                                  if (pulses >= 3) {
+                                    id(leak_test_preparing_irr) = false;
+                                    id(leak_test_active_irr) = false;
+                                    id(leak_test_result_irr) = 12;  // Aborted — water used while closing
+                                    id(leak_test_restore_irr).execute();
+                                    ESP_LOGW("leak_test", "IRRIGATION: leak test aborted — %u meter pulses while the "
+                                      "valve was closing. A fixture was opened; the result would have read as a leak.",
+                                      (unsigned) pulses);
+                                  }
+                              - delay: !lambda 'return (uint32_t) (id(leak_settle_s_irr).state * 1000.0f);'
+                              - lambda: |-
+                                  if (!id(leak_test_preparing_irr)) return;
+                                  // 3.13.1: verify the valve physically closed — see main circuit.
+                                  if (!id(closed_end_stop_valve2).state) {
+                                    id(leak_test_result_irr) = 10;  // Aborted — valve failed to close
+                                    id(leak_test_preparing_irr) = false;
+                                    id(leak_test_active_irr) = false;
+                                    ESP_LOGE("leak_test", "IRRIGATION: valve did not reach the closed end stop — "
+                                      "aborting test (motor/relay fault?). Result would be meaningless.");
+                                    return;
+                                  }
+                                  float baseline = id(pressure_irrigation).state;
+                                  if (isnan(baseline) || baseline < 1.0f) {
+                                    id(leak_test_result_irr) = 6;  // Not run — sensor not ready
+                                    id(leak_test_preparing_irr) = false;
+                                    id(leak_test_active_irr) = false;
+                                    ESP_LOGW("leak_test", "IRRIGATION: baseline invalid (%.1f PSI) — "
+                                      "ADC not settled after close, aborting test", baseline);
+                                    return;
+                                  }
+                                  id(leak_test_preparing_irr) = false;
+                                  id(leak_test_elapsed_irr) = 0.0f;
+                                  id(leak_test_start_ms_irr) = millis();
+                                  id(leak_test_baseline_irr) = baseline;
+                                  id(leak_test_prev_psi_irr) = baseline;
+                                  id(leak_test_prev_ms_irr)  = millis();
+                                  id(leak_test_active_irr) = true;
+                                  id(leak_test_result_irr) = 1;  // In progress
+                                  ESP_LOGI("leak_test", "IRRIGATION: test started. Baseline: %.1f PSI "
+                                    "(%.1f PSI at valve close, %.1f PSI lost while settling), "
+                                    "Threshold: %.1f PSI, Duration: %.0f min",
+                                    id(leak_test_baseline_irr),
+                                    id(leak_test_closed_psi_irr),
+                                    id(leak_test_closed_psi_irr) - id(leak_test_baseline_irr),
+                                    id(leak_threshold_psi_irr).state,
+                                    id(leak_duration_irr).state);
 
   # ---------------------------------------------------------------------------
   # LEAK TEST RESTORE — Irrigation circuit

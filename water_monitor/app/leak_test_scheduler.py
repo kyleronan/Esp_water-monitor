@@ -4,9 +4,11 @@ Leak test scheduler.
 The scheduler decides WHEN to run — it learns the quietest hour of the day
 from historical usage data and schedules tests at that time (e.g. 1am).
 
-Key design decision: there is NO quiet-period flow check inside _execute_test.
-Waiting for the house to go quiet is the wrong approach — instead, the
-scheduler picks a time when the house is statistically quiet.
+The scheduler picks a time when the house is statistically quiet rather than
+waiting for it to go quiet. That is still the right approach — but "usually
+quiet" is not "quiet right now", so _execute_test also refuses to start while
+water is actually moving (3.13.2). A test started mid-draw measures the draw,
+not the plumbing, and reports it as a leak.
 
 Two code paths:
   run_now(triggered_by="manual")    — immediate, from web UI
@@ -40,7 +42,39 @@ TERMINAL_RESULTS = {
     "Aborted — demand detected (sudden pressure drop)",
     "Not run — water softener regenerating (deferred)",
     "Aborted — valve failed to close",  # firmware 3.13.1: closed end stop never reached
+    # firmware 3.13.2 — demand detected before the valve sealed, or a test
+    # refused because water was already running.
+    "Not run — water in use",
+    "Aborted — water used while closing",
 }
+
+# Results that mean "a fixture was running, so this tells us nothing about a
+# leak" — the row is presented as an abort, not a failure. The firmware
+# reaches these three different ways: refusing to start (11), catching meter
+# pulses before the valve sealed (12), and classifying the decay by fall rate
+# once sealed (9). The add-on adds a fourth via the reopen slug.
+DEMAND_RESULTS = {
+    "Not run — water in use",
+    "Aborted — water used while closing",
+    "Aborted — demand detected (sudden pressure drop)",
+}
+
+# How far out to push a test that was deferred because water was running.
+RETRY_AFTER_DEMAND_MIN: int = 30
+
+# Post-restore watch (the reopen-slug backstop). Once the valve reopens,
+# anything drawn during the test has to come back through the meter. Measured
+# 2026-07-26: a flapper-scale refill is ~0.04 L, a pump recharge pushes
+# 0.3-0.5 L, and a toilet that was flushed during the test pulls 3-8 L as it
+# finishes filling. 1 L sits in the gap with an order of magnitude either side.
+POST_RESTORE_WATCH_S: int = 120
+POST_RESTORE_LEAD_S: int = 15      # covers the <=10 s poll gap plus valve travel
+POST_RESTORE_DEMAND_L: float = 1.0
+
+# Compliance of the isolated section, mL per PSI — converts a decay rate into a
+# leak rate. Used only until a circuit calibrates its own from a reopen refill.
+# 9.5 measured on Main 2026-07-26 (257 mL lost for 27 PSI).
+DEFAULT_COMPLIANCE_ML_PSI: float = 9.5
 
 # dev.24 — water-softener regeneration blackout. A regen draws on the softener's
 # circuit (Main) and would read as a leak, so a leak test is kept out of
@@ -376,8 +410,10 @@ class LeakTestScheduler:
         """
         Execute a leak test on one circuit.
 
-        The scheduler already chose a statistically quiet time, so there is
-        no flow-based gating here — just valve/fault pre-checks then start.
+        The scheduler picks a statistically quiet hour, but "usually quiet" is
+        not "quiet right now" — a test started mid-draw reads the draw as a
+        leak (verified 2026-07-26). Pre-checks are valve / fault / valve-type /
+        softener-blackout / live-flow, then start.
         """
         circuit = circuit_cfg.circuit
         name    = circuit_cfg.label
@@ -444,13 +480,36 @@ class LeakTestScheduler:
                                 circuit, _ex)
                 return {"result": result, "skipped": True}
 
-        # --- Baseline pressure ---
+        # --- Pre-check: water already running ---
+        # The firmware refuses too (result 11), but checking here avoids
+        # driving the valve at all and lets us reschedule instead of burning
+        # the slot. Reuses the softener-blackout defer shape.
+        if await self._flow_is_live(circuit_cfg):
+            log.info("[%s] leak test deferred — water is in use", circuit)
+            result = "Not run — water in use"
+            await self._store_result(circuit, run_at, triggered_by, result,
+                                     None, None, None, None)
+            try:
+                _next = run_at + timedelta(minutes=RETRY_AFTER_DEMAND_MIN)
+                upsert_leak_test_schedule(self._db, circuit,
+                                          next_run_at=_next.isoformat())
+            except Exception as _ex:
+                log.warning("[%s] could not reschedule deferred test: %s",
+                            circuit, _ex)
+            return {"result": result, "skipped": True}
+
+        # --- Pre-close pressure ---
+        # Context only. What the test JUDGES against is the firmware's
+        # post-settle baseline, read after the run below — reading pressure
+        # here and calling it the baseline (as this did before 3.13.2) folded
+        # the close transient and the whole settle-phase loss into every
+        # recorded drop.
         pressure_str = await self._ha.get_state_value(
             circuit_cfg.pressure_avg_sensor, "0")
         try:
-            baseline_psi = float(pressure_str)
+            pre_close_psi = float(pressure_str)
         except (ValueError, TypeError):
-            baseline_psi = None
+            pre_close_psi = None
 
         # --- Start the firmware leak test ---
         log.info("[%s] starting leak test (triggered_by=%s)", circuit, triggered_by)
@@ -473,49 +532,110 @@ class LeakTestScheduler:
         start_wait   = datetime.now(timezone.utc)
         final_result = "In progress"
         result_str   = "unknown"   # initialised before loop so timeout log is safe
+        monitor_started_at: Optional[datetime] = None
 
-        while (datetime.now(timezone.utc) - start_wait).total_seconds() < max_wait_seconds:
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=10)
-                return {"result": "cancelled"}
-            except asyncio.TimeoutError:
-                pass
+        # A test interrupted part-way still happened, and the interruption is
+        # itself worth seeing. Before 3.13.2 both interruption paths returned
+        # without writing a row, so an aborted test vanished from history
+        # entirely (observed 2026-07-26: a run that measured for three minutes
+        # left no trace). The abort button cancels the task, so CancelledError
+        # — a BaseException — has to be caught explicitly, and re-raised so the
+        # cancellation still takes effect.
+        def _interrupted_row(reason: str):
+            return self._store_result(
+                circuit, run_at, triggered_by, reason,
+                round((datetime.now(timezone.utc) - run_at
+                       ).total_seconds() / 60, 1),
+                None, None, None)
 
-            result_str = await self._ha.get_state_value(
-                circuit_cfg.leak_test_result_sensor, "In progress")
-            if result_str in TERMINAL_RESULTS:
-                final_result = result_str
-                break
-        else:
-            log.warning(
-                "[%s] leak test timed out after %.0f s — firmware result '%s' not in "
-                "TERMINAL_RESULTS. Check firmware version or update TERMINAL_RESULTS.",
-                circuit,
-                (datetime.now(timezone.utc) - start_wait).total_seconds(),
-                result_str,
-            )
-            final_result = "Timed out — no terminal result received"
-
-        # --- Final pressure ---
-        final_pressure_str = await self._ha.get_state_value(
-            circuit_cfg.pressure_avg_sensor, "0")
         try:
-            final_psi = float(final_pressure_str)
-        except (ValueError, TypeError):
-            final_psi = None
+            while (datetime.now(timezone.utc) - start_wait).total_seconds() < max_wait_seconds:
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=10)
+                    # Add-on shutting down (restart / update) mid-test.
+                    await _interrupted_row("Stopped manually")
+                    return {"result": "cancelled"}
+                except asyncio.TimeoutError:
+                    pass
+
+                result_str = await self._ha.get_state_value(
+                    circuit_cfg.leak_test_result_sensor, "unknown")
+
+                # First sighting of "In progress" = the firmware has sealed the
+                # valve, settled, frozen its baseline and started measuring
+                # (firmware:4092). Everything before this is travel and settle,
+                # and counting it as monitored time is what made the stored
+                # drop rate meaningless.
+                if monitor_started_at is None and result_str == "In progress":
+                    monitor_started_at = datetime.now(timezone.utc)
+
+                if result_str in TERMINAL_RESULTS:
+                    final_result = result_str
+                    break
+            else:
+                log.warning(
+                    "[%s] leak test timed out after %.0f s — firmware result '%s' not in "
+                    "TERMINAL_RESULTS. Check firmware version or update TERMINAL_RESULTS.",
+                    circuit,
+                    (datetime.now(timezone.utc) - start_wait).total_seconds(),
+                    result_str,
+                )
+                final_result = "Timed out — no terminal result received"
+        except asyncio.CancelledError:
+            # Abort button — cancel() cancels this task directly.
+            await _interrupted_row("Stopped manually")
+            raise
+
+        # --- What the test measured ---
+        # Read AFTER the terminal result: both firmware globals latch until the
+        # next test, so this has no race with the sensors' 5 s publish cadence.
+        # Falls back to the pre-close reading on pre-3.13.2 firmware, which is
+        # wrong in the old way rather than newly wrong.
+        baseline_psi = await self._read_float(
+            circuit_cfg.leak_test_baseline_sensor)
+        if baseline_psi is None:
+            baseline_psi = pre_close_psi
+        closed_psi = await self._read_float(circuit_cfg.leak_test_closed_sensor)
+        if closed_psi is None:
+            closed_psi = pre_close_psi
+        threshold_psi = await self._read_float(
+            circuit_cfg.leak_threshold_entity)
+
+        # Final pressure from the FAST sensor: the averaged one lags badly on a
+        # steep fall — 2026-07-26 it recorded 58.0 and 38.5 where the fast trace
+        # was at ~28 and ~33.
+        final_psi = await self._read_float(circuit_cfg.pressure_fast_sensor)
+        if final_psi is None:
+            final_psi = await self._read_float(circuit_cfg.pressure_avg_sensor)
 
         pressure_drop = (
             round(baseline_psi - final_psi, 2)
             if baseline_psi is not None and final_psi is not None
             else None
         )
+        settle_loss = (
+            round(closed_psi - baseline_psi, 2)
+            if closed_psi is not None and baseline_psi is not None
+            else None
+        )
         duration_minutes = round(
             (datetime.now(timezone.utc) - run_at).total_seconds() / 60, 1)
+        monitor_minutes = (
+            round((datetime.now(timezone.utc) - monitor_started_at
+                   ).total_seconds() / 60, 2)
+            if monitor_started_at is not None else None
+        )
+        est_leak = self._estimate_leak_ml_min(
+            circuit, pressure_drop, settle_loss, monitor_minutes,
+            duration_minutes)
 
         # --- Persist result ---
         await self._store_result(
             circuit, run_at, triggered_by, final_result,
             duration_minutes, baseline_psi, final_psi, pressure_drop,
+            closed_psi=closed_psi, settle_loss_psi=settle_loss,
+            monitor_minutes=monitor_minutes, threshold_psi=threshold_psi,
+            est_leak_ml_min=est_leak,
         )
 
         # --- Pump plan Phase 5b: cross-circuit verdict (vfd pump mode only).
@@ -532,9 +652,27 @@ class LeakTestScheduler:
             log.warning("[%s] pump cross-check failed (non-fatal): %s",
                         circuit, e)
 
+        # --- Reopen-slug backstop: did a fixture actually run? ---
+        # Last rung of the demand ladder, and the only one that needs no
+        # firmware support. Runs after the row exists and BEFORE the
+        # notification, so a toilet flush never fires "leak detected".
+        draw_verdict = None
+        try:
+            draw_verdict = await self._post_restore_draw_check(circuit_cfg)
+        except Exception as e:
+            log.warning("[%s] post-restore draw check failed (non-fatal): %s",
+                        circuit, e)
+
+        demand = (final_result in DEMAND_RESULTS) or (draw_verdict == "demand")
+        effective_result = (
+            "Aborted — water in use during test"
+            if demand and final_result.startswith("Failed")
+            else final_result
+        )
+
         upsert_leak_test_schedule(self._db, circuit,
                                   last_run_at=run_at.isoformat(),
-                                  last_result=final_result)
+                                  last_result=effective_result)
 
         # --- HA notification via AlertManager ---
         passed = final_result == "Passed — no leak detected"
@@ -543,7 +681,18 @@ class LeakTestScheduler:
             await am.alert_leak_test_passed(
                 circuit, duration_minutes or 0, name)
         elif am and not passed and notify_fail and "Passed" not in final_result:
-            if "Failed" in final_result or "leak" in final_result.lower():
+            if demand:
+                # Never "leak detected" — a fixture was running, so the test
+                # measured demand, not the plumbing.
+                await am.fire(
+                    circuit, "leak_test",
+                    title=f"Water Monitor — Leak test ({name})",
+                    message=(f"{effective_result}. Water was being used, so the "
+                             "test could not measure the line. It will run "
+                             "again on schedule."),
+                    notification_id=f"water_leak_test_result_{circuit}",
+                )
+            elif "Failed" in final_result or "leak" in final_result.lower():
                 await am.alert_leak_test_failed(
                     circuit, pressure_drop or 0, name)
             else:
@@ -555,17 +704,144 @@ class LeakTestScheduler:
                     notification_id=f"water_leak_test_result_{circuit}",
                 )
 
-        log.info("[%s] leak test complete — %s (%.1f min, %.2f PSI drop)",
-                 circuit, final_result, duration_minutes or 0, pressure_drop or 0)
+        log.info("[%s] leak test complete — %s (monitored %.2f min, %.2f PSI "
+                 "drop, %.2f PSI lost settling, est %s mL/min)",
+                 circuit, effective_result,
+                 monitor_minutes or 0, pressure_drop or 0, settle_loss or 0,
+                 f"{est_leak:.1f}" if est_leak is not None else "n/a")
 
         return {
             "result":           final_result,
+            "effective_result": effective_result,
             "duration_minutes": duration_minutes,
+            "monitor_minutes":  monitor_minutes,
             "baseline_psi":     baseline_psi,
+            "closed_psi":       closed_psi,
+            "settle_loss_psi":  settle_loss,
             "final_psi":        final_psi,
             "pressure_drop_psi": pressure_drop,
+            "est_leak_ml_min":  est_leak,
+            "draw_verdict":     draw_verdict,
             "passed":           passed,
         }
+
+    async def _read_float(self, entity_id: str) -> Optional[float]:
+        """Read one HA entity as a float. None for an unset role, a missing
+        entity, or a non-numeric state ('unavailable', 'unknown')."""
+        if not entity_id:
+            return None
+        try:
+            raw = await self._ha.get_state_value(entity_id, None)
+            return float(raw)
+        except (ValueError, TypeError):
+            return None
+
+    async def _flow_is_live(self, circuit_cfg: Any) -> bool:
+        """True if water is moving on this circuit right now.
+
+        Deliberately reads the flow RATE rather than a pulse timestamp, which
+        the firmware uses: the add-on only sees HA state, and the pulse_meter
+        rate holding nonzero for its 10 s timeout after flow stops is
+        acceptable here (a 10 s over-hold defers a test, it never lets a bad
+        one run). Compared against the circuit's own meter floor so a
+        registration-floor dribble can't block every test forever."""
+        rate = await self._read_float(getattr(circuit_cfg, "flow_sensor", ""))
+        if rate is None:
+            return False        # no reading is not evidence of flow
+        try:
+            floor = float(circuit_cfg.min_flow_lpm)
+        except (AttributeError, TypeError, ValueError):
+            floor = 0.15
+        return rate >= floor
+
+    def _compliance_ml_psi(self, circuit: str) -> Optional[float]:
+        """Per-circuit mL-per-PSI of the section this valve isolates."""
+        try:
+            row = self._db.execute(
+                "SELECT compliance_ml_psi FROM sensitivity_config "
+                "WHERE circuit = ?", (circuit,)).fetchone()
+        except sqlite3.Error:
+            return DEFAULT_COMPLIANCE_ML_PSI
+        val = row["compliance_ml_psi"] if row is not None else None
+        if val is None:
+            return DEFAULT_COMPLIANCE_ML_PSI
+        try:
+            val = float(val)
+        except (TypeError, ValueError):
+            return DEFAULT_COMPLIANCE_ML_PSI
+        return val if val > 0 else DEFAULT_COMPLIANCE_ML_PSI
+
+    def _estimate_leak_ml_min(
+        self, circuit: str,
+        pressure_drop: Optional[float],
+        settle_loss: Optional[float],
+        monitor_minutes: Optional[float],
+        duration_minutes: Optional[float],
+    ) -> Optional[float]:
+        """Leak rate in mL/min from the pressure the line actually lost.
+
+        Counts the settle-phase loss as well as the monitored drop — water that
+        escaped before the baseline was frozen is still water — and divides by
+        the whole isolated span. Returns None when there is nothing to divide
+        by or no drop was recorded.
+        """
+        if pressure_drop is None or pressure_drop <= 0:
+            return None
+        span = duration_minutes if monitor_minutes is None else monitor_minutes
+        if settle_loss and settle_loss > 0 and duration_minutes:
+            # Settle loss happened over the pre-monitoring part of the span.
+            total_psi = pressure_drop + settle_loss
+            span = duration_minutes
+        else:
+            total_psi = pressure_drop
+        if not span or span <= 0:
+            return None
+        compliance = self._compliance_ml_psi(circuit)
+        if not compliance:
+            return None
+        return round(total_psi / span * compliance, 2)
+
+    async def _post_restore_draw_check(
+        self, circuit_cfg: Any) -> Optional[str]:
+        """Reopen-slug backstop — was a fixture running during the test?
+
+        With the valve shut the meter is blind by construction, so the only
+        remaining witness is what comes back through it once the valve reopens.
+        A micro leak refills millilitres; a toilet that was flushed during the
+        test finishes its fill and pulls litres. Annotates the row and returns
+        the verdict; never raises into the caller's result.
+        """
+        circuit = circuit_cfg.circuit
+        vol_entity = getattr(circuit_cfg, "volume_sensor", "")
+        verdict, slug = "unavailable", None
+        if vol_entity:
+            start_total = await self._read_float(vol_entity)
+            try:
+                await asyncio.wait_for(self._stop.wait(),
+                                       timeout=POST_RESTORE_WATCH_S)
+                return None      # shutting down — leave the row alone
+            except asyncio.TimeoutError:
+                pass
+            end_total = await self._read_float(vol_entity)
+            if start_total is not None and end_total is not None:
+                delta = end_total - start_total
+                if delta >= 0:   # negative = ESP reboot reset the total
+                    slug = round(delta, 3)
+                    verdict = ("demand" if delta >= POST_RESTORE_DEMAND_L
+                               else "clean")
+        try:
+            self._db.execute(
+                "UPDATE leak_test_history SET post_restore_volume_l = ?, "
+                "  draw_verdict = ? "
+                "WHERE id = (SELECT MAX(id) FROM leak_test_history "
+                "            WHERE circuit = ?)",
+                (slug, verdict, circuit))
+            self._db.commit()
+        except sqlite3.Error as e:
+            log.warning("[%s] could not store draw verdict: %s", circuit, e)
+        log.info("[%s] post-restore draw check: %s (%s L back through the meter)",
+                 circuit, verdict, slug)
+        return verdict
 
     async def _pump_cross_check(self, tested_circuit: str,
                                 start_dt, end_dt) -> None:
@@ -619,7 +895,22 @@ class LeakTestScheduler:
                 flow = _ffill_1hz(hist.get(flow_entity) or [], start_dt, n,
                                   default=0.0)
                 if (hist.get(pressure_entity) or []):
-                    verdict, cycles, period = classify_cross_circuit(pres, flow)
+                    # This home's learned recharge period is the yardstick for
+                    # "was the window long enough to call quiet". Without it a
+                    # zero-rise window is judged against the 60 s floor, which
+                    # let a 5-minute test on a ~170 s pump claim "Pump quiet"
+                    # it hadn't watched long enough to earn (2026-08-02).
+                    learned_period = None
+                    try:
+                        row = self._db.execute(
+                            "SELECT pump_detect_period_s FROM home_profile "
+                            "WHERE id = 1").fetchone()
+                        if row is not None and row["pump_detect_period_s"]:
+                            learned_period = float(row["pump_detect_period_s"])
+                    except sqlite3.Error:
+                        pass
+                    verdict, cycles, period = classify_cross_circuit(
+                        pres, flow, expected_period_s=learned_period)
             except Exception as e:
                 log.warning("[%s] pump cross-check fetch failed: %s",
                             tested_circuit, e)
@@ -711,6 +1002,12 @@ class LeakTestScheduler:
         result: str, duration: Optional[float],
         baseline_psi: Optional[float], final_psi: Optional[float],
         pressure_drop: Optional[float],
+        *,
+        closed_psi: Optional[float] = None,
+        settle_loss_psi: Optional[float] = None,
+        monitor_minutes: Optional[float] = None,
+        threshold_psi: Optional[float] = None,
+        est_leak_ml_min: Optional[float] = None,
     ) -> None:
         insert_leak_test_history(
             self._db,
@@ -722,6 +1019,11 @@ class LeakTestScheduler:
             baseline_psi=baseline_psi,
             final_psi=final_psi,
             pressure_drop_psi=pressure_drop,
+            closed_psi=closed_psi,
+            settle_loss_psi=settle_loss_psi,
+            monitor_minutes=monitor_minutes,
+            threshold_psi=threshold_psi,
+            est_leak_ml_min=est_leak_ml_min,
         )
 
 

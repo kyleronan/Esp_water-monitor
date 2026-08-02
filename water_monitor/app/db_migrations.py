@@ -175,7 +175,15 @@ _BASELINE_VERSION: int = 20260523
 #              (persisted arming stamp). sensitivity_config: pump_mode
 #              ('auto'|'on'|'off' per-circuit override), low_pressure_alert_psi
 #              (irrigation under-load floor, default 25). DDL only, no backfill.
-_CURRENT_VERSION: int = 20260562
+#   20260563 — leak test measures the right interval and reports a rate.
+#              leak_test_history: closed_psi, settle_loss_psi, monitor_minutes,
+#              threshold_psi, est_leak_ml_min, post_restore_volume_l,
+#              draw_verdict; sensitivity_config.compliance_ml_psi (mL per PSI
+#              of the isolated section, calibrated from the reopen refill).
+#              baseline_psi was previously read BEFORE the valve closed, so
+#              every row carried the close transient plus the settle-phase
+#              loss. DDL only — historical rows cannot be corrected.
+_CURRENT_VERSION: int = 20260563
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1692,6 +1700,55 @@ def _missing_leak_test_dismissed_column(conn: sqlite3.Connection) -> set[str]:
     return set()
 
 
+# 20260563 — leak test measures the right interval, and reports a rate.
+# baseline_psi was read BEFORE the valve closed, so every stored row carried
+# the close transient plus the whole settle-phase loss (measured 2026-07-26:
+# a row read 1.0 PSI where the monitored decay was 0.28, and another read
+# 21.5 where it was ~3). Firmware 3.13.2 publishes the values the test
+# actually judged against; these columns store them, plus the derived leak
+# rate and the demand verdict.
+_LEAK_TEST_MEASUREMENT_COLUMNS: tuple = (
+    ("closed_psi",            "REAL"),     # pressure the instant the valve sealed
+    ("settle_loss_psi",       "REAL"),     # closed_psi - baseline_psi
+    ("monitor_minutes",       "REAL"),     # monitored window only
+    ("threshold_psi",         "REAL"),     # leak_pressure_threshold at test time
+    ("est_leak_ml_min",       "REAL"),     # decay rate x per-circuit compliance
+    ("post_restore_volume_l", "REAL"),     # reopen slug
+    ("draw_verdict",          "TEXT"),     # demand | clean | unavailable
+)
+
+
+def _apply_leak_test_measurement_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260563. Guarded + idempotent; DDL only.
+    Historical rows keep their inflated pressures — no backfill is possible,
+    the firmware never published what they were measured against."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                    "name='leak_test_history'").fetchone():
+        for col, ddl in _LEAK_TEST_MEASUREMENT_COLUMNS:
+            if not _has_column(conn, "leak_test_history", col):
+                conn.execute(
+                    f"ALTER TABLE leak_test_history ADD COLUMN {col} {ddl}")
+    # Per-circuit compliance (mL per PSI of the isolated section) — converts
+    # the decay rate into a leak rate. Seeded from the reopen refill; NULL
+    # means "not yet calibrated" and the leak rate is simply not shown.
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                    "name='sensitivity_config'").fetchone():
+        if not _has_column(conn, "sensitivity_config", "compliance_ml_psi"):
+            conn.execute("ALTER TABLE sensitivity_config ADD COLUMN "
+                         "compliance_ml_psi REAL")
+    conn.commit()
+    log.info("Migration 20260563: leak-test measurement columns ready")
+
+
+def _missing_leak_test_measurement_columns(conn: sqlite3.Connection) -> set[str]:
+    missing = {f"leak_test_history.{col}"
+               for col, _ddl in _LEAK_TEST_MEASUREMENT_COLUMNS
+               if not _has_column(conn, "leak_test_history", col)}
+    if not _has_column(conn, "sensitivity_config", "compliance_ml_psi"):
+        missing.add("sensitivity_config.compliance_ml_psi")
+    return missing
+
+
 # 20260561 (dev28) — one-shot overlap cleanup.
 def _apply_overlap_cleanup(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260561 — resolve historical
@@ -1864,6 +1921,7 @@ _MIGRATIONS: tuple = (
     (20260560, _apply_pump_low_pressure_column),
     (20260561, _apply_overlap_cleanup),
     (20260562, _apply_leak_test_dismissed_column),
+    (20260563, _apply_leak_test_measurement_columns),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -1938,6 +1996,7 @@ def _run_migrations_impl(
             | _missing_pump_low_pressure_columns(conn)
             | _missing_overlap_audit_table(conn)
             | _missing_leak_test_dismissed_column(conn)
+            | _missing_leak_test_measurement_columns(conn)
         )
         if missing:
             raise RuntimeError(

@@ -420,6 +420,7 @@ def estimate_leak_rate_lph(pressure_1hz: Sequence[float],
 
 def classify_cross_circuit(pressure_1hz: Sequence[float],
                            flow_1hz_lpm: Sequence[float],
+                           expected_period_s: Optional[float] = None,
                            ) -> Tuple[str, int, Optional[float]]:
     """Phase 5b — verdict for the UNTESTED circuit's window while its sibling
     ran a valve-closed leak test. Returns (verdict, cycles, period_s).
@@ -431,7 +432,22 @@ def classify_cross_circuit(pressure_1hz: Sequence[float],
     through the OTHER (tested) circuit's meter or below this one's floor, so
     this circuit sees the pressure sawtooth with zero flow — pressure-only
     cycling here is exactly the signal. >=3 in-band-spaced rises =>
-    'untested_side'; else 'quiet'.
+    'untested_side'.
+
+    Falling short of that only means 'quiet' if the window was long enough to
+    have reached it. A short test cannot: observed 2026-07-26, a 6-minute test
+    with two unmistakable recharges ~170 s apart returned 'quiet', which the
+    UI renders as "no sign of a leak anywhere" — active false reassurance.
+    When the window can't hold three rises at the spacing actually observed,
+    the answer is 'inconclusive'. With too few rises to measure spacing, the
+    yardstick is ``expected_period_s`` — THIS home's learned recharge period
+    (home_profile.pump_detect_period_s) — falling back to the minimum
+    plausible period only when the home has never measured one. The fallback
+    cuts the wrong way on a slow pump: this home cycles ~170 s, so judging a
+    5-minute window against the 60 s floor calls it "long enough" when three
+    real cycles need 8.5 minutes (observed 2026-08-02: a 5.3-minute test with
+    zero rises earned a green "Pump quiet" it hadn't watched long enough to
+    claim).
     """
     f = np.asarray(flow_1hz_lpm, dtype=float)
     if f.size and bool((f > 0.0).any()):
@@ -445,6 +461,18 @@ def classify_cross_circuit(pressure_1hz: Sequence[float],
     if len(rises) >= 3 and len(in_band) >= 2:
         return ("untested_side", len(rises),
                 float(np.median(in_band)))
+    # Could this window have produced a verdict at all? Three rises need two
+    # gaps, so the span has to cover ~2 periods plus the leading partial cycle.
+    # Yardstick preference: observed spacing > home's learned period > floor.
+    if in_band:
+        period = float(np.median(in_band))
+    elif expected_period_s and PUMP_PERIOD_MIN_S <= expected_period_s <= PUMP_PERIOD_MAX_S:
+        period = float(expected_period_s)
+    else:
+        period = PUMP_PERIOD_MIN_S
+    if float(p.size) < 3.0 * period:
+        return "inconclusive", len(rises), (float(np.median(in_band))
+                                            if in_band else None)
     return "quiet", len(rises), None
 
 

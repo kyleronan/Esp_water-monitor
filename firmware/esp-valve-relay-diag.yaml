@@ -1,0 +1,284 @@
+﻿# =============================================================================
+# RELAY DRIVE DIAGNOSTIC FIRMWARE — bench use only
+#
+# Purpose: the production firmware pulses each RT424F12 latching-relay coil for
+# only 15 ms — far too fast to probe with a multimeter or hear reliably. This
+# firmware exposes the four relay-coil GPIOs directly so each drive line can be
+# held ON while you walk the signal chain with a meter:
+#
+#   ESP GPIO pin  →  driver input  →  driver output  →  relay coil  →  click
+#
+# What it provides (device web UI, http://<device-ip>, same web credentials):
+#   - Four HOLD switches, one per coil. Turning one ON drives that GPIO high
+#     and LEAVES IT ON until you turn it off. Probe DC voltages at each stage.
+#   - Four PULSE buttons — a single 300 ms pulse, long enough to hear the
+#     latch click clearly and see a flick on a meter.
+#   - The four end-stop inputs, live, so valve movement is visible in the UI.
+#
+# Interlocks prevent both coils of the same relay from being driven at once
+# (prohibited for dual-coil latching relays).
+#
+# SAFETY / USAGE NOTES
+#   - This firmware has NO valve logic, NO safety shutoffs, NO leak testing.
+#     Bench diagnosis only. Reflash esp-water-shut-off-3_13.yaml when done.
+#   - A successful coil drive LATCHES the relay — the valve may start moving
+#     if motor power is connected. Expect water valves to actuate.
+#   - Keep holds short (≤ 10 s) out of ordinary coil-thermal courtesy.
+#   - Expected good readings while a HOLD switch is ON:
+#       ESP GPIO pin:        ~3.3 V   (dead pin here = DevKit/GPIO problem)
+#       driver input:        ~3.3 V   (dead here = broken trace/connector ESP→driver)
+#       driver output/coil:  ~12 V across the coil (dead here = driver stage or
+#                            its 12 V feed / ground — measure the 12 V rail at
+#                            the driver and its ground continuity to ESP GND)
+# =============================================================================
+
+substitutions:
+  circuit_1_name: "Main"
+  circuit_2_name: "Irrigation"
+
+esphome:
+  name: esp-water-shut-off
+  friendly_name: ESP Valve Relay Diag
+  min_version: 2026.6.1
+  name_add_mac_suffix: true
+  platformio_options:
+    board_build.flash_mode: dio
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: arduino
+
+logger:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+improv_serial:
+
+wifi:
+  ap:
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+web_server:
+  version: 3
+  auth:
+    username: !secret web_username
+    password: !secret web_password
+  sorting_groups:
+    - id: group_holds
+      name: "Coil HOLD switches (probe with meter)"
+      sorting_weight: 1
+    - id: group_pulses
+      name: "DRIVE tests (hold coil until end stop or 90 s)"
+      sorting_weight: 2
+    - id: group_endstops
+      name: "End stops (valve position feedback)"
+      sorting_weight: 3
+
+# -----------------------------------------------------------------------------
+# COIL HOLD SWITCHES — direct GPIO control, stays on until turned off.
+# Interlock stops both coils of one relay being on together.
+# -----------------------------------------------------------------------------
+switch:
+  - platform: gpio
+    pin: GPIO48
+    name: "HOLD Open Coil - ${circuit_1_name} (GPIO48)"
+    id: relay_open_valve1
+    interlock: [relay_closed_valve1]
+    restore_mode: ALWAYS_OFF
+    web_server:
+      sorting_group_id: group_holds
+      sorting_weight: 1
+
+  - platform: gpio
+    pin: GPIO47
+    name: "HOLD Close Coil - ${circuit_1_name} (GPIO47)"
+    id: relay_closed_valve1
+    interlock: [relay_open_valve1]
+    restore_mode: ALWAYS_OFF
+    web_server:
+      sorting_group_id: group_holds
+      sorting_weight: 2
+
+  # Irrigation coil pins corrected 2026-07-26: GPIO21 = OPEN, GPIO14 = CLOSE.
+  - platform: gpio
+    pin: GPIO21
+    name: "HOLD Open Coil - ${circuit_2_name} (GPIO21)"
+    id: relay_open_valve2
+    interlock: [relay_closed_valve2]
+    restore_mode: ALWAYS_OFF
+    web_server:
+      sorting_group_id: group_holds
+      sorting_weight: 3
+
+  - platform: gpio
+    pin: GPIO14
+    name: "HOLD Close Coil - ${circuit_2_name} (GPIO14)"
+    id: relay_closed_valve2
+    interlock: [relay_open_valve2]
+    restore_mode: ALWAYS_OFF
+    web_server:
+      sorting_group_id: group_holds
+      sorting_weight: 4
+
+# -----------------------------------------------------------------------------
+# DRIVE-TO-END-STOP BUTTONS — mimic the production 3.13.1 hold-to-drive
+# sequence: hold the coil until the target end stop fires (or 90 s), then
+# release. Tests the coil chain AND the end-stop chain together. The log
+# stream reports which one ended the drive (end stop vs timeout).
+# -----------------------------------------------------------------------------
+button:
+  - platform: template
+    name: "DRIVE to OPEN - ${circuit_1_name}"
+    web_server:
+      sorting_group_id: group_pulses
+      sorting_weight: 1
+    on_press:
+      - logger.log: { level: INFO, format: "MAIN: driving OPEN, holding GPIO48 until end stop (GPIO16) or 90s" }
+      - switch.turn_off: relay_closed_valve1
+      - delay: 20ms
+      - switch.turn_on: relay_open_valve1
+      - wait_until:
+          condition:
+            binary_sensor.is_on: open_end_stop_valve1
+          timeout: 90s
+      - switch.turn_off: relay_open_valve1
+      - lambda: |-
+          if (id(open_end_stop_valve1).state) ESP_LOGI("diag", "MAIN: open end stop fired — drive complete");
+          else ESP_LOGE("diag", "MAIN: TIMEOUT — open end stop (GPIO16) never fired");
+
+  - platform: template
+    name: "DRIVE to CLOSED - ${circuit_1_name}"
+    web_server:
+      sorting_group_id: group_pulses
+      sorting_weight: 2
+    on_press:
+      - logger.log: { level: INFO, format: "MAIN: driving CLOSED, holding GPIO47 until end stop (GPIO15) or 90s" }
+      - switch.turn_off: relay_open_valve1
+      - delay: 20ms
+      - switch.turn_on: relay_closed_valve1
+      - wait_until:
+          condition:
+            binary_sensor.is_on: closed_end_stop_valve1
+          timeout: 90s
+      - switch.turn_off: relay_closed_valve1
+      - lambda: |-
+          if (id(closed_end_stop_valve1).state) ESP_LOGI("diag", "MAIN: closed end stop fired — drive complete");
+          else ESP_LOGE("diag", "MAIN: TIMEOUT — closed end stop (GPIO15) never fired");
+
+  - platform: template
+    name: "DRIVE to OPEN - ${circuit_2_name}"
+    web_server:
+      sorting_group_id: group_pulses
+      sorting_weight: 3
+    on_press:
+      - logger.log: { level: INFO, format: "IRRIGATION: driving OPEN, holding GPIO21 until end stop (GPIO18) or 90s" }
+      - switch.turn_off: relay_closed_valve2
+      - delay: 20ms
+      - switch.turn_on: relay_open_valve2
+      - wait_until:
+          condition:
+            binary_sensor.is_on: open_end_stop_valve2
+          timeout: 90s
+      - switch.turn_off: relay_open_valve2
+      - lambda: |-
+          if (id(open_end_stop_valve2).state) ESP_LOGI("diag", "IRRIGATION: open end stop fired — drive complete");
+          else ESP_LOGE("diag", "IRRIGATION: TIMEOUT — open end stop (GPIO18) never fired");
+
+  - platform: template
+    name: "DRIVE to CLOSED - ${circuit_2_name}"
+    web_server:
+      sorting_group_id: group_pulses
+      sorting_weight: 4
+    on_press:
+      - logger.log: { level: INFO, format: "IRRIGATION: driving CLOSED, holding GPIO14 until end stop (GPIO17) or 90s" }
+      - switch.turn_off: relay_open_valve2
+      - delay: 20ms
+      - switch.turn_on: relay_closed_valve2
+      - wait_until:
+          condition:
+            binary_sensor.is_on: closed_end_stop_valve2
+          timeout: 90s
+      - switch.turn_off: relay_closed_valve2
+      - lambda: |-
+          if (id(closed_end_stop_valve2).state) ESP_LOGI("diag", "IRRIGATION: closed end stop fired — drive complete");
+          else ESP_LOGE("diag", "IRRIGATION: TIMEOUT — closed end stop (GPIO17) never fired");
+
+# -----------------------------------------------------------------------------
+# END STOPS — live valve-position feedback. NO internal pull (field fix
+# 2026-07-26): the end stops are ACTIVE-HIGH with an ONBOARD pulldown (~10 k,
+# R16 family) — the switch feeds 3.3 V when pressed, the board holds the line
+# low otherwise. The internal pullup the firmware used to enable fought that
+# pulldown into a ~1.3-1.4 V divider — the ESP32-S3's UNDEFINED logic band —
+# making every end-stop read a coin flip. With no internal pull:
+#   sensor ON  = pin HIGH (~3.3 V) — switch pressed and feeding the line.
+#   sensor OFF = pin LOW  (~0 V)  — switch released (onboard pulldown), or
+#                the switch's 3.3 V feed is not reaching the terminal.
+# Terminals should now read ~0 V idle, ~3.3 V pressed. Anything in between
+# means a resistive fault in the path. Every edge is logged with the pin
+# level so you can work the switch by hand and watch the log respond.
+# -----------------------------------------------------------------------------
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO16
+      mode:
+        input: true
+    id: open_end_stop_valve1
+    name: "Open End Stop - ${circuit_1_name} (GPIO16)"
+    web_server:
+      sorting_group_id: group_endstops
+      sorting_weight: 1
+    on_press:
+      - logger.log: { level: INFO, format: "GPIO16 (MAIN open end stop) -> HIGH (pressed/fed 3.3V)" }
+    on_release:
+      - logger.log: { level: INFO, format: "GPIO16 (MAIN open end stop) -> LOW (released/held low)" }
+
+  - platform: gpio
+    pin:
+      number: GPIO15
+      mode:
+        input: true
+    id: closed_end_stop_valve1
+    name: "Closed End Stop - ${circuit_1_name} (GPIO15)"
+    web_server:
+      sorting_group_id: group_endstops
+      sorting_weight: 2
+    on_press:
+      - logger.log: { level: INFO, format: "GPIO15 (MAIN closed end stop) -> HIGH (pressed/fed 3.3V)" }
+    on_release:
+      - logger.log: { level: INFO, format: "GPIO15 (MAIN closed end stop) -> LOW (released/held low)" }
+
+  - platform: gpio
+    pin:
+      number: GPIO18
+      mode:
+        input: true
+    id: open_end_stop_valve2
+    name: "Open End Stop - ${circuit_2_name} (GPIO18)"
+    web_server:
+      sorting_group_id: group_endstops
+      sorting_weight: 3
+    on_press:
+      - logger.log: { level: INFO, format: "GPIO18 (IRR open end stop) -> HIGH (pressed/fed 3.3V)" }
+    on_release:
+      - logger.log: { level: INFO, format: "GPIO18 (IRR open end stop) -> LOW (released/held low)" }
+
+  - platform: gpio
+    pin:
+      number: GPIO17
+      mode:
+        input: true
+    id: closed_end_stop_valve2
+    name: "Closed End Stop - ${circuit_2_name} (GPIO17)"
+    web_server:
+      sorting_group_id: group_endstops
+      sorting_weight: 4
+    on_press:
+      - logger.log: { level: INFO, format: "GPIO17 (IRR closed end stop) -> HIGH (pressed/fed 3.3V)" }
+    on_release:
+      - logger.log: { level: INFO, format: "GPIO17 (IRR closed end stop) -> LOW (released/held low)" }

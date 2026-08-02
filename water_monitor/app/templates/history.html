@@ -443,22 +443,33 @@
           <th>End ({{ pressure_unit }})</th>
           <th>Drop</th>
           <th>Drop rate</th>
+          <th title="Pressure lost between the valve sealing and the start of measurement. Large values mean most of the loss happened before the test could see it.">Lost settling</th>
+          <th title="Estimated water loss, from the pressure the line gave up and how much water this circuit's plumbing holds per PSI.">Leak rate</th>
           <th>Duration</th>
           <th>Pump check</th>
         </tr>
       </thead>
       <tbody>
         {% for t in ch.leak_tests %}
-        {% set drop_rate = (t.pressure_drop_psi / t.duration_minutes) if (t.pressure_drop_psi is not none and t.duration_minutes) else none %}
+        {# Rate over the MONITORED window where 3.13.2 recorded one; older rows
+           only have wall-clock duration, which includes travel and settle and
+           so understates the rate. #}
+        {% set _span = t.monitor_minutes or t.duration_minutes %}
+        {% set drop_rate = (t.pressure_drop_psi / _span) if (t.pressure_drop_psi is not none and _span) else none %}
         {% set _r = t.result or '' %}
         {% set lt = namespace(label='', pill='pill-neutral', row='') %}
-        {# Red badge follows leak_test_scheduler.py:525,531 — a leak failure is 'Failed' or any
+        {# Red badge follows leak_test_scheduler.py — a leak failure is 'Failed' or any
            'leak' mention, with Passed excluded. Pre-flight skips ('Not run …', incl. the 3-port
            "micro leak test not applicable" wording) short-circuit BEFORE that check in the
            scheduler, so we match the skip/abort prefixes FIRST and only then apply the 'leak'
            catch-all — otherwise the benign 3-port message would read as a red leak. KEEP IN SYNC. #}
         {% if _r.startswith('Passed') %}
           {% set lt.label = 'Passed' %}{% set lt.pill = 'pill-green' %}{% set lt.row = 'hist-row-pass' %}
+        {% elif _r.startswith('Failed') and t.draw_verdict == 'demand' %}
+          {# 3.13.2 — litres came back through the meter when the valve reopened,
+             so a fixture was running and the test measured the draw, not the
+             plumbing. Presented as an abort: retry, don't go hunting for a drip. #}
+          {% set lt.label = 'Aborted — water in use' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
         {% elif _r.startswith('Failed') and t.user_dismissed %}
           {# dev30 — user acknowledged this failure as benign (interrupted by
              an update, known coincident draw): amber, not red. #}
@@ -492,6 +503,11 @@
             data-final="{{ (t.final_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.final_psi is not none else '—' }}"
             data-drop="{{ (t.pressure_drop_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.pressure_drop_psi is not none else '—' }}"
             data-drop-rate="{{ '%.4f %s/min'|format(drop_rate * pressure_factor, pressure_unit) if drop_rate is not none else '—' }}"
+            data-settle-loss="{{ (t.settle_loss_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.settle_loss_psi is not none else '—' }}"
+            data-leak-rate="{{ '%.1f %s/day'|format(t.est_leak_ml_min * 1.44 * vol_factor, vol_unit) if t.est_leak_ml_min else '—' }}"
+            data-reopen="{{ '%.2f %s'|format(t.post_restore_volume_l * vol_factor, vol_unit) if t.post_restore_volume_l is not none else '—' }}"
+            data-draw-verdict="{{ t.draw_verdict or '' }}"
+            data-monitor="{{ '%.2f min'|format(t.monitor_minutes) if t.monitor_minutes else '—' }}"
             data-duration="{{ '%.1f min'|format(t.duration_minutes) if t.duration_minutes else '—' }}">
           <td class="hist-td hist-td-mono"><time data-ts="{{ t.run_at or '' }}">{{ (t.run_at or '')[:16] }}</time></td>
           <td class="hist-td">{{ t.triggered_by or '—' }}</td>
@@ -513,6 +529,9 @@
           <td class="hist-td hist-td-mono">{{ (t.final_psi * pressure_factor)|round(pressure_decimals) if t.final_psi is not none else "—" }}</td>
           <td class="hist-td hist-td-mono">{{ (t.pressure_drop_psi * pressure_factor)|round(pressure_decimals) if t.pressure_drop_psi is not none else "—" }}</td>
           <td class="hist-td hist-td-mono">{{ "%.4f %s/min"|format(drop_rate * pressure_factor, pressure_unit) if drop_rate is not none else "—" }}</td>
+          <td class="hist-td hist-td-mono">{{ (t.settle_loss_psi * pressure_factor)|round(pressure_decimals) if t.settle_loss_psi is not none else "—" }}</td>
+          {# mL/min → volume/day in the user's unit (1440 min/day, 1000 mL/L). #}
+          <td class="hist-td hist-td-mono">{{ "%.1f %s/day"|format(t.est_leak_ml_min * 1.44 * vol_factor, vol_unit) if t.est_leak_ml_min else "—" }}</td>
           <td class="hist-td">{{ "%.1f min"|format(t.duration_minutes) if t.duration_minutes else "—" }}</td>
           {# Pump plan 5b — cross-circuit verdict while this line was isolated. #}
           <td class="hist-td">
@@ -520,6 +539,8 @@
               <span class="pill pill-amber" title="While this line was shut off for the test, the booster pump kept topping the system up ({{ t.other_circuit_cycles }} cycles) — the leak is likely on the other line, between the pump and this valve, or inside the pump's own check valve.">⚠ Leak elsewhere?</span>
             {% elif t.pump_verdict == 'quiet' %}
               <span class="pill pill-green" title="The booster pump stayed quiet while this line was isolated — no sign of a leak anywhere during the test.">Pump quiet</span>
+            {% elif t.pump_verdict == 'inconclusive' %}
+              <span class="pill pill-neutral" title="This test was too short to judge the pump — it takes about three recharge cycles to tell 'quiet' from 'not watched long enough'. Not a sign of anything either way.">Too short to judge</span>
             {% elif t.pump_verdict == 'unavailable' %}
               <span class="pill pill-neutral" title="Couldn't read the other line's pressure history for this test window.">—</span>
             {% else %}—{% endif %}
@@ -919,6 +940,13 @@
       <dt>Final</dt>         <dd id="ltm-final"></dd>
       <dt>Pressure drop</dt> <dd id="ltm-drop"></dd>
       <dt>Drop rate</dt>     <dd id="ltm-drop-rate"></dd>
+      <dt title="Pressure lost between the valve sealing and the start of measurement — water that escaped before the test could see it.">Lost settling</dt>
+      <dd id="ltm-settle-loss"></dd>
+      <dt title="Estimated loss, from the pressure given up and how much water this circuit's plumbing holds per PSI.">Estimated leak</dt>
+      <dd id="ltm-leak-rate"></dd>
+      <dt title="Water that came back through the meter after the valve reopened. Litres mean a fixture was running during the test.">After reopen</dt>
+      <dd id="ltm-reopen"></dd>
+      <dt>Measured for</dt>  <dd id="ltm-monitor"></dd>
       <dt>Duration</dt>      <dd id="ltm-duration"></dd>
     </dl>
   </div>
@@ -1791,9 +1819,13 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
 
   const LT_EXPLAIN = {
     'Passed — no leak detected':
-      'No pressure loss was detected while the valve was closed. Your plumbing held steady — no sign of a leak on this circuit.',
+      'Pressure held steady while the valve was closed — no sign of a leak on this circuit, down to the smallest loss this test can measure.',
     'Failed — leak detected':
-      'Pressure dropped while the valve was closed, meaning water is escaping downstream. Check for running toilets, dripping fixtures, or wet spots; consider keeping the valve closed until you find the source.',
+      'Pressure fell steadily while the valve was closed, meaning water is escaping downstream. The estimated leak rate is below. Check for running toilets, dripping fixtures, or wet spots.',
+    'Not run — water in use':
+      'Skipped because water was already running. The test needs a quiet line — a draw in progress would read as a leak. It will run again at the next quiet period.',
+    'Aborted — water used while closing':
+      'The meter registered water moving while the valve was still closing, so a fixture was opened after the test began. Nothing is wrong with the line; re-run it when no water is being used.',
     'Aborted — external pressure influence':
       'Stopped because outside pressure changes (the street supply or the other circuit) made the reading unreliable. Try again during a quieter period.',
     'Aborted — demand detected (sudden pressure drop)':
@@ -1838,12 +1870,22 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   }
 
+  // A failure the reopen slug proved was really water use gets the demand
+  // explanation, not the go-hunt-for-a-drip one. Mirrors the row's amber
+  // badge in the template's `lt` namespace block. KEEP IN SYNC.
+  const LT_DEMAND_EXPLAIN =
+    'Water came back through the meter as soon as the valve reopened, so a ' +
+    'fixture was running during the test — that is what pushed the pressure ' +
+    'down, not a leak. Nothing to chase; it will run again on schedule.';
+
   function openLeakModal(row) {
     const d = row.dataset;
+    const demand = d.drawVerdict === 'demand' && (d.result || '').startsWith('Failed');
     const badge = document.getElementById('ltm-badge');
     badge.className = 'pill ' + (d.pill || 'pill-neutral');
     badge.textContent = d.label || 'Unknown';
-    document.getElementById('ltm-explain').textContent   = ltExplain(d.result);
+    document.getElementById('ltm-explain').textContent   =
+      demand ? LT_DEMAND_EXPLAIN : ltExplain(d.result);
     document.getElementById('ltm-time').textContent      = fmtTs(d.ts);
     document.getElementById('ltm-triggered').textContent = d.triggered || '—';
     document.getElementById('ltm-result').textContent    = d.result || '—';
@@ -1851,6 +1893,10 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     document.getElementById('ltm-final').textContent     = d.final || '—';
     document.getElementById('ltm-drop').textContent      = d.drop || '—';
     document.getElementById('ltm-drop-rate').textContent = d.dropRate || '—';
+    document.getElementById('ltm-settle-loss').textContent = d.settleLoss || '—';
+    document.getElementById('ltm-leak-rate').textContent = d.leakRate || '—';
+    document.getElementById('ltm-reopen').textContent    = d.reopen || '—';
+    document.getElementById('ltm-monitor').textContent   = d.monitor || '—';
     document.getElementById('ltm-duration').textContent  = d.duration || '—';
     modal.classList.add('is-open'); modal.focus();
   }

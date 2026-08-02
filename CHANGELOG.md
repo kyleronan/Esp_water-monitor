@@ -9,6 +9,40 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Leak test rework — firmware 3.13.2 + dev31** — driven by a controlled
+  drip experiment (2026-07-26: bench runs A/B/D with a measured 214 mL/min
+  drip and mid-test toilet flushes). Firmware: a failed test no longer
+  raises a safety fault (the water stays ON — a fail is informational; the
+  trickle detector still owns auto-shutoff); tests refuse to start while
+  water is flowing (result 11) and abort if the meter registers pulses
+  before the valve seals (result 12); the settle runs AFTER the closed end
+  stop instead of a flat 60 s that also covered travel (new "Leak Test
+  Settle Time" number, default 5 s — run B lost 25 of its 27 PSI before
+  the baseline existed); at the threshold crossing the decay is classified
+  by fall RATE (≥2 PSI/s → result 9 "demand detected"; measured: flapper
+  0.04 PSI/s, real 214 mL/min leak 0.37, toilet flush 5–12 — result 9 was
+  previously unreachable because the 2 PSI leak threshold always tripped
+  before the ~10 PSI burst rule); new "Leak Test Baseline" / "Leak Test
+  Close Pressure" sensors expose what the test judged against. Add-on
+  (migration 20260563): rows now record the firmware's post-settle baseline
+  instead of a pre-close read that folded the close transient + settle loss
+  into every drop (a bench row read 21.5 PSI where the monitored decay was
+  ~3); new settle-loss / monitored-window / threshold columns; an estimated
+  leak rate from decay × per-circuit compliance (mL per PSI of the isolated
+  section — 9.5 measured on Main, `sensitivity_config.compliance_ml_psi`),
+  rendered as gal/day; a 120 s post-reopen watch measures the refill slug
+  (flapper ~0.04 L, pump recharge 0.3–0.5 L, toilet finishing its fill
+  3–8 L) and ≥1 L relabels a failure amber "Aborted — water in use" with a
+  non-alarm notification; cancelled tests now leave a "Stopped manually"
+  row (previously vanished); manual-start pre-check defers when flow is
+  live. Phase 5b honesty fix: a test window too short to hold ~3 pump
+  recharge cycles now reads "Too short to judge" instead of a green "Pump
+  quiet" (run A had two visible recharges and still said quiet); the
+  "long enough" yardstick prefers the HOME's learned recharge period
+  (`home_profile.pump_detect_period_s`) over the 60 s plausibility floor
+  when the window shows no rises at all — field-found 2026-08-02, a
+  5.3-minute test on a ~170 s pump earned a green "quiet" it hadn't
+  watched long enough to claim (three cycles need 8.5 min).
 - **Dismissible failed leak tests + observer-valve guard (dev30)** — a
   failed leak test the user has reviewed and judged benign (test
   interrupted by an add-on update, known coincident draw) can be marked

@@ -57,6 +57,12 @@ OPTIONAL_ROLES = {
     "trickle_max_flow",
     "trickle_duration",
     "leak_test_duration_number",  # preferred name; leak_test_duration_sensor is the compat alias
+    # Firmware 3.13.2 — what the leak test actually measured. Optional so older
+    # firmware still adopts; without them the scheduler falls back to reading
+    # pressure when the result first turns "In progress".
+    "leak_test_baseline_sensor",
+    "leak_test_closed_sensor",
+    "leak_settle_number",
     # Runtime per-circuit flow-meter pulses-per-litre (firmware 3.12.0+). Optional so
     # older firmware (compile-time k-factor) still adopts; the add-on falls back to its
     # cached pulses_per_litre / 396 default when this role is unmatched.
@@ -113,6 +119,9 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "leak_test_switch":        (r"micro leak test.*main",                           "switch"),
         "leak_test_result_sensor": (r"leak test result.*main",                          "sensor"),
         "leak_test_duration_sensor": (r"leak test duration.*main",                      "number"),   # compat alias
+        # 3.13.2 — post-settle baseline and the pressure at valve close.
+        "leak_test_baseline_sensor": (r"leak test baseline.*main",                      "sensor"),
+        "leak_test_closed_sensor":  (r"leak test close pressure.*main",                 "sensor"),
         "volume_sensor":           (r"water volume total.*main",                        "sensor"),
         # Reset buttons (firmware v3.6+)
         "fault_reset_button":         (r"reset safety fault.*main",                    "button"),
@@ -130,6 +139,7 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "trickle_max_flow":           (r"trickle flow max threshold.*main",            "number"),
         "trickle_duration":           (r"trickle flow alert duration.*main",           "number"),
         "leak_test_duration_number":  (r"leak test duration.*main",                    "number"),
+        "leak_settle_number":         (r"leak test settle time.*main",                 "number"),
         # Runtime per-circuit flow-meter pulses-per-litre (firmware 3.12.0+).
         "flow_meter_ppl":             (r"flow meter ppl.*main",                        "number"),
         # Waveform diagnostic counters (firmware 3.7.0+ / 3.9.0+, circuit_1 only).
@@ -152,6 +162,9 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "leak_test_switch":        (r"micro leak test.*irrigation",                           "switch"),
         "leak_test_result_sensor": (r"leak test result.*irrigation",                          "sensor"),
         "leak_test_duration_sensor": (r"leak test duration.*irrigation|leak_duration_irr\b",  "number"),   # compat alias
+        # 3.13.2 — post-settle baseline and the pressure at valve close.
+        "leak_test_baseline_sensor": (r"leak test baseline.*irrigation",                      "sensor"),
+        "leak_test_closed_sensor":  (r"leak test close pressure.*irrigation",                 "sensor"),
         "volume_sensor":           (r"water volume total.*irrigation",                        "sensor"),
         # Reset buttons (firmware v3.6+)
         # Display names use ${circuit_2_name} → "Irrigation"; entity_id suffix fallback uses _irr\b
@@ -171,6 +184,7 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "trickle_max_flow":           (r"trickle flow max threshold.*irrigation|trickle_max_flow_irr\b",       "number"),
         "trickle_duration":           (r"trickle flow alert duration.*irrigation|trickle_duration_irr\b",      "number"),
         "leak_test_duration_number":  (r"leak test duration.*irrigation|leak_duration_irr\b",                  "number"),
+        "leak_settle_number":         (r"leak test settle time.*irrigation|leak_settle_s_irr\b",               "number"),
         # Runtime per-circuit flow-meter pulses-per-litre (firmware 3.12.0+).
         "flow_meter_ppl":             (r"flow meter ppl.*irrigation|ppl_irr\b",                                "number"),
     },

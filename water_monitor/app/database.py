@@ -434,6 +434,12 @@ CREATE TABLE IF NOT EXISTS sensitivity_config (
     -- action (incl. the one-tap hint apply) writes a value — non-NULL doubles
     -- as the arming rule's "explicit user-set floor" signal.
     pump_low_pressure_alert_psi REAL,
+    -- Compliance of the section this circuit's valve isolates, in mL per PSI
+    -- (migration 20260563). Converts a leak test's decay rate into a leak
+    -- rate: mL/min = PSI/min x this. Calibrated from the reopen refill
+    -- (volume delta / pressure recovered); measured 9.5 on Main 2026-07-26.
+    -- NULL = not yet calibrated, and the leak rate is simply not shown.
+    compliance_ml_psi           REAL,
     updated_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -1115,7 +1121,21 @@ CREATE TABLE IF NOT EXISTS leak_test_history (
     -- reviewed and judged benign (test interrupted by an update, known
     -- coincident draw). Display-only — renders amber instead of red; the
     -- record itself is never altered.
-    user_dismissed         INTEGER DEFAULT 0
+    user_dismissed         INTEGER DEFAULT 0,
+    -- Migration 20260563 — what the test actually measured. baseline_psi is
+    -- the post-settle value the FIRMWARE judged against (3.13.2 publishes it);
+    -- closed_psi is the pressure the instant the valve sealed, so
+    -- settle_loss_psi is the water that escaped before measurement began.
+    -- monitor_minutes excludes travel and settle. est_leak_ml_min is the
+    -- decay rate times the circuit's compliance. draw_verdict flags a test
+    -- invalidated by real water use ('demand' | 'clean' | 'unavailable').
+    closed_psi             REAL,
+    settle_loss_psi        REAL,
+    monitor_minutes        REAL,
+    threshold_psi          REAL,
+    est_leak_ml_min        REAL,
+    post_restore_volume_l  REAL,
+    draw_verdict           TEXT
 );
 
 -- ==========================================================================

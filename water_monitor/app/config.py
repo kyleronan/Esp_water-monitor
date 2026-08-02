@@ -61,6 +61,15 @@ class CircuitConfig:
     leak_test_sensor: str = ""
     leak_test_switch: str = ""
     leak_test_result_sensor: str = ""
+    # Firmware 3.13.2 — the values the leak test actually judged against:
+    # the post-settle baseline, and the pressure the instant the valve sealed.
+    # Empty on older firmware; the scheduler falls back to reading pressure
+    # when the result first turns "In progress".
+    leak_test_baseline_sensor: str = ""
+    leak_test_closed_sensor: str = ""
+    # Leak-test pressure threshold number entity — stored on the row so a later
+    # threshold change can't retroactively reinterpret past results.
+    leak_threshold_entity: str = ""
     volume_sensor: str = ""
     # Runtime per-circuit flow-meter pulses-per-litre number entity (firmware 3.12.0+).
     flow_meter_ppl_entity: str = ""

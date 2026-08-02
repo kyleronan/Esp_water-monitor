@@ -258,6 +258,12 @@ class Orchestrator:
                 "leak_test_switch", "")
             circuit_cfg.leak_test_result_sensor = entities.get(
                 "leak_test_result_sensor", "")
+            circuit_cfg.leak_test_baseline_sensor = entities.get(
+                "leak_test_baseline_sensor", "")
+            circuit_cfg.leak_test_closed_sensor = entities.get(
+                "leak_test_closed_sensor", "")
+            circuit_cfg.leak_threshold_entity = entities.get(
+                "leak_pressure_threshold", "")
             circuit_cfg.volume_sensor = entities.get("volume_sensor", "")
             circuit_cfg.flow_meter_ppl_entity = entities.get("flow_meter_ppl", "")
             # Waveforms now arrive via chunked HA events (firmware 3.9.0+).
