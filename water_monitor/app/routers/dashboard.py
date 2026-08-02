@@ -69,6 +69,16 @@ async def dashboard(request: Request):
     except Exception:
         pump_banner = {"show": False}
 
+    # Supply-pressure regime banner — shows while the current regime was
+    # auto-detected and neither confirmed (recalibrated) nor dismissed.
+    # Best-effort; a failure must never break the dashboard.
+    try:
+        from ..supply_regime import supply_banner_state
+        supply_banner = supply_banner_state(
+            orch.db, cfg.circuits[0].circuit if cfg.circuits else None)
+    except Exception:
+        supply_banner = {"show": False}
+
     # Phase 5a leak-watch tile: latest nightly street-calibrated estimate,
     # shown only when pump mode is armed and the last evaluated night carried
     # an estimate. Best-effort.
@@ -103,6 +113,7 @@ async def dashboard(request: Request):
         "away_mode":           profile.get("away_mode", False),
         "circuit_type_labels": CIRCUIT_TYPE_LABELS,
         "pump_banner":         pump_banner,
+        "supply_banner":       supply_banner,
         "leak_watch":          leak_watch,
     })
 

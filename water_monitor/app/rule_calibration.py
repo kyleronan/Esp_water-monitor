@@ -165,15 +165,33 @@ def _pool_from_rows(rows: List[dict]) -> Dict[str, List[dict]]:
     return pool
 
 
-def _fit_pool(conn: sqlite3.Connection, circuit: str) -> Dict[str, List[dict]]:
-    """Build the fit pool from all of one circuit's events."""
+def _regime_window(regime: Optional[Dict[str, Any]]) -> Tuple[str, tuple]:
+    """SQL fragment + args restricting events to one supply regime's TIME
+    window [started_at, ended_at). A TIME filter, not a pressure filter — a
+    NULL-pressure event still belongs to whatever regime was in force when it
+    happened, and the regime boundary is a temporal fact (the day the pump
+    went in). ``regime`` is a supply_regime row dict or None (no filter)."""
+    if not regime or not regime.get("started_at"):
+        return "", ()
+    sql = " AND start_ts >= ?"
+    args: tuple = (regime["started_at"],)
+    if regime.get("ended_at"):
+        sql += " AND start_ts < ?"
+        args += (regime["ended_at"],)
+    return sql, args
+
+
+def _fit_pool(conn: sqlite3.Connection, circuit: str,
+              regime: Optional[Dict[str, Any]] = None) -> Dict[str, List[dict]]:
+    """Build the fit pool from one circuit's events (optionally one regime's)."""
+    rsql, rargs = _regime_window(regime)
     rows = conn.execute(
         "SELECT user_fixture_type, fixture_label_source, matched_fixture_type, "
         "       matched_via, "
         "       COALESCE(excluded_from_training, 0) AS excluded_from_training, "
         "       volume_litres, duration_seconds, peak_flow_lpm "
-        "FROM events WHERE circuit = ?",
-        (circuit,),
+        f"FROM events WHERE circuit = ?{rsql}",
+        (circuit,) + rargs,
     ).fetchall()
     return _pool_from_rows([dict(r) for r in rows])
 
@@ -331,11 +349,13 @@ def _fit_from_pool(pool: Dict[str, List[dict]]) -> Tuple[Dict[str, Any], Dict[st
     return calib, report
 
 
-def fit_rule_constants(conn: sqlite3.Connection,
-                       circuit: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def fit_rule_constants(conn: sqlite3.Connection, circuit: str,
+                       regime: Optional[Dict[str, Any]] = None,
+                       ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Derive per-home rule bands from this circuit's weighted, gated, sanity-
-    checked label pool. Returns ``(calib, report)``; pure read — does not persist."""
-    return _fit_from_pool(_fit_pool(conn, circuit))
+    checked label pool — optionally restricted to one supply regime's time
+    window. Returns ``(calib, report)``; pure read — does not persist."""
+    return _fit_from_pool(_fit_pool(conn, circuit, regime))
 
 
 def fit_rule_constants_from_rows(
@@ -350,42 +370,51 @@ def fit_rule_constants_from_rows(
 def save_rule_calibration(conn: sqlite3.Connection, circuit: str,
                           calib: Dict[str, Any],
                           report: Optional[Dict[str, Any]] = None,
-                          source: str = "activation") -> None:
-    """Persist (freeze) the fitted calibration + report for a circuit with a stamp."""
+                          source: str = "activation",
+                          regime_id: int = 0) -> None:
+    """Persist (freeze) the fitted calibration + report for a (circuit, supply
+    regime) with a stamp. ``regime_id`` 0 is the legacy/pre-regime row."""
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO rule_calibration "
-        "    (circuit, params, report, source, locked_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(circuit) DO UPDATE SET "
+        "    (circuit, regime_id, params, report, source, locked_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(circuit, regime_id) DO UPDATE SET "
         "  params = excluded.params, report = excluded.report, "
         "  source = excluded.source, locked_at = excluded.locked_at, "
         "  updated_at = excluded.updated_at",
-        (circuit, json.dumps(calib), json.dumps(report or {}), source, now, now),
+        (circuit, int(regime_id), json.dumps(calib), json.dumps(report or {}),
+         source, now, now),
     )
     conn.commit()
-    log.info("[%s] rule calibration frozen (%s): %d band(s) fit — %s",
-             circuit, source, len(calib), ", ".join(sorted(calib)) or "none")
+    log.info("[%s] rule calibration frozen (%s, regime %d): %d band(s) fit — %s",
+             circuit, source, regime_id, len(calib),
+             ", ".join(sorted(calib)) or "none")
 
 
-def _load_pool_rows(conn: sqlite3.Connection, circuit: str) -> List[dict]:
+def _load_pool_rows(conn: sqlite3.Connection, circuit: str,
+                    regime: Optional[Dict[str, Any]] = None) -> List[dict]:
+    rsql, rargs = _regime_window(regime)
     return [dict(r) for r in conn.execute(
         "SELECT id, user_fixture_type, fixture_label_source, matched_fixture_type, "
         "       matched_via, "
         "       COALESCE(excluded_from_training,0) AS excluded_from_training, "
         "       volume_litres, duration_seconds, peak_flow_lpm "
-        "FROM events WHERE circuit = ?", (circuit,)).fetchall()]
+        f"FROM events WHERE circuit = ?{rsql}",
+        (circuit,) + rargs).fetchall()]
 
 
-def _load_explicit_rows(conn: sqlite3.Connection, circuit: str) -> List[dict]:
+def _load_explicit_rows(conn: sqlite3.Connection, circuit: str,
+                        regime: Optional[Dict[str, Any]] = None) -> List[dict]:
+    rsql, rargs = _regime_window(regime)
     return [dict(r) for r in conn.execute(
         "SELECT id, user_fixture_type, volume_litres, duration_seconds, "
         "       peak_flow_lpm, cycle_pulse_count, has_pressure_transient, "
         "       pressure_delta_psi "
         "FROM events WHERE circuit = ? AND user_fixture_type IS NOT NULL "
         "  AND user_fixture_type <> '' AND COALESCE(excluded_from_training,0)=0 "
-        "  AND fixture_label_source IN ('user','training') ORDER BY id",
-        (circuit,)).fetchall()]
+        f"  AND fixture_label_source IN ('user','training'){rsql} ORDER BY id",
+        (circuit,) + rargs).fetchall()]
 
 
 def kfold_type_accuracy(pool_rows: List[dict], explicit_rows: List[dict],
@@ -429,17 +458,22 @@ def kfold_type_accuracy(pool_rows: List[dict], explicit_rows: List[dict],
 
 def _do_no_harm(conn: sqlite3.Connection, circuit: str,
                 calib: Dict[str, Any],
-                report: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+                report: Dict[str, Any],
+                regime: Optional[Dict[str, Any]] = None,
+                ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Drop fitted bands that REDUCE held-out recall vs the frozen default for their
     type — so the per-home fit can only help an atypical home, never regress a
-    well-tuned one. (washing_machine isn't validated here — cycle detector.)"""
+    well-tuned one. (washing_machine isn't validated here — cycle detector.)
+    With a ``regime``, both the folds' fits and the test rows stay inside the
+    regime's window so the check measures within-regime performance."""
     try:
         from .database import get_circuit_type
         circuit_type = get_circuit_type(conn, circuit)
     except Exception:
         circuit_type = "fixture"
-    acc = kfold_type_accuracy(_load_pool_rows(conn, circuit),
-                              _load_explicit_rows(conn, circuit), circuit_type)
+    acc = kfold_type_accuracy(_load_pool_rows(conn, circuit, regime),
+                              _load_explicit_rows(conn, circuit, regime),
+                              circuit_type)
     for ftype, keys in _TYPE_KEYS.items():
         a = acc.get(ftype)
         if a and a["fitted"] < a["frozen"]:
@@ -456,30 +490,57 @@ def _do_no_harm(conn: sqlite3.Connection, circuit: str,
 
 def fit_and_freeze(conn: sqlite3.Connection, circuit: str,
                    source: str = "activation",
-                   do_no_harm: bool = True) -> Dict[str, Any]:
-    """Shared fit → sanity → do-no-harm → persist path used by BOTH activation and
-    the dev ``retrain()``. ``do_no_harm`` drops fitted bands that regress vs the
-    frozen default on held-out labels. Returns the per-type report."""
-    calib, report = fit_rule_constants(conn, circuit)
+                   do_no_harm: bool = True,
+                   regime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Shared fit → sanity → do-no-harm → persist path used by activation, the
+    dev ``retrain()``, and the regime-shift recalibration. With a ``regime``
+    (a supply_regime row dict) the fit pool, the held-out check, and the saved
+    row are all scoped to that regime; without one, behavior is exactly the
+    legacy whole-history fit saved as regime_id 0. Returns the per-type report."""
+    calib, report = fit_rule_constants(conn, circuit, regime)
     if do_no_harm and calib:
-        calib, report = _do_no_harm(conn, circuit, calib, report)
-    save_rule_calibration(conn, circuit, calib, report=report, source=source)
+        calib, report = _do_no_harm(conn, circuit, calib, report, regime)
+    save_rule_calibration(conn, circuit, calib, report=report, source=source,
+                          regime_id=int(regime["id"]) if regime else 0)
     return report
 
 
-def load_rule_calibration(conn: sqlite3.Connection, circuit: str) -> Dict[str, Any]:
-    """Return the frozen calibration dict for a circuit, or ``{}`` if none.
+def _select_calibration_row(conn: sqlite3.Connection, circuit: str,
+                            columns: str,
+                            regime_id: Optional[int]) -> Optional[sqlite3.Row]:
+    """Resolution chain: exact (circuit, regime_id) → legacy (circuit, 0) →
+    None. ``regime_id`` None or 0 reads the legacy row directly. Tolerates a
+    pre-20260565 table (no regime_id column) by falling back to the plain
+    per-circuit read."""
+    try:
+        if regime_id:
+            row = conn.execute(
+                f"SELECT {columns} FROM rule_calibration "
+                "WHERE circuit = ? AND regime_id = ?",
+                (circuit, int(regime_id))).fetchone()
+            if row:
+                return row
+        return conn.execute(
+            f"SELECT {columns} FROM rule_calibration "
+            "WHERE circuit = ? AND regime_id = 0", (circuit,)).fetchone()
+    except sqlite3.OperationalError:
+        try:
+            return conn.execute(
+                f"SELECT {columns} FROM rule_calibration WHERE circuit = ?",
+                (circuit,)).fetchone()
+        except sqlite3.OperationalError:
+            return None
+
+
+def load_rule_calibration(conn: sqlite3.Connection, circuit: str,
+                          regime_id: Optional[int] = None) -> Dict[str, Any]:
+    """Return the frozen calibration dict for a circuit (preferring the given
+    supply regime's row, falling back to the legacy regime-0 row), or ``{}``.
 
     Resilient to a missing table / corrupt JSON — returns ``{}`` so callers fall
     back to the shipped defaults rather than crashing the classification path.
     """
-    try:
-        row = conn.execute(
-            "SELECT params FROM rule_calibration WHERE circuit = ?",
-            (circuit,),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return {}
+    row = _select_calibration_row(conn, circuit, "params", regime_id)
     if not row or not row["params"]:
         return {}
     try:
@@ -489,20 +550,17 @@ def load_rule_calibration(conn: sqlite3.Connection, circuit: str) -> Dict[str, A
         return {}
 
 
-def get_rule_calibration_meta(conn: sqlite3.Connection,
-                              circuit: str) -> Optional[Dict[str, Any]]:
+def get_rule_calibration_meta(conn: sqlite3.Connection, circuit: str,
+                              regime_id: Optional[int] = None,
+                              ) -> Optional[Dict[str, Any]]:
     """Lock metadata for the UI/diagnostics: when it was frozen, how many bands
-    were fit, and the per-type fit-vs-fallback report. None if never calibrated."""
-    try:
-        row = conn.execute(
-            "SELECT report, source, locked_at FROM rule_calibration WHERE circuit = ?",
-            (circuit,),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return None
+    were fit, and the per-type fit-vs-fallback report. None if never calibrated.
+    Same regime resolution chain as ``load_rule_calibration``."""
+    row = _select_calibration_row(
+        conn, circuit, "report, source, locked_at", regime_id)
     if not row:
         return None
-    calib = load_rule_calibration(conn, circuit)
+    calib = load_rule_calibration(conn, circuit, regime_id)
     try:
         report = json.loads(row["report"]) if row["report"] else {}
     except (json.JSONDecodeError, TypeError):
@@ -510,6 +568,7 @@ def get_rule_calibration_meta(conn: sqlite3.Connection,
     return {
         "locked_at": row["locked_at"],
         "source": row["source"],
+        "regime_id": regime_id or 0,
         "fit_keys": sorted(calib),
         "fit_count": len(calib),
         "report": report,

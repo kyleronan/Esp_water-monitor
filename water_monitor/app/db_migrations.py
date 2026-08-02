@@ -183,7 +183,18 @@ _BASELINE_VERSION: int = 20260523
 #              baseline_psi was previously read BEFORE the valve closed, so
 #              every row carried the close transient plus the settle-phase
 #              loss. DDL only — historical rows cannot be corrected.
-_CURRENT_VERSION: int = 20260563
+#   20260564 — supply-pressure regime tracking: supply_pressure_daily (daily
+#              settled-pressure median/p10/p90 per circuit) + supply_regime
+#              (discrete supply-band intervals; a booster-pump install or
+#              removal opens a new regime instead of silently degrading
+#              classification). Table-create only, no backfill — the tracker
+#              worker bootstraps history from events.pre_event_pressure_psi
+#              on first run.
+#   20260565 — rule_calibration rebuilt with PRIMARY KEY (circuit, regime_id):
+#              rule bands are fitted once PER SUPPLY REGIME. The existing row
+#              is copied as regime_id=0 (legacy fallback), so behavior with no
+#              regimes recorded is bit-identical to before.
+_CURRENT_VERSION: int = 20260565
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1807,6 +1818,91 @@ def _missing_pump_low_pressure_columns(conn: sqlite3.Connection) -> set[str]:
     return missing
 
 
+# 20260564 — supply-pressure regime tracking tables.
+def _apply_supply_regime_tables(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260564 — supply-pressure regime
+    tracking (daily settled-pressure medians + discrete regime intervals).
+    Table-create only; guarded + idempotent."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS supply_pressure_daily (
+            circuit       TEXT NOT NULL,
+            day_date      TEXT NOT NULL,
+            sample_count  INTEGER NOT NULL,
+            median_psi    REAL NOT NULL,
+            p10_psi       REAL,
+            p90_psi       REAL,
+            source        TEXT NOT NULL DEFAULT 'settled',
+            updated_at    TIMESTAMP,
+            PRIMARY KEY (circuit, day_date)
+        )""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS supply_regime (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at    TEXT NOT NULL,
+            ended_at      TEXT,
+            center_psi    REAL NOT NULL,
+            band_lo_psi   REAL,
+            band_hi_psi   REAL,
+            source        TEXT NOT NULL,
+            detected_at   TEXT,
+            confirmed_at  TEXT,
+            dismissed_at  TEXT,
+            note          TEXT
+        )""")
+    conn.commit()
+    log.info("Migration 20260564: supply-pressure regime tables ready")
+
+
+def _missing_supply_regime_tables(conn: sqlite3.Connection) -> set[str]:
+    missing: set[str] = set()
+    for tbl in ("supply_pressure_daily", "supply_regime"):
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name=?", (tbl,)).fetchone():
+            missing.add(tbl)
+    return missing
+
+
+# 20260565 — rule_calibration keyed per (circuit, supply regime).
+def _apply_regime_calibration(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260565 — rebuild rule_calibration with
+    PRIMARY KEY (circuit, regime_id). The existing per-circuit row is copied
+    as regime_id=0 (the legacy/pre-regime row, still the fallback when a
+    regime has no fit of its own). Guarded + idempotent."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                        "name='rule_calibration'").fetchone():
+        conn.commit()
+        return
+    if _has_column(conn, "rule_calibration", "regime_id"):
+        conn.commit()
+        return
+    conn.execute("""
+        CREATE TABLE rule_calibration_new (
+            circuit     TEXT NOT NULL,
+            regime_id   INTEGER NOT NULL DEFAULT 0,
+            params      TEXT NOT NULL DEFAULT '{}',
+            report      TEXT,
+            source      TEXT,
+            locked_at   TIMESTAMP,
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (circuit, regime_id)
+        )""")
+    conn.execute(
+        "INSERT INTO rule_calibration_new "
+        " (circuit, regime_id, params, report, source, locked_at, updated_at) "
+        "SELECT circuit, 0, params, report, source, locked_at, updated_at "
+        "FROM rule_calibration")
+    conn.execute("DROP TABLE rule_calibration")
+    conn.execute("ALTER TABLE rule_calibration_new RENAME TO rule_calibration")
+    conn.commit()
+    log.info("Migration 20260565: rule_calibration keyed per (circuit, regime)")
+
+
+def _missing_regime_calibration_columns(conn: sqlite3.Connection) -> set[str]:
+    if not _has_column(conn, "rule_calibration", "regime_id"):
+        return {"rule_calibration.regime_id"}
+    return set()
+
+
 def _missing_pump_mode_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the 20260558 pump-mode columns absent (home_profile +
     sensitivity_config)."""
@@ -1922,6 +2018,8 @@ _MIGRATIONS: tuple = (
     (20260561, _apply_overlap_cleanup),
     (20260562, _apply_leak_test_dismissed_column),
     (20260563, _apply_leak_test_measurement_columns),
+    (20260564, _apply_supply_regime_tables),
+    (20260565, _apply_regime_calibration),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

@@ -569,6 +569,16 @@ class CircuitEventDetector:
         self.zone_low_floor_psi = zone_floor_psi
         self.pump_fail_floor_psi = pump_fail_floor_psi
 
+    def settled_pressure(self) -> Optional[Tuple[float, datetime]]:
+        """Current idle-line (settled) pressure as ``(psi, stable_since)``, or
+        None when there is no trustworthy baseline — during an active event,
+        after a sensor blip cleared the buffer, or before the buffer warmed up.
+        Read-only accessor for the supply-regime tracker; inherits the settled-
+        baseline trust semantics of on_pressure_fast for free."""
+        if self._active_event is not None or self._settled_pressure_psi is None:
+            return None
+        return (self._settled_pressure_psi, self._settled_pressure_since)
+
     def _track_zone_flow(self, now: datetime, flow: float) -> None:
         """6a run/grace bookkeeping, called from on_flow_rate on zone
         circuits. A run starts at the first above-floor flow after idle; the
@@ -2125,6 +2135,13 @@ class EventDetector:
         det = self._detectors.get(circuit)
         if det is not None:
             det.update_min_flow(min_flow_lpm)
+
+    def settled_pressure(self, circuit: str) -> Optional[Tuple[float, datetime]]:
+        """Idle-line settled pressure for one circuit — see
+        CircuitEventDetector.settled_pressure. None when the circuit's
+        detector isn't built or has no trustworthy baseline."""
+        det = self._detectors.get(circuit)
+        return det.settled_pressure() if det is not None else None
 
     def setup(self) -> None:
         """Instantiate detectors and register HA entity subscriptions.

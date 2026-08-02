@@ -454,6 +454,32 @@
             <button type="submit" class="btn btn-warning btn-sm">Start Recalibration</button>
           </form>
         </details>
+        {% if supply_regime and supply_regime.exists %}
+        <div style="margin-top:.75rem">
+          <p class="sett-card-desc muted" style="margin-bottom:.35rem">
+            Supply pressure regime: <strong>~{{ supply_regime.center_psi }} PSI</strong>
+            since {{ supply_regime.since }}
+            {% if supply_regime.labels_needed %}
+            · to fit all rules for this pressure, label a few recent events of:
+            {{ supply_regime.labels_needed }}
+            {% endif %}
+          </p>
+          <form method="post"
+                action="{{ ingress_path }}/settings/recalibrate-regime/{{ c.circuit }}"
+                style="margin:0">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">
+              Re-fit rules for current pressure
+            </button>
+          </form>
+          <p class="sett-help" style="margin-top:.35rem">
+            Quick re-fit of the fixture recognition bands on events from the
+            current supply pressure — no learning period, nothing is deleted,
+            leak protection unaffected. Use after a booster pump or pressure
+            regulator change.
+          </p>
+        </div>
+        {% endif %}
         <p class="sett-cal-warning">⚠ Incorrect calibration values may cause false shutoffs or missed leaks.</p>
       </div>
 

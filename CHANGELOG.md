@@ -9,6 +9,36 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Supply-pressure-aware fixture classification — dev32** — the 2026-07
+  booster-pump install shifted resting pressure ~46→~54 PSI, sped up flows
+  (~P^0.4 on peaks; toilets fill faster, so shorter durations at unchanged
+  volume) and quietly degraded recognition: unmatched share of ≥2 L events
+  rose 16%→35% because both the k-NN exemplars and the frozen rule bands
+  were fitted on old-pressure physics. Four pieces: **(1)** starting supply
+  pressure (`pre_event_pressure_psi`) is now a k-NN feature (linear, scale
+  1.5 locked by LOO sweep — interior optimum, collapse below 1.0 proves
+  it's signal not memorization; tap recall 0.65→0.75, dishwasher
+  0.654→0.692, no class regressed), with missing/legacy-zero values
+  median-imputed so an unknown pressure is distance-neutral, never a
+  phantom "0 PSI" outlier — post-pump events now find post-pump neighbours
+  automatically, and self-heal if the pump is ever removed. **(2)** A
+  supply-regime tracker (migration 20260564) samples the detector's settled
+  idle-line pressure every 10 min into daily medians and detects sustained
+  shifts (3-of-4 evaluated days > 5 PSI, pump-detector-style hysteresis);
+  first run bootstraps history from stored events — on the real backup it
+  reconstructs the pump install at 2026-07-18 unaided. **(3)** Rule
+  calibration is now fitted once PER REGIME (migration 20260565,
+  `rule_calibration` keyed `(circuit, regime_id)`; the old row lives on as
+  regime 0): live events use the current regime's bands, batch reclassify
+  resolves each historical event's bands by its own regime, and the locked
+  anti-drift baseline philosophy is preserved within each regime.
+  **(4)** A dashboard banner ("Water pressure changed — recalibrate?") plus
+  a Settings-card action run a one-tap `regime_shift` re-fit + reclassify
+  since the shift, with a per-type labels-needed nudge (the dual gate
+  still requires 5 explicit labels per type; do-no-harm still drops any
+  fit that regresses held-out recall). Nothing adapts silently, and
+  firmware leak/trickle safety is untouched.
+
 - **Leak test rework — firmware 3.13.2 + dev31** — driven by a controlled
   drip experiment (2026-07-26: bench runs A/B/D with a measured 214 mL/min
   drip and mid-test toilet flushes). Firmware: a failed test no longer

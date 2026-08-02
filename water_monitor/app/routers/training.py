@@ -81,6 +81,60 @@ async def _bg_reclassify_training(circuit: str) -> None:
         log.warning("[%s] training reclassify failed: %s", circuit, e)
 
 
+async def start_regime_recalibration(orch) -> bool:
+    """Kick off the supply-regime recalibration in the background: fit each
+    circuit's rule bands on the CURRENT regime's events (source
+    'regime_shift') and reclassify everything since the shift. Job-tracked so
+    pollJobs toasts the per-type outcome. Returns False (nothing started)
+    when no current regime exists."""
+    import asyncio
+
+    from ..config import DB_PATH
+    from ..database import run_isolated_write
+    from ..supply_regime import get_current_regime
+    regime = get_current_regime(orch.db)
+    if regime is None:
+        return False
+    circuits = [c.circuit for c in orch._cfg.circuits]
+
+    def _work(conn):
+        from ..database import (finish_job,
+                                reclassify_all_events_from_signatures,
+                                start_job)
+        from ..rule_calibration import MIN_EXPLICIT_LABELS, fit_and_freeze
+        for circuit in circuits:
+            job = start_job(conn, "regime_recalibration", circuit,
+                            "Recalibrating for new supply pressure…")
+            try:
+                report = fit_and_freeze(conn, circuit, source="regime_shift",
+                                        regime=regime)
+                reclassify_all_events_from_signatures(
+                    conn, circuit, since_ts=regime["started_at"])
+                n_fit = sum(1 for r in report.values()
+                            if isinstance(r, dict) and r.get("status") == "fit")
+                short = [t for t, r in sorted(report.items())
+                         if isinstance(r, dict)
+                         and r.get("status") == "insufficient_labels"]
+                msg = f"{circuit}: {n_fit} fixture type(s) re-fit for the new pressure"
+                if short:
+                    msg += (f" — label {MIN_EXPLICIT_LABELS}+ recent events to "
+                            f"also fit: {', '.join(short)}")
+                finish_job(conn, job, "done", msg)
+            except Exception:
+                finish_job(conn, job, "error",
+                           f"{circuit}: regime recalibration failed — see log")
+                raise
+
+    async def _run():
+        try:
+            await run_isolated_write(DB_PATH, _work)
+        except Exception as e:
+            log.warning("regime recalibration failed: %s", e)
+
+    asyncio.create_task(_run())
+    return True
+
+
 # ── Page ──────────────────────────────────────────────────────────────────────
 
 @router.get("", response_class=HTMLResponse)

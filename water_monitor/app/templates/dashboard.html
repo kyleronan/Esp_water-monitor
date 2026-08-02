@@ -44,6 +44,41 @@
 </div>
 {% endif %}
 
+{# ── Supply-pressure regime banner ─────────────────────────────────
+   Shows while the current auto-detected supply regime is unacknowledged.
+   Confirming re-fits the fixture rule bands on events from the new regime
+   (a background job); dismissing just hides the banner. #}
+{% if supply_banner and supply_banner.show %}
+<div class="dash-alert dash-alert-degraded" aria-live="polite">
+  <div class="dash-alert-body">
+    <span class="dash-alert-title">🧭 Water pressure changed</span>
+    <span class="dash-alert-detail">
+      Your home's resting water pressure moved
+      {% if supply_banner.old_psi %}from about {{ supply_banner.old_psi }} to
+      {{ supply_banner.new_psi }} PSI{% else %}to about
+      {{ supply_banner.new_psi }} PSI{% endif %}
+      around {{ supply_banner.since }} — usually a booster pump,
+      pressure-regulator, or municipal change. Fixture recognition was tuned
+      for the old pressure. Recalibrate for the new one?
+      {% if supply_banner.labels_needed %}
+      <br><em>Tip: labeling a few recent events first makes the fit better —
+      still needed: {{ supply_banner.labels_needed }}.</em>
+      {% endif %}
+    </span>
+  </div>
+  {% if is_admin %}
+  <form method="post" action="{{ ingress_path }}/settings/supply-banner/confirm"
+        style="margin:0">
+    <button type="submit" class="btn btn-primary btn-sm">Recalibrate now</button>
+  </form>
+  <form method="post" action="{{ ingress_path }}/settings/supply-banner/dismiss"
+        style="margin:0">
+    <button type="submit" class="btn btn-secondary btn-sm">Dismiss</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
 {# ── Pump leak-watch (Phase 5a) — nightly recharge-derived leak estimate,
    street-meter calibrated. Shows while pump mode is armed and the leak is
    measurable; disappears when the pump stops cycling overnight (leak fixed). #}

@@ -525,6 +525,8 @@ class Orchestrator:
             self._rise_corr_backfill.stop()
         if self._leak_test_scheduler:
             self._leak_test_scheduler.stop()
+        if getattr(self, "_supply_regime", None):
+            self._supply_regime.stop()
         if self._ha:
             self._ha.stop()
 
@@ -809,6 +811,16 @@ class Orchestrator:
                                                ha_tz=self._ha_tz,
                                                alert_manager=self._alert_manager)
 
+        # Supply-pressure regime tracker — persists idle-line pressure daily,
+        # detects sustained supply shifts (pump install/removal, PRV change)
+        # and banners a per-regime rule recalibration. Detection only; nothing
+        # adapts until the user confirms.
+        from .supply_regime import SupplyRegimeTracker
+        self._supply_regime = SupplyRegimeTracker(
+            self._db, self._cfg,
+            settled_getter=self._event_detector.settled_pressure,
+            ha_tz=self._ha_tz, alert_manager=self._alert_manager)
+
         # Fixture publisher — MQTT Discovery for confirmed fixtures
         self._fixture_publisher = FixturePublisher(self._db, self._cfg, self._ha)
         try:
@@ -831,6 +843,7 @@ class Orchestrator:
                 self._supervise("maturity_recheck",    self._maturity_recheck.run),
                 self._supervise("rise_corr_backfill",  self._rise_corr_backfill.run),
                 self._supervise("pump_regime_detector", self._pump_regime.run),
+                self._supervise("supply_regime_tracker", self._supply_regime.run),
                 self._supervise("waveform_purger",     self._run_waveform_purger),
                 self._supervise("volume_baseline_rollover",
                                 self._run_volume_baseline_rollover),

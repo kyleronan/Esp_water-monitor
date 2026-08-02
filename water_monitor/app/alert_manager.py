@@ -433,6 +433,31 @@ class AlertManager:
             notification_id="water_pump_leak_watch",
         )
 
+    async def alert_supply_regime_shift(self, circuit: str, old_psi: float,
+                                        new_psi: float) -> None:
+        """Supply-pressure regime shift (booster pump installed/removed, PRV
+        change, municipal shift). Transition-only by construction — fired once
+        when the tracker opens the new regime. Informational: nothing changes
+        until the user confirms the dashboard banner's recalibration."""
+        from .units import convert_pressure, load_unit_context
+        uc = load_unit_context(self._db)
+        old_v = convert_pressure(old_psi, uc)
+        new_v = convert_pressure(new_psi, uc)
+        direction = "higher" if new_psi > old_psi else "lower"
+        await self.fire(
+            circuit, "supply_regime_shift",
+            title="🧭 Water supply pressure changed",
+            message=(
+                f"Your home's resting water pressure moved from about "
+                f"{old_v} to {new_v} {uc['pressure_unit']} and has stayed "
+                f"{direction} for several days — usually a booster pump, "
+                "pressure-regulator, or municipal change. Fixture "
+                "recognition was tuned for the old pressure; open the "
+                "dashboard to recalibrate for the new one."
+            ),
+            notification_id="water_supply_regime_shift",
+        )
+
     async def alert_leak_test_failed(self, circuit: str,
                                       pressure_drop_psi: float,
                                       circuit_name: str) -> None:

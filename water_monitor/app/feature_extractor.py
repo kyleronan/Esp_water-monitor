@@ -4592,7 +4592,11 @@ class FeatureExtractor:
                 self._circuit_type_cache[circuit] = ctype
             # Frozen per-home rule bands (empty → shipped defaults). Read fresh so
             # an activation / recalibration takes effect on the next event.
-            calib = load_rule_calibration(self._db, circuit)
+            # Regime-aware: a live event belongs to the CURRENT supply regime,
+            # so its bands win when fitted (fallback: legacy regime-0 row).
+            from .supply_regime import get_current_regime_id
+            calib = load_rule_calibration(self._db, circuit,
+                                          regime_id=get_current_regime_id(self._db))
             # dev.24 — water-softener session (precedence: softener → washer →
             # rules → knn). Profile read FRESH (NOT cached) so a Settings toggle
             # takes effect on the next event with no restart. Hard-gated.

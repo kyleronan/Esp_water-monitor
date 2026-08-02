@@ -352,7 +352,14 @@ class TrainingManager:
         misuse") that silently skipped post-lock reclassify + anomaly rescore."""
         from .rule_calibration import fit_and_freeze
         from .database import reclassify_all_events_from_signatures
-        report = fit_and_freeze(conn, circuit, source=source)
+        # Regime-aware: fit the bands for the CURRENT supply regime (falls back
+        # to the legacy whole-history fit / regime_id 0 when none is recorded).
+        try:
+            from .supply_regime import get_current_regime
+            regime = get_current_regime(conn)
+        except Exception:
+            regime = None
+        report = fit_and_freeze(conn, circuit, source=source, regime=regime)
         # Re-type events with the freshly-frozen rules so matched_* reflects the fit.
         try:
             reclassify_all_events_from_signatures(conn, circuit)

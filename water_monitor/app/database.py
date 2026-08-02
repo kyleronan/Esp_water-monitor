@@ -523,13 +523,19 @@ CREATE INDEX IF NOT EXISTS idx_type_signatures_circuit
 -- re-train — never on ordinary reclassify or live events — so the locked
 -- reference can't drift (the basis for leak / odd-usage detection).
 -- ==========================================================================
+-- One row per (circuit, supply regime) since migration 20260565: regime_id 0
+-- is the legacy/pre-regime row; other ids reference supply_regime.id. Bands
+-- stay fit-once-and-frozen WITHIN a regime; a supply shift (pump install,
+-- PRV change) gets a fresh fit instead of silently stale bands.
 CREATE TABLE IF NOT EXISTS rule_calibration (
-    circuit     TEXT PRIMARY KEY,
+    circuit     TEXT NOT NULL,
+    regime_id   INTEGER NOT NULL DEFAULT 0,
     params      TEXT NOT NULL DEFAULT '{}',   -- JSON dict of fitted rule bands
     report      TEXT,                         -- JSON per-type fit-vs-fallback report
-    source      TEXT,                         -- 'activation' | 'retrain'
+    source      TEXT,                         -- 'activation' | 'retrain' | 'regime_shift'
     locked_at   TIMESTAMP,
-    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (circuit, regime_id)
 );
 
 -- ==========================================================================
@@ -1222,6 +1228,41 @@ CREATE TABLE IF NOT EXISTS pump_regime_nightly (
     min_psi       REAL,
     created_ts    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (circuit, night_date)
+);
+
+-- ==========================================================================
+-- SUPPLY-PRESSURE REGIME TRACKING (migration 20260564)
+-- Idle-line (settled) pressure persisted daily + the discrete pressure
+-- regimes derived from it. A regime is a sustained supply band (city ~46 psi
+-- vs booster pump ~59 psi); rule calibration is fitted PER REGIME so the
+-- locked-baseline anti-drift philosophy holds within each regime while a
+-- plumbing change (pump install/removal, PRV swap) gets fresh bands instead
+-- of silently degrading classification.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS supply_pressure_daily (
+    circuit       TEXT NOT NULL,
+    day_date      TEXT NOT NULL,          -- local calendar date
+    sample_count  INTEGER NOT NULL,
+    median_psi    REAL NOT NULL,
+    p10_psi       REAL,
+    p90_psi       REAL,
+    source        TEXT NOT NULL DEFAULT 'settled',  -- 'settled' | 'event_backfill'
+    updated_at    TIMESTAMP,
+    PRIMARY KEY (circuit, day_date)
+);
+
+CREATE TABLE IF NOT EXISTS supply_regime (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at    TEXT NOT NULL,          -- UTC ISO; interval [started_at, ended_at)
+    ended_at      TEXT,                   -- NULL = current regime
+    center_psi    REAL NOT NULL,          -- median of settle-window daily medians
+    band_lo_psi   REAL,
+    band_hi_psi   REAL,
+    source        TEXT NOT NULL,          -- 'bootstrap' | 'detected' | 'user'
+    detected_at   TEXT,
+    confirmed_at  TEXT,                   -- banner Confirm
+    dismissed_at  TEXT,                   -- banner Dismiss
+    note          TEXT
 );
 
 -- ==========================================================================
@@ -4724,6 +4765,17 @@ _SIGNATURE_KNN_ACTIVE_FEATURES: tuple = (
     # engine at weight 0.2; dev.39 wires them into the k-NN matcher too. Active set
     # only — kept out of _SIGNATURE_MATCH_FEATURES so the stored centroid is unchanged.
     "hour_sin", "hour_cos",
+    # dev.NN: starting supply pressure conditions the vote on the home's pressure
+    # regime. A booster-pump install (2026-07) shifted settled pressure 46→59 psi
+    # and peak flows ~15-20% (measured flow≈P^0.4 on peaks, ~P^0.1 on averages,
+    # NEGATIVE on showers — so per-type conditioning, not a normalizing constant).
+    # With this dim a post-change query finds post-change neighbours automatically
+    # and self-heals if the regime ever reverts. Active set only — kept out of
+    # _SIGNATURE_MATCH_FEATURES so the stored centroid shape is unchanged.
+    # Missing/implausible values (<5 psi: NULLs and legacy coerced-0.0 rows) are
+    # median-imputed per vote by _impute_pressure — NEVER left to the 0.0 fallback
+    # of _knn_transform, which would be a huge phantom outlier in psi space.
+    "pre_event_pressure_psi",
 )
 _SIGNATURE_KNN_ACTIVE_LOG_FEATURES: frozenset = frozenset({
     "true_avg_flow_lpm", "peak_flow_lpm", "active_flow_duration_seconds", "volume_litres",
@@ -4747,6 +4799,17 @@ _SIGNATURE_KNN_ACTIVE_SCALES: dict = {
     # tap recall 0.46→0.57; 0.1–0.7 all beat baseline, 0.35 the peak).
     "hour_sin":                    0.35,
     "hour_cos":                    0.35,
+    # pre_event_pressure_psi is linear psi (NOT log — the 40-70 psi band has no
+    # right skew, and log would compress exactly the regime separation the
+    # feature exists to expose). Scale 1.5 LOCKED by the LOO sweep on the 154-
+    # label 2026-07-28 archive (production-path --with-rules): baseline 107/154,
+    # sweep 0.25:106 / 0.5:107 / 1.0:111 / 1.5:110 / 2-4.5:109 / 6-12:~109 —
+    # interior optimum at 1.0-1.5 with collapse below (so the gain is signal,
+    # not nearest-in-time memorization); 1.5 chosen over 1.0 for robustness
+    # (1-event difference on a small set). At 1.5 the 13-psi pump/city regime
+    # gap ≈8.7σ (strong conditioning), within-regime jitter ±2-3 psi ≈1.7σ.
+    # tap recall 0.65→0.75, dishwasher 0.654→0.692, no class regressed.
+    "pre_event_pressure_psi":      1.5,
 }
 
 # ── Edge-signature k-NN tier (dev19) ─────────────────────────────────────────
@@ -4798,6 +4861,62 @@ def _knn_transform(feat: str, value, log_features: frozenset) -> float:
     if not math.isfinite(v):
         return 0.0
     return math.log1p(max(0.0, v)) if feat in log_features else v
+
+
+# Supply pressure below this is not a plausible static line pressure — it marks
+# a NULL or a legacy coerced-0.0 row (feature_extractor stored `or 0` before the
+# detector's honest-None semantics), i.e. missing data, not a reading.
+_PRESSURE_FEATURE = "pre_event_pressure_psi"
+_PRESSURE_VALID_MIN_PSI = 5.0
+
+
+def _valid_pressure(value) -> Optional[float]:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v) or v < _PRESSURE_VALID_MIN_PSI:
+        return None
+    return v
+
+
+def _impute_pressure(labelled, event_features):
+    """Median-impute missing/implausible ``pre_event_pressure_psi`` on both the
+    labelled pool and the query, so the pressure dim is distance-NEUTRAL where
+    data is absent (an unknown pressure must not read as "0 psi", which in a
+    40-70 psi home is a phantom outlier that would dominate the vote).
+
+    Returns ``(labelled, query_features)`` — copies where mutation was needed;
+    the caller's inputs are never modified. When NO labelled row carries a valid
+    pressure the query value is discarded too, collapsing the dimension to zero
+    distance for every pair (pre-feature behavior).
+    """
+    vals: list = []
+    invalid_idx: list = []
+    for i, (_t, r) in enumerate(labelled):
+        v = _valid_pressure(r[_PRESSURE_FEATURE])
+        if v is None:
+            invalid_idx.append(i)
+        else:
+            vals.append(v)
+    q = dict(event_features)
+    qv = _valid_pressure(q.get(_PRESSURE_FEATURE))
+    if vals:
+        vals.sort()
+        mid = len(vals) // 2
+        fill = vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+    else:
+        fill = 0.0
+        qv = None  # constant on all sides → the dim contributes nothing
+    q[_PRESSURE_FEATURE] = qv if qv is not None else fill
+    if invalid_idx:
+        labelled = list(labelled)
+        for i in invalid_idx:
+            t, r = labelled[i]
+            rd = dict(r)
+            rd[_PRESSURE_FEATURE] = fill
+            labelled[i] = (t, rd)
+    return labelled, q
 
 
 def _knn_vote(labelled, event_features, features, scales, log_features):
@@ -5374,6 +5493,7 @@ def match_event_to_signature_knn(
                 "       active_flow_duration_seconds, volume_litres, "
                 "       pressure_delta_psi, steady_state_fraction, flow_on_ratio, "
                 "       cycle_pulse_count, hour_sin, hour_cos, "
+                "       pre_event_pressure_psi, "
                 "       onset_signature_json, offset_signature_json "
                 "FROM events "
                 "WHERE circuit = ? "
@@ -5392,6 +5512,7 @@ def match_event_to_signature_knn(
                 if _expand_edge_features(rd):
                     edge_labelled.append((t, rd))
             if len(edge_labelled) >= _SIGNATURE_KNN_MIN_TOTAL_LABELS:
+                edge_labelled, q_edges = _impute_pressure(edge_labelled, q_edges)
                 hit = _knn_vote(
                     edge_labelled, q_edges,
                     _SIGNATURE_KNN_ACTIVE_FEATURES + _SIGNATURE_KNN_EDGE_FEATURES,
@@ -5408,7 +5529,7 @@ def match_event_to_signature_knn(
             "SELECT user_fixture_type, true_avg_flow_lpm, peak_flow_lpm, "
             "       active_flow_duration_seconds, volume_litres, pressure_delta_psi, "
             "       steady_state_fraction, flow_on_ratio, cycle_pulse_count, "
-            "       hour_sin, hour_cos "
+            "       hour_sin, hour_cos, pre_event_pressure_psi "
             "FROM events "
             "WHERE circuit = ? "
             "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
@@ -5419,7 +5540,8 @@ def match_event_to_signature_knn(
             "  AND flow_on_ratio IS NOT NULL"
         )
         if len(active) >= _SIGNATURE_KNN_MIN_TOTAL_LABELS:
-            hit = _knn_vote(active, event_features, _SIGNATURE_KNN_ACTIVE_FEATURES,
+            active, q_active = _impute_pressure(active, event_features)
+            hit = _knn_vote(active, q_active, _SIGNATURE_KNN_ACTIVE_FEATURES,
                             _SIGNATURE_KNN_ACTIVE_SCALES, _SIGNATURE_KNN_ACTIVE_LOG_FEATURES)
             if hit is not None:
                 hit["match_source"] = "active_flow"
@@ -5503,7 +5625,23 @@ def reclassify_all_events_from_signatures(
     from .rule_calibration import load_rule_calibration
 
     # Frozen per-home rule bands (empty dict → predicates use shipped defaults).
-    calib = load_rule_calibration(conn, circuit)
+    # Regime-aware: bands are fitted per SUPPLY REGIME (migration 20260565), so
+    # the per-event rule tier below resolves each event's calib by its
+    # start_ts — a pre-pump event is judged by pre-pump bands even when the
+    # pass runs today. The window-scanning cycle detectors (washer/dishwasher/
+    # softener) take ONE calib per pass; they get the CURRENT regime's — the
+    # regime where new events land. (v1 limitation: a full reprocess spanning
+    # a regime boundary scans historical cycles with current bands; per-event
+    # rules, where the observed staleness actually bit, are fully resolved.)
+    from .supply_regime import (get_current_regime_id, get_regimes,
+                                resolve_regime_for_ts)
+    _regimes = get_regimes(conn)
+    _calib_cache: Dict[int, Dict[str, Any]] = {
+        0: load_rule_calibration(conn, circuit)}
+    for _rg in _regimes:
+        _calib_cache[int(_rg["id"])] = load_rule_calibration(
+            conn, circuit, regime_id=int(_rg["id"]))
+    calib = _calib_cache.get(get_current_regime_id(conn), _calib_cache[0])
     qfeats = tuple(dict.fromkeys(
         _SIGNATURE_MATCH_FEATURES + _SIGNATURE_KNN_ACTIVE_FEATURES
         + ("has_pressure_transient",)     # the flush predicate's extra input
@@ -5584,8 +5722,9 @@ def reclassify_all_events_from_signatures(
         where += " AND start_ts >= ?"
         qparams.append(since_ts)
     select_cols = list(dict.fromkeys(
-        ("id", "matched_fixture_type", "matched_via", "cycle_group_id",
-         "excluded_from_training", "active_flow_segment_count")
+        ("id", "start_ts", "matched_fixture_type", "matched_via",
+         "cycle_group_id", "excluded_from_training",
+         "active_flow_segment_count")
         + qfeats + _SCORE_COLS))
     rows = conn.execute(
         "SELECT " + ", ".join(select_cols) + " "
@@ -5620,7 +5759,10 @@ def reclassify_all_events_from_signatures(
                 _pump = _pga(conn, circuit)
             except Exception:
                 _pump = False
-            rule_hit = rule_classify_event(feats, circuit_type, calib=calib,
+            _ev_calib = (_calib_cache.get(
+                resolve_regime_for_ts(_regimes, r["start_ts"]), calib)
+                if _regimes else calib)
+            rule_hit = rule_classify_event(feats, circuit_type, calib=_ev_calib,
                                            pump_mode=_pump)
             if rule_hit is not None:
                 new_type, new_via = rule_hit

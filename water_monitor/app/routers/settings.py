@@ -274,7 +274,9 @@ async def settings_page(request: Request):
                 "percent_complete": 0,
             }
         )
-        cal_meta = get_rule_calibration_meta(orch.db, c)
+        from ..supply_regime import get_current_regime_id
+        cal_meta = get_rule_calibration_meta(
+            orch.db, c, regime_id=get_current_regime_id(orch.db))
         art_meta = get_artifact_calibration_meta(orch.db, c)
         dv = load_validation_report(orch.db, c)
 
@@ -354,10 +356,29 @@ async def settings_page(request: Request):
             pump_floor["current"] = row[0] if row else None
     except Exception:
         pass
+    # Supply-pressure regime summary for the Recalibration card (best-effort).
+    supply_regime_ctx = {"exists": False}
+    try:
+        from ..supply_regime import get_current_regime, regime_labels_needed
+        _cur = get_current_regime(orch.db)
+        if _cur is not None:
+            _primary = (orch._cfg.circuits[0].circuit
+                        if orch._cfg.circuits else None)
+            supply_regime_ctx = {
+                "exists": True,
+                "center_psi": round(_cur["center_psi"]),
+                "since": _cur["started_at"][:10],
+                "labels_needed": (regime_labels_needed(orch.db, _primary, _cur)
+                                  if _primary else ""),
+            }
+    except Exception:
+        pass
+
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
         "dev_tools": DEV_TOOLS,
         "pump_floor": pump_floor,
+        "supply_regime": supply_regime_ctx,
         "profile": dict(get_home_profile(orch.db) or {}),
         "circuits": circuits,
         "general_entities": entities_by_circuit.get("general", []),
@@ -519,6 +540,62 @@ async def pump_banner_dismiss(request: Request):
     log.info("pump banner: dismissed (re-banner only if detection persists "
              "30+ evaluated nights)")
     return ingress_redirect(request, "/settings#profile")
+
+
+# ------------------------------------------------------------------
+# Supply-pressure regime banner
+# ------------------------------------------------------------------
+@router.post("/supply-banner/confirm")
+async def supply_banner_confirm(request: Request):
+    """User confirmed the detected supply-pressure regime: stamp the ack and
+    kick off the per-regime rule recalibration job (fit on the new regime's
+    events + reclassify since the shift)."""
+    orch = _orch(request)
+    from datetime import datetime as _dt, timezone as _tzinfo
+    from ..supply_regime import get_current_regime
+    current = get_current_regime(orch.db)
+    if current is None:
+        return ingress_redirect(request, "/")
+    orch.db.execute("UPDATE supply_regime SET confirmed_at = ? WHERE id = ?",
+                    (_dt.now(_tzinfo.utc).isoformat(), current["id"]))
+    orch.db.commit()
+    log.info("supply banner: regime %s CONFIRMED — starting regime "
+             "recalibration", current["id"])
+    from .training import start_regime_recalibration
+    await start_regime_recalibration(orch)
+    return ingress_redirect(request, "/")
+
+
+@router.post("/supply-banner/dismiss")
+async def supply_banner_dismiss(request: Request):
+    """User dismissed the supply-shift banner. Nothing recalibrates; the
+    regime row keeps the dismissal so the banner stays hidden."""
+    orch = _orch(request)
+    from datetime import datetime as _dt, timezone as _tzinfo
+    from ..supply_regime import get_current_regime
+    current = get_current_regime(orch.db)
+    if current is not None:
+        orch.db.execute(
+            "UPDATE supply_regime SET dismissed_at = ? WHERE id = ?",
+            (_dt.now(_tzinfo.utc).isoformat(), current["id"]))
+        orch.db.commit()
+        log.info("supply banner: regime %s dismissed", current["id"])
+    return ingress_redirect(request, "/")
+
+
+@router.post("/recalibrate-regime/{circuit}")
+async def recalibrate_regime(circuit: str, request: Request):
+    """Re-fit the rule bands on the CURRENT supply regime's events (all
+    circuits) + reclassify since the shift. Admin action from the Settings
+    calibration card; the dashboard banner's Confirm runs the same job."""
+    orch = _orch(request)
+    from .training import start_regime_recalibration
+    started = await start_regime_recalibration(orch)
+    if not started:
+        return JSONResponse(
+            {"error": "No supply regime recorded yet — the tracker needs a "
+                      "few days of pressure history first."}, status_code=400)
+    return ingress_redirect(request, "/settings#sett-advanced")
 
 
 # ------------------------------------------------------------------
