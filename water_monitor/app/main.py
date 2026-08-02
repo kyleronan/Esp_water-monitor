@@ -513,7 +513,7 @@ async def ingress_middleware(request: Request, call_next):
 #
 # CSP is deliberately permissive: the current UI has ~60 inline event
 # handlers (onclick="…") and a few inline <script> / <style> blocks,
-# plus Chart.js (+ its date-fns adapter) loaded from cdnjs. A strict CSP would require
+# plus Chart.js loaded from cdnjs. A strict CSP would require
 # refactoring all of those to external files + per-request nonces.
 # What we ship today catches the easy wins (frame-ancestors,
 # object-src, base-uri) and pins the CDN origin so a compromised

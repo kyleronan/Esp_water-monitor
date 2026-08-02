@@ -390,14 +390,26 @@ class CircuitEventDetector:
     # dip has recovered to ≤ FRACTION of its starting magnitude for this many seconds.
     PRESSURE_RECOVERY_FRACTION: float = 0.5
     PRESSURE_RECOVERY_DURATION_S: float = 10.0
-    # Flow-override END: if pressure has been recovered for this much longer, end
-    # the event REGARDLESS of the flow reading. Covers a flow sensor that reports
+    # Flow-override END: if pressure has been recovered for this much longer AND
+    # the flow reading is STALE (no sample within FLOW_SAMPLE_STALE_S), end the
+    # event despite the last flow value. Covers a flow sensor that reports
     # high while flowing but never reports 0 when it stops, leaving
     # _current_flow_lpm stale-high so the flow<MIN gate never fires — the cause of
     # the 27.6 h irrigation event. Pressure (40 Hz) is the authority once it has
     # sat at baseline this long; a real run keeps pressure DROPPED so the timer
     # only completes when the draw is genuinely over.
     PRESSURE_RECOVERY_FLOW_OVERRIDE_S: float = 300.0   # 5 min
+    # The override additionally requires the flow READING itself to be stale —
+    # a live, healthy flow sample vetoes the "pressure says we're done"
+    # heuristic. A constant-pressure (VFD booster pump) home restores line
+    # pressure DURING a draw, so without this guard the override chopped one
+    # 42-minute shower into three events (2026-07-31: force-closed at 5 min of
+    # pump-held baseline pressure with 5.6 L/min still flowing, twice). The
+    # stuck-sensor case the override exists for goes SILENT (HA fires only on
+    # state change), so sample staleness is the honest proxy for "the flow
+    # reading can't be trusted". 120 s tolerates a perfectly steady reading
+    # that publishes rarely; a genuinely stuck sensor is silent for hours.
+    FLOW_SAMPLE_STALE_S: float = 120.0
     # Absolute hard cap on event duration (watchdog). The longest legitimate run
     # (a multi-zone irrigation cycle) is ~2.8 h; anything past this is a missed
     # end signal, so force-close. Bounds the blast radius of ANY unclosed event.
@@ -913,20 +925,29 @@ class CircuitEventDetector:
                         rec_secs = (now - self._pressure_recovered_since).total_seconds()
                         flow_stopped = self._current_flow_lpm < self.MIN_FLOW_LPM
                         # Normal END: pressure back >= 10 s AND flow has stopped.
-                        # Flow-override END: pressure back for a LONG time regardless
-                        # of the flow value — a flow sensor that never reports 0 on
-                        # stop leaves _current_flow_lpm stale-high so flow<MIN never
-                        # fires (the 27.6 h irrigation event). Pressure is the
-                        # authority once it has sat at baseline this long.
+                        # Flow-override END: pressure back for a LONG time AND the
+                        # flow reading is STALE — a flow sensor that never reports
+                        # 0 on stop goes silent (HA fires on change only), leaving
+                        # _current_flow_lpm stale-high so flow<MIN never fires (the
+                        # 27.6 h irrigation event). Pressure is the authority once
+                        # it has sat at baseline this long WITH no fresh flow data.
+                        # A live flow sample vetoes the override: a VFD booster
+                        # pump restores line pressure mid-draw, and closing on
+                        # pressure alone split one 42-min shower into three events.
+                        flow_stale = (
+                            self._last_flow_sample_ts is None
+                            or (now - self._last_flow_sample_ts).total_seconds()
+                            >= self.FLOW_SAMPLE_STALE_S)
                         if ((rec_secs >= self.PRESSURE_RECOVERY_DURATION_S
                              and flow_stopped)
-                                or rec_secs >= self.PRESSURE_RECOVERY_FLOW_OVERRIDE_S):
+                                or (rec_secs >= self.PRESSURE_RECOVERY_FLOW_OVERRIDE_S
+                                    and (flow_stopped or flow_stale))):
                             log.info(
                                 "[%s] pressure recovered (>= %.2f PSI for %.0f s, "
                                 "flow=%.3f%s) — ending pressure-triggered event",
                                 self.circuit, recovery_line, rec_secs,
                                 self._current_flow_lpm,
-                                "" if flow_stopped else " [flow-override]",
+                                "" if flow_stopped else " [flow-override, stale]",
                             )
                             # Definitive "draw is over" — bypasses the off-grace hold.
                             self._end_event(now, force=True)

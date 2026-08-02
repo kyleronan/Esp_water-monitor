@@ -548,8 +548,8 @@ const mix    = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparen
     if (!d || !d.available) { showMsg((d && ERR[d.error]) || "No pressure history available."); return; }
 
     const pf = window.UNITS.pressure_factor, pd = window.UNITS.pressure_decimals, pu = window.UNITS.pressure_unit;
-    // {x: epoch-ms, y: value} so the x-axis is a real time scale with round-hour
-    // ticks — raw bucket timestamps are anchored to the open-time minute (e.g. :56).
+    // {x: epoch-ms, y: value} points feed the linear time axis (round-hour ticks
+    // are placed in the x-scale's afterBuildTicks below).
     const series = d.points.map(p => ({ x: p.t, y: p.v == null ? null : +(p.v * pf).toFixed(pd) }));
     const datasets = [{
       label: `Pressure (${pu})`,
@@ -577,7 +577,10 @@ const mix    = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparen
         plugins: {
           legend: { display: true, labels: { font: { family: "DM Sans", size: 11 }, color: cssVar("--text-3"), boxWidth: 12 } },
           tooltip: {
-            callbacks: { label: c => c.parsed.y == null ? "" : `${c.dataset.label}: ${c.parsed.y.toFixed(pd)} ${pu}` },
+            callbacks: {
+              title: items => { if (!items.length) return ""; const d = new Date(items[0].parsed.x); return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); },
+              label: c => c.parsed.y == null ? "" : `${c.dataset.label}: ${c.parsed.y.toFixed(pd)} ${pu}`,
+            },
             backgroundColor: cssVar("--surface-2"), titleColor: cssVar("--text"),
             bodyColor: cssVar("--text"), borderColor: cssVar("--border"), borderWidth: 1,
             titleFont: { family: "DM Sans", size: 11 }, bodyFont: { family: "JetBrains Mono", size: 12 },
@@ -586,10 +589,23 @@ const mix    = (color, pct) => `color-mix(in oklch, ${color} ${pct}%, transparen
         },
         scales: {
           x: {
-            type: "time",
-            time: { unit: "hour", stepSize: 3, displayFormats: { hour: "HH:mm" }, tooltipFormat: "MMM d, HH:mm" },
+            // Linear epoch-ms axis with hand-placed round-hour ticks (local time,
+            // every 3 h) — no date adapter needed. Raw bucket timestamps are anchored
+            // to the modal's open-time minute, so default ticks land on odd minutes (:56).
+            type: "linear",
+            afterBuildTicks: (axis) => {
+              if (!isFinite(axis.min) || !isFinite(axis.max)) return;
+              const t = new Date(axis.min); t.setMinutes(0, 0, 0);
+              while (t.getHours() % 3 !== 0 || t.getTime() < axis.min) t.setHours(t.getHours() + 1);
+              const ticks = [];
+              for (; t.getTime() <= axis.max; t.setHours(t.getHours() + 3)) ticks.push({ value: t.getTime() });
+              axis.ticks = ticks;
+            },
             grid: { display: false },
-            ticks: { font: { family: "DM Sans", size: 10 }, color: cssVar("--text-3"), maxRotation: 0 },
+            ticks: {
+              callback: v => { const d = new Date(v); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; },
+              font: { family: "DM Sans", size: 10 }, color: cssVar("--text-3"), maxRotation: 0, autoSkip: false,
+            },
           },
           y: { beginAtZero: true, grid: { color: cssVar("--border") }, ticks: { font: { family: "DM Sans", size: 10 }, color: cssVar("--text-3") } },
         },
