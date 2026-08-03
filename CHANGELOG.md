@@ -40,6 +40,17 @@ landed without a version bump; per-build details are in git history.)
   as such. **After deploying, re-run the regime recalibration** — the sanity
   gate applies at fit time, so bands already frozen stay until refit.
 
+### Fixes
+
+- **Startup no longer crash-loops when a recalibration runs during it (dev34)**
+  — triggering a heavy admin write (regime recalibration, recompute) while the
+  add-on is still starting can hold the SQLite write lock for tens of seconds,
+  longer than the 5 s busy timeout. The resulting error crashed the whole
+  supervised training task, which restarted every 5 s and collided again for as
+  long as the admin job ran (observed live: ~8 cycles). Startup now waits the
+  lock out — the defaults it writes are idempotent, and everything else in that
+  window was already non-fatal. Recovery previously needed a manual restart.
+
 - **Volume-accounting repairs + pump-ripple exemption — dev33** — driven by a
   full audit of every stored event against raw Home Assistant history
   (2026-08-02). The measurement chain is healthy (±1% per event, 98.1%

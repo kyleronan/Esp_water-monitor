@@ -32,6 +32,16 @@ from .ha_client import HaClient
 
 log = logging.getLogger(__name__)
 
+# Startup defaults vs. a concurrent heavy admin write (dev34). A user-triggered
+# regime recalibration / recompute runs on a private connection under the write
+# lock and can hold the SQLite file lock for tens of seconds — longer than the
+# 5 s busy_timeout. Before this, the resulting OperationalError crashed the
+# whole supervised training task, which restarted every 5 s and collided again
+# for the duration of the admin job (observed 2026-08-03: ~8 crash cycles).
+# Wait it out instead — ensure_circuit_defaults is idempotent.
+_INIT_LOCK_RETRIES: int = 12
+_INIT_LOCK_BACKOFF_S: float = 5.0
+
 # Auto-activate a circuit stuck in 'labelling' after this many days of
 # user inaction, so anomaly detection isn't blocked indefinitely waiting
 # for the user to review clusters.
@@ -84,10 +94,30 @@ class TrainingManager:
 
     async def run(self) -> None:
         """Background loop — check calibration progress every 60s."""
-        # Initial setup
+        # Initial setup. A heavy admin write (regime recalibration, recompute)
+        # triggered while startup is still running can hold the SQLite write
+        # lock for longer than the 5 s busy_timeout — and an OperationalError
+        # here crashed the whole supervised task, which then retried every 5 s
+        # and collided again for as long as the admin job ran. Wait it out
+        # instead: the defaults are idempotent and nothing downstream needs
+        # them in the first seconds.
         for circuit_cfg in self._cfg.circuits:
-            ensure_circuit_defaults(
-                self._db, circuit_cfg.circuit, circuit_cfg.circuit_type)
+            for attempt in range(_INIT_LOCK_RETRIES):
+                try:
+                    ensure_circuit_defaults(
+                        self._db, circuit_cfg.circuit, circuit_cfg.circuit_type)
+                    break
+                except sqlite3.OperationalError as e:
+                    if "locked" not in str(e).lower():
+                        raise
+                    log.info("[%s] circuit defaults: DB busy (%s) — retry %d/%d",
+                             circuit_cfg.circuit, e, attempt + 1,
+                             _INIT_LOCK_RETRIES)
+                    await asyncio.sleep(_INIT_LOCK_BACKOFF_S)
+            else:
+                log.warning("[%s] circuit defaults skipped — DB stayed locked; "
+                            "the next startup applies them (idempotent)",
+                            circuit_cfg.circuit)
 
         # Lower stale whole-home event targets for in-progress zone
         # calibrations so they aren't stuck forever (see method docstring).
