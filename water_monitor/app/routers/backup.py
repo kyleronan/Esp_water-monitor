@@ -438,8 +438,25 @@ async def import_quick_restore(
 async def import_history_archive(
     request: Request,
     file: UploadFile = File(...),
+    labels_only: bool = Form(False),
 ):
-    """Merge history rows from a SQLite archive. Existing rows are kept."""
+    """Merge history rows from a SQLite archive. Existing rows are kept.
+
+    ``labels_only`` (dev34) merges ONLY the archive's user-labelled events —
+    the training fuel — instead of its full event history. Motivation: a
+    fresh start discarded 486 hand-made labels, and the classifier's coverage
+    (not its accuracy) collapsed afterwards. Importing the labels back roughly
+    triples the pool, particularly for the starved classes.
+
+    Rows arrive with their FEATURES INTACT. Blanking the pressure columns
+    would look conservative and is the opposite: `pressure_delta_psi` is a
+    LINEAR k-NN dimension, so a NULL becomes a fabricated "0 psi drop" that
+    pulls every imported row into one corner of the space. Cross-regime
+    distance is already handled — the rule-fit pools are windowed by
+    timestamp, the active/edge k-NN tiers hard-require active-flow columns
+    that firmware-3.12 rows lack (so those rows serve the legacy tier), and
+    the dev32 pressure feature conditions on supply regime by design.
+    """
     orch = _orch(request)
     raw = await file.read(MAX_BACKUP_BYTES + 1)
     if len(raw) > MAX_BACKUP_BYTES:
@@ -451,7 +468,7 @@ async def import_history_archive(
         tmp.write(raw)
         tmp_path = Path(tmp.name)
 
-    imported, errors = {}, []
+    imported, errors, ignored = {}, [], {}
     arc = None
 
     try:
@@ -466,7 +483,21 @@ async def import_history_archive(
                 for tbl in HISTORY_ARCHIVE_TABLES:
                     if tbl not in in_archive:
                         continue
-                    rows = arc.execute(f"SELECT * FROM {tbl}").fetchall()
+                    if labels_only and tbl != "events":
+                        continue          # labels live on events only
+                    if labels_only:
+                        # Explicit user labels only, and never an artifact row:
+                        # the goal is training fuel, not the archive's whole
+                        # pre-board history (which adds noise and volume rows
+                        # that would double-count against the live ledger).
+                        rows = arc.execute(
+                            "SELECT * FROM events "
+                            "WHERE user_fixture_type IS NOT NULL "
+                            "  AND user_fixture_type <> '' "
+                            "  AND COALESCE(excluded_from_training, 0) = 0"
+                        ).fetchall()
+                    else:
+                        rows = arc.execute(f"SELECT * FROM {tbl}").fetchall()
                     if not rows:
                         imported[tbl] = 0
                         continue
@@ -495,6 +526,16 @@ async def import_history_archive(
                     after = orch.db.execute(
                         f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
                     imported[tbl] = after - before
+                    # INSERT OR IGNORE drops an entire row on an id collision
+                    # (ids are uuid5 over circuit+start_ts, so a collision means
+                    # the live DB already has that instant). "Probably zero" is
+                    # a proxy — count it, and name the casualties when it isn't.
+                    skipped = len(rows) - (after - before)
+                    if skipped > 0:
+                        ignored[tbl] = skipped
+                        log.warning(
+                            "Import archive %s: %d of %d row(s) skipped on id "
+                            "collision (live rows kept)", tbl, skipped, len(rows))
         except Exception as e:
             log.error("Import history-archive failed (transaction rolled back): %s", e)
             errors.append(str(e))
@@ -529,11 +570,18 @@ async def import_history_archive(
 
     total = sum(imported.values())
 
+    summary = f"{total} rows merged from history archive"
+    if labels_only:
+        summary = f"{total} labelled event(s) merged from history archive"
+    if ignored:
+        summary += (f" ({sum(ignored.values())} skipped on id collision)")
+
     return JSONResponse({
         "ok":      len(errors) == 0,
         "imported": imported,
+        "ignored": ignored,
         "errors":  errors,
-        "summary": f"{total} rows merged from history archive",
+        "summary": summary,
     })
 
 

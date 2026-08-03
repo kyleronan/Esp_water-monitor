@@ -48,7 +48,17 @@ log = logging.getLogger(__name__)
 # ── Gates / knobs (placeholders until the held-out eval locks them on real data) ─
 MIN_EXPLICIT_LABELS = 5        # ≥ this many user/training labels to AUTHORISE a fit
 MIN_FIT_WEIGHT = 8.0           # AND ≥ this weighted label mass
+# Do-no-harm noise margin (dev34). The frozen default must beat the fit by BOTH
+# of these before the fit is discarded — a 1-of-25 difference is a coin flip,
+# and treating it as evidence kept pre-pump toilet constants in force through a
+# regime whose ΔP had risen 2.6×. Both gates matter: the absolute one protects
+# small test sets, the fractional one protects large ones.
+_DO_NO_HARM_MIN_MARGIN = 2      # events
+_DO_NO_HARM_MIN_FRACTION = 0.05  # 5% of the held-out set
 _FIT_MAX_SPAN_FACTOR = 2.0     # a fitted range span may be at most this × default span
+# Bounded LOOSENING for scalar floor/ceiling bands (dev34 — see _is_sane).
+_FIT_MIN_FLOOR_FRACTION = 0.5   # a fitted floor may not drop below half the default
+_FIT_MAX_CEILING_FACTOR = 2.5   # a fitted ceiling may not exceed 2.5× the default
 
 _LO_PCT = 10.0
 _HI_PCT = 90.0
@@ -306,11 +316,39 @@ def _is_sane(key: str, value: Any) -> bool:
             return False  # implausibly wide → noisy labels, fall back
         return True
     # floor / ceiling scalar
+    default = RULE_DEFAULTS.get(key)
     try:
         v = float(value)
     except (TypeError, ValueError):
         return False
-    return lo_abs <= v <= hi_abs
+    if not (lo_abs <= v <= hi_abs):
+        return False
+    # dev34 — BOUNDED LOOSENING. The absolute bounds above are deliberately
+    # wide (a shower floor may legitimately sit anywhere in 0-600 L), which
+    # let a fit collapse a discriminative threshold to nothing: the 2026-08-02
+    # regime-2 refit produced SHOWER_BIG_VOL_L = 2.13 L and ZONE_MIN_DUR_S =
+    # 14.6 s against defaults of 30 L and 240 s — a "big shower" floor small
+    # enough to swallow a toilet flush. The cause is a percentile fit over a
+    # pool that contains fragments and the occasional mislabel; the p10 then
+    # sits far below the class's real lower edge.
+    #
+    # This is the scalar analogue of _FIT_MAX_SPAN_FACTOR for ranges: a fit may
+    # tighten a threshold freely (that only ever makes the rule more selective)
+    # but may only loosen it within a bounded factor of the shipped default,
+    # which encodes the physics of the class. LOWERING a floor loosens; RAISING
+    # a ceiling loosens. 2.5x on ceilings keeps the legitimate pump-driven
+    # dishwasher change (3.6 -> 7.59 LPM = 2.1x) while still catching runaways.
+    if default is not None:
+        try:
+            d = float(default)
+        except (TypeError, ValueError):
+            return True
+        if d > 0:
+            if kind == "floor" and v < _FIT_MIN_FLOOR_FRACTION * d:
+                return False
+            if kind == "ceiling" and v > _FIT_MAX_CEILING_FACTOR * d:
+                return False
+    return True
 
 
 # ── Public API ──────────────────────────────────────────────────────────────────
@@ -461,11 +499,23 @@ def _do_no_harm(conn: sqlite3.Connection, circuit: str,
                 report: Dict[str, Any],
                 regime: Optional[Dict[str, Any]] = None,
                 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Drop fitted bands that REDUCE held-out recall vs the frozen default for their
-    type — so the per-home fit can only help an atypical home, never regress a
-    well-tuned one. (washing_machine isn't validated here — cycle detector.)
-    With a ``regime``, both the folds' fits and the test rows stay inside the
-    regime's window so the check measures within-regime performance."""
+    """Drop fitted bands that MEANINGFULLY reduce held-out recall vs the frozen
+    default for their type — so the per-home fit can only help an atypical home,
+    never regress a well-tuned one. (washing_machine isn't validated here —
+    cycle detector.) With a ``regime``, both the folds' fits and the test rows
+    stay inside the regime's window so the check measures within-regime
+    performance.
+
+    dev34 — the comparison now needs a MARGIN. Strict `fitted < frozen` made a
+    one-event difference decisive: on the 2026-08-02 regime-2 refit, toilet
+    scored 23 vs 24 correct of 25 and the fit was discarded, leaving pre-pump
+    constants in force in a regime where toilet ΔP had gone 4.37 → 11.32 psi.
+    A single held-out event is noise, not evidence. The fit is now kept unless
+    the frozen default wins by at least ``_DO_NO_HARM_MIN_MARGIN`` events AND
+    ``_DO_NO_HARM_MIN_FRACTION`` of the test set — so a real regression (which
+    shows up as several events, e.g. the 30% collapses this gate was built to
+    catch) still discards the fit, while a coin flip no longer does.
+    """
     try:
         from .database import get_circuit_type
         circuit_type = get_circuit_type(conn, circuit)
@@ -476,15 +526,32 @@ def _do_no_harm(conn: sqlite3.Connection, circuit: str,
                               circuit_type)
     for ftype, keys in _TYPE_KEYS.items():
         a = acc.get(ftype)
-        if a and a["fitted"] < a["frozen"]:
+        if not a:
+            continue
+        deficit = a["frozen"] - a["fitted"]
+        n = max(1, a["n"])
+        regressed = (deficit >= _DO_NO_HARM_MIN_MARGIN
+                     and (deficit / n) >= _DO_NO_HARM_MIN_FRACTION)
+        if regressed:
             for key in keys:
                 calib.pop(key, None)
             if ftype in report:
                 report[ftype]["status"] = "regressed_kept_default"
                 report[ftype]["held_out"] = {
                     "fitted": a["fitted"], "frozen": a["frozen"], "n": a["n"]}
-            log.info("[%s] do-no-harm: dropped %s fit (held-out %d<%d) — kept default",
-                     circuit, ftype, a["fitted"], a["frozen"])
+            log.info("[%s] do-no-harm: dropped %s fit (held-out %d<%d of %d) "
+                     "— kept default", circuit, ftype, a["fitted"],
+                     a["frozen"], a["n"])
+        elif deficit > 0 and ftype in report:
+            # Within the margin: the fit ships, but record that it was behind
+            # so a report reader can see it wasn't a clean win.
+            report[ftype]["held_out"] = {
+                "fitted": a["fitted"], "frozen": a["frozen"], "n": a["n"],
+                "kept_within_margin": True}
+            log.info("[%s] do-no-harm: %s fit kept despite held-out %d<%d of "
+                     "%d (within the %d-event / %.0f%% noise margin)",
+                     circuit, ftype, a["fitted"], a["frozen"], a["n"],
+                     _DO_NO_HARM_MIN_MARGIN, 100 * _DO_NO_HARM_MIN_FRACTION)
     return calib, report
 
 

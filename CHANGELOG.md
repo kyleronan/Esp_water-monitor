@@ -9,6 +9,37 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Label re-import + calibration guardrails — dev34** — the classifier's
+  coverage (not its accuracy) collapsed after a fresh start discarded 486
+  hand-made labels, so the History Archive import gains a **labels-only**
+  mode that merges just the archive's user-labelled events. Rows arrive with
+  features INTACT: blanking the pressure columns looks conservative and is
+  the opposite, because `pressure_delta_psi` is a linear k-NN dimension where
+  a NULL becomes a fabricated "0 PSI drop". Measured on the real archives:
+  the labelled pool goes **238 → 616 (2.6×)** with zero id collisions,
+  water-softener 1 → 12, washing machine 22 → 48; k-NN coverage rises
+  0.910 → 0.927 with accuracy flat once the `other` class (which the
+  classifier structurally cannot emit) is excluded. Collisions are counted
+  and named rather than silently dropped.
+  Two calibration guardrails ship with it. **(1) Bounded loosening.** The
+  per-home rule fit could collapse a discriminative threshold to nothing: the
+  2026-08-02 regime refit produced a "big shower" floor of **2.13 L** against
+  a 30 L default (and a 14.6 s irrigation-zone floor against 240 s), because
+  a percentile fit over a pool containing event fragments puts the p10 far
+  below the class's real edge — and the absolute sanity bounds (0–600 L) are
+  far too wide to catch it. A fit may now *tighten* a threshold freely but
+  may only *loosen* it within a bounded factor of the shipped default, which
+  encodes the physics of the class. This keeps the legitimate pump-driven
+  dishwasher change (peak ceiling 3.6 → 7.59 L/min) and rejects the
+  degenerate floors. **(2) A noise margin on do-no-harm.** The gate that
+  protects a well-tuned home from a bad refit was discarding fits on a
+  one-event held-out difference — that is a coin flip, and it left pre-pump
+  toilet constants in force through a regime where toilet ΔP had risen 2.6×.
+  The frozen default must now win by at least 2 events AND 5% of the test set
+  before the fit is dropped; a fit that ships while slightly behind is logged
+  as such. **After deploying, re-run the regime recalibration** — the sanity
+  gate applies at fit time, so bands already frozen stay until refit.
+
 - **Volume-accounting repairs + pump-ripple exemption — dev33** — driven by a
   full audit of every stored event against raw Home Assistant history
   (2026-08-02). The measurement chain is healthy (±1% per event, 98.1%
