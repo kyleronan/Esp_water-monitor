@@ -200,7 +200,13 @@ _BASELINE_VERSION: int = 20260523
 #              regime, so neither a gate flip nor a later supply transition can
 #              re-flag events that were already exempted. DDL only; resolved
 #              lazily by supply_regime.pump_era_start.
-_CURRENT_VERSION: int = 20260566
+#   20260567 — home_profile.leak_watch_ack: the night a user dismissed on the
+#              leak-watch tile ('dismissed:<night_date>'). The tile was the one
+#              home banner with no dismiss control, and it had no age bound
+#              either — it showed the newest night carrying an estimate out of
+#              the last 14, so a single stale reading stayed on screen for two
+#              weeks after the cycling stopped. DDL only.
+_CURRENT_VERSION: int = 20260567
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1891,6 +1897,29 @@ def _missing_pump_era_columns(conn: sqlite3.Connection) -> set[str]:
     return set()
 
 
+# 20260567 — leak-watch tile dismissal.
+def _apply_leak_watch_ack_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260567 — `home_profile.leak_watch_ack`,
+    holding 'dismissed:<night_date>' for the newest night the user has
+    acknowledged on the leak-watch tile. Dismissal is per-READING, not per-
+    feature: a later night carrying a fresh estimate re-shows the tile, which
+    is what keeps a real leak from being silenced by one click. DDL only;
+    guarded + idempotent."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                    "name='home_profile'").fetchone():
+        if not _has_column(conn, "home_profile", "leak_watch_ack"):
+            conn.execute("ALTER TABLE home_profile ADD COLUMN "
+                         "leak_watch_ack TEXT")
+    conn.commit()
+    log.info("Migration 20260567: leak_watch_ack column ready")
+
+
+def _missing_leak_watch_columns(conn: sqlite3.Connection) -> set[str]:
+    if not _has_column(conn, "home_profile", "leak_watch_ack"):
+        return {"home_profile.leak_watch_ack"}
+    return set()
+
+
 # 20260565 — rule_calibration keyed per (circuit, supply regime).
 def _apply_regime_calibration(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260565 — rebuild rule_calibration with
@@ -2050,6 +2079,7 @@ _MIGRATIONS: tuple = (
     (20260564, _apply_supply_regime_tables),
     (20260565, _apply_regime_calibration),
     (20260566, _apply_pump_era_column),
+    (20260567, _apply_leak_watch_ack_column),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

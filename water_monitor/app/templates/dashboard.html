@@ -80,24 +80,34 @@
 {% endif %}
 
 {# ── Pump leak-watch (Phase 5a) — nightly recharge-derived leak estimate,
-   street-meter calibrated. Shows while pump mode is armed and the leak is
-   measurable; disappears when the pump stops cycling overnight (leak fixed). #}
+   street-meter calibrated. Shows while pump mode is armed and the estimate is
+   RECENT (within the last 3 evaluated nights — dev34); clears itself once the
+   pump stops cycling overnight, which is what a repaired leak looks like. #}
 {% if leak_watch %}
 <div class="dash-alert dash-alert-degraded" aria-live="polite">
   <div class="dash-alert-body">
     <span class="dash-alert-title">💧 Leak watch</span>
     <span class="dash-alert-detail">
-      Your booster pump topped the system up
+      On the night of <strong>{{ leak_watch.night }}</strong> your booster pump
+      topped the system up
       {% if leak_watch.period_min %}about every {{ leak_watch.period_min }}
-      minutes{% else %}repeatedly{% endif %} overnight ({{ leak_watch.night }})
+      minutes{% else %}repeatedly{% endif %}
       with nothing running — an estimated
       <strong>~{{ leak_watch.gpd }} gal/day (~{{ leak_watch.lpd }} L/day)</strong>
       is leaking somewhere. This is an <em>estimate</em> inferred from pump
       activity, not a direct measurement — treat it as a size class, not an
       exact number. Closing shut-off valves one at a time and watching
       whether the cycling stops can locate the leak.
+      <br><em>This clears on its own after three nights without cycling. If
+      you've just had a repair done, that's the confirmation to watch for.</em>
     </span>
   </div>
+  {% if is_admin %}
+  <form method="post" action="{{ ingress_path }}/settings/leak-banner/dismiss"
+        style="margin:0">
+    <button type="submit" class="btn btn-secondary btn-sm">Dismiss</button>
+  </form>
+  {% endif %}
 </div>
 {% endif %}
 

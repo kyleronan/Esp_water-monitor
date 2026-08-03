@@ -9,6 +9,33 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Fixture recognition now survives a change in water supply — dev34** — a new
+  final rung in the matching ladder classifies on **fixture shape alone**, with
+  every pressure-derived feature excluded from its feature set. This is the
+  durable answer to the failure that motivated this whole milestone: installing
+  a booster pump moved toilet pressure-drop from 4.4 to 11.3 PSI at an
+  unchanged 4.9 L flush, and because every existing tier reads pressure, the
+  home's post-pump events fell outside their learned bands and **800+ events
+  went unnamed for twelve days**.
+  Measured by training only on pre-pump labels and testing only on post-pump
+  ones — the actual test of whether a tier survives a supply change:
+
+  | tier | accuracy | coverage | toilet recall |
+  |---|---|---|---|
+  | existing (pressure-drop) | 0.250 | 0.423 | 0.15 |
+  | existing (pressure-conditioned) | 0.375 | 0.731 | 0.46 |
+  | **new (shape only)** | **0.750** | **0.856** | **0.96** |
+
+  It runs **last**, after every existing tier has abstained, so a home whose
+  supply hasn't changed sees identical verdicts — the tiers above carry more
+  signal while pressure is stable, and leave-one-out on the full pool confirms
+  it adds coverage without cost (0.927 → 0.947 coverage, 0.750 → 0.759
+  accuracy, no class worse). Matches it makes are recorded as `knn_invariant`
+  so its contribution stays separable in the data. It abstains on the classes
+  it is weak at rather than guessing, and — a known limit worth stating — it
+  cannot emit `other`, so a genuinely novel draw is left unnamed rather than
+  forced into the nearest known fixture.
+
 - **Label re-import + calibration guardrails — dev34** — the classifier's
   coverage (not its accuracy) collapsed after a fresh start discarded 486
   hand-made labels, so the History Archive import gains a **labels-only**
@@ -41,6 +68,31 @@ landed without a version bump; per-build details are in git history.)
   gate applies at fit time, so bands already frozen stay until refit.
 
 ### Fixes
+
+- **The leak-watch banner no longer reports a leak that has stopped (dev34)** —
+  and it can now be dismissed. The tile showed the most recent night *that
+  carried an estimate* out of the last fourteen, with no test of how old that
+  night was. When the 2026-07 pump cycling stopped after a valve service, the
+  last night with a reading kept winning, and the dashboard went on stating in
+  the present tense that ~110 L/day "is leaking somewhere" for six days — with
+  a number that a data audit had by then attributed to an irrigation program
+  running inside the analysis window, not to a leak. (dev33 stopped such nights
+  from writing an estimate, but that only applies going forward; it left the
+  already-stored reading on screen.) The estimate must now come from one of the
+  **last three evaluated nights**, so three quiet nights clear it — which is
+  what a completed repair looks like, and what the tile always claimed it would
+  do. A **Dismiss** button covers the rest; it was the only home banner without
+  one. Dismissal acknowledges a *reading*, not the feature: a later night with
+  a fresh estimate re-shows the tile, so one click can never silence a leak
+  that is still being measured, and the Home Assistant alert path is untouched.
+
+- **Vetoed toilet matches now say which physics test rejected them (dev34)** —
+  the log line printed the event volume and the home's flush cap, so an event
+  turned down by the 2.8 L manufactured-flush floor logged as "vol=2.5 L,
+  cap=30.5 L" and read like a passing event. It now names the condition that
+  fired (floor, cap, peak flow, or segment count). Behaviour is unchanged;
+  several dozen of these can scroll past in a single reclassify, and they were
+  unreadable.
 
 - **Startup no longer crash-loops when a recalibration runs during it (dev34)**
   — triggering a heavy admin write (regime recalibration, recompute) while the

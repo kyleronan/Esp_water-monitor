@@ -259,6 +259,12 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- a gate flip nor a later supply transition can re-flag already-exempted
     -- events. Resolved once by supply_regime.pump_era_start, then read.
     pump_era_start                 TEXT,
+    -- leak_watch_ack (migration 20260567): 'dismissed:<night_date>' — the
+    -- newest leak-watch reading the user has acknowledged. The tile hides that
+    -- night and older; a later night carrying a fresh estimate re-shows it, so
+    -- a dismissal acknowledges a READING and can never silence the feature.
+    -- Display-only: the HA leak alert path does not consult this.
+    leak_watch_ack                 TEXT,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -4924,6 +4930,46 @@ _SIGNATURE_KNN_ACTIVE_SCALES: dict = {
     "pre_event_pressure_psi":      1.5,
 }
 
+# ── Regime-invariant k-NN tier (dev34) ───────────────────────────────────────
+# The final rung before abstention. Deliberately contains NO pressure-derived
+# feature: ΔP, hydraulic resistance and pre-event pressure all move when the
+# supply does (the 2026-07 pump took toilet ΔP 4.37 → 11.32 psi at unchanged
+# volume), and that is exactly what silently killed cluster matching for twelve
+# days. Volume, duration, flow rate/shape and time-of-day do not move.
+#
+# Scales ≈ the per-feature standard deviation over the 516-event combined
+# labelled pool, in log1p space for the two skewed dimensions — the same
+# convention as the tiers above, and equivalent to the z-scoring the audit's
+# reference implementation used, but as FIXED constants so a fit can't drift
+# with the pool. Re-derive with tools/eval_knn_classifier.py --scale if the
+# label distribution changes substantially.
+_SIGNATURE_KNN_INVARIANT_FEATURES: tuple = (
+    "volume_litres", "duration_seconds", "avg_flow_lpm", "peak_flow_lpm",
+    "flow_variability", "steady_state_fraction", "flow_rise_rate_lpm_s",
+    "flow_fall_rate_lpm_s", "time_to_90pct_flow_seconds", "opening_step_lpm",
+    "hour_sin", "hour_cos",
+)
+_SIGNATURE_KNN_INVARIANT_LOG_FEATURES: frozenset = frozenset({
+    "volume_litres", "duration_seconds",
+})
+_SIGNATURE_KNN_INVARIANT_SCALES: dict = {
+    "volume_litres":              1.39,   # log1p space
+    "duration_seconds":           1.26,   # log1p space
+    "avg_flow_lpm":               2.76,
+    "peak_flow_lpm":              4.52,
+    "flow_variability":           1.19,
+    "steady_state_fraction":      0.24,
+    "flow_rise_rate_lpm_s":       4.53,
+    "flow_fall_rate_lpm_s":       0.32,
+    "time_to_90pct_flow_seconds": 364.19,
+    "opening_step_lpm":           2.38,
+    # Time-of-day at the same weight the active tier uses — a strong
+    # tiebreaker, never a dominant term.
+    "hour_sin":                   0.35,
+    "hour_cos":                   0.35,
+}
+
+
 # ── Edge-signature k-NN tier (dev19) ─────────────────────────────────────────
 # Fixed-time onset/offset shape cells (events.onset_signature_json /
 # offset_signature_json) as an EXTRA feature block on top of the active-flow
@@ -5667,9 +5713,10 @@ def match_event_to_signature_knn(
 
 
 def _legacy_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any]]:
-    """The 6-scalar legacy k-NN tier — the shared final rung of the matcher
-    ladder (factored out so the edge tier can reach it directly on abstention
-    without re-voting the plain active tier)."""
+    """The 6-scalar legacy k-NN tier — the shared penultimate rung of the
+    matcher ladder (factored out so the edge tier can reach it directly on
+    abstention without re-voting the plain active tier). When IT abstains the
+    regime-invariant tier below gets the last word."""
     legacy = _labelled(
         "SELECT user_fixture_type, avg_flow_lpm, peak_flow_lpm, duration_seconds, "
         "       volume_litres, pressure_delta_psi, steady_state_fraction "
@@ -5679,11 +5726,58 @@ def _legacy_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any]]:
         "  AND COALESCE(excluded_from_training, 0) = 0"
     )
     if len(legacy) < _SIGNATURE_KNN_MIN_TOTAL_LABELS:
-        return None
+        return _invariant_knn_fallback(_labelled, event_features)
     hit = _knn_vote(legacy, event_features, _SIGNATURE_MATCH_FEATURES,
                     _SIGNATURE_KNN_SCALES, _SIGNATURE_LOG_FEATURES)
     if hit is not None:
         hit["match_source"] = "legacy_features"
+        return hit
+    return _invariant_knn_fallback(_labelled, event_features)
+
+
+def _invariant_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any]]:
+    """Regime-INVARIANT k-NN — the final rung before abstention (dev34).
+
+    Every tier above this one reads at least one pressure-derived feature, and
+    pressure is the thing a supply change moves: the 2026-07 booster pump took
+    toilet ΔP from 4.37 to 11.32 psi with the same 4.9 L flush, which put every
+    post-pump event outside the locked cluster gates and left the classifier
+    silently unable to name 800+ events for twelve days.
+
+    This tier reads ONLY quantities a supply change does not move — volume,
+    duration, flow rates, flow shape, and time of day. The pressure columns are
+    excluded from the FEATURE SET; they are not nulled out of the data (a NULL
+    in a linear dimension is a fabricated zero, which is worse). Measured on
+    the combined old+new label set: 83% leave-one-out, and 84% on the harder
+    train-pre-pump / test-post-pump split — which is the actual test of the
+    invariance claim, and the reason this tier survives the NEXT supply change
+    without a re-fit.
+
+    It runs LAST on purpose. The tiers above see more of the signal when the
+    regime is stable, and the ladder's shape is load-bearing (see the note in
+    match_event_to_signature_knn): this is a pure addition below them, so a
+    stable home's verdicts are unchanged and only events that would otherwise
+    have gone unnamed reach it.
+    """
+    rows = _labelled(
+        "SELECT user_fixture_type, volume_litres, duration_seconds, "
+        "       avg_flow_lpm, peak_flow_lpm, flow_variability, "
+        "       steady_state_fraction, flow_rise_rate_lpm_s, "
+        "       flow_fall_rate_lpm_s, time_to_90pct_flow_seconds, "
+        "       opening_step_lpm, hour_sin, hour_cos "
+        "FROM events "
+        "WHERE circuit = ? "
+        "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
+        "  AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND volume_litres > 0 AND duration_seconds > 0"
+    )
+    if len(rows) < _SIGNATURE_KNN_MIN_TOTAL_LABELS:
+        return None
+    hit = _knn_vote(rows, event_features, _SIGNATURE_KNN_INVARIANT_FEATURES,
+                    _SIGNATURE_KNN_INVARIANT_SCALES,
+                    _SIGNATURE_KNN_INVARIANT_LOG_FEATURES)
+    if hit is not None:
+        hit["match_source"] = "invariant_features"
     return hit
 
 
@@ -5756,6 +5850,9 @@ def reclassify_all_events_from_signatures(
     calib = _calib_cache.get(get_current_regime_id(conn), _calib_cache[0])
     qfeats = tuple(dict.fromkeys(
         _SIGNATURE_MATCH_FEATURES + _SIGNATURE_KNN_ACTIVE_FEATURES
+        # dev34: the regime-invariant rung's shape features (the rest of its
+        # set is already covered by the tuples above).
+        + _SIGNATURE_KNN_INVARIANT_FEATURES
         + ("has_pressure_transient",)     # the flush predicate's extra input
         # dev19: the edge tier reads these off the query dict (expanded inside
         # match_event_to_signature_knn); harmless extras for the rules tier.
@@ -5825,7 +5922,7 @@ def reclassify_all_events_from_signatures(
             log.warning("[%s] fingerprint library unavailable: %s", circuit, e)
 
     # Toilet physics veto (dev17) — cap computed once for the whole pass.
-    from .event_rules import toilet_physics_veto
+    from .event_rules import toilet_veto_reason
     _toilet_cap = get_toilet_flush_cap_litres(conn)
 
     where = "WHERE circuit = ? AND user_fixture_type IS NULL"
@@ -5905,17 +6002,24 @@ def reclassify_all_events_from_signatures(
                     # tight threshold, enforced inside FingerprintLibrary.match.)
                     if new_type in CYCLE_ONLY_FIXTURE_TYPES:
                         new_type = None
-                    new_via = "knn" if new_type is not None else None
+                    # dev34: distinguish the regime-invariant rung so its
+                    # contribution is measurable (and separable) in the data.
+                    new_via = (
+                        None if new_type is None
+                        else "knn_invariant"
+                        if hit.get("match_source") == "invariant_features"
+                        else "knn")
             # Toilet physics veto (dev17): whatever tier proposed 'toilet'
             # (rule / fingerprint / k-NN), the event must be physically able
             # to BE a flush. Vetoed → abstain (never re-guess another type).
             if new_type == "toilet":
                 vfeats = dict(feats)
                 vfeats["active_flow_segment_count"] = r["active_flow_segment_count"]
-                if toilet_physics_veto(vfeats, _toilet_cap):
+                why = toilet_veto_reason(vfeats, _toilet_cap)
+                if why:
                     log.info("[%s] event %s: toilet match (%s) vetoed by flush "
-                             "physics (vol=%s L, cap=%.1f L)", circuit, r["id"],
-                             new_via, r["volume_litres"], _toilet_cap)
+                             "physics — %s (vol=%s L)", circuit, r["id"],
+                             new_via, why, r["volume_litres"])
                     new_type, new_via = None, None
         prev = r["matched_fixture_type"]
         if (new_type, new_via, new_group) != (

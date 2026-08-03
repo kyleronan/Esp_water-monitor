@@ -20,6 +20,42 @@ def _get_orchestrator(request: Request):
     return request.app.state.orchestrator
 
 
+# Leak-watch freshness: the estimate must come from one of the N most recent
+# EVALUATED nights. "Evaluated" (not calendar) nights matches the convention in
+# evaluate_hysteresis/evaluate_leak_alert — an HA outage that skips a night
+# must not age out a live reading.
+#
+# dev34: the tile previously took the newest night carrying an estimate out of
+# the last 14, with no age test at all. When the 2026-07 pump cycling stopped
+# after the valve service, the last night that HAD an estimate kept winning and
+# the banner asserted an active leak in the present tense for six days — and,
+# because dev33's contamination gate only stops FUTURE writes, the number it
+# was showing was the one the audit had already attributed to the 02:00
+# irrigation program. Three evaluated nights of no estimate now clears it,
+# which is the behavior the tile's docstring always claimed.
+_LEAK_WATCH_MAX_AGE_NIGHTS: int = 3
+
+
+def _fresh_leak_estimate(nights: list, ack: str | None) -> Dict[str, Any] | None:
+    """Newest evaluated night carrying a leak estimate, or None.
+
+    Two gates: the night must be within _LEAK_WATCH_MAX_AGE_NIGHTS of the most
+    recent evaluated night, and it must be newer than any night the user has
+    dismissed. Dismissal is per-READING — a later night with a fresh estimate
+    re-shows the tile, so one click can never silence a real leak.
+    """
+    dismissed_through = None
+    if ack and str(ack).startswith("dismissed:"):
+        dismissed_through = str(ack).split(":", 1)[1]
+    for n in nights[:_LEAK_WATCH_MAX_AGE_NIGHTS]:
+        if not n.get("est_leak_lpd"):
+            continue
+        if dismissed_through and n["night_date"] <= dismissed_through:
+            return None      # this reading, or an older one, was acknowledged
+        return n
+    return None
+
+
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     orch = _get_orchestrator(request)
@@ -80,7 +116,7 @@ async def dashboard(request: Request):
         supply_banner = {"show": False}
 
     # Phase 5a leak-watch tile: latest nightly street-calibrated estimate,
-    # shown only when pump mode is armed and the last evaluated night carried
+    # shown only when pump mode is armed and a RECENT evaluated night carried
     # an estimate. Best-effort.
     leak_watch = None
     try:
@@ -88,7 +124,7 @@ async def dashboard(request: Request):
         from ..database import get_pump_regime_nights
         if any(pump_gates_active(orch.db, c.circuit) for c in cfg.circuits):
             nights = get_pump_regime_nights(orch.db, limit=14)
-            latest = next((n for n in nights if n.get("est_leak_lpd")), None)
+            latest = _fresh_leak_estimate(nights, profile.get("leak_watch_ack"))
             if latest:
                 leak_watch = {
                     "lpd": latest["est_leak_lpd"],

@@ -542,6 +542,30 @@ async def pump_banner_dismiss(request: Request):
     return ingress_redirect(request, "/settings#profile")
 
 
+@router.post("/leak-banner/dismiss")
+async def leak_banner_dismiss(request: Request):
+    """User acknowledged the leak-watch reading. Stamps the night being shown
+    so THAT reading (and older ones) stay hidden; a later night carrying a
+    fresh estimate re-shows the tile. Per-reading, not per-feature — one click
+    must never be able to silence a leak that is still being measured.
+
+    Nothing about detection, alerting or the nightly estimate changes: the HA
+    alert path (evaluate_leak_alert) is untouched by this.
+    """
+    orch = _orch(request)
+    from ..config import pump_gates_active
+    from ..database import get_pump_regime_nights, update_home_profile
+    nights = get_pump_regime_nights(orch.db, limit=14)
+    latest = next((n for n in nights if n.get("est_leak_lpd")), None)
+    if latest is None:
+        return ingress_redirect(request, "/")
+    update_home_profile(orch.db,
+                        leak_watch_ack=f"dismissed:{latest['night_date']}")
+    log.info("leak-watch banner: dismissed through night %s (a newer estimate "
+             "re-shows it)", latest["night_date"])
+    return ingress_redirect(request, "/")
+
+
 # ------------------------------------------------------------------
 # Supply-pressure regime banner
 # ------------------------------------------------------------------

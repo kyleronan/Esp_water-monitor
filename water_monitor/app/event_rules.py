@@ -204,6 +204,34 @@ def toilet_flush_cap_litres(build_year: Optional[int] = None,
     return _TOILET_CAP_FALLBACK_L * _TOILET_CAP_MARGIN
 
 
+def toilet_veto_reason(features: Dict[str, Any],
+                       cap_litres: float) -> Optional[str]:
+    """Which physics test rejects this event as a single flush, or None.
+
+    Same logic as ``toilet_physics_veto`` (which wraps this); split out so the
+    log line can name the condition that actually fired. It previously printed
+    only the volume and the era cap, so a 2.5 L event rejected by the 2.8 L
+    manufactured floor logged as "vol=2.5 L, cap=30.5 L" and read like a
+    passing event — which is no help at all when several dozen of them scroll
+    past in one reclassify.
+    """
+    vol = _f(features, "volume_litres")
+    if vol is not None:
+        if vol < TOILET_MIN_FLUSH_L:
+            return f"below the {TOILET_MIN_FLUSH_L} L manufactured flush floor"
+        if vol > cap_litres:
+            return f"above this home's {cap_litres:.1f} L era cap"
+    pk = _f(features, "peak_flow_lpm")
+    if pk is not None and pk < TOILET_VETO_MIN_PK_LPM:
+        return (f"peak flow {pk:.2f} < {TOILET_VETO_MIN_PK_LPM} L/min "
+                "(too weak for a cistern refill)")
+    seg = _f(features, "active_flow_segment_count")
+    if seg is not None and seg > TOILET_VETO_MAX_SEGMENTS:
+        return (f"{int(seg)} flow segments > {TOILET_VETO_MAX_SEGMENTS} "
+                "(a refill is one continuous segment)")
+    return None
+
+
 def toilet_physics_veto(features: Dict[str, Any], cap_litres: float) -> bool:
     """True = this event physically cannot be a single toilet flush.
 
@@ -213,16 +241,7 @@ def toilet_physics_veto(features: Dict[str, Any], cap_litres: float) -> bool:
     a flush", this one says "cannot be a flush" — only the latter may override
     another tier's positive evidence (e.g. a k-NN vote).
     """
-    vol = _f(features, "volume_litres")
-    if vol is not None and (vol < TOILET_MIN_FLUSH_L or vol > cap_litres):
-        return True
-    pk = _f(features, "peak_flow_lpm")
-    if pk is not None and pk < TOILET_VETO_MIN_PK_LPM:
-        return True
-    seg = _f(features, "active_flow_segment_count")
-    if seg is not None and seg > TOILET_VETO_MAX_SEGMENTS:
-        return True
-    return False
+    return toilet_veto_reason(features, cap_litres) is not None
 
 
 # ── Per-home calibration plumbing (Phase 1) ─────────────────────────────────────

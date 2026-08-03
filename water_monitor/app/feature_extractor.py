@@ -5016,7 +5016,9 @@ class FeatureExtractor:
                              circuit, event_id, sig_hit["fixture_type"])
                 else:
                     matched_fixture_type = sig_hit["fixture_type"]
-                    matched_via = "knn"
+                    matched_via = ("knn_invariant"
+                                   if sig_hit.get("match_source")
+                                   == "invariant_features" else "knn")
                     log.info(
                         "[%s] event %s matched signature %s (dist=%.2f, "
                         "trained on %d events)",
@@ -5037,14 +5039,15 @@ class FeatureExtractor:
         if matched_fixture_type == "toilet":
             try:
                 from .database import get_toilet_flush_cap_litres
-                from .event_rules import toilet_physics_veto
+                from .event_rules import toilet_veto_reason
                 cap = get_toilet_flush_cap_litres(self._db)
-                if toilet_physics_veto(features, cap):
+                why = toilet_veto_reason(features, cap)
+                if why:
                     log.info("[%s] event %s: toilet match (%s) vetoed by flush "
-                             "physics (vol=%s L, peak=%s lpm, cap=%.1f L)",
-                             circuit, event_id, matched_via,
+                             "physics — %s (vol=%s L, peak=%s lpm)",
+                             circuit, event_id, matched_via, why,
                              features.get("volume_litres"),
-                             features.get("peak_flow_lpm"), cap)
+                             features.get("peak_flow_lpm"))
                     matched_fixture_type, matched_via = None, None
             except Exception as e:
                 log.warning("[%s] toilet physics veto failed (non-fatal): %s",
