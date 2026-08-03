@@ -292,6 +292,38 @@ PRESSURE_AUTOCORR_THRESHOLD  = 0.5
 FLOW_TROUGH_LPM              = 0.20
 MIN_TROUGH_EPISODE_RATE_HZ   = 0.15
 APPLIANCE_FLOW_PRESSURE_RATIO = 30.0
+
+# dev33 — constant-pressure (VFD) booster-pump ripple exemption.
+#
+# The ESYBOX's control loop hunts around its setpoint at ~1 Hz with ±1.4-2.1 psi
+# of mid-event pressure wobble. That is invisible at a fixture and leaves the
+# meter perfectly trustworthy, but it satisfies every pulsing-supply gate — the
+# 2026-07 install drove degraded events from 0 to 27-68/week, each one needlessly
+# volume-estimated and excluded.
+#
+# 1.5 s is INSIDE the observed distribution, not a gap: measured pump ripple runs
+# 0.93-2.0 s (all but 2 of 121 post-pump events below 1.5 s), and pre-pump GENUINE
+# pulsing runs 0.81-2.0 s. Period alone therefore cannot discriminate — which is
+# why the exemption is additionally gated on the pump ERA (see
+# supply_regime.pump_era_start). Re-derive this constant if the pump's setpoint
+# or hunting frequency changes: histogram pressure_dominant_period_s over
+# degraded events in the pump era and take the upper edge of the fast mode.
+#
+# Interim measure. The principled fix is a narrowband spectral discriminator
+# (FFT the 6.2 Hz idle-pressure stream and gate on the ripple line) — that also
+# addresses the premature-close and volume-inflation members of this family.
+_VFD_RIPPLE_MAX_PERIOD_S: float = 1.5
+VFD_RIPPLE_EXEMPT_REASON: str = "vfd_ripple_exempt"
+
+# dev33 — "every classification tier evaluated this event and abstained".
+# Distinct from the artifact reasons (which say the event isn't real water) and
+# from the cluster-tier reasons ('no_centers' / 'features_missing' /
+# 'type_gate_rejected'); this one says the event IS real, was evaluated, and
+# nothing recognised it. Written only into an empty reason, and retracted as
+# soon as any pass matches the event — a marker that couldn't retract would
+# make a classification RECOVERY as invisible as the outage it measures.
+NO_TIER_MATCHED_REASON: str = "no_tier_matched"
+
 VOLUME_ENVELOPE_PERCENTILE   = 0.95
 VOLUME_ENVELOPE_WINDOW_S     = 5.0
 FIXTURE_CYCLE_PERIOD_MAX_S   = 30.0
@@ -352,13 +384,22 @@ _PHANTOM_MAX_FLOW_ON_RATIO:   float = 0.05
 # never mask a leak (only zeroing could), so this is strictly leak-safer.
 _PHANTOM_REVIEW_FLAG_LITRES:  float = 10.0
 
-# Pulsing-supply envelope cap (2026-07 audit, Phase 2a). The envelope estimate
-# measured 2.86x reality in aggregate (worst single case: 336 L claimed for 2 L
-# real). Cap it against the best available measured-flow evidence: the estimate
-# may exceed the flow integral (the flow meter under-reads during pulsing —
-# that's why the envelope estimator exists) but not by more than the multiplier;
-# the floor keeps tiny events from being clamped into meaninglessness.
-_ENVELOPE_CAP_FLOW_MULT: float = 1.5
+# Pulsing-supply envelope cap (2026-07 audit Phase 2a; TIGHTENED dev33 §8.5).
+# The envelope estimate measured 2.86x reality in aggregate (worst single case:
+# 336 L claimed for 2 L real). Phase 2a capped it at 1.5x the measured-flow
+# evidence — but the 2026-08-02 audit showed that ceiling IS the remaining
+# inflation: effective > raw > true-history on every checked pulsing event
+# (11.73 -> 18.04 L = exactly 1.5x the flow integral; +105 L across the live
+# DB). The premise that "the flow meter under-reads during pulsing" did not
+# survive: the meter agreed with raw HA history to ~1% on those same events.
+#
+# So the multiplier is 1.0 — for a degraded event the estimate can only REDUCE
+# or match the metered volume. Genuine meter gaps are still covered by the
+# `base is None` branch below (meter read NOTHING at all). A PARTIAL meter gap
+# (meter read something, but under-read) is uncorrectable upward by design:
+# a chosen trade, and an empirical bet on this house's meters, not a property
+# of the design. `_ENVELOPE_CAP_FLOOR_L` still protects tiny events.
+_ENVELOPE_CAP_FLOW_MULT: float = 1.0
 _ENVELOPE_CAP_FLOOR_L:   float = 2.0
 
 # Sparse envelope (Fix 4): a LONG event that is almost entirely idle — a brief real draw
@@ -435,6 +476,15 @@ _METER_FLOOR_PD_LPM:      float = 1.1
 _METER_FLOOR_TURBINE_LPM: float = 1.0
 _PD_CLASS_MIN_FLOW_FLOOR_LPM: float = 0.5
 BELOW_METER_FLOOR_REASON: str = "below_meter_floor"
+
+# dev33 (§1.1) — minimum raw volume for the one-shot relabel-repair scan to
+# auto-restore a user-classified zeroed row. Set at 1.0 L: the production
+# census showed the two genuine losses at 685.3 L and 3.9 L, and every
+# false-positive candidate at <= 0.2 L, so this sits an order of magnitude
+# clear of both. A conservative gate by design — a row below it that really
+# was water is restored the moment the user relabels it (see
+# database.revert_artifact_zeroing_on_relabel).
+_RELABEL_REPAIR_MIN_VOLUME_L: float = 1.0
 
 
 def _meter_registration_floor(min_flow_lpm: float) -> float:
@@ -735,6 +785,8 @@ def _detect_degraded_supply(
     pre_event_pressure_psi: float,
     resistance_shape: str,
     duration_s: float,
+    *,
+    pump_mode: bool = False,
 ):
     """Detect supply-driven pulsation in a captured event.
 
@@ -880,18 +932,23 @@ def _detect_degraded_supply(
     diag["resistance_shape"] = resistance_shape
     diag["period_matched"] = period_matched
 
-    is_degraded, reason = _evaluate_degraded_from_diag(diag)
+    if pump_mode:
+        diag["pump_mode"] = True      # provenance: persisted in the stored diag
+    is_degraded, reason = _evaluate_degraded_from_diag(diag, pump_mode)
     diag["reason"] = reason
     return is_degraded, diag
 
 
-def _evaluate_degraded_from_diag(diag: dict):
+def _evaluate_degraded_from_diag(diag: dict, pump_mode: bool = False):
     """Apply the post-detection threshold gates to a diagnostic dict.
 
     Pure function over the stored diagnostic fields. Used by both the live
     detector (so the gates exist in one place) and the reprocess endpoint
     (so threshold changes apply retroactively to events with stored
     diagnostics, without needing the raw sample series).
+
+    ``pump_mode`` marks an event captured while a constant-pressure (VFD)
+    booster pump was in service — see ``_VFD_RIPPLE_MAX_PERIOD_S``.
 
     Diagnostics produced by early-exit gates (`pressure_steady`,
     `frequency_mismatch_fixture_cycling`, `appliance_cycling`,
@@ -904,6 +961,22 @@ def _evaluate_degraded_from_diag(diag: dict):
     """
     if "flow_trough_episode_rate_hz" not in diag:
         return False, diag.get("reason", "unknown")
+
+    # dev33 — VFD ripple exemption. A constant-pressure pump hunts around its
+    # setpoint at ~1 Hz; that ripple pattern-matches "pulsing supply" while the
+    # meter stays perfectly trustworthy, and it drove degraded events from 0 to
+    # 27-68/week after the 2026-07 install. Exempt the fast band, but ONLY for
+    # events captured in the pump era: pre-pump genuine pulsing occupies the
+    # SAME 0.8-2.0 s band, so period alone cannot discriminate — era + period
+    # can. Slower supply pulsation (>= 1.5 s) stays detectable under the pump.
+    if pump_mode:
+        _p = diag.get("pressure_dominant_period_s")
+        try:
+            _p = float(_p) if _p is not None else None
+        except (TypeError, ValueError):
+            _p = None
+        if _p is not None and _p < _VFD_RIPPLE_MAX_PERIOD_S:
+            return False, VFD_RIPPLE_EXEMPT_REASON
 
     period_matched = bool(diag.get("period_matched", False))
     flow_score = float(diag.get("flow_autocorr_score") or 0.0)
@@ -2228,6 +2301,94 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             log.info("capped-reprocess: re-included %d capped-only event(s)",
                      capped_reincluded)
 
+    # ── Scan 6 (dev33 §1.1): restore user-labelled real water that an artifact
+    # verdict zeroed while `user_classified=1` held every other sweep off it.
+    #
+    # These rows are unreachable by Scans 1-5 (all carry uc_guard/uft_guard) and
+    # by repair_artifact_flag_consistency (which HONOURS mrr on user_classified
+    # rows, cementing the bad state). They exist because the History modal
+    # pre-checked its classification boxes from the row's AUTO flags and posted
+    # them back as manual verdicts on save — fixed for new saves in the same
+    # build (history.html clsTouched), so this pass is one-shot in practice: a
+    # restored row no longer matches, and no new rows of this shape are created.
+    #
+    # Deliberately CONSERVATIVE — a real fixture label alone is not enough,
+    # because a user may legitimately label a genuine artifact (e.g. naming a
+    # 0.2 L phantom 'toilet'). Restoration additionally requires real-water
+    # evidence: >= _RELABEL_REPAIR_MIN_VOLUME_L AND active flow at or above the
+    # circuit's meter registration floor. On the 2026-08-02 production census
+    # (24 candidate rows) this restores exactly the two unambiguous ones — a
+    # 685.3 L / 8.7 LPM draw and a 3.9 L / 6.3 LPM toilet — and leaves 18
+    # sub-0.2 L micro-phantoms zeroed. Rows with real-water shape but NO fixture
+    # type are reported for manual review, never auto-restored.
+    from .database import _RELABEL_REVERTIBLE_REASONS
+    relabel_restored = 0
+    relabel_review: list = []
+    if _events_has_column(conn, "user_classified") and has_af:
+        rl_rows = conn.execute(
+            "SELECT id, circuit, start_ts, volume_litres, volume_litres_effective, "
+            "       true_avg_flow_lpm, peak_flow_lpm, user_fixture_type, "
+            "       match_rejection_reason, is_composite "
+            "FROM events "
+            "WHERE COALESCE(user_classified, 0) = 1 "
+            "  AND COALESCE(user_ignored, 0) = 0 "
+            "  AND volume_litres > ? "
+            "  AND COALESCE(volume_litres_effective, 0) < volume_litres "
+            "  AND match_rejection_reason IS NOT NULL",
+            (_RELABEL_REPAIR_MIN_VOLUME_L,),
+        ).fetchall()
+        rl_days: set = set()
+        for row in rl_rows:
+            if row["match_rejection_reason"] not in _RELABEL_REVERTIBLE_REASONS:
+                continue
+            floor = _meter_registration_floor(
+                _circuit_min_flow(conn, row["circuit"]))
+            flow = max(float(row["true_avg_flow_lpm"] or 0.0),
+                       float(row["peak_flow_lpm"] or 0.0))
+            if flow < floor:
+                continue          # sub-meter-floor: the zeroing stands
+            _label = row["user_fixture_type"]
+            if not (_label and str(_label).strip()):
+                relabel_review.append({
+                    "id": row["id"], "circuit": row["circuit"],
+                    "volume_litres": round(float(row["volume_litres"] or 0.0), 2),
+                    "reason": row["match_rejection_reason"],
+                })
+                continue
+            raw = float(row["volume_litres"] or 0.0)
+            with transaction(conn):
+                conn.execute(
+                    "UPDATE events SET "
+                    "  is_pressure_restoration_phantom = 0, is_low_flow_dribble = 0, "
+                    "  is_cross_talk = 0, phantom_suppression_averted = 0, "
+                    "  volume_litres_effective = ?, volume_estimation_method = 'raw', "
+                    "  match_rejection_reason = NULL, "
+                    "  excluded_from_training = "
+                    "    CASE WHEN is_composite = 1 THEN 1 ELSE 0 END, "
+                    "  volume_recomputed_at = ? "
+                    "WHERE id = ?",
+                    (round(raw, 3), datetime.now(timezone.utc).isoformat(), row["id"]),
+                )
+                apply_effective_volume(conn, row["id"], row["circuit"],
+                                       row["start_ts"], raw)
+            relabel_restored += 1
+            day = (row["start_ts"] or "")[:10]
+            if day:
+                rl_days.add((row["circuit"], day))
+            log.info("relabel-repair: restored %.3f L on %s (was %s, label=%r)",
+                     raw, row["id"], row["match_rejection_reason"],
+                     row["user_fixture_type"])
+        for circ, day in rl_days:
+            compute_daily_summary(conn, circ, day)
+        if rl_days:
+            conn.commit()
+        if relabel_review:
+            log.info("relabel-repair: %d user-classified row(s) look like real "
+                     "water but carry no fixture label — relabel them in History "
+                     "to restore: %s", len(relabel_review),
+                     ", ".join(f"{r['id'][:8]} ({r['volume_litres']} L, "
+                               f"{r['reason']})" for r in relabel_review))
+
     return {"flagged": flagged, "dribbles_flagged": dribbles_flagged,
             "dribbles_restored": dribbles_restored,
             "psilent_flagged": psilent_flagged,
@@ -2235,6 +2396,8 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "rise_flagged": rise["rise_flagged"],
             "sparse_flagged": sparse_flagged,
             "capped_reincluded": capped_reincluded,
+            "relabel_restored": relabel_restored,
+            "relabel_review": relabel_review,
             "excluded_fixed": repair["excluded_fixed"],
             "flag_pairs_resolved": repair["pairs_resolved"],
             "flag_pairs_unresolved": repair["unresolved"]}
@@ -2372,19 +2535,34 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
     are counted as `skipped_legacy`.
 
     Volume bookkeeping is kept in sync: events flipping to degraded swap
-    `volume_litres_effective` to the envelope estimate; events flipping
-    back to clean revert to raw `volume_litres`. The hourly_volume bucket
-    is adjusted by the delta so daily totals stay correct.
+    `volume_litres_effective` to the CAPPED envelope estimate (dev33 §8.5 —
+    this path used to write the raw uncapped one); events flipping back to
+    clean revert to raw `volume_litres`. The hourly_volume bucket is adjusted
+    by the delta, and every affected day's `daily_summary` is rebuilt — this
+    sweep was the only one of five that skipped the rebuild, so flips silently
+    left daily totals and every chart reading them stale.
+
+    dev33 also gates the VFD-ripple exemption here (`pump_mode`), resolved
+    per row from the PINNED `pump_era_start` — never from live pump-gate
+    state, which would re-flag every exempted event the moment gates flipped
+    off. Rows flipping degraded→clean are additionally re-run through
+    `_detect_pump_recharge`: they were suppressed by the finalizer's
+    `not is_degraded` guard and would otherwise become raw "Other" events
+    forever.
 
     Returns a summary dict with the counts the endpoint relays to the UI.
     """
-    from .database import _hour_bucket_for, transaction, apply_effective_volume
+    from .database import (_hour_bucket_for, transaction, apply_effective_volume,
+                           compute_daily_summary)
+    from .supply_regime import pump_era_start
+    era_start = pump_era_start(conn)
 
     rows = conn.execute(
         "SELECT id, circuit, start_ts, degraded_supply, "
-        "       degraded_diagnostic_json, volume_litres, "
+        "       degraded_diagnostic_json, volume_litres, flow_integral_litres, "
         "       volume_litres_estimated, hourly_volume_applied_litres, "
-        "       hourly_volume_applied_bucket, is_composite "
+        "       hourly_volume_applied_bucket, is_composite, "
+        "       duration_seconds, flow_pressure_corr, pressure_delta_psi "
         "FROM events "
         "WHERE degraded_diagnostic_json IS NOT NULL "
         "  AND degraded_diagnostic_json != '' "
@@ -2402,7 +2580,10 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
 
     flipped_to_degraded = 0
     flipped_to_clean = 0
+    ripple_exempted = 0
+    recharge_rederived = 0
     evaluated = 0
+    affected_days: set = set()
 
     for row in rows:
         evaluated += 1
@@ -2413,7 +2594,10 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
                         row["id"])
             continue
 
-        new_is_degraded, new_reason = _evaluate_degraded_from_diag(diag)
+        # Era-only pump gate (see the docstring): historical question,
+        # historical answer.
+        row_pump = bool(era_start and (row["start_ts"] or "") >= era_start)
+        new_is_degraded, new_reason = _evaluate_degraded_from_diag(diag, row_pump)
         old_is_degraded = bool(row["degraded_supply"])
         if new_is_degraded == old_is_degraded:
             continue  # verdict unchanged
@@ -2422,7 +2606,19 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
         diag["reason"] = new_reason
         raw_volume = float(row["volume_litres"] or 0.0)
         envelope_volume = float(row["volume_litres_estimated"] or 0.0)
-        new_effective = envelope_volume if new_is_degraded else raw_volume
+        if new_is_degraded:
+            # dev33 §8.5: route through the SAME cap as the live finalizer.
+            # This path wrote the raw uncapped `volume_litres_estimated`
+            # straight to effective, so an admin-triggered re-check could
+            # restore pre-cap inflation (the 336 L-for-2 L class of error).
+            new_effective, cap_diag = _cap_envelope_estimate(
+                envelope_volume,
+                {"flow_integral_litres": row["flow_integral_litres"],
+                 "volume_litres": row["volume_litres"]})
+            if cap_diag:
+                diag.update(cap_diag)
+        else:
+            new_effective = raw_volume
         new_method = "pulsing_supply_envelope" if new_is_degraded else "raw"
 
         # match_rejection_reason: 'pulsing_supply' only when flipped TO
@@ -2463,10 +2659,39 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
             apply_effective_volume(conn, row["id"], row["circuit"], row["start_ts"],
                                    new_effective)
 
+        day = (row["start_ts"] or "")[:10]
+        if day:
+            affected_days.add((row["circuit"], day))
+
         if new_is_degraded:
             flipped_to_degraded += 1
         else:
             flipped_to_clean += 1
+            if new_reason == VFD_RIPPLE_EXEMPT_REASON:
+                ripple_exempted += 1
+            # dev33: this row was held back from the recharge detector by the
+            # finalizer's `not is_degraded` guard. Give it one fair pass at the
+            # canonical arms now that it is clean, otherwise a genuine pump
+            # top-up becomes a raw "Other" event forever (and never anchors the
+            # recharge population).
+            if _detect_pump_recharge(row["duration_seconds"],
+                                     raw_volume,
+                                     row["flow_pressure_corr"],
+                                     row["pressure_delta_psi"]):
+                with transaction(conn):
+                    conn.execute(
+                        "UPDATE events SET is_pressure_restoration_phantom = 1, "
+                        "  volume_litres_effective = 0.0, "
+                        "  volume_estimation_method = ?, "
+                        "  match_rejection_reason = ?, "
+                        "  excluded_from_training = 1 "
+                        "WHERE id = ?",
+                        (PUMP_RECHARGE_REASON, PUMP_RECHARGE_REASON, row["id"]),
+                    )
+                    apply_effective_volume(conn, row["id"], row["circuit"],
+                                           row["start_ts"], 0.0)
+                recharge_rederived += 1
+                new_effective = 0.0
         log.info(
             "reprocess: event %s flipped %s → %s (reason=%s, effective_vol %.3f → %.3f)",
             row["id"],
@@ -2477,10 +2702,25 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
             new_effective,
         )
 
+    # Rebuild every affected day ONCE (batched): this sweep moves real volume
+    # — both the un-degraded rows reverting to raw and the dev33 cap change —
+    # and was the only reprocess of five that never refreshed daily_summary.
+    for circ, day in affected_days:
+        compute_daily_summary(conn, circ, day)
+    if affected_days:
+        conn.commit()
+    if ripple_exempted:
+        log.info("reprocess: %d event(s) exempted as VFD pump ripple "
+                 "(period < %.1f s inside the pump era)",
+                 ripple_exempted, _VFD_RIPPLE_MAX_PERIOD_S)
+
     return {
         "evaluated": evaluated,
         "flipped_to_degraded": flipped_to_degraded,
         "flipped_to_clean": flipped_to_clean,
+        "ripple_exempted": ripple_exempted,
+        "recharge_rederived": recharge_rederived,
+        "days_rebuilt": len(affected_days),
         "skipped_legacy": skipped_legacy,
     }
 
@@ -2488,6 +2728,7 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
 def _estimate_volume_smoothed(
     flow_readings: List[float],
     duration_s: float,
+    flow_integral_litres: Optional[float] = None,
 ) -> float:
     """Spike-resistant smoothed volume estimate for degraded events.
 
@@ -2498,15 +2739,37 @@ def _estimate_volume_smoothed(
     AND any phantom-pulse spikes that paddlewheel rectification might
     introduce.
 
-    For very short events with too few samples to envelope-smooth, fall
-    back to a plain mean times duration.
+    dev33 (§8.5): this became load-bearing when the envelope cap dropped to
+    1.0x, because the `base is None` branch of ``_cap_envelope_estimate`` is
+    now the ONLY path whose result may exceed the metered volume. Two honesty
+    fixes:
+
+      * few-sample / very short events used ``mean x duration``, which for a
+        burst-shaped draw over-counts the idle remainder — prefer the measured
+        flow integral when one exists;
+      * the windowed path takes the median of window MAXES, which for an event
+        with only a handful of windows approximates ``peak x duration``. Use
+        the window MEAN so a short event's estimate reflects sustained flow
+        rather than its peak. (Trough rejection is preserved: the percentile
+        cap still clips spikes, and the median across windows still rejects
+        sub-event outliers.)
     """
     if not flow_readings or duration_s <= 0:
         return 0.0
     cleaned = [f for f in _finite_float_series(flow_readings) if f >= 0]
     if not cleaned:
         return 0.0
+    try:
+        integral = (float(flow_integral_litres)
+                    if flow_integral_litres is not None else None)
+    except (TypeError, ValueError):
+        integral = None
+    if integral is not None and (not math.isfinite(integral) or integral <= 0):
+        integral = None
+
     if len(cleaned) < 5 or duration_s < 5:
+        if integral is not None:
+            return integral      # measured beats mean x duration
         avg = sum(cleaned) / len(cleaned)
         return max(0.0, avg * (duration_s / 60.0))
 
@@ -2522,11 +2785,11 @@ def _estimate_volume_smoothed(
     for i in range(0, len(cleaned), win):
         chunk = cleaned[i:i + win]
         if chunk:
-            windowed.append(min(max(chunk), cap))
+            windowed.append(min(sum(chunk) / len(chunk), cap))
     if not windowed:
         return 0.0
     windowed.sort()
-    effective_flow = windowed[len(windowed) // 2]   # median of window-maxes
+    effective_flow = windowed[len(windowed) // 2]   # median of window means
     return max(0.0, effective_flow * (duration_s / 60.0))
 
 
@@ -3560,7 +3823,8 @@ def _late_waveform_upgrade_job(conn, circuit: str, record: WaveformRecord):
     return best["id"] if cur.rowcount > 0 else None
 
 
-def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15) -> Dict[str, Any]:
+def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
+                     pump_mode: bool = False) -> Dict[str, Any]:
     """Compute the full feature vector from a RawEvent.
 
     ``min_flow_lpm`` is the per-circuit meter-derived low-flow floor (60 ÷ ppl);
@@ -3656,7 +3920,7 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15) -> Dict[str
     # corrupted by the chaotic flow readings). Always compute the smoothed
     # estimate — useful diagnostically even for healthy events.
     volume_litres_estimated = _estimate_volume_smoothed(
-        event.flow_readings, duration
+        event.flow_readings, duration, flow_integral_litres
     )
     is_degraded, deg_diag = _detect_degraded_supply(
         event.pressure_readings,
@@ -3664,6 +3928,7 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15) -> Dict[str
         pre_event_pressure,
         shape,
         duration,
+        pump_mode=pump_mode,
     )
     # The phantom verdict + volume_litres_effective + volume_estimation_method
     # + excluded_from_training + match_rejection_reason are ALL derived by
@@ -4052,7 +4317,27 @@ class FeatureExtractor:
         min_flow_lpm = 0.15
         if self._event_detector is not None:
             min_flow_lpm = self._event_detector.min_flow_for(event.circuit)
-        features = extract_features(event, min_flow_lpm=min_flow_lpm)
+        # dev33 — VFD ripple exemption (see _VFD_RIPPLE_MAX_PERIOD_S). Live and
+        # retroactive verdicts must answer the SAME question, so the live path
+        # takes the era predicate too, OR'd with current gate state. Once
+        # pump_era_start is pinned in the past the OR is permanently true; the
+        # gate term is kept because it is the only branch that fires on a home
+        # with pump mode confirmed but no era pinned yet.
+        _pump_ripple = False
+        try:
+            from .config import pump_gates_active
+            from .supply_regime import pump_era_start
+            _era = pump_era_start(self._db)
+            _pump_ripple = bool(pump_gates_active(self._db, event.circuit)) or (
+                _era is not None
+                and (event.start_ts.isoformat() if hasattr(event.start_ts,
+                                                           "isoformat")
+                     else str(event.start_ts)) >= _era)
+        except Exception as e:      # never fatal — worst case: legacy behavior
+            log.debug("[%s] pump-era resolve failed (non-fatal): %s",
+                      event.circuit, e)
+        features = extract_features(event, min_flow_lpm=min_flow_lpm,
+                                    pump_mode=_pump_ripple)
 
         # Attempt to enrich features from ESP waveform capture (firmware 3.7.0+).
         # Per-group routing: each group falls back to the legacy value independently.
@@ -4495,6 +4780,23 @@ class FeatureExtractor:
     async def _cluster_event(self, circuit: str, features: dict) -> None:
         """Compute sequence context, run cluster matching, write results back."""
         if features.get("excluded_from_training"):
+            # dev33 (§2.1): record WHY, instead of returning in silence. The
+            # schema has documented 'excluded_from_training' as a
+            # match_rejection_reason value since the matcher shipped, but
+            # nothing ever wrote it — so an excluded row and a row the
+            # classifier evaluated and declined were indistinguishable
+            # downstream. Never clobber an artifact reason (which is both more
+            # specific and the thing that caused the exclusion).
+            if not features.get("match_rejection_reason"):
+                try:
+                    self._db.execute(
+                        "UPDATE events SET match_rejection_reason = "
+                        "'excluded_from_training' "
+                        "WHERE id = ? AND match_rejection_reason IS NULL",
+                        (features.get("id"),))
+                    self._db.commit()
+                except Exception as e:      # visibility must never be fatal
+                    log.debug("[%s] excluded-reason stamp failed: %s", circuit, e)
             return
 
         event_id    = features["id"]
@@ -4757,6 +5059,20 @@ class FeatureExtractor:
         features["matched_fixture_type"] = matched_fixture_type
         anomaly = self._score_anomaly(circuit, features)
         features["_anomaly"] = anomaly
+
+        # dev33 (§2.1) — record classification-tier abstention. When every tier
+        # (structural rules → fingerprint → k-NN) declines, the row used to be
+        # written with matched_fixture_type=NULL, matched_via=NULL and no
+        # reason: "the classifier looked and declined" was indistinguishable
+        # from "never evaluated". 933 events failed that way silently while the
+        # cluster tier was dead. Only fills an EMPTY reason (artifact and
+        # cluster-tier reasons are more specific and must win), and is cleared
+        # symmetrically the moment a later pass matches the event.
+        if matched_fixture_type is None and not match_rejection_reason:
+            match_rejection_reason = NO_TIER_MATCHED_REASON
+        elif (matched_fixture_type is not None
+                and match_rejection_reason == NO_TIER_MATCHED_REASON):
+            match_rejection_reason = None
 
         # Write cluster results back to the event row
         self._db.execute(

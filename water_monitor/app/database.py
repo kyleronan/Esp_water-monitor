@@ -253,6 +253,12 @@ CREATE TABLE IF NOT EXISTS home_profile (
     pump_profile                   TEXT,
     supply_type_set_at             TEXT,
     pump_alert_armed_at            TEXT,
+    -- pump_era_start (migration 20260566): PINNED start of the booster-pump
+    -- era. Retroactive pump-era sweeps (the VFD-ripple exemption) gate on this
+    -- instead of live pump-gate state or the current supply regime, so neither
+    -- a gate flip nor a later supply transition can re-flag already-exempted
+    -- events. Resolved once by supply_regime.pump_era_start, then read.
+    pump_era_start                 TEXT,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -908,12 +914,16 @@ CREATE TABLE IF NOT EXISTS events (
     -- (anomaly_type 'suppression_averted'). Excluded from training until the
     -- user reviews/relabels. Survives rescores (score_event_anomaly reads it).
     phantom_suppression_averted      INTEGER DEFAULT 0,
-    -- Low-flow dribble guard (migration 20260535). When 1, this event is a
-    -- brief low-flow / low-volume / near-zero-pressure trickle (sensor or
-    -- pressure-equalisation noise). UNLIKE a phantom it does NOT zero volume —
-    -- it only sets excluded_from_training so the event stays out of the
-    -- classifier / clustering training set while its (tiny) volume still counts
-    -- toward totals. Auto-derived; suppressed for user_classified rows.
+    -- Low-flow dribble guard (migration 20260535). When 1, this event's ACTIVE
+    -- flow never reached the circuit meter's registration floor (2026-07-05
+    -- below-meter-floor rule; ~1.0-1.1 L/min) — the reading is outside the
+    -- meter's valid operating regime. Since 2026-06-19 this DOES zero volume
+    -- (volume_litres_effective=0, like a phantom) as well as setting
+    -- excluded_from_training; the pre-2026-06 comment here claimed otherwise
+    -- and was stale for over a year. Auto-derived (reason 'below_meter_floor')
+    -- or manual (reason 'low_flow_dribble'); suppressed for user_classified
+    -- rows. A user assigning a real fixture type REVERSES the zeroing —
+    -- database.revert_artifact_zeroing_on_relabel.
     is_low_flow_dribble              INTEGER NOT NULL DEFAULT 0,
     -- Cross-talk artifact (migration 20260540). When 1, a long event registered
     -- via a pressure drop with essentially no real flow on THIS circuit (another
@@ -924,10 +934,15 @@ CREATE TABLE IF NOT EXISTS events (
     is_cross_talk                    INTEGER NOT NULL DEFAULT 0,
     -- Sprint H. user_ignored: explicit Ignore/Restore intent (separate from
     -- the derived excluded_from_training, which is auto OR user_ignored OR
-    -- manual). user_classified: lock bit — when 1 the three category flags
-    -- (is_pressure_restoration_phantom / is_cross_talk / degraded_supply /
-    -- is_composite) hold the user's manual choices and auto-detection must never
-    -- overwrite them.
+    -- manual). user_classified: lock bit — when 1 the category flags
+    -- (is_pressure_restoration_phantom / is_cross_talk / is_low_flow_dribble /
+    -- degraded_supply / is_composite) hold the user's manual choices and
+    -- auto-detection must never overwrite them. NOTE (dev33): the lock holds
+    -- auto-detection off, but it does NOT outrank a later fixture LABEL — a
+    -- real user_fixture_type means "this was real water" and reverses a
+    -- zeroing verdict (revert_artifact_zeroing_on_relabel). Before dev33 the
+    -- lock could preserve a wrong zeroing forever, which is how a labelled
+    -- 685 L draw counted as 0.
     user_ignored                     INTEGER DEFAULT 0,
     user_classified                  INTEGER DEFAULT 0,
     -- Temporal "appliance cycle" signal: count of similar-volume neighbour
@@ -3131,7 +3146,8 @@ def _apply_event_verdicts(
     therefore never drift. Returns False if no such event.
     """
     row = conn.execute(
-        "SELECT volume_litres, volume_litres_estimated, user_ignored, "
+        "SELECT volume_litres, volume_litres_estimated, flow_integral_litres, "
+        "       user_ignored, "
         "       hourly_volume_applied_litres, hourly_volume_applied_bucket, start_ts "
         "FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit),
@@ -3146,7 +3162,17 @@ def _apply_event_verdicts(
     elif new_cross_talk:
         new_effective, method = 0.0, "cross_talk"
     elif new_degraded:
+        # dev33 §8.5: the manual "supply pressure" checkbox wrote the RAW
+        # uncapped envelope estimate — the same bypass the reprocess sweep had.
+        # Route it through the finalizer's cap so a user checkbox can never
+        # produce more water than the meter measured.
+        from .feature_extractor import _cap_envelope_estimate
         new_effective = float(est) if est is not None else raw
+        if est is not None:
+            new_effective, _ = _cap_envelope_estimate(
+                new_effective,
+                {"flow_integral_litres": row["flow_integral_litres"],
+                 "volume_litres": row["volume_litres"]})
         method = "pulsing_supply_envelope"
     elif new_dribble:
         # Dribble is now a volume-zeroing verdict (matches _finalize_derived_verdicts):
@@ -3428,6 +3454,92 @@ def revert_irrigation_cross_talk(
         compute_daily_summary(conn, circuit, day)
         conn.commit()
     return True
+
+
+# Artifact verdicts that ZERO an event's volume and are therefore undone when
+# the user says "this was real water" by assigning a fixture type. Deliberately
+# EXCLUDES:
+#   * 'pulsing_supply'    — degraded supply ESTIMATES volume, it doesn't zero it
+#                           (a relabel shouldn't silently swap estimate→raw);
+#   * 'overlap_duplicate' — the volume is genuinely counted by the child events,
+#                           so restoring it would double-count.
+_RELABEL_REVERTIBLE_REASONS: frozenset = frozenset({
+    "below_meter_floor",             # BELOW_METER_FLOOR_REASON (auto dribble path)
+    "low_flow_dribble",              # legacy/manual dribble verdict
+    "pressure_restoration_phantom",
+    "rising_pressure_phantom",       # RISE_PHANTOM_REASON
+    "pressure_silent_flow",          # PRESSURE_SILENT_REASON
+    "pump_recharge",                 # PUMP_RECHARGE_REASON
+    "cross_talk",
+    "irrigation_cross_talk",         # _IRRIGATION_XTALK_REASON
+    "sparse_envelope",               # SPARSE_ENVELOPE_REASON
+})
+
+
+def revert_artifact_zeroing_on_relabel(
+    conn: sqlite3.Connection, event_id: str, circuit: str,
+) -> Optional[str]:
+    """Undo an artifact ZEROING when the user labels the event a real fixture.
+
+    A fixture label is the user asserting "this was real water", and the UI
+    frames every artifact flag as *relabel if wrong* — so relabeling has to BE
+    the recovery path. Before dev33 only irrigation cross-talk had one
+    (``revert_irrigation_cross_talk``), which is how a user-labelled 685 L draw
+    stayed zeroed: its verdict had been written through the manual classify
+    endpoint, and nothing downstream honoured the label.
+
+    Restores ``volume_litres_effective = volume_litres`` through the
+    ``apply_effective_volume`` chokepoint, clears the zeroing flags + reason,
+    and recomputes the day's summary. Unlike ``revert_irrigation_cross_talk``
+    this DOES override ``user_classified`` — a fresh explicit label supersedes
+    an earlier checkbox verdict — but it never touches:
+      * ``user_ignored`` rows (the user asked for this event to be ignored),
+      * verdicts outside ``_RELABEL_REVERTIBLE_REASONS`` (see the note there),
+      * rows whose effective volume already equals raw (nothing to restore).
+
+    Returns the reverted reason (for logging) or None when nothing changed.
+    """
+    row = conn.execute(
+        "SELECT volume_litres, volume_litres_effective, start_ts, user_ignored, "
+        "       match_rejection_reason, is_pressure_restoration_phantom, "
+        "       is_low_flow_dribble, is_cross_talk, is_composite "
+        "FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if row is None or row["user_ignored"]:
+        return None
+    reason = row["match_rejection_reason"]
+    if reason not in _RELABEL_REVERTIBLE_REASONS:
+        return None
+    raw = float(row["volume_litres"] or 0.0)
+    eff = float(row["volume_litres_effective"] or 0.0)
+    if raw <= 0.0 or abs(eff - raw) < 1e-6:
+        return None   # nothing was zeroed (or nothing to restore)
+
+    with transaction(conn):
+        conn.execute(
+            "UPDATE events SET "
+            "  is_pressure_restoration_phantom = 0, is_low_flow_dribble = 0, "
+            "  is_cross_talk = 0, phantom_suppression_averted = 0, "
+            "  volume_litres_effective = ?, volume_estimation_method = 'raw', "
+            "  match_rejection_reason = NULL, "
+            # excluded_from_training mirrors (composite OR artifact); the
+            # artifact half is now cleared, so only composite can still hold it.
+            "  excluded_from_training = CASE WHEN is_composite = 1 THEN 1 ELSE 0 END, "
+            "  volume_recomputed_at = ? "
+            "WHERE id = ? AND circuit = ?",
+            (round(raw, 3), datetime.now(timezone.utc).isoformat(),
+             event_id, circuit),
+        )
+        apply_effective_volume(conn, event_id, circuit, row["start_ts"], raw)
+
+    day = (row["start_ts"] or "")[:10]
+    if day:
+        compute_daily_summary(conn, circuit, day)
+        conn.commit()
+    log.info("[%s] relabel reverted %s zeroing on %s (restored %.3f L)",
+             circuit, reason, event_id, raw)
+    return reason
 
 
 def get_leak_test_schedule(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
@@ -5724,6 +5836,7 @@ def reclassify_all_events_from_signatures(
     select_cols = list(dict.fromkeys(
         ("id", "start_ts", "matched_fixture_type", "matched_via",
          "cycle_group_id", "excluded_from_training",
+         "match_rejection_reason",       # dev33: abstention marker mark/retract
          "active_flow_segment_count")
         + qfeats + _SCORE_COLS))
     rows = conn.execute(
@@ -5811,6 +5924,21 @@ def reclassify_all_events_from_signatures(
                                            via=new_via, cycle_group_id=new_group)
             if new_type is None and prev is not None:
                 cleared += 1
+        # dev33 (§2.1) — mark / retract classification-tier abstention so a
+        # silent outage is measurable and a recovery is visible. Only ever
+        # fills an EMPTY reason (artifact + cluster reasons are more specific),
+        # and is retracted the moment any tier names the event.
+        from .feature_extractor import NO_TIER_MATCHED_REASON as _NTM
+        _mrr = r["match_rejection_reason"] if "match_rejection_reason" in r.keys() \
+            else None
+        if new_type is None and not _mrr and not r["excluded_from_training"]:
+            conn.execute(
+                "UPDATE events SET match_rejection_reason = ? "
+                "WHERE id = ? AND match_rejection_reason IS NULL", (_NTM, r["id"]))
+        elif new_type is not None and _mrr == _NTM:
+            conn.execute(
+                "UPDATE events SET match_rejection_reason = NULL WHERE id = ?",
+                (r["id"],))
         if new_type is not None:
             matched += 1
             if new_via == "softener_session":

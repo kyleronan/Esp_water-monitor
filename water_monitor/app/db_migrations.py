@@ -194,7 +194,13 @@ _BASELINE_VERSION: int = 20260523
 #              rule bands are fitted once PER SUPPLY REGIME. The existing row
 #              is copied as regime_id=0 (legacy fallback), so behavior with no
 #              regimes recorded is bit-identical to before.
-_CURRENT_VERSION: int = 20260565
+#   20260566 — home_profile.pump_era_start: the PINNED start of this home's
+#              booster-pump era. Retroactive pump-era sweeps (the VFD-ripple
+#              exemption) gate on it instead of live pump state or the current
+#              regime, so neither a gate flip nor a later supply transition can
+#              re-flag events that were already exempted. DDL only; resolved
+#              lazily by supply_regime.pump_era_start.
+_CURRENT_VERSION: int = 20260566
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1862,6 +1868,29 @@ def _missing_supply_regime_tables(conn: sqlite3.Connection) -> set[str]:
     return missing
 
 
+# 20260566 — pinned pump-era anchor.
+def _apply_pump_era_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260566 — `home_profile.pump_era_start`,
+    the PINNED timestamp from which this home has run a booster pump.
+    Retroactive pump-era sweeps resolve it once and read the stored value
+    thereafter, so re-bootstrapping/merging supply regimes can never move a
+    boundary that gates historical verdicts. DDL only; resolution happens
+    lazily in supply_regime.pump_era_start. Guarded + idempotent."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                    "name='home_profile'").fetchone():
+        if not _has_column(conn, "home_profile", "pump_era_start"):
+            conn.execute("ALTER TABLE home_profile ADD COLUMN "
+                         "pump_era_start TEXT")
+    conn.commit()
+    log.info("Migration 20260566: pump_era_start column ready")
+
+
+def _missing_pump_era_columns(conn: sqlite3.Connection) -> set[str]:
+    if not _has_column(conn, "home_profile", "pump_era_start"):
+        return {"home_profile.pump_era_start"}
+    return set()
+
+
 # 20260565 — rule_calibration keyed per (circuit, supply regime).
 def _apply_regime_calibration(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260565 — rebuild rule_calibration with
@@ -2020,6 +2049,7 @@ _MIGRATIONS: tuple = (
     (20260563, _apply_leak_test_measurement_columns),
     (20260564, _apply_supply_regime_tables),
     (20260565, _apply_regime_calibration),
+    (20260566, _apply_pump_era_column),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

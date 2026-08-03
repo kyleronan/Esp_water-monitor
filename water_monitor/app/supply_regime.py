@@ -148,6 +148,163 @@ def get_current_regime(db: sqlite3.Connection) -> Optional[Dict[str, Any]]:
     return None
 
 
+_PUMP_ERA_MIN_RISE_PSI: float = 5.0
+
+
+def pump_era_start(db: sqlite3.Connection) -> Optional[str]:
+    """UTC-ISO timestamp from which this home has run a booster pump, PINNED.
+
+    The retroactive VFD-ripple exemption and any other pump-era-scoped sweep
+    ask a HISTORICAL question ("did the pump exist when this event was
+    captured?"), so they must not consult live pump-gate state — gates
+    flipping off would silently re-flag every exempted event on the next
+    reprocess. They also must not use the *current* regime: a later supply
+    transition would shrink the era and produce exactly the same churn.
+
+    Resolution, once, then stored in ``home_profile.pump_era_start``:
+
+      1. the stored value (authoritative thereafter — regimes can be
+         re-bootstrapped, merged or pruned; a pinned anchor cannot drift);
+      2. else the LATEST 'detected' regime that opened with a >= 5 psi centre
+         rise over its predecessor AND began before ``pump_mode_detected_at``
+         — "latest preceding" so an unrelated earlier step (a PRV change, a
+         municipal shift) can't pull the anchor back, while still beating
+         detection lag (this home: install 2026-07-18, detection 2026-07-26 —
+         8 days of ripple events the detected_at anchor would have missed);
+      3. else ``home_profile.pump_mode_detected_at``;
+      4. else None → callers never exempt/absorb anything.
+
+    Logs which branch produced the value: if a home's regime table doesn't
+    yield the step, the fallback is loud rather than silently narrower.
+    """
+    try:
+        prof = db.execute(
+            "SELECT pump_era_start, pump_mode_detected_at FROM home_profile "
+            "WHERE id = 1").fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if prof is None:
+        return None
+    stored = prof["pump_era_start"] if "pump_era_start" in prof.keys() else None
+    if stored:
+        return str(stored)
+
+    detected_at = prof["pump_mode_detected_at"]
+    resolved, branch = None, "none"
+    regimes = get_regimes(db)
+    for prev, cur in zip(regimes, regimes[1:]):
+        if cur.get("source") != "detected":
+            continue
+        if float(cur["center_psi"] or 0) - float(prev["center_psi"] or 0) \
+                < _PUMP_ERA_MIN_RISE_PSI:
+            continue
+        if detected_at and cur["started_at"] > str(detected_at):
+            continue          # after detection → not the install step
+        resolved, branch = cur["started_at"], "regime_step"
+    if resolved is None and detected_at:
+        resolved, branch = str(detected_at), "detected_at_fallback"
+
+    if resolved:
+        try:
+            db.execute("UPDATE home_profile SET pump_era_start = ? WHERE id = 1",
+                       (resolved,))
+            db.commit()
+        except sqlite3.OperationalError:
+            pass              # pre-migration DB — resolve fresh next time
+    log.info("supply-regime: pump era start resolved to %s (%s)",
+             resolved or "none", branch)
+    return resolved
+
+
+_RECENTER_MIN_DAYS: int = 5
+_RECENTER_NOTE_PREFIX: str = "recentered"
+
+
+def recenter_current_regime(db: sqlite3.Connection, circuit: str, tz,
+                            *, reason: str = "post-repair") -> Optional[float]:
+    """Re-fit the CURRENT regime's centre from its recent settled pressure.
+
+    Why this exists (dev33): a regime's centre is settle-fit from its first
+    days, so a regime opened while a plumbing defect was active inherits the
+    defect. This home's regime 2 was fitted across 7/19-7/26, when the supply
+    was sawtoothing 58 -> 54.4 psi on a leak-driven pump cycle: its centre
+    (54.3) is an artifact of the leak, and when the valve was repaired the
+    idle pressure settled at its TRUE value ~59-60 — more than the 5 psi shift
+    threshold above the artifact centre. Left alone the tracker would open a
+    regime 3 and encode *a valve repair* as a supply change, splitting the
+    per-regime rule-fit pools days after they were refit.
+
+    Uses the MEDIAN of recent daily medians: the thermal ratchet puts ~5% of
+    idle time above 65 psi with +11 psi excursions, and a mean would chase
+    that tail. Do not "improve" this to a mean.
+
+    The band WIDTH is carried across (translated), not refitted: a width fit
+    from the handful of post-repair days would be tight enough for ordinary
+    seasonal drift to re-trigger a shift.
+
+    Returns the new centre, or None when nothing was changed.
+    """
+    current = get_current_regime(db)
+    if current is None:
+        return None
+    days = [d for d in get_supply_days(db, circuit, limit=30)
+            if (d["sample_count"] or 0) >= _MIN_DAY_SAMPLES]
+    if len(days) < _RECENTER_MIN_DAYS:
+        return None
+    medians = [float(d["median_psi"]) for d in days[:_RECENTER_MIN_DAYS * 2]]
+    new_center = round(_median(medians), 1)
+    old_center = float(current["center_psi"] or 0.0)
+    if abs(new_center - old_center) < _SHIFT_DELTA_PSI:
+        return None                       # nothing meaningful to recentre
+    lo, hi = current.get("band_lo_psi"), current.get("band_hi_psi")
+    shift = new_center - old_center
+    new_lo = round(float(lo) + shift, 1) if lo is not None else None
+    new_hi = round(float(hi) + shift, 1) if hi is not None else None
+    note = (f"{_RECENTER_NOTE_PREFIX} {old_center}->{new_center} psi "
+            f"({reason}); band width carried")
+    db.execute(
+        "UPDATE supply_regime SET center_psi = ?, band_lo_psi = ?, "
+        " band_hi_psi = ?, note = ? WHERE id = ?",
+        (new_center, new_lo, new_hi, note, current["id"]))
+    db.commit()
+    log.info("supply-regime: regime %s recentred %.1f -> %.1f psi (%s)",
+             current["id"], old_center, new_center, reason)
+    return new_center
+
+
+def merge_spurious_regime(db: sqlite3.Connection) -> bool:
+    """Undo a regime opened by the recenter step itself.
+
+    If the tracker fires before ``recenter_current_regime`` lands, the recovery
+    is to merge that regime back rather than adopt it: close it, re-open the
+    predecessor at the merged centre. Rule fits keep targeting the merged
+    regime. Genuine later shifts (a pump setpoint change, a pump removal) still
+    open regimes normally against the recentred value.
+
+    Returns True when a merge happened.
+    """
+    regimes = get_regimes(db)
+    if len(regimes) < 2:
+        return False
+    current, prev = regimes[-1], regimes[-2]
+    if current["ended_at"] is not None or current["source"] != "detected":
+        return False
+    if current.get("confirmed_at"):
+        return False              # the user accepted it — leave it alone
+    merged_center = round((float(current["center_psi"] or 0.0)
+                           + float(prev["center_psi"] or 0.0)) / 2.0, 1)
+    db.execute("DELETE FROM supply_regime WHERE id = ?", (current["id"],))
+    db.execute(
+        "UPDATE supply_regime SET ended_at = NULL, center_psi = ?, note = ? "
+        "WHERE id = ?",
+        (merged_center, f"{_RECENTER_NOTE_PREFIX}: merged regime "
+                        f"{current['id']} back (recenter artifact)", prev["id"]))
+    db.commit()
+    log.info("supply-regime: merged spurious regime %s back into %s "
+             "(centre now %.1f psi)", current["id"], prev["id"], merged_center)
+    return True
+
+
 def get_current_regime_id(db: sqlite3.Connection) -> int:
     """Id of the open (current) regime, or 0 — the legacy/pre-regime id — when
     none exists or the table predates migration 20260564. Cheap single-row
@@ -422,6 +579,17 @@ class SupplyRegimeTracker:
                              banner.get("since"))
         except Exception as e:
             log.warning("supply-regime bootstrap failed (non-fatal): %s", e)
+
+        # dev33 one-shot: a regime whose centre was settle-fit while a plumbing
+        # defect was active carries that defect. Recentre it (and merge back a
+        # regime the recentre step itself provoked) BEFORE the sampling loop can
+        # evaluate a shift against the stale centre. Both helpers are no-ops
+        # once applied, and both are guarded per their own preconditions.
+        try:
+            merge_spurious_regime(self._db)
+            recenter_current_regime(self._db, circuit, self._ha_tz)
+        except Exception as e:
+            log.warning("supply-regime recentre failed (non-fatal): %s", e)
 
         while not self._stop.is_set():
             try:

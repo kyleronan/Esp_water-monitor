@@ -728,14 +728,24 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
     # recovery path). revert_irrigation_cross_talk self-guards: it only touches
     # rows the auto pass flagged (never a user-classified cross-talk) and
     # audits the revert.
+    # dev33 (§1.1): this runs AFTER the classification block above, deliberately —
+    # a fresh fixture label is the newer, more specific user intent and must win
+    # over a checkbox verdict saved in the same request. revert_artifact_zeroing_
+    # on_relabel covers every zeroing verdict (dribble/below-meter-floor, the
+    # phantom family, cross-talk); revert_irrigation_cross_talk stays for its
+    # audit-row bookkeeping on the auto-flagged irrigation rows it owns.
     if kwargs.get("user_fixture_type"):
         try:
-            from ..database import revert_irrigation_cross_talk
+            from ..database import (revert_artifact_zeroing_on_relabel,
+                                    revert_irrigation_cross_talk)
             if revert_irrigation_cross_talk(db, event_id, circuit):
                 log.info("[%s] relabel to %r reverted auto cross-talk on %s",
                          circuit, kwargs["user_fixture_type"], event_id)
+            elif revert_artifact_zeroing_on_relabel(db, event_id, circuit):
+                log.info("[%s] relabel to %r restored zeroed volume on %s",
+                         circuit, kwargs["user_fixture_type"], event_id)
         except Exception:
-            log.exception("cross-talk revert on relabel failed (label saved)")
+            log.exception("artifact revert on relabel failed (label saved)")
 
     # Sprint B — if the patch touched user_fixture_type, propagate the
     # signal into the cluster's suggested_type (soft hint; never silently

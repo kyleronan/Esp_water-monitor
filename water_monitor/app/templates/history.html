@@ -1281,6 +1281,18 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   // only sends `classification` when the user actually changed something
   // (labelling alone must not silently lock auto-detection off).
   let clsInitial = { phantom: false, supply_pressure: false, dribble: false, cross_talk: false };
+  // dev33 (§1.1) — the boxes are PRE-CHECKED from the row's *automatic* flags,
+  // so a diff against that render state can fire without the user touching a
+  // classification box (any drift between d.* and the rendered checkbox posts
+  // a `classification` payload, which sets user_classified=1 and rewrites the
+  // rejection reason to the manual value). That is how a 685 L draw ended up
+  // locked as a manual 'low_flow_dribble'. Track ACTUAL user interaction per
+  // checkbox instead: only a real toggle in this modal session may promote an
+  // auto verdict into a manual one.
+  let clsTouched = false;
+  [clsPhantom, clsSupply, clsDribble, clsCrosstalk].forEach((box) => {
+    if (box) box.addEventListener('change', () => { clsTouched = true; });
+  });
 
   // Startup diagnostic
   const rows = document.querySelectorAll('.hist-event-row');
@@ -1334,6 +1346,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       dribble:         d.dribble === '1',
       cross_talk:      d.crossTalk === '1',
     };
+    clsTouched = false;   // fresh modal session — see the clsTouched note above
     // Sprint H.1 — the "manually classified" hint + Reset link only apply
     // once the user has locked a manual classification.
     const isClassified = d.classified === '1';
@@ -1690,10 +1703,14 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       dribble:         !!(clsDribble && clsDribble.checked),
       cross_talk:      !!(clsCrosstalk && clsCrosstalk.checked),
     };
-    if (cur.phantom !== clsInitial.phantom
-        || cur.supply_pressure !== clsInitial.supply_pressure
-        || cur.dribble !== clsInitial.dribble
-        || cur.cross_talk !== clsInitial.cross_talk) {
+    // Both gates: the user must have TOUCHED a classification box in this modal
+    // session (clsTouched) AND the result must differ from what was rendered.
+    // The touch gate is the load-bearing one — see the clsTouched note above.
+    if (clsTouched
+        && (cur.phantom !== clsInitial.phantom
+            || cur.supply_pressure !== clsInitial.supply_pressure
+            || cur.dribble !== clsInitial.dribble
+            || cur.cross_talk !== clsInitial.cross_talk)) {
       payload.classification = cur;
     }
     const ok = await patchEvent(payload);

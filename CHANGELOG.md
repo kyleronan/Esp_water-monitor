@@ -9,6 +9,57 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Volume-accounting repairs + pump-ripple exemption — dev33** — driven by a
+  full audit of every stored event against raw Home Assistant history
+  (2026-08-02). The measurement chain is healthy (±1% per event, 98.1%
+  coverage, two different meters agreeing to <1% on fixed-volume fixtures) —
+  the errors were all downstream of it. **(1) A 685 L draw counted as zero
+  is restored.** A user-labelled 78-minute, 8.7 L/min draw carried a manual
+  "drip" verdict, so 2026-07-12 reported 588 L instead of 1,266 L. Root
+  cause: the History modal pre-checked its classification boxes from the
+  row's *automatic* flags and posted them back as manual verdicts on any
+  save — so opening an event and changing anything could silently promote an
+  auto flag into a permanent one. The checkboxes now only submit when you
+  actually toggle one, **a real fixture label now reverses any zeroing
+  verdict** (the UI has always said "relabel if wrong" — now that works for
+  drip/phantom/cross-talk, not just irrigation cross-talk), and a one-shot
+  repair restores past rows that carry a real label *and* real-water evidence
+  (≥1 L above the meter's registration floor), listing anything ambiguous for
+  you to relabel rather than guessing. **(2) Degraded events can no longer
+  report more water than the meter measured.** The pulsing-supply estimator's
+  1.5× ceiling was itself the inflation (+105 L live; worst historical case
+  2.01 L measured, 335.88 L reported); it is now 1.0×, and the two paths that
+  bypassed the cap entirely — the admin re-check sweep and the manual "supply
+  pressure" checkbox — go through it. Trade named explicitly: a *partial*
+  meter gap can no longer be corrected upward; a total one still is.
+  **(3) The booster pump's ~1 Hz control ripple is no longer read as failing
+  supply.** It satisfied every pulsing-supply gate while the meter stayed
+  accurate, taking degraded events from 0 to 27–68/week — 121 events on the
+  live database. Exempted only inside the *pump era*, anchored to a pinned
+  `pump_era_start` (migration 20260566) rather than live pump state or the
+  current supply regime, because pre-pump genuine pulsing occupies the same
+  period band and either of those would re-flag everything on the next
+  re-check. Rows freed by this get one fair pass at the pump-recharge
+  detector, and the sweep now rebuilds each affected day's totals — it was
+  the only one of five that didn't. **(4) Overlap de-duplication stops
+  dropping real water.** A wrapper event zeroed as a duplicate although its
+  children only began 42 minutes in cost 704.7 L of irrigation on 2026-07-25;
+  a wrapper now keeps whatever its children don't account for, and nested /
+  same-instant children are counted once (which is where a further 114.6 L of
+  double-counting came from). **(5) Classification failures are recorded
+  instead of silent** — 933 events had been unmatched with no reason at all,
+  making a 12-day cluster outage invisible; unmatched-but-evaluated rows now
+  read `no_tier_matched` (and the marker retracts when a later pass matches
+  them, so a recovery is as visible as the outage). Also: nightly pump-leak
+  estimates are suppressed for any night when the *other* circuit drew water
+  inside the analysis window — that, not a fabricating estimator, is what
+  produced the "110 L/day" reading on 2026-07-28 (it was the 02:00 irrigation
+  program; the 7/26 estimate was correct, and the ~26 L/day loss it measured
+  stopped the day after the valve service). Note for anyone reading leak-test
+  rates: the system compliance constant (9.5 mL/PSI) reads ~1.5× low against
+  measured pump bursts, so `est_leak_ml_min` values are lower bounds until it
+  is recalibrated at the leak test's actual closing pressure.
+
 - **Supply-pressure-aware fixture classification — dev32** — the 2026-07
   booster-pump install shifted resting pressure ~46→~54 PSI, sped up flows
   (~P^0.4 on peaks; toilets fill faster, so shorter durations at unchanged

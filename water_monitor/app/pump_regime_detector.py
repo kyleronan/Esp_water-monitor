@@ -317,6 +317,42 @@ class PumpRegimeDetector:
         except Exception as e:
             log.warning("pump-leak alert evaluation failed (non-fatal): %s", e)
 
+    # Flow minutes on a sibling circuit that invalidate a leak estimate. A few
+    # scattered minutes (a night flush) leave the pressure trace usable; the
+    # 7/28 irrigation program ran for well over an hour inside the window.
+    _CONTAMINATION_MIN_MINUTES: float = 5.0
+
+    async def _sibling_flow_minutes(self, circuit: str, w_start, w_end):
+        """(sibling_circuit, minutes) when ANOTHER circuit drew water inside
+        this analysis window, else None.
+
+        The leak estimate reads the pressure decline of the whole house, so it
+        is only meaningful when the whole house is quiet — but the quiet-window
+        search only sees the analysed circuit's own meter. Best-effort: an HA
+        history failure returns None (estimate proceeds as before).
+        """
+        others = [c for c in self._cfg.circuits if c.circuit != circuit
+                  and getattr(c, "flow_sensor", None)]
+        if not others:
+            return None
+        try:
+            hist = await self._ha.get_history_batch(
+                [c.flow_sensor for c in others], w_start, w_end)
+        except Exception as e:
+            log.debug("[%s] sibling-flow check failed (non-fatal): %s",
+                      circuit, e)
+            return None
+        n = max(1, int((w_end - w_start).total_seconds()))
+        for c in others:
+            rows = hist.get(c.flow_sensor) or []
+            if not rows:
+                continue
+            series = _ffill_1hz(rows, w_start, n, default=0.0)
+            minutes = float((series > 0.0).sum()) / 60.0
+            if minutes >= self._CONTAMINATION_MIN_MINUTES:
+                return (c.circuit, minutes)
+        return None
+
     async def _analyze_circuit_night(self, circuit_cfg, night: str) -> bool:
         import numpy as np
         from .pump_regime_math import (detect_pump_regime,
@@ -354,6 +390,18 @@ class PumpRegimeDetector:
         s, e = max(spans, key=lambda x: x[1] - x[0])
         v = detect_pump_regime(pres[s:e], flow[s:e])
 
+        # dev33 — SIBLING-CIRCUIT contamination gate. quiet_windows() only
+        # screens THIS circuit's flow, so a draw on the other circuit leaves
+        # the window looking quiet while its pressure signature is anything
+        # but. The 2026-07-28 "110 L/day leak" was the 02:00 irrigation
+        # program on circuit_2: main pressure declined for four hours while
+        # the main meter (correctly) read 1.4 L. Gate on in-window flow
+        # MINUTES, not "an event happened that night" — a 21-minute softener
+        # regen does not explain a 240-minute window.
+        contaminated_by = await self._sibling_flow_minutes(
+            circuit_cfg.circuit, start + timedelta(seconds=int(s)),
+            start + timedelta(seconds=int(e)))
+
         from .database import upsert_pump_regime_night
         # Store the ROBUST period (median inter-rise spacing) — the raw
         # autocorr peak locked onto a 62 s sub-harmonic on the first
@@ -363,10 +411,14 @@ class PumpRegimeDetector:
         # street-meter calibration (the home meter registers ~half of each
         # slug) so the stored/alerted number is the TRUE rate.
         est_lpd = None
-        if v.detected:
+        if v.detected and contaminated_by is None:
             est = estimate_leak_rate_lph(pres[s:e], flow[s:e])
             est_lpd = round(
                 est["cycle_lph"] * 24.0 * PUMP_SLUG_CALIBRATION_FACTOR, 1)
+        elif v.detected:
+            log.info("[%s] %s: leak estimate suppressed — %s drew water inside "
+                     "the analysis window (%.1f min)", circuit_cfg.circuit,
+                     night, contaminated_by[0], contaminated_by[1])
         upsert_pump_regime_night(
             self._db, circuit_cfg.circuit, night,
             detected=1 if v.detected else 0,
