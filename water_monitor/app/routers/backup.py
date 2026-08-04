@@ -630,7 +630,20 @@ def _merge_archive_from_path(orch, db_path: Path,
                     # archive could be from a different schema version)
                     valid_cols = {r[1] for r in orch.db.execute(
                         f"PRAGMA table_info({tbl})").fetchall()}
-                    cols = [c for c in rows[0].keys() if c in valid_cols]
+                    # Cluster linkage is a DB-LOCAL derived cache, never
+                    # portable: fixture_clusters ids are small autoincrements,
+                    # so an archive row's cluster_id points at a missing
+                    # cluster here at best and a DIFFERENT one at worst
+                    # (observed live: 272 orphaned + 11 silently joined to
+                    # wrong clusters and replayed into cluster state every
+                    # boot). Imported rows arrive unlinked; the post-merge
+                    # backfill re-derives membership against THIS db's
+                    # clusters. Features stay intact — they are measurements,
+                    # not references.
+                    drop = ({"cluster_id", "match_confidence", "match_level"}
+                            if tbl == "events" else set())
+                    cols = [c for c in rows[0].keys()
+                            if c in valid_cols and c not in drop]
                     if not cols:
                         log.warning("Import archive %s: no valid columns", tbl)
                         continue
@@ -661,6 +674,31 @@ def _merge_archive_from_path(orch, db_path: Path,
                         log.warning(
                             "Import archive %s: %d of %d row(s) skipped on id "
                             "collision (live rows kept)", tbl, skipped, len(rows))
+                    # Heal-on-reimport: rows a PRE-FIX import inserted still
+                    # carry the old install's cluster linkage (missing or,
+                    # worse, colliding ids). Re-importing the same archive is
+                    # otherwise a no-op (INSERT OR IGNORE), so use it as the
+                    # repair channel: clear linkage on every archive row that
+                    # already exists here. Safe — linkage is a derived cache
+                    # the startup backfill/reclassify re-derives against
+                    # THIS db's clusters.
+                    if tbl == "events":
+                        ids = [r["id"] for r in rows if "id" in r.keys()]
+                        healed = 0
+                        for i in range(0, len(ids), 500):
+                            chunk = ids[i:i + 500]
+                            healed += orch.db.execute(
+                                f"UPDATE events SET cluster_id = NULL, "
+                                f"  match_confidence = NULL, match_level = NULL "
+                                f"WHERE cluster_id IS NOT NULL AND id IN "
+                                f"({','.join('?' * len(chunk))})",
+                                chunk).rowcount
+                        if healed:
+                            imported["cluster_links_cleared"] = healed
+                            log.info(
+                                "Import archive: cleared stale cluster linkage "
+                                "on %d previously-imported row(s) — backfill "
+                                "re-derives it locally", healed)
         except Exception as e:
             log.error("Import history-archive failed (transaction rolled back): %s", e)
             errors.append(str(e))
