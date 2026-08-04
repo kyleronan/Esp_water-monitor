@@ -5967,6 +5967,7 @@ def reclassify_all_events_from_signatures(
         qparams,
     ).fetchall()
     scanned = matched = rule_matched = softener_matched = cleared = abstained = 0
+    veto_counts: Dict[str, int] = {}   # flush-physics vetoes by condition
     for r in rows:
         scanned += 1
         new_group = None
@@ -6040,9 +6041,18 @@ def reclassify_all_events_from_signatures(
                 vfeats["active_flow_segment_count"] = r["active_flow_segment_count"]
                 why = toilet_veto_reason(vfeats, _toilet_cap)
                 if why:
-                    log.info("[%s] event %s: toilet match (%s) vetoed by flush "
-                             "physics — %s (vol=%s L)", circuit, r["id"],
-                             new_via, why, r["volume_litres"])
+                    # DEBUG per event, one INFO summary at the end: ~60 of
+                    # these fire per reclassify and they are the veto WORKING
+                    # (investigated 2026-08-03: the recurring 2.2–2.8 L band
+                    # is the labelled dishwasher's upper fill-pulse tail — 9
+                    # user labels in-band, 0 of them toilet, every event has
+                    # a neighbour within 30 min — so the floor is what keeps
+                    # appliance pulses from being named flushes).
+                    log.debug("[%s] event %s: toilet match (%s) vetoed by "
+                              "flush physics — %s (vol=%s L)", circuit,
+                              r["id"], new_via, why, r["volume_litres"])
+                    veto_counts[why.split(" (")[0]] = (
+                        veto_counts.get(why.split(" (")[0], 0) + 1)
                     new_type, new_via = None, None
         prev = r["matched_fixture_type"]
         if (new_type, new_via, new_group) != (
@@ -6135,6 +6145,11 @@ def reclassify_all_events_from_signatures(
         circuit, signatures_trained, scanned, matched, rule_matched, abstained,
         cleared,
     )
+    if veto_counts:
+        log.info("[%s] flush-physics vetoes: %s (per-event detail at DEBUG)",
+                 circuit, "; ".join(f"{n}× {why}" for why, n
+                                    in sorted(veto_counts.items(),
+                                              key=lambda kv: -kv[1])))
     return result
 
 

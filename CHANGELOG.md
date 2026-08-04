@@ -151,9 +151,14 @@ landed without a version bump; per-build details are in git history.)
   the log line printed the event volume and the home's flush cap, so an event
   turned down by the 2.8 L manufactured-flush floor logged as "vol=2.5 L,
   cap=30.5 L" and read like a passing event. It now names the condition that
-  fired (floor, cap, peak flow, or segment count). Behaviour is unchanged;
-  several dozen of these can scroll past in a single reclassify, and they were
-  unreadable.
+  fired (floor, cap, peak flow, or segment count), and the per-event lines
+  moved to DEBUG behind a one-line INFO summary per reclassify — the readable
+  reasons made the recurring band diagnosable, and it turned out to be the
+  veto *working*: the ~90 rejected 2.2–2.8 L events are the dishwasher's
+  upper fill-pulse tail (of the user labels in that band, 7 are dishwasher
+  and none are toilet; every one has a neighbouring event within 30 minutes,
+  clustered at meal times). The 2.8 L floor is what keeps appliance pulses
+  from being named flushes — it stays.
 
 - **Startup no longer crash-loops when a recalibration runs during it (dev34)**
   — triggering a heavy admin write (regime recalibration, recompute) while the
