@@ -130,6 +130,29 @@ landed without a version bump; per-build details are in git history.)
 
 ### Fixes
 
+- **The regime recalibration now outwaits a busy database instead of dying
+  (dev34)** — pressing "Re-fit rules for current pressure" while a startup or
+  import reclassify held the write lock failed after one 5-second busy
+  timeout with "database is locked", and invisibly: the job row that would
+  have surfaced the failure is created inside the locked work. Observed twice
+  live. The recalibration now retries every 20 seconds for up to 10 minutes —
+  a full reclassify runs minutes, so the budget is sized in minutes — and
+  only lock errors retry; anything else still fails fast.
+
+- **Imported events no longer carry the old install's cluster links (dev34)**
+  — cluster ids are small local autoincrements, not portable, but the history
+  import copied them verbatim. On the real label import that meant 272 rows
+  pointing at clusters that don't exist here (the startup "orphaned events"
+  warning) and 11 that collided with existing ids and silently joined the
+  wrong clusters, polluting cluster state on every boot. Imports now strip
+  cluster linkage from incoming events (features are measurements and still
+  travel intact; linkage is a local cache the post-merge backfill re-derives)
+  — and because re-importing an archive is otherwise a no-op, it doubles as
+  the repair: archive rows that already exist locally get their stale
+  linkage cleared. **If you imported labels on an earlier dev34 build,
+  re-import the same archive once** — the result reports the cleared count
+  and the orphan warning disappears on the next start.
+
 - **The leak-watch banner no longer reports a leak that has stopped (dev34)** —
   and it can now be dismissed. The tile showed the most recent night *that
   carried an estimate* out of the last fourteen, with no test of how old that
