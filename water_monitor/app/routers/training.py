@@ -81,6 +81,12 @@ async def _bg_reclassify_training(circuit: str) -> None:
         log.warning("[%s] training reclassify failed: %s", circuit, e)
 
 
+# A startup or import reclassify holds the write lock for minutes; the
+# recalibration must outwait it, not lose to it. 30 × 20 s = 10 minutes.
+_RECAL_LOCK_RETRIES: int = 30
+_RECAL_LOCK_BACKOFF_S: float = 20.0
+
+
 async def start_regime_recalibration(orch) -> bool:
     """Kick off the supply-regime recalibration in the background: fit each
     circuit's rule bands on the CURRENT regime's events (source
@@ -145,10 +151,35 @@ async def start_regime_recalibration(orch) -> bool:
                 raise
 
     async def _run():
-        try:
-            await run_isolated_write(DB_PATH, _work)
-        except Exception as e:
-            log.warning("regime recalibration failed: %s", e)
+        # dev34 — wait out a busy writer instead of dying on the first
+        # 5 s busy_timeout. Observed twice live: the button pressed while a
+        # startup/import reclassify held the write lock → "database is
+        # locked" after 5 s, and because the job row is created INSIDE the
+        # locked work, the UI never even showed a failure. A full reclassify
+        # runs minutes, so the retry budget is sized in minutes. The work
+        # itself is idempotent — a retry after a partial failure re-fits and
+        # re-scores from scratch.
+        import sqlite3 as _sqlite3
+        for attempt in range(_RECAL_LOCK_RETRIES):
+            try:
+                await run_isolated_write(DB_PATH, _work)
+                return
+            except _sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower():
+                    log.warning("regime recalibration failed: %s", e)
+                    return
+                log.info("regime recalibration: database busy (attempt %d/%d)"
+                         " — retrying in %.0f s", attempt + 1,
+                         _RECAL_LOCK_RETRIES, _RECAL_LOCK_BACKOFF_S)
+                await asyncio.sleep(_RECAL_LOCK_BACKOFF_S)
+            except Exception as e:
+                log.warning("regime recalibration failed: %s", e)
+                return
+        log.warning("regime recalibration failed: database stayed locked "
+                    "through %d attempts (~%.0f min) — run it again from "
+                    "Settings once the current job finishes",
+                    _RECAL_LOCK_RETRIES,
+                    _RECAL_LOCK_RETRIES * _RECAL_LOCK_BACKOFF_S / 60)
 
     asyncio.create_task(_run())
     return True
