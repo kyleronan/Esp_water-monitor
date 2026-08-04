@@ -36,6 +36,24 @@ landed without a version bump; per-build details are in git history.)
   cannot emit `other`, so a genuinely novel draw is left unnamed rather than
   forced into the nearest known fixture.
 
+- **Large backups no longer depend on browser uploads — dev34** — Home
+  Assistant's ingress proxy rejects big uploads before the add-on ever sees
+  them, which surfaced as a cryptic "not valid JSON" error and fails exactly
+  when a backup matters most: restoring years of history onto a rebuilt HA,
+  where the history archive (or a full export) is tens of MB. The add-on now
+  maps **`/share`** and exchanges large files there instead, in both
+  directions: the Backup page can **save the Full Export to
+  `/share/water_monitor/`** (where HA backups and Samba can pick it up), and
+  the import dialog lists archives found there — a raw `.db` or a Full Export
+  `.zip` both work (the database inside the zip is used), with the same
+  merge semantics and labels-only option as the upload path. Filenames are
+  validated strictly (bare names inside the share folder only). The upload
+  path also fails clearly now: oversized files are stopped client-side with
+  an explanation, and a proxy rejection shows the proxy's actual words. The
+  import dialog additionally gained the **"Labelled events only"** checkbox
+  the dev34 label re-import added server-side. Requires one add-on restart
+  after updating for the `/share` mapping to appear.
+
 - **Anomaly detection now follows a supply change too — dev34** — the regime
   recalibration re-fit the *classification* rules but left the *usage
   baselines* — the per-fixture envelopes and overall volume percentiles

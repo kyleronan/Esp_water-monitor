@@ -49,6 +49,15 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/backup", dependencies=[Depends(require_admin)])
 MAX_BACKUP_BYTES = 50 * 1024 * 1024  # 50 MB hard limit
 
+# dev34 — the /share pickup path. Browser uploads pass through Home
+# Assistant's ingress proxy, which rejects large bodies before the add-on
+# ever sees them — fine for the ~1 MB history archive, fatal for a years-old
+# archive or a full export. Files placed here (Samba / File editor / SSH) are
+# read straight from disk, so size stops mattering. Requires `map: share:rw`
+# in config.yaml.
+SHARE_DIR = Path("/share/water_monitor")
+_SHARE_SUFFIXES = {".db", ".zip"}
+
 
 # ── Table groups ─────────────────────────────────────────────────────────────
 
@@ -301,6 +310,111 @@ async def export_full(request: Request):
                      "application/zip")
 
 
+# ── /share pickup + drop-off (dev34) ─────────────────────────────────────────
+
+def _resolve_share_file(filename: str) -> Path:
+    """Validate a user-supplied /share filename: bare basename, allowed
+    suffix, and resolving inside SHARE_DIR. Raises ValueError otherwise —
+    the filename crosses a trust boundary (it names a server-side path)."""
+    if not filename or Path(filename).name != filename:
+        raise ValueError("Filename must be a bare name, not a path.")
+    if Path(filename).suffix.lower() not in _SHARE_SUFFIXES:
+        raise ValueError("Only .db and .zip files can be imported.")
+    p = (SHARE_DIR / filename).resolve()
+    if p.parent != SHARE_DIR.resolve():
+        raise ValueError("File is outside the share folder.")
+    if not p.is_file():
+        raise ValueError(f"Not found: {SHARE_DIR}/{filename}")
+    return p
+
+
+@router.get("/share-archives")
+async def list_share_archives(request: Request):
+    """Importable files in /share/water_monitor. `available` is False when
+    the share mapping is absent (older install of the add-on config)."""
+    if not SHARE_DIR.parent.exists():
+        return JSONResponse({"available": False, "files": [],
+                             "dir": str(SHARE_DIR)})
+    SHARE_DIR.mkdir(exist_ok=True)
+    files = sorted(
+        ({"name": p.name, "size_mb": round(p.stat().st_size / 1048576, 1),
+          "mtime": datetime.fromtimestamp(
+              p.stat().st_mtime, tz=timezone.utc).isoformat()}
+         for p in SHARE_DIR.iterdir()
+         if p.is_file() and p.suffix.lower() in _SHARE_SUFFIXES),
+        key=lambda f: f["mtime"], reverse=True)
+    return JSONResponse({"available": True, "files": files,
+                         "dir": str(SHARE_DIR)})
+
+
+@router.post("/import/share-archive")
+async def import_share_archive(
+    request: Request,
+    filename: str = Form(...),
+    labels_only: bool = Form(False),
+):
+    """Merge history from a file in /share/water_monitor — the no-size-limit
+    twin of the upload import, for archives the ingress proxy would reject
+    (a years-old history archive, or a full export). Accepts a raw SQLite
+    .db or a full-export .zip (the water_monitor.db member is used). Same
+    merge semantics: existing rows kept, labels_only honoured, post-merge
+    reprocess+reclassify runs."""
+    orch = _orch(request)
+    try:
+        src = _resolve_share_file(filename)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    tmp_path: Path = src
+    extracted = None
+    if src.suffix.lower() == ".zip":
+        try:
+            with zipfile.ZipFile(src) as zf:
+                member = next((n for n in zf.namelist()
+                               if Path(n).name == "water_monitor.db"), None)
+                if member is None:
+                    return JSONResponse(
+                        {"ok": False, "error": "No water_monitor.db inside "
+                         "this zip — is it a Water Monitor full export?"},
+                        status_code=400)
+                with tempfile.NamedTemporaryFile(suffix=".db",
+                                                 delete=False) as tmp:
+                    with zf.open(member) as m:
+                        while chunk := m.read(1 << 20):
+                            tmp.write(chunk)
+                    extracted = tmp_path = Path(tmp.name)
+        except zipfile.BadZipFile:
+            return JSONResponse({"ok": False, "error": "Not a valid zip file."},
+                                status_code=400)
+    try:
+        log.info("Importing history from %s (labels_only=%s)", src, labels_only)
+        return _merge_archive_from_path(orch, tmp_path, labels_only)
+    finally:
+        if extracted is not None:
+            extracted.unlink(missing_ok=True)
+
+
+@router.post("/export/full-to-share")
+async def export_full_to_share(request: Request):
+    """Write the Full Export zip to /share/water_monitor instead of the
+    browser — the drop-off half of the /share path, so large backups never
+    transit ingress in either direction (and land where HA backups / Samba
+    can pick them up)."""
+    if not SHARE_DIR.parent.exists():
+        return JSONResponse(
+            {"ok": False, "error": "/share is not mapped into the add-on — "
+             "update to a build with the share mapping and restart."},
+            status_code=503)
+    SHARE_DIR.mkdir(exist_ok=True)
+    resp = await export_full(request)
+    name = f"wm_full_export_{_ts()}.zip"
+    (SHARE_DIR / name).write_bytes(resp.body)
+    size_mb = round(len(resp.body) / 1048576, 1)
+    log.info("Full export written to %s (%s MB)", SHARE_DIR / name, size_mb)
+    return JSONResponse({"ok": True, "file": f"{SHARE_DIR}/{name}",
+                         "size_mb": size_mb})
+
+
 # ── Import: Quick Restore JSON ────────────────────────────────────────────────
 
 @router.post("/import/quick-restore")
@@ -467,12 +581,23 @@ async def import_history_archive(
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         tmp.write(raw)
         tmp_path = Path(tmp.name)
+    try:
+        return _merge_archive_from_path(orch, tmp_path, labels_only)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
+
+def _merge_archive_from_path(orch, db_path: Path,
+                             labels_only: bool) -> JSONResponse:
+    """The history-archive merge core, shared by the upload endpoint and the
+    /share pickup (dev34): merge rows from the SQLite file at ``db_path`` into
+    the live DB, then run the post-merge verdict/reclassify pass. The caller
+    owns ``db_path``'s lifetime."""
     imported, errors, ignored = {}, [], {}
     arc = None
 
     try:
-        arc = sqlite3.connect(str(tmp_path))
+        arc = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         arc.row_factory = sqlite3.Row
 
         in_archive = {r[0] for r in arc.execute(
@@ -566,7 +691,6 @@ async def import_history_archive(
     finally:
         if arc is not None:
             arc.close()
-        tmp_path.unlink(missing_ok=True)
 
     total = sum(imported.values())
 

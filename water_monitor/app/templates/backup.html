@@ -119,6 +119,15 @@
         <button class="btn btn-warning btn-sm" onclick="doHistoryImport()">⬆ Import History</button>
         <div id="ha-result" class="bk-result" style="display:none"></div>
       </form>
+      <div class="bk-restore-note" style="margin-top:.75rem">
+        <strong>Large file?</strong> Uploads are size-limited by Home
+        Assistant. Put the archive (a .db, or a Full Export .zip) in
+        <code>/share/water_monitor/</code> instead — via Samba, the File
+        editor add-on, or SSH — then pick it here:
+        <div id="share-list" style="margin-top:.4rem">
+          <button class="btn btn-ghost btn-sm" onclick="loadShareArchives()">🔄 Check /share for archives</button>
+        </div>
+      </div>
     </div>
   </details>
 </div>
@@ -140,8 +149,10 @@
   <div class="bk-actions">
     <a href="{{ ingress_path }}/backup/export/full"
        class="btn btn-secondary btn-sm">⬇ Download Full Export (.zip)</a>
+    <button class="btn btn-secondary btn-sm" onclick="saveFullToShare(this)">💾 Save to /share</button>
     <span class="bk-size-est">~{{ full_size_est }} estimated</span>
   </div>
+  <div id="share-save-result" class="bk-result" style="display:none"></div>
   <p class="bk-footnote">
     ⚠ May be large on long-running installs. Use Quick Restore for regular backups.
   </p>
@@ -198,11 +209,106 @@ async function doQuickRestore() {
   }
 }
 
+async function loadShareArchives() {
+  const box = document.getElementById('share-list');
+  try {
+    const resp = await fetch(`${window.INGRESS_PATH}/backup/share-archives`);
+    const data = await resp.json();
+    if (!data.available) {
+      box.innerHTML = '<em>/share is not mapped into the add-on yet — restart the add-on after updating.</em>';
+      return;
+    }
+    if (!data.files.length) {
+      box.innerHTML = `<em>No archives found in ${data.dir}. Drop a .db or Full Export .zip there and check again.</em> ` +
+        '<button class="btn btn-ghost btn-sm" onclick="loadShareArchives()">🔄 Check again</button>';
+      return;
+    }
+    box.innerHTML = data.files.map(f =>
+      `<div class="bk-file-row" style="margin:.25rem 0">
+         <span class="bk-fname">${f.name} (${f.size_mb} MB)</span>
+         <button class="btn btn-warning btn-sm" onclick="doShareImport('${f.name}')">⬆ Import</button>
+       </div>`).join('') +
+      '<button class="btn btn-ghost btn-sm" onclick="loadShareArchives()">🔄 Check again</button>';
+  } catch (e) {
+    box.innerHTML = `<em>Could not list /share: ${e.message}</em>`;
+  }
+}
+
+async function doShareImport(name) {
+  const resultEl = document.getElementById('ha-result');
+  const labelsOnly = document.getElementById('ha-labels-only').checked;
+  if (!confirm((labelsOnly
+      ? `Import only the labelled events from ${name}?`
+      : `Merge history from ${name}?`) + ' Existing rows will be kept.')) return;
+  const form = new FormData();
+  form.append('filename', name);
+  if (labelsOnly) form.append('labels_only', '1');
+  form.append('_csrf', window.CSRF_TOKEN || '');
+  resultEl.style.display = '';
+  resultEl.className = 'bk-result bk-result-info';
+  resultEl.textContent = `Importing ${name} from /share… large archives can take a while.`;
+  try {
+    const resp = await fetch(`${window.INGRESS_PATH}/backup/import/share-archive`,
+                             { method: 'POST', body: form });
+    const data = await resp.json();
+    if (data.ok) {
+      resultEl.className = 'bk-result bk-result-ok';
+      _setResult(resultEl, `✓ ${data.summary}`, 'Existing rows kept; archive rows merged in.');
+    } else {
+      resultEl.className = 'bk-result bk-result-err';
+      _setResult(resultEl, `✗ ${data.error || 'Failed'}`, (data.errors || []).join('\n'));
+    }
+  } catch (e) {
+    resultEl.className = 'bk-result bk-result-err';
+    resultEl.textContent = `✗ Network error: ${e.message}`;
+  }
+}
+
+async function saveFullToShare(btn) {
+  const resultEl = document.getElementById('share-save-result');
+  btn.disabled = true;
+  resultEl.style.display = '';
+  resultEl.className = 'bk-result bk-result-info';
+  resultEl.textContent = 'Writing full export to /share…';
+  try {
+    const form = new FormData();
+    form.append('_csrf', window.CSRF_TOKEN || '');
+    const resp = await fetch(`${window.INGRESS_PATH}/backup/export/full-to-share`,
+                             { method: 'POST', body: form });
+    const data = await resp.json();
+    if (data.ok) {
+      resultEl.className = 'bk-result bk-result-ok';
+      resultEl.textContent = `✓ Saved ${data.file} (${data.size_mb} MB)`;
+    } else {
+      resultEl.className = 'bk-result bk-result-err';
+      resultEl.textContent = `✗ ${data.error || 'Failed'}`;
+    }
+  } catch (e) {
+    resultEl.className = 'bk-result bk-result-err';
+    resultEl.textContent = `✗ Network error: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function doHistoryImport() {
   const fileEl   = document.getElementById('ha-file');
   const resultEl = document.getElementById('ha-result');
   if (!fileEl.files.length) { alert('Choose a .db file first.'); return; }
   const labelsOnly = document.getElementById('ha-labels-only').checked;
+  // Home Assistant's ingress proxy rejects large uploads with a plain-text
+  // error before the add-on ever sees them. A full water_monitor.db is tens
+  // of MB; the intended file here is the small History Archive export.
+  if (fileEl.files[0].size > 8 * 1024 * 1024) {
+    resultEl.style.display = '';
+    resultEl.className = 'bk-result bk-result-err';
+    _setResult(resultEl,
+      `✗ File too large to upload through Home Assistant (${(fileEl.files[0].size/1048576).toFixed(0)} MB).`,
+      'This looks like a full database, not a History Archive. Use the small ' +
+      '"Download History Archive (.db)" file from the old install, or a ' +
+      'labels-only extract.');
+    return;
+  }
   if (!confirm(labelsOnly
       ? 'Import only the labelled events from this archive? Existing rows will be kept.'
       : 'Merge history from this archive? Existing rows will be kept.')) return;
@@ -216,7 +322,14 @@ async function doHistoryImport() {
   try {
     const resp = await fetch(`${window.INGRESS_PATH}/backup/import/history-archive`,
                              { method: 'POST', body: form });
-    const data = await resp.json();
+    let data;
+    const raw = await resp.text();
+    try { data = JSON.parse(raw); }
+    catch {
+      // The ingress proxy (not the add-on) answered — usually a body-size
+      // rejection in plain text. Show its words instead of a JSON parse error.
+      data = { ok: false, error: `Upload rejected before reaching the add-on: ${raw.slice(0, 200)}` };
+    }
     if (data.ok) {
       resultEl.className = 'bk-result bk-result-ok';
       _setResult(resultEl, `✓ ${data.summary}`, 'Existing rows kept; archive rows merged in.');

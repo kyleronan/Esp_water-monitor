@@ -19,6 +19,12 @@ hassio_api: true
 hassio_role: default
 homeassistant_api: true
 host_network: false
+# /share access (dev34): large backups can't transit the ingress proxy (it
+# rejects big uploads before the add-on sees them), so archives are exchanged
+# through /share/water_monitor instead — Full Export written there, history
+# archives imported from there. rw: the add-on both reads and writes it.
+map:
+  - share:rw
 ingress: true
 ingress_port: 8765
 panel_icon: mdi:water-check
