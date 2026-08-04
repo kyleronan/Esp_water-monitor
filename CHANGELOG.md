@@ -130,6 +130,17 @@ landed without a version bump; per-build details are in git history.)
 
 ### Fixes
 
+- **A stuck database write lock now names itself, and event saves fail
+  gracefully (dev34)** — one connection was observed holding an open write
+  transaction for 27+ minutes: every save from the History page returned a
+  raw "Error 500", the background samplers logged isolated warnings, and
+  nothing correlated them into "one wedged writer is blocking everything".
+  Locked-write failures across the app now feed a shared detector that
+  escalates once per episode after failures span two minutes, with restart
+  guidance in the log. Marking an event (Normal use / labels / checkboxes)
+  during such an episode now answers with a clear "database is busy — your
+  change was NOT saved, try again in a minute" instead of a 500 traceback.
+
 - **The regime recalibration now outwaits a busy database instead of dying
   (dev34)** — pressing "Re-fit rules for current pressure" while a startup or
   import reclassify held the write lock failed after one 5-second busy

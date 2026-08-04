@@ -48,6 +48,44 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+# ── Stuck-writer detector (dev34) ────────────────────────────────────────────
+# Observed live 2026-08-03: one connection sat in an open write transaction
+# for 27+ minutes — every writer on every OTHER connection failed with
+# "database is locked" (UI saves, the supply-regime sampler, the importer)
+# and nothing in the log identified the holder. A brief lock is normal (the
+# busy_timeout absorbs it); a lock that keeps failing for minutes is a wedged
+# transaction only a restart clears. Callers that catch a locked error feed
+# this; when the failures span the threshold it escalates ONCE per episode.
+_LOCKED_EPISODE_START: float = 0.0
+_LOCKED_LAST: float = 0.0
+_LOCKED_COUNT: int = 0
+_LOCKED_ESCALATED: bool = False
+_LOCKED_STUCK_AFTER_S: float = 120.0
+_LOCKED_RESET_GAP_S: float = 60.0
+
+
+def note_locked_write(source: str) -> None:
+    """Record a 'database is locked' failure. Cheap, thread-safe enough for
+    its purpose (worst case an extra log line). A gap of _LOCKED_RESET_GAP_S
+    without failures starts a new episode."""
+    global _LOCKED_EPISODE_START, _LOCKED_LAST, _LOCKED_COUNT, _LOCKED_ESCALATED
+    import time
+    now = time.monotonic()
+    if now - _LOCKED_LAST > _LOCKED_RESET_GAP_S:
+        _LOCKED_EPISODE_START, _LOCKED_COUNT, _LOCKED_ESCALATED = now, 0, False
+    _LOCKED_LAST = now
+    _LOCKED_COUNT += 1
+    span = now - _LOCKED_EPISODE_START
+    if span >= _LOCKED_STUCK_AFTER_S and not _LOCKED_ESCALATED:
+        _LOCKED_ESCALATED = True
+        log.error(
+            "WRITE LOCK APPEARS STUCK: %d locked-write failure(s) over %.0f s "
+            "(latest from %s). One connection is holding an open write "
+            "transaction; nothing else can save until it releases. If this "
+            "persists, restart the add-on — and report this log line.",
+            _LOCKED_COUNT, span, source)
+
+
 async def run_isolated_write(db_path, fn):
     """Serialise a heavy DB-write job and run it on a fresh PRIVATE connection.
 

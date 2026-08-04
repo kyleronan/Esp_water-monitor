@@ -718,7 +718,25 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
             })
 
     if kwargs:
-        found = _patch_event(db, event_id, circuit, **kwargs)
+        # A locked DB is a transient state (a background job writing, or —
+        # observed live 2026-08-03 — a wedged writer that held the lock for
+        # 27 min), not a server fault: answer 503 with words the user can act
+        # on instead of a raw 500 traceback, and feed the stuck-writer
+        # detector so a persistent holder names itself in the log.
+        import sqlite3 as _sqlite3
+
+        from ..database import note_locked_write
+        try:
+            found = _patch_event(db, event_id, circuit, **kwargs)
+        except _sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower():
+                raise
+            note_locked_write("history.patch_event")
+            return JSONResponse(
+                {"error": "The database is busy with a background job — "
+                          "your change was NOT saved. Try again in a minute; "
+                          "if this keeps happening, restart the add-on."},
+                status_code=503)
         if not found:
             return JSONResponse({"error": "Event not found"}, status_code=404)
 

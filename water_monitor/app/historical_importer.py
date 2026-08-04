@@ -305,6 +305,9 @@ class HistoricalImporter:
             except Exception as e:
                 log.error("Historical importer periodic check failed: %s", e,
                           exc_info=True)
+                if "locked" in str(e).lower():
+                    from .database import note_locked_write
+                    note_locked_write("historical_importer.catch_up")
 
     def stop(self) -> None:
         self._running = False

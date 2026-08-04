@@ -596,6 +596,9 @@ class SupplyRegimeTracker:
                 self._sample(circuit)
             except Exception as e:
                 log.warning("supply-regime sample failed (non-fatal): %s", e)
+                if "locked" in str(e).lower():
+                    from .database import note_locked_write
+                    note_locked_write("supply_regime.sampler")
             try:
                 await asyncio.wait_for(self._stop.wait(),
                                        timeout=_SAMPLE_INTERVAL_S)
