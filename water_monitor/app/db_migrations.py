@@ -212,7 +212,10 @@ _BASELINE_VERSION: int = 20260523
 #              space the centers were learned in — replaying pressure-blind
 #              centers with pressure features on shifts every distance and
 #              breaks the id-map rebuild. Set by the pump-era cluster re-seed.
-_CURRENT_VERSION: int = 20260568
+#   20260569 — baseline_snapshot table: the frozen usage baseline + anomaly
+#              percentiles as they stood before each freeze, so a regime refit
+#              that lands badly is revertable. Table-create only.
+_CURRENT_VERSION: int = 20260569
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1947,6 +1950,27 @@ def _missing_cluster_mode_columns(conn: sqlite3.Connection) -> set[str]:
     return set()
 
 
+# 20260569 — baseline snapshots (dev34 B3).
+def _apply_baseline_snapshot_table(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260569 — `baseline_snapshot`, the
+    pre-freeze copies of the usage baseline + anomaly percentiles that make a
+    regime refit revertable. Table-create only; the schema DDL is the source
+    of truth. Guarded + idempotent."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS baseline_snapshot (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            circuit          TEXT NOT NULL,
+            reason           TEXT,
+            params           TEXT NOT NULL DEFAULT '{}',
+            source           TEXT,
+            locked_at        TIMESTAMP,
+            sensitivity_json TEXT,
+            created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+    conn.commit()
+    log.info("Migration 20260569: baseline_snapshot table ready")
+
+
 # 20260565 — rule_calibration keyed per (circuit, supply regime).
 def _apply_regime_calibration(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260565 — rebuild rule_calibration with
@@ -2108,6 +2132,7 @@ _MIGRATIONS: tuple = (
     (20260566, _apply_pump_era_column),
     (20260567, _apply_leak_watch_ack_column),
     (20260568, _apply_cluster_features_mode),
+    (20260569, _apply_baseline_snapshot_table),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

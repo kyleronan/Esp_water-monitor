@@ -572,6 +572,23 @@ CREATE TABLE IF NOT EXISTS usage_baseline (
 );
 
 -- ==========================================================================
+-- BASELINE SNAPSHOTS (migration 20260569, dev34 B3) — the frozen usage
+-- baseline + overall anomaly percentiles as they stood BEFORE each freeze,
+-- so a regime refit that lands badly is revertable
+-- (anomaly_baseline.restore_usage_baselines). Pruned to 10 per circuit.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS baseline_snapshot (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit          TEXT NOT NULL,
+    reason           TEXT,                    -- the freeze source that displaced it
+    params           TEXT NOT NULL DEFAULT '{}',
+    source           TEXT,
+    locked_at        TIMESTAMP,
+    sensitivity_json TEXT,                    -- the anomaly p85/p95/p99 + n
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==========================================================================
 -- ARTIFACT CALIBRATION (Phase 2.4) — per-home phantom/dribble/cross-talk detector
 -- thresholds, FROZEN at activation. Calibrates ONLY the long-quiet / dribble
 -- identifier thresholds (never the leak-safety true-flow guards) and is gated

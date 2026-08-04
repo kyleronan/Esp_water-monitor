@@ -27,6 +27,13 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger(__name__)
 
 MIN_EVENTS_FOR_ENVELOPE = 8     # a type needs this many events to fit an envelope
+# dev34 B3 — the overall volume percentiles may window to the pump era only
+# when the era holds at least this many events; below it the era estimate of a
+# p99 is noise and the all-time fit (more data, slightly stale distribution)
+# is the lesser error. Deliberately equals MIN_N_FOR_SHUTOFF: an era window
+# thinner than what may authorise a shut-off shouldn't re-anchor the
+# percentiles that feed one.
+MIN_EVENTS_FOR_OVERALL = 30
 _LO_PCT = 5.0
 _HI_PCT = 95.0
 _PAD = 0.10                     # widen each band by 10% of its span
@@ -73,7 +80,9 @@ def _band(vals: List[Optional[float]]) -> Optional[List[float]]:
 
 def fit_usage_baselines(
         conn: sqlite3.Connection,
-        circuit: str) -> Tuple[Dict[str, Any], Dict[str, float]]:
+        circuit: str,
+        era_start: Optional[str] = None
+        ) -> Tuple[Dict[str, Any], Dict[str, float]]:
     """Compute (per-type envelopes, overall volume percentiles) from this circuit's
     labelled + matched, non-excluded events. Pure read — does not persist.
 
@@ -81,10 +90,19 @@ def fit_usage_baselines(
     out: a draw the user couldn't identify must never stretch a fixture
     envelope or the overall percentiles toward "normal", even when a machine
     label matched it. A later relabel clears the verdict and readmits it.
+
+    era_start (dev34 B3): when given (the PINNED pump-era anchor — the era,
+    not the current regime, which a recenter/merge can move), each fit prefers
+    era-only events and falls back PER TYPE to all-time when the era pool is
+    too thin: toilet durations shortened 2.6× under the pump, so a pre-pump
+    toilet envelope flags every normal post-pump flush — but a type with 3
+    era events can't re-fit yet, and keeping its stale envelope (stamped
+    ``era: False``) beats having none. The overall percentiles window the same
+    way at MIN_EVENTS_FOR_OVERALL.
     """
     rows = conn.execute(
         "SELECT COALESCE(user_fixture_type, matched_fixture_type) AS t, "
-        "       volume_litres, duration_seconds, peak_flow_lpm, "
+        "       start_ts, volume_litres, duration_seconds, peak_flow_lpm, "
         "       COALESCE(volume_litres_effective, volume_litres) AS eff_vol "
         "FROM events WHERE circuit = ? "
         "  AND COALESCE(user_fixture_type, matched_fixture_type) IS NOT NULL "
@@ -93,28 +111,45 @@ def fit_usage_baselines(
         (circuit,),
     ).fetchall()
 
-    by_type: Dict[str, Dict[str, List]] = {}
-    eff_vols: List[float] = []
-    for r in rows:
-        t = r["t"]
-        d = by_type.setdefault(t, {"vol": [], "dur": [], "pk": []})
-        d["vol"].append(r["volume_litres"])
-        d["dur"].append(r["duration_seconds"])
-        d["pk"].append(r["peak_flow_lpm"])
-        if r["eff_vol"] is not None:
-            eff_vols.append(r["eff_vol"])
+    def _collect(only_era: bool):
+        by_type: Dict[str, Dict[str, List]] = {}
+        vols: List[float] = []
+        for r in rows:
+            if only_era and era_start and r["start_ts"] < era_start:
+                continue
+            d = by_type.setdefault(r["t"], {"vol": [], "dur": [], "pk": []})
+            d["vol"].append(r["volume_litres"])
+            d["dur"].append(r["duration_seconds"])
+            d["pk"].append(r["peak_flow_lpm"])
+            if r["eff_vol"] is not None:
+                vols.append(r["eff_vol"])
+        return by_type, vols
+
+    all_types, all_vols = _collect(only_era=False)
+    era_types, era_vols = ((all_types, all_vols) if not era_start
+                           else _collect(only_era=True))
 
     envelopes: Dict[str, Any] = {}
-    for t, d in by_type.items():
+    for t in all_types:
+        # Per-type: era window when it can support a fit, all-time otherwise.
+        use_era = (era_start is not None
+                   and len(era_types.get(t, {}).get("vol", []))
+                   >= MIN_EVENTS_FOR_ENVELOPE)
+        d = era_types[t] if use_era else all_types[t]
         if len(d["vol"]) < MIN_EVENTS_FOR_ENVELOPE:
             continue
         env = {"n": len(d["vol"])}
+        if era_start is not None:
+            env["era"] = use_era
         for key, src in (("vol", "vol"), ("dur", "dur"), ("peak", "pk")):
             b = _band(d[src])
             if b is not None:
                 env[key] = b
         envelopes[t] = env
 
+    use_era_overall = (era_start is not None
+                       and len(era_vols) >= MIN_EVENTS_FOR_OVERALL)
+    eff_vols = era_vols if use_era_overall else all_vols
     overall: Dict[str, float] = {}
     for label, p in (("baseline_anomaly_p85", 85.0),
                      ("baseline_anomaly_p95", 95.0),
@@ -125,14 +160,95 @@ def fit_usage_baselines(
     # Event count behind the percentiles — the shut-off confidence gate reads this
     # (always written, even 0, so a thin baseline is distinguishable from "no row").
     overall["baseline_anomaly_n"] = len(eff_vols)
+    if era_start is not None and not use_era_overall:
+        log.info("[%s] usage baseline: era window too thin for overall "
+                 "percentiles (%d < %d) — all-time fit kept", circuit,
+                 len(era_vols), MIN_EVENTS_FOR_OVERALL)
     return envelopes, overall
+
+
+def snapshot_usage_baselines(conn: sqlite3.Connection, circuit: str,
+                             reason: str) -> None:
+    """dev34 B3 — copy the current frozen baseline (envelopes + overall
+    anomaly percentiles) into baseline_snapshot before an overwrite, so a
+    regime refit that lands badly is revertable (restore_usage_baselines).
+    Keeps the newest 10 per circuit. No-op when nothing is frozen yet."""
+    row = conn.execute("SELECT params, source, locked_at FROM usage_baseline "
+                       "WHERE circuit = ?", (circuit,)).fetchone()
+    if row is None:
+        return
+    sens = conn.execute(
+        "SELECT baseline_anomaly_p85, baseline_anomaly_p95, "
+        "       baseline_anomaly_p99, baseline_anomaly_n "
+        "FROM sensitivity_config WHERE circuit = ?", (circuit,)).fetchone()
+    conn.execute(
+        "INSERT INTO baseline_snapshot (circuit, reason, params, source, "
+        "  locked_at, sensitivity_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (circuit, reason, row["params"], row["source"], row["locked_at"],
+         json.dumps(dict(sens) if sens else {})))
+    conn.execute(
+        "DELETE FROM baseline_snapshot WHERE circuit = ? AND id NOT IN "
+        "(SELECT id FROM baseline_snapshot WHERE circuit = ? "
+        " ORDER BY id DESC LIMIT 10)", (circuit, circuit))
+    conn.commit()
+
+
+def restore_usage_baselines(conn: sqlite3.Connection, circuit: str,
+                            snapshot_id: Optional[int] = None) -> bool:
+    """Restore the frozen baseline from a snapshot (newest by default).
+    Returns False when no snapshot exists. The replaced state is itself
+    snapshotted first, so a restore is undoable."""
+    q = "SELECT * FROM baseline_snapshot WHERE circuit = ?"
+    args: list = [circuit]
+    if snapshot_id is not None:
+        q += " AND id = ?"
+        args.append(snapshot_id)
+    row = conn.execute(q + " ORDER BY id DESC LIMIT 1", args).fetchone()
+    if row is None:
+        return False
+    snapshot_usage_baselines(conn, circuit, reason="pre_restore")
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO usage_baseline (circuit, params, source, locked_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(circuit) DO UPDATE SET params=excluded.params, "
+        "  source=excluded.source, locked_at=excluded.locked_at, "
+        "  updated_at=excluded.updated_at",
+        (circuit, row["params"], f"restored:{row['source']}",
+         row["locked_at"], now))
+    sens = json.loads(row["sensitivity_json"] or "{}")
+    sens = {k: v for k, v in sens.items() if v is not None}
+    if sens:
+        from .database import upsert_sensitivity_config
+        upsert_sensitivity_config(conn, circuit, baseline_computed_at=now,
+                                  **sens)
+    conn.commit()
+    invalidate_baseline_cache(circuit)
+    log.info("[%s] usage baseline restored from snapshot %s", circuit,
+             row["id"])
+    return True
 
 
 def freeze_usage_baselines(conn: sqlite3.Connection, circuit: str,
                            source: str = "activation") -> Dict[str, Any]:
     """Fit + persist (freeze) the usage baselines for a circuit. Returns the
-    per-type envelope dict."""
-    envelopes, overall = fit_usage_baselines(conn, circuit)
+    per-type envelope dict.
+
+    dev34 B3: in a pump-era home the fit windows on the PINNED era anchor
+    (per-type/overall fallback inside fit_usage_baselines), and the previous
+    frozen state is snapshotted first so a refit is revertable."""
+    era = None
+    try:
+        from .supply_regime import pump_era_start
+        era = pump_era_start(conn)
+    except Exception:
+        era = None
+    try:
+        snapshot_usage_baselines(conn, circuit, reason=source)
+    except Exception as e:
+        log.warning("[%s] baseline snapshot failed (freeze continues): %s",
+                    circuit, e)
+    envelopes, overall = fit_usage_baselines(conn, circuit, era_start=era)
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO usage_baseline (circuit, params, source, locked_at, updated_at) "

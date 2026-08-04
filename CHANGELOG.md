@@ -36,6 +36,27 @@ landed without a version bump; per-build details are in git history.)
   cannot emit `other`, so a genuinely novel draw is left unnamed rather than
   forced into the nearest known fixture.
 
+- **Anomaly detection now follows a supply change too — dev34** — the regime
+  recalibration re-fit the *classification* rules but left the *usage
+  baselines* — the per-fixture envelopes and overall volume percentiles
+  behind "unusual event" flags and the shut-off confidence gate — fit on
+  pre-pump usage. Toilet fills shortened 2.6× under the pump, so a pre-pump
+  toilet envelope flags every normal post-pump flush; the dashboard's
+  "152 events didn't fit your home's usual pattern" is that failure at full
+  size. The regime recalibration now also re-freezes the usage baselines and
+  re-scores anomalies. The fit windows on the **pinned pump-era anchor** (the
+  era, not the current regime, which a recenter can move), falling back per
+  fixture type to the all-time fit when the era has too few events — a stale
+  envelope beats none — and the overall percentiles fall back below 30 era
+  events, deliberately the same minimum the shut-off gate requires: a window
+  too thin to authorise a shut-off must not re-anchor the percentiles that
+  feed one. Every freeze snapshots the previous state first (migration
+  20260569, kept 10 deep per circuit) so a refit that lands badly is
+  revertable. **After deploying, run "Re-fit rules for current pressure"
+  once** — that single action now refreshes rules, baselines, and anomaly
+  scores together, and should clear most of the standing "unusual events"
+  backlog.
+
 - **Fixture grouping can be rebuilt after a supply change — dev34** — the
   automatic fixture grouping (clustering) died outright after the pump
   install: live matching stopped when the features moved, and because the

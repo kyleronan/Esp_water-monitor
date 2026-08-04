@@ -110,6 +110,25 @@ async def start_regime_recalibration(orch) -> bool:
                                         regime=regime)
                 reclassify_all_events_from_signatures(
                     conn, circuit, since_ts=regime["started_at"])
+                # dev34 B3 — the anomaly side must follow the supply too: a
+                # regime refit that leaves the usage baselines fit on the OLD
+                # pressure flags every normal event of the new one (toilet
+                # durations shortened 2.6× under the pump). Era-windowed with
+                # per-type fallback inside; the previous frozen state is
+                # snapshotted, so this is revertable. Then re-score against
+                # the fresh baseline — the reclassify above ran before it
+                # existed, so its anomaly verdicts used the stale one.
+                try:
+                    from ..anomaly_baseline import (freeze_usage_baselines,
+                                                    invalidate_baseline_cache)
+                    freeze_usage_baselines(conn, circuit,
+                                           source="regime_shift")
+                    invalidate_baseline_cache(circuit)
+                    reclassify_all_events_from_signatures(
+                        conn, circuit, since_ts=regime["started_at"])
+                except Exception as e:
+                    log.warning("[%s] regime baseline refresh failed "
+                                "(rules still refit): %s", circuit, e)
                 n_fit = sum(1 for r in report.values()
                             if isinstance(r, dict) and r.get("status") == "fit")
                 short = [t for t, r in sorted(report.items())
