@@ -92,6 +92,24 @@ FEATURE_KEYS = [
     f'pressure_sig_{i:02d}' for i in range(SIG_POINTS)
 ]
 
+# Every pressure-derived dimension, for the pump-era "pressure-blind" cluster
+# space (dev34 B2). Under a VFD constant-pressure pump the supply servos
+# pressure flat, so ΔP measures pump droop-and-recovery instead of the fixture:
+# corr(ΔP, peak_flow²) fell 0.721 → 0.060 across the 2026-07 pump install, and
+# the class-matched F-ratio of the pressure-signature block — 36.6% of the
+# cluster distance, its largest single share — fell 5.53 → 2.15 (noise = 1.0)
+# while flow shape held at 6.38. Re-seeding on pressure features would also
+# mean re-seeding again at every pump setpoint change. propagation_delay_ms
+# rides along: it is a pressure-arrival measure (and was already ~noise,
+# F ≈ 0.2). has_pressure_transient stays — valve slam is a fixture property.
+PRESSURE_FEATURE_KEYS: frozenset = frozenset(
+    {'pressure_delta_psi', 'pre_event_pressure_psi', 'min_pressure_psi',
+     'hydraulic_resistance', 'pressure_transient_energy',
+     'pressure_transient_duration_ms', 'pressure_onset_ms',
+     'recovery_overshoot_psi', 'pressure_oscillation_count',
+     'propagation_delay_ms'}
+    | {f'pressure_sig_{i:02d}' for i in range(SIG_POINTS)})
+
 # Per-dimension weights for weighted Euclidean distance.
 # Pressure shape > flow shape; scalars default 1.0; hour sinusoids 0.2.
 # Per-dim values scale inversely with SIG_POINTS so the TOTAL shape weight in
@@ -191,6 +209,9 @@ class ClusterEngine:
         # rejects the match rather than silently accepting a possibly-wrong one), so
         # this surfaces a gate that's quietly erroring on every event.
         self._type_gate_errors: Dict[str, int] = {}
+        # dev34 B2 — circuit -> pressure-blind feature mode (see
+        # PRESSURE_FEATURE_KEYS). Loaded from training_state in _init_circuit.
+        self._pressure_blind: Dict[str, bool] = {}
 
         for c in cfg.circuits:
             self._init_circuit(c.circuit)
@@ -211,6 +232,34 @@ class ClusterEngine:
         ).fetchone()
         self._next_cluster_id[circuit] = (row[0] if row[0] is not None else -1) + 1
         self._refresh_type_cache(circuit)
+        # dev34 B2 — the feature mode is persisted so a restart rebuilds the
+        # SAME space the centers were seeded in. A pressure-blind center set
+        # replayed with pressure features on (or vice versa) is silent
+        # nonsense: every distance shifts and the id-map rebuild mismatches.
+        try:
+            r = self._db.execute(
+                "SELECT cluster_features_mode FROM training_state "
+                "WHERE circuit = ?", (circuit,)).fetchone()
+            self._pressure_blind[circuit] = bool(
+                r and r["cluster_features_mode"] == "pressure_blind")
+        except Exception:
+            self._pressure_blind[circuit] = False
+        if self._pressure_blind.get(circuit):
+            log.info("[%s] cluster space is pressure-blind (pump-era seed)",
+                     circuit)
+
+    def set_pressure_blind(self, circuit: str, on: bool) -> None:
+        """Persist + apply the cluster feature mode. The caller MUST rebuild
+        the circuit's cluster state afterwards (reset + replay) — flipping the
+        mode under live centers changes every distance."""
+        self._db.execute(
+            "UPDATE training_state SET cluster_features_mode = ? "
+            "WHERE circuit = ?",
+            ("pressure_blind" if on else "full", circuit))
+        self._db.commit()
+        self._pressure_blind[circuit] = on
+        log.info("[%s] cluster feature mode -> %s", circuit,
+                 "pressure_blind" if on else "full")
 
     def _refresh_type_cache(self, circuit: str) -> None:
         """(Re)load the {cluster_id -> fixture_type} map from the DB.
@@ -259,7 +308,9 @@ class ClusterEngine:
 
     # ── Feature extraction ─────────────────────────────────────────────────────
 
-    def _extract_features(self, event: dict) -> Optional[Dict[str, float]]:
+    def _extract_features(self, event: dict,
+                          circuit: Optional[str] = None
+                          ) -> Optional[Dict[str, float]]:
         """Build the full feature dict from an event DB row. Returns None if unusable."""
         if event.get('avg_flow_lpm') is None or not event.get('duration_seconds'):
             return None
@@ -334,6 +385,16 @@ class ClusterEngine:
                     pass
             for i in range(SIG_POINTS):
                 features.setdefault(f'{prefix}_{i:02d}', 0.0)
+
+        # dev34 B2 — pressure-blind mode: every pressure-derived dimension is
+        # pinned to 0.0 for EVERY event, so the block carries no variance and
+        # no distance. Zeroing at extraction (not in the weights) is what makes
+        # it reach DBSTREAM's internal clustering, which ignores the weight
+        # table.
+        key = circuit if circuit is not None else str(event.get('circuit') or '')
+        if self._pressure_blind.get(key):
+            for k in PRESSURE_FEATURE_KEYS:
+                features[k] = 0.0
 
         return features
 
@@ -707,7 +768,7 @@ class ClusterEngine:
         within SEQUENCE_GAP_MAX_SECONDS, the cooccurrence table is updated.
         Stage 3 will apply a confidence boost from this table.
         """
-        features = self._extract_features(event)
+        features = self._extract_features(event, circuit)
         if features is None:
             return (None, 0.0, '', 'features_missing')
 
@@ -843,7 +904,7 @@ class ClusterEngine:
 
         count = 0
         for row in rows:
-            features = self._extract_features(dict(row))
+            features = self._extract_features(dict(row), circuit)
             if features is None:
                 continue
             scaler = self._scalers[circuit]
@@ -851,6 +912,28 @@ class ClusterEngine:
             x = scaler.transform_one(features)
             self._streams[circuit].learn_one(x)
             count += 1
+
+        if count == 0 and self._is_frozen(circuit):
+            # dev34 B2 — the death spiral, named. This replay reads only
+            # cluster_id IS NOT NULL rows; once live matching stops (e.g. a
+            # supply change moves the features), the pool drains, the next
+            # restart replays nothing, and every subsequent event rejects with
+            # 'no_centers' — permanently, and silently but for this line.
+            # Production hit exactly this after the 2026-07 pump install:
+            # weekly assignment went 75% → 58% → 45% → 8% → 0% and no cluster
+            # gained a member after 07-21. rebuild_from_db CANNOT recover it
+            # (nothing left to replay) — run the cluster re-seed
+            # (training_manager.reseed_clusters_for_regime) instead.
+            n_unmatched = self._db.execute(
+                "SELECT COUNT(*) FROM events WHERE circuit = ? "
+                "AND cluster_id IS NULL AND end_ts >= ?",
+                (circuit, cutoff)).fetchone()[0]
+            log.warning(
+                "[%s] cluster replay pool is EMPTY while the circuit is "
+                "frozen — matching is dead (every event will reject with "
+                "no_centers; %d unmatched events in the window). "
+                "rebuild_from_db cannot recover this; re-seed the clusters "
+                "from Settings.", circuit, n_unmatched)
 
         if count > 0:
             self._rebuild_id_map_from_centroids(circuit)
@@ -863,7 +946,8 @@ class ClusterEngine:
         log.info("Restored %d events into circuit '%s' state", count, circuit)
         return count
 
-    def backfill_unmatched(self, circuit: str) -> int:
+    def backfill_unmatched(self, circuit: str,
+                           since_ts: Optional[str] = None) -> int:
         """
         Assign cluster_id to events that were collected before the DBSTREAM
         engine existed (v0.1.x upgrades) or before a full recalibration.
@@ -873,14 +957,23 @@ class ClusterEngine:
         Safe to call multiple times — only processes unmatched rows.
         Called from orchestrator after rebuild_from_db and from
         training_manager after calibration completes.
+
+        since_ts (dev34 B2): window the pool to events at/after this
+        timestamp. The pump-era re-seed uses it so pre-anchor rows — recorded
+        before the fragmentation fixes and under the old supply — cannot seed
+        the new space; fragments below the training support would become
+        centers.
         """
+        window_sql = "AND start_ts >= ?" if since_ts else ""
+        params = (circuit, since_ts) if since_ts else (circuit,)
         rows = self._db.execute(
-            """SELECT * FROM events
+            f"""SELECT * FROM events
                WHERE circuit = ? AND cluster_id IS NULL
                  AND excluded_from_training = 0
                  AND end_ts IS NOT NULL
+                 {window_sql}
                ORDER BY start_ts ASC""",
-            (circuit,)
+            params
         ).fetchall()
 
         if not rows:

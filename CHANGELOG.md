@@ -36,6 +36,28 @@ landed without a version bump; per-build details are in git history.)
   cannot emit `other`, so a genuinely novel draw is left unnamed rather than
   forced into the nearest known fixture.
 
+- **Fixture grouping can be rebuilt after a supply change — dev34** — the
+  automatic fixture grouping (clustering) died outright after the pump
+  install: live matching stopped when the features moved, and because the
+  startup replay reads only events that already carry a cluster assignment,
+  the replay pool drained until a restart rebuilt nothing — weekly assignment
+  went 75% → 58% → 45% → 8% → **0%**, permanently and silently. A new
+  **"Rebuild fixture grouping for current pressure"** action on the Settings
+  calibration card re-seeds the clusters from pump-era events, and the empty
+  replay pool now logs a loud warning naming the fix instead of failing
+  quietly. The rebuilt space excludes **every pressure-derived feature** —
+  under a constant-pressure pump those describe the pump, not the fixture
+  (the pressure-vs-flow² correlation that makes pressure fixture evidence
+  fell 0.72 → 0.06 across the install), and they were most of the problem:
+  the pressure-shape block alone was 37% of the grouping distance and its
+  class separation collapsed to near noise, while flow shape held. Measured
+  on the production export: 0% → 100% of trainable pump-era events grouped,
+  with softener and shower clusters cleanly separated. The feature mode is
+  persisted (migration 20260568) so a restart rebuilds the same space.
+  Pre-pump groupings are kept as history; nothing is deleted, leak protection
+  is untouched, and the action is re-runnable — grouping quality improves as
+  post-repair events accumulate, so it is worth re-running after a few weeks.
+
 - **Label re-import + calibration guardrails — dev34** — the classifier's
   coverage (not its accuracy) collapsed after a fresh start discarded 486
   hand-made labels, so the History Archive import gains a **labels-only**

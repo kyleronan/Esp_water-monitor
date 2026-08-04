@@ -622,6 +622,35 @@ async def recalibrate_regime(circuit: str, request: Request):
     return ingress_redirect(request, "/settings#sett-advanced")
 
 
+@router.post("/reseed-clusters/{circuit}")
+async def reseed_clusters(circuit: str, request: Request):
+    """dev34 B2 — rebuild the circuit's cluster space from pump-era events in
+    the pressure-blind feature space. The recovery path for the cluster death
+    spiral (live matching stops → the startup replay pool drains →
+    'no_centers' forever); rebuild_from_db cannot recover it. Windowed to the
+    pinned pump-era anchor. Best run with a few weeks of post-repair events —
+    the pool size is reported so a thin pool is visible, not silent."""
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    if orch.training_manager is None:
+        return JSONResponse({"error": "training manager not running"},
+                            status_code=503)
+    from ..supply_regime import pump_era_start
+    anchor = pump_era_start(orch.db)
+    if not anchor:
+        return JSONResponse(
+            {"error": "No pump era recorded for this home — the re-seed "
+                      "exists to recover from a supply change; without one, "
+                      "the normal cluster path is already correct."},
+            status_code=400)
+    result = await orch.training_manager.reseed_clusters_for_regime(
+        circuit, anchor)
+    if "error" in result:
+        return JSONResponse(result, status_code=503)
+    log.info("[%s] cluster re-seed via Settings: %s", circuit, result)
+    return ingress_redirect(request, "/settings#sett-advanced")
+
+
 # ------------------------------------------------------------------
 # Sensitivity
 # ------------------------------------------------------------------

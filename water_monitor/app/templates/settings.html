@@ -478,6 +478,22 @@
             leak protection unaffected. Use after a booster pump or pressure
             regulator change.
           </p>
+          <form method="post"
+                action="{{ ingress_path }}/settings/reseed-clusters/{{ c.circuit }}"
+                style="margin:.5rem 0 0"
+                onsubmit="return confirm('Rebuild fixture grouping from events since the pump was installed? Older groupings are kept as history; leak protection is unaffected.')">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">
+              Rebuild fixture grouping for current pressure
+            </button>
+          </form>
+          <p class="sett-help" style="margin-top:.35rem">
+            Rebuilds the automatic fixture grouping from events recorded since
+            the pump was installed, ignoring pressure readings (a
+            constant-pressure pump makes them describe the pump, not the
+            fixture). Works best after a few weeks of new events. Nothing is
+            deleted and leak protection is unaffected.
+          </p>
         </div>
         {% endif %}
         <p class="sett-cal-warning">⚠ Incorrect calibration values may cause false shutoffs or missed leaks.</p>

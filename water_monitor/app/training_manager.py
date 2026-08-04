@@ -538,6 +538,65 @@ class TrainingManager:
         except Exception as e:
             log.warning("[%s] calibration report notify failed: %s", circuit, e)
 
+    async def reseed_clusters_for_regime(self, circuit: str,
+                                         since_ts: str) -> Dict[str, Any]:
+        """dev34 B2 — rebuild this circuit's cluster space from PUMP-ERA events
+        only, in the pressure-blind feature space.
+
+        Why rebuild_from_db can't do this: it replays only rows that already
+        HAVE a cluster_id, so once live matching stops (the 2026-07 pump moved
+        the features out of every learned band), the replay pool drains and
+        'no_centers' becomes permanent — production sat at 0% assignment with
+        no cluster gaining a member after 07-21. This function replays the
+        post-anchor events through learning instead, with every
+        pressure-derived dimension excluded (see PRESSURE_FEATURE_KEYS: under
+        a VFD pump those dims measure the pump, not the fixture, and would
+        demand another re-seed at every setpoint change).
+
+        `since_ts` should be the pinned pump-era anchor
+        (supply_regime.pump_era_start) — NOT the current regime's start, which
+        a later recenter/merge can move.
+
+        Pre-pump events keep their historical cluster_ids (those clusters and
+        their stats remain valid history); post-anchor assignments are cleared
+        and re-derived in the new space. Ends frozen (locked reference).
+        """
+        import functools
+        if self.cluster_engine is None:
+            return {"error": "cluster engine not wired"}
+        eng = self.cluster_engine
+        loop = asyncio.get_running_loop()
+
+        def _work() -> Dict[str, Any]:
+            # Persist the feature mode FIRST so a crash mid-seed restarts into
+            # the same space and the re-run is a clean redo, not a mix.
+            eng.set_pressure_blind(circuit, True)
+            # Post-anchor rows: drop stale assignments (they point at pre-pump
+            # centers) so the replay below re-derives them.
+            cleared = self._db.execute(
+                """UPDATE events SET cluster_id = NULL, match_confidence = NULL,
+                       match_level = NULL
+                   WHERE circuit = ? AND start_ts >= ?
+                     AND cluster_id IS NOT NULL""",
+                (circuit, since_ts)).rowcount
+            self._db.commit()
+            eng.reset_circuit(circuit)
+            eng.unfreeze_circuit(circuit)
+            # Learning replay, chronological, WINDOWED to the anchor — the
+            # cleared set plus the never-matched backlog the outage left
+            # behind, and nothing older: pre-anchor rows predate the
+            # fragmentation fixes and the supply change, and must not become
+            # centers in the new space.
+            assigned = eng.backfill_unmatched(circuit, since_ts=since_ts)
+            eng.freeze_circuit(circuit)
+            return {"cleared": cleared, "assigned": assigned}
+
+        result = await loop.run_in_executor(None, _work)
+        log.info("[%s] cluster re-seed (pump era, pressure-blind): "
+                 "%s stale assignment(s) cleared, %s event(s) clustered",
+                 circuit, result.get("cleared"), result.get("assigned"))
+        return result
+
     async def retrain(self, circuit: str) -> Dict[str, Any]:
         """DEV/testing only: re-fit + re-lock immediately against CURRENT labels —
         no new learning period. Reuses the shared fit+freeze path (so the sanity

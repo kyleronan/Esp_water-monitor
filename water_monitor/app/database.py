@@ -354,7 +354,13 @@ CREATE TABLE IF NOT EXISTS training_state (
     events_collected    INTEGER DEFAULT 0,
     labelling_deadline  TIMESTAMP,
     completed_at        TIMESTAMP,
-    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- cluster_features_mode (migration 20260568): the feature space this
+    -- circuit's cluster centers were seeded in — 'full' (default) or
+    -- 'pressure_blind' (pump-era re-seed; every pressure-derived dimension
+    -- pinned to 0). Persisted so the startup replay rebuilds the space the
+    -- centers were learned in.
+    cluster_features_mode TEXT DEFAULT 'full'
 );
 
 -- ==========================================================================
