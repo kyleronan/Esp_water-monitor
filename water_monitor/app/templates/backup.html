@@ -109,6 +109,13 @@
                  onchange="document.getElementById('ha-fname').textContent=this.files[0]?.name||''">
           <span id="ha-fname" class="bk-fname">No file chosen</span>
         </div>
+        <label class="bk-restore-note" style="display:flex;gap:.4rem;align-items:flex-start;cursor:pointer">
+          <input type="checkbox" id="ha-labels-only" style="margin-top:.2rem">
+          <span><strong>Labelled events only</strong> — import just the events
+          you named in the archive (training fuel for fixture recognition),
+          skipping unlabelled history. Use this to recover your labels from an
+          old install without merging thousands of unnamed rows.</span>
+        </label>
         <button class="btn btn-warning btn-sm" onclick="doHistoryImport()">⬆ Import History</button>
         <div id="ha-result" class="bk-result" style="display:none"></div>
       </form>
@@ -195,9 +202,13 @@ async function doHistoryImport() {
   const fileEl   = document.getElementById('ha-file');
   const resultEl = document.getElementById('ha-result');
   if (!fileEl.files.length) { alert('Choose a .db file first.'); return; }
-  if (!confirm('Merge history from this archive? Existing rows will be kept.')) return;
+  const labelsOnly = document.getElementById('ha-labels-only').checked;
+  if (!confirm(labelsOnly
+      ? 'Import only the labelled events from this archive? Existing rows will be kept.'
+      : 'Merge history from this archive? Existing rows will be kept.')) return;
   const form = new FormData();
   form.append('file', fileEl.files[0]);
+  if (labelsOnly) form.append('labels_only', '1');
   form.append('_csrf', window.CSRF_TOKEN || '');
   resultEl.style.display = '';
   resultEl.className = 'bk-result bk-result-info';
