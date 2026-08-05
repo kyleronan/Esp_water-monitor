@@ -203,6 +203,7 @@
           <option value="estimated" {% if filter_bar.note == 'estimated' %}selected{% endif %}>〰 Estimated</option>
           <option value="not_real"  {% if filter_bar.note == 'not_real' %}selected{% endif %}>Not real use</option>
           <option value="sparse"    {% if filter_bar.note == 'sparse' %}selected{% endif %}>Brief use — long idle tail</option>
+          <option value="leak_test" {% if filter_bar.note == 'leak_test' %}selected{% endif %}>🔧 Leak test — line refill</option>
           <option value="none"      {% if filter_bar.note == 'none' %}selected{% endif %}>No notes</option>
         </select>
       </div>
@@ -234,6 +235,7 @@
         note: <strong>{{ {'unusual': '⚠ Unusual', 'estimated': '〰 Estimated',
                           'not_real': 'Not real use',
                           'sparse': 'Brief use — long idle tail',
+                          'leak_test': '🔧 Leak test — line refill',
                           'none': 'No notes'}.get(filter_bar.note, filter_bar.note) }}</strong>{% endif %}
       — the charts are unaffected.
     </p>
@@ -313,7 +315,8 @@
 </script>
 
 {# ── Summary strip ────────────────────────────────────────────────── #}
-{% set ns = namespace(total_vol=0, total_events=0, tests_pass=0, tests_fail=0, total_alerts=0,
+{% set ns = namespace(total_vol=0, total_events=0, tests_pass=0, tests_fail=0,
+                      tests_ignored=0, total_alerts=0,
                       has_events=false, has_phantom=false, has_crosstalk=false,
                       has_degraded=false, has_dribble=false) %}
 {% for ch in circuit_history %}
@@ -327,9 +330,13 @@
   {% if ch.events | selectattr('is_cross_talk') | list %}{% set ns.has_crosstalk = true %}{% endif %}
   {% if ch.events | selectattr('degraded_supply') | list %}{% set ns.has_degraded = true %}{% endif %}
   {% if ch.events | selectattr('is_low_flow_dribble') | list %}{% set ns.has_dribble = true %}{% endif %}
+  {# Counts follow the SAME verdict the badge on each row shows (classify_leak_test
+     in routers/history.py) — a test the user ignored, or one that never reached a
+     verdict (aborted / stopped / not run), must not be tallied as a red failure. #}
   {% for t in ch.leak_tests %}
-    {% if 'Passed' in (t.result or '') %}{% set ns.tests_pass = ns.tests_pass + 1 %}
-    {% elif t.result %}{% set ns.tests_fail = ns.tests_fail + 1 %}{% endif %}
+    {% if t.ui.category == 'pass' %}{% set ns.tests_pass = ns.tests_pass + 1 %}
+    {% elif t.ui.category == 'fail' %}{% set ns.tests_fail = ns.tests_fail + 1 %}
+    {% elif t.ui.category == 'ignored' %}{% set ns.tests_ignored = ns.tests_ignored + 1 %}{% endif %}
   {% endfor %}
 {% endfor %}
 <div class="hist-summary-strip">
@@ -344,10 +351,12 @@
   <div class="hist-summary-item">
     <span class="hist-summary-label">Leak tests (last 20)</span>
     <span class="hist-summary-value">
-      {% if ns.tests_pass + ns.tests_fail == 0 %}—
+      {% if ns.tests_pass + ns.tests_fail + ns.tests_ignored == 0 %}—
       {% else %}
         <span class="hist-summary-pass">{{ ns.tests_pass }} passed</span>
         {% if ns.tests_fail %} · <span class="hist-summary-fail">{{ ns.tests_fail }} failed</span>{% endif %}
+        {% if ns.tests_ignored %} · <span class="hist-summary-ignored"
+              title="Failures you marked as known/benign — still listed below, just not counted as failures.">{{ ns.tests_ignored }} ignored</span>{% endif %}
       {% endif %}
     </span>
   </div>
@@ -457,42 +466,10 @@
         {% set _span = t.monitor_minutes or t.duration_minutes %}
         {% set drop_rate = (t.pressure_drop_psi / _span) if (t.pressure_drop_psi is not none and _span) else none %}
         {% set _r = t.result or '' %}
-        {% set lt = namespace(label='', pill='pill-neutral', row='') %}
-        {# Red badge follows leak_test_scheduler.py — a leak failure is 'Failed' or any
-           'leak' mention, with Passed excluded. Pre-flight skips ('Not run …', incl. the 3-port
-           "micro leak test not applicable" wording) short-circuit BEFORE that check in the
-           scheduler, so we match the skip/abort prefixes FIRST and only then apply the 'leak'
-           catch-all — otherwise the benign 3-port message would read as a red leak. KEEP IN SYNC. #}
-        {% if _r.startswith('Passed') %}
-          {% set lt.label = 'Passed' %}{% set lt.pill = 'pill-green' %}{% set lt.row = 'hist-row-pass' %}
-        {% elif _r.startswith('Failed') and t.draw_verdict == 'demand' %}
-          {# 3.13.2 — litres came back through the meter when the valve reopened,
-             so a fixture was running and the test measured the draw, not the
-             plumbing. Presented as an abort: retry, don't go hunting for a drip. #}
-          {% set lt.label = 'Aborted — water in use' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
-        {% elif _r.startswith('Failed') and t.user_dismissed %}
-          {# dev30 — user acknowledged this failure as benign (interrupted by
-             an update, known coincident draw): amber, not red. #}
-          {% set lt.label = 'Failed — ignored' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
-        {% elif _r.startswith('Failed') %}
-          {% set lt.label = 'Failed' %}{% set lt.pill = 'pill-red' %}{% set lt.row = 'hist-row-fail' %}
-        {% elif _r.startswith('Aborted') %}
-          {% set lt.label = 'Aborted' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
-        {% elif _r.startswith('Timed out') %}
-          {% set lt.label = 'Timed out' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
-        {% elif _r.startswith('Not run') %}
-          {% set lt.label = 'Not run' %}{% set lt.pill = 'pill-neutral' %}{% set lt.row = 'hist-row-skip' %}
-        {% elif _r.startswith('Stopped') %}
-          {% set lt.label = 'Stopped' %}{% set lt.pill = 'pill-neutral' %}{% set lt.row = 'hist-row-skip' %}
-        {% elif _r|lower == 'cancelled' %}
-          {% set lt.label = 'Cancelled' %}{% set lt.pill = 'pill-neutral' %}{% set lt.row = 'hist-row-skip' %}
-        {% elif 'leak' in _r|lower %}
-          {# Any other wording mentioning a leak (and not a pre-flight skip) → treat as a leak. #}
-          {% set lt.label = 'Failed' %}{% set lt.pill = 'pill-red' %}{% set lt.row = 'hist-row-fail' %}
-        {% elif _r %}
-          {# Unrecognized non-empty result → AMBER (caution), never benign grey #}
-          {% set lt.label = 'Unknown' %}{% set lt.pill = 'pill-amber' %}{% set lt.row = 'hist-row-degraded' %}
-        {% endif %}
+        {# Badge + row tint resolved server-side (classify_leak_test in
+           routers/history.py), which is the same verdict the summary strip
+           counts on — the two can no longer drift. #}
+        {% set lt = t.ui %}
         <tr class="lt-row {{ lt.row }}{% if loop.index > 3 %} hist-extra-row{% endif %}"{% if loop.index > 3 %} style="display:none"{% endif %}
             tabindex="0" role="button" aria-label="Leak test detail"
             data-ts="{{ t.run_at or '' }}"
@@ -594,7 +571,8 @@
                        or (ch.events|selectattr('is_low_flow_dribble')|list)
                        or (ch.events|selectattr('is_cross_talk')|list)
                        or (ch.events|selectattr('flagged')|list)
-                       or (ch.events|selectattr('match_rejection_reason','equalto','sparse_envelope')|list) %}
+                       or (ch.events|selectattr('match_rejection_reason','equalto','sparse_envelope')|list)
+                       or (ch.events|selectattr('match_rejection_reason','equalto','leak_test_refill')|list) %}
   <div class="hist-table-wrap">
     <table class="hist-table">
       <thead>
@@ -647,6 +625,8 @@
             data-classified="{{ '1' if e.user_classified else '0' }}"
             data-volume-effective="{{ (e.volume_litres_effective * vol_factor)|round(vol_decimals) if e.volume_litres_effective is not none else '' }}"
             data-volume-method="{{ e.volume_estimation_method or 'raw' }}"
+            data-refill="{{ '1' if e.match_rejection_reason == 'leak_test_refill' else '0' }}"
+            data-leak-test-id="{{ e.leak_test_id if e.leak_test_id is not none else '' }}"
             data-degraded-diag="{{ e.degraded_diagnostic_json or '' }}"
             data-other-valve="{{ e.other_valve_open if e.other_valve_open is not none else '' }}"
             data-pressure-sig="{{ e.pressure_signature_json or '' }}"
@@ -664,7 +644,7 @@
              rows are unchanged. The mini waveform (formerly the Shape column —
              the word pill was dropped as unhelpful, dev15) rides along so the
              at-a-glance flow shape survives; colors still key off flow_shape. #}
-          {% set _row_vol = e.volume_litres_effective if (e.is_pressure_restoration_phantom or e.is_cross_talk or e.is_low_flow_dribble) else e.volume_litres %}
+          {% set _row_vol = e.volume_litres_effective if (e.is_pressure_restoration_phantom or e.is_cross_talk or e.is_low_flow_dribble or e.match_rejection_reason == 'leak_test_refill') else e.volume_litres %}
           {% set shape = e.flow_shape or 'unknown' %}
           {% set spark_stroke = {'steady': 'oklch(55% .18 240/.85)', 'rising': 'oklch(65% .18 80/.85)', 'falling': 'oklch(50% .18 145/.85)', 'pulsed': 'oklch(55% .05 240/.85)'} %}
           {% set spark_fill   = {'steady': 'oklch(55% .18 240/.12)', 'rising': 'oklch(65% .18 80/.12)', 'falling': 'oklch(50% .18 145/.12)', 'pulsed': 'oklch(55% .05 240/.10)'} %}
@@ -722,6 +702,7 @@
               {% if e.degraded_supply %}<span class="pill pill-amber" title="Unsteady water pressure — pressure was pulsing, so this volume is an estimate, not exact.">〰 Estimated</span>{% endif %}
               {% if e.is_low_flow_dribble %}<span class="pill pill-neutral" title="Not real water use — the flow stayed below what this water meter can reliably measure, so the reading is sensor noise rather than a real tap or appliance. Volume removed from your totals. If water was running here, open it and relabel.">Drip — not real use</span>{% endif %}
               {% if e.match_rejection_reason == 'sparse_envelope' %}<span class="pill pill-neutral" title="A brief use followed by a long idle stretch — the listed time is mostly no-flow. The water still counts, but it's too irregular to learn your fixtures from.">⏳ Brief use, long idle tail</span>{% endif %}
+              {% if e.match_rejection_reason == 'leak_test_refill' %}<span class="pill pill-neutral" title="The app's own leak test caused this. The test closes your main valve, and when it reopens the pipes refill — that refill runs through the meter and gets logged as a short burst. It isn't a tap or appliance, so its volume is removed from your totals. Kept visible on purpose: there's at most one a day, and a refill that suddenly gets bigger is worth noticing. If water was really running, open it and relabel.">🔧 Leak test — line refill</span>{% endif %}
               {# Reviewed anomalies keep a pill rather than losing it: the event
                  stays findable in ?filter=anomaly, so its row should still say
                  why it's there — just no longer as a call to action. Verdicts:
@@ -835,6 +816,20 @@
         <dt>Duration</dt>           <dd id="emd-ph-duration">—</dd>
         <dt>Pressure drop</dt>      <dd id="emd-ph-dp">—</dd>
         <dt>Reading we ignored</dt> <dd id="emd-ph-rawvol">—</dd>
+      </dl>
+    </section>
+    <section id="emd-leaktest-section" class="evt-modal-degraded" hidden
+             aria-label="Caused by a leak test">
+      <h4 class="evt-modal-degraded-title">🔧 Caused by the app's leak test</h4>
+      <p>A scheduled leak test closed your main valve just before this. When the
+         valve reopened, the pipes refilled — and that refill ran through the
+         meter, which is what you're looking at. It isn't a tap or an appliance,
+         so we've removed its volume from every total.
+         <strong>If water really was running, open Classification below and
+         relabel it</strong> — your label overrides this call.</p>
+      <dl class="evt-modal-dl evt-modal-dl-extra">
+        <dt>Leak test</dt>          <dd id="emd-lt-test">—</dd>
+        <dt>Reading we ignored</dt> <dd id="emd-lt-rawvol">—</dd>
       </dl>
     </section>
     <section id="emd-anomaly-section" class="evt-modal-degraded" hidden
@@ -1443,6 +1438,19 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       phSection.hidden = false;
     } else {
       phSection.hidden = true;
+    }
+
+    // ── Leak-test reopen refill ─────────────────────────────────────────
+    // The add-on's own valve cycle, not household use. Kept visible in the
+    // list (unlike the artifact family) so this panel is what explains it.
+    const ltSection = document.getElementById('emd-leaktest-section');
+    if (d.refill === '1') {
+      document.getElementById('emd-lt-test').textContent =
+        d.leakTestId ? `#${d.leakTestId} — see Leak tests above` : 'scheduled test';
+      document.getElementById('emd-lt-rawvol').textContent = d.volume || '—';
+      ltSection.hidden = false;
+    } else {
+      ltSection.hidden = true;
     }
 
     // ── Unusual-event (anomaly) triage ──────────────────────────────────

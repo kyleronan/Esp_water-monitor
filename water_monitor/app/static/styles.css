@@ -1284,6 +1284,9 @@ a.dash-next-chip:hover { text-decoration: underline; }
 }
 .hist-summary-pass { color: var(--green, oklch(55% .18 145)); }
 .hist-summary-fail { color: var(--red,   oklch(55% .22 25)); }
+/* Failures the user marked known/benign — amber, deliberately NOT red: they are
+   still shown, just not counted against the failure tally. */
+.hist-summary-ignored { color: var(--amber, oklch(68% .18 70)); }
 
 /* Shared card shell for all history sections */
 .hist-card {

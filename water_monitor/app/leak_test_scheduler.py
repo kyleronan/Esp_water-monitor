@@ -28,6 +28,9 @@ from .config import AddonConfig
 from .database import (get_leak_test_schedule, upsert_leak_test_schedule,
                        insert_leak_test_history, get_leak_test_history)
 from .ha_client import HaClient
+from .leak_test_refill import (POST_RESTORE_WATCH_S, POST_RESTORE_LEAD_S,
+                               POST_RESTORE_DEMAND_L,
+                               reconcile_leak_test_refills)
 
 log = logging.getLogger(__name__)
 
@@ -63,13 +66,11 @@ DEMAND_RESULTS = {
 RETRY_AFTER_DEMAND_MIN: int = 30
 
 # Post-restore watch (the reopen-slug backstop). Once the valve reopens,
-# anything drawn during the test has to come back through the meter. Measured
-# 2026-07-26: a flapper-scale refill is ~0.04 L, a pump recharge pushes
-# 0.3-0.5 L, and a toilet that was flushed during the test pulls 3-8 L as it
-# finishes filling. 1 L sits in the gap with an order of magnitude either side.
-POST_RESTORE_WATCH_S: int = 120
-POST_RESTORE_LEAD_S: int = 15      # covers the <=10 s poll gap plus valve travel
-POST_RESTORE_DEMAND_L: float = 1.0
+# anything drawn during the test has to come back through the meter. The window
+# and the demand bar are imported at the top from leak_test_refill, which owns
+# them: the refill reconcile needs the SAME numbers to re-derive the window for
+# tests that ran while the add-on was down. Re-exported here under their
+# original names — POST_RESTORE_WATCH_S / _LEAD_S / _DEMAND_L.
 
 # Compliance of the isolated section, mL per PSI — converts a decay rate into a
 # leak rate. Used only until a circuit calibrates its own from a reopen refill.
@@ -662,6 +663,19 @@ class LeakTestScheduler:
         except Exception as e:
             log.warning("[%s] post-restore draw check failed (non-fatal): %s",
                         circuit, e)
+
+        # --- Tag the refill the reopen just produced ---
+        # Runs AFTER the draw check so draw_verdict is stored: a 'demand' test
+        # (a fixture was running) claims nothing. The watch above already waited
+        # out the window, so the detector has closed the refill event by now;
+        # anything it still misses is picked up by the periodic reconcile.
+        try:
+            res = reconcile_leak_test_refills(self._db, circuit, lookback_days=1)
+            if res.get("tagged"):
+                log.info("[%s] tagged %d leak-test refill event(s)",
+                         circuit, res["tagged"])
+        except Exception as e:
+            log.warning("[%s] refill tagging failed (non-fatal): %s", circuit, e)
 
         demand = (final_result in DEMAND_RESULTS) or (draw_verdict == "demand")
         effective_result = (

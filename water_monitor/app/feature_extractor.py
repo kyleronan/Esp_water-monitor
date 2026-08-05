@@ -594,6 +594,16 @@ _XTALK_IRR_MIN_MAIN_DELTA_PSI: float = 2.0  # need a real main pressure swing to
 _XTALK_IRR_PRESSURE_RATIO:    float = 1.3   # irrigation swing ≥ 1.3× main swing
 _XTALK_IRR_MIN_FLOW_LPM:      float = 5.0   # irrigation "running" flow floor (interval build)
 _IRRIGATION_XTALK_REASON: str = "irrigation_cross_talk"
+# Leak-test reopen refill (2026-08-04). Mirrored from leak_test_refill rather
+# than imported: that module imports database, which lazily imports this one.
+# test_leak_test_refill asserts the two strings are equal.
+_LEAK_TEST_REFILL_REASON: str = "leak_test_refill"
+# SQL guard the artifact reprocess scans append so they cannot steal a refill's
+# provenance. Those scans filter on the three artifact FLAG bits, and this
+# verdict deliberately sets none of them (it stays visible), so without this
+# they would re-claim a refill whose shape happens to trip another detector.
+_LEAK_REFILL_GUARD_SQL: str = (
+    "  AND COALESCE(match_rejection_reason, '') <> 'leak_test_refill' ")
 # The "brief use, long idle tail" inflated-envelope reason. ONE constant for every
 # writer/matcher (finalizer, sparse-reprocess scan, capped re-include, auto-split
 # candidate query) — the dev6 bug was one predicate not knowing this string.
@@ -1448,6 +1458,26 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         features["phantom_suppression_averted"] = 0
         return
 
+    # Durable leak-test reopen refill — set out-of-band by
+    # leak_test_refill.reconcile_leak_test_refills from the add-on's OWN test
+    # timing. No single-event detector can reproduce it (the event looks like a
+    # small correctly-metered draw, because that is exactly what it is), so a
+    # recompute would restore the volume and drop the provenance. Preserve —
+    # unless the user has since applied a real fixture label. Note this branch
+    # sets no artifact flag bit: the verdict zeroes volume and excludes from
+    # training but stays VISIBLE in History (see the leak_test_refill module).
+    if (features.get("match_rejection_reason") == _LEAK_TEST_REFILL_REASON
+            and not str(features.get("user_fixture_type") or "").strip()):
+        features["volume_litres_effective"] = 0.0
+        features["volume_estimation_method"] = _LEAK_TEST_REFILL_REASON
+        features["excluded_from_training"] = 1
+        features["match_rejection_reason"] = _LEAK_TEST_REFILL_REASON
+        features["is_pressure_restoration_phantom"] = 0
+        features["is_cross_talk"] = 0
+        features["is_low_flow_dribble"] = 0
+        features["phantom_suppression_averted"] = 0
+        return
+
     # Durable overlap-duplicate verdict (dev28, overlap_guard) — set
     # out-of-band by the overlap guard from CROSS-EVENT evidence (another
     # event on the same circuit already counts this water). The single-event
@@ -1898,6 +1928,10 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
         " AND (user_fixture_type IS NULL OR user_fixture_type = '')"
         if _events_has_column(conn, "user_fixture_type") else ""
     )
+    # A leak-test reopen refill already has its verdict, and its FLAG bits are
+    # deliberately clear (it stays visible), so the scans' flag filters below
+    # would otherwise let another detector re-claim it and lose the provenance.
+    uft_guard += _LEAK_REFILL_GUARD_SQL
     # Duration prefilter is metric-gated: legacy rows (no active-flow metrics) stay at the
     # frozen 1800 s floor, while rows that HAVE the no-flow metrics also qualify from 120 s.
     # The canonical _detect_pressure_restoration_phantom re-runs inside the loop and does the
@@ -2389,10 +2423,25 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                      ", ".join(f"{r['id'][:8]} ({r['volume_litres']} L, "
                                f"{r['reason']})" for r in relabel_review))
 
+    # ── Scan 7: leak-test reopen refills ──────────────────────────────────────
+    # Runs LAST so it sees the verdicts the scans above just settled and can
+    # take the automatic ones over: inside a leak test's reopen window the test
+    # is ground truth about causation, while those detectors are inferring from
+    # shape. The scans in turn skip rows already tagged here (uft_guard carries
+    # _LEAK_REFILL_GUARD_SQL), so the precedence holds in both directions.
+    # Self-healing: a reprocess that dropped a refill's verdict gets it back.
+    try:
+        from .leak_test_refill import reconcile_leak_test_refills
+        refill = reconcile_leak_test_refills(conn)
+    except Exception as e:
+        log.warning("leak-test refill reconcile failed (non-fatal): %s", e)
+        refill = {"tagged": 0}
+
     return {"flagged": flagged, "dribbles_flagged": dribbles_flagged,
             "dribbles_restored": dribbles_restored,
             "psilent_flagged": psilent_flagged,
             "cross_talk_flagged": cross_talk_flagged,
+            "leak_test_refills": refill.get("tagged", 0),
             "rise_flagged": rise["rise_flagged"],
             "sparse_flagged": sparse_flagged,
             "capped_reincluded": capped_reincluded,
@@ -2444,7 +2493,8 @@ def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
         "  AND COALESCE(is_low_flow_dribble, 0) = 0 "
         "  AND COALESCE(degraded_supply, 0) = 0 "
         "  AND COALESCE(user_classified, 0) = 0 "
-        "  AND (user_fixture_type IS NULL OR user_fixture_type = '')",
+        "  AND (user_fixture_type IS NULL OR user_fixture_type = '')"
+        + _LEAK_REFILL_GUARD_SQL,
         (_RISE_PHANTOM_MIN_CORR, _RISE_PHANTOM_MAX_DURATION_S,
          _RISE_PHANTOM_MAX_VOLUME_PD_L),   # loose prefilter = the larger PD cap;
                                            # the detector applies the per-circuit one

@@ -215,7 +215,11 @@ _BASELINE_VERSION: int = 20260523
 #   20260569 — baseline_snapshot table: the frozen usage baseline + anomaly
 #              percentiles as they stood before each freeze, so a regime refit
 #              that lands badly is revertable. Table-create only.
-_CURRENT_VERSION: int = 20260569
+#   20260570 — events.leak_test_id: provenance for the reopen-refill verdict
+#              (the add-on's own leak test cycling the valve logs a short flow
+#              burst that is neither fixture use nor a sensor phantom). DDL plus
+#              a one-time backfill over leak_test_history.
+_CURRENT_VERSION: int = 20260570
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1971,6 +1975,35 @@ def _apply_baseline_snapshot_table(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260569: baseline_snapshot table ready")
 
 
+# 20260570 — leak-test reopen refill provenance.
+def _apply_leak_test_refill_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260570 — ``events.leak_test_id`` plus a
+    one-time backfill of the reopen-refill verdict over ALL stored leak tests.
+
+    The backfill runs the same idempotent reconcile the scheduler calls live, so
+    historical refills get the same verdict as future ones (on the production
+    export that is one ~0.04 L event per test night). Best-effort: a backfill
+    failure must never block boot — the periodic reconcile retries it.
+    """
+    if not _has_column(conn, "events", "leak_test_id"):
+        conn.execute("ALTER TABLE events ADD COLUMN leak_test_id INTEGER")
+    conn.commit()
+    try:
+        from .leak_test_refill import reconcile_leak_test_refills
+        res = reconcile_leak_test_refills(conn, lookback_days=0, since=None)
+        log.info("Migration 20260570: leak_test_id ready; backfill tagged "
+                 "%d refill event(s) over %d test(s)",
+                 res.get("tagged", 0), res.get("tests_scanned", 0))
+    except Exception as e:
+        log.warning("Migration 20260570: refill backfill skipped (non-fatal): %s", e)
+
+
+def _missing_leak_test_refill_columns(conn: sqlite3.Connection) -> set[str]:
+    if not _has_column(conn, "events", "leak_test_id"):
+        return {"events.leak_test_id"}
+    return set()
+
+
 # 20260565 — rule_calibration keyed per (circuit, supply regime).
 def _apply_regime_calibration(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260565 — rebuild rule_calibration with
@@ -2133,6 +2166,7 @@ _MIGRATIONS: tuple = (
     (20260567, _apply_leak_watch_ack_column),
     (20260568, _apply_cluster_features_mode),
     (20260569, _apply_baseline_snapshot_table),
+    (20260570, _apply_leak_test_refill_column),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -2208,6 +2242,7 @@ def _run_migrations_impl(
             | _missing_overlap_audit_table(conn)
             | _missing_leak_test_dismissed_column(conn)
             | _missing_leak_test_measurement_columns(conn)
+            | _missing_leak_test_refill_columns(conn)
         )
         if missing:
             raise RuntimeError(

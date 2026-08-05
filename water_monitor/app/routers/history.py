@@ -200,6 +200,73 @@ def _filters_to_storage(raw: dict, vol_factor: float,
     return out
 
 
+def classify_leak_test(t: dict) -> dict:
+    """Leak-test row → the verdict the page shows for it.
+
+    ONE source of truth for the badge on each row AND the "Leak tests (last 20)"
+    summary tally, so the counts can never disagree with the badges (they did:
+    the strip counted every non-'Passed' result as a red failure, including
+    ignored ones, aborts and manual stops).
+
+    Follows leak_test_scheduler.py — a leak failure is 'Failed' or any 'leak'
+    mention, with Passed excluded. Pre-flight skips ('Not run …', incl. the
+    3-port "micro leak test not applicable" wording) short-circuit BEFORE that
+    check in the scheduler, so we match the skip/abort prefixes FIRST and only
+    then apply the 'leak' catch-all — otherwise the benign 3-port message would
+    read as a red leak.
+
+    ``category`` is what the summary strip counts on:
+      ``pass``    — a clean test
+      ``fail``    — an unexplained failure (the only red one, the only one tallied
+                    as failed)
+      ``ignored`` — an admin marked the failure known/benign; counted apart
+      ``other``   — no verdict either way (aborted, timed out, stopped, not run)
+      ``none``    — still running / no result yet
+    """
+    r = (t.get("result") or "")
+    if not r:
+        return {"category": "none", "label": "", "pill": "pill-neutral", "row": ""}
+    if r.startswith("Passed"):
+        return {"category": "pass", "label": "Passed",
+                "pill": "pill-green", "row": "hist-row-pass"}
+    if r.startswith("Failed") and t.get("draw_verdict") == "demand":
+        # 3.13.2 — litres came back through the meter when the valve reopened,
+        # so a fixture was running and the test measured the draw, not the
+        # plumbing. Presented as an abort: retry, don't go hunting for a drip.
+        return {"category": "other", "label": "Aborted — water in use",
+                "pill": "pill-amber", "row": "hist-row-degraded"}
+    if r.startswith("Failed") and t.get("user_dismissed"):
+        # dev30 — user acknowledged this failure as benign (interrupted by an
+        # update, known coincident draw): amber, not red.
+        return {"category": "ignored", "label": "Failed — ignored",
+                "pill": "pill-amber", "row": "hist-row-degraded"}
+    if r.startswith("Failed"):
+        return {"category": "fail", "label": "Failed",
+                "pill": "pill-red", "row": "hist-row-fail"}
+    if r.startswith("Aborted"):
+        return {"category": "other", "label": "Aborted",
+                "pill": "pill-amber", "row": "hist-row-degraded"}
+    if r.startswith("Timed out"):
+        return {"category": "other", "label": "Timed out",
+                "pill": "pill-amber", "row": "hist-row-degraded"}
+    if r.startswith("Not run"):
+        return {"category": "other", "label": "Not run",
+                "pill": "pill-neutral", "row": "hist-row-skip"}
+    if r.startswith("Stopped"):
+        return {"category": "other", "label": "Stopped",
+                "pill": "pill-neutral", "row": "hist-row-skip"}
+    if r.lower() == "cancelled":
+        return {"category": "other", "label": "Cancelled",
+                "pill": "pill-neutral", "row": "hist-row-skip"}
+    if "leak" in r.lower():
+        # Any other wording mentioning a leak (and not a pre-flight skip) → leak.
+        return {"category": "fail", "label": "Failed",
+                "pill": "pill-red", "row": "hist-row-fail"}
+    # Unrecognized non-empty result → AMBER (caution), never benign grey.
+    return {"category": "other", "label": "Unknown",
+            "pill": "pill-amber", "row": "hist-row-degraded"}
+
+
 def _collect_circuit_history_sync(
     db,
     circuits,
@@ -400,6 +467,10 @@ def _collect_circuit_history_sync(
             else:
                 e["anomaly_reason"] = ""
         leak_tests = get_leak_test_history(db, circuit_cfg.circuit, limit=20)
+        # Verdict resolved server-side so the row badge and the summary tally
+        # read the SAME classification (see classify_leak_test).
+        for _t in leak_tests:
+            _t["ui"] = classify_leak_test(_t)
         summaries  = get_daily_summaries(
             db, circuit_cfg.circuit,
             date_from=chart_from,

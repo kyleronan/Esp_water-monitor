@@ -999,6 +999,16 @@ CREATE TABLE IF NOT EXISTS events (
     -- it can be shown / hidden separately. Auto-derived; suppressed for
     -- user_classified rows (a peer of the phantom flag in patch_event).
     is_cross_talk                    INTEGER NOT NULL DEFAULT 0,
+    -- Leak-test reopen refill (migration 20260570). The id of the
+    -- leak_test_history row whose valve reopen produced this event — set by
+    -- leak_test_refill.reconcile_leak_test_refills alongside
+    -- match_rejection_reason='leak_test_refill'. Deliberately OUTSIDE the
+    -- artifact flag family above (this verdict zeroes volume and excludes from
+    -- training but stays VISIBLE in History — at most one per day, and its size
+    -- reads out the isolated section). The feature pipeline never writes this
+    -- column, so the event upsert cannot clear it: it is the durable
+    -- provenance the reconcile repairs from. NULL = not a refill.
+    leak_test_id                     INTEGER,
     -- Sprint H. user_ignored: explicit Ignore/Restore intent (separate from
     -- the derived excluded_from_training, which is auto OR user_ignored OR
     -- manual). user_classified: lock bit — when 1 the category flags
@@ -2855,6 +2865,10 @@ _NOTE_KIND_SQL: Dict[str, str] = {
                   "OR COALESCE(e.is_cross_talk, 0) = 1 "
                   "OR COALESCE(e.is_low_flow_dribble, 0) = 1)"),
     "sparse":    "e.match_rejection_reason = 'sparse_envelope'",
+    # Leak-test refill is its OWN filter rather than part of 'not_real': it is
+    # never hidden by the not-real-use toggle (see leak_test_refill), so folding
+    # it in would make the two disagree.
+    "leak_test": "e.match_rejection_reason = 'leak_test_refill'",
     "none":      ("(COALESCE(e.flagged, 0) = 0 "
                   "AND COALESCE(e.degraded_supply, 0) = 0 "
                   "AND COALESCE(e.volume_estimation_method, 'raw') "
@@ -2863,6 +2877,7 @@ _NOTE_KIND_SQL: Dict[str, str] = {
                   "AND COALESCE(e.is_cross_talk, 0) = 0 "
                   "AND COALESCE(e.is_low_flow_dribble, 0) = 0 "
                   "AND COALESCE(e.match_rejection_reason, '') <> 'sparse_envelope' "
+                  "AND COALESCE(e.match_rejection_reason, '') <> 'leak_test_refill' "
                   "AND COALESCE(e.user_reviewed, 0) = 0)"),
 }
 
@@ -3475,6 +3490,87 @@ def mark_event_irrigation_cross_talk(
     return True
 
 
+def mark_event_leak_test_refill(
+    conn: sqlite3.Connection,
+    event_id: str,
+    circuit: str,
+    *,
+    leak_test_id: int,
+    recompute_summary: bool = True,
+) -> bool:
+    """Flag an event as the refill that followed a leak test's valve reopen.
+
+    Applied OUT-OF-BAND by ``leak_test_refill.reconcile_leak_test_refills`` from
+    the add-on's own test timing — never by a detector, and never by the user —
+    so ``user_classified`` stays 0. Durability across a reprocess comes from the
+    distinct ``match_rejection_reason`` (preserved by
+    ``_finalize_derived_verdicts``), the ``leak_test_id`` provenance column (the
+    feature pipeline never writes it, so the upsert cannot clear it), and the
+    reconcile being idempotent.
+
+    Zeroes effective volume through the §2.5 ledger chokepoint and excludes the
+    row from training, but sets NONE of the artifact flag bits — see the module
+    docstring in ``leak_test_refill``: this verdict stays VISIBLE in History.
+
+    TAKES OVER an existing AUTOMATIC artifact verdict (the reasons in
+    ``_RELABEL_REVERTIBLE_REASONS``) and clears its flags. A leak test is ground
+    truth about CAUSATION, while those detectors infer from shape — and on the
+    2026-08 production export they had claimed 9 of these refills between them
+    as 'below_meter_floor' / 'pressure_silent_flow' / 'pump_recharge'. The
+    volume outcome is identical (all zero); what changes is that the event says
+    what actually happened and stops counting against the artifact detectors'
+    own validation statistics. ``overlap_duplicate`` and the degraded-supply
+    estimate are deliberately NOT taken over — the first means a sibling event
+    already accounts for this water, and the second never zeroed anything.
+
+    No-op (returns False) when the event is gone, already tagged, carries a
+    verdict outside that set, or the user has claimed it (classified, labelled,
+    or ignored) — real water always wins.
+    """
+    from .leak_test_refill import LEAK_TEST_REFILL_REASON
+
+    row = conn.execute(
+        "SELECT volume_litres, start_ts, user_classified, user_ignored, "
+        "       user_fixture_type, match_rejection_reason, degraded_supply "
+        "FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+    if row is None:
+        return False
+    if (row["user_classified"] or row["user_ignored"]
+            or str(row["user_fixture_type"] or "").strip()):
+        return False
+    if row["degraded_supply"]:
+        return False    # an ESTIMATE, not a zeroing — leave the envelope alone
+    reason = row["match_rejection_reason"]
+    if reason == LEAK_TEST_REFILL_REASON:
+        return False    # idempotent
+    if reason is not None and reason not in _RELABEL_REVERTIBLE_REASONS:
+        return False    # e.g. overlap_duplicate — a sibling counts this water
+
+    with transaction(conn):
+        conn.execute(
+            "UPDATE events SET "
+            "  is_pressure_restoration_phantom = 0, is_cross_talk = 0, "
+            "  is_low_flow_dribble = 0, phantom_suppression_averted = 0, "
+            "  excluded_from_training = 1, volume_litres_effective = 0.0, "
+            "  volume_estimation_method = ?, match_rejection_reason = ?, "
+            "  leak_test_id = ? "
+            "WHERE id = ? AND circuit = ?",
+            (LEAK_TEST_REFILL_REASON, LEAK_TEST_REFILL_REASON, leak_test_id,
+             event_id, circuit),
+        )
+        apply_effective_volume(conn, event_id, circuit, row["start_ts"], 0.0)
+
+    day = (row["start_ts"] or "")[:10]
+    if day and recompute_summary:
+        compute_daily_summary(conn, circuit, day)
+        conn.commit()
+    log.info("[%s] leak-test refill: event %s zeroed (%.3f L, test #%s)",
+             circuit, event_id, float(row["volume_litres"] or 0.0), leak_test_id)
+    return True
+
+
 def revert_irrigation_cross_talk(
     conn: sqlite3.Connection, event_id: str, circuit: str,
 ) -> bool:
@@ -3540,6 +3636,7 @@ _RELABEL_REVERTIBLE_REASONS: frozenset = frozenset({
     "cross_talk",
     "irrigation_cross_talk",         # _IRRIGATION_XTALK_REASON
     "sparse_envelope",               # SPARSE_ENVELOPE_REASON
+    "leak_test_refill",              # LEAK_TEST_REFILL_REASON
 })
 
 

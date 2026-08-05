@@ -9,6 +9,33 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **The app's own leak test no longer shows up as water you used — dev35** — a
+  scheduled leak test closes your main valve, and when it reopens the pipes
+  refill. That refill runs through the meter, so it was logged as an ordinary
+  little draw: on 2026-08-04 at 01:56, 9 seconds and 0.04 L with the pressure
+  climbing back from 52 to 56 PSI. It isn't a tap or an appliance, but it also
+  isn't a sensor error — the meter measured it correctly — so none of the
+  existing "not real use" detectors could recognise it. The only thing that
+  knows what it was is the scheduler that closed the valve, so that is now what
+  labels it: events landing in a test's reopen window are tagged **"🔧 Leak
+  test — line refill"**, their volume is removed from every total, and they are
+  kept out of fixture learning.
+  Unlike the other not-real-use verdicts these stay **visible** in History
+  rather than being hidden — there is at most one a day, and a refill that
+  suddenly gets bigger is worth noticing, since it reads out how much the
+  isolated section is losing between tests. They have their own **Note filter**
+  entry, and opening one explains what happened. If water really was running,
+  relabelling still overrides the call and restores the volume.
+  The tag also **takes over** from the older detectors: on the production
+  history they had claimed 9 of 10 of these refills as "drip", "pressure-silent
+  flow", or "pump top-up". The water removed is identical either way — what
+  changes is that the event now says what actually happened.
+  Safety comes from the test's own demand bar: **at most 1.0 L per test** can
+  ever be attributed to a refill, and a test that already detected water in use
+  attributes nothing at all. Verified against the full stored history — 10
+  refills tagged (0.014–0.083 L), and three real toilet flushes that happened
+  to fall inside a reopen window (3.9, 6.0 and 6.2 L) were all left untouched.
+
 - **Fixture recognition now survives a change in water supply — dev34** — a new
   final rung in the matching ladder classifies on **fixture shape alone**, with
   every pressure-derived feature excluded from its feature set. This is the
