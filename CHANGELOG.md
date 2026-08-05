@@ -157,6 +157,16 @@ landed without a version bump; per-build details are in git history.)
 
 ### Fixes
 
+- **An ignored leak test no longer counts as a failure in the History summary
+  (dev35)** — the "Leak tests (last 20)" tile read "11 passed · 9 failed" while
+  the rows below it showed amber "Failed — ignored", "Stopped" and "Aborted"
+  badges: the tile counted *every* result that wasn't "Passed" as a red
+  failure. It now counts the same verdict the badges show — only an unexplained
+  failure is tallied as failed, ignored ones get their own amber "N ignored"
+  count, and tests that never reached a verdict (aborted, timed out, stopped,
+  not run) aren't counted either way. Both the tile and the row badges now read
+  one shared classifier, so the number and the badges can't drift apart again.
+
 - **A stuck database write lock now names itself, and event saves fail
   gracefully (dev34)** — one connection was observed holding an open write
   transaction for 27+ minutes: every save from the History page returned a

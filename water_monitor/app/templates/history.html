@@ -475,7 +475,7 @@
             data-ts="{{ t.run_at or '' }}"
             data-triggered="{{ t.triggered_by or '—' }}"
             data-result="{{ t.result or '' }}"
-            data-label="{{ lt.label }}" data-pill="{{ lt.pill }}"
+            data-label="{{ lt.label }}" data-pill="{{ lt.pill }}" data-category="{{ lt.category }}"
             data-baseline="{{ (t.baseline_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.baseline_psi is not none else '—' }}"
             data-final="{{ (t.final_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.final_psi is not none else '—' }}"
             data-drop="{{ (t.pressure_drop_psi * pressure_factor)|round(pressure_decimals) ~ ' ' ~ pressure_unit if t.pressure_drop_psi is not none else '—' }}"
@@ -1896,12 +1896,18 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   }
 
   // A failure the reopen slug proved was really water use gets the demand
-  // explanation, not the go-hunt-for-a-drip one. Mirrors the row's amber
-  // badge in the template's `lt` namespace block. KEEP IN SYNC.
+  // explanation, not the go-hunt-for-a-drip one — and one the user has ignored
+  // says so rather than telling them to go hunting. Both keyed off the SAME
+  // server-side verdict that drew the badge and fed the summary tally
+  // (data-category ← classify_leak_test), so nothing here can drift.
   const LT_DEMAND_EXPLAIN =
     'Water came back through the meter as soon as the valve reopened, so a ' +
     'fixture was running during the test — that is what pushed the pressure ' +
     'down, not a leak. Nothing to chase; it will run again on schedule.';
+  const LT_IGNORED_EXPLAIN =
+    'Pressure did fall during this test, but you marked the failure as ' +
+    'known — so it shows in amber and is left out of the passed/failed count. ' +
+    'The measurements are below; use "Un-ignore" on the row to count it again.';
 
   function openLeakModal(row) {
     const d = row.dataset;
@@ -1910,7 +1916,9 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     badge.className = 'pill ' + (d.pill || 'pill-neutral');
     badge.textContent = d.label || 'Unknown';
     document.getElementById('ltm-explain').textContent   =
-      demand ? LT_DEMAND_EXPLAIN : ltExplain(d.result);
+      demand ? LT_DEMAND_EXPLAIN
+             : d.category === 'ignored' ? LT_IGNORED_EXPLAIN
+             : ltExplain(d.result);
     document.getElementById('ltm-time').textContent      = fmtTs(d.ts);
     document.getElementById('ltm-triggered').textContent = d.triggered || '—';
     document.getElementById('ltm-result').textContent    = d.result || '—';
