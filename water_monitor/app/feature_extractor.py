@@ -1899,7 +1899,8 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
         extreme outliers is negligible and not worth a full retrain. This is a
         deliberate scope decision, not an oversight.
     """
-    from .database import transaction, compute_daily_summary, apply_effective_volume
+    from .database import (transaction, compute_daily_summary,
+                           apply_effective_volume, local_day_of)
 
     # Repair any cross-cutting flag-consistency violations first (P2): zeroed events
     # that slipped through still feeding training, and stale mutually-exclusive flags.
@@ -1989,7 +1990,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             apply_effective_volume(conn, row["id"], row["circuit"], row["start_ts"], 0)
 
         flagged += 1
-        day = (row["start_ts"] or "")[:10]   # UTC date portion of ISO ts
+        day = local_day_of(row["start_ts"])   # HOME-LOCAL day of the UTC ts
         if day:
             affected_days.add((row["circuit"], day))
         log.info(
@@ -2112,7 +2113,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                 dribbles_restored += 1
             else:
                 continue
-            day = (row["start_ts"] or "")[:10]
+            day = local_day_of(row["start_ts"])
             if day:
                 dr_days.add((row["circuit"], day))
         for circ, day in dr_days:
@@ -2171,7 +2172,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                 apply_effective_volume(conn, row["id"], row["circuit"],
                                        row["start_ts"], 0)
             cross_talk_flagged += 1
-            day = (row["start_ts"] or "")[:10]
+            day = local_day_of(row["start_ts"])
             if day:
                 xt_days.add((row["circuit"], day))
         for circ, day in xt_days:
@@ -2259,7 +2260,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                                        row["start_ts"], 0)
             psilent_flagged += 1
             ps_litres += float(row["veff"] or 0.0)
-            day = (row["start_ts"] or "")[:10]
+            day = local_day_of(row["start_ts"])
             if day:
                 ps_days.add((row["circuit"], day))
         for circ, day in ps_days:
@@ -2406,7 +2407,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                 apply_effective_volume(conn, row["id"], row["circuit"],
                                        row["start_ts"], raw)
             relabel_restored += 1
-            day = (row["start_ts"] or "")[:10]
+            day = local_day_of(row["start_ts"])
             if day:
                 rl_days.add((row["circuit"], day))
             log.info("relabel-repair: restored %.3f L on %s (was %s, label=%r)",
@@ -2475,7 +2476,8 @@ def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
 
     Returns ``{"rise_flagged": <n>}``.
     """
-    from .database import transaction, compute_daily_summary, apply_effective_volume
+    from .database import (transaction, compute_daily_summary,
+                           apply_effective_volume, local_day_of)
 
     if not _events_has_column(conn, "flow_pressure_corr"):
         return {"rise_flagged": 0}
@@ -2537,7 +2539,7 @@ def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
             apply_effective_volume(conn, row["id"], row["circuit"],
                                    row["start_ts"], 0)
         rise_flagged += 1
-        day = (row["start_ts"] or "")[:10]
+        day = local_day_of(row["start_ts"])
         if day:
             days.add((row["circuit"], day))
         log.info("rise-phantom-reprocess: event %s flagged "
@@ -2603,7 +2605,7 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
     Returns a summary dict with the counts the endpoint relays to the UI.
     """
     from .database import (_hour_bucket_for, transaction, apply_effective_volume,
-                           compute_daily_summary)
+                           compute_daily_summary, local_day_of)
     from .supply_regime import pump_era_start
     era_start = pump_era_start(conn)
 
@@ -2709,7 +2711,7 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
             apply_effective_volume(conn, row["id"], row["circuit"], row["start_ts"],
                                    new_effective)
 
-        day = (row["start_ts"] or "")[:10]
+        day = local_day_of(row["start_ts"])
         if day:
             affected_days.add((row["circuit"], day))
 

@@ -22,6 +22,7 @@ from pathlib import Path
 
 from .database import (
     get_data_retention, update_data_retention, compute_daily_summary,
+    local_day_of, local_day_bounds_utc,
 )
 
 log = logging.getLogger(__name__)
@@ -235,55 +236,74 @@ class DataPruner:
 
     # ── Daily summary computation ───────────────────────────────────────────
 
+    def _local_days_with_events(self, circuit: str) -> list:
+        """Every LOCAL calendar day this circuit has events on, oldest first.
+
+        Derived from the circuit's first/last event rather than
+        `GROUP BY date(start_ts)`: start_ts is UTC, and one UTC day straddles
+        two local days, so a UTC-keyed group can't address a local-day summary
+        row. Two scalar queries + a date walk beats a full-table group-by.
+        """
+        row = self._db.execute(
+            "SELECT MIN(start_ts) AS lo, MAX(start_ts) AS hi "
+            "FROM events WHERE circuit = ?", (circuit,)).fetchone()
+        if not row or not row["lo"]:
+            return []
+        first = local_day_of(row["lo"])
+        last  = local_day_of(row["hi"])
+        if not first or not last:
+            return []
+        out, d = [], datetime.strptime(first, "%Y-%m-%d")
+        end = datetime.strptime(last, "%Y-%m-%d")
+        while d <= end:
+            out.append(d.strftime("%Y-%m-%d"))
+            d += timedelta(days=1)
+        return out
+
     def _compute_missing_summaries(self, now: datetime,
                                    full_backfill: bool = False) -> None:
         """
         Compute daily summaries for days that are missing or stale.
         full_backfill=True processes all historical days (used at startup).
+
+        Days are the home's LOCAL calendar days (see database.local_day_of) —
+        the same key `daily_summary.day` is written under.
         """
-        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        # Bounds are LOCAL days (local_day_of), so `now` — which arrives in UTC
+        # — has to be converted before slicing, or the cutoff lands on the wrong
+        # side of the boundary for the six hours after local midnight.
+        yesterday = local_day_of((now - timedelta(days=1)).isoformat())
+        week_ago  = local_day_of((now - timedelta(days=7)).isoformat())
+        lower = "" if full_backfill else week_ago
 
         try:
-            if full_backfill:
-                # All days in events that don't have a summary yet
-                gaps = self._db.execute("""
-                    SELECT e.circuit, date(e.start_ts) AS day
-                    FROM events e
-                    LEFT JOIN daily_summary ds
-                        ON ds.circuit = e.circuit
-                        AND ds.day    = date(e.start_ts)
-                    WHERE ds.day IS NULL
-                      AND date(e.start_ts) <= ?
-                    GROUP BY e.circuit, date(e.start_ts)
-                    ORDER BY e.circuit, day ASC
-                """, (yesterday,)).fetchall()
-            else:
-                # Only recent gaps (last 7 days) to catch any missed runs
-                week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-                gaps = self._db.execute("""
-                    SELECT e.circuit, date(e.start_ts) AS day
-                    FROM events e
-                    LEFT JOIN daily_summary ds
-                        ON ds.circuit = e.circuit
-                        AND ds.day    = date(e.start_ts)
-                    WHERE (ds.day IS NULL
-                           -- Wrap computed_at in date() so an ISO timestamp
-                           -- ('2026-05-03T12:00:00+00:00') compares correctly
-                           -- against a plain date string ('2026-05-04').
-                           -- Without date(), 'T' > '-' in ASCII causes the
-                           -- comparison to silently fail for same-day rows.
-                           OR date(ds.computed_at) < date(e.start_ts, '+1 day'))
-                      AND date(e.start_ts) BETWEEN ? AND ?
-                    GROUP BY e.circuit, date(e.start_ts)
-                    ORDER BY e.circuit, day ASC
-                """, (week_ago, yesterday)).fetchall()
+            circuits = [r["circuit"] for r in self._db.execute(
+                "SELECT DISTINCT circuit FROM events").fetchall()]
+            gaps = []
+            for circuit in circuits:
+                existing = {
+                    r["day"]: r["computed_at"] for r in self._db.execute(
+                        "SELECT day, computed_at FROM daily_summary "
+                        "WHERE circuit = ?", (circuit,)).fetchall()}
+                for day in self._local_days_with_events(circuit):
+                    if day > yesterday or (lower and day < lower):
+                        continue
+                    if day not in existing:
+                        gaps.append((circuit, day))
+                        continue
+                    # Stale: summarised before the day was over, so later
+                    # events on it were never counted. The day's end is a UTC
+                    # instant, directly comparable to the stored computed_at.
+                    computed_at = existing[day]
+                    _, day_end = local_day_bounds_utc(day)
+                    if not computed_at or str(computed_at)[:19] < day_end:
+                        gaps.append((circuit, day))
         except Exception as e:
             log.warning("Summary gap query: %s", e)
             return
 
         computed = 0
-        for row in gaps:
-            circuit, day = row["circuit"], row["day"]
+        for circuit, day in gaps:
             try:
                 if compute_daily_summary(self._db, circuit, day):
                     computed += 1
@@ -303,34 +323,40 @@ class DataPruner:
         triples that have events but no summary row.  Runs nightly and on
         the startup backfill so analytics are available from day one.
         """
-        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday = local_day_of((now - timedelta(days=1)).isoformat())
         try:
-            gaps = self._db.execute("""
-                SELECT e.circuit, e.fixture_id, date(e.start_ts) AS day
-                FROM events e
-                LEFT JOIN fixture_daily_summary fds
-                    ON fds.circuit    = e.circuit
-                    AND fds.fixture_id = e.fixture_id
-                    AND fds.day        = date(e.start_ts)
-                WHERE e.fixture_id IS NOT NULL
-                  AND fds.day IS NULL
-                  AND date(e.start_ts) <= ?
-                GROUP BY e.circuit, e.fixture_id, date(e.start_ts)
-            """, (yesterday,)).fetchall()
+            gaps = []
+            circuits = [r["circuit"] for r in self._db.execute(
+                "SELECT DISTINCT circuit FROM events "
+                "WHERE fixture_id IS NOT NULL").fetchall()]
+            for circuit in circuits:
+                have = {(r["fixture_id"], r["day"]) for r in self._db.execute(
+                    "SELECT fixture_id, day FROM fixture_daily_summary "
+                    "WHERE circuit = ?", (circuit,)).fetchall()}
+                for day in self._local_days_with_events(circuit):
+                    if day > yesterday:
+                        continue
+                    lo, hi = local_day_bounds_utc(day)
+                    for r in self._db.execute(
+                        "SELECT DISTINCT fixture_id FROM events "
+                        "WHERE circuit = ? AND fixture_id IS NOT NULL "
+                        "  AND start_ts >= ? AND start_ts < ?",
+                            (circuit, lo, hi)).fetchall():
+                        if (r["fixture_id"], day) not in have:
+                            gaps.append((circuit, r["fixture_id"], day, lo, hi))
         except Exception as e:
             log.warning("fixture_daily_summary gap query: %s", e)
             return
 
         computed = 0
-        for row in gaps:
-            circuit, fixture_id, day = row["circuit"], row["fixture_id"], row["day"]
+        for circuit, fixture_id, day, lo, hi in gaps:
             try:
                 self._db.execute("""
                     INSERT OR REPLACE INTO fixture_daily_summary
                         (circuit, fixture_id, day, event_count,
                          total_volume_litres, avg_flow_lpm, peak_flow_lpm)
                     SELECT circuit, fixture_id,
-                           date(start_ts)    AS day,
+                           ?                 AS day,
                            COUNT(*)          AS event_count,
                            COALESCE(SUM(COALESCE(volume_litres_effective,
                                                  volume_litres, 0)), 0)
@@ -338,9 +364,10 @@ class DataPruner:
                            AVG(avg_flow_lpm)               AS avg_flow_lpm,
                            MAX(peak_flow_lpm)              AS peak_flow_lpm
                     FROM events
-                    WHERE circuit = ? AND fixture_id = ? AND date(start_ts) = ?
-                    GROUP BY circuit, fixture_id, date(start_ts)
-                """, (circuit, fixture_id, day))
+                    WHERE circuit = ? AND fixture_id = ?
+                      AND start_ts >= ? AND start_ts < ?
+                    GROUP BY circuit, fixture_id
+                """, (day, circuit, fixture_id, lo, hi))
                 computed += 1
             except Exception as e:
                 log.warning("fixture_daily_summary [%s/%s/%s]: %s",

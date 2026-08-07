@@ -219,7 +219,14 @@ _BASELINE_VERSION: int = 20260523
 #              (the add-on's own leak test cycling the valve logs a short flow
 #              burst that is neither fixture use nor a sensor phantom). DDL plus
 #              a one-time backfill over leak_test_history.
-_CURRENT_VERSION: int = 20260570
+#   20260571 — one day boundary. volume_snapshots.last_reading (high-water mark
+#              per period, so a meter reset carries the period's volume over
+#              instead of zeroing the dashboard's TODAY tile) plus
+#              home_profile.daily_summary_tz (which zone daily_summary rows are
+#              bucketed in — the rows themselves move from the UTC day to the
+#              home-local day, rebuilt by the orchestrator once HA has answered
+#              with the timezone). DDL only.
+_CURRENT_VERSION: int = 20260571
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1365,6 +1372,13 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     )
 
 
+def _has_table(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone() is not None
+
+
 # Required columns in the events table that only exist in the baseline schema.
 # Checking multiple columns is more robust — an old DB might have some
 # backfilled but not others.
@@ -2004,6 +2018,48 @@ def _missing_leak_test_refill_columns(conn: sqlite3.Connection) -> set[str]:
     return set()
 
 
+# 20260571 — one day boundary.
+def _apply_local_day_boundary(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260571 — the columns behind the unified
+    day boundary and the meter-reset carry-over.
+
+    ``volume_snapshots.last_reading`` — high-water mark per period, so a meter
+    reset carries the period's volume over instead of zeroing it.
+    ``home_profile.daily_summary_tz`` — which timezone the stored daily_summary
+    rows are bucketed in. NULL means "UTC-bucketed, pre-migration": the
+    orchestrator rebuilds them once the HA timezone is known (it isn't here —
+    migrations run before HA is reachable), then stamps this.
+
+    DDL only; both are additive, idempotent, and skipped when the table is
+    absent (the partial-schema fixtures the forward-walk tests build).
+    """
+    if (_has_table(conn, "volume_snapshots")
+            and not _has_column(conn, "volume_snapshots", "last_reading")):
+        conn.execute("ALTER TABLE volume_snapshots ADD COLUMN last_reading REAL")
+        # Seed the high-water mark at the baseline: a reset before the first
+        # live read then carries 0 L, which is the old behaviour and never
+        # invents water. Every subsequent read raises it to the true maximum.
+        conn.execute("UPDATE volume_snapshots SET last_reading = ha_volume "
+                     "WHERE last_reading IS NULL")
+    if (_has_table(conn, "home_profile")
+            and not _has_column(conn, "home_profile", "daily_summary_tz")):
+        conn.execute("ALTER TABLE home_profile ADD COLUMN daily_summary_tz TEXT")
+    conn.commit()
+    log.info("Migration 20260571: local-day boundary columns ready "
+             "(daily_summary rebuild deferred to tz detection)")
+
+
+def _missing_local_day_columns(conn: sqlite3.Connection) -> set[str]:
+    missing = set()
+    if (_has_table(conn, "volume_snapshots")
+            and not _has_column(conn, "volume_snapshots", "last_reading")):
+        missing.add("volume_snapshots.last_reading")
+    if (_has_table(conn, "home_profile")
+            and not _has_column(conn, "home_profile", "daily_summary_tz")):
+        missing.add("home_profile.daily_summary_tz")
+    return missing
+
+
 # 20260565 — rule_calibration keyed per (circuit, supply regime).
 def _apply_regime_calibration(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260565 — rebuild rule_calibration with
@@ -2167,6 +2223,7 @@ _MIGRATIONS: tuple = (
     (20260568, _apply_cluster_features_mode),
     (20260569, _apply_baseline_snapshot_table),
     (20260570, _apply_leak_test_refill_column),
+    (20260571, _apply_local_day_boundary),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -2243,6 +2300,7 @@ def _run_migrations_impl(
             | _missing_leak_test_dismissed_column(conn)
             | _missing_leak_test_measurement_columns(conn)
             | _missing_leak_test_refill_columns(conn)
+            | _missing_local_day_columns(conn)
         )
         if missing:
             raise RuntimeError(

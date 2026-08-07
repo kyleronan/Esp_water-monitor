@@ -9,6 +9,37 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **One "day", everywhere — dev36** — the same water was being reported as four
+  different daily totals. On 2026-08-06 the History chart said 100.1 gal, the
+  dashboard's 24-hour chart said 108.4, Home Assistant's own card said 108, and
+  the dashboard's **TODAY** tile said 20.2. None of them were lying; they were
+  answering four different questions.
+  The History chart bucketed days by **UTC**, so a "day" ran 6 PM to 6 PM local
+  — last night's evening showers counted as today, and tonight's counted as
+  tomorrow. The 24-hour chart is a *rolling* window rather than a day at all,
+  and it labelled its bars in UTC too, so the 5 AM shower was drawn at "11:00".
+  Daily rollups now cut at **your local midnight** — the same instant the TODAY
+  tile and Home Assistant's utility meter use — and the rolling chart's axis
+  reads in local clock time, with the word "rolling" in its subtitle so it
+  isn't mistaken for a daily total. Existing history is rebucketed once,
+  automatically, the first time the add-on starts after the update; day totals
+  near the boundary will shift by design, because they were previously cut in
+  the wrong place. Changing your Home Assistant timezone re-runs the rebuild.
+
+- **A meter hiccup no longer erases the day — dev36** — the TODAY tile works out
+  your usage as "meter now, minus what the meter read at midnight". If the ESP's
+  lifetime counter ever stepped *backwards* — a reboot that loses the last
+  flash write, a reflash, a stale value republished on reconnect — that was
+  treated as a new starting point and **everything already used that day was
+  thrown away**. That is the 20.2 above: a real 108 gal day, restarted in the
+  evening. The 7-day tile never showed the problem, because its starting point
+  sits far below any single day's reading.
+  The day's volume is now carried across the reset the same way Home Assistant's
+  utility meter carries it, so the two agree instead of drifting apart, and the
+  reset is written to the log rather than passing silently. A period with no
+  measured high-water mark still restarts from zero — under-reporting a day is
+  recoverable, inventing water that never flowed is not.
+
 - **The app's own leak test no longer shows up as water you used — dev35** — a
   scheduled leak test closes your main valve, and when it reopens the pipes
   refill. That refill runs through the meter, so it was logged as an ordinary

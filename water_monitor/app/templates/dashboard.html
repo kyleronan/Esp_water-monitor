@@ -407,7 +407,9 @@
   <div class="dash-chart-header">
     <div>
       <h3 class="dash-chart-title">{{ c.display_name }}</h3>
-      <span class="dash-chart-subtitle">Past 24 hours</span>
+      {# Rolling, NOT a calendar day — it reaches back into yesterday evening,
+         so its total legitimately differs from the TODAY tile above. #}
+      <span class="dash-chart-subtitle">Past 24 hours (rolling)</span>
     </div>
     <span class="dash-chart-total" id="total-{{ c.circuit }}">— {{ vol_unit }} total</span>
   </div>

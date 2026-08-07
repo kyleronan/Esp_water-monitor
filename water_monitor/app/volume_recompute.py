@@ -117,7 +117,7 @@ def recompute_volume_and_active_flow(
     Returns counts: recomputed, skipped (no history), degraded, unchanged.
     """
     from .database import (transaction, compute_daily_summary,
-                           apply_effective_volume)
+                           apply_effective_volume, local_day_of)
     from .feature_extractor import _finalize_derived_verdicts
     from .artifact_calibration import load_artifact_calibration
 
@@ -267,7 +267,7 @@ def recompute_volume_and_active_flow(
             # §2.5 — reverse/apply/bookkeep via the one chokepoint.
             apply_effective_volume(conn, r["id"], circuit, r["start_ts"], eff)
 
-        day = (r["start_ts"] or "")[:10]
+        day = local_day_of(r["start_ts"])
         if day:
             affected_days.add(day)
         counts["recomputed"] += 1

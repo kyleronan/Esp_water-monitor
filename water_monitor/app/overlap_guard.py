@@ -194,7 +194,8 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
     """Apply the resolution policy to one overlap group. Returns counters.
     Idempotent: an already-zeroed wrapper (mrr='overlap_duplicate') is a
     no-op, and audit rows are INSERT OR IGNORE on the wrapper id."""
-    from .database import apply_effective_volume, compute_daily_summary
+    from .database import (apply_effective_volume, compute_daily_summary,
+                           local_day_of)
     stats = {"wrappers_zeroed": 0, "flag_only": 0, "ambiguous": 0,
              "partial_remainder": 0, "litres_recovered": 0.0}
     spans = {r["id"]: _span(r) for r in group}
@@ -264,7 +265,7 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
         _audit(conn, w["circuit"], w["id"], kept, prior_eff - new_eff,
                "wrapper_zeroed" if full_duplicate else "wrapper_partial_remainder",
                source)
-        day = (w["start_ts"] or "")[:10]
+        day = local_day_of(w["start_ts"])
         if day:
             try:
                 compute_daily_summary(conn, w["circuit"], day)

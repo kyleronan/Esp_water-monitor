@@ -254,8 +254,14 @@ def _build_chart_data(db, circuit: str) -> Dict[str, Any]:
     """
     Build hourly volume chart data for the past 24 hours (rolling).
     Returns {labels: [...], values: [...], total: float}.
+
+    Buckets are UTC hours (that's how hourly_volume is keyed) but the LABELS
+    are the home's local clock. They used to be the raw UTC hour, so a 05:00
+    shower was drawn at "11:00" and the whole chart read six hours out of step
+    with every other time on the page.
     """
     from ..database import get_hourly_volumes
+    from ..event_rules import get_home_timezone
     rows = get_hourly_volumes(db, circuit, hours=24)
 
     # Build exactly 24 slots: hours 23..1 back + current partial hour (i=0)
@@ -272,9 +278,18 @@ def _build_chart_data(db, circuit: str) -> Dict[str, Any]:
         if key in slots:
             slots[key] = row["volume_litres"]
 
-    labels = [k[-2:] + ":00" for k in sorted(slots.keys())]
-    values = [round(v, 2) for v in
-               [slots[k] for k in sorted(slots.keys())]]
+    tz = get_home_timezone() or timezone.utc
+    ordered = sorted(slots.keys())
+
+    def _label(key: str) -> str:
+        # key is 'YYYY-MM-DDTHH' in UTC. Zones offset by whole hours land on
+        # the hour; the half-hour zones (India, parts of Australia) keep their
+        # real minutes rather than being rounded into a lie.
+        dt = datetime.strptime(key, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
+        return dt.astimezone(tz).strftime("%H:%M")
+
+    labels = [_label(k) for k in ordered]
+    values = [round(slots[k], 2) for k in ordered]
     total = round(sum(values), 1)
 
     return {"labels": labels, "values": values, "total": total}

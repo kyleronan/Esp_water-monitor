@@ -1052,6 +1052,7 @@ class Orchestrator:
         except ImportError:
             from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
         from .event_rules import set_home_timezone
+        tz_name = "UTC"
         try:
             ha_cfg = await self._ha.get_ha_config()
             tz_name = ha_cfg.get("time_zone") or "UTC"
@@ -1064,6 +1065,38 @@ class Orchestrator:
         # dev.24 — cache for the softener regen-band match (reclassify + live path
         # read this without threading a tzinfo through every caller).
         set_home_timezone(self._ha_tz)
+        await self._resync_daily_summary_boundary(tz_name)
+
+    async def _resync_daily_summary_boundary(self, tz_name: str) -> None:
+        """Rebuild daily_summary when its day boundary no longer matches the home.
+
+        Daily rollups are keyed on the LOCAL day, but the timezone only becomes
+        known here — after migrations, after HA answers. A stored bucketing zone
+        that differs from the detected one means every historical day total is
+        cut at the wrong instant (the pre-20260571 rows are cut at UTC midnight,
+        i.e. 18:00 local in Denver), so they're recomputed once and the zone is
+        stamped. Runs off-loop: the rebuild touches every day of history.
+
+        Best-effort — a failure leaves the stamp alone, so the next boot retries
+        rather than silently keeping mis-bucketed rows.
+        """
+        from .database import get_home_profile, rebuild_daily_summaries, \
+            update_home_profile
+        try:
+            profile = get_home_profile(self._db)
+            stored = (dict(profile or {}) or {}).get("daily_summary_tz")
+            if stored == tz_name:
+                return
+            log.info("daily_summary day boundary: %s → %s — rebuilding",
+                     stored or "UTC (pre-20260571)", tz_name)
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(
+                None, rebuild_daily_summaries, self._db)
+            update_home_profile(self._db, daily_summary_tz=tz_name)
+            log.info("daily_summary rebuild complete: %s", res)
+        except Exception as e:
+            log.warning("daily_summary boundary resync failed (retried next "
+                        "boot, non-fatal): %s", e)
 
     def _local_midnight_utc(self, days_ago: int = 0) -> str:
         """Return the UTC equivalent of local midnight (or N days ago) as a naive ISO string.
@@ -1182,12 +1215,19 @@ class Orchestrator:
                               circuit, label, e)
                     continue
 
+                # last_reading tracks with the baseline: a re-derived baseline
+                # invalidates any high-water mark measured against the old one.
+                # The next live read raises it to the true maximum within
+                # seconds, so the only exposure is a reset in that window —
+                # which carries 0 L, never invented water.
                 self._db.execute("""
-                    INSERT INTO volume_snapshots (circuit, period_ts, ha_volume)
-                    VALUES (?,?,?)
+                    INSERT INTO volume_snapshots (circuit, period_ts, ha_volume,
+                                                  last_reading)
+                    VALUES (?,?,?,?)
                     ON CONFLICT (circuit, period_ts)
-                    DO UPDATE SET ha_volume = excluded.ha_volume
-                """, (circuit, period_ts, midnight_val))
+                    DO UPDATE SET ha_volume    = excluded.ha_volume,
+                                  last_reading = excluded.last_reading
+                """, (circuit, period_ts, midnight_val, midnight_val))
                 self._db.commit()
                 log.info("[%s] volume baseline set for %s: %.2f L",
                          circuit, label, midnight_val)

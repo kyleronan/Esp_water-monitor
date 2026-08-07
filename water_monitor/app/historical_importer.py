@@ -670,7 +670,8 @@ class HistoricalImporter:
                     ratio=round(pid / pmd, 3) if pmd > 0 else None,
                     recompute_summary=False):
                 flagged += 1
-                day = (ev["start_ts"] or "")[:10]
+                from .database import local_day_of
+                day = local_day_of(ev["start_ts"])
                 if day:
                     affected_days.add(day)
         # One daily-summary recompute per affected DAY, not per event (the backfill

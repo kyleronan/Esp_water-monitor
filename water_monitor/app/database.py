@@ -303,6 +303,13 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- a dismissal acknowledges a READING and can never silence the feature.
     -- Display-only: the HA leak alert path does not consult this.
     leak_watch_ack                 TEXT,
+    -- daily_summary_tz (migration 20260571): the timezone the stored
+    -- daily_summary rows were bucketed in ('America/Denver'). Daily rollups are
+    -- keyed on the HOME-LOCAL day, but the timezone isn't known until HA answers
+    -- at startup — so the rebuild can't run inside the migration. The
+    -- orchestrator compares this to the detected zone after tz detection and
+    -- rebuilds when they differ, which also covers the user moving HA's zone.
+    daily_summary_tz               TEXT,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -1100,9 +1107,14 @@ CREATE INDEX IF NOT EXISTS idx_event_waveforms_created
 -- on the internal event-based estimates.
 -- ==========================================================================
 CREATE TABLE IF NOT EXISTS volume_snapshots (
-    circuit     TEXT NOT NULL,
-    period_ts   TEXT NOT NULL,   -- ISO datetime of period start (midnight)
-    ha_volume   REAL NOT NULL,   -- HA sensor reading at that moment
+    circuit      TEXT NOT NULL,
+    period_ts    TEXT NOT NULL,  -- ISO datetime of period start (midnight)
+    ha_volume    REAL NOT NULL,  -- HA sensor reading at that moment
+    -- Highest reading seen in this period (migration 20260571). A meter reset
+    -- is detected as current < ha_volume; without knowing how far the meter
+    -- had climbed first, the reset handler had to throw the period's volume
+    -- away. This makes the carry-over exact.
+    last_reading REAL,
     PRIMARY KEY (circuit, period_ts)
 );
 
@@ -1472,13 +1484,73 @@ def _apply_post_create_migrations(conn: sqlite3.Connection) -> None:
 # Data access helpers
 # ==========================================================================
 
+# ── The day boundary ──────────────────────────────────────────────────────
+# Everything is STORED in UTC; every daily rollup is KEYED on the home's local
+# calendar day. Before this, `daily_summary.day` came from `date(start_ts)` —
+# a UTC day, i.e. 18:00→18:00 local in Denver — while the dashboard's TODAY
+# tile cut at local midnight and HA's own utility_meter cut at local midnight
+# too. Three surfaces, three different "days", so the same water showed up as
+# three different totals. These two helpers are the single definition; nothing
+# outside them may slice a timestamp to get a day.
+
+
+def _home_tz():
+    """Home timezone (HA's), or UTC when detection hasn't run yet."""
+    from .event_rules import get_home_timezone
+    return get_home_timezone() or timezone.utc
+
+
+def local_day_of(ts: Any, tz=None) -> str:
+    """Local calendar date ('YYYY-MM-DD') of a stored UTC timestamp.
+
+    Accepts the naive and offset-suffixed ISO forms both present in `events`
+    (a naive string is read as UTC, matching how it was written). Degrades to
+    the leading date characters when the value isn't parseable at all — the
+    old behaviour, so a malformed row can never raise inside a rollup.
+    """
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return str(ts)[:10]
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz or _home_tz()).strftime("%Y-%m-%d")
+
+
+def local_day_bounds_utc(day: str, tz=None) -> tuple:
+    """``[start, end)`` UTC bounds of the LOCAL calendar day ``day``.
+
+    Returned as naive-UTC ISO strings so they compare directly against stored
+    `start_ts` / `hour_ts` values: those are all UTC and zero-padded, so
+    lexicographic order is chronological order, and a half-open range beats
+    `date(...)` because it uses the index instead of scanning.
+
+    DST-correct — both ends convert independently, so a spring-forward day is
+    23 h wide and a fall-back day 25 h, with no hour double-counted or lost.
+    """
+    tz = tz or _home_tz()
+    d = datetime.strptime(str(day)[:10], "%Y-%m-%d")
+    lo_local = datetime(d.year, d.month, d.day, tzinfo=tz)
+    hi_local = lo_local + timedelta(days=1)
+    # Re-anchor the end at the next local midnight: adding 24 h to a wall-clock
+    # time lands an hour off across a DST edge.
+    hi_local = datetime(hi_local.year, hi_local.month, hi_local.day, tzinfo=tz)
+    to_utc = lambda x: x.astimezone(timezone.utc).replace(  # noqa: E731
+        tzinfo=None).isoformat(timespec="seconds")
+    return to_utc(lo_local), to_utc(hi_local)
+
+
 def compute_daily_summary(conn: sqlite3.Connection,
                           circuit: str, day: str) -> Optional[Dict[str, Any]]:
     """
     Compute and upsert a daily summary row for the given circuit and day.
-    day format: 'YYYY-MM-DD'.
+    day format: 'YYYY-MM-DD', in the home's LOCAL timezone (see
+    local_day_bounds_utc). Callers derive it with local_day_of(start_ts).
     Returns the summary dict, or None if no events that day.
     """
+    day_lo, day_hi = local_day_bounds_utc(day)
     # Volume uses volume_litres_effective (falling back to raw) so degraded-
     # supply estimates and zeroed pressure-restoration phantoms are reflected
     # here exactly as they are in hourly_volume. Keeps the History charts /
@@ -1497,8 +1569,8 @@ def compute_daily_summary(conn: sqlite3.Connection,
             SUM(CASE WHEN triggered_alert = 1  THEN 1 ELSE 0 END) AS alert_count
         FROM events
         WHERE circuit = ?
-          AND date(start_ts) = ?
-    """, (circuit, day)).fetchone()
+          AND start_ts >= ? AND start_ts < ?
+    """, (circuit, day_lo, day_hi)).fetchone()
 
     if not rows or rows["event_count"] == 0:
         return None
@@ -1507,12 +1579,12 @@ def compute_daily_summary(conn: sqlite3.Connection,
     top5 = conn.execute("""
         SELECT fixture_id, COUNT(*) AS cnt
         FROM events
-        WHERE circuit = ? AND date(start_ts) = ?
+        WHERE circuit = ? AND start_ts >= ? AND start_ts < ?
           AND fixture_id IS NOT NULL
         GROUP BY fixture_id
         ORDER BY cnt DESC
         LIMIT 5
-    """, (circuit, day)).fetchall()
+    """, (circuit, day_lo, day_hi)).fetchall()
     fixture_breakdown = json.dumps(
         [{"fixture_id": r["fixture_id"], "count": r["cnt"]} for r in top5]
     ) if top5 else None
@@ -1570,6 +1642,43 @@ def get_daily_summaries(
         params,
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def rebuild_daily_summaries(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Recompute every `daily_summary` row against the current local-day cut.
+
+    Needed once when the day boundary moved off UTC (migration 20260571), and
+    again whenever the home's timezone changes — stored rows are keyed by a day
+    string, so a boundary change silently mis-attributes every historical total
+    until they're rebuilt. Rows are dropped and recomputed inside one
+    transaction: a half-rebuilt chart is worse than a brief lock.
+
+    Days with no events are simply absent (compute_daily_summary returns None
+    without writing), which is how a fresh DB looks anyway.
+    """
+    circuits = [r["circuit"] for r in
+                conn.execute("SELECT DISTINCT circuit FROM events").fetchall()]
+    days_written, days_seen = 0, 0
+    with transaction(conn):
+        for circuit in circuits:
+            row = conn.execute(
+                "SELECT MIN(start_ts) AS lo, MAX(start_ts) AS hi "
+                "FROM events WHERE circuit = ?", (circuit,)).fetchone()
+            if not row or not row["lo"]:
+                continue
+            conn.execute("DELETE FROM daily_summary WHERE circuit = ?", (circuit,))
+            d = datetime.strptime(local_day_of(row["lo"]), "%Y-%m-%d")
+            end = datetime.strptime(local_day_of(row["hi"]), "%Y-%m-%d")
+            while d <= end:
+                days_seen += 1
+                if compute_daily_summary(conn, circuit, d.strftime("%Y-%m-%d")):
+                    days_written += 1
+                d += timedelta(days=1)
+    log.info("daily_summary rebuilt on the local-day boundary: %d day(s) "
+             "written across %d circuit(s) (%d scanned)",
+             days_written, len(circuits), days_seen)
+    return {"circuits": len(circuits), "days_written": days_written,
+            "days_scanned": days_seen}
 
 
 def get_data_retention(conn: sqlite3.Connection) -> dict:
@@ -2512,11 +2621,12 @@ def coalesce_low_flow_events(
                     (m["id"],))
                 conn.execute("DELETE FROM events WHERE id = ?", (m["id"],))
             for m in g:
-                d = _ts(m["start_ts"])
+                d = local_day_of(m["start_ts"])
                 if d:
-                    affected_days.add(d.strftime("%Y-%m-%d"))
+                    affected_days.add(d)
             if end_ts:
-                affected_days.add(end_ts.strftime("%Y-%m-%d"))
+                # A merge can straddle local midnight — both days need a redo.
+                affected_days.add(local_day_of(end_ts.isoformat()))
 
         for day in sorted(affected_days):
             compute_daily_summary(conn, circuit, day)
@@ -2591,7 +2701,7 @@ def delete_events_in_range(
                 "DELETE FROM training_capture_candidates WHERE event_id = ?",
                 (r["id"],))
             conn.execute("DELETE FROM events WHERE id = ?", (r["id"],))
-            d = (r["start_ts"] or "")[:10]
+            d = local_day_of(r["start_ts"])
             if d:
                 affected_days.add(d)
         for day in sorted(affected_days):
@@ -2637,7 +2747,7 @@ def restore_deleted_events(
     # Rebuild the daily rollups the delete recomputed/dropped — without this the
     # restored events exist but their days read ~0 L until something else happens
     # to recompute those (possibly old) days.
-    pairs = {(dict(r).get("circuit"), (dict(r).get("start_ts") or "")[:10])
+    pairs = {(dict(r).get("circuit"), local_day_of(dict(r).get("start_ts")))
              for r in rows}
     for circuit, day in sorted(p for p in pairs if p[0] and p[1]):
         compute_daily_summary(conn, circuit, day)
@@ -2723,12 +2833,25 @@ def _get_volume_baseline(
     """
     Return the stored HA sensor baseline for period_ts, creating it if absent.
 
-    If the stored baseline is HIGHER than the current reading the sensor has
-    reset (device restart / firmware flash).  In that case we update the
-    baseline to the current reading so the delta starts from zero again.
+    The period's volume is ``current_ha_value − baseline``, so the baseline is
+    also where a meter RESET is absorbed. The ESP's lifetime total is NVS-backed
+    and never resets in normal operation, but a reboot that loses the last flash
+    write, a reflash, or a reconnect that republishes a stale value all make the
+    reading step backwards.
+
+    Reset handling carries the period's accumulated volume over instead of
+    discarding it. The old code set ``baseline = current``, which zeroed the
+    period: on 2026-08-06 an evening blip dropped the dashboard's TODAY tile from
+    ~108 gal to 20.2 while HA's own utility_meter — which carries over — still
+    read 108, and the 7-day tile was untouched because its baseline sits far
+    below any single day's reading. Now the baseline is pushed NEGATIVE by the
+    carried-over amount, so ``current − baseline`` continues from where the
+    period left off. That mirrors HA's total_increasing semantics, which is what
+    makes the two agree.
     """
     row = conn.execute(
-        "SELECT ha_volume FROM volume_snapshots WHERE circuit=? AND period_ts=?",
+        "SELECT ha_volume, last_reading FROM volume_snapshots "
+        "WHERE circuit=? AND period_ts=?",
         (circuit, period_ts),
     ).fetchone()
 
@@ -2741,21 +2864,58 @@ def _get_volume_baseline(
         # (_init_volume_baselines) then force-overwrites this with the accurate
         # midnight reading from HA history.
         conn.execute(
-            "INSERT INTO volume_snapshots (circuit, period_ts, ha_volume) VALUES (?,?,?)",
-            (circuit, period_ts, current_ha_value),
+            "INSERT INTO volume_snapshots (circuit, period_ts, ha_volume, "
+            "last_reading) VALUES (?,?,?,?)",
+            (circuit, period_ts, current_ha_value, current_ha_value),
         )
         conn.commit()
         return current_ha_value
 
-    baseline = row[0]
+    baseline, last_reading = row[0], row[1]
+
     if current_ha_value < baseline:
-        # Sensor reset (device restarted) — update baseline to new zero point
+        # Meter reset. Everything between the baseline and the highest reading
+        # we saw is real water that was already delivered — keep it, and treat
+        # what the meter reads NOW as consumption since the reset (a reflashed
+        # accumulator starts at 0 and climbs). That is exactly what HA's
+        # utility_meter does with a total_increasing source, which is why the
+        # tile and the HA card agree afterwards.
+        #
+        # A row with NO high-water mark (raw INSERT, or a period that has never
+        # been read live) can't say how far the meter climbed, so it falls back
+        # to the pre-20260571 rule: rebase to the current reading and continue
+        # from zero. Counting the post-reset reading there would report the
+        # meter's whole remaining lifetime total as one day's use — the exact
+        # failure this module's baseline seeding exists to prevent.
+        if last_reading is None:
+            new_baseline = current_ha_value
+            accumulated = 0.0
+        else:
+            accumulated = max(0.0, last_reading - baseline)
+            new_baseline = -accumulated
         conn.execute(
-            "UPDATE volume_snapshots SET ha_volume=? WHERE circuit=? AND period_ts=?",
+            "UPDATE volume_snapshots SET ha_volume=?, last_reading=? "
+            "WHERE circuit=? AND period_ts=?",
+            (new_baseline, current_ha_value, circuit, period_ts),
+        )
+        conn.commit()
+        log.warning(
+            "[%s] volume meter reset for period %s (%.2f → %.2f L); carried "
+            "%.2f L forward, baseline now %.2f",
+            circuit, period_ts, last_reading if last_reading is not None
+            else baseline, current_ha_value, accumulated, new_baseline,
+        )
+        return new_baseline
+
+    # High-water mark for the next reset. Only ever moves up, and only when it
+    # actually changes, so the steady-state read path stays read-only.
+    if last_reading is None or current_ha_value > last_reading:
+        conn.execute(
+            "UPDATE volume_snapshots SET last_reading=? "
+            "WHERE circuit=? AND period_ts=?",
             (current_ha_value, circuit, period_ts),
         )
         conn.commit()
-        return current_ha_value
 
     return baseline
 
@@ -3293,7 +3453,7 @@ def _apply_event_verdicts(
         # §2.5 — the ledger reverse/apply/bookkeep goes through the one chokepoint.
         apply_effective_volume(conn, event_id, circuit, row["start_ts"], new_effective)
 
-    day = (row["start_ts"] or "")[:10]
+    day = local_day_of(row["start_ts"])
     if day:
         compute_daily_summary(conn, circuit, day)
         conn.commit()
@@ -3483,7 +3643,7 @@ def mark_event_irrigation_cross_talk(
         )
         apply_effective_volume(conn, event_id, circuit, row["start_ts"], 0.0)
 
-    day = (row["start_ts"] or "")[:10]
+    day = local_day_of(row["start_ts"])
     if day and recompute_summary:
         compute_daily_summary(conn, circuit, day)
         conn.commit()
@@ -3562,7 +3722,7 @@ def mark_event_leak_test_refill(
         )
         apply_effective_volume(conn, event_id, circuit, row["start_ts"], 0.0)
 
-    day = (row["start_ts"] or "")[:10]
+    day = local_day_of(row["start_ts"])
     if day and recompute_summary:
         compute_daily_summary(conn, circuit, day)
         conn.commit()
@@ -3612,7 +3772,7 @@ def revert_irrigation_cross_talk(
         )
         apply_effective_volume(conn, event_id, circuit, row["start_ts"], raw_volume)
 
-    day = (row["start_ts"] or "")[:10]
+    day = local_day_of(row["start_ts"])
     if day:
         compute_daily_summary(conn, circuit, day)
         conn.commit()
@@ -3697,7 +3857,7 @@ def revert_artifact_zeroing_on_relabel(
         )
         apply_effective_volume(conn, event_id, circuit, row["start_ts"], raw)
 
-    day = (row["start_ts"] or "")[:10]
+    day = local_day_of(row["start_ts"])
     if day:
         compute_daily_summary(conn, circuit, day)
         conn.commit()
@@ -5612,7 +5772,7 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
 
         repaired += 1
         litres_restored += restored
-        day = (row["start_ts"] or "")[:10]
+        day = local_day_of(row["start_ts"])
         if day:
             affected_days.add((row["circuit"], day))
         log.info(

@@ -570,15 +570,22 @@ def _collect_circuit_history_sync(
         # summaries exist yet (first-day install).
         hv_daily: dict = {}
         if not summaries:
+            # Bucketed in Python, not `date(hour_ts)`: hour_ts is UTC, and the
+            # fallback has to land on the same LOCAL day boundary the real
+            # summaries use, or the first-day chart disagrees with every chart
+            # that follows it.
+            from ..database import local_day_of
             hv_rows = db.execute("""
-                SELECT date(hour_ts) AS day, SUM(volume_litres) AS vol
+                SELECT hour_ts, volume_litres
                 FROM hourly_volume
                 WHERE circuit = ?
                   AND (? IS NULL OR hour_ts >= ?)
-                GROUP BY date(hour_ts)
-                ORDER BY day ASC
+                ORDER BY hour_ts ASC
             """, (circuit_cfg.circuit, chart_from, chart_from)).fetchall()
-            hv_daily = {r["day"]: r["vol"] for r in hv_rows}
+            for _r in hv_rows:
+                _d = local_day_of(_r["hour_ts"])
+                if _d:
+                    hv_daily[_d] = hv_daily.get(_d, 0.0) + (_r["volume_litres"] or 0.0)
 
         # dev15 filter-bar slider bounds — per-circuit maxima in DISPLAY units
         # (minutes / display-ΔP / display-volume), ceil'd to whole numbers so
@@ -644,8 +651,12 @@ async def _history_page(request: Request):
     # 30d | 6m | 1y | all | monthly | yearly | yoy
     using_range = bool(date_from or date_to)
 
-    from datetime import date, timedelta as td
-    today = date.today()
+    from datetime import datetime as _dt, timedelta as td, timezone as _tz
+    # The home's today, not the container's. daily_summary rows are keyed on the
+    # local day, so a UTC-derived window edge would clip or pad the chart by a
+    # day for the six hours either side of local midnight.
+    from ..event_rules import get_home_timezone
+    today = _dt.now(get_home_timezone() or _tz.utc).date()
     chart_from_map = {
         "30d":    (today - td(days=30)).isoformat(),
         "6m":     (today - td(days=183)).isoformat(),
