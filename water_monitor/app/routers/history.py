@@ -267,6 +267,58 @@ def classify_leak_test(t: dict) -> dict:
             "pill": "pill-amber", "row": "hist-row-degraded"}
 
 
+def annotate_pump_overnight(tests, nights_by_date, ha_tz=None) -> None:
+    """Attach the nightly pressure watch's verdict to leak-test rows whose own
+    window couldn't judge the pump.
+
+    The in-window cross-circuit check (classify_cross_circuit) needs ~3 recharge
+    cycles INSIDE the test window. A normal-length test on a slow pump can never
+    hold that — this home's last confirmed period is ~8 min, so the bar is ~24
+    minutes — and tests are deliberately SHORT (5–15 min): a longer isolation
+    window invites false failures from occupant draws (icemaker, humidifier,
+    someone up at night) and from thermal contraction (a winter test started
+    after a heater cycle reads the tank+piping cooling as a leak). So the answer
+    is never "run a longer test". Instead: the pump-regime detector already
+    watches a passive 3-hour window every night — the same small hours the
+    scheduled test runs in — closing no valves and immune to decay-shaped
+    thermal effects (it counts repeated recharge RISES, not slow decline). For
+    the reassurance direction that evidence is strictly stronger than anything
+    a short test window could say.
+
+    Display-time on purpose: the same-night analysis lands ~30 min after the
+    3-hour window ends — hours AFTER the 1–2 AM test wrote its verdict — so a
+    stored-at-test-time fallback would permanently miss the most relevant night.
+
+    Verdicts that DID rule in-window ('untested_side', 'quiet') are left alone:
+    localization to the isolated line is exactly what the overnight watch cannot
+    provide. Eligible rows get ``t['pump_overnight']`` = 'quiet' | 'active' and
+    ``t['pump_overnight_night']`` = the analysis night used (the test's local
+    date, else the day before — the watch whose window most recently ended).
+    """
+    from datetime import datetime, timedelta, timezone
+    tz = ha_tz or timezone.utc
+    for t in tests:
+        if t.get("pump_verdict") in ("untested_side", "quiet"):
+            continue
+        raw = t.get("run_at")
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local_date = dt.astimezone(tz).date()
+        for cand in (local_date, local_date - timedelta(days=1)):
+            key = cand.isoformat()
+            if key in nights_by_date:
+                t["pump_overnight"] = ("active" if nights_by_date[key]
+                                       else "quiet")
+                t["pump_overnight_night"] = key
+                break
+
+
 def _collect_circuit_history_sync(
     db,
     circuits,
@@ -288,11 +340,21 @@ def _collect_circuit_history_sync(
     """
     import json
     from ..database import (get_recent_events, get_leak_test_history,
-                            get_daily_summaries, get_home_profile)
+                            get_daily_summaries, get_home_profile,
+                            get_pump_regime_nights)
     from ..feature_extractor import (SIGNATURE_POINTS, _wf_resample,
                                      classify_flow_shape, classify_magnitude_tier)
     from ..units import load_unit_context
     _units = load_unit_context(db)
+    # Overnight pump-watch fallback for the leak-test Pump check column (see
+    # annotate_pump_overnight). Home-level: fetched once for every circuit.
+    try:
+        from ..event_rules import get_home_timezone
+        _ha_tz = get_home_timezone()
+    except Exception:
+        _ha_tz = None
+    _nights_by_date = {n["night_date"]: bool(n["any_detected"])
+                       for n in get_pump_regime_nights(db, limit=200)}
     # Read the "hide not-real-use events" display preference once (same for all
     # circuits). One unified toggle hides EVERY volume-zeroing verdict — phantom,
     # cross-talk, and low-flow dribble — so the single "Not real use" label maps to a
@@ -303,6 +365,20 @@ def _collect_circuit_history_sync(
     _profile = get_home_profile(db)
     hide_not_real = bool(_profile and (_profile["hide_pressure_artifact_events"]
                                        or _profile["hide_cross_talk_events"]))
+    # How long a test window would need to be for the IN-WINDOW pump check to
+    # rule (3 × the home's last confirmed recharge period, clamped to the
+    # detector's plausible band). Shown in the "No pump verdict" tooltip so the
+    # bar stops being a mystery — NOT as advice to run longer tests (tests are
+    # deliberately short; see annotate_pump_overnight).
+    _pump_judge_min = None
+    try:
+        _pp = _profile["pump_detect_period_s"] if _profile is not None else None
+        if _pp:
+            from ..pump_regime_math import PUMP_PERIOD_MIN_S, PUMP_PERIOD_MAX_S
+            _pp = min(max(float(_pp), PUMP_PERIOD_MIN_S), PUMP_PERIOD_MAX_S)
+            _pump_judge_min = int(-(-3.0 * _pp // 60.0))   # ceil to minutes
+    except (IndexError, KeyError, TypeError, ValueError):
+        pass
     # dev15 filter bar: convert the raw display-unit params ONCE (same units
     # for every circuit) into storage-unit pushdown kwargs.
     bar_filters = _filters_to_storage(
@@ -471,6 +547,7 @@ def _collect_circuit_history_sync(
         # read the SAME classification (see classify_leak_test).
         for _t in leak_tests:
             _t["ui"] = classify_leak_test(_t)
+        annotate_pump_overnight(leak_tests, _nights_by_date, _ha_tz)
         summaries  = get_daily_summaries(
             db, circuit_cfg.circuit,
             date_from=chart_from,
@@ -529,6 +606,7 @@ def _collect_circuit_history_sync(
             "display_name":    circuit_cfg.label,
             "events":          events,
             "leak_tests":      leak_tests,
+            "pump_judge_min":  _pump_judge_min,
             "event_count":     len(events),
             "hidden_not_real": hidden_not_real,
             "summaries":       summaries,

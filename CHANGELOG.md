@@ -36,6 +36,27 @@ landed without a version bump; per-build details are in git history.)
   refills tagged (0.014–0.083 L), and three real toilet flushes that happened
   to fall inside a reopen window (3.9, 6.0 and 6.2 L) were all left untouched.
 
+- **"Too short to judge" replaced by the overnight pump watch — dev35** — the
+  Pump check column on leak tests needs ~3 recharge cycles inside the test
+  window to rule, and at this pump's last confirmed pace that's ~24 minutes —
+  while tests are deliberately kept to a few minutes, because a long
+  valve-closed window invites false failures from household draws (icemaker,
+  humidifier, someone up at night) and from thermal contraction after a heater
+  cycle. So on a quiet pump every nightly test showed **"Too short to judge"**
+  forever, reading like a complaint about the test. Now rows the in-window
+  check can't rule on answer from the **nightly 3-hour pressure watch** that
+  already runs in the same small hours — valve open, no isolation, and immune
+  to decay-shaped thermal effects since it counts recharge *rises*, not slow
+  decline: **"Quiet overnight"** (green) when that night's watch saw no
+  cycling, **"⚠ Pump busy overnight"** (amber) when it did. Resolved at
+  display time on purpose, because the same-night analysis lands hours *after*
+  the 1 AM test — so the morning's result upgrades the row you look at over
+  coffee. The in-window verdicts ("Leak elsewhere" / "Pump quiet") still win
+  when the test itself could rule, and a night with no watch result shows a
+  neutral "No pump verdict" whose tooltip finally says how long a window the
+  in-window call would need — as an explanation, never as advice to run
+  longer tests.
+
 - **Fixture recognition now survives a change in water supply — dev34** — a new
   final rung in the matching ladder classifies on **fixture shape alone**, with
   every pressure-derived feature excluded from its feature set. This is the
