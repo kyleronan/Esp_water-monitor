@@ -226,7 +226,11 @@ _BASELINE_VERSION: int = 20260523
 #              bucketed in — the rows themselves move from the UTC day to the
 #              home-local day, rebuilt by the orchestrator once HA has answered
 #              with the timezone). DDL only.
-_CURRENT_VERSION: int = 20260571
+#   20260572 — sawtooth pump-recharge backfill: one-shot re-verdict of stored
+#              pump-era events under the widened third prong of
+#              _detect_pump_recharge (slow-decay pressure-triggered restart
+#              slugs the 2026-08 micro-event audit surfaced). Data-only.
+_CURRENT_VERSION: int = 20260572
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -2049,6 +2053,23 @@ def _apply_local_day_boundary(conn: sqlite3.Connection) -> None:
              "(daily_summary rebuild deferred to tz detection)")
 
 
+# 20260572 — sawtooth pump-recharge backfill.
+def _apply_sawtooth_recharge_backfill(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260572 — one-shot re-verdict of stored
+    pump-era events under the widened (sawtooth micro-cycle) prong of the
+    pump-recharge detector. No DDL; data-only, idempotent, and best-effort —
+    a backfill failure must never block boot (the degraded-reprocess sweep
+    re-derives on its next pass)."""
+    try:
+        from .feature_extractor import backfill_sawtooth_pump_recharge
+        res = backfill_sawtooth_pump_recharge(conn)
+        log.info("Migration 20260572: sawtooth recharge backfill tagged "
+                 "%d event(s)", res.get("tagged", 0))
+    except Exception as e:
+        log.warning("Migration 20260572: sawtooth backfill skipped "
+                    "(non-fatal): %s", e)
+
+
 def _missing_local_day_columns(conn: sqlite3.Connection) -> set[str]:
     missing = set()
     if (_has_table(conn, "volume_snapshots")
@@ -2224,6 +2245,7 @@ _MIGRATIONS: tuple = (
     (20260569, _apply_baseline_snapshot_table),
     (20260570, _apply_leak_test_refill_column),
     (20260571, _apply_local_day_boundary),
+    (20260572, _apply_sawtooth_recharge_backfill),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

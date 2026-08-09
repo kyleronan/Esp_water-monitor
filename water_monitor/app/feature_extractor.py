@@ -1178,19 +1178,39 @@ PUMP_SLUG_MAX_L: float = 0.6          # metered; 2x the largest observed slug
 _PUMP_SLUG_MAX_DURATION_S: float = 60.0
 _PUMP_SLUG_MIN_CORR: float = 0.5      # flow-during-rise (phase-aligned)
 _PUMP_SLUG_SILENT_DP_PSI: float = 0.8 # or: too brief for a pressure verdict
+# Third prong (2026-08, validated on the 08-09 production export): the
+# sawtooth micro-cycle. The bypass leak bleeds the line down SLOWLY until the
+# pump restarts — a pressure-triggered start whose measured drop is just the
+# restart deadband (~1.2-1.7 PSI) reached at leak-decay speed, far below
+# demand speed (bench: demand 5-12 PSI/s vs leak 0.37). These fail both
+# original prongs: dP sits above the 0.8 "quiet" bar, and the corr is diluted
+# toward 0 by the decay-then-recover pressure curve. Export eval: 69 matches
+# over 21 days, spread around the clock (leak-consistent), 1/69 ever
+# user-touched, ≤0.6 L each (leak-safe under the frozen slug cap).
+_PUMP_SAWTOOTH_MIN_DURATION_S: float = 5.0   # sharp blips stay with prongs 1/2
+_PUMP_SAWTOOTH_MAX_DP_PSI: float = 2.5       # restart deadband, with margin
+_PUMP_SAWTOOTH_MAX_FALL_PSI_S: float = 0.7   # leak-decay speed ceiling
+_PUMP_SAWTOOTH_MIN_CORR: float = -0.1        # a clearly demand-shaped corr vetoes
 
 
 def _detect_pump_recharge(duration_s, volume_litres, flow_pressure_corr,
-                          pressure_delta_psi) -> bool:
+                          pressure_delta_psi,
+                          pressure_transient_duration_ms=None,
+                          start_trigger=None) -> bool:
     """True = this event is a pump recharge slug (pump mode only — caller
-    gates). Two signatures, matching how the storm actually presented:
+    gates). Three signatures, matching how the storm actually presented:
       * phase-aligned: flow coincided with the pressure RISE (corr >= 0.5 —
         the same signal the rise-phantom detector reads, but under a pump the
         physical cause is the pump pushing water, and the water is real);
       * pressure-quiet: the slug is too brief/small for a meaningful supply
-        response (|dP| <= 0.8 — the pressure_silent signature).
+        response (|dP| <= 0.8 — the pressure_silent signature);
+      * sawtooth micro-cycle: a pressure-TRIGGERED start whose drop is small
+        (restart deadband) and was reached at leak-decay speed, with no
+        demand-shaped (strongly negative) correlation to veto it. Callers
+        that can't supply transient duration / trigger simply never fire
+        this prong — prongs 1 and 2 are unchanged.
     A short small draw with a REAL pressure dip and negative correlation (an
-    icemaker fill between recharges) matches neither and stays a normal
+    icemaker fill between recharges) matches none and stays a normal
     event. Known v1 limitation: a micro-draw that TRIGGERS a recharge merges
     with it and classifies half-wrong either way (plan round-4 #8)."""
     try:
@@ -1211,7 +1231,28 @@ def _detect_pump_recharge(duration_s, volume_litres, flow_pressure_corr,
         dp = abs(float(pressure_delta_psi)) if pressure_delta_psi is not None else None
     except (TypeError, ValueError):
         dp = None
-    return dp is not None and dp <= _PUMP_SLUG_SILENT_DP_PSI
+    if dp is not None and dp <= _PUMP_SLUG_SILENT_DP_PSI:
+        return True
+    # Prong 3 — sawtooth micro-cycle.
+    if (not str(start_trigger or "").startswith("pressure")
+            or dur < _PUMP_SAWTOOTH_MIN_DURATION_S
+            or dp is None or dp > _PUMP_SAWTOOTH_MAX_DP_PSI):
+        return False
+    try:
+        transient_ms = float(pressure_transient_duration_ms or 0.0)
+    except (TypeError, ValueError):
+        transient_ms = 0.0
+    if transient_ms <= 0.0:
+        return False   # no fall-rate verdict possible → keep the water
+    if dp / (transient_ms / 1000.0) > _PUMP_SAWTOOTH_MAX_FALL_PSI_S:
+        return False   # pressure fell at demand speed — a real draw
+    if corr is not None:
+        try:
+            if float(corr) <= _PUMP_SAWTOOTH_MIN_CORR:
+                return False   # demand-shaped: flow pulled pressure down
+        except (TypeError, ValueError):
+            pass
+    return True
 
 
 def _detect_rising_pressure_phantom(duration_s, volume_litres,
@@ -1550,7 +1591,10 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         and _detect_pump_recharge(
             features.get("duration_seconds"), features.get("volume_litres"),
             features.get("flow_pressure_corr"),
-            features.get("pressure_delta_psi"))
+            features.get("pressure_delta_psi"),
+            pressure_transient_duration_ms=features.get(
+                "pressure_transient_duration_ms"),
+            start_trigger=features.get("start_trigger"))
     )
     is_rise_phantom = (
         not pump_gates
@@ -2614,7 +2658,8 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
         "       degraded_diagnostic_json, volume_litres, flow_integral_litres, "
         "       volume_litres_estimated, hourly_volume_applied_litres, "
         "       hourly_volume_applied_bucket, is_composite, "
-        "       duration_seconds, flow_pressure_corr, pressure_delta_psi "
+        "       duration_seconds, flow_pressure_corr, pressure_delta_psi, "
+        "       pressure_transient_duration_ms, start_trigger "
         "FROM events "
         "WHERE degraded_diagnostic_json IS NOT NULL "
         "  AND degraded_diagnostic_json != '' "
@@ -2729,7 +2774,10 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
             if _detect_pump_recharge(row["duration_seconds"],
                                      raw_volume,
                                      row["flow_pressure_corr"],
-                                     row["pressure_delta_psi"]):
+                                     row["pressure_delta_psi"],
+                                     pressure_transient_duration_ms=row[
+                                         "pressure_transient_duration_ms"],
+                                     start_trigger=row["start_trigger"]):
                 with transaction(conn):
                     conn.execute(
                         "UPDATE events SET is_pressure_restoration_phantom = 1, "
@@ -2775,6 +2823,79 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
         "days_rebuilt": len(affected_days),
         "skipped_legacy": skipped_legacy,
     }
+
+
+def backfill_sawtooth_pump_recharge(conn) -> dict:
+    """One-shot re-verdict of stored pump-era events under the sawtooth prong
+    of ``_detect_pump_recharge`` (migration 20260572; idempotent — flagged
+    rows are excluded from the candidate query, so a re-run finds nothing).
+
+    Scope mirrors the live finalizer's gates exactly: pump era only, never
+    degraded rows, never user-touched rows, never rows some other artifact
+    verdict already owns (candidates are mrr NULL / 'no_tier_matched' with
+    volume still applied). Volume moves through ``apply_effective_volume``
+    and every affected day's summary is rebuilt, same as the dev33 sweep.
+    """
+    from .database import (transaction, apply_effective_volume,
+                           compute_daily_summary, local_day_of)
+    from .supply_regime import pump_era_start
+    era_start = pump_era_start(conn)
+    if not era_start:
+        return {"tagged": 0, "days_rebuilt": 0}
+
+    rows = conn.execute(
+        "SELECT id, circuit, start_ts, duration_seconds, volume_litres, "
+        "       flow_pressure_corr, pressure_delta_psi, "
+        "       pressure_transient_duration_ms, start_trigger "
+        "FROM events "
+        "WHERE start_ts >= ? "
+        "  AND start_trigger LIKE 'pressure%' "
+        "  AND COALESCE(degraded_supply, 0) = 0 "
+        "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+        "  AND COALESCE(user_classified, 0) = 0 "
+        "  AND user_fixture_type IS NULL "
+        "  AND (match_rejection_reason IS NULL "
+        "       OR match_rejection_reason = 'no_tier_matched') "
+        "  AND COALESCE(volume_litres_effective, 0) > 0",
+        (era_start,),
+    ).fetchall()
+
+    tagged = 0
+    affected_days: set = set()
+    for row in rows:
+        if not _detect_pump_recharge(
+                row["duration_seconds"], row["volume_litres"],
+                row["flow_pressure_corr"], row["pressure_delta_psi"],
+                pressure_transient_duration_ms=row[
+                    "pressure_transient_duration_ms"],
+                start_trigger=row["start_trigger"]):
+            continue
+        with transaction(conn):
+            conn.execute(
+                "UPDATE events SET is_pressure_restoration_phantom = 1, "
+                "  volume_litres_effective = 0.0, "
+                "  volume_estimation_method = ?, "
+                "  match_rejection_reason = ?, "
+                "  excluded_from_training = 1 "
+                "WHERE id = ?",
+                (PUMP_RECHARGE_REASON, PUMP_RECHARGE_REASON, row["id"]),
+            )
+            apply_effective_volume(conn, row["id"], row["circuit"],
+                                   row["start_ts"], 0.0)
+        tagged += 1
+        day = local_day_of(row["start_ts"])
+        if day:
+            affected_days.add((row["circuit"], day))
+
+    for circ, day in affected_days:
+        compute_daily_summary(conn, circ, day)
+    if affected_days:
+        conn.commit()
+    log.info("sawtooth recharge backfill: tagged %d of %d candidate(s), "
+             "%d day summar(ies) rebuilt", tagged, len(rows),
+             len(affected_days))
+    return {"tagged": tagged, "candidates": len(rows),
+            "days_rebuilt": len(affected_days)}
 
 
 def _estimate_volume_smoothed(

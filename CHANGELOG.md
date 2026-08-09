@@ -9,6 +9,28 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Pump top-ups no longer masquerade as tiny mystery draws — dev37** — with
+  the booster pump holding the line, the small bypass leak slowly bleeds
+  pressure until the pump restarts and pushes a brief ~10–15 s slug of water
+  to top the line back up. Around ten of these a day were being recorded as
+  unclassifiable micro-events with garbled-looking waveforms, and about 1 L/day
+  of pump top-up water was counted as fixture usage. Two fixes:
+  the recharge detector gained a third signature — a pressure-triggered start
+  whose drop is just the pump's restart deadband, reached at leak-decay speed
+  (bench: demand pulls pressure down at 5–12 PSI/s, a leak at ~0.4) with no
+  demand-shaped flow/pressure correlation to veto it — validated against the
+  08-09 production export (71 events tagged across 22 days, none user-labeled,
+  each under the frozen 0.6 L leak-safety cap; migration 20260572 re-verdicts
+  stored history once). And the garbled waveforms themselves are fixed at the
+  source: the live detector seeded the *flow* curve with the pre-onset ramp but
+  not the *pressure* curve, so the two series started at different times and
+  every consumer that lines them up index-by-index — the event modal's overlay
+  and the software flow/pressure correlation — read a time-shifted pressure
+  trace. Both series now share the same origin, which also repairs the
+  correlation feature the phantom and recharge detectors depend on. (The
+  "Reprocess event" button remains for genuinely garbled history, but these
+  events no longer need it.)
+
 - **One "day", everywhere — dev36** — the same water was being reported as four
   different daily totals. On 2026-08-06 the History chart said 100.1 gal, the
   dashboard's 24-hour chart said 108.4, Home Assistant's own card said 108, and

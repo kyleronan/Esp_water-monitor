@@ -1086,6 +1086,20 @@ class CircuitEventDetector:
 
         self._flow_sample_count = 0
         self._pressure_sample_count = 0
+        # Seed the flow signature series with the recovered pre-onset ramp
+        # (samples strictly before start_ts) so the "front" the sustain
+        # trigger cut off is restored. flow_samples (volume) is untouched.
+        flow_seed = [(t, v) for (t, v) in self._pretrigger_flow if t < start_ts]
+        # Pressure gets the SAME pre-onset window. A flow seed alone starts the
+        # two signature series at different times, and every consumer that
+        # index-aligns them — the modal waveform overlay and the software
+        # flow_pressure_corr — then reads a time-shifted pressure curve (the
+        # "garbled pressure" micro-events, 2026-08).
+        seed_t0 = flow_seed[0][0] if flow_seed else start_ts
+        pressure_seed = [
+            p for (t, p) in zip(self._pressure_ts_buf, self._pressure_buf)
+            if seed_t0 <= t < start_ts
+        ]
         self._active_event = RawEvent(
             circuit=self.circuit,
             start_ts=start_ts,
@@ -1096,13 +1110,8 @@ class CircuitEventDetector:
             pre_event_pressure_psi=baseline,
             min_pressure_psi=baseline if baseline is not None else 0.0,
             max_pressure_psi=baseline if baseline is not None else 0.0,
-            # Seed the signature series with the recovered pre-onset ramp
-            # (samples strictly before start_ts) so the "front" the sustain
-            # trigger cut off is restored. flow_samples (volume) is untouched.
-            flow_readings=(
-                [v for (t, v) in self._pretrigger_flow if t < start_ts]
-                + [self._current_flow_lpm]
-            ),
+            flow_readings=[v for (_, v) in flow_seed] + [self._current_flow_lpm],
+            pressure_readings=pressure_seed,
             flow_samples=[(start_ts, self._current_flow_lpm)],
             other_valve_open=self._get_other_valve_open(),
         )
@@ -1221,6 +1230,11 @@ class CircuitEventDetector:
             max_pressure_psi=current_pressure,
             pressure_delta_psi=drop,
             pressure_readings=[current_pressure],
+            # One flow sample at the trigger so both signature series share
+            # the trigger-time origin — without it the flow series starts at
+            # the FIRST post-trigger flow update (seconds later on a short
+            # event) and index-aligned consumers read it time-stretched.
+            flow_readings=[self._current_flow_lpm],
             flow_samples=[(now, self._current_flow_lpm)],
             flow_onset_entity=self._flow_onset_entity,
             other_valve_open=self._get_other_valve_open(),
