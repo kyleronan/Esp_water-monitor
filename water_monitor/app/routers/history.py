@@ -443,6 +443,43 @@ def _collect_circuit_history_sync(
         # Presentation-only — the stored flow_signature_json is a cluster
         # feature and is never rewritten; the flow_shape word below derives
         # from the same upgraded array the sparkline draws, so they agree.
+        # Overlap-duplicate provenance: link each zeroed wrapper to the kept
+        # event(s) that actually count its water (overlap_audit, dev28), so the
+        # modal banner can point at where the "ignored" volume went instead of
+        # reading like a loss. Display-only.
+        _dup_ids = [e["id"] for e in events
+                    if e.get("match_rejection_reason") == "overlap_duplicate"]
+        _covering: dict = {}
+        if _dup_ids:
+            _ph = ",".join("?" * len(_dup_ids))
+            for _row in db.execute(
+                    f"SELECT wrapper_event_id, kept_event_ids FROM overlap_audit "
+                    f"WHERE wrapper_event_id IN ({_ph}) ORDER BY id", _dup_ids
+                    ).fetchall():
+                try:
+                    _kept = json.loads(_row["kept_event_ids"] or "[]")
+                except (ValueError, TypeError):
+                    _kept = []
+                if _kept:   # later audit rows overwrite earlier (last verdict wins)
+                    _covering[_row["wrapper_event_id"]] = _kept
+            _all_kept = sorted({i for ids in _covering.values() for i in ids})
+            _kept_meta: dict = {}
+            if _all_kept:
+                _ph = ",".join("?" * len(_all_kept))
+                for _row in db.execute(
+                        f"SELECT id, start_ts, volume_litres_effective "
+                        f"FROM events WHERE id IN ({_ph})", _all_kept).fetchall():
+                    _kept_meta[_row["id"]] = _row
+            for e in events:
+                _kept = _covering.get(e.get("id"))
+                if not _kept:
+                    continue
+                e["covering_json"] = json.dumps([
+                    {"id": k,
+                     "ts": (_kept_meta[k]["start_ts"] if k in _kept_meta else None),
+                     "vol_l": (round(float(_kept_meta[k]["volume_litres_effective"] or 0.0), 2)
+                               if k in _kept_meta else None)}
+                    for k in _kept])
         _ids = [e["id"] for e in events if e.get("id")]
         _envelopes: dict = {}
         if _ids:

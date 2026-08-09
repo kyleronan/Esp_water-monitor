@@ -631,6 +631,7 @@
             data-degraded="{{ '1' if e.degraded_supply else '0' }}"
             data-phantom="{{ '1' if e.is_pressure_restoration_phantom else '0' }}"
             data-mrr="{{ e.match_rejection_reason or '' }}"
+            data-covering="{{ e.covering_json or '' }}"
             data-cross-talk="{{ '1' if e.is_cross_talk else '0' }}"
             data-dribble="{{ '1' if e.is_low_flow_dribble else '0' }}"
             data-classified="{{ '1' if e.user_classified else '0' }}"
@@ -823,6 +824,7 @@
          its volume from every total so it doesn't inflate your usage.
          <strong>If water really was running, open Classification below and
          relabel it</strong> — your label overrides this call.</p>
+      <div id="emd-ph-covering" hidden style="margin:0 0 8px"></div>
       <dl class="evt-modal-dl evt-modal-dl-extra">
         <dt>Duration</dt>           <dd id="emd-ph-duration">—</dd>
         <dt>Pressure drop</dt>      <dd id="emd-ph-dp">—</dd>
@@ -1446,7 +1448,49 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       // open — the modal is reused across rows.
       const phTitle = document.getElementById('emd-ph-title');
       const phText = document.getElementById('emd-ph-text');
-      if (d.mrr === 'pump_recharge') {
+      const phCov = document.getElementById('emd-ph-covering');
+      phCov.hidden = true;
+      phCov.innerHTML = '';
+      if (d.mrr === 'overlap_duplicate') {
+        phTitle.textContent = '⧉ Removed: duplicate reading — not extra water';
+        phText.innerHTML = 'This span overlaps other event(s) that already ' +
+          'count this water — the same draw was recorded twice, so this ' +
+          'copy was zeroed to prevent double-counting. Nothing was lost: ' +
+          'the water is counted by the event(s) below. <strong>If this ' +
+          'really was a separate use, open Classification below and relabel ' +
+          'it</strong> — your label overrides this call.';
+        let covering = [];
+        try { covering = JSON.parse(d.covering || '[]'); } catch (e) { /* noop */ }
+        if (covering.length) {
+          phCov.innerHTML = covering.map(c => {
+            const covRow = document.querySelector(
+              `tr.hist-event-row[data-event-id="${c.id}"]`);
+            const when = c.ts
+              ? new Date(c.ts).toLocaleString([], {month:'short', day:'numeric',
+                                                   hour:'2-digit', minute:'2-digit'})
+              : 'event';
+            const vol = covRow ? (covRow.dataset.volumeEffective ||
+                                  covRow.dataset.volume || '') : '';
+            const label = vol ? `${when} — ${vol} counted` : when;
+            return covRow
+              ? `<button type="button" class="btn btn-secondary btn-sm" ` +
+                `data-open-event="${c.id}" style="margin:2px 6px 2px 0">` +
+                `↗ ${label}</button>`
+              : `<span class="muted" style="font-size:12px;margin-right:8px">` +
+                `${label} (not on this page)</span>`;
+          }).join('');
+          phCov.querySelectorAll('[data-open-event]').forEach(btn => {
+            btn.addEventListener('click', ev => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              const covRow = document.querySelector(
+                `tr.hist-event-row[data-event-id="${btn.dataset.openEvent}"]`);
+              if (covRow) openModal(covRow);
+            });
+          });
+          phCov.hidden = false;
+        }
+      } else if (d.mrr === 'pump_recharge') {
         phTitle.textContent = '🔄 Removed: pump top-up — not real use';
         phText.innerHTML = 'Your booster pump briefly pushed water to ' +
           're-pressurize the pipes after they slowly drifted down — not a tap ' +
