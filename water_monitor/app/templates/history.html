@@ -630,6 +630,7 @@
             data-review-verdict="{{ e.review_verdict or '' }}"
             data-degraded="{{ '1' if e.degraded_supply else '0' }}"
             data-phantom="{{ '1' if e.is_pressure_restoration_phantom else '0' }}"
+            data-mrr="{{ e.match_rejection_reason or '' }}"
             data-cross-talk="{{ '1' if e.is_cross_talk else '0' }}"
             data-dribble="{{ '1' if e.is_low_flow_dribble else '0' }}"
             data-classified="{{ '1' if e.user_classified else '0' }}"
@@ -816,8 +817,8 @@
     </section>
     <section id="emd-phantom-section" class="evt-modal-degraded" hidden
              aria-label="Removed: not real water use">
-      <h4 class="evt-modal-degraded-title">Removed: not real water use</h4>
-      <p>A long, very steady reading like this is usually your city water
+      <h4 class="evt-modal-degraded-title" id="emd-ph-title">Removed: not real water use</h4>
+      <p id="emd-ph-text">A long, very steady reading like this is usually your city water
          pressure recovering after a dip — not a tap or appliance. We've removed
          its volume from every total so it doesn't inflate your usage.
          <strong>If water really was running, open Classification below and
@@ -1441,6 +1442,27 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     // discriminating values plus the raw sensor volume that was discarded.
     const phSection = document.getElementById('emd-phantom-section');
     if (d.phantom === '1') {
+      // Verdict-specific copy (mirrors the list pill wording). Reset on every
+      // open — the modal is reused across rows.
+      const phTitle = document.getElementById('emd-ph-title');
+      const phText = document.getElementById('emd-ph-text');
+      if (d.mrr === 'pump_recharge') {
+        phTitle.textContent = '🔄 Removed: pump top-up — not real use';
+        phText.innerHTML = 'Your booster pump briefly pushed water to ' +
+          're-pressurize the pipes after they slowly drifted down — not a tap ' +
+          'or appliance being used. We’ve removed its volume from your ' +
+          'usage totals (any leak this water feeds is tracked separately). ' +
+          '<strong>If water really was running, open Classification below and ' +
+          'relabel it</strong> — your label overrides this call.';
+      } else {
+        phTitle.textContent = 'Removed: not real water use';
+        phText.innerHTML = 'A long, very steady reading like this is usually ' +
+          'your city water pressure recovering after a dip — not a tap or ' +
+          'appliance. We’ve removed its volume from every total so it ' +
+          'doesn’t inflate your usage. <strong>If water really was ' +
+          'running, open Classification below and relabel it</strong> — your ' +
+          'label overrides this call.';
+      }
       document.getElementById('emd-ph-duration').textContent = d.duration || '—';
       document.getElementById('emd-ph-dp').textContent =
         (d.pressure && d.pressure !== '—') ? `${d.pressure} ${pressUnit}` : '—';
