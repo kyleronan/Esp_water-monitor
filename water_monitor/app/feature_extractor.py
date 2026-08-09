@@ -3596,6 +3596,19 @@ _WF_MATCH_MIN_SCORE: float = 0.55
 # current processing moment. Guards against stale records from a previous event.
 _WF_MATCH_WINDOW_S: float = 90.0
 
+# Physical-consistency floor for a record's metadata peak. A record whose peak
+# flow is below the event's own volume-derived active average cannot describe
+# this draw — the average of a series can never exceed its maximum — so the
+# record belongs to a DIFFERENT event and every field it carries (pressure
+# delta, propagation delay, signatures, display envelope) is equally wrong.
+#
+# Deliberately permissive at 0.95: the record's peak is firmware-measured while
+# true_avg comes from the HA flow stream, so healthy records legitimately sit
+# just above 1.0× on short draws (production p1 = 1.007–1.09 by duration
+# bucket). Only provable mismatches are rejected; see the [wf-sanity-reject]
+# log tag for the observed false-reject rate.
+_WF_PEAK_SANITY_RATIO: float = 0.95
+
 # Waveform flag bits (must match firmware wire format).
 _WF_FL_START_COMPLETE:     int = 0x01  # pre-roll covers full start-window span
 _WF_FL_FULL_COMPLETE:      int = 0x02  # full-window capture is complete
@@ -3656,7 +3669,7 @@ def _enrich_from_waveform(
     features: Dict[str, Any],
     record: WaveformRecord,
     overlap_score: float,
-) -> None:
+) -> bool:
     """
     Selectively override features in ``features`` with ESP waveform data.
 
@@ -3674,10 +3687,31 @@ def _enrich_from_waveform(
       * ``waveform_quality``       — firmware self-reported quality 0–100.
       * ``waveform_overlap_score`` — fraction of the event window covered
                                      by valid waveform samples (0.0–1.0).
+
+    Returns True when the record was applied, False when it was rejected
+    wholesale by the physical-consistency gate (``_WF_PEAK_SANITY_RATIO``) —
+    in which case ``features`` is left completely untouched and the caller
+    must NOT hand this record to ``_persist_waveform`` either.
     """
     meta = record.metadata
     fl   = meta.flags
     any_wf_used = False
+
+    # ── 0. Physical-consistency gate ───────────────────────────────────────
+    # peak < the event's own active average is impossible for a single draw,
+    # so this record describes a different event (duration-only matching lets
+    # two same-length draws both clear the score gate). Reject the WHOLE
+    # record: pressure delta, propagation delay, signatures and the display
+    # envelope all come from that same wrong capture.
+    true_avg = float(features.get("true_avg_flow_lpm") or 0.0)
+    if true_avg > 0 and meta.peak_flow > 0 and (
+            meta.peak_flow < _WF_PEAK_SANITY_RATIO * true_avg):
+        log.info(
+            "[wf-sanity-reject] fw event_id=%d boot=%d peak=%.2f < true_avg=%.2f "
+            "L/min — record describes a different draw, falling back to software",
+            meta.event_id, meta.boot_id, meta.peak_flow, true_avg,
+        )
+        return False
 
     # ── 1. Metadata-sourced features (always, no flag guard needed) ────────
     # The metadata is always valid when we reach this point; replace features
@@ -3879,8 +3913,14 @@ def _enrich_from_waveform(
     # ── 4. Set A/B tracking fields ─────────────────────────────────────────
     features["esp_waveform_used"]     = 1 if any_wf_used else 0
     features["waveform_event_id"]     = meta.event_id
+    # boot_id completes the claim key: the firmware event counter restarts at
+    # every reboot, so (boot_id, event_id) — not event_id alone — identifies a
+    # capture. Persisted so _wf_already_claimed can enforce one-record-one-event
+    # across restarts and across the live/late-upgrade paths.
+    features["waveform_boot_id"]      = meta.boot_id
     features["waveform_quality"]      = meta.quality
     features["waveform_overlap_score"] = round(overlap_score, 4)
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -3900,8 +3940,8 @@ def _enrich_from_waveform(
 # write a volume/user/bookkeeping column through this path).
 _WF_UPGRADE_COLUMNS = (
     "signature_source", "flow_signature_json", "pressure_signature_json",
-    "esp_waveform_used", "waveform_event_id", "waveform_quality",
-    "waveform_overlap_score",
+    "esp_waveform_used", "waveform_event_id", "waveform_boot_id",
+    "waveform_quality", "waveform_overlap_score",
     "peak_flow_lpm", "pressure_delta_psi", "propagation_delay_ms",
     "flow_rise_rate_lpm_s", "time_to_90pct_flow_seconds", "opening_step_lpm",
     "pressure_onset_ms", "steady_state_fraction", "flow_variability",
@@ -3914,6 +3954,32 @@ _WF_UPGRADE_COLUMNS = (
     # same quality gate as flow_signature_json.
     "onset_signature_json", "offset_signature_json",
 )
+
+
+def _wf_already_claimed(conn, circuit: str, boot_id, fw_event_id) -> bool:
+    """True when some stored event already claimed this firmware capture.
+
+    One capture describes one draw, so it may enrich exactly one event. The
+    events table IS the ledger — no side table, and it survives restarts.
+    Claims never expire: ``boot_id`` is a per-boot ``random_uint32()`` from the
+    firmware, so a stale claim cannot collide with a future capture.
+
+    Rows written before migration 20260572 have a NULL ``waveform_boot_id`` and
+    are therefore unclaimable — deliberate, since ``waveform_event_id`` alone
+    (a per-boot counter) cannot identify a capture across reboots.
+    """
+    if boot_id is None or fw_event_id is None:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM events WHERE circuit = ? AND waveform_boot_id = ? "
+            "AND waveform_event_id = ? AND esp_waveform_used = 1 LIMIT 1",
+            (circuit, boot_id, fw_event_id),
+        ).fetchone()
+    except sqlite3.Error:
+        # Pre-migration schema (no waveform_boot_id column) → no ledger yet.
+        return False
+    return row is not None
 
 
 def _parse_iso(ts):
@@ -3970,8 +4036,20 @@ def _late_waveform_upgrade_job(conn, circuit: str, record: WaveformRecord):
     if best is None or best_score < _WF_MATCH_MIN_SCORE:
         return None
 
+    # Exclusivity: this capture may already have enriched the live event that
+    # finalised just before this assembly. The SELECT and the UPDATE below run
+    # inside ONE write-lock acquisition, so no concurrent late job can slip
+    # between them. (The live path is a different task, so a live upsert can
+    # still interleave here — see the note in _process; the consequence is one
+    # duplicate claim, i.e. exactly the pre-fix behaviour, which the sanity
+    # gate and the repair sweep both catch. Cross-task locking is not worth it.)
+    if _wf_already_claimed(conn, circuit, record.metadata.boot_id,
+                           record.metadata.event_id):
+        return None
+
     features = dict(best)
-    _enrich_from_waveform(features, record, best_score)
+    if not _enrich_from_waveform(features, record, best_score):
+        return None   # physically inconsistent record — leave the row alone
     # Only persist a genuine signature flip (software → esp_*). A no-flow / no-
     # signal waveform leaves signature_source 'software' → nothing to upgrade, so
     # artifact rows (phantom/cross-talk/dribble) are never rewritten through here.
@@ -4395,7 +4473,9 @@ class FeatureExtractor:
 
         Returns the record with the highest duration-overlap score among those
         assembled within _WF_MATCH_WINDOW_S, when that score reaches
-        _WF_MATCH_MIN_SCORE; otherwise None.
+        _WF_MATCH_MIN_SCORE; otherwise None. Records already claimed by a
+        stored event are skipped entirely, so the next-best unclaimed record
+        can still win rather than the event falling back to software.
         """
         import time as _time
 
@@ -4414,6 +4494,12 @@ class FeatureExtractor:
             # Recency guard: a record assembled too long ago belongs to a
             # previous event, not this one.
             if now_mono - record.received_at > _WF_MATCH_WINDOW_S:
+                continue
+            # Exclusivity: one capture enriches one event. Skipping (rather
+            # than rejecting after the fact) lets the runner-up record win.
+            if _wf_already_claimed(self._db, event.circuit,
+                                   record.metadata.boot_id,
+                                   record.metadata.event_id):
                 continue
             score = _wf_overlap_score(event, record)
             if score > best_score:
@@ -4515,25 +4601,27 @@ class FeatureExtractor:
         # Attempt to enrich features from ESP waveform capture (firmware 3.7.0+).
         # Per-group routing: each group falls back to the legacy value independently.
         wf_record = self._find_waveform(event)
+        wf_applied = False
         if wf_record is not None:
             score = _wf_overlap_score(event, wf_record)
-            _enrich_from_waveform(features, wf_record, score)
+            wf_applied = _enrich_from_waveform(features, wf_record, score)
             # NOTE: enrichment overwrites pressure_delta_psi / peak_flow_lpm
             # with ESP-measured values. The phantom verdict is re-derived
             # below (after the existing-row read), so a real long event — e.g.
             # a 40-min shower whose pressure drop wasn't captured in the
             # software pass — is NOT left with a stale phantom flag + zeroed
             # volume.
-            log.debug(
-                "[%s] waveform enriched — event_id=%d boot_id=%d "
-                "overlap=%.2f q=%d fl=0x%02x",
-                event.circuit,
-                wf_record.metadata.event_id,
-                wf_record.metadata.boot_id,
-                score,
-                wf_record.metadata.quality,
-                wf_record.metadata.flags,
-            )
+            if wf_applied:
+                log.debug(
+                    "[%s] waveform enriched — event_id=%d boot_id=%d "
+                    "overlap=%.2f q=%d fl=0x%02x",
+                    event.circuit,
+                    wf_record.metadata.event_id,
+                    wf_record.metadata.boot_id,
+                    score,
+                    wf_record.metadata.quality,
+                    wf_record.metadata.flags,
+                )
 
         try:
             from .database import (upsert_event_and_apply_hourly_volume,
@@ -4684,14 +4772,32 @@ class FeatureExtractor:
             # Persist the hi-res waveform for the event-detail modal. Always
             # called, even for healthy events — useful diagnostic data. Skips
             # silently when readings lists are empty (historical events).
+            # A record rejected by the sanity gate describes a different draw —
+            # it must not substitute the display envelope either, or the modal
+            # shows another event's waveform.
             _persist_waveform(
                 self._db,
                 features["id"],
                 event.flow_readings,
                 event.pressure_readings,
                 float(features.get("duration_seconds") or 0),
-                esp_record=wf_record,
+                esp_record=wf_record if wf_applied else None,
             )
+
+            # Consume the capture so no later event can claim it (the durable
+            # ledger covers restarts; this also drops it from the in-memory
+            # buffer immediately). Only on success — a rejected record may
+            # still legitimately belong to the NEXT event to finalise.
+            if wf_applied and self._event_detector is not None:
+                try:
+                    self._event_detector.pop_waveform_record(
+                        event.circuit,
+                        wf_record.metadata.boot_id,
+                        wf_record.metadata.event_id,
+                    )
+                except Exception as e:
+                    log.debug("[%s] waveform consume failed (non-fatal): %s",
+                              event.circuit, e)
 
             if is_new_event and not features.get("excluded_from_training"):
                 self._db.execute("""

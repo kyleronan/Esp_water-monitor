@@ -909,8 +909,19 @@ CREATE TABLE IF NOT EXISTS events (
     -- ESP waveform A/B fields (migration 031)
     esp_waveform_used                INTEGER,
     waveform_event_id                INTEGER,
+    -- Claim ledger (migration 20260573). The firmware event counter restarts
+    -- at every reboot, so (waveform_boot_id, waveform_event_id) — not the
+    -- event id alone — identifies a capture. One capture enriches one event.
+    waveform_boot_id                 INTEGER,
     waveform_quality                 INTEGER,
     waveform_overlap_score           REAL,
+    -- Mis-attachment repair audit (migration 20260573). Populated only by the
+    -- wf_repair_backfill sweep; the corrupted values are preserved here.
+    peak_flow_lpm_pre_repair         REAL,
+    pressure_delta_psi_pre_repair    REAL,
+    propagation_delay_ms_pre_repair  REAL,
+    wf_repair_at                     TEXT,
+    wf_repair_verdict                TEXT,
     -- Signature provenance — which source generated the shape signatures.
     -- 'software' (default) | 'esp_full_flow' | 'esp_full_pressure' | 'esp_full_flow_pressure'
     signature_source                 TEXT,
@@ -1064,6 +1075,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_events_circuit_start_unique
     ON events (circuit, start_ts);
 CREATE INDEX IF NOT EXISTS idx_events_start_ts
     ON events (start_ts);
+-- NOTE: idx_events_wf_claim (the waveform claim lookup) is deliberately NOT
+-- here — it indexes waveform_boot_id, a column older DBs only gain during
+-- migration 20260573, and this script also runs against those. Migration
+-- 20260573 creates it; the fresh-DB path runs the whole chain too.
 
 -- ==========================================================================
 -- HOURLY VOLUME (pre-aggregated for fast chart queries)

@@ -33,6 +33,7 @@ from .historical_importer import HistoricalImporter
 from .cluster_metrics import ClusterMetrics
 from .maturity_recheck import MaturityRecheck
 from .rise_corr_backfill import RiseCorrBackfill
+from .wf_repair_backfill import WfRepairBackfill
 from .fixture_publisher import FixturePublisher
 
 log = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ class Orchestrator:
         self._cluster_metrics: Optional[ClusterMetrics] = None
         self._maturity_recheck: Optional[MaturityRecheck] = None
         self._rise_corr_backfill: Optional[RiseCorrBackfill] = None
+        self._wf_repair_backfill: Optional[WfRepairBackfill] = None
         self._fixture_publisher: Optional[FixturePublisher] = None
         self._stop = asyncio.Event()
         self._live_state_cache: Dict[str, Any] = {}
@@ -523,6 +525,8 @@ class Orchestrator:
             self._maturity_recheck.stop()
         if self._rise_corr_backfill:
             self._rise_corr_backfill.stop()
+        if self._wf_repair_backfill:
+            self._wf_repair_backfill.stop()
         if self._leak_test_scheduler:
             self._leak_test_scheduler.stop()
         if getattr(self, "_supply_regime", None):
@@ -801,6 +805,13 @@ class Orchestrator:
         # historical candidate events from HA history, then stamps itself done.
         self._rise_corr_backfill = RiseCorrBackfill(self._db, self._cfg, self._ha)
 
+        # One-shot waveform mis-attachment repair (migration 20260573) — fixes
+        # stored events that a wrongly-matched firmware capture left reporting
+        # an average above their own peak, then replays the affected circuits'
+        # cluster state so the in-memory scaler stops carrying those outliers.
+        self._wf_repair_backfill = WfRepairBackfill(
+            self._db, self._cluster_engine)
+
         # Nightly pump-regime detector (dev23, pump plan Phase 3) — analyzes
         # the quiet-hour pressure/flow window with the study-validated math
         # and maintains the banner+confirm home flag. Detection only; no
@@ -842,6 +853,7 @@ class Orchestrator:
                 self._supervise("cluster_metrics",     self._cluster_metrics.run),
                 self._supervise("maturity_recheck",    self._maturity_recheck.run),
                 self._supervise("rise_corr_backfill",  self._rise_corr_backfill.run),
+                self._supervise("wf_repair_backfill",  self._wf_repair_backfill.run),
                 self._supervise("pump_regime_detector", self._pump_regime.run),
                 self._supervise("supply_regime_tracker", self._supply_regime.run),
                 self._supervise("waveform_purger",     self._run_waveform_purger),

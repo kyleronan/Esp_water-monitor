@@ -424,6 +424,21 @@ class CircuitEventDetector:
     # are never closed here. Conservative: flow has been zero for the whole event.
     SETTLED_NOFLOW_CLOSE_S: float = 60.0
 
+    # Sawtooth hold-open close (2026-08 export study; pump mode only). A pump's
+    # periodic recharge slugs peak above MIN_FLOW, so each top-up resets the
+    # normal end conditions and holds an open event through many minutes of
+    # real idle until the next genuine draw merges in (the overlap-duplicate
+    # wrappers — every one post-pump-install). Close once the trailing
+    # SAWTOOTH_HOLD_CLOSE_S seconds contain nothing but micro-pulses shorter
+    # than SAWTOOTH_PULSE_MAX_S over true idle. Study (08-09 export): closes
+    # 11/15 known long-idle wrappers, splits 0 washer/dishwasher (their
+    # internal gaps max 92 s), 0 softener (their inter-fill flow sits above
+    # the idle floor), 0 user-labeled events; the only "splits" were further
+    # mislabeled wrappers verified against raw HA history.
+    SAWTOOTH_PULSE_MAX_S: float = 25.0    # a real fill/draw runs longer
+    SAWTOOTH_HOLD_CLOSE_S: float = 420.0  # washer max internal gap x 4.5
+    SAWTOOTH_IDLE_FRACTION: float = 0.18  # idle floor = fraction of MIN_FLOW
+
     # Minimum event volume.  Events whose computed volume (avg_flow × duration)
     # is below this threshold are discarded as noise.  1 mL is a sanity floor —
     # no real water-use event produces less than 1 mL.
@@ -759,6 +774,8 @@ class CircuitEventDetector:
                           self.circuit, self._current_flow_lpm)
             elif self._maybe_finalize_held_low_flow(now):
                 return
+            if self._maybe_close_sawtooth_hold(now):         # recharge hold-open
+                return
             if self._maybe_force_close_overlong(now):        # over-long watchdog
                 return
             elapsed = (now - self._active_event.start_ts).total_seconds()
@@ -904,6 +921,8 @@ class CircuitEventDetector:
             if self._maybe_force_close_overlong(now):    # over-long watchdog
                 return
             if self._maybe_close_settled_noflow(now):    # stuck no-flow phantom
+                return
+            if self._maybe_close_sawtooth_hold(now):     # recharge hold-open
                 return
             elapsed_p = (now - self._active_event.start_ts).total_seconds()
             self._pressure_sample_count += 1
@@ -1355,6 +1374,56 @@ class CircuitEventDetector:
             self.SETTLED_STABILITY_PSI, self.MAX_EVENT_DURATION_S / 3600.0,
         )
         self._end_event(now, force=True)
+        return True
+
+    def _maybe_close_sawtooth_hold(self, now: datetime) -> bool:
+        """Close an event held open only by pump recharge micro-pulses.
+
+        Pump mode only (``pump_osc_gate_psi`` is the detector's pump-mode
+        signal, set with the dev25 oscillation gate). Walks the event's
+        timestamped ``flow_samples`` step function backwards from ``now`` and
+        finds the last REAL activity: either an above-MIN_FLOW run at least
+        SAWTOOTH_PULSE_MAX_S long (a genuine draw/fill) or sub-threshold flow
+        above the idle floor (a softener/low-draw — breaks the idle stretch).
+        If everything since then — for SAWTOOTH_HOLD_CLOSE_S or longer — was
+        micro-pulses over true idle, the event is finalized AT that last real
+        activity, so the recharge tail never inflates duration. Subsequent
+        recharge pulses then open their own events and the sawtooth prong of
+        the recharge detector absorbs them. Returns True when it finalized."""
+        ev = self._active_event
+        if ev is None or self.pump_osc_gate_psi is None:
+            return False
+        if self._current_flow_lpm >= self.MIN_FLOW_LPM:
+            return False
+        if (now - ev.start_ts).total_seconds() < self.SAWTOOTH_HOLD_CLOSE_S:
+            return False
+        samples = ev.flow_samples
+        if not samples:
+            return False
+        idle_thr = self.SAWTOOTH_IDLE_FRACTION * self.MIN_FLOW_LPM
+        last_real = ev.start_ts
+        run_start: Optional[datetime] = None
+        for i, (t, v) in enumerate(samples):
+            seg_end = samples[i + 1][0] if i + 1 < len(samples) else now
+            if v >= self.MIN_FLOW_LPM:
+                if run_start is None:
+                    run_start = t
+                if (seg_end - run_start).total_seconds() >= self.SAWTOOTH_PULSE_MAX_S:
+                    last_real = seg_end       # wide run: real until it ends
+            else:
+                run_start = None
+                if v >= idle_thr:
+                    last_real = seg_end       # sub-threshold but real flow
+        if (now - last_real).total_seconds() < self.SAWTOOTH_HOLD_CLOSE_S:
+            return False
+        log.info(
+            "[%s] closing sawtooth-held event: only recharge micro-pulses for "
+            "%.0f s (last real activity %s) — trimming end there instead of "
+            "letting the next draw merge in",
+            self.circuit, (now - last_real).total_seconds(),
+            last_real.isoformat(),
+        )
+        self._end_event(last_real, force=True)
         return True
 
     def _end_event(self, ts: datetime, force: bool = False) -> None:

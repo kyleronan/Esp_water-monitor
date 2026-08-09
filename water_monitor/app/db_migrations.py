@@ -230,7 +230,13 @@ _BASELINE_VERSION: int = 20260523
 #              pump-era events under the widened third prong of
 #              _detect_pump_recharge (slow-decay pressure-triggered restart
 #              slugs the 2026-08 micro-event audit surfaced). Data-only.
-_CURRENT_VERSION: int = 20260572
+#   20260573 — waveform claim ledger + mis-attachment repair audit:
+#              events.waveform_boot_id (completes the firmware-capture identity
+#              so one capture can enrich only one event), the
+#              *_pre_repair audit trio, wf_repair_at / wf_repair_verdict, and
+#              idx_events_wf_claim. DDL only — the repair sweep itself runs as
+#              the wf_repair_backfill worker after boot.
+_CURRENT_VERSION: int = 20260573
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -2134,6 +2140,73 @@ def _missing_pump_mode_columns(conn: sqlite3.Connection) -> set[str]:
     return missing
 
 
+# 20260573 — waveform claim ledger + mis-attachment repair audit.
+_WF_CLAIM_COLUMNS: tuple = (
+    # Completes the firmware-capture identity. The ESP event counter restarts
+    # at every reboot, so event_id alone cannot identify a capture; boot_id is
+    # a per-boot random_uint32() from the firmware. Together they are the claim
+    # key enforcing one-capture-one-event (see _wf_already_claimed).
+    ("waveform_boot_id", "INTEGER"),
+    # Audit trail for the one-shot repair sweep (wf_repair_backfill), following
+    # the volume_litres_original / volume_recomputed_at precedent: the corrupted
+    # values are preserved, never silently overwritten.
+    ("peak_flow_lpm_pre_repair", "REAL"),
+    ("pressure_delta_psi_pre_repair", "REAL"),
+    ("propagation_delay_ms_pre_repair", "REAL"),
+    ("wf_repair_at", "TEXT"),
+    # 'misattached' (capture provably belonged to another draw) or 'floor_only'
+    # (cross-sensor disagreement; peak floored, provenance kept). The verdict
+    # distribution is the empirical check on the mis-attachment diagnosis.
+    ("wf_repair_verdict", "TEXT"),
+)
+
+
+def _apply_wf_claim_and_repair_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260573 — the waveform claim ledger and
+    the repair-audit columns.
+
+    DDL only, deliberately: the repair itself needs the event corpus and the
+    cluster engine, which this module must not import (see the 20260535 note).
+    ``wf_repair_backfill`` runs it as a supervised one-shot worker after boot.
+
+    Background: ``_enrich_from_waveform`` overwrote peak_flow_lpm /
+    pressure_delta_psi / propagation_delay_ms from whichever buffered capture
+    best matched on DURATION, with nothing stopping two same-length draws from
+    both claiming the same capture. On the 2026-08-09 production export that
+    left 110 events with true_avg_flow_lpm > peak_flow_lpm — impossible for a
+    single draw, since an average cannot exceed its own maximum.
+    """
+    if not _has_table(conn, "events"):
+        return
+    for col, ddl in _WF_CLAIM_COLUMNS:
+        if not _has_column(conn, "events", col):
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {ddl}")
+    # Plain, NOT unique: the live path writes events through a wide upsert, and
+    # a constraint violation there would abort event storage entirely. The
+    # check-first SELECT in _wf_already_claimed is the enforcement.
+    #
+    # Guarded on every indexed column: other migration tests exercise this
+    # chain against stub `events` tables that carry only the columns their own
+    # step needs, and an index over a missing column aborts the whole run.
+    if all(_has_column(conn, "events", c)
+           for c in ("circuit", "waveform_boot_id", "waveform_event_id")):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)"
+        )
+    conn.commit()
+    log.info("Migration 20260573: waveform claim ledger + repair audit columns ready")
+
+
+def _missing_wf_claim_columns(conn: sqlite3.Connection) -> set[str]:
+    if not _has_table(conn, "events"):
+        return set()
+    return {
+        f"events.{col}" for col, _ddl in _WF_CLAIM_COLUMNS
+        if not _has_column(conn, "events", col)
+    }
+
+
 def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the set of required baseline columns absent from the events table."""
     return {
@@ -2246,6 +2319,7 @@ _MIGRATIONS: tuple = (
     (20260570, _apply_leak_test_refill_column),
     (20260571, _apply_local_day_boundary),
     (20260572, _apply_sawtooth_recharge_backfill),
+    (20260573, _apply_wf_claim_and_repair_columns),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -2323,6 +2397,7 @@ def _run_migrations_impl(
             | _missing_leak_test_measurement_columns(conn)
             | _missing_leak_test_refill_columns(conn)
             | _missing_local_day_columns(conn)
+            | _missing_wf_claim_columns(conn)
         )
         if missing:
             raise RuntimeError(
