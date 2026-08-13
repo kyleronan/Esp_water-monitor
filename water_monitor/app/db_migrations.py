@@ -241,6 +241,14 @@ _BASELINE_VERSION: int = 20260523
 #              can say WHEN the cycling was observed ("between 1:05 and 2:11
 #              AM") instead of the ambiguous "night of <date>". DDL only;
 #              old rows stay NULL and the banner falls back to date-only copy.
+#
+# VERSION-NUMBER CONVENTION (2026-08-12, decided with the operator): from the
+# next migration onward, versions are YYYYMM + a 2-digit per-month sequence —
+# the NEXT one is 20260801 (August 2026, #01), then 20260802, and September
+# rolls to 20260901. The historical 202605xx run reads the same way with the
+# month stuck at 05 (it drifted into a plain sequence); everything stays
+# strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
+# reorder a shipped number.
 _CURRENT_VERSION: int = 20260574
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
