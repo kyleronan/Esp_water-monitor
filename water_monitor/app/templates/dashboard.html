@@ -88,8 +88,11 @@
   <div class="dash-alert-body">
     <span class="dash-alert-title">💧 Leak watch</span>
     <span class="dash-alert-detail">
-      On the night of <strong>{{ leak_watch.night }}</strong> your booster pump
-      topped the system up
+      {% if leak_watch.window_range %}Between
+      <strong>{{ leak_watch.window_range }}</strong> on
+      <strong>{{ leak_watch.night }}</strong>{% else %}During the quiet hours
+      of <strong>{{ leak_watch.night }}</strong>{% endif %}
+      your booster pump topped the system up
       {% if leak_watch.period_min %}about every {{ leak_watch.period_min }}
       minutes{% else %}repeatedly{% endif %}
       with nothing running — an estimated

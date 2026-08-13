@@ -424,6 +424,10 @@ class PumpRegimeDetector:
             detected=1 if v.detected else 0,
             period_s=period, amplitude_psi=v.p2p_psi, sd_psi=v.sd_psi,
             cycles=v.cycles, window_s=int(e - s), est_leak_lpd=est_lpd,
+            # UTC bounds of the analyzed sub-window, so the leak-watch banner
+            # can name the actual time range instead of "the night of".
+            window_start_ts=(start + timedelta(seconds=int(s))).isoformat(),
+            window_end_ts=(start + timedelta(seconds=int(e))).isoformat(),
             # Quiet-window pressure floor ≈ pump cut-in — feeds the Phase 6b
             # suggested-floor hint (works on healthy homes too: the quiet
             # minimum is the bottom of the normal band).

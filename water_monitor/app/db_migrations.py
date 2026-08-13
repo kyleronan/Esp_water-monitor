@@ -236,7 +236,12 @@ _BASELINE_VERSION: int = 20260523
 #              *_pre_repair audit trio, wf_repair_at / wf_repair_verdict, and
 #              idx_events_wf_claim. DDL only — the repair sweep itself runs as
 #              the wf_repair_backfill worker after boot.
-_CURRENT_VERSION: int = 20260573
+#   20260574 — pump_regime_nightly.window_start_ts / window_end_ts: the UTC
+#              bounds of the analyzed quiet window, so the leak-watch banner
+#              can say WHEN the cycling was observed ("between 1:05 and 2:11
+#              AM") instead of the ambiguous "night of <date>". DDL only;
+#              old rows stay NULL and the banner falls back to date-only copy.
+_CURRENT_VERSION: int = 20260574
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -2076,6 +2081,33 @@ def _apply_sawtooth_recharge_backfill(conn: sqlite3.Connection) -> None:
                     "(non-fatal): %s", e)
 
 
+# 20260574 — leak-watch window bounds.
+def _apply_regime_window_bounds(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260574 — ``pump_regime_nightly``
+    window_start_ts / window_end_ts (UTC ISO bounds of the analyzed quiet
+    window). Additive, idempotent, skipped when the table is absent (the
+    partial-schema fixtures the forward-walk tests build)."""
+    if _has_table(conn, "pump_regime_nightly"):
+        for col in ("window_start_ts", "window_end_ts"):
+            if not _has_column(conn, "pump_regime_nightly", col):
+                conn.execute(
+                    f"ALTER TABLE pump_regime_nightly ADD COLUMN {col} TEXT")
+    # Belt-and-braces re-create of the 20260573 wf-claim index: the base
+    # schema deliberately omits it (it references waveform_boot_id, which
+    # pre-20260573 DBs lack when the schema script runs), so a DB stamped at
+    # 20260573 without having walked through it would miss the index. By this
+    # point in the ladder the columns exist on every path — IF NOT EXISTS
+    # makes it a no-op everywhere else.
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+    conn.commit()
+    log.info("Migration 20260574: regime window-bound columns ready")
+
+
 def _missing_local_day_columns(conn: sqlite3.Connection) -> set[str]:
     missing = set()
     if (_has_table(conn, "volume_snapshots")
@@ -2320,6 +2352,7 @@ _MIGRATIONS: tuple = (
     (20260571, _apply_local_day_boundary),
     (20260572, _apply_sawtooth_recharge_backfill),
     (20260573, _apply_wf_claim_and_repair_columns),
+    (20260574, _apply_regime_window_bounds),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

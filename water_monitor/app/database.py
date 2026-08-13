@@ -1345,6 +1345,10 @@ CREATE TABLE IF NOT EXISTS pump_regime_nightly (
     -- Quiet-window pressure floor ≈ pump cut-in (migration 20260560) — feeds
     -- the Phase 6b suggested-floor hint (cut-in − 5).
     min_psi       REAL,
+    -- UTC ISO bounds of the analyzed sub-window (migration 20260574) — the
+    -- leak-watch banner names the actual time range instead of "night of".
+    window_start_ts TEXT,
+    window_end_ts   TEXT,
     created_ts    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (circuit, night_date)
 );
@@ -3232,7 +3236,11 @@ def get_pump_regime_nights(conn: sqlite3.Connection,
                   ) AS period_s,
                   MAX(CASE WHEN detected = 1 THEN amplitude_psi END)
                       AS amplitude_psi,
-                  MAX(est_leak_lpd) AS est_leak_lpd
+                  MAX(est_leak_lpd) AS est_leak_lpd,
+                  MAX(CASE WHEN detected = 1 THEN window_start_ts END)
+                      AS window_start_ts,
+                  MAX(CASE WHEN detected = 1 THEN window_end_ts END)
+                      AS window_end_ts
            FROM pump_regime_nightly
            GROUP BY night_date ORDER BY night_date DESC LIMIT ?""",
         (limit,)).fetchall()

@@ -30,6 +30,16 @@ landed without a version bump; per-build details are in git history.)
   correlation feature the phantom and recharge detectors depend on. (The
   "Reprocess event" button remains for genuinely garbled history, but these
   events no longer need it.)
+  Also — dev37: the **Leak watch banner now requires two nights of evidence**.
+  On 2026-08-10 it announced "~294 gal/day is leaking" from a single
+  contaminated night: a water-softener regeneration shrank the analyzer's
+  quiet window to 66 minutes and its pump cycling read as 27-second leak
+  top-ups. A real leak regime cycles every night (the July incident detected
+  on consecutive nights); one-off contamination — a softener regen, the 02:00
+  irrigation program that caused the earlier "110 L/day" banner — shows up as
+  a lone detected night surrounded by quiet ones. The banner now stays silent
+  unless the evaluated night before the estimate also detected cycling; both
+  historical false banners fail that test, the real July incident passes it.
 
 - **One "day", everywhere — dev36** — the same water was being reported as four
   different daily totals. On 2026-08-06 the History chart said 100.1 gal, the

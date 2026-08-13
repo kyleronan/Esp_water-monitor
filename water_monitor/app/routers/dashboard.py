@@ -39,19 +39,32 @@ _LEAK_WATCH_MAX_AGE_NIGHTS: int = 3
 def _fresh_leak_estimate(nights: list, ack: str | None) -> Dict[str, Any] | None:
     """Newest evaluated night carrying a leak estimate, or None.
 
-    Two gates: the night must be within _LEAK_WATCH_MAX_AGE_NIGHTS of the most
-    recent evaluated night, and it must be newer than any night the user has
-    dismissed. Dismissal is per-READING — a later night with a fresh estimate
-    re-shows the tile, so one click can never silence a real leak.
+    Three gates: the night must be within _LEAK_WATCH_MAX_AGE_NIGHTS of the
+    most recent evaluated night, it must be newer than any night the user has
+    dismissed, and the evaluated night immediately BEFORE it must also have
+    detected cycling (corroboration). Dismissal is per-READING — a later night
+    with a fresh estimate re-shows the tile, so one click can never silence a
+    real leak.
+
+    The corroboration gate (2026-08-11): a real leak regime cycles every
+    night (the 2026-07 incident detected on 7/25 AND 7/26), while one-off
+    contamination — a softener regen shrinking the quiet window (8/10,
+    "1114 L/day"), the 02:00 irrigation program (7/28, "110 L/day") — shows
+    up as a single detected night surrounded by quiet ones. Both historical
+    false banners fail this gate; the real incident's banner passes it.
     """
     dismissed_through = None
     if ack and str(ack).startswith("dismissed:"):
         dismissed_through = str(ack).split(":", 1)[1]
-    for n in nights[:_LEAK_WATCH_MAX_AGE_NIGHTS]:
+    for i, n in enumerate(nights[:_LEAK_WATCH_MAX_AGE_NIGHTS]):
         if not n.get("est_leak_lpd"):
             continue
         if dismissed_through and n["night_date"] <= dismissed_through:
             return None      # this reading, or an older one, was acknowledged
+        prev = nights[i + 1] if i + 1 < len(nights) else None
+        if not (prev and prev.get("any_detected")):
+            return None      # uncorroborated single night — likely a
+                             # contaminated window, not a leak regime
         return n
     return None
 
@@ -126,10 +139,24 @@ async def dashboard(request: Request):
             nights = get_pump_regime_nights(orch.db, limit=14)
             latest = _fresh_leak_estimate(nights, profile.get("leak_watch_ack"))
             if latest:
+                # Local wall-clock range of the analyzed window ("1:05 AM to
+                # 2:11 AM"), so the banner names WHEN the cycling was seen —
+                # quiet hours differ per home and aren't always at night.
+                window_range = None
+                try:
+                    if latest.get("window_start_ts") and latest.get("window_end_ts"):
+                        _tz = getattr(orch, "_ha_tz", None) or timezone.utc
+                        _fmt = lambda iso: datetime.fromisoformat(iso).astimezone(
+                            _tz).strftime("%I:%M %p").lstrip("0")
+                        window_range = (f"{_fmt(latest['window_start_ts'])} to "
+                                        f"{_fmt(latest['window_end_ts'])}")
+                except (ValueError, TypeError):
+                    window_range = None
                 leak_watch = {
                     "lpd": latest["est_leak_lpd"],
                     "gpd": round(latest["est_leak_lpd"] / 3.785, 1),
                     "night": latest["night_date"],
+                    "window_range": window_range,
                     "period_min": (round(latest["period_s"] / 60.0, 1)
                                    if latest.get("period_s") else None),
                     "nights": [

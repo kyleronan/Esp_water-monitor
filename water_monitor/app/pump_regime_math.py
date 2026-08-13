@@ -199,6 +199,12 @@ def segment_recharge_rises(pressure_1hz: Sequence[float],
     Walks the series accumulating rising runs; a run tolerates brief
     counter-dips up to ``dip_tolerance_psi`` below its running max. A run
     qualifies when its net rise >= min_rise_psi within <= max_seconds.
+
+    NOTE (2026-08-11): do NOT add a max-rise "deadband" cap here — the
+    validated 2026-07 incident regime cycled a 12 PSI band, so rise
+    magnitude cannot separate real recharge cycling from demand recovery.
+    The softener-regen false positive is handled by the window-length gate
+    in the nightly analyzer instead.
     """
     x = np.asarray(pressure_1hz, dtype=float)
     rises: List[RechargeRise] = []
