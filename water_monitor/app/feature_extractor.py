@@ -4722,9 +4722,26 @@ class FeatureExtractor:
             # Idempotent: re-imports subtract the prior contribution before
             # adding the new value, so no double-counting.
             effective_volume = float(features.get("volume_litres_effective") or 0)
-            is_new_event = upsert_event_and_apply_hourly_volume(
-                self._db, features, effective_volume,
-            )
+            # Lock-tolerant store (2026-08-12): a long admin write (the ~30 s
+            # "Apply my labels" reclassify) holds the DB past busy_timeout and
+            # a live event's store then fails "database is locked" — the
+            # catch-up importer recovers it later, but the primary path
+            # should outwait the writer. Retries with async sleeps so the
+            # event loop stays responsive; total wait comfortably exceeds the
+            # longest observed admin write.
+            is_new_event = None
+            for _attempt in range(6):
+                try:
+                    is_new_event = upsert_event_and_apply_hourly_volume(
+                        self._db, features, effective_volume,
+                    )
+                    break
+                except sqlite3.OperationalError as _lock_err:
+                    if "locked" not in str(_lock_err).lower() or _attempt == 5:
+                        raise
+                    log.info("[%s] event store hit locked DB — retry %d/5 in 8 s",
+                             event.circuit, _attempt + 1)
+                    await asyncio.sleep(8)
 
             # ── Plumbing-event exclusion window (Phase 2.1) ───────────────
             # If the user opened an exclusion window (e.g. post-winterization

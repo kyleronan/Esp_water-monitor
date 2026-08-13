@@ -48,6 +48,16 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _rollback_quietly(conn: sqlite3.Connection) -> None:
+    """Best-effort rollback after a tolerated locked-DB write failure —
+    a rollback on an already-broken connection state must not mask the
+    original (already-handled) error."""
+    try:
+        conn.rollback()
+    except sqlite3.Error:
+        pass
+
+
 # ── Stuck-writer detector (dev34) ────────────────────────────────────────────
 # Observed live 2026-08-03: one connection sat in an open write transaction
 # for 27+ minutes — every writer on every OTHER connection failed with
@@ -2882,12 +2892,20 @@ def _get_volume_baseline(
         # ~0 for a just-started period; the orchestrator's midnight rollover
         # (_init_volume_baselines) then force-overwrites this with the accurate
         # midnight reading from HA history.
-        conn.execute(
-            "INSERT INTO volume_snapshots (circuit, period_ts, ha_volume, "
-            "last_reading) VALUES (?,?,?,?)",
-            (circuit, period_ts, current_ha_value, current_ha_value),
-        )
-        conn.commit()
+        # Lock-tolerant (2026-08-12): this runs inside the dashboard's live
+        # poll, and a long admin write (the ~30 s "Apply my labels"
+        # reclassify) holds the DB past busy_timeout — the poll must degrade
+        # to the computed value, not 500; the next poll persists it.
+        try:
+            conn.execute(
+                "INSERT INTO volume_snapshots (circuit, period_ts, ha_volume, "
+                "last_reading) VALUES (?,?,?,?)",
+                (circuit, period_ts, current_ha_value, current_ha_value),
+            )
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            _rollback_quietly(conn)
+            log.debug("volume-baseline seed skipped (non-fatal): %s", e)
         return current_ha_value
 
     baseline, last_reading = row[0], row[1]
@@ -2912,29 +2930,40 @@ def _get_volume_baseline(
         else:
             accumulated = max(0.0, last_reading - baseline)
             new_baseline = -accumulated
-        conn.execute(
-            "UPDATE volume_snapshots SET ha_volume=?, last_reading=? "
-            "WHERE circuit=? AND period_ts=?",
-            (new_baseline, current_ha_value, circuit, period_ts),
-        )
-        conn.commit()
-        log.warning(
-            "[%s] volume meter reset for period %s (%.2f → %.2f L); carried "
-            "%.2f L forward, baseline now %.2f",
-            circuit, period_ts, last_reading if last_reading is not None
-            else baseline, current_ha_value, accumulated, new_baseline,
-        )
+        # Lock-tolerant: the carry-over math is a pure function of the stored
+        # row, so returning the computed baseline without persisting is
+        # consistent — the next call recomputes and persists the same values.
+        try:
+            conn.execute(
+                "UPDATE volume_snapshots SET ha_volume=?, last_reading=? "
+                "WHERE circuit=? AND period_ts=?",
+                (new_baseline, current_ha_value, circuit, period_ts),
+            )
+            conn.commit()
+            log.warning(
+                "[%s] volume meter reset for period %s (%.2f → %.2f L); carried "
+                "%.2f L forward, baseline now %.2f",
+                circuit, period_ts, last_reading if last_reading is not None
+                else baseline, current_ha_value, accumulated, new_baseline,
+            )
+        except sqlite3.OperationalError as e:
+            _rollback_quietly(conn)
+            log.debug("volume-baseline reset write skipped (non-fatal): %s", e)
         return new_baseline
 
     # High-water mark for the next reset. Only ever moves up, and only when it
     # actually changes, so the steady-state read path stays read-only.
     if last_reading is None or current_ha_value > last_reading:
-        conn.execute(
-            "UPDATE volume_snapshots SET last_reading=? "
-            "WHERE circuit=? AND period_ts=?",
-            (current_ha_value, circuit, period_ts),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                "UPDATE volume_snapshots SET last_reading=? "
+                "WHERE circuit=? AND period_ts=?",
+                (current_ha_value, circuit, period_ts),
+            )
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            _rollback_quietly(conn)
+            log.debug("volume high-water update skipped (non-fatal): %s", e)
 
     return baseline
 
@@ -7157,18 +7186,27 @@ def expire_stale_training_captures(conn: sqlite3.Connection) -> int:
     """
     instant = tuple(_TRAINING_INSTANT_TYPES)
     ph = ",".join("?" * len(instant))
-    # Windowed (non-instant) past-due → 'ready' (review, or "no events" redo).
-    conn.execute(
-        f"UPDATE training_capture SET status = 'ready' "
-        f"WHERE status = 'armed' AND expires_at <= datetime('now') "
-        f"AND fixture_type NOT IN ({ph})", instant)
-    # Instant past-due that never caught an event → 'expired'.
-    cur = conn.execute(
-        f"UPDATE training_capture SET status = 'expired' "
-        f"WHERE status = 'armed' AND expires_at <= datetime('now') "
-        f"AND fixture_type IN ({ph})", instant)
-    conn.commit()
-    return cur.rowcount
+    try:
+        # Windowed (non-instant) past-due → 'ready' (review, or "no events" redo).
+        conn.execute(
+            f"UPDATE training_capture SET status = 'ready' "
+            f"WHERE status = 'armed' AND expires_at <= datetime('now') "
+            f"AND fixture_type NOT IN ({ph})", instant)
+        # Instant past-due that never caught an event → 'expired'.
+        cur = conn.execute(
+            f"UPDATE training_capture SET status = 'expired' "
+            f"WHERE status = 'armed' AND expires_at <= datetime('now') "
+            f"AND fixture_type IN ({ph})", instant)
+        conn.commit()
+        return cur.rowcount
+    except sqlite3.OperationalError as e:
+        # Opportunistic hygiene must never 500 the UI's status poll: during a
+        # long admin write (e.g. the ~30 s "Apply my labels" reclassify) the
+        # database is locked and this sweep simply waits for the next poll /
+        # pruner pass (observed: 13 ASGI 500s in one 30 s window, 2026-08-12).
+        _rollback_quietly(conn)
+        log.debug("expire_stale_training_captures skipped (non-fatal): %s", e)
+        return 0
 
 
 def confirm_training_capture(conn: sqlite3.Connection, circuit: str) -> Dict[str, Any]:
