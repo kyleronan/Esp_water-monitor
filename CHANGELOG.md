@@ -9,6 +9,28 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Automatic fixture grouping no longer dies silently after a restart —
+  dev39** — live cluster matching stopped cold on 2026-08-13 while the
+  database showed 30 healthy clusters, no error anywhere. Root cause: the
+  boot-time replay rebuilds the in-memory matcher from scratch and then
+  re-attached its centers to the stored clusters by *centroid proximity
+  under an acceptance bound* — any center whose best stored centroid
+  drifted outside the bound (scaler statistics shift a little on every
+  restart, and dev38's timezone feature rewrite shifted them a lot) stayed
+  unmapped, and the frozen-circuit matcher then returned "success with no
+  cluster": events stored NULL with no rejection reason, indistinguishable
+  from never having been evaluated. Three fixes: the id map is now grounded
+  in the replayed rows' **own stored cluster assignments** (majority vote
+  per center — the database already knows which cluster each replayed event
+  belongs to, so the link can't drift), with the old proximity method
+  demoted to a fallback for vote-less centers; a match landing on an
+  unmapped center now rejects explicitly with `unmapped_center` (stored on
+  the event, warned in the log) instead of silently succeeding with
+  nothing; and an empty id map after a replay logs a loud pointer at the
+  Settings re-seed. Regression-tested with a restart simulation seeded
+  with deliberately-garbage stored centroids — the vote-based map survives
+  it, the old method couldn't.
+
 - **Every fix from the full raw-sensor audit, in one release — dev38** — the
   2026-08-14 audit replayed all 6,124 stored events against 91.6 M raw HA
   recorder readings and the fixes land here, app-side only. The big one: 619

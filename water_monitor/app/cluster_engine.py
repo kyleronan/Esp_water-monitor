@@ -212,6 +212,10 @@ class ClusterEngine:
         # dev34 B2 — circuit -> pressure-blind feature mode (see
         # PRESSURE_FEATURE_KEYS). Loaded from training_state in _init_circuit.
         self._pressure_blind: Dict[str, bool] = {}
+        # dev39 — count frozen matches landing on river centers the id-map
+        # rebuild failed to attach (rejection 'unmapped_center'). Nonzero and
+        # climbing = the restart desync; used to rate-limit the warning.
+        self._unmapped_center_hits: Dict[str, int] = {}
 
         for c in cfg.circuits:
             self._init_circuit(c.circuit)
@@ -709,10 +713,23 @@ class ClusterEngine:
             return (None, 0.0, '', 'no_centers')
 
         candidate_id = self._river_id_map.get(circuit, {}).get(nearest_id)
-        fixture_type = (
-            self._type_cache.get(circuit, {}).get(candidate_id)
-            if candidate_id is not None else None
-        )
+        if candidate_id is None:
+            # dev39 — an in-memory center with no DB mapping. Before this,
+            # the frozen path returned (None, conf, level, None): the caller
+            # stored cluster_id NULL with NO rejection reason, so a dead id
+            # map after a restart was indistinguishable from "never
+            # evaluated" (production: matching silently stopped 2026-08-13
+            # while the DB showed 30 healthy clusters). Reject explicitly.
+            n = self._unmapped_center_hits.get(circuit, 0) + 1
+            self._unmapped_center_hits[circuit] = n
+            if n == 1 or n % 25 == 0:
+                log.warning(
+                    "[%s] frozen match landed on UNMAPPED river center %s "
+                    "(%d hit(s) since start) — the id map lost this center "
+                    "at the last rebuild; re-seed from Settings if this "
+                    "persists.", circuit, nearest_id, n)
+            return (None, 0.0, '', 'unmapped_center')
+        fixture_type = self._type_cache.get(circuit, {}).get(candidate_id)
         if fixture_type:
             try:
                 from .fixtures import get_match_threshold
@@ -911,6 +928,7 @@ class ClusterEngine:
         ).fetchall()
 
         count = 0
+        replayed: List[Tuple[dict, int]] = []
         for row in rows:
             features = self._extract_features(dict(row), circuit)
             if features is None:
@@ -919,6 +937,7 @@ class ClusterEngine:
             scaler.learn_one(features)
             x = scaler.transform_one(features)
             self._streams[circuit].learn_one(x)
+            replayed.append((features, int(row["cluster_id"])))
             count += 1
 
         if count == 0 and self._is_frozen(circuit):
@@ -944,7 +963,21 @@ class ClusterEngine:
                 "from Settings.", circuit, n_unmatched)
 
         if count > 0:
+            # dev39 — ground the map in the replayed rows' OWN cluster_ids
+            # (majority vote) before falling back to centroid proximity.
+            # The proximity method alone silently killed live matching on
+            # 2026-08-13: any river center whose best DB centroid sat outside
+            # the acceptance bound stayed unmapped, and every live event
+            # landing on it stored cluster_id NULL with no rejection reason.
+            self._rebuild_id_map_from_assignments(circuit, replayed)
             self._rebuild_id_map_from_centroids(circuit)
+            if (self._streams[circuit].centers
+                    and not self._river_id_map[circuit]):
+                log.warning(
+                    "[%s] cluster id map is EMPTY after replaying %d event(s) "
+                    "— live matching will reject every event with "
+                    "'unmapped_center' until a re-seed rebuilds the space "
+                    "(Settings → Rebuild fixture grouping).", circuit, count)
 
         # Belt-and-braces: re-derive the type cache from the DB after a
         # rebuild so any drift (e.g. a UI/import path that toggled
@@ -1150,6 +1183,47 @@ class ClusterEngine:
                          circuit, merges)
 
             return merges
+
+    def _rebuild_id_map_from_assignments(
+        self, circuit: str, replayed: List[Tuple[dict, int]],
+    ) -> None:
+        """Map river centers to DB clusters by majority vote of the replayed
+        rows' stored cluster_ids.
+
+        The replay pool is `cluster_id IS NOT NULL` rows, so the DB already
+        says which cluster each event belongs to — re-deriving that link by
+        nearest-centroid proximity (the only method before dev39) threw that
+        truth away and depended on the freshly-replayed scaler placing old
+        stored centroids within an acceptance bound. Any drift (tz-feature
+        rewrite, scaler-stat shift across restarts) left centers unmapped and
+        live matching silently dead. A vote from actual assignments cannot
+        drift: the same rows that built each center name its cluster.
+
+        Runs BEFORE the centroid fallback; centers with no votes (formed but
+        never nearest to any replayed row) still get the proximity attempt.
+        """
+        stream = self._streams[circuit]
+        scaler = self._scalers[circuit]
+        if not stream.centers or not replayed:
+            return
+        votes: Dict[int, Dict[int, int]] = {}
+        for features, db_cluster_id in replayed:
+            x = scaler.transform_one(features)
+            river_id, _ = self._nearest_center(stream, x)
+            if river_id is None:
+                continue
+            votes.setdefault(river_id, {})
+            votes[river_id][db_cluster_id] = (
+                votes[river_id].get(db_cluster_id, 0) + 1)
+        mapping = self._river_id_map[circuit]
+        for river_id, tally in votes.items():
+            if river_id in mapping:
+                continue
+            winner = max(tally.items(), key=lambda kv: kv[1])[0]
+            mapping[river_id] = winner
+            log.debug("[%s] post-rebuild: river cluster %d → DB cluster %d "
+                      "(%d/%d votes)", circuit, river_id, winner,
+                      tally[winner], sum(tally.values()))
 
     def _rebuild_id_map_from_centroids(self, circuit: str) -> None:
         """
