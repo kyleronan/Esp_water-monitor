@@ -200,6 +200,56 @@ def _filters_to_storage(raw: dict, vol_factor: float,
     return out
 
 
+def waveform_time_axis(n_bins: int, duration_s: float, src_n, src_hz):
+    """dev38 — per-channel bin-centre times for a stored waveform envelope.
+
+    ESP-sourced channel (``src_hz`` present, fixed-rate capture): the TRUE
+    span is ``src_n / src_hz`` seconds, and ``t_k = (k+½)·src_n/(hz·N)``.
+    Duration-scaling would be wrong here — the audit established the capture
+    window ≠ the event window (per-event δ fits). The capture's wall-clock
+    start is NOT recoverable (WaveformRecord.start_ms is firmware millis(),
+    received_at is monotonic; neither persisted), so the axis is anchored at
+    event start with the residual offset disclosed:
+    basis = ``uniform_exact_unanchored`` (exact spacing/span, approximate
+    anchor).
+
+    Software channel / rows without metadata (pre-20260801 backlog, cleared
+    by the 60-day retention): the event-driven series has NO recoverable
+    axis, so the fallback stretches bins uniformly across the event window:
+    ``t_k = duration·(k+½)/N``, basis = ``uniform_approx``.
+    """
+    if n_bins <= 0:
+        return [], "empty"
+    if src_hz and src_n:
+        span = float(src_n) / float(src_hz)
+        times = [round((k + 0.5) * span / n_bins, 3) for k in range(n_bins)]
+        return times, "uniform_exact_unanchored"
+    dur = float(duration_s or 0)
+    times = [round(dur * (k + 0.5) / n_bins, 3) for k in range(n_bins)]
+    return times, "uniform_approx"
+
+
+def transient_dip_note(t: dict) -> "str | None":
+    """dev38 — advisory for a firmware-Failed test whose SUSTAINED drop
+    (median of the monitor window's tail) sits under half the threshold: the
+    terminal verdict most likely latched on a momentary dip the line
+    recovered from. DISPLAY ONLY — the verdict, badge and tallies are
+    untouched, and the advice is always to RE-RUN the test, never to
+    dismiss it. Requires t["ui"] to be set (classify_leak_test)."""
+    try:
+        sus = t.get("sustained_drop_psi")
+        thr = t.get("threshold_psi")
+        if (t.get("ui", {}).get("category") == "fail" and sus is not None
+                and thr and float(sus) < float(thr) / 2.0):
+            return (f"Sustained drop {float(sus):.2f} psi (below the "
+                    f"{float(thr):.1f} psi threshold). A transient dip "
+                    "likely triggered this result — recommend re-running "
+                    "the leak test.")
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def classify_leak_test(t: dict) -> dict:
     """Leak-test row → the verdict the page shows for it.
 
@@ -452,9 +502,14 @@ def _collect_circuit_history_sync(
         _covering: dict = {}
         if _dup_ids:
             _ph = ",".join("?" * len(_dup_ids))
+            # dev38: stale audit rows (events superseded by reprocess or
+            # removed by retention) are SKIPPED — their kept ids point at
+            # rows that no longer exist, which previously rendered as blank
+            # "covering event" chips (43 dangling wrappers on the audited DB).
             for _row in db.execute(
                     f"SELECT wrapper_event_id, kept_event_ids FROM overlap_audit "
-                    f"WHERE wrapper_event_id IN ({_ph}) ORDER BY id", _dup_ids
+                    f"WHERE wrapper_event_id IN ({_ph}) "
+                    f"AND stale_reason IS NULL ORDER BY id", _dup_ids
                     ).fetchall():
                 try:
                     _kept = json.loads(_row["kept_event_ids"] or "[]")
@@ -584,6 +639,13 @@ def _collect_circuit_history_sync(
         # read the SAME classification (see classify_leak_test).
         for _t in leak_tests:
             _t["ui"] = classify_leak_test(_t)
+            # dev38 — transient-dip advisory. When the firmware said Failed but
+            # the SUSTAINED drop (median of the monitor window's tail) sits
+            # under half the threshold, the terminal verdict most likely
+            # latched on a momentary dip the line recovered from. DISPLAY
+            # ONLY: the verdict, badge and tallies are untouched, and the
+            # advice is always to RE-RUN the test — never to dismiss it.
+            _t["transient_note"] = transient_dip_note(_t)
         annotate_pump_overnight(leak_tests, _nights_by_date, _ha_tz)
         summaries  = get_daily_summaries(
             db, circuit_cfg.circuit,
@@ -776,6 +838,7 @@ async def event_waveform(event_id: str, request: Request):
         """SELECT w.flow_min_json, w.flow_max_json,
                   w.pressure_min_json, w.pressure_max_json,
                   w.duration_seconds,
+                  w.flow_src_n, w.press_src_n, w.flow_src_hz, w.press_src_hz,
                   e.start_ts, e.degraded_supply
            FROM event_waveforms w
            JOIN events e ON w.event_id = e.id
@@ -785,15 +848,31 @@ async def event_waveform(event_id: str, request: Request):
     if not row:
         return JSONResponse({"error": "waveform not found"}, status_code=404)
     try:
+        flow_max = _json.loads(row["flow_max_json"])
+        press_max = _json.loads(row["pressure_max_json"])
+        dur = float(row["duration_seconds"] or 0)
+        times_flow, flow_basis = waveform_time_axis(
+            len(flow_max), dur, row["flow_src_n"], row["flow_src_hz"])
+        times_press, press_basis = waveform_time_axis(
+            len(press_max), dur, row["press_src_n"], row["press_src_hz"])
         return JSONResponse({
             "event_id":         event_id,
             "start_ts":         row["start_ts"],
             "duration_seconds": row["duration_seconds"],
             "degraded_supply":  bool(row["degraded_supply"]),
             "flow_min":         _json.loads(row["flow_min_json"]),
-            "flow_max":         _json.loads(row["flow_max_json"]),
+            "flow_max":         flow_max,
             "pressure_min":     _json.loads(row["pressure_min_json"]),
-            "pressure_max":     _json.loads(row["pressure_max_json"]),
+            "pressure_max":     press_max,
+            # dev38 — per-channel time axes. The two channels are binned from
+            # DIFFERENT source streams (an ESP flow capture can pair with the
+            # ~5 s HA pressure series in one row), so index i of one array is
+            # NOT the same instant as index i of the other; the audit found
+            # 18.2% of events visibly misaligned on the shared index axis.
+            "times_flow":       times_flow,
+            "times_pressure":   times_press,
+            "flow_time_basis":  flow_basis,
+            "pressure_time_basis": press_basis,
         })
     except (ValueError, TypeError) as e:
         log.warning("Waveform JSON decode failed for %s: %s", event_id, e)

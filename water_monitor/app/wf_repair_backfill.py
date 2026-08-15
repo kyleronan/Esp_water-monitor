@@ -206,6 +206,153 @@ def repair_misattached_waveforms(conn: sqlite3.Connection) -> Dict[str, Any]:
     }
 
 
+
+# ── dev38: shared-capture sweep ────────────────────────────────────────────────
+# Winner-selection mismatch gate (pinned a priori): if even the best
+# candidate's |duration − capture_span| exceeds max(0.25·duration, 30 s), the
+# rightful owner was likely pruned/merged/zeroed and NO member keeps the claim.
+_SHARED_NO_WINNER_FRAC = 0.25
+_SHARED_NO_WINNER_MIN_S = 30.0
+_ESP_CAPTURE_HZ = 200.0
+_SHARED_MIN_ARRAY_CHARS = 300      # matches the audit's LEN>300 fingerprint gate
+
+
+def repair_shared_captures(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """dev38 — repair events that share one ESP capture with another event.
+
+    The 2026-08 audit hashed every stored ``flow_max_json`` and found 269
+    groups / 619 events with byte-identical arrays — 615 of them with
+    *different* durations, which one draw cannot produce. The dev37 sweep
+    missed all of them: its predicate keys on ``true_avg > peak``, but a
+    shared capture usually overwrites BOTH events' peaks with the same
+    plausible value. Array identity is the decisive test.
+
+    Winner rule (deterministic): within a group, the claim stays with the
+    event whose ``|duration_seconds − n_points/200 Hz|`` is smallest; ties
+    break on earliest ``start_ts``. Escape hatch: when even the best mismatch
+    exceeds ``max(0.25·duration, 30 s)`` the group has NO winner — the
+    rightful owner is gone (pruned/merged/zeroed) — and every member is
+    de-enriched.
+
+    Loser action set = the dev37 ``misattached`` set, verdict
+    ``'shared_capture'``, plus (VERIFIED PROVENANCE, dev38): the flow/
+    pressure/edge signatures of an esp-labelled row were regenerated FROM the
+    capture arrays, i.e. they are a foreign draw's shape — so they are NULLed
+    and ``signature_source`` set NULL, never relabelled 'software' (which
+    would launder contaminated shape data under a trusted label). The shared
+    envelope row is deleted in all cases (it is contaminated regardless of
+    the signature label). ``hydraulic_resistance`` is NULLed with ΔP.
+
+    Self-exhausting without stamping winners: losers lose their envelope
+    rows, so a repaired group can never form again.
+    """
+    try:
+        rows = conn.execute(
+            """SELECT e.id, e.circuit, e.start_ts, e.duration_seconds,
+                      e.peak_flow_lpm, e.true_avg_flow_lpm, e.avg_flow_lpm,
+                      e.signature_source, e.cluster_id, e.prev_cluster_id,
+                      e.match_rejection_reason, e.wf_repair_verdict,
+                      w.flow_max_json
+               FROM event_waveforms w
+               JOIN events e ON e.id = w.event_id
+               WHERE LENGTH(w.flow_max_json) > ?
+               ORDER BY e.start_ts""",
+            (_SHARED_MIN_ARRAY_CHARS,),
+        ).fetchall()
+    except sqlite3.Error as e:
+        log.debug("wf-shared: candidate query unavailable (%s)", e)
+        return {"groups": 0, "losers": 0, "winners": 0, "no_winner_groups": 0,
+                "envelopes_deleted": 0, "circuits": []}
+
+    groups: Dict[str, list] = {}
+    for r in rows:
+        groups.setdefault(r["flow_max_json"], []).append(r)
+    shared_groups = [g for g in groups.values() if len(g) > 1]
+    if not shared_groups:
+        return {"groups": 0, "losers": 0, "winners": 0, "no_winner_groups": 0,
+                "envelopes_deleted": 0, "circuits": []}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    losers = winners = no_winner_groups = envelopes = 0
+    circuits: set = set()
+
+    for members in shared_groups:
+        n_pts = members[0]["flow_max_json"].count(",") + 1
+        span_s = n_pts / _ESP_CAPTURE_HZ
+
+        def _mismatch(m) -> float:
+            return abs(float(m["duration_seconds"] or 0.0) - span_s)
+
+        best = min(members, key=lambda m: (_mismatch(m), str(m["start_ts"])))
+        dur_best = float(best["duration_seconds"] or 0.0)
+        gate = max(_SHARED_NO_WINNER_FRAC * dur_best, _SHARED_NO_WINNER_MIN_S)
+        has_winner = _mismatch(best) <= gate
+        if not has_winner:
+            no_winner_groups += 1
+
+        for m in members:
+            if has_winner and m["id"] == best["id"]:
+                winners += 1
+                continue
+            true_avg = float(m["true_avg_flow_lpm"] or 0.0)
+            avg_flow = float(m["avg_flow_lpm"] or 0.0)
+            peak = float(m["peak_flow_lpm"] or 0.0)
+            new_peak = math.ceil(max(true_avg, avg_flow, peak) * 1000.0) / 1000.0
+
+            sets = [
+                "peak_flow_lpm_pre_repair = COALESCE(peak_flow_lpm_pre_repair, peak_flow_lpm)",
+                "pressure_delta_psi_pre_repair = COALESCE(pressure_delta_psi_pre_repair, pressure_delta_psi)",
+                "propagation_delay_ms_pre_repair = COALESCE(propagation_delay_ms_pre_repair, propagation_delay_ms)",
+                "peak_flow_lpm = ?",
+                "pressure_delta_psi = NULL",
+                "propagation_delay_ms = NULL",
+                "hydraulic_resistance = NULL",     # ΔP-derived — follows ΔP
+                "esp_waveform_used = 0",
+                "waveform_event_id = NULL",
+                "waveform_boot_id = NULL",
+                "waveform_quality = NULL",
+                "waveform_overlap_score = NULL",
+                "wf_repair_at = COALESCE(wf_repair_at, ?)",
+                "wf_repair_verdict = 'shared_capture'",
+                "excluded_from_training = 1",
+                "match_rejection_reason = COALESCE(match_rejection_reason, "
+                "'wf_enrichment_repaired')",
+                "prev_cluster_id = COALESCE(prev_cluster_id, cluster_id)",
+                "cluster_id = NULL",
+            ]
+            params: list = [new_peak, now_iso]
+            if str(m["signature_source"] or "").startswith("esp"):
+                # Foreign shape under an esp label — NULL, never relabel.
+                sets += [
+                    "flow_signature_json = NULL",
+                    "pressure_signature_json = NULL",
+                    "onset_signature_json = NULL",
+                    "offset_signature_json = NULL",
+                    "signature_source = NULL",
+                ]
+            conn.execute(
+                f"UPDATE events SET {', '.join(sets)} WHERE id = ?",
+                (*params, m["id"]),
+            )
+            cur = conn.execute(
+                "DELETE FROM event_waveforms WHERE event_id = ?", (m["id"],))
+            envelopes += cur.rowcount or 0
+            losers += 1
+            circuits.add(m["circuit"])
+
+    conn.commit()
+    log.info(
+        "wf-shared: %d group(s) — %d loser(s) de-enriched (%d envelope(s) "
+        "dropped), %d winner(s) kept, %d group(s) with no credible owner",
+        len(shared_groups), losers, envelopes, winners, no_winner_groups,
+    )
+    return {
+        "groups": len(shared_groups), "losers": losers, "winners": winners,
+        "no_winner_groups": no_winner_groups, "envelopes_deleted": envelopes,
+        "circuits": sorted(circuits),
+    }
+
+
 class WfRepairBackfill:
     """Supervised one-shot: run the repair sweep once after boot, then park.
 
@@ -239,17 +386,33 @@ class WfRepairBackfill:
         except asyncio.TimeoutError:
             pass
 
+        # dev38: one worker chain — the dev37 mis-attachment sweep first (its
+        # stamps land before the shared-capture predicate runs), then the
+        # array-identity sweep. The tz-feature backfill has already completed
+        # by now (it runs at HA-tz detection, seconds after boot; this worker
+        # starts at +240 s), so the cluster replay below trains on local-time
+        # features.
+        affected: set = set()
         try:
             from .database import run_isolated_write
             res = await run_isolated_write(self._db_path,
                                            repair_misattached_waveforms)
+            if res.get("misattached"):
+                affected.update(res.get("circuits") or [])
         except Exception as e:
             log.error("wf-repair sweep failed: %s", e, exc_info=True)
-            await self._idle()
-            return
 
-        if res.get("misattached") and self._cluster_engine is not None:
-            await self._replay_clusters(res.get("circuits") or [])
+        try:
+            from .database import run_isolated_write
+            res2 = await run_isolated_write(self._db_path,
+                                            repair_shared_captures)
+            if res2.get("losers"):
+                affected.update(res2.get("circuits") or [])
+        except Exception as e:
+            log.error("wf-shared sweep failed: %s", e, exc_info=True)
+
+        if affected and self._cluster_engine is not None:
+            await self._replay_clusters(sorted(affected))
 
         await self._idle()
 

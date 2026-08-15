@@ -122,6 +122,20 @@ class DataPruner:
         # Only events within [calibration_started_at, calibration_ends_at] are
         # protected — events predating the device installation are not preserved.
         try:
+            # dev38 — overlap_audit rows whose events retention is about to
+            # remove become permanently unreferencable: mark them
+            # 'event_pruned' (distinct from reprocess supersession — here the
+            # event is genuinely gone forever, not re-created under a new id).
+            try:
+                self._db.execute("""
+                    UPDATE overlap_audit SET stale_reason =
+                        COALESCE(stale_reason, 'event_pruned')
+                    WHERE stale_reason IS NULL
+                      AND wrapper_event_id IN (
+                          SELECT id FROM events WHERE start_ts < ?)
+                """, (events_cutoff,))
+            except Exception:
+                pass       # pre-20260801 schema
             cur = self._db.execute("""
                 DELETE FROM events
                 WHERE start_ts < ?
@@ -314,6 +328,20 @@ class DataPruner:
             self._db.commit()
             log.info("Daily summaries computed: %d day(s)%s",
                      computed, " (backfill)" if full_backfill else "")
+
+        # dev38 — drain the dirty-day markers. The gap scan above cannot see
+        # a stale ALREADY-computed day (it freezes anything summarised after
+        # its own day_end) and never looks past the 7-day lower bound; the
+        # markers written by every event write / delete carry no such limits,
+        # so late imports and reprocessed history heal here.
+        try:
+            from .database import drain_daily_summary_dirty
+            res = drain_daily_summary_dirty(self._db)
+            if res.get("recomputed"):
+                log.info("Dirty daily summaries recomputed: %d day(s)",
+                         res["recomputed"])
+        except Exception as e:
+            log.warning("Dirty-day drain failed (non-fatal): %s", e)
 
     # ── Fixture daily summaries (F1) ────────────────────────────────────────
 

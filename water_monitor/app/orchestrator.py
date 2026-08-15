@@ -668,6 +668,13 @@ class Orchestrator:
         if self.setup_complete:
             self._event_detector.setup()
             log.info("Event detection active")
+            # dev38: seed valve states AFTER the change subscriptions are wired
+            # (subscribe-then-prime) so other_valve_open can record a confirmed
+            # 0 even for valves that never transition after boot.
+            try:
+                await self._event_detector.prime_valve_states()
+            except Exception as e:
+                log.warning("Valve-state prime failed (non-fatal): %s", e)
             # Runtime per-circuit flow-meter PPL: sync current values from the firmware
             # number entities (the source of truth) into the cache + detector floor, and
             # watch for changes. A change forces a non-destructive re-baseline.
@@ -1078,6 +1085,7 @@ class Orchestrator:
         # read this without threading a tzinfo through every caller).
         set_home_timezone(self._ha_tz)
         await self._resync_daily_summary_boundary(tz_name)
+        await self._backfill_time_features(tz_name)
 
     async def _resync_daily_summary_boundary(self, tz_name: str) -> None:
         """Rebuild daily_summary when its day boundary no longer matches the home.
@@ -1109,6 +1117,29 @@ class Orchestrator:
         except Exception as e:
             log.warning("daily_summary boundary resync failed (retried next "
                         "boot, non-fatal): %s", e)
+
+    async def _backfill_time_features(self, tz_name: str) -> None:
+        """dev38 — deferred local-time rewrite of the per-event time features.
+
+        Same shape as _resync_daily_summary_boundary: migrations run before HA
+        answers, so migration 20260801 only added the events.time_features_tz
+        marker and the rewrite happens here once the zone is known. The
+        function itself only touches rows whose marker mismatches, so this is
+        a fast no-op on every boot after the first. Best-effort — a failure
+        leaves markers alone and the next boot retries. MUST run before the
+        waveform-repair workers' cluster rebuild (their supervised chain
+        starts at +240 s; this completes in seconds for ~6k rows).
+        """
+        from .database import backfill_time_features_tz
+        try:
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(
+                None, backfill_time_features_tz, self._db, tz_name)
+            if res.get("rewritten"):
+                log.info("Time-feature tz backfill (%s): %s", tz_name, res)
+        except Exception as e:
+            log.warning("Time-feature tz backfill failed (retried next boot, "
+                        "non-fatal): %s", e)
 
     def _local_midnight_utc(self, days_ago: int = 0) -> str:
         """Return the UTC equivalent of local midnight (or N days ago) as a naive ISO string.

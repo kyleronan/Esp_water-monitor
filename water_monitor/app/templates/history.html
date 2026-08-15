@@ -490,6 +490,18 @@
           <td class="hist-td">{{ t.triggered_by or '—' }}</td>
           <td class="hist-td">
             {% if t.result %}<span class="pill {{ lt.pill }}">{{ lt.label }}</span>{% else %}—{% endif %}
+            {# dev38 — sustained-drop advisory. Display-only: the firmware
+               verdict above stays primary; this only ever recommends a
+               RETEST, never dismissal. #}
+            {% if t.transient_note %}
+            <span class="pill pill-amber" title="{{ t.transient_note }}">Transient dip — retest?</span>
+            {% endif %}
+            {% if t.sustained_drop_psi is not none %}
+            <span class="hist-td-mono" style="opacity:.75;font-size:.85em"
+                  title="Median fast-sensor pressure over the last ~{{ t.final_window_s or 20 }} s of the monitor window, subtracted from the frozen baseline — a held drop, as opposed to the instantaneous end-of-test reading in the Drop column.">
+              sustained {{ (t.sustained_drop_psi * pressure_factor)|round(pressure_decimals) }} {{ pressure_unit }}
+            </span>
+            {% endif %}
             {# dev30 — acknowledge a benign failure (or undo). Display-only. #}
             {% if _r.startswith('Failed') and is_admin %}
             <form method="post" action="{{ ingress_path }}/history/api/leak-tests/{{ t.id }}/dismiss"
@@ -589,7 +601,10 @@
         <tr>
           <th>Time</th>
           <th>Duration</th>
-          <th title="Average flow while water is actually running (idle gaps excluded)">Avg flow</th>
+          {# dev38: the tooltip is honest about the fallback — old rows without
+             true_avg_flow_lpm fall back to avg_flow_lpm, a plain sample mean
+             that INCLUDES idle zeros (docs/PIPELINE.md §6). #}
+          <th title="Average flow while water is actually running (idle gaps excluded). Older events without that measurement show the whole-event average instead, which idle gaps dilute.">Avg flow</th>
           <th>ΔP ({{ pressure_unit }})</th>
           <th>Volume ({{ vol_unit }})</th>
           <th>Fixture</th>
@@ -609,6 +624,7 @@
             data-flow="{{ (_disp_flow * flow_factor)|round(flow_decimals) if _disp_flow is not none else '—' }} {{ flow_unit }}"
             data-pressure="{{ (e.pressure_delta_psi * pressure_factor)|round(pressure_decimals) if e.pressure_delta_psi is not none else '—' }}"
             data-volume="{{ (e.volume_litres * vol_factor)|round(vol_decimals) if e.volume_litres is not none else '—' }} {{ vol_unit }}"
+            data-registration-est="{{ (e.registration_est_litres * vol_factor)|round(vol_decimals) ~ ' ' ~ vol_unit if e.registration_est_litres is not none else '' }}"
             data-shape="{{ e.flow_shape or 'unknown' }}"
             data-pressure-shape="{{ e.resistance_curve_shape or 'unknown' }}"
             data-cluster="{{ e.cluster_id if e.cluster_id is not none else '—' }}"
@@ -758,9 +774,17 @@
     <dl class="evt-modal-dl">
       <dt>Time</dt>       <dd id="emd-start"></dd>
       <dt>Duration</dt>   <dd id="emd-duration"></dd>
-      <dt>Avg flow</dt>   <dd id="emd-flow"></dd>
+      <dt title="Average flow while water is actually running (idle gaps excluded); older events fall back to the whole-event average, which idle gaps dilute.">Avg flow</dt>
+                          <dd id="emd-flow"></dd>
       <dt>ΔP</dt>         <dd id="emd-pressure"></dd>
       <dt>Volume</dt>     <dd id="emd-volume"></dd>
+      {# dev38 — annotate-only meter-registration estimate: shown when this
+         draw spent time at 1–8 L/min, where the audit's pressure-witness
+         inversion measured the oval-gear meter reading 6–27% low. The
+         Volume above and every total stay on the metered figure. #}
+      <dt id="emd-reg-est-dt" hidden
+          title="Estimated true volume after correcting the meter's measured under-registration at low flow (reads ~27% low at 1.5–2.5 L/min). An estimate pending validation against the utility meter — the Volume figure and all totals remain the metered values.">Est. corrected</dt>
+                          <dd id="emd-reg-est" hidden></dd>
       <dt>Shape</dt>      <dd id="emd-shape"></dd>
       <dt title="How steady the pressure-per-flow load was (ΔP ÷ flow). 'pulsed' here means an oscillating pressure load, not the flow shape.">Pressure pattern</dt>
                           <dd id="emd-pressure-shape"></dd>
@@ -1321,6 +1345,15 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     document.getElementById('emd-flow').textContent     = d.flow;
     document.getElementById('emd-pressure').textContent = d.pressure;
     document.getElementById('emd-volume').textContent   = d.volume;
+    // dev38 — annotate-only registration estimate (hidden when immaterial).
+    const regDt = document.getElementById('emd-reg-est-dt');
+    const regDd = document.getElementById('emd-reg-est');
+    if (d.registrationEst) {
+      regDd.textContent = d.registrationEst + ' (estimate)';
+      regDt.hidden = false; regDd.hidden = false;
+    } else {
+      regDt.hidden = true; regDd.hidden = true;
+    }
     document.getElementById('emd-shape').textContent    = d.shape;
     document.getElementById('emd-pressure-shape').textContent = d.pressureShape || '—';
     document.getElementById('emd-cluster').textContent  = d.cluster;
@@ -1596,7 +1629,16 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       try { pressPts = pressSig ? JSON.parse(pressSig) : []; }
       catch (err) { console.warn('[evt-modal] invalid pressure signature JSON', err); }
 
-      const renderWf = (fPts, pPts, hiRes) => {
+      /* dev38: the flow and pressure arrays are binned from DIFFERENT source
+         streams (an ESP 200 Hz flow capture can pair with the ~5 s HA
+         pressure series in one row), so drawing both on one shared index
+         axis misaligned them on 18.2% of events (audit §3.5). The hi-res
+         path now plots each channel as {x,y} points on its OWN seconds
+         axis, using the per-channel times the API computes from the stored
+         source metadata. The initial 32/256-pt signature render keeps the
+         index axis — signatures are single-channel-normalized proportional
+         resamples with no time metadata at all. */
+      const renderWf = (fPts, pPts, hiRes, ax) => {
         const pressHasData = pPts.some(v => Math.abs(Number(v) || 0) > 0.01);
         const hasFlow = fPts.length > 0;
 
@@ -1605,18 +1647,25 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         if (!hasFlow) { wfMeta.textContent = ''; return; }
 
         if (wfChart) { wfChart.destroy(); wfChart = null; }
-        const labels = fPts.map((_, i) => i);
+        const timeAxis = !!(ax && Array.isArray(ax.tf)
+                            && ax.tf.length === fPts.length);
         const datasets = [{
           label: 'Flow',
-          data: fPts.map(v => (Number(v) || 0) * wfScale),   // size-tier band
+          data: timeAxis
+            ? fPts.map((v, i) => ({ x: ax.tf[i], y: (Number(v) || 0) * wfScale }))
+            : fPts.map(v => (Number(v) || 0) * wfScale),   // size-tier band
           borderColor: cssVar('--accent'),
           backgroundColor: mix(cssVar('--accent'), 12),
           fill: true, tension: hiRes ? 0 : 0.3, pointRadius: 0, borderWidth: 1.5,
         }];
         if (pressHasData) {
+          const pTimes = (timeAxis && Array.isArray(ax.tp)
+                          && ax.tp.length === pPts.length) ? ax.tp : null;
           datasets.push({
             label: 'Pressure',
-            data: pPts,
+            data: (timeAxis && pTimes)
+              ? pPts.map((v, i) => ({ x: pTimes[i], y: v }))
+              : pPts,
             borderColor: cssVar('--red'),
             backgroundColor: 'transparent',
             fill: false, tension: hiRes ? 0 : 0.3, pointRadius: 0, borderWidth: 1.5,
@@ -1625,7 +1674,8 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
 
         wfChart = new Chart(chartCanvas, {
           type: 'line',
-          data: { labels, datasets },
+          data: timeAxis ? { datasets }
+                         : { labels: fPts.map((_, i) => i), datasets },
           options: {
             animation: false,
             responsive: true,
@@ -1637,7 +1687,11 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
               },
             },
             scales: {
-              x: { display: false },
+              x: timeAxis
+                ? { type: 'linear', display: true, grid: { display: false },
+                    ticks: { font: { size: 10 }, maxTicksLimit: 8,
+                             callback: (v) => `${v}s` } }
+                : { display: false },
               y: { display: false, min: 0, max: 1 },
             },
           },
@@ -1659,7 +1713,17 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         wfMeta.textContent =
           `${source}${resText} · ${fPts.length} samples · ${channels}${pkText}${dpText}`;
         const note = document.createElement('span');
-        note.textContent = 'Flow curve height reflects the event\'s size tier; values are normalized, not actual units.';
+        let noteText = 'Flow curve height reflects the event\'s size tier; values are normalized, not actual units.';
+        if (timeAxis) {
+          // dev38 basis caveats from the API.
+          if (ax.fBasis === 'uniform_exact_unanchored'
+              || ax.pBasis === 'uniform_exact_unanchored') {
+            noteText += ' Time axis: exact sample spacing; capture start alignment approximate.';
+          } else {
+            noteText += ' Time axis approximate (event-driven sampling).';
+          }
+        }
+        note.textContent = noteText;
         wfMeta.appendChild(document.createElement('br'));
         wfMeta.appendChild(note);
       };
@@ -1686,7 +1750,11 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
             const lo = Math.min(...pMin), hi = Math.max(...pMin);
             if (hi - lo > 0.05) pPts = pMin.map(v => (v - lo) / (hi - lo));
           }
-          renderWf(fPts, pPts, true);
+          renderWf(fPts, pPts, true, {
+            tf: Array.isArray(w.times_flow) ? w.times_flow : null,
+            tp: Array.isArray(w.times_pressure) ? w.times_pressure : null,
+            fBasis: w.flow_time_basis, pBasis: w.pressure_time_basis,
+          });
         })
         .catch(err => console.debug('[evt-modal] hi-res waveform unavailable', err));
     }
@@ -2029,6 +2097,11 @@ document.querySelectorAll('canvas.shape-spark').forEach(canvas => {
   let sig;
   try { sig = JSON.parse(canvas.dataset.sig || '[]'); } catch { return; }
   if (!sig.length) return;
+  /* dev38 note: the sparkline's x axis is PROPORTIONAL, not linear time —
+     point i sits at i/N through the sample list, and for a software series
+     (event-driven ~5 s cadence, every-5th decimated past 120 s) that is not
+     linear in seconds. Single-channel, so no cross-channel misalignment;
+     accepted as-is (the modal's hi-res view carries the honest axis). */
   const w = canvas.width, h = canvas.height;
   const ctx = canvas.getContext('2d');
   const max = Math.max(...sig, 0.001);

@@ -9,6 +9,50 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Every fix from the full raw-sensor audit, in one release — dev38** — the
+  2026-08-14 audit replayed all 6,124 stored events against 91.6 M raw HA
+  recorder readings and the fixes land here, app-side only. The big one: 619
+  events (August audit, 269 groups) shared a single ESP waveform capture with
+  another event — byte-identical stored arrays with physically impossible
+  duration mismatches, invisible to the dev37 repair because a shared capture
+  usually overwrites *both* peaks with the same plausible value. A second
+  startup sweep now finds groups by array identity, keeps the claim on the
+  event whose duration best matches the capture span (no-winner escape hatch
+  when the rightful owner is gone), and de-enriches the rest — foreign
+  peak/ΔP/propagation-delay cleared with pre-repair audit copies, and the
+  contaminated signatures NULLed rather than relabelled (they were regenerated
+  from the foreign capture's arrays, so "software" would launder a wrong shape
+  under a trusted label; migration 20260804 applies the same correction to the
+  31 rows dev37 repaired). The claim ledger's NULL-boot_id hole — nine ESP
+  rows in ten couldn't block a double claim — now falls back to a same-circuit
+  48-hour probe. Alongside it: time-of-day features are computed in the home
+  timezone instead of UTC (day-of-week was wrong on 30 % of events; a deferred
+  boot task rewrites all stored rows once the zone is known, marker column via
+  migration 20260801); `hydraulic_resistance` is recomputed whenever ESP
+  enrichment overwrites ΔP (1,324 stale rows backfilled by 20260803);
+  `true_avg > peak` is clamped at write time (825 impossible rows raised by
+  20260802); `other_valve_open` can finally record a confirmed "no" (valve
+  states are primed from HA at startup instead of waiting for a transition);
+  leak tests store a sustained-drop figure — the median of the monitor
+  window's tail from the full-resolution sensor, not one instantaneous
+  0.5-psi-quantised read — with read timestamps, the leak-rate estimate uses
+  it, and a firmware-Failed test whose sustained drop sits under half the
+  threshold gets a "transient dip — recommend re-running" note (display only;
+  the firmware verdict is never altered); the event modal's waveform draws
+  flow and pressure on honest per-channel seconds axes (they were index-
+  aligned across different cadences — misaligned on 18 % of events; new
+  per-channel source metadata on `event_waveforms`); a new annotate-only
+  `registration_est_litres` estimates true volume where the meter's measured
+  low-flow under-registration bites (1.5–4 L/min reads 10–27 % low per the
+  audit's pressure-witness inversion) without touching any total; daily
+  summaries heal via a dirty-day marker drained nightly with no lookback
+  limit (event counts were stale on 19 % of days — frozen post-day-end
+  summaries plus reprocess re-imports); and `overlap_audit` rows whose events
+  were reprocessed away or retention-pruned are marked stale instead of
+  rendering blank "covering event" chips, with the restore-dedup path doing a
+  real id remap. Validated by 13 new test files and a replay of the audit's
+  own queries against the audited database copy.
+
 - **Pump top-ups no longer masquerade as tiny mystery draws — dev37** — with
   the booster pump holding the line, the small bypass leak slowly bleeds
   pressure until the pump restarts and pushes a brief ~10–15 s slug of water

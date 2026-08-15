@@ -317,7 +317,15 @@ class ClusterEngine:
         start_ts = event.get('start_ts')
         if start_ts:
             try:
-                hour = datetime.fromisoformat(str(start_ts)).hour
+                # dev38: stored start_ts is UTC — convert to the HOME timezone
+                # before taking .hour (second instance of the audit's UTC
+                # time-feature bug; naive timestamps are treated as UTC, the
+                # storage convention).
+                _dt = datetime.fromisoformat(str(start_ts))
+                if _dt.tzinfo is None:
+                    _dt = _dt.replace(tzinfo=timezone.utc)
+                from .event_rules import get_home_timezone
+                hour = _dt.astimezone(get_home_timezone() or timezone.utc).hour
             except (ValueError, TypeError):
                 hour = 0
         else:

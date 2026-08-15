@@ -505,12 +505,15 @@ class LeakTestScheduler:
         # here and calling it the baseline (as this did before 3.13.2) folded
         # the close transient and the whole settle-phase loss into every
         # recorded drop.
-        pressure_str = await self._ha.get_state_value(
-            circuit_cfg.pressure_avg_sensor, "0")
-        try:
-            pre_close_psi = float(pressure_str)
-        except (ValueError, TypeError):
-            pre_close_psi = None
+        # dev38: fast sensor FIRST — the averaged entity is snapped to 0.5 psi
+        # by the firmware (round→×2→round→×0.5 chain), and this value leaks
+        # into stored baselines through the fallbacks below. The audit found
+        # 76% of stored baselines sitting on 0.5-psi multiples while the
+        # sensor resolves 0.01.
+        pre_close_psi = await self._read_float(circuit_cfg.pressure_fast_sensor)
+        if pre_close_psi is None:
+            pre_close_psi = await self._read_float(
+                circuit_cfg.pressure_avg_sensor)
 
         # --- Start the firmware leak test ---
         log.info("[%s] starting leak test (triggered_by=%s)", circuit, triggered_by)
@@ -549,6 +552,13 @@ class LeakTestScheduler:
                        ).total_seconds() / 60, 1),
                 None, None, None)
 
+        # dev38: fast-pressure samples accumulated during the monitor window —
+        # the sustained-drop figure comes from a MEDIAN over the tail of these,
+        # not a single instantaneous read (the audit found tests whose stored
+        # multi-psi "drop" was a transient dip the raw trace had fully
+        # recovered from by test end).
+        monitor_samples: list = []          # (utc_datetime, psi)
+
         try:
             while (datetime.now(timezone.utc) - start_wait).total_seconds() < max_wait_seconds:
                 try:
@@ -569,6 +579,12 @@ class LeakTestScheduler:
                 # drop rate meaningless.
                 if monitor_started_at is None and result_str == "In progress":
                     monitor_started_at = datetime.now(timezone.utc)
+
+                if monitor_started_at is not None:
+                    psi = await self._read_float(circuit_cfg.pressure_fast_sensor)
+                    if psi is not None:
+                        monitor_samples.append(
+                            (datetime.now(timezone.utc), psi))
 
                 if result_str in TERMINAL_RESULTS:
                     final_result = result_str
@@ -596,6 +612,7 @@ class LeakTestScheduler:
             circuit_cfg.leak_test_baseline_sensor)
         if baseline_psi is None:
             baseline_psi = pre_close_psi
+        baseline_read_ts = datetime.now(timezone.utc)      # dev38 provenance
         closed_psi = await self._read_float(circuit_cfg.leak_test_closed_sensor)
         if closed_psi is None:
             closed_psi = pre_close_psi
@@ -608,12 +625,23 @@ class LeakTestScheduler:
         final_psi = await self._read_float(circuit_cfg.pressure_fast_sensor)
         if final_psi is None:
             final_psi = await self._read_float(circuit_cfg.pressure_avg_sensor)
+        final_read_ts = datetime.now(timezone.utc)
 
         pressure_drop = (
             round(baseline_psi - final_psi, 2)
             if baseline_psi is not None and final_psi is not None
             else None
         )
+
+        # dev38 — sustained drop: baseline minus the MEDIAN of the tail of the
+        # monitor-window fast samples. Distinguishes a held drop from a
+        # transient dip the trace recovered from; stored beside — never
+        # instead of — the firmware verdict. pressure_drop keeps its
+        # historical single-read meaning for comparability with old rows.
+        sustained_drop_psi, final_window_s, _tail_ts = _sustained_drop(
+            baseline_psi, monitor_samples)
+        if _tail_ts is not None:
+            final_read_ts = _tail_ts
         settle_loss = (
             round(closed_psi - baseline_psi, 2)
             if closed_psi is not None and baseline_psi is not None
@@ -626,9 +654,14 @@ class LeakTestScheduler:
                    ).total_seconds() / 60, 2)
             if monitor_started_at is not None else None
         )
+        # dev38: the leak-rate estimate divides the SUSTAINED drop when one was
+        # measured — a transient dip that recovered is not water leaving the
+        # line at a steady rate. Falls back to the single-read drop when the
+        # monitor window produced no samples (pre-3.13.2 firmware, aborts).
         est_leak = self._estimate_leak_ml_min(
-            circuit, pressure_drop, settle_loss, monitor_minutes,
-            duration_minutes)
+            circuit,
+            sustained_drop_psi if sustained_drop_psi is not None else pressure_drop,
+            settle_loss, monitor_minutes, duration_minutes)
 
         # --- Persist result ---
         await self._store_result(
@@ -637,6 +670,12 @@ class LeakTestScheduler:
             closed_psi=closed_psi, settle_loss_psi=settle_loss,
             monitor_minutes=monitor_minutes, threshold_psi=threshold_psi,
             est_leak_ml_min=est_leak,
+            baseline_read_ts=baseline_read_ts.isoformat(),
+            final_read_ts=final_read_ts.isoformat(),
+            final_window_s=final_window_s,
+            sustained_drop_psi=sustained_drop_psi,
+            monitor_started_at=(monitor_started_at.isoformat()
+                                if monitor_started_at is not None else None),
         )
 
         # --- Pump plan Phase 5b: cross-circuit verdict (vfd pump mode only).
@@ -1022,6 +1061,11 @@ class LeakTestScheduler:
         monitor_minutes: Optional[float] = None,
         threshold_psi: Optional[float] = None,
         est_leak_ml_min: Optional[float] = None,
+        baseline_read_ts: Optional[str] = None,
+        final_read_ts: Optional[str] = None,
+        final_window_s: Optional[float] = None,
+        sustained_drop_psi: Optional[float] = None,
+        monitor_started_at: Optional[str] = None,
     ) -> None:
         insert_leak_test_history(
             self._db,
@@ -1038,7 +1082,33 @@ class LeakTestScheduler:
             monitor_minutes=monitor_minutes,
             threshold_psi=threshold_psi,
             est_leak_ml_min=est_leak_ml_min,
+            # dev38 measurement provenance + sustained-drop figure.
+            baseline_read_ts=baseline_read_ts,
+            final_read_ts=final_read_ts,
+            final_window_s=final_window_s,
+            sustained_drop_psi=sustained_drop_psi,
+            monitor_started_at=monitor_started_at,
         )
+
+
+def _sustained_drop(baseline_psi, samples):
+    """dev38 — (sustained_drop_psi, final_window_s, tail_ts) from the
+    monitor-window fast-pressure samples.
+
+    Sustained = baseline − median of the last up-to-3 samples (~20–30 s at
+    the scheduler's 10 s poll cadence). The median makes a single dipped
+    read harmless; the tail placement makes a dip the line RECOVERED from
+    read near zero — exactly the case the audit found the single-read drop
+    misreporting as a multi-psi leak. Returns (None, None, None) when there
+    is no baseline or no samples (aborts, pre-3.13.2 firmware).
+    """
+    tail = list(samples)[-3:]
+    if not tail or baseline_psi is None:
+        return None, None, None
+    vals = sorted(p for _, p in tail)
+    median_psi = vals[len(vals) // 2]
+    window_s = round((tail[-1][0] - tail[0][0]).total_seconds(), 1)
+    return round(baseline_psi - median_psi, 2), window_s, tail[-1][0]
 
 
 def _parse_utc_ts(ts_str: str) -> datetime:

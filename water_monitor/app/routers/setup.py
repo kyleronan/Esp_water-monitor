@@ -780,6 +780,12 @@ async def setup_home_details_save(request: Request):
             log.info("Event detection activated after setup wizard completion")
         except Exception as e:
             log.warning("Event detector setup failed (non-fatal): %s", e)
+        # dev38: subscribe-then-prime — seed valve states so other_valve_open
+        # can record a confirmed 0 before any valve transitions.
+        try:
+            await orch.event_detector.prime_valve_states()
+        except Exception as e:
+            log.warning("Valve-state prime failed (non-fatal): %s", e)
 
     # The HA WebSocket was already connected before setup completed (monitoring 0
     # entities).  subscribe_entity() adds to the dict but cannot update the live

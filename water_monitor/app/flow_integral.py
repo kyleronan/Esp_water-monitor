@@ -82,6 +82,85 @@ def integrate_litres(samples) -> Tuple[float, bool]:
     return round(litres, 4), capped
 
 
+# ── dev38: meter registration correction (ANNOTATION ONLY) ────────────────────
+# The 2026-08 audit inverted the pressure channel — an independent witness
+# that shares none of the oval-gear meter's pulse mechanism — and recovered
+# the meter's registration curve on the pre-pump eras (n=1,086 events):
+#
+#   band (L/min)   metered ÷ true    95% CI
+#   >= 8.0            0.999          0.971 – 1.030
+#   4.0 – 8.0         0.941          0.908 – 0.986
+#   2.5 – 4.0         0.904          0.826 – 0.958
+#   1.5 – 2.5         0.732          0.669 – 0.821
+#   1.0 – 1.5         0.59           0.316 – 1.767  (weak; n=20)
+#
+# The curve is RELATIVE to the meter's own >= 8 L/min band (a common-mode
+# scale error is invisible to it) and remains pending utility-anchor
+# validation — which is why the corrected figure is stored as a separate
+# estimate column and NEVER feeds volume_litres, volume_litres_effective or
+# any total (the orchestrator's historical-volumes-are-never-recomputed
+# invariant). Sub-1 L/min flow gets NO correction: non-registration cannot
+# be recovered by a ratio, and extrapolating 0.59 downward would be
+# invention — those draws stay governed by the below-meter-floor verdict.
+_REGISTRATION_RATIO: Tuple[Tuple[float, float, float], ...] = (
+    (8.0, math.inf, 0.999),
+    (4.0, 8.0, 0.941),
+    (2.5, 4.0, 0.904),
+    (1.5, 2.5, 0.732),
+    (1.0, 1.5, 0.59),
+)
+# Store the estimate only when it moves the integral by more than this
+# fraction (mirrors the UI display threshold).
+_REGISTRATION_MIN_DELTA_FRAC = 0.02
+
+
+def _registration_ratio(flow_lpm: float) -> float:
+    """metered/true ratio for one sample's flow rate; 1.0 outside 1–∞."""
+    for lo, hi, ratio in _REGISTRATION_RATIO:
+        if lo <= flow_lpm < hi:
+            return ratio
+    return 1.0
+
+
+def integrate_litres_registration_corrected(samples) -> Tuple[float, float]:
+    """dev38 — ``(raw_litres, corrected_litres)`` over the same sample walk.
+
+    Identical hold semantics to :func:`integrate_litres`; each sample's
+    contribution in the 1.0–8.0 L/min correction band is divided by its
+    band's registration ratio. Returned pair lets the caller apply the
+    2% materiality gate without re-integrating.
+    """
+    s = _clean(samples)
+    if len(s) < 2:
+        return 0.0, 0.0
+    raw = corrected = 0.0
+    for i in range(1, len(s)):
+        dt = _dt_seconds(s[i - 1][0], s[i][0])
+        if dt <= 0:
+            continue
+        if dt > _FLOW_INTEGRAL_MAX_DT_SECONDS:
+            dt = _FLOW_INTEGRAL_MAX_DT_SECONDS
+        flow = s[i - 1][1]
+        contrib = flow * (dt / 60.0)
+        raw += contrib
+        corrected += contrib / _registration_ratio(flow)
+    return round(raw, 4), round(corrected, 4)
+
+
+def registration_estimate(samples):
+    """dev38 — the value stored in ``events.registration_est_litres``.
+
+    The corrected integral, or None when the correction is immaterial
+    (< 2% above the raw integral) or nothing integrates. None is the common
+    case: draws at fixture flow rates (>= 4 L/min peaks with brief ramps)
+    barely graze the correction bands.
+    """
+    raw, corrected = integrate_litres_registration_corrected(samples)
+    if raw <= 0 or corrected <= raw * (1.0 + _REGISTRATION_MIN_DELTA_FRAC):
+        return None
+    return round(corrected, 3)
+
+
 def _segment_count(intervals: List[Tuple[float, bool]]) -> int:
     """Count distinct flow "on" segments with debounce.
 

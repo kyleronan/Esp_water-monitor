@@ -2382,6 +2382,41 @@ class EventDetector:
         """Update tracked valve state for cross-circuit feature."""
         self._valve_open[circuit] = state in ("open", "on")
 
+    async def prime_valve_states(self) -> None:
+        """Seed other-valve tracking from current HA state (dev38).
+
+        Subscribe-then-prime: setup() wires the change subscriptions FIRST,
+        then this fills ``self._valve_open`` for valves that simply never
+        change state after boot. Without it the dict stayed empty until the
+        first valve transition, so ``_get_other_valve_open`` returned None
+        ("unknown") indefinitely and ``other_valve_open`` could never record
+        a confirmed 0 — the 2026-08 audit found the column was only ever
+        1 or NULL across all 6,124 events. A change event that races in
+        during priming wins (checked before AND after the await).
+        """
+        for cfg in self._circuits:
+            if not cfg.valve_entity or cfg.circuit in self._valve_open:
+                continue
+            try:
+                state = await self._ha.get_state_value(cfg.valve_entity)
+            except Exception as e:
+                log.debug("[%s] valve-state prime failed (non-fatal): %s",
+                          cfg.circuit, e)
+                continue
+            s = str(state or "").lower()
+            if s in ("open", "on"):
+                seeded = True
+            elif s in ("closed", "off"):
+                seeded = False
+            else:
+                continue  # unknown/unavailable — leave unseeded
+            # Recheck after the await: a real change event during the fetch
+            # is fresher than the polled state and must not be overwritten.
+            if cfg.circuit not in self._valve_open:
+                self._valve_open[cfg.circuit] = seeded
+                log.info("[%s] valve state primed: %s", cfg.circuit,
+                         "open" if seeded else "closed")
+
     def _get_other_valve_open(self, this_circuit: str) -> Optional[bool]:
         """Return True if any other circuit's valve is currently open, False if all
         are closed, or None if no other valve states have been received yet."""

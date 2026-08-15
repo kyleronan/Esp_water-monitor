@@ -13,6 +13,7 @@ Old pre-squash database: startup fails fast. Delete the DB and restart.
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -241,6 +242,26 @@ _BASELINE_VERSION: int = 20260523
 #              can say WHEN the cycling was observed ("between 1:05 and 2:11
 #              AM") instead of the ambiguous "night of <date>". DDL only;
 #              old rows stay NULL and the banner falls back to date-only copy.
+#   20260801 — dev38 audit-fix DDL, all in one step: events.time_features_tz
+#              (deferred local-time feature backfill marker) +
+#              events.registration_est_litres (annotate-only meter-registration
+#              estimate); event_waveforms per-channel source metadata
+#              (flow/press _src_n, _src_hz) for an honest waveform time axis;
+#              overlap_audit.stale_reason (dangling refs are MARKED, never
+#              deleted); leak_test_history measurement-provenance columns
+#              (baseline/final read timestamps, final_window_s,
+#              sustained_drop_psi, monitor_started_at); daily_summary_dirty
+#              table (days needing a summary recompute).
+#   20260802 — data backfill: raise peak_flow_lpm to ceil(true_avg*1000)/1000
+#              where true_avg_flow_lpm > peak_flow_lpm (825 physically
+#              impossible software-sourced rows; live path now clamps too).
+#   20260803 — data backfill: recompute hydraulic_resistance = ΔP/avg on
+#              ESP-enriched rows (1,324 rows carried the pre-enrichment ΔP
+#              ratio; the finalize/enrich paths now keep it current).
+#   20260804 — data retro-fix: NULL the contaminated (foreign-draw) signatures
+#              + signature_source on the 31 dev37 'misattached' rows the
+#              repair sweep left labelled esp_* (their signature bytes came
+#              from the mis-attached ESP capture; envelopes already deleted).
 #
 # VERSION-NUMBER CONVENTION (2026-08-12, decided with the operator): from the
 # next migration onward, versions are YYYYMM + a 2-digit per-month sequence —
@@ -249,7 +270,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260574
+_CURRENT_VERSION: int = 20260804
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -2127,6 +2148,190 @@ def _missing_local_day_columns(conn: sqlite3.Connection) -> set[str]:
     return missing
 
 
+# 20260801 — dev38 audit-fix columns (all DDL for the release in one step).
+_202608_EVENT_COLUMNS = (
+    ("time_features_tz", "TEXT"),
+    ("registration_est_litres", "REAL"),
+)
+_202608_WAVEFORM_COLUMNS = (
+    ("flow_src_n", "INTEGER"),
+    ("press_src_n", "INTEGER"),
+    ("flow_src_hz", "REAL"),
+    ("press_src_hz", "REAL"),
+)
+_202608_LEAK_TEST_COLUMNS = (
+    ("baseline_read_ts", "TEXT"),
+    ("final_read_ts", "TEXT"),
+    ("final_window_s", "REAL"),
+    ("sustained_drop_psi", "REAL"),
+    ("monitor_started_at", "TEXT"),
+)
+
+
+def _apply_dev38_audit_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260801 — every dev38 column in one DDL
+    step (see the changelog block for the per-fix rationale):
+
+      events.time_features_tz        — deferred-tz marker for the local-time
+                                       feature backfill (20260571 pattern:
+                                       migrations run before HA is reachable,
+                                       so the rewrite happens at boot once
+                                       the home zone is known)
+      events.registration_est_litres — annotate-only meter-registration
+                                       estimate; never feeds totals
+      event_waveforms.*_src_n/_hz    — per-channel source metadata for an
+                                       honest waveform time axis
+      overlap_audit.stale_reason     — dangling-reference marking (rows are
+                                       provenance and are never deleted)
+      leak_test_history.*            — measurement provenance + sustained drop
+      daily_summary_dirty            — days needing a summary recompute
+
+    Additive, idempotent, tables-absent-safe (forward-walk fixtures)."""
+    if _has_table(conn, "events"):
+        for col, typ in _202608_EVENT_COLUMNS:
+            if not _has_column(conn, "events", col):
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col} {typ}")
+    if _has_table(conn, "event_waveforms"):
+        for col, typ in _202608_WAVEFORM_COLUMNS:
+            if not _has_column(conn, "event_waveforms", col):
+                conn.execute(
+                    f"ALTER TABLE event_waveforms ADD COLUMN {col} {typ}")
+    if _has_table(conn, "leak_test_history"):
+        for col, typ in _202608_LEAK_TEST_COLUMNS:
+            if not _has_column(conn, "leak_test_history", col):
+                conn.execute(
+                    f"ALTER TABLE leak_test_history ADD COLUMN {col} {typ}")
+    if (_has_table(conn, "overlap_audit")
+            and not _has_column(conn, "overlap_audit", "stale_reason")):
+        conn.execute("ALTER TABLE overlap_audit ADD COLUMN stale_reason TEXT")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS daily_summary_dirty ("
+        "circuit TEXT NOT NULL, day TEXT NOT NULL, "
+        "PRIMARY KEY (circuit, day))")
+    conn.commit()
+    log.info("Migration 20260801: dev38 audit-fix columns ready")
+
+
+# 20260802 — true_avg > peak consistency backfill.
+def _apply_peak_consistency_backfill(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260802 — raise ``peak_flow_lpm`` to
+    ``ceil(true_avg*1000)/1000`` wherever ``true_avg_flow_lpm`` exceeds it
+    (physically impossible; 825 rows in the 2026-08 audit, all software-
+    sourced — avg/peak come from ``flow_readings`` while true_avg comes from
+    the timestamped ``flow_samples``). Matches the dev37 repair convention
+    (ceil, never round down; never lower true_avg). Data-only, idempotent,
+    best-effort — a failure must never block boot (the live write path now
+    clamps at extract time, so the population cannot regrow)."""
+    try:
+        rows = conn.execute(
+            "SELECT id, true_avg_flow_lpm FROM events "
+            "WHERE true_avg_flow_lpm IS NOT NULL AND peak_flow_lpm IS NOT NULL "
+            "AND true_avg_flow_lpm > peak_flow_lpm").fetchall()
+        for r in rows:
+            # Index access — the migration conn's row factory is not guaranteed.
+            new_peak = math.ceil(float(r[1]) * 1000.0) / 1000.0
+            conn.execute("UPDATE events SET peak_flow_lpm = ? WHERE id = ?",
+                         (new_peak, r[0]))
+        conn.commit()
+        log.info("Migration 20260802: peak-consistency backfill raised "
+                 "%d row(s)", len(rows))
+    except Exception as e:
+        log.warning("Migration 20260802: peak backfill skipped (non-fatal): %s", e)
+
+
+# 20260803 — stale hydraulic_resistance backfill.
+def _apply_resistance_backfill(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260803 — recompute the stored
+    ``hydraulic_resistance`` on ESP-enriched rows from the CURRENT ΔP.
+
+    Pinned definition (identical to extract_features / the dev38 finalize
+    recompute): ΔP / avg_flow_lpm, gated on avg >= 0.15 AND
+    has_pressure_transient AND ΔP > 0. The 2026-08 audit found 1,324 rows
+    whose ratio still reflected the pre-enrichment ΔP (resistance was
+    computed before the ESP metadata overwrote pressure_delta_psi).
+
+    Ordering vs the +240 s shared-capture sweep is safe by construction:
+    rows the sweep has not yet de-enriched still carry the ESP ΔP, so
+    ΔP/avg is CONSISTENT for them; the sweep then NULLs both ΔP and
+    resistance on its losers. Data-only, idempotent, best-effort."""
+    try:
+        cur = conn.execute(
+            "UPDATE events SET hydraulic_resistance = "
+            "ROUND(pressure_delta_psi / avg_flow_lpm, 3) "
+            "WHERE esp_waveform_used = 1 AND avg_flow_lpm >= 0.15 "
+            "AND COALESCE(has_pressure_transient, 0) != 0 "
+            "AND pressure_delta_psi > 0")
+        conn.commit()
+        log.info("Migration 20260803: resistance backfill updated %d row(s)",
+                 cur.rowcount)
+    except Exception as e:
+        log.warning("Migration 20260803: resistance backfill skipped "
+                    "(non-fatal): %s", e)
+
+
+# 20260804 — retro-fix the dev37-repaired rows' contaminated signatures.
+def _apply_misattached_signature_null(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260804 — NULL the signatures of rows
+    the dev37 sweep marked ``misattached`` but left carrying esp-labelled
+    signature bytes (31 rows in the 2026-08 audit).
+
+    VERIFIED PROVENANCE: when an ESP capture is claimed, the flow/pressure/
+    edge signatures are regenerated FROM the capture arrays
+    (feature_extractor._enrich_from_waveform), so a mis-attached row's
+    signature is a FOREIGN draw's shape. No HA-derived signature was ever
+    persisted for these rows, and the dev37 sweep already deleted their
+    envelopes — so the signatures are NULLed and signature_source is set
+    NULL (NOT 'software', which would launder contaminated shape data under
+    a trusted label). Data-only, idempotent."""
+    try:
+        cur = conn.execute(
+            "UPDATE events SET flow_signature_json = NULL, "
+            "pressure_signature_json = NULL, onset_signature_json = NULL, "
+            "offset_signature_json = NULL, signature_source = NULL "
+            "WHERE wf_repair_verdict = 'misattached' "
+            "AND signature_source LIKE 'esp%'")
+        conn.commit()
+        log.info("Migration 20260804: nulled contaminated signatures on "
+                 "%d misattached row(s)", cur.rowcount)
+    except Exception as e:
+        log.warning("Migration 20260804: signature retro-fix skipped "
+                    "(non-fatal): %s", e)
+    # Belt-and-braces re-create of the wf-claim index — LAST migration of the
+    # dev38 group, same rationale as 20260574 for dev37: the base schema
+    # deliberately omits it, so every forward walk that ends here must still
+    # end up with it regardless of which intermediate version it started at.
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+        conn.commit()
+
+
+def _missing_202608_columns(conn: sqlite3.Connection) -> set[str]:
+    """Verifier for the 20260801 DDL (current-version guard set)."""
+    missing = set()
+    if _has_table(conn, "events"):
+        for col, _ in _202608_EVENT_COLUMNS:
+            if not _has_column(conn, "events", col):
+                missing.add(f"events.{col}")
+    if _has_table(conn, "event_waveforms"):
+        for col, _ in _202608_WAVEFORM_COLUMNS:
+            if not _has_column(conn, "event_waveforms", col):
+                missing.add(f"event_waveforms.{col}")
+    if _has_table(conn, "leak_test_history"):
+        for col, _ in _202608_LEAK_TEST_COLUMNS:
+            if not _has_column(conn, "leak_test_history", col):
+                missing.add(f"leak_test_history.{col}")
+    if (_has_table(conn, "overlap_audit")
+            and not _has_column(conn, "overlap_audit", "stale_reason")):
+        missing.add("overlap_audit.stale_reason")
+    if not _has_table(conn, "daily_summary_dirty"):
+        missing.add("daily_summary_dirty")
+    return missing
+
+
 # 20260565 — rule_calibration keyed per (circuit, supply regime).
 def _apply_regime_calibration(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260565 — rebuild rule_calibration with
@@ -2361,6 +2566,10 @@ _MIGRATIONS: tuple = (
     (20260572, _apply_sawtooth_recharge_backfill),
     (20260573, _apply_wf_claim_and_repair_columns),
     (20260574, _apply_regime_window_bounds),
+    (20260801, _apply_dev38_audit_columns),
+    (20260802, _apply_peak_consistency_backfill),
+    (20260803, _apply_resistance_backfill),
+    (20260804, _apply_misattached_signature_null),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -2439,6 +2648,7 @@ def _run_migrations_impl(
             | _missing_leak_test_refill_columns(conn)
             | _missing_local_day_columns(conn)
             | _missing_wf_claim_columns(conn)
+            | _missing_202608_columns(conn)
         )
         if missing:
             raise RuntimeError(

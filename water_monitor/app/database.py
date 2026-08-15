@@ -847,6 +847,12 @@ CREATE TABLE IF NOT EXISTS events (
     hour_sin                    REAL DEFAULT 0,
     hour_cos                    REAL DEFAULT 1,
     is_weekend                  BOOLEAN DEFAULT 0,
+    -- dev38 (migration 20260801): which IANA zone produced the five time
+    -- features above. NULL = written before tz detection ran (UTC basis) —
+    -- the deferred boot backfill rewrites those rows once the home zone is
+    -- known and stamps this marker (the 2026-08 audit found hour_of_day was
+    -- UTC on 100% of events and day_of_week wrong on 30%).
+    time_features_tz            TEXT,
     is_composite                BOOLEAN DEFAULT 0,
     other_valve_open            INTEGER,           -- NULL=unknown 0=closed 1=open
     excluded_from_training      BOOLEAN DEFAULT 0,
@@ -967,6 +973,12 @@ CREATE TABLE IF NOT EXISTS events (
     -- event window, from the HA recorder (NULL = not reconciled / sensor unavailable).
     -- Audit ("recorder said X vs stored Y") + what flag-mode review/apply uses.
     volume_recorder_litres           REAL,
+    -- dev38 (migration 20260801): ANNOTATION-ONLY registration-corrected
+    -- estimate. The audit's pressure-witness inversion showed the oval-gear
+    -- meter reads ~27% low at 1.5-2.5 L/min and ~10% low at 2.5-4; this
+    -- stores the inverse-curve estimate when it differs >2% from the raw
+    -- integral. NEVER feeds volume_litres/effective or any total.
+    registration_est_litres          REAL,
     hourly_volume_applied_litres     REAL DEFAULT 0,
     hourly_volume_applied_bucket     TEXT,
     degraded_diagnostic_json         TEXT,
@@ -1120,7 +1132,18 @@ CREATE TABLE IF NOT EXISTS event_waveforms (
     pressure_min_json     TEXT NOT NULL,
     pressure_max_json     TEXT NOT NULL,
     duration_seconds      REAL NOT NULL,
-    created_at            TEXT NOT NULL          -- ISO-8601 UTC, Python-written
+    created_at            TEXT NOT NULL,         -- ISO-8601 UTC, Python-written
+    -- dev38 (migration 20260801): per-channel source metadata so a renderer
+    -- can build an honest time axis. The two channels are binned
+    -- INDEPENDENTLY from streams of different cadences (audit §3.5: 18.2%
+    -- of events misaligned on a shared index axis). *_src_n = source sample
+    -- count before binning; *_src_hz = fixed sample rate when one exists
+    -- (200.0 for ESP captures; NULL for the event-driven software series,
+    -- whose spacing is NOT uniform and has no recoverable axis).
+    flow_src_n            INTEGER,
+    press_src_n           INTEGER,
+    flow_src_hz           REAL,
+    press_src_hz          REAL
 );
 CREATE INDEX IF NOT EXISTS idx_event_waveforms_created
     ON event_waveforms (created_at);
@@ -1270,7 +1293,19 @@ CREATE TABLE IF NOT EXISTS leak_test_history (
     threshold_psi          REAL,
     est_leak_ml_min        REAL,
     post_restore_volume_l  REAL,
-    draw_verdict           TEXT
+    draw_verdict           TEXT,
+    -- dev38 (migration 20260801): measurement provenance + a sustained-drop
+    -- figure. The audit found the stored drop was a single instantaneous
+    -- end-of-test read (often the 0.5-psi-quantised averaged entity via
+    -- fallbacks) that raw pressure did not support on 1/3 of tests.
+    -- sustained_drop_psi = baseline − median(fast-pressure over the final
+    -- window). DISPLAY/diagnostic only — the firmware verdict is never
+    -- altered by any of these.
+    baseline_read_ts       TEXT,
+    final_read_ts          TEXT,
+    final_window_s         REAL,
+    sustained_drop_psi     REAL,
+    monitor_started_at     TEXT
 );
 
 -- ==========================================================================
@@ -1325,7 +1360,26 @@ CREATE TABLE IF NOT EXISTS overlap_audit (
                                        -- | flagged_ambiguous
     source           TEXT NOT NULL,    -- live_guard | cleanup_migration
     created_ts       TIMESTAMP,
+    -- dev38 (migration 20260801): reprocess re-creates events under NEW
+    -- uuid5 ids (id = f(circuit, start_ts)), so referenced ids can go
+    -- dangling — the audit found 43 dangling wrappers + 130 dangling kept
+    -- ids. Rows are MARKED, never deleted (they are provenance):
+    --   'superseded_by_reprocess' — events replaced under new ids
+    --   'event_pruned'            — referenced event removed by retention
+    -- NULL = references live. The History reader skips/annotates stale rows.
+    stale_reason     TEXT,
     UNIQUE (wrapper_event_id, resolution)
+);
+
+-- dev38 (migration 20260801): days whose daily_summary must be recomputed.
+-- The nightly gap-finder only looks 7 days back and permanently freezes a
+-- day once it was summarised after its own end — so late imports, reprocess
+-- and live inserts write a dirty marker here instead, drained (and deleted)
+-- by the pruner's summary pass with no lookback limit.
+CREATE TABLE IF NOT EXISTS daily_summary_dirty (
+    circuit  TEXT NOT NULL,
+    day      TEXT NOT NULL,             -- local YYYY-MM-DD (daily_summary key)
+    PRIMARY KEY (circuit, day)
 );
 
 -- The overlap guard queries same-circuit span intersections on every NEW
@@ -1571,6 +1625,118 @@ def local_day_bounds_utc(day: str, tz=None) -> tuple:
     return to_utc(lo_local), to_utc(hi_local)
 
 
+def mark_daily_summary_dirty(conn: sqlite3.Connection, circuit: str,
+                             start_ts: Any) -> None:
+    """dev38 — flag ``start_ts``'s LOCAL day for a daily_summary recompute.
+
+    The nightly gap-finder only looks 7 days back and permanently freezes a
+    day once it was summarised after its own end, so late imports, reprocess
+    re-imports and ordinary live inserts on an already-summarised day left
+    ``event_count``/peaks stale (exact on only 81% of audited days). Every
+    event write drops a marker here; the pruner's summary pass drains the
+    table with NO lookback limit. INSERT OR IGNORE on the (circuit, day) PK
+    makes repeated same-day marking free. Best-effort by design — a marker
+    lost to an exception only delays the recompute to the next mutation.
+    """
+    try:
+        day = local_day_of(start_ts)
+        if day:
+            conn.execute(
+                "INSERT OR IGNORE INTO daily_summary_dirty (circuit, day) "
+                "VALUES (?, ?)", (circuit, day))
+    except sqlite3.Error as e:
+        log.debug("daily_summary_dirty mark failed (non-fatal): %s", e)
+
+
+def drain_daily_summary_dirty(conn: sqlite3.Connection) -> Dict[str, int]:
+    """dev38 — recompute every day flagged dirty, then clear the markers.
+
+    Today's still-open local day is deliberately SKIPPED (and its marker
+    kept): the day is still accumulating events, and the nightly pass
+    summarises it once it closes — recomputing it early would just re-freeze
+    it stale again. Zero-event days get their stale row DELETED by
+    compute_daily_summary. Returns {"recomputed": n, "skipped_open": n}.
+    """
+    today = datetime.now(_home_tz()).strftime("%Y-%m-%d")
+    recomputed = skipped = 0
+    try:
+        rows = conn.execute(
+            "SELECT circuit, day FROM daily_summary_dirty ORDER BY day"
+        ).fetchall()
+    except sqlite3.Error:
+        return {"recomputed": 0, "skipped_open": 0}
+    for r in rows:
+        circuit, day = r[0], r[1]
+        if day >= today:
+            skipped += 1
+            continue
+        try:
+            compute_daily_summary(conn, circuit, day)
+            conn.execute(
+                "DELETE FROM daily_summary_dirty WHERE circuit=? AND day=?",
+                (circuit, day))
+            recomputed += 1
+        except sqlite3.Error as e:
+            log.warning("dirty-day recompute failed for %s/%s: %s",
+                        circuit, day, e)
+    conn.commit()
+    return {"recomputed": recomputed, "skipped_open": skipped}
+
+
+def backfill_time_features_tz(conn: sqlite3.Connection, tz_name: str,
+                              chunk: int = 500) -> Dict[str, int]:
+    """dev38 — rewrite the per-event time features in the home timezone.
+
+    hour_of_day / day_of_week / hour_sin / hour_cos / is_weekend were computed
+    on the UTC timestamp until dev38 (the 2026-08 audit: hour matched UTC on
+    100% of events, weekday wrong on 30%). Migrations can't fix this — they
+    run before HA answers, so the zone is unknown there — hence this deferred
+    pass, called at boot once tz detection lands (the 20260571 pattern).
+
+    Touches only rows whose ``time_features_tz`` marker is NULL or names a
+    different zone, so it is idempotent and a zone change re-runs it exactly
+    once. Chunked commits keep the write lock polite on add-on hardware.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        return {"rewritten": 0, "skipped_bad_tz": 1}
+    rewritten = 0
+    while True:
+        rows = conn.execute(
+            "SELECT id, start_ts FROM events WHERE time_features_tz IS NULL "
+            "OR time_features_tz != ? LIMIT ?", (tz_name, chunk)).fetchall()
+        if not rows:
+            break
+        for r in rows:
+            eid, start_ts = r[0], r[1]
+            try:
+                dt = datetime.fromisoformat(str(start_ts))
+            except (ValueError, TypeError):
+                # Unparseable timestamp: stamp the marker so the loop can't
+                # spin on the row forever; features stay as written.
+                conn.execute(
+                    "UPDATE events SET time_features_tz = ? WHERE id = ?",
+                    (tz_name, eid))
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            local = dt.astimezone(tz)
+            hour = local.hour
+            dow = local.weekday()
+            rad = 2 * math.pi * hour / 24
+            conn.execute(
+                "UPDATE events SET hour_of_day = ?, day_of_week = ?, "
+                "hour_sin = ?, hour_cos = ?, is_weekend = ?, "
+                "time_features_tz = ? WHERE id = ?",
+                (hour, dow, round(math.sin(rad), 4), round(math.cos(rad), 4),
+                 1 if dow >= 5 else 0, tz_name, eid))
+            rewritten += 1
+        conn.commit()
+    return {"rewritten": rewritten}
+
+
 def compute_daily_summary(conn: sqlite3.Connection,
                           circuit: str, day: str) -> Optional[Dict[str, Any]]:
     """
@@ -1602,6 +1768,12 @@ def compute_daily_summary(conn: sqlite3.Connection,
     """, (circuit, day_lo, day_hi)).fetchone()
 
     if not rows or rows["event_count"] == 0:
+        # dev38: a day emptied of events must not keep a stale inflated row —
+        # previously the caller had to remember to delete it (only
+        # delete_events_in_range did). Dropping it here makes every caller
+        # correct; a day with genuinely no events correctly has no row.
+        conn.execute("DELETE FROM daily_summary WHERE circuit = ? AND day = ?",
+                     (circuit, day))
         return None
 
     # Top-5 fixtures for the day (JSON for breakdown chart)
@@ -2427,6 +2599,9 @@ def upsert_event_and_apply_hourly_volume(
         _do_event_upsert(conn, event)
         apply_effective_volume(conn, event_id, circuit, event["start_ts"],
                                new_effective_volume)
+        # dev38 — every event write flags its local day for a summary
+        # recompute (drained by the pruner with no lookback limit).
+        mark_daily_summary_dirty(conn, circuit, event["start_ts"])
 
     # Overlap guard (dev28): a genuinely-new event that intersects an existing
     # same-circuit event means the same water was recorded twice (live blip
@@ -2729,6 +2904,20 @@ def delete_events_in_range(
             conn.execute(
                 "DELETE FROM training_capture_candidates WHERE event_id = ?",
                 (r["id"],))
+            # dev38 — overlap_audit rows referencing this event become stale
+            # (reprocess re-creates events under NEW uuid5 ids: id is a pure
+            # function of start_ts, and re-imported boundaries are 15 s-
+            # granular). MARK, never delete: the rows are the durable record
+            # of where zeroed litres went. kept_event_ids is a JSON list, so
+            # a LIKE probe on the quoted id catches child references too.
+            try:
+                conn.execute(
+                    "UPDATE overlap_audit SET stale_reason = "
+                    "COALESCE(stale_reason, 'superseded_by_reprocess') "
+                    "WHERE wrapper_event_id = ? OR kept_event_ids LIKE ?",
+                    (r["id"], f'%"{r["id"]}"%'))
+            except sqlite3.Error:
+                pass       # pre-20260801 schema
             conn.execute("DELETE FROM events WHERE id = ?", (r["id"],))
             d = local_day_of(r["start_ts"])
             if d:
@@ -4367,6 +4556,23 @@ def dedup_events(conn: sqlite3.Connection, commit: bool = True) -> int:
         conn.executemany(
             "UPDATE events SET id = ? WHERE id = ?", id_updates
         )
+        # dev38 — this path has the one EXACT old→new id map in the codebase,
+        # so overlap_audit references get a real remap here instead of a
+        # stale mark (the audit found 43 dangling wrappers + 130 dangling
+        # kept ids from paths with no such map). kept_event_ids is a JSON
+        # list, remapped by quoted-string REPLACE.
+        try:
+            conn.executemany(
+                "UPDATE overlap_audit SET wrapper_event_id = ? "
+                "WHERE wrapper_event_id = ?", id_updates)
+            conn.executemany(
+                "UPDATE overlap_audit SET kept_event_ids = "
+                "REPLACE(kept_event_ids, ?, ?) "
+                "WHERE kept_event_ids LIKE ?",
+                [(f'"{old}"', f'"{new}"', f'%"{old}"%')
+                 for new, old in id_updates])
+        except sqlite3.Error:
+            pass       # pre-20260561 schema (no overlap_audit yet)
 
     if commit:
         conn.commit()

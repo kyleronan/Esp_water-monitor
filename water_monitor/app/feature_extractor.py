@@ -1465,7 +1465,8 @@ def _finalize_derived_verdicts(features: dict, calib=None,
 
     Recomputes, IN PLACE, from the CURRENT values in ``features``:
         is_pressure_restoration_phantom, volume_litres_effective,
-        volume_estimation_method, excluded_from_training, match_rejection_reason
+        volume_estimation_method, excluded_from_training, match_rejection_reason,
+        hydraulic_resistance (dev38 — always ΔP/avg from the CURRENT ΔP)
 
     Idempotent — safe to call again after ``_enrich_from_waveform`` mutates
     pressure_delta_psi / peak_flow_lpm, so the stored verdict always matches the
@@ -1478,6 +1479,23 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     Reads: duration_seconds, pressure_delta_psi, degraded_supply, is_composite,
     user_ignored, volume_litres, volume_litres_estimated.
     """
+    # dev38: hydraulic_resistance must always match the CURRENT ΔP. ESP
+    # enrichment overwrites pressure_delta_psi AFTER extract_features computed
+    # resistance, so the stored ratio went stale on every ESP-enriched event
+    # (1,324 rows in the 2026-08 audit). Pinned definition — identical to
+    # extract_features: ΔP / avg_flow_lpm, gated on avg >= 0.15,
+    # has_pressure_transient, ΔP > 0; NULL otherwise, including NULL ΔP on
+    # de-enriched shared-capture rows. Runs BEFORE the user_classified guard:
+    # resistance is a measurement, not a classification, so a manual label
+    # must not preserve a stale ratio.
+    _res_dp = features.get("pressure_delta_psi")
+    _res_avg = features.get("avg_flow_lpm")
+    if (_res_dp is not None and _res_avg is not None and _res_avg >= 0.15
+            and features.get("has_pressure_transient") and _res_dp > 0):
+        features["hydraulic_resistance"] = round(_res_dp / _res_avg, 3)
+    else:
+        features["hydraulic_resistance"] = None
+
     if features.get("user_classified"):
         return  # manual classification wins — never auto-override
 
@@ -3026,10 +3044,21 @@ def _persist_waveform(
     past 120 s, which erases short pulses (washer fill pauses) that the ESP
     capture resolves.
     """
+    # dev38 — per-channel source metadata (audit §3.5): the two channels are
+    # binned from streams of different cadences, so a renderer needs to know
+    # each channel's source count and (when fixed-rate) sample frequency to
+    # build an honest time axis. hz stays NULL for the event-driven software
+    # series, whose spacing has no recoverable axis.
+    _ESP_HZ = 200.0
+    flow_hz = press_hz = None
     if _wf_full_res_usable(esp_record):
         flow_readings = esp_record.full_flow
+        flow_hz = _ESP_HZ
         if esp_record.full_pressure:
             pressure_readings = esp_record.full_pressure
+            press_hz = _ESP_HZ
+    flow_src_n = len(flow_readings or [])
+    press_src_n = len(pressure_readings or [])
     flow_min, flow_max = _bin_min_max(flow_readings, MAX_WAVEFORM_BINS)
     pres_min, pres_max = _bin_min_max(pressure_readings, MAX_WAVEFORM_BINS)
     if not flow_min and not pres_min:
@@ -3040,8 +3069,9 @@ def _persist_waveform(
             "INSERT OR REPLACE INTO event_waveforms "
             "(event_id, flow_min_json, flow_max_json, "
             " pressure_min_json, pressure_max_json, "
-            " duration_seconds, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " duration_seconds, created_at, "
+            " flow_src_n, press_src_n, flow_src_hz, press_src_hz) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event_id,
                 json.dumps(flow_min, allow_nan=False),
@@ -3050,6 +3080,10 @@ def _persist_waveform(
                 json.dumps(pres_max, allow_nan=False),
                 float(duration_s),
                 now_iso,
+                flow_src_n or None,
+                press_src_n or None,
+                flow_hz,
+                press_hz,
             ),
         )
     except Exception as e:
@@ -3722,6 +3756,18 @@ def _enrich_from_waveform(
     if meta.pressure_delta >= 0:
         features["pressure_delta_psi"] = round(meta.pressure_delta, 2)
         any_wf_used = True
+        # dev38: resistance is ΔP-derived, so it must follow the overwrite —
+        # same pinned definition as extract_features / _finalize_derived_verdicts
+        # (ΔP / avg_flow_lpm, gated avg >= 0.15 + has_pressure_transient + ΔP > 0).
+        # Keeps the LATE upgrade path consistent too (it never calls the
+        # finalizer); the live path's finalizer recomputes identically.
+        _r_avg = features.get("avg_flow_lpm")
+        _r_dp = features["pressure_delta_psi"]
+        if (_r_avg is not None and _r_avg >= 0.15
+                and features.get("has_pressure_transient") and _r_dp > 0):
+            features["hydraulic_resistance"] = round(_r_dp / _r_avg, 3)
+        else:
+            features["hydraulic_resistance"] = None
     # Propagation delay — firmware measures at ~50 Hz (ISR resolution);
     # -1 means the firmware did not detect a clear onset, keep legacy value.
     if meta.propagation_delay_ms >= 0:
@@ -3943,6 +3989,9 @@ _WF_UPGRADE_COLUMNS = (
     "esp_waveform_used", "waveform_event_id", "waveform_boot_id",
     "waveform_quality", "waveform_overlap_score",
     "peak_flow_lpm", "pressure_delta_psi", "propagation_delay_ms",
+    # dev38 — ΔP-derived, recomputed inside _enrich_from_waveform right after
+    # the ΔP overwrite so the late path can't leave a stale ratio behind.
+    "hydraulic_resistance",
     "flow_rise_rate_lpm_s", "time_to_90pct_flow_seconds", "opening_step_lpm",
     "pressure_onset_ms", "steady_state_fraction", "flow_variability",
     "recovery_overshoot_psi",
@@ -3964,18 +4013,34 @@ def _wf_already_claimed(conn, circuit: str, boot_id, fw_event_id) -> bool:
     Claims never expire: ``boot_id`` is a per-boot ``random_uint32()`` from the
     firmware, so a stale claim cannot collide with a future capture.
 
-    Rows written before migration 20260572 have a NULL ``waveform_boot_id`` and
-    are therefore unclaimable — deliberate, since ``waveform_event_id`` alone
-    (a per-boot counter) cannot identify a capture across reboots.
+    dev38 hardening: a NULL ``boot_id`` no longer short-circuits to "not
+    claimed". The audit traced 619 shared-capture events to exactly this hole
+    — 90.7% of ESP-enriched rows carry a NULL boot_id (never persisted before
+    20260573), so the composite key was degenerate and could neither claim
+    nor block. The fallback mirrors the repair sweep's boot-NULL duplicate
+    probe: a same-circuit event that claimed this ``waveform_event_id``
+    within the last 48 h blocks the claim (the per-boot counter cannot wrap
+    to the same id that fast on real hardware, while cross-reboot collisions
+    older than that are exactly what the boot_id exists to disambiguate).
     """
-    if boot_id is None or fw_event_id is None:
+    if fw_event_id is None:
         return False
     try:
-        row = conn.execute(
-            "SELECT 1 FROM events WHERE circuit = ? AND waveform_boot_id = ? "
-            "AND waveform_event_id = ? AND esp_waveform_used = 1 LIMIT 1",
-            (circuit, boot_id, fw_event_id),
-        ).fetchone()
+        if boot_id is not None:
+            row = conn.execute(
+                "SELECT 1 FROM events WHERE circuit = ? AND waveform_boot_id = ? "
+                "AND waveform_event_id = ? AND esp_waveform_used = 1 LIMIT 1",
+                (circuit, boot_id, fw_event_id),
+            ).fetchone()
+        else:
+            cutoff = (datetime.now(timezone.utc)
+                      - timedelta(hours=48)).isoformat()
+            row = conn.execute(
+                "SELECT 1 FROM events WHERE circuit = ? "
+                "AND waveform_event_id = ? AND esp_waveform_used = 1 "
+                "AND start_ts >= ? LIMIT 1",
+                (circuit, fw_event_id, cutoff),
+            ).fetchone()
     except sqlite3.Error:
         # Pre-migration schema (no waveform_boot_id column) → no ledger yet.
         return False
@@ -4074,6 +4139,16 @@ def _late_waveform_upgrade_job(conn, circuit: str, record: WaveformRecord):
     return best["id"] if cur.rowcount > 0 else None
 
 
+def _get_home_tz_or_utc():
+    """Home timezone for time-of-day features, UTC until detection has run.
+
+    Deferred import mirrors the file's database-import style and avoids any
+    import-order coupling with event_rules at module load.
+    """
+    from .event_rules import get_home_timezone
+    return get_home_timezone() or timezone.utc
+
+
 def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
                      pump_mode: bool = False) -> Dict[str, Any]:
     """Compute the full feature vector from a RawEvent.
@@ -4126,9 +4201,24 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
     # which over-counts a brief burst trapped in a long pressure-defined event).
     # Prefer the firmware's cumulative integration sensor when present; fall back
     # to the old approximation only for legacy events with no timestamped samples.
-    from .flow_integral import integrate_litres, active_flow_features
+    from .flow_integral import (integrate_litres, active_flow_features,
+                                registration_estimate)
     flow_integral_litres, _integral_capped = integrate_litres(event.flow_samples)
     active = active_flow_features(event.flow_samples, duration)
+    # dev38 ANNOTATION ONLY: registration-corrected estimate when flow spent
+    # material time in the meter's under-registration band (1–8 L/min). Never
+    # feeds volume_litres/effective or any total.
+    registration_est = registration_estimate(event.flow_samples)
+
+    # dev38 consistency clamp: true_avg comes from the TIMESTAMPED flow_samples
+    # while peak comes from the (differently sampled) flow_readings list, so
+    # true_avg > peak was reachable on short pulsed draws — 825 physically
+    # impossible rows in the 2026-08 audit, none of them ESP-enriched. Raise
+    # peak to true_avg (ceil to 3 dp, the dev37 repair convention); never
+    # lower true_avg, which is the volume-consistent figure.
+    _ta = active.get("true_avg_flow_lpm")
+    if _ta is not None and _ta > peak_flow:
+        peak_flow = math.ceil(_ta * 1000.0) / 1000.0
     if event.volume_litres_measured is not None:
         volume_litres = event.volume_litres_measured
     elif event.flow_samples:
@@ -4186,11 +4276,6 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
     # _finalize_derived_verdicts() on the assembled dict below — the single
     # source of truth, re-run after ESP-waveform enrichment in _process().
 
-    # Time features
-    ts = event.start_ts
-    hour = ts.hour
-    dow = ts.weekday()
-    hour_radians = 2 * math.pi * hour / 24
     duration_log = math.log(duration + 1)
 
     # Normalize timestamps to UTC so the UUID5 id and stored start_ts are
@@ -4201,6 +4286,18 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
     if _start.tzinfo is None:
         _start = _start.replace(tzinfo=timezone.utc)
     start_utc = _start.astimezone(timezone.utc)
+
+    # Time features — computed in the HOME timezone, not UTC (dev38 fix:
+    # the 2026-08 audit found hour_of_day matched the UTC hour on 100% of
+    # events and day_of_week was wrong on 30%; any event after 18:00 local
+    # fell on the next UTC day). Falls back to UTC only when tz detection
+    # hasn't run yet; the deferred backfill task re-stamps those rows once
+    # the tz is known (events.time_features_tz marker).
+    _home_tz = _get_home_tz_or_utc()
+    _local = start_utc.astimezone(_home_tz)
+    hour = _local.hour
+    dow = _local.weekday()
+    hour_radians = 2 * math.pi * hour / 24
     _end = event.end_ts
     if _end is not None:
         if _end.tzinfo is None:
@@ -4236,6 +4333,8 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
         # Active-flow features (timestamped-flow integral). Drive classification
         # and the hardened phantom guard; NULL only for legacy/no-sample events.
         "flow_integral_litres": round(flow_integral_litres, 3),
+        # dev38 annotate-only meter-registration estimate (see flow_integral).
+        "registration_est_litres": registration_est,
         "active_flow_duration_seconds": active["active_flow_duration_seconds"],
         "true_avg_flow_lpm": active["true_avg_flow_lpm"],
         "flow_on_ratio": active["flow_on_ratio"],
@@ -4251,13 +4350,16 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
             if event.propagation_delay_ms is not None else None
         ),
 
-        # Derived features for ML clustering
+        # Derived features for ML clustering — HOME-local time basis (dev38);
+        # time_features_tz records which zone produced them so the deferred
+        # backfill can detect rows written under a different (or no) zone.
         "duration_log": round(duration_log, 4),
         "hour_of_day": hour,
         "day_of_week": dow,
         "hour_sin": round(math.sin(hour_radians), 4),
         "hour_cos": round(math.cos(hour_radians), 4),
         "is_weekend": 1 if dow >= 5 else 0,
+        "time_features_tz": str(_home_tz) if _home_tz is not timezone.utc else None,
 
         # Composite / training flags
         "is_composite": 1 if event.is_composite else 0,

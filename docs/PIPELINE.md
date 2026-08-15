@@ -172,14 +172,47 @@ Volume < 1 mL (`MIN_EVENT_VOLUME_L`) is noise. A pressure-surge phantom — max 
 
 - **Volume:** time integral of the timestamped samples (`flow_integral.integrate_litres`). A gap > 300 s
   marks `integration_quality = 'degraded'` (kept out of training).
+- **Averages — two different figures (dev38 doc):** `avg_flow_lpm` is a plain **sample mean of the
+  detector's reading list, idle zeros included** — it dilutes toward 0 on any event with a no-flow
+  tail and is *not* a physical average. `true_avg_flow_lpm` (volume ÷ active time, from the
+  timestamped samples) is the figure the verdicts, the UI and any analysis should use.
+  `daily_summary.avg_flow_lpm` is an unweighted **mean of those per-event sample means** — not a
+  volume- or duration-weighted daily average. A dev38 write-time clamp also guarantees
+  `true_avg_flow_lpm ≤ peak_flow_lpm` (the two came from differently-sampled series, and 825
+  historical rows violated it; backfilled by migration 20260802).
+- **Meter registration estimate (dev38, annotation only):** `registration_est_litres` — the volume
+  after correcting the oval-gear meter's measured low-flow under-registration
+  (`flow_integral._REGISTRATION_RATIO`: reads ~27% low at 1.5–2.5 L/min, ~10% at 2.5–4, ~6% at
+  4–8; unity ≥ 8). The curve comes from the 2026-08 audit's pressure-witness inversion and is
+  **relative to the meter's own ≥ 8 L/min band** — a common-mode scale error is invisible to it —
+  and remains pending utility-anchor validation. Sub-1 L/min flow gets **no** correction
+  (non-registration cannot be recovered by a ratio; those draws stay governed by 7h below).
+  Stored only when the correction is material (> 2%); **never feeds `volume_litres`,
+  `volume_litres_effective`, or any total.**
 - **Signatures:** 256-point *proportional* flow + pressure envelopes (`SIGNATURE_POINTS = 256`, widened
   32→64→256; point *i* = *i*/256 through the event) — plus a separate 32-cell × 1 s *absolute-time*
   onset/offset **edge signature** (`onset_signature_json` / `offset_signature_json`) that feeds the
   edge-signature k-NN tier.
 - **Hydraulics:** `pressure_delta_psi`, `pre_event_pressure_psi`, propagation delay, resistance shape.
+  `hydraulic_resistance` is **ΔP ÷ `avg_flow_lpm`** (not true_avg), gated on avg ≥ 0.15 ∧
+  transient captured ∧ ΔP > 0 — and since dev38 it is recomputed wherever ΔP changes (ESP
+  enrichment, late upgrade, re-finalize), because the 2026-08 audit found 1,324 rows carrying the
+  pre-enrichment ratio (backfilled by migration 20260803).
 - **Active-flow metrics** the verdicts depend on: `flow_integral_litres`, `flow_on_ratio`,
   `true_avg_flow_lpm`, `active_flow_segment_count`.
-- **Time features:** `hour_sin` / `hour_cos`, day-of-week, weekend.
+- **Time features:** `hour_sin` / `hour_cos`, day-of-week, weekend — computed in the **home
+  timezone** since dev38 (they were UTC-based: the audit found `hour_of_day` matched the UTC hour
+  on 100% of events and `day_of_week` was wrong on 30%). `events.time_features_tz` records the
+  zone that produced each row's features; a deferred boot task rewrites rows whose marker
+  mismatches once tz detection lands (migrations run before HA answers).
+- **Waveform display metadata (dev38):** `event_waveforms.flow_src_n / press_src_n /
+  flow_src_hz / press_src_hz` — per-channel source sample counts and (ESP only) the 200 Hz fixed
+  rate, so the History modal can draw each channel on its own honest seconds axis. The two
+  channels are binned from different streams; before dev38 they shared one index axis and were
+  visibly misaligned on 18% of events. ESP channels use the capture span (`n/hz`, basis
+  `uniform_exact_unanchored` — the capture's wall-clock start is not recoverable); software
+  channels are duration-stretched (`uniform_approx` — the event-driven series has no recoverable
+  axis).
 
 > **If it breaks here:** event volume disagreeing with the meter → check `integration_quality` (gap
 > `'degraded'`) and `volume_recorder_litres` for the firmware-meter cross-check.
