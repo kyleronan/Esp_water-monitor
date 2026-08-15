@@ -1002,6 +1002,16 @@ CREATE TABLE IF NOT EXISTS events (
     -- cycle anchor id; NULL = ungrouped singleton. Stamped by reclassify; SKIPS
     -- user-labelled events (so a relabel pulls a member out of its group).
     cycle_group_id                   TEXT,
+    -- dev40 training quarantine (migration 20260805): non-NULL reason keeps
+    -- this event OUT of every training/exemplar pool (k-NN label pools, type
+    -- centroids, fingerprint library, rule-calibration fits, usage baselines,
+    -- cluster label votes) without touching its labels, verdicts or volume —
+    -- annotate-don't-modify. First use: 'dev40_precision_quarantine', the
+    -- unreviewed machine dishwasher-cycle labels the 2026-08-15 audit measured
+    -- at 9/19 / 1/10 precision. A user review supersedes the machine label, so
+    -- reviewed events are never flagged.
+    training_quarantine_reason       TEXT,
+    training_quarantined_at          TEXT,
     -- Embedded-fixture annotation (migration 20260548). JSON array of draws
     -- found superimposed on a sustained event's waveform (a toilet flushed
     -- mid-shower) by composite_detector. Metadata ONLY — never changes the
@@ -3551,8 +3561,13 @@ def patch_event(
         # clears any 'unknown' review verdict: identifying the draw supersedes
         # "I don't recognise it" (and lets the event back into baseline refits
         # under its new label).
+        # An explicit user label also lifts a dev40 training quarantine — the
+        # quarantine distrusts the MACHINE label, and the user's is ground
+        # truth (clearing a label back to NULL keeps the quarantine: the
+        # distrusted machine label is what remains visible again).
         _resolve_review = ", phantom_suppression_averted = 0" + (
             ", user_reviewed = 1, review_verdict = NULL"
+            ", training_quarantine_reason = NULL, training_quarantined_at = NULL"
             if user_fixture_type else "")
         conn.execute(
             "UPDATE events SET user_fixture_type = ?, fixture_label_source = ?, "
@@ -5112,6 +5127,7 @@ def _knn_usable_label_counts(conn: sqlite3.Connection, circuit: str) -> Dict[str
         "SELECT user_fixture_type, COUNT(*) FROM events "
         "WHERE circuit = ? AND user_fixture_type IS NOT NULL "
         "  AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND training_quarantine_reason IS NULL "
         "GROUP BY user_fixture_type", (circuit,)).fetchall()}
 
 
@@ -5140,6 +5156,7 @@ def recompute_cluster_suggestion_from_user_labels(
         "WHERE e.circuit = ? AND e.cluster_id = ? "
         "  AND e.user_fixture_type IS NOT NULL "
         "  AND COALESCE(e.excluded_from_training, 0) = 0 "
+        "  AND e.training_quarantine_reason IS NULL "
         "GROUP BY e.id, e.user_fixture_type",
         (circuit, cluster_id),
     ).fetchall()
@@ -5744,7 +5761,8 @@ def upsert_fixture_signature(
             FROM events
             WHERE circuit = ?
               AND user_fixture_type = ?
-              AND COALESCE(excluded_from_training, 0) = 0""",
+              AND COALESCE(excluded_from_training, 0) = 0
+              AND training_quarantine_reason IS NULL""",
         (circuit, fixture_type),
     ).fetchall()
     if not rows:
@@ -6233,6 +6251,7 @@ def match_event_to_signature_knn(
                 "WHERE circuit = ? "
                 "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
                 "  AND COALESCE(excluded_from_training, 0) = 0 "
+                "  AND training_quarantine_reason IS NULL "
                 "  AND COALESCE(integration_quality, 'ok') = 'ok' "
                 "  AND true_avg_flow_lpm IS NOT NULL "
                 "  AND active_flow_duration_seconds IS NOT NULL "
@@ -6268,6 +6287,7 @@ def match_event_to_signature_knn(
             "WHERE circuit = ? "
             "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
             "  AND COALESCE(excluded_from_training, 0) = 0 "
+            "  AND training_quarantine_reason IS NULL "
             "  AND COALESCE(integration_quality, 'ok') = 'ok' "
             "  AND true_avg_flow_lpm IS NOT NULL "
             "  AND active_flow_duration_seconds IS NOT NULL "
@@ -6299,7 +6319,8 @@ def _legacy_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any]]:
         "FROM events "
         "WHERE circuit = ? "
         "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
-        "  AND COALESCE(excluded_from_training, 0) = 0"
+        "  AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND training_quarantine_reason IS NULL"
     )
     if len(legacy) < _SIGNATURE_KNN_MIN_TOTAL_LABELS:
         return _invariant_knn_fallback(_labelled, event_features)
@@ -6345,6 +6366,7 @@ def _invariant_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any
         "WHERE circuit = ? "
         "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
         "  AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND training_quarantine_reason IS NULL "
         "  AND volume_litres > 0 AND duration_seconds > 0"
     )
     if len(rows) < _SIGNATURE_KNN_MIN_TOTAL_LABELS:

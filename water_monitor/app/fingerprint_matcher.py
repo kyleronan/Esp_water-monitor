@@ -157,6 +157,7 @@ class FingerprintLibrary:
             "       w.flow_max_json, w.pressure_min_json, w.duration_seconds "
             "FROM events e JOIN event_waveforms w ON w.event_id = e.id "
             "WHERE e.circuit = ? AND e.user_fixture_type IS NOT NULL "
+            "  AND e.training_quarantine_reason IS NULL "
             "  AND e.duration_seconds >= ? "
             "  AND COALESCE(e.volume_litres_effective, e.volume_litres) >= ?",
             (circuit, MIN_EVENT_SECONDS, MIN_MATCH_VOLUME_L)).fetchall()

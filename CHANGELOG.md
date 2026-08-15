@@ -9,6 +9,35 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Bad dishwasher labels no longer teach the system — dev40** — a check of
+  reviewed events on 2026-08-15 found the automatic "dishwasher cycle" label
+  was wrong more often than right: 9 of 19 correct before the August outage,
+  1 of 10 after the last re-seed, where short faucet bursts were being chained
+  together into a fake fill-and-drain sequence. Because those labels are also
+  what the add-on learns from, the fitted dishwasher flow band had already
+  stretched 3.75 → 8.32 L/min over three re-fits — wrong labels making the
+  next wrong label easier to accept. Affected events are now marked as "don't
+  learn from this" (migration 20260805) and skipped by every learning path:
+  the k-NN label pools, cluster suggestions, fixture signatures, rule fitting,
+  and the usage baselines behind anomaly detection. Nothing about the events
+  themselves changes — labels, verdicts and volumes are untouched, they still
+  appear normally in History, and reviewing one restores it to the learning
+  pool immediately, since your label is ground truth. Only unreviewed
+  automatic labels in the two measured windows are marked; the outage window
+  is left alone pending re-grouping. The grouping rule that produced the bad
+  labels is unchanged for now — this stops the damage spreading while that fix
+  is validated.
+
+  Two smaller items ride along. Cluster health now shows up in the log at
+  rebuild time: a warning when the fixture groups have blurred into each other
+  (the condition that preceded the dev39 outage — three groups on the main
+  circuit were 40–49 % overlapping on 2026-08-15), plus a count of how many
+  distinct groups saw water in the last 48 hours. And the "Rebuild fixture
+  grouping for current pressure" button no longer breaks when double-clicked:
+  the rebuild takes about a minute with the page sitting there loading, so
+  people click again, and the second run used to crash the first one
+  mid-write. It now reports that a rebuild is already running.
+
 - **Automatic fixture grouping no longer dies silently after a restart —
   dev39** — live cluster matching stopped cold on 2026-08-13 while the
   database showed 30 healthy clusters, no error anywhere. Root cause: the

@@ -559,7 +559,7 @@ class Orchestrator:
                 log.warning(
                     "Orphan-reference integrity check: events_orphaned=%d "
                     "fixtures_unbacked=%d clusters_dangling=%d — see "
-                    "Fixtures page for relink affordance",
+                    "the Water Use page for the relink banner",
                     _orphans["events_orphaned"],
                     _orphans["fixtures_unbacked"],
                     _orphans["clusters_dangling"],

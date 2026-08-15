@@ -88,6 +88,14 @@ class TrainingManager:
         self._last_undertarget_warn: Dict[str, datetime] = {}
         # Set by orchestrator after ClusterEngine is initialised
         self.cluster_engine = None
+        # Serializes cluster re-seeds. The re-seed runs ~1 min in an executor
+        # thread on the shared SQLite connection; the Settings button's page
+        # sits loading that whole time, so users re-click, and two concurrent
+        # _work() bodies on one connection die with sqlite3.InterfaceError
+        # ("bad parameter or other API misuse") mid-backfill — observed
+        # 2026-08-15 11:56. One lock for ALL circuits: the engine + connection
+        # are shared, so even different-circuit re-seeds must not overlap.
+        self._reseed_lock = asyncio.Lock()
 
     def stop(self) -> None:
         self._stop.set()
@@ -564,6 +572,15 @@ class TrainingManager:
         import functools
         if self.cluster_engine is None:
             return {"error": "cluster engine not wired"}
+        # Lazy fallback: test fixtures build the manager without __init__.
+        if not hasattr(self, "_reseed_lock"):
+            self._reseed_lock = asyncio.Lock()
+        if self._reseed_lock.locked():
+            # A double-submit must not start a second concurrent replay (see
+            # the lock's init comment) — surface it instead of queueing, so
+            # the user sees "already running" rather than a doubled run.
+            return {"error": "a cluster re-seed is already running — "
+                             "wait for it to finish, then retry if needed"}
         eng = self.cluster_engine
         loop = asyncio.get_running_loop()
 
@@ -591,7 +608,8 @@ class TrainingManager:
             eng.freeze_circuit(circuit)
             return {"cleared": cleared, "assigned": assigned}
 
-        result = await loop.run_in_executor(None, _work)
+        async with self._reseed_lock:
+            result = await loop.run_in_executor(None, _work)
         log.info("[%s] cluster re-seed (pump era, pressure-blind): "
                  "%s stale assignment(s) cleared, %s event(s) clustered",
                  circuit, result.get("cleared"), result.get("assigned"))

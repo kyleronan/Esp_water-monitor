@@ -350,12 +350,12 @@ class FixturePublisher:
 
     def publish_fixture(self, fixture_id: str) -> None:
         log.debug("publish_fixture(%s): no-op since Sprint F; category_publish "
-                  "is now the source of truth (toggle on the Fixtures page).",
+                  "is now the source of truth (toggle on the Water Use page).",
                   fixture_id)
 
     def retract_fixture(self, fixture_id: str) -> None:
         log.debug("retract_fixture(%s): no-op since Sprint F; category_publish "
-                  "is now the source of truth (toggle on the Fixtures page).",
+                  "is now the source of truth (toggle on the Water Use page).",
                   fixture_id)
 
     def _publish_all_confirmed_sync(self) -> None:

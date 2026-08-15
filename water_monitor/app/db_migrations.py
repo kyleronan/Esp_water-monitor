@@ -262,6 +262,12 @@ _BASELINE_VERSION: int = 20260523
 #              + signature_source on the 31 dev37 'misattached' rows the
 #              repair sweep left labelled esp_* (their signature bytes came
 #              from the mis-attached ESP capture; envelopes already deleted).
+#   20260805 — dev40 training quarantine: events.training_quarantine_reason /
+#              training_quarantined_at + backfill flagging unreviewed machine
+#              dishwasher-cycle labels (pre-outage + post-reseed windows) out
+#              of every training/exemplar pool (measured 9/19 and 1/10
+#              precision on user reviews; the labels had widened the fitted
+#              DW band 3.75→8.32 LPM). Labels/verdicts/volumes untouched.
 #
 # VERSION-NUMBER CONVENTION (2026-08-12, decided with the operator): from the
 # next migration onward, versions are YYYYMM + a 2-digit per-month sequence —
@@ -270,7 +276,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260804
+_CURRENT_VERSION: int = 20260805
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -2309,6 +2315,69 @@ def _apply_misattached_signature_null(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+# 20260805 — dev40 training quarantine for the over-firing dishwasher-cycle tier.
+def _apply_training_quarantine(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260805 — annotate-don't-modify quarantine
+    of machine dishwasher-cycle labels from every training/exemplar pool.
+
+    The 2026-08-15 precision readout measured the dishwasher_cycle tier at
+    9/19 on pre-outage user reviews and 1/10 post-reseed (faucet bursts chained
+    into fake fill sequences), and the contaminated labels had already widened
+    the fitted DW band 3.75 → 8.32 LPM across three calibration fits — a
+    self-reinforcing loop. Until the grouping gate is fixed, unreviewed events
+    carrying a machine dishwasher label (either matched_via='dishwasher_cycle'
+    or a cycle-stamped user_fixture_type) are excluded from training pools via
+    ``training_quarantine_reason`` — labels, verdicts and volumes untouched, so
+    History display and the user's ability to review/relabel are unchanged, and
+    a later review lifts the quarantine's effect by supplying real ground truth.
+
+    Windows (UTC bounds of the audited Denver-local windows): the pre-outage
+    calibration-source window [2026-07-01, 2026-07-22) and the post-reseed
+    window [2026-08-13, open) — the 07-22..08-13 outage window is deliberately
+    NOT flagged here: it is sequenced for re-attribution off the reseeded
+    cluster model first. Idempotent (only NULL-reason rows are stamped)."""
+    from datetime import datetime, timezone
+    for col in ("training_quarantine_reason", "training_quarantined_at"):
+        if not _has_column(conn, "events", col):
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    # The backfill reads columns older migrations add (a DB walking forward
+    # from a mid-ladder version gains them earlier in the same run, but a
+    # test-stripped schema may lack them) — without any of them no row can
+    # carry a machine dishwasher-cycle label, so there is nothing to flag.
+    if all(_has_column(conn, "events", c) for c in
+           ("matched_via", "fixture_label_source", "user_reviewed",
+            "user_fixture_type")):
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            "UPDATE events SET training_quarantine_reason = 'dev40_precision_quarantine', "
+            "       training_quarantined_at = ? "
+            "WHERE training_quarantine_reason IS NULL "
+            "  AND COALESCE(user_reviewed, 0) = 0 "
+            "  AND (matched_via = 'dishwasher_cycle' "
+            "       OR (fixture_label_source = 'cycle' "
+            "           AND user_fixture_type = 'dishwasher')) "
+            "  AND ((start_ts >= '2026-07-01T06:00' AND start_ts < '2026-07-22T06:00') "
+            "       OR start_ts >= '2026-08-13T06:00')",
+            (now,))
+        log.info("Migration 20260805: training-quarantined %d unreviewed "
+                 "dishwasher-cycle row(s)", cur.rowcount)
+    else:
+        log.info("Migration 20260805: label/provenance columns absent — "
+                 "quarantine backfill skipped (nothing to flag)")
+    conn.commit()
+    # Belt-and-braces re-create of the wf-claim index — this is now the LAST
+    # migration, and the convention (see 20260574/20260804) is that every
+    # forward walk must end up with the index regardless of start version,
+    # because the base schema deliberately omits it.
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+        conn.commit()
+
+
 def _missing_202608_columns(conn: sqlite3.Connection) -> set[str]:
     """Verifier for the 20260801 DDL (current-version guard set)."""
     missing = set()
@@ -2570,6 +2639,7 @@ _MIGRATIONS: tuple = (
     (20260802, _apply_peak_consistency_backfill),
     (20260803, _apply_resistance_backfill),
     (20260804, _apply_misattached_signature_null),
+    (20260805, _apply_training_quarantine),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

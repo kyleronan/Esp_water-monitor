@@ -200,7 +200,8 @@ def _fit_pool(conn: sqlite3.Connection, circuit: str,
         "       matched_via, "
         "       COALESCE(excluded_from_training, 0) AS excluded_from_training, "
         "       volume_litres, duration_seconds, peak_flow_lpm "
-        f"FROM events WHERE circuit = ?{rsql}",
+        f"FROM events WHERE circuit = ?{rsql} "
+        "  AND training_quarantine_reason IS NULL",
         (circuit,) + rargs,
     ).fetchall()
     return _pool_from_rows([dict(r) for r in rows])

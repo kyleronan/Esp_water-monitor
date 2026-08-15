@@ -107,6 +107,7 @@ def fit_usage_baselines(
         "FROM events WHERE circuit = ? "
         "  AND COALESCE(user_fixture_type, matched_fixture_type) IS NOT NULL "
         "  AND COALESCE(excluded_from_training, 0) = 0 "
+        "  AND training_quarantine_reason IS NULL "
         "  AND COALESCE(review_verdict, '') <> 'unknown'",
         (circuit,),
     ).fetchall()

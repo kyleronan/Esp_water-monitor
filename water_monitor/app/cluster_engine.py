@@ -1221,9 +1221,46 @@ class ClusterEngine:
                 continue
             winner = max(tally.items(), key=lambda kv: kv[1])[0]
             mapping[river_id] = winner
+            # Health metric (dev40): a healthy river↔DB mapping is a
+            # SUPERMAJORITY — the members that built a center agree on its
+            # cluster. A sub-50% plurality means the center sits across
+            # several DB clusters' members (degenerate geometry), which is
+            # the cheap early warning that fires before cluster-count
+            # collapse is visible (2026-08-15: three circuit_1 centers all
+            # plurality-mapped to one DB cluster at 40-49%).
+            frac = tally[winner] / max(sum(tally.values()), 1)
             log.debug("[%s] post-rebuild: river cluster %d → DB cluster %d "
                       "(%d/%d votes)", circuit, river_id, winner,
                       tally[winner], sum(tally.values()))
+            if frac < 0.50:
+                log.warning("[%s] post-rebuild health: river cluster %d "
+                            "mapped to DB cluster %d on a %.0f%% PLURALITY "
+                            "(%d/%d votes) — sub-majority id-map votes "
+                            "indicate degenerate cluster geometry; consider "
+                            "a river-model re-seed", circuit, river_id,
+                            winner, frac * 100, tally[winner],
+                            sum(tally.values()))
+        self._log_cluster_diversity_48h(circuit)
+
+    def _log_cluster_diversity_48h(self, circuit: str) -> None:
+        """Health metric (dev40): distinct DB clusters actually receiving
+        events in the last rolling 48 h. Logged at rebuild time next to the
+        vote fractions — a collapse from the circuit's usual spread down to
+        1-2 clusters is the other face of the same degeneracy the sub-50%
+        plurality warning catches. Log/metric only; never changes behavior."""
+        try:
+            row = self._db.execute(
+                "SELECT COUNT(DISTINCT cluster_id), COUNT(*) FROM events "
+                "WHERE circuit = ? AND cluster_id IS NOT NULL "
+                "  AND start_ts >= strftime('%Y-%m-%dT%H:%M:%S', "
+                "                           'now', '-48 hours')",
+                (circuit,)).fetchone()
+            log.info("[%s] post-rebuild health: %d distinct DB cluster(s) "
+                     "over %d clustered event(s) in the last 48h",
+                     circuit, row[0], row[1])
+        except Exception as e:
+            log.debug("[%s] 48h cluster-diversity metric failed "
+                      "(non-fatal): %s", circuit, e)
 
     def _rebuild_id_map_from_centroids(self, circuit: str) -> None:
         """
