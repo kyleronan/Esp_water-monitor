@@ -277,6 +277,12 @@ async def repair_stale_links(request: Request):
     orch = _orch(request)
     from ..database import find_orphaned_cluster_references, get_write_lock
     engine = getattr(orch, "cluster_engine", None)
+    # dev44 — refuse while the startup cluster work is still replaying: it
+    # holds a pre-repair snapshot in executor threads, and whichever rebuild
+    # finishes LAST owns the in-memory map. A repair clicked 15 s after a
+    # restart lost exactly that race and the cleared references returned.
+    if not getattr(orch, "startup_cluster_work_done", True):
+        return ingress_redirect(request, "/fixtures?msg=starting")
     try:
         import asyncio
         import functools

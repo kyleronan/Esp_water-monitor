@@ -797,6 +797,15 @@ class Orchestrator:
         except Exception as e:
             log.warning("startup reclassify/reprocess failed (non-fatal): %s", e)
 
+        # dev44 — the startup cluster work above (rebuild → reclassify →
+        # backfill) runs in executor threads against a snapshot of the DB
+        # taken at boot. Any repair that mutates cluster references while
+        # it's in flight gets silently overwritten when the stale replay
+        # finishes (observed: the stale-link repair clicked 15 s after a
+        # restart lost the race and the orphans returned). Routes that
+        # rebuild engine state gate on this flag.
+        self.startup_cluster_work_done = True
+
         # Initialise daily/weekly volume baselines from HA history so that
         # the dashboard shows accurate totals from the first page load.
         # force=True so a restart/redeploy re-derives the midnight readings and

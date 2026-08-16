@@ -4,10 +4,27 @@
 
 Smarter fixture labeling, anomaly surfacing, and a round of volume-accuracy
 guardrails driven by a full audit of the add-on's stored events against raw
-Home Assistant history. (Shipped incrementally as dev1–dev44 — dev7/dev8
+Home Assistant history. (Shipped incrementally as dev1–dev45 — dev7/dev8
 landed without a version bump; per-build details are in git history.)
 
 ### New Features
+
+- **The waveform time axis finally shows up — dev45** — the event modal has
+  quietly been showing every event on the axis-less, index-aligned signature
+  overlay: the code that upgrades to the high-resolution view (with the real
+  per-channel seconds axis added in dev38) refused to run whenever the
+  hi-res capture had fewer points than the stored signature — a sensible
+  rule when signatures were 32 points, and an always-true one after they
+  widened to 256. The upgrade now runs whenever the capture can draw an
+  honest time axis, which covers ~93 % of events (5,407 of 5,784 with a
+  stored capture). The remaining ~377 signature-only events keep the
+  proportional overlay — their per-channel time spans were never recorded,
+  so an honest axis for them is queued as forward-only work. Also in dev45:
+  the "Clear stale group links" button now refuses with a friendly message
+  while the add-on is still starting up — clicking it mid-boot raced the
+  startup's own replay of the event history, and whichever finished last
+  owned the result. (The dev44 reset fix held in production; this makes the
+  ordering deterministic instead of lucky.)
 
 - **The stale-link repair now resets the matcher, so the cleanup sticks —
   dev44** — the first click of dev43's "Clear stale group links" cleared all

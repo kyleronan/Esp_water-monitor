@@ -26,6 +26,10 @@
 {% elif msg == 'busy' %}
 <div class="fx-msg fx-msg-warn">Another volume operation is already running — wait for it
   to finish, then try again.</div>
+{% elif msg == 'starting' %}
+<div class="fx-msg fx-msg-warn">The add-on is still starting up and replaying
+  its event history — wait a minute for the startup work to finish, then try
+  again.</div>
 {% elif msg == 'links_repaired' %}
 <div class="fx-msg fx-msg-ok">Stale group links cleared —
   {{ request.query_params.get('fixed', '0') }} event(s) unlinked from deleted

@@ -1741,7 +1741,16 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         .then(w => {
           if (!w || activeRow !== row) return;   // modal closed / row changed
           const fMax = Array.isArray(w.flow_max) ? w.flow_max.map(Number) : [];
-          if (fMax.length <= flowPts.length) return;   // no more detail than the sig
+          // dev44: the old guard here skipped the upgrade when the hi-res
+          // envelope had fewer points than the signature ("no more detail").
+          // It predates the 32→256-pt signature widening, after which it
+          // skipped nearly ALWAYS — leaving the dev38 per-channel TIME AXIS
+          // unreachable and every modal on the axis-less shared-index
+          // overlay. The envelope's value is its real timestamps, not its
+          // point count: upgrade whenever it can draw an honest axis.
+          const hasTimes = Array.isArray(w.times_flow)
+                           && w.times_flow.length === fMax.length;
+          if (fMax.length < 2 || (!hasTimes && fMax.length <= flowPts.length)) return;
           const fPeak = Math.max(...fMax, 0);
           if (fPeak <= 0) return;
           const fPts = fMax.map(v => Math.min(Math.max(v / fPeak, 0), 1));
