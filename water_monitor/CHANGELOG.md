@@ -9,6 +9,23 @@ landed without a version bump; per-build details are in git history.)
 
 ### New Features
 
+- **Slow steady draws stop reading as toilets — dev45** — the flush-scan
+  review found the "~ Toilet" suggestion landing on square, plateau-shaped
+  draws that plainly weren't flushes (a 3-pulse 62 s tap run, back-to-back
+  appliance fills, a two-notch draw). The hole: the flush rule accepted any
+  peak above 5 L/min, but a real flush valve dumps at full line rate — every
+  one of the 90 reviewed genuine flushes peaks at 7.1 L/min or higher, while
+  the mislabeled slow draws sit at 5–7.5. The rule's peak floor is now 7.5
+  L/min (validated against all 116 reviewed toilet claims: keeps 89 of 90
+  genuine flushes, precision 0.81 → 0.87), and it stays calibratable so a
+  per-pressure fit with your labels can adjust it — with the do-no-harm
+  check arbitrating as always. This also explains why that check kept
+  refusing the fitted toilet band three re-fits running: the band was being
+  fit partly on those mislabeled square draws, and the check correctly
+  preferred the defaults. Remaining look-alikes (fast squarish draws that
+  match flush physics exactly) still need the refill-curve shape analysis —
+  queued; your star-labels fix them individually meanwhile.
+
 - **The waveform time axis finally shows up — dev45** — the event modal has
   quietly been showing every event on the axis-less, index-aligned signature
   overlay: the code that upgrades to the high-resolution view (with the real

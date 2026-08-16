@@ -122,7 +122,13 @@ CYCLE_ONLY_FIXTURE_TYPES: frozenset = frozenset(
 # ── Other rule constants ───────────────────────────────────────────────────────
 _FLUSH_VOL_L: Tuple[float, float] = (2.2, 8.5)
 _FLUSH_DUR_S: Tuple[float, float] = (20.0, 150.0)
-_FLUSH_MIN_PK_LPM: float = 5.0
+# dev45 — raised 5.0 → 7.5, validated against all 116 reviewed toilet claims
+# (2026-08-16 export): every one of the 90 genuine flushes peaks ≥ 7.11 L/min
+# (a flush valve dumps at full line rate), while the mislabeled slow steady
+# draws (taps/appliance fills the rule was claiming at 5–7.5) sit below it.
+# Reviewed-set precision 0.81 → 0.87 at 89/90 recall. Calibratable: a per-
+# regime fit with explicit labels may lower it, and do-no-harm arbitrates.
+_FLUSH_MIN_PK_LPM: float = 7.5
 _FLUSH_MIN_DELTA_PSI: float = 1.5
 
 _DW_VOL_L: Tuple[float, float] = (0.2, 3.5)
