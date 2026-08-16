@@ -152,6 +152,21 @@ async def fixtures_page(request: Request, preview: bool = False):
             "orphaned_fixtures": get_orphaned_fixtures(orch.db, c),
         })
 
+    # dev42 (U4 cleanup) — events whose fixture-group id points at a deleted
+    # group. The old "relink banner" only covers unbacked FIXTURES; this class
+    # had no UI surface at all, while live matching kept re-minting them
+    # against the dead in-memory ids (1,776 in prod by 2026-08-16).
+    try:
+        stale_link_count = orch.db.execute(
+            """SELECT COUNT(*) FROM events e
+               WHERE e.cluster_id IS NOT NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM fixture_clusters fc
+                   WHERE fc.circuit = e.circuit AND fc.id = e.cluster_id)"""
+        ).fetchone()[0]
+    except Exception:
+        stale_link_count = 0
+
     return _tmpl(request).TemplateResponse("fixtures.html", {
         "request":             request,
         "page":                "fixtures",
@@ -160,6 +175,7 @@ async def fixtures_page(request: Request, preview: bool = False):
         "preview":             preview,
         "sel_range":           sel_range,
         "range_label":         range_label,
+        "stale_link_count":    stale_link_count,
     })
 
 
@@ -248,6 +264,37 @@ async def category_publish_toggle(
 #    delete_fixture_signature) remain consumed by cluster_engine and tests;
 #    pruning these route handlers themselves is a future cleanup pass.
 # ────────────────────────────────────────────────────────────────────────────
+
+
+# ── Repair stale group links (dev42) ─────────────────────────────────────────
+
+@router.post("/repair-stale-links")
+async def repair_stale_links(request: Request):
+    """dev42 (U4 cleanup) — null events whose fixture-group id points at a
+    deleted group, then rebuild the in-memory engine so its id map (derived
+    from those events' votes) can no longer resurrect the dead ids. Without
+    the rebuild, live matching re-mints stale references immediately."""
+    orch = _orch(request)
+    from ..database import find_orphaned_cluster_references, get_write_lock
+    engine = getattr(orch, "cluster_engine", None)
+    try:
+        import asyncio
+        import functools
+        loop = asyncio.get_running_loop()
+        async with get_write_lock():
+            counts = find_orphaned_cluster_references(orch.db, repair=True)
+            if engine:
+                for c in orch._cfg.circuits:
+                    await loop.run_in_executor(
+                        None, functools.partial(engine.rebuild_from_db,
+                                                c.circuit))
+        log.info("repair-stale-links: %s (engine rebuilt)", counts)
+    except Exception as e:
+        log.error("repair-stale-links failed: %s", e, exc_info=True)
+        return ingress_redirect(request, "/fixtures?msg=error")
+    return ingress_redirect(
+        request,
+        f"/fixtures?msg=links_repaired&fixed={counts['events_orphaned']}")
 
 
 # ── Re-run clustering ─────────────────────────────────────────────────────────

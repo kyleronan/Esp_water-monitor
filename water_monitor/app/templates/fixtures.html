@@ -26,8 +26,28 @@
 {% elif msg == 'busy' %}
 <div class="fx-msg fx-msg-warn">Another volume operation is already running — wait for it
   to finish, then try again.</div>
+{% elif msg == 'links_repaired' %}
+<div class="fx-msg fx-msg-ok">Stale group links cleared —
+  {{ request.query_params.get('fixed', '0') }} event(s) unlinked from deleted
+  fixture groups and returned to the matching pool.</div>
 {% elif msg == 'error' %}
 <div class="fx-msg fx-msg-err">Action failed — check the addon log for details.</div>
+{% endif %}
+
+{# ── dev42: stale group-link repair. Events can point at fixture groups a
+     recalibration deleted; until cleared, the matcher keeps assigning new
+     events to those deleted groups. Admin-only, shown only when needed. ── #}
+{% if is_admin and stale_link_count and stale_link_count > 0 %}
+<div class="fx-msg fx-msg-warn" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <span><strong>{{ stale_link_count }}</strong> event(s) still point at fixture
+  groups that no longer exist (left over from an earlier rebuild). They can't
+  be matched or counted toward a group until this is cleaned up.</span>
+  <form method="post" action="{{ ingress_path }}/fixtures/repair-stale-links"
+        style="display:inline">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <button type="submit" class="btn btn-sm">🔧 Clear stale group links</button>
+  </form>
+</div>
 {% endif %}
 
 {# ── Page header ──────────────────────────────────────────────────────── #}

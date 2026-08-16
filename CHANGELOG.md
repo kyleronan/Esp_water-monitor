@@ -4,10 +4,23 @@
 
 Smarter fixture labeling, anomaly surfacing, and a round of volume-accuracy
 guardrails driven by a full audit of the add-on's stored events against raw
-Home Assistant history. (Shipped incrementally as dev1–dev42 — dev7/dev8
+Home Assistant history. (Shipped incrementally as dev1–dev43 — dev7/dev8
 landed without a version bump; per-build details are in git history.)
 
 ### New Features
+
+- **The stale-group cleanup finally has a button — dev43** — dev42 stopped
+  rebuilds from stranding events on deleted fixture groups, but the 1,776
+  already-stranded events had no way to be cleaned up: the boot warning
+  pointed at a "relink banner" that only ever appears for a different
+  problem (a confirmed fixture losing its group), so the actual repair was
+  unreachable outside a years-old migration. The Water Use page now shows
+  an amber banner whenever stranded events exist — "N event(s) still point
+  at fixture groups that no longer exist" — with a one-click **Clear stale
+  group links** that unlinks them and rebuilds the in-memory matcher, so
+  the deleted group ids can't be resurrected from the stranded events'
+  votes (which is how the count kept climbing on its own). Admin-only,
+  hidden when the count is zero.
 
 - **The fake-dishwasher tap is turned off, and rebuilds can't corrupt the
   books anymore — dev42** — three fixes, all found chasing last night's
