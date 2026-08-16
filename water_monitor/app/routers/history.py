@@ -237,6 +237,12 @@ def transient_dip_note(t: dict) -> "str | None":
     untouched, and the advice is always to RE-RUN the test, never to
     dismiss it. Requires t["ui"] to be set (classify_leak_test)."""
     try:
+        # dev41 (B4/C1): an indeterminate addon-side measurement must not
+        # fire the note — one noisy baseline capture, an under-sampled
+        # window or an open other valve can't be allowed to flip it.
+        # Legacy rows (status NULL) keep the dev38 behavior.
+        if t.get("addon_measure_status") == "indeterminate":
+            return None
         sus = t.get("sustained_drop_psi")
         thr = t.get("threshold_psi")
         if (t.get("ui", {}).get("category") == "fail" and sus is not None

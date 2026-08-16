@@ -148,6 +148,12 @@ at-baseline samples to confirm the transient onset → `propagation_delay_ms`.
 records per circuit, 2 h TTL). If assembly succeeds, `signature_source = 'esp_full_*'`; otherwise the
 software 1 Hz signature is the fallback.
 
+> **Claim-ledger key caveat (dev41):** `waveform_boot_id` is **not** NVS-backed monotonic — the
+> firmware has no persisted boot counter, so `(boot_id, event_id)` can in principle collide across
+> reboots. The same-circuit **48-hour probe** in `_wf_already_claimed` is therefore load-bearing,
+> not a stopgap for legacy NULLs. New ESP-sourced rows are asserted non-NULL at the insert path
+> (warning-level; 1,842 legacy NULLs stay as honest unknowns).
+
 ### 5 · How does the event end?
 **`app/event_detector.py`** — any one of five exits closes it.
 

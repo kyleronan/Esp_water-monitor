@@ -243,3 +243,65 @@ async def cancel(circuit: str, request: Request):
     _sessions.pop(circuit, None)
     orch.set_calibrating(circuit, False)
     return JSONResponse({"ok": True})
+
+
+# ── dev41 — meter anchors + utility register readings (provenance in data) ────
+# The registration curve is fit against THESE rows, never against constants
+# folded into code. Admin-only like the rest of this router; plain JSON CRUD
+# (create + list), no sessions, no firmware writes.
+
+@router.get("/anchors")
+async def list_anchors(request: Request):
+    from ..database import list_meter_anchor_points
+    return JSONResponse({"ok": True,
+                         "anchors": list_meter_anchor_points(_orch(request).db)})
+
+
+@router.post("/anchors")
+async def add_anchor(request: Request):
+    body = await _json(request)
+    try:
+        flow = float(body["flow_rate_lpm"])
+        measured = float(body["measured_volume_l"])
+        reference = float(body["reference_volume_l"])
+    except (KeyError, TypeError, ValueError):
+        return _err("flow_rate_lpm, measured_volume_l and reference_volume_l "
+                    "are required numbers")
+    if reference <= 0:
+        return _err("reference_volume_l must be > 0")
+    from ..database import insert_meter_anchor_point
+    row_id = insert_meter_anchor_point(
+        _orch(request).db,
+        circuit=body.get("circuit"),
+        flow_rate_lpm=flow, measured_volume_l=measured,
+        reference_volume_l=reference,
+        test_date=body.get("test_date"),
+        method=str(body.get("method") or "bucket"),
+        notes=body.get("notes"))
+    return JSONResponse({"ok": True, "id": row_id})
+
+
+@router.get("/register-readings")
+async def list_register_readings(request: Request):
+    from ..database import list_utility_register_readings
+    return JSONResponse({"ok": True, "readings":
+                         list_utility_register_readings(_orch(request).db)})
+
+
+@router.post("/register-readings")
+async def add_register_reading(request: Request):
+    body = await _json(request)
+    try:
+        value = float(body["reading_value"])
+        ts = str(body["reading_ts"])
+    except (KeyError, TypeError, ValueError):
+        return _err("reading_value (number) and reading_ts are required")
+    from ..database import insert_utility_register_reading
+    row_id = insert_utility_register_reading(
+        _orch(request).db,
+        reading_value=value, reading_ts=ts,
+        meter_serial=body.get("meter_serial"),
+        source=str(body.get("source") or "manual"),
+        entered_by=body.get("entered_by"),
+        notes=body.get("notes"))
+    return JSONResponse({"ok": True, "id": row_id})

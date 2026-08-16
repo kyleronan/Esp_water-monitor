@@ -4,10 +4,43 @@
 
 Smarter fixture labeling, anomaly surfacing, and a round of volume-accuracy
 guardrails driven by a full audit of the add-on's stored events against raw
-Home Assistant history. (Shipped incrementally as dev1–dev17 — dev7/dev8
+Home Assistant history. (Shipped incrementally as dev1–dev41 — dev7/dev8
 landed without a version bump; per-build details are in git history.)
 
 ### New Features
+
+- **Measurement provenance lands in data, not code — dev41** — a conformance
+  review of the dev38 audit fixes against the audit's own decisions closed
+  the remaining gaps. Training hygiene: the dishwasher-label quarantine now
+  covers ALL remaining unreviewed machine labels (migration 20260806, no
+  time bounds — see the dev40 entry), and cycle-detector outputs no longer
+  feed the rule fits at all — the cycle detectors are gated by the very
+  bands being fit, so their labels can never again walk a band wider.
+  Leak tests: the addon-side measurement grew a quality gate — minimum
+  sample counts per phase, a measured noise floor (robust σ of detrended
+  monitor samples; the firmware baseline is a 1.375 s-smoothed 0.01-psi
+  read, so ripple, not quantization, is what the floor guards), a
+  sustainedness figure that separates a held drop from a recovered dip by
+  *shape*, the other circuit's valve state at monitor start, and the raw
+  monitor samples retained on the row. When any of these makes the
+  measurement indeterminate, the leak-rate estimate is not computed at all —
+  it no longer silently falls back to the raw two-point drop — and the
+  "transient dip" note stays silent; the firmware verdict is, as always,
+  never touched. Provenance: `other_valve_open` now records when/how the
+  valve state was established; `overlap_audit` stale marks carry a
+  timestamp; new ESP rows warn if the firmware omits a waveform boot id
+  (the 48-hour claim probe is load-bearing — boot ids are not persistent
+  counters). And the meter-registration correction curve moved out of code
+  into a versioned `registration_curve` table seeded from the audit
+  analysis and explicitly marked **unvalidated** — every stored estimate is
+  stamped with the curve version that produced it, new
+  `meter_anchor_points` / `utility_register_readings` tables hold the
+  physical reference data the curve must eventually be anchored against
+  (the audit's band table is committed at
+  `docs/audit_2026-08_registration_curve.md`), and the estimate stays
+  annotate-only: no volume, no total, no historical row is ever recomputed.
+  (Migration 20260807; the throttled-valve bucket test that flips the curve
+  to "anchored" — or refutes it — is a physical action still owed.)
 
 - **Bad dishwasher labels no longer teach the system — dev40** — a check of
   reviewed events on 2026-08-15 found the automatic "dishwasher cycle" label
@@ -22,16 +55,21 @@ landed without a version bump; per-build details are in git history.)
   and the usage baselines behind anomaly detection. Nothing about the events
   themselves changes — labels, verdicts and volumes are untouched, they still
   appear normally in History, and reviewing one restores it to the learning
-  pool immediately, since your label is ground truth. Only unreviewed
-  automatic labels in the two measured windows are marked; the outage window
-  is left alone pending re-grouping. The grouping rule that produced the bad
-  labels is unchanged for now — this stops the damage spreading while that fix
-  is validated.
+  pool immediately, since your label is ground truth. Every unreviewed
+  automatic dishwasher label is marked: the first pass (migration 20260805)
+  covered the two measured windows, and the dev41 sweep (migration 20260806)
+  extends it to everything else with no time bounds — the outage mid-window
+  had originally been exempted pending re-grouping, but re-grouping touches
+  cluster assignments, never labels, so the exemption protected nothing
+  while those rows kept feeding the fits. The grouping rule that produced
+  the bad labels is unchanged for now — this stops the damage spreading
+  while that fix is validated.
 
   Two smaller items ride along. Cluster health now shows up in the log at
   rebuild time: a warning when the fixture groups have blurred into each other
-  (the condition that preceded the dev39 outage — three groups on the main
-  circuit were 40–49 % overlapping on 2026-08-15), plus a count of how many
+  (the condition that preceded the dev39 outage — on 2026-08-15 no fixture
+  group on the main circuit had its members agreeing more than 49 % on a
+  single stored cluster), plus a count of how many
   distinct groups saw water in the last 48 hours. And the "Rebuild fixture
   grouping for current pressure" button no longer breaks when double-clicked:
   the rebuild takes about a minute with the page sitting there loading, so
@@ -93,9 +131,11 @@ landed without a version bump; per-build details are in git history.)
   flow and pressure on honest per-channel seconds axes (they were index-
   aligned across different cadences — misaligned on 18 % of events; new
   per-channel source metadata on `event_waveforms`); a new annotate-only
-  `registration_est_litres` estimates true volume where the meter's measured
-  low-flow under-registration bites (1.5–4 L/min reads 10–27 % low per the
-  audit's pressure-witness inversion) without touching any total; daily
+  `registration_est_litres` **estimates** true volume where the meter's
+  low-flow under-registration bites (per audit cross-analysis, 1.5–2.5 L/min
+  reads ~27 % low and 2.5–4 ~10 % low, relative to the meter's own
+  ≥ 8 L/min band and pending validation against a low-flow reference test)
+  without touching any total; daily
   summaries heal via a dirty-day marker drained nightly with no lookback
   limit (event counts were stale on 19 % of days — frozen post-day-end
   summaries plus reprocess re-imports); and `overlap_audit` rows whose events

@@ -113,10 +113,43 @@ _REGISTRATION_RATIO: Tuple[Tuple[float, float, float], ...] = (
 # fraction (mirrors the UI display threshold).
 _REGISTRATION_MIN_DELTA_FRAC = 0.02
 
+# dev41 (E1): the curve now LIVES IN DATA (registration_curve table, seeded
+# v1 = the constants above by migration 20260807) and is loaded here at boot
+# via set_registration_curve(). The constants remain only as the identical
+# fallback for a pre-20260807 schema. Every stored estimate is stamped with
+# the version that produced it (events.registration_curve_version).
+_curve_bands: Tuple[Tuple[float, float, float], ...] = _REGISTRATION_RATIO
+_curve_version: int = 1
+_curve_status: str = "unvalidated"
+
+
+def set_registration_curve(bands, version: int, status: str) -> None:
+    """Install the DB-backed curve: bands = [{band_lo_lpm, band_hi_lpm,
+    ratio}, ...] (band_hi_lpm None = unbounded), highest band first."""
+    global _curve_bands, _curve_version, _curve_status
+    parsed = tuple(
+        (float(b["band_lo_lpm"]),
+         math.inf if b["band_hi_lpm"] is None else float(b["band_hi_lpm"]),
+         float(b["ratio"]))
+        for b in bands)
+    if parsed:
+        _curve_bands = parsed
+        _curve_version = int(version)
+        _curve_status = str(status)
+
+
+def registration_curve_version() -> int:
+    return _curve_version
+
+
+def registration_curve_status() -> str:
+    """'unvalidated' until a low-flow anchor confirms the curve (E2)."""
+    return _curve_status
+
 
 def _registration_ratio(flow_lpm: float) -> float:
     """metered/true ratio for one sample's flow rate; 1.0 outside 1–∞."""
-    for lo, hi, ratio in _REGISTRATION_RATIO:
+    for lo, hi, ratio in _curve_bands:
         if lo <= flow_lpm < hi:
             return ratio
     return 1.0

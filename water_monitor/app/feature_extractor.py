@@ -3964,6 +3964,15 @@ def _enrich_from_waveform(
     # capture. Persisted so _wf_already_claimed can enforce one-record-one-event
     # across restarts and across the live/late-upgrade paths.
     features["waveform_boot_id"]      = meta.boot_id
+    # dev41 insert-path assertion (D4): every NEW ESP-sourced row must carry a
+    # boot_id — the claim ledger's (boot_id, event_id) key degrades to the
+    # 48-hour same-circuit probe without it (boot_id is NOT NVS-monotonic;
+    # the probe is load-bearing, not a stopgap — see PIPELINE.md). Legacy
+    # NULLs stay as honest unknowns; this only flags new writes. Non-fatal:
+    # enrichment must not die on a firmware omission.
+    if any_wf_used and meta.boot_id is None:
+        log.warning("ESP waveform claimed with NULL boot_id (event_id=%s) — "
+                    "claim dedup falls back to the 48h probe", meta.event_id)
     features["waveform_quality"]      = meta.quality
     features["waveform_overlap_score"] = round(overlap_score, 4)
     return True
@@ -4202,13 +4211,17 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
     # Prefer the firmware's cumulative integration sensor when present; fall back
     # to the old approximation only for legacy events with no timestamped samples.
     from .flow_integral import (integrate_litres, active_flow_features,
-                                registration_estimate)
+                                registration_estimate,
+                                registration_curve_version)
     flow_integral_litres, _integral_capped = integrate_litres(event.flow_samples)
     active = active_flow_features(event.flow_samples, duration)
     # dev38 ANNOTATION ONLY: registration-corrected estimate when flow spent
     # material time in the meter's under-registration band (1–8 L/min). Never
     # feeds volume_litres/effective or any total.
     registration_est = registration_estimate(event.flow_samples)
+    # dev41 (E1): stamp which curve version produced the estimate.
+    registration_curve_ver = (registration_curve_version()
+                              if registration_est is not None else None)
 
     # dev38 consistency clamp: true_avg comes from the TIMESTAMPED flow_samples
     # while peak comes from the (differently sampled) flow_readings list, so
@@ -4335,6 +4348,7 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
         "flow_integral_litres": round(flow_integral_litres, 3),
         # dev38 annotate-only meter-registration estimate (see flow_integral).
         "registration_est_litres": registration_est,
+        "registration_curve_version": registration_curve_ver,
         "active_flow_duration_seconds": active["active_flow_duration_seconds"],
         "true_avg_flow_lpm": active["true_avg_flow_lpm"],
         "flow_on_ratio": active["flow_on_ratio"],
@@ -4368,6 +4382,11 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
             else 0 if event.other_valve_open is False
             else None
         ),
+        # dev41 provenance for the tri-state (NULL on legacy/unknown).
+        "other_valve_open_source": getattr(
+            event, "other_valve_open_source", None),
+        "other_valve_open_set_at": getattr(
+            event, "other_valve_open_set_at", None),
         # The next five fields are DERIVED — provisional values here, then
         # overwritten by _finalize_derived_verdicts() before return (and again
         # after ESP-waveform enrichment in _process). Single source of truth

@@ -239,6 +239,18 @@ async def lifespan(app: FastAPI):
             orch.load_roles_from_db(_db)
         except Exception as e:
             log.warning("RBAC role pre-load failed (non-fatal): %s", e)
+        # dev41 (E1): install the DB-backed registration curve so every
+        # stored estimate is stamped with the version that produced it. The
+        # code-constant fallback is byte-identical to seeded v1, so a load
+        # failure changes nothing.
+        try:
+            from .database import get_registration_curve
+            from . import flow_integral
+            _ver, _bands, _status = get_registration_curve(_db)
+            if _bands:
+                flow_integral.set_registration_curve(_bands, _ver, _status)
+        except Exception as e:
+            log.warning("Registration-curve load failed (non-fatal): %s", e)
     except Exception as e:
         log.critical("DB migration failed — cannot start: %s", e)
         raise

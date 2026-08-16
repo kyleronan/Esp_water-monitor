@@ -66,9 +66,13 @@ _RANGE_PAD = 0.10              # widen fitted [lo, hi] ranges by 10% each side
 
 # Provenance → (weight, is_explicit). Explicit labels authorise; the rest refine.
 _W_EXPLICIT = 1.0
-_W_CYCLE = 0.75
 _W_KNN = 0.5
 _W_RULE = 0.25
+# dev41: cycle-tier outputs are EXCLUDED from rule fits entirely — the cycle
+# detectors are gated by the very bands being fit here, so feeding their
+# labels back in is a self-reinforcing loop (measured: the dishwasher band
+# walked 3.75 → 8.32 LPM across three fits on contaminated cycle labels).
+_CYCLE_VIAS = frozenset(("dishwasher_cycle", "washer_cycle", "softener_session"))
 
 # Per-key sanity metadata: kind + absolute physical bounds. Range keys also get a
 # span cap relative to RULE_DEFAULTS. Floor/ceiling keys are scalar.
@@ -137,13 +141,18 @@ def _provenance_weight(uft, src, mft, via) -> Optional[Tuple[str, float, bool]]:
     skip (no usable type)."""
     if uft:
         if src == "cycle":
-            return (uft, _W_CYCLE, False)
+            # dev41: cycle-stamped labels no longer feed rule fits at all —
+            # outputs of the bands being fit must not refine those bands.
+            return None
         # 'user', 'training', or legacy NULL source on a user-set label → explicit
         return (uft, _W_EXPLICIT, True)
     if mft:
+        if via in _CYCLE_VIAS:
+            # dev41: same self-training loop via the matcher tier — excluded.
+            return None
         if via == "knn":
             return (mft, _W_KNN, False)
-        # rule_*, washer_cycle, softener_session, zone_default, legacy cluster
+        # rule_*, zone_default, legacy cluster
         return (mft, _W_RULE, False)
     return None
 

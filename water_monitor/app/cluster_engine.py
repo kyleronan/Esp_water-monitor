@@ -370,6 +370,12 @@ class ClusterEngine:
             'flow_cv':                variability / avg_flow if avg_flow > 0 else 0.0,
             # Compound event signals
             'is_composite':           float(event.get('is_composite')           or 0),
+            # dev41: `or 0` DELIBERATELY conflates NULL (unknown) with 0
+            # (closed) — splitting into two features (value + known) changes
+            # the clustering feature space, which requires a full re-seed
+            # (the dev39 outage was a feature-space shift). A future split is
+            # reseed-gated: it may only ship in the same build as a pending
+            # re-seed, never standalone.
             'other_valve_open':       float(event.get('other_valve_open')       or 0),
             # Pressure scalars
             'pre_event_pressure_psi': float(event.get('pre_event_pressure_psi') or 0),

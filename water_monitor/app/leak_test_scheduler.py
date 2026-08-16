@@ -18,6 +18,7 @@ Two code paths:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -545,6 +546,7 @@ class LeakTestScheduler:
         # left no trace). The abort button cancels the task, so CancelledError
         # — a BaseException — has to be caught explicitly, and re-raised so the
         # cancellation still takes effect.
+        # (dev41 B3 helper is _other_valve_state on the class, below.)
         def _interrupted_row(reason: str):
             return self._store_result(
                 circuit, run_at, triggered_by, reason,
@@ -558,6 +560,19 @@ class LeakTestScheduler:
         # multi-psi "drop" was a transient dip the raw trace had fully
         # recovered from by test end).
         monitor_samples: list = []          # (utc_datetime, psi)
+        # dev41 (B1 latency diagnostic): the firmware freezes its baseline at
+        # the moment it flips to "In progress"; the addon only SEES that flip
+        # on its next poll. The freeze therefore happened somewhere between
+        # the previous poll and the sighting — record that bound. Diagnostic
+        # only, never a gate (the magnitude uses the firmware's own frozen
+        # baseline, so the latency cannot bias it).
+        prev_poll_ts: Optional[datetime] = None
+        sighting_latency_s: Optional[float] = None
+        # dev41 (B3): the other circuit's valve state at monitor start. An
+        # open other valve keeps the shared supply pump-held (VFD constant
+        # pressure), and ripple through an imperfect seal is a known false-
+        # signal source — the addon-side annotation goes indeterminate.
+        other_valve_state: str = "none"
 
         try:
             while (datetime.now(timezone.utc) - start_wait).total_seconds() < max_wait_seconds:
@@ -579,6 +594,12 @@ class LeakTestScheduler:
                 # drop rate meaningless.
                 if monitor_started_at is None and result_str == "In progress":
                     monitor_started_at = datetime.now(timezone.utc)
+                    if prev_poll_ts is not None:
+                        sighting_latency_s = round(
+                            (monitor_started_at - prev_poll_ts
+                             ).total_seconds(), 1)
+                    other_valve_state = await self._other_valve_state(circuit)
+                prev_poll_ts = datetime.now(timezone.utc)
 
                 if monitor_started_at is not None:
                     psi = await self._read_float(circuit_cfg.pressure_fast_sensor)
@@ -638,10 +659,16 @@ class LeakTestScheduler:
         # transient dip the trace recovered from; stored beside — never
         # instead of — the firmware verdict. pressure_drop keeps its
         # historical single-read meaning for comparability with old rows.
-        sustained_drop_psi, final_window_s, _tail_ts = _sustained_drop(
-            baseline_psi, monitor_samples)
-        if _tail_ts is not None:
-            final_read_ts = _tail_ts
+        # dev41 — the full addon-side measurement-quality pass (B1–B4):
+        # sustainedness (shape), per-phase minimum sample counts, a measured
+        # noise floor, and an 'ok'/'indeterminate' status that gates every
+        # addon-side consumer. The firmware verdict is untouched throughout.
+        stats = _monitor_stats(baseline_psi, monitor_samples,
+                               other_valve_state)
+        sustained_drop_psi = stats["sustained_drop_psi"]
+        final_window_s = stats["final_window_s"]
+        if stats["tail_ts"] is not None:
+            final_read_ts = stats["tail_ts"]
         settle_loss = (
             round(closed_psi - baseline_psi, 2)
             if closed_psi is not None and baseline_psi is not None
@@ -656,12 +683,21 @@ class LeakTestScheduler:
         )
         # dev38: the leak-rate estimate divides the SUSTAINED drop when one was
         # measured — a transient dip that recovered is not water leaving the
-        # line at a steady rate. Falls back to the single-read drop when the
-        # monitor window produced no samples (pre-3.13.2 firmware, aborts).
-        est_leak = self._estimate_leak_ml_min(
-            circuit,
-            sustained_drop_psi if sustained_drop_psi is not None else pressure_drop,
-            settle_loss, monitor_minutes, duration_minutes)
+        # line at a steady rate.
+        # dev41 (C1): when the addon-side measurement is INDETERMINATE, no
+        # estimate is computed at all — the old `sustained if not None else
+        # pressure_drop` fallback would have silently diverted the estimate
+        # to the raw two-point figure, a lower-quality number than the one
+        # just rejected. The pressure_drop fallback survives ONLY for rows
+        # that never had monitor samples (pre-3.13.2 firmware, aborts) —
+        # never for a figure deliberately withheld.
+        if stats["status"] == "indeterminate":
+            est_leak = None
+        else:
+            est_leak = self._estimate_leak_ml_min(
+                circuit,
+                sustained_drop_psi if sustained_drop_psi is not None else pressure_drop,
+                settle_loss, monitor_minutes, duration_minutes)
 
         # --- Persist result ---
         await self._store_result(
@@ -676,6 +712,16 @@ class LeakTestScheduler:
             sustained_drop_psi=sustained_drop_psi,
             monitor_started_at=(monitor_started_at.isoformat()
                                 if monitor_started_at is not None else None),
+            # dev41 measurement-quality columns (B1–B4).
+            sustainedness_psi=stats["sustainedness_psi"],
+            head_window_s=stats["head_window_s"],
+            monitor_sample_count=stats["monitor_sample_count"],
+            sighting_latency_s=sighting_latency_s,
+            addon_measure_status=stats["status"],
+            addon_measure_reason=stats["reason"],
+            other_valve_state=other_valve_state,
+            measured_noise_psi=stats["measured_noise_psi"],
+            monitor_samples_json=_samples_json(monitor_samples),
         )
 
         # --- Pump plan Phase 5b: cross-circuit verdict (vfd pump mode only).
@@ -896,6 +942,29 @@ class LeakTestScheduler:
                  circuit, verdict, slug)
         return verdict
 
+    async def _other_valve_state(self, tested_circuit: str) -> str:
+        """dev41 (B3) — the OTHER circuit's valve state at monitor start:
+        'open' | 'closed' | 'unknown' | 'none' (single-circuit home).
+        Recorded on the verdict row; 'open' marks the addon-side measurement
+        indeterminate (pump-held supply + seal ripple = false-signal source).
+        Best-effort: a fetch failure reads as 'unknown', never an error."""
+        other = next((c for c in self._cfg.circuits
+                      if c.circuit != tested_circuit), None)
+        if other is None:
+            return "none"
+        entity = getattr(other, "valve_entity", None)
+        if not entity:
+            return "none"
+        try:
+            s = str(await self._ha.get_state_value(entity, "") or "").lower()
+        except Exception:
+            return "unknown"
+        if s in ("open", "opening", "on"):
+            return "open"
+        if s in ("closed", "closing", "off"):
+            return "closed"
+        return "unknown"
+
     async def _pump_cross_check(self, tested_circuit: str,
                                 start_dt, end_dt) -> None:
         """Phase 5b (dev26): annotate the just-stored leak-test row with the
@@ -1066,6 +1135,16 @@ class LeakTestScheduler:
         final_window_s: Optional[float] = None,
         sustained_drop_psi: Optional[float] = None,
         monitor_started_at: Optional[str] = None,
+        sustainedness_psi: Optional[float] = None,
+        # (dev41 columns continue below)
+        head_window_s: Optional[float] = None,
+        monitor_sample_count: Optional[int] = None,
+        sighting_latency_s: Optional[float] = None,
+        addon_measure_status: Optional[str] = None,
+        addon_measure_reason: Optional[str] = None,
+        other_valve_state: Optional[str] = None,
+        measured_noise_psi: Optional[float] = None,
+        monitor_samples_json: Optional[str] = None,
     ) -> None:
         insert_leak_test_history(
             self._db,
@@ -1088,6 +1167,16 @@ class LeakTestScheduler:
             final_window_s=final_window_s,
             sustained_drop_psi=sustained_drop_psi,
             monitor_started_at=monitor_started_at,
+            # dev41 measurement-quality columns.
+            sustainedness_psi=sustainedness_psi,
+            head_window_s=head_window_s,
+            monitor_sample_count=monitor_sample_count,
+            sighting_latency_s=sighting_latency_s,
+            addon_measure_status=addon_measure_status,
+            addon_measure_reason=addon_measure_reason,
+            other_valve_state=other_valve_state,
+            measured_noise_psi=measured_noise_psi,
+            monitor_samples_json=monitor_samples_json,
         )
 
 
@@ -1109,6 +1198,107 @@ def _sustained_drop(baseline_psi, samples):
     median_psi = vals[len(vals) // 2]
     window_s = round((tail[-1][0] - tail[0][0]).total_seconds(), 1)
     return round(baseline_psi - median_psi, 2), window_s, tail[-1][0]
+
+
+# dev41 (B2): minimum samples per phase — a one-sample "median" is an
+# instantaneous read wearing a robust-statistic label.
+_MIN_PHASE_SAMPLES = 3
+# dev41 (B4): noise-floor floor. The firmware baseline is a single publish of
+# a 1.375 s-smoothed 0.01-psi stream (R1c inspection): quantization is a
+# non-issue, but pressure structure slower than ~1.4 s (pump/solenoid ripple)
+# survives the smoothing — the measured floor below is sized to that, with
+# this constant as the never-below bound.
+_NOISE_FLOOR_MIN_PSI = 0.15
+
+
+def _median(vals):
+    s = sorted(vals)
+    return s[len(s) // 2] if s else None
+
+
+def _samples_json(samples) -> Optional[str]:
+    """dev41 (B4) — raw (iso_ts, psi) monitor samples for retention."""
+    if not samples:
+        return None
+    return json.dumps([[t.isoformat(), p] for t, p in samples])
+
+
+def _monitor_stats(baseline_psi, samples, other_valve_state="none"):
+    """dev41 — addon-side measurement statistics over the monitor window.
+
+    Magnitude (definition unchanged from dev38 / _sustained_drop): the
+    FIRMWARE frozen baseline − median of the tail samples. The firmware
+    baseline is deliberate — an addon-side baseline would start after decay
+    has already begun on a real leak and systematically understate the drop.
+
+    Shape (new): ``sustainedness_psi`` = head median − tail median. ~0 =
+    flat window; positive = pressure kept falling (held, leak-like);
+    negative = the line RECOVERED (transient dip). Shape only, never
+    magnitude.
+
+    Status: 'ok' | 'indeterminate' (+reason) gates every addon-side consumer
+    (leak-rate estimate, transient-dip note). None = no samples at all
+    (pre-3.13.2 firmware, aborts) — the legacy pressure_drop fallback is
+    scoped to exactly that case, never to a withheld figure (C1).
+
+    Noise floor: robust σ (1.4826 × MAD) of residuals from a least-squares
+    line over the whole window — detrending removes the leak slope itself,
+    so what remains is measurement noise + ripple. |drop| ≤ max(3σ, 0.15)
+    → 'within_noise'. SCOPE LIMIT: this governs ONLY the addon-side
+    annotation and the transient-dip note; the firmware's threshold_psi and
+    the firmware test itself are never adjusted by any of it."""
+    out = {"sustained_drop_psi": None, "final_window_s": None, "tail_ts": None,
+           "sustainedness_psi": None, "head_window_s": None,
+           "monitor_sample_count": len(samples) if samples else 0,
+           "measured_noise_psi": None, "status": None, "reason": None}
+    if not samples or baseline_psi is None:
+        return out          # legacy path: no addon measurement ever existed
+    pts = list(samples)
+    n = len(pts)
+    # B2 — per-phase minimum; head and tail must be distinct sample sets.
+    if n < 2 * _MIN_PHASE_SAMPLES:
+        out["status"] = "indeterminate"
+        out["reason"] = "insufficient_samples"
+        return out          # figure withheld entirely (NULL)
+    tail = pts[-_MIN_PHASE_SAMPLES:]
+    head = pts[:_MIN_PHASE_SAMPLES]
+    tail_median = _median([p for _, p in tail])
+    head_median = _median([p for _, p in head])
+    out["sustained_drop_psi"] = round(baseline_psi - tail_median, 2)
+    out["final_window_s"] = round(
+        (tail[-1][0] - tail[0][0]).total_seconds(), 1)
+    out["tail_ts"] = tail[-1][0]
+    out["sustainedness_psi"] = round(head_median - tail_median, 2)
+    out["head_window_s"] = round(
+        (head[-1][0] - head[0][0]).total_seconds(), 1)
+    # B4 — measured noise floor: robust σ of detrended residuals.
+    t0 = pts[0][0]
+    xs = [(t - t0).total_seconds() for t, _ in pts]
+    ys = [p for _, p in pts]
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    slope = (sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+             if denom > 0 else 0.0)
+    resid = [y - (mean_y + slope * (x - mean_x)) for x, y in zip(xs, ys)]
+    med_r = _median(resid)
+    mad = _median([abs(r - med_r) for r in resid])
+    sigma = 1.4826 * mad
+    noise_floor = max(_NOISE_FLOOR_MIN_PSI, 3.0 * sigma)
+    out["measured_noise_psi"] = round(noise_floor, 3)
+    # B3 — state guarantee: an open other valve keeps the shared supply
+    # pump-held (VFD constant pressure); ripple through an imperfect seal is
+    # a known false-signal source.
+    if str(other_valve_state).lower() in ("open", "opening", "on"):
+        out["status"] = "indeterminate"
+        out["reason"] = "other_valve_open"
+        return out
+    if abs(out["sustained_drop_psi"]) <= noise_floor:
+        out["status"] = "indeterminate"
+        out["reason"] = "within_noise"
+        return out
+    out["status"] = "ok"
+    return out
 
 
 def _parse_utc_ts(ts_str: str) -> datetime:

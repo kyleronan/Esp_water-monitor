@@ -96,6 +96,11 @@ class RawEvent:
     # True if any other circuit's valve was open when this event started.
     # Helps distinguish main-circuit irrigation bleed-through from household demand.
     other_valve_open: Optional[bool] = None
+    # dev41 provenance for the tri-state above (supply_type_set_at precedent):
+    # how the underlying valve state was established ('ha_prime' at startup
+    # vs 'state_change') and when. None on legacy/unknown.
+    other_valve_open_source: Optional[str] = None
+    other_valve_open_set_at: Optional[str] = None
 
     # Measured volume from the firmware's cumulative integration sensor.
     # Set by the historical importer when the volume_sensor entity is available.
@@ -110,6 +115,14 @@ class RawEvent:
     # turbine's low-flow chatter doesn't fragment one draw into many events.
     # Cleared by on_flow_rate the instant flow resumes (bridging the dip).
     low_flow_hold_until: Optional[datetime] = None
+
+
+def _valve_meta_kwargs(meta: "Optional[Tuple[str, str]]") -> dict:
+    """dev41 — RawEvent kwargs for the other-valve provenance pair."""
+    if not meta:
+        return {}
+    return {"other_valve_open_source": meta[0],
+            "other_valve_open_set_at": meta[1]}
 
 
 # --------------------------------------------------------------------------- #
@@ -469,6 +482,8 @@ class CircuitEventDetector:
         flow_onset_entity: Optional[str] = None,
         debug_capture_propagation: bool = False,
         min_flow_lpm: float = 0.15,
+        get_other_valve_meta: Optional[
+            Callable[[], Optional[Tuple[str, str]]]] = None,
     ) -> None:
         self.circuit = circuit
         self.pressure_drop_threshold = pressure_drop_threshold_psi
@@ -482,6 +497,13 @@ class CircuitEventDetector:
         # Callable provided by parent EventDetector to read other-circuit valve states
         self._get_other_valve_open: Callable[[], Optional[bool]] = (
             get_other_valve_open or (lambda: None)
+        )
+        # dev41: (source, set_at_iso) provenance for the valve tri-state, or
+        # None when the state is unknown. Optional so tests/legacy callers
+        # that only wire the bool keep working.
+        self._get_other_valve_meta: Callable[
+            [], Optional[Tuple[str, str]]] = (
+            get_other_valve_meta or (lambda: None)
         )
 
         self._debug_capture_propagation: bool = debug_capture_propagation
@@ -1133,6 +1155,7 @@ class CircuitEventDetector:
             pressure_readings=pressure_seed,
             flow_samples=[(start_ts, self._current_flow_lpm)],
             other_valve_open=self._get_other_valve_open(),
+            **_valve_meta_kwargs(self._get_other_valve_meta()),
         )
 
     def _log_propagation_scan(
@@ -1257,6 +1280,7 @@ class CircuitEventDetector:
             flow_samples=[(now, self._current_flow_lpm)],
             flow_onset_entity=self._flow_onset_entity,
             other_valve_open=self._get_other_valve_open(),
+            **_valve_meta_kwargs(self._get_other_valve_meta()),
         )
         self._flow_sustained_since = None
 
@@ -2219,6 +2243,8 @@ class EventDetector:
         self._detectors: Dict[str, CircuitEventDetector] = {}
         # Tracks live valve open/closed state per circuit for cross-circuit feature
         self._valve_open: Dict[str, bool] = {}
+        # dev41: (source, set_at_iso) provenance per circuit for the above.
+        self._valve_meta: Dict[str, Tuple[str, str]] = {}
         # Chunked HA-event waveform accumulators (firmware 3.9.0+) — sole transport.
         self._chunk_accumulators: Dict[str, WaveformChunkAccumulator] = {}
         self._wf_event_subscribed: bool = False
@@ -2267,6 +2293,9 @@ class EventDetector:
                 event_queue=self._queue,
                 get_other_valve_open=(
                     lambda c=cfg.circuit: self._get_other_valve_open(c)
+                ),
+                get_other_valve_meta=(
+                    lambda c=cfg.circuit: self._get_other_valve_meta(c)
                 ),
                 flow_onset_entity=cfg.flow_onset_sensor,
                 debug_capture_propagation=self._debug_capture_propagation,
@@ -2381,6 +2410,9 @@ class EventDetector:
     def _on_valve_state(self, circuit: str, state: str) -> None:
         """Update tracked valve state for cross-circuit feature."""
         self._valve_open[circuit] = state in ("open", "on")
+        # dev41 provenance: how/when this circuit's state was established.
+        self._valve_meta[circuit] = (
+            "state_change", datetime.now(timezone.utc).isoformat())
 
     async def prime_valve_states(self) -> None:
         """Seed other-valve tracking from current HA state (dev38).
@@ -2414,6 +2446,8 @@ class EventDetector:
             # is fresher than the polled state and must not be overwritten.
             if cfg.circuit not in self._valve_open:
                 self._valve_open[cfg.circuit] = seeded
+                self._valve_meta[cfg.circuit] = (
+                    "ha_prime", datetime.now(timezone.utc).isoformat())
                 log.info("[%s] valve state primed: %s", cfg.circuit,
                          "open" if seeded else "closed")
 
@@ -2424,6 +2458,18 @@ class EventDetector:
         if not others:
             return None   # not yet observed
         return any(others.values())
+
+    def _get_other_valve_meta(
+            self, this_circuit: str) -> Optional[Tuple[str, str]]:
+        """dev41 — (source, set_at_iso) provenance for the aggregate the
+        method above returns: the most recently established other-circuit
+        state (in a two-circuit home there is exactly one). None when no
+        other state has been observed."""
+        metas = [m for c, m in self._valve_meta.items()
+                 if c != this_circuit and c in self._valve_open]
+        if not metas:
+            return None
+        return max(metas, key=lambda m: m[1])
 
     def reset_circuit(self, circuit: str) -> None:
         """Reset a single circuit (e.g. after valve close)."""

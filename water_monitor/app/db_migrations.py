@@ -268,6 +268,18 @@ _BASELINE_VERSION: int = 20260523
 #              of every training/exemplar pool (measured 9/19 and 1/10
 #              precision on user reviews; the labels had widened the fitted
 #              DW band 3.75→8.32 LPM). Labels/verdicts/volumes untouched.
+#   20260806 — dev41 quarantine sweep: flag ALL remaining unreviewed machine
+#              dishwasher-cycle labels (no time bounds — the 20260805
+#              mid-window exemption protected nothing, since re-attribution
+#              touches cluster ids, never labels; ~48 pre-July rows from the
+#              same over-firing gate ride along). Distinct reason string
+#              'dev40_precision_quarantine_sweep'; lift is reason-agnostic.
+#   20260807 — dev41 conformance-review DDL: other_valve_open provenance,
+#              registration_curve_version, leak-test measurement-quality
+#              columns (sustainedness/status/noise/raw samples),
+#              overlap_audit.stale_at, utility_register_readings,
+#              meter_anchor_points, registration_curve (v1 seeded
+#              'unvalidated' from the audit inversion).
 #
 # VERSION-NUMBER CONVENTION (2026-08-12, decided with the operator): from the
 # next migration onward, versions are YYYYMM + a 2-digit per-month sequence —
@@ -276,7 +288,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260805
+_CURRENT_VERSION: int = 20260807
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -2365,6 +2377,67 @@ def _apply_training_quarantine(conn: sqlite3.Connection) -> None:
         log.info("Migration 20260805: label/provenance columns absent — "
                  "quarantine backfill skipped (nothing to flag)")
     conn.commit()
+    # Belt-and-braces re-create of the wf-claim index — kept here per the
+    # last-migration convention (see 20260574/20260804) even though 20260806
+    # now follows: every forward walk must end up with the index regardless
+    # of start version, because the base schema deliberately omits it.
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+        conn.commit()
+
+
+# 20260806 — dev41 quarantine sweep: ALL remaining unreviewed machine
+# dishwasher labels, no time bounds.
+def _apply_training_quarantine_sweep(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260806 — sweep the remaining unreviewed
+    machine dishwasher-cycle labels into the training quarantine, with NO
+    start_ts bounds.
+
+    20260805 flagged two audited windows and deliberately exempted the
+    07-22..08-13 outage mid-window, reasoning it was sequenced for
+    re-attribution first — but re-attribution touches cluster ids, never
+    labels, so the exemption protected nothing while the mid-window rows kept
+    feeding every training pool (the post-quarantine refit still fit
+    DW_MAX_PK ≈ 8.59 from them). Planning review also surfaced ~48 more
+    unreviewed machine-DW rows predating 07-01, minted by the same over-firing
+    gate under the older band. Rather than a third hand-written window, this
+    sweep drops the window arithmetic entirely: every unreviewed machine
+    dishwasher label still unflagged is quarantined.
+
+    Distinct reason string ('dev40_precision_quarantine_sweep') gives real
+    per-migration provenance; readers only test IS NULL, and the relabel lift
+    (database.py set_user_fixture_type) clears the column unconditionally, so
+    flagged rows lift identically regardless of reason. Idempotent (only
+    NULL-reason rows are stamped); labels, verdicts and volumes untouched."""
+    from datetime import datetime, timezone
+    for col in ("training_quarantine_reason", "training_quarantined_at"):
+        if not _has_column(conn, "events", col):
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    if all(_has_column(conn, "events", c) for c in
+           ("matched_via", "fixture_label_source", "user_reviewed",
+            "user_fixture_type")):
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            "UPDATE events SET "
+            "       training_quarantine_reason = 'dev40_precision_quarantine_sweep', "
+            "       training_quarantined_at = ? "
+            "WHERE training_quarantine_reason IS NULL "
+            "  AND COALESCE(user_reviewed, 0) = 0 "
+            "  AND (matched_via = 'dishwasher_cycle' "
+            "       OR (fixture_label_source = 'cycle' "
+            "           AND user_fixture_type = 'dishwasher'))",
+            (now,))
+        log.info("Migration 20260806: swept %d remaining unreviewed "
+                 "dishwasher-cycle row(s) into the training quarantine",
+                 cur.rowcount)
+    else:
+        log.info("Migration 20260806: label/provenance columns absent — "
+                 "quarantine sweep skipped (nothing to flag)")
+    conn.commit()
     # Belt-and-braces re-create of the wf-claim index — this is now the LAST
     # migration, and the convention (see 20260574/20260804) is that every
     # forward walk must end up with the index regardless of start version,
@@ -2376,6 +2449,107 @@ def _apply_training_quarantine(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
             "ON events (circuit, waveform_boot_id, waveform_event_id)")
         conn.commit()
+
+
+# 20260807 — dev41 conformance-review DDL (all in one step, dev38 pattern).
+_DEV41_EVENT_COLUMNS = (
+    ("other_valve_open_set_at", "TEXT"),
+    ("other_valve_open_source", "TEXT"),
+    ("registration_curve_version", "INTEGER"),
+)
+_DEV41_LEAK_TEST_COLUMNS = (
+    ("sustainedness_psi", "REAL"),
+    ("head_window_s", "REAL"),
+    ("monitor_sample_count", "INTEGER"),
+    ("sighting_latency_s", "REAL"),
+    ("addon_measure_status", "TEXT"),
+    ("addon_measure_reason", "TEXT"),
+    ("other_valve_state", "TEXT"),
+    ("measured_noise_psi", "REAL"),
+    ("monitor_samples_json", "TEXT"),
+)
+# v1 registration curve — seeded from the audit's pressure-witness inversion
+# (flow_integral historically carried these as the _REGISTRATION_RATIO code
+# constants; dev41 moves them into data with provenance). Relative to the
+# meter's own >=8 L/min band; 'unvalidated' until a low-flow anchor lands.
+_DEV41_CURVE_V1 = (
+    (8.0, None, 0.999),
+    (4.0, 8.0, 0.941),
+    (2.5, 4.0, 0.904),
+    (1.5, 2.5, 0.732),
+    (1.0, 1.5, 0.59),
+)
+
+
+def _apply_dev41_conformance_ddl(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260807 — dev41 conformance-review DDL:
+
+      events.other_valve_open_set_at/_source — tri-state provenance (D6)
+      events.registration_curve_version      — estimate provenance (E1)
+      leak_test_history.*                    — addon-side measurement quality:
+                                               sustainedness (shape), sample
+                                               counts, sighting latency,
+                                               indeterminate status+reason,
+                                               noise floor, raw samples (B1-B4)
+      overlap_audit.stale_at                 — when the stale mark landed (D5)
+      utility_register_readings              — manual register pairs (item 7)
+      meter_anchor_points                    — bucket/timed-fill anchors (D1)
+      registration_curve                     — versioned correction curve,
+                                               v1 seeded 'unvalidated' from
+                                               the audit inversion (E1)
+
+    Additive, idempotent, tables-absent-safe."""
+    from datetime import datetime, timezone
+    if _has_table(conn, "events"):
+        for col, typ in _DEV41_EVENT_COLUMNS:
+            if not _has_column(conn, "events", col):
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col} {typ}")
+    if _has_table(conn, "leak_test_history"):
+        for col, typ in _DEV41_LEAK_TEST_COLUMNS:
+            if not _has_column(conn, "leak_test_history", col):
+                conn.execute(
+                    f"ALTER TABLE leak_test_history ADD COLUMN {col} {typ}")
+    if (_has_table(conn, "overlap_audit")
+            and not _has_column(conn, "overlap_audit", "stale_at")):
+        conn.execute("ALTER TABLE overlap_audit ADD COLUMN stale_at TEXT")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS utility_register_readings ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "reading_value REAL NOT NULL, reading_ts TEXT NOT NULL, "
+        "meter_serial TEXT, source TEXT, entered_by TEXT, notes TEXT, "
+        "created_at TEXT)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meter_anchor_points ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, circuit TEXT, "
+        "flow_rate_lpm REAL, measured_volume_l REAL, "
+        "reference_volume_l REAL, test_date TEXT, method TEXT, notes TEXT, "
+        "created_at TEXT)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS registration_curve ("
+        "curve_version INTEGER NOT NULL, band_lo_lpm REAL NOT NULL, "
+        "band_hi_lpm REAL, ratio REAL NOT NULL, status TEXT NOT NULL, "
+        "source TEXT, created_at TEXT, "
+        "PRIMARY KEY (curve_version, band_lo_lpm))")
+    # Seed curve v1 (idempotent via the PK).
+    now = datetime.now(timezone.utc).isoformat()
+    for lo, hi, ratio in _DEV41_CURVE_V1:
+        conn.execute(
+            "INSERT OR IGNORE INTO registration_curve "
+            "(curve_version, band_lo_lpm, band_hi_lpm, ratio, status, "
+            " source, created_at) VALUES (1, ?, ?, ?, 'unvalidated', "
+            " 'audit_2026-08_pressure_witness_inversion', ?)",
+            (lo, hi, ratio, now))
+    conn.commit()
+    # Belt-and-braces re-create of the wf-claim index — this is now the LAST
+    # migration (convention: see 20260574/20260804/20260806).
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+        conn.commit()
+    log.info("Migration 20260807: dev41 conformance-review DDL ready")
 
 
 def _missing_202608_columns(conn: sqlite3.Connection) -> set[str]:
@@ -2640,6 +2814,8 @@ _MIGRATIONS: tuple = (
     (20260803, _apply_resistance_backfill),
     (20260804, _apply_misattached_signature_null),
     (20260805, _apply_training_quarantine),
+    (20260806, _apply_training_quarantine_sweep),
+    (20260807, _apply_dev41_conformance_ddl),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

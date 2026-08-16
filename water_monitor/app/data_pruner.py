@@ -129,11 +129,12 @@ class DataPruner:
             try:
                 self._db.execute("""
                     UPDATE overlap_audit SET stale_reason =
-                        COALESCE(stale_reason, 'event_pruned')
+                        COALESCE(stale_reason, 'event_pruned'),
+                        stale_at = COALESCE(stale_at, ?)
                     WHERE stale_reason IS NULL
                       AND wrapper_event_id IN (
                           SELECT id FROM events WHERE start_ts < ?)
-                """, (events_cutoff,))
+                """, (now.isoformat(), events_cutoff))
             except Exception:
                 pass       # pre-20260801 schema
             cur = self._db.execute("""

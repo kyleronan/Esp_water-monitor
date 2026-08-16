@@ -855,6 +855,12 @@ CREATE TABLE IF NOT EXISTS events (
     time_features_tz            TEXT,
     is_composite                BOOLEAN DEFAULT 0,
     other_valve_open            INTEGER,           -- NULL=unknown 0=closed 1=open
+    -- dev41 (migration 20260807): provenance for the tri-state above, per
+    -- the supply_type_set_at precedent — when the underlying valve state was
+    -- last established and how ('ha_prime' at startup vs 'state_change').
+    -- Legacy rows stay NULL (honest unknowns).
+    other_valve_open_set_at     TEXT,
+    other_valve_open_source     TEXT,
     excluded_from_training      BOOLEAN DEFAULT 0,
     cluster_id                  INTEGER,
     -- Phase 2.1 type-aware match gate: when cluster_id IS NULL, this records
@@ -979,6 +985,9 @@ CREATE TABLE IF NOT EXISTS events (
     -- stores the inverse-curve estimate when it differs >2% from the raw
     -- integral. NEVER feeds volume_litres/effective or any total.
     registration_est_litres          REAL,
+    -- dev41 (migration 20260807): which registration_curve version produced
+    -- the estimate above (provenance; the curve now lives in data, not code).
+    registration_curve_version       INTEGER,
     hourly_volume_applied_litres     REAL DEFAULT 0,
     hourly_volume_applied_bucket     TEXT,
     degraded_diagnostic_json         TEXT,
@@ -1315,7 +1324,23 @@ CREATE TABLE IF NOT EXISTS leak_test_history (
     final_read_ts          TEXT,
     final_window_s         REAL,
     sustained_drop_psi     REAL,
-    monitor_started_at     TEXT
+    monitor_started_at     TEXT,
+    -- dev41 (migration 20260807): addon-side measurement-quality columns.
+    -- sustainedness_psi is SHAPE only (head median − tail median of the
+    -- monitor window: ~0 = held, negative = recovered) — never magnitude;
+    -- magnitude stays sustained_drop_psi (firmware baseline − tail median).
+    -- addon_measure_status 'ok' | 'indeterminate' gates every addon-side
+    -- consumer (leak-rate estimate, transient-dip note); NULL = legacy row.
+    -- The firmware verdict is never altered by any of these.
+    sustainedness_psi      REAL,
+    head_window_s          REAL,
+    monitor_sample_count   INTEGER,
+    sighting_latency_s     REAL,     -- diagnostic: firmware start → first addon sample
+    addon_measure_status   TEXT,     -- 'ok' | 'indeterminate' | NULL (legacy)
+    addon_measure_reason   TEXT,     -- e.g. 'insufficient_samples' | 'within_noise' | 'other_valve_open'
+    other_valve_state      TEXT,     -- B3 state record: 'open'|'closed'|'unknown'|'none'
+    measured_noise_psi     REAL,     -- noise floor from detrended head samples
+    monitor_samples_json   TEXT      -- raw (ts, psi) fast samples, B4 retention
 );
 
 -- ==========================================================================
@@ -1378,7 +1403,57 @@ CREATE TABLE IF NOT EXISTS overlap_audit (
     --   'event_pruned'            — referenced event removed by retention
     -- NULL = references live. The History reader skips/annotates stale rows.
     stale_reason     TEXT,
+    -- dev41 (migration 20260807): when the stale mark was applied. Orphaned
+    -- audit rows are evidence of deletion — annotated, never pruned.
+    stale_at         TEXT,
     UNIQUE (wrapper_event_id, resolution)
+);
+
+-- ==========================================================================
+-- METER ANCHORS (dev41, migration 20260807) — provenance in data, not code.
+-- ==========================================================================
+-- Manual utility-register reading pairs: the long-duration cumulative
+-- cross-check on the registration curve, and the low-flow anchor path if no
+-- throttled bucket tests are run.
+CREATE TABLE IF NOT EXISTS utility_register_readings (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    reading_value  REAL NOT NULL,      -- register units as read (record units in notes)
+    reading_ts     TEXT NOT NULL,      -- when the register was read
+    meter_serial   TEXT,
+    source         TEXT,               -- 'portal' | 'photo' | 'manual'
+    entered_by     TEXT,
+    notes          TEXT,
+    created_at     TEXT
+);
+
+-- Physical reference tests (bucket tests, timed fills): flow rate, what the
+-- meter said, what the reference measured. The registration curve is fit
+-- against these — never against constants folded into code.
+CREATE TABLE IF NOT EXISTS meter_anchor_points (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit             TEXT,
+    flow_rate_lpm       REAL,
+    measured_volume_l   REAL,          -- what the meter registered
+    reference_volume_l  REAL,          -- what the bucket / reference measured
+    test_date           TEXT,
+    method              TEXT,          -- 'bucket' | 'timed_fill' | 'utility_register'
+    notes               TEXT,
+    created_at          TEXT
+);
+
+-- The registration correction curve itself, versioned. v1 is seeded from the
+-- audit's pressure-witness inversion (relative to the meter's own >=8 L/min
+-- band) with status 'unvalidated'; the marker flips to 'anchored' — and the
+-- version increments — only when a low-flow anchor point confirms it.
+CREATE TABLE IF NOT EXISTS registration_curve (
+    curve_version  INTEGER NOT NULL,
+    band_lo_lpm    REAL NOT NULL,
+    band_hi_lpm    REAL,               -- NULL = unbounded (∞)
+    ratio          REAL NOT NULL,      -- metered ÷ true
+    status         TEXT NOT NULL,      -- 'unvalidated' | 'anchored'
+    source         TEXT,               -- e.g. 'audit_2026-08_pressure_witness_inversion'
+    created_at     TEXT,
+    PRIMARY KEY (curve_version, band_lo_lpm)
 );
 
 -- dev38 (migration 20260801): days whose daily_summary must be recomputed.
@@ -2923,9 +2998,11 @@ def delete_events_in_range(
             try:
                 conn.execute(
                     "UPDATE overlap_audit SET stale_reason = "
-                    "COALESCE(stale_reason, 'superseded_by_reprocess') "
+                    "COALESCE(stale_reason, 'superseded_by_reprocess'), "
+                    "stale_at = COALESCE(stale_at, ?) "
                     "WHERE wrapper_event_id = ? OR kept_event_ids LIKE ?",
-                    (r["id"], f'%"{r["id"]}"%'))
+                    (datetime.now(timezone.utc).isoformat(),
+                     r["id"], f'%"{r["id"]}"%'))
             except sqlite3.Error:
                 pass       # pre-20260801 schema
             conn.execute("DELETE FROM events WHERE id = ?", (r["id"],))
@@ -4138,6 +4215,77 @@ def insert_leak_test_history(conn: sqlite3.Connection, **kwargs) -> None:
     conn.execute(f"INSERT INTO leak_test_history ({cols}) VALUES ({placeholders})",
                  list(kwargs.values()))
     conn.commit()
+
+
+# ── dev41 — meter anchors + utility register readings ────────────────────────
+
+def insert_meter_anchor_point(conn: sqlite3.Connection, *, circuit=None,
+                              flow_rate_lpm=None, measured_volume_l=None,
+                              reference_volume_l=None, test_date=None,
+                              method="bucket", notes=None) -> int:
+    cur = conn.execute(
+        "INSERT INTO meter_anchor_points (circuit, flow_rate_lpm, "
+        " measured_volume_l, reference_volume_l, test_date, method, notes, "
+        " created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (circuit, flow_rate_lpm, measured_volume_l, reference_volume_l,
+         test_date, method, notes,
+         datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_meter_anchor_points(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM meter_anchor_points ORDER BY test_date, id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def insert_utility_register_reading(conn: sqlite3.Connection, *,
+                                    reading_value, reading_ts,
+                                    meter_serial=None, source="manual",
+                                    entered_by=None, notes=None) -> int:
+    cur = conn.execute(
+        "INSERT INTO utility_register_readings (reading_value, reading_ts, "
+        " meter_serial, source, entered_by, notes, created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (reading_value, reading_ts, meter_serial, source, entered_by, notes,
+         datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_utility_register_readings(
+        conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM utility_register_readings "
+        "ORDER BY reading_ts, id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_registration_curve(
+        conn: sqlite3.Connection) -> "Tuple[int, List[Dict[str, Any]], str]":
+    """dev41 (E1) — (curve_version, bands, status) for the LATEST curve.
+
+    Bands are dicts with band_lo_lpm / band_hi_lpm (None = unbounded) /
+    ratio, ordered high band first (the flow_integral lookup convention).
+    Status is 'anchored' only when every band of the version is anchored.
+    Returns (0, [], 'missing') on a pre-20260807 schema."""
+    try:
+        ver_row = conn.execute(
+            "SELECT MAX(curve_version) FROM registration_curve").fetchone()
+    except sqlite3.Error:
+        return 0, [], "missing"
+    if not ver_row or ver_row[0] is None:
+        return 0, [], "missing"
+    ver = int(ver_row[0])
+    rows = conn.execute(
+        "SELECT band_lo_lpm, band_hi_lpm, ratio, status "
+        "FROM registration_curve WHERE curve_version = ? "
+        "ORDER BY band_lo_lpm DESC", (ver,)).fetchall()
+    bands = [dict(r) for r in rows]
+    status = ("anchored" if bands and
+              all(b["status"] == "anchored" for b in bands) else "unvalidated")
+    return ver, bands, status
 
 
 def get_leak_test_history(
