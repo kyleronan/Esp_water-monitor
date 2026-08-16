@@ -280,6 +280,8 @@ _BASELINE_VERSION: int = 20260523
 #              overlap_audit.stale_at, utility_register_readings,
 #              meter_anchor_points, registration_curve (v1 seeded
 #              'unvalidated' from the audit inversion).
+#   20260808 — dev42: training_state.reseed_in_progress marker (F-C2) — a
+#              crashed re-seed leaves it set; boot warns until a rerun.
 #
 # VERSION-NUMBER CONVENTION (2026-08-12, decided with the operator): from the
 # next migration onward, versions are YYYYMM + a 2-digit per-month sequence —
@@ -288,7 +290,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260807
+_CURRENT_VERSION: int = 20260808
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -2552,6 +2554,31 @@ def _apply_dev41_conformance_ddl(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260807: dev41 conformance-review DDL ready")
 
 
+# 20260808 — dev42: reseed completion marker (F-C2).
+def _apply_reseed_marker_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260808 —
+    ``training_state.reseed_in_progress``: ISO timestamp stamped when a
+    cluster re-seed clears assignments, cleared only on success. A crash
+    mid-replay leaves it set (the 2026-08-15 11:56 reseed crash stranded a
+    part-cleared model with no persistent trace); boot and the post-rebuild
+    health pass warn loudly until a rerun succeeds. Additive, idempotent."""
+    if (_has_table(conn, "training_state")
+            and not _has_column(conn, "training_state", "reseed_in_progress")):
+        conn.execute("ALTER TABLE training_state "
+                     "ADD COLUMN reseed_in_progress TEXT")
+    conn.commit()
+    # Belt-and-braces re-create of the wf-claim index — LAST-migration
+    # convention (see 20260574/20260804/20260806/20260807).
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+        conn.commit()
+    log.info("Migration 20260808: reseed-in-progress marker column ready")
+
+
 def _missing_202608_columns(conn: sqlite3.Connection) -> set[str]:
     """Verifier for the 20260801 DDL (current-version guard set)."""
     missing = set()
@@ -2816,6 +2843,7 @@ _MIGRATIONS: tuple = (
     (20260805, _apply_training_quarantine),
     (20260806, _apply_training_quarantine_sweep),
     (20260807, _apply_dev41_conformance_ddl),
+    (20260808, _apply_reseed_marker_column),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

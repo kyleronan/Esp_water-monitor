@@ -4,10 +4,38 @@
 
 Smarter fixture labeling, anomaly surfacing, and a round of volume-accuracy
 guardrails driven by a full audit of the add-on's stored events against raw
-Home Assistant history. (Shipped incrementally as dev1–dev41 — dev7/dev8
+Home Assistant history. (Shipped incrementally as dev1–dev42 — dev7/dev8
 landed without a version bump; per-build details are in git history.)
 
 ### New Features
+
+- **The fake-dishwasher tap is turned off, and rebuilds can't corrupt the
+  books anymore — dev42** — three fixes, all found chasing last night's
+  numbers. First, the loose grouping rule that invented dishwasher cycles
+  out of chained faucet bursts (measured wrong 9 times in 10 after the last
+  re-seed) now requires each candidate fill to LOOK like a fill — steady,
+  gentle flow (flow variability ≤ 1.6 and at least 40 % of the draw at
+  steady state). Validated against three months of your reviews before
+  shipping: it keeps 8 of 9 genuine pre-outage cycles and rejects the burst
+  chains; this closes the last channel that was still minting bad labels
+  into the learning pools daily. Second, the "Rebuild fixture grouping"
+  action was quietly corrupting bookkeeping two ways: a recalibration
+  deleted provisional fixture groups while thousands of events still
+  pointed at them (the climbing "orphaned events" warning — 1,772 by last
+  night — with live matching happily assigning MORE events to the deleted
+  groups every day), and the rebuild itself could crash mid-run when a page
+  load touched the database at the wrong moment (the 8/15 crash), leaving a
+  half-rebuilt model with no trace. Now: deleting groups always unlinks
+  their events in the same transaction; the rebuild runs in small chunks
+  that share the database politely instead of fighting over it; events
+  arriving mid-rebuild wait and are matched against the FINISHED model,
+  never a half-built one; and a rebuild that dies leaves a persistent
+  "rebuild incomplete — rerun required" marker that warns at every boot
+  until a rerun succeeds (migration 20260808). Also recorded: the offline
+  parameter study concluded the 2-cluster collapse cannot be fixed by
+  tuning — no setting in a 30-configuration sweep escaped it — so the fix
+  is a feature-space redesign, queued deliberately rather than another
+  hopeful re-seed.
 
 - **Measurement provenance lands in data, not code — dev41** — a conformance
   review of the dev38 audit fixes against the audit's own decisions closed

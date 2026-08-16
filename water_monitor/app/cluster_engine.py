@@ -216,6 +216,12 @@ class ClusterEngine:
         # rebuild failed to attach (rejection 'unmapped_center'). Nonzero and
         # climbing = the restart desync; used to rate-limit the warning.
         self._unmapped_center_hits: Dict[str, int] = {}
+        # dev42 (F-C1) — circuits with a reseed replay in flight. While set,
+        # live match_and_learn calls DEFER (store NULL + 'reseed_deferred')
+        # instead of matching a partially rebuilt model; the reseed flushes
+        # them through the completed model after freeze. Never stores a
+        # wrong id — annotate-don't-modify favors no id over a bad one.
+        self._reseed_active: Dict[str, bool] = {}
 
         for c in cfg.circuits:
             self._init_circuit(c.circuit)
@@ -799,6 +805,33 @@ class ClusterEngine:
         within SEQUENCE_GAP_MAX_SECONDS, the cooccurrence table is updated.
         Stage 3 will apply a confidence boost from this table.
         """
+        # dev42 (F-C1): a reseed replay is rebuilding this circuit's model —
+        # matching now would consult a half-built center set and store a
+        # wrong-or-NULL id indistinguishable from an honest match. Defer:
+        # the reseed flushes 'reseed_deferred' rows through the completed
+        # model right after freeze. (The replay itself calls the internal
+        # path below, not this public method.)
+        if self._reseed_active.get(circuit):
+            return (None, 0.0, '', 'reseed_deferred')
+        return self._match_and_learn_impl(
+            event, circuit, prev_cluster_id, seconds_since_prev)
+
+    def begin_reseed(self, circuit: str) -> None:
+        """dev42 (F-C1) — defer live matching while a reseed replay runs.
+        Deliberately NOT cleared by a crashed reseed: a half-built model must
+        not resume matching; the F-C2 marker tells the user to rerun."""
+        self._reseed_active[circuit] = True
+
+    def end_reseed(self, circuit: str) -> None:
+        self._reseed_active[circuit] = False
+
+    def _match_and_learn_impl(
+        self,
+        event: dict,
+        circuit: str,
+        prev_cluster_id: Optional[int] = None,
+        seconds_since_prev: Optional[float] = None,
+    ) -> Tuple[Optional[int], float, str, Optional[str]]:
         features = self._extract_features(event, circuit)
         if features is None:
             return (None, 0.0, '', 'features_missing')
@@ -1029,8 +1062,10 @@ class ClusterEngine:
         count = 0
         for row in rows:
             event = dict(row)
+            # dev42: the internal path — the replay must keep working while
+            # the F-C1 deferral flag is set for live traffic.
             cluster_id, confidence, level, reason = \
-                self.match_and_learn(event, circuit)
+                self._match_and_learn_impl(event, circuit)
             if cluster_id is None:
                 # Record why the backfill couldn't place this event so the
                 # events page can surface "no_centers" vs.
@@ -1058,6 +1093,66 @@ class ClusterEngine:
         if count:
             log.info("[%s] backfill_unmatched: assigned cluster_id to %d events",
                      circuit, count)
+        return count
+
+    async def backfill_unmatched_async(self, circuit: str,
+                                       since_ts: Optional[str] = None,
+                                       batch: int = 100,
+                                       only_deferred: bool = False) -> int:
+        """dev42 (F1) — ``backfill_unmatched`` in event-loop-friendly chunks.
+
+        Runs ON the event loop (never an executor thread): the 8/15 reseed
+        crash was two threads sharing one SQLite connection
+        (InterfaceError: bad parameter or other API misuse). Chunking with an
+        ``await asyncio.sleep(0)`` between batches keeps the UI responsive
+        while every DB touch stays on one thread — the cross-thread misuse is
+        structurally gone, not narrowed.
+
+        ``only_deferred``: process only rows the F-C1 deferral stamped
+        'reseed_deferred' — the post-freeze flush. Without it, a second full
+        pass would re-run every abstained row in the window.
+        """
+        import asyncio
+        conds = ["circuit = ?", "cluster_id IS NULL",
+                 "excluded_from_training = 0", "end_ts IS NOT NULL"]
+        params: list = [circuit]
+        if since_ts:
+            conds.append("start_ts >= ?")
+            params.append(since_ts)
+        if only_deferred:
+            conds.append("match_rejection_reason = 'reseed_deferred'")
+        ids = [r[0] for r in self._db.execute(
+            f"SELECT id FROM events WHERE {' AND '.join(conds)} "
+            "ORDER BY start_ts ASC", params).fetchall()]
+        count = 0
+        for i in range(0, len(ids), batch):
+            chunk = ids[i:i + batch]
+            ph = ",".join("?" * len(chunk))
+            rows = self._db.execute(
+                f"SELECT * FROM events WHERE id IN ({ph}) "
+                "ORDER BY start_ts ASC", chunk).fetchall()
+            for row in rows:
+                event = dict(row)
+                cluster_id, confidence, level, reason = \
+                    self._match_and_learn_impl(event, circuit)
+                if cluster_id is None:
+                    self._db.execute(
+                        "UPDATE events SET match_rejection_reason = ? "
+                        "WHERE id = ?", (reason, event["id"]))
+                    continue
+                self._db.execute(
+                    """UPDATE events
+                       SET cluster_id = ?, match_confidence = ?,
+                           match_level = ?, match_rejection_reason = NULL
+                       WHERE id = ?""",
+                    (cluster_id, confidence, level, event["id"]))
+                count += 1
+            self._db.commit()
+            await asyncio.sleep(0)      # yield between chunks
+        if count:
+            log.info("[%s] backfill_unmatched_async: assigned cluster_id "
+                     "to %d events%s", circuit, count,
+                     " (deferred flush)" if only_deferred else "")
         return count
 
     # ── Type-level auto-merge ──────────────────────────────────────────────────
@@ -1267,6 +1362,21 @@ class ClusterEngine:
         except Exception as e:
             log.debug("[%s] 48h cluster-diversity metric failed "
                       "(non-fatal): %s", circuit, e)
+        # dev42 (F-C2): a stale reseed marker means a re-seed crashed
+        # mid-replay and never finished — the model this rebuild just
+        # replayed is part-cleared. Warn at every health pass until a rerun
+        # succeeds.
+        try:
+            r = self._db.execute(
+                "SELECT reseed_in_progress FROM training_state "
+                "WHERE circuit = ? AND reseed_in_progress IS NOT NULL",
+                (circuit,)).fetchone()
+            if r:
+                log.warning("[%s] post-rebuild health: reseed incomplete "
+                            "(started %s, never finished) — model untrusted, "
+                            "rerun required", circuit, r[0])
+        except Exception:
+            pass    # pre-20260808 schema
 
     def _rebuild_id_map_from_centroids(self, circuit: str) -> None:
         """

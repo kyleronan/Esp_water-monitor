@@ -415,7 +415,12 @@ CREATE TABLE IF NOT EXISTS training_state (
     -- 'pressure_blind' (pump-era re-seed; every pressure-derived dimension
     -- pinned to 0). Persisted so the startup replay rebuilds the space the
     -- centers were learned in.
-    cluster_features_mode TEXT DEFAULT 'full'
+    cluster_features_mode TEXT DEFAULT 'full',
+    -- dev42 (migration 20260808, F-C2): reseed-in-progress marker — an ISO
+    -- timestamp stamped when a cluster re-seed clears assignments, cleared
+    -- ONLY on success. A crash mid-replay leaves it set; boot and the
+    -- post-rebuild health pass warn "reseed incomplete — rerun required".
+    reseed_in_progress  TEXT
 );
 
 -- ==========================================================================
@@ -1455,6 +1460,16 @@ CREATE TABLE IF NOT EXISTS registration_curve (
     created_at     TEXT,
     PRIMARY KEY (curve_version, band_lo_lpm)
 );
+-- Base-schema/migration duality: a FRESH install must end in the same state
+-- as a migrated one — curve v1 seeded 'unvalidated' (mirrors 20260807).
+INSERT OR IGNORE INTO registration_curve
+    (curve_version, band_lo_lpm, band_hi_lpm, ratio, status, source, created_at)
+VALUES
+    (1, 8.0, NULL, 0.999, 'unvalidated', 'audit_2026-08_pressure_witness_inversion', CURRENT_TIMESTAMP),
+    (1, 4.0, 8.0,  0.941, 'unvalidated', 'audit_2026-08_pressure_witness_inversion', CURRENT_TIMESTAMP),
+    (1, 2.5, 4.0,  0.904, 'unvalidated', 'audit_2026-08_pressure_witness_inversion', CURRENT_TIMESTAMP),
+    (1, 1.5, 2.5,  0.732, 'unvalidated', 'audit_2026-08_pressure_witness_inversion', CURRENT_TIMESTAMP),
+    (1, 1.0, 1.5,  0.59,  'unvalidated', 'audit_2026-08_pressure_witness_inversion', CURRENT_TIMESTAMP);
 
 -- dev38 (migration 20260801): days whose daily_summary must be recomputed.
 -- The nightly gap-finder only looks 7 days back and permanently freezes a

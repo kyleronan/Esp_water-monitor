@@ -185,6 +185,55 @@ class TrainingManager:
                     "[%s] lowered calibration target %d → %d (%s circuit)",
                     circuit, current_min, new_min, circuit_kind)
 
+    def _set_reseed_marker(self, circuit: str, active: bool) -> None:
+        """dev42 (F-C2) — persisted reseed-in-progress marker. Set at
+        clear-time, cleared ONLY on success: a crash mid-replay leaves it
+        stamped, and the boot / post-rebuild health checks warn loudly that
+        the model is untrusted until a rerun succeeds. Best-effort on a
+        pre-20260808 schema."""
+        from datetime import datetime, timezone
+        try:
+            self._db.execute(
+                "UPDATE training_state SET reseed_in_progress = ? "
+                "WHERE circuit = ?",
+                (datetime.now(timezone.utc).isoformat() if active else None,
+                 circuit))
+            self._db.commit()
+        except sqlite3.Error as e:
+            log.warning("[%s] reseed marker write failed (non-fatal): %s",
+                        circuit, e)
+
+    def _clear_unconfirmed_clusters(self, circuit: str) -> int:
+        """dev42 (U4) — delete this circuit's unconfirmed cluster rows AND
+        null their event references in the same transaction, mirroring
+        ``delete_cluster``'s semantics.
+
+        The old bare DELETE left events pointing at the removed rows — and
+        because the engine's id map is rebuilt from those events' stored
+        votes, live matching kept assigning NEW events to the dead ids: the
+        self-perpetuating orphan loop behind the 990 → 1,772
+        events_orphaned climb (clusters 42/43 after the 8/15
+        reseed→recalibrate sequence). Confirmed clusters
+        (fixture_id IS NOT NULL) are untouched."""
+        unref = self._db.execute(
+            "UPDATE events SET cluster_id = NULL, match_confidence = NULL, "
+            "       match_level = NULL "
+            "WHERE circuit = ? AND cluster_id IN ("
+            "  SELECT id FROM fixture_clusters "
+            "  WHERE circuit = ? AND fixture_id IS NULL)",
+            (circuit, circuit),
+        ).rowcount
+        deleted = self._db.execute(
+            "DELETE FROM fixture_clusters "
+            "WHERE circuit = ? AND fixture_id IS NULL",
+            (circuit,),
+        ).rowcount
+        self._db.commit()
+        if deleted:
+            log.info("[%s] calibration start: cleared %d orphan cluster(s), "
+                     "unreferenced %d event(s)", circuit, deleted, unref)
+        return deleted
+
     async def start_calibration(self, circuit: str,
                                 calibration_days: int) -> bool:
         """
@@ -242,15 +291,7 @@ class TrainingManager:
         # stale micro-clusters don't pollute the new run.  Confirmed
         # clusters (fixture_id IS NOT NULL) are kept — they represent
         # user-labelled fixtures that should survive recalibration.
-        deleted = self._db.execute(
-            "DELETE FROM fixture_clusters "
-            "WHERE circuit = ? AND fixture_id IS NULL",
-            (circuit,),
-        ).rowcount
-        self._db.commit()
-        if deleted:
-            log.info("[%s] calibration start: cleared %d orphan cluster(s)",
-                     circuit, deleted)
+        self._clear_unconfirmed_clusters(circuit)
 
         # Reset in-memory DBSTREAM/scaler so the engine starts fresh
         # alongside the cleared cluster table.  Confirmed clusters in DB
@@ -569,7 +610,6 @@ class TrainingManager:
         their stats remain valid history); post-anchor assignments are cleared
         and re-derived in the new space. Ends frozen (locked reference).
         """
-        import functools
         if self.cluster_engine is None:
             return {"error": "cluster engine not wired"}
         # Lazy fallback: test fixtures build the manager without __init__.
@@ -582,34 +622,59 @@ class TrainingManager:
             return {"error": "a cluster re-seed is already running — "
                              "wait for it to finish, then retry if needed"}
         eng = self.cluster_engine
-        loop = asyncio.get_running_loop()
 
-        def _work() -> Dict[str, Any]:
-            # Persist the feature mode FIRST so a crash mid-seed restarts into
-            # the same space and the re-run is a clean redo, not a mix.
-            eng.set_pressure_blind(circuit, True)
-            # Post-anchor rows: drop stale assignments (they point at pre-pump
-            # centers) so the replay below re-derives them.
-            cleared = self._db.execute(
-                """UPDATE events SET cluster_id = NULL, match_confidence = NULL,
-                       match_level = NULL
-                   WHERE circuit = ? AND start_ts >= ?
-                     AND cluster_id IS NOT NULL""",
-                (circuit, since_ts)).rowcount
-            self._db.commit()
-            eng.reset_circuit(circuit)
-            eng.unfreeze_circuit(circuit)
-            # Learning replay, chronological, WINDOWED to the anchor — the
-            # cleared set plus the never-matched backlog the outage left
-            # behind, and nothing older: pre-anchor rows predate the
-            # fragmentation fixes and the supply change, and must not become
-            # centers in the new space.
-            assigned = eng.backfill_unmatched(circuit, since_ts=since_ts)
-            eng.freeze_circuit(circuit)
-            return {"cleared": cleared, "assigned": assigned}
-
+        # dev42 (F1): the replay runs ON the event loop in chunks — the 8/15
+        # crash was the executor thread and the loop sharing one SQLite
+        # connection (InterfaceError). dev42 (F2): any failure returns
+        # {"error": ...} instead of a raw 500. dev42 (F-C1/F-C2): live
+        # matches defer while the model is half-built, and a persisted
+        # marker survives a crash so an incomplete reseed is loud.
         async with self._reseed_lock:
-            result = await loop.run_in_executor(None, _work)
+            try:
+                self._set_reseed_marker(circuit, True)      # F-C2, at clear
+                eng.begin_reseed(circuit)                   # F-C1 defer
+                # Persist the feature mode FIRST so a crash mid-seed restarts
+                # into the same space and the re-run is a clean redo.
+                eng.set_pressure_blind(circuit, True)
+                # Post-anchor rows: drop stale assignments (they point at
+                # pre-pump centers) so the replay below re-derives them.
+                cleared = self._db.execute(
+                    """UPDATE events SET cluster_id = NULL,
+                           match_confidence = NULL, match_level = NULL
+                       WHERE circuit = ? AND start_ts >= ?
+                         AND cluster_id IS NOT NULL""",
+                    (circuit, since_ts)).rowcount
+                self._db.commit()
+                eng.reset_circuit(circuit)
+                eng.unfreeze_circuit(circuit)
+                # Learning replay, chronological, WINDOWED to the anchor —
+                # the cleared set plus the never-matched backlog, nothing
+                # older: pre-anchor rows predate the fragmentation fixes and
+                # the supply change, and must not become centers.
+                assigned = await eng.backfill_unmatched_async(
+                    circuit, since_ts=since_ts)
+                eng.freeze_circuit(circuit)
+                # F-C1 flush: live events that arrived mid-replay were
+                # stamped 'reseed_deferred' — re-match them through the
+                # COMPLETED model now.
+                eng.end_reseed(circuit)
+                flushed = await eng.backfill_unmatched_async(
+                    circuit, since_ts=since_ts, only_deferred=True)
+                self._set_reseed_marker(circuit, False)     # success only
+                result = {"cleared": cleared, "assigned": assigned,
+                          "flushed": flushed}
+            except Exception as e:
+                # F2: no raw ASGI 500. F-C2: the marker stays SET — the model
+                # is part-cleared and untrusted until a rerun succeeds; the
+                # boot/health check warns loudly. F-C1: the deferral flag
+                # also deliberately stays on (see begin_reseed) so a
+                # half-built model never matches live traffic.
+                log.error("[%s] cluster re-seed FAILED mid-replay — model "
+                          "incomplete, marker left set, rerun required: %s",
+                          circuit, e)
+                return {"error": f"re-seed failed mid-replay ({e}) — the "
+                                 "cluster model is incomplete; rerun the "
+                                 "re-seed"}
         log.info("[%s] cluster re-seed (pump era, pressure-blind): "
                  "%s stale assignment(s) cleared, %s event(s) clustered",
                  circuit, result.get("cleared"), result.get("assigned"))

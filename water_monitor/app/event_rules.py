@@ -148,6 +148,14 @@ _DW_MIN_CYCLE_PULSES: int = 3   # >=3 similar-volume neighbours in ±45 min == a
 _DW_CYCLE_CHAIN_GAP_MIN: float = 30.0   # consecutive fills <= this apart chain together
 _DW_CYCLE_MAX_SPAN_MIN: float = 180.0   # cap a session — a cycle isn't all afternoon
 _DW_CYCLE_MIN_MEMBERS: int = 3          # >=3 chained gentle fills == a cycle
+# dev42 (T5) — per-candidate shape gate. The tier's measured failure mode was
+# burst-chaining (short spiky faucet draws strung into a fake cycle; 9/19
+# precision pre-outage, 1/10 post-reseed). A genuine fill is steady:
+# validated out-of-sample on the pre-outage reviews at recall 0.889 /
+# precision 0.727. CONFIGURED CONSTANTS, never auto-fit (LOO: thresholds
+# weakly identified at n=50). STRUCTURAL — never in RULE_DEFAULTS.
+_DW_CYCLE_MAX_FLOW_VARIABILITY: float = 1.6
+_DW_CYCLE_MIN_STEADY_FRACTION: float = 0.4
 
 _SHOWER_BIG_VOL_L: float = 30.0
 _SHOWER_BIG_DUR_S: float = 300.0
@@ -461,7 +469,8 @@ def detect_dishwasher_cycles(
     params.append(limit)
     rows = conn.execute(
         "SELECT id, start_ts, duration_seconds, volume_litres, peak_flow_lpm, "
-        "       has_pressure_transient, pressure_delta_psi "
+        "       has_pressure_transient, pressure_delta_psi, "
+        "       flow_variability, steady_state_fraction "
         f"FROM events {where} ORDER BY start_ts LIMIT ?",
         params,
     ).fetchall()
@@ -475,6 +484,20 @@ def detect_dishwasher_cycles(
             continue                       # already a washer/softener member
         v, pk = r["volume_litres"], r["peak_flow_lpm"]
         if v is None or pk is None or not (dw_vol[0] <= v <= dw_vol[1]) or pk > dw_pk:
+            continue
+        # dev42 (T5) — per-candidate shape gate: a genuine fill is a gentle,
+        # steady draw; the burst-chaining failure mode (short faucet bursts
+        # strung into a fake fill-and-drain sequence — measured 1/10
+        # precision post-reseed) rides on spiky, unsteady candidates.
+        # Validated out-of-sample on the 7/01–7/21 pre-outage reviews:
+        # recall 0.889, precision 0.727 (G6, dev42 plan §10.6). Configured
+        # constants, NOT auto-fit — LOO showed thresholds are weakly
+        # identified at n=50. NULL features (legacy rows) pass unchallenged:
+        # the gate must not silently delabel history the features can't vet.
+        fv, ssf = r["flow_variability"], r["steady_state_fraction"]
+        if fv is not None and fv > _DW_CYCLE_MAX_FLOW_VARIABILITY:
+            continue
+        if ssf is not None and ssf < _DW_CYCLE_MIN_STEADY_FRACTION:
             continue
         feats = {"volume_litres": v, "duration_seconds": r["duration_seconds"],
                  "peak_flow_lpm": pk, "has_pressure_transient": r["has_pressure_transient"],

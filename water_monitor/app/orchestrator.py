@@ -569,6 +569,21 @@ class Orchestrator:
                 "Orphan-reference integrity check failed (non-fatal): %s", _e
             )
 
+        # dev42 (F-C2): a reseed that crashed mid-replay leaves its marker
+        # stamped — the cluster model was part-cleared and never finished
+        # rebuilding. Warn on every boot until a rerun succeeds.
+        try:
+            for _r in self._db.execute(
+                    "SELECT circuit, reseed_in_progress FROM training_state "
+                    "WHERE reseed_in_progress IS NOT NULL"):
+                log.warning(
+                    "[%s] reseed incomplete (started %s, never finished) — "
+                    "cluster model untrusted; rerun 'Rebuild fixture "
+                    "grouping for current pressure' in Settings",
+                    _r["circuit"], _r["reseed_in_progress"])
+        except Exception:
+            pass    # pre-20260808 schema
+
         # HA client
         self._ha = HaClient()
         await self._ha.__aenter__()
