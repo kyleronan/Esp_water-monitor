@@ -285,10 +285,18 @@ async def repair_stale_links(request: Request):
             counts = find_orphaned_cluster_references(orch.db, repair=True)
             if engine:
                 for c in orch._cfg.circuits:
+                    # dev44: RESET before replay. rebuild_from_db does not
+                    # clear the live engine's model or river→DB id map (at
+                    # startup _init_circuit made them fresh) — replaying on
+                    # top of a poisoned map left the dominant center's stale
+                    # dead-cluster entry in place, and the very next backfill
+                    # re-minted 1,736 orphans through it (observed 8/16
+                    # 10:20:43, ninety seconds after the first repair).
+                    engine.reset_circuit(c.circuit)
                     await loop.run_in_executor(
                         None, functools.partial(engine.rebuild_from_db,
                                                 c.circuit))
-        log.info("repair-stale-links: %s (engine rebuilt)", counts)
+        log.info("repair-stale-links: %s (engine reset + rebuilt)", counts)
     except Exception as e:
         log.error("repair-stale-links failed: %s", e, exc_info=True)
         return ingress_redirect(request, "/fixtures?msg=error")

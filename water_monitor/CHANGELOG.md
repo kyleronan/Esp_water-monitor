@@ -4,10 +4,23 @@
 
 Smarter fixture labeling, anomaly surfacing, and a round of volume-accuracy
 guardrails driven by a full audit of the add-on's stored events against raw
-Home Assistant history. (Shipped incrementally as dev1–dev43 — dev7/dev8
+Home Assistant history. (Shipped incrementally as dev1–dev44 — dev7/dev8
 landed without a version bump; per-build details are in git history.)
 
 ### New Features
+
+- **The stale-link repair now resets the matcher, so the cleanup sticks —
+  dev44** — the first click of dev43's "Clear stale group links" cleared all
+  1,787 stranded references, and ninety seconds later the startup's backfill
+  quietly re-created 1,736 of them: the repair rebuilt the in-memory matcher
+  WITHOUT resetting it first, and a rebuild on a live matcher layers new
+  events onto the existing model without clearing its group-id map — the
+  poisoned entry pointing at the deleted group survived underneath, and the
+  very next matching pass wrote it back onto every event. The repair now
+  resets the matcher before replaying (the same reset-then-replay order the
+  rebuild action has always used), regression-tested with a deliberately
+  poisoned map. Click the button once more after this update to clear the
+  re-minted references for good.
 
 - **The stale-group cleanup finally has a button — dev43** — dev42 stopped
   rebuilds from stranding events on deleted fixture groups, but the 1,776
