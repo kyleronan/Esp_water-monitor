@@ -431,7 +431,16 @@ CREATE TABLE IF NOT EXISTS circuit_profile (
     -- Flow-meter pulses-per-litre (migration 20260546). The add-on's CACHE of
     -- the firmware's runtime PPL number entity (firmware is the source of truth);
     -- the low-flow floor is derived as 60 ÷ ppl. Default 396 = reference turbine.
-    pulses_per_litre    REAL DEFAULT 396.0
+    pulses_per_litre    REAL DEFAULT 396.0,
+    -- Winterized (migration 20260809, dev46 46h). The circuit is deliberately
+    -- drained for the season: its meter and transducer sit downstream of the
+    -- shutoff and drain with it, so ~0 psi for months is EXPECTED, and
+    -- drain-down day would otherwise look like a catastrophic pressure event.
+    -- While set, the event detector skips the circuit, supply-regime sampling
+    -- and the pump-regime nightly exclude it, and baselines / leak-test
+    -- scheduling pause. Clearing it restores everything (with a brief grace so
+    -- spring re-pressurisation does not alarm either).
+    winterized          INTEGER DEFAULT 0
 );
 
 -- ==========================================================================
@@ -1064,6 +1073,20 @@ CREATE TABLE IF NOT EXISTS events (
     -- reviewed events are never flagged.
     training_quarantine_reason       TEXT,
     training_quarantined_at          TEXT,
+    -- User training-exclusion (migration 20260809, dev46 46f). "Keep my label,
+    -- but do not train on this event." Set when a label is TRUE while the
+    -- event's FEATURES describe a composite draw — without it the only way to
+    -- keep such an event out of training was to lie about its label. DISTINCT
+    -- from training_quarantine_reason above and NOT lifted by review: review
+    -- is what SETS this one. Pool readers filter on it alongside quarantine.
+    training_excluded_by_user        INTEGER DEFAULT 0,
+    -- Per-channel signature spans (migration 20260809, dev46 46i). The real
+    -- captured duration of each signature channel, so the event modal can draw
+    -- an honest per-channel time axis instead of a proportional overlay.
+    -- Forward-only: legacy rows stay NULL and keep the proportional render,
+    -- because their true spans are unknowable (annotate-don't-modify).
+    flow_sig_span_s                  REAL,
+    pressure_sig_span_s              REAL,
     -- Embedded-fixture annotation (migration 20260548). JSON array of draws
     -- found superimposed on a sustained event's waveform (a toilet flushed
     -- mid-shower) by composite_detector. Metadata ONLY — never changes the
@@ -2404,6 +2427,74 @@ def get_valve_type(
     return normalize_valve_type(raw)
 
 
+# dev46 (46h) — winterization.
+#
+# After a circuit is un-winterized the plumbing has to refill and re-pressurise,
+# which looks exactly like the catastrophic pressure event the detector exists
+# to catch. This grace window keeps the alarms quiet through that transition;
+# the toggle going ON has no grace by design, because the operator sets it
+# BEFORE draining (there is nothing to suppress yet).
+WINTERIZE_UNSET_GRACE_S: int = 3600
+
+
+def get_incomplete_reseed(conn: sqlite3.Connection,
+                         circuit: str) -> Optional[str]:
+    """dev46 (46j) — the F-C2 marker, for the UI rather than just the log.
+
+    ``training_state.reseed_in_progress`` holds the ISO timestamp stamped when
+    a cluster re-seed cleared assignments, and is cleared only on success. A
+    crash mid-replay therefore leaves it set with a part-cleared model behind
+    it (the 2026-08-15 11:56 crash stranded exactly that state). dev42 warned
+    at boot and in the health pass; both are places the operator does not
+    look. Returns the timestamp, or None when the model is intact.
+    """
+    try:
+        row = conn.execute(
+            "SELECT reseed_in_progress FROM training_state WHERE circuit = ?",
+            (circuit,)).fetchone()
+    except sqlite3.OperationalError:
+        return None                       # pre-20260808 schema
+    return (row["reseed_in_progress"] or None) if row else None
+
+
+def is_circuit_winterized(conn: sqlite3.Connection, circuit: str) -> bool:
+    """True while ``circuit`` is deliberately drained for the season.
+
+    Its meter and transducer sit downstream of the shutoff and drain with it,
+    so ~0 psi for months is EXPECTED — not a fault, not a leak, and not water
+    that went missing. Consumers pause rather than alarm; see
+    ``winterize_grace_active`` for the other side of the transition.
+
+    Forgiving: a missing profile row or a pre-20260809 schema reads as False,
+    so a partially-migrated DB never silently mutes a live circuit.
+    """
+    try:
+        row = conn.execute(
+            "SELECT winterized FROM circuit_profile WHERE circuit = ?",
+            (circuit,)).fetchone()
+    except sqlite3.OperationalError:
+        return False                      # pre-20260809 schema
+    return bool(row and row["winterized"])
+
+
+def set_circuit_winterized(conn: sqlite3.Connection, circuit: str,
+                           winterized: bool, commit: bool = True) -> None:
+    """Set/clear the winterized flag, stamping the un-set time for the grace.
+
+    The stamp lives in ``training_state.winterize_cleared_at``-free territory:
+    it is kept in memory by the orchestrator rather than schema'd, because the
+    grace is a boot-scoped courtesy — a restart during re-pressurisation is
+    rare, and the worst case is one spurious alarm the operator can dismiss,
+    versus a schema column that would outlive its usefulness every spring.
+    """
+    conn.execute(
+        "INSERT INTO circuit_profile (circuit, winterized) VALUES (?, ?) "
+        "ON CONFLICT(circuit) DO UPDATE SET winterized = excluded.winterized",
+        (circuit, 1 if winterized else 0))
+    if commit:
+        conn.commit()
+
+
 def set_valve_type(
     conn: sqlite3.Connection,
     circuit: str,
@@ -2524,6 +2615,11 @@ _EVENT_USER_COLUMNS: frozenset[str] = frozenset({
     # Label provenance ('user'/'cycle'/'training') — preserved so a re-import
     # never drops the auto-label source that drives the undo + exclude-warning.
     "fixture_label_source",
+    # dev46 (46f): "keep my label, but don't train on this event" is a USER
+    # intent, exactly like user_ignored above. A re-import or reprocess must
+    # not silently un-exclude an event the user deliberately held out — the
+    # composite features that motivated the flag are still composite.
+    "training_excluded_by_user",
 })
 
 # Columns whose values must NOT be overwritten by an event-row upsert.
@@ -3662,6 +3758,7 @@ def patch_event(
     user_ignored=_PATCH_UNSET,
     user_reviewed=_PATCH_UNSET,
     review_verdict=_PATCH_UNSET,
+    training_excluded_by_user=_PATCH_UNSET,
 ) -> bool:
     """Update user-editable fields on a single event.
 
@@ -3714,6 +3811,12 @@ def patch_event(
             ", user_reviewed = 1, review_verdict = NULL"
             ", training_quarantine_reason = NULL, training_quarantined_at = NULL"
             if user_fixture_type else "")
+        # dev46 (46f): note what this does NOT clear —
+        # training_excluded_by_user survives a relabel BY DESIGN. The dev40
+        # quarantine distrusts a MACHINE label, so a user label supersedes
+        # it; the 46f flag says "my label is right but the FEATURES are a
+        # composite", which relabelling cannot make untrue. Review is what
+        # SETS it, so review must not lift it.
         conn.execute(
             "UPDATE events SET user_fixture_type = ?, fixture_label_source = ?, "
             "cycle_group_id = NULL" + _resolve_review + " "
@@ -3735,6 +3838,14 @@ def patch_event(
             "UPDATE events SET excluded_from_training = ? WHERE id = ? AND circuit = ?",
             (1 if excluded_from_training else 0, event_id, circuit),
         )
+    if training_excluded_by_user is not _PATCH_UNSET:
+        # dev46 (46f): "keep my label, but don't train on this event."
+        # Annotate-don't-modify — touches no label, verdict or volume.
+        conn.execute(
+            "UPDATE events SET training_excluded_by_user = ? "
+            "WHERE id = ? AND circuit = ?",
+            (1 if training_excluded_by_user else 0, event_id, circuit))
+
     if user_reviewed is not _PATCH_UNSET:
         # Anomaly triage: "I looked at this flagged event" — clears it from the
         # dashboard's unreviewed-anomalies count. Display/triage state only.
@@ -5344,6 +5455,7 @@ def _knn_usable_label_counts(conn: sqlite3.Connection, circuit: str) -> Dict[str
         "WHERE circuit = ? AND user_fixture_type IS NOT NULL "
         "  AND COALESCE(excluded_from_training, 0) = 0 "
         "  AND training_quarantine_reason IS NULL "
+        "  AND COALESCE(training_excluded_by_user, 0) = 0 "
         "GROUP BY user_fixture_type", (circuit,)).fetchall()}
 
 
@@ -5373,6 +5485,7 @@ def recompute_cluster_suggestion_from_user_labels(
         "  AND e.user_fixture_type IS NOT NULL "
         "  AND COALESCE(e.excluded_from_training, 0) = 0 "
         "  AND e.training_quarantine_reason IS NULL "
+        "  AND COALESCE(e.training_excluded_by_user, 0) = 0 "
         "GROUP BY e.id, e.user_fixture_type",
         (circuit, cluster_id),
     ).fetchall()
@@ -5978,7 +6091,8 @@ def upsert_fixture_signature(
             WHERE circuit = ?
               AND user_fixture_type = ?
               AND COALESCE(excluded_from_training, 0) = 0
-              AND training_quarantine_reason IS NULL""",
+              AND training_quarantine_reason IS NULL
+              AND COALESCE(training_excluded_by_user, 0) = 0""",
         (circuit, fixture_type),
     ).fetchall()
     if not rows:
@@ -6478,6 +6592,7 @@ def match_event_to_signature_knn(
                 "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
                 "  AND COALESCE(excluded_from_training, 0) = 0 "
                 "  AND training_quarantine_reason IS NULL "
+                "  AND COALESCE(training_excluded_by_user, 0) = 0 "
                 "  AND COALESCE(integration_quality, 'ok') = 'ok' "
                 "  AND true_avg_flow_lpm IS NOT NULL "
                 "  AND active_flow_duration_seconds IS NOT NULL "
@@ -6514,6 +6629,7 @@ def match_event_to_signature_knn(
             "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
             "  AND COALESCE(excluded_from_training, 0) = 0 "
             "  AND training_quarantine_reason IS NULL "
+            "  AND COALESCE(training_excluded_by_user, 0) = 0 "
             "  AND COALESCE(integration_quality, 'ok') = 'ok' "
             "  AND true_avg_flow_lpm IS NOT NULL "
             "  AND active_flow_duration_seconds IS NOT NULL "
@@ -6547,6 +6663,7 @@ def _legacy_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any]]:
         "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
         "  AND COALESCE(excluded_from_training, 0) = 0 "
         "  AND training_quarantine_reason IS NULL"
+        "  AND COALESCE(training_excluded_by_user, 0) = 0"
     )
     if len(legacy) < _SIGNATURE_KNN_MIN_TOTAL_LABELS:
         return _invariant_knn_fallback(_labelled, event_features)
@@ -6593,6 +6710,7 @@ def _invariant_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any
         "  AND user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
         "  AND COALESCE(excluded_from_training, 0) = 0 "
         "  AND training_quarantine_reason IS NULL "
+        "  AND COALESCE(training_excluded_by_user, 0) = 0 "
         "  AND volume_litres > 0 AND duration_seconds > 0"
     )
     if len(rows) < _SIGNATURE_KNN_MIN_TOTAL_LABELS:

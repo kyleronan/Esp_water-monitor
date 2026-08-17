@@ -96,7 +96,8 @@ async def settings_page(request: Request):
     if gated is not None:
         return gated
     orch = _orch(request)
-    from ..database import (get_home_profile, get_sensitivity_config,
+    from ..database import (
+    is_circuit_winterized, get_incomplete_reseed, get_home_profile, get_sensitivity_config,
                             get_alert_configs)
     from ..device_discovery import get_device_config
 
@@ -284,6 +285,8 @@ async def settings_page(request: Request):
                 "art_meta": get_artifact_calibration_meta(orch.db, cid),
                 "dv": load_validation_report(orch.db, cid),
                 "valve_type": get_valve_type(orch.db, cid),
+                "winterized": is_circuit_winterized(orch.db, cid),
+                "incomplete_reseed": get_incomplete_reseed(orch.db, cid),
                 "exclusion": get_active_exclusion_window(orch.db, cid),
             }
         return out
@@ -310,6 +313,8 @@ async def settings_page(request: Request):
             "display_name": circuit_cfg.label,
             "circuit_type": circuit_cfg.circuit_type,
             "valve_type": _row["valve_type"],
+            "winterized": _row["winterized"],
+            "incomplete_reseed": _row["incomplete_reseed"],
             # Runtime per-circuit flow meter (read-only). The firmware "Flow Meter PPL"
             # number entity is the source of truth; the add-on caches it and derives the
             # low-flow floor (60 ÷ ppl). Read from the LIVE config so the display reflects
@@ -1443,6 +1448,62 @@ async def circuit_type_update(circuit: str, request: Request):
         "circuit": circuit,
         "circuit_type": circuit_type,
     })
+
+
+@router.post("/circuit/{circuit}/winterized")
+async def circuit_winterized_update(circuit: str, request: Request):
+    """dev46 (46h) — mark a circuit drained for the season, or back in service.
+
+    While set, the event detector skips the circuit, supply-regime sampling
+    and the pump-regime nightly leave it out, and leak tests do not run: its
+    meter and transducer are downstream of the shutoff and drain with it, so
+    ~0 psi is EXPECTED rather than a catastrophic pressure event.
+
+    Clearing it re-arms everything immediately and starts a short grace window
+    so the refill/re-pressurisation itself does not alarm. The set direction
+    has no grace by design — the operator sets it BEFORE draining, so there is
+    nothing yet to suppress.
+    """
+    from ..circuit_compat import resolve_circuit
+    from ..database import is_circuit_winterized, set_circuit_winterized
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+
+    if not orch._cfg.get_circuit(circuit):
+        return JSONResponse(
+            {"status": "error", "message": f"Unknown circuit: {circuit}"},
+            status_code=404,
+        )
+
+    form = await request.form()
+    raw = str(form.get("winterized", "")).strip().lower()
+    if raw not in ("0", "1", "true", "false", "on", "off"):
+        return JSONResponse(
+            {"status": "error",
+             "message": f"Invalid winterized value {raw!r}"},
+            status_code=400,
+        )
+    wanted = raw in ("1", "true", "on")
+
+    current = await run_db(is_circuit_winterized, orch.db, circuit)
+    if current == wanted:
+        return JSONResponse({"status": "no_change", "circuit": circuit,
+                             "winterized": wanted})
+
+    await run_db(set_circuit_winterized, orch.db, circuit, wanted)
+    # Re-arm / stand down the live detector without waiting for a restart.
+    try:
+        if orch.event_detector is not None:
+            await orch.event_detector.update_thresholds()
+        if not wanted:
+            orch.note_winterize_cleared(circuit)
+    except Exception as exc:      # noqa: BLE001 — the flag is already saved
+        log.warning("[%s] winterized applied, live refresh failed: %s",
+                    circuit, exc)
+
+    log.info("[%s] winterized -> %s", circuit, wanted)
+    return JSONResponse({"status": "updated", "circuit": circuit,
+                         "winterized": wanted})
 
 
 @router.post("/circuit/{circuit}/valve-type")

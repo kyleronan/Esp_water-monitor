@@ -349,6 +349,36 @@
         {% endif %}
       </div>
 
+      {# Winterized (dev46 46h) #}
+      <div class="sett-card sett-adv-card">
+        <h3 class="sett-card-title">Winterized for the season</h3>
+        <p class="sett-card-desc">
+          Turn this on when this circuit is drained for winter. Its meter and
+          pressure sensor drain with it, so the add-on would otherwise read
+          the empty line as a sudden total pressure loss and keep alarming all
+          season. While it is on, this circuit records no water use, runs no
+          leak tests, and is left out of pressure learning.
+        </p>
+        <p class="sett-card-desc" style="color:var(--color-warn)">
+          <strong>Turn it on BEFORE you drain the line</strong> — switching it
+          on afterwards is too late to prevent the alarm.
+        </p>
+        <label style="display:flex;align-items:flex-start;gap:.5rem;cursor:pointer">
+          <input type="checkbox"
+                 id="winterized_{{ c.circuit }}"
+                 {% if c.winterized %}checked{% endif %}
+                 onchange="settingsWinterizedUpdate('{{ c.circuit }}', this)"
+                 style="margin-top:3px;flex-shrink:0">
+          <span><strong>This circuit is drained for winter</strong>
+            <span class="muted" style="font-size:.8125rem;display:block">
+              Turn it off once the line is refilled and back under pressure.
+            </span>
+          </span>
+        </label>
+        <p class="sett-card-desc" id="winterized-saving-{{ c.circuit }}"
+           style="display:none;color:var(--color-warn);margin-top:.5rem">Saving…</p>
+      </div>
+
       {# ── Flow Meter (read-only; the PPL is set in Home Assistant) ── #}
       <div class="sett-card">
         <h3 class="sett-card-title">Flow Meter</h3>
@@ -478,6 +508,19 @@
             leak protection unaffected. Use after a booster pump or pressure
             regulator change.
           </p>
+          {% if c.incomplete_reseed %}
+          {# dev46 (46j) — the F-C2 marker, surfaced at the control that fixes
+             it. dev42 only logged it, and a warning in the boot log is not
+             somewhere the operator ever looks. #}
+          <p class="sett-help" style="margin-top:.5rem;padding:.5rem .65rem;
+                    border-radius:6px;background:var(--amber-bg);
+                    color:var(--amber-text);border:1px solid var(--amber-border)">
+            <strong>A fixture-grouping rebuild was interrupted</strong>
+            (started {{ c.incomplete_reseed }}). The automatic grouping is
+            incomplete until you run it again — use the button below. Your
+            labels, water totals and leak protection are unaffected.
+          </p>
+          {% endif %}
           <form method="post"
                 action="{{ ingress_path }}/settings/reseed-clusters/{{ c.circuit }}"
                 style="margin:.5rem 0 0"
@@ -1969,6 +2012,46 @@ async function settingsValveTypeUpdate(circuit, valveType, radio) {
         document.querySelectorAll(`input[name="valve_type_${circuit}"]`)
           .forEach(r => { r.checked = (r.value === previous); });
       }
+    }
+  } finally {
+    if (note) note.style.display = 'none';
+  }
+}
+
+async function settingsWinterizedUpdate(circuit, box) {
+  const on = !!(box && box.checked);
+  const msg = on
+    ? "Mark this circuit as drained for winter?
+
+It will stop recording "
+      + "water use, stop running leak tests, and stop learning from its "
+      + "pressure until you turn this off.
+
+Do this BEFORE you drain the "
+      + "line — afterwards is too late to prevent the alarm."
+    : "Put this circuit back in service?
+
+Refill and re-pressurise the "
+      + "line first. Normal monitoring resumes right away, with a short "
+      + "quiet period so refilling doesn't set off an alarm.";
+  if (!window.confirm(msg)) {
+    if (box) box.checked = !on;          // revert; nothing was saved
+    return;
+  }
+  const note = document.getElementById(`winterized-saving-${circuit}`);
+  if (note) note.style.display = 'block';
+  try {
+    const resp = await fetch(`${window.INGRESS_PATH}/settings/circuit/${circuit}/winterized`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&winterized=${on ? 1 : 0}`
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (data.status === 'updated') {
+      window.location.reload();          // surface the paused-state notes
+    } else {
+      toast('Could not update: ' + (data.message || 'unknown error'), 'error');
+      if (box) box.checked = !on;
     }
   } finally {
     if (note) note.style.display = 'none';

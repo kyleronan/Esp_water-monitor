@@ -282,6 +282,9 @@ _BASELINE_VERSION: int = 20260523
 #              'unvalidated' from the audit inversion).
 #   20260808 — dev42: training_state.reseed_in_progress marker (F-C2) — a
 #              crashed re-seed leaves it set; boot warns until a rerun.
+#   20260809 — dev46: events.training_excluded_by_user (46f), events
+#              flow_sig_span_s / pressure_sig_span_s (46i), and
+#              circuit_profile.winterized (46h).
 #
 # VERSION-NUMBER CONVENTION (2026-08-12, decided with the operator): from the
 # next migration onward, versions are YYYYMM + a 2-digit per-month sequence —
@@ -290,7 +293,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260808
+_CURRENT_VERSION: int = 20260809
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -2579,6 +2582,54 @@ def _apply_reseed_marker_column(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260808: reseed-in-progress marker column ready")
 
 
+# 20260809 — dev46: training-exclusion flag (46f), per-channel signature
+# spans (46i), and the winterized-circuit flag (46h).
+def _apply_dev46_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to version 20260809 — three additive flags.
+
+    ``events.training_excluded_by_user`` (46f) — "keep my label, but don't
+    train on this event". Four confirmed cases exist where a user label is
+    TRUE while the event's features describe a composite draw; before this,
+    the only way to keep such an event out of training was to lie about its
+    label. Deliberately DISTINCT from training_quarantine_reason and NOT
+    lifted by review — review is what SETS it.
+
+    ``events.flow_sig_span_s`` / ``pressure_sig_span_s`` (46i) — the real
+    captured span of each signature channel, so the event modal can draw an
+    honest per-channel time axis. Forward-only: legacy rows stay NULL and
+    keep the proportional overlay, because their spans are unknowable
+    (annotate-don't-modify).
+
+    ``circuit_profile.winterized`` (46h) — the circuit is deliberately
+    drained for winter, so ~0 psi is EXPECTED rather than a catastrophic
+    pressure event. Consumers pause detection, regime sampling, baselines
+    and leak-test scheduling for the circuit while set.
+
+    All additive and idempotent."""
+    if _has_table(conn, "events"):
+        for col, decl in (("training_excluded_by_user", "INTEGER DEFAULT 0"),
+                          ("flow_sig_span_s", "REAL"),
+                          ("pressure_sig_span_s", "REAL")):
+            if not _has_column(conn, "events", col):
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
+    if (_has_table(conn, "circuit_profile")
+            and not _has_column(conn, "circuit_profile", "winterized")):
+        conn.execute("ALTER TABLE circuit_profile "
+                     "ADD COLUMN winterized INTEGER DEFAULT 0")
+    conn.commit()
+    # Belt-and-braces re-create of the wf-claim index — LAST-migration
+    # convention (see 20260574/20260804/20260806/20260807/20260808).
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+        conn.commit()
+    log.info("Migration 20260809: training-exclusion flag, signature spans "
+             "and winterized flag ready")
+
+
 def _missing_202608_columns(conn: sqlite3.Connection) -> set[str]:
     """Verifier for the 20260801 DDL (current-version guard set)."""
     missing = set()
@@ -2844,6 +2895,7 @@ _MIGRATIONS: tuple = (
     (20260806, _apply_training_quarantine_sweep),
     (20260807, _apply_dev41_conformance_ddl),
     (20260808, _apply_reseed_marker_column),
+    (20260809, _apply_dev46_columns),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

@@ -87,6 +87,18 @@ _RECAL_LOCK_RETRIES: int = 30
 _RECAL_LOCK_BACKOFF_S: float = 20.0
 
 
+# dev46 (46l) — one in-flight regime recalibration at a time.
+#
+# Observed 2026-08-15 21:47-21:50: the same recalibration executed THREE times
+# back to back (three identical freeze lines). The retry loop below waits out a
+# busy writer for minutes, and every click during that wait queued another full
+# pass — so a user clicking again because "nothing seems to be happening" got
+# their wish three times over, each pass re-fitting and re-freezing the same
+# bands. Module-level rather than per-orchestrator: there is one process, one
+# connection, and the work is global to the home.
+_RECAL_IN_FLIGHT: bool = False
+
+
 async def start_regime_recalibration(orch) -> bool:
     """Kick off the supply-regime recalibration in the background: fit each
     circuit's rule bands on the CURRENT regime's events (source
@@ -94,6 +106,12 @@ async def start_regime_recalibration(orch) -> bool:
     pollJobs toasts the per-type outcome. Returns False (nothing started)
     when no current regime exists."""
     import asyncio
+
+    global _RECAL_IN_FLIGHT
+    if _RECAL_IN_FLIGHT:
+        log.info("regime recalibration already running — ignoring duplicate "
+                 "request (dev46 46l)")
+        return False
 
     from ..config import DB_PATH
     from ..database import run_db, run_isolated_write
@@ -181,7 +199,18 @@ async def start_regime_recalibration(orch) -> bool:
                     _RECAL_LOCK_RETRIES,
                     _RECAL_LOCK_RETRIES * _RECAL_LOCK_BACKOFF_S / 60)
 
-    asyncio.create_task(_run())
+    async def _guarded() -> None:
+        global _RECAL_IN_FLIGHT
+        try:
+            await _run()
+        finally:
+            # Cleared in `finally` so a crash mid-pass cannot wedge the button
+            # permanently — a stuck flag would be a worse failure than the
+            # duplicate runs this exists to prevent.
+            _RECAL_IN_FLIGHT = False
+
+    _RECAL_IN_FLIGHT = True
+    asyncio.create_task(_guarded())
     return True
 
 

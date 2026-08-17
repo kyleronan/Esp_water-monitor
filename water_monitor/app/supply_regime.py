@@ -622,6 +622,12 @@ class SupplyRegimeTracker:
     # ── sampling / rollover ──────────────────────────────────────────────────
 
     def _sample(self, circuit: str) -> None:
+        # dev46 (46h): a winterized circuit is drained — its transducer reads
+        # ~0 psi for months. Sampling that would drag the regime centre to
+        # zero and then declare a "shift" the moment spring re-pressurises.
+        from .database import is_circuit_winterized
+        if is_circuit_winterized(self._db, circuit):
+            return
         today = datetime.now(self._ha_tz).date().isoformat()
         if self._bucket_day is not None and today != self._bucket_day:
             self._evaluate(circuit)

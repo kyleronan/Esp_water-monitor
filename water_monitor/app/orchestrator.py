@@ -122,6 +122,8 @@ class Orchestrator:
         # in-memory first-sight guard so seen_users is logged once per user/process.
         self.admin_ids: set = set()
         self.operator_ids: set = set()
+        # dev46 (46h) — per-circuit post-winterization grace starts.
+        self._winterize_cleared_at: dict = {}
         self._seen_uids: set = set()
 
     @property
@@ -756,6 +758,7 @@ class Orchestrator:
             pump_gate_getter=self._get_pump_osc_gate,  # audit-ok(run_db): invoked only inside EventDetector.collect_circuit_inputs, which is submitted via run_db
             low_pressure_getter=self._get_low_pressure_floors,  # audit-ok(run_db): invoked only inside EventDetector.collect_circuit_inputs, which is submitted via run_db
             low_pressure_cb=self._on_low_pressure_alert,
+            winterized_getter=self._is_circuit_winterized,  # audit-ok(run_db): invoked only inside EventDetector.collect_circuit_inputs, which is submitted via run_db
             pump_fail_cb=self._on_pump_fail_alert,
         )
         if await run_db(self._setup_complete_sync):
@@ -1107,6 +1110,37 @@ class Orchestrator:
             self, "get_display_name") else circuit
         asyncio.ensure_future(self._alert_manager.alert_pump_low_pressure(
             circuit, psi, kind, name))
+
+    def note_winterize_cleared(self, circuit: str) -> None:
+        """dev46 (46h) — start the post-winterization grace for ``circuit``.
+
+        Refilling a drained line looks exactly like the catastrophic pressure
+        event the detector exists to catch, so alarms stay quiet briefly after
+        the flag clears. In-memory on purpose: the grace is a boot-scoped
+        courtesy, and a schema column would outlive its usefulness every
+        spring. A restart mid-refill costs at most one dismissible alarm.
+        """
+        from datetime import datetime, timezone
+        self._winterize_cleared_at[circuit] = datetime.now(timezone.utc)
+
+    def winterize_grace_active(self, circuit: str) -> bool:
+        """True while ``circuit`` is inside its post-winterization grace."""
+        from datetime import datetime, timezone
+        from .database import WINTERIZE_UNSET_GRACE_S
+        ts = self._winterize_cleared_at.get(circuit)
+        if ts is None:
+            return False
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+        return age < WINTERIZE_UNSET_GRACE_S
+
+    def _is_circuit_winterized(self, circuit: str) -> bool:
+        """dev46 (46h) — is this circuit deliberately drained for the season?
+
+        Handed to EventDetector as a getter (it has no connection of its own),
+        alongside the sensitivity / pump-gate / low-pressure getters.
+        """
+        from .database import is_circuit_winterized
+        return is_circuit_winterized(self._db, circuit)
 
     def _get_sensitivity(self, circuit: str) -> dict:
         """Return effective sensitivity settings for a circuit."""

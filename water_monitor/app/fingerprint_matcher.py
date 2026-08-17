@@ -158,6 +158,7 @@ class FingerprintLibrary:
             "FROM events e JOIN event_waveforms w ON w.event_id = e.id "
             "WHERE e.circuit = ? AND e.user_fixture_type IS NOT NULL "
             "  AND e.training_quarantine_reason IS NULL "
+            "  AND COALESCE(e.training_excluded_by_user, 0) = 0 "
             "  AND e.duration_seconds >= ? "
             "  AND COALESCE(e.volume_litres_effective, e.volume_litres) >= ?",
             (circuit, MIN_EVENT_SECONDS, MIN_MATCH_VOLUME_L)).fetchall()

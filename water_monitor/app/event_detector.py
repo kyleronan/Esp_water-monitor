@@ -87,6 +87,15 @@ class RawEvent:
     # 1Hz flow readings collected during the event
     flow_readings: List[float] = field(default_factory=list)
 
+    # dev46 (46i) — the REAL captured span of each signature channel, in
+    # seconds from start_ts to that channel's last appended sample. The two
+    # channels sample on independent callbacks and downsample independently,
+    # so their spans genuinely differ; without them the event modal can only
+    # stretch both signatures proportionally across the event duration and
+    # call it a time axis. None until the first sample lands.
+    flow_sig_span_s: Optional[float] = None
+    pressure_sig_span_s: Optional[float] = None
+
     # Coalesced timestamped flow samples (ts, L/min) for the volume TIME-INTEGRAL
     # (flow_integral.integrate_litres / active_flow_features). Distinct from the
     # downsampled flow_readings used for the 32-pt signature: volume must be a
@@ -520,6 +529,11 @@ class CircuitEventDetector:
         # derived by the parent (max(2.0, 0.15 × measured band)) so a milder
         # pump than the incident's 12 PSI band still gates correctly.
         self.pump_osc_gate_psi: Optional[float] = None
+        # dev46 (46h) — the circuit is deliberately drained for the season;
+        # sample handlers return immediately so ~0 psi never becomes an event
+        # or an alarm. Refreshed from circuit_profile on setup and whenever
+        # settings change.
+        self.winterized: bool = False
         # Surge-phantom rejection threshold as an INSTANCE attr: in pump mode
         # a recharge upswing during a real event is exactly the "max pressure
         # rose above baseline" pattern this rejects, so the gate is widened to
@@ -604,6 +618,21 @@ class CircuitEventDetector:
 
     def update_threshold(self, threshold_psi: float) -> None:
         self.pressure_drop_threshold = threshold_psi
+
+    def set_winterized(self, winterized: bool) -> None:
+        """dev46 (46h) — pause detection while the circuit is drained.
+
+        Set BEFORE the drain, so the drain-down itself is never seen as a
+        catastrophic pressure event. Clearing it closes any event still open
+        from before the drain rather than letting a months-long phantom run
+        finalise with a fabricated volume.
+        """
+        was = self.winterized
+        self.winterized = bool(winterized)
+        if self.winterized and not was and self._active_event is not None:
+            log.info("[%s] winterized — discarding the in-flight event",
+                     self.circuit)
+            self._active_event = None
 
     def update_pump_gate(self, gate_psi: Optional[float]) -> None:
         """Set/clear the pump-mode oscillation gate (dev25). Also widens the
@@ -735,6 +764,8 @@ class CircuitEventDetector:
     # ------------------------------------------------------------------ #
 
     def on_flow_rate(self, entity_id: str, state: str, attributes: dict) -> None:
+        if self.winterized:
+            return          # dev46 (46h) — drained for the season
         """
         1 Hz smoothed flow rate.
 
@@ -804,6 +835,8 @@ class CircuitEventDetector:
             self._flow_sample_count += 1
             if elapsed < self._DOWNSAMPLE_AFTER_SECONDS or self._flow_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.flow_readings.append(self._current_flow_lpm)
+                # dev46 (46i): honest span for this channel's signature.
+                self._active_event.flow_sig_span_s = elapsed
             # Coalesced timestamped capture for the volume integral.
             fs = self._active_event.flow_samples
             v = self._current_flow_lpm
@@ -849,6 +882,8 @@ class CircuitEventDetector:
                 self._flow_start_dips = 0
 
     def on_pressure_fast(self, entity_id: str, state: str, attributes: dict) -> None:
+        if self.winterized:
+            return          # dev46 (46h) — drained for the season
         """
         40 Hz fast pressure sensor.
 
@@ -952,6 +987,8 @@ class CircuitEventDetector:
             self._active_event.max_pressure_psi = max(self._active_event.max_pressure_psi, pressure)
             if elapsed_p < self._DOWNSAMPLE_AFTER_SECONDS or self._pressure_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.pressure_readings.append(pressure)
+                # dev46 (46i): honest span for this channel's signature.
+                self._active_event.pressure_sig_span_s = elapsed_p
 
             ev = self._active_event
             if ev.has_pressure_transient and ev.pressure_delta_psi > 0:
@@ -2299,8 +2336,14 @@ class EventDetector:
                 floors = self._low_pressure_getter(circuit)                     if self._low_pressure_getter else None
             except Exception:
                 floors = None
+            try:
+                winterized = (bool(self._winterized_getter(circuit))
+                              if self._winterized_getter else False)
+            except Exception:
+                winterized = False
             out[circuit] = {"sens": self._sensitivity_getter(circuit),
-                            "gate": gate, "floors": floors}
+                            "gate": gate, "floors": floors,
+                            "winterized": winterized}
         return out
 
     async def setup(self, inputs=None) -> None:
@@ -2336,6 +2379,7 @@ class EventDetector:
             )
             self._detectors[cfg.circuit] = detector
             detector.update_pump_gate(inputs[cfg.circuit]["gate"])
+            detector.set_winterized(inputs[cfg.circuit].get("winterized"))
             detector.low_pressure_cb = self._low_pressure_cb
             detector.pump_fail_cb = self._pump_fail_cb
             if inputs[cfg.circuit]["floors"] is not None:
@@ -2404,6 +2448,7 @@ class EventDetector:
             sens = inputs[circuit]["sens"]
             detector.update_threshold(sens.get("pressure_drop_event_psi", 1.2))
             detector.min_event_duration = sens.get("min_event_duration_seconds", 3.0)
+            detector.set_winterized(inputs[circuit].get("winterized"))
             try:
                 detector.update_pump_gate(inputs[circuit]["gate"])
             except Exception as e:

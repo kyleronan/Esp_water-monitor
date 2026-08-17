@@ -311,10 +311,14 @@ class LeakTestScheduler:
         3-port valves silently skip scheduled checks; reading both together
         keeps that decision consistent with the row it is made against.
         """
-        from .database import get_valve_type
+        from .database import get_valve_type, is_circuit_winterized
         return {"schedule": get_leak_test_schedule(self._db, circuit),
                 "valve_type": get_valve_type(self._db, circuit,
-                                             default="2_port")}
+                                             default="2_port"),
+                # dev46 (46h): a drained circuit holds no pressure, so a leak
+                # test on it measures nothing and would report a failure every
+                # night all winter.
+                "winterized": is_circuit_winterized(self._db, circuit)}
 
     async def _check_schedule(self, circuit: str) -> None:
         """Check if a scheduled test is due and run it if so."""
@@ -322,6 +326,8 @@ class LeakTestScheduler:
         # reads — one hop.
         _sv = await run_db(self._schedule_and_valve_sync, circuit)
         schedule, _valve_type = _sv["schedule"], _sv["valve_type"]
+        if _sv["winterized"]:
+            return          # dev46 (46h) — drained for the season
         if not schedule or not schedule["enabled"]:
             return
 

@@ -651,6 +651,9 @@
             data-cross-talk="{{ '1' if e.is_cross_talk else '0' }}"
             data-dribble="{{ '1' if e.is_low_flow_dribble else '0' }}"
             data-classified="{{ '1' if e.user_classified else '0' }}"
+            data-no-train="{{ '1' if e.training_excluded_by_user else '0' }}"
+            data-flow-span="{{ e.flow_sig_span_s if e.flow_sig_span_s is not none else '' }}"
+            data-press-span="{{ e.pressure_sig_span_s if e.pressure_sig_span_s is not none else '' }}"
             data-volume-effective="{{ (e.volume_litres_effective * vol_factor)|round(vol_decimals) if e.volume_litres_effective is not none else '' }}"
             data-volume-method="{{ e.volume_estimation_method or 'raw' }}"
             data-refill="{{ '1' if e.match_rejection_reason == 'leak_test_refill' else '0' }}"
@@ -917,6 +920,15 @@
         <label class="emd-check"><input type="checkbox" id="emd-cls-crosstalk">
           <span>Caused by the other water line</span></label>
       </div>
+      <label class="emd-check" style="margin-top:.5rem">
+        <input type="checkbox" id="emd-no-train">
+        <span>Keep my label, but don't learn from this event
+              <span class="muted">(it mixes more than one draw)</span></span></label>
+      <p class="muted" style="font-size:11px;margin:.2rem 0 0">
+        Use this when the label is right but the event's shape isn't a clean
+        example — a dishwasher fill with a tap running over it, say. The label
+        stays; the app just won't use this event as a pattern to learn from.
+      </p>
       <div style="display:flex;align-items:center;gap:.75rem;margin-top:.5rem;flex-wrap:wrap">
         <span class="muted" style="font-size:11px">Saved with the <strong>Save</strong> button below.</span>
         <button id="emd-classify-reset-btn" class="btn btn-ghost btn-sm" hidden>Reset to automatic</button>
@@ -1310,11 +1322,13 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   const clsSupply   = document.getElementById('emd-cls-supply');
   const clsDribble  = document.getElementById('emd-cls-dribble');
   const clsCrosstalk = document.getElementById('emd-cls-crosstalk');
+  const noTrainBox   = document.getElementById('emd-no-train');
   const clsResetBtn = document.getElementById('emd-classify-reset-btn');
   const clsHint     = document.getElementById('emd-classify-hint');
   // Initial checkbox state captured on modal open — used so the main Save
   // only sends `classification` when the user actually changed something
   // (labelling alone must not silently lock auto-detection off).
+  let noTrainInitial = false;
   let clsInitial = { phantom: false, supply_pressure: false, dribble: false, cross_talk: false };
   // dev33 (§1.1) — the boxes are PRE-CHECKED from the row's *automatic* flags,
   // so a diff against that render state can fire without the user touching a
@@ -1384,6 +1398,10 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     if (clsSupply)   clsSupply.checked   = d.degraded === '1';
     if (clsDribble)  clsDribble.checked  = d.dribble === '1';
     if (clsCrosstalk) clsCrosstalk.checked = d.crossTalk === '1';
+    if (noTrainBox) {
+      noTrainInitial = d.noTrain === '1';
+      noTrainBox.checked = noTrainInitial;
+    }
     clsInitial = {
       phantom:         d.phantom === '1',
       supply_pressure: d.degraded === '1',
@@ -1731,7 +1749,25 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         wfMeta.appendChild(note);
       };
 
-      renderWf(flowPts, pressPts, false);
+      // dev46 (46i): give the SIGNATURE render an honest per-channel time
+      // axis when the event stored one. The two channels sample on separate
+      // callbacks and downsample independently, so their captured spans
+      // genuinely differ — without the spans both signatures get stretched
+      // to the same width on a shared index, which silently mis-aligns a
+      // pressure dip against the flow that caused it. Legacy rows have no
+      // spans and keep the proportional overlay (their true spans are
+      // unknowable — annotate-don't-modify).
+      const _fSpan = parseFloat(row.dataset.flowSpan);
+      const _pSpan = parseFloat(row.dataset.pressSpan);
+      const sigAx = (Number.isFinite(_fSpan) && _fSpan > 0 && flowPts.length > 1)
+        ? {
+            tf: flowPts.map((_, i) => (i / (flowPts.length - 1)) * _fSpan),
+            tp: (Number.isFinite(_pSpan) && _pSpan > 0 && pressPts.length > 1)
+                  ? pressPts.map((_, i) => (i / (pressPts.length - 1)) * _pSpan)
+                  : null,
+          }
+        : null;
+      renderWf(flowPts, pressPts, false, sigAx);
 
       // Upgrade to the hi-res min/max envelope when the add-on stored one
       // (event_waveforms). 404 → keep the 32-pt signature already rendered.
@@ -1870,6 +1906,12 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     // Both gates: the user must have TOUCHED a classification box in this modal
     // session (clsTouched) AND the result must differ from what was rendered.
     // The touch gate is the load-bearing one — see the clsTouched note above.
+    // dev46 (46f): its own field, deliberately NOT part of `classification`
+    // — that payload sets user_classified and freezes auto-detection, and
+    // this flag must do neither. Sent only when actually changed.
+    if (noTrainBox && noTrainBox.checked !== noTrainInitial) {
+      payload.training_excluded_by_user = !!noTrainBox.checked;
+    }
     if (clsTouched
         && (cur.phantom !== clsInitial.phantom
             || cur.supply_pressure !== clsInitial.supply_pressure

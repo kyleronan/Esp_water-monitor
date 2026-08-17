@@ -1001,6 +1001,12 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
         # Ignore/Restore — route to the explicit user_ignored intent (Sprint H);
         # patch_event re-derives effective excluded_from_training.
         kwargs["user_ignored"] = bool(payload["excluded_from_training"])
+    if "training_excluded_by_user" in payload:
+        # dev46 (46f): "keep my label, but don't learn from this event."
+        # Annotate-don't-modify — never touches the label, verdict or volume,
+        # and is NOT cleared by a later relabel (review is what sets it).
+        kwargs["training_excluded_by_user"] = bool(
+            payload["training_excluded_by_user"])
     if "user_reviewed" in payload:
         # Anomaly triage: mark a flagged event as looked-at (dashboard count).
         kwargs["user_reviewed"] = bool(payload["user_reviewed"])

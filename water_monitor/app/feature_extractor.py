@@ -4330,6 +4330,11 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
 
         # Raw measurements
         "duration_seconds": round(duration, 2),
+        # dev46 (46i) — the real captured span of each signature channel.
+        # Forward-only: None for importer-reconstructed events (whose true
+        # spans are unknowable), and those rows keep the proportional render.
+        "flow_sig_span_s": getattr(event, "flow_sig_span_s", None),
+        "pressure_sig_span_s": getattr(event, "pressure_sig_span_s", None),
         "avg_flow_lpm": round(avg_flow, 3),
         "peak_flow_lpm": round(peak_flow, 3),
         "flow_variability": round(flow_variability, 4),

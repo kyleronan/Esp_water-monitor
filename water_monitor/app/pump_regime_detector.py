@@ -36,7 +36,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from .database import run_db
+from .database import is_circuit_winterized, run_db
 
 log = logging.getLogger(__name__)
 
@@ -289,7 +289,16 @@ class PumpRegimeDetector:
         return ok
 
     def _night_row_exists_sync(self, circuit: str, night: str):
-        """dev46 (46a) — has this night already been evaluated?"""
+        """dev46 (46a) — has this night already been evaluated?
+
+        dev46 (46h): a winterized circuit reports "already done" so the
+        nightly skips it without writing a row. Writing no row is the
+        established way this detector represents an unevaluable night (see
+        the module docstring) — the hysteresis counters never see it, so a
+        drained winter cannot silently clear a real pump detection.
+        """
+        if is_circuit_winterized(self._db, circuit):
+            return True
         return self._db.execute(
             "SELECT 1 FROM pump_regime_nightly "
             "WHERE circuit = ? AND night_date = ?",
