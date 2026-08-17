@@ -17,6 +17,13 @@ RUN apk add --no-cache python3 py3-pip \
         dtaidistance==2.3.13 \
         paho-mqtt==2.1.0
 
+# dev46: config.yaml must reach the image, not just the build context. Both
+# the boot version line (46g) and the static-asset cache-buster read the
+# `version:` field from here at runtime; without it they fall back to
+# "unknown"/"dev", which made the boot line useless for verifying a deploy AND
+# pinned every asset URL to ?v=dev — so browsers kept serving cached CSS/JS
+# across upgrades.
+COPY config.yaml /opt/water_monitor/config.yaml
 COPY app /opt/water_monitor/app
 COPY rootfs /
 
