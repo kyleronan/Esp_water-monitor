@@ -68,6 +68,7 @@
     pressure_unit:      {{ pressure_unit|tojson }},
     pressure_decimals:  {{ pressure_decimals }},
   };</script>
+  <script src="{{ ingress_path }}/static/wf_axis.js?v={{ asset_version }}"></script>
   <script src="{{ ingress_path }}/static/app.js?v={{ asset_version }}"></script>
   <script>
   // Auto-inject CSRF token into every HTML form on the page

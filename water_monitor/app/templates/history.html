@@ -1757,16 +1757,9 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       // pressure dip against the flow that caused it. Legacy rows have no
       // spans and keep the proportional overlay (their true spans are
       // unknowable — annotate-don't-modify).
-      const _fSpan = parseFloat(row.dataset.flowSpan);
-      const _pSpan = parseFloat(row.dataset.pressSpan);
-      const sigAx = (Number.isFinite(_fSpan) && _fSpan > 0 && flowPts.length > 1)
-        ? {
-            tf: flowPts.map((_, i) => (i / (flowPts.length - 1)) * _fSpan),
-            tp: (Number.isFinite(_pSpan) && _pSpan > 0 && pressPts.length > 1)
-                  ? pressPts.map((_, i) => (i / (pressPts.length - 1)) * _pSpan)
-                  : null,
-          }
-        : null;
+      const sigAx = WFAxis.signatureTimeAxis(
+        flowPts.length, pressPts.length,
+        parseFloat(row.dataset.flowSpan), parseFloat(row.dataset.pressSpan));
       renderWf(flowPts, pressPts, false, sigAx);
 
       // Upgrade to the hi-res min/max envelope when the add-on stored one
@@ -1784,9 +1777,9 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
           // unreachable and every modal on the axis-less shared-index
           // overlay. The envelope's value is its real timestamps, not its
           // point count: upgrade whenever it can draw an honest axis.
-          const hasTimes = Array.isArray(w.times_flow)
-                           && w.times_flow.length === fMax.length;
-          if (fMax.length < 2 || (!hasTimes && fMax.length <= flowPts.length)) return;
+          const hasTimes = WFAxis.hasHonestTimes(w.times_flow, fMax.length);
+          if (!WFAxis.shouldUpgradeToEnvelope(
+                fMax.length, flowPts.length, hasTimes)) return;
           const fPeak = Math.max(...fMax, 0);
           if (fPeak <= 0) return;
           const fPts = fMax.map(v => Math.min(Math.max(v / fPeak, 0), 1));

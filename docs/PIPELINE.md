@@ -7,12 +7,16 @@ Every step below names the responsible **file/function**, the **gates with their
 the **DB columns written**, and an **"if it breaks here"** symptom so you can jump from a wrong number
 straight to the code that produced it.
 
-> Verified against commit `d81b7e3` — **0.3.1-dev31 + firmware 3.13.2**. This revision rewrote flow
-> measurement (`pulse_meter`), replaced the dribble verdict with `below_meter_floor`, widened
-> signatures to 256 points, and added a booster-pump subsystem (Part 5). If you touch the pipeline,
-> re-check the constants cited here against the code before trusting them.
+> Verified against **0.3.1-dev46 + firmware 3.13.2**. Since the dev31 revision this
+> doc last described: the training pool gained two independent exclusion filters
+> (dev40 quarantine, dev46 user flag), the labeling ladder gained validated shape
+> gates for dishwasher cycles and toilet flushes, the fingerprint tier began
+> weighting exemplars by era, cluster re-seeds became crash-visible, and — the
+> change most likely to surprise you — **every threaded database touch now goes
+> through one worker thread**. If you touch this pipeline, re-check the constants
+> cited here against the code before trusting them.
 
-Two invariants hold the whole thing together:
+Three invariants hold the whole thing together:
 
 1. **The leak alarm is firmware-side and reads live flow.** Nothing in the database — no split, zero,
    reprocess, or relabel — can mask a real leak.
@@ -20,6 +24,15 @@ Two invariants hold the whole thing together:
    feedback loops (hygiene auto-split, meter audit, your labels, recompute) all re-enter there rather
    than writing totals directly. If totals ever disagree with the sum of events, that function — or a
    caller that bypassed it — is the first suspect.
+3. **One SQLite connection, one thread** (dev46 46a). The add-on shares a single
+   connection (`check_same_thread=False`), so every threaded DB touch goes through
+   `database.run_db`, whose executor has exactly one worker. Two threads on that
+   connection corrupt each other's statement mid-flight — that is what produced
+   `sqlite3.InterfaceError: bad parameter or other API misuse` twice in 2026-08.
+   `tools/audit_db_thread_safety.py` enforces it and must run to zero; it resolves
+   every path reaching the connection, including sync helpers that merely close
+   over it. Long passes are submitted **chunk-wise** (chunk = transaction = one
+   `run_db` call) so a queued page render interleaves instead of waiting minutes.
 
 ---
 
@@ -338,11 +351,53 @@ get a `cycle_group_id` (the History rollup key).
 |---|---|---|---|
 | 10a | **Softener session** (`detect_softener_sessions`) | *skipped unless* `has_water_softener` + right circuit. Low-flow draws (≤1.5 L/min, peaks < 4) at regen time ±20 min (local clock); chains gaps ≤45 min, session ≤210 min; needs a backwash ≥30 L and brine span ≥90 min | `water_softener`, `matched_via='softener_session'` |
 | 10b | **Washer cycle** (`detect_washer_cycles`) | anchor fill ≥9 L, 80–400 s, peak 7.5–15 L/min; siblings at 0.8–1.3× anchor peak, 2–45 min away, ≥0.5 L, ≤400 s, not flush-shaped; needs anchor + **≥2** siblings. Live path retro-stamps mates from the trailing 50 min | `washing_machine`, `matched_via='washer_cycle'` |
-| 10c | **Dishwasher cycle** (`detect_dishwasher_cycles`) | ≥3 chained gentle fills: 0.2–3.5 L, peak ≤3.6 L/min, not flush-shaped; consecutive fills ≤30 min apart, whole run ≤180 min; skips artifacts + washer/softener members | `dishwasher`, `matched_via='dishwasher_cycle'` |
+| 10c | **Dishwasher cycle** (`detect_dishwasher_cycles`) | ≥3 chained gentle fills: 0.2–3.5 L, peak ≤3.6 L/min, not flush-shaped; consecutive fills ≤30 min apart, whole run ≤180 min; skips artifacts + washer/softener members. **T5 shape gate (dev42)**: each fill must have flow variability ≤1.6 AND steady fraction ≥0.4 — validated pre-outage at recall 0.889 / precision 0.727. NULL features pass unchallenged; constants never auto-fit | `dishwasher`, `matched_via='dishwasher_cycle'` |
 | 10d | **Per-event rules** (`rule_classify_event`) | first hit wins — see below | fixture type, `matched_via='rule_*'` / `'zone_default'` |
 | 10e | **Fingerprint tier** (`fingerprint_matcher.py`) | only if rules abstain, *before* k-NN; now with a **2 L floor** — see below | fixture type, `matched_via='fingerprint'` |
 | 10f | **k-NN residual** | only if the fingerprint tier also abstains. Internally a 3-level sub-ladder: **edge-signature → plain active-flow → legacy 6-scalar** — see below | fixture type, `matched_via='knn'` (all three sub-levels) |
 | 10g | **Composite** (`composite_detector.py`) | sustained ≥300 s + usable waveform (≥30 bins, ≤15 s/bin); embedded toilet = 3–8 L excess at ≥3 L/min over a rolling 35th-percentile baseline | promotes unlabeled → `other`, `matched_via='composite'`; writes `embedded_fixtures_json` |
+
+### 10.5 · What the labeling pool is allowed to learn from
+
+The ladder above *reads* labels; these decide which labelled events it may learn
+FROM. Two independent filters, deliberately not merged — they answer different
+questions and are lifted by different things.
+
+| Filter | Column | Question it answers | Lifted by |
+|---|---|---|---|
+| **Training quarantine** (dev40) | `training_quarantine_reason` | "Do we trust the MACHINE's label here?" | A user label — the user's is ground truth |
+| **User training-exclusion** (dev46 46f) | `training_excluded_by_user` | "The label is right, but is the SHAPE a clean example?" | Nothing automatic — review is what SETS it |
+
+The second exists because four confirmed events carried a true label over
+composite features (a dishwasher fill with a tap running across it). Before it,
+the only way to keep such an event out of training was to lie about its label —
+putting the truth pipeline and the training pool in direct conflict.
+
+Both filters are applied at every pool reader: k-NN pools, fixture signatures,
+the fingerprint library load, usage baselines, rule-calibration's `_load_pool_rows`,
+and cluster-suggestion recompute. **Adding a pool reader means adding both
+filters**; they use different table aliases per site, so copy the neighbouring
+query rather than a generic snippet.
+
+Cycle-tier outputs (`src='cycle'`, via `dishwasher_cycle` / `washer_cycle` /
+`softener_session`) are structurally excluded from rule fits — `_provenance_weight`
+returns None for them, so a machine cycle label can never feed back into the
+bands that produced it.
+
+### 10.6 · Era weighting in the fingerprint tier (dev46 46q)
+
+The library spans the 2026-07-19 booster-pump install, which moved every fixture's
+geometry (toilet ΔP by 2.6×). A pre-pump exemplar is not a worse toilet — it is an
+accurate example of a *different hydraulic regime*, so `FingerprintLibrary.match`
+multiplies each exemplar's distance by an era penalty (60-day half-life, 4× cap)
+before choosing the neighbour.
+
+**Age is event-era, never wall clock**: the gap between the candidate event's own
+timestamp and the member's. Wall-clock ageing would make matching a function of
+*when you ran it* — the same event drifting to different answers month over month
+with no config change. Members with no timestamp take no penalty, so this can
+never make the matcher stricter than before; `raw_distance` is returned alongside
+`distance` so a same-era rescue is distinguishable from a genuinely close match.
 
 **Toilet physics veto (dev17) — post-filter on *every* `toilet` label** (from rule, fingerprint, *or*
 k-NN). `toilet_physics_veto()` turns a proposed toilet into an abstention (never re-guessed) when any
@@ -350,6 +405,13 @@ of: volume < 2.8 L (`TOILET_MIN_FLUSH_L`, below the smallest flush ever made); v
 (`toilet_flush_cap_litres` from `home_profile.build_year` — 1994+ ≈ 7.0 L, 1982–93 ≈ 13.2 L, else ≈
 30.5 L, each ×1.15); peak < 3.0 L/min (`TOILET_VETO_MIN_PK_LPM`); or > 2 active flow segments (a cistern
 refill is one continuous segment). These are structural constants, never per-home calibrated.
+
+**Flush shape floor (dev45)** — `is_flush_shaped()` additionally requires a peak of
+≥7.5 L/min (`_FLUSH_MIN_PK_LPM`). Validated on the reviewed sets: recall 89/90 on
+genuine flushes, precision 0.81 → 0.87. Its purpose is the reverse of the veto
+above — the veto stops a proposed toilet that cannot be one, the floor stops
+appliance fill pulses from *looking* like one in the first place (the recurring
+2.2–2.8 L band was the labelled dishwasher's upper fill pulse).
 
 **10d · Per-event rules** (first hit wins):
 
@@ -536,6 +598,56 @@ is true only for an active **VFD constant-pressure** profile.
 
 ---
 
+## Part 6 — Operational states the pipeline honours (dev42–46)
+
+Three states in which the pipeline deliberately does **less**, and one place it
+now shows its own damage.
+
+### Winterized circuit (dev46 46h)
+
+`circuit_profile.winterized`. Circuit 2 drains for the season; its meter and
+transducer sit downstream of the shutoff and drain with it, so ~0 psi for months
+is *expected*. While set: the detector's sample handlers return immediately,
+supply-regime `_sample` skips, the pump-regime nightly reports the night as
+already evaluated (writing **no row**, so the hysteresis counters never see it
+and a drained winter cannot silently CLEAR a real pump detection), and leak-test
+preflight refuses. Setting it discards any in-flight event rather than letting it
+finalise months later with a fabricated volume. Clearing it opens a 1 h grace so
+re-pressurisation does not alarm.
+
+**Set it before draining.** There is grace on un-set and none on set. And note the
+limit of the flag's reach: the firmware cannot see it. Every autonomous firmware
+alarm is flow- or valve-motion-driven (there is no low-pressure alarm at all), so
+months at 0 psi raise nothing — but water moving through the meter *during* the
+drain still can.
+
+### Re-seed in flight, and re-seed that died (dev42 F-C1/F-C2)
+
+A cluster re-seed clears assignments before replaying them, so a crash mid-replay
+leaves a part-cleared model. `begin_reseed`/`end_reseed` defer live matches during
+the replay (stamped `reseed_deferred`, flushed afterwards), and
+`training_state.reseed_in_progress` is stamped at the clear and cleared only on
+success. dev46 46j surfaces that marker on Settings, next to the button that fixes
+it — a marker only a boot log knows about is a marker nobody acts on.
+
+### Startup (dev46 46a/46c)
+
+The boot pass re-derives verdicts across the whole history and is submitted
+chunk-wise. Pages whose own query is expensive (History, Water Use, Settings)
+check `startup_cluster_work_done` *before* submitting and render a
+"still starting up" notice instead of queueing — post-46a the failure mode of an
+ungated heavy page is a multi-minute hang, not a crash.
+
+### Interrupted or duplicated admin jobs (dev46 46l)
+
+The regime recalibration retries for minutes while another job holds the write
+lock. Every click during that wait used to queue another full pass (three ran
+back-to-back on 2026-08-15). Duplicate requests are now declined; the in-flight
+flag clears in `finally`, because a wedged button would be worse than the
+duplicates it prevents.
+
+---
+
 ## Quick debugging index
 
 | Symptom | Start at | First thing to check |
@@ -554,3 +666,10 @@ is true only for an active **VFD constant-pressure** profile.
 | A toilet label disappeared | step 10 veto | toilet physics veto (floor 2.8 L / era cap / peak / segments) turned it into an abstain |
 | Label came from `fingerprint` and looks wrong | step 10e | 2 L floor + library size / self-calibrated threshold; save a correct label to re-seed |
 | A label won't stick | step 13 branch | whether the ID changed (reprocess) — user rows are never overwritten |
+| Label came from `fingerprint` but the exemplar is ancient | step 10.6 | `raw_distance` vs `distance` — a large gap means era weighting rescued it |
+| A labelled event isn't improving the model | step 10.5 | `training_quarantine_reason` AND `training_excluded_by_user` — two independent filters, lifted by different things |
+| Circuit records nothing / no leak tests | Part 6 | `circuit_profile.winterized` — is it still marked drained from last season? |
+| Fixture grouping looks half-finished | Part 6 | `training_state.reseed_in_progress` — a crashed re-seed; Settings shows it |
+| `InterfaceError: bad parameter or other API misuse` | invariant 3 | a DB touch escaped `run_db` — run `tools/audit_db_thread_safety.py` |
+| A page hangs for minutes after a restart | invariant 3 | it queued behind the boot pass; heavy pages should gate on `startup_cluster_work_done` |
+| A leak test says "indeterminate" | not this pipeline | `addon_measure_status` — too few samples or the other valve was open; no leak rate is inferred |

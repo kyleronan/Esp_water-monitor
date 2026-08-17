@@ -4,10 +4,58 @@
 
 Smarter fixture labeling, anomaly surfacing, and a round of volume-accuracy
 guardrails driven by a full audit of the add-on's stored events against raw
-Home Assistant history. (Shipped incrementally as dev1–dev45 — dev7/dev8
+Home Assistant history. (Shipped incrementally as dev1–dev46 — dev7/dev8
 landed without a version bump; per-build details are in git history.)
 
 ### New Features
+
+- **The database is now driven from one thread — dev46** — the add-on shares a
+  single SQLite connection, and database work was spread across a pool of
+  threads. Two of them touching it at the same moment corrupt each other
+  mid-statement, which is what killed a fixture-grouping rebuild on 8/15 and
+  broke the History page on 8/16. All of it now goes through one worker. Long
+  startup work is done in slices so pages stay responsive instead of waiting
+  behind it, and the pages that need that data say "still starting up" rather
+  than hanging. A build-time check keeps it that way.
+
+- **Winterized circuits — dev46** — mark a circuit as drained for the season and
+  the add-on stops recording water use, running leak tests, and learning
+  pressure for it, instead of reading the empty line as a catastrophic pressure
+  loss and alarming all winter. Turn it on *before* draining; turning it off
+  resumes everything with a short quiet period so refilling doesn't set off an
+  alarm.
+
+- **Keep a label, stop learning from the event — dev46** — some events carry a
+  correct label over a messy shape: a dishwasher fill with a tap running across
+  it. Previously the only way to keep those out of the learning pool was to
+  mislabel them. A checkbox in the event details now separates the two.
+
+- **A Help page — dev46** — what each button does, when to use it, and what the
+  warnings mean, organised by what you're trying to do. Includes the two things
+  that are easy to get wrong: set the winterized toggle before draining, and
+  rebuild fixture grouping *before* re-fitting rules.
+
+- **Download a study snapshot — dev46** — a copy of the data stamped with the
+  version it came from, for digging into a question offline. It cannot stall the
+  app or run while a rebuild is in progress.
+
+- **Older examples carry less weight — dev46** — the booster pump changed the
+  shape of every fixture, so pattern matching now prefers examples from the same
+  era as the event it is identifying. Judged by when the events happened, not by
+  today's date, so an answer doesn't drift over time.
+
+- **Honest waveform timing — dev46** — flow and pressure are sampled at
+  different rates, and the event chart was stretching both to the same width.
+  New events record each channel's real span so a pressure dip lines up with the
+  flow that caused it.
+
+- **An interrupted rebuild now says so — dev46** — a fixture-grouping rebuild
+  cut short by a restart leaves the grouping half-finished. Settings now shows
+  that, with the time it started, next to the button that fixes it.
+
+- **One recalibration at a time — dev46** — recalibration waits out other
+  database work for minutes, and every click during that wait used to queue
+  another full run. Extra clicks are now declined.
 
 - **Slow steady draws stop reading as toilets — dev45** — the flush-scan
   review found the "~ Toilet" suggestion landing on square, plateau-shaped

@@ -57,6 +57,55 @@ MATURE_LIBRARY_N: int = 100       # below this, use the tight percentile
 THRESHOLD_PCTL_MATURE: float = 30.0
 THRESHOLD_PCTL_TIGHT: float = 15.0
 MIN_LIBRARY_N: int = 10           # below this the matcher abstains entirely
+
+# ── dev46 (46q) — era weighting ──────────────────────────────────────────────
+#
+# The library spans a supply change: the booster pump went in 2026-07-19 and
+# moved every fixture's geometry (toilet ΔP by 2.6×). A pre-pump exemplar is
+# not a worse example of a toilet — it is an accurate example of a DIFFERENT
+# hydraulic regime, and letting it win a match imports that regime's shape.
+#
+# AGE IS EVENT-ERA, NEVER WALL CLOCK: the gap between the candidate event's
+# own timestamp and the library member's. Wall-clock age would make matching a
+# function of when you happened to run it — the same event would drift to
+# different answers month over month with no config change, boot reclassify
+# would silently re-label history, and no "classifier fingerprint" could ever
+# certify a stored match as still valid. Era age keeps matching a pure
+# function of stored data. It is also simply more correct: a July event should
+# be judged against July.
+#
+# Applied as a distance MULTIPLIER, so an old exemplar has to be
+# proportionally closer to win. Constants are documented and hand-set — never
+# auto-fit (the same rule the T5 and flush-floor gates follow).
+FP_AGE_HALFLIFE_DAYS: float = 60.0   # penalty reaches half its range here
+FP_AGE_MAX_PENALTY: float = 4.0      # asymptote: 4x distance for ancient eras
+
+
+def _era_penalty(age_days: float) -> float:
+    """Distance multiplier for an exemplar ``age_days`` from the candidate.
+
+    1.0 at zero age, rising asymptotically to FP_AGE_MAX_PENALTY. Symmetric:
+    a member from the wrong era is equally wrong whichever side it falls on
+    (reclassify walks history, so members are not always older).
+    """
+    if age_days <= 0:
+        return 1.0
+    decayed = 0.5 ** (age_days / FP_AGE_HALFLIFE_DAYS)
+    return 1.0 + (FP_AGE_MAX_PENALTY - 1.0) * (1.0 - decayed)
+
+
+def _parse_ts(value) -> Optional[float]:
+    """ISO timestamp -> epoch seconds; None on anything unparseable."""
+    if not value:
+        return None
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (ValueError, TypeError):
+        return None
 # Micro-draws are noise-alike: they cluster tightly, drag the self-calibrated
 # threshold down, and inherit each other's labels. Both library membership and
 # query events must carry at least this much EFFECTIVE volume (falls back to
@@ -133,11 +182,16 @@ class FingerprintLibrary:
     self-calibrated match threshold. Build via :meth:`load`."""
 
     def __init__(self, matrix, scales, labels: List[str],
-                 event_ids: List[str], threshold: float, pctl: float):
+                 event_ids: List[str], threshold: float, pctl: float,
+                 start_ts: Optional[List[Optional[float]]] = None):
         self.matrix = matrix          # (n, 3*N_CELLS) channel-scaled
         self.scales = scales          # per-channel std used to scale
         self.labels = labels
         self.event_ids = event_ids
+        # dev46 (46q): each member's OWN event time (epoch seconds), for
+        # era weighting. None where a row had no parseable timestamp — such
+        # members simply take no penalty rather than being excluded.
+        self.start_ts = start_ts if start_ts is not None else [None] * len(labels)
         self.threshold = threshold
         self.percentile_used = pctl
         from collections import Counter
@@ -154,6 +208,7 @@ class FingerprintLibrary:
         np = _np()
         rows = conn.execute(
             "SELECT e.id, e.user_fixture_type, e.pre_event_pressure_psi, "
+            "       e.start_ts, "
             "       w.flow_max_json, w.pressure_min_json, w.duration_seconds "
             "FROM events e JOIN event_waveforms w ON w.event_id = e.id "
             "WHERE e.circuit = ? AND e.user_fixture_type IS NOT NULL "
@@ -162,7 +217,7 @@ class FingerprintLibrary:
             "  AND e.duration_seconds >= ? "
             "  AND COALESCE(e.volume_litres_effective, e.volume_litres) >= ?",
             (circuit, MIN_EVENT_SECONDS, MIN_MATCH_VOLUME_L)).fetchall()
-        fps, labels, ids = [], [], []
+        fps, labels, ids, stamps = [], [], [], []
         for r in rows:
             fp = build_fingerprint(r["flow_max_json"], r["pressure_min_json"],
                                    r["duration_seconds"],
@@ -171,6 +226,7 @@ class FingerprintLibrary:
                 fps.append(fp)
                 labels.append(r["user_fixture_type"])
                 ids.append(r["id"])
+                stamps.append(_parse_ts(r["start_ts"]))
         if len(fps) < MIN_LIBRARY_N:
             return None
         raw = np.vstack(fps)
@@ -194,18 +250,25 @@ class FingerprintLibrary:
         pctl = (THRESHOLD_PCTL_MATURE if len(fps) >= MATURE_LIBRARY_N
                 else THRESHOLD_PCTL_TIGHT)
         threshold = float(np.percentile(nnd, pctl))
-        lib = cls(matrix, scales, labels, ids, threshold, pctl)
+        lib = cls(matrix, scales, labels, ids, threshold, pctl, stamps)
         log.debug("[%s] fingerprint library: %d labels, %d classes, "
                   "threshold %.3f (p%.0f)", circuit, len(labels),
                   len(lib.class_counts), threshold, pctl)
         return lib
 
-    def match(self, fingerprint) -> Optional[Dict[str, Any]]:
+    def match(self, fingerprint,
+              event_ts: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Match a raw (unscaled) fingerprint against the library.
 
         Returns {fixture_type, distance, threshold, neighbor_event_id,
         confidence} on a tight match, else None. Enforces the per-class
         minimum library size and the stricter threshold for CYCLE_ONLY types.
+
+        ``event_ts`` is the CANDIDATE event's own time (epoch seconds). When
+        given, exemplars from a different era are pushed away in proportion to
+        the gap (dev46 46q) — an old exemplar must be proportionally closer to
+        win. Omitted, or where a member has no timestamp, no penalty applies,
+        so this can never make the matcher stricter than it was.
         """
         np = _np()
         if fingerprint is None:
@@ -215,6 +278,17 @@ class FingerprintLibrary:
             for c in range(3)])
         d = self.matrix - scaled[None, :]
         dist = np.sqrt((d * d).sum(-1))
+        # dev46 (46q): era weighting BEFORE picking the nearest neighbour —
+        # penalising only the winner would let a stale exemplar shut out a
+        # better-era one that was a hair further away in raw distance.
+        raw_dist = dist
+        if event_ts is not None:
+            pen = np.ones(len(self.labels), dtype=float)
+            for k, member_ts in enumerate(self.start_ts):
+                if member_ts is None:
+                    continue
+                pen[k] = _era_penalty(abs(event_ts - member_ts) / 86400.0)
+            dist = dist * pen
         i = int(dist.argmin())
         best = float(dist[i])
         label = self.labels[i]
@@ -231,6 +305,10 @@ class FingerprintLibrary:
             return None
         confidence = max(0.0, min(1.0, 1.0 - best / max(limit, 1e-9)))
         return {"fixture_type": label, "distance": best,
+                # The unweighted distance, for diagnostics: a match that only
+                # passed because it was same-era looks different from one that
+                # was simply close.
+                "raw_distance": float(raw_dist[i]),
                 "threshold": limit, "neighbor_event_id": self.event_ids[i],
                 "confidence": round(confidence, 3)}
 
@@ -287,7 +365,7 @@ def match_event_fingerprint(conn: sqlite3.Connection, circuit: str,
     if lib is None:
         return None
     row = conn.execute(
-        "SELECT e.pre_event_pressure_psi, w.flow_max_json, "
+        "SELECT e.pre_event_pressure_psi, e.start_ts, w.flow_max_json, "
         "       w.pressure_min_json, w.duration_seconds, "
         "       COALESCE(e.volume_litres_effective, e.volume_litres) AS vol_eff "
         "FROM events e JOIN event_waveforms w ON w.event_id = e.id "
@@ -301,4 +379,6 @@ def match_event_fingerprint(conn: sqlite3.Connection, circuit: str,
                            row["pre_event_pressure_psi"])
     if fp is None:
         return None
-    return lib.match(fp)
+    # dev46 (46q): the candidate's OWN time drives era weighting — never
+    # "now", so a stored match stays valid regardless of when it is re-derived.
+    return lib.match(fp, event_ts=_parse_ts(row["start_ts"]))
