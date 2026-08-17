@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from ..circuit_compat import resolve_circuit
 from ..fixtures import FIXTURE_TYPE_LABELS, user_selectable_types
 from ..database import patch_event as _patch_event
-from ._helpers import ingress_redirect, run_blocking
+from ._helpers import ingress_redirect, run_blocking, startup_gate
 
 _VALID_USER_FIXTURE_TYPES: frozenset = frozenset(user_selectable_types())
 
@@ -90,6 +90,14 @@ def _schedule_reclassify(circuit: str) -> None:
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def history_page(request: Request):
+    # dev46 (46c) — proactive readiness gate. This page's DB work is the
+    # heaviest in the addon and now shares ONE DB worker with the startup
+    # reclassify/backfill (46a). Checking readiness BEFORE submitting means a
+    # page opened during startup answers instantly instead of queueing behind
+    # minutes of boot work (the 8/16 11:02 repro, which used to 500 outright).
+    gated = startup_gate(request, "history", "History", "/history")
+    if gated is not None:
+        return gated
     try:
         return await _history_page(request)
     except Exception:
@@ -840,17 +848,21 @@ async def event_waveform(event_id: str, request: Request):
     """
     import json as _json
     orch = _orch(request)
-    row = orch.db.execute(
-        """SELECT w.flow_min_json, w.flow_max_json,
-                  w.pressure_min_json, w.pressure_max_json,
-                  w.duration_seconds,
-                  w.flow_src_n, w.press_src_n, w.flow_src_hz, w.press_src_hz,
-                  e.start_ts, e.degraded_supply
-           FROM event_waveforms w
-           JOIN events e ON w.event_id = e.id
-           WHERE w.event_id = ?""",
-        (event_id,),
-    ).fetchone()
+    from ..database import run_db
+    # dev46 (46a): waveform rows are the largest BLOBs in the schema and this
+    # fires on every modal open — never query it inline from the loop thread.
+    row = await run_db(
+        lambda: orch.db.execute(
+            """SELECT w.flow_min_json, w.flow_max_json,
+                      w.pressure_min_json, w.pressure_max_json,
+                      w.duration_seconds,
+                      w.flow_src_n, w.press_src_n, w.flow_src_hz, w.press_src_hz,
+                      e.start_ts, e.degraded_supply
+               FROM event_waveforms w
+               JOIN events e ON w.event_id = e.id
+               WHERE w.event_id = ?""",
+            (event_id,),
+        ).fetchone())
     if not row:
         return JSONResponse({"error": "waveform not found"}, status_code=404)
     try:
@@ -895,9 +907,9 @@ async def events_api(
 ):
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
-    from ..database import get_recent_events
-    events = get_recent_events(
-        orch.db, circuit,
+    from ..database import get_recent_events, run_db
+    events = await run_db(                                    # dev46 (46a)
+        get_recent_events, orch.db, circuit,
         limit=limit,
         date_from=date_from or None,
         date_to=date_to or None,
@@ -925,6 +937,32 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                 status_code=400,
             )
 
+    # dev46 (46a) — ONE hop for the whole write path. This handler is the
+    # PATCH that races the chunked startup reclassify (see the write-time
+    # re-check in set_event_matched_fixture_type): it must never touch the
+    # shared connection from the loop thread while the DB worker holds it.
+    from ..database import run_db
+    outcome = await run_db(_patch_event_sync, db, event_id, circuit, payload)
+    if "error" in outcome:
+        return JSONResponse(outcome["error"], status_code=outcome["status"])
+    if outcome.get("reclassify"):
+        # asyncio.create_task needs the running loop — stays out of run_db.
+        _schedule_reclassify(circuit)
+    return JSONResponse(outcome["ok"])
+
+
+def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
+    """Every DB touch of the event PATCH, in one DB-thread callable.
+
+    dev46 (46a): the handler used to run this inline on the event loop —
+    a dozen statements, several of them writes, on the shared connection.
+    Returns either ``{"error": <json>, "status": <code>}`` for an early exit
+    or ``{"ok": <json>, "reclassify": <bool>}``; the caller owns the
+    HTTP response and the background-task scheduling (which needs the loop).
+
+    Self-contained transaction-wise (rule N2a): every write and its commit
+    happen inside this one call.
+    """
     propagation_meta: dict = {}
     signature_meta: dict = {}
     classification_meta = None
@@ -941,7 +979,7 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                                 clear_event_classification, classify_action)
         action, data = classify_action(payload["classification"])
         if action == "error":
-            return JSONResponse({"error": data["msg"]}, status_code=400)
+            return {"error": {"error": data["msg"]}, "status": 400}
         if action == "reset":
             ok = clear_event_classification(db, event_id, circuit)
         else:
@@ -953,7 +991,7 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                 cross_talk=data["cross_talk"],
             )
         if not ok:
-            return JSONResponse({"error": "Event not found"}, status_code=404)
+            return {"error": {"error": "Event not found"}, "status": 404}
         classification_meta = {"action": action, "classification": data}
 
     kwargs: dict = {}
@@ -972,8 +1010,7 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
         # verdict implies user_reviewed=1; null clears the verdict.
         verdict = payload["review_verdict"] or None
         if verdict not in (None, "normal", "unknown"):
-            return JSONResponse({"error": "invalid review_verdict"},
-                                status_code=400)
+            return {"error": {"error": "invalid review_verdict"}, "status": 400}
         kwargs["review_verdict"] = verdict
 
     # B7 — guard against accidentally EXCLUDING a sparse 'training' anchor: that
@@ -992,12 +1029,12 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                 "  AND id <> ? AND COALESCE(excluded_from_training, 0) = 0",
                 (circuit, srow["user_fixture_type"], event_id)).fetchone()[0]
             scope = "the only" if others == 0 else "one of several"
-            return JSONResponse({
+            return {"error": {
                 "needs_confirm": "exclude_training",
                 "message": (f"This event was captured during setup and is {scope} "
                             f"training example for {ftype}. Excluding it may leave "
                             f"that fixture unclassified. Exclude anyway?"),
-            })
+            }, "status": 200}
 
     if kwargs:
         # A locked DB is a transient state (a background job writing, or —
@@ -1014,13 +1051,13 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
             if "locked" not in str(e).lower():
                 raise
             note_locked_write("history.patch_event")
-            return JSONResponse(
-                {"error": "The database is busy with a background job — "
-                          "your change was NOT saved. Try again in a minute; "
-                          "if this keeps happening, restart the add-on."},
-                status_code=503)
+            return {"error": {
+                "error": "The database is busy with a background job — "
+                         "your change was NOT saved. Try again in a minute; "
+                         "if this keeps happening, restart the add-on."},
+                "status": 503}
         if not found:
-            return JSONResponse({"error": "Event not found"}, status_code=404)
+            return {"error": {"error": "Event not found"}, "status": 404}
 
     # A real fixture label = "confirmed real water" — it must also undo an
     # automatic irrigation cross-talk zeroing, restoring the event's volume
@@ -1051,6 +1088,7 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
     # signal into the cluster's suggested_type (soft hint; never silently
     # links a cluster to a fixture). When the event has no cluster_id we
     # have nowhere to land the signal — log it so the gap is visible.
+    reclassify = False
     if "user_fixture_type" in payload:
         try:
             from ..database import (
@@ -1121,8 +1159,9 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
             # spreads + stale matched_fixture_type clears. Offloaded to the background
             # AND debounced (the user's own label + cycle-mates are already applied
             # synchronously above) so a burst of labels doesn't stack reclassifies and
-            # starve the next save's write lock.
-            _schedule_reclassify(circuit)
+            # starve the next save's write lock. The caller schedules it — the
+            # debounce task needs the event loop, which this thread doesn't have.
+            reclassify = True
         except Exception as e:
             # Propagation is best-effort. A failure here must not block
             # the label save the user already saw succeed.
@@ -1131,12 +1170,15 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                 circuit, event_id, e,
             )
 
-    return JSONResponse({
-        "ok": True,
-        "propagation": propagation_meta,
-        "signatures": signature_meta,
-        "classification": classification_meta,
-    })
+    return {
+        "ok": {
+            "ok": True,
+            "propagation": propagation_meta,
+            "signatures": signature_meta,
+            "classification": classification_meta,
+        },
+        "reclassify": reclassify,
+    }
 
 
 @router.post("/api/events/{circuit}/undo_auto_cycle")
@@ -1155,36 +1197,49 @@ async def undo_auto_cycle_api(circuit: str, request: Request):
     event_id = (payload or {}).get("event_id")
     if not event_id:
         return JSONResponse({"error": "event_id required"}, status_code=400)
-    anchor = db.execute(
-        "SELECT start_ts, cycle_group_id FROM events WHERE id = ? AND circuit = ?",
-        (event_id, circuit),
-    ).fetchone()
-    if anchor is None:
-        return JSONResponse({"error": "Event not found"}, status_code=404)
-    gid = anchor["cycle_group_id"]
-    if gid:
-        # dev.24 — precise: clear by the persisted cycle-group key (the rollup
-        # grouping), so exactly this cycle's auto labels are undone.
-        ids = [r["id"] for r in db.execute(
-            "SELECT id FROM events WHERE circuit = ? AND cycle_group_id = ? "
-            "  AND fixture_label_source = 'cycle'",
-            (circuit, gid),
-        ).fetchall()]
-    else:
-        # Legacy fallback — pre-dev.24 cycle labels have no group id, so undo by
-        # the original ±45-min proximity window around the anchor.
-        a_ts = _parse_event_ts(anchor["start_ts"])
-        if a_ts is None:
-            return JSONResponse({"error": "Event has no usable timestamp"},
-                                status_code=400)
-        lo = (a_ts - timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
-        hi = (a_ts + timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
-        ids = [r["id"] for r in db.execute(
-            "SELECT id FROM events WHERE circuit = ? AND fixture_label_source = 'cycle' "
-            "  AND start_ts BETWEEN ? AND ?",
-            (circuit, lo, hi),
-        ).fetchall()]
-    cleared = clear_auto_labels(db, circuit, event_ids=ids) if ids else 0
+
+    def _undo_sync():
+        # dev46 (46a): the anchor lookup, the id sweep and the clear are one
+        # DB-thread callable — never inline on the loop.
+        anchor = db.execute(
+            "SELECT start_ts, cycle_group_id FROM events "
+            "WHERE id = ? AND circuit = ?",
+            (event_id, circuit),
+        ).fetchone()
+        if anchor is None:
+            return {"error": {"error": "Event not found"}, "status": 404}
+        gid = anchor["cycle_group_id"]
+        if gid:
+            # dev.24 — precise: clear by the persisted cycle-group key (the
+            # rollup grouping), so exactly this cycle's auto labels are undone.
+            ids = [r["id"] for r in db.execute(
+                "SELECT id FROM events WHERE circuit = ? AND cycle_group_id = ? "
+                "  AND fixture_label_source = 'cycle'",
+                (circuit, gid),
+            ).fetchall()]
+        else:
+            # Legacy fallback — pre-dev.24 cycle labels have no group id, so
+            # undo by the original ±45-min proximity window around the anchor.
+            a_ts = _parse_event_ts(anchor["start_ts"])
+            if a_ts is None:
+                return {"error": {"error": "Event has no usable timestamp"},
+                        "status": 400}
+            lo = (a_ts - timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
+            hi = (a_ts + timedelta(seconds=_CYCLE_PULSE_WINDOW_SECONDS)).isoformat()
+            ids = [r["id"] for r in db.execute(
+                "SELECT id FROM events WHERE circuit = ? "
+                "  AND fixture_label_source = 'cycle' "
+                "  AND start_ts BETWEEN ? AND ?",
+                (circuit, lo, hi),
+            ).fetchall()]
+        return {"cleared": clear_auto_labels(db, circuit, event_ids=ids)
+                if ids else 0}
+
+    from ..database import run_db
+    outcome = await run_db(_undo_sync)
+    if "error" in outcome:
+        return JSONResponse(outcome["error"], status_code=outcome["status"])
+    cleared = outcome["cleared"]
     if cleared:
         _schedule_reclassify(circuit)
     return JSONResponse({"ok": True, "cleared": cleared})
@@ -1197,16 +1252,27 @@ async def dismiss_leak_test(test_id: int, request: Request):
     ran water"): the row renders amber instead of red; the record itself is
     never altered and future tests are unaffected."""
     db = _orch(request).db
-    row = db.execute(
-        "SELECT user_dismissed FROM leak_test_history WHERE id = ?",
-        (test_id,)).fetchone()
-    if row is None:
+
+    def _toggle_sync():
+        # dev46 (46a/N2a): read-modify-write + commit in ONE callable, so the
+        # toggle's transaction can't be split across a queue boundary.
+        row = db.execute(
+            "SELECT user_dismissed FROM leak_test_history WHERE id = ?",
+            (test_id,)).fetchone()
+        if row is None:
+            return None
+        new_val = 0 if row["user_dismissed"] else 1
+        db.execute(
+            "UPDATE leak_test_history SET user_dismissed = ? WHERE id = ?",
+            (new_val, test_id))
+        db.commit()
+        return new_val
+
+    from ..database import run_db
+    new_val = await run_db(_toggle_sync)
+    if new_val is None:
         return JSONResponse({"status": "error", "error": "not_found"},
                             status_code=404)
-    new_val = 0 if row["user_dismissed"] else 1
-    db.execute("UPDATE leak_test_history SET user_dismissed = ? WHERE id = ?",
-               (new_val, test_id))
-    db.commit()
     log.info("leak test %d %s by user", test_id,
              "dismissed" if new_val else "un-dismissed")
     return ingress_redirect(request, "/history")
@@ -1241,10 +1307,12 @@ async def reprocess_event_api(circuit: str, event_id: str, request: Request):
         buffer_min = 0
     buffer_min = max(0, min(buffer_min, 240))            # clamp 0..4 h
 
-    row = db.execute(
-        "SELECT start_ts, end_ts FROM events WHERE id = ? AND circuit = ?",
-        (event_id, circuit),
-    ).fetchone()
+    from ..database import run_db
+    row = await run_db(                                       # dev46 (46a)
+        lambda: db.execute(
+            "SELECT start_ts, end_ts FROM events WHERE id = ? AND circuit = ?",
+            (event_id, circuit),
+        ).fetchone())
     if row is None:
         return JSONResponse({"error": "Event not found"}, status_code=404)
     start = _parse_event_ts(row["start_ts"])

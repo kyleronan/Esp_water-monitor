@@ -1,0 +1,39 @@
+{# dev46 (46c) — shown when a heavy page is requested before the startup
+   replay finishes.
+
+   DELIBERATELY standalone (does not extend base.html): this renders while the
+   add-on is still coming up, so it must not depend on the full layout's
+   injected context. A template error here would turn a deliberate "please
+   wait" into a 500 — exactly the failure the gate exists to remove.
+
+   Wording matches the 'starting' flash on the Water Use page (fixtures.html)
+   so the add-on says the same thing wherever this state surfaces. #}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page_title }} — starting up</title>
+  <meta http-equiv="refresh" content="15">
+  <link rel="stylesheet" href="{{ ingress_path }}/static/styles.css">
+  <style>
+    /* Self-contained fallback: if styles.css hasn't loaded yet (the add-on is
+       still starting, after all) the page must still be readable. */
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+           margin: 0; padding: 2rem 1.25rem; line-height: 1.5; }
+    .wait-wrap { max-width: 42rem; margin: 0 auto; }
+    .wait-note { padding: .85rem 1rem; border-radius: 8px; margin: 1rem 0;
+                 background: #fff6e0; color: #6b4b00;
+                 border: 1px solid #e6c766; }
+  </style>
+</head>
+<body>
+  <div class="wait-wrap">
+    <h1>{{ page_title }}</h1>
+    <div class="wait-note">The add-on is still starting up and replaying its
+      event history — wait a minute for the startup work to finish, then try
+      again. This page reloads itself every 15&nbsp;seconds.</div>
+    <p><a href="{{ ingress_path }}{{ retry_path }}">Reload now</a></p>
+  </div>
+</body>
+</html>

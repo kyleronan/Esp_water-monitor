@@ -96,9 +96,9 @@ async def start_regime_recalibration(orch) -> bool:
     import asyncio
 
     from ..config import DB_PATH
-    from ..database import run_isolated_write
+    from ..database import run_db, run_isolated_write
     from ..supply_regime import get_current_regime
-    regime = get_current_regime(orch.db)
+    regime = await run_db(get_current_regime, orch.db)         # dev46 (46a)
     if regime is None:
         return False
     circuits = [c.circuit for c in orch._cfg.circuits]
@@ -191,10 +191,23 @@ async def start_regime_recalibration(orch) -> bool:
 @router.get("/", response_class=HTMLResponse)
 async def training_page(request: Request):
     orch = _orch(request)
+    # dev46 (46a): the per-circuit type lookup + checklist are DB reads — one
+    # hop for all circuits instead of 2N inline queries on the loop thread.
+    from ..database import run_db
+
+    def _checklists():
+        out = {}
+        for cc in orch._cfg.circuits:
+            types = _applicable_types(orch, cc.circuit)
+            out[cc.circuit] = (types,
+                               get_training_checklist(orch.db, cc.circuit, types))
+        return out
+
+    per_circuit = await run_db(_checklists)
+
     circuits = []
     for cc in orch._cfg.circuits:
-        types = _applicable_types(orch, cc.circuit)
-        checklist = get_training_checklist(orch.db, cc.circuit, types)
+        types, checklist = per_circuit[cc.circuit]
         items = [{
             "type": t,
             "label": FIXTURE_TYPE_LABELS.get(t, t.replace("_", " ").title()),
@@ -234,11 +247,21 @@ def _sub_state(circuit, cap, live_flow):
 async def training_state_api(request: Request):
     orch = _orch(request)
     db = orch.db
-    expire_stale_training_captures(db)
+    # dev46 (46a): this endpoint is polled by the training wizard. The stale
+    # expiry (a WRITE) and every circuit's active-capture read go through the
+    # single DB thread in one hop, before the per-circuit HA awaits below.
+    from ..database import run_db
+
+    def _captures():
+        expire_stale_training_captures(db)
+        return {cc.circuit: get_active_training_capture(db, cc.circuit)
+                for cc in orch._cfg.circuits}
+
+    caps = await run_db(_captures)
     out = {}
     for cc in orch._cfg.circuits:
         circ = cc.circuit
-        cap = get_active_training_capture(db, circ)
+        cap = caps.get(circ)
         try:
             live = await orch.get_live_state_async(circ)
             flow = float(str(live.get("flow_rate", "0")).replace(",", ""))
@@ -273,18 +296,20 @@ async def training_state_api(request: Request):
 @router.post("/api/{circuit}/arm")
 async def arm_api(circuit: str, request: Request):
     orch = _orch(request)
-    if get_active_training_capture(orch.db, circuit):
+    from ..database import run_db
+    if await run_db(get_active_training_capture, orch.db, circuit):
         return JSONResponse(
             {"error": f"Another capture is in progress for {circuit} — "
                       "complete or cancel it first."}, status_code=409)
     payload = await _json(request)
     ftype = payload.get("fixture_type")
-    if ftype not in _applicable_types(orch, circuit):
+    # dev46 (46a): _applicable_types reads circuit_type from the DB.
+    if ftype not in await run_db(_applicable_types, orch, circuit):
         return JSONResponse({"error": "fixture type not applicable to this circuit"},
                             status_code=400)
     try:
-        cap = arm_training_capture(orch.db, circuit, ftype,
-                                   window_minutes=payload.get("window_minutes"))
+        cap = await run_db(arm_training_capture, orch.db, circuit, ftype,
+                           window_minutes=payload.get("window_minutes"))
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     return JSONResponse({"ok": True, "capture": cap})
@@ -292,14 +317,18 @@ async def arm_api(circuit: str, request: Request):
 
 @router.post("/api/{circuit}/cancel")
 async def cancel_api(circuit: str, request: Request):
-    n = cancel_training_capture(_orch(request).db, circuit)
+    from ..database import run_db
+    n = await run_db(cancel_training_capture,                 # dev46 (46a)
+                     _orch(request).db, circuit)
     return JSONResponse({"ok": True, "cancelled": n})
 
 
 @router.post("/api/{circuit}/confirm")
 @router.post("/api/{circuit}/done")
 async def confirm_api(circuit: str, request: Request):
-    res = confirm_training_capture(_orch(request).db, circuit)
+    from ..database import run_db
+    res = await run_db(confirm_training_capture,              # dev46 (46a)
+                       _orch(request).db, circuit)
     if res.get("labeled"):
         import asyncio
         asyncio.create_task(_bg_reclassify_training(circuit))
@@ -310,13 +339,15 @@ async def confirm_api(circuit: str, request: Request):
 async def reject_api(circuit: str, request: Request):
     orch = _orch(request)
     payload = await _json(request)
+    from ..database import run_db
     cid = payload.get("capture_id")
     if cid is None:
-        cap = get_active_training_capture(orch.db, circuit)
+        cap = await run_db(get_active_training_capture, orch.db, circuit)
         cid = cap["id"] if cap else None
     if cid is None:
         return JSONResponse({"error": "no capture to reject"}, status_code=400)
-    res = reject_training_capture(orch.db, circuit, int(cid))
+    res = await run_db(reject_training_capture,               # dev46 (46a)
+                       orch.db, circuit, int(cid))
     if res.get("cleared"):
         import asyncio
         asyncio.create_task(_bg_reclassify_training(circuit))
@@ -326,6 +357,8 @@ async def reject_api(circuit: str, request: Request):
 @router.post("/api/{circuit}/extend")
 async def extend_api(circuit: str, request: Request):
     payload = await _json(request)
-    res = extend_training_capture(_orch(request).db, circuit,
-                                  payload.get("add_minutes", 15))
+    from ..database import run_db
+    res = await run_db(extend_training_capture,               # dev46 (46a)
+                       _orch(request).db, circuit,
+                       payload.get("add_minutes", 15))
     return JSONResponse({"ok": True, **res})

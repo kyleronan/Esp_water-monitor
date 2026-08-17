@@ -47,9 +47,15 @@ class PresenceWatcher:
 
     # ── Setup ──────────────────────────────────────────────────────────
 
-    def setup(self) -> None:
-        """Register HA callbacks for all configured presence entities."""
-        profile = self._load_profile()
+    async def setup(self) -> None:
+        """Register HA callbacks for all configured presence entities.
+
+        dev46 (46a): async so the profile read can go through run_db — this
+        runs from the orchestrator's boot sequence, which shares the loop
+        with request handlers already submitting to the DB worker.
+        """
+        from .database import run_db
+        profile = await run_db(self._load_profile)
         if not profile:
             return
 
@@ -70,7 +76,8 @@ class PresenceWatcher:
         Called once at startup — read current entity states from HA and
         immediately sync away mode without waiting for a state_changed event.
         """
-        profile = self._load_profile()
+        from .database import run_db
+        profile = await run_db(self._load_profile)
         if not profile:
             return
 
@@ -115,22 +122,30 @@ class PresenceWatcher:
 
         log.info("Presence: %s → %s", entity_id, state)
 
-        profile = self._load_profile()
-        if not profile:
-            return
+        # dev46 (46a): HaClient invokes this callback ON THE EVENT LOOP, so it
+        # must not touch the connection. The profile read moved into
+        # _evaluate, which is async and can go through run_db.
 
         # Cancel any in-flight evaluation — rapid state changes (e.g. flapping
         # sensor) should only trigger one evaluation, not dozens concurrently.
         if self._pending_eval and not self._pending_eval.done():
             self._pending_eval.cancel()
-        self._pending_eval = asyncio.create_task(self._evaluate(profile))
+        self._pending_eval = asyncio.create_task(self._evaluate())
 
     # ── Evaluation logic ───────────────────────────────────────────────
 
-    async def _evaluate(self, profile: dict) -> None:
+    async def _evaluate(self, profile: Optional[dict] = None) -> None:
         """
         Decide whether to toggle away mode based on current entity states.
+
+        dev46 (46a): loads the profile itself when the caller did not — the
+        state-changed callback is sync and on the loop, so it cannot.
         """
+        if profile is None:
+            from .database import run_db
+            profile = await run_db(self._load_profile)
+        if not profile:
+            return
         entities    = self._parse_entities(profile.get("ha_presence_entities", ""))
         away_state  = profile.get("ha_away_state", "not_home")
         home_state  = profile.get("ha_home_state", "home")

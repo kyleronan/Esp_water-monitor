@@ -558,6 +558,17 @@ class SupplyRegimeTracker:
         circuits = [c.circuit for c in self._cfg.circuits]
         return circuits[0] if circuits else None
 
+    def _bootstrap_and_banner_sync(self, circuit: str):
+        """dev46 (46a) — reconstruct a missed shift, then read the banner."""
+        created = bootstrap_from_events(self._db, circuit, self._ha_tz)
+        banner = supply_banner_state(self._db) if created else {}
+        return created, banner
+
+    def _recentre_sync(self, circuit: str) -> None:
+        """dev46 (46a) — the dev33 one-shot recentre pair, in order."""
+        merge_spurious_regime(self._db)
+        recenter_current_regime(self._db, circuit, self._ha_tz)
+
     async def run(self) -> None:
         circuit = self._primary_circuit()
         if circuit is None:
@@ -569,9 +580,11 @@ class SupplyRegimeTracker:
         except asyncio.TimeoutError:
             pass
         try:
-            created = bootstrap_from_events(self._db, circuit, self._ha_tz)
+            # dev46 (46a): bootstrap + banner read are adjacent — one hop.
+            from .database import run_db
+            created, banner = await run_db(
+                self._bootstrap_and_banner_sync, circuit)
             if created:
-                banner = supply_banner_state(self._db)
                 if banner.get("show"):
                     log.info("supply-regime: reconstructed shift pending user "
                              "confirmation (%s→%s psi around %s)",
@@ -586,14 +599,14 @@ class SupplyRegimeTracker:
         # evaluate a shift against the stale centre. Both helpers are no-ops
         # once applied, and both are guarded per their own preconditions.
         try:
-            merge_spurious_regime(self._db)
-            recenter_current_regime(self._db, circuit, self._ha_tz)
+            # One hop: both are guarded one-shots that must run in order.
+            await run_db(self._recentre_sync, circuit)
         except Exception as e:
             log.warning("supply-regime recentre failed (non-fatal): %s", e)
 
         while not self._stop.is_set():
             try:
-                self._sample(circuit)
+                await run_db(self._sample, circuit)
             except Exception as e:
                 log.warning("supply-regime sample failed (non-fatal): %s", e)
                 if "locked" in str(e).lower():

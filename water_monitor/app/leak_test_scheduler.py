@@ -27,7 +27,7 @@ from datetime import tzinfo
 
 from .config import AddonConfig
 from .database import (get_leak_test_schedule, upsert_leak_test_schedule,
-                       insert_leak_test_history, get_leak_test_history)
+                       insert_leak_test_history, get_leak_test_history, run_db)
 from .ha_client import HaClient
 from .leak_test_refill import (POST_RESTORE_WATCH_S, POST_RESTORE_LEAD_S,
                                POST_RESTORE_DEMAND_L,
@@ -215,7 +215,7 @@ class LeakTestScheduler:
         if not circuit_cfg:
             raise ValueError(f"Unknown circuit: {circuit}")
 
-        schedule    = get_leak_test_schedule(self._db, circuit)
+        schedule    = await run_db(get_leak_test_schedule, self._db, circuit)
         notify_pass = schedule["notify_on_pass"] if schedule else True
         notify_fail = schedule["notify_on_fail"] if schedule else True
 
@@ -305,9 +305,23 @@ class LeakTestScheduler:
     # Internal
     # ------------------------------------------------------------------
 
+    def _schedule_and_valve_sync(self, circuit: str) -> dict:
+        """dev46 (46a) — the schedule row plus the valve-type gate, one hop.
+
+        3-port valves silently skip scheduled checks; reading both together
+        keeps that decision consistent with the row it is made against.
+        """
+        from .database import get_valve_type
+        return {"schedule": get_leak_test_schedule(self._db, circuit),
+                "valve_type": get_valve_type(self._db, circuit,
+                                             default="2_port")}
+
     async def _check_schedule(self, circuit: str) -> None:
         """Check if a scheduled test is due and run it if so."""
-        schedule = get_leak_test_schedule(self._db, circuit)
+        # dev46 (46a): the schedule row and the valve-type gate are adjacent
+        # reads — one hop.
+        _sv = await run_db(self._schedule_and_valve_sync, circuit)
+        schedule, _valve_type = _sv["schedule"], _sv["valve_type"]
         if not schedule or not schedule["enabled"]:
             return
 
@@ -317,8 +331,7 @@ class LeakTestScheduler:
         # schedule row itself is preserved so switching back to 2_port
         # resumes the schedule without reconfiguration. Manual triggers
         # via run_now() DO record a skip row — see _execute_test().
-        from .database import get_valve_type
-        if get_valve_type(self._db, circuit, default="2_port") == "3_port":
+        if _valve_type == "3_port":
             return
 
         next_run_str = schedule["next_run_at"]
@@ -379,13 +392,11 @@ class LeakTestScheduler:
 
         if auto_learn:
             # learn_best_hour queries up to 60 days of hourly_volume and
-            # does Python-side aggregation — offload to a worker thread
-            # so the scheduler's async loop stays responsive while it
-            # runs.
-            loop = asyncio.get_running_loop()
-            best_hour = await loop.run_in_executor(
-                None, self.learn_best_hour, circuit,
-            )
+            # does Python-side aggregation — offload to the single DB
+            # thread (dev46 46a) so the scheduler's async loop stays
+            # responsive while it runs.
+            from .database import run_db
+            best_hour = await run_db(self.learn_best_hour, circuit)
             if best_hour is not None:
                 current_hour = schedule.get("run_hour") if isinstance(schedule, dict) \
                     else schedule["run_hour"]
@@ -393,14 +404,30 @@ class LeakTestScheduler:
                 if best_hour != current_hour:
                     log.info("[%s] auto-learn updating run_hour %02d→%02d from usage history",
                              circuit, current_hour, best_hour)
-                    upsert_leak_test_schedule(self._db, circuit, run_hour=best_hour)
+                    await run_db(upsert_leak_test_schedule, self._db,
+                                 circuit, run_hour=best_hour)
                     schedule = dict(schedule)
                     schedule["run_hour"] = best_hour
 
-        next_run = self._compute_next_run(schedule, after_trigger=after_trigger)
+        # dev46 (46a): _compute_next_run reaches the DB through
+        # _push_past_softener_blackout (a closed-over helper — the class the
+        # attribute grep alone could not see).
+        next_run = await run_db(self._compute_next_run, schedule,
+                                after_trigger=after_trigger)
         if next_run:
-            upsert_leak_test_schedule(self._db, circuit,
-                                      next_run_at=next_run.isoformat())
+            await run_db(upsert_leak_test_schedule, self._db, circuit,
+                         next_run_at=next_run.isoformat())
+
+    def _execute_preflight_sync(self, circuit: str) -> dict:
+        """dev46 (46a) — the two DB-backed pre-checks for a leak test.
+
+        Valve type (3-port drains, so the micro test cannot apply) and the
+        softener regeneration blackout window.
+        """
+        from .database import get_valve_type
+        return {"valve_type": get_valve_type(self._db, circuit,
+                                             default="2_port"),
+                "blackout": self._softener_blackout_min(circuit)}
 
     async def _execute_test(
         self,
@@ -445,8 +472,10 @@ class LeakTestScheduler:
         # apply). The Device-page button is also disabled for 3-port
         # circuits, but the route is intentionally still reachable so
         # automations / direct POSTs produce a visible skip row here. ---
-        from .database import get_valve_type
-        if get_valve_type(self._db, circuit, default="2_port") == "3_port":
+        # dev46 (46a): valve type + softener blackout are the two DB-backed
+        # pre-checks — one hop, taken before any of the awaits below.
+        _pre = await run_db(self._execute_preflight_sync, circuit)
+        if _pre["valve_type"] == "3_port":
             log.info("[%s] leak test skipped — valve_type='3_port' "
                      "(drain-capable; micro leak test not applicable)",
                      circuit)
@@ -460,7 +489,7 @@ class LeakTestScheduler:
         # A regen draws on this (Main) circuit and would read as a leak. Defer
         # WITHOUT closing the valve, record a history row, and reschedule just
         # past the window so the test still runs and the cadence is preserved.
-        _blackout = self._softener_blackout_min(circuit)
+        _blackout = _pre["blackout"]
         if _blackout is not None:
             _now_local = run_at.astimezone(self._ha_tz)
             _m = _now_local.hour * 60 + _now_local.minute
@@ -475,8 +504,8 @@ class LeakTestScheduler:
                                                    microsecond=0)
                     _next = (_midnight + timedelta(minutes=_blackout[1])
                              ).astimezone(timezone.utc)
-                    upsert_leak_test_schedule(self._db, circuit,
-                                              next_run_at=_next.isoformat())
+                    await run_db(upsert_leak_test_schedule, self._db,
+                                              circuit, next_run_at=_next.isoformat())
                 except Exception as _ex:
                     log.warning("[%s] could not reschedule deferred test: %s",
                                 circuit, _ex)
@@ -493,8 +522,8 @@ class LeakTestScheduler:
                                      None, None, None, None)
             try:
                 _next = run_at + timedelta(minutes=RETRY_AFTER_DEMAND_MIN)
-                upsert_leak_test_schedule(self._db, circuit,
-                                          next_run_at=_next.isoformat())
+                await run_db(upsert_leak_test_schedule, self._db,
+                                          circuit, next_run_at=_next.isoformat())
             except Exception as _ex:
                 log.warning("[%s] could not reschedule deferred test: %s",
                             circuit, _ex)
@@ -694,8 +723,8 @@ class LeakTestScheduler:
         if stats["status"] == "indeterminate":
             est_leak = None
         else:
-            est_leak = self._estimate_leak_ml_min(
-                circuit,
+            est_leak = await run_db(self._estimate_leak_ml_min,
+                                    circuit,
                 sustained_drop_psi if sustained_drop_psi is not None else pressure_drop,
                 settle_loss, monitor_minutes, duration_minutes)
 
@@ -755,7 +784,8 @@ class LeakTestScheduler:
         # out the window, so the detector has closed the refill event by now;
         # anything it still misses is picked up by the periodic reconcile.
         try:
-            res = reconcile_leak_test_refills(self._db, circuit, lookback_days=1)
+            res = await run_db(reconcile_leak_test_refills, self._db,
+                               circuit, lookback_days=1)
             if res.get("tagged"):
                 log.info("[%s] tagged %d leak-test refill event(s)",
                          circuit, res["tagged"])
@@ -769,8 +799,8 @@ class LeakTestScheduler:
             else final_result
         )
 
-        upsert_leak_test_schedule(self._db, circuit,
-                                  last_run_at=run_at.isoformat(),
+        await run_db(upsert_leak_test_schedule, self._db, circuit,
+                     last_run_at=run_at.isoformat(),
                                   last_result=effective_result)
 
         # --- HA notification via AlertManager ---
@@ -929,13 +959,11 @@ class LeakTestScheduler:
                     verdict = ("demand" if delta >= POST_RESTORE_DEMAND_L
                                else "clean")
         try:
-            self._db.execute(
-                "UPDATE leak_test_history SET post_restore_volume_l = ?, "
-                "  draw_verdict = ? "
-                "WHERE id = (SELECT MAX(id) FROM leak_test_history "
-                "            WHERE circuit = ?)",
-                (slug, verdict, circuit))
-            self._db.commit()
+            # dev46 (46a) — hop after the HA volume reads. NO re-check: this
+            # stamps the verdict onto the row for the test that just ran, and
+            # the values come from meter totals already captured above; an
+            # interleaved write cannot make that verdict wrong.
+            await run_db(self._store_draw_verdict_sync, circuit, slug, verdict)
         except sqlite3.Error as e:
             log.warning("[%s] could not store draw verdict: %s", circuit, e)
         log.info("[%s] post-restore draw check: %s (%s L back through the meter)",
@@ -974,7 +1002,7 @@ class LeakTestScheduler:
         icemaker fill would fake cycling). Writes 'unavailable' on fetch
         failure so a blank column is distinguishable from "never ran"."""
         from .config import pump_gates_active
-        if not pump_gates_active(self._db, tested_circuit):
+        if not await run_db(pump_gates_active, self._db, tested_circuit):
             return
         other = next((c for c in self._cfg.circuits
                       if c.circuit != tested_circuit), None)
@@ -990,12 +1018,7 @@ class LeakTestScheduler:
             try:
                 vstate = await self._ha.get_state_value(other_valve, "")
                 if str(vstate).lower() in ("closed", "closing"):
-                    self._db.execute(
-                        "UPDATE leak_test_history SET pump_verdict = "
-                        "'not_applicable' WHERE id = (SELECT MAX(id) FROM "
-                        "leak_test_history WHERE circuit = ?)",
-                        (tested_circuit,))
-                    self._db.commit()
+                    await run_db(self._store_pump_na_sync, tested_circuit)
                     log.info("[%s] pump cross-check skipped — observer "
                              "circuit %s valve is closed (both sides "
                              "isolated)", tested_circuit, other.circuit)
@@ -1022,20 +1045,55 @@ class LeakTestScheduler:
                     # zero-rise window is judged against the 60 s floor, which
                     # let a 5-minute test on a ~170 s pump claim "Pump quiet"
                     # it hadn't watched long enough to earn (2026-08-02).
-                    learned_period = None
-                    try:
-                        row = self._db.execute(
-                            "SELECT pump_detect_period_s FROM home_profile "
-                            "WHERE id = 1").fetchone()
-                        if row is not None and row["pump_detect_period_s"]:
-                            learned_period = float(row["pump_detect_period_s"])
-                    except sqlite3.Error:
-                        pass
+                    learned_period = await run_db(
+                        self._learned_pump_period_sync)
                     verdict, cycles, period = classify_cross_circuit(
                         pres, flow, expected_period_s=learned_period)
             except Exception as e:
                 log.warning("[%s] pump cross-check fetch failed: %s",
                             tested_circuit, e)
+        # dev46 (46a) — hop after the HA history fetch. NO re-check: the
+        # verdict describes the observer circuit's behaviour during the test
+        # that just ran, stamped onto that test's row.
+        await run_db(self._store_pump_verdict_sync, tested_circuit, cycles,
+                     period, verdict)
+        log.info("[%s] pump cross-check: %s (%s cycles on %s)",
+                 tested_circuit, verdict, cycles, other.circuit)
+
+    def _store_draw_verdict_sync(self, circuit, slug, verdict) -> None:
+        """dev46 (46a) — stamp the post-restore draw verdict."""
+        self._db.execute(
+            "UPDATE leak_test_history SET post_restore_volume_l = ?, "
+            "  draw_verdict = ? "
+            "WHERE id = (SELECT MAX(id) FROM leak_test_history "
+            "            WHERE circuit = ?)",
+            (slug, verdict, circuit))
+        self._db.commit()
+
+    def _store_pump_na_sync(self, tested_circuit: str) -> None:
+        """dev46 (46a) — mark the pump cross-check not-applicable."""
+        self._db.execute(
+            "UPDATE leak_test_history SET pump_verdict = "
+            "'not_applicable' WHERE id = (SELECT MAX(id) FROM "
+            "leak_test_history WHERE circuit = ?)",
+            (tested_circuit,))
+        self._db.commit()
+
+    def _learned_pump_period_sync(self):
+        """dev46 (46a) — the learned pump detect period, if any."""
+        try:
+            row = self._db.execute(
+                "SELECT pump_detect_period_s FROM home_profile "
+                "WHERE id = 1").fetchone()
+            if row is not None and row["pump_detect_period_s"]:
+                return float(row["pump_detect_period_s"])
+        except sqlite3.Error:
+            pass
+        return None
+
+    def _store_pump_verdict_sync(self, tested_circuit, cycles, period,
+                                 verdict) -> None:
+        """dev46 (46a) — stamp the pump cross-check verdict."""
         self._db.execute(
             "UPDATE leak_test_history SET other_circuit_cycles = ?, "
             "  other_circuit_period_s = ?, pump_verdict = ? "
@@ -1043,8 +1101,6 @@ class LeakTestScheduler:
             "            WHERE circuit = ?)",
             (cycles, period, verdict, tested_circuit))
         self._db.commit()
-        log.info("[%s] pump cross-check: %s (%s cycles on %s)",
-                 tested_circuit, verdict, cycles, other.circuit)
 
     def _compute_next_run(
         self, schedule: Any, now: Optional[datetime] = None,
@@ -1146,7 +1202,8 @@ class LeakTestScheduler:
         measured_noise_psi: Optional[float] = None,
         monitor_samples_json: Optional[str] = None,
     ) -> None:
-        insert_leak_test_history(
+        await run_db(
+            insert_leak_test_history,
             self._db,
             circuit=circuit,
             run_at=run_at.isoformat(),

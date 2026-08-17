@@ -725,6 +725,67 @@ class OptionalRoleRescanResult:
     prefix_updated: bool = False
 
 
+def _rescan_writes_sync(db, circuits, circuit_matches, target_device,
+                        _prefix) -> dict:
+    """dev46 (46a) — every write behind an optional-role rescan, one hop.
+
+    Re-reads device_config first: the caller's copy predates the HA registry
+    fetch, and both "update if changed" writes below must compare against
+    current state (see the hop-2 note at the call site).
+    """
+    cfg = get_device_config(db) or {}
+    prefix_updated = False
+    stored_prefix = (cfg.get("esp_device_prefix") or "").strip()
+    if _prefix and _prefix != stored_prefix:
+        db.execute(
+            "UPDATE device_config SET esp_device_prefix=? WHERE id=1",
+            (_prefix,),
+        )
+        db.commit()
+        prefix_updated = True
+        log.info(
+            "rescan_optional_roles: esp_device_prefix updated %r → %r",
+            stored_prefix, _prefix,
+        )
+
+    # Merge optional roles per circuit, counting new rows
+    per_circuit: Dict[str, int] = {}
+    total_changed = 0
+    for circuit in circuits:
+        n = merge_optional_roles(db, circuit, circuit_matches.get(circuit, []))
+        per_circuit[circuit] = n
+        if n:
+            log.info("[%s] %d new optional entities discovered", circuit, n)
+        total_changed += n
+
+    # Update stored fw_version if the reported version is trustworthy and different.
+    # Never overwrite with empty / sentinel strings.
+    fw_version_updated = False
+    new_fw: Optional[str] = None
+    raw_sw = (target_device.sw_version or "").strip()
+    if raw_sw and raw_sw.lower() not in _UNTRUSTWORTHY_FW:
+        # Strip HA suffix: "3.7.0 (ESPHome 2024.11.0)" → "3.7.0"
+        fw_str = raw_sw.split("(")[0].strip()
+        if fw_str:
+            stored_fw = (cfg.get("fw_version") or "").strip()
+            if fw_str != stored_fw:
+                db.execute(
+                    "UPDATE device_config SET fw_version=? WHERE id=1",
+                    (fw_str,),
+                )
+                db.commit()
+                fw_version_updated = True
+                new_fw = fw_str
+                log.info(
+                    "rescan_optional_roles: fw_version updated %r → %r",
+                    stored_fw, fw_str,
+                )
+
+    return {"prefix_updated": prefix_updated, "per_circuit": per_circuit,
+            "total_changed": total_changed,
+            "fw_version_updated": fw_version_updated, "new_fw": new_fw}
+
+
 async def rescan_optional_roles(
     ha,
     db: sqlite3.Connection,
@@ -792,52 +853,25 @@ async def rescan_optional_roles(
     # the registry-order bug that glued "reset_" onto the prefix — persisted
     # across restarts and kept the waveform accumulator rejecting every chunk
     # (expected-node check). Same pattern as the fw_version heal below.
-    prefix_updated = False
-    stored_prefix = (cfg.get("esp_device_prefix") or "").strip()
-    if _prefix and _prefix != stored_prefix:
-        db.execute(
-            "UPDATE device_config SET esp_device_prefix=? WHERE id=1",
-            (_prefix,),
-        )
-        db.commit()
-        prefix_updated = True
-        log.info(
-            "rescan_optional_roles: esp_device_prefix updated %r → %r",
-            stored_prefix, _prefix,
-        )
-
-    # Merge optional roles per circuit, counting new rows
-    per_circuit: Dict[str, int] = {}
-    total_changed = 0
-    for circuit in circuits:
-        n = merge_optional_roles(db, circuit, circuit_matches.get(circuit, []))
-        per_circuit[circuit] = n
-        if n:
-            log.info("[%s] %d new optional entities discovered", circuit, n)
-        total_changed += n
-
-    # Update stored fw_version if the reported version is trustworthy and different.
-    # Never overwrite with empty / sentinel strings.
-    fw_version_updated = False
-    new_fw: Optional[str] = None
-    raw_sw = (target_device.sw_version or "").strip()
-    if raw_sw and raw_sw.lower() not in _UNTRUSTWORTHY_FW:
-        # Strip HA suffix: "3.7.0 (ESPHome 2024.11.0)" → "3.7.0"
-        fw_str = raw_sw.split("(")[0].strip()
-        if fw_str:
-            stored_fw = (cfg.get("fw_version") or "").strip()
-            if fw_str != stored_fw:
-                db.execute(
-                    "UPDATE device_config SET fw_version=? WHERE id=1",
-                    (fw_str,),
-                )
-                db.commit()
-                fw_version_updated = True
-                new_fw = fw_str
-                log.info(
-                    "rescan_optional_roles: fw_version updated %r → %r",
-                    stored_fw, fw_str,
-                )
+    # dev46 (46a): every write in this function lands AFTER the HA fetches
+    # above and they are contiguous — one hop, one transaction.
+    #
+    # HOP-2 RE-CHECK (named): _rescan_writes_sync RE-READS device_config
+    # inside the write callable and compares against THAT, not against the
+    # `cfg` captured before the awaits. Both the prefix and fw_version writes
+    # are "update if different from stored", so a setup-wizard save_discovery
+    # landing during the registry fetch would otherwise be silently
+    # overwritten from stale premises. merge_optional_roles needs no re-check
+    # — it never overwrites a confirmed or non-empty mapping, so it is
+    # fill-only (monotonic exemption class).
+    from .database import run_db
+    _w = await run_db(_rescan_writes_sync, db, circuits, circuit_matches,
+                      target_device, _prefix)
+    prefix_updated    = _w["prefix_updated"]
+    per_circuit       = _w["per_circuit"]
+    total_changed     = _w["total_changed"]
+    fw_version_updated = _w["fw_version_updated"]
+    new_fw            = _w["new_fw"]
 
     return OptionalRoleRescanResult(
         total_changed=total_changed,

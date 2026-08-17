@@ -23,7 +23,7 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +97,34 @@ class AlertManager:
             "SELECT away_mode FROM home_profile WHERE id = 1").fetchone()
         return bool(row["away_mode"]) if row else False
 
+    def _fire_prep_sync(self, circuit: str, alert_type: str) -> Dict[str, Any]:
+        """dev46 (46a) — every DB read ``fire`` needs, in one DB-thread hop.
+
+        Was three separate inline reads on the event-loop thread
+        (``_is_enabled`` / ``_mobile_targets``, plus ``load_unit_context`` in
+        each caller). Bundled here so an alert costs ONE trip over the wall
+        instead of several, and none of it races the DB worker.
+
+        Note for the audit: those reads were invisible to the connection-touch
+        grep because the async method called a SYNC helper that closed over
+        ``self._db`` — no ``conn`` argument to spot. Async-calls-sync-helper is
+        the same violation; grep for it by helper name, not just by conn.
+        """
+        from .database import run_db
+        from .units import load_unit_context
+        return {
+            "enabled":       self._is_enabled(circuit, alert_type),
+            "targets":       self._mobile_targets(),
+            "unit_context":  load_unit_context(self._db),
+        }
+
+    def _stamp_triggered_alert_sync(self, event_id: str) -> None:
+        """dev46 (46a) — audit stamp, on the DB thread. Self-contained
+        transaction (rule N2a): the write and its commit are both here."""
+        self._db.execute(
+            "UPDATE events SET triggered_alert = 1 WHERE id = ?", (event_id,))
+        self._db.commit()
+
     async def fire(
         self,
         circuit: str,
@@ -105,6 +133,7 @@ class AlertManager:
         message: str,
         notification_id: Optional[str] = None,
         critical: bool = False,
+        prep: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
         Send a notification if alert_type is enabled for circuit.
@@ -115,8 +144,17 @@ class AlertManager:
         Returns True when the notification was dispatched, False when it was
         suppressed by the per-type enable config — so callers can record
         "this event actually notified" (events.triggered_alert).
+
+        dev46 (46a): ``prep`` is the caller's already-fetched
+        ``_fire_prep_sync`` bundle. Callers that need the unit context to
+        BUILD the message fetch it once and hand it over, so the alert makes
+        one run_db hop rather than two. Omitted → fetched here.
         """
-        if not critical and not self._is_enabled(circuit, alert_type):
+        from .database import run_db
+        if prep is None:
+            prep = await run_db(self._fire_prep_sync, circuit, alert_type)
+
+        if not critical and not prep["enabled"]:
             log.debug("[%s] alert '%s' suppressed (disabled in config)",
                       circuit, alert_type)
             return False
@@ -128,7 +166,7 @@ class AlertManager:
                               notification_id=nid)
 
         # 2. Mobile push (all configured targets)
-        for target in self._mobile_targets():
+        for target in prep["targets"]:
             await self._send_mobile_push(
                 target, title, message, data={
                     "notification_id": nid,
@@ -230,21 +268,26 @@ class AlertManager:
 
     async def alert_pressure_drop(self, circuit: str, drop_psi: float,
                                    circuit_name: str) -> None:
+        from .database import run_db
         from .units import load_unit_context, convert_pressure
-        uc  = load_unit_context(self._db)
+        _prep = await run_db(self._fire_prep_sync, circuit, "pressure_drop")
+        uc = _prep["unit_context"]
         val = convert_pressure(drop_psi, uc)
         await self.fire(
             circuit, "pressure_drop",
             title=f"⚠ Pressure drop — {circuit_name}",
             message=(f"Rapid pressure drop of {val} {uc['pressure_unit']} detected. "
                      "Possible burst pipe or demand surge."),
+            prep=_prep,
         )
 
     async def alert_high_flow(self, circuit: str, flow_lpm: float,
                                threshold_lpm: float,
                                circuit_name: str) -> None:
+        from .database import run_db
         from .units import load_unit_context, convert_flow
-        uc  = load_unit_context(self._db)
+        _prep = await run_db(self._fire_prep_sync, circuit, "high_flow")
+        uc = _prep["unit_context"]
         val = convert_flow(flow_lpm, uc)
         thr = convert_flow(threshold_lpm, uc)
         await self.fire(
@@ -254,12 +297,15 @@ class AlertManager:
                      f"threshold {thr} {uc['flow_unit']}. "
                      "Possible burst pipe. Valve has been closed."),
             critical=True,
+            prep=_prep,
         )
 
     async def alert_trickle(self, circuit: str, duration_min: float,
                              flow_lpm: float, circuit_name: str) -> None:
+        from .database import run_db
         from .units import load_unit_context, convert_flow
-        uc  = load_unit_context(self._db)
+        _prep = await run_db(self._fire_prep_sync, circuit, "trickle")
+        uc = _prep["unit_context"]
         val = convert_flow(flow_lpm, uc)
         await self.fire(
             circuit, "trickle",
@@ -267,6 +313,7 @@ class AlertManager:
             message=(f"Sustained low flow of {val} {uc['flow_unit']} "
                      f"for {duration_min:.0f} minutes. "
                      "Possible running toilet or dripping tap."),
+            prep=_prep,
         )
 
     async def alert_flow_anomaly(self, circuit: str, score: float,
@@ -318,11 +365,14 @@ class AlertManager:
         # Audit trail: record that this event actually notified. Best-effort —
         # a DB hiccup must never fail (or retry-spam) the alert itself.
         if dispatched and event_id:
+            # dev46 (46a): the stamp follows a non-DB await (the notify
+            # dispatch above), so it is its own hop — a write bundle, run on
+            # the DB thread. Idempotent single-column set, so nothing here
+            # needs a state re-check: it only ever sets the flag to 1, and a
+            # concurrent writer cannot make that wrong.
+            from .database import run_db
             try:
-                self._db.execute(
-                    "UPDATE events SET triggered_alert = 1 WHERE id = ?",
-                    (event_id,))
-                self._db.commit()
+                await run_db(self._stamp_triggered_alert_sync, event_id)
             except Exception as e:  # noqa: BLE001 — audit write is non-critical
                 log.warning("triggered_alert stamp failed for %s: %s", event_id, e)
 
@@ -363,8 +413,10 @@ class AlertManager:
                                         circuit_name: str,
                                         pump_active: bool) -> None:
         """Phase 6a — sustained low pressure while a zone is flowing."""
+        from .database import run_db
         from .units import load_unit_context, convert_pressure
-        uc = load_unit_context(self._db)
+        _prep = await run_db(self._fire_prep_sync, circuit, "low_pressure_supply")
+        uc = _prep["unit_context"]
         val = convert_pressure(psi, uc)
         pump_note = (" If this is new, the pump may need attention."
                      if pump_active else "")
@@ -375,6 +427,7 @@ class AlertManager:
                      f"{uc['pressure_unit']} while irrigation was running — "
                      f"sprinkler heads may not pop up fully.{pump_note}"),
             notification_id=f"water_low_pressure_{circuit}",
+            prep=_prep,
         )
 
     async def alert_pump_low_pressure(self, circuit: str, psi: float,
@@ -382,8 +435,10 @@ class AlertManager:
         """Phase 6b — pressure sustained below the pump's normal band.
         kind='failure' (low/zero flow, no recharge rise) vs 'overload' (a
         maxed-out VFD serving heavy demand — NOT a dead pump)."""
+        from .database import run_db
         from .units import load_unit_context, convert_pressure
-        uc = load_unit_context(self._db)
+        _prep = await run_db(self._fire_prep_sync, circuit, "pump_low_pressure")
+        uc = _prep["unit_context"]
         val = convert_pressure(psi, uc)
         if kind == "overload":
             msg = (f"Water pressure has stayed around {val} "
@@ -401,6 +456,7 @@ class AlertManager:
             title="🚱 Pump pressure low",
             message=msg,
             notification_id="water_pump_low_pressure",
+            prep=_prep,
         )
 
     async def alert_pump_leak_suspected(self, circuit: str, lpd: float,
@@ -410,8 +466,10 @@ class AlertManager:
         by standing user decision (never shutoff: the leak is below both home
         meters' floors, so the firmware cannot corroborate). The copy teaches
         the valve bisect that located the 2026-07 zone-valve leak."""
+        from .database import run_db
         from .units import load_unit_context
-        uc = load_unit_context(self._db)
+        _prep = await run_db(self._fire_prep_sync, circuit, "pump_leak")
+        uc = _prep["unit_context"]
         gal = lpd / 3.785
         vol_txt = (f"{gal:.0f} gallons" if uc.get("vol_unit") == "gal"
                    else f"{lpd:.0f} liters")
@@ -431,6 +489,7 @@ class AlertManager:
                 "that valve, or inside the pump's own check valve)."
             ),
             notification_id="water_pump_leak_watch",
+            prep=_prep,
         )
 
     async def alert_supply_regime_shift(self, circuit: str, old_psi: float,
@@ -439,8 +498,10 @@ class AlertManager:
         change, municipal shift). Transition-only by construction — fired once
         when the tracker opens the new regime. Informational: nothing changes
         until the user confirms the dashboard banner's recalibration."""
+        from .database import run_db
         from .units import convert_pressure, load_unit_context
-        uc = load_unit_context(self._db)
+        _prep = await run_db(self._fire_prep_sync, circuit, "supply_regime_shift")
+        uc = _prep["unit_context"]
         old_v = convert_pressure(old_psi, uc)
         new_v = convert_pressure(new_psi, uc)
         direction = "higher" if new_psi > old_psi else "lower"
@@ -456,13 +517,16 @@ class AlertManager:
                 "dashboard to recalibrate for the new one."
             ),
             notification_id="water_supply_regime_shift",
+            prep=_prep,
         )
 
     async def alert_leak_test_failed(self, circuit: str,
                                       pressure_drop_psi: float,
                                       circuit_name: str) -> None:
+        from .database import run_db
         from .units import load_unit_context, convert_pressure
-        uc  = load_unit_context(self._db)
+        _prep = await run_db(self._fire_prep_sync, circuit, "leak_test")
+        uc = _prep["unit_context"]
         val = convert_pressure(pressure_drop_psi, uc)
         await self.fire(
             circuit, "leak_test",
@@ -471,6 +535,7 @@ class AlertManager:
                      f"{val} {uc['pressure_unit']}. "
                      "A slow leak may be present. Check the History page."),
             critical=True,
+            prep=_prep,
         )
 
     async def alert_leak_test_passed(self, circuit: str,
@@ -485,6 +550,14 @@ class AlertManager:
 
     async def alert_away_mode_on(self) -> None:
         """Notify when away mode is activated."""
+        # dev46 (46a): the push-target read goes over the wall like every
+        # other DB touch. Fetched BEFORE the notify await so this method makes
+        # one hop, and because the targets are what the loop below needs —
+        # a stale-by-one-notification target list is not a correctness
+        # concern (the user changing targets mid-notify simply takes effect
+        # on the next alert).
+        from .database import run_db
+        targets = await run_db(self._mobile_targets)
         await self._ha.notify(
             title="🏖 Away mode activated — Water Monitor",
             message="Leak tests continue. Baseline learning paused until you return.",
@@ -493,7 +566,7 @@ class AlertManager:
         # Route via the shared mobile-push helper so failures land in
         # the same failure-counter / cooldown machinery as event alerts
         # rather than being swallowed silently.
-        for target in self._mobile_targets():
+        for target in targets:
             await self._send_mobile_push(
                 target,
                 title="🏖 Away mode activated — Water Monitor",

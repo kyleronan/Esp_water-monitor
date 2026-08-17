@@ -65,6 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .config import AddonConfig, CircuitConfig
 from .event_detector import RawEvent, CircuitEventDetector as _CED
 from .database import (
+    run_db,
     get_import_state, update_import_state,
     get_last_event_ts, find_overlapping_event,
     mark_event_irrigation_cross_talk,
@@ -420,7 +421,7 @@ class HistoricalImporter:
         for cfg in self._cfg.circuits:
             if not self._circuit_has_sensors(cfg):
                 continue
-            last_ts = get_last_event_ts(self._db, cfg.circuit)
+            last_ts = await run_db(get_last_event_ts, self._db, cfg.circuit)
             if last_ts:
                 try:
                     start = datetime.fromisoformat(
@@ -436,7 +437,7 @@ class HistoricalImporter:
             # Respect any import_state checkpoint — e.g. stamped at setup time
             # when the user chose to skip historical import.  Clamp so we never
             # reach before that cutoff, even across restarts.
-            state = get_import_state(self._db, cfg.circuit)
+            state = await run_db(get_import_state, self._db, cfg.circuit)
             cutoff_ts = state.get("last_check_ts") if state else None
             if cutoff_ts:
                 try:
@@ -478,7 +479,7 @@ class HistoricalImporter:
         for cfg in self._cfg.circuits:
             if not self._circuit_has_sensors(cfg):
                 continue
-            state = get_import_state(self._db, cfg.circuit)
+            state = await run_db(get_import_state, self._db, cfg.circuit)
             last = state.get("last_check_ts")
             if last:
                 try:
@@ -505,7 +506,8 @@ class HistoricalImporter:
             # a later startup backfill could recover it. When set, the next
             # catch-up re-covers from that point; otherwise advance to now.
             checkpoint = retry_from.isoformat() if retry_from else now.isoformat()
-            update_import_state(self._db, cfg.circuit, checkpoint, n)
+            await run_db(update_import_state, self._db, cfg.circuit,
+                         checkpoint, n)
             if n:
                 log.info("[%s] catch-up: imported %d new event(s)",
                          cfg.circuit, n)
@@ -552,7 +554,7 @@ class HistoricalImporter:
             if not (cfg.pressure_history_sensor or cfg.pressure_avg_sensor):
                 continue
             key = self._xtalk_watermark_key(cfg.circuit)
-            state = get_import_state(self._db, key)
+            state = await run_db(get_import_state, self._db, key)
             wm = _parse_ts(state.get("last_check_ts")) if state else None
             start = (wm - margin) if wm else (
                 now - timedelta(days=self.MAX_BACKFILL_DAYS))
@@ -573,11 +575,33 @@ class HistoricalImporter:
                 # the margin so the trailing edge (events still being written) is
                 # re-scanned next pass. Never past `now − margin`.
                 wm_out = max(window_end - margin, start)
-                update_import_state(self._db, key, wm_out.isoformat(), total)
+                await run_db(update_import_state, self._db, key,
+                             wm_out.isoformat(), total)
                 window_start = window_end
             if total:
                 log.info("[%s] cross-talk reconcile: flagged %d zone-switch "
                          "event(s)", cfg.circuit, total)
+
+    def _xtalk_candidates_sync(self, circuit: str, start_iso: str,
+                               end_iso: str):
+        """dev46 (46a) — cross-talk reconcile candidates, one hop."""
+        return self._db.execute(
+            "SELECT id, start_ts, end_ts, duration_seconds, volume_litres "
+            "FROM events "
+            "WHERE circuit = ? AND COALESCE(is_cross_talk,0) = 0 "
+            "  AND COALESCE(user_classified,0) = 0 "
+            "  AND COALESCE(excluded_from_training,0) = 0 "
+            "  AND COALESCE(volume_litres,0) <= ? "
+            "  AND start_ts >= ? AND start_ts < ?",
+            (circuit, _XTALK_IRR_MAX_VOLUME_L, start_iso, end_iso),
+        ).fetchall()
+
+    def _recompute_days_sync(self, circuit: str, days) -> None:
+        """dev46 (46a) — one daily-summary recompute per affected day."""
+        from .database import compute_daily_summary
+        for day in days:
+            compute_daily_summary(self._db, circuit, day)
+        self._db.commit()
 
     async def _reconcile_irrigation_cross_talk(
         self,
@@ -604,17 +628,10 @@ class HistoricalImporter:
         if not (main_press_e and irr_press_e and irr_flow_e):
             return 0
 
-        rows = self._db.execute(
-            "SELECT id, start_ts, end_ts, duration_seconds, volume_litres "
-            "FROM events "
-            "WHERE circuit = ? AND COALESCE(is_cross_talk,0) = 0 "
-            "  AND COALESCE(user_classified,0) = 0 "
-            "  AND COALESCE(excluded_from_training,0) = 0 "
-            "  AND COALESCE(volume_litres,0) <= ? "
-            "  AND start_ts >= ? AND start_ts < ?",
-            (main_cfg.circuit, _XTALK_IRR_MAX_VOLUME_L,
-             start.isoformat(), end.isoformat()),
-        ).fetchall()
+        # dev46 (46a): the candidate read happens BEFORE the HA history
+        # fetches below — its own hop.
+        rows = await run_db(self._xtalk_candidates_sync, main_cfg.circuit,
+                            start.isoformat(), end.isoformat())
         if not rows:
             return 0
 
@@ -661,7 +678,8 @@ class HistoricalImporter:
                     pmd, pid, irrigation_active=True):
                 continue
             iv = _containing_interval(s, e, intervals)
-            if mark_event_irrigation_cross_talk(
+            if await run_db(
+                    mark_event_irrigation_cross_talk,
                     self._db, ev["id"], main_cfg.circuit,
                     reconciled_at=datetime.now(timezone.utc).isoformat(),
                     interval_start=iv[0].isoformat() if iv else None,
@@ -674,13 +692,12 @@ class HistoricalImporter:
                 day = local_day_of(ev["start_ts"])
                 if day:
                     affected_days.add(day)
-        # One daily-summary recompute per affected DAY, not per event (the backfill
-        # flagged 185 events over 12 days — 185 full-table scans where 12 do).
+        # One daily-summary recompute per affected DAY, not per event (the
+        # 2026-08-13 backfill flagged 185 events over 12 days — 185 full-table
+        # scans where 12 would do). dev46 (46a): one hop for the whole set.
         if affected_days:
-            from .database import compute_daily_summary
-            for day in sorted(affected_days):
-                compute_daily_summary(self._db, main_cfg.circuit, day)
-            self._db.commit()
+            await run_db(self._recompute_days_sync, main_cfg.circuit,
+                         sorted(affected_days))
         return flagged
 
     # ------------------------------------------------------------------ #
@@ -808,7 +825,8 @@ class HistoricalImporter:
             # Meaningful = overlap >= 30 s OR >= 50% of the shorter event.
             # This catches importer catch-up duplicates whose start_ts drifted
             # by minutes — well beyond the old ±30 s point-match.
-            existing = find_overlapping_event(
+            existing = await run_db(
+                find_overlapping_event,
                 self._db, cfg.circuit,
                 period_start.isoformat(),
                 period_end.isoformat(),

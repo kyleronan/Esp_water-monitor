@@ -92,7 +92,8 @@ def _block_if_setup_complete(request: Request):
 @router.get("/", response_class=HTMLResponse)  # matches /setup/
 async def setup_home(request: Request):
     orch = _orch(request)
-    device_cfg = get_device_config(orch.db)
+    from ..database import run_db
+    device_cfg = await run_db(get_device_config, orch.db)   # dev46 (46a)
     initial_name = (
         device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
     )
@@ -113,7 +114,8 @@ async def setup_home(request: Request):
 @router.get("/new", response_class=HTMLResponse)
 async def setup_new(request: Request):
     orch = _orch(request)
-    device_cfg = get_device_config(orch.db)
+    from ..database import run_db
+    device_cfg = await run_db(get_device_config, orch.db)   # dev46 (46a)
     initial_name = (
         device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
     )
@@ -251,7 +253,8 @@ async def setup_restore(request: Request):
              len(groups_to_restore))
 
     # Pull the saved device name so step 1 pre-fills it
-    device_cfg   = get_device_config(orch.db)
+    from ..database import run_db
+    device_cfg   = await run_db(get_device_config, orch.db)  # dev46 (46a)
     initial_name = (
         device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
     )
@@ -280,11 +283,18 @@ async def setup_search(
     orch = _orch(request)
 
     # Persist the searched name
-    orch.db.execute("""
-        UPDATE device_config SET esp_device_name = ?, updated_at = datetime('now')
-        WHERE id = 1
-    """, (device_name.strip(),))
-    orch.db.commit()
+    from ..database import run_db
+
+    def _save_name():
+        # dev46 (46a/N2a): write + commit in one DB-thread callable.
+        orch.db.execute("""
+            UPDATE device_config SET esp_device_name = ?,
+                   updated_at = datetime('now')
+            WHERE id = 1
+        """, (device_name.strip(),))
+        orch.db.commit()
+
+    await run_db(_save_name)
 
     try:
         devices = await orch.ha.get_devices()
@@ -364,9 +374,10 @@ async def setup_discover(device_id: str, request: Request):
     # so non-default circuit names (e.g. "Zone A") are recognised in tier 1.
     diag_labels = await _resolve_labels_from_diagnostics(orch.ha, entities)
     if diag_labels:
-        from ..database import upsert_circuit_label
-        for cid, lbl in diag_labels.items():
-            upsert_circuit_label(orch.db, cid, lbl)
+        from ..database import run_db, upsert_circuit_label
+        # dev46 (46a): N label upserts in one DB-thread callable.
+        await run_db(lambda: [upsert_circuit_label(orch.db, cid, lbl)
+                              for cid, lbl in diag_labels.items()])
         orch.reload_circuit_labels()
 
     circuit_matches, prefix = match_entities_to_roles(
@@ -384,7 +395,8 @@ async def setup_discover(device_id: str, request: Request):
         circuit_matches=circuit_matches,
         esp_device_prefix=prefix,
     )
-    save_discovery(orch.db, result)
+    from ..database import run_db
+    await run_db(save_discovery, orch.db, result)            # dev46 (46a)
 
     # Convert matches to serialisable form
     circuit_data = {}
@@ -445,26 +457,33 @@ async def setup_confirm(device_id: str, request: Request):
     # Union of all role names across every circuit type
     _valid_roles = {r for roles in ROLE_PATTERNS.values() for r in roles}
 
-    for key, value in form.items():
-        # Form fields are named: circuit__role  e.g. main__flow_sensor
-        if "__" in key and value:
-            parts = key.split("__", 1)
-            if len(parts) == 2:
-                circuit, role = parts
-                if circuit not in _valid_circuits or role not in _valid_roles:
-                    log.warning(
-                        "setup_confirm: ignoring unknown circuit/role pair "
-                        "%r/%r", circuit, role)
-                    continue
-                orch.db.execute("""
-                    INSERT INTO circuit_entity_map (circuit, role, entity_id, confirmed)
-                    VALUES (?, ?, ?, 1)
-                    ON CONFLICT (circuit, role)
-                    DO UPDATE SET entity_id = excluded.entity_id,
-                                  confirmed = 1
-                """, (circuit, role, value.strip()))
+    def _save_map():
+        # dev46 (46a/N2a): every INSERT plus the commit in ONE DB-thread
+        # callable — the mapping is one transaction and must not be split
+        # across queue boundaries.
+        for key, value in form.items():
+            # Form fields are named: circuit__role  e.g. main__flow_sensor
+            if "__" in key and value:
+                parts = key.split("__", 1)
+                if len(parts) == 2:
+                    circuit, role = parts
+                    if circuit not in _valid_circuits or role not in _valid_roles:
+                        log.warning(
+                            "setup_confirm: ignoring unknown circuit/role pair "
+                            "%r/%r", circuit, role)
+                        continue
+                    orch.db.execute("""
+                        INSERT INTO circuit_entity_map
+                               (circuit, role, entity_id, confirmed)
+                        VALUES (?, ?, ?, 1)
+                        ON CONFLICT (circuit, role)
+                        DO UPDATE SET entity_id = excluded.entity_id,
+                                      confirmed = 1
+                    """, (circuit, role, value.strip()))
+        orch.db.commit()
 
-    orch.db.commit()
+    from ..database import run_db
+    await run_db(_save_map)
     log.info("Entity mapping confirmed for device %s — proceeding to circuit names", device_id)
     return ingress_redirect(request, "/setup/circuit-names")
 
@@ -584,8 +603,10 @@ async def setup_circuit_names_save(request: Request):
     # commit boundary here. A runtime DB error mid-chain rolls back
     # every prior write — no more partial-commit risk where a circuit
     # ends up with the new display_name but the old circuit_type.
-    from ..database import transaction
-    try:
+    from ..database import run_db, transaction
+
+    def _save_names():
+        # dev46 (46a/N2a): the whole transaction lives in ONE callable.
         with transaction(orch.db):
             for entry in pending:
                 if "display_name" in entry:
@@ -603,6 +624,9 @@ async def setup_circuit_names_save(request: Request):
                         orch.db, entry["circuit"], entry["valve_type"],
                         commit=False,
                     )
+
+    try:
+        await run_db(_save_names)
     except Exception as exc:
         log.error("Setup step 3b save failed (rolled back): %s",
                   exc, exc_info=True)
@@ -633,8 +657,10 @@ async def setup_units(request: Request):
     orch = _orch(request)
     from ..database import get_home_profile
     from ..units import load_unit_context, FLOW_OPTIONS, PRESSURE_OPTIONS
-    profile = dict(get_home_profile(orch.db) or {})
-    uc = load_unit_context(orch.db)
+    from ..database import run_db
+    profile, uc = await run_db(                              # dev46 (46a)
+        lambda: (dict(get_home_profile(orch.db) or {}),
+                 load_unit_context(orch.db)))
     return _tmpl(request).TemplateResponse("setup.html", {
         "request":          request,
         "step":             4,
@@ -662,11 +688,17 @@ async def setup_units_save(request: Request):
     pressure_key = form.get("pressure_unit", "psi")
     if flow_key     not in FLOW_OPTIONS:     flow_key     = "L/min"
     if pressure_key not in PRESSURE_OPTIONS: pressure_key = "psi"
-    orch.db.execute(
-        "UPDATE home_profile SET flow_unit=?, pressure_unit=? WHERE id=1",
-        (flow_key, pressure_key),
-    )
-    orch.db.commit()
+    from ..database import run_db
+
+    def _save_units():
+        # dev46 (46a/N2a): write + commit in one DB-thread callable.
+        orch.db.execute(
+            "UPDATE home_profile SET flow_unit=?, pressure_unit=? WHERE id=1",
+            (flow_key, pressure_key),
+        )
+        orch.db.commit()
+
+    await run_db(_save_units)
     invalidate_unit_cache()
     log.info("Setup: units saved — flow=%s pressure=%s", flow_key, pressure_key)
     return ingress_redirect(request, "/setup/home")
@@ -674,8 +706,8 @@ async def setup_units_save(request: Request):
 @router.get("/home", response_class=HTMLResponse)
 async def setup_home_details(request: Request):
     orch = _orch(request)
-    from ..database import get_home_profile
-    profile = dict(get_home_profile(orch.db) or {})
+    from ..database import get_home_profile, run_db
+    profile = dict(await run_db(get_home_profile, orch.db) or {})  # dev46 (46a)
     return _tmpl(request).TemplateResponse("setup.html", {
         "request": request,
         "step": 5,
@@ -727,17 +759,19 @@ async def setup_home_details_save(request: Request):
     softener_start = (form.get("softener_regen_start") or "").strip()
     softener_circuit = (form.get("softener_circuit") or "").strip() or None
     if has_softener and parse_hhmm_to_minutes(softener_start) is None:
-        from ..database import get_home_profile
+        from ..database import get_home_profile, run_db
         return _tmpl(request).TemplateResponse("setup.html", {
             "request": request, "step": 5, "page": "setup",
-            "profile": dict(get_home_profile(orch.db) or {}),
+            "profile": dict(await run_db(get_home_profile, orch.db) or {}),
             "circuits": [c.circuit for c in orch._cfg.circuits],
             "error": "Enter the water softener's regeneration start time "
                      "(HH:MM, 24-hour).",
         })
 
     from datetime import datetime as _dt, timezone as _tzinfo
-    update_home_profile(
+    from ..database import run_db
+    await run_db(                                             # dev46 (46a)
+        update_home_profile,
         orch.db,
         bathrooms_full=bathrooms_full,
         bathrooms_half=bathrooms_half,
@@ -756,7 +790,7 @@ async def setup_home_details_save(request: Request):
     )
 
     # Mark setup complete and reload entity IDs into live circuit configs
-    mark_setup_complete(orch.db)
+    await run_db(mark_setup_complete, orch.db)                # dev46 (46a)
     orch.reload_circuit_entities()
 
     # If the user opted out of historical import, stamp import_state to NOW
@@ -766,8 +800,10 @@ async def setup_home_details_save(request: Request):
         from datetime import datetime, timezone as _tz
         from ..database import update_import_state
         now_ts = datetime.now(_tz.utc).isoformat()
-        for _circuit_cfg in orch._cfg.circuits:
-            update_import_state(orch.db, _circuit_cfg.circuit, now_ts, 0)
+        # dev46 (46a): all circuits' checkpoints in one DB-thread callable.
+        await run_db(lambda: [
+            update_import_state(orch.db, cc.circuit, now_ts, 0)
+            for cc in orch._cfg.circuits])
         log.info("Historical import disabled — import_state stamped to %s for all circuits", now_ts)
 
     # Activate event detection now that entity IDs are known.
@@ -776,7 +812,7 @@ async def setup_home_details_save(request: Request):
     # is not lost — without this, subscriptions stay at 0 until restart.
     if orch.event_detector:
         try:
-            orch.event_detector.setup()
+            await orch.event_detector.setup()
             log.info("Event detection activated after setup wizard completion")
         except Exception as e:
             log.warning("Event detector setup failed (non-fatal): %s", e)
@@ -847,7 +883,8 @@ async def setup_home_details_save(request: Request):
 @router.get("/complete", response_class=HTMLResponse)
 async def setup_complete(request: Request):
     orch = _orch(request)
-    cfg = get_device_config(orch.db)
+    from ..database import run_db
+    cfg = await run_db(get_device_config, orch.db)           # dev46 (46a)
 
     # Pick up calibration info passed as query params from the /home POST,
     # or read from DB if the user refreshes the page.

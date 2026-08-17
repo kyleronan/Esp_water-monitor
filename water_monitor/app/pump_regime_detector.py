@@ -36,6 +36,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from .database import run_db
+
 log = logging.getLogger(__name__)
 
 _STARTUP_DELAY_S = 240      # stagger past rise_corr_backfill's 180 s boot fetch
@@ -218,7 +220,8 @@ class PumpRegimeDetector:
             except Exception as e:
                 log.warning("pump-regime pass failed (non-fatal): %s", e)
                 ran = False
-            delay = self._seconds_until_next_pass() if ran else _RECHECK_ON_ERROR_S
+            delay = (await run_db(self._seconds_until_next_pass)
+                     if ran else _RECHECK_ON_ERROR_S)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
                 return
@@ -241,7 +244,7 @@ class PumpRegimeDetector:
     def _seconds_until_next_pass(self) -> float:
         """Sleep until ~30 min after the next quiet window ends."""
         now = datetime.now(self._ha_tz)
-        qh = self._quiet_hour()
+        qh = self._quiet_hour()          # already on the DB thread (N2b)
         target = now.replace(hour=(qh + _WINDOW_HOURS) % 24, minute=30,
                              second=0, microsecond=0)
         if target <= now:
@@ -263,15 +266,13 @@ class PumpRegimeDetector:
         """Evaluate last night for every circuit missing a row. Returns True
         when the pass completed without HA fetch errors (a clean 'nothing to
         do' also counts). No row is written for unevaluable windows."""
-        night = self._last_night_date()
+        night = await run_db(self._last_night_date)
         ok = True
         wrote_any = False
         for circuit_cfg in self._cfg.circuits:
             circuit = circuit_cfg.circuit
-            exists = self._db.execute(
-                "SELECT 1 FROM pump_regime_nightly "
-                "WHERE circuit = ? AND night_date = ?",
-                (circuit, night)).fetchone()
+            exists = await run_db(self._night_row_exists_sync, circuit,
+                                  night)
             if exists:
                 continue
             try:
@@ -283,9 +284,24 @@ class PumpRegimeDetector:
                             circuit, night, e)
                 ok = False
         if wrote_any:
-            self._apply_hysteresis()
+            await run_db(self._apply_hysteresis)
             await self._maybe_leak_alert()
         return ok
+
+    def _night_row_exists_sync(self, circuit: str, night: str):
+        """dev46 (46a) — has this night already been evaluated?"""
+        return self._db.execute(
+            "SELECT 1 FROM pump_regime_nightly "
+            "WHERE circuit = ? AND night_date = ?",
+            (circuit, night)).fetchone()
+
+    def _leak_alert_inputs_sync(self, circuits) -> dict:
+        """dev46 (46a) — pump-gate check + the nightly history, one hop."""
+        from .config import pump_gates_active
+        from .database import get_pump_regime_nights
+        return {"any_pump": any(pump_gates_active(self._db, c)
+                                for c in circuits),
+                "nights": get_pump_regime_nights(self._db, limit=40)}
 
     async def _maybe_leak_alert(self) -> None:
         """Phase 5a: transition-only slow-leak alert. Gated on ARMED pump
@@ -298,9 +314,12 @@ class PumpRegimeDetector:
             from .config import pump_gates_active
             from .database import get_pump_regime_nights
             circuits = [c.circuit for c in self._cfg.circuits]
-            if not any(pump_gates_active(self._db, c) for c in circuits):
+            # dev46 (46a): the gate check and the nights read are adjacent —
+            # one hop.
+            _la = await run_db(self._leak_alert_inputs_sync, circuits)
+            if not _la["any_pump"]:
                 return
-            nights = get_pump_regime_nights(self._db, limit=40)
+            nights = _la["nights"]
             verdict = evaluate_leak_alert(nights)
             if verdict is None:
                 return
@@ -364,7 +383,7 @@ class PumpRegimeDetector:
         if not pressure_entity or not flow_entity:
             return False
 
-        qh = self._quiet_hour()
+        qh = await run_db(self._quiet_hour)
         local_start = datetime.fromisoformat(night).replace(
             hour=qh, tzinfo=self._ha_tz)
         start = local_start.astimezone(timezone.utc)
@@ -419,7 +438,8 @@ class PumpRegimeDetector:
             log.info("[%s] %s: leak estimate suppressed — %s drew water inside "
                      "the analysis window (%.1f min)", circuit_cfg.circuit,
                      night, contaminated_by[0], contaminated_by[1])
-        upsert_pump_regime_night(
+        await run_db(
+            upsert_pump_regime_night,
             self._db, circuit_cfg.circuit, night,
             detected=1 if v.detected else 0,
             period_s=period, amplitude_psi=v.p2p_psi, sd_psi=v.sd_psi,

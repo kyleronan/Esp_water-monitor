@@ -48,12 +48,11 @@ class ClusterMetrics:
             except asyncio.TimeoutError:
                 pass
 
+            from .database import run_db
             for circuit_cfg in self._cfg.circuits:
                 try:
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        None, self.compute_and_store, circuit_cfg.circuit
-                    )
+                    # dev46 (46a): DB work runs on the single DB thread.
+                    await run_db(self.compute_and_store, circuit_cfg.circuit)
                 except Exception as e:
                     log.error("[%s] cluster metrics error: %s",
                               circuit_cfg.circuit, e, exc_info=True)

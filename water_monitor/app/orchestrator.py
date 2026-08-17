@@ -39,6 +39,26 @@ from .fixture_publisher import FixturePublisher
 log = logging.getLogger(__name__)
 
 
+async def _timed_startup_job(name: str, awaitable):
+    """dev46 (46a/C2a) — time one startup job and log how long it held.
+
+    C2a chunked the two jobs known to be expensive (reclassify, cluster
+    backfill). The rest were left whole on a JUDGEMENT that they are cheap,
+    which is exactly the kind of claim that should be a number instead. Each
+    boot now prints its own evidence, so the tripwires recorded in the plan
+    can be checked against a real boot log rather than re-argued.
+
+    Failure is not swallowed — the timing line is emitted either way and the
+    exception propagates to the caller's existing handler.
+    """
+    import time
+    t0 = time.monotonic()
+    try:
+        return await awaitable
+    finally:
+        log.info("startup job %s took %.1fs", name, time.monotonic() - t0)
+
+
 def _fmt_sensor(
     raw: Optional[str],
     decimals: int = 1,
@@ -140,6 +160,27 @@ class Orchestrator:
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
 
+        # dev46 (46a): every DB touch in this method — the away-since read,
+        # the per-circuit calibration extension, and the profile write — goes
+        # over the wall in ONE hop. They all precede the single HA await at
+        # the end, so there is nothing to split: one callable, one
+        # transaction (rule N2a).
+        from .database import run_db
+        await run_db(self._set_away_mode_sync, enabled, now, now_iso)
+
+        if self._alert_manager and enabled:
+            await self._alert_manager.alert_away_mode_on()
+        log.info("Away mode %s", "enabled" if enabled else "disabled")
+
+    def _set_away_mode_sync(self, enabled: bool, now, now_iso: str) -> None:
+        """dev46 (46a) — the away-mode DB work, on the DB thread.
+
+        Self-contained transaction: the calibration extensions and the
+        home_profile flip commit together, so a crash between them cannot
+        leave timers extended for an away period that never got recorded.
+        """
+        from datetime import datetime, timezone, timedelta
+
         if not enabled:
             # Extend calibration timers by the actual time spent away so the
             # learning period reflects real occupancy — handles offline periods too.
@@ -191,10 +232,6 @@ class Orchestrator:
             WHERE id = 1
         """, (enabled_int, enabled_int, now_iso, now_iso))
         self._db.commit()
-
-        if self._alert_manager and enabled:
-            await self._alert_manager.alert_away_mode_on()
-        log.info("Away mode %s", "enabled" if enabled else "disabled")
 
     def reload_presence_watcher(self) -> None:
         """Re-subscribe after the user updates presence entity settings."""
@@ -351,7 +388,10 @@ class Orchestrator:
         admins = [(u.get("id"), u.get("name") or "")
                   for u in users if u.get("is_admin")]
         if admins != getattr(self, "_last_saved_admins", None):
-            save_admin_ids_cache(self._db, [u for u in users if u.get("is_admin")])
+            # dev46 (46a): change-gated write, over the wall like every other.
+            from .database import run_db
+            await run_db(save_admin_ids_cache, self._db,
+                         [u for u in users if u.get("is_admin")])
             self._last_saved_admins = admins
             log.info("role-sync: cached %d HA admin(s)", len(new_ids))
         return True
@@ -459,8 +499,9 @@ class Orchestrator:
             else "small trim, re-scaling anomaly thresholds (no relearn)")
         # 1) Persist to the DB cache + live config.
         try:
-            from .database import set_circuit_pulses_per_litre
-            set_circuit_pulses_per_litre(self._db, circuit, new_ppl)
+            from .database import run_db, set_circuit_pulses_per_litre
+            await run_db(set_circuit_pulses_per_litre, self._db, circuit,
+                         new_ppl)
         except Exception as e:
             log.warning("[%s] PPL cache write failed: %s", circuit, e)
         cfg.pulses_per_litre = new_ppl
@@ -486,7 +527,9 @@ class Orchestrator:
             # recompute historical event volumes (the never-recompute invariant holds).
             try:
                 from .anomaly_baseline import rescale_anomaly_percentiles
-                rescale_anomaly_percentiles(self._db, circuit, cached / new_ppl)
+                from .database import run_db
+                await run_db(rescale_anomaly_percentiles, self._db, circuit,
+                             cached / new_ppl)
             except Exception as e:
                 log.warning("[%s] anomaly-percentile rescale failed: %s", circuit, e)
             note = ("Small calibration trim applied — no re-learning needed. Past usage "
@@ -534,11 +577,33 @@ class Orchestrator:
         if self._ha:
             self._ha.stop()
 
-    async def run(self) -> None:
-        """Initialise and run all components concurrently."""
-        # Database
-        self._db = init_db(DB_PATH)
+    def _setup_complete_sync(self) -> bool:
+        """dev46 (46a) — ``setup_complete`` is a PROPERTY that queries the DB
+        on every access, so reading it from the loop is a connection touch
+        like any other. This wrapper gives run_db something to call."""
+        return self.setup_complete
 
+    def _reload_config_and_roles_sync(self) -> None:
+        """dev46 (46a) — entity/label/profile reloads + RBAC roles, one hop.
+
+        Load entity IDs, display labels, and circuit types from the DB into
+        the circuit configs, then refresh the RBAC role sets against the
+        orchestrator's own connection (the lifespan pre-loaded them from the
+        migration connection) and re-apply the bootstrap admin.
+        """
+        self.reload_circuit_entities()
+        self.reload_circuit_labels()
+        self.reload_circuit_profiles()
+        self.load_roles_from_db(self._db)
+
+    def _boot_db_preamble_sync(self) -> None:
+        """dev46 (46a) — the boot DB work that precedes the HA client.
+
+        Per-circuit defaults, the read-only orphan-reference check, and the
+        F-C2 incomplete-reseed warning. One callable, one transaction
+        (rule N2a); each sub-step keeps its own best-effort try/except so a
+        failure in one does not skip the others.
+        """
         # Ensure per-circuit defaults exist
         for circuit_cfg in self._cfg.circuits:
             ensure_circuit_defaults(
@@ -584,18 +649,31 @@ class Orchestrator:
         except Exception:
             pass    # pre-20260808 schema
 
+
+    async def run(self) -> None:
+        """Initialise and run all components concurrently."""
+        # Database
+        self._db = init_db(DB_PATH)
+
+        # dev46 (46a): the whole pre-HA boot block — per-circuit defaults, the
+        # orphan-reference integrity check, and the incomplete-reseed warning —
+        # is one contiguous run of DB work with no awaits in it, so it goes
+        # over the wall in ONE hop. NOTE this is NOT startup-before-loop:
+        # main.py creates run() as a task and immediately yields to uvicorn, so
+        # request handlers are already submitting to run_db while this executes.
+        from .database import run_db
+        await run_db(self._boot_db_preamble_sync)
+
         # HA client
         self._ha = HaClient()
         await self._ha.__aenter__()
 
-        # Load entity IDs, display labels, and circuit types from DB into circuit configs
-        self.reload_circuit_entities()
-        self.reload_circuit_labels()
-        self.reload_circuit_profiles()
-        # RBAC role sets from the orchestrator's own DB connection (the lifespan
-        # pre-loaded them from the migration connection; this refreshes against
-        # self._db and re-applies the bootstrap admin).
-        self.load_roles_from_db(self._db)
+        # dev46 (46a): the three config reloads and the RBAC role load are all
+        # DB reads with no awaits between them — one hop. Each of these
+        # reaches the connection through a closed-over helper rather than a
+        # conn argument, which is exactly the class the attribute-only audit
+        # could not see.
+        await run_db(self._reload_config_and_roles_sync)
         # Kick off the FIRST HA admin-set fetch NOW (right after the HA client is
         # up), before the heavy startup work below, so admins are recognised before
         # normal traffic rather than only after _run_role_sync's first tick at the
@@ -610,7 +688,7 @@ class Orchestrator:
         # This runs before EventDetector is constructed so that CircuitConfig waveform
         # fields are populated before setup() subscribes entities.
         # Never calls save_discovery() — never clears existing mappings.
-        if self.setup_complete:
+        if await run_db(self._setup_complete_sync):
             try:
                 _rescan = await rescan_optional_roles(
                     self._ha,
@@ -623,7 +701,7 @@ class Orchestrator:
                         "prefix_updated=%s — reloading",
                         _rescan.total_changed, _rescan.prefix_updated,
                     )
-                    self.reload_circuit_entities()
+                    await run_db(self.reload_circuit_entities)
             except Exception as _e:
                 log.warning("Optional-role rescan failed (non-fatal): %s", _e)
 
@@ -637,7 +715,7 @@ class Orchestrator:
         self._alert_manager = AlertManager(self._db, self._ha)
         self._presence_watcher = PresenceWatcher(
             self._db, self._ha, self.set_away_mode)
-        self._presence_watcher.setup()
+        await self._presence_watcher.setup()
         await self._presence_watcher.sync_initial_state()
 
         # Fetch the HA instance timezone so the leak-test scheduler and "Today"
@@ -673,15 +751,15 @@ class Orchestrator:
             circuits=self._cfg.circuits,
             ha_client=self._ha,
             event_queue=self._event_queue,
-            sensitivity_getter=self._get_sensitivity,
+            sensitivity_getter=self._get_sensitivity,  # audit-ok(run_db): invoked only inside EventDetector.collect_circuit_inputs, which is submitted via run_db
             debug_capture_propagation=self._cfg.debug_capture_propagation,
-            pump_gate_getter=self._get_pump_osc_gate,
-            low_pressure_getter=self._get_low_pressure_floors,
+            pump_gate_getter=self._get_pump_osc_gate,  # audit-ok(run_db): invoked only inside EventDetector.collect_circuit_inputs, which is submitted via run_db
+            low_pressure_getter=self._get_low_pressure_floors,  # audit-ok(run_db): invoked only inside EventDetector.collect_circuit_inputs, which is submitted via run_db
             low_pressure_cb=self._on_low_pressure_alert,
             pump_fail_cb=self._on_pump_fail_alert,
         )
-        if self.setup_complete:
-            self._event_detector.setup()
+        if await run_db(self._setup_complete_sync):
+            await self._event_detector.setup()
             log.info("Event detection active")
             # dev38: seed valve states AFTER the change subscriptions are wired
             # (subscribe-then-prime) so other_valve_open can record a confirmed
@@ -718,18 +796,25 @@ class Orchestrator:
         # of already-matched events so DBSTREAM + scaler are warm on startup.
         try:
             from .cluster_engine import ClusterEngine
-            loop = asyncio.get_running_loop()
+            from .database import run_db
             self._cluster_engine = ClusterEngine(self._db, self._cfg)
             for c in self._cfg.circuits:
-                count = await loop.run_in_executor(
-                    None, self._cluster_engine.rebuild_from_db, c.circuit
-                )
+                # dev46 (46a): every DB touch goes through the single DB
+                # thread. Interleave-safe by construction — the live matching
+                # path can't reach the engine yet (feature_extractor's
+                # cluster_engine is wired below, and it guards on that).
+                count = await _timed_startup_job(
+                    f"rebuild_from_db[{c.circuit}]",
+                    run_db(self._cluster_engine.rebuild_from_db, c.circuit))
                 log.info("[%s] cluster state rebuilt — %d events replayed",
                          c.circuit, count)
-                # Backfill events that had no cluster_id (e.g. v0.1.x upgrades)
-                backfilled = await loop.run_in_executor(
-                    None, self._cluster_engine.backfill_unmatched, c.circuit
-                )
+                # Backfill events that had no cluster_id (e.g. v0.1.x upgrades).
+                # dev46 (46a/C2a): the chunked variant — it already submits one
+                # run_db call per batch, so a queued page render interleaves at
+                # each chunk instead of waiting out the whole backlog.
+                backfilled = await _timed_startup_job(
+                    f"backfill_unmatched[{c.circuit}]",
+                    self._cluster_engine.backfill_unmatched_async(c.circuit))
                 if backfilled:
                     log.info("[%s] backfilled cluster_id on %d previously unmatched events",
                              c.circuit, backfilled)
@@ -745,26 +830,39 @@ class Orchestrator:
         # Both passes are idempotent and best-effort — a failure must not block
         # boot. The 20260535 migration only adds the dribble column (lightweight
         # DDL); the verdict + typing backfill lands here.
+        # dev46 (46a/C2a) — these passes run on the single DB worker via
+        # run_db, and the expensive one is submitted CHUNK-WISE.
+        #
+        # With one DB worker, a monolithic submission makes every queued page
+        # render wait for the whole pass — the ~2-minute startup reclassify
+        # would turn the old crash into a hang. reclassify_..._async slices the
+        # row loop into batches (chunk = transaction = one run_db call), so the
+        # queue gets a seam every ~200 rows and small pages stay responsive
+        # through boot. The whole-circuit cycle detectors still run once, in
+        # the pass's prepare step — they were never the obstacle to batching.
         try:
-            loop = asyncio.get_running_loop()
+            from .database import run_db
             from .feature_extractor import reprocess_event_exclusion_verdicts
-            res = await loop.run_in_executor(
-                None, reprocess_event_exclusion_verdicts, self._db)
+            res = await _timed_startup_job(
+                "reprocess_event_exclusion_verdicts",
+                run_db(reprocess_event_exclusion_verdicts, self._db))
             if res.get("dribbles_flagged"):
                 log.info("startup: flagged %d low-flow dribble event(s)",
                          res["dribbles_flagged"])
-            from .database import (reclassify_all_events_from_signatures,
+            from .database import (reclassify_all_events_from_signatures_async,
                                    recompute_cycle_pulse_counts,
                                    resuggest_all_clusters,
                                    recompute_all_user_label_suggestions)
             for c in self._cfg.circuits:
                 # dev.22: cycle-pulse backfill MUST precede reclassify so the
                 # matcher's cycle_pulse_count feature is populated before it types.
-                cyc = await loop.run_in_executor(
-                    None, recompute_cycle_pulse_counts, self._db, c.circuit)
-                r = await loop.run_in_executor(
-                    None, reclassify_all_events_from_signatures,
-                    self._db, c.circuit)
+                cyc = await _timed_startup_job(
+                    f"recompute_cycle_pulse_counts[{c.circuit}]",
+                    run_db(recompute_cycle_pulse_counts, self._db, c.circuit))
+                r = await _timed_startup_job(
+                    f"reclassify[{c.circuit}]",
+                    reclassify_all_events_from_signatures_async(
+                        self._db, c.circuit))
                 if r.get("events_matched") or r.get("events_cleared"):
                     log.info(
                         "[%s] startup reclassify: %d matched, %d abstained, "
@@ -777,18 +875,21 @@ class Orchestrator:
                 # pass assigns them. Idempotent: backfill_unmatched only touches
                 # cluster_id IS NULL rows, so it skips everything already clustered.
                 if self._cluster_engine is not None:
-                    bf = await loop.run_in_executor(
-                        None, self._cluster_engine.backfill_unmatched, c.circuit)
+                    bf = await self._cluster_engine.backfill_unmatched_async(
+                        c.circuit)
                     if bf:
                         log.info("[%s] startup post-reprocess backfill: "
                                  "%d event(s) clustered", c.circuit, bf)
                 # Re-run the heuristic suggestion over the patched centroids, then
                 # the GATED user-label suggestion to un-poison mixed clusters
                 # (dev.22) — the only path that clears a stale 'user_labels' vote.
-                rs = await loop.run_in_executor(
-                    None, resuggest_all_clusters, self._db, c.circuit)
-                ul = await loop.run_in_executor(
-                    None, recompute_all_user_label_suggestions, self._db, c.circuit)
+                rs = await _timed_startup_job(
+                    f"resuggest_all_clusters[{c.circuit}]",
+                    run_db(resuggest_all_clusters, self._db, c.circuit))
+                ul = await _timed_startup_job(
+                    f"recompute_all_user_label_suggestions[{c.circuit}]",
+                    run_db(recompute_all_user_label_suggestions, self._db,
+                           c.circuit))
                 if cyc.get("updated") or rs.get("updated") or ul.get("cleared"):
                     log.info("[%s] startup reprocess: %d cycle events, %d heuristic "
                              "+ %d user-label suggestion(s) re-derived (%d cleared)",
@@ -976,15 +1077,27 @@ class Orchestrator:
         """6a callback (runs on the event loop from the WS callback)."""
         if self._alert_manager is None:
             return
-        from .config import pump_mode_effective_cached
-        try:
-            pump_active = pump_mode_effective_cached(self._db, circuit)["active"]
-        except Exception:
-            pump_active = False
         name = self.get_display_name(circuit) if hasattr(
             self, "get_display_name") else circuit
-        asyncio.ensure_future(self._alert_manager.alert_low_pressure_supply(
-            circuit, psi, name, pump_active))
+        # dev46 (46a): the WS handler invokes this callback ON THE EVENT
+        # LOOP, so the pump-mode read cannot happen here. It moves into the
+        # task that was already being spawned — no behaviour change, the
+        # alert was always fired asynchronously.
+        asyncio.ensure_future(
+            self._low_pressure_alert_async(circuit, psi, name))
+
+    async def _low_pressure_alert_async(self, circuit: str, psi: float,
+                                        name: str) -> None:
+        """dev46 (46a) — the DB half of the 6a low-pressure alert."""
+        from .config import pump_mode_effective_cached
+        from .database import run_db
+        try:
+            pump_active = (await run_db(pump_mode_effective_cached,
+                                        self._db, circuit))["active"]
+        except Exception:
+            pump_active = False
+        await self._alert_manager.alert_low_pressure_supply(
+            circuit, psi, name, pump_active)
 
     def _on_pump_fail_alert(self, circuit: str, psi: float, kind: str) -> None:
         """6b callback (runs on the event loop from the WS callback)."""
@@ -1062,19 +1175,53 @@ class Orchestrator:
         Uses INSERT … ON CONFLICT DO UPDATE so the detection also works on a
         fresh install where home_profile row may not exist yet.
         """
+        # dev46 (46a) — TWO-HOP handler: read, await HA, write.
+        # HOP-2 RE-CHECK (named): _write_display_units_sync re-asserts
+        # "both units still at schema defaults" INSIDE the write callable.
+        # Without it, a user who picks gal/min on the Settings page while
+        # get_ha_unit_system() is in flight would have their choice silently
+        # overwritten by HA's default — the exact stale-premises class R1
+        # exists to prevent. This is NOT exemption-class material: the write
+        # is a value-set, not monotonic, so an interleaved write absolutely
+        # can change the right outcome.
+        from .database import run_db
         from .units import defaults_from_ha, invalidate_unit_cache
-        row = self._db.execute(
-            "SELECT flow_unit, pressure_unit FROM home_profile WHERE id = 1"
-        ).fetchone()
-        # Skip if either unit has been explicitly changed from schema defaults
-        if row and (
-            (row["flow_unit"]     and row["flow_unit"]     != "L/min") or
-            (row["pressure_unit"] and row["pressure_unit"] != "psi")
-        ):
+        if not await run_db(self._display_units_are_default_sync):
             return
         ha_units = await self._ha.get_ha_unit_system()
         ha_vol   = ha_units.get("volume", "L")
         flow_key, pressure_key = defaults_from_ha(ha_vol)
+        if not await run_db(self._write_display_units_sync, flow_key,
+                            pressure_key):
+            log.info("Display-unit auto-detect skipped — a preference was set "
+                     "while HA's unit system was being read")
+            return
+        invalidate_unit_cache()
+        log.info("Display units auto-detected from HA: flow=%s pressure=%s",
+                 flow_key, pressure_key)
+
+    def _display_units_are_default_sync(self) -> bool:
+        """True while both display units are still at their schema defaults."""
+        row = self._db.execute(
+            "SELECT flow_unit, pressure_unit FROM home_profile WHERE id = 1"
+        ).fetchone()
+        if row and (
+            (row["flow_unit"]     and row["flow_unit"]     != "L/min") or
+            (row["pressure_unit"] and row["pressure_unit"] != "psi")
+        ):
+            return False
+        return True
+
+    def _write_display_units_sync(self, flow_key: str,
+                                  pressure_key: str) -> bool:
+        """Write the HA-derived display units, re-checking the precondition.
+
+        dev46 (46a) hop-2 re-check: the gate is re-evaluated inside the same
+        callable as the write, so a preference saved during the HA await wins
+        instead of being clobbered. Returns False when it declined to write.
+        """
+        if not self._display_units_are_default_sync():
+            return False
         # ON CONFLICT handles both fresh install (no row) and existing row
         self._db.execute("""
             INSERT INTO home_profile (id, flow_unit, pressure_unit)
@@ -1084,9 +1231,7 @@ class Orchestrator:
                 pressure_unit = excluded.pressure_unit
         """, (flow_key, pressure_key))
         self._db.commit()
-        invalidate_unit_cache()
-        log.info("Display units auto-detected from HA: flow=%s pressure=%s",
-                 flow_key, pressure_key)
+        return True
 
     async def _init_ha_timezone(self) -> None:
         """Fetch the HA instance's configured timezone and cache it for volume queries."""
@@ -1111,6 +1256,25 @@ class Orchestrator:
         await self._resync_daily_summary_boundary(tz_name)
         await self._backfill_time_features(tz_name)
 
+    def _resync_boundary_sync(self, tz_name: str):
+        """dev46 (46a) — read the stored zone, rebuild day totals, stamp it.
+
+        One DB-thread callable, one transaction (rule N2a). Returns ``None``
+        when the stored zone already matches, so the caller can skip its log
+        line; otherwise the rebuild's result dict.
+        """
+        from .database import (get_home_profile, rebuild_daily_summaries,
+                               update_home_profile)
+        profile = get_home_profile(self._db)
+        stored = (dict(profile or {}) or {}).get("daily_summary_tz")
+        if stored == tz_name:
+            return None
+        log.info("daily_summary day boundary: %s → %s — rebuilding",
+                 stored or "UTC (pre-20260571)", tz_name)
+        res = rebuild_daily_summaries(self._db)
+        update_home_profile(self._db, daily_summary_tz=tz_name)
+        return res
+
     async def _resync_daily_summary_boundary(self, tz_name: str) -> None:
         """Rebuild daily_summary when its day boundary no longer matches the home.
 
@@ -1124,19 +1288,16 @@ class Orchestrator:
         Best-effort — a failure leaves the stamp alone, so the next boot retries
         rather than silently keeping mis-bucketed rows.
         """
-        from .database import get_home_profile, rebuild_daily_summaries, \
-            update_home_profile
         try:
-            profile = get_home_profile(self._db)
-            stored = (dict(profile or {}) or {}).get("daily_summary_tz")
-            if stored == tz_name:
+            # dev46 (46a): read the stored zone, rebuild, and stamp the new
+            # zone in ONE hop. Bundling is not only about thread-safety here —
+            # the stamp must not outlive a failed rebuild, and inside a single
+            # callable it cannot (rule N2a: one callable, one transaction).
+            # None means the stored zone already matches and nothing was done.
+            from .database import run_db
+            res = await run_db(self._resync_boundary_sync, tz_name)
+            if res is None:
                 return
-            log.info("daily_summary day boundary: %s → %s — rebuilding",
-                     stored or "UTC (pre-20260571)", tz_name)
-            loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(
-                None, rebuild_daily_summaries, self._db)
-            update_home_profile(self._db, daily_summary_tz=tz_name)
             log.info("daily_summary rebuild complete: %s", res)
         except Exception as e:
             log.warning("daily_summary boundary resync failed (retried next "
@@ -1154,11 +1315,9 @@ class Orchestrator:
         waveform-repair workers' cluster rebuild (their supervised chain
         starts at +240 s; this completes in seconds for ~6k rows).
         """
-        from .database import backfill_time_features_tz
+        from .database import backfill_time_features_tz, run_db
         try:
-            loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(
-                None, backfill_time_features_tz, self._db, tz_name)
+            res = await run_db(backfill_time_features_tz, self._db, tz_name)
             if res.get("rewritten"):
                 log.info("Time-feature tz backfill (%s): %s", tz_name, res)
         except Exception as e:
@@ -1250,13 +1409,11 @@ class Orchestrator:
 
                 # At startup only fix baselines still at the 0.0 placeholder; on
                 # a forced rollover always re-derive from HA history.
-                row = self._db.execute(
-                    "SELECT ha_volume FROM volume_snapshots "
-                    "WHERE circuit=? AND period_ts=?",
-                    (circuit, period_ts),
-                ).fetchone()
-
-                if not force and row is not None and row[0] != 0.0:
+                # dev46 (46a) — hop 1 of a two-hop handler (the HA history
+                # fetch below is the non-DB await).
+                from .database import run_db
+                if not await run_db(self._volume_baseline_needs_fix_sync,
+                                    circuit, period_ts, force):
                     continue   # already set to a real value
 
                 # Query HA history for the earliest reading at/after midnight
@@ -1287,17 +1444,59 @@ class Orchestrator:
                 # The next live read raises it to the true maximum within
                 # seconds, so the only exposure is a reset in that window —
                 # which carries 0 L, never invented water.
-                self._db.execute("""
-                    INSERT INTO volume_snapshots (circuit, period_ts, ha_volume,
-                                                  last_reading)
-                    VALUES (?,?,?,?)
-                    ON CONFLICT (circuit, period_ts)
-                    DO UPDATE SET ha_volume    = excluded.ha_volume,
-                                  last_reading = excluded.last_reading
-                """, (circuit, period_ts, midnight_val, midnight_val))
-                self._db.commit()
+                # HOP-2 RE-CHECK (named): _write_volume_baseline_sync
+                # re-evaluates the same "still a 0.0 placeholder (or forced)"
+                # gate inside the write callable. If a live read seeded a real
+                # baseline while the HA history fetch was in flight, this
+                # write stands down rather than overwriting it from stale
+                # premises — and since a baseline shifts every daily total
+                # measured against it, that is volume-accounting correctness,
+                # not just tidiness. Not exemption-class: the write is a
+                # value-set, so an interleaved write changes the right answer.
+                if not await run_db(self._write_volume_baseline_sync, circuit,
+                                    period_ts, midnight_val, force):
+                    log.info("[%s] volume baseline for %s left alone — a real "
+                             "value landed while HA history was being read",
+                             circuit, label)
+                    continue
                 log.info("[%s] volume baseline set for %s: %.2f L",
                          circuit, label, midnight_val)
+
+    def _volume_baseline_needs_fix_sync(self, circuit: str, period_ts,
+                                        force: bool) -> bool:
+        """True when this period's baseline should be re-derived from HA.
+
+        Startup fixes only rows still at the 0.0 placeholder; a forced
+        rollover always re-derives.
+        """
+        row = self._db.execute(
+            "SELECT ha_volume FROM volume_snapshots "
+            "WHERE circuit=? AND period_ts=?",
+            (circuit, period_ts),
+        ).fetchone()
+        return bool(force or row is None or row[0] == 0.0)
+
+    def _write_volume_baseline_sync(self, circuit: str, period_ts,
+                                    midnight_val: float,
+                                    force: bool) -> bool:
+        """Write an HA-derived baseline, re-checking the precondition.
+
+        dev46 (46a) hop-2 re-check: the gate is re-evaluated inside the same
+        callable as the write, so a real baseline seeded during the HA await
+        is not overwritten from stale premises. Returns False when it declined.
+        """
+        if not self._volume_baseline_needs_fix_sync(circuit, period_ts, force):
+            return False
+        self._db.execute("""
+            INSERT INTO volume_snapshots (circuit, period_ts, ha_volume,
+                                          last_reading)
+            VALUES (?,?,?,?)
+            ON CONFLICT (circuit, period_ts)
+            DO UPDATE SET ha_volume    = excluded.ha_volume,
+                          last_reading = excluded.last_reading
+        """, (circuit, period_ts, midnight_val, midnight_val))
+        self._db.commit()
+        return True
 
     async def _recompute_leak_test_schedules(self) -> None:
         """Recompute next_run_at for every enabled leak-test schedule.
@@ -1312,12 +1511,13 @@ class Orchestrator:
         Invalid or unparsable existing values are logged and overwritten;
         naive datetimes are treated as UTC for the diff log.
         """
-        from .database import get_leak_test_schedule
+        from .database import get_leak_test_schedule, run_db
 
         for circuit_cfg in self._cfg.circuits:
             circuit = circuit_cfg.circuit
             try:
-                schedule = get_leak_test_schedule(self._db, circuit)
+                schedule = await run_db(get_leak_test_schedule, self._db,
+                                        circuit)
             except Exception as e:
                 log.warning("[%s] could not read leak_test_schedule: %s",
                             circuit, e)
@@ -1345,11 +1545,47 @@ class Orchestrator:
                             circuit, e)
                 continue
 
-            new_row = get_leak_test_schedule(self._db, circuit)
+            # Read-back after the scheduler's await. No hop-2 re-check is
+            # needed: re-checks exist to stop a STALE WRITE landing, and
+            # nothing is written here — this read only feeds a log line.
+            new_row = await run_db(get_leak_test_schedule, self._db, circuit)
             new_str = new_row["next_run_at"] if new_row else None
             if new_str and new_str != prior_str:
                 log.info("[%s] startup recompute: next_run_at %s → %s",
                          circuit, prior_str or "(none)", new_str)
+
+    def _live_state_db_sync(self, circuit: str, ha_volume_total,
+                            today_ts, week_ts):
+        """dev46 (46a) — every DB read behind one live-state poll, one hop.
+
+        Read-only, so no transaction to own. Bundling also makes the poll
+        internally consistent: the volumes, valve type and degraded/anomaly
+        state now all describe the same instant rather than whatever each
+        separate touch happened to see.
+        """
+        from .database import (compute_ha_daily_volume,
+                               compute_ha_weekly_volume, get_daily_volume,
+                               get_weekly_volume)
+        from .units import load_unit_context
+        if ha_volume_total is not None and ha_volume_total >= 0:
+            volume_daily = compute_ha_daily_volume(
+                self._db, circuit, ha_volume_total, period_ts=today_ts)
+            volume_weekly = compute_ha_weekly_volume(
+                self._db, circuit, ha_volume_total, period_ts=week_ts)
+        else:
+            volume_daily = get_daily_volume(self._db, circuit,
+                                            since_utc=today_ts)
+            volume_weekly = get_weekly_volume(self._db, circuit,
+                                              since_utc=week_ts)
+        return {
+            "volume_daily":   volume_daily,
+            "volume_weekly":  volume_weekly,
+            "unit_context":   load_unit_context(self._db),
+            "setup_complete": self.setup_complete,
+            "valve_type":     self._valve_type_for(circuit),
+            "degraded":       self._degraded_state_for(circuit),
+            "anomaly":        self._anomaly_state_for(circuit),
+        }
 
     async def _fetch_live_state(self, circuit: str) -> Dict[str, Any]:
         circuit_cfg = self._cfg.get_circuit(circuit)
@@ -1408,12 +1644,17 @@ class Orchestrator:
         today_ts = self._local_midnight_utc(days_ago=0)
         week_ts  = self._local_midnight_utc(days_ago=7)
 
-        if ha_volume_total is not None and ha_volume_total >= 0:
-            volume_daily  = compute_ha_daily_volume(self._db, circuit, ha_volume_total, period_ts=today_ts)
-            volume_weekly = compute_ha_weekly_volume(self._db, circuit, ha_volume_total, period_ts=week_ts)
-        else:
-            volume_daily  = get_daily_volume(self._db, circuit, since_utc=today_ts)
-            volume_weekly = get_weekly_volume(self._db, circuit, since_utc=week_ts)
+        # dev46 (46a): every DB read this method needs — volumes, unit
+        # context, setup flag, valve type, degraded + anomaly state — is
+        # gathered in ONE hop. They are all reads and all independent of the
+        # HA state fetch above, so there is no split to make; done separately
+        # they were nine event-loop-thread touches on a dashboard poll that
+        # runs for every circuit on a timer.
+        from .database import run_db
+        dbst = await run_db(self._live_state_db_sync, circuit,
+                            ha_volume_total, today_ts, week_ts)
+        volume_daily  = dbst["volume_daily"]
+        volume_weekly = dbst["volume_weekly"]
 
         fault_active = states.get(circuit_cfg.fault_sensor) == "on"
 
@@ -1445,8 +1686,7 @@ class Orchestrator:
             except Exception as e:
                 log.warning("[%s] ETC computation error: %s", circuit, e)
 
-        from .units import load_unit_context
-        uc = load_unit_context(self._db)
+        uc = dbst["unit_context"]
 
         _vt_raw = states.get(circuit_cfg.volume_sensor, "")
         try:
@@ -1486,15 +1726,15 @@ class Orchestrator:
             "volume_weekly": f"{volume_weekly * uc['vol_factor']:.{uc['vol_decimals']}f}",
             "leak_test_running": self._leak_test_scheduler.is_running(circuit)
             if self._leak_test_scheduler else False,
-            "setup_complete": self.setup_complete,
+            "setup_complete": dbst["setup_complete"],
             # Valve type for this circuit; the device template uses it to
             # disable the manual leak-test button for 3-port valves.
-            "valve_type": self._valve_type_for(circuit),
+            "valve_type": dbst["valve_type"],
             # Degraded-supply guard status. Python-computed UTC ISO cutoffs
             # so the comparison format matches stored start_ts exactly.
-            **self._degraded_state_for(circuit),
+            **dbst["degraded"],
             # Unreviewed-anomaly triage count for the dashboard card.
-            **self._anomaly_state_for(circuit),
+            **dbst["anomaly"],
         }
 
     def _valve_type_for(self, circuit: str) -> str:
@@ -1590,14 +1830,12 @@ class Orchestrator:
         # Wait ~30s after startup so the rest of the boot sequence finishes
         # before the first purge runs.
         await asyncio.sleep(30)
-        loop = asyncio.get_running_loop()
+        from .database import run_db
         while not self._stop.is_set():
             try:
                 cutoff = (datetime.now(timezone.utc)
                           - timedelta(days=WAVEFORM_RETENTION_DAYS)).isoformat()
-                rowcount = await loop.run_in_executor(
-                    None, self._purge_waveforms_sync, cutoff,
-                )
+                rowcount = await run_db(self._purge_waveforms_sync, cutoff)
                 if rowcount:
                     log.info("Purged %d waveform row(s) older than %d days",
                              rowcount, WAVEFORM_RETENTION_DAYS)
@@ -1610,8 +1848,8 @@ class Orchestrator:
                 pass
 
     def _purge_waveforms_sync(self, cutoff: str) -> int:
-        """DELETE old event_waveforms rows. Runs in a worker thread —
-        only the calling async wrapper uses run_in_executor."""
+        """DELETE old event_waveforms rows. Runs on the single DB thread —
+        the calling async wrapper submits it via run_db (dev46 46a)."""
         cur = self._db.execute(
             "DELETE FROM event_waveforms WHERE created_at < ?",
             (cutoff,),

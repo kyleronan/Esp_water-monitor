@@ -5,12 +5,12 @@ import logging
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from ._helpers import coerce_int, ingress_redirect
+from ._helpers import coerce_int, ingress_redirect, startup_gate
 
 from ..auth import require_admin
 from ..circuit_compat import resolve_circuit
 from ..config import SENSITIVITY_PRESETS
-from ..database import get_data_retention, update_data_retention
+from ..database import get_data_retention, run_db, update_data_retention
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +91,10 @@ def _anomaly_shutoff_ready(sdict: dict) -> bool:
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def settings_page(request: Request):
+    # dev46 (46c): per-circuit calibration meta + validation reports.
+    gated = startup_gate(request, "settings", "Settings", "/settings")
+    if gated is not None:
+        return gated
     orch = _orch(request)
     from ..database import (get_home_profile, get_sensitivity_config,
                             get_alert_configs)
@@ -99,7 +103,8 @@ async def settings_page(request: Request):
 
 
     # Fetch configurable device entities (number + select) from HA
-    device_cfg = get_device_config(orch.db)
+    from ..database import run_db
+    device_cfg = await run_db(get_device_config, orch.db)   # dev46 (46a)
     prefix = device_cfg.get("esp_device_prefix", "") if device_cfg else ""
     try:
         device_entities = await orch.ha.get_device_configurable_entities(prefix)
@@ -130,7 +135,7 @@ async def settings_page(request: Request):
     # Load unit context once so descriptions and state values are shown in
     # the user's chosen units (e.g. gal/min instead of L/min).
     from ..units import load_unit_context
-    _uc              = load_unit_context(orch.db)
+    _uc              = await run_db(load_unit_context, orch.db)  # dev46 (46a)
     _flow_label      = _uc["flow_unit"]       # e.g. "gal/min"
     _flow_factor     = _uc["flow_factor"]     # multiply L/min → display
     _pressure_label  = _uc["pressure_unit"]   # e.g. "bar"
@@ -260,32 +265,51 @@ async def settings_page(request: Request):
     from ..detector_validation import load_validation_report
     from ..anomaly_baseline import MIN_N_FOR_SHUTOFF, MIN_LIVE_DAYS_FOR_SHUTOFF
     _home_tz = get_home_timezone()
+    from ..database import get_active_exclusion_window, get_valve_type
+    from ..supply_regime import get_current_regime_id
+
+    def _per_circuit_db():
+        """dev46 (46a): every per-circuit DB read for this page in ONE hop —
+        ~10 queries per circuit used to run inline on the event loop."""
+        out = {}
+        for cc in orch._cfg.circuits:
+            cid = cc.circuit
+            out[cid] = {
+                "sens": get_sensitivity_config(orch.db, cid),
+                "alerts": [dict(a) for a in get_alert_configs(orch.db, cid)],
+                "training": (orch.training_manager.get_training_info(cid)
+                             if orch.training_manager else None),
+                "cal_meta": get_rule_calibration_meta(
+                    orch.db, cid, regime_id=get_current_regime_id(orch.db)),
+                "art_meta": get_artifact_calibration_meta(orch.db, cid),
+                "dv": load_validation_report(orch.db, cid),
+                "valve_type": get_valve_type(orch.db, cid),
+                "exclusion": get_active_exclusion_window(orch.db, cid),
+            }
+        return out
+
+    _pc = await run_db(_per_circuit_db)
+
     circuits = []
     for circuit_cfg in orch._cfg.circuits:
         c = circuit_cfg.circuit
-        sens = get_sensitivity_config(orch.db, c)
+        _row = _pc[c]
+        sens = _row["sens"]
         sdict = dict(sens) if sens else {}
-        alerts = [dict(a) for a in get_alert_configs(orch.db, c)]
-        training = (
-            orch.training_manager.get_training_info(c)
-            if orch.training_manager else {
-                "state": "idle", "events_collected": 0,
-                "minimum_events": 0, "days_remaining": 0,
-                "percent_complete": 0,
-            }
-        )
-        from ..supply_regime import get_current_regime_id
-        cal_meta = get_rule_calibration_meta(
-            orch.db, c, regime_id=get_current_regime_id(orch.db))
-        art_meta = get_artifact_calibration_meta(orch.db, c)
-        dv = load_validation_report(orch.db, c)
-
-        from ..database import get_active_exclusion_window, get_valve_type
+        alerts = _row["alerts"]
+        training = _row["training"] or {
+            "state": "idle", "events_collected": 0,
+            "minimum_events": 0, "days_remaining": 0,
+            "percent_complete": 0,
+        }
+        cal_meta = _row["cal_meta"]
+        art_meta = _row["art_meta"]
+        dv = _row["dv"]
         circuits.append({
             "circuit": c,
             "display_name": circuit_cfg.label,
             "circuit_type": circuit_cfg.circuit_type,
-            "valve_type": get_valve_type(orch.db, c),
+            "valve_type": _row["valve_type"],
             # Runtime per-circuit flow meter (read-only). The firmware "Flow Meter PPL"
             # number entity is the source of truth; the add-on caches it and derives the
             # low-flow floor (60 ÷ ppl). Read from the LIVE config so the display reflects
@@ -328,7 +352,7 @@ async def settings_page(request: Request):
             # P6 detector self-validation against HA history (Dev Tools, diagnostic).
             "detector_validation": _localize_validation(dv, _home_tz) if dv else None,
             "device_entities": entities_by_circuit.get(c, []),
-            "active_exclusion": get_active_exclusion_window(orch.db, c),
+            "active_exclusion": _row["exclusion"],
         })
 
     # MQTT status for the Integrations section status pill
@@ -343,47 +367,58 @@ async def settings_page(request: Request):
     from ..config import DEV_TOOLS
     # Phase 6b: derived pump-failure floor hint (one-tap apply). Shown only
     # for pump homes with nightly data; never auto-applied.
-    pump_floor = {"hint": None, "current": None}
-    try:
-        from ..config import pump_mode_effective_cached
-        if pump_mode_effective_cached(orch.db, "circuit_1")["active"]:
-            from ..pump_regime_detector import pump_floor_hint
-            pump_floor["hint"] = pump_floor_hint(orch.db)
-            row = orch.db.execute(
-                "SELECT pump_low_pressure_alert_psi FROM sensitivity_config "
-                "WHERE pump_low_pressure_alert_psi IS NOT NULL LIMIT 1"
-            ).fetchone()
-            pump_floor["current"] = row[0] if row else None
-    except Exception:
-        pass
-    # Supply-pressure regime summary for the Recalibration card (best-effort).
-    supply_regime_ctx = {"exists": False}
-    try:
-        from ..supply_regime import get_current_regime, regime_labels_needed
-        _cur = get_current_regime(orch.db)
-        if _cur is not None:
-            _primary = (orch._cfg.circuits[0].circuit
-                        if orch._cfg.circuits else None)
-            supply_regime_ctx = {
-                "exists": True,
-                "center_psi": round(_cur["center_psi"]),
-                "since": _cur["started_at"][:10],
-                "labels_needed": (regime_labels_needed(orch.db, _primary, _cur)
-                                  if _primary else ""),
-            }
-    except Exception:
-        pass
+    def _tail_db():
+        """dev46 (46a): the page's remaining reads — pump-floor hint, supply
+        regime summary, profile and retention — in one DB-thread callable."""
+        pump_floor = {"hint": None, "current": None}
+        try:
+            from ..config import pump_mode_effective_cached
+            if pump_mode_effective_cached(orch.db, "circuit_1")["active"]:
+                from ..pump_regime_detector import pump_floor_hint
+                pump_floor["hint"] = pump_floor_hint(orch.db)
+                row = orch.db.execute(
+                    "SELECT pump_low_pressure_alert_psi FROM sensitivity_config "
+                    "WHERE pump_low_pressure_alert_psi IS NOT NULL LIMIT 1"
+                ).fetchone()
+                pump_floor["current"] = row[0] if row else None
+        except Exception:
+            pass
+        # Supply-pressure regime summary for the Recalibration card
+        # (best-effort).
+        supply_regime_ctx = {"exists": False}
+        try:
+            from ..supply_regime import (get_current_regime,
+                                         regime_labels_needed)
+            _cur = get_current_regime(orch.db)
+            if _cur is not None:
+                _primary = (orch._cfg.circuits[0].circuit
+                            if orch._cfg.circuits else None)
+                supply_regime_ctx = {
+                    "exists": True,
+                    "center_psi": round(_cur["center_psi"]),
+                    "since": _cur["started_at"][:10],
+                    "labels_needed": (regime_labels_needed(orch.db, _primary,
+                                                           _cur)
+                                      if _primary else ""),
+                }
+        except Exception:
+            pass
+        return (pump_floor, supply_regime_ctx,
+                dict(get_home_profile(orch.db) or {}),
+                get_data_retention(orch.db))
+
+    pump_floor, supply_regime_ctx, _profile, _retention = await run_db(_tail_db)
 
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
         "dev_tools": DEV_TOOLS,
         "pump_floor": pump_floor,
         "supply_regime": supply_regime_ctx,
-        "profile": dict(get_home_profile(orch.db) or {}),
+        "profile": _profile,
         "circuits": circuits,
         "general_entities": entities_by_circuit.get("general", []),
         "presets": SENSITIVITY_PRESETS,
-        "retention": get_data_retention(orch.db),
+        "retention": _retention,
         "mqtt_status": mqtt_status,
         "circuit_types": CIRCUIT_TYPES,
         "circuit_type_labels": CIRCUIT_TYPE_LABELS,
@@ -424,7 +459,7 @@ async def profile_update(request: Request):
     # actually changes: settings forms re-post every field on save, and an
     # unchanged pre-feature answer must not launder into post-feature consent
     # for the pump-alert arming rule.
-    prev = get_home_profile(orch.db)
+    prev = await run_db(get_home_profile, orch.db)
     prev_supply = ((prev["supply_type"] if prev else None) or "mains")
     supply_type = form.get("supply_type", prev_supply)
     if supply_type not in SUPPLY_TYPES:
@@ -441,7 +476,8 @@ async def profile_update(request: Request):
             pump_fields["pump_mode_ack"] = None
             pump_fields["pump_alert_armed_at"] = None
 
-    update_home_profile(
+    await run_db(                                             # dev46 (46a)
+        update_home_profile,
         orch.db,
         bathrooms_full=coerce_int(form.get("bathrooms_full"), lo=0, hi=20, default=1),
         bathrooms_half=coerce_int(form.get("bathrooms_half"), lo=0, hi=20, default=0),
@@ -460,7 +496,7 @@ async def profile_update(request: Request):
         invalidate_pump_mode_cache()
         if getattr(orch, "event_detector", None):
             try:
-                orch.event_detector.update_thresholds()
+                await orch.event_detector.update_thresholds()
             except Exception as e:
                 log.warning("supply change: detector threshold reload failed "
                             "(non-fatal): %s", e)
@@ -477,16 +513,18 @@ async def pump_floor_apply(request: Request):
     'explicit user-set floor' clause. Never applied automatically."""
     orch = _orch(request)
     from ..pump_regime_detector import pump_floor_hint
-    hint = pump_floor_hint(orch.db)
+    hint = await run_db(pump_floor_hint, orch.db)
     if hint is None:
         return ingress_redirect(request, "/settings#profile")
     from ..database import upsert_sensitivity_config
-    for c in orch._cfg.circuits:
+    # dev46 (46a): every circuit's write in one DB-thread callable.
+    await run_db(lambda: [
         upsert_sensitivity_config(orch.db, c.circuit,
                                   pump_low_pressure_alert_psi=hint)
+        for c in orch._cfg.circuits])
     if getattr(orch, "event_detector", None):
         try:
-            orch.event_detector.update_thresholds()
+            await orch.event_detector.update_thresholds()
         except Exception as e:
             log.warning("pump-floor apply: threshold reload failed "
                         "(non-fatal): %s", e)
@@ -506,7 +544,8 @@ async def pump_banner_confirm(request: Request):
     orch = _orch(request)
     from datetime import datetime as _dt, timezone as _tzinfo
     from ..database import update_home_profile
-    update_home_profile(
+    await run_db(                                             # dev46 (46a)
+        update_home_profile,
         orch.db,
         supply_type="city_pump",
         supply_type_set_at=_dt.now(_tzinfo.utc).isoformat(),
@@ -517,7 +556,7 @@ async def pump_banner_confirm(request: Request):
     # dev25: flip the live detector's oscillation gate immediately too.
     if getattr(orch, "event_detector", None):
         try:
-            orch.event_detector.update_thresholds()
+            await orch.event_detector.update_thresholds()
         except Exception as e:
             log.warning("pump banner: detector threshold reload failed "
                         "(non-fatal): %s", e)
@@ -536,7 +575,7 @@ async def pump_banner_dismiss(request: Request):
     from datetime import datetime as _dt, timezone as _tzinfo
     from ..database import update_home_profile
     today = _dt.now(_tzinfo.utc).date().isoformat()
-    update_home_profile(orch.db, pump_mode_ack=f"dismissed:{today}")
+    await run_db(update_home_profile, orch.db, pump_mode_ack=f"dismissed:{today}")
     log.info("pump banner: dismissed (re-banner only if detection persists "
              "30+ evaluated nights)")
     return ingress_redirect(request, "/settings#profile")
@@ -555,12 +594,12 @@ async def leak_banner_dismiss(request: Request):
     orch = _orch(request)
     from ..config import pump_gates_active
     from ..database import get_pump_regime_nights, update_home_profile
-    nights = get_pump_regime_nights(orch.db, limit=14)
+    nights = await run_db(get_pump_regime_nights, orch.db, limit=14)
     latest = next((n for n in nights if n.get("est_leak_lpd")), None)
     if latest is None:
         return ingress_redirect(request, "/")
-    update_home_profile(orch.db,
-                        leak_watch_ack=f"dismissed:{latest['night_date']}")
+    await run_db(update_home_profile, orch.db,                # dev46 (46a)
+                 leak_watch_ack=f"dismissed:{latest['night_date']}")
     log.info("leak-watch banner: dismissed through night %s (a newer estimate "
              "re-shows it)", latest["night_date"])
     return ingress_redirect(request, "/")
@@ -577,12 +616,23 @@ async def supply_banner_confirm(request: Request):
     orch = _orch(request)
     from datetime import datetime as _dt, timezone as _tzinfo
     from ..supply_regime import get_current_regime
-    current = get_current_regime(orch.db)
+    from ..database import run_db
+
+    def _confirm():
+        # dev46 (46a/N2a): read the current regime and stamp it in ONE
+        # callable — the id must not be read in one hop and written in another.
+        cur = get_current_regime(orch.db)
+        if cur is None:
+            return None
+        orch.db.execute(
+            "UPDATE supply_regime SET confirmed_at = ? WHERE id = ?",
+            (_dt.now(_tzinfo.utc).isoformat(), cur["id"]))
+        orch.db.commit()
+        return cur
+
+    current = await run_db(_confirm)
     if current is None:
         return ingress_redirect(request, "/")
-    orch.db.execute("UPDATE supply_regime SET confirmed_at = ? WHERE id = ?",
-                    (_dt.now(_tzinfo.utc).isoformat(), current["id"]))
-    orch.db.commit()
     log.info("supply banner: regime %s CONFIRMED — starting regime "
              "recalibration", current["id"])
     from .training import start_regime_recalibration
@@ -597,12 +647,21 @@ async def supply_banner_dismiss(request: Request):
     orch = _orch(request)
     from datetime import datetime as _dt, timezone as _tzinfo
     from ..supply_regime import get_current_regime
-    current = get_current_regime(orch.db)
-    if current is not None:
+    from ..database import run_db
+
+    def _dismiss():
+        # dev46 (46a/N2a): read + stamp + commit in one callable.
+        cur = get_current_regime(orch.db)
+        if cur is None:
+            return None
         orch.db.execute(
             "UPDATE supply_regime SET dismissed_at = ? WHERE id = ?",
-            (_dt.now(_tzinfo.utc).isoformat(), current["id"]))
+            (_dt.now(_tzinfo.utc).isoformat(), cur["id"]))
         orch.db.commit()
+        return cur
+
+    current = await run_db(_dismiss)
+    if current is not None:
         log.info("supply banner: regime %s dismissed", current["id"])
     return ingress_redirect(request, "/")
 
@@ -636,7 +695,7 @@ async def reseed_clusters(circuit: str, request: Request):
         return JSONResponse({"error": "training manager not running"},
                             status_code=503)
     from ..supply_regime import pump_era_start
-    anchor = pump_era_start(orch.db)
+    anchor = await run_db(pump_era_start, orch.db)
     if not anchor:
         return JSONResponse(
             {"error": "No pump era recorded for this home — the re-seed "
@@ -666,7 +725,8 @@ async def sensitivity_update(circuit: str, request: Request):
     preset = SENSITIVITY_PRESETS.get(level, SENSITIVITY_PRESETS["medium"])
 
     if mode == "simple":
-        upsert_sensitivity_config(
+        await run_db(                                         # dev46 (46a)
+            upsert_sensitivity_config,
             orch.db, circuit,
             mode=mode,
             simple_level=level,
@@ -674,7 +734,8 @@ async def sensitivity_update(circuit: str, request: Request):
         )
     else:
         # Advanced — read individual fields
-        upsert_sensitivity_config(
+        await run_db(                                         # dev46 (46a)
+            upsert_sensitivity_config,
             orch.db, circuit,
             mode=mode,
             simple_level="custom",
@@ -698,7 +759,7 @@ async def sensitivity_update(circuit: str, request: Request):
 
     # Refresh event detector thresholds
     if orch.event_detector:
-        orch.event_detector.update_thresholds()
+        await orch.event_detector.update_thresholds()
 
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
@@ -719,7 +780,7 @@ async def anomaly_update(circuit: str, request: Request):
     level = form.get("anomaly_response", "notify")
     if level not in _ANOMALY_RESPONSE_LEVELS:
         level = "notify"
-    upsert_sensitivity_config(orch.db, circuit, anomaly_response=level)
+    await run_db(upsert_sensitivity_config, orch.db, circuit, anomaly_response=level)
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
@@ -733,7 +794,7 @@ async def reconcile_update(circuit: str, request: Request):
     from ..database import upsert_sensitivity_config
 
     auto = 1 if form.get("recorder_reconcile_auto") == "on" else 0
-    upsert_sensitivity_config(orch.db, circuit, recorder_reconcile_auto=auto)
+    await run_db(upsert_sensitivity_config, orch.db, circuit, recorder_reconcile_auto=auto)
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
@@ -772,17 +833,17 @@ async def recalibrate(circuit: str, request: Request):
             # Household composition changed — reset to idle so
             # start_calibration can proceed, then begin a new run
             from ..database import upsert_training_state
-            upsert_training_state(orch.db, circuit, state="idle",
-                                  events_collected=0)
+            await run_db(upsert_training_state, orch.db,      # dev46 (46a)
+                         circuit, state="idle", events_collected=0)
             await orch.training_manager.start_calibration(
                 circuit, calibration_days)
 
     # §2.4 — confirm the (fast) recalibration trigger; the slow re-lock at the next
     # activation is tracked separately by _fit_and_lock.
     from ..database import start_job, finish_job
-    job = start_job(orch.db, "recalibration", circuit, "Recalibration…")
-    finish_job(orch.db, job, "done",
-               f"{circuit}: {kind} recalibration started — new learning period")
+    job = await run_db(start_job, orch.db, "recalibration", circuit, "Recalibration…")
+    await run_db(finish_job, orch.db, job, "done",            # dev46 (46a)
+                 f"{circuit}: {kind} recalibration started — new learning period")
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
@@ -876,7 +937,7 @@ async def suggest_days(circuit: str, request: Request):
     from ..database import get_home_profile
     from ..config import compute_suggested_calibration_days
 
-    profile = get_home_profile(orch.db) or {}
+    profile = await run_db(get_home_profile, orch.db) or {}   # dev46 (46a)
     days, tier = compute_suggested_calibration_days(
         profile.get("bathrooms_full") or 1,
         profile.get("bathrooms_half") or 0,
@@ -897,7 +958,7 @@ async def alert_toggle(circuit: str, alert_id: str, request: Request):
     orch = _orch(request)
     enabled = form.get("enabled") == "true"
     from ..database import set_alert_enabled
-    set_alert_enabled(orch.db, alert_id, enabled)
+    await run_db(set_alert_enabled, orch.db, alert_id, enabled)
     return JSONResponse({"status": "updated", "enabled": enabled})
 
 
@@ -950,7 +1011,7 @@ async def device_entity_update(request: Request):
     from ..device_discovery import load_circuit_entities
     allowed: set[str] = set()
     for c in orch._cfg.circuits:
-        ents = load_circuit_entities(orch.db, c.circuit)
+        ents = await run_db(load_circuit_entities, orch.db, c.circuit)
         allowed.update(v for k, v in ents.items() if k in _SETTINGS_MUTABLE_ROLES and v)
 
     if entity_id not in allowed:
@@ -971,10 +1032,10 @@ async def device_entity_update(request: Request):
         _PRESSURE_KEYWORDS = ("pressure_threshold", "pressure_drop")
         if any(k in entity_id for k in _FLOW_KEYWORDS):
             from ..units import load_unit_context as _luc
-            numeric = numeric / _luc(orch.db)["flow_factor"]
+            numeric = numeric / (await run_db(_luc, orch.db))["flow_factor"]
         elif any(k in entity_id for k in _PRESSURE_KEYWORDS):
             from ..units import load_unit_context as _luc
-            numeric = numeric / _luc(orch.db)["pressure_factor"]
+            numeric = numeric / (await run_db(_luc, orch.db))["pressure_factor"]
         # Round to the entity's native step to satisfy HA validation
         if native_step:
             try:
@@ -1014,7 +1075,8 @@ async def retention_update(request: Request):
         except (ValueError, TypeError):
             return default
 
-    update_data_retention(
+    await run_db(                                             # dev46 (46a)
+        update_data_retention,
         orch.db,
         events_retain_years=_int("events_retain_years", 1),
         hourly_volume_retain_years=_int("hourly_volume_retain_years", 2),
@@ -1029,15 +1091,14 @@ async def retention_update(request: Request):
 
 @router.post("/retention/prune-now")
 async def retention_prune_now(request: Request):
-    import asyncio
+    from ..database import run_db
     orch = _orch(request)
     if not orch.data_pruner:
         return JSONResponse({"ok": False, "error": "Pruner not available"}, status_code=503)
     # prune_now() runs synchronous SQLite DELETEs that can block for several
-    # seconds on large tables.  Run it in a thread-pool executor so the
-    # asyncio event loop stays responsive during the operation.
-    loop = asyncio.get_running_loop()
-    deleted = await loop.run_in_executor(None, orch.data_pruner.prune_now)
+    # seconds on large tables. Run it on the single DB thread (dev46 46a) so
+    # the asyncio event loop stays responsive during the operation.
+    deleted = await run_db(orch.data_pruner.prune_now)
     return JSONResponse({"ok": True, "deleted": deleted})
 
 
@@ -1047,14 +1108,11 @@ async def reprocess_degraded_supply(request: Request):
     stored diagnostics. Used after the guard's gates are tuned so past
     verdicts (and the daily-volume totals derived from them) match the
     new policy without waiting for new traffic."""
-    import asyncio
+    from ..database import run_db
     from ..feature_extractor import reprocess_degraded_supply_verdicts
 
     orch = _orch(request)
-    loop = asyncio.get_running_loop()
-    summary = await loop.run_in_executor(
-        None, reprocess_degraded_supply_verdicts, orch.db
-    )
+    summary = await run_db(reprocess_degraded_supply_verdicts, orch.db)
     log.info(
         "Degraded-supply reprocess: evaluated=%d flipped_to_degraded=%d "
         "flipped_to_clean=%d skipped_legacy=%d",
@@ -1079,8 +1137,8 @@ async def setup_unlock(request: Request):
     orch = _orch(request)
     # Both flags: the wizard lock (_block_if_setup_complete → orch.setup_complete)
     # reads device_config.setup_complete; home_profile mirrors it for the UI.
-    update_home_profile(orch.db, setup_complete=0)
-    unmark_setup_complete(orch.db)
+    await run_db(update_home_profile, orch.db, setup_complete=0)
+    await run_db(unmark_setup_complete, orch.db)
     log.warning("Setup wizard unlocked via Settings → Advanced — /setup/* mutators are open until the wizard completes again")
     return ingress_redirect(request, "/setup")
 
@@ -1105,10 +1163,17 @@ async def mobile_notify_update(request: Request):
     orch = _orch(request)
     form = await request.form()
     targets = form.get("mobile_notify_targets", "").strip()
-    orch.db.execute(
-        "UPDATE home_profile SET mobile_notify_targets = ?, updated_at = datetime('now') WHERE id = 1",
-        (targets,))
-    orch.db.commit()
+    # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
+    from ..database import run_db
+
+    def _save():
+        orch.db.execute(
+            "UPDATE home_profile SET mobile_notify_targets = ?, "
+            "updated_at = datetime('now') WHERE id = 1",
+            (targets,))
+        orch.db.commit()
+
+    await run_db(_save)
     return ingress_redirect(request, "/settings#notifications")
 
 
@@ -1121,15 +1186,21 @@ async def presence_update(request: Request):
     entities = form.get("ha_presence_entities", "").strip()
     away_state = form.get("ha_away_state", "not_home").strip()
     home_state = form.get("ha_home_state", "home").strip()
-    orch.db.execute("""
-        UPDATE home_profile
-        SET ha_presence_entities = ?,
-            ha_away_state        = ?,
-            ha_home_state        = ?,
-            updated_at = datetime('now')
-        WHERE id = 1
-    """, (entities, away_state, home_state))
-    orch.db.commit()
+    # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
+    from ..database import run_db
+
+    def _save():
+        orch.db.execute("""
+            UPDATE home_profile
+            SET ha_presence_entities = ?,
+                ha_away_state        = ?,
+                ha_home_state        = ?,
+                updated_at = datetime('now')
+            WHERE id = 1
+        """, (entities, away_state, home_state))
+        orch.db.commit()
+
+    await run_db(_save)
     orch.reload_presence_watcher()
     return ingress_redirect(request, "/settings#away")
 
@@ -1147,11 +1218,17 @@ async def units_update(request: Request):
         flow_key = "L/min"
     if pressure_key not in PRESSURE_OPTIONS:
         pressure_key = "psi"
-    orch.db.execute(
-        "UPDATE home_profile SET flow_unit=?, pressure_unit=? WHERE id=1",
-        (flow_key, pressure_key),
-    )
-    orch.db.commit()
+    # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
+    from ..database import run_db
+
+    def _save():
+        orch.db.execute(
+            "UPDATE home_profile SET flow_unit=?, pressure_unit=? WHERE id=1",
+            (flow_key, pressure_key),
+        )
+        orch.db.commit()
+
+    await run_db(_save)
     from ..units import invalidate_unit_cache
     invalidate_unit_cache()
     return ingress_redirect(request, "/settings#units")
@@ -1176,12 +1253,18 @@ async def history_events_update(request: Request):
     hide_not_real = 1 if form.get("hide_pressure_artifact_events") == "1" else 0
     # dev.38 — guarded auto-split (read fresh by the periodic maturity pass).
     auto_split = 1 if form.get("auto_split_enabled") == "1" else 0
-    orch.db.execute(
-        "UPDATE home_profile SET hide_pressure_artifact_events=?, "
-        "hide_cross_talk_events=?, auto_split_enabled=? WHERE id=1",
-        (hide_not_real, hide_not_real, auto_split),
-    )
-    orch.db.commit()
+    # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
+    from ..database import run_db
+
+    def _save():
+        orch.db.execute(
+            "UPDATE home_profile SET hide_pressure_artifact_events=?, "
+            "hide_cross_talk_events=?, auto_split_enabled=? WHERE id=1",
+            (hide_not_real, hide_not_real, auto_split),
+        )
+        orch.db.commit()
+
+    await run_db(_save)
     return ingress_redirect(request, "/settings#history-events")
 
 
@@ -1202,7 +1285,8 @@ async def water_softener_update(request: Request):
     if enabled and parse_hhmm_to_minutes(start) is None:
         return ingress_redirect(
             request, "/settings?msg=softener_time_required#water-softener")
-    update_home_profile(
+    await run_db(                                             # dev46 (46a)
+        update_home_profile,
         orch.db,
         has_water_softener=1 if enabled else 0,
         softener_regen_start=start if enabled else None,
@@ -1216,11 +1300,17 @@ async def integrations_update(request: Request):
     form = await request.form()
     enabled = 1 if form.get("mqtt_publish_enabled") == "1" else 0
     orch = _orch(request)
-    orch.db.execute(
-        """UPDATE home_profile SET mqtt_publish_enabled = ? WHERE id = 1""",
-        (enabled,)
-    )
-    orch.db.commit()
+    # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
+    from ..database import run_db
+
+    def _save():
+        orch.db.execute(
+            """UPDATE home_profile SET mqtt_publish_enabled = ? WHERE id = 1""",
+            (enabled,)
+        )
+        orch.db.commit()
+
+    await run_db(_save)
     return ingress_redirect(request, "/settings#integrations")
 
 
@@ -1250,7 +1340,7 @@ async def circuit_rename(circuit: str, request: Request):
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
 
     from ..database import upsert_circuit_label
-    upsert_circuit_label(orch.db, circuit, display_name)
+    await run_db(upsert_circuit_label, orch.db, circuit, display_name)
     orch.reload_circuit_labels()
 
     return JSONResponse({"status": "renamed", "circuit": circuit, "display_name": display_name})
@@ -1299,15 +1389,17 @@ async def circuit_type_update(circuit: str, request: Request):
     # and just hidden by the template filter).
     if circuit_type == "zone":
         allowed_zone_types = set(zone_user_selectable_types())
-        rows = orch.db.execute(
-            """SELECT f.id, f.fixture_type, COALESCE(f.display_name, f.name) AS name
-               FROM fixture_clusters fc
-               JOIN fixtures f ON fc.fixture_id = f.id
-              WHERE fc.circuit = ?
-                AND f.fixture_type IS NOT NULL
-                AND f.fixture_type != ''""",
-            (circuit,),
-        ).fetchall()
+        rows = await run_db(                                  # dev46 (46a)
+            lambda: orch.db.execute(
+                """SELECT f.id, f.fixture_type,
+                          COALESCE(f.display_name, f.name) AS name
+                   FROM fixture_clusters fc
+                   JOIN fixtures f ON fc.fixture_id = f.id
+                  WHERE fc.circuit = ?
+                    AND f.fixture_type IS NOT NULL
+                    AND f.fixture_type != ''""",
+                (circuit,),
+            ).fetchall())
         conflicts = [
             dict(r) for r in rows
             if r["fixture_type"] not in allowed_zone_types
@@ -1338,7 +1430,7 @@ async def circuit_type_update(circuit: str, request: Request):
             )
 
     try:
-        set_circuit_type(orch.db, circuit, circuit_type)
+        await run_db(set_circuit_type, orch.db, circuit, circuit_type)
     except Exception as exc:
         log.error("[%s] set_circuit_type failed: %s", circuit, exc)
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
@@ -1389,7 +1481,7 @@ async def circuit_valve_type_update(circuit: str, request: Request):
         )
 
     # No-change short-circuit — keeps the log clean on idempotent posts.
-    current = get_valve_type(orch.db, circuit)
+    current = await run_db(get_valve_type, orch.db, circuit)
     if current == parsed:
         return JSONResponse({
             "status": "no_change",
@@ -1398,7 +1490,7 @@ async def circuit_valve_type_update(circuit: str, request: Request):
         })
 
     try:
-        set_valve_type(orch.db, circuit, parsed)
+        await run_db(set_valve_type, orch.db, circuit, parsed)
     except Exception as exc:
         log.error("[%s] set_valve_type failed: %s", circuit, exc)
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
@@ -1427,7 +1519,7 @@ async def start_exclusion_window(request: Request, circuit: str):
     # fall back to the 15 minute default.
     minutes = coerce_int(form.get("minutes"), lo=5, hi=60, default=15)
     reason  = (form.get("reason") or "plumbing").strip() or "plumbing"
-    create_exclusion_window(_orch(request).db, circuit, minutes, reason)
+    await run_db(create_exclusion_window, _orch(request).db, circuit, minutes, reason)
     log.info("[%s] exclusion window started — %d min (%s)", circuit, minutes, reason)
     return ingress_redirect(request, "/settings#maintenance")
 
@@ -1437,7 +1529,7 @@ async def cancel_exclusion_window_endpoint(request: Request, circuit: str):
     """End the active exclusion window immediately."""
     circuit = resolve_circuit(circuit)
     from ..database import cancel_exclusion_window
-    cancel_exclusion_window(_orch(request).db, circuit)
+    await run_db(cancel_exclusion_window, _orch(request).db, circuit)
     log.info("[%s] exclusion window cancelled", circuit)
     return ingress_redirect(request, "/settings#maintenance")
 
@@ -1447,7 +1539,7 @@ async def extend_exclusion_window_endpoint(request: Request, circuit: str):
     """Add 15 minutes to the active exclusion window (capped at 60 min from start)."""
     circuit = resolve_circuit(circuit)
     from ..database import extend_exclusion_window
-    extend_exclusion_window(_orch(request).db, circuit, extra_minutes=15)
+    await run_db(extend_exclusion_window, _orch(request).db, circuit, extra_minutes=15)
     log.info("[%s] exclusion window extended +15 min", circuit)
     return ingress_redirect(request, "/settings#maintenance")
 

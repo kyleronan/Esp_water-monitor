@@ -388,7 +388,12 @@ async def import_share_archive(
                                 status_code=400)
     try:
         log.info("Importing history from %s (labels_only=%s)", src, labels_only)
-        return _merge_archive_from_path(orch, tmp_path, labels_only)
+        # dev46 (46a): the whole merge — including its single `with orch.db:`
+        # transaction — runs in ONE run_db callable, so no foreign statement
+        # can land inside the open transaction (rule N2a).
+        from ..database import run_db
+        return await run_db(_merge_archive_from_path, orch, tmp_path,
+                            labels_only)
     finally:
         if extracted is not None:
             extracted.unlink(missing_ok=True)
@@ -453,73 +458,90 @@ async def import_quick_restore(
                              "error": "Select at least one group."},
                             status_code=400)
 
-    imported = {}
     db = orch.db
 
-    # PRAGMA foreign_keys must be set outside the transaction — SQLite ignores
-    # it when a transaction is already open.  Disable for the bulk restore so
-    # cross-table FK ordering (e.g. events → fixtures) does not block the
-    # DELETE pass, then re-enable immediately after.
-    db.execute("PRAGMA foreign_keys = OFF")
-    # Wrap the entire restore in a single transaction.  If any table's DELETE
-    # or INSERT fails, all prior DELETEs are rolled back — avoiding a state
-    # where some tables are wiped but not restored.
-    #
-    # Every table in the restore list is cleared unconditionally, even when
-    # the backup has an empty array or the table is absent from the backup
-    # entirely.  This ensures the DB reflects the exact state of the backup
-    # — stale rows from a previous restore cannot bleed through.
+    def _restore_sync() -> dict:
+        """dev46 (46a): the entire quick-restore — PRAGMA toggles, the single
+        bulk transaction, the events normalize/dedup pass and the circuit-label
+        restore — in ONE DB-thread callable. Splitting it would leave the bulk
+        transaction open across a queue boundary (rule N2a); running it on the
+        loop thread would put multi-second DELETE/INSERT batches on the shared
+        connection while the DB worker may be mid-statement."""
+        imported: dict = {}
+        # PRAGMA foreign_keys must be set outside the transaction — SQLite
+        # ignores it when a transaction is already open.  Disable for the bulk
+        # restore so cross-table FK ordering (e.g. events → fixtures) does not
+        # block the DELETE pass, then re-enable immediately after.
+        db.execute("PRAGMA foreign_keys = OFF")
+        # Wrap the entire restore in a single transaction.  If any table's
+        # DELETE or INSERT fails, all prior DELETEs are rolled back — avoiding
+        # a state where some tables are wiped but not restored.
+        #
+        # Every table in the restore list is cleared unconditionally, even when
+        # the backup has an empty array or the table is absent from the backup
+        # entirely.  This ensures the DB reflects the exact state of the backup
+        # — stale rows from a previous restore cannot bleed through.
+        try:
+            with db:
+                for tbl in restore:
+                    db.execute(f"DELETE FROM {tbl}")
+                    rows = tables.get(tbl)
+                    if rows:
+                        imported[tbl] = _safe_insert(db, tbl, rows)
+                    else:
+                        imported[tbl] = 0
+        finally:
+            db.execute("PRAGMA foreign_keys = ON")
+
+        # After events are imported, normalize timestamps to UTC then dedup.
+        # Order matters: normalize first so rows with the same logical instant
+        # but different offset strings (+00:00 vs -06:00) collapse correctly.
+        if "events" in restore:
+            try:
+                from ..database import normalize_events_utc, dedup_events
+                normalize_events_utc(db)
+                removed = dedup_events(db)
+                if removed:
+                    log.warning(
+                        "Quick Restore: removed %d duplicate event(s) from backup",
+                        removed)
+            except Exception as e:
+                log.warning("Quick Restore dedup failed (non-fatal): %s", e)
+
+        # Restore circuit display labels from backup, or seed defaults for old
+        # backups.
+        try:
+            from ..database import load_circuit_labels, upsert_circuit_label
+            circuit_entries = payload.get("circuits", [])
+            if circuit_entries:
+                for entry in circuit_entries:
+                    cid   = entry.get("circuit_id", "")
+                    label = entry.get("display_name", "")
+                    if cid and label:
+                        upsert_circuit_label(db, cid, label)
+                log.info("Quick Restore: restored %d circuit label(s)",
+                         len(circuit_entries))
+            else:
+                # Old backup without circuit metadata — seed defaults if the
+                # table is empty.
+                existing = load_circuit_labels(db)
+                if not existing:
+                    upsert_circuit_label(db, "circuit_1", "Main")
+                    upsert_circuit_label(db, "circuit_2", "Irrigation")
+                    log.info("Quick Restore: seeded default circuit labels "
+                             "(legacy backup)")
+        except Exception as e:
+            log.warning("Quick Restore: circuit label restore failed "
+                        "(non-fatal): %s", e)
+        return imported
+
+    from ..database import run_db
     try:
-        with db:
-            for tbl in restore:
-                db.execute(f"DELETE FROM {tbl}")
-                rows = tables.get(tbl)
-                if rows:
-                    imported[tbl] = _safe_insert(db, tbl, rows)
-                else:
-                    imported[tbl] = 0
+        imported = await run_db(_restore_sync)
     except Exception as e:
         log.error("Import quick-restore failed: %s", e)
         return JSONResponse({"ok": False, "error": f"Restore failed: {e}"},
                             status_code=500)
-    finally:
-        db.execute("PRAGMA foreign_keys = ON")
-
-    # After events are imported, normalize timestamps to UTC then dedup.
-    # Order matters: normalize first so rows with the same logical instant
-    # but different offset strings (+00:00 vs -06:00) collapse correctly.
-    if "events" in restore:
-        try:
-            from ..database import normalize_events_utc, dedup_events
-            normalize_events_utc(db)
-            removed = dedup_events(db)
-            if removed:
-                log.warning(
-                    "Quick Restore: removed %d duplicate event(s) from backup",
-                    removed)
-        except Exception as e:
-            log.warning("Quick Restore dedup failed (non-fatal): %s", e)
-
-    # Restore circuit display labels from backup, or seed defaults for old backups
-    try:
-        from ..database import load_circuit_labels, upsert_circuit_label
-        circuit_entries = payload.get("circuits", [])
-        if circuit_entries:
-            for entry in circuit_entries:
-                cid   = entry.get("circuit_id", "")
-                label = entry.get("display_name", "")
-                if cid and label:
-                    upsert_circuit_label(db, cid, label)
-            log.info("Quick Restore: restored %d circuit label(s)", len(circuit_entries))
-        else:
-            # Old backup without circuit metadata — seed defaults if table is empty
-            existing = load_circuit_labels(db)
-            if not existing:
-                upsert_circuit_label(db, "circuit_1", "Main")
-                upsert_circuit_label(db, "circuit_2", "Irrigation")
-                log.info("Quick Restore: seeded default circuit labels (legacy backup)")
-    except Exception as e:
-        log.warning("Quick Restore: circuit label restore failed (non-fatal): %s", e)
 
     try:
         orch.reload_circuit_entities()
@@ -582,7 +604,12 @@ async def import_history_archive(
         tmp.write(raw)
         tmp_path = Path(tmp.name)
     try:
-        return _merge_archive_from_path(orch, tmp_path, labels_only)
+        # dev46 (46a): the whole merge — including its single `with orch.db:`
+        # transaction — runs in ONE run_db callable, so no foreign statement
+        # can land inside the open transaction (rule N2a).
+        from ..database import run_db
+        return await run_db(_merge_archive_from_path, orch, tmp_path,
+                            labels_only)
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -757,7 +784,9 @@ async def backup_page(request: Request):
 
     all_tables = list(dict.fromkeys(
         QUICK_RESTORE_TABLES + QUICK_RESTORE_RECENT + HISTORY_ARCHIVE_TABLES))
-    counts = _row_counts(db, all_tables)
+    from ..database import run_db
+    # dev46 (46a): one COUNT(*) per table — off the loop thread.
+    counts = await run_db(_row_counts, db, all_tables)
 
     try:
         db_size_bytes = DB_PATH.stat().st_size if DB_PATH.exists() else 0

@@ -33,6 +33,38 @@ def get_write_lock():
         _WRITE_LOCK = asyncio.Lock()
     return _WRITE_LOCK
 
+
+# ── dev46 (46a) — THE single DB executor ─────────────────────────────────────
+# The shared orchestrator connection is opened check_same_thread=False and was
+# historically touched from whatever thread the default executor pool handed
+# out. Two concurrent touches from different threads corrupt a statement
+# mid-flight ("sqlite3.InterfaceError: bad parameter or other API misuse") —
+# it killed the 8/15 reseed mid-replay and 500'd the History page during the
+# 8/16 startup. One worker = the connection is PHYSICALLY serialized; the
+# asyncio write lock above still provides job-level logical exclusivity on
+# top. All threaded DB work must go through run_db(); only non-DB blocking
+# work (HA I/O, file ops) may use the default pool.
+_DB_EXECUTOR: Optional[Any] = None
+
+
+def get_db_executor():
+    """Return the singleton one-thread executor for ALL threaded DB work."""
+    from concurrent.futures import ThreadPoolExecutor
+    global _DB_EXECUTOR
+    if _DB_EXECUTOR is None:
+        _DB_EXECUTOR = ThreadPoolExecutor(max_workers=1,
+                                          thread_name_prefix="db")
+    return _DB_EXECUTOR
+
+
+async def run_db(fn, *args, **kwargs):
+    """Run blocking DB work on the single DB thread and await the result."""
+    import asyncio
+    import functools
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        get_db_executor(), functools.partial(fn, *args, **kwargs))
+
 SCHEMA_VERSION = 1
 
 
@@ -115,6 +147,12 @@ async def run_isolated_write(db_path, fn):
     ``fn`` is a sync callable taking the private connection; its return value is
     propagated. The connection is closed even if ``fn`` raises. ``db_path`` is
     passed in (not imported) so this module stays free of config imports.
+
+    dev46 (46a) AUDIT EXEMPTION — justified separate connection. This job
+    deliberately does NOT go through ``run_db``: it never touches the shared
+    connection, and it is long-running, so putting it on the one DB worker
+    would block every page render for its duration. It stays on the default
+    pool. WAL + busy_timeout cover connection-vs-connection contention.
     """
     import asyncio
 
@@ -2647,7 +2685,12 @@ def volume_ledger_discrepancy(conn: sqlite3.Connection,
                               circuit: Optional[str] = None) -> float:
     """SUM(events.hourly_volume_applied_litres) − SUM(hourly_volume.volume_litres);
     ~0 when the ledger is consistent. Backs the §2.5 reconciliation test + is safe to
-    log as a diagnostic. Rounded to swallow float noise."""
+    log as a diagnostic. Rounded to swallow float noise.
+
+    dev46 (46b) reviewed — both ``fetchone()[0]`` below stay UNGUARDED. They are
+    ``COALESCE(SUM(...))`` aggregates, which always return exactly one row, so a
+    None here means the cursor is broken, not that the result is empty. Guarding
+    would turn a loud failure into a silently wrong ledger discrepancy."""
     where = "" if circuit is None else " WHERE circuit = ?"
     args = () if circuit is None else (circuit,)
     applied = conn.execute(
@@ -3578,7 +3621,17 @@ def count_not_real_events(
     show them"). ``since_ts`` bounds the count to the time span the visible
     list actually covers (the oldest displayed row's start_ts) so the badge
     keeps its original meaning — hidden rows among what you're looking at —
-    now that the visible list is SQL-limited to matching rows."""
+    now that the visible list is SQL-limited to matching rows.
+
+    dev46 (46b) — the ``fetchone()`` below is DELIBERATELY not guarded. A bare
+    ``COUNT(*)`` always returns exactly one row, so a None here means the
+    cursor itself is broken, not that the result is empty. The 8/16 boot
+    ``TypeError: 'NoneType' object is not subscriptable`` was that symptom —
+    collateral damage from the cross-thread ``InterfaceError`` that 46a's
+    single DB executor eliminates at the source. Guarding it would have
+    converted a loud, diagnosable failure into a silent wrong answer (a badge
+    reading "0 hidden"). Guard ``fetchone()`` only where an empty result is a
+    legitimate state."""
     conditions = ["e.circuit = ?", _NOT_REAL_SQL]
     params: list = [circuit]
     if date_from:
@@ -6306,12 +6359,22 @@ def set_event_matched_fixture_type(
     the History rollup key (washer anchor id / softener session id) and is NULL
     for non-cycle matches; recomputed by every reclassify.
 
-    Does not commit — caller batches with surrounding writes (typically
-    the cluster_id update in feature_extractor._cluster_event).
+    Does not commit — caller batches with surrounding writes.
+
+    dev46 (46a/N1): the WHERE re-checks ``user_fixture_type IS NULL`` at WRITE
+    time, not just in the caller's candidate snapshot. The reclassify pass now
+    runs chunked on the DB executor, so a user PATCH can land between the
+    snapshot and this row's write; without the re-check the pass would overwrite
+    a just-labelled event's match from stale premises. The PATCH API is NOT
+    gated during startup, so this guard is load-bearing — do not remove it on
+    the theory that the snapshot already filtered. Same shape as the live path's
+    inline write (feature_extractor.py) and the cycle-detector writes below.
+    Sole caller: reclassify_all_events_from_signatures.
     """
     conn.execute(
         "UPDATE events SET matched_fixture_type = ?, matched_via = ?, "
-        "cycle_group_id = ? WHERE id = ? AND circuit = ?",
+        "cycle_group_id = ? WHERE id = ? AND circuit = ? "
+        "  AND user_fixture_type IS NULL",
         (fixture_type,
          via if fixture_type is not None else None,
          cycle_group_id if fixture_type is not None else None,
@@ -6542,30 +6605,31 @@ def _invariant_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any
     return hit
 
 
-def reclassify_all_events_from_signatures(
-    conn: sqlite3.Connection,
-    circuit: str,
-    ha_tz=None,
-    since_ts: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Retrain signatures, then backfill ``matched_fixture_type`` over every
-    unlabelled event on ``circuit`` — STRUCTURAL RULES FIRST (dev.24 precedence:
-    water-softener session, then dev.23's washer-cycle sweep, then the per-event
-    toilet/dishwasher/shower/zone rules), k-NN as the residual. Each write stamps
-    ``matched_via`` and ``cycle_group_id`` (the History rollup key, §7).
+def _new_reclassify_counters() -> Dict[str, Any]:
+    """Fresh accumulator bundle for a reclassify pass.
 
-    ``ha_tz`` (the home timezone) is needed only for the water-softener regen-band
-    match (local clock vs UTC-stored timestamps) — pass it from EVERY caller so
-    the softener label is stable across reclassifies. Softener detection is
-    hard-gated by ``home_profile.has_water_softener`` + ``softener_circuit``.
+    dev46 (46a/C2a): the pass is driven in CHUNKS, so its loop-carried state
+    lives in one dict that is threaded through every batch instead of in
+    function locals. Six counters plus the flush-veto tally — nothing else
+    crosses a row boundary, which is exactly why the pass could be sliced.
+    """
+    return {"scanned": 0, "matched": 0, "rule_matched": 0,
+            "softener_matched": 0, "cleared": 0, "abstained": 0,
+            "veto_counts": {}}
 
-    NEVER touches user-labelled rows (WHERE user_fixture_type IS NULL). Writes
-    the canonical matched type, or NULL on abstention — writing NULL clears a
-    stale prior match (and its provenance), making the whole pass idempotent.
-    Never writes 'other' (that is a display-only fallback).
 
-    Returns counts: ``{"signatures_trained", "events_scanned", "events_matched",
-    "events_rule_matched", "events_cleared", "events_abstained"}``.
+def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
+                        since_ts: Optional[str] = None):
+    """Everything a reclassify pass computes ONCE, plus its candidate rows.
+
+    dev46 (46a/C2a) — split out of ``reclassify_all_events_from_signatures``
+    so the pass can be driven chunk-wise through ``run_db``. This half is the
+    expensive-but-bounded part: signature training, the per-regime calib
+    cache, the whole-circuit cycle detectors (washer / softener / dishwasher),
+    usage baselines, the fingerprint library and the toilet cap. All of it is
+    READ-ONLY for the row loop, which is what makes batching safe.
+
+    Returns ``(ctx, rows)``.
     """
     # 1. Retrain the per-type centroids (for the Signatures UI display). The
     #    k-NN itself reads events directly, so this is purely cosmetic but keeps
@@ -6704,8 +6768,65 @@ def reclassify_all_events_from_signatures(
         "ORDER BY start_ts",
         qparams,
     ).fetchall()
-    scanned = matched = rule_matched = softener_matched = cleared = abstained = 0
-    veto_counts: Dict[str, int] = {}   # flush-physics vetoes by condition
+    return ({
+        "signatures_trained": signatures_trained,
+        "softener_ids":       softener_ids,
+        "washer_ids":         washer_ids,
+        "dishwasher_ids":     dishwasher_ids,
+        "qfeats":             qfeats,
+        "circuit_type":       circuit_type,
+        "calib":              calib,
+        "calib_cache":        _calib_cache,
+        "regimes":            _regimes,
+        "fp_library":         _fp_library,
+        "toilet_cap":         _toilet_cap,
+        "baselines":          _baselines,
+        "sens":               _sens,
+        "score_cols":         _SCORE_COLS,
+    }, rows)
+
+
+def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
+                           ctx: Dict[str, Any],
+                           counters: Dict[str, Any]) -> None:
+    """One batch of the reclassify row loop — runs on the single DB thread.
+
+    dev46 rule N2a: self-contained transaction. Every statement for this
+    chunk, plus its commit, happens inside this one callable, so no foreign
+    statement can land inside an open transaction. Chunk boundary =
+    transaction boundary = where a queued page render gets to interleave.
+
+    ``counters`` is mutated in place so the tallies survive across batches.
+    The write-time ``user_fixture_type IS NULL`` guard inside
+    ``set_event_matched_fixture_type`` (dev46 R1/N1) is what makes an
+    interleaved user relabel safe here — do not weaken it.
+    """
+    from .event_rules import (CYCLE_ONLY_FIXTURE_TYPES, rule_classify_event,
+                              toilet_veto_reason)
+    from .supply_regime import resolve_regime_for_ts
+    from .anomaly_baseline import score_event_anomaly
+
+    softener_ids   = ctx["softener_ids"]
+    washer_ids     = ctx["washer_ids"]
+    dishwasher_ids = ctx["dishwasher_ids"]
+    qfeats         = ctx["qfeats"]
+    circuit_type   = ctx["circuit_type"]
+    calib          = ctx["calib"]
+    _calib_cache   = ctx["calib_cache"]
+    _regimes       = ctx["regimes"]
+    _fp_library    = ctx["fp_library"]
+    _toilet_cap    = ctx["toilet_cap"]
+    _baselines     = ctx["baselines"]
+    _sens          = ctx["sens"]
+    _SCORE_COLS    = ctx["score_cols"]
+
+    scanned          = counters["scanned"]
+    matched          = counters["matched"]
+    rule_matched     = counters["rule_matched"]
+    softener_matched = counters["softener_matched"]
+    cleared          = counters["cleared"]
+    abstained        = counters["abstained"]
+    veto_counts      = counters["veto_counts"]
     for r in rows:
         scanned += 1
         new_group = None
@@ -6833,12 +6954,33 @@ def reclassify_all_events_from_signatures(
             (av.get("score"), av.get("anomaly_type"),
              1 if av.get("is_anomalous") else 0, r["id"]),
         )
-        # Release the SQLite write lock periodically so a concurrent user
-        # label-save isn't starved into "database is locked" — reclassify is
-        # storage-only + idempotent, so a batched commit is safe. Runs in a
-        # worker thread (executor), so the sleep never blocks the event loop.
-        yield_write_lock(conn, scanned)
+    # dev46 (46a/C2a): NO yield_write_lock here. The pre-chunking loop called
+    # it every 300 rows to commit and sleep 30 ms so a waiting user save could
+    # win the SQLite write lock. Both of its jobs now belong to the chunk
+    # boundary: the commit below is the chunk's ONE commit (rule N2a — chunk =
+    # transaction), and yielding is the executor queue's job. Kept inside a
+    # chunk it would be actively harmful — the 30 ms sleep would hold the
+    # single DB worker rather than release it, delaying the very queue it was
+    # meant to let through.
     conn.commit()
+    counters.update(scanned=scanned, matched=matched,
+                    rule_matched=rule_matched,
+                    softener_matched=softener_matched,
+                    cleared=cleared, abstained=abstained)
+
+
+def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
+                         since_ts: Optional[str], ctx: Dict[str, Any],
+                         counters: Dict[str, Any]) -> Dict[str, Any]:
+    """Composite annotation + result assembly, after every batch has run."""
+    signatures_trained = ctx["signatures_trained"]
+    scanned          = counters["scanned"]
+    matched          = counters["matched"]
+    rule_matched     = counters["rule_matched"]
+    softener_matched = counters["softener_matched"]
+    cleared          = counters["cleared"]
+    abstained        = counters["abstained"]
+    veto_counts      = counters["veto_counts"]
     # ── Composite annotation (dev.39, step 1) ────────────────────────────────
     # Annotate sustained events with fixtures hidden inside them (a toilet flushed
     # mid-shower), then upgrade events that abstained but clearly contain a second
@@ -6891,6 +7033,61 @@ def reclassify_all_events_from_signatures(
     return result
 
 
+async def reclassify_all_events_from_signatures_async(
+        conn: sqlite3.Connection, circuit: str, ha_tz=None,
+        since_ts: Optional[str] = None, batch: int = 200) -> Dict[str, Any]:
+    """dev46 (46a/C2a) — ``reclassify_all_events_from_signatures`` in chunks.
+
+    Same pass, same result, but the row loop is submitted to ``run_db`` one
+    batch at a time instead of as a single multi-minute call. With ONE DB
+    worker, a monolithic submission makes every queued page render wait for
+    the whole pass; batching gives the queue a seam every ~batch rows.
+
+    Mirrors ``ClusterEngine.backfill_unmatched_async`` — chunk = transaction =
+    one run_db call. Prepare and finalize are their own submissions.
+    """
+    ctx, rows = await run_db(_reclassify_prepare, conn, circuit, ha_tz,
+                             since_ts)
+    counters = _new_reclassify_counters()
+    for i in range(0, len(rows), batch):
+        await run_db(_reclassify_chunk_sync, conn, circuit,
+                     rows[i:i + batch], ctx, counters)
+    return await run_db(_reclassify_finalize, conn, circuit, since_ts, ctx,
+                        counters)
+
+
+
+def reclassify_all_events_from_signatures(
+    conn: sqlite3.Connection,
+    circuit: str,
+    ha_tz=None,
+    since_ts: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Retrain signatures, then backfill ``matched_fixture_type`` over every
+    unlabelled event on ``circuit`` — STRUCTURAL RULES FIRST (dev.24 precedence:
+    water-softener session, then dev.23's washer-cycle sweep, then the per-event
+    toilet/dishwasher/shower/zone rules), k-NN as the residual. Each write stamps
+    ``matched_via`` and ``cycle_group_id`` (the History rollup key, §7).
+
+    ``ha_tz`` (the home timezone) is needed only for the water-softener regen-band
+    match (local clock vs UTC-stored timestamps) — pass it from EVERY caller so
+    the softener label is stable across reclassifies. Softener detection is
+    hard-gated by ``home_profile.has_water_softener`` + ``softener_circuit``.
+
+    NEVER touches user-labelled rows (WHERE user_fixture_type IS NULL). Writes
+    the canonical matched type, or NULL on abstention — writing NULL clears a
+    stale prior match (and its provenance), making the whole pass idempotent.
+    Never writes 'other' (that is a display-only fallback).
+
+    Returns counts: ``{"signatures_trained", "events_scanned", "events_matched",
+    "events_rule_matched", "events_cleared", "events_abstained"}``.
+    """
+    ctx, rows = _reclassify_prepare(conn, circuit, ha_tz, since_ts)
+    counters = _new_reclassify_counters()
+    _reclassify_chunk_sync(conn, circuit, rows, ctx, counters)
+    return _reclassify_finalize(conn, circuit, since_ts, ctx, counters)
+
+
 _EMBEDDED_MIN_PARENT_DURATION_S: float = 300.0   # only sustained events can hide a draw
 
 
@@ -6924,9 +7121,13 @@ def promote_embedded_composites(
             continue
         if not (isinstance(embedded, list) and embedded):
             continue
+        # dev46 (46a/N1): re-check the label at WRITE time — the candidate
+        # snapshot above filtered user_fixture_type IS NULL, but the pass runs
+        # chunked on the DB executor and a user PATCH can land in between.
         conn.execute(
             "UPDATE events SET matched_fixture_type = 'other', "
-            "matched_via = 'composite' WHERE id = ?",
+            "matched_via = 'composite' "
+            "WHERE id = ? AND user_fixture_type IS NULL",
             (r["id"],),
         )
         promoted += 1
@@ -7538,6 +7739,9 @@ def get_active_training_capture(conn: sqlite3.Connection, circuit: str):
     if row is None:
         return None
     d = dict(row)
+    # dev46 (46b) reviewed — UNGUARDED by design: COUNT(*) always returns a
+    # row, so None means a broken cursor (loud failure is the right outcome),
+    # not "no candidates" (which is COUNT(*) = 0).
     d["candidate_count"] = conn.execute(
         "SELECT COUNT(*) FROM training_capture_candidates WHERE capture_id = ?",
         (row["id"],)).fetchone()[0]

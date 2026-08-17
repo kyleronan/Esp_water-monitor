@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional
 from .config import AddonConfig, compute_suggested_calibration_days, compute_minimum_events
 from .database import (get_training_state, upsert_training_state,
                        get_home_profile, ensure_circuit_defaults,
-                       get_circuit_type, get_event_cadence_seconds)
+                       get_circuit_type, get_event_cadence_seconds, run_db)
 from .ha_client import HaClient
 
 log = logging.getLogger(__name__)
@@ -112,8 +112,10 @@ class TrainingManager:
         for circuit_cfg in self._cfg.circuits:
             for attempt in range(_INIT_LOCK_RETRIES):
                 try:
-                    ensure_circuit_defaults(
-                        self._db, circuit_cfg.circuit, circuit_cfg.circuit_type)
+                    # dev46 (46a): one hop per attempt; the backoff sleep
+                    # stays on the loop so it never blocks the DB worker.
+                    await run_db(ensure_circuit_defaults, self._db,
+                                 circuit_cfg.circuit, circuit_cfg.circuit_type)
                     break
                 except sqlite3.OperationalError as e:
                     if "locked" not in str(e).lower():
@@ -129,7 +131,7 @@ class TrainingManager:
 
         # Lower stale whole-home event targets for in-progress zone
         # calibrations so they aren't stuck forever (see method docstring).
-        self._reconcile_calibration_thresholds()
+        await run_db(self._reconcile_calibration_thresholds)
 
         # Initial publish
         for circuit_cfg in self._cfg.circuits:
@@ -179,6 +181,8 @@ class TrainingManager:
             )
             current_min = state_row["minimum_events"] or 0
             if new_min < current_min:
+                # Already ON the DB thread — this whole method is submitted via
+                # run_db by its caller (N2b: no re-entry from inside a callable).
                 upsert_training_state(
                     self._db, circuit, minimum_events=new_min)
                 log.info(
@@ -234,6 +238,12 @@ class TrainingManager:
                      "unreferenced %d event(s)", circuit, deleted, unref)
         return deleted
 
+    def _profile_and_kind_sync(self, circuit: str, default_kind: str) -> dict:
+        """dev46 (46a) — home profile + circuit kind, one hop."""
+        return {"profile": get_home_profile(self._db),
+                "kind": get_circuit_type(self._db, circuit,
+                                         default=default_kind)}
+
     async def start_calibration(self, circuit: str,
                                 calibration_days: int) -> bool:
         """
@@ -245,7 +255,7 @@ class TrainingManager:
         a no-op so we don't clobber the existing timer or
         ``events_collected`` counter.
         """
-        state_row = get_training_state(self._db, circuit)
+        state_row = await run_db(get_training_state, self._db, circuit)
         current = state_row["state"] if state_row else "idle"
 
         if current not in ("idle", "calibrating", "labelling"):
@@ -262,11 +272,11 @@ class TrainingManager:
                      circuit, state_row["started_at"])
             return True
 
-        profile = get_home_profile(self._db)
         circuit_cfg = self._cfg.get_circuit(circuit)
-        circuit_kind = get_circuit_type(
-            self._db, circuit,
-            default=circuit_cfg.circuit_type if circuit_cfg else "fixture")
+        # dev46 (46a): profile + circuit kind are adjacent reads — one hop.
+        _pk = await run_db(self._profile_and_kind_sync, circuit,
+                           circuit_cfg.circuit_type if circuit_cfg else "fixture")
+        profile, circuit_kind = _pk["profile"], _pk["kind"]
         minimum_events = compute_minimum_events(
             profile["bathrooms_full"] or 2,
             profile["bathrooms_half"] or 0,
@@ -277,7 +287,8 @@ class TrainingManager:
         now = datetime.now(timezone.utc)
         ends_at = now + timedelta(days=calibration_days)
 
-        upsert_training_state(
+        await run_db(
+            upsert_training_state,
             self._db, circuit,
             state="calibrating",
             calibration_days=calibration_days,
@@ -291,7 +302,7 @@ class TrainingManager:
         # stale micro-clusters don't pollute the new run.  Confirmed
         # clusters (fixture_id IS NOT NULL) are kept — they represent
         # user-labelled fixtures that should survive recalibration.
-        self._clear_unconfirmed_clusters(circuit)
+        await run_db(self._clear_unconfirmed_clusters, circuit)
 
         # Reset in-memory DBSTREAM/scaler so the engine starts fresh
         # alongside the cleared cluster table.  Confirmed clusters in DB
@@ -313,7 +324,8 @@ class TrainingManager:
 
     async def stop_calibration(self, circuit: str) -> None:
         """Cancel calibration and return to idle."""
-        upsert_training_state(
+        await run_db(
+            upsert_training_state,
             self._db, circuit,
             state="idle",
             started_at=None,
@@ -333,7 +345,8 @@ class TrainingManager:
         for the user to come back.
         """
         now = datetime.now(timezone.utc)
-        upsert_training_state(
+        await run_db(
+            upsert_training_state,
             self._db, circuit,
             state="labelling",
             completed_at=now.isoformat(),
@@ -344,12 +357,8 @@ class TrainingManager:
         # instantiated (e.g. installs that upgraded from v0.1.x mid-calibration)
         if self.cluster_engine is not None:
             try:
-                import asyncio as _asyncio, functools
-                loop = _asyncio.get_running_loop()
-                backfilled = await loop.run_in_executor(
-                    None,
-                    functools.partial(self.cluster_engine.backfill_unmatched, circuit),
-                )
+                backfilled = await run_db(
+                    self.cluster_engine.backfill_unmatched, circuit)
                 if backfilled:
                     log.info("[%s] post-calibration backfill: %d events matched",
                              circuit, backfilled)
@@ -360,14 +369,8 @@ class TrainingManager:
         # Merge same-type clusters so the labelling page shows one card per type
         if self.cluster_engine is not None:
             try:
-                import asyncio as _asyncio, functools
-                loop = _asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    None,
-                    functools.partial(
-                        self.cluster_engine.auto_merge_same_type_clusters, circuit
-                    ),
-                )
+                await run_db(
+                    self.cluster_engine.auto_merge_same_type_clusters, circuit)
             except Exception as e:
                 log.warning("[%s] post-calibration type-merge failed (non-fatal): %s",
                             circuit, e)
@@ -394,7 +397,7 @@ class TrainingManager:
         False (no-op) if the circuit is not in labelling state, so a
         stale browser tab can't accidentally activate.
         """
-        state_row = get_training_state(self._db, circuit)
+        state_row = await run_db(get_training_state, self._db, circuit)
         if not state_row or state_row["state"] != "labelling":
             log.warning(
                 "[%s] activate_fixtures called from state '%s' — ignored",
@@ -403,7 +406,8 @@ class TrainingManager:
             )
             return False
         now = datetime.now(timezone.utc)
-        upsert_training_state(
+        await run_db(
+            upsert_training_state,
             self._db, circuit,
             state="live",
             completed_at=now.isoformat(),
@@ -490,7 +494,8 @@ class TrainingManager:
         label = circuit_cfg.label if circuit_cfg else circuit
         # §2.4 — track the (slow) re-lock so the UI can toast its success/failure.
         # Covers BOTH activation and the dev retrain (both route through here).
-        job = start_job(self._db, "calibration", circuit, f"Calibrating {label}…")
+        job = await run_db(start_job, self._db, "calibration", circuit,
+                           f"Calibrating {label}…")
         try:
             # Private connection + write lock (run_isolated_write) so the fit /
             # reclassify / freeze writes never share the orchestrator connection with
@@ -502,8 +507,8 @@ class TrainingManager:
                 lambda conn: self._fit_and_lock_sync(conn, circuit, source))
             n_fit = sum(1 for r in report.values()
                         if isinstance(r, dict) and r.get("status") == "fit")
-            finish_job(self._db, job, "done",
-                       f"{label}: calibration locked ({n_fit} home-fit)")
+            await run_db(finish_job, self._db, job, "done",
+                         f"{label}: calibration locked ({n_fit} home-fit)")
             # P6: validate the just-frozen detectors against HA history (diagnostic
             # only — never writes a threshold). Best-effort; a failure must not affect
             # the freeze.
@@ -518,7 +523,8 @@ class TrainingManager:
             return report
         except Exception as e:
             log.error("[%s] fit-and-lock failed: %s", circuit, e)
-            finish_job(self._db, job, "error", f"{label}: calibration failed")
+            await run_db(finish_job, self._db, job, "error",
+                         f"{label}: calibration failed")
             return {}
 
     async def validate_detectors(self, circuit: str) -> Dict[str, Any]:
@@ -546,19 +552,20 @@ class TrainingManager:
             return
         if (now - started).days < INTERIM_VALIDATION_DAY:
             return
-        if interim_already_sent(self._db, circuit, started_str):
+        if await run_db(interim_already_sent, self._db, circuit, started_str):
             return
         try:
             report = await run_detector_validation(
                 self._db, self._ha, self._cfg, circuit, now, source="interim")
             if report.get("error"):
                 return
-            title, message = build_interim_advisory(self._db, circuit, report)
+            title, message = await run_db(build_interim_advisory, self._db,
+                                          circuit, report)
             await self._ha.notify(
                 title=title, message=message,
                 notification_id=f"water_interim_validate_{circuit}")
             # Mark sent only AFTER a successful notify, so a transient failure retries.
-            mark_interim_sent(self._db, circuit, started_str)
+            await run_db(mark_interim_sent, self._db, circuit, started_str)
             log.info("[%s] interim (day-%d) detector advisory sent",
                      circuit, INTERIM_VALIDATION_DAY)
         except Exception as e:
@@ -586,6 +593,30 @@ class TrainingManager:
                 notification_id=f"water_calibration_locked_{circuit}")
         except Exception as e:
             log.warning("[%s] calibration report notify failed: %s", circuit, e)
+
+    def _reseed_prepare_sync(self, eng, circuit: str, since_ts: str) -> int:
+        """dev46 (46a) — everything a reseed does BEFORE the replay, one hop.
+
+        F-C2 marker, F-C1 deferral, the pressure-blind mode persist, and the
+        stale-assignment clear. One transaction: a crash between the marker
+        and the clear would otherwise leave the model half-torn with nothing
+        recording it. Returns the number of assignments cleared.
+        """
+        self._set_reseed_marker(circuit, True)      # F-C2, at clear
+        eng.begin_reseed(circuit)                   # F-C1 defer
+        # Persist the feature mode FIRST so a crash mid-seed restarts
+        # into the same space and the re-run is a clean redo.
+        eng.set_pressure_blind(circuit, True)
+        # Post-anchor rows: drop stale assignments (they point at
+        # pre-pump centers) so the replay below re-derives them.
+        cleared = self._db.execute(
+            """UPDATE events SET cluster_id = NULL,
+                   match_confidence = NULL, match_level = NULL
+               WHERE circuit = ? AND start_ts >= ?
+                 AND cluster_id IS NOT NULL""",
+            (circuit, since_ts)).rowcount
+        self._db.commit()
+        return cleared
 
     async def reseed_clusters_for_regime(self, circuit: str,
                                          since_ts: str) -> Dict[str, Any]:
@@ -631,20 +662,12 @@ class TrainingManager:
         # marker survives a crash so an incomplete reseed is loud.
         async with self._reseed_lock:
             try:
-                self._set_reseed_marker(circuit, True)      # F-C2, at clear
-                eng.begin_reseed(circuit)                   # F-C1 defer
-                # Persist the feature mode FIRST so a crash mid-seed restarts
-                # into the same space and the re-run is a clean redo.
-                eng.set_pressure_blind(circuit, True)
-                # Post-anchor rows: drop stale assignments (they point at
-                # pre-pump centers) so the replay below re-derives them.
-                cleared = self._db.execute(
-                    """UPDATE events SET cluster_id = NULL,
-                           match_confidence = NULL, match_level = NULL
-                       WHERE circuit = ? AND start_ts >= ?
-                         AND cluster_id IS NOT NULL""",
-                    (circuit, since_ts)).rowcount
-                self._db.commit()
+                # dev46 (46a): marker stamp, engine mode persist and the
+                # stale-assignment clear are one contiguous DB run — ONE hop,
+                # one transaction, so a crash cannot leave the marker set
+                # without the clear (or vice versa).
+                cleared = await run_db(self._reseed_prepare_sync, eng,
+                                       circuit, since_ts)
                 eng.reset_circuit(circuit)
                 eng.unfreeze_circuit(circuit)
                 # Learning replay, chronological, WINDOWED to the anchor —
@@ -660,7 +683,7 @@ class TrainingManager:
                 eng.end_reseed(circuit)
                 flushed = await eng.backfill_unmatched_async(
                     circuit, since_ts=since_ts, only_deferred=True)
-                self._set_reseed_marker(circuit, False)     # success only
+                await run_db(self._set_reseed_marker, circuit, False)  # success only
                 result = {"cleared": cleared, "assigned": assigned,
                           "flushed": flushed}
             except Exception as e:
@@ -686,13 +709,9 @@ class TrainingManager:
         gate applies). Exposed only behind the feature-flagged Settings → Dev tab;
         recalibration remains the normal long-term mechanism."""
         if self.cluster_engine is not None:
-            import functools
-            loop = asyncio.get_running_loop()
             try:
                 self.cluster_engine.unfreeze_circuit(circuit)
-                await loop.run_in_executor(
-                    None,
-                    functools.partial(self.cluster_engine.rebuild_from_db, circuit))
+                await run_db(self.cluster_engine.rebuild_from_db, circuit)
             except Exception as e:
                 log.warning("[%s] retrain rebuild failed (non-fatal): %s",
                             circuit, e)
@@ -704,7 +723,8 @@ class TrainingManager:
     async def trigger_full_recalibration(self, circuit: str,
                                          days: int) -> bool:
         """Reset to idle then start fresh calibration."""
-        upsert_training_state(
+        await run_db(
+            upsert_training_state,
             self._db, circuit,
             state="idle",
             events_collected=0,
@@ -717,6 +737,14 @@ class TrainingManager:
         # confirmed cluster centroids left in the DB would be inconsistent
         # with the empty in-memory model — new events would be type-gate-
         # rejected instead of matched against the stale centroid rows.
+        # dev46 (46a): the whole clear is ONE hop and ONE transaction — a
+        # half-cleared recalibration (some tables dropped, others not) is a
+        # far worse state than either endpoint.
+        await run_db(self._clear_for_recalibration_sync, circuit)
+        return await self.start_calibration(circuit, days)
+
+    def _clear_for_recalibration_sync(self, circuit: str) -> None:
+        """dev46 (46a) — drop this circuit's learned state, on the DB thread."""
         for table, col in [
             ("events",           "circuit"),
             ("hourly_volume",    "circuit"),
@@ -731,7 +759,11 @@ class TrainingManager:
             except Exception as e:
                 log.warning("[%s] recalibration clear %s: %s", circuit, table, e)
         self._db.commit()
-        return await self.start_calibration(circuit, days)
+
+    def _away_mode_row_sync(self):
+        """dev46 (46a) — the away-mode flag read."""
+        return self._db.execute(
+            "SELECT away_mode FROM home_profile WHERE id = 1").fetchone()
 
     async def trigger_partial_recalibration(self, circuit: str) -> None:
         """
@@ -742,7 +774,8 @@ class TrainingManager:
         from .database import upsert_learning_config
         now = datetime.now(timezone.utc)
         accel_until = (now + timedelta(days=14)).isoformat()
-        upsert_learning_config(
+        await run_db(
+            upsert_learning_config,
             self._db, circuit,
             accelerated_adaptation_until=accel_until,
             accelerated_adaptation_reason="partial_recalibration",
@@ -759,7 +792,7 @@ class TrainingManager:
         calibration_ends_at timestamp is extended by 1 day for every day
         spent in away mode so the learning period reflects actual occupancy.
         """
-        state_row = get_training_state(self._db, circuit)
+        state_row = await run_db(get_training_state, self._db, circuit)
         if not state_row:
             return
 
@@ -807,9 +840,7 @@ class TrainingManager:
         # The timer is extended by the true away duration when the occupant
         # returns (see orchestrator.set_away_mode), so we just early-return here.
         try:
-            profile = self._db.execute(
-                "SELECT away_mode FROM home_profile WHERE id = 1"
-            ).fetchone()
+            profile = await run_db(self._away_mode_row_sync)
             if profile and profile["away_mode"]:
                 log.debug("[%s] away mode active — calibration check deferred",
                           circuit)
@@ -848,8 +879,9 @@ class TrainingManager:
             # already in the past, so the next events_ok tick completes on the
             # branch above. The deadline itself is intentionally NOT moved.
             last = self._last_undertarget_warn.get(circuit)
-            cadence = get_event_cadence_seconds(
-                self._db, circuit, since_iso=state_row["started_at"])
+            cadence = await run_db(get_event_cadence_seconds, self._db,
+                                   circuit,
+                                   since_iso=state_row["started_at"])
             interval = _compute_recheck_interval(cadence)
             if last is None or (now - last) >= interval:
                 self._last_undertarget_warn[circuit] = now
@@ -878,7 +910,7 @@ class TrainingManager:
 
     async def _publish_status(self, circuit: str) -> None:
         """Publish training status sensor to HA."""
-        state_row = get_training_state(self._db, circuit)
+        state_row = await run_db(get_training_state, self._db, circuit)
         if not state_row:
             return
 

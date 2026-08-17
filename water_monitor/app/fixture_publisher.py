@@ -126,7 +126,19 @@ class FixturePublisher:
             log.info("Fixture publisher connected to MQTT broker")
             loop = getattr(self, "_loop", None)
             if loop and loop.is_running():
-                loop.call_soon_threadsafe(self._publish_all_confirmed_sync)
+                # dev46 (46a): this callback fires on paho's client thread.
+                # It used to be scheduled onto the EVENT LOOP, where its DB
+                # reads (_is_publishing_enabled, _categories_for_circuit)
+                # would drive the shared connection from the loop thread —
+                # a deferred violation the attribute grep could never see,
+                # because the connection is only reached through closed-over
+                # helpers. Now it is scheduled onto the DB worker instead.
+                # The MQTT publishes inside it hand off to paho's own queue,
+                # so they do not block the worker.
+                async def _republish():
+                    from .database import run_db
+                    await run_db(self._publish_all_confirmed_sync)
+                asyncio.run_coroutine_threadsafe(_republish(), loop)
             else:
                 log.warning("Fixture publisher: event loop unavailable on connect "
                             "— deferred re-publish skipped")
@@ -376,42 +388,19 @@ class FixturePublisher:
         except Exception as e:
             log.error("publish_all_confirmed failed: %s", e)
 
-    async def update_state(self, circuit: str) -> None:
-        """Push today's aggregated state per category for this circuit.
+    def _update_state_reads_sync(self, circuit: str):
+        """dev46 (46a) — every DB read behind one publish tick, one hop.
 
-        Sprint F: aggregates by EFFECTIVE TYPE (via the same COALESCE chain
-        the Fixtures page uses) and gates on the per-category publish map.
-        A category toggled off mid-day will NOT have its state republished
-        by the next tick — this is the second half of the off-toggle gate.
+        Returns ``{"publish_map", "rows", "unusual"}``, or ``None`` when the
+        global publish toggle is off or the aggregate read fails — either way
+        the caller skips this tick, exactly as the inline checks used to.
+        Read-only: no transaction to own.
         """
-        if not self._connected or not self._is_publishing_enabled():
-            return
-
-        from datetime import datetime, timedelta, timezone
-        from .database import get_category_publish_map
-        from .fixtures import (fixture_user_selectable_types,
-                               normalize_fixture_type_for_circuit,
-                               zone_user_selectable_types)
-
-        # Determine circuit kind for normalizer.
-        circuit_kind = "fixture"
-        for c in self._cfg.circuits:
-            if c.circuit == circuit:
-                if getattr(c, "circuit_type", None) == "zone":
-                    circuit_kind = "zone"
-                break
-        allowed = set(zone_user_selectable_types() if circuit_kind == "zone"
-                      else fixture_user_selectable_types())
-
-        # Read publish gates once. Categories missing from the map default
-        # to True (publish on) — same contract as the Fixtures page.
+        if not self._is_publishing_enabled():
+            return None                  # global publish toggle is off
         publish_map = get_category_publish_map(self._db, circuit)
-
-        # Today's per-event-by-effective-type aggregates. Excludes phantoms,
-        # matches Sprint F's get_category_rollup semantics. UTC-midnight
-        # boundary matches the existing publisher behaviour (HA-side daily
-        # sensors anchor on HA's own day handling).
-        utc_midnight = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00+00:00")
+        utc_midnight = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT00:00:00+00:00")
         try:
             rows = self._db.execute(
                 """SELECT
@@ -432,7 +421,65 @@ class FixturePublisher:
             ).fetchall()
         except Exception as e:
             log.warning("[%s] fixture state update failed: %s", circuit, e)
+            return None
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).strftime(
+            "%Y-%m-%dT%H:%M:%S+00:00")
+        try:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM events WHERE circuit = ? AND start_ts >= ? "
+                "AND COALESCE(flagged, 0) = 1", (circuit, cutoff)).fetchone()
+            unusual = bool(row and row[0])
+        except Exception:
+            unusual = False
+        return {"publish_map": publish_map, "rows": rows, "unusual": unusual}
+
+    async def update_state(self, circuit: str) -> None:
+        """Push today's aggregated state per category for this circuit.
+
+        Sprint F: aggregates by EFFECTIVE TYPE (via the same COALESCE chain
+        the Fixtures page uses) and gates on the per-category publish map.
+        A category toggled off mid-day will NOT have its state republished
+        by the next tick — this is the second half of the off-toggle gate.
+        """
+        # dev46 (46a): the global publish gate is a DB read too — it joins the
+        # bundle below rather than running inline. Checking _connected first
+        # keeps the common "MQTT down" path free of any DB work at all.
+        if not self._connected:
             return
+
+        from datetime import datetime, timedelta, timezone
+        from .database import get_category_publish_map
+        from .fixtures import (fixture_user_selectable_types,
+                               normalize_fixture_type_for_circuit,
+                               zone_user_selectable_types)
+
+        # Determine circuit kind for normalizer.
+        circuit_kind = "fixture"
+        for c in self._cfg.circuits:
+            if c.circuit == circuit:
+                if getattr(c, "circuit_type", None) == "zone":
+                    circuit_kind = "zone"
+                break
+        allowed = set(zone_user_selectable_types() if circuit_kind == "zone"
+                      else fixture_user_selectable_types())
+
+        # dev46 (46a): all three of this method's reads — publish gates,
+        # today's per-type aggregate, and the recent-unusual count — go over
+        # the wall in ONE hop. There is no await between them, so bundling is
+        # free; separately they were three event-loop-thread touches per
+        # publish tick, per circuit.
+        from .database import run_db
+        reads = await run_db(self._update_state_reads_sync, circuit)
+        if reads is None:        # publishing disabled, or the read failed
+            return
+        publish_map = reads["publish_map"]
+        rows        = reads["rows"]
+        unusual     = reads["unusual"]
+
+        # Today's per-event-by-effective-type aggregates. Excludes phantoms,
+        # matches Sprint F's get_category_rollup semantics. UTC-midnight
+        # boundary matches the existing publisher behaviour (HA-side daily
+        # sensors anchor on HA's own day handling).
 
         # Normalize + bucket by canonical category, gated by publish_map.
         cat_counts:  Dict[str, int]   = {}
@@ -473,15 +520,6 @@ class FixturePublisher:
         # / shut-off response is applied live in feature_extractor, never from this
         # tick, and the by-start_ts window means a backfill re-flagging an OLD event
         # cannot make the sensor fire.
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).strftime(
-            "%Y-%m-%dT%H:%M:%S+00:00")
-        try:
-            row = self._db.execute(
-                "SELECT COUNT(*) FROM events WHERE circuit = ? AND start_ts >= ? "
-                "AND COALESCE(flagged, 0) = 1", (circuit, cutoff)).fetchone()
-            unusual = bool(row and row[0])
-        except Exception:
-            unusual = False
         self._client.publish(
             f"{_DISCOVERY_PREFIX}/binary_sensor/{_NODE_ID}_{_slugify(circuit)}_unusual_usage/state",
             "ON" if unusual else "OFF",

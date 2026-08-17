@@ -34,6 +34,8 @@ from typing import List, Optional, Tuple
 
 from .config import AddonConfig, DB_PATH
 
+from .database import run_db
+
 log = logging.getLogger(__name__)
 
 _STARTUP_DELAY_S = 180        # let boot catch-up import / migrations settle first
@@ -84,7 +86,7 @@ class RiseCorrBackfill:
             await self._idle()
             return
         try:
-            if self._done():
+            if await run_db(self._done):
                 log.debug("rise-corr backfill already stamped done — idle")
                 await self._idle()
                 return
@@ -110,7 +112,7 @@ class RiseCorrBackfill:
                 # applied. Whatever remains NULL is permanently uncomputable
                 # (history pruned / no pressure signal) and stays counted.
                 await self._apply_verdicts()          # final reconcile
-                self._stamp_done()
+                await run_db(self._stamp_done)
                 log.info("rise-corr backfill COMPLETE — stamped done "
                          "(%d corr(s) stored this sweep)", stored)
                 await self._idle()
@@ -139,7 +141,8 @@ class RiseCorrBackfill:
                 continue                    # no usable sensors → nothing to do
             watermark = ""                  # start_ts cursor within this sweep
             while not self._stop.is_set():
-                rows = self._candidates(circuit_cfg.circuit, watermark)
+                rows = await run_db(self._candidates,
+                                    circuit_cfg.circuit, watermark)
                 if not rows:
                     break
                 stored, errors = await self._process_batch(

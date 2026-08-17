@@ -418,16 +418,12 @@ class WfRepairBackfill:
 
     async def _replay_clusters(self, circuits) -> None:
         """Rebuild in-memory cluster state so it stops carrying the outliers."""
-        import functools
-        loop = asyncio.get_running_loop()
+        from .database import run_db
         for circuit in circuits:
             if self._stop.is_set():
                 return
             try:
-                await loop.run_in_executor(
-                    None,
-                    functools.partial(self._cluster_engine.rebuild_from_db,
-                                      circuit))
+                await run_db(self._cluster_engine.rebuild_from_db, circuit)
                 log.info("wf-repair: cluster state replayed for %s", circuit)
             except Exception as e:
                 log.warning("wf-repair: cluster replay failed for %s "

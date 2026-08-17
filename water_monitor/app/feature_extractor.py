@@ -4685,6 +4685,162 @@ class FeatureExtractor:
             log.debug("[%s] late-waveform upgrade — event %s software→esp",
                       circuit, upgraded_id)
 
+    def _pre_store_reads_sync(self, event) -> dict:
+        """dev46 (46a) — pump-era/gate state plus the waveform lookup, one hop."""
+        from .config import pump_gates_active
+        from .supply_regime import pump_era_start
+        try:
+            era = pump_era_start(self._db)
+        except Exception:
+            era = None
+        try:
+            gates = pump_gates_active(self._db, event.circuit)
+        except Exception:
+            gates = False
+        return {"era": era, "pump_gates": gates,
+                "wf_record": self._find_waveform(event)}
+
+    def _store_preflight_sync(self, event, event_id: str) -> dict:
+        """dev46 (46a) — the duplicate guard and the stored-intent read.
+
+        Both are reads taken as close to the INSERT as the architecture
+        allows; bundling them keeps that property while removing two
+        loop-thread touches.
+        """
+        from .database import find_overlapping_event
+        blocking = None
+        if event.end_ts is not None:
+            blocking = find_overlapping_event(
+                self._db, event.circuit,
+                event.start_ts.isoformat(),
+                event.end_ts.isoformat(),
+                exclude_event_id=event_id,
+            )
+        existing = self._db.execute(
+            "SELECT user_ignored, user_classified, "
+            "       is_pressure_restoration_phantom, degraded_supply, "
+            "       is_cross_talk, is_low_flow_dribble, "
+            "       is_composite, volume_litres_effective "
+            "FROM events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        return {"blocking": blocking, "existing": existing}
+
+    def _verdict_inputs_sync(self, circuit) -> dict:
+        """dev46 (46a) — frozen artifact calibration + pump-gate state."""
+        from .artifact_calibration import load_artifact_calibration
+        from .config import pump_gates_active
+        acal = load_artifact_calibration(self._db, circuit)
+        try:
+            pump = pump_gates_active(self._db, circuit)
+        except Exception:
+            pump = False
+        return {"acal": acal or None, "pump": pump}
+
+    def _post_store_sync(self, event, features: dict, wf_record, wf_applied,
+                         is_new_event) -> None:
+        """dev46 (46a) — post-upsert DB work, one hop, one transaction.
+
+        Mutates ``features`` in place (exclusion flags) — safe because the
+        caller is awaiting this call and nothing else reads the dict meanwhile.
+        """
+        from .database import is_event_in_exclusion_window
+            # ── Plumbing-event exclusion window (Phase 2.1) ───────────────
+        # If the user opened an exclusion window (e.g. post-winterization
+        # flush), flag the event so the cluster engine skips it.  Volume
+        # tracking continues — only fixture identification is excluded.
+        # Preserves any upstream match_rejection_reason already set by
+        # feature extraction (e.g. 'pulsing_supply') — only stamps
+        # 'excluded_from_training' when no reason was set.
+        start_ts_str = features.get("start_ts")
+        if (start_ts_str
+                and is_event_in_exclusion_window(
+                    self._db, event.circuit, start_ts_str)):
+            existing_reason = features.get("match_rejection_reason")
+            new_reason = existing_reason or "excluded_from_training"
+            self._db.execute(
+                """UPDATE events
+                   SET excluded_from_training  = 1,
+                       match_rejection_reason  = ?
+                   WHERE id = ?""",
+                (new_reason, features["id"]),
+            )
+            features["excluded_from_training"] = 1
+            features["match_rejection_reason"] = new_reason
+            log.debug(
+                "[%s] event excluded from training (exclusion window active)",
+                event.circuit,
+            )
+
+        # Calibration test draw — a deliberate, known bucket / municipal run is NOT
+        # organic usage: exclude it from training + anomaly stats so it can't pollute
+        # the frozen baseline. (Notify / shut-off are separately suppressed in
+        # _apply_anomaly_response.)
+        if self._is_calibrating(event.circuit):
+            reason = features.get("match_rejection_reason") or "calibration"
+            self._db.execute(
+                "UPDATE events SET excluded_from_training = 1, "
+                "match_rejection_reason = ? WHERE id = ?",
+                (reason, features["id"]),
+            )
+            features["excluded_from_training"] = 1
+            features["match_rejection_reason"] = reason
+            log.info("[%s] event excluded from training — calibration test draw",
+                     event.circuit)
+
+        # Persist the hi-res waveform for the event-detail modal. Always
+        # called, even for healthy events — useful diagnostic data. Skips
+        # silently when readings lists are empty (historical events).
+        # A record rejected by the sanity gate describes a different draw —
+        # it must not substitute the display envelope either, or the modal
+        # shows another event's waveform.
+        _persist_waveform(
+            self._db,
+            features["id"],
+            event.flow_readings,
+            event.pressure_readings,
+            float(features.get("duration_seconds") or 0),
+            esp_record=wf_record if wf_applied else None,
+        )
+
+        if is_new_event and not features.get("excluded_from_training"):
+            self._db.execute("""
+                UPDATE training_state
+                SET events_collected = events_collected + 1,
+                    updated_at = datetime('now')
+                WHERE circuit = ?
+                  AND state = 'calibrating'
+            """, (event.circuit,))
+        self._db.commit()
+
+
+    def _post_cluster_sync(self, circuit: str, features: dict) -> dict:
+        """dev46 (46a) — training-capture hook + the live-state read, one hop.
+
+        The capture hook is best-effort exactly as it was inline: a bug in
+        capture logic must never block event storage.
+        """
+        from .database import record_training_candidate
+        try:
+            record_training_candidate(self._db, circuit, features)
+        except Exception as e:      # noqa: BLE001 — never block storage
+            log.warning("[%s] training-capture hook failed (non-fatal): %s",
+                        circuit, e)
+        row = self._db.execute(
+            "SELECT state FROM training_state WHERE circuit = ?",
+            (circuit,)).fetchone()
+        return {"state": row["state"] if row else None}
+
+    def _degraded_count_sync(self, circuit: str, cutoff_30min: str) -> int:
+        """dev46 (46a) — degraded-event count for the pulsing-supply limiter."""
+        row = self._db.execute(
+            "SELECT COUNT(*) FROM events "
+            "WHERE circuit = ? AND degraded_supply = 1 "
+            "AND start_ts >= ?",
+            (circuit, cutoff_30min),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     async def _process(self, event: RawEvent) -> None:
         if not event.complete:
             return
@@ -4703,12 +4859,14 @@ class FeatureExtractor:
         # pump_era_start is pinned in the past the OR is permanently true; the
         # gate term is kept because it is the only branch that fires on a home
         # with pump mode confirmed but no era pinned yet.
+        # dev46 (46a): pump era + gate + the waveform lookup are three reads
+        # with only pure computation between them — one hop.
+        from .database import run_db
+        _pre = await run_db(self._pre_store_reads_sync, event)
         _pump_ripple = False
         try:
-            from .config import pump_gates_active
-            from .supply_regime import pump_era_start
-            _era = pump_era_start(self._db)
-            _pump_ripple = bool(pump_gates_active(self._db, event.circuit)) or (
+            _era = _pre["era"]
+            _pump_ripple = bool(_pre["pump_gates"]) or (
                 _era is not None
                 and (event.start_ts.isoformat() if hasattr(event.start_ts,
                                                            "isoformat")
@@ -4721,7 +4879,7 @@ class FeatureExtractor:
 
         # Attempt to enrich features from ESP waveform capture (firmware 3.7.0+).
         # Per-group routing: each group falls back to the legacy value independently.
-        wf_record = self._find_waveform(event)
+        wf_record = _pre["wf_record"]
         wf_applied = False
         if wf_record is not None:
             score = _wf_overlap_score(event, wf_record)
@@ -4753,13 +4911,14 @@ class FeatureExtractor:
             # both queue a reconstruction before either has written to the DB,
             # so the importer-side check alone cannot prevent the race.  Check
             # here too, as close to the INSERT as the architecture allows.
+            # dev46 (46a): the duplicate guard and the stored-intent read are
+            # both reads with nothing but pure logic between them — one hop,
+            # still "as close to the INSERT as the architecture allows".
+            _pf = await run_db(self._store_preflight_sync, event,
+                               features["id"])
+            blocking = _pf["blocking"]
+            existing = _pf["existing"]
             if event.end_ts is not None:
-                blocking = find_overlapping_event(
-                    self._db, event.circuit,
-                    event.start_ts.isoformat(),
-                    event.end_ts.isoformat(),
-                    exclude_event_id=features["id"],
-                )
                 if blocking is not None:
                     suffix = ""
                     if blocking.get("user_fixture_type"):
@@ -4789,14 +4948,6 @@ class FeatureExtractor:
             #   • user_classified — manual classification is authoritative:
             #     copy the stored category flags and SKIP the auto finalizer
             #     so auto-detection / waveform enrichment never overrides it.
-            existing = self._db.execute(
-                "SELECT user_ignored, user_classified, "
-                "       is_pressure_restoration_phantom, degraded_supply, "
-                "       is_cross_talk, is_low_flow_dribble, "
-                "       is_composite, volume_litres_effective "
-                "FROM events WHERE id = ?",
-                (features["id"],),
-            ).fetchone()
             if existing is not None and existing["user_classified"]:
                 features["user_classified"] = 1
                 features["user_ignored"] = int(existing["user_ignored"] or 0)
@@ -4826,13 +4977,9 @@ class FeatureExtractor:
                 features["user_ignored"] = (
                     int(existing["user_ignored"] or 0) if existing is not None else 0
                 )
-                from .artifact_calibration import load_artifact_calibration
-                from .config import pump_gates_active
-                _acal = load_artifact_calibration(self._db, features.get("circuit"))
-                try:
-                    _pump = pump_gates_active(self._db, features.get("circuit"))
-                except Exception:
-                    _pump = False
+                _vi = await run_db(self._verdict_inputs_sync,
+                                   features.get("circuit"))
+                _acal, _pump = _vi["acal"], _vi["pump"]
                 _finalize_derived_verdicts(features, _acal or None,
                                            min_flow_lpm=min_flow_lpm,
                                            pump_gates=_pump)
@@ -4853,7 +5000,13 @@ class FeatureExtractor:
             is_new_event = None
             for _attempt in range(6):
                 try:
-                    is_new_event = upsert_event_and_apply_hourly_volume(
+                    # dev46 (46a): one run_db hop PER ATTEMPT. The retry loop
+                    # and its sleep stay on the event loop deliberately —
+                    # sleeping inside the DB worker would block the single
+                    # thread this retry is waiting on, turning a recoverable
+                    # lock into a self-inflicted deadlock.
+                    is_new_event = await run_db(
+                        upsert_event_and_apply_hourly_volume,
                         self._db, features, effective_volume,
                     )
                     break
@@ -4864,63 +5017,13 @@ class FeatureExtractor:
                              event.circuit, _attempt + 1)
                     await asyncio.sleep(8)
 
-            # ── Plumbing-event exclusion window (Phase 2.1) ───────────────
-            # If the user opened an exclusion window (e.g. post-winterization
-            # flush), flag the event so the cluster engine skips it.  Volume
-            # tracking continues — only fixture identification is excluded.
-            # Preserves any upstream match_rejection_reason already set by
-            # feature extraction (e.g. 'pulsing_supply') — only stamps
-            # 'excluded_from_training' when no reason was set.
-            start_ts_str = features.get("start_ts")
-            if (start_ts_str
-                    and is_event_in_exclusion_window(
-                        self._db, event.circuit, start_ts_str)):
-                existing_reason = features.get("match_rejection_reason")
-                new_reason = existing_reason or "excluded_from_training"
-                self._db.execute(
-                    """UPDATE events
-                       SET excluded_from_training  = 1,
-                           match_rejection_reason  = ?
-                       WHERE id = ?""",
-                    (new_reason, features["id"]),
-                )
-                features["excluded_from_training"] = 1
-                features["match_rejection_reason"] = new_reason
-                log.debug(
-                    "[%s] event excluded from training (exclusion window active)",
-                    event.circuit,
-                )
-
-            # Calibration test draw — a deliberate, known bucket / municipal run is NOT
-            # organic usage: exclude it from training + anomaly stats so it can't pollute
-            # the frozen baseline. (Notify / shut-off are separately suppressed in
-            # _apply_anomaly_response.)
-            if self._is_calibrating(event.circuit):
-                reason = features.get("match_rejection_reason") or "calibration"
-                self._db.execute(
-                    "UPDATE events SET excluded_from_training = 1, "
-                    "match_rejection_reason = ? WHERE id = ?",
-                    (reason, features["id"]),
-                )
-                features["excluded_from_training"] = 1
-                features["match_rejection_reason"] = reason
-                log.info("[%s] event excluded from training — calibration test draw",
-                         event.circuit)
-
-            # Persist the hi-res waveform for the event-detail modal. Always
-            # called, even for healthy events — useful diagnostic data. Skips
-            # silently when readings lists are empty (historical events).
-            # A record rejected by the sanity gate describes a different draw —
-            # it must not substitute the display envelope either, or the modal
-            # shows another event's waveform.
-            _persist_waveform(
-                self._db,
-                features["id"],
-                event.flow_readings,
-                event.pressure_readings,
-                float(features.get("duration_seconds") or 0),
-                esp_record=wf_record if wf_applied else None,
-            )
+            # dev46 (46a): exclusion window, calibration exclusion, waveform
+            # persist and the training-state increment are one contiguous run
+            # of DB work — ONE hop, one transaction (N2a). It mutates
+            # ``features`` in place; that is safe because the loop is awaiting
+            # this call, so there is no concurrent reader.
+            await run_db(self._post_store_sync, event, features, wf_record,
+                         wf_applied, is_new_event)
 
             # Consume the capture so no later event can claim it (the durable
             # ledger covers restarts; this also drops it from the in-memory
@@ -4937,15 +5040,6 @@ class FeatureExtractor:
                     log.debug("[%s] waveform consume failed (non-fatal): %s",
                               event.circuit, e)
 
-            if is_new_event and not features.get("excluded_from_training"):
-                self._db.execute("""
-                    UPDATE training_state
-                    SET events_collected = events_collected + 1,
-                        updated_at = datetime('now')
-                    WHERE circuit = ?
-                      AND state = 'calibrating'
-                """, (event.circuit,))
-            self._db.commit()
 
             # ── Phase 2: sequence context + cluster matching ───────────────
             await self._cluster_event(event.circuit, features)
@@ -4957,12 +5051,15 @@ class FeatureExtractor:
             # idle). Lazy import matches this module's circular-import-avoidance
             # pattern (cf. the database imports above); best-effort — a capture-logic
             # bug must never block event storage.
-            try:
-                from .database import record_training_candidate
-                record_training_candidate(self._db, event.circuit, features)
-            except Exception as e:
-                log.warning("[%s] training-capture hook failed (non-fatal): %s",
-                            event.circuit, e)
+            # dev46 (46a) — HOP after the _cluster_event await. The capture
+            # write needs NO hop-2 re-check of its own: record_training_candidate
+            # re-reads the armed-capture row at write time (that IS its gate),
+            # so a capture disarmed during clustering simply records nothing.
+            # The 'live' state read is bundled with it — a read, and the two
+            # are adjacent.
+            _post = await run_db(self._post_cluster_sync, event.circuit,
+                                 features)
+            _live_state = _post["state"]
 
             # ── Phase 2.3 anomaly response (frozen-baseline deviation) ─────────
             # Replaces the old match-confidence alert (which fired on anything that
@@ -4974,10 +5071,7 @@ class FeatureExtractor:
             am = self._alert_manager
             anomaly = features.get("_anomaly") or {}
             if am and anomaly.get("is_anomalous"):
-                ts_row = self._db.execute(
-                    "SELECT state FROM training_state WHERE circuit = ?",
-                    (event.circuit,)).fetchone()
-                if ts_row and ts_row["state"] == "live":
+                if _live_state == "live":
                     await self._apply_anomaly_response(
                         event.circuit, features, anomaly)
 
@@ -4990,13 +5084,11 @@ class FeatureExtractor:
                 now = datetime.now(timezone.utc)
                 cutoff_30min = (now - timedelta(minutes=30)).isoformat()
                 try:
-                    row = self._db.execute(
-                        "SELECT COUNT(*) FROM events "
-                        "WHERE circuit = ? AND degraded_supply = 1 "
-                        "AND start_ts >= ?",
-                        (event.circuit, cutoff_30min),
-                    ).fetchone()
-                    count = int(row[0]) if row else 0
+                    # dev46 (46a): a READ after the anomaly-response await.
+                    # No re-check needed — re-checks guard stale WRITES, and
+                    # this only feeds a rate-limited alert decision.
+                    count = await run_db(self._degraded_count_sync,
+                                         event.circuit, cutoff_30min)
                 except Exception as e:
                     log.warning("[%s] pulsing-supply count query failed: %s",
                                 event.circuit, e)
@@ -5051,9 +5143,9 @@ class FeatureExtractor:
         # shut off in response to it (the event is also excluded from training).
         if self._is_calibrating(circuit):
             return
-        from .database import get_sensitivity_config
+        from .database import get_sensitivity_config, run_db
         from .anomaly_baseline import _row_get, MIN_LIVE_DAYS_FOR_SHUTOFF
-        sens = get_sensitivity_config(self._db, circuit)
+        sens = await run_db(get_sensitivity_config, self._db, circuit)
         response = (_row_get(sens, "anomaly_response", "notify") or "notify")
         if response == "off":
             return
@@ -5066,14 +5158,28 @@ class FeatureExtractor:
             (response == "shutoff_any" and anomaly.get("shutoff_ok_any"))
             or (response == "notify_shutoff_severe" and anomaly.get("shutoff_ok_severe"))
         )
+        # dev46 (46a): the two DB-backed shut-off gates go over the wall
+        # together, and ONLY when want_shutoff is true — evaluating them
+        # eagerly would preserve thread-safety but change behaviour, adding
+        # two reads to every anomaly event on a notify-only install. The
+        # seasoned check is pure (it reads the already-fetched sens row).
         if (want_shutoff
-                and self._anomaly_shutoff_state_ok(circuit)
                 and self._anomaly_seasoned(sens, MIN_LIVE_DAYS_FOR_SHUTOFF)
-                and self._anomaly_shutoff_rate_ok(circuit, sens)):
+                and await run_db(self._anomaly_shutoff_gates_sync, circuit,
+                                 sens)):
             if await self._auto_shutoff(circuit, circuit_name, score, atype, event_id):
                 return   # the shut-off path already notified (why + reopen)
         # Off-ramp: degrade to / default notify, rate-limited so it cannot spam.
         self._notify_anomaly(circuit, circuit_name, score, atype, event_id)
+
+    def _anomaly_shutoff_gates_sync(self, circuit: str, sens) -> bool:
+        """dev46 (46a) — both DB-backed shut-off gates, one hop.
+
+        Order is preserved from the inline version: valve/alert state first,
+        then the rate limiter. Short-circuits exactly as the ``and`` chain did.
+        """
+        return (self._anomaly_shutoff_state_ok(circuit)
+                and self._anomaly_shutoff_rate_ok(circuit, sens))
 
     def _anomaly_seasoned(self, sens, min_days: int) -> bool:
         """Earned-trust gate — the baseline has had ≥ ``min_days`` of real usage since
@@ -5135,6 +5241,33 @@ class FeatureExtractor:
             "WHERE circuit = ? AND role = 'valve_entity'", (circuit,)).fetchone()
         return row[0] if row and row[0] else None
 
+    def _shutoff_preflight_sync(self, circuit: str) -> dict:
+        """dev46 (46a) — the two DB reads that must precede actuation.
+
+        Returned together so the hard state gate and the valve lookup describe
+        the same instant; the caller still checks the gate first.
+        """
+        return {"state_ok": self._anomaly_shutoff_state_ok(circuit),
+                "valve":    self._resolve_valve_entity(circuit)}
+
+    def _log_shutoff_sync(self, circuit: str, event_id, atype,
+                          score: float) -> None:
+        """dev46 (46a) — append the shut-off audit row, on the DB thread.
+
+        Store closed_at as an explicit UTC ISO timestamp (NOT the
+        CURRENT_TIMESTAMP default, whose 'YYYY-MM-DD HH:MM:SS' space format
+        sorts BELOW the 'YYYY-MM-DDT…+00:00' cutoff in
+        _anomaly_shutoff_rate_ok — the rate limit would never trip). Both ends
+        must use the same ISO format.
+        """
+        self._db.execute(
+            "INSERT INTO anomaly_shutoff_log "
+            "    (circuit, event_id, anomaly_type, score, closed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (circuit, event_id, atype, score,
+             datetime.now(timezone.utc).isoformat()))
+        self._db.commit()
+
     async def _auto_shutoff(self, circuit: str, circuit_name: str, score: float,
                             atype, event_id) -> bool:
         """Close the valve, log it (persistent), and notify with why + a one-action
@@ -5143,11 +5276,17 @@ class FeatureExtractor:
         # HARD final gate at the actuation chokepoint: the valve can NEVER close
         # unless the circuit is live and settled (not learning / setup / recalibrating),
         # independent of how this method was reached.
-        if not self._anomaly_shutoff_state_ok(circuit):
+        # dev46 (46a): the hard gate and the valve lookup are both DB reads
+        # and both must happen immediately before actuation, so they cross
+        # together in ONE hop — the gate keeps its position as the last thing
+        # checked before the valve moves.
+        from .database import run_db
+        gate = await run_db(self._shutoff_preflight_sync, circuit)
+        if not gate["state_ok"]:
             log.warning("[%s] anomaly auto-shutoff refused — circuit is not in a live, "
                         "settled state (learning / setup / recalibrating)", circuit)
             return False
-        valve = self._resolve_valve_entity(circuit)
+        valve = gate["valve"]
         if not valve or self._ha is None:
             log.warning("[%s] anomaly auto-shutoff requested but no valve entity / "
                         "ha client — degrading to notify", circuit)
@@ -5163,13 +5302,19 @@ class FeatureExtractor:
         # default, whose 'YYYY-MM-DD HH:MM:SS' space format sorts BELOW the
         # 'YYYY-MM-DDT…+00:00' cutoff in _anomaly_shutoff_rate_ok — the rate limit
         # would never trip). Both ends must use the same ISO format.
-        self._db.execute(
-            "INSERT INTO anomaly_shutoff_log "
-            "    (circuit, event_id, anomaly_type, score, closed_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (circuit, event_id, atype, score,
-             datetime.now(timezone.utc).isoformat()))
-        self._db.commit()
+        #
+        # dev46 (46a) — HOP 2, after the valve await. NO re-check, and this
+        # one is argued, not inherited:
+        #   * The valve is ALREADY CLOSED. This row records a physical action
+        #     that definitively happened, so a re-check that could skip the
+        #     write would make the add-on's bookkeeping lie about the valve.
+        #   * It is an append of an immutable fact — the log only ever grows,
+        #     and no interleaved write can make this row wrong or redundant.
+        #     That is exemption-class membership (monotonic), not convenience.
+        #   * Skipping it would also be unsafe in the other direction:
+        #     _anomaly_shutoff_rate_ok counts these rows, so a missing entry
+        #     under-counts the limiter and permits MORE shut-offs.
+        await run_db(self._log_shutoff_sync, circuit, event_id, atype, score)
         log.warning("[%s] ANOMALY AUTO-SHUTOFF — closed valve %s (event %s, %s, "
                     "score %.2f)", circuit, valve, event_id, atype, score)
         am = self._alert_manager
@@ -5195,7 +5340,20 @@ class FeatureExtractor:
             circuit, score, atype, circuit_name, shutoff=False, event_id=event_id))
 
     async def _cluster_event(self, circuit: str, features: dict) -> None:
-        """Compute sequence context, run cluster matching, write results back."""
+        """Compute sequence context, run cluster matching, write results back.
+
+        dev46 (46a): the body is ~360 lines of DB work whose ONLY await was
+        the matcher hop, so the whole thing goes over the wall as ONE
+        callable rather than 23 separate loop-thread touches. Bundling also
+        makes the write-back atomic: sequence context, cluster assignment,
+        suggestion recompute and fixtures.last_seen_at now commit together
+        (rule N2a) instead of as a scatter of independent statements.
+        """
+        from .database import run_db
+        await run_db(self._cluster_event_sync, circuit, features)
+
+    def _cluster_event_sync(self, circuit: str, features: dict) -> None:
+        """The clustering write-back, on the single DB thread."""
         if features.get("excluded_from_training"):
             # dev33 (§2.1): record WHY, instead of returning in silence. The
             # schema has documented 'excluded_from_training' as a
@@ -5261,19 +5419,18 @@ class FeatureExtractor:
                     "SELECT * FROM events WHERE id = ?", (event_id,)
                 ).fetchone()
                 if event_row:
-                    import functools
-                    loop = asyncio.get_running_loop()
+                    # dev46 (46a/N2b): we are ALREADY on the DB thread, so
+                    # the matcher is called directly. Re-submitting to run_db
+                    # from inside a run_db callable would deadlock the single
+                    # worker — the no-re-entry rule, and this is exactly the
+                    # site where a mechanical conversion would have broken it.
                     (cluster_id_result, match_confidence, match_level,
-                     match_rejection_reason) = await loop.run_in_executor(
-                        None,
-                        functools.partial(
-                            self.cluster_engine.match_and_learn,
+                     match_rejection_reason) =                         self.cluster_engine.match_and_learn(
                             dict(event_row),
                             circuit,
                             prev_cluster_id,
                             seconds_since_prev,
                         )
-                    )
             except Exception as e:
                 log.error("[%s] cluster matching failed: %s", circuit, e,
                           exc_info=True)

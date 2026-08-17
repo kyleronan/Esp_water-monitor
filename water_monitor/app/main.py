@@ -203,8 +203,20 @@ async def lifespan(app: FastAPI):
     logging.getLogger("multipart").setLevel(logging.WARNING)
     logging.getLogger("multipart.multipart").setLevel(logging.WARNING)
     log = logging.getLogger(__name__)
-    log.info("Water Monitor starting — %d circuits configured",
-             len(cfg.circuits))
+    # dev46 (46g): announce the running build. Every deploy in the 2026-08
+    # arc needed migration log lines as a proxy for "did the new image
+    # actually start" — twice the supervisor served a stale build and the
+    # only tell was a missing migration. Best-effort: version/commit read
+    # failures must never block boot.
+    try:
+        from .event_detector import _read_addon_version, _read_git_commit
+        _ver = _read_addon_version() or "unknown"
+        _commit = _read_git_commit()
+        _build = f"v{_ver}" + (f" ({_commit})" if _commit else "")
+    except Exception:
+        _build = "version unknown"
+    log.info("Water Monitor %s starting — %d circuits configured",
+             _build, len(cfg.circuits))
     # RBAC trusts the ingress X-Remote-User-Id header ONLY because the ingress-IP
     # guard rejects non-Supervisor clients. If that guard is disabled in production
     # (INGRESS_ALLOWED_IP cleared while DEV_MODE is off), the header could be forged
@@ -364,7 +376,12 @@ async def ingress_middleware(request: Request, call_next):
         request.app.state, "csrf_server_secret", ""
     )
     if not server_secret and orch and getattr(orch, "db", None):
-        server_secret = get_or_create_csrf_server_secret(orch.db)
+        # dev46 (46a): once-per-process lazy init, but it still runs on the
+        # event-loop thread on whichever request happens to be first — so it
+        # goes over the wall like every other DB touch. The app-state cache
+        # above means this costs one hop on that first request only.
+        from .database import run_db
+        server_secret = await run_db(get_or_create_csrf_server_secret, orch.db)
         request.app.state.csrf_server_secret = server_secret
 
     session_id = request.cookies.get(SESSION_COOKIE, "")

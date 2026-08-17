@@ -6,8 +6,8 @@ Async-safety convention (plan C-IQ-4 follow-up)
 sqlite3 is sync. Multi-second queries inside an `async def` path
 block the event loop and stall every other ingress request for the
 duration. The orchestrator's startup hot path
-(`rebuild_from_db` / `backfill_unmatched`) already wraps with
-`loop.run_in_executor(...)`; route handlers should do the same when
+(`rebuild_from_db` / `backfill_unmatched`) dispatches via
+`database.run_db(...)`; route handlers should do the same when
 their DB work is non-trivial.
 
 Cheap single-row UPSERTs / SELECTs (e.g. `set_circuit_type`,
@@ -25,6 +25,21 @@ context-switch overhead outweighs the actual query time. Wrap when:
 Use `run_blocking(fn, *args, **kwargs)` for one-off offloads. For
 hot paths, extract a `_xxx_sync(...)` helper that bundles ALL the
 sync DB calls so the executor hop happens once.
+
+dev46 (46a) — run_blocking is DB-ONLY
+-------------------------------------
+Every caller of `run_blocking` passes a helper that takes `orch.db`,
+so it now dispatches to `database.run_db()` — the single-thread DB
+executor. The shared connection is `check_same_thread=False` and must
+be touched from exactly ONE thread, ever.
+
+Blocking work that does NOT touch the DB (HA I/O, file writes,
+subprocess) must NOT use this helper — call
+`loop.run_in_executor(None, ...)` directly so it stays on the default
+pool. Putting non-DB work here would serialize it behind DB traffic
+for no reason, and — because a `run_db` callable may never itself
+submit to `run_db` and wait (single worker → deadlock) — it would
+also create a re-entrancy foot-gun.
 
 
 HTTP status-code convention (plan C-IQ-24)
@@ -67,7 +82,6 @@ reaching for something outside this list, add a comment explaining why.
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Callable, TypeVar
 
 from fastapi import Request
@@ -78,30 +92,53 @@ from fastapi.responses import RedirectResponse
 # can be unit-tested without pulling in FastAPI.
 from ..forms import coerce_int
 
-__all__ = ["coerce_int", "ingress_redirect", "run_blocking"]
+__all__ = ["coerce_int", "ingress_redirect", "run_blocking", "startup_gate"]
 
 
 T = TypeVar("T")
 
 
 async def run_blocking(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-    """Run `fn(*args, **kwargs)` on the default thread executor.
+    """Run a blocking **DB** helper on the single DB thread and await it.
 
-    Thin wrapper over ``loop.run_in_executor`` for the common case
-    "call this sync helper and await its result". Use it to offload
-    heavy SQLite work (or any other blocking I/O) from async route
-    handlers so a long-running DB query doesn't stall every other
-    ingress request.
+    dev46 (46a): dispatches to ``database.run_db`` — the one-worker DB
+    executor — so page renders can never touch the shared connection
+    concurrently with startup/reseed work (the 8/15 + 8/16
+    ``InterfaceError``). All four callers pass ``orch.db``-taking
+    helpers, so the wholesale routing is correct.
 
-    See the module docstring for guidance on when to wrap and when
-    to leave sync calls inline.
+    NOT for non-DB blocking work: see the module docstring.
     """
-    loop = asyncio.get_running_loop()
-    # functools.partial avoids creating a closure per call; lambda is
-    # fine here too and keeps the surface area small.
-    return await loop.run_in_executor(
-        None, lambda: fn(*args, **kwargs),
-    )
+    from ..database import run_db
+    return await run_db(fn, *args, **kwargs)
+
+
+def startup_gate(request: Request, page: str, title: str,
+                 retry_path: str):
+    """dev46 (46c) — readiness gate for pages with heavy DB work.
+
+    Returns a rendered "still starting" response when the orchestrator's
+    startup replay is still running, else ``None`` (caller proceeds).
+
+    Why a PROACTIVE check rather than an exception handler: 46a routes every
+    DB touch through ONE worker thread, so a page opened during startup no
+    longer 500s with an ``InterfaceError`` — it QUEUES behind the boot pass.
+    Checking readiness BEFORE submitting means the user gets an instant,
+    honest answer instead of a request that hangs until it times out.
+
+    Wording is shared with the Water Use page's 'starting' flash so the
+    add-on says the same thing wherever this state surfaces.
+    """
+    orch = getattr(request.app.state, "orchestrator", None)
+    if orch is None or getattr(orch, "startup_cluster_work_done", True):
+        return None
+    templates = request.app.state.templates
+    return templates.TemplateResponse("starting.html", {
+        "request":    request,
+        "page":       page,
+        "page_title": title,
+        "retry_path": retry_path,
+    }, status_code=503)
 
 
 def ingress_redirect(

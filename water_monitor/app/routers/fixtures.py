@@ -6,7 +6,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from ._helpers import ingress_redirect
+from ._helpers import ingress_redirect, startup_gate
 from ..circuit_compat import resolve_circuit
 
 log = logging.getLogger(__name__)
@@ -43,7 +43,58 @@ async def fixtures_page(request: Request, preview: bool = False):
     type via fixtures.normalize_fixture_type_for_circuit. Correction of
     mis-bucketed events happens on the History page (Sprint B feedback loop).
     """
+    # dev46 (46c): lifetime rollups over every event — gate on startup.
+    gated = startup_gate(request, "fixtures", "Water Use", "/fixtures")
+    if gated is not None:
+        return gated
     orch = _orch(request)
+    from ..fixtures import FIXTURE_TYPE_LABELS
+
+    # Time-range selector (top of page). Each option is a rolling window back
+    # to HA-local midnight N days ago — the same helper the dashboard uses for
+    # get_daily_volume, so the "today" boundary matches across pages.
+    # "lifetime" = no lower bound (None). Unknown/hand-edited values clamp to
+    # "today" so the page never 500s. Default "today" preserves prior behaviour.
+    _RANGE_DAYS = {"today": 0, "week": 7, "month": 30, "3months": 90,
+                   "6months": 183, "year": 365, "2years": 730}
+    _RANGE_LABELS = {"today": "today", "week": "past week", "month": "past month",
+                     "3months": "past 3 months", "6months": "past 6 months",
+                     "year": "past year", "2years": "past 2 years",
+                     "lifetime": "all-time"}
+    sel_range = request.query_params.get("range", "today")
+    if sel_range not in _RANGE_DAYS and sel_range != "lifetime":
+        sel_range = "today"
+    range_start_utc = (None if sel_range == "lifetime"
+                       else orch._local_midnight_utc(days_ago=_RANGE_DAYS[sel_range]))
+    range_label = _RANGE_LABELS[sel_range]
+
+    # dev46 (46a) — this whole page is DB work with no awaits in the loop, so
+    # it goes over the wall in ONE hop: per-circuit rollups, publish maps,
+    # exclusion windows, orphan lists and the stale-link count all ran inline
+    # on the event loop before, contending with the DB worker statement by
+    # statement.
+    from ..database import run_db
+    circuits_ctx, stale_link_count = await run_db(
+        _fixtures_page_payload, orch, range_start_utc)
+
+    return _tmpl(request).TemplateResponse("fixtures.html", {
+        "request":             request,
+        "page":                "fixtures",
+        "circuits":            circuits_ctx,
+        "fixture_type_labels": FIXTURE_TYPE_LABELS,
+        "preview":             preview,
+        "sel_range":           sel_range,
+        "range_label":         range_label,
+        "stale_link_count":    stale_link_count,
+    })
+
+
+def _fixtures_page_payload(orch, range_start_utc):
+    """Every DB read behind the Water Use page, in one DB-thread callable.
+
+    Returns ``(circuits_ctx, stale_link_count)``. dev46 (46a): extracted from
+    the handler so no statement runs on the event-loop thread.
+    """
     from ..database import (get_active_exclusion_window, get_category_rollup,
                             get_category_publish_map, get_orphaned_fixtures)
     from ..fixtures import (FIXTURE_TYPE_LABELS,
@@ -63,24 +114,6 @@ async def fixtures_page(request: Request, preview: bool = False):
         "irrigation_zone": "\U0001F4A7",
         "other":           "❓",
     }
-
-    # Time-range selector (top of page). Each option is a rolling window back
-    # to HA-local midnight N days ago — the same helper the dashboard uses for
-    # get_daily_volume, so the "today" boundary matches across pages.
-    # "lifetime" = no lower bound (None). Unknown/hand-edited values clamp to
-    # "today" so the page never 500s. Default "today" preserves prior behaviour.
-    _RANGE_DAYS = {"today": 0, "week": 7, "month": 30, "3months": 90,
-                   "6months": 183, "year": 365, "2years": 730}
-    _RANGE_LABELS = {"today": "today", "week": "past week", "month": "past month",
-                     "3months": "past 3 months", "6months": "past 6 months",
-                     "year": "past year", "2years": "past 2 years",
-                     "lifetime": "all-time"}
-    sel_range = request.query_params.get("range", "today")
-    if sel_range not in _RANGE_DAYS and sel_range != "lifetime":
-        sel_range = "today"
-    range_start_utc = (None if sel_range == "lifetime"
-                       else orch._local_midnight_utc(days_ago=_RANGE_DAYS[sel_range]))
-    range_label = _RANGE_LABELS[sel_range]
 
     circuits_ctx = []
     for circ_cfg in orch._cfg.circuits:
@@ -167,16 +200,7 @@ async def fixtures_page(request: Request, preview: bool = False):
     except Exception:
         stale_link_count = 0
 
-    return _tmpl(request).TemplateResponse("fixtures.html", {
-        "request":             request,
-        "page":                "fixtures",
-        "circuits":            circuits_ctx,
-        "fixture_type_labels": FIXTURE_TYPE_LABELS,
-        "preview":             preview,
-        "sel_range":           sel_range,
-        "range_label":         range_label,
-        "stale_link_count":    stale_link_count,
-    })
+    return circuits_ctx, stale_link_count
 
 
 def _max_iso(a, b):
@@ -239,7 +263,9 @@ async def category_publish_toggle(
 
     form = await request.form()
     publish_to_ha = 1 if form.get("publish_to_ha") == "1" else 0
-    set_category_publish(orch.db, circuit, fixture_type, publish_to_ha)
+    from ..database import run_db
+    await run_db(set_category_publish, orch.db, circuit,      # dev46 (46a)
+                 fixture_type, publish_to_ha)
 
     # Apply to the live HA broker immediately (no wait for the periodic tick).
     fp = getattr(orch, "_fixture_publisher", None) or getattr(orch, "fixture_publisher", None)
@@ -285,10 +311,12 @@ async def repair_stale_links(request: Request):
         return ingress_redirect(request, "/fixtures?msg=starting")
     try:
         import asyncio
-        import functools
-        loop = asyncio.get_running_loop()
+        from ..database import run_db
+        # dev46 (46a/N2c): the write lock is async and is acquired OUTSIDE
+        # run_db — never inside a callable on the single DB worker.
         async with get_write_lock():
-            counts = find_orphaned_cluster_references(orch.db, repair=True)
+            counts = await run_db(find_orphaned_cluster_references,
+                                  orch.db, repair=True)
             if engine:
                 for c in orch._cfg.circuits:
                     # dev44: RESET before replay. rebuild_from_db does not
@@ -299,9 +327,7 @@ async def repair_stale_links(request: Request):
                     # re-minted 1,736 orphans through it (observed 8/16
                     # 10:20:43, ninety seconds after the first repair).
                     engine.reset_circuit(c.circuit)
-                    await loop.run_in_executor(
-                        None, functools.partial(engine.rebuild_from_db,
-                                                c.circuit))
+                    await run_db(engine.rebuild_from_db, c.circuit)
         log.info("repair-stale-links: %s (engine reset + rebuilt)", counts)
     except Exception as e:
         log.error("repair-stale-links failed: %s", e, exc_info=True)
@@ -322,16 +348,12 @@ async def retrigger_cluster(request: Request, circuit: str = Depends(_valid_circ
     if not engine:
         return ingress_redirect(request, "/fixtures?msg=error")
     try:
-        import asyncio, functools
-        from ..database import get_write_lock
-        loop = asyncio.get_running_loop()
+        from ..database import get_write_lock, run_db
         # Serialise against recompute/reclassify/other rebuilds — all share the
         # write lock so heavy DB writers never run concurrently on the engine's
-        # shared connection.
+        # shared connection. (dev46 46a: the lock is held OUTSIDE run_db.)
         async with get_write_lock():
-            count = await loop.run_in_executor(
-                None, functools.partial(engine.rebuild_from_db, circuit)
-            )
+            count = await run_db(engine.rebuild_from_db, circuit)
         log.info("[%s] manual rebuild: %d events replayed", circuit, count)
         if count == 0:
             return ingress_redirect(request, "/fixtures?msg=too_few_events")
@@ -372,8 +394,9 @@ async def confirm_cluster(request: Request, cluster_id: int, circuit: str = Depe
         name = fixture_type.replace("_", " ").title()
 
     orch = _orch(request)
-    from ..database import upsert_fixture_from_cluster
-    fixture_id = upsert_fixture_from_cluster(
+    from ..database import run_db, upsert_fixture_from_cluster
+    fixture_id = await run_db(                                # dev46 (46a)
+        upsert_fixture_from_cluster,
         orch.db, circuit, cluster_id, name, fixture_type, publish
     )
     if publish and fixture_id:
@@ -416,9 +439,10 @@ async def relink_orphaned_fixture(
         return ingress_redirect(request, "/fixtures?msg=error")
 
     orch = _orch(request)
-    from ..database import relink_fixture_to_cluster
+    from ..database import relink_fixture_to_cluster, run_db
     try:
-        relink_fixture_to_cluster(orch.db, circuit, fixture_id, cluster_id)
+        await run_db(relink_fixture_to_cluster,               # dev46 (46a)
+                     orch.db, circuit, fixture_id, cluster_id)
     except ValueError as e:
         log.warning("[%s] relink %s → cluster %d rejected: %s",
                     circuit, fixture_id, cluster_id, e)
@@ -442,9 +466,10 @@ async def relink_orphaned_fixture(
     engine = getattr(orch, "cluster_engine", None)
     if engine:
         # Look up the fixture_type to feed the notification.
-        row = orch.db.execute(
-            "SELECT fixture_type FROM fixtures WHERE id = ?", (fixture_id,)
-        ).fetchone()
+        row = await run_db(                                   # dev46 (46a)
+            lambda: orch.db.execute(
+                "SELECT fixture_type FROM fixtures WHERE id = ?", (fixture_id,)
+            ).fetchone())
         ftype = row["fixture_type"] if row else None
         if ftype:
             try:
@@ -474,9 +499,10 @@ async def forget_signature(
     on the next save.)
     """
     orch = _orch(request)
-    from ..database import delete_fixture_signature
+    from ..database import delete_fixture_signature, run_db
     try:
-        removed = delete_fixture_signature(orch.db, circuit, fixture_type)
+        removed = await run_db(delete_fixture_signature,      # dev46 (46a)
+                               orch.db, circuit, fixture_type)
     except Exception as e:
         log.error("[%s] forget signature %s failed: %s",
                   circuit, fixture_type, e, exc_info=True)
@@ -494,9 +520,16 @@ async def forget_signature(
 @router.post("/{circuit}/cluster/{cluster_id}/delete")
 async def delete_cluster_endpoint(request: Request, cluster_id: int, circuit: str = Depends(_valid_circuit)):
     orch = _orch(request)
-    from ..database import delete_cluster, get_fixture_id_for_cluster
-    fixture_id = get_fixture_id_for_cluster(orch.db, circuit, cluster_id)
-    delete_cluster(orch.db, circuit, cluster_id)
+    from ..database import delete_cluster, get_fixture_id_for_cluster, run_db
+
+    def _lookup_and_delete():
+        # dev46 (46a/N2a): lookup + delete in ONE callable — the id must not
+        # be read in one hop and acted on in another.
+        fid = get_fixture_id_for_cluster(orch.db, circuit, cluster_id)
+        delete_cluster(orch.db, circuit, cluster_id)
+        return fid
+
+    fixture_id = await run_db(_lookup_and_delete)
     if fixture_id:
         fp = getattr(orch, "_fixture_publisher", None)
         if fp:
@@ -525,8 +558,10 @@ async def merge_page(request: Request, circuit: str = Depends(_valid_circuit)):
     orch = _orch(request)
     from ..database import get_clusters_with_fixtures, get_all_cluster_stats
     from ..fixtures import FIXTURE_TYPE_LABELS
-    clusters_raw = get_clusters_with_fixtures(orch.db, circuit)
-    all_stats = get_all_cluster_stats(orch.db, circuit)
+    from ..database import run_db
+    clusters_raw, all_stats = await run_db(                   # dev46 (46a)
+        lambda: (get_clusters_with_fixtures(orch.db, circuit),
+                 get_all_cluster_stats(orch.db, circuit)))
     clusters_by_id = {
         cl["id"]: {**cl, **all_stats.get(cl["id"], {})}
         for cl in clusters_raw
@@ -576,13 +611,17 @@ async def merge_clusters_endpoint(
 
     # Collect non-survivor fixture IDs before merge, for HA retraction only.
     deleted_ids = [i for i in ids if i != survivor_id]
-    retract_fixture_ids = [
-        fid for i in deleted_ids
-        if (fid := get_fixture_id_for_cluster(orch.db, circuit, i))
-    ]
 
+    def _collect_and_merge():
+        # dev46 (46a/N2a): the pre-merge id sweep and the merge itself are one
+        # transaction's worth of work — one callable on the single DB thread.
+        retract = [fid for i in deleted_ids
+                   if (fid := get_fixture_id_for_cluster(orch.db, circuit, i))]
+        return retract, merge_clusters(orch.db, circuit, survivor_id, ids)
+
+    from ..database import run_db
     try:
-        summary = merge_clusters(orch.db, circuit, survivor_id, ids)
+        retract_fixture_ids, summary = await run_db(_collect_and_merge)
     except ValueError as e:
         log.warning("[%s] merge validation failed: %s", circuit, e)
         return ingress_redirect(request, "/fixtures?msg=merge_failed")
@@ -603,13 +642,9 @@ async def merge_clusters_endpoint(
     engine = getattr(orch, "cluster_engine", None)
     if engine:
         try:
-            import asyncio, functools
-            from ..database import get_write_lock
-            loop = asyncio.get_running_loop()
+            from ..database import get_write_lock, run_db
             async with get_write_lock():
-                await loop.run_in_executor(
-                    None, functools.partial(engine.rebuild_from_db, circuit)
-                )
+                await run_db(engine.rebuild_from_db, circuit)
         except Exception as e:
             log.error("[%s] rebuild_from_db after merge failed: %s", circuit, e)
 
@@ -633,17 +668,23 @@ async def migrate_circuit(request: Request, circuit: str = Depends(_valid_circui
     suggested-only clusters.
     """
     orch = _orch(request)
-    from ..database import migrate_to_type_level_clusters
+    from ..database import migrate_to_type_level_clusters, run_db
+
+    def _migrate_and_commit(conn):
+        # dev46 (46a/N2a): the migration's writes and their commit belong to
+        # ONE transaction, so they must live in ONE run_db callable. Splitting
+        # them across two hops would leave the transaction open across a
+        # queue boundary, letting a foreign statement land inside it — a
+        # silent correctness bug on a shared connection, with no exception.
+        summary = migrate_to_type_level_clusters(conn, circuit)
+        conn.commit()
+        return summary
+
     try:
-        summary = migrate_to_type_level_clusters(orch.db, circuit)
-        orch.db.commit()
+        summary = await run_db(_migrate_and_commit, orch.db)
         engine = getattr(orch, "cluster_engine", None)
         if engine:
-            import asyncio, functools
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None, functools.partial(engine.rebuild_from_db, circuit)
-            )
+            await run_db(engine.rebuild_from_db, circuit)
         log.info("[%s] type-level migration: %s", circuit, summary)
     except Exception as e:
         log.error("[%s] migrate_circuit failed: %s", circuit, e, exc_info=True)
@@ -698,17 +739,19 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
                                 get_write_lock, recompute_cycle_pulse_counts,
                                 resuggest_all_clusters,
                                 recompute_all_user_label_suggestions,
-                                coalesce_low_flow_events, snapshot_database)
+                                coalesce_low_flow_events, run_db,
+                                snapshot_database)
         from ..config import DB_PATH
         # Reject (don't silently queue for many seconds) if another heavy DB
         # write is already running — recompute/reclassify/recluster all share
         # the write lock. Best-effort UX guard; correctness is the lock itself.
         if get_write_lock().locked():
             return ingress_redirect(request, "/fixtures?msg=busy")
-        rng = orch.db.execute(
-            "SELECT MIN(start_ts) mn, MAX(end_ts) mx FROM events WHERE circuit = ?",
-            (circuit,),
-        ).fetchone()
+        rng = await run_db(                                   # dev46 (46a)
+            lambda: orch.db.execute(
+                "SELECT MIN(start_ts) mn, MAX(end_ts) mx FROM events "
+                "WHERE circuit = ?", (circuit,),
+            ).fetchone())
         if not rng or not rng["mn"]:
             return ingress_redirect(
                 request, "/fixtures?msg=recomputed&recomputed=0&skipped=0&degraded=0")

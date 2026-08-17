@@ -44,8 +44,13 @@ async def access_page(request: Request):
     """Render the access-management page: every known HA user with its resolved
     role and an operator toggle for non-admins."""
     orch = _orch(request)
+    from ..database import run_db
     db = orch.db
-    operator_ids = load_operator_ids(db)
+    # dev46 (46a): every DB read on this page goes through the single DB
+    # thread. The seen-users fallback below is fetched here too — one hop,
+    # and the branch that uses it is decided after the HA call returns.
+    operator_ids, seen_users = await run_db(
+        lambda: (load_operator_ids(db), list_seen_users(db)))
     admin_ids = set(getattr(orch, "admin_ids", set()))
 
     # Primary source: live HA user list. Falls back to the seen-users log if the
@@ -77,7 +82,7 @@ async def access_page(request: Request):
             })
     else:
         # Fallback: users we've actually seen open the add-on.
-        for s in list_seen_users(db):
+        for s in seen_users:
             uid = s["user_id"]
             users.append({
                 "id": uid,
@@ -113,8 +118,16 @@ async def grant_operator(
     """Grant the operator tier (read + valve control) to a HA user."""
     orch = _orch(request)
     actor = request.headers.get(REMOTE_USER_ID_HEADER, "")
-    add_operator(orch.db, user_id.strip(), display_name.strip(), actor)
-    orch.reload_operator_ids()
+    from ..database import run_db
+
+    def _grant():
+        # dev46 (46a): the write AND the allow-list reload it invalidates are
+        # both DB work — one callable on the single DB thread keeps them
+        # together (reload_operator_ids re-SELECTs the operator set).
+        add_operator(orch.db, user_id.strip(), display_name.strip(), actor)
+        orch.reload_operator_ids()
+
+    await run_db(_grant)
     log.info("RBAC: operator granted to %r by %r", user_id, actor)
     return ingress_redirect(request, "/access")
 
@@ -127,7 +140,13 @@ async def revoke_operator(
     """Revoke the operator tier from a HA user (they fall back to viewer)."""
     orch = _orch(request)
     actor = request.headers.get(REMOTE_USER_ID_HEADER, "")
-    remove_operator(orch.db, user_id.strip())
-    orch.reload_operator_ids()
+    from ..database import run_db
+
+    def _revoke():
+        # dev46 (46a): write + allow-list reload in one DB-thread callable.
+        remove_operator(orch.db, user_id.strip())
+        orch.reload_operator_ids()
+
+    await run_db(_revoke)
     log.info("RBAC: operator revoked from %r by %r", user_id, actor)
     return ingress_redirect(request, "/access")

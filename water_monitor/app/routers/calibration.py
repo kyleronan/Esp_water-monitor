@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 
 from ..auth import require_admin
 from ..circuit_compat import resolve_circuit
+from ..database import run_db
 from ..units import load_unit_context
 from ..calibration_math import (
     BUCKET_MIN_L, MUNICIPAL_MIN_L, METER_UNIT_FACTORS, gate, pooled, run_ppl, to_litres,
@@ -101,7 +102,7 @@ async def start(circuit: str, request: Request):
     if method not in ("bucket", "municipal"):
         return _err("Unknown method")
 
-    units = load_unit_context(orch.db)
+    units = await run_db(load_unit_context, orch.db)   # dev46 (46a)
     sess = _session(circuit)
     if sess is None or sess.get("method") != method:
         sess = {"method": method, "runs": [], "actual_l": None, "meter_unit": None,
@@ -153,7 +154,7 @@ async def poll(circuit: str, request: Request):
         return _err("session expired — start over", 409)
     now_l = await _read_volume_l(orch, cfg)
     measured = max(0.0, (now_l - sess["baseline_l"]) if now_l is not None else 0.0)
-    units = load_unit_context(orch.db)
+    units = await run_db(load_unit_context, orch.db)   # dev46 (46a)
     factor = units.get("vol_factor") or 1.0
     return JSONResponse({"ok": True, "measured_l": round(measured, 3),
                          "measured_display": round(measured * factor, 2),
@@ -253,8 +254,9 @@ async def cancel(circuit: str, request: Request):
 @router.get("/anchors")
 async def list_anchors(request: Request):
     from ..database import list_meter_anchor_points
-    return JSONResponse({"ok": True,
-                         "anchors": list_meter_anchor_points(_orch(request).db)})
+    anchors = await run_db(list_meter_anchor_points,           # dev46 (46a)
+                           _orch(request).db)
+    return JSONResponse({"ok": True, "anchors": anchors})
 
 
 @router.post("/anchors")
@@ -270,7 +272,8 @@ async def add_anchor(request: Request):
     if reference <= 0:
         return _err("reference_volume_l must be > 0")
     from ..database import insert_meter_anchor_point
-    row_id = insert_meter_anchor_point(
+    row_id = await run_db(                                     # dev46 (46a)
+        insert_meter_anchor_point,
         _orch(request).db,
         circuit=body.get("circuit"),
         flow_rate_lpm=flow, measured_volume_l=measured,
@@ -284,8 +287,9 @@ async def add_anchor(request: Request):
 @router.get("/register-readings")
 async def list_register_readings(request: Request):
     from ..database import list_utility_register_readings
-    return JSONResponse({"ok": True, "readings":
-                         list_utility_register_readings(_orch(request).db)})
+    readings = await run_db(list_utility_register_readings,    # dev46 (46a)
+                            _orch(request).db)
+    return JSONResponse({"ok": True, "readings": readings})
 
 
 @router.post("/register-readings")
@@ -297,7 +301,8 @@ async def add_register_reading(request: Request):
     except (KeyError, TypeError, ValueError):
         return _err("reading_value (number) and reading_ts are required")
     from ..database import insert_utility_register_reading
-    row_id = insert_utility_register_reading(
+    row_id = await run_db(                                     # dev46 (46a)
+        insert_utility_register_reading,
         _orch(request).db,
         reading_value=value, reading_ts=ts,
         meter_serial=body.get("meter_serial"),

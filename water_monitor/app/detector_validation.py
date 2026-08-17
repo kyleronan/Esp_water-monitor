@@ -461,6 +461,21 @@ def load_validation_report(conn: sqlite3.Connection,
 
 # ── async orchestration (fetch + clamp + validate + persist) ──────────────────────
 
+def _validate_and_persist_sync(db, circuit, flow_histories, window, min_flow,
+                               source, now_utc, persist):
+    """dev46 (46a) — the validation query + report persist, on the DB thread."""
+    report = validate_detectors_against_history(
+        db, circuit, flow_histories, window, min_flow=min_flow)
+    report["source"] = source
+    report["validated_at"] = now_utc.isoformat()
+    if persist:
+        try:
+            persist_validation_report(db, circuit, report)
+        except Exception as e:
+            log.warning("[%s] detector-validation persist failed: %s", circuit, e)
+    return report
+
+
 async def run_detector_validation(db: sqlite3.Connection, ha: Any, cfg: Any,
                                    circuit: str, now_utc: datetime, *,
                                    source: str = "freeze",
@@ -495,16 +510,17 @@ async def run_detector_validation(db: sqlite3.Connection, ha: Any, cfg: Any,
         irrig.extend(_series(e))
     flow_histories = {"main": _series(main_entity), "irrigation": irrig}
 
-    report = validate_detectors_against_history(
-        db, circuit, flow_histories, (start, end),
-        min_flow=getattr(circuit_cfg, "min_flow_lpm", MIN_FLOW_LPM))
-    report["source"] = source
-    report["validated_at"] = now_utc.isoformat()
-    if persist:
-        try:
-            persist_validation_report(db, circuit, report)
-        except Exception as e:
-            log.warning("[%s] detector-validation persist failed: %s", circuit, e)
+    # dev46 (46a): every DB touch in this function lives AFTER the HA fetch
+    # and is contiguous — the validation query and the report persist go over
+    # the wall together in ONE hop. No hop-2 re-check is needed: this function
+    # is DIAGNOSTIC ONLY (it never writes a threshold), and the report it
+    # stores describes the history window it just read, so nothing an
+    # interleaved write could change makes the stored report wrong.
+    from .database import run_db
+    report = await run_db(
+        _validate_and_persist_sync, db, circuit, flow_histories,
+        (start, end), getattr(circuit_cfg, "min_flow_lpm", MIN_FLOW_LPM),
+        source, now_utc, persist)
     log.info("[%s] detector self-validation (%s): overall=%s, %d suspect zeroing(s), "
              "%d unflagged no-flow", circuit, source, report.get("overall"),
              len(report.get("suspect_zeroings", [])),

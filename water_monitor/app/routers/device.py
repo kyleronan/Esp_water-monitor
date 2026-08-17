@@ -48,13 +48,18 @@ async def device_page(request: Request):
     orch = _orch(request)
     cfg = orch._cfg
 
+    # dev46 (46a): every DB read this page needs, in ONE hop off the loop
+    # thread. The per-circuit loop below still awaits HA (natively async) but
+    # never touches the shared connection.
+    from ..database import run_db
+    db_payload = await run_db(_device_db_payload, orch.db, list(cfg.circuits))
+
     circuit_states = []
     for circuit_cfg in cfg.circuits:
         state = await orch.get_live_state_async(circuit_cfg.circuit)
 
         # Leak test schedule
-        from ..database import get_leak_test_schedule
-        sched = get_leak_test_schedule(orch.db, circuit_cfg.circuit)
+        sched = db_payload["schedules"].get(circuit_cfg.circuit)
         state["schedule"] = dict(sched) if sched else {}
 
         # Phase 3 — waveform-transport health: addon-side counters (assembled /
@@ -79,25 +84,9 @@ async def device_page(request: Request):
         # (healthy events whose stored volume still diverges from the recorder's). Only
         # shown when the firmware publishes a cumulative volume sensor.
         if getattr(circuit_cfg, "volume_sensor", ""):
-            from ..database import get_reconcile_state, get_sensitivity_config
-            from ..recorder_reconcile import count_flagged_backlog
-            from ..routers.settings import _fmt_local_ts
-            from ..event_rules import get_home_timezone
-            rs = get_reconcile_state(orch.db, circuit_cfg.circuit)
-            sens = get_sensitivity_config(orch.db, circuit_cfg.circuit)
-            auto = True
-            if sens and "recorder_reconcile_auto" in sens.keys() \
-                    and sens["recorder_reconcile_auto"] is not None:
-                auto = bool(sens["recorder_reconcile_auto"])
-            state["reconcile"] = {
-                "auto": auto,
-                "corrections": (rs["corrections"] if rs else 0) or 0,
-                "flagged": (rs["flagged"] if rs else 0) or 0,
-                "last_run": _fmt_local_ts(rs["last_run_at"] if rs else None,
-                                          get_home_timezone()),
-                "last_delta": (rs["last_delta_litres"] if rs else None),
-                "backlog": count_flagged_backlog(orch.db, circuit_cfg.circuit),
-            }
+            reconcile = db_payload["reconcile"].get(circuit_cfg.circuit)
+            if reconcile is not None:
+                state["reconcile"] = reconcile
 
         circuit_states.append(state)
 
@@ -106,6 +95,54 @@ async def device_page(request: Request):
         "circuits": circuit_states,
         "page": "device",
     })
+
+
+def _device_db_payload(db, circuits) -> dict:
+    """Every DB read the device page needs, bundled into one DB-thread call.
+
+    dev46 (46a): these ran inline on the event loop, once per circuit —
+    concurrent statements on the shared connection whenever a background job
+    was mid-write. Best-effort per circuit so one bad row can't blank the page.
+    """
+    from ..database import (get_leak_test_schedule, get_reconcile_state,
+                            get_sensitivity_config)
+    from ..recorder_reconcile import count_flagged_backlog
+    from ..routers.settings import _fmt_local_ts
+    from ..event_rules import get_home_timezone
+
+    schedules: dict = {}
+    reconcile: dict = {}
+    tz = get_home_timezone()
+    for c in circuits:
+        try:
+            schedules[c.circuit] = get_leak_test_schedule(db, c.circuit)
+        except Exception:
+            schedules[c.circuit] = None
+        # Phase 3 §2 — recorder volume reconciliation surface: cumulative
+        # correction / flag counts + last-run time (from reconcile_state) and
+        # the current flag backlog (healthy events whose stored volume still
+        # diverges from the recorder's). Only meaningful when the firmware
+        # publishes a cumulative volume sensor — the caller gates on that.
+        if not getattr(c, "volume_sensor", ""):
+            continue
+        try:
+            rs = get_reconcile_state(db, c.circuit)
+            sens = get_sensitivity_config(db, c.circuit)
+            auto = True
+            if sens and "recorder_reconcile_auto" in sens.keys() \
+                    and sens["recorder_reconcile_auto"] is not None:
+                auto = bool(sens["recorder_reconcile_auto"])
+            reconcile[c.circuit] = {
+                "auto": auto,
+                "corrections": (rs["corrections"] if rs else 0) or 0,
+                "flagged": (rs["flagged"] if rs else 0) or 0,
+                "last_run": _fmt_local_ts(rs["last_run_at"] if rs else None, tz),
+                "last_delta": (rs["last_delta_litres"] if rs else None),
+                "backlog": count_flagged_backlog(db, c.circuit),
+            }
+        except Exception:
+            reconcile[c.circuit] = None
+    return {"schedules": schedules, "reconcile": reconcile}
 
 
 # ------------------------------------------------------------------
@@ -168,7 +205,8 @@ async def fault_reset(circuit: str, request: Request):
     log.info(">>> fault_reset called for circuit=%s", circuit)
     orch = _orch(request)
     from ..device_discovery import load_circuit_entities
-    entities = load_circuit_entities(orch.db, circuit)
+    from ..database import run_db
+    entities = await run_db(load_circuit_entities, orch.db, circuit)  # dev46 (46a)
     entity_id = entities.get("fault_reset_button")
     if not entity_id:
         return JSONResponse(
@@ -192,7 +230,8 @@ async def trickle_reset(circuit: str, request: Request):
     log.info(">>> trickle_reset called for circuit=%s", circuit)
     orch = _orch(request)
     from ..device_discovery import load_circuit_entities
-    entities = load_circuit_entities(orch.db, circuit)
+    from ..database import run_db
+    entities = await run_db(load_circuit_entities, orch.db, circuit)  # dev46 (46a)
     entity_id = entities.get("trickle_reset_button")
     if not entity_id:
         return JSONResponse(
@@ -231,7 +270,8 @@ async def threshold_update(
 
     # Build allowlist from only the writable threshold roles for this circuit
     from ..device_discovery import load_circuit_entities
-    entities = load_circuit_entities(orch.db, circuit)
+    from ..database import run_db
+    entities = await run_db(load_circuit_entities, orch.db, circuit)  # dev46 (46a)
     allowed = {v for k, v in entities.items() if k in _THRESHOLD_ROLES and v}
     if entity_id not in allowed:
         # 400 not 403 — the request is well-formed, but the supplied
@@ -282,7 +322,8 @@ async def alert_toggle(
             status_code=404,
         )
     from ..device_discovery import load_circuit_entities
-    entities = load_circuit_entities(orch.db, circuit)
+    from ..database import run_db
+    entities = await run_db(load_circuit_entities, orch.db, circuit)  # dev46 (46a)
     role = f"alert_{alert_type}_switch"
     entity_id = entities.get(role)
     if not entity_id:
@@ -301,7 +342,8 @@ async def alert_toggle(
 
     # Update local alert_config only after HA confirms
     from ..database import set_alert_enabled
-    set_alert_enabled(orch.db, f"{alert_type}_{circuit}", enabled)
+    await run_db(set_alert_enabled, orch.db,                  # dev46 (46a)
+                 f"{alert_type}_{circuit}", enabled)
 
     return JSONResponse({"status": "updated", "enabled": enabled})
 
@@ -428,7 +470,7 @@ async def leaktest_schedule(circuit: str, request: Request):
     form = await request.form()
     orch = _orch(request)
 
-    from ..database import upsert_leak_test_schedule
+    from ..database import run_db, upsert_leak_test_schedule
     # Bounded coercion: out-of-range form values (run_hour=99,
     # day_of_week=-1, etc.) fall back to the listed default rather
     # than being persisted as garbage. The numeric bounds match the
@@ -437,7 +479,8 @@ async def leaktest_schedule(circuit: str, request: Request):
     #   week_of_month  1..5
     #   run_hour       0..23
     #   run_minute     0..59
-    upsert_leak_test_schedule(
+    await run_db(                                             # dev46 (46a)
+        upsert_leak_test_schedule,
         orch.db, circuit,
         enabled=form.get("enabled") == "on",
         auto_learn_hour=form.get("auto_learn_hour") == "on",

@@ -2273,7 +2273,37 @@ class EventDetector:
         det = self._detectors.get(circuit)
         return det.settled_pressure() if det is not None else None
 
-    def setup(self) -> None:
+    def collect_circuit_inputs(self, circuits=None) -> dict:
+        """dev46 (46a) — every DB-backed input the detector needs, one hop.
+
+        The three getters injected by the orchestrator (sensitivity, pump
+        gate, low-pressure floors) each query the shared connection. They
+        used to be invoked inline from ``setup`` / ``update_thresholds``,
+        which run on the event loop — a deferred connection touch the
+        attribute grep could never see, because the orchestrator hands them
+        over as plain callables.
+
+        Collected together here so the loop-side code below stays exactly as
+        it was: object construction and HA subscription must NOT move to the
+        DB thread (that would trade a DB race for a subscription-registry
+        one).
+        """
+        out = {}
+        for circuit in (circuits if circuits is not None
+                        else [c.circuit for c in self._circuits]):
+            try:
+                gate = self._pump_gate_getter(circuit)                     if self._pump_gate_getter else None
+            except Exception:
+                gate = None
+            try:
+                floors = self._low_pressure_getter(circuit)                     if self._low_pressure_getter else None
+            except Exception:
+                floors = None
+            out[circuit] = {"sens": self._sensitivity_getter(circuit),
+                            "gate": gate, "floors": floors}
+        return out
+
+    async def setup(self, inputs=None) -> None:
         """Instantiate detectors and register HA entity subscriptions.
 
         Idempotent — safe to call more than once (e.g. after the setup
@@ -2284,8 +2314,11 @@ class EventDetector:
             log.debug("Event detector already configured — skipping re-setup")
             return
         self._is_configured = True
+        if inputs is None:
+            from .database import run_db
+            inputs = await run_db(self.collect_circuit_inputs)
         for cfg in self._circuits:
-            sens = self._sensitivity_getter(cfg.circuit)
+            sens = inputs[cfg.circuit]["sens"]
             detector = CircuitEventDetector(
                 circuit=cfg.circuit,
                 pressure_drop_threshold_psi=sens.get("pressure_drop_event_psi", 1.2),
@@ -2302,19 +2335,12 @@ class EventDetector:
                 min_flow_lpm=getattr(cfg, "min_flow_lpm", 0.15),
             )
             self._detectors[cfg.circuit] = detector
-            try:
-                detector.update_pump_gate(self._pump_gate_getter(cfg.circuit))
-            except Exception as e:
-                log.warning("[%s] pump-gate resolve failed (non-fatal): %s",
-                            cfg.circuit, e)
+            detector.update_pump_gate(inputs[cfg.circuit]["gate"])
             detector.low_pressure_cb = self._low_pressure_cb
             detector.pump_fail_cb = self._pump_fail_cb
-            try:
-                zf, pf = self._low_pressure_getter(cfg.circuit)
+            if inputs[cfg.circuit]["floors"] is not None:
+                zf, pf = inputs[cfg.circuit]["floors"]
                 detector.update_low_pressure_config(zf, pf)
-            except Exception as e:
-                log.warning("[%s] low-pressure resolve failed (non-fatal): %s",
-                            cfg.circuit, e)
 
             if cfg.flow_sensor:
                 self._ha.subscribe_entity(cfg.flow_sensor,          detector.on_flow_rate)
@@ -2366,21 +2392,25 @@ class EventDetector:
             if self._debug_capture_propagation else "disabled",
         )
 
-    def update_thresholds(self) -> None:
+    async def update_thresholds(self, inputs=None) -> None:
         """Reload thresholds from config after sensitivity settings change
         (also re-resolves the pump-mode oscillation gate — the banner-confirm
         route calls this so pump suppression flips without a restart)."""
+        if inputs is None:
+            from .database import run_db
+            inputs = await run_db(self.collect_circuit_inputs,
+                                  list(self._detectors))
         for circuit, detector in self._detectors.items():
-            sens = self._sensitivity_getter(circuit)
+            sens = inputs[circuit]["sens"]
             detector.update_threshold(sens.get("pressure_drop_event_psi", 1.2))
             detector.min_event_duration = sens.get("min_event_duration_seconds", 3.0)
             try:
-                detector.update_pump_gate(self._pump_gate_getter(circuit))
+                detector.update_pump_gate(inputs[circuit]["gate"])
             except Exception as e:
-                log.warning("[%s] pump-gate resolve failed (non-fatal): %s",
+                log.warning("[%s] pump-gate apply failed (non-fatal): %s",
                             circuit, e)
             try:
-                zf, pf = self._low_pressure_getter(circuit)
+                zf, pf = inputs[circuit]["floors"]
                 detector.update_low_pressure_config(zf, pf)
             except Exception as e:
                 log.warning("[%s] low-pressure resolve failed (non-fatal): %s",

@@ -950,7 +950,7 @@ class ClusterEngine:
     def rebuild_from_db(self, circuit: str, days: int = 60) -> int:
         """
         Replay recent matched events to reconstruct DBSTREAM + scaler state.
-        Called once per circuit at startup (via run_in_executor).
+        Called once per circuit at startup (via run_db — dev46 46a).
         Does not modify the database — DB rows are already correct.
 
         After replaying, attempts to rebuild the river→DB ID mapping by
@@ -1099,20 +1099,27 @@ class ClusterEngine:
                                        since_ts: Optional[str] = None,
                                        batch: int = 100,
                                        only_deferred: bool = False) -> int:
-        """dev42 (F1) — ``backfill_unmatched`` in event-loop-friendly chunks.
+        """dev42 (F1) — ``backfill_unmatched`` in chunks, one chunk per hop.
 
-        Runs ON the event loop (never an executor thread): the 8/15 reseed
-        crash was two threads sharing one SQLite connection
-        (InterfaceError: bad parameter or other API misuse). Chunking with an
-        ``await asyncio.sleep(0)`` between batches keeps the UI responsive
-        while every DB touch stays on one thread — the cross-thread misuse is
-        structurally gone, not narrowed.
+        dev46 (46a/C1) — each chunk's DB work is submitted to ``run_db``, the
+        SINGLE DB thread. dev42 moved this ON the event loop to escape the
+        8/15 crash (two threads sharing one ``check_same_thread=False``
+        connection → InterfaceError), but on-loop is only serialized against
+        other loop code: a concurrent page render on the DB executor would
+        reopen the exact same window. Routing every touch through the one DB
+        worker closes it for good, and hands the event loop back for the
+        reseed's whole duration (reversing dev42's responsiveness cost).
+
+        Chunk boundary == transaction boundary (rule N2a): each
+        ``_backfill_chunk_sync`` call opens, writes, and commits entirely
+        inside one run_db callable, so no foreign statement can land inside
+        an open transaction.
 
         ``only_deferred``: process only rows the F-C1 deferral stamped
         'reseed_deferred' — the post-freeze flush. Without it, a second full
         pass would re-run every abstained row in the window.
         """
-        import asyncio
+        from .database import run_db
         conds = ["circuit = ?", "cluster_id IS NULL",
                  "excluded_from_training = 0", "end_ts IS NOT NULL"]
         params: list = [circuit]
@@ -1121,38 +1128,51 @@ class ClusterEngine:
             params.append(since_ts)
         if only_deferred:
             conds.append("match_rejection_reason = 'reseed_deferred'")
-        ids = [r[0] for r in self._db.execute(
-            f"SELECT id FROM events WHERE {' AND '.join(conds)} "
-            "ORDER BY start_ts ASC", params).fetchall()]
+        sql = (f"SELECT id FROM events WHERE {' AND '.join(conds)} "
+               "ORDER BY start_ts ASC")
+        ids = await run_db(
+            lambda: [r[0] for r in self._db.execute(sql, params).fetchall()])
         count = 0
         for i in range(0, len(ids), batch):
-            chunk = ids[i:i + batch]
-            ph = ",".join("?" * len(chunk))
-            rows = self._db.execute(
-                f"SELECT * FROM events WHERE id IN ({ph}) "
-                "ORDER BY start_ts ASC", chunk).fetchall()
-            for row in rows:
-                event = dict(row)
-                cluster_id, confidence, level, reason = \
-                    self._match_and_learn_impl(event, circuit)
-                if cluster_id is None:
-                    self._db.execute(
-                        "UPDATE events SET match_rejection_reason = ? "
-                        "WHERE id = ?", (reason, event["id"]))
-                    continue
-                self._db.execute(
-                    """UPDATE events
-                       SET cluster_id = ?, match_confidence = ?,
-                           match_level = ?, match_rejection_reason = NULL
-                       WHERE id = ?""",
-                    (cluster_id, confidence, level, event["id"]))
-                count += 1
-            self._db.commit()
-            await asyncio.sleep(0)      # yield between chunks
+            count += await run_db(self._backfill_chunk_sync,
+                                  ids[i:i + batch], circuit)
         if count:
             log.info("[%s] backfill_unmatched_async: assigned cluster_id "
                      "to %d events%s", circuit, count,
                      " (deferred flush)" if only_deferred else "")
+        return count
+
+    def _backfill_chunk_sync(self, chunk: list, circuit: str) -> int:
+        """One chunk of the async backfill — runs on the single DB thread.
+
+        Self-contained transaction (dev46 rule N2a): every statement for this
+        chunk, plus its commit, happens inside this one callable. Returns the
+        number of events that received a cluster_id.
+        """
+        if not chunk:
+            return 0
+        ph = ",".join("?" * len(chunk))
+        rows = self._db.execute(
+            f"SELECT * FROM events WHERE id IN ({ph}) "
+            "ORDER BY start_ts ASC", chunk).fetchall()
+        count = 0
+        for row in rows:
+            event = dict(row)
+            cluster_id, confidence, level, reason = \
+                self._match_and_learn_impl(event, circuit)
+            if cluster_id is None:
+                self._db.execute(
+                    "UPDATE events SET match_rejection_reason = ? "
+                    "WHERE id = ?", (reason, event["id"]))
+                continue
+            self._db.execute(
+                """UPDATE events
+                   SET cluster_id = ?, match_confidence = ?,
+                       match_level = ?, match_rejection_reason = NULL
+                   WHERE id = ?""",
+                (cluster_id, confidence, level, event["id"]))
+            count += 1
+        self._db.commit()
         return count
 
     # ── Type-level auto-merge ──────────────────────────────────────────────────

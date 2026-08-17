@@ -74,69 +74,51 @@ async def dashboard(request: Request):
     orch = _get_orchestrator(request)
     cfg = orch._cfg
 
-    # Fetch live state for all circuits
+    # dev46 (46a) — ONE hop for every DB read this page needs (charts,
+    # profile, per-circuit training + leak schedules, both banners, the
+    # pump-regime nights). Nothing below may query the shared connection
+    # inline: the loop thread and the DB worker must never touch it at once.
+    from ..database import get_home_profile
+    dashboard_payload = await run_blocking(
+        _build_dashboard_sync_payload, orch.db, cfg.circuits, get_home_profile,
+        orch.training_manager,
+    )
+    chart_data = dashboard_payload["chart_data"]
+    profile = dashboard_payload["profile"]
+    pump_banner = dashboard_payload["pump_banner"]
+    supply_banner = dashboard_payload["supply_banner"]
+    nights = dashboard_payload["nights"]
+
+    _idle_training = {"state": "idle", "events_collected": 0,
+                      "minimum_events": 0, "days_remaining": 0,
+                      "percent_complete": 0}
+
+    # Fetch live state for all circuits (HA I/O — natively async, stays here).
     circuit_states = []
     for circuit_cfg in cfg.circuits:
         state = await orch.get_live_state_async(circuit_cfg.circuit)
-        training = (
-            orch.training_manager.get_training_info(circuit_cfg.circuit)
-            if orch.training_manager else {"state": "idle", "events_collected": 0,
-                                           "minimum_events": 0, "days_remaining": 0,
-                                           "percent_complete": 0}
-        )
-        state["training"] = training
+        state["training"] = (
+            dashboard_payload["training"].get(circuit_cfg.circuit)
+            or _idle_training)
 
-        # Leak test schedule
-        from ..database import get_leak_test_schedule
-        sched = get_leak_test_schedule(orch.db, circuit_cfg.circuit)
+        sched = dashboard_payload["schedules"].get(circuit_cfg.circuit)
         state["next_leak_test"] = sched["next_run_at"] if sched else None
         state["last_leak_test"] = sched["last_run_at"] if sched else None
         state["last_leak_result"] = sched["last_result"] if sched else None
 
         circuit_states.append(state)
 
-    # Volume chart data for each circuit. Pull the sync DB queries
-    # for ALL circuits + the home_profile read in a single executor
-    # hop so the dashboard refresh doesn't make the event loop fight
-    # for control across N circuits' worth of `get_hourly_volumes`.
-    from ..database import get_home_profile
-    dashboard_payload = await run_blocking(
-        _build_dashboard_sync_payload, orch.db, cfg.circuits, get_home_profile,
-    )
-    chart_data = dashboard_payload["chart_data"]
-    profile = dashboard_payload["profile"]
-
     templates = request.app.state.templates
 
     from ..fixtures import CIRCUIT_TYPE_LABELS
-    # Pump-regime detection banner (dev23) — banner+confirm: shows only while
-    # detection is unacknowledged; confirming is the sole auto-path into pump
-    # mode. Best-effort; a failure must never break the dashboard.
-    try:
-        from ..pump_regime_detector import pump_banner_state
-        pump_banner = pump_banner_state(orch.db)
-    except Exception:
-        pump_banner = {"show": False}
-
-    # Supply-pressure regime banner — shows while the current regime was
-    # auto-detected and neither confirmed (recalibrated) nor dismissed.
-    # Best-effort; a failure must never break the dashboard.
-    try:
-        from ..supply_regime import supply_banner_state
-        supply_banner = supply_banner_state(
-            orch.db, cfg.circuits[0].circuit if cfg.circuits else None)
-    except Exception:
-        supply_banner = {"show": False}
 
     # Phase 5a leak-watch tile: latest nightly street-calibrated estimate,
     # shown only when pump mode is armed and a RECENT evaluated night carried
-    # an estimate. Best-effort.
+    # an estimate. Best-effort. (Nights were fetched in the bundle above; the
+    # freshness/format work below is pure Python.)
     leak_watch = None
     try:
-        from ..config import pump_gates_active
-        from ..database import get_pump_regime_nights
-        if any(pump_gates_active(orch.db, c.circuit) for c in cfg.circuits):
-            nights = get_pump_regime_nights(orch.db, limit=14)
+        if nights:
             latest = _fresh_leak_estimate(nights, profile.get("leak_watch_ack"))
             if latest:
                 # Local wall-clock range of the analyzed window ("1:05 AM to
@@ -187,16 +169,25 @@ async def dashboard_live(request: Request):
     orch = _get_orchestrator(request)
     cfg = orch._cfg
 
+    # dev46 (46a): get_training_info reads training_state — a DB touch. This
+    # endpoint is polled by the dashboard's auto-refresh, so an inline query
+    # here was the most frequent loop-thread contact with the shared
+    # connection in the whole addon. One run_db hop covers every circuit.
+    from ..database import run_db
+    _idle = {"state": "idle", "events_collected": 0, "minimum_events": 0,
+             "days_remaining": 0, "percent_complete": 0}
+    tm = orch.training_manager
+    if tm is not None:
+        training = await run_db(
+            lambda: {c.circuit: tm.get_training_info(c.circuit)
+                     for c in cfg.circuits})
+    else:
+        training = {}
+
     result = {}
     for circuit_cfg in cfg.circuits:
         state = await orch.get_live_state_async(circuit_cfg.circuit)
-        training = (
-            orch.training_manager.get_training_info(circuit_cfg.circuit)
-            if orch.training_manager else {"state": "idle", "events_collected": 0,
-                                           "minimum_events": 0, "days_remaining": 0,
-                                           "percent_complete": 0}
-        )
-        state["training"] = training
+        state["training"] = training.get(circuit_cfg.circuit) or _idle
         result[circuit_cfg.circuit] = state
 
     return JSONResponse(result)
@@ -207,8 +198,10 @@ async def jobs_poll(request: Request, since: int = 0):
     """Recent background-job statuses with id > ``since`` for the UI poll-and-toast
     (§2.4 reclassify / calibration feedback). Newest first."""
     orch = _get_orchestrator(request)
-    from ..database import get_jobs_since
-    return JSONResponse({"jobs": get_jobs_since(orch.db, since_id=since)})
+    from ..database import get_jobs_since, run_db
+    # dev46 (46a): polled endpoint — off the loop thread, onto the DB worker.
+    jobs = await run_db(get_jobs_since, orch.db, since_id=since)
+    return JSONResponse({"jobs": jobs})
 
 
 @router.get("/api/chart/{circuit}")
@@ -260,20 +253,81 @@ async def dashboard_pressure(circuit: str, request: Request):
                          "baseline_psi": baseline, "unit": "psi"})
 
 
-def _build_dashboard_sync_payload(db, circuits, get_home_profile) -> dict:
+def _build_dashboard_sync_payload(db, circuits, get_home_profile,
+                                  training_manager=None) -> dict:
     """Synchronous bundle of the dashboard's DB work.
 
     Combined into one executor hop so a multi-circuit refresh doesn't
     bounce in and out of the thread pool for every per-circuit query.
     Returns the chart_data dict (keyed by circuit id) plus the resolved
     home_profile row.
+
+    dev46 (46a) — this bundle grew to cover EVERY DB read the dashboard
+    needs: training state, leak-test schedules, both banners and the
+    pump-regime nights used to have their own inline queries on the event
+    loop. Inline sync queries touch the shared connection from the loop
+    thread while the DB worker may be mid-statement on it — the same
+    two-thread window that produced the 8/15 + 8/16 InterfaceErrors. One
+    hop, one thread. Each best-effort block keeps its own try/except so a
+    single failing widget still can't break the dashboard.
     """
     chart_data: Dict[str, Any] = {}
     for c in circuits:
         chart_data[c.circuit] = _build_chart_data(db, c.circuit)
+    profile = dict(get_home_profile(db) or {})
+
+    # Per-circuit training state + leak-test schedule.
+    from ..database import get_leak_test_schedule
+    training: Dict[str, Any] = {}
+    schedules: Dict[str, Any] = {}
+    for c in circuits:
+        if training_manager is not None:
+            try:
+                training[c.circuit] = training_manager.get_training_info(c.circuit)
+            except Exception:
+                training[c.circuit] = None
+        try:
+            schedules[c.circuit] = get_leak_test_schedule(db, c.circuit)
+        except Exception:
+            schedules[c.circuit] = None
+
+    # Pump-regime detection banner (dev23) — banner+confirm: shows only while
+    # detection is unacknowledged; confirming is the sole auto-path into pump
+    # mode. Best-effort; a failure must never break the dashboard.
+    try:
+        from ..pump_regime_detector import pump_banner_state
+        pump_banner = pump_banner_state(db)
+    except Exception:
+        pump_banner = {"show": False}
+
+    # Supply-pressure regime banner — shows while the current regime was
+    # auto-detected and neither confirmed (recalibrated) nor dismissed.
+    try:
+        from ..supply_regime import supply_banner_state
+        supply_banner = supply_banner_state(
+            db, circuits[0].circuit if circuits else None)
+    except Exception:
+        supply_banner = {"show": False}
+
+    # Phase 5a leak-watch tile: the nights feeding the latest nightly
+    # street-calibrated estimate, only when pump mode is armed.
+    try:
+        from ..config import pump_gates_active
+        from ..database import get_pump_regime_nights
+        nights = (get_pump_regime_nights(db, limit=14)
+                  if any(pump_gates_active(db, c.circuit) for c in circuits)
+                  else [])
+    except Exception:
+        nights = []
+
     return {
-        "chart_data": chart_data,
-        "profile":    dict(get_home_profile(db) or {}),
+        "chart_data":    chart_data,
+        "profile":       profile,
+        "training":      training,
+        "schedules":     schedules,
+        "pump_banner":   pump_banner,
+        "supply_banner": supply_banner,
+        "nights":        nights,
     }
 
 

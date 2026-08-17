@@ -46,16 +46,16 @@ class DataPruner:
         prune_now() and _startup_backfill() do many sync SQLite operations
         (DELETEs + daily-summary computation across all events) which can
         block the event loop for several seconds on a populated DB. They're
-        offloaded to a worker thread via run_in_executor so the rest of the
-        addon stays responsive to ingress requests.
+        offloaded to the single DB thread via run_db (dev46 46a) so the rest
+        of the addon stays responsive to ingress requests.
         """
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._startup_backfill_sync)
+        from .database import run_db
+        await run_db(self._startup_backfill_sync)
 
         await self._wait_until_3am()
         while not self._stop.is_set():
             try:
-                await loop.run_in_executor(None, self.prune_now)
+                await run_db(self.prune_now)
                 await self._run_auto_backup()
             except Exception as e:
                 log.error("Data pruner nightly error: %s", e, exc_info=True)
@@ -68,8 +68,8 @@ class DataPruner:
 
     def _startup_backfill_sync(self) -> None:
         """Synchronous variant of the startup backfill — invoked from
-        run() via run_in_executor so the heavy summary computation
-        doesn't block the event loop.
+        run() via run_db so the heavy summary computation doesn't block
+        the event loop.
 
         If daily_summary is empty (first install or fresh DB), compute
         summaries for all historical events immediately so the history
@@ -92,10 +92,10 @@ class DataPruner:
 
     async def _startup_backfill(self) -> None:
         """Async wrapper kept for any external callers that expect the
-        original signature. Delegates to the sync variant via the loop's
-        default executor so the heavy work happens off the event loop."""
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._startup_backfill_sync)
+        original signature. Delegates to the sync variant via the single
+        DB thread (dev46 46a) so the heavy work happens off the event loop."""
+        from .database import run_db
+        await run_db(self._startup_backfill_sync)
 
     # ── Nightly job ─────────────────────────────────────────────────────────
 
@@ -408,9 +408,24 @@ class DataPruner:
 
     # ── Auto-backup ─────────────────────────────────────────────────────────
 
+    def _snapshot_tables_sync(self, cutoff: str) -> dict:
+        """dev46 (46a) — the Quick Restore table snapshot, one hop."""
+        tables = {}
+        for tbl in QUICK_RESTORE_TABLES:
+            rows = self._db.execute(f"SELECT * FROM {tbl}").fetchall()
+            tables[tbl] = [dict(r) for r in rows]
+        for tbl, col in [("events", "start_ts"),
+                         ("hourly_volume", "hour_ts")]:
+            rows = self._db.execute(
+                f"SELECT * FROM {tbl} WHERE {col} >= ?",
+                (cutoff,)).fetchall()
+            tables[tbl] = [dict(r) for r in rows]
+        return tables
+
     async def _run_auto_backup(self) -> None:
         """Write a Quick Restore JSON to the filesystem if due."""
-        cfg = get_data_retention(self._db)
+        from .database import run_db
+        cfg = await run_db(get_data_retention, self._db)
         if not cfg.get("auto_backup_enabled"):
             return
 
@@ -434,18 +449,10 @@ class DataPruner:
 
             cutoff = (datetime.now(timezone.utc)
                       - timedelta(days=QUICK_RESTORE_DAYS)).isoformat()
-            tables = {}
-
-            for tbl in QUICK_RESTORE_TABLES:
-                rows = self._db.execute(f"SELECT * FROM {tbl}").fetchall()
-                tables[tbl] = [dict(r) for r in rows]
-
-            for tbl, col in [("events", "start_ts"),
-                              ("hourly_volume", "hour_ts")]:
-                rows = self._db.execute(
-                    f"SELECT * FROM {tbl} WHERE {col} >= ?",
-                    (cutoff,)).fetchall()
-                tables[tbl] = [dict(r) for r in rows]
+            # dev46 (46a): the whole snapshot read is ONE hop, which also
+            # makes the backup internally consistent — every table now comes
+            # from the same instant instead of drifting across the dump.
+            tables = await run_db(self._snapshot_tables_sync, cutoff)
 
             payload = {
                 "backup_type":  "quick_restore",
@@ -459,7 +466,11 @@ class DataPruner:
             filename.write_text(
                 json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
-            update_data_retention(
+            # dev46 (46a) — hop after the file write. NO re-check: this
+            # stamps "an auto-backup was written at T", a monotonic
+            # record of something that just happened on disk.
+            await run_db(
+                update_data_retention,
                 self._db,
                 last_auto_backup_at=datetime.now(timezone.utc).isoformat())
 
