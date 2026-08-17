@@ -1,0 +1,263 @@
+{% extends "base.html" %}
+{% block content %}
+{#
+  dev46 (46o) — the operator runbook.
+
+  Every control name below was taken from the templates that render it, not
+  from memory. Getting a name wrong here is worse than saying nothing: this
+  page exists BECAUSE the names were hard to keep straight, so a page that
+  invents its own vocabulary would make the original problem worse.
+
+  Source of record for each: nav labels base.html; "Re-fit rules for current
+  pressure" / "Rebuild fixture grouping for current pressure" settings.html;
+  "Clear stale group links" fixtures.html; "Open Valve" / "Close Valve" /
+  "Run Now" / "Reset Fault" / "Reset Trickle" / "Abort Test" device.html;
+  leak-test verdict strings leak_test_scheduler.py.
+#}
+<style>
+  .rb-toc      { display:flex; flex-wrap:wrap; gap:.4rem; margin:.75rem 0 1.5rem }
+  .rb-toc a    { font-size:.8125rem; padding:.25rem .6rem; border-radius:999px;
+                 background:var(--panel-2, rgba(127,127,127,.12));
+                 text-decoration:none }
+  .rb-sec      { margin:0 0 2rem }
+  .rb-sec h2   { margin:0 0 .35rem; font-size:1.1rem }
+  .rb-lead     { margin:.15rem 0 .9rem }
+  .rb-item     { padding:.6rem .75rem; border-radius:8px; margin:0 0 .6rem;
+                 background:var(--panel-2, rgba(127,127,127,.08)) }
+  .rb-item h3  { margin:0 0 .2rem; font-size:.9375rem }
+  .rb-item p   { margin:.2rem 0 0; font-size:.875rem }
+  .rb-where    { font-size:.75rem; opacity:.75; display:block; margin-top:.25rem }
+  .rb-warn     { background:var(--amber-bg); color:var(--amber-text);
+                 border:1px solid var(--amber-border) }
+  .rb-order    { border-left:3px solid var(--accent); padding-left:.75rem }
+</style>
+
+<h1>Help &amp; runbook</h1>
+<p class="rb-lead muted">
+  What each button does, when to use it, and what the warnings mean. Written
+  for the person who has to decide something at 11pm — shortest useful answer
+  first.
+</p>
+
+<div class="rb-toc">
+  <a href="#everyday">Everyday</a>
+  <a href="#pressure">After a pressure change</a>
+  <a href="#winter">Winterizing</a>
+  <a href="#leak">Leak tests</a>
+  <a href="#warnings">Warnings you might see</a>
+  <a href="#deploy">After an update</a>
+</div>
+
+<!-- ─────────────────────────────────────────────────────────────────── -->
+<div class="rb-sec" id="everyday">
+  <h2>Everyday</h2>
+  <p class="rb-lead muted">The things worth doing regularly.</p>
+
+  <div class="rb-item">
+    <h3>Correct a mislabelled event</h3>
+    <p>Open the event on <strong>History</strong>, pick the right fixture, and
+    press <strong>Save</strong>. This is the single most valuable thing you can
+    do — every label improves how the next event is recognised.</p>
+    <span class="rb-where">History → click a row</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>Keep a label but stop the app learning from it</h3>
+    <p>In the event's <strong>Classification</strong> section, tick
+    <strong>“Keep my label, but don't learn from this event”</strong>. Use it
+    when the label is right but the event is a mix of draws — a dishwasher
+    fill with a tap running over it. Your label stays; only the pattern
+    matching ignores it.</p>
+    <span class="rb-where">History → event → Classification</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>Mark something that wasn't real water use</h3>
+    <p>Same <strong>Classification</strong> section:
+    <strong>Not real water use</strong> removes its volume from all totals, and
+    <strong>Ignore event</strong> hides it from learning. Both are reversible.</p>
+    <span class="rb-where">History → event → Classification</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>Take a snapshot for digging into a question</h3>
+    <p><strong>Download Study Snapshot</strong> gives a copy of the data
+    stamped with the version it came from. Send this when something needs
+    investigating — it is for looking at, not for restoring.</p>
+    <span class="rb-where">Backup → Study Snapshot</span>
+  </div>
+</div>
+
+<!-- ─────────────────────────────────────────────────────────────────── -->
+<div class="rb-sec" id="pressure">
+  <h2>After a pressure change</h2>
+  <p class="rb-lead muted">
+    A booster pump, a new regulator, or a supply change alters the shape of
+    every draw. Two different buttons fix two different things — the names are
+    similar, so this is the part worth reading twice.
+  </p>
+
+  <div class="rb-item">
+    <h3>Re-fit rules for current pressure</h3>
+    <p>Re-learns the size bands that name a fixture (how big a flush is, how
+    long a shower runs). Quick, deletes nothing. Use it when events are being
+    given the <em>wrong name</em> since a pressure change.</p>
+    <span class="rb-where">Settings → the circuit's card</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>Rebuild fixture grouping for current pressure</h3>
+    <p>Rebuilds the automatic grouping of similar events, ignoring pressure
+    readings. Slower — minutes. Use it when events that are obviously the same
+    fixture are being split into separate groups. Best after a few weeks of new
+    events.</p>
+    <span class="rb-where">Settings → the circuit's card</span>
+  </div>
+
+  <div class="rb-item rb-order">
+    <h3>If you are doing both: rebuild first, then re-fit</h3>
+    <p>The re-fit learns from the groups, so re-fitting first means fitting to
+    groups that are about to change. Rebuild, let it finish, then re-fit.</p>
+  </div>
+
+  <div class="rb-item">
+    <h3>Clear stale group links</h3>
+    <p>Reconnects events that point at fixture groups which no longer exist.
+    Use it when the page reports orphaned events, or after an interrupted
+    rebuild. Safe to run any time; nothing is deleted.</p>
+    <span class="rb-where">Water Use → Clear stale group links</span>
+  </div>
+</div>
+
+<!-- ─────────────────────────────────────────────────────────────────── -->
+<div class="rb-sec" id="winter">
+  <h2>Winterizing a circuit</h2>
+
+  <div class="rb-item rb-warn">
+    <h3>Turn the toggle on BEFORE you drain the line</h3>
+    <p>Draining empties the meter and the pressure sensor along with the pipe,
+    so the app sees a sudden total pressure loss. Marking the circuit first
+    tells it to expect that. Turning it on afterwards is too late — the alarm
+    has already fired.</p>
+    <span class="rb-where">Settings → the circuit's card → Winterized for the season</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>What pauses while it is on</h3>
+    <p>No water use is recorded for that circuit, no leak tests run, and it is
+    left out of pressure learning. The other circuit is unaffected, and your
+    history, totals and leak protection are untouched.</p>
+  </div>
+
+  <div class="rb-item">
+    <h3>In the spring</h3>
+    <p>Refill and re-pressurise the line first, then turn the toggle off.
+    Normal monitoring resumes immediately, with a short quiet period so the
+    refill itself doesn't set off an alarm.</p>
+  </div>
+
+  <div class="rb-item">
+    <h3>One thing the app cannot cover</h3>
+    <p>While the water is actually draining, the valve controller itself may
+    see it as a large flow and react — that part is independent of this app
+    and does not know about the toggle. If it trips, clear it with
+    <strong>Reset Fault</strong> or <strong>Reset Trickle</strong> once the
+    line is empty. Draining without routing water through the meter avoids it
+    entirely.</p>
+    <span class="rb-where">Valve &amp; Tests → Reset Fault / Reset Trickle</span>
+  </div>
+</div>
+
+<!-- ─────────────────────────────────────────────────────────────────── -->
+<div class="rb-sec" id="leak">
+  <h2>Leak tests</h2>
+
+  <div class="rb-item">
+    <h3>Running one</h3>
+    <p><strong>Run Now</strong> starts a test immediately; it closes the valve
+    for a few minutes and watches whether pressure holds. <strong>Abort
+    Test</strong> stops it and reopens the valve.</p>
+    <span class="rb-where">Valve &amp; Tests</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>What the results mean</h3>
+    <p><strong>Passed — no leak detected</strong>: pressure held.
+    <strong>Failed — leak detected</strong>: it didn't, and it is worth
+    investigating. Anything starting with <strong>Aborted</strong> or
+    <strong>Not run</strong> means the test could not measure cleanly — usually
+    water was in use — and tells you nothing either way. It is not a failure;
+    the next scheduled test will try again.</p>
+    <span class="rb-where">History → Leak tests</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>Tests that keep aborting</h3>
+    <p>Almost always something drawing water during the test window — a
+    softener regeneration, an ice maker, irrigation. Move the schedule to a
+    quieter hour rather than lengthening the test.</p>
+    <span class="rb-where">Valve &amp; Tests → Save Schedule</span>
+  </div>
+</div>
+
+<!-- ─────────────────────────────────────────────────────────────────── -->
+<div class="rb-sec" id="warnings">
+  <h2>Warnings you might see</h2>
+
+  <div class="rb-item">
+    <h3>“A fixture-grouping rebuild was interrupted”</h3>
+    <p>A rebuild was cut short — by a restart, usually — so the grouping is
+    half-finished. Run <strong>Rebuild fixture grouping for current
+    pressure</strong> again. Your labels, totals and leak protection are
+    unaffected; only the automatic grouping is incomplete.</p>
+    <span class="rb-where">Settings → the circuit's card</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>“The add-on is still starting up”</h3>
+    <p>Normal for a minute or two after a restart while it re-reads history.
+    The page reloads itself; nothing is wrong.</p>
+  </div>
+
+  <div class="rb-item">
+    <h3>A trickle alert</h3>
+    <p>Sustained small flow — most often a running toilet. This comes from the
+    valve controller, not from pattern matching, so it is worth trusting.
+    <strong>Reset Trickle</strong> clears it after you have fixed the cause.</p>
+    <span class="rb-where">Valve &amp; Tests → Reset Trickle</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>A safety fault</h3>
+    <p>The controller shut the valve because of a burst-flow or motor problem.
+    Faults never clear themselves — find the cause, then
+    <strong>Reset Fault</strong>, then <strong>Open Valve</strong>.</p>
+    <span class="rb-where">Valve &amp; Tests → Reset Fault</span>
+  </div>
+</div>
+
+<!-- ─────────────────────────────────────────────────────────────────── -->
+<div class="rb-sec" id="deploy">
+  <h2>After updating the add-on</h2>
+
+  <div class="rb-item">
+    <h3>Check it actually restarted</h3>
+    <p>The add-on log's first line names the version now running. If it isn't
+    the one you expect, the old build is still up.</p>
+  </div>
+
+  <div class="rb-item">
+    <h3>Give it a minute</h3>
+    <p>Startup re-reads the event history. Pages that need that data say so and
+    reload themselves; the rest work straight away.</p>
+  </div>
+
+  <div class="rb-item">
+    <h3>Take a backup before anything unusual</h3>
+    <p><strong>Quick Restore</strong> is the everyday one and is small.
+    <strong>Full Export</strong> is the complete archive. Both are on the
+    Backup page.</p>
+    <span class="rb-where">Backup</span>
+  </div>
+</div>
+{% endblock %}

@@ -36,6 +36,8 @@
     <a href="{{ ingress_path }}/access"    class="nav-item {% if page == 'access'   %}active{% endif %}"
        title="Manage who can control the valve (operators) vs view only">Access</a>
     {% endif %}
+    <a href="{{ ingress_path }}/help"     class="nav-item {% if page == 'help' %}active{% endif %}"
+       title="What each button does, and when to use it">Help</a>
     {% if not setup_complete and is_admin %}
     <a href="{{ ingress_path }}/setup"    class="nav-item {% if page == 'setup'    %}active{% endif %}">Setup</a>
     {% endif %}

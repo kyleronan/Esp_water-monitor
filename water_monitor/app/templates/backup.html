@@ -158,6 +158,29 @@
   </p>
 </div>
 
+<div class="bk-tier">
+  <div class="bk-tier-head">
+    <span class="bk-tier-icon">🔬</span>
+    <div>
+      <h2 class="bk-tier-title">Study Snapshot</h2>
+      <p class="bk-tier-desc">
+        A copy of the database for offline analysis, stamped with the schema
+        and add-on version it came from. This is the file to send when a
+        question needs digging into — it is for looking at, not for restoring.
+      </p>
+    </div>
+  </div>
+
+  <div class="bk-actions">
+    <a href="{{ ingress_path }}/backup/export/study-snapshot"
+       class="btn btn-secondary btn-sm">⬇ Download Study Snapshot (.zip)</a>
+  </div>
+  <p class="bk-footnote">
+    Unavailable while the add-on is starting up or a fixture-grouping rebuild
+    is running — the copy would keep restarting. Try again once it finishes.
+  </p>
+</div>
+
 {% endblock %}
 
 {% block scripts %}

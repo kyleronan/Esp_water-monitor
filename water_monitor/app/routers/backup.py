@@ -104,6 +104,124 @@ def _row_counts(db, tables: List[str]) -> Dict[str, int]:
     return out
 
 
+
+# ── Export: study snapshot (dev46 46p) ────────────────────────────────────────
+
+async def _snapshot_db(db_path) -> bytes:
+    """Consistent copy of the whole DB, WITHOUT touching the shared connection.
+
+    dev46 (46a/N3). The one-thread invariant applies to the SHARED connection,
+    not to the database FILE — so the snapshot opens its own short-lived
+    connection and runs on the default pool. Wrapping ``Connection.backup()``
+    in ``run_db`` would be wrong twice over: it has no per-step return, so one
+    call would hold the single DB worker for the whole copy INCLUDING its
+    sleeps, stalling every page render behind it.
+
+    This is the audit's sole "justified separate connection" (Verification #4,
+    bucket 3): source duplicate + destination file, neither of which is the
+    shared connection.
+    """
+    import asyncio
+
+    def _work() -> bytes:
+        import sqlite3 as _sq
+        import tempfile as _tf
+        src = _sq.connect(str(db_path))
+        try:
+            with _tf.TemporaryDirectory() as td:
+                dest_path = Path(td) / "snapshot.db"
+                dst = _sq.connect(str(dest_path))
+                try:
+                    # pages/sleep let SQLite yield between steps; WAL means a
+                    # reader never blocks the writer.
+                    src.backup(dst, pages=512, sleep=0.005)
+                finally:
+                    dst.close()
+                return dest_path.read_bytes()
+        finally:
+            src.close()
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _work)
+
+
+@router.get("/export/study-snapshot", response_class=Response)
+async def export_study_snapshot(request: Request):
+    """dev46 (46p) — one click for the "fresh export" every study needs.
+
+    Pulling study data by hand is the step that has actually gated the
+    refill-shape, feature-space and idle-decay work, so it is worth a button.
+    The payload is the whole database plus a manifest stamping schema version,
+    add-on version and export time — a study that cannot say WHICH schema and
+    build it was run against is not reproducible.
+
+    Two gates, both because SQLite's backup restarts from scratch whenever
+    another connection writes the source:
+      * startup (R2) — the boot pass writes at every chunk boundary, and
+        "export right after a restart" is exactly the workflow, so an
+        ungated export could restart indefinitely;
+      * an in-flight rebuild (R3) — same problem, minutes long, and the
+        operator gets no explanation for the wait.
+    """
+    from ..config import DB_PATH
+    from ..database import get_write_lock
+    from ..db_migrations import _CURRENT_VERSION
+
+    orch = _orch(request)
+    if not getattr(orch, "startup_cluster_work_done", True):
+        return JSONResponse(
+            {"status": "starting",
+             "message": "The add-on is still starting up — try again in a "
+                        "minute, once the startup pass has finished."},
+            status_code=503)
+
+    lock = get_write_lock()
+    rebuilding = lock.locked()
+    if not rebuilding:
+        try:
+            from ..database import get_incomplete_reseed, run_db
+            for c in orch._cfg.circuits:
+                if await run_db(get_incomplete_reseed, orch.db, c.circuit):
+                    rebuilding = True
+                    break
+        except Exception:               # noqa: BLE001 — gate is best-effort
+            pass
+    if rebuilding:
+        return JSONResponse(
+            {"status": "busy",
+             "message": "A rebuild is running — try again shortly."},
+            status_code=409)
+
+    stamp = _ts()
+    snapshot = await _snapshot_db(DB_PATH)
+    manifest = {
+        "export_type":    "study_snapshot",
+        "exported_at":    datetime.now(timezone.utc).isoformat(),
+        "schema_version": _CURRENT_VERSION,
+        "addon_version":  _addon_version(),
+        "db_bytes":       len(snapshot),
+        "note": "Whole-database snapshot for offline study work. Read-only "
+                "by intent — nothing here is meant to be imported back.",
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.json", json.dumps(manifest, indent=2))
+        z.writestr("water_monitor.db", snapshot)
+    log.info("study snapshot exported (%d bytes, schema %s)",
+             len(snapshot), _CURRENT_VERSION)
+    return _download(buf.getvalue(), f"wm_study_{stamp}.zip", "application/zip")
+
+
+def _addon_version() -> str:
+    """Best-effort add-on version for the manifest (same source as the boot
+    log line, 46g)."""
+    try:
+        from ..event_detector import _read_addon_version
+        return _read_addon_version() or "unknown"
+    except Exception:                   # noqa: BLE001
+        return "unknown"
+
+
 # ── Export: Quick Restore ─────────────────────────────────────────────────────
 
 @router.get("/export/quick-restore", response_class=Response)
