@@ -349,6 +349,41 @@
         {% endif %}
       </div>
 
+      {# Volume cross-check (dev46 46v) #}
+      {% if c.reconcile and c.reconcile.last_run_at %}
+      <div class="sett-card sett-adv-card">
+        <h3 class="sett-card-title">Volume cross-check</h3>
+        <p class="sett-card-desc">
+          Each night the add-on compares the water it recorded against the
+          meter's own running total — the one number it does not calculate
+          itself. They should agree closely.
+        </p>
+        {% set _d = c.reconcile.last_delta_litres %}
+        {% if _d is not none and (_d > 2 or _d < -2) %}
+        <p class="sett-card-desc" style="padding:.5rem .65rem;border-radius:6px;
+                  background:var(--amber-bg);color:var(--amber-text);
+                  border:1px solid var(--amber-border)">
+          {% if _d > 0 %}
+          <strong>The meter counted about {{ '%.1f'|format(_d) }} L more than
+          the add-on recorded.</strong> Usually means some water use wasn't
+          picked up as an event.
+          {% else %}
+          <strong>The add-on recorded about {{ '%.1f'|format(-_d) }} L more
+          than the meter counted.</strong> Usually means something was counted
+          twice, or water from the other line was attributed here.
+          {% endif %}
+          Nothing has been changed — your totals are untouched.
+        </p>
+        {% else %}
+        <p class="sett-card-desc">Last check: agreed to within
+          {{ '%.1f'|format(c.reconcile.last_delta_litres|abs)
+             if c.reconcile.last_delta_litres is not none else '0.0' }} L.</p>
+        {% endif %}
+        <p class="sett-help">Checked {{ c.reconcile.last_run_at[:16]|replace('T',' ') }}
+          {%- if c.reconcile.flagged %} · {{ c.reconcile.flagged }} day(s) flagged so far{% endif %}.</p>
+      </div>
+      {% endif %}
+
       {# Winterized (dev46 46h) #}
       <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Winterized for the season</h3>

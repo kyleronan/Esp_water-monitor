@@ -97,7 +97,8 @@ async def settings_page(request: Request):
         return gated
     orch = _orch(request)
     from ..database import (
-    is_circuit_winterized, get_incomplete_reseed, get_home_profile, get_sensitivity_config,
+    is_circuit_winterized, get_incomplete_reseed, get_reconcile_state,
+    get_home_profile, get_sensitivity_config,
                             get_alert_configs)
     from ..device_discovery import get_device_config
 
@@ -287,6 +288,7 @@ async def settings_page(request: Request):
                 "valve_type": get_valve_type(orch.db, cid),
                 "winterized": is_circuit_winterized(orch.db, cid),
                 "incomplete_reseed": get_incomplete_reseed(orch.db, cid),
+                "reconcile": get_reconcile_state(orch.db, cid),
                 "exclusion": get_active_exclusion_window(orch.db, cid),
             }
         return out
@@ -315,6 +317,7 @@ async def settings_page(request: Request):
             "valve_type": _row["valve_type"],
             "winterized": _row["winterized"],
             "incomplete_reseed": _row["incomplete_reseed"],
+            "reconcile": _row["reconcile"],
             # Runtime per-circuit flow meter (read-only). The firmware "Flow Meter PPL"
             # number entity is the source of truth; the add-on caches it and derives the
             # low-flow floor (60 ÷ ppl). Read from the LIVE config so the display reflects

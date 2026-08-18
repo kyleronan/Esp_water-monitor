@@ -986,6 +986,7 @@ class Orchestrator:
                 self._supervise("leak_test_scheduler", self._leak_test_scheduler.run),
                 self._supervise("historical_importer", self._historical_importer.run),
                 self._supervise("cluster_metrics",     self._cluster_metrics.run),
+                self._supervise("recorder_reconcile", self._run_recorder_reconcile),
                 self._supervise("maturity_recheck",    self._maturity_recheck.run),
                 self._supervise("rise_corr_backfill",  self._rise_corr_backfill.run),
                 self._supervise("wf_repair_backfill",  self._wf_repair_backfill.run),
@@ -1308,6 +1309,42 @@ class Orchestrator:
         res = rebuild_daily_summaries(self._db)
         update_home_profile(self._db, daily_summary_tz=tz_name)
         return res
+
+    async def _run_recorder_reconcile(self) -> None:
+        """dev46 (46v) — daily volume reconciliation against the firmware total.
+
+        Runs a few minutes after the local day rolls over, so "yesterday" is
+        complete (dev36 boundary). Annotate-only: it reports drift and never
+        rewrites a volume — correcting history from this would violate
+        annotate-don't-modify AND destroy the evidence the next run needs.
+
+        This is the only check in the add-on that compares stored data against
+        something the add-on did not produce. Everything else compares our
+        numbers with our other numbers, which cannot notice the detector going
+        quiet — the July live-miss class, or dev46's own boot regression.
+        """
+        import asyncio
+        from .volume_drift import check_yesterdays_drift
+
+        # Stagger past the pruner's 03:00 nightly so two heavy jobs do not
+        # contend for the write lock.
+        while not self._stop.is_set():
+            try:
+                now = datetime.now(getattr(self, "_ha_tz", timezone.utc))
+                target = now.replace(hour=4, minute=15, second=0, microsecond=0)
+                if target <= now:
+                    target += timedelta(days=1)
+                await asyncio.wait_for(self._stop.wait(),
+                                       timeout=(target - now).total_seconds())
+                return                              # stop requested
+            except asyncio.TimeoutError:
+                pass
+            for c in self._cfg.circuits:
+                try:
+                    await check_yesterdays_drift(self, c.circuit)
+                except Exception as e:              # noqa: BLE001 — diagnostic only
+                    log.warning("[%s] recorder reconciliation failed "
+                                "(non-fatal): %s", c.circuit, e)
 
     async def _resync_daily_summary_boundary(self, tz_name: str) -> None:
         """Rebuild daily_summary when its day boundary no longer matches the home.

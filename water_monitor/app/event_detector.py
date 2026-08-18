@@ -2259,6 +2259,7 @@ class EventDetector:
         pump_gate_getter: Optional[Callable[[str], Optional[float]]] = None,
         low_pressure_getter: Optional[Callable[[str], tuple]] = None,
         low_pressure_cb: Optional[Callable[[str, float], None]] = None,
+        winterized_getter: Optional[Callable[[str], bool]] = None,
         pump_fail_cb: Optional[Callable[[str, float, str], None]] = None,
     ) -> None:
         self._circuits = circuits
@@ -2275,6 +2276,11 @@ class EventDetector:
         self._low_pressure_getter = low_pressure_getter or (
             lambda _c: (None, None))
         self._low_pressure_cb = low_pressure_cb
+        # dev46 (46h): injected like the other DB-backed getters — this class
+        # has no connection of its own, and giving it one would break the
+        # single-connection invariant (46a). Optional so every existing
+        # construction site (tests, tools) keeps working.
+        self._winterized_getter = winterized_getter
         self._pump_fail_cb = pump_fail_cb
         self._debug_capture_propagation = debug_capture_propagation
         self._detectors: Dict[str, CircuitEventDetector] = {}
