@@ -10,7 +10,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from ._helpers import run_blocking
+from ._helpers import run_blocking, startup_gate
 
 router = APIRouter()
 log = logging.getLogger(__name__)
@@ -72,6 +72,19 @@ def _fresh_leak_estimate(nights: list, ack: str | None) -> Dict[str, Any] | None
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     orch = _get_orchestrator(request)
+
+    # dev46 (46c) — the LANDING page needs the gate most of all, and the
+    # original three-page scope missed it. This is where ingress drops the
+    # operator after every restart, so it is the first thing hit while the
+    # boot pass owns the single DB worker; the page's own first hop then sits
+    # in the queue behind ~21 s of cluster replay and the operator sees the
+    # ingress spinner on a blank frame with nothing to explain it (observed
+    # 2026-08-17 19:22). A "still starting" notice is a worse-looking page and
+    # a far better answer.
+    gated = startup_gate(request, "dashboard", "Dashboard", "/")
+    if gated is not None:
+        return gated
+
     cfg = orch._cfg
 
     # dev46 (46a) — ONE hop for every DB read this page needs (charts,

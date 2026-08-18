@@ -130,7 +130,15 @@ def startup_gate(request: Request, page: str, title: str,
     add-on says the same thing wherever this state surfaces.
     """
     orch = getattr(request.app.state, "orchestrator", None)
-    if orch is None or getattr(orch, "startup_cluster_work_done", True):
+    # dev46 (46k) — `startup_pages_ready`, NOT `startup_cluster_work_done`.
+    # The two answer different questions and the difference is ~145 s: the
+    # cluster-work flag means "every job that touches cluster references has
+    # finished" (what the repair route and the study export need), while a
+    # page only needs the cluster engine rebuilt and wired. Gating pages on
+    # the stricter flag is what kept the operator staring at a notice — or,
+    # before the flag was initialised at all, at a spinner — for the whole
+    # background classification pass.
+    if orch is None or getattr(orch, "startup_pages_ready", True):
         return None
     templates = request.app.state.templates
     return templates.TemplateResponse("starting.html", {

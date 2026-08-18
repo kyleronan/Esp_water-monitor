@@ -87,6 +87,33 @@ class Orchestrator:
 
     def __init__(self, cfg: AddonConfig):
         self._cfg = cfg
+        # dev46 (46c) — MUST start False, and the reason is the whole gate.
+        # Readers ask `getattr(orch, "startup_cluster_work_done", True)`: that
+        # default protects a caller holding some other object, but if this
+        # attribute only ever came into existence at the END of the boot pass
+        # (which is how it shipped in dev44), then during boot — the one window
+        # the flag exists for — it is ABSENT and every reader defaults to
+        # "startup is done". The gate then waves the request through and the
+        # page queues behind a ~2 min boot pass instead of rendering the notice.
+        # Observed 2026-08-17 19:14: History hung on a spinner while
+        # reclassify[circuit_1] held the DB worker.
+        self.startup_cluster_work_done = False
+        # dev46 (46k) — SEPARATE from the flag above, and the split is the
+        # whole of option B. `startup_cluster_work_done` keeps its exact dev44
+        # meaning: every startup job that mutates cluster references has
+        # finished. The repair route and the study export depend on that
+        # meaning and are untouched.
+        #
+        # This flag answers the different, earlier question the PAGES actually
+        # ask — "can you render me?" — which becomes true as soon as the
+        # cluster replay is wired, ~22 s in. The ~145 s reclassify that follows
+        # runs in the background: it is chunked (C2a), so a page render
+        # interleaves at the next ~1 s seam instead of waiting out the pass.
+        self.startup_pages_ready = False
+        # Strong ref for the background classification task — without it the
+        # only reference is create_task's return value and Python may GC the
+        # task mid-pass (same trap as _ppl_tasks below).
+        self._startup_classify_task: Optional[asyncio.Task] = None
         self._db: Optional[sqlite3.Connection] = None
         self._ha: Optional[HaClient] = None
         self._event_queue: Optional[asyncio.Queue] = None
@@ -560,6 +587,14 @@ class Orchestrator:
 
     def stop(self) -> None:
         self._stop.set()
+        # dev46 (46k) — the background classification pass outlives boot, so
+        # shutdown has to cancel it explicitly or the process waits out a
+        # ~145 s pass nobody is going to read the results of. Cancelling
+        # between chunks is safe by construction: chunk = transaction, each
+        # one committed before the next is submitted, so the work already done
+        # is durable and the rest is simply re-derived on the next boot.
+        if self._startup_classify_task is not None:
+            self._startup_classify_task.cancel()
         if self._feature_extractor:
             self._feature_extractor.stop()
         if self._training_manager:
@@ -650,6 +685,97 @@ class Orchestrator:
                     _r["circuit"], _r["reseed_in_progress"])
         except Exception:
             pass    # pre-20260808 schema
+
+
+    async def _run_startup_classification(self) -> None:
+        """The ~145 s label-derivation pass, off the critical path (46k).
+
+        WHY THIS IS SAFE TO RUN CONCURRENTLY WITH LIVE TRAFFIC — the analysis
+        is the plan's N1 interleave-tolerance table, and every job here was
+        already classified there:
+
+        * ``reclassify`` — (c), needs a write-time guard, and HAS one: the
+          ``user_fixture_type IS NULL`` re-check inside
+          ``set_event_matched_fixture_type``. That guard was called
+          load-bearing because the PATCH API is not startup-gated; backgrounding
+          the pass widens exactly the window it was written for, so it is now
+          load-bearing twice over. Do not remove it.
+        * ``backfill_unmatched_async`` — (a) tolerant: touches only
+          ``cluster_id IS NULL`` rows, so a live event clustered concurrently
+          simply falls out of scope.
+        * ``resuggest_all_clusters`` / ``recompute_all_user_label_suggestions``
+          — (a) tolerant, eventually consistent: a mid-pass label edit yields a
+          stale suggestion until the next recompute, exactly as today.
+
+        The pass is chunked (C2a), so it releases the single DB worker every
+        ~1 s and a queued page render never waits longer than one chunk.
+        """
+        from .database import (reclassify_all_events_from_signatures_async,
+                               recompute_cycle_pulse_counts,
+                               resuggest_all_clusters,
+                               recompute_all_user_label_suggestions,
+                               run_db)
+        try:
+            for c in self._cfg.circuits:
+                # dev.22: cycle-pulse backfill MUST precede reclassify so the
+                # matcher's cycle_pulse_count feature is populated before it types.
+                cyc = await _timed_startup_job(
+                    f"recompute_cycle_pulse_counts[{c.circuit}]",
+                    run_db(recompute_cycle_pulse_counts, self._db, c.circuit))
+                r = await _timed_startup_job(
+                    f"reclassify[{c.circuit}]",
+                    reclassify_all_events_from_signatures_async(
+                        self._db, c.circuit))
+                if r.get("events_matched") or r.get("events_cleared"):
+                    log.info(
+                        "[%s] startup reclassify: %d matched, %d abstained, "
+                        "%d stale cleared", c.circuit, r["events_matched"],
+                        r["events_abstained"], r["events_cleared"])
+                # dev.37 — backfill cluster_id over events the reprocess just
+                # un-excluded (capped-rescued) and any accumulated NULL backlog. The
+                # ~line-440 backfill ran BEFORE reprocess, so those events never got a
+                # cluster and user labels on them had nothing to propagate into. This
+                # pass assigns them. Idempotent: backfill_unmatched only touches
+                # cluster_id IS NULL rows, so it skips everything already clustered.
+                if self._cluster_engine is not None:
+                    bf = await self._cluster_engine.backfill_unmatched_async(
+                        c.circuit)
+                    if bf:
+                        log.info("[%s] startup post-reprocess backfill: "
+                                 "%d event(s) clustered", c.circuit, bf)
+                # Re-run the heuristic suggestion over the patched centroids, then
+                # the GATED user-label suggestion to un-poison mixed clusters
+                # (dev.22) — the only path that clears a stale 'user_labels' vote.
+                rs = await _timed_startup_job(
+                    f"resuggest_all_clusters[{c.circuit}]",
+                    run_db(resuggest_all_clusters, self._db, c.circuit))
+                ul = await _timed_startup_job(
+                    f"recompute_all_user_label_suggestions[{c.circuit}]",
+                    run_db(recompute_all_user_label_suggestions, self._db,
+                           c.circuit))
+                if cyc.get("updated") or rs.get("updated") or ul.get("cleared"):
+                    log.info("[%s] startup reprocess: %d cycle events, %d heuristic "
+                             "+ %d user-label suggestion(s) re-derived (%d cleared)",
+                             c.circuit, cyc["updated"], rs["updated"],
+                             ul["suggested"] + ul["abstained"], ul["cleared"])
+        except Exception as e:
+            log.warning("startup reclassify/reprocess failed (non-fatal): %s", e)
+
+        # dev44 — the startup cluster work (rebuild → reclassify → backfill)
+        # runs against a snapshot of the DB taken at boot. Any repair that
+        # mutates cluster references while it's in flight gets silently
+        # overwritten when the stale replay finishes (observed: the stale-link
+        # repair clicked 15 s after a restart lost the race and the orphans
+        # returned). Routes that rebuild engine state gate on this flag.
+        #
+        # dev46 (46k) — the flag KEEPS that meaning exactly; it just lands here
+        # now, at the end of the background pass, instead of at the end of a
+        # blocking one. That is what lets the repair route and the study export
+        # stay correct with no change: they still refuse until the last job
+        # that touches cluster references has finished. Pages use the earlier
+        # `startup_pages_ready` instead — a different question, honestly asked.
+        self.startup_cluster_work_done = True
+        log.info("startup: background classification complete")
 
 
     async def run(self) -> None:
@@ -843,6 +969,11 @@ class Orchestrator:
         # queue gets a seam every ~200 rows and small pages stay responsive
         # through boot. The whole-circuit cycle detectors still run once, in
         # the pass's prepare step — they were never the obstacle to batching.
+        #
+        # dev46 (46k) — chunking made the pass INTERRUPTIBLE; backgrounding it
+        # (below) is what makes the app usable during it. The two go together:
+        # a backgrounded monolith would still hold the worker for ~145 s, so a
+        # page would wait just as long with no gate to explain why.
         try:
             from .database import run_db
             from .feature_extractor import reprocess_event_exclusion_verdicts
@@ -852,63 +983,30 @@ class Orchestrator:
             if res.get("dribbles_flagged"):
                 log.info("startup: flagged %d low-flow dribble event(s)",
                          res["dribbles_flagged"])
-            from .database import (reclassify_all_events_from_signatures_async,
-                                   recompute_cycle_pulse_counts,
-                                   resuggest_all_clusters,
-                                   recompute_all_user_label_suggestions)
-            for c in self._cfg.circuits:
-                # dev.22: cycle-pulse backfill MUST precede reclassify so the
-                # matcher's cycle_pulse_count feature is populated before it types.
-                cyc = await _timed_startup_job(
-                    f"recompute_cycle_pulse_counts[{c.circuit}]",
-                    run_db(recompute_cycle_pulse_counts, self._db, c.circuit))
-                r = await _timed_startup_job(
-                    f"reclassify[{c.circuit}]",
-                    reclassify_all_events_from_signatures_async(
-                        self._db, c.circuit))
-                if r.get("events_matched") or r.get("events_cleared"):
-                    log.info(
-                        "[%s] startup reclassify: %d matched, %d abstained, "
-                        "%d stale cleared", c.circuit, r["events_matched"],
-                        r["events_abstained"], r["events_cleared"])
-                # dev.37 — backfill cluster_id over events the reprocess just
-                # un-excluded (capped-rescued) and any accumulated NULL backlog. The
-                # ~line-440 backfill ran BEFORE reprocess, so those events never got a
-                # cluster and user labels on them had nothing to propagate into. This
-                # pass assigns them. Idempotent: backfill_unmatched only touches
-                # cluster_id IS NULL rows, so it skips everything already clustered.
-                if self._cluster_engine is not None:
-                    bf = await self._cluster_engine.backfill_unmatched_async(
-                        c.circuit)
-                    if bf:
-                        log.info("[%s] startup post-reprocess backfill: "
-                                 "%d event(s) clustered", c.circuit, bf)
-                # Re-run the heuristic suggestion over the patched centroids, then
-                # the GATED user-label suggestion to un-poison mixed clusters
-                # (dev.22) — the only path that clears a stale 'user_labels' vote.
-                rs = await _timed_startup_job(
-                    f"resuggest_all_clusters[{c.circuit}]",
-                    run_db(resuggest_all_clusters, self._db, c.circuit))
-                ul = await _timed_startup_job(
-                    f"recompute_all_user_label_suggestions[{c.circuit}]",
-                    run_db(recompute_all_user_label_suggestions, self._db,
-                           c.circuit))
-                if cyc.get("updated") or rs.get("updated") or ul.get("cleared"):
-                    log.info("[%s] startup reprocess: %d cycle events, %d heuristic "
-                             "+ %d user-label suggestion(s) re-derived (%d cleared)",
-                             c.circuit, cyc["updated"], rs["updated"],
-                             ul["suggested"] + ul["abstained"], ul["cleared"])
+            # dev46 (46k) — PAGES OPEN HERE, not after the reclassify.
+            # Everything the pages need is now in place: the cluster engine is
+            # rebuilt and wired, and the exclusion verdicts are current. What
+            # remains (~145 s of it) re-derives fixture LABELS, which a page
+            # can render around — it shows the stored verdict, and the pass
+            # updates it underneath if it changed.
+            #
+            # Measured 2026-08-17: boot reached this point in ~22 s and then
+            # spent a further ~148 s in reclassify, during which the operator
+            # got a spinner and could do nothing. On a repeat boot that entire
+            # 145 s changed ZERO verdicts (see events_changed, database.py).
+            self.startup_pages_ready = True
+            log.info("startup: pages are ready — classification continues in "
+                     "the background")
+
+            self._startup_classify_task = asyncio.create_task(
+                self._run_startup_classification())
         except Exception as e:
             log.warning("startup reclassify/reprocess failed (non-fatal): %s", e)
-
-        # dev44 — the startup cluster work above (rebuild → reclassify →
-        # backfill) runs in executor threads against a snapshot of the DB
-        # taken at boot. Any repair that mutates cluster references while
-        # it's in flight gets silently overwritten when the stale replay
-        # finishes (observed: the stale-link repair clicked 15 s after a
-        # restart lost the race and the orphans returned). Routes that
-        # rebuild engine state gate on this flag.
-        self.startup_cluster_work_done = True
+            # The background pass never got scheduled, so nothing else will
+            # ever set the cluster-work flag — release the repair/export gates
+            # rather than wedging them shut for the process's lifetime.
+            self.startup_pages_ready = True
+            self.startup_cluster_work_done = True
 
         # Initialise daily/weekly volume baselines from HA history so that
         # the dashboard shows accurate totals from the first page load.

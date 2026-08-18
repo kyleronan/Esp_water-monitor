@@ -6730,10 +6730,17 @@ def _new_reclassify_counters() -> Dict[str, Any]:
     lives in one dict that is threaded through every batch instead of in
     function locals. Six counters plus the flush-veto tally — nothing else
     crosses a row boundary, which is exactly why the pass could be sliced.
+
+    dev46 (46k): ``changed`` counts rows whose verdict actually DIFFERED from
+    what was already stored — the number that decides whether this ~145 s boot
+    pass earns its cost. Every other counter reports what the pass PRODUCED,
+    which is why nobody could tell that a second boot nine minutes after the
+    first re-derived 5,417 identical answers (observed 2026-08-17 19:22 vs
+    19:31: the same events vetoed, in the same order, both times).
     """
     return {"scanned": 0, "matched": 0, "rule_matched": 0,
             "softener_matched": 0, "cleared": 0, "abstained": 0,
-            "veto_counts": {}}
+            "changed": 0, "veto_counts": {}}
 
 
 def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
@@ -6944,6 +6951,7 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     softener_matched = counters["softener_matched"]
     cleared          = counters["cleared"]
     abstained        = counters["abstained"]
+    changed          = counters["changed"]
     veto_counts      = counters["veto_counts"]
     for r in rows:
         scanned += 1
@@ -7036,6 +7044,10 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                 prev, r["matched_via"], r["cycle_group_id"]):
             set_event_matched_fixture_type(conn, circuit, r["id"], new_type,
                                            via=new_via, cycle_group_id=new_group)
+            # dev46 (46k) — this branch IS the pass's real output. Counting it
+            # costs nothing and is the only way to see how much of the boot
+            # pass was necessary.
+            changed += 1
             if new_type is None and prev is not None:
                 cleared += 1
         # dev33 (§2.1) — mark / retract classification-tier abstention so a
@@ -7084,7 +7096,7 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     counters.update(scanned=scanned, matched=matched,
                     rule_matched=rule_matched,
                     softener_matched=softener_matched,
-                    cleared=cleared, abstained=abstained)
+                    cleared=cleared, abstained=abstained, changed=changed)
 
 
 def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
@@ -7098,6 +7110,7 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
     softener_matched = counters["softener_matched"]
     cleared          = counters["cleared"]
     abstained        = counters["abstained"]
+    changed          = counters["changed"]
     veto_counts      = counters["veto_counts"]
     # ── Composite annotation (dev.39, step 1) ────────────────────────────────
     # Annotate sustained events with fixtures hidden inside them (a toilet flushed
@@ -7134,15 +7147,26 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
         "events_softener_matched": softener_matched,
         "events_cleared": cleared,
         "events_abstained": abstained,
+        # dev46 (46k) — rows whose verdict actually differed from the stored
+        # one. The pass's only real output; everything above is throughput.
+        "events_changed": changed,
         "events_embedded_annotated": embedded_annotated,
         "events_composite_other": embedded_other,
     }
     log.info(
         "[%s] reclassify: trained %d signature(s); scanned %d unlabelled "
-        "event(s) → %d matched (%d via rules), %d abstained (%d stale cleared)",
+        "event(s) → %d matched (%d via rules), %d abstained (%d stale cleared) "
+        "— %d verdict(s) CHANGED",
         circuit, signatures_trained, scanned, matched, rule_matched, abstained,
-        cleared,
+        cleared, changed,
     )
+    # dev46 (46k) — the boot pass costs ~145 s on this install. If `changed` is
+    # 0 here, every second of it re-derived answers already in the database.
+    # Said out loud at INFO because it is the evidence for the skip condition,
+    # and a redundant pass that never says so is one nobody thinks to cut.
+    if scanned and not changed:
+        log.info("[%s] reclassify: no verdict changed — this pass re-derived "
+                 "%d stored answer(s) and wrote none of them", circuit, scanned)
     if veto_counts:
         log.info("[%s] flush-physics vetoes: %s (per-event detail at DEBUG)",
                  circuit, "; ".join(f"{n}× {why}" for why, n

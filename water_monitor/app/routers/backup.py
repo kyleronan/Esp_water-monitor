@@ -170,9 +170,13 @@ async def export_study_snapshot(request: Request):
     orch = _orch(request)
     if not getattr(orch, "startup_cluster_work_done", True):
         return JSONResponse(
+            # dev46 (46k): pages are up by now, so "still starting up" would
+            # read as a contradiction the operator can see on screen. Name the
+            # thing that is actually still running.
             {"status": "starting",
-             "message": "The add-on is still starting up — try again in a "
-                        "minute, once the startup pass has finished."},
+             "message": "The add-on is still re-deriving event labels after "
+                        "the restart — try again in a minute, once that "
+                        "background pass has finished."},
             status_code=503)
 
     lock = get_write_lock()
