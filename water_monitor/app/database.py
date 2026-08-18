@@ -6778,6 +6778,56 @@ _VERDICT_STAMP_ALGO = 1
 _VERDICT_STAMP_MAX_AGE_DAYS = 7
 
 
+_CODE_FINGERPRINT: Optional[str] = None
+
+
+def _code_fingerprint() -> str:
+    """Identify the RUNNING BUILD, for the verdict stamp's code component.
+
+    The obvious answer — the add-on version string — is not enough, and the
+    reason is specific to how this add-on ships. ``_read_git_commit`` returns
+    None in the container (the image copies the app directory, not ``.git``),
+    so the version string alone would be the literal ``0.3.1-dev46`` across
+    every rebuild of a dev cycle. A rule change deployed without a version
+    bump would then leave every stamp looking current and every verdict
+    silently stale — defeating the stamp's single most important invalidator,
+    since "a new build may classify differently" is exactly the case a version
+    string is supposed to cover.
+
+    So the fingerprint also folds in the size of every module in the app
+    package. Any real code edit changes at least one file's size, and it costs
+    a few dozen ``stat`` calls once per process.
+
+    The residual gap is honest and bounded: an edit that leaves every file
+    byte-identical in LENGTH (swapping two characters, say) is invisible here.
+    That is what ``_VERDICT_STAMP_MAX_AGE_DAYS`` exists to catch — and it is
+    why the version string is still included, so a deliberate bump always
+    invalidates regardless.
+    """
+    global _CODE_FINGERPRINT
+    if _CODE_FINGERPRINT is not None:
+        return _CODE_FINGERPRINT
+    import hashlib
+
+    h = hashlib.sha256()
+    try:
+        from .event_detector import _read_addon_version, _read_git_commit
+        h.update(f"v={_read_addon_version()}/{_read_git_commit()}".encode())
+    except Exception:                       # noqa: BLE001 — never block a pass
+        h.update(b"v=unknown")
+    try:
+        pkg = Path(__file__).resolve().parent
+        for f in sorted(pkg.glob("*.py")):
+            h.update(f"|{f.name}:{f.stat().st_size}".encode())
+    except Exception:                       # noqa: BLE001
+        # Unreadable package must not read as "same as last time" — make it
+        # unique per process so the pass degrades to a full re-derivation
+        # rather than skipping on a false match.
+        h.update(f"|unreadable:{id(object())}".encode())
+    _CODE_FINGERPRINT = h.hexdigest()[:16]
+    return _CODE_FINGERPRINT
+
+
 def compute_verdict_stamp(conn: sqlite3.Connection, circuit: str) -> str:
     """Fingerprint of everything that can change an unlabelled event's verdict.
 
@@ -6805,14 +6855,7 @@ def compute_verdict_stamp(conn: sqlite3.Connection, circuit: str) -> str:
     h = hashlib.sha256()
     h.update(f"algo={_VERDICT_STAMP_ALGO};circuit={circuit};".encode())
 
-    try:
-        from .event_detector import _read_addon_version, _read_git_commit
-        h.update(f"code={_read_addon_version()}/{_read_git_commit()};".encode())
-    except Exception:                       # noqa: BLE001 — never block a pass
-        # Unknown version must not read as "same as last time": fall back to a
-        # value that differs from any real one, so the pass degrades to today's
-        # full re-derivation rather than skipping on a false match.
-        h.update(b"code=unknown-forces-full-pass;")
+    h.update(f"code={_code_fingerprint()};".encode())
 
     try:
         # Hash the fitted bands THEMSELVES (params), not just updated_at: a

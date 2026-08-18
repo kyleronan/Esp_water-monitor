@@ -215,8 +215,14 @@
 
   <div class="rb-item">
     <h3>“The add-on is still starting up”</h3>
-    <p>Normal for a minute or two after a restart while it re-reads history.
-    The page reloads itself; nothing is wrong.</p>
+    <p>Normal for the first 20&ndash;30&nbsp;seconds after a restart, while the
+    add-on rebuilds its fixture grouping. The page reloads itself; nothing is
+    wrong. If it is still saying this after a few minutes, the add-on did not
+    finish starting &mdash; check the add-on log.</p>
+    <p>For a couple of minutes <em>after</em> the pages come back, it is still
+    re-checking fixture labels in the background. Everything works during that;
+    the one exception is <strong>Download Study Snapshot (.zip)</strong>, which
+    waits until that finishes and tells you so.</p>
   </div>
 
   <div class="rb-item">
@@ -247,9 +253,11 @@
   </div>
 
   <div class="rb-item">
-    <h3>Give it a minute</h3>
-    <p>Startup re-reads the event history. Pages that need that data say so and
-    reload themselves; the rest work straight away.</p>
+    <h3>Give it half a minute</h3>
+    <p>Startup rebuilds the fixture grouping first &mdash; about 20&ndash;30
+    seconds. Pages that need that data say so and reload themselves; the rest
+    work straight away. Label re-checking then continues in the background for
+    a couple of minutes without holding anything up.</p>
   </div>
 
   <div class="rb-item">

@@ -630,13 +630,62 @@ the replay (stamped `reseed_deferred`, flushed afterwards), and
 success. dev46 46j surfaces that marker on Settings, next to the button that fixes
 it — a marker only a boot log knows about is a marker nobody acts on.
 
-### Startup (dev46 46a/46c)
+### Startup (dev46 46a/46c/46k)
 
-The boot pass re-derives verdicts across the whole history and is submitted
-chunk-wise. Pages whose own query is expensive (History, Water Use, Settings)
-check `startup_cluster_work_done` *before* submitting and render a
-"still starting up" notice instead of queueing — post-46a the failure mode of an
-ungated heavy page is a multi-minute hang, not a crash.
+The boot pass re-derives verdicts across history and is submitted chunk-wise.
+Pages whose own query is expensive (Dashboard, History, Water Use, Settings)
+check readiness *before* submitting and render a "still starting up" notice
+instead of queueing — post-46a the failure mode of an ungated heavy page is a
+multi-minute hang, not a crash.
+
+**Two readiness flags, and they are not interchangeable** (46k):
+
+| flag | true when | who reads it |
+|---|---|---|
+| `startup_pages_ready` | cluster engine rebuilt and wired (~22 s) | the four heavy pages |
+| `startup_cluster_work_done` | every job that touches cluster references has finished (~3 min) | stale-link repair, study export |
+
+Classification runs in the background between those two moments, so pages are
+usable while it works. The repair route and the export keep the *stricter*
+flag deliberately: both are unsafe while cluster references are still being
+written (a repair loses the race; the export's SQLite backup restarts on every
+chunk-boundary write and can livelock).
+
+Both flags start `False` in `Orchestrator.__init__`. That is load-bearing:
+readers spell the check `getattr(orch, "<flag>", True)`, so a flag that only
+came into existence when it was set to `True` was *absent* during boot and
+every reader defaulted to "ready" — which is how the gate shipped unable to
+fire, and why the landing page showed an ingress spinner rather than a notice.
+
+### Not re-deriving what cannot have changed (dev46 46k)
+
+The boot pass stored its answer in `matched_fixture_type` but stored nothing
+about whether that answer was still *valid*, so it re-derived every unlabelled
+event on every boot: 151.7 s over 5,426 events, with the same events re-vetoed
+on every restart since 2026-07-26, and the candidate set growing ~45–60/day
+with no ceiling. Abstention made it permanent — an abstention's stored form is
+`NULL`, so an event the classifier agreed with had nothing recording that the
+decision had been made.
+
+`events.verdict_stamp` records **which inputs produced this row's verdict**:
+classifier code version, the circuit's rule bands, and its label pool. The
+candidate query adds one clause — `verdict_stamp IS NULL OR <> :current` — so
+skipping is loss-free by construction and every uncertain case falls on the
+recompute side. Every row examined is stamped, *including* ones already
+correct; that is the half that actually retires a repeat abstention.
+
+Per-row invalidation is a **trigger** on the classifier-input columns, not a
+call at each write site: those writes live in nine or more places and a missed
+one yields a silently stale verdict. The trigger watches inputs only —
+watching `matched_fixture_type` would have the pass erase the stamp it had
+just written, and the skip would never engage while looking implemented.
+
+Two safety properties, both deliberate: the skip **refuses to engage when the
+trigger is absent**, so the optimisation cannot outlive the mechanism that
+keeps it honest; and an unfiltered pass is forced when the last one is over 7
+days old, bounding any input accidentally left out of the stamp.
+
+Measured on the production database: 79.6 s first pass, 0.8 s thereafter.
 
 ### Interrupted or duplicated admin jobs (dev46 46l)
 
@@ -645,6 +694,57 @@ lock. Every click during that wait used to queue another full pass (three ran
 back-to-back on 2026-08-15). Duplicate requests are now declined; the in-flight
 flag clears in `finally`, because a wedged button would be worse than the
 duplicates it prevents.
+
+---
+
+## Measured and rejected (do not re-attempt without new evidence)
+
+Null results are expensive to produce and cheap to forget, so the ones that
+would otherwise be re-attempted live here. Each was run against real exported
+data with a ship gate fixed *before* the numbers were seen.
+
+**Separating flush lookalikes by SHAPE (dev46 46d) — refuted.** The premise
+was that a cistern refills against a rising float and decays toward zero while
+lookalikes cut off square. Measured over 151 genuine flushes and 38 reviewed
+non-toilets *inside* the flush rule's own scalar box: flushes have *higher*
+tails than lookalikes (tail20 median 0.360 vs 0.329) — the decay signature is
+not there. Best candidate of ten (flow rise rate) reached AUC 0.624 and, at
+95.4 % recall, caught 6 of 38 lookalikes. Vetoing ~4.6 % of genuine flushes on
+the highest-frequency fixture in the house to remove 16 % of lookalikes is a
+bad trade. The tail is *not* wholly eaten by the meter floor (median 33.5 s of
+above-floor decay exists), so that pessimistic explanation is also refuted.
+The pressure channel gives AUC 0.560; per pre-registration that null is
+attributed to VFD regulation — the pump holds pressure by design — not to
+absence of the physical tail. Re-open only with a non-VFD comparison or finer
+pressure capture. The dev45 peak floor remains the only validated defence, and
+the residual lookalikes are a labelling task, not a detector task.
+
+**Enriching the cluster feature space (dev46 46e) — gate not met, and the
+diagnosis moved.** Down-weighting the 512 signature dimensions *post*-scaler
+does work: 1-NN label purity rises 0.674 → 0.745 (majority-class baseline
+0.281), confirming the signature block drowns the ~21 hydraulic scalars. But
+DBSTREAM cannot exploit it — best label purity 0.387 across every weight and
+every threshold from 1 to 25, against a ≥ 0.5 gate. On the same data in the
+same space, 1-NN reads 0.745 where DBSTREAM reads 0.387. **The feature space
+is no longer the binding constraint, so adding features is the wrong move.**
+The candidate is replacing DBSTREAM's assignment step (centroid/k-NN against
+confirmed clusters, keeping DBSTREAM for discovery). Also measured: pairwise
+distance in this space is p5 11.0 / median 17.8 / p95 36.0, while the shipped
+threshold is 2.0 — far below scale.
+
+**Single-circuit idle-decay as a leak instrument (dev46 46t) — confounded;
+use the two-circuit differential instead.** Nightly slopes of −1 to −3 PSI/h
+naively read as 0.24–0.57 L/day of leak, but a sealed ~50 L volume at
+9.5 mL/PSI moves ~1 PSI per °C, so an ordinary Denver overnight swing produces
+exactly those numbers. Confirmed unambiguously: on 2026-08-12 **both** circuits'
+pressure *rose* overnight. A leak cannot raise pressure. Both circuits share a
+mechanical room, so thermal is common-mode and differencing cancels it — on the
+one night with no flow on either circuit the two tracked to 0.016 PSI/h, a
+98.5 % cancellation of a 1.1 PSI/h common signal. The instrument is real but
+needs flow-free nights, which arrive about weekly, so it reports weekly rather
+than nightly. Its two honest limits: a leak present on *both* circuits cancels
+out, and the circuits' differing water volumes make cancellation good but not
+perfect.
 
 ---
 
@@ -671,5 +771,10 @@ duplicates it prevents.
 | Circuit records nothing / no leak tests | Part 6 | `circuit_profile.winterized` — is it still marked drained from last season? |
 | Fixture grouping looks half-finished | Part 6 | `training_state.reseed_in_progress` — a crashed re-seed; Settings shows it |
 | `InterfaceError: bad parameter or other API misuse` | invariant 3 | a DB touch escaped `run_db` — run `tools/audit_db_thread_safety.py` |
-| A page hangs for minutes after a restart | invariant 3 | it queued behind the boot pass; heavy pages should gate on `startup_cluster_work_done` |
+| A page hangs for minutes after a restart | invariant 3 | it queued behind the boot pass; heavy pages gate on `startup_pages_ready` (NOT `startup_cluster_work_done` — that one stays false for the whole background pass) |
+| A page shows "still starting up" forever | Part 6 | `startup_pages_ready` never got set — boot died before wiring the cluster engine; check the boot log's last line |
+| The same events are re-vetoed on every boot | Part 6 | `verdict_stamp` — expected before dev46 46k; after it, means the stamp is being invalidated every boot (check whether a label or rule band keeps changing) |
+| Boot reclassify still takes minutes every restart | Part 6 | the log line naming the skip; if the trigger is missing the skip refuses to engage and says so at WARNING |
+| A verdict looks stale / ignores a feature you fixed | Part 6 | whether that column is in the invalidation trigger's watch list — an unwatched input leaves the row stamped |
+| Study export refuses right after a restart | Part 6 | `startup_cluster_work_done` — the background classification is still writing; it clears when the boot log says "background classification complete" |
 | A leak test says "indeterminate" | not this pipeline | `addon_measure_status` — too few samples or the other valve was open; no leak rate is inferred |

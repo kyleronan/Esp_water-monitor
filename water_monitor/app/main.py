@@ -213,6 +213,15 @@ async def lifespan(app: FastAPI):
         _ver = _read_addon_version() or "unknown"
         _commit = _read_git_commit()
         _build = f"v{_ver}" + (f" ({_commit})" if _commit else "")
+        # dev46 (46k) — the build fingerprint, so two rebuilds of the SAME dev
+        # version are distinguishable in the log. The container has no .git, so
+        # without this every rebuild of a dev cycle prints an identical line and
+        # "did my change actually deploy?" cannot be answered from the log —
+        # which cost real time on 2026-08-17. Same value the verdict stamp uses,
+        # so a changed fingerprint here also explains why that boot re-derived
+        # every label.
+        from .database import _code_fingerprint
+        _build += f" build:{_code_fingerprint()[:8]}"
     except Exception:
         _build = "version unknown"
     log.info("Water Monitor %s starting — %d circuits configured",

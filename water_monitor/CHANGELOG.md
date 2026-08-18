@@ -18,6 +18,49 @@ landed without a version bump; per-build details are in git history.)
   behind it, and the pages that need that data say "still starting up" rather
   than hanging. A build-time check keeps it that way.
 
+- **The add-on is usable seconds after a restart — dev46** — a restart used to
+  lock the whole interface for about three minutes: opening it just showed a
+  spinner on an empty page, with nothing to say why. Two things caused that.
+  The notice that was supposed to appear could never actually appear, and the
+  page you land on first was not covered by it at all. Both fixed. Underneath,
+  the slow part — re-checking every event's fixture label — no longer holds
+  anything up: pages come back in about 20 seconds and that work finishes in
+  the background. The one thing that still waits is **Download Study Snapshot
+  (.zip)**, which needs the background pass to finish and now says so.
+
+- **It stops re-checking labels it already knows — dev46** — every restart
+  re-derived a label for all 5,400-odd unlabelled events, and almost none of
+  them ever changed: the same events were re-examined and re-rejected on every
+  boot since late July, and the pile grows by roughly 50 a day with no upper
+  limit. It stored the answer but never stored anything about whether that
+  answer was still good. Each event now records which inputs produced its
+  label, so a restart re-checks only what could genuinely have moved —
+  everything else is left alone. A new build, a rules re-fit, or a label you
+  save all still trigger a full re-check, which is exactly when you want one.
+  Measured on the real database: 80 seconds down to under one.
+
+- **Yesterday's water is checked against the meter — dev46** — every night the
+  add-on now compares the water it recorded against the flow meter's own
+  running total for the same day and reports any gap. This is the one check
+  that measures its numbers against something it did not produce, so it can
+  notice the failure nothing else can: events that were never recorded at all.
+  It reports and never rewrites — a gap is evidence, and correcting history
+  from a daily total would destroy it. Which direction the gap runs is part of
+  the finding: more on the meter means water went unrecorded, more in the
+  events means something was counted twice.
+
+- **The flush look-alikes are a labelling job, not a detector job — dev46** —
+  dev45 left the remaining look-alikes (fast squarish draws that match flush
+  physics in every measurement) queued for "refill-curve shape analysis". That
+  analysis has now been run against 151 genuine flushes and 38 reviewed
+  non-toilets, and it does not work: the expected signature — a cistern's flow
+  tailing off as the float rises — simply is not in the data, and flushes
+  actually show slightly *more* tail than the look-alikes do. The best measure
+  found would catch 6 of 38 look-alikes while wrongly vetoing about 1 in 20
+  real flushes, on the most-used fixture in the house. Nothing shipped. The
+  dev45 peak floor stays the only validated defence, and your own labels
+  remain the fix for the stragglers.
+
 - **Winterized circuits — dev46** — mark a circuit as drained for the season and
   the add-on stops recording water use, running leak tests, and learning
   pressure for it, instead of reading the empty line as a catastrophic pressure
