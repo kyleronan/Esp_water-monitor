@@ -467,7 +467,12 @@ CREATE TABLE IF NOT EXISTS training_state (
     -- timestamp stamped when a cluster re-seed clears assignments, cleared
     -- ONLY on success. A crash mid-replay leaves it set; boot and the
     -- post-rebuild health pass warn "reseed incomplete — rerun required".
-    reseed_in_progress  TEXT
+    reseed_in_progress  TEXT,
+    -- dev46 (46k, migration 20260810) — max-age backstop for the verdict
+    -- stamp. The stamp is only as good as the list of inputs baked into it;
+    -- if one is ever missed, stale verdicts would persist silently. Forcing a
+    -- full unstamped pass when this is old bounds that to days, not forever.
+    last_full_reclassify_at TIMESTAMP
 );
 
 -- ==========================================================================
@@ -1087,6 +1092,15 @@ CREATE TABLE IF NOT EXISTS events (
     -- because their true spans are unknowable (annotate-don't-modify).
     flow_sig_span_s                  REAL,
     pressure_sig_span_s              REAL,
+    -- dev46 (46k, migration 20260810). WHICH inputs produced this row's
+    -- stored verdict: classifier code version + this circuit's rule bands +
+    -- its label pool. The boot reclassify scans only rows whose stamp differs
+    -- from the current one, so a verdict that provably cannot have changed is
+    -- not re-derived. NULL = never stamped = always a candidate, which is why
+    -- no backfill is needed and why any doubt costs correctness nothing.
+    -- Cleared explicitly by anything that rewrites a classification input on
+    -- one event (see invalidate_verdict_stamps).
+    verdict_stamp                    TEXT,
     -- Embedded-fixture annotation (migration 20260548). JSON array of draws
     -- found superimposed on a sustained event's waveform (a toilet flushed
     -- mid-shower) by composite_detector. Metadata ONLY — never changes the
@@ -1547,6 +1561,35 @@ CREATE TABLE IF NOT EXISTS daily_summary_dirty (
 -- event write; this index keeps that O(log n).
 CREATE INDEX IF NOT EXISTS idx_events_circuit_span
     ON events (circuit, start_ts, end_ts);
+
+-- dev46 (46k) — verdict-stamp invalidation, enforced at the TABLE.
+--
+-- The stamp says "this row's stored verdict was derived from these inputs".
+-- A global stamp cannot see a per-row edit, so any write that changes an
+-- input the classifier reads must release that row. Doing it here rather
+-- than at each call site is deliberate: those writes live in at least nine
+-- places across feature_extractor and database, and a missed one produces a
+-- SILENTLY stale verdict — the exact failure this stamp exists to prevent.
+-- A trigger cannot be forgotten by a future writer.
+--
+-- Watched columns are classifier INPUTS only. matched_fixture_type,
+-- matched_via, cycle_group_id, match_rejection_reason and verdict_stamp are
+-- deliberately absent: they are the pass's OUTPUTS, and watching them would
+-- have the pass erase the stamp it had just written.
+CREATE TRIGGER IF NOT EXISTS trg_events_verdict_stamp_invalidate
+AFTER UPDATE OF
+    cycle_pulse_count, excluded_from_training, volume_litres,
+    volume_litres_effective, duration_seconds, peak_flow_lpm,
+    active_flow_segment_count, has_pressure_transient,
+    flow_signature_json, pressure_signature_json,
+    is_pressure_restoration_phantom, is_cross_talk, is_low_flow_dribble,
+    user_ignored, training_excluded_by_user
+ON events
+FOR EACH ROW WHEN NEW.verdict_stamp IS NOT NULL
+BEGIN
+    UPDATE events SET verdict_stamp = NULL WHERE id = NEW.id;
+END;
+
 
 -- ==========================================================================
 -- PUMP REGIME NIGHTLY (dev23, pump plan Phase 3)
@@ -6723,6 +6766,156 @@ def _invariant_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any
     return hit
 
 
+# dev46 (46k) — bump when the STAMP'S OWN definition changes (a new input
+# folded in, a component computed differently). Every stamp then differs from
+# every stored one and the next pass re-derives everything, which is the
+# correct response to "the rule for deciding staleness just changed".
+_VERDICT_STAMP_ALGO = 1
+
+# Force a full unstamped pass if the last one is older than this. The stamp can
+# only be as complete as the input list baked into it; this is what stops an
+# omission from meaning "stale forever" (see the migration's docstring).
+_VERDICT_STAMP_MAX_AGE_DAYS = 7
+
+
+def compute_verdict_stamp(conn: sqlite3.Connection, circuit: str) -> str:
+    """Fingerprint of everything that can change an unlabelled event's verdict.
+
+    Same stamp ⇒ the classifier would reach the same answer it already stored,
+    so the event needs no work. The components, and why each is here:
+
+    * **classifier code version** — a deploy can change any rule, veto or
+      tier. This is also the safety net for any input NOT enumerated below:
+      whatever is missed, shipping a build invalidates everything, so
+      staleness can never outlive a release.
+    * **rule bands, all regimes** — bands are fitted per supply regime and an
+      event is judged by ITS era's bands, so a re-fit in any regime can move
+      verdicts. Cheap: one row per regime.
+    * **label pool (id + label)** — the k-NN pool, the fingerprint library and
+      the per-type signatures are all built from labelled events, so one new
+      or changed label can move any unlabelled verdict. Hashed over ids AND
+      labels so a RELABEL counts, which a bare COUNT(*) would miss.
+
+    Deliberately NOT included: an individual event's own features. Those are
+    per-row, and a global stamp cannot express them — anything that rewrites
+    them calls ``invalidate_verdict_stamps`` instead.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update(f"algo={_VERDICT_STAMP_ALGO};circuit={circuit};".encode())
+
+    try:
+        from .event_detector import _read_addon_version, _read_git_commit
+        h.update(f"code={_read_addon_version()}/{_read_git_commit()};".encode())
+    except Exception:                       # noqa: BLE001 — never block a pass
+        # Unknown version must not read as "same as last time": fall back to a
+        # value that differs from any real one, so the pass degrades to today's
+        # full re-derivation rather than skipping on a false match.
+        h.update(b"code=unknown-forces-full-pass;")
+
+    try:
+        # Hash the fitted bands THEMSELVES (params), not just updated_at: a
+        # re-fit that lands identical values should NOT invalidate, and a band
+        # edited without touching the timestamp MUST. The JSON is the truth.
+        for r in conn.execute(
+                "SELECT regime_id, params, locked_at FROM rule_calibration "
+                "WHERE circuit = ? ORDER BY regime_id", (circuit,)):
+            h.update(f"|band:{r[0]}:{r[1]}:{r[2]}".encode())
+    except sqlite3.OperationalError:        # pre-migration schema
+        h.update(b"|band:unavailable")
+
+    for r in conn.execute(
+            "SELECT id, user_fixture_type FROM events "
+            "WHERE circuit = ? AND user_fixture_type IS NOT NULL "
+            "ORDER BY id", (circuit,)):
+        h.update(f"|lbl:{r[0]}:{r[1]}".encode())
+
+    return h.hexdigest()[:32]
+
+
+def _verdict_stamp_pass_is_due(conn: sqlite3.Connection, circuit: str) -> bool:
+    """True when the stamp filter must be BYPASSED and everything re-derived.
+
+    The stamp is only as complete as the input list baked into it. If some
+    input is ever missed, affected verdicts would stay stale silently and
+    nothing would ever say so. This bounds that failure to
+    ``_VERDICT_STAMP_MAX_AGE_DAYS`` instead of forever, at a cost of one full
+    pass a week — which the operator no longer waits on, since the pass runs
+    in the background (46k option B).
+
+    Unreadable state returns True: forcing the expensive-but-correct path is
+    the right way to fail.
+    """
+    # The stamp is only trustworthy while the invalidation trigger exists to
+    # release rows whose own inputs changed. Without it a stamped row would
+    # keep a verdict derived from features it no longer has, and NOTHING would
+    # say so. So the skip refuses to engage rather than run unguarded — the
+    # optimisation cannot outlive the mechanism that keeps it correct.
+    try:
+        if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
+                ("trg_events_verdict_stamp_invalidate",)).fetchone() is None:
+            log.warning("[%s] verdict-stamp trigger missing — re-deriving every "
+                        "unlabelled event (the skip stays off until it exists)",
+                        circuit)
+            return True
+    except sqlite3.OperationalError:
+        return True
+
+    try:
+        row = conn.execute(
+            "SELECT last_full_reclassify_at FROM training_state WHERE circuit = ?",
+            (circuit,)).fetchone()
+    except sqlite3.OperationalError:        # pre-migration schema
+        return True
+    if row is None or not row[0]:
+        return True
+    last = _parse_event_ts(str(row[0]))
+    if last is None:
+        return True
+    now = datetime.now(timezone.utc)
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (now - last).total_seconds() > _VERDICT_STAMP_MAX_AGE_DAYS * 86400
+
+
+def _mark_full_reclassify(conn: sqlite3.Connection, circuit: str) -> None:
+    """Record that an unfiltered pass just completed (max-age backstop)."""
+    try:
+        conn.execute(
+            "UPDATE training_state SET last_full_reclassify_at = ? "
+            "WHERE circuit = ?",
+            (datetime.now(timezone.utc).isoformat(), circuit))
+    except sqlite3.OperationalError:        # pre-migration schema
+        pass
+
+
+def invalidate_verdict_stamps(conn: sqlite3.Connection, event_ids) -> int:
+    """Mark these events as needing re-classification (46k).
+
+    Call from ANY path that rewrites a feature the classifier reads —
+    cycle-pulse recount, volume recompute, waveform repair, exclusion-verdict
+    changes. The global stamp cannot see per-row edits, so a row whose own
+    inputs changed must be released explicitly or it keeps a verdict derived
+    from features it no longer has.
+
+    Clearing is always safe: the worst case is one event re-derived
+    unnecessarily. NOT clearing is the unsafe direction.
+    """
+    ids = [e for e in (event_ids or []) if e]
+    if not ids:
+        return 0
+    n = 0
+    for i in range(0, len(ids), 400):       # keep well under SQLITE_MAX_VARIABLE
+        chunk = ids[i:i + 400]
+        cur = conn.execute(
+            "UPDATE events SET verdict_stamp = NULL WHERE id IN "
+            "(" + ",".join("?" * len(chunk)) + ")", chunk)
+        n += cur.rowcount or 0
+    return n
+
+
 def _new_reclassify_counters() -> Dict[str, Any]:
     """Fresh accumulator bundle for a reclassify pass.
 
@@ -6880,6 +7073,25 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     if since_ts is not None:
         where += " AND start_ts >= ?"
         qparams.append(since_ts)
+
+    # dev46 (46k) — skip events whose verdict provably cannot have changed.
+    #
+    # The pass always stored its answer (matched_fixture_type) but never
+    # stored whether that answer was still VALID, so every boot re-derived
+    # every unlabelled event to discover almost none of them had moved
+    # (2026-08-17: 151.7 s, 5,426 events, ~0 net changes on a repeat boot —
+    # and the same events re-vetoed since 2026-07-26).
+    #
+    # A row is a candidate when its stamp is NULL (new, or explicitly released
+    # by invalidate_verdict_stamps) or differs from the current one (code,
+    # bands or labels moved). Everything else already holds the answer this
+    # pass would compute. Skipping is therefore loss-free by construction, and
+    # every uncertain case falls on the recompute side.
+    stamp = compute_verdict_stamp(conn, circuit)
+    forced = _verdict_stamp_pass_is_due(conn, circuit)
+    if not forced:
+        where += (" AND (verdict_stamp IS NULL OR verdict_stamp <> ?)")
+        qparams.append(stamp)
     select_cols = list(dict.fromkeys(
         ("id", "start_ts", "matched_fixture_type", "matched_via",
          "cycle_group_id", "excluded_from_training",
@@ -6908,6 +7120,10 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         "baselines":          _baselines,
         "sens":               _sens,
         "score_cols":         _SCORE_COLS,
+        # dev46 (46k) — the stamp every row this pass touches gets written
+        # with, and whether the stamp filter was bypassed for a due full pass.
+        "verdict_stamp":      stamp,
+        "forced_full":        forced,
     }, rows)
 
 
@@ -6944,6 +7160,7 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     _baselines     = ctx["baselines"]
     _sens          = ctx["sens"]
     _SCORE_COLS    = ctx["score_cols"]
+    _stamp         = ctx["verdict_stamp"]
 
     scanned          = counters["scanned"]
     matched          = counters["matched"]
@@ -7050,6 +7267,21 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
             changed += 1
             if new_type is None and prev is not None:
                 cleared += 1
+        # dev46 (46k) — stamp EVERY row examined, including the ones whose
+        # verdict was already right. That is the whole mechanism: without it
+        # an event the classifier agrees with is never recorded as decided,
+        # so it returns as a candidate on the next boot forever. `fb9d5fa5`
+        # was re-derived on every boot since 2026-07-26 for exactly this
+        # reason — the pass kept confirming an abstention it had no way to
+        # remember making.
+        #
+        # The user_fixture_type re-check is the same N1 guard the verdict
+        # write carries: a PATCH landing mid-pass must not have its row
+        # stamped from premises that no longer hold.
+        conn.execute(
+            "UPDATE events SET verdict_stamp = ? "
+            "WHERE id = ? AND user_fixture_type IS NULL",
+            (_stamp, r["id"]))
         # dev33 (§2.1) — mark / retract classification-tier abstention so a
         # silent outage is measurable and a recovery is visible. Only ever
         # fills an EMPTY reason (artifact + cluster reasons are more specific),
@@ -7156,17 +7388,39 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
     log.info(
         "[%s] reclassify: trained %d signature(s); scanned %d unlabelled "
         "event(s) → %d matched (%d via rules), %d abstained (%d stale cleared) "
-        "— %d verdict(s) CHANGED",
+        "— %d verdict(s) CHANGED, %d re-promoted composite",
         circuit, signatures_trained, scanned, matched, rule_matched, abstained,
-        cleared, changed,
+        cleared, changed, embedded_other,
     )
-    # dev46 (46k) — the boot pass costs ~145 s on this install. If `changed` is
-    # 0 here, every second of it re-derived answers already in the database.
-    # Said out loud at INFO because it is the evidence for the skip condition,
-    # and a redundant pass that never says so is one nobody thinks to cut.
-    if scanned and not changed:
-        log.info("[%s] reclassify: no verdict changed — this pass re-derived "
-                 "%d stored answer(s) and wrote none of them", circuit, scanned)
+    # dev46 (46k) — the boot pass costs ~145 s on this install, so what it
+    # actually CHANGED is the evidence for whether it earns that.
+    #
+    # Read the two numbers together. The row loop abstains on composite events
+    # (no single tier names them) and CLEARS their stored verdict; then
+    # promote_embedded_composites, a few lines above, puts it straight back as
+    # 'other'/'composite'. That round-trip is internal to one pass and leaves
+    # the same final state, but it lands in `changed` — so `changed` on its
+    # own OVERSTATES churn by roughly the composite count. Measured 2026-08-17
+    # 21:00 boot: circuit_1 48 changed / 52 composites, circuit_2 1 / 1, i.e.
+    # net change ~0 on both. Anyone using these numbers to judge the pass —
+    # or to build a skip condition on it — needs both or they will conclude
+    # the boot pass is doing real work when it is chasing its own tail.
+    if scanned and changed <= embedded_other:
+        log.info("[%s] reclassify: no NET verdict change — this pass "
+                 "re-derived %d stored answer(s) and every write it made was "
+                 "the composite round-trip", circuit, scanned)
+
+    # dev46 (46k) — an UNFILTERED pass just covered every unlabelled event, so
+    # restart the max-age clock. Only a forced pass may do this: a stamped
+    # pass skips rows by design and must not be mistaken for full coverage,
+    # or the backstop would never fire and the omission it guards against
+    # would once again be permanent.
+    if ctx.get("forced_full"):
+        _mark_full_reclassify(conn, circuit)
+    if not scanned:
+        log.info("[%s] reclassify: nothing to do — every unlabelled event "
+                 "already carries the current verdict stamp (code, rule bands "
+                 "and labels all unchanged since the last pass)", circuit)
     if veto_counts:
         log.info("[%s] flush-physics vetoes: %s (per-event detail at DEBUG)",
                  circuit, "; ".join(f"{n}× {why}" for why, n
@@ -7579,8 +7833,16 @@ def recompute_cycle_pulse_counts(conn: sqlite3.Connection, circuit: str,
                                         this_steady=evs[i][3], this_flow_cv=evs[i][4])
         eid = evs[i][1]
         if stored.get(eid) != cnt:
+            # dev46 (46k) — cycle_pulse_count is a MATCHER feature, so a row
+            # whose count just moved may now classify differently. Clear its
+            # verdict stamp in the same statement: the global stamp cannot see
+            # per-row edits, and a row left stamped would keep a verdict
+            # derived from a feature value it no longer has. This runs at boot
+            # immediately BEFORE reclassify, so the release lands in time for
+            # the very next pass to pick the row up.
             conn.execute(
-                "UPDATE events SET cycle_pulse_count = ? WHERE id = ? AND circuit = ?",
+                "UPDATE events SET cycle_pulse_count = ?, verdict_stamp = NULL "
+                "WHERE id = ? AND circuit = ?",
                 (cnt, eid, circuit),
             )
             updated += 1

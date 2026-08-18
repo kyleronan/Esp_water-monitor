@@ -285,6 +285,9 @@ _BASELINE_VERSION: int = 20260523
 #   20260809 — dev46: events.training_excluded_by_user (46f), events
 #              flow_sig_span_s / pressure_sig_span_s (46i), and
 #              circuit_profile.winterized (46h).
+#   20260810 — dev46 (46k): events.verdict_stamp + training_state
+#              .last_full_reclassify_at — lets the boot reclassify SKIP an
+#              event whose verdict provably cannot have changed.
 #
 # VERSION-NUMBER CONVENTION (2026-08-12, decided with the operator): from the
 # next migration onward, versions are YYYYMM + a 2-digit per-month sequence —
@@ -293,7 +296,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260809
+_CURRENT_VERSION: int = 20260810
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -2630,6 +2633,111 @@ def _apply_dev46_columns(conn: sqlite3.Connection) -> None:
              "and winterized flag ready")
 
 
+# 20260810 — dev46 (46k): per-event verdict validity stamp.
+# Must match the trigger's UPDATE OF list below — the guard checks these exist
+# before creating it, and a mismatch would create a trigger that never fires.
+_VERDICT_STAMP_WATCHED = (
+    "cycle_pulse_count", "excluded_from_training", "volume_litres",
+    "volume_litres_effective", "duration_seconds", "peak_flow_lpm",
+    "active_flow_segment_count", "has_pressure_transient",
+    "flow_signature_json", "pressure_signature_json",
+    "is_pressure_restoration_phantom", "is_cross_talk",
+    "is_low_flow_dribble", "user_ignored", "training_excluded_by_user",
+)
+
+
+def _apply_verdict_stamp(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260810 — make the boot reclassify skippable.
+
+    ``events.verdict_stamp`` records WHICH inputs produced the row's stored
+    verdict. The boot pass then scans only events whose stamp differs from the
+    current one, instead of re-deriving every unlabelled event every boot.
+
+    Why this is needed at all: the pass already stores its answer in
+    matched_fixture_type, but stored nothing that said whether that answer was
+    still valid — so it recomputed ~5,400 verdicts to discover that ~5,400 of
+    them were unchanged. Measured 2026-08-17: 151.7 s per boot, growing by
+    roughly 45-60 events/day as the unlabelled backlog grows, with no ceiling.
+
+    NULL means "never stamped" and therefore always a candidate, so the
+    migration needs no backfill: the first pass after upgrade stamps every row
+    and behaves exactly as today.
+
+    ``training_state.last_full_reclassify_at`` is the max-age backstop. If an
+    input is ever left out of the stamp, staleness would otherwise be
+    invisible; forcing a full pass when the last one is old bounds that to
+    days rather than forever.
+
+    Both additive and idempotent."""
+    if (_has_table(conn, "events")
+            and not _has_column(conn, "events", "verdict_stamp")):
+        conn.execute("ALTER TABLE events ADD COLUMN verdict_stamp TEXT")
+    if (_has_table(conn, "training_state")
+            and not _has_column(conn, "training_state",
+                                "last_full_reclassify_at")):
+        conn.execute("ALTER TABLE training_state "
+                     "ADD COLUMN last_full_reclassify_at TIMESTAMP")
+    # The pass's candidate query filters circuit + user_fixture_type +
+    # verdict_stamp; without this it degrades to a full scan of every event
+    # on every boot, which is the cost this migration exists to remove.
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "user_fixture_type", "verdict_stamp"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_verdict_stamp "
+            "ON events (circuit, user_fixture_type, verdict_stamp)")
+    # Belt-and-braces re-create of the wf-claim index — LAST-migration
+    # convention (see 20260574/20260804/20260806/20260807/20260808/20260809).
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+    conn.commit()
+    # Recreated (not IF NOT EXISTS alone) so that changing the watched-column
+    # list in a later release replaces the old trigger instead of silently
+    # keeping a stale one.
+    # Every watched column must exist or the CREATE fails. A partial schema
+    # (only synthetic test DBs in practice) simply gets no trigger — and the
+    # runtime refuses to skip when the trigger is absent, so the optimisation
+    # cannot engage without the mechanism that keeps it honest.
+    if _has_table(conn, "events") and all(
+            _has_column(conn, "events", c) for c in _VERDICT_STAMP_WATCHED):
+        conn.execute("DROP TRIGGER IF EXISTS trg_events_verdict_stamp_invalidate")
+        conn.executescript("""
+-- dev46 (46k) — verdict-stamp invalidation, enforced at the TABLE.
+--
+-- The stamp says "this row's stored verdict was derived from these inputs".
+-- A global stamp cannot see a per-row edit, so any write that changes an
+-- input the classifier reads must release that row. Doing it here rather
+-- than at each call site is deliberate: those writes live in at least nine
+-- places across feature_extractor and database, and a missed one produces a
+-- SILENTLY stale verdict — the exact failure this stamp exists to prevent.
+-- A trigger cannot be forgotten by a future writer.
+--
+-- Watched columns are classifier INPUTS only. matched_fixture_type,
+-- matched_via, cycle_group_id, match_rejection_reason and verdict_stamp are
+-- deliberately absent: they are the pass's OUTPUTS, and watching them would
+-- have the pass erase the stamp it had just written.
+CREATE TRIGGER IF NOT EXISTS trg_events_verdict_stamp_invalidate
+AFTER UPDATE OF
+    cycle_pulse_count, excluded_from_training, volume_litres,
+    volume_litres_effective, duration_seconds, peak_flow_lpm,
+    active_flow_segment_count, has_pressure_transient,
+    flow_signature_json, pressure_signature_json,
+    is_pressure_restoration_phantom, is_cross_talk, is_low_flow_dribble,
+    user_ignored, training_excluded_by_user
+ON events
+FOR EACH ROW WHEN NEW.verdict_stamp IS NOT NULL
+BEGIN
+    UPDATE events SET verdict_stamp = NULL WHERE id = NEW.id;
+END;
+""")
+    conn.commit()
+    log.info("Migration 20260810: per-event verdict stamp ready")
+
+
 def _missing_202608_columns(conn: sqlite3.Connection) -> set[str]:
     """Verifier for the 20260801 DDL (current-version guard set)."""
     missing = set()
@@ -2896,6 +3004,7 @@ _MIGRATIONS: tuple = (
     (20260807, _apply_dev41_conformance_ddl),
     (20260808, _apply_reseed_marker_column),
     (20260809, _apply_dev46_columns),
+    (20260810, _apply_verdict_stamp),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
