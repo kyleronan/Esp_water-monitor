@@ -6781,7 +6781,7 @@ def _invariant_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any
 # v2 (2026-08-18): the label pool left the stamp — a label now pushes an
 # invalidation to its own cluster instead. Bumping forces one full re-derive so
 # no row keeps a stamp computed under the old, stricter rule.
-_VERDICT_STAMP_ALGO = 2
+_VERDICT_STAMP_ALGO = 3
 
 # Force a full unstamped pass if the last one is older than this. The stamp can
 # only be as complete as the input list baked into it; this is what stops an
@@ -6894,6 +6894,48 @@ def compute_verdict_stamp(conn: sqlite3.Connection, circuit: str) -> str:
             h.update(f"|band:{r[0]}:{r[1]}:{r[2]}".encode())
     except sqlite3.OperationalError:        # pre-migration schema
         h.update(b"|band:unavailable")
+
+    # Settings the pass reads that are NOT rule bands. Enumerated column by
+    # column rather than hashing the rows, and that is not fussiness:
+    # home_profile.away_mode flips with presence and updated_at moves on any
+    # write, so `SELECT *` would re-stamp the whole table several times a day
+    # and quietly undo the entire optimisation. Same rule as the invalidation
+    # trigger's watch list — inputs only.
+    #
+    #   has_water_softener / softener_circuit -> the softener session detector
+    #   fingerprint_labeling_enabled          -> whether the fingerprint tier runs
+    #   build_year / epa_flush_cap_enabled    -> the toilet flush cap (veto input)
+    #   daily_summary_tz                      -> time-of-day rule predicates
+    try:
+        row = conn.execute(
+            "SELECT has_water_softener, softener_circuit, "
+            "       fingerprint_labeling_enabled, build_year, "
+            "       epa_flush_cap_enabled, daily_summary_tz "
+            "FROM home_profile WHERE id = 1").fetchone()
+        h.update(f"|home:{tuple(row) if row else ()}".encode())
+    except sqlite3.OperationalError:
+        h.update(b"|home:unavailable")
+
+    # circuit_type picks the rule set; winterized (46h) suspends the circuit.
+    try:
+        row = conn.execute(
+            "SELECT circuit_type, winterized FROM circuit_profile "
+            "WHERE circuit = ?", (circuit,)).fetchone()
+        h.update(f"|circuit:{tuple(row) if row else ()}".encode())
+    except sqlite3.OperationalError:
+        h.update(b"|circuit:unavailable")
+
+    # Regime SPANS, because an event is judged by the bands of the era its
+    # start_ts falls in — closing or moving a regime re-points events at a
+    # different band set even when no band value changed. Metadata columns
+    # (detected_at, note, ...) are deliberately excluded.
+    try:
+        for r in conn.execute(
+                "SELECT id, started_at, ended_at FROM supply_regime "
+                "ORDER BY id"):
+            h.update(f"|regime:{r[0]}:{r[1]}:{r[2]}".encode())
+    except sqlite3.OperationalError:
+        h.update(b"|regime:unavailable")
 
     return h.hexdigest()[:32]
 

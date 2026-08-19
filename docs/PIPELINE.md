@@ -667,12 +667,28 @@ with no ceiling. Abstention made it permanent — an abstention's stored form is
 `NULL`, so an event the classifier agreed with had nothing recording that the
 decision had been made.
 
-`events.verdict_stamp` records **which inputs produced this row's verdict**:
-the classifier code version and the circuit's rule bands. The candidate query
-adds one clause — `verdict_stamp IS NULL OR <> :current` — so skipping is
-loss-free by construction and every uncertain case falls on the recompute
-side. Every row examined is stamped, *including* ones already correct; that is
-the half that actually retires a repeat abstention.
+`events.verdict_stamp` records **which inputs produced this row's verdict**.
+The candidate query adds one clause — `verdict_stamp IS NULL OR <> :current` —
+so skipping is loss-free by construction and every uncertain case falls on the
+recompute side. Every row examined is stamped, *including* ones already
+correct; that is the half that actually retires a repeat abstention.
+
+What the stamp covers, derived by walking every read in
+`_reclassify_prepare` rather than from memory:
+
+| component | why |
+|---|---|
+| build fingerprint (version + module sizes) | any code change can move any verdict; the container has no `.git`, so the version string alone is constant across a dev cycle's rebuilds |
+| `rule_calibration.params`, all regimes | bands are per-era and an event is judged by its own era's |
+| `home_profile`: softener config, `fingerprint_labeling_enabled`, `build_year` / `epa_flush_cap_enabled`, `daily_summary_tz` | the tiers and vetoes these switch on |
+| `circuit_profile`: `circuit_type`, `winterized` | picks the rule set; suspends the circuit |
+| `supply_regime` spans (`id`, `started_at`, `ended_at`) | closing or moving a regime re-points events at a different band set even when no band changed |
+
+Those settings are enumerated **column by column, never `SELECT *`**.
+`home_profile` also holds `away_mode` (flips with presence) and `updated_at`
+(moves on any write); hashing whole rows would re-derive the table several
+times a day and quietly undo the optimisation — while looking like it worked,
+because nothing would fail.
 
 **Labels PUSH, they do not poll.** The stamp deliberately does not hash the
 label pool. It did at first, and that made it useless on the circuit that
