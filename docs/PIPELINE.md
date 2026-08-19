@@ -699,13 +699,21 @@ what makes that acceptable — a miss lands within days rather than never. It
 also means this gets better for free when the DBSTREAM assignment step is
 replaced.
 
-**Boot's remaining job is catch-up, not sweeping.** The hourly maturity
-re-check covers the last 6 h because cycle context arrives after an event
-closes. If the add-on was off — power cut, redeploy, crash — those hours got
-no re-check, and the stamp cannot tell: the events were stamped when first
-classified, so they look settled. Boot therefore re-opens that window
-(`release_settle_window`), which is a few dozen events. Anything missed
+**An event inside the settle horizon is never stamped.** `maturity_recheck`
+re-runs this pass hourly over the last 6 h because cycle context arrives
+*after* an event closes — a dishwasher's third fill is what lets the cycle
+detector claim its first. Stamping a young event on its first look would mark
+that conversation finished before it started, and the hourly pass would skip
+it for the rest of the window, silently disabling the mechanism. So young
+rows keep a NULL stamp until they age out.
+
+**Boot's remaining job is catch-up, not sweeping.** It scans whatever is
+unstamped: new events, released cluster peers, and anything still settling.
+That covers the offline case with no special handling — an event that aged
+past the horizon while the add-on was down was never stamped, and one missed
 entirely returns as a NEW row from the historical importer, unstamped already.
+`release_settle_window` remains as belt-and-braces for a widened horizon or a
+row stamped early by some other path.
 
 Per-row invalidation is a **trigger** on the classifier-input columns, not a
 call at each write site: those writes live in nine or more places and a missed

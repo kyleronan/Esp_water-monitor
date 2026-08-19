@@ -7229,6 +7229,27 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     if not forced:
         where += (" AND (verdict_stamp IS NULL OR verdict_stamp <> ?)")
         qparams.append(stamp)
+
+    # dev46 (46k) — an event younger than the settle horizon is NOT DECIDED
+    # YET, so it must not be stamped.
+    #
+    # maturity_recheck re-runs this pass hourly over recent events precisely
+    # because cycle context arrives AFTER an individual event closes: a
+    # dishwasher's third fill is what lets the cycle detector claim the first
+    # one. Stamping a young event on its first look would mark that
+    # conversation finished before it started, and the hourly pass would skip
+    # it for the rest of the settle window — silently disabling the mechanism
+    # (verified: passes 2 and 3 over a 1-hour-old event scanned nothing).
+    #
+    # Leaving them unstamped also IS the offline catch-up: an event that ages
+    # past the horizon while the add-on is down was never stamped, so the next
+    # pass picks it up with no special case.
+    try:
+        from .maturity_recheck import _SETTLE_HORIZON_HOURS as _settle_h
+    except Exception:                       # noqa: BLE001 — never block a pass
+        _settle_h = 6
+    stamp_before_ts = (datetime.now(timezone.utc)
+                       - timedelta(hours=_settle_h)).isoformat()
     select_cols = list(dict.fromkeys(
         ("id", "start_ts", "matched_fixture_type", "matched_via",
          "cycle_group_id", "excluded_from_training",
@@ -7261,6 +7282,7 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         # with, and whether the stamp filter was bypassed for a due full pass.
         "verdict_stamp":      stamp,
         "forced_full":        forced,
+        "stamp_before_ts":    stamp_before_ts,
     }, rows)
 
 
@@ -7298,6 +7320,7 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     _sens          = ctx["sens"]
     _SCORE_COLS    = ctx["score_cols"]
     _stamp         = ctx["verdict_stamp"]
+    _stamp_before  = ctx["stamp_before_ts"]
 
     scanned          = counters["scanned"]
     matched          = counters["matched"]
@@ -7415,10 +7438,14 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
         # The user_fixture_type re-check is the same N1 guard the verdict
         # write carries: a PATCH landing mid-pass must not have its row
         # stamped from premises that no longer hold.
-        conn.execute(
-            "UPDATE events SET verdict_stamp = ? "
-            "WHERE id = ? AND user_fixture_type IS NULL",
-            (_stamp, r["id"]))
+        # ...but only once the event is old enough to be DECIDED. A row still
+        # inside the settle horizon keeps its NULL stamp so the hourly
+        # maturity re-check can keep re-evaluating it as cycle context lands.
+        if r["start_ts"] and r["start_ts"] < _stamp_before:
+            conn.execute(
+                "UPDATE events SET verdict_stamp = ? "
+                "WHERE id = ? AND user_fixture_type IS NULL",
+                (_stamp, r["id"]))
         # dev33 (§2.1) — mark / retract classification-tier abstention so a
         # silent outage is measurable and a recovery is visible. Only ever
         # fills an EMPTY reason (artifact + cluster reasons are more specific),
