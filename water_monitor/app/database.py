@@ -7372,7 +7372,8 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
 
 def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                            ctx: Dict[str, Any],
-                           counters: Dict[str, Any]) -> None:
+                           counters: Dict[str, Any],
+                           yield_lock: bool = False) -> None:
     """One batch of the reclassify row loop — runs on the single DB thread.
 
     dev46 rule N2a: self-contained transaction. Every statement for this
@@ -7564,14 +7565,23 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
             (av.get("score"), av.get("anomaly_type"),
              1 if av.get("is_anomalous") else 0, r["id"]),
         )
-    # dev46 (46a/C2a): NO yield_write_lock here. The pre-chunking loop called
-    # it every 300 rows to commit and sleep 30 ms so a waiting user save could
-    # win the SQLite write lock. Both of its jobs now belong to the chunk
-    # boundary: the commit below is the chunk's ONE commit (rule N2a — chunk =
-    # transaction), and yielding is the executor queue's job. Kept inside a
-    # chunk it would be actively harmful — the 30 ms sleep would hold the
-    # single DB worker rather than release it, delaying the very queue it was
-    # meant to let through.
+        # dev46 (46a/C2a + 46k): WHO OWNS THE TRANSACTION decides this.
+        #
+        # Through run_db the chunk IS the transaction (rule N2a) and the one
+        # commit below is correct: yielding here would sleep 30 ms holding the
+        # single DB worker, delaying the very queue it exists to let through.
+        #
+        # But the SYNC entry point is called from inside run_isolated_write by
+        # maturity_recheck, reprocess and training_manager — a PRIVATE
+        # connection whose contract is spelled out in run_isolated_write's own
+        # docstring: "the job's per-row commits release the file write-lock
+        # between rows". C2a removed this call for the run_db path and silently
+        # broke that contract for those three, so one long pass held the SQLite
+        # write lock for its whole duration and every concurrent user save got
+        # "database is locked" (observed 2026-08-18 22:47 onward: a label save
+        # and the supply-regime sampler both refused for minutes).
+        if yield_lock:
+            yield_write_lock(conn, scanned)
     conn.commit()
     counters.update(scanned=scanned, matched=matched,
                     rule_matched=rule_matched,
@@ -7739,7 +7749,10 @@ def reclassify_all_events_from_signatures(
     ctx, rows = _reclassify_prepare(conn, circuit, ha_tz, since_ts,
                                     backlog_limit)
     counters = _new_reclassify_counters()
-    _reclassify_chunk_sync(conn, circuit, rows, ctx, counters)
+    # yield_lock=True: this entry point runs on a PRIVATE connection inside
+    # run_isolated_write, where releasing the file write-lock periodically is
+    # what lets a waiting user save through. See the note at the call site.
+    _reclassify_chunk_sync(conn, circuit, rows, ctx, counters, yield_lock=True)
     return _reclassify_finalize(conn, circuit, since_ts, ctx, counters)
 
 
