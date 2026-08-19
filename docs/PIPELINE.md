@@ -668,11 +668,44 @@ with no ceiling. Abstention made it permanent — an abstention's stored form is
 decision had been made.
 
 `events.verdict_stamp` records **which inputs produced this row's verdict**:
-classifier code version, the circuit's rule bands, and its label pool. The
-candidate query adds one clause — `verdict_stamp IS NULL OR <> :current` — so
-skipping is loss-free by construction and every uncertain case falls on the
-recompute side. Every row examined is stamped, *including* ones already
-correct; that is the half that actually retires a repeat abstention.
+the classifier code version and the circuit's rule bands. The candidate query
+adds one clause — `verdict_stamp IS NULL OR <> :current` — so skipping is
+loss-free by construction and every uncertain case falls on the recompute
+side. Every row examined is stamped, *including* ones already correct; that is
+the half that actually retires a repeat abstention.
+
+**Labels PUSH, they do not poll.** The stamp deliberately does not hash the
+label pool. It did at first, and that made it useless on the circuit that
+mattered: one new label invalidated all ~5,400 events, so the boot pass ran in
+full every time the operator labelled anything. Measured on the production
+database — labelling 3 events re-derived 5,417 verdicts in 85 s and moved
+**zero** of them. Instead, labelling an event releases the stamps of its
+*cluster peers*, and only those a label can actually reach:
+
+| peer's `matched_via` | released? | why |
+|---|---|---|
+| NULL (abstained), `knn`, `fingerprint`, `composite` | yes | decided by evidence a new exemplar can move |
+| `rule_*`, `washer_cycle`, `dishwasher_cycle`, `softener_session` | **no** | the ladder tries rules FIRST; bands are locked and features immutable, so the verdict cannot change |
+
+This is the locked-baseline architecture applied consistently: of the three
+inputs to an old event's verdict — its features, its era's bands, the label
+pool — the first two are frozen, so only the third needs a propagation
+mechanism, and its reach is bounded.
+
+Cluster membership is an imperfect proxy for similarity (46e measured
+DBSTREAM purity at 0.387; circuit_1 has collapsed into two mega-clusters), so
+a label *can* reach a peer in another cluster. The weekly unfiltered pass is
+what makes that acceptable — a miss lands within days rather than never. It
+also means this gets better for free when the DBSTREAM assignment step is
+replaced.
+
+**Boot's remaining job is catch-up, not sweeping.** The hourly maturity
+re-check covers the last 6 h because cycle context arrives after an event
+closes. If the add-on was off — power cut, redeploy, crash — those hours got
+no re-check, and the stamp cannot tell: the events were stamped when first
+classified, so they look settled. Boot therefore re-opens that window
+(`release_settle_window`), which is a few dozen events. Anything missed
+entirely returns as a NEW row from the historical importer, unstamped already.
 
 Per-row invalidation is a **trigger** on the classifier-input columns, not a
 call at each write site: those writes live in nine or more places and a missed

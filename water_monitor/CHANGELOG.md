@@ -35,9 +35,17 @@ landed without a version bump; per-build details are in git history.)
   limit. It stored the answer but never stored anything about whether that
   answer was still good. Each event now records which inputs produced its
   label, so a restart re-checks only what could genuinely have moved —
-  everything else is left alone. A new build, a rules re-fit, or a label you
-  save all still trigger a full re-check, which is exactly when you want one.
-  Measured on the real database: 80 seconds down to under one.
+  everything else is left alone. A new build or a rules re-fit still triggers
+  a full re-check, which is exactly when you want one.
+
+  Saving a label used to trigger one too, and that made the whole thing
+  pointless in practice — you label constantly, so the long pass ran on every
+  restart anyway. Measured: labelling 3 events re-checked 5,417 and changed
+  none of them. A label now only re-checks the events it could plausibly
+  affect (its own group, and only those the locked rules didn't already
+  decide), which is also why this keeps working as your history grows instead
+  of getting slower forever. Measured on the real database: 80 seconds down to
+  under one, and a restart after labelling down from 85 to 72.
 
 - **Yesterday's water is checked against the meter — dev46** — every night the
   add-on now compares the water it recorded against the flow meter's own

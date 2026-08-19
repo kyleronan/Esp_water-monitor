@@ -3866,6 +3866,14 @@ def patch_event(
             "WHERE id = ? AND circuit = ?",
             (user_fixture_type, src, event_id, circuit),
         )
+        # dev46 (46k) — push the new exemplar's influence to the events it can
+        # plausibly reach, instead of having every boot poll the whole table
+        # to find out. This is the ONLY thing that propagates a label
+        # backwards now that the stamp no longer hashes the label pool.
+        _released = invalidate_cluster_verdict_stamps(conn, circuit, event_id)
+        if _released:
+            log.debug("[%s] label on %s released %d cluster peer(s) for "
+                      "re-classification", circuit, event_id[:8], _released)
     if user_ignored is not _PATCH_UNSET:
         ign = 1 if user_ignored else 0
         excluded = 1 if (ign or row["is_pressure_restoration_phantom"]
@@ -6770,7 +6778,10 @@ def _invariant_knn_fallback(_labelled, event_features) -> Optional[Dict[str, Any
 # folded in, a component computed differently). Every stamp then differs from
 # every stored one and the next pass re-derives everything, which is the
 # correct response to "the rule for deciding staleness just changed".
-_VERDICT_STAMP_ALGO = 1
+# v2 (2026-08-18): the label pool left the stamp — a label now pushes an
+# invalidation to its own cluster instead. Bumping forces one full re-derive so
+# no row keeps a stamp computed under the old, stricter rule.
+_VERDICT_STAMP_ALGO = 2
 
 # Force a full unstamped pass if the last one is older than this. The stamp can
 # only be as complete as the input list baked into it; this is what stops an
@@ -6841,14 +6852,30 @@ def compute_verdict_stamp(conn: sqlite3.Connection, circuit: str) -> str:
     * **rule bands, all regimes** — bands are fitted per supply regime and an
       event is judged by ITS era's bands, so a re-fit in any regime can move
       verdicts. Cheap: one row per regime.
-    * **label pool (id + label)** — the k-NN pool, the fingerprint library and
-      the per-type signatures are all built from labelled events, so one new
-      or changed label can move any unlabelled verdict. Hashed over ids AND
-      labels so a RELABEL counts, which a bare COUNT(*) would miss.
+    **The label pool is deliberately NOT here, and that is the whole design.**
+    It was, and it made the stamp useless on the circuit that mattered: one
+    new label invalidated all ~5,400 events, so the boot pass ran in full
+    every time the operator labelled anything — which is constantly. Measured
+    on the production database: labelling 3 events re-derived 5,417 verdicts
+    in 85 s and moved **zero** of them. Three more examples of a class that
+    already has dozens does not shift a k-NN neighbourhood.
 
-    Deliberately NOT included: an individual event's own features. Those are
-    per-row, and a global stamp cannot express them — anything that rewrites
-    them calls ``invalidate_verdict_stamps`` instead.
+    A label's realistic reach is events SIMILAR to it, which is a bounded set,
+    not the whole table — so a label PUSHES an invalidation to its own cluster
+    (``invalidate_cluster_verdict_stamps``) instead of the stamp polling every
+    row. That keeps the cost proportional to what could actually change, and
+    flat as the table grows: at 20,000 events the old rule would have swept
+    ~9 minutes per boot to conclude nothing had changed.
+
+    Also deliberately not here: an individual event's own features. Those are
+    per-row, and a global stamp cannot express them — the invalidation trigger
+    handles those.
+
+    What makes both omissions safe is ``_VERDICT_STAMP_MAX_AGE_DAYS``: a
+    cluster is an imperfect proxy for similarity (46e measured DBSTREAM label
+    purity at 0.387), so a label CAN reach an event in another cluster. The
+    weekly unfiltered pass means anything the targeted invalidation misses
+    lands within days rather than never.
     """
     import hashlib
 
@@ -6868,13 +6895,80 @@ def compute_verdict_stamp(conn: sqlite3.Connection, circuit: str) -> str:
     except sqlite3.OperationalError:        # pre-migration schema
         h.update(b"|band:unavailable")
 
-    for r in conn.execute(
-            "SELECT id, user_fixture_type FROM events "
-            "WHERE circuit = ? AND user_fixture_type IS NOT NULL "
-            "ORDER BY id", (circuit,)):
-        h.update(f"|lbl:{r[0]}:{r[1]}".encode())
-
     return h.hexdigest()[:32]
+
+
+def invalidate_cluster_verdict_stamps(conn: sqlite3.Connection, circuit: str,
+                                      event_id: str) -> int:
+    """A new label PUSHES a re-check to the events it could plausibly affect.
+
+    Called when the operator labels an event. Its cluster is the set of
+    events the classifier considers similar, and therefore the set whose
+    verdicts a new exemplar can realistically move. Releasing those — rather
+    than the whole circuit — is what keeps the work proportional to the change
+    and flat as history grows.
+
+    The event itself does not need releasing: it now carries a user label, so
+    the pass skips it by definition (``user_fixture_type IS NULL``).
+
+    Returns the number of peers released. Zero is normal and fine — an event
+    with no cluster yet simply has no known neighbours, and the weekly
+    unfiltered pass is the backstop for anything this misses.
+    """
+    row = conn.execute(
+        "SELECT cluster_id FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit)).fetchone()
+    if row is None or row[0] is None:
+        return 0
+    # Narrow further by TIER, and the reason is the locked-baseline design.
+    # The ladder tries the rule tier FIRST and the label-driven tiers only
+    # when it abstains. Rule bands are fit-once and hard-locked, and an
+    # event's features are immutable, so a peer already claimed by a rule
+    # (or by a cycle/session detector, which sit above the label tiers and
+    # are equally rule-driven) will return the identical verdict no matter
+    # how many labels exist. Re-deriving those is provably wasted work.
+    #
+    # Everything else — an abstention, a fingerprint hit, a k-NN hit — was
+    # decided by evidence a new exemplar can move, so it is released.
+    cur = conn.execute(
+        "UPDATE events SET verdict_stamp = NULL "
+        "WHERE circuit = ? AND cluster_id = ? AND user_fixture_type IS NULL "
+        "  AND verdict_stamp IS NOT NULL "
+        # LIKE 'rule%' rather than a list: the tier emits rule_toilet,
+        # rule_shower, rule_dishwasher and gains more as rules are added, and
+        # an enumeration would silently stop covering the new ones.
+        "  AND (matched_via IS NULL OR (matched_via NOT LIKE 'rule%' "
+        "       AND matched_via NOT IN ('softener_session','washer_cycle',"
+        "                               'dishwasher_cycle')))",
+        (circuit, row[0]))
+    return cur.rowcount or 0
+
+
+def release_settle_window(conn: sqlite3.Connection, circuit: str,
+                          hours: int) -> int:
+    """Re-open recent events for one pass — boot's CATCH-UP job.
+
+    The hourly maturity re-check (maturity_recheck.py) re-evaluates events
+    from the last few hours, because an event's cycle context arrives after
+    it closes. If the add-on was off — a power cut, a redeploy, a crash —
+    those hours had no re-check, and the stamp alone would not know: those
+    events were stamped when they were first classified, so they look settled.
+
+    Boot therefore releases the same window unconditionally. It is a handful
+    of events (the hourly pass logs 6-26), so it costs nothing, and it means a
+    restart can never leave an event stuck with a verdict taken before its
+    cycle context landed.
+
+    Events the add-on missed entirely arrive as NEW rows via the historical
+    importer and are unstamped already, so they need nothing here.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    cur = conn.execute(
+        "UPDATE events SET verdict_stamp = NULL "
+        "WHERE circuit = ? AND start_ts >= ? AND user_fixture_type IS NULL "
+        "  AND verdict_stamp IS NOT NULL",
+        (circuit, cutoff))
+    return cur.rowcount or 0
 
 
 def _verdict_stamp_pass_is_due(conn: sqlite3.Connection, circuit: str) -> bool:

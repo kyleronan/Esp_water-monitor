@@ -712,11 +712,33 @@ class Orchestrator:
         """
         from .database import (reclassify_all_events_from_signatures_async,
                                recompute_cycle_pulse_counts,
+                               release_settle_window,
                                resuggest_all_clusters,
                                recompute_all_user_label_suggestions,
                                run_db)
+        from .maturity_recheck import _SETTLE_HORIZON_HOURS
         try:
             for c in self._cfg.circuits:
+                # dev46 (46k) — CATCH-UP, and the only reason boot re-derives
+                # anything by default any more.
+                #
+                # The hourly maturity re-check re-evaluates the last few hours,
+                # because an event's cycle context lands after it closes. If
+                # the add-on was off — power cut, redeploy, crash — those hours
+                # got no re-check, and the stamp cannot tell: those events were
+                # stamped when first classified, so they look settled. So boot
+                # re-opens the same window. A handful of events, and it means a
+                # restart can never strand an event on a verdict taken before
+                # its cycle context arrived.
+                #
+                # Events missed entirely come back as NEW rows from the
+                # historical importer, already unstamped, so they need nothing.
+                reopened = await run_db(release_settle_window, self._db,
+                                        c.circuit, _SETTLE_HORIZON_HOURS)
+                if reopened:
+                    log.info("[%s] startup: re-opened %d recent event(s) for "
+                             "the settle re-check the hourly pass may have "
+                             "missed", c.circuit, reopened)
                 # dev.22: cycle-pulse backfill MUST precede reclassify so the
                 # matcher's cycle_pulse_count feature is populated before it types.
                 cyc = await _timed_startup_job(
