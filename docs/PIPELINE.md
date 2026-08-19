@@ -723,6 +723,24 @@ that conversation finished before it started, and the hourly pass would skip
 it for the rest of the window, silently disabling the mechanism. So young
 rows keep a NULL stamp until they age out.
 
+**The backlog trickles; it never bursts.** A new build legitimately
+invalidates every stamp — but nobody is *waiting* for that work, and doing it
+at boot put ~150 s at the one moment the operator has just deployed and wants
+to look at the add-on. Boot and the hourly re-check each take a bounded slice
+(`_VERDICT_BACKLOG_PER_PASS`), so a deploy costs ~14 s of background work and
+the rest drains overnight at ~13 s an hour. Every capped pass logs what it
+left queued — a backlog that drains silently is one nobody can tell has
+stalled.
+
+Priority inside the budget is **who is waiting**: rows with a NULL stamp
+(new events, ones still settling, peers freed by a label you just saved) sort
+ahead of merely-stale ones, then newest first. Without that ordering, saving a
+label during a long drain would appear to do nothing for hours.
+
+The cap is opt-in, so operator-triggered work stays immediate: a rules re-fit
+or a manual reprocess re-derives the whole circuit in one pass, because there
+the operator *is* waiting for the answer.
+
 **Boot's remaining job is catch-up, not sweeping.** It scans whatever is
 unstamped: new events, released cluster peers, and anything still settling.
 That covers the offline case with no special handling — an event that aged

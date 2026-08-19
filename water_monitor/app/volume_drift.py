@@ -151,9 +151,18 @@ async def check_yesterdays_drift(orch, circuit: str) -> Dict[str, Any]:
                 continue
         if len(vals) >= 2:
             t0, t1 = vals[0], vals[-1]
+        # Keep the raw shape of what HA returned. The first real firing
+        # (2026-08-18, circuit_1) reported a 417.8 L over-count that raw flow
+        # history refuted to within 0.1% — the EVENTS were right and this
+        # meter read was the outlier — and it could not be diagnosed because
+        # only the delta was logged. A witness that can accuse the rest of the
+        # pipeline has to show its own working.
+        _n = len(vals)
+        _lo, _hi = (min(vals), max(vals)) if vals else (None, None)
     except Exception as e:                      # noqa: BLE001 — HA is optional
         log.debug("[%s] volume drift: firmware total unavailable: %s", circuit, e)
         t0 = t1 = None
+        _n, _lo, _hi = 0, None, None
 
     if counter_was_reset(t0, t1):
         log.info("[%s] volume drift: firmware counter reset (%.1f -> %.1f) — "
@@ -169,7 +178,12 @@ async def check_yesterdays_drift(orch, circuit: str) -> Dict[str, Any]:
     verdict.update({"circuit": circuit, "window_start": start_utc,
                     "window_end": end_utc, "events_litres": round(events_l, 3),
                     "recorder_litres": (round(recorder_l, 3)
-                                        if recorder_l is not None else None)})
+                                        if recorder_l is not None else None),
+                    # Provenance of the meter half, so a verdict can be
+                    # audited from the returned dict alone.
+                    "recorder_samples": _n,
+                    "recorder_first": t0, "recorder_last": t1,
+                    "recorder_min": _lo, "recorder_max": _hi})
 
     # flagged_delta only — `corrections` stays at zero from this path by
     # design; this module reports, it never rewrites.
@@ -182,6 +196,19 @@ async def check_yesterdays_drift(orch, circuit: str) -> Dict[str, Any]:
                     "(%+.1f L, %s) — %s", circuit, recorder_l, events_l,
                     verdict["drift_litres"], verdict["direction"],
                     verdict["note"])
+        # The counter reads this verdict rests on. A drift report is an
+        # accusation against the rest of the pipeline, so it has to be
+        # checkable without a second deploy: a short series, or endpoints that
+        # do not bracket the range, means the METER read is the suspect rather
+        # than the events. Exactly that happened on the first firing.
+        log.warning("[%s] volume drift: counter %s -> %s over %d sample(s) "
+                    "(range %s..%s) for %s..%s — if these look wrong, suspect "
+                    "the meter read before the events", circuit,
+                    f"{t0:.1f}" if t0 is not None else "n/a",
+                    f"{t1:.1f}" if t1 is not None else "n/a", _n,
+                    f"{_lo:.1f}" if _lo is not None else "n/a",
+                    f"{_hi:.1f}" if _hi is not None else "n/a",
+                    start_utc[:16], end_utc[:16])
     else:
         log.info("[%s] volume drift: %s (meter %s vs events %.1f L)",
                  circuit, verdict["status"],

@@ -744,10 +744,19 @@ class Orchestrator:
                 cyc = await _timed_startup_job(
                     f"recompute_cycle_pulse_counts[{c.circuit}]",
                     run_db(recompute_cycle_pulse_counts, self._db, c.circuit))
+                # dev46 (46k) — boot takes a SLICE, never the whole backlog.
+                # A new build legitimately invalidates every stamp, but nobody
+                # is waiting for that work: it needs doing eventually, not at
+                # the one moment the operator wants to look at the add-on.
+                # Deliberately-released rows (settle window, new events, a
+                # label's cluster peers) sort first inside the budget, so the
+                # things someone IS waiting on still land immediately.
+                from .database import _VERDICT_BACKLOG_PER_PASS
                 r = await _timed_startup_job(
                     f"reclassify[{c.circuit}]",
                     reclassify_all_events_from_signatures_async(
-                        self._db, c.circuit))
+                        self._db, c.circuit,
+                        backlog_limit=_VERDICT_BACKLOG_PER_PASS))
                 if r.get("events_matched") or r.get("events_cleared"):
                     log.info(
                         "[%s] startup reclassify: %d matched, %d abstained, "

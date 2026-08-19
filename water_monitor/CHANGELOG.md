@@ -47,6 +47,15 @@ landed without a version bump; per-build details are in git history.)
   of getting slower forever. Measured on the real database: 80 seconds down to
   under one, and a restart after labelling down from 85 to 72.
 
+  A new build still has to re-check everything — a code change can move any
+  rule, and that is exactly what you want after one. But nobody is waiting for
+  that, so it no longer happens all at once while you are trying to look at the
+  add-on: a slice runs at startup and the rest drains quietly over the next few
+  hours, newest events first. Things you ARE waiting on skip the queue — a
+  label you just saved, and re-fitting the rules, both still take effect
+  immediately. Measured: a restart straight after a deploy went from 157
+  seconds of churn to 14.
+
 - **Yesterday's water is checked against the meter — dev46** — every night the
   add-on now compares the water it recorded against the flow meter's own
   running total for the same day and reports any gap. This is the one check

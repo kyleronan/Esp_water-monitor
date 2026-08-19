@@ -7115,8 +7115,22 @@ def _new_reclassify_counters() -> Dict[str, Any]:
             "changed": 0, "veto_counts": {}}
 
 
+# dev46 (46k) — how many events one pass may re-derive. The backlog left by a
+# global change (a new build, a rules re-fit) is drained a slice at a time by
+# the hourly pass instead of in one burst, because NOBODY IS WAITING for it:
+# a deploy needs the work done eventually, not now, and doing it at boot put
+# it at the single worst moment — right when the operator wants to look at the
+# add-on. ~400 costs a few seconds and drains 5,400 events overnight.
+#
+# Deliberately released rows (NULL stamp — new events, the settle window, a
+# label's cluster push) are prioritised inside this budget, because those DO
+# have someone waiting on them.
+_VERDICT_BACKLOG_PER_PASS: int = 400
+
+
 def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
-                        since_ts: Optional[str] = None):
+                        since_ts: Optional[str] = None,
+                        backlog_limit: Optional[int] = None):
     """Everything a reclassify pass computes ONCE, plus its candidate rows.
 
     dev46 (46a/C2a) — split out of ``reclassify_all_events_from_signatures``
@@ -7298,13 +7312,40 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
          "match_rejection_reason",       # dev33: abstention marker mark/retract
          "active_flow_segment_count")
         + qfeats + _SCORE_COLS))
-    rows = conn.execute(
-        "SELECT " + ", ".join(select_cols) + " "
-        "FROM events "
-        + where + " "
-        "ORDER BY start_ts",
-        qparams,
-    ).fetchall()
+    # dev46 (46k) — TRICKLE. With a budget, take the highest-priority slice
+    # and leave the rest for the next pass.
+    #
+    # The inner ORDER BY ranks by WHO IS WAITING:
+    #   verdict_stamp IS NULL first — deliberately released rows: a new event,
+    #     one still settling, a peer freed by a label you just saved. Someone
+    #     is looking at those.
+    #   then start_ts DESC — within the global backlog, recent events first,
+    #     because that is what the operator actually opens.
+    #
+    # The subquery picks the slice; the outer ORDER BY start_ts keeps the row
+    # loop's existing ascending order, so batching changes WHICH rows a pass
+    # sees, never how it processes them.
+    backlog_remaining = 0
+    if backlog_limit is not None and backlog_limit > 0:
+        total = conn.execute("SELECT COUNT(*) FROM events " + where,
+                             qparams).fetchone()[0]
+        backlog_remaining = max(0, total - backlog_limit)
+        rows = conn.execute(
+            "SELECT " + ", ".join(select_cols) + " FROM events "
+            "WHERE id IN (SELECT id FROM events " + where + " "
+            "             ORDER BY (verdict_stamp IS NOT NULL), start_ts DESC "
+            "             LIMIT ?) "
+            "ORDER BY start_ts",
+            qparams + [backlog_limit],
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT " + ", ".join(select_cols) + " "
+            "FROM events "
+            + where + " "
+            "ORDER BY start_ts",
+            qparams,
+        ).fetchall()
     return ({
         "signatures_trained": signatures_trained,
         "softener_ids":       softener_ids,
@@ -7325,6 +7366,7 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         "verdict_stamp":      stamp,
         "forced_full":        forced,
         "stamp_before_ts":    stamp_before_ts,
+        "backlog_remaining":  backlog_remaining,
     }, rows)
 
 
@@ -7588,6 +7630,9 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
         # dev46 (46k) — rows whose verdict actually differed from the stored
         # one. The pass's only real output; everything above is throughput.
         "events_changed": changed,
+        # dev46 (46k) — what this pass deliberately did NOT do. A capped pass
+        # that reports only what it processed reads as "everything is done".
+        "events_backlog_remaining": ctx.get("backlog_remaining") or 0,
         "events_embedded_annotated": embedded_annotated,
         "events_composite_other": embedded_other,
     }
@@ -7623,7 +7668,12 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
     # would once again be permanent.
     if ctx.get("forced_full"):
         _mark_full_reclassify(conn, circuit)
-    if not scanned:
+    _left = ctx.get("backlog_remaining") or 0
+    if _left:
+        log.info("[%s] reclassify: %d event(s) re-derived, %d still queued — "
+                 "draining in the background so a deploy costs nothing at boot",
+                 circuit, scanned, _left)
+    if not scanned and not _left:
         log.info("[%s] reclassify: nothing to do — every unlabelled event "
                  "already carries the current verdict stamp (code, rule bands "
                  "and labels all unchanged since the last pass)", circuit)
@@ -7637,7 +7687,8 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
 
 async def reclassify_all_events_from_signatures_async(
         conn: sqlite3.Connection, circuit: str, ha_tz=None,
-        since_ts: Optional[str] = None, batch: int = 200) -> Dict[str, Any]:
+        since_ts: Optional[str] = None, batch: int = 200,
+        backlog_limit: Optional[int] = None) -> Dict[str, Any]:
     """dev46 (46a/C2a) — ``reclassify_all_events_from_signatures`` in chunks.
 
     Same pass, same result, but the row loop is submitted to ``run_db`` one
@@ -7649,7 +7700,7 @@ async def reclassify_all_events_from_signatures_async(
     one run_db call. Prepare and finalize are their own submissions.
     """
     ctx, rows = await run_db(_reclassify_prepare, conn, circuit, ha_tz,
-                             since_ts)
+                             since_ts, backlog_limit)
     counters = _new_reclassify_counters()
     for i in range(0, len(rows), batch):
         await run_db(_reclassify_chunk_sync, conn, circuit,
@@ -7664,6 +7715,7 @@ def reclassify_all_events_from_signatures(
     circuit: str,
     ha_tz=None,
     since_ts: Optional[str] = None,
+    backlog_limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Retrain signatures, then backfill ``matched_fixture_type`` over every
     unlabelled event on ``circuit`` — STRUCTURAL RULES FIRST (dev.24 precedence:
@@ -7684,7 +7736,8 @@ def reclassify_all_events_from_signatures(
     Returns counts: ``{"signatures_trained", "events_scanned", "events_matched",
     "events_rule_matched", "events_cleared", "events_abstained"}``.
     """
-    ctx, rows = _reclassify_prepare(conn, circuit, ha_tz, since_ts)
+    ctx, rows = _reclassify_prepare(conn, circuit, ha_tz, since_ts,
+                                    backlog_limit)
     counters = _new_reclassify_counters()
     _reclassify_chunk_sync(conn, circuit, rows, ctx, counters)
     return _reclassify_finalize(conn, circuit, since_ts, ctx, counters)

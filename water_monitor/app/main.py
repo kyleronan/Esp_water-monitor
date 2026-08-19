@@ -288,9 +288,24 @@ async def lifespan(app: FastAPI):
         autoescape=select_autoescape(["html", "htm"]),
     )
 
-    # Static-asset cache-buster — derived from the addon version so a deploy
-    # version bump automatically busts the browser's cached styles.css / JS.
-    app.state.asset_version = _read_addon_version()
+    # Static-asset cache-buster.
+    #
+    # It used to be the addon version alone, and that is stable for a whole dev
+    # cycle: every rebuild of 0.3.1-dev46 emitted the same `?v=0.3.1-dev46`, so
+    # the browser kept serving a styles.css / app.js it had cached days and
+    # many deploys earlier. A front-end fix could be deployed repeatedly and
+    # never reach the page — with nothing in any log to say so.
+    #
+    # The build fingerprint changes whenever any module does, which is exactly
+    # the condition under which cached assets must be discarded. (Same root
+    # cause as the verdict stamp's code component — a version string is not a
+    # build identity inside a dev cycle.)
+    try:
+        from .database import _code_fingerprint
+        app.state.asset_version = (f"{_read_addon_version()}-"
+                                   f"{_code_fingerprint()[:8]}")
+    except Exception:                       # noqa: BLE001 — never block boot
+        app.state.asset_version = _read_addon_version()
 
     # Register tojson filter (not included by default in FastAPI's Jinja2).
     # Must return Markup so Jinja2 autoescape does not HTML-encode the JSON

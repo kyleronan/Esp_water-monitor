@@ -94,7 +94,26 @@ class MaturityRecheck:
             recompute_cycle_pulse_counts(conn, circuit, since_ts=window_start)
             r = reclassify_all_events_from_signatures(conn, circuit,
                                                       since_ts=window_start)
+            # dev46 (46k) — drain a SLICE of the global backlog.
+            #
+            # The pass above is windowed to the settle horizon, so it can
+            # never work off the events a global change invalidated (a new
+            # build, a rules re-fit). That backlog used to be cleared in one
+            # ~150 s burst at boot, which is the worst possible moment: the
+            # operator has just deployed and wants to look at the add-on, and
+            # nobody is waiting on the work itself.
+            #
+            # So it drains here instead, a bounded slice per hour, alongside
+            # the other quiet-time jobs this add-on already runs. Rows with a
+            # NULL stamp — new events, ones still settling, peers freed by a
+            # label — sort first inside the budget, because those DO have
+            # someone waiting.
+            from .database import _VERDICT_BACKLOG_PER_PASS
+            b = reclassify_all_events_from_signatures(
+                conn, circuit, backlog_limit=_VERDICT_BACKLOG_PER_PASS)
             resuggest_all_clusters(conn, circuit)
+            r["backlog_scanned"] = b.get("events_scanned", 0)
+            r["backlog_remaining"] = b.get("events_backlog_remaining", 0)
             return r
 
         res = await run_isolated_write(DB_PATH, _job)
@@ -102,6 +121,12 @@ class MaturityRecheck:
             log.info("[%s] maturity re-check (last %dh): %d matched, %d cleared",
                      circuit, _SETTLE_HORIZON_HOURS, res.get("events_matched", 0),
                      res.get("events_cleared", 0))
+        # dev46 (46k) — say what the trickle did and what is still queued. A
+        # backlog that drains silently is one nobody can tell has stalled.
+        if res and (res.get("backlog_scanned") or res.get("backlog_remaining")):
+            log.info("[%s] backlog re-derive: %d event(s) this hour, %d still "
+                     "queued", circuit, res.get("backlog_scanned", 0),
+                     res.get("backlog_remaining", 0))
 
         # §2 recorder reconciliation — best-effort, AFTER the reclassify job released the
         # write lock (the reconcile pass takes its own isolated write). A reconcile bug
