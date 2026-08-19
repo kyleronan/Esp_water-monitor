@@ -7127,6 +7127,19 @@ def _new_reclassify_counters() -> Dict[str, Any]:
 # have someone waiting on them.
 _VERDICT_BACKLOG_PER_PASS: int = 400
 
+# dev46 (46k) — the chunk budget, in SECONDS, because that is what the C2a
+# contract is actually about: how long one run_db call can hold the single DB
+# worker before a queued page render notices. ~1 s is the threshold at which a
+# wait stops being distinguishable from a normal request.
+_CHUNK_TARGET_SECONDS: float = 1.0
+# First chunk of a pass, before there is a measurement to aim with. Small on
+# purpose: guessing low costs one extra round-trip, guessing high costs the
+# operator a visible stall on exactly the boot they are watching.
+_CHUNK_START_ROWS: int = 25
+# Never go below this, or chunk overhead (a commit and a round-trip each) would
+# dominate on a slow event.
+_CHUNK_MIN_ROWS: int = 5
+
 
 def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
                         since_ts: Optional[str] = None,
@@ -7712,9 +7725,34 @@ async def reclassify_all_events_from_signatures_async(
     ctx, rows = await run_db(_reclassify_prepare, conn, circuit, ha_tz,
                              since_ts, backlog_limit)
     counters = _new_reclassify_counters()
-    for i in range(0, len(rows), batch):
+    # dev46 (46k) — ADAPTIVE batch, because a fixed row count is not a time
+    # budget and the contract is stated in time: "no single run_db call holds
+    # the worker for more than ~1 s" (C2a).
+    #
+    # batch=200 met that on the machine it was written on and missed it by 17x
+    # on the target: a production event costs ~87 ms here, so 200 rows held the
+    # single worker ~17 s. With a 400-row slice that is two chunks, and a page
+    # render queued behind one waited ~17 s — the operator saw "pages are
+    # ready" logged and then could not open a page for 37 s (2026-08-18 23:11).
+    # Chunking that releases the worker twice is not chunking.
+    #
+    # So the driver measures its own throughput and re-aims each chunk at the
+    # budget. Self-tuning beats a tuned constant here: per-event cost varies
+    # with hardware, waveform size and how many tiers an event reaches, and no
+    # single number is right for a dev laptop and a HA host at once.
+    import time as _time
+
+    i, size = 0, min(batch, _CHUNK_START_ROWS)
+    while i < len(rows):
+        t0 = _time.monotonic()
         await run_db(_reclassify_chunk_sync, conn, circuit,
-                     rows[i:i + batch], ctx, counters)
+                     rows[i:i + size], ctx, counters)
+        took = _time.monotonic() - t0
+        i += size
+        if took > 0.01:
+            per_row = took / max(1, size)
+            size = int(_CHUNK_TARGET_SECONDS / per_row)
+        size = max(_CHUNK_MIN_ROWS, min(batch, size))
     return await run_db(_reclassify_finalize, conn, circuit, since_ts, ctx,
                         counters)
 

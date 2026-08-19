@@ -811,6 +811,12 @@ class Orchestrator:
 
     async def run(self) -> None:
         """Initialise and run all components concurrently."""
+        # dev46 (46k) — so the readiness line states its own elapsed time.
+        # Reading it used to mean subtracting two timestamps several hundred
+        # log lines apart, which is exactly how a 61 s time-to-usable got
+        # reported (by me) as the 24 s that the flag flipped at.
+        import time as _time
+        _run_t0 = _time.monotonic()
         # Database
         self._db = init_db(DB_PATH)
 
@@ -1026,8 +1032,8 @@ class Orchestrator:
             # got a spinner and could do nothing. On a repeat boot that entire
             # 145 s changed ZERO verdicts (see events_changed, database.py).
             self.startup_pages_ready = True
-            log.info("startup: pages are ready — classification continues in "
-                     "the background")
+            log.info("startup: pages are ready after %.1fs — classification "
+                     "continues in the background", _time.monotonic() - _run_t0)
 
             self._startup_classify_task = asyncio.create_task(
                 self._run_startup_classification())
