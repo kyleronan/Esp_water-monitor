@@ -7294,10 +7294,34 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     # pass would compute. Skipping is therefore loss-free by construction, and
     # every uncertain case falls on the recompute side.
     stamp = compute_verdict_stamp(conn, circuit)
+    # dev46 (46k) — the weekly backstop INVALIDATES; it does not bypass.
+    #
+    # It used to bypass the stamp filter for one pass. That worked while a
+    # pass meant "every candidate", and broke the moment the backlog trickle
+    # made every pass a slice: bypassing means rows already re-derived in this
+    # sweep stay candidates, so the sweep re-does the same slice forever and
+    # never finishes. Marking completion after one slice was no better — the
+    # backstop would cover 400 of ~5,500 rows and restart its own clock,
+    # becoming the permanent silent omission it exists to prevent.
+    #
+    # Clearing the stamps instead makes the sweep ordinary work: every row is
+    # now genuinely un-derived, the normal filter picks it up, and the trickle
+    # drains it at the usual rate with no special case anywhere. The clock
+    # restarts HERE, at the start, because the invalidation is what guarantees
+    # the coverage happens — the rows cannot be skipped again until they are
+    # re-stamped, one slice at a time.
     forced = _verdict_stamp_pass_is_due(conn, circuit)
-    if not forced:
-        where += (" AND (verdict_stamp IS NULL OR verdict_stamp <> ?)")
-        qparams.append(stamp)
+    if forced:
+        n = conn.execute(
+            "UPDATE events SET verdict_stamp = NULL "
+            "WHERE circuit = ? AND user_fixture_type IS NULL "
+            "  AND verdict_stamp IS NOT NULL", (circuit,)).rowcount or 0
+        conn.commit()
+        _mark_full_reclassify(conn, circuit)
+        log.info("[%s] reclassify: periodic full re-derive due — re-opened %d "
+                 "event(s); they drain at the normal slice rate", circuit, n)
+    where += (" AND (verdict_stamp IS NULL OR verdict_stamp <> ?)")
+    qparams.append(stamp)
 
     # dev46 (46k) — an event younger than the settle horizon is NOT DECIDED
     # YET, so it must not be stamped.
@@ -7689,8 +7713,9 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
     # pass skips rows by design and must not be mistaken for full coverage,
     # or the backstop would never fire and the omission it guards against
     # would once again be permanent.
-    if ctx.get("forced_full"):
-        _mark_full_reclassify(conn, circuit)
+    # NOTE: the periodic full re-derive is marked at its START, in prepare,
+    # where it clears the stamps. Nothing to record here — by the time this
+    # runs the rows are already un-stamped and will drain like any others.
     _left = ctx.get("backlog_remaining") or 0
     if _left:
         log.info("[%s] reclassify: %d event(s) re-derived, %d still queued — "
