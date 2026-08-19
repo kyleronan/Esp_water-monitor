@@ -2055,18 +2055,17 @@ async function settingsValveTypeUpdate(circuit, valveType, radio) {
 
 async function settingsWinterizedUpdate(circuit, box) {
   const on = !!(box && box.checked);
+  // NOTE the \n\n escapes. These were literal newlines inside the string
+  // when 46h shipped, which JavaScript does not allow — one SyntaxError that
+  // killed this whole <script> block, so settNav() was never defined and
+  // EVERY Settings tab silently stopped working. Nothing server-side logged
+  // it; the only evidence was in the browser console.
   const msg = on
-    ? "Mark this circuit as drained for winter?
-
-It will stop recording "
+    ? "Mark this circuit as drained for winter?\n\nIt will stop recording "
       + "water use, stop running leak tests, and stop learning from its "
-      + "pressure until you turn this off.
-
-Do this BEFORE you drain the "
+      + "pressure until you turn this off.\n\nDo this BEFORE you drain the "
       + "line — afterwards is too late to prevent the alarm."
-    : "Put this circuit back in service?
-
-Refill and re-pressurise the "
+    : "Put this circuit back in service?\n\nRefill and re-pressurise the "
       + "line first. Normal monitoring resumes right away, with a short "
       + "quiet period so refilling doesn't set off an alarm.";
   if (!window.confirm(msg)) {

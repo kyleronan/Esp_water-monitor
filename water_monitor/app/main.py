@@ -574,12 +574,20 @@ async def ingress_middleware(request: Request, call_next):
 # (drop 'unsafe-inline' for script-src, self-host Chart.js) is its
 # own sprint.
 _CHART_CDN = "https://cdnjs.cloudflare.com"
+# styles.css line 4 does `@import url('https://fonts.googleapis.com/...')`, and
+# the CSP did not allow it — so the webfonts were blocked on every page load
+# since the policy shipped, silently falling back to system fonts and logging a
+# console violation each time. Pin the two origins Google Fonts actually uses:
+# the stylesheet comes from fonts.googleapis.com, the font files it references
+# from fonts.gstatic.com, so allowing only the first still blocks the fonts.
+_FONT_CSS_CDN = "https://fonts.googleapis.com"
+_FONT_FILE_CDN = "https://fonts.gstatic.com"
 _CSP_DIRECTIVES = (
     "default-src 'self'; "
     f"script-src 'self' 'unsafe-inline' {_CHART_CDN}; "
-    "style-src 'self' 'unsafe-inline'; "
+    f"style-src 'self' 'unsafe-inline' {_FONT_CSS_CDN}; "
     "img-src 'self' data:; "
-    "font-src 'self' data:; "
+    f"font-src 'self' data: {_FONT_FILE_CDN}; "
     "connect-src 'self'; "
     "frame-ancestors 'self'; "
     "form-action 'self'; "
