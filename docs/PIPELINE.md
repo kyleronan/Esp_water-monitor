@@ -821,6 +821,38 @@ than nightly. Its two honest limits: a leak present on *both* circuits cancels
 out, and the circuits' differing water volumes make cancellation good but not
 perfect.
 
+**The two-circuit differential as a general nightly instrument (dev46 46u) —
+does not hold up; the second of those limits is the binding one.** 46u was
+recorded as blocked on data ("needs more flow-free nights, 1 in 7"). That
+framing was wrong. Requiring a whole 4-hour window with no flow on either
+circuit is what made clean nights rare — this household draws water most
+nights, and one 3 a.m. flush disqualifies the night. Scanning instead for
+flow-free **sub-windows** of ≥ 75 min yields **n = 19 across 12 nights**
+(2026-08-11 … 08-22) rather than n = 1. The data was always there.
+
+With that sample the method fails: residual **mean −0.410 PSI/h, sd 0.394**.
+A leak-free house should scatter around zero; this sits consistently negative
+with a spread as large as its mean, so a "noise floor" derived from it
+(0.273 L/day) measures the method's own bias rather than the house.
+
+The structure says why. The three longest settled spans reproduce 46t's
+result almost exactly — 408 min → −0.060, 284 min → +0.053, 237 min → −0.020
+— while short spans run −0.5 to −1.2, consistent with post-draw
+re-pressurisation still relaxing. But a duration gate alone does not rescue
+it: 08-22 ran 243 min and still gave −1.087, on the night with the steepest
+common-mode fall (main −2.789 PSI/h). Cancellation degrades as the common
+signal grows, which is exactly the differing-water-volumes limit above. A
+proportional correction was checked and rejected — the residual/common ratio
+ranges 0.03 to 0.94, so it is not a single scale factor.
+
+**46u is therefore blocked on METHOD, not data.** What it would need:
+characterising the residual against common-mode magnitude, which most likely
+means measuring each circuit's compliance separately instead of assuming the
+bench 9.5 mL/PSI (a house-side figure) applies to the RPZ-isolated irrigation
+segment too. 46t's finding stands — thermal dominates and the differential
+cancels it *when both circuits are settled*; what does not stand is treating
+that as a nightly instrument.
+
 ---
 
 ## Quick debugging index

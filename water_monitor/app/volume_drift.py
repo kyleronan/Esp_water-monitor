@@ -136,17 +136,39 @@ async def check_yesterdays_drift(orch, circuit: str) -> Dict[str, Any]:
     # two boundary reads, not a sum. Same get_history path the volume
     # baselines use.
     t0 = t1 = None
+    unit = ""          # bound before the try: the failure log reports it too
     try:
         import datetime as _dt
         s_dt = _dt.datetime.fromisoformat(start_utc).replace(tzinfo=_dt.timezone.utc)
         e_dt = _dt.datetime.fromisoformat(end_utc).replace(tzinfo=_dt.timezone.utc)
+        # UNITS. The firmware publishes flow rate in L/min but the cumulative
+        # total in US GALLONS, so the raw counter must be converted before it
+        # can be compared with event litres. Reading it as litres made this
+        # check report a 3.785x "over-count" every single day — the ratio was
+        # identical on both circuits (500.1/133.1 and 3805.4/1005.3), which is
+        # what gave it away, and raw HA flow history confirmed the EVENTS were
+        # right to within 0.01%.
+        #
+        # recorder_reconcile has always done this correctly; this module was
+        # written without it. Same helper, same idiom — deliberately not a
+        # second implementation.
+        from .ha_client import vol_to_litres as _v2l
+
+        unit = ""
+        try:
+            vs = await orch.ha.get_state(cfg.volume_sensor)
+            unit = (vs.get("attributes") or {}).get("unit_of_measurement", "") \
+                if vs else ""
+        except Exception:                   # noqa: BLE001 — unit is best-effort
+            unit = ""
+
         vals = []
         for h in (await orch.ha.get_history(cfg.volume_sensor, s_dt, e_dt)) or []:
             v = h.get("state")
             if v in (None, "", "unknown", "unavailable"):
                 continue
             try:
-                vals.append(float(v))
+                vals.append(_v2l(float(v), unit))
             except (TypeError, ValueError):
                 continue
         if len(vals) >= 2:
@@ -201,14 +223,14 @@ async def check_yesterdays_drift(orch, circuit: str) -> Dict[str, Any]:
         # checkable without a second deploy: a short series, or endpoints that
         # do not bracket the range, means the METER read is the suspect rather
         # than the events. Exactly that happened on the first firing.
-        log.warning("[%s] volume drift: counter %s -> %s over %d sample(s) "
-                    "(range %s..%s) for %s..%s — if these look wrong, suspect "
-                    "the meter read before the events", circuit,
+        log.warning("[%s] volume drift: counter %s -> %s L over %d sample(s) "
+                    "(range %s..%s, sensor unit %r) for %s..%s — if these look "
+                    "wrong, suspect the meter read before the events", circuit,
                     f"{t0:.1f}" if t0 is not None else "n/a",
                     f"{t1:.1f}" if t1 is not None else "n/a", _n,
                     f"{_lo:.1f}" if _lo is not None else "n/a",
                     f"{_hi:.1f}" if _hi is not None else "n/a",
-                    start_utc[:16], end_utc[:16])
+                    unit, start_utc[:16], end_utc[:16])
     else:
         log.info("[%s] volume drift: %s (meter %s vs events %.1f L)",
                  circuit, verdict["status"],
