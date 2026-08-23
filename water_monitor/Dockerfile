@@ -5,7 +5,27 @@ ENV LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# scikit-learn powers the dev47 TinyModel tier (47b). It is installed from
+# ALPINE'S PACKAGE, before pip, and is ALLOWED TO FAIL. Three things forced
+# that shape, all learned the hard way on this base image:
+#
+#  1. scikit-learn ships no musllinux wheel. Asking pip for it makes pip fetch
+#     the 7 MB sdist and try to compile it; the HA base has no compiler, so the
+#     IMAGE BUILD FAILS. (river and aiohttp install fine because they DO ship
+#     musllinux wheels — that is the whole difference.)
+#  2. apk must run BEFORE pip. py3-scikit-learn pulls py3-numpy/py3-scipy, and
+#     pip then satisfies river's numpy requirement from those instead of
+#     installing a second, conflicting copy into the same site-packages.
+#  3. `|| true` is deliberate. The tier is optional at runtime —
+#     `tinymodel.sklearn_available()` reports it unavailable and the kNN ladder
+#     serves exactly as before dev47 — so a missing package must cost the
+#     feature, never the add-on.
+#
+# Do NOT "fix" this by adding gcc/g++/gfortran to force a source build: that is
+# a many-minute compile and a much larger image, for a tier designed to be
+# optional.
 RUN apk add --no-cache python3 py3-pip \
+ && { apk add --no-cache py3-scikit-learn || echo 'py3-scikit-learn unavailable: TinyModel tier stays off, kNN ladder serves'; } \
  && pip3 install --no-cache-dir --break-system-packages \
         fastapi==0.115.0 \
         uvicorn==0.30.6 \
@@ -15,18 +35,7 @@ RUN apk add --no-cache python3 py3-pip \
         python-multipart==0.0.22 \
         river==0.24.2 \
         dtaidistance==2.3.13 \
-        paho-mqtt==2.1.0 \
-        scikit-learn==1.5.2
-
-# scikit-learn is the dev47 TinyModel tier (47b). A real dependency, not a
-# convenience: every dev47 accuracy gate was measured with this exact
-# estimator, so substituting another invalidates the evidence base.
-#
-# It is also OPTIONAL AT RUNTIME by design — `tinymodel.sklearn_available()`
-# reports the tier unavailable and the k-NN ladder serves unchanged. So if the
-# musllinux wheels ever fail to resolve on a target architecture the add-on
-# still runs: it classifies as it did before dev47 and says why in the log.
-# VERIFY on both amd64 and aarch64 before relying on the tier in a release.
+        paho-mqtt==2.1.0
 
 # dev46: config.yaml must reach the image, not just the build context. Both
 # the boot version line (46g) and the static-asset cache-buster read the
