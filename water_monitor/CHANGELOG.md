@@ -263,6 +263,15 @@ makes the add-on survive that.
 
 ### Performance and reliability
 
+- **The add-on now runs on Debian** — the learned classifier needs
+  scikit-learn, and on the previous Alpine base that library could not be made
+  to work: it publishes no build for Alpine's C library in any version, and
+  Alpine's own packaged copy is built against a numeric library too old for the
+  clustering engine to use, so installing one broke the other. On Debian every
+  piece installs as a tested, version-pinned build. Nothing about the add-on's
+  behaviour changes; the image is somewhat larger and the first rebuild takes
+  longer. On 32-bit systems (armv7/armhf/i386) no such build exists for either
+  library, so those keep the previous matching, exactly as before.
 - **Database work is single-threaded** — the add-on shares one SQLite
   connection while database work was spread across a thread pool; two threads
   touching it at once corrupt each other mid-statement, which killed a

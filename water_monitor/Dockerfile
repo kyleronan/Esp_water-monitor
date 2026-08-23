@@ -1,37 +1,42 @@
 # The Supervisor always passes --build-arg BUILD_FROM for the target arch, so
 # this default is only used by a plain `docker build`. It exists to silence
 # Docker's InvalidDefaultArgInFrom warning and to make a manual build work;
-# the multi-arch `base` manifest resolves to the right image either way.
-# Pinned to 3.20 deliberately — the add-on's dependency set (notably Alpine's
-# py3-scikit-learn) is resolved against that release.
-ARG BUILD_FROM=ghcr.io/home-assistant/base:3.20
+# the multi-arch manifest resolves to the right image either way.
+# Debian rather than Alpine — see build.yaml for why. In short: scikit-learn
+# has no musllinux wheel at any version, and Alpine's own build cannot coexist
+# with river's numpy floor, so on musl the tier is unreachable by construction.
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm-2026.02.0
 FROM ${BUILD_FROM}
 
 ENV LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# scikit-learn powers the dev47 TinyModel tier (47b). It is installed from
-# ALPINE'S PACKAGE, before pip, and is ALLOWED TO FAIL. Three things forced
-# that shape, all learned the hard way on this base image:
+# scikit-learn powers the dev47 TinyModel tier (47b). On this Debian base it
+# installs from a pinned manylinux wheel like everything else — no compiler,
+# no apk/pip split, no ABI negotiation. Three earlier shapes failed on Alpine
+# and are recorded here so they are not retried:
 #
-#  1. scikit-learn ships no musllinux wheel. Asking pip for it makes pip fetch
-#     the 7 MB sdist and try to compile it; the HA base has no compiler, so the
-#     IMAGE BUILD FAILS. (river and aiohttp install fine because they DO ship
-#     musllinux wheels — that is the whole difference.)
-#  2. apk must run BEFORE pip. py3-scikit-learn pulls py3-numpy/py3-scipy, and
-#     pip then satisfies river's numpy requirement from those instead of
-#     installing a second, conflicting copy into the same site-packages.
-#  3. `|| true` is deliberate. The tier is optional at runtime —
-#     `tinymodel.sklearn_available()` reports it unavailable and the kNN ladder
-#     serves exactly as before dev47 — so a missing package must cost the
-#     feature, never the add-on.
+#  1. `pip install scikit-learn` on musl -> no wheel exists -> pip fetches the
+#     sdist and tries to compile -> no compiler in the base -> BUILD FAILS.
+#  2. `apk add py3-scikit-learn` -> installs, but Alpine builds it against
+#     Alpine's py3-numpy (1.25.2 on 3.20), which cannot satisfy river's
+#     `numpy>=2.3.4`. pip then replaces numpy underneath it and the compiled
+#     extensions no longer load: 'numpy.dtype size changed'.
+#  3. `pip --only-binary=:all:` on musl -> resolves nothing, tier simply absent.
 #
-# Do NOT "fix" this by adding gcc/g++/gfortran to force a source build: that is
-# a many-minute compile and a much larger image, for a tier designed to be
-# optional.
-RUN apk add --no-cache python3 py3-pip \
- && { apk add --no-cache py3-scikit-learn || echo 'py3-scikit-learn unavailable: TinyModel tier stays off, kNN ladder serves'; } \
+# It is still ALLOWED TO FAIL. armv7/armhf/i386 have no scikit-learn wheel on
+# any libc (river has none there either), so on those arches the tier stays
+# off and `tinymodel.sklearn_available()` reports it — the kNN ladder serves
+# exactly as before dev47. A missing optional tier must never cost the add-on.
+#
+# Do NOT add gcc/g++/gfortran to force a source build: many minutes and a much
+# larger image, for a tier designed to be optional. And do NOT substitute
+# river's own classifiers — ARF/Hoeffding were measured against this home's
+# 848 labels and lose ~10 points on the refit-on-cadence arm that ships.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-pip \
+ && rm -rf /var/lib/apt/lists/* \
  && pip3 install --no-cache-dir --break-system-packages \
         fastapi==0.115.0 \
         uvicorn==0.30.6 \
@@ -41,7 +46,19 @@ RUN apk add --no-cache python3 py3-pip \
         python-multipart==0.0.22 \
         river==0.24.2 \
         dtaidistance==2.3.13 \
-        paho-mqtt==2.1.0
+        paho-mqtt==2.1.0 \
+ && { pip3 install --no-cache-dir --break-system-packages --only-binary=:all: \
+        scikit-learn==1.7.2 && echo 'SKLEARN: installed from manylinux wheel' \
+      || echo 'SKLEARN: no wheel for this arch - TinyModel tier stays off'; }
+
+# Say in the BUILD LOG whether the tier will actually work. Installing a
+# package is not the same as being able to import it — an ABI mismatch shows
+# up only at import, which is how the Alpine build looked healthy while the
+# tier was dead. Non-fatal: this reports, it never gates. main.py logs the
+# same probe at boot, and that is the one you can actually read, because the
+# Supervisor only dumps build output when a build FAILS.
+RUN python3 -c "import sklearn, numpy, river; print('SKLEARN: import OK', sklearn.__version__, 'numpy', numpy.__version__, 'river', river.__version__)" \
+ || echo 'SKLEARN: NOT IMPORTABLE - TinyModel tier stays off, kNN ladder serves'
 
 # dev46: config.yaml must reach the image, not just the build context. Both
 # the boot version line (46g) and the static-asset cache-buster read the

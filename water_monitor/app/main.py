@@ -240,9 +240,19 @@ async def lifespan(app: FastAPI):
             log.info("TinyModel tier available (scikit-learn %s) — it serves "
                      "once a circuit has enough labels", _sk.__version__)
         else:
-            log.info("TinyModel tier NOT available (scikit-learn absent from "
-                     "this image) — the kNN ladder serves, exactly as before "
-                     "dev47. Everything else in dev47 is unaffected.")
+            # Report WHY, not just that. "No module named 'sklearn'" means the
+            # package never installed; anything else (typically a numpy ABI
+            # complaint) means it installed but cannot load — two different
+            # problems with two different fixes, and the build log cannot tell
+            # them apart because Supervisor only dumps build output on failure.
+            try:
+                import sklearn  # noqa: F401
+                why = "imported but reported unavailable"
+            except Exception as _why:
+                why = f"{type(_why).__name__}: {_why}"
+            log.info("TinyModel tier NOT available — the kNN ladder serves, "
+                     "exactly as before dev47, and everything else in dev47 is "
+                     "unaffected. Reason: %s", why)
     except Exception as _tm_exc:            # never block boot on a report
         log.debug("could not report TinyModel availability: %s", _tm_exc)
     # RBAC trusts the ingress X-Remote-User-Id header ONLY because the ingress-IP
