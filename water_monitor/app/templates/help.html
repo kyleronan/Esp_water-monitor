@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 {#
-  dev46 (46o) — the operator runbook.
+  dev47 — the operator runbook.
 
   Every control name below was taken from the templates that render it, not
   from memory. Getting a name wrong here is worse than saying nothing: this
@@ -12,7 +12,14 @@
   pressure" / "Rebuild fixture grouping for current pressure" settings.html;
   "Clear stale group links" fixtures.html; "Open Valve" / "Close Valve" /
   "Run Now" / "Reset Fault" / "Reset Trickle" / "Abort Test" device.html;
-  leak-test verdict strings leak_test_scheduler.py.
+  leak-test verdict strings leak_test_scheduler.py; "✓ Fixed it" / "Dismiss" /
+  "★ Label on History" fixtures.html.
+
+  dev47 added a second classifier that has to be explained in terms of what the
+  operator sees, never its internals: it needs about a hundred of their labels
+  before it starts, re-checks itself weekly, and can decline its own new fit.
+  Those three facts are why "How long before your labels change anything"
+  exists — three separate questions collapse into that one gap.
 #}
 <style>
   .rb-toc      { display:flex; flex-wrap:wrap; gap:.4rem; margin:.75rem 0 1.5rem }
@@ -57,8 +64,33 @@
     <h3>Correct a mislabelled event</h3>
     <p>Open the event on <strong>History</strong>, pick the right fixture, and
     press <strong>Save</strong>. This is the single most valuable thing you can
-    do — every label improves how the next event is recognised.</p>
+    do — every label improves how the next event is recognised, immediately for
+    the pattern matching and more slowly for the part that learns your home.</p>
     <span class="rb-where">History → click a row</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>How long before your labels change anything</h3>
+    <p>Straight away for the pattern matching &mdash; the next similar event is
+    already being judged against your answer. Separately, once a circuit has
+    around a hundred of your own labels, the app fits a classifier to your home
+    and re-checks that fit once a week, keeping the new one only if it measures
+    at least as well as the one already running. A week where nothing visibly
+    changes is usually that check doing its job, not a fault.</p>
+    <p>Only labels you give count towards the hundred. The app&#39;s own
+    confident guesses do not, deliberately &mdash; otherwise it would end up
+    learning from itself.</p>
+    <span class="rb-where">History &rarr; click a row</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>&#8220;Worth a quick look&#8221;</h3>
+    <p>A short list on <strong>Water Use</strong> of events the app could not
+    identify confidently. It is capped deliberately &mdash; these are the few
+    where your answer teaches it the most, not everything it is unsure about.
+    Answering them is optional and there is no penalty for ignoring them; the
+    events keep their best guess either way.</p>
+    <span class="rb-where">Water Use &rarr; &#9733; Label on History</span>
   </div>
 
   <div class="rb-item">
@@ -90,34 +122,6 @@
 
 <!-- ─────────────────────────────────────────────────────────────────── -->
 <div class="rb-sec" id="pressure">
-  <div class="rb-item">
-    <h3>&#8220;Using more water per run than it used to&#8221;</h3>
-    <p>When a fixture&#39;s draws grow steadily, the app says so on
-    <strong>Water Use</strong>. It compares recent runs against how that fixture
-    behaved when it was first measured &mdash; a comparison it never updates on
-    its own, which is what lets it notice slow change at all. Nothing is
-    mislabelled when this appears; the events are still recognised correctly,
-    they are simply bigger. A toilet flapper or a fill valve that no longer
-    seals is the usual reason.</p>
-    <p>Press <strong>&#10003; Fixed it</strong> only after you have actually
-    repaired or replaced the fixture: it throws away the old measurement and
-    starts again from how the fixture behaves now, which takes a few weeks of
-    normal use to settle. Press <strong>Dismiss</strong> if nothing is wrong
-    &mdash; that keeps the original measurement, so the app is still able to
-    notice if the drift continues.</p>
-    <span class="rb-where">Water Use &rarr; &#10003; Fixed it / Dismiss</span>
-  </div>
-
-  <div class="rb-item">
-    <h3>&#8220;Worth a quick look&#8221;</h3>
-    <p>A short list on <strong>Water Use</strong> of events the app could not
-    identify confidently. It is capped deliberately &mdash; these are the few
-    where your answer teaches it the most, not everything it is unsure about.
-    Answering them is optional and there is no penalty for ignoring them; the
-    events keep their best guess either way.</p>
-    <span class="rb-where">Water Use &rarr; &#9733; Label on History</span>
-  </div>
-
   <h2>After a pressure change</h2>
   <p class="rb-lead muted">
     A booster pump, a new regulator, or a supply change alters the shape of
@@ -254,6 +258,38 @@
   </div>
 
   <div class="rb-item">
+    <h3>&#8220;Using more water per run than it used to&#8221;</h3>
+    <p>When a fixture&#39;s draws grow steadily, the app says so on
+    <strong>Water Use</strong>. It compares recent runs against how that fixture
+    behaved when it was first measured &mdash; a comparison it never updates on
+    its own, which is what lets it notice slow change at all. Nothing is
+    mislabelled when this appears; the events are still recognised correctly,
+    they are simply bigger. A toilet flapper or a fill valve that no longer
+    seals is the usual reason.</p>
+    <p>Press <strong>&#10003; Fixed it</strong> only after you have actually
+    repaired or replaced the fixture: it throws away the old measurement and
+    starts again from how the fixture behaves now, which takes a few weeks of
+    normal use to settle. Press <strong>Dismiss</strong> if nothing is wrong
+    &mdash; that keeps the original measurement, so the app is still able to
+    notice if the drift continues.</p>
+    <span class="rb-where">Water Use &rarr; &#10003; Fixed it / Dismiss</span>
+  </div>
+
+  <div class="rb-item">
+    <h3>Why nothing has been flagged yet</h3>
+    <p>The comparison above needs a settled month of a fixture&#39;s own runs
+    before it has anything to measure against &mdash; roughly twenty runs inside
+    a thirty-day stretch that ended at least a fortnight ago. It will not build
+    that reference out of recent runs, because a reference that keeps up with a
+    slow leak could never reveal one.</p>
+    <p>So expect the first weeks after an update to be quiet, and expect a
+    fixture used once or twice a week &mdash; a guest bathroom &mdash; to stay
+    quiet far longer. Silence here means it has not seen enough yet, which is
+    not the same as a clean bill of health.</p>
+    <span class="rb-where">Water Use</span>
+  </div>
+
+  <div class="rb-item">
     <h3>A trickle alert</h3>
     <p>Sustained small flow — most often a running toilet. This comes from the
     valve controller, not from pattern matching, so it is worth trusting.
@@ -278,6 +314,15 @@
     <h3>Check it actually restarted</h3>
     <p>The add-on log's first line names the version now running. If it isn't
     the one you expect, the old build is still up.</p>
+  </div>
+
+  <div class="rb-item">
+    <h3>This one update takes far longer to build</h3>
+    <p>Version 0.3.1 moves to a larger base image, so the first build after
+    updating downloads a great deal more than usual and can run for several
+    minutes before anything starts. A long wait here is the download, not a
+    hang &mdash; leave it alone and let it finish. Later updates go back to
+    normal, and nothing below changes.</p>
   </div>
 
   <div class="rb-item">

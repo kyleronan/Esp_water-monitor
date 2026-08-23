@@ -1,2 +1,7 @@
 #!/usr/bin/execlineb -S0
-s6-svscanctl -t /var/run/s6/services
+# s6-overlay v3 renamed the scandir: /var/run/s6/services became /run/service.
+# The old path made this print "s6-svscanctl: fatal: unable to control
+# /var/run/s6/services: No such file or directory" on every single shutdown,
+# which also meant the container was never actually being brought down from
+# here — the add-on stopped only because the supervisor killed it.
+s6-svscanctl -t /run/service

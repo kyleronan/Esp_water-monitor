@@ -7,13 +7,17 @@ Every step below names the responsible **file/function**, the **gates with their
 the **DB columns written**, and an **"if it breaks here"** symptom so you can jump from a wrong number
 straight to the code that produced it.
 
-> Verified against **0.3.1-dev46 + firmware 3.13.2**. Since the dev31 revision this
+> Verified against **0.3.1-dev47 + firmware 3.13.2**. Since the dev31 revision this
 > doc last described: the training pool gained two independent exclusion filters
 > (dev40 quarantine, dev46 user flag), the labeling ladder gained validated shape
 > gates for dishwasher cycles and toilet flushes, the fingerprint tier began
 > weighting exemplars by era, cluster re-seeds became crash-visible, and — the
 > change most likely to surprise you — **every threaded database touch now goes
-> through one worker thread**. If you touch this pipeline, re-check the constants
+> through one worker thread**. dev47 then added the change most likely to
+> surprise you *now*: a **learned per-home model** sits inside the ladder above
+> the fingerprint and k-NN tiers, so classification is no longer a pure function
+> of the code plus the frozen bands — it also depends on which model artifact is
+> currently serving. If you touch this pipeline, re-check the constants
 > cited here against the code before trusting them.
 
 Three invariants hold the whole thing together:
@@ -54,7 +58,7 @@ flowchart TD
     KEEP["Kept + flagged<br/>big phantom ≥10 L → review"]
     STORE["9 · Row stored<br/>events table + hour ledger"]
     HYGIENE["Hygiene auto-split<br/>reprocess inflated events"]
-    LADDER{"10 · Labeling ladder<br/>softener → washer → dishwasher → rules →<br/>fingerprint → k-NN (edge/active/legacy) → composite"}
+    LADDER{"10 · Labeling ladder<br/>softener → washer → dishwasher → rules →<br/>learned model → fingerprint → k-NN (edge/active/legacy) → composite"}
     ANOM["11 · Anomaly score<br/>vs frozen baseline"]
     CHOKE["12 · apply_effective_volume()<br/>THE chokepoint — reverse old, post new"]
     AUDIT["Meter audit<br/>recorder_reconcile.py"]
@@ -353,9 +357,10 @@ get a `cycle_group_id` (the History rollup key).
 | 10b | **Washer cycle** (`detect_washer_cycles`) | anchor fill ≥9 L, 80–400 s, peak 7.5–15 L/min; siblings at 0.8–1.3× anchor peak, 2–45 min away, ≥0.5 L, ≤400 s, not flush-shaped; needs anchor + **≥2** siblings. Live path retro-stamps mates from the trailing 50 min | `washing_machine`, `matched_via='washer_cycle'` |
 | 10c | **Dishwasher cycle** (`detect_dishwasher_cycles`) | ≥3 chained gentle fills: 0.2–3.5 L, peak ≤3.6 L/min, not flush-shaped; consecutive fills ≤30 min apart, whole run ≤180 min; skips artifacts + washer/softener members. **T5 shape gate (dev42)**: each fill must have flow variability ≤1.6 AND steady fraction ≥0.4 — validated pre-outage at recall 0.889 / precision 0.727. NULL features pass unchallenged; constants never auto-fit | `dishwasher`, `matched_via='dishwasher_cycle'` |
 | 10d | **Per-event rules** (`rule_classify_event`) | first hit wins — see below | fixture type, `matched_via='rule_*'` / `'zone_default'` |
-| 10e | **Fingerprint tier** (`fingerprint_matcher.py`) | only if rules abstain, *before* k-NN; now with a **2 L floor** — see below | fixture type, `matched_via='fingerprint'` |
-| 10f | **k-NN residual** | only if the fingerprint tier also abstains. Internally a 3-level sub-ladder: **edge-signature → plain active-flow → legacy 6-scalar** — see below | fixture type, `matched_via='knn'` (all three sub-levels) |
-| 10g | **Composite** (`composite_detector.py`) | sustained ≥300 s + usable waveform (≥30 bins, ≤15 s/bin); embedded toilet = 3–8 L excess at ≥3 L/min over a rolling 35th-percentile baseline | promotes unlabeled → `other`, `matched_via='composite'`; writes `embedded_fixtures_json` |
+| 10e | **TinyModel tier** (`tinymodel.py`) | only if the label-free anchors and the per-event rules abstain. Needs **≥100 user labels** on the circuit (`MIN_USER_LABELS`) and ≥3 per class (`MIN_LABELS_PER_CLASS`) — anchor exemplars deliberately do **not** count towards graduation, or a home would graduate on its own teacher's output. Abstains below a precision-calibrated threshold picked on a held-out split (`DEFAULT_TARGET_PRECISION` 0.85, `FALLBACK_THRESHOLD` 0.60), and abstains entirely when scikit-learn is absent from the image | fixture type, `matched_via='tinymodel'` |
+| 10f | **Fingerprint tier** (`fingerprint_matcher.py`) | only if rules **and the learned model** abstain, *before* k-NN; now with a **2 L floor** — see below | fixture type, `matched_via='fingerprint'` |
+| 10g | **k-NN residual** | only if the fingerprint tier also abstains. Internally a 3-level sub-ladder: **edge-signature → plain active-flow → legacy 6-scalar** — see below | fixture type, `matched_via='knn'` (all three sub-levels) |
+| 10h | **Composite** (`composite_detector.py`) | sustained ≥300 s + usable waveform (≥30 bins, ≤15 s/bin); embedded toilet = 3–8 L excess at ≥3 L/min over a rolling 35th-percentile baseline | promotes unlabeled → `other`, `matched_via='composite'`; writes `embedded_fixtures_json` |
 
 ### 10.5 · What the labeling pool is allowed to learn from
 
@@ -425,10 +430,12 @@ capped at ≤2× the default span, do-no-harm k-fold validation — a fit that r
 discarded and the default kept). A PPL change triggers *partial* recalibration of artifact thresholds
 only, never these rule bands.
 
-**10e · Fingerprint tier** (dev11, `fingerprint_matcher.py`):
+**10f · Fingerprint tier** (dev11, `fingerprint_matcher.py`):
 
 A whole-waveform nearest-neighbour match — much stronger evidence than k-NN's scalar summaries, so it
-runs *ahead* of k-NN and short-circuits it on a hit.
+runs *ahead* of k-NN and short-circuits it on a hit. It is in turn short-circuited by the **TinyModel
+tier above it**, which outranks it once the circuit has graduated: a model hit means the fingerprint
+matcher is never consulted. The tiers below the model are its fallback, not its reviewers.
 
 - **Fingerprint:** the event's un-normalised waveform trio — absolute-time flow (L/min), cumulative
   volume (L), and pressure drop below baseline (psi) — sampled on a 4 s grid, 64 cells (first 256 s).
@@ -447,7 +454,7 @@ runs *ahead* of k-NN and short-circuits it on a hit.
 - Measured on this home: ~30% coverage at ~97% precision; ~29% of the events the rest of the pipeline
   declined, at ~94%. Per-circuit 5-min library cache, invalidated when you save a label.
 
-**10f · k-NN residual** — a 3-level sub-ladder, all stamping `matched_via='knn'`:
+**10g · k-NN residual** — a 3-level sub-ladder, all stamping `matched_via='knn'`:
 
 - **Level 1 · edge-signature k-NN (dev19):** runs when the event and its neighbours all carry decodable
   32-cell onset/offset edge signatures. Adds 64 edge features (`onset_00..offset_31`, per-dim scale
@@ -700,13 +707,23 @@ database — labelling 3 events re-derived 5,417 verdicts in 85 s and moved
 
 | peer's `matched_via` | released? | why |
 |---|---|---|
-| NULL (abstained), `knn`, `fingerprint`, `composite` | yes | decided by evidence a new exemplar can move |
+| NULL (abstained), `tinymodel`, `knn`, `fingerprint`, `composite` | yes | decided by evidence a new exemplar can move |
 | `rule_*`, `washer_cycle`, `dishwasher_cycle`, `softener_session` | **no** | the ladder tries rules FIRST; bands are locked and features immutable, so the verdict cannot change |
 
-This is the locked-baseline architecture applied consistently: of the three
+This is the locked-baseline architecture applied consistently: of the four
 inputs to an old event's verdict — its features, its era's bands, the label
-pool — the first two are frozen, so only the third needs a propagation
-mechanism, and its reach is bounded.
+pool, and the **serving model artifact** — the first two are frozen, so the
+last two each need a propagation mechanism, and both are bounded.
+
+The model artifact is deliberately **not** hashed into the global verdict
+stamp, for the same reason the label pool is not: the stamp is global, so
+folding a per-circuit model hash into it would mark every stored verdict in
+the database stale on every weekly retrain — a full-history re-derive, which
+is exactly what the incremental re-derivation exists to avoid. A model swap
+instead pushes a *scoped* invalidation: only events the new model could
+plausibly answer differently (`learning_loop.scoped_invalidation_ids`). If you
+find yourself concluding that a retrain leaves every old verdict permanently
+stale, this is the paragraph you are missing.
 
 Cluster membership is an imperfect proxy for similarity (46e measured
 DBSTREAM purity at 0.387; circuit_1 has collapsed into two mega-clusters), so
@@ -871,10 +888,10 @@ that as a nightly instrument.
 | Big draw flagged "review" not counted-clean | step 7d backstop | `phantom_suppression_averted` (≥10 L phantom kept + flagged on purpose) |
 | Degraded volume looks capped/too low | step 7j | `degraded_diagnostic_json` (`envelope_cap_applied`, `envelope_uncapped_litres`) |
 | A toilet label disappeared | step 10 veto | toilet physics veto (floor 2.8 L / era cap / peak / segments) turned it into an abstain |
-| Label came from `fingerprint` and looks wrong | step 10e | 2 L floor + library size / self-calibrated threshold; save a correct label to re-seed |
+| Label came from `fingerprint` and looks wrong | step 10f | 2 L floor + library size / self-calibrated threshold; save a correct label to re-seed |
 | A label won't stick | step 13 branch | whether the ID changed (reprocess) — user rows are never overwritten |
 | Label came from `fingerprint` but the exemplar is ancient | step 10.6 | `raw_distance` vs `distance` — a large gap means era weighting rescued it |
-| A labelled event isn't improving the model | step 10.5 | `training_quarantine_reason` AND `training_excluded_by_user` — two independent filters, lifted by different things |
+| A labelled event isn't improving the model | step 10.5 / 10e | `training_quarantine_reason` AND `training_excluded_by_user` — two independent filters, lifted by different things; **or** the circuit is still under 100 user labels; **or** the weekly referee rejected the challenger and the incumbent still serves (see the retrain log line and the `tinymodel_retrain` job); **or** scikit-learn is absent from this image |
 | Circuit records nothing / no leak tests | Part 6 | `circuit_profile.winterized` — is it still marked drained from last season? |
 | Fixture grouping looks half-finished | Part 6 | `training_state.reseed_in_progress` — a crashed re-seed; Settings shows it |
 | `InterfaceError: bad parameter or other API misuse` | invariant 3 | a DB touch escaped `run_db` — run `tools/audit_db_thread_safety.py` |

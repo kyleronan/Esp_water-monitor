@@ -4910,7 +4910,8 @@ class FeatureExtractor:
         try:
             from .database import (upsert_event_and_apply_hourly_volume,
                                    is_event_in_exclusion_window,
-                                   find_overlapping_event)
+                                   find_overlapping_event,
+                                   is_retryable_db_error)
 
             # Writer-boundary duplicate guard: two importer catch-up runs can
             # both queue a reconstruction before either has written to the DB,
@@ -5015,11 +5016,18 @@ class FeatureExtractor:
                         self._db, features, effective_volume,
                     )
                     break
-                except sqlite3.OperationalError as _lock_err:
-                    if "locked" not in str(_lock_err).lower() or _attempt == 5:
+                except sqlite3.DatabaseError as _db_err:
+                    # DatabaseError, not OperationalError. "another row
+                    # available" is a bare DatabaseError — a SIBLING of
+                    # OperationalError — so the narrower catch that used to be
+                    # here let it through to the outer handler, which logged it
+                    # and dropped the event. That is how a real draw was lost on
+                    # 2026-08-22 at 11:12.
+                    if not is_retryable_db_error(_db_err) or _attempt == 5:
                         raise
-                    log.info("[%s] event store hit locked DB — retry %d/5 in 8 s",
-                             event.circuit, _attempt + 1)
+                    log.info("[%s] event store hit a transient DB fault (%s) "
+                             "— retry %d/5 in 8 s",
+                             event.circuit, _db_err, _attempt + 1)
                     await asyncio.sleep(8)
 
             # dev46 (46a): exclusion window, calibration exclusion, waveform
@@ -5121,7 +5129,14 @@ class FeatureExtractor:
                 features["hydraulic_resistance"] or 0,
             )
         except Exception as e:
-            log.error("[%s] failed to store event: %s", event.circuit, e, exc_info=True)
+            # This drops a real measurement. Say so — "failed to store event"
+            # reads like a skipped step, and the volume it carried is missing
+            # from every total downstream until the catch-up importer re-derives
+            # it from HA history.
+            log.error("[%s] EVENT LOST — could not store it after retries: %s. "
+                      "Its volume is missing from totals until the historical "
+                      "importer re-derives it from HA history.",
+                      event.circuit, e, exc_info=True)
 
     def _score_anomaly(self, circuit: str, features: dict) -> dict:
         """Score an event against the FROZEN baseline (Phase 2.3). Read-only — the

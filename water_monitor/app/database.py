@@ -57,6 +57,34 @@ def get_db_executor():
     return _DB_EXECUTOR
 
 
+# ── transient DB faults ─────────────────────────────────────────────────────
+# sqlite3's exception tree is Error > DatabaseError > (OperationalError,
+# ProgrammingError, IntegrityError, ...). "database is locked" arrives as an
+# OperationalError, but "another row available" arrives as a BARE DatabaseError
+# — a SIBLING of OperationalError, not a subclass. Any handler written as
+# `except sqlite3.OperationalError` therefore misses it entirely, which is how
+# a live event was dropped instead of retried on 2026-08-22 at 11:12.
+#
+# Catch sqlite3.DatabaseError and ask this instead. It answers one question:
+# would waiting and trying again plausibly succeed? A locked or busy database
+# clears; a cursor left mid-iteration on the shared connection clears. A schema
+# error or a constraint violation never does, and must keep propagating.
+_RETRYABLE_DB_FAULTS = (
+    "database is locked",
+    "database is busy",
+    "another row available",
+    "no more rows available",
+)
+
+
+def is_retryable_db_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a sqlite fault that a retry could clear."""
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    text = str(exc).lower()
+    return any(sig in text for sig in _RETRYABLE_DB_FAULTS)
+
+
 async def run_db(fn, *args, **kwargs):
     """Run blocking DB work on the single DB thread and await the result."""
     import asyncio
@@ -1837,6 +1865,28 @@ def _home_tz():
     return get_home_timezone() or timezone.utc
 
 
+def local_midnight_utc_iso(days_ago: int = 0) -> str:
+    """UTC instant of local midnight (or N days back), as a naive ISO string.
+
+    This is the volume-baseline KEY. It must agree exactly with
+    ``Orchestrator._local_midnight_utc``, which is what writes the rows — a key
+    computed any other way addresses a different row in ``volume_snapshots``.
+
+    That is not hypothetical: the daily/weekly helpers below used to fall back
+    to UTC midnight when a caller omitted ``period_ts``, so a home six hours off
+    UTC seeded a SECOND row for the same day. The live poll then kept updating
+    the local-midnight row while the UTC one stayed frozen at its seed value
+    (``ha_volume == last_reading``), and any reader landing on the frozen row
+    computed a period total of roughly zero. 26 such rows exist in this
+    database alongside 114 correct ones.
+    """
+    tz = _home_tz()
+    midnight_local = datetime.now(tz).replace(
+        hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_ago)
+    return midnight_local.astimezone(timezone.utc).replace(
+        tzinfo=None).isoformat(timespec="seconds")
+
+
 def local_day_of(ts: Any, tz=None) -> str:
     """Local calendar date ('YYYY-MM-DD') of a stored UTC timestamp.
 
@@ -3500,13 +3550,11 @@ def compute_ha_daily_volume(
     """Daily volume from the authoritative HA cumulative sensor.
 
     period_ts is the UTC equivalent of local midnight, as a naive ISO string
-    (e.g. '2026-05-17T05:00:00').  Falls back to UTC midnight when not provided.
+    (e.g. '2026-05-17T05:00:00').  Falls back to local midnight when not provided.
     Must match the key written by _init_volume_baselines().
     """
     if not period_ts:
-        period_ts = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-        ).isoformat(timespec="seconds")
+        period_ts = local_midnight_utc_iso(0)
     baseline = _get_volume_baseline(conn, circuit, period_ts, current_ha_value)
     return round(max(0.0, current_ha_value - baseline), 1)
 
@@ -3520,12 +3568,10 @@ def compute_ha_weekly_volume(
     """Rolling 7-day volume from the authoritative HA cumulative sensor.
 
     period_ts is the UTC equivalent of local midnight 7 days ago, as a naive
-    ISO string.  Falls back to UTC midnight 7 days ago when not provided.
+    ISO string.  Falls back to local midnight 7 days ago when not provided.
     """
     if not period_ts:
-        period_ts = (datetime.now(timezone.utc) - timedelta(days=7)).replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-        ).isoformat(timespec="seconds")
+        period_ts = local_midnight_utc_iso(7)
     baseline = _get_volume_baseline(conn, circuit, period_ts, current_ha_value)
     return round(max(0.0, current_ha_value - baseline), 1)
 
