@@ -7538,6 +7538,7 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     interleaved user relabel safe here — do not weaken it.
     """
     from .event_rules import (CYCLE_ONLY_FIXTURE_TYPES, rule_classify_event,
+                             toilet_burst_veto_reason,
                               toilet_veto_reason)
     from .supply_regime import resolve_regime_for_ts
     from .anomaly_baseline import score_event_anomaly
@@ -7608,12 +7609,23 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
             _ev_calib = (_calib_cache.get(
                 resolve_regime_for_ts(_regimes, r["start_ts"]), calib)
                 if _regimes else calib)
+            _ev_burst = _burst_ctx.get(r["id"])
             rule_hit = rule_classify_event(feats, circuit_type, calib=_ev_calib,
-                                           pump_mode=_pump,
-                                           burst=_burst_ctx.get(r["id"]))
+                                           pump_mode=_pump, burst=_ev_burst)
             if rule_hit is not None:
                 new_type, new_via = rule_hit
             else:
+                # Report the burst veto the same way the flush-physics floor is
+                # reported: DEBUG per event, one INFO summary at the end. The
+                # rule returns None either way, so without this a veto that
+                # fires and a veto that never fires look identical from outside.
+                _bw = toilet_burst_veto_reason(feats, _ev_calib, _pump, _ev_burst)
+                if _bw:
+                    log.debug("[%s] event %s: toilet match vetoed by burst "
+                              "context — %s (vol=%s L)", circuit, r["id"], _bw,
+                              r["volume_litres"])
+                    _key = "in an appliance burst"
+                    veto_counts[_key] = veto_counts.get(_key, 0) + 1
                 # dev47 (47b) — TinyModel tier, in the same ladder position the
                 # live path uses (anchors -> model -> fingerprint/k-NN). The
                 # batch pass uses MATURE burst features: every event's siblings
@@ -7877,7 +7889,7 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
                  "already carries the current verdict stamp (code, rule bands "
                  "and labels all unchanged since the last pass)", circuit)
     if veto_counts:
-        log.info("[%s] flush-physics vetoes: %s (per-event detail at DEBUG)",
+        log.info("[%s] toilet vetoes: %s (per-event detail at DEBUG)",
                  circuit, "; ".join(f"{n}× {why}" for why, n
                                     in sorted(veto_counts.items(),
                                               key=lambda kv: -kv[1])))

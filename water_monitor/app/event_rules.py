@@ -442,6 +442,33 @@ def in_appliance_burst(burst: Optional[Dict[str, Any]]) -> bool:
     return heavy is not None and heavy > _TOILET_VETO_HEAVY_2H
 
 
+def toilet_burst_veto_reason(features: Dict[str, Any],
+                             calib: Optional[Dict[str, Any]] = None,
+                             pump_mode: bool = False,
+                             burst: Optional[Dict[str, Any]] = None
+                             ) -> Optional[str]:
+    """Why the burst veto suppressed a toilet claim, or None if it did not.
+
+    ``rule_classify_event`` returns None without a reason, so a caller that
+    wants to REPORT a veto asks separately — the same shape as
+    ``toilet_veto_reason`` for the flush-physics floor, and for the same
+    reason: a guard nobody can see firing is indistinguishable from a guard
+    that is not there, which is the failure this whole area keeps rediscovering.
+
+    Answers only for draws that WOULD otherwise have been claimed. An event
+    that is not flush-shaped was never a toilet, and reporting a veto on it
+    would inflate the count with cases the veto had no part in.
+    """
+    if not in_appliance_burst(burst):
+        return None
+    if not (is_flush_shaped(features, calib, pump_mode=pump_mode)
+            and has_flush_flow_signature(features, calib)):
+        return None
+    n = (burst or {}).get("n_heavy_2h")
+    return (f"{n} fill-sized draws within the hour "
+            f"(> {_TOILET_VETO_HEAVY_2H}; a flush arrives alone)")
+
+
 def has_flush_flow_signature(features: Dict[str, Any],
                              calib: Optional[Dict[str, Any]] = None) -> bool:
     """Does this draw move water at the RATE a flush does, throughout?

@@ -5625,6 +5625,16 @@ class FeatureExtractor:
                                                pump_mode=_pump, burst=_burst)
                 if rule_hit is not None:
                     matched_fixture_type, matched_via = rule_hit
+                else:
+                    # Same reporting as the batch pass. Live there is no run to
+                    # summarise, so DEBUG only; the aggregate appears on the
+                    # re-derive, which is also where the veto does most of its
+                    # work — a washer's first fill has no siblings yet.
+                    from .event_rules import toilet_burst_veto_reason
+                    _bw = toilet_burst_veto_reason(features, calib, _pump, _burst)
+                    if _bw:
+                        log.debug("[%s] event %s: toilet match vetoed by burst "
+                                  "context — %s", circuit, event_id, _bw)
         except Exception as e:
             log.warning("[%s] structural rules tier failed (non-fatal): %s",
                         circuit, e)
