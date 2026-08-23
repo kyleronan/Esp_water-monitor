@@ -71,6 +71,16 @@
   <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history?filter=anomaly{% if filter_circuit %}&amp;circuit={{ filter_circuit }}{% endif %}">Show all unusual</a>
   <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history">Clear filter</a>
 </div>
+{% elif filter_param == 'review' %}
+<div class="hist-filter-banner" role="status" aria-live="polite">
+  <span><strong>Filtered:</strong> showing just the events from the Water Use
+  list — the handful where your answer teaches the app the most. Star-label the
+  ones you recognise. If you cannot tell what one was, ignore it rather than
+  guessing: that keeps the guess out of what the app learns and stops it coming
+  back. Answering is optional, and they keep their current best guess either
+  way.</span>
+  <a class="btn btn-secondary btn-sm" href="{{ ingress_path }}/history">Clear filter</a>
+</div>
 {% endif %}
 
 {# ── Filter bar (dev15): date · duration · ΔP · volume · fixture · note ── #}

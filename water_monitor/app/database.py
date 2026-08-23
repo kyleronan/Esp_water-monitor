@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
-from typing import Any, Dict, Generator, Iterable, List, Optional
+from typing import Any, Dict, Generator, Iterable, List, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
@@ -3633,6 +3633,7 @@ def get_recent_events(
     fixture_type: Optional[str] = None,
     note_kind: Optional[str] = None,
     exclude_not_real: bool = False,
+    only_ids: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Return events for a circuit ordered newest first.
@@ -3696,6 +3697,19 @@ def get_recent_events(
         conditions.append("e.degraded_supply = 1")
     if unreviewed_only:
         conditions.append("COALESCE(e.user_reviewed, 0) = 0")
+    if only_ids is not None:
+        # dev47 (47d): the review card's "Label on History" link. An empty list
+        # is a real answer — nothing to review — and must select NOTHING, not
+        # fall through to every event, so this tests `is not None` rather than
+        # truthiness. In the WHERE for the same reason as flagged_only: these
+        # events are chosen for teaching value, not recency, so a Python-side
+        # filter over the newest N rows would drop most of them.
+        _ids = list(only_ids)
+        if not _ids:
+            conditions.append("1 = 0")
+        else:
+            conditions.append("e.id IN (%s)" % ",".join("?" * len(_ids)))
+            params.extend(_ids)
     if date_from:
         conditions.append("e.start_ts >= ?")
         params.append(date_from)

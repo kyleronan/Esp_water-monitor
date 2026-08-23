@@ -473,7 +473,20 @@ def _collect_circuit_history_sync(
         # bar's Note = "Not real use" — the user just asked for exactly those
         # rows (hiding them would render an empty list). ?show_hidden=1 bypasses
         # for one render (presentation-only, viewer-safe).
+        # dev47 (47d): Water Use's "Label on History" link arrives as
+        # ?filter=review&circuit=… . Without it that button landed on the
+        # unfiltered page and the card's promise — "these are the 12 where your
+        # answer teaches it the most" — was unusable, because nothing said
+        # WHICH twelve. The card is rebuilt here rather than passing ids
+        # through the URL so the list and the card cannot disagree, and because
+        # ids in a query string go stale the moment the card is regenerated.
+        _review_ids = None
+        if filter_param == "review":
+            from ..review_queue import build_card
+            _review_ids = [it.event_id for it in
+                           build_card(db, circuit_cfg.circuit).items]
         _hiding_active = (hide_not_real and not show_hidden and not _anomaly_view
+                          and _review_ids is None
                           and bar_filters.get("note_kind") != "not_real")
         events = get_recent_events(
             db, circuit_cfg.circuit,
@@ -484,6 +497,7 @@ def _collect_circuit_history_sync(
             degraded_only=(filter_param == "degraded"),
             unreviewed_only=(filter_param == "anomaly_unreviewed"),
             exclude_not_real=_hiding_active,
+            only_ids=_review_ids,
             **bar_filters,
         )
         # "N hidden — show them" badge: count the hidden rows within the time

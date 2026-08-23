@@ -150,23 +150,41 @@
 {% for cid, q in health.queue.items() %}
 <div class="fx-msg fx-msg-ok" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
   <span>
+    {#- Two different questions share this card. Identity slots are events the
+        ladder could not type; anchor slots are events it typed confidently and
+        wants confirmed. Calling all of them "could not type confidently" asked
+        the operator to identify things that already had a name. #}
     <strong>{{ q.shown }}</strong> event{{ '' if q.shown == 1 else 's' }} on
-    {{ q.circuit_name }} would be worth a quick look — the app could not type
-    {{ 'it' if q.shown == 1 else 'them' }} confidently.
-    {% if q.waiting > q.shown %}
-      ({{ q.waiting }} are unmatched in total; these are the {{ q.shown }} where
-      your answer teaches it the most.)
+    {{ q.circuit_name }} would be worth a quick look —
+    {%- if not q.n_anchor %} the app could not type
+      {{ 'it' if q.shown == 1 else 'them' }} confidently.
+    {%- elif not q.n_identity %} the app named
+      {{ 'it' if q.shown == 1 else 'them' }} itself and would like you to confirm
+      {{ 'it' if q.shown == 1 else 'them' }}.
+    {%- else %} {{ q.n_identity }} the app could not type confidently, and
+      {{ q.n_anchor }} it named itself and would like you to confirm.
+    {%- endif %}
+    {#- `waiting` counts the untyped pool only, so it is compared against the
+        identity slots — not the whole card, which the anchors inflate. #}
+    {% if q.n_identity and q.waiting > q.n_identity %}
+      ({{ q.waiting }} are unmatched in total; {{ 'this is the one' if q.n_identity == 1
+        else 'these are the %d'|format(q.n_identity) }} where your answer
+      teaches it the most.)
     {% endif %}
     {#- "I cannot tell" needs somewhere to go. Without this the only options
         are to guess — which puts a wrong label into training — or to leave it,
         which keeps it in the card forever. Ignore is neither: it is recorded as
         a deliberate non-answer, and it is already excluded from training. #}
-    If you cannot tell what one of them was, ignore it on History rather than
-    guessing — that is a real answer, it keeps the guess out of what the app
-    learns, and it stops that event coming back.
+    If you cannot tell what {{ 'it' if q.shown == 1 else 'one of them' }} was,
+    ignore it on History rather than guessing — that is a real answer, it keeps
+    the guess out of what the app learns, and it stops that event coming back.
   </span>
-  <a class="btn btn-ghost btn-sm" href="{{ ingress_path }}/history">
-    ★ Label on History
+  {#- Filtered to exactly the events this card is talking about. Linking to
+      the bare page left the operator on an unfiltered list of the newest 100
+      events with no way to tell which twelve were meant. #}
+  <a class="btn btn-ghost btn-sm"
+     href="{{ ingress_path }}/history?filter=review&amp;circuit={{ cid }}">
+    ★ Label these on History
   </a>
 </div>
 {% endfor %}
