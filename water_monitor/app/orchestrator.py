@@ -168,6 +168,12 @@ class Orchestrator:
         return self._training_manager
 
     @property
+    def learning(self) -> Optional["LearningScheduler"]:
+        """The dev47 learning jobs. None until start() has wired them, so
+        callers must check — a settings page can be served before it exists."""
+        return self._learning
+
+    @property
     def data_pruner(self) -> DataPruner:
         return self._data_pruner
 

@@ -81,18 +81,43 @@
 {% for a in health.alerts %}
 <div class="fx-msg fx-msg-warn" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
   <span>
+    {#- Five signals reach this card, and they do not mean the same thing. This
+        block used to describe all of them as a volume increase, so a longer-
+        running tap and a recognition drop both read as "using more water". The
+        wording still avoids diagnosing a CAUSE — the add-on can see that a
+        number moved, not why — but it must at least name the right number. #}
     <strong>{{ fixture_type_labels.get(a.fixture_type, a.fixture_type) }}</strong>
-    on {{ a.circuit_name }} is using more water per run than it used to.
-    {% if a.observed and a.baseline_median %}
-      Recent runs average <strong>{{ '%.1f'|format(a.observed) }} L</strong>
-      against <strong>{{ '%.1f'|format(a.baseline_median) }} L</strong> when this
-      was first measured.
+    on {{ a.circuit_name }}
+    {%- if a.signal == 'duration_trend' %} is running for longer than it used to.
+    {%- elif a.signal == 'unsolicited_refills' %} is refilling on its own between uses.
+    {%- elif a.signal == 'class_share' %} is being recorded far less often than it used to.
+    {%- elif a.signal == 'anchor_claim_rate' %} is being recognised less reliably than it used to.
+    {%- elif a.signal == 'volume_trend' %} is using more water per run than it used to.
+    {%- else %} has changed from how it behaved when it was first measured.
+    {%- endif %}
+    {#- Only shown when the observed value and the frozen reference are in the
+        same units; the router returns None otherwise rather than pairing a
+        count or a proportion with a volume. #}
+    {% if a.observed and a.baseline_median and a.unit %}
+      Recent runs average <strong>{{ '%.1f'|format(a.observed) }} {{ a.unit }}</strong>
+      against <strong>{{ '%.1f'|format(a.baseline_median) }} {{ a.unit }}</strong>
+      when this was first measured.
     {% endif %}
     {% if a.events_to_fire %}
       Seen over {{ a.events_to_fire }} runs.
     {% endif %}
-    Worth checking the fixture — a toilet flapper or a fill valve that no longer
-    seals is the usual reason.
+    {% if a.signal in ('volume_trend', 'unsolicited_refills') %}
+      Worth checking the fixture — a toilet flapper or a fill valve that no longer
+      seals is the usual reason.
+    {% elif a.signal == 'duration_trend' %}
+      Worth checking the fixture — a partly-closed supply valve, a clogged
+      aerator or a weakening fill valve all make a run take longer.
+    {% elif a.signal in ('class_share', 'anchor_claim_rate') %}
+      This one is about recognition rather than plumbing: the add-on is naming
+      this fixture less confidently than it used to. That can mean the fixture
+      changed, or simply that its runs now look different. Labelling a few on
+      History settles which.
+    {% endif %}
   </span>
   {% if is_admin %}
   <form method="post" action="{{ ingress_path }}/fixtures/health/{{ a.id }}/resolve"
@@ -132,6 +157,13 @@
       ({{ q.waiting }} are unmatched in total; these are the {{ q.shown }} where
       your answer teaches it the most.)
     {% endif %}
+    {#- "I cannot tell" needs somewhere to go. Without this the only options
+        are to guess — which puts a wrong label into training — or to leave it,
+        which keeps it in the card forever. Ignore is neither: it is recorded as
+        a deliberate non-answer, and it is already excluded from training. #}
+    If you cannot tell what one of them was, ignore it on History rather than
+    guessing — that is a real answer, it keeps the guess out of what the app
+    learns, and it stops that event coming back.
   </span>
   <a class="btn btn-ghost btn-sm" href="{{ ingress_path }}/history">
     ★ Label on History

@@ -1442,6 +1442,31 @@
       </div>
 
       <div class="sett-card">
+        <h3 class="sett-card-title">Re-fit the learned model</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Re-fits the learned classifier from your current labels straight away,
+          instead of waiting for the weekly pass. This forces a <em>decision</em>,
+          not a swap: the new fit only takes over if it measures at least as well
+          as the one already running, and otherwise the current one keeps serving.
+          Either way the result appears as a toast. Needs about a hundred of your
+          own labels on the circuit before there is anything to fit; the weekly
+          run still happens as normal.
+        </p>
+        {% for c in circuits %}
+        <div class="dev-refit-row"
+             style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
+          <div><strong>{{ c.display_name }}</strong></div>
+          <form method="post"
+                action="{{ ingress_path }}/settings/dev/retrain-model/{{ c.circuit }}"
+                style="margin:0">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">Re-fit now</button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+
+      <div class="sett-card">
         <h3 class="sett-card-title">Artifact-detector calibration</h3>
         <p class="sett-help" style="margin:.25rem 0 .75rem">
           Per-home phantom / cross-talk / dribble thresholds, frozen at activation

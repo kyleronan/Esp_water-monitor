@@ -104,9 +104,6 @@ class LearningScheduler:
         which is something the operator should be able to see.
         """
         from . import tinymodel as tm
-        from .config import DATA_DIR
-        from .database import get_write_lock, run_db
-        from .learning_loop import retrain
 
         today = datetime.now(timezone.utc).strftime("%G-W%V")
         if self._last_retrain_day == today:
@@ -119,11 +116,49 @@ class LearningScheduler:
         for circ in self._cfg.circuits:
             if self._stop.is_set():
                 return
+            await self.retrain_circuit(circ.circuit, "weekly scheduled retrain")
+        self._last_retrain_day = today
+
+    async def retrain_circuit(self, circuit: str, reason: str):
+        """Put ONE circuit through the referee, and return its outcome.
+
+        Shared by the weekly pass and the on-demand Dev Tools button, so the
+        two cannot drift: same write lock, same single DB hop (46a), same cache
+        invalidation afterwards. On-demand does NOT touch ``_last_retrain_day``
+        — forcing a retrain today should not silently cancel this week's
+        scheduled one.
+
+        Note this forces a DECISION, not a swap. The referee still rules, so a
+        challenger that is not better leaves the incumbent serving; ``status``
+        says which happened.
+        """
+        from . import tinymodel as tm
+        from .config import DATA_DIR
+        from .database import finish_job, get_write_lock, run_db, start_job
+        from .learning_loop import retrain
+
+        # Every outcome gets a job row, not just the ones that swap the model.
+        # A referee that rejects week after week is a model that has stopped
+        # improving, and V6d's finding was that this failure is SILENT: a frozen
+        # champion serves exactly like a healthy one. Logging alone could not
+        # surface it, because nothing reads the log. This is the one place both
+        # the weekly pass and the Dev Tools button go through, so recording it
+        # here covers both.
+        job = await run_db(start_job, self._db, "tinymodel_retrain", circuit,
+                           "Re-fitting the learned model…")
+        try:
             async with get_write_lock():
-                out = await run_db(retrain, self._db, circ.circuit,
+                out = await run_db(retrain, self._db, circuit,
                                    str(DATA_DIR), None,
                                    tm.DEFAULT_TARGET_PRECISION, None, True,
-                                   "weekly scheduled retrain")
-            tm.invalidate_cache(circ.circuit)
-            log.info("[%s] retrain: %s — %s", circ.circuit, out.status, out.reason)
-        self._last_retrain_day = today
+                                   reason)
+        except Exception as e:                              # noqa: BLE001
+            await run_db(finish_job, self._db, job, "error",
+                         f"{circuit}: retrain failed — {e}")
+            raise
+        tm.invalidate_cache(circuit)
+        log.info("[%s] retrain: %s — %s", circuit, out.status, out.reason)
+        await run_db(finish_job, self._db, job,
+                     "error" if out.status == "unavailable" else "done",
+                     f"{circuit}: {out.status} — {out.reason}")
+        return out

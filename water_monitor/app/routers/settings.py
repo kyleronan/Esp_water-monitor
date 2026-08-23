@@ -874,6 +874,37 @@ async def dev_retrain(circuit: str, request: Request):
     return ingress_redirect(request, "/settings#sett-dev")
 
 
+@router.post("/dev/retrain-model/{circuit}")
+async def dev_retrain_model(circuit: str, request: Request):
+    """DEV/testing only — run the dev47 learned-model retrain NOW instead of
+    waiting for the weekly pass (10:00 UTC, once per ISO week).
+
+    Deliberately the same call the scheduler makes, so the button cannot drift
+    from the job: same training pool, same referee, same scoped invalidation.
+    That means it forces a DECISION, not a swap — if the challenger is not
+    better than the incumbent the referee keeps the incumbent, and the job
+    message says so. It also leaves the weekly schedule alone.
+
+    Plain form POST → redirect (kept off the JS path, like ``dev_retrain``);
+    the outcome is surfaced through the jobs table the UI already polls."""
+    from ..config import DEV_TOOLS
+    if not DEV_TOOLS:
+        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    if orch.learning is None:
+        return ingress_redirect(request, "/settings#sett-dev")
+    try:
+        # retrain_circuit owns the job record now, so the weekly pass surfaces
+        # its verdict the same way this button does. Nothing to write here.
+        await orch.learning.retrain_circuit(circuit, "on-demand (Dev Tools)")
+    except Exception:                                       # noqa: BLE001
+        # Already recorded as a failed job; a broken retrain must not cost the
+        # page — the kNN ladder keeps serving either way.
+        log.exception("[%s] on-demand retrain failed", circuit)
+    return ingress_redirect(request, "/settings#sett-dev")
+
+
 @router.post("/dev/validate-detectors/{circuit}")
 async def dev_validate_detectors(circuit: str, request: Request):
     """DEV/testing only — run the detector self-validation (P6) against HA history on

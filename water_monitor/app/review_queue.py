@@ -59,8 +59,15 @@ ANCHOR_SLOTS: int = 2
 # the add-on is about to answer correctly by itself.
 MATURITY_WINDOW_S: float = 2 * 3600.0
 
-ANSWER_NOT_SURE = "not_sure"
-ANSWER_OTHER = "other"
+# There is deliberately no "not sure" ANSWER constant here. An earlier draft
+# carried ANSWER_NOT_SURE plus an answer_is_trainable() guard, for an inline
+# answering flow this card intentionally does not have — it points at History
+# instead, because two ways to label one event is how they drift apart. The
+# guard those symbols promised is real, but it lives in the schema, not here:
+# History's Ignore sets `user_ignored`, load_candidates() excludes it from the
+# card, and it folds into `excluded_from_training`, which build_training_pool()
+# filters on. Keeping an unused copy here made the guard look absent while it
+# was working, so it is gone; this note is what it replaced.
 
 KIND_IDENTITY = "identity"
 KIND_ANCHOR = "anchor_check"
@@ -237,12 +244,3 @@ def build_card(conn: sqlite3.Connection, circuit: str,
                  "rest keep their machine verdicts", circuit,
                  len(identity_items), len(candidates), CARD_CAP)
     return card
-
-
-def answer_is_trainable(answer: Optional[str]) -> bool:
-    """Does this answer belong in the training pool?
-
-    'not sure' does not. It is an honest human "I don't know", and recording it
-    as a label would teach the model that ambiguous events are a class.
-    """
-    return bool(answer) and answer != ANSWER_NOT_SURE

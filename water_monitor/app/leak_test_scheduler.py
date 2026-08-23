@@ -88,6 +88,18 @@ _SOFTENER_REGEN_LEAD_MIN: int = 20
 _SOFTENER_REGEN_WINDOW_MIN: int = 210
 
 
+class SoftenerBlackoutUnknown(RuntimeError):
+    """The regen window could not be determined.
+
+    Distinct from "there is no softener", which is a plain ``None`` and means
+    every hour is fair game. This means we do not KNOW, and the two must never
+    collapse into each other: a regen draws ~200 L on the main circuit, so a
+    test run inside one reads as a catastrophic leak. Skipping a test costs a
+    night of cadence; running one blind costs a false verdict, and the operator
+    has already had a week of those.
+    """
+
+
 def _row_get(row, key, default=None):
     """Safe key access for a sqlite3.Row (raises IndexError on a missing column)
     OR a plain dict (hand-built schedules in tests / a missing key)."""
@@ -241,8 +253,16 @@ class LeakTestScheduler:
         """Quietest local hour for this circuit (shared helper — see
         ``learn_quiet_hour``; the pump-regime detector uses the same
         inference, so the logic lives once at module level)."""
-        return learn_quiet_hour(self._db, circuit, self._ha_tz,
-                                self._softener_blackout_min(circuit))
+        try:
+            blackout = self._softener_blackout_min(circuit)
+        except SoftenerBlackoutUnknown:
+            # Fail closed: returning None makes the caller keep the run_hour it
+            # already has. Moving the schedule on an unknown blackout is how a
+            # test ends up planned inside the regen window.
+            log.warning("[%s] keeping the existing leak-test hour — the "
+                        "softener blackout could not be determined", circuit)
+            return None
+        return learn_quiet_hour(self._db, circuit, self._ha_tz, blackout)
 
     def _softener_blackout_min(self, circuit: str):
         """Return ``(lo, hi)`` local minutes-since-midnight of the softener regen
@@ -263,15 +283,25 @@ class LeakTestScheduler:
             return (max(0, start - _SOFTENER_REGEN_LEAD_MIN),
                     start + _SOFTENER_REGEN_WINDOW_MIN)
         except Exception as e:
-            log.warning("[%s] softener blackout lookup failed (non-fatal): %s",
-                        circuit, e)
-            return None
+            # Deliberately NOT `return None`. None means "no softener here" and
+            # opens every hour; this path knows nothing, so it says so and lets
+            # each caller choose its own safe response.
+            log.warning("[%s] softener blackout lookup failed: %s", circuit, e)
+            raise SoftenerBlackoutUnknown(str(e)) from e
 
     def _push_past_softener_blackout(self, candidate, circuit: str):
         """If ``candidate`` (local, tz-aware) lands in the softener regen
         blackout, move it to just after the window the same day; no-op otherwise.
         This keeps the scheduler from ever PLANNING a test inside the regen."""
-        window = self._softener_blackout_min(circuit)
+        try:
+            window = self._softener_blackout_min(circuit)
+        except SoftenerBlackoutUnknown:
+            # Nothing to push past without a window. Leave the candidate: the
+            # preflight below refuses to run a test it cannot clear, so this
+            # degrades to a deferred test rather than a blind one.
+            log.warning("[%s] leak-test time left unadjusted — softener "
+                        "blackout unknown", circuit)
+            return candidate
         if window is None:
             return candidate
         lo, hi = window
@@ -431,9 +461,14 @@ class LeakTestScheduler:
         softener regeneration blackout window.
         """
         from .database import get_valve_type
+        try:
+            blackout, unknown = self._softener_blackout_min(circuit), False
+        except SoftenerBlackoutUnknown:
+            blackout, unknown = None, True
         return {"valve_type": get_valve_type(self._db, circuit,
                                              default="2_port"),
-                "blackout": self._softener_blackout_min(circuit)}
+                "blackout": blackout,
+                "blackout_unknown": unknown}
 
     async def _execute_test(
         self,
@@ -495,6 +530,20 @@ class LeakTestScheduler:
         # A regen draws on this (Main) circuit and would read as a leak. Defer
         # WITHOUT closing the valve, record a history row, and reschedule just
         # past the window so the test still runs and the cadence is preserved.
+        if _pre.get("blackout_unknown"):
+            # We could not read the softener profile, so we cannot tell whether
+            # this moment is inside a regen. A regen draws ~200 L on this
+            # circuit and would be recorded as a leak, so the only safe answer
+            # is not to test. The next scheduled run tries again.
+            log.warning("[%s] leak test skipped — the softener regeneration "
+                        "window could not be determined; refusing to test "
+                        "blind", circuit)
+            result = ("Not run — could not check the water-softener "
+                      "schedule (will retry next run)")
+            await self._store_result(circuit, run_at, triggered_by, result,
+                                     None, None, None, None)
+            return {"result": result, "skipped": True}
+
         _blackout = _pre["blackout"]
         if _blackout is not None:
             _now_local = run_at.astimezone(self._ha_tz)

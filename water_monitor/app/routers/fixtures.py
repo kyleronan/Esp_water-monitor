@@ -33,6 +33,26 @@ def _valid_circuit(circuit: str, request: Request) -> str:
     return circuit
 
 
+_HEALTH_UNITS = {"volume_trend": "L", "duration_trend": "seconds"}
+
+
+def _health_reference(base, signal):
+    """The baseline scalar comparable to this signal's ``observed``, or None.
+
+    None is a real answer here: unsolicited_refills counts events, class_share
+    is a proportion and anchor_claim_rate is a rate, so none of them has a
+    frozen median in the same units, and printing one would be worse than
+    printing nothing.
+    """
+    if base is None:
+        return None
+    if signal == "volume_trend":
+        return base.volume_median
+    if signal == "duration_trend":
+        return base.duration_median
+    return None
+
+
 # ── Page ──────────────────────────────────────────────────────────────────────
 
 @router.get("", response_class=HTMLResponse)
@@ -231,7 +251,15 @@ def _fixtures_page_payload(orch, range_start_utc):
                     "observed": detail.get("observed"),
                     "threshold": detail.get("threshold"),
                     "events_to_fire": detail.get("events_to_fire"),
-                    "baseline_median": None if base is None else base.volume_median,
+                    # The reference depends on WHICH signal fired. volume_trend
+                    # and duration_trend share one rolling-median detector, so
+                    # `observed` is litres for one and seconds for the other;
+                    # pairing either with volume_median unconditionally (as this
+                    # did) prints a duration against a volume. Signals with no
+                    # comparable scalar get None, and the template then omits the
+                    # comparison rather than inventing one.
+                    "baseline_median": _health_reference(base, alert["signal"]),
+                    "unit": _HEALTH_UNITS.get(alert["signal"]),
                 })
             try:
                 card = build_card(orch.db, cid)
