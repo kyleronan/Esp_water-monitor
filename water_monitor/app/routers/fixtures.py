@@ -1,6 +1,8 @@
 """Fixtures router — Phase 2."""
 from __future__ import annotations
 
+import json
+
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -74,7 +76,7 @@ async def fixtures_page(request: Request, preview: bool = False):
     # on the event loop before, contending with the DB worker statement by
     # statement.
     from ..database import run_db
-    circuits_ctx, stale_link_count = await run_db(
+    circuits_ctx, stale_link_count, health_ctx = await run_db(
         _fixtures_page_payload, orch, range_start_utc)
 
     return _tmpl(request).TemplateResponse("fixtures.html", {
@@ -86,14 +88,16 @@ async def fixtures_page(request: Request, preview: bool = False):
         "sel_range":           sel_range,
         "range_label":         range_label,
         "stale_link_count":    stale_link_count,
+        "health":              health_ctx,
     })
 
 
 def _fixtures_page_payload(orch, range_start_utc):
     """Every DB read behind the Water Use page, in one DB-thread callable.
 
-    Returns ``(circuits_ctx, stale_link_count)``. dev46 (46a): extracted from
-    the handler so no statement runs on the event-loop thread.
+    Returns ``(circuits_ctx, stale_link_count, health_ctx)``. dev46 (46a):
+    extracted from the handler so no statement runs on the event-loop thread —
+    dev47's health and review reads ride the SAME hop for the same reason.
     """
     from ..database import (get_active_exclusion_window, get_category_rollup,
                             get_category_publish_map, get_orphaned_fixtures)
@@ -200,7 +204,49 @@ def _fixtures_page_payload(orch, range_start_utc):
     except Exception:
         stale_link_count = 0
 
-    return circuits_ctx, stale_link_count
+    # dev47 (47i / 47d) — fixture health and the review queue, on the SAME DB
+    # hop as everything else this page reads. Both are strictly best-effort:
+    # a home that has not pinned a baseline, or an install predating the
+    # migration, must render the page exactly as before rather than 500.
+    health_ctx = {"alerts": [], "queue": {}}
+    try:
+        from ..fixture_health import load_baseline, open_alerts
+        from ..review_queue import build_card
+        for circ in circuits_ctx:
+            cid = circ["circuit"]
+            for alert in open_alerts(orch.db, cid):
+                detail = {}
+                try:
+                    detail = json.loads(alert.get("detail_json") or "{}")
+                except (TypeError, ValueError):
+                    detail = {}
+                base = load_baseline(orch.db, cid, alert["fixture_type"])
+                health_ctx["alerts"].append({
+                    "id": alert["id"],
+                    "circuit": cid,
+                    "circuit_name": circ.get("display_name") or cid,
+                    "fixture_type": alert["fixture_type"],
+                    "signal": alert["signal"],
+                    "opened_at": alert["opened_at"],
+                    "observed": detail.get("observed"),
+                    "threshold": detail.get("threshold"),
+                    "events_to_fire": detail.get("events_to_fire"),
+                    "baseline_median": None if base is None else base.volume_median,
+                })
+            try:
+                card = build_card(orch.db, cid)
+                if card.items:
+                    health_ctx["queue"][cid] = {
+                        "shown": len(card.items),
+                        "waiting": card.n_candidates,
+                        "circuit_name": circ.get("display_name") or cid,
+                    }
+            except Exception:                       # noqa: BLE001
+                pass
+    except Exception as exc:                        # noqa: BLE001
+        log.debug("fixture-health context unavailable: %s", exc)
+
+    return circuits_ctx, stale_link_count, health_ctx
 
 
 def _max_iso(a, b):
@@ -293,6 +339,62 @@ async def category_publish_toggle(
 
 
 # ── Repair stale group links (dev42) ─────────────────────────────────────────
+
+@router.post("/health/{alert_id}/resolve")
+async def resolve_health_alert(alert_id: int, request: Request):
+    """Close a fixture-health alert, and say which of the two things happened.
+
+    The reason code is not bookkeeping — it decides what the reference becomes:
+
+    * ``fixture_repaired`` UNLOCKS the baseline, so the fixture is re-measured
+      against how it behaves now. Correct after replacing a flapper: the old
+      normal is gone.
+    * ``false_alarm`` KEEPS the baseline. Correct when nothing was wrong —
+      re-pinning here would quietly adopt the drifted behaviour as normal and
+      guarantee the alert never fires again, which is the exact failure this
+      whole feature exists to prevent.
+
+    CSRF is enforced by the project-wide middleware.
+    """
+    orch = _orch(request)
+    form = await request.form()
+    reason = str(form.get("reason") or "").strip()
+    from ..fixture_health import (REASON_FALSE_ALARM, REASON_REPAIRED,
+                                  UNLOCK_REASONS, resolve_alert,
+                                  unlock_baseline)
+    if reason not in UNLOCK_REASONS:
+        return ingress_redirect(request, "/fixtures?msg=error")
+
+    def _job(conn):
+        row = conn.execute(
+            "SELECT circuit, fixture_type FROM fixture_health_alert "
+            "WHERE id = ?", (alert_id,)).fetchone()
+        if row is None:
+            return False
+        resolve_alert(conn, alert_id, reason)
+        if reason == REASON_REPAIRED:
+            # Unlock only. The nightly job re-pins from a CLOSED window, so the
+            # new reference cannot be built from the days that are still
+            # settling after the repair.
+            unlock_baseline(conn, row["circuit"], row["fixture_type"], reason)
+            conn.execute(
+                "DELETE FROM fixture_baseline WHERE circuit = ? "
+                "AND fixture_type = ?", (row["circuit"], row["fixture_type"]))
+        conn.commit()
+        return True
+
+    try:
+        from ..database import get_write_lock, run_db
+        async with get_write_lock():
+            ok = await run_db(_job)
+    except Exception as e:                          # noqa: BLE001
+        log.error("resolve-health-alert failed: %s", e, exc_info=True)
+        return ingress_redirect(request, "/fixtures?msg=error")
+    if not ok:
+        return ingress_redirect(request, "/fixtures?msg=error")
+    log.info("fixture-health alert %s resolved as %s", alert_id, reason)
+    return ingress_redirect(request, "/fixtures?msg=health_resolved")
+
 
 @router.post("/repair-stale-links")
 async def repair_stale_links(request: Request):

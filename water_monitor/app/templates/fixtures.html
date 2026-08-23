@@ -34,6 +34,10 @@
 <div class="fx-msg fx-msg-ok">Stale group links cleared —
   {{ request.query_params.get('fixed', '0') }} event(s) unlinked from deleted
   fixture groups and returned to the matching pool.</div>
+{% elif msg == 'health_resolved' %}
+<div class="fx-msg fx-msg-ok">Thanks — noted. If you replaced or repaired the
+  fixture, the app will start measuring it against how it behaves from now on;
+  that takes a few weeks of normal use to settle.</div>
 {% elif msg == 'error' %}
 <div class="fx-msg fx-msg-err">Action failed — check the addon log for details.</div>
 {% endif %}
@@ -68,6 +72,73 @@
   more accurate labels? Run each fixture once with the
   <a href="{{ ingress_path }}/training">Training helper</a>.
 </p>
+
+{# ── dev47 (47i): fixture health. Classification adapts; these baselines do
+     not — so a fixture whose draws are drifting shows up here even though its
+     events are still labelled correctly. Wording avoids diagnosing the cause:
+     the add-on can see that refills grew, not why. ─────────────────────── #}
+{% if health and health.alerts %}
+{% for a in health.alerts %}
+<div class="fx-msg fx-msg-warn" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <span>
+    <strong>{{ fixture_type_labels.get(a.fixture_type, a.fixture_type) }}</strong>
+    on {{ a.circuit_name }} is using more water per run than it used to.
+    {% if a.observed and a.baseline_median %}
+      Recent runs average <strong>{{ '%.1f'|format(a.observed) }} L</strong>
+      against <strong>{{ '%.1f'|format(a.baseline_median) }} L</strong> when this
+      was first measured.
+    {% endif %}
+    {% if a.events_to_fire %}
+      Seen over {{ a.events_to_fire }} runs.
+    {% endif %}
+    Worth checking the fixture — a toilet flapper or a fill valve that no longer
+    seals is the usual reason.
+  </span>
+  {% if is_admin %}
+  <form method="post" action="{{ ingress_path }}/fixtures/health/{{ a.id }}/resolve"
+        style="display:inline">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <input type="hidden" name="reason" value="fixture_repaired">
+    <button type="submit" class="btn btn-ghost btn-sm"
+            title="I fixed the fixture — start measuring it against how it behaves now.">
+      ✓ Fixed it
+    </button>
+  </form>
+  <form method="post" action="{{ ingress_path }}/fixtures/health/{{ a.id }}/resolve"
+        style="display:inline">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <input type="hidden" name="reason" value="false_alarm">
+    <button type="submit" class="btn btn-ghost btn-sm"
+            title="Nothing is wrong — keep the original measurement and stop flagging this.">
+      Dismiss
+    </button>
+  </form>
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+
+{# ── dev47 (47d): the weekly review queue. Deliberately a POINTER to History
+     rather than a second labelling interface — History already does this, and
+     two ways to label the same event is how they drift apart. ──────────── #}
+{% if health and health.queue %}
+{% for cid, q in health.queue.items() %}
+<div class="fx-msg fx-msg-ok" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <span>
+    <strong>{{ q.shown }}</strong> event{{ '' if q.shown == 1 else 's' }} on
+    {{ q.circuit_name }} would be worth a quick look — the app could not type
+    {{ 'it' if q.shown == 1 else 'them' }} confidently.
+    {% if q.waiting > q.shown %}
+      ({{ q.waiting }} are unmatched in total; these are the {{ q.shown }} where
+      your answer teaches it the most.)
+    {% endif %}
+  </span>
+  <a class="btn btn-ghost btn-sm" href="{{ ingress_path }}/history">
+    ★ Label on History
+  </a>
+</div>
+{% endfor %}
+{% endif %}
 
 {# ── Time-range selector — rescopes every card's windowed total. Reuses the #}
 {# History page's hist-range-btn styling; server-side nav via ?range=. ──── #}

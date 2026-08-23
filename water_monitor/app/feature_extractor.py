@@ -5546,6 +5546,31 @@ class FeatureExtractor:
             log.warning("[%s] structural rules tier failed (non-fatal): %s",
                         circuit, e)
 
+        # dev47 (47b) — TinyModel tier, between the label-free anchors above and
+        # the k-NN residual below. That position is the design: the anchors are
+        # label-free and work on day one, the model is per-home and beats the
+        # ladder's house-tuned scales once it has labels, and the k-NN remains
+        # the fallback for everything the model abstains on.
+        #
+        # `immature` burst features here by necessity — a fill's siblings have
+        # not happened yet when it is first classified. The deferred re-classify
+        # revisits with `mature` features, which is the whole reason it exists.
+        if matched_fixture_type is None:
+            try:
+                from . import tinymodel as _tm
+                hit = _tm.classify(self._db, circuit, event_id, features,
+                                   burst_config=_tm.bf.CONFIG_IMMATURE)
+                if hit is not None:
+                    matched_fixture_type, _conf = hit
+                    matched_via = "tinymodel"
+                    match_confidence = _conf
+                    log.info("[%s] event %s matched %s by tinymodel "
+                             "(confidence %.2f)", circuit, event_id,
+                             matched_fixture_type, _conf)
+            except Exception as e:
+                log.warning("[%s] tinymodel tier failed (non-fatal): %s",
+                            circuit, e)
+
         # Sprint C — signature-matcher (k-NN) residual. Runs when no structural
         # rule claimed the event AND the cluster matcher either returned no
         # cluster_id or a low-confidence match. Caught broadly because

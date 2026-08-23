@@ -287,6 +287,9 @@ _BASELINE_VERSION: int = 20260523
 #              circuit_profile.winterized (46h).
 #   20260810 — dev46 (46k): events.verdict_stamp + training_state
 #              .last_full_reclassify_at — lets the boot reclassify SKIP an
+#   20260811 — dev47 (47i): fixture health baselines, nightly stats and
+#               alerts (fixture_baseline / fixture_health_stat /
+#               fixture_health_alert).
 #              event whose verdict provably cannot have changed.
 #
 # VERSION-NUMBER CONVENTION (2026-08-12, decided with the operator): from the
@@ -296,7 +299,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260810
+_CURRENT_VERSION: int = 20260811
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -2943,6 +2946,85 @@ def _log_schema_state(conn: sqlite3.Connection) -> None:
 # one loop — adding a migration is ONE line here (plus bumping _CURRENT_VERSION),
 # not an edit to ~28 hand-maintained per-version branches (the old ladder, where
 # one missed branch stamped a DB current while silently missing a table).
+# 20260811 — dev47 (47i): fixture health baselines, stats and alerts.
+def _apply_fixture_health(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260811 — three tables for fixture health.
+
+    dev47 separates two things the label schema conflates: WHICH fixture a
+    draw came from, and whether that fixture is healthy. Classification stays
+    adaptive (a leaking toilet is still a toilet, and the model may absorb its
+    new shape); health is measured downstream against a reference that does
+    NOT adapt. These tables hold that reference and its evidence.
+
+    ``fixture_baseline`` — one frozen row per (circuit, fixture_type),
+    pinned over an explicit window. ``locked`` defaults to 1 and only an
+    explicit unlock with a reason code clears it, because a baseline that
+    could drift with the data would detect nothing: a degrading flapper would
+    simply redefine normal, which is exactly the failure this exists to catch.
+
+    ``fixture_health_stat`` — append-only nightly observations. The series is
+    the evidence a health card is built from; rewriting it would make an alarm
+    unexplainable afterwards. UNIQUE on (circuit, fixture_type, as_of_day) so
+    a re-run of the nightly job updates that day rather than duplicating it.
+
+    ``fixture_health_alert`` — open/resolved alerts. The retrain reads the
+    open set for holdout hygiene; it is NOT the detector.
+
+    All three are additive and idempotent."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS fixture_baseline (
+               circuit         TEXT NOT NULL,
+               fixture_type    TEXT NOT NULL,
+               baseline_hash   TEXT,
+               pinned_at       TEXT,
+               window_start    TEXT,
+               window_end      TEXT,
+               n_events        INTEGER,
+               stats_json      TEXT,
+               locked          INTEGER NOT NULL DEFAULT 1,
+               unlocked_reason TEXT,
+               unlocked_at     TEXT,
+               PRIMARY KEY (circuit, fixture_type)
+           )""")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS fixture_health_stat (
+               id           INTEGER PRIMARY KEY AUTOINCREMENT,
+               circuit      TEXT NOT NULL,
+               fixture_type TEXT NOT NULL,
+               as_of_day    TEXT NOT NULL,
+               stats_json   TEXT,
+               UNIQUE (circuit, fixture_type, as_of_day)
+           )""")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS fixture_health_alert (
+               id           INTEGER PRIMARY KEY AUTOINCREMENT,
+               circuit      TEXT NOT NULL,
+               fixture_type TEXT NOT NULL,
+               signal       TEXT NOT NULL,
+               opened_at    TEXT NOT NULL,
+               resolved_at  TEXT,
+               resolution   TEXT,
+               detail_json  TEXT
+           )""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fixture_health_alert_open "
+        "ON fixture_health_alert (circuit, fixture_type, resolved_at)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fixture_health_stat_day "
+        "ON fixture_health_stat (circuit, fixture_type, as_of_day)")
+    # Belt-and-braces re-create of the wf-claim index — LAST-migration
+    # convention (see 20260574/20260804/.../20260810).
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+    conn.commit()
+    log.info("Migration 20260811: fixture health baselines ready")
+
+
+
 _MIGRATIONS: tuple = (
     (20260524, _drop_retired_wf_entity_map_rows),
     (20260525, _apply_unique_events_index),
@@ -3005,6 +3087,7 @@ _MIGRATIONS: tuple = (
     (20260808, _apply_reseed_marker_column),
     (20260809, _apply_dev46_columns),
     (20260810, _apply_verdict_stamp),
+    (20260811, _apply_fixture_health),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

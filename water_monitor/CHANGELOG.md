@@ -5,10 +5,34 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev46 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev47 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
+
+- **It learns your home instead of being tuned to one** — the add-on now fits
+  its own classifier from the labels you give it, rather than relying on
+  thresholds hand-tuned against a single house. Tested against four simulated
+  homes with differently-shaped fixtures, the fitted model held its accuracy
+  where the fixed thresholds lost 13–18 points. Until a home has enough labels
+  the previous matching still runs, so nothing changes on day one.
+- **It notices what else was running** — a 1.5 L draw is a dishwasher fill or a
+  tap run depending entirely on whether three more like it arrive over the next
+  hour. The add-on now reads that rhythm. It needs no labels and no setup, and
+  it helps most where fixtures are unusual — which is exactly where fixed
+  thresholds do worst.
+- **It tells you when a fixture starts using more water than it used to** — a
+  toilet flapper that stops sealing keeps producing perfectly ordinary,
+  correctly-labelled flushes; they simply get bigger, and a leak of that size
+  can hide for months. Each fixture is now measured against how it behaved when
+  it was first seen, and that reference is never quietly updated — which is the
+  only way slow change is visible at all. If you repair the fixture, one button
+  starts the measurement again.
+- **A short weekly list instead of a standing chore** — events the add-on could
+  not identify confidently are collected on Water Use, capped at a dozen, and
+  chosen so your answers teach it the most. Ignoring them is free; they keep
+  their best guess either way.
+
 
 - **Winterized circuits** — mark a circuit as drained for the season and the
   add-on stops recording use, running leak tests, and learning pressure for

@@ -31,6 +31,7 @@ from .alert_manager import AlertManager
 from .presence_watcher import PresenceWatcher
 from .historical_importer import HistoricalImporter
 from .cluster_metrics import ClusterMetrics
+from .learning_scheduler import LearningScheduler
 from .maturity_recheck import MaturityRecheck
 from .rise_corr_backfill import RiseCorrBackfill
 from .wf_repair_backfill import WfRepairBackfill
@@ -128,6 +129,7 @@ class Orchestrator:
         self._cluster_engine = None
         self._cluster_metrics: Optional[ClusterMetrics] = None
         self._maturity_recheck: Optional[MaturityRecheck] = None
+        self._learning: Optional[LearningScheduler] = None
         self._rise_corr_backfill: Optional[RiseCorrBackfill] = None
         self._wf_repair_backfill: Optional[WfRepairBackfill] = None
         self._fixture_publisher: Optional[FixturePublisher] = None
@@ -603,6 +605,8 @@ class Orchestrator:
             self._data_pruner.stop()
         if self._maturity_recheck:
             self._maturity_recheck.stop()
+        if self._learning:
+            self._learning.stop()
         if self._rise_corr_backfill:
             self._rise_corr_backfill.stop()
         if self._wf_repair_backfill:
@@ -1070,6 +1074,11 @@ class Orchestrator:
         # labels once an event's cycle-mates have had time to occur (Branch-2.2).
         self._maturity_recheck = MaturityRecheck(self._db, self._cfg, self._ha,
                                                  orch=self)
+        # dev47 — the nightly fixture-health pass and the weekly
+        # referee'd retrain. Both are off the classification path: a
+        # failure here means no model refresh tonight, never that
+        # events stop being classified.
+        self._learning = LearningScheduler(self._db, self._cfg, self)
 
         # One-shot rise-corr backfill (dev14) — fills flow_pressure_corr for
         # historical candidate events from HA history, then stamps itself done.
@@ -1123,6 +1132,8 @@ class Orchestrator:
                 self._supervise("cluster_metrics",     self._cluster_metrics.run),
                 self._supervise("recorder_reconcile", self._run_recorder_reconcile),
                 self._supervise("maturity_recheck",    self._maturity_recheck.run),
+                self._supervise("fixture_health",      self._learning.run_health),
+                self._supervise("tinymodel_retrain",   self._learning.run_retrain),
                 self._supervise("rise_corr_backfill",  self._rise_corr_backfill.run),
                 self._supervise("wf_repair_backfill",  self._wf_repair_backfill.run),
                 self._supervise("pump_regime_detector", self._pump_regime.run),

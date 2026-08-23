@@ -15,7 +15,18 @@ RUN apk add --no-cache python3 py3-pip \
         python-multipart==0.0.22 \
         river==0.24.2 \
         dtaidistance==2.3.13 \
-        paho-mqtt==2.1.0
+        paho-mqtt==2.1.0 \
+        scikit-learn==1.5.2
+
+# scikit-learn is the dev47 TinyModel tier (47b). A real dependency, not a
+# convenience: every dev47 accuracy gate was measured with this exact
+# estimator, so substituting another invalidates the evidence base.
+#
+# It is also OPTIONAL AT RUNTIME by design — `tinymodel.sklearn_available()`
+# reports the tier unavailable and the k-NN ladder serves unchanged. So if the
+# musllinux wheels ever fail to resolve on a target architecture the add-on
+# still runs: it classifies as it did before dev47 and says why in the log.
+# VERIFY on both amd64 and aarch64 before relying on the tier in a release.
 
 # dev46: config.yaml must reach the image, not just the build context. Both
 # the boot version line (46g) and the static-asset cache-buster read the

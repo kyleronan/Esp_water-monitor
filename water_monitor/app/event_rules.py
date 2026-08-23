@@ -116,6 +116,22 @@ WASHER_FAMILY_PK_ENVELOPE: Tuple[float, float] = (
 # the reclassify and live k-NN write paths so the guard can never drift apart. A real
 # cycle/session member suppressed here is re-stamped by its session detector (the washer
 # retro-scan live, or the softener/washer sweep on the next full reclassify).
+# ── detector era ────────────────────────────────────────────────────────────
+# The date the newest DETECTOR change shipped. It exists because a stored
+# machine verdict is frozen the moment the operator labels that event —
+# `reclassify_all_events_from_signatures` skips user-labelled rows by design —
+# so verdicts on labelled events are never re-derived and an archive-wide
+# precision figure silently averages every code era the add-on has ever run.
+#
+# Measured 2026-08-22, the difference is not academic: dishwasher_cycle reads
+# 0.742 archive-wide and 1.000 (14/14) since the dev42/T5 shape gate shipped.
+# The first number describes code that no longer exists.
+#
+# BUMP THIS whenever a detector or rule constant changes, and expect
+# `measure_anchor_precision` to report "not enough current-era data" for a
+# while afterwards — that is the honest state, not a regression.
+DETECTOR_ERA_START: str = "2026-08-22"   # dev47: toilet average-flow floor
+
 CYCLE_ONLY_FIXTURE_TYPES: frozenset = frozenset(
     {"washing_machine", "dishwasher", "water_softener"})
 
@@ -129,6 +145,26 @@ _FLUSH_DUR_S: Tuple[float, float] = (20.0, 150.0)
 # Reviewed-set precision 0.81 → 0.87 at 89/90 recall. Calibratable: a per-
 # regime fit with explicit labels may lower it, and do-no-harm arbitrates.
 _FLUSH_MIN_PK_LPM: float = 7.5
+# dev47 (47e) — AVERAGE-flow floor for a toilet CLAIM.
+#
+# The peak floor above (dev45) removed slow draws with one fast spike. What it
+# could not remove is the draw that is slow THROUGHOUT and still lands inside
+# the flush volume/duration box: measured on the labelled archive, the toilet
+# rule's false positives sit at median true-avg 5.2 L/min against 8.8 for real
+# flushes — a flush empties a cistern at a rate a tap or an appliance fill does
+# not sustain.
+#
+# Measured effect of this floor on rule_toilet's claims (labelled archive,
+# n=169): precision 0.763 -> 0.842 while keeping 128 of 129 genuine flushes
+# (recall 0.992). On post-T5 events alone (n=30): 0.700 -> 0.778 with recall
+# 1.000. The 17 events it rejects are 6 'other', 6 tap, 2 dishwasher, 2 washer
+# and 1 toilet.
+#
+# 5.0 rather than the 5.5 the sweep also supports: recall on the highest-
+# frequency fixture in the house is the expensive side of this trade (dev45,
+# 46d), and 5.5 buys ~3 more points of precision for 3 more vetoed flushes.
+# Revisit with more labels; calibratable, never auto-fit.
+_FLUSH_MIN_AVG_FLOW_LPM: float = 5.0
 _FLUSH_MIN_DELTA_PSI: float = 1.5
 
 _DW_VOL_L: Tuple[float, float] = (0.2, 3.5)
@@ -269,6 +305,7 @@ RULE_DEFAULTS: Dict[str, Any] = {
     "FLUSH_VOL_L":             _FLUSH_VOL_L,
     "FLUSH_DUR_S":             _FLUSH_DUR_S,
     "FLUSH_MIN_PK_LPM":        _FLUSH_MIN_PK_LPM,
+    "FLUSH_MIN_AVG_FLOW_LPM":  _FLUSH_MIN_AVG_FLOW_LPM,
     "DW_VOL_L":                _DW_VOL_L,
     "DW_MAX_PK_LPM":           _DW_MAX_PK_LPM,
     "SHOWER_BIG_VOL_L":        _SHOWER_BIG_VOL_L,
@@ -352,6 +389,38 @@ def is_flush_shaped(features: Dict[str, Any],
         # is waived and the flow-only shape gates above decide.
         return True
     return bool(transient) or (delta is not None and delta >= _FLUSH_MIN_DELTA_PSI)
+
+
+def has_flush_flow_signature(features: Dict[str, Any],
+                             calib: Optional[Dict[str, Any]] = None) -> bool:
+    """Does this draw move water at the RATE a flush does, throughout?
+
+    Deliberately NOT folded into ``is_flush_shaped``. That predicate is shared:
+    the toilet rule uses it to CLAIM, while the washer sweep, the dishwasher
+    cycle detector and the softener session detector use it to EXCLUDE. Adding
+    a floor there would narrow what counts as a flush everywhere, which quietly
+    LOOSENS all three of those detectors — a change to three tiers that has not
+    been measured. So the floor lives here and is required only where a claim
+    is made.
+
+    ``true_avg_flow_lpm`` is preferred (it excludes the pressure-window padding
+    in ``avg_flow_lpm``); legacy rows without it fall back, and rows with
+    neither pass unchallenged rather than being delabelled by a feature they
+    never had.
+    """
+    flow = _f(features, "true_avg_flow_lpm")
+    # A draw that moved water cannot average zero. A non-positive value here
+    # means the active-flow computation did not run for this event, not that
+    # the flow was zero — the same coerced-0.0 trap the pressure feature
+    # documents (`_PRESSURE_VALID_MIN_PSI`). Reading it as a measurement makes
+    # this floor reject EVERY event, which is exactly what the 46r recording
+    # corpus caught when this gate was first written: the genuine toilet in the
+    # corpus replays with true_avg 0.0 and avg_flow 8.0.
+    if flow is None or flow <= 0.0:
+        flow = _f(features, "avg_flow_lpm")
+    if flow is None or flow <= 0.0:
+        return True
+    return flow >= _cv(calib, "FLUSH_MIN_AVG_FLOW_LPM")
 
 
 def _is_washer_anchor(vol, dur, pk, calib: Optional[Dict[str, Any]] = None) -> bool:
@@ -564,7 +633,8 @@ def rule_classify_event(
             return "irrigation_zone", "zone_default"
         return None
 
-    if is_flush_shaped(features, calib, pump_mode=pump_mode):
+    if (is_flush_shaped(features, calib, pump_mode=pump_mode)
+            and has_flush_flow_signature(features, calib)):
         return "toilet", "rule_toilet"
 
     dw_vol = _cv(calib, "DW_VOL_L")

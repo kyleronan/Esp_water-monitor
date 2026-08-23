@@ -1657,6 +1657,56 @@ CREATE TABLE IF NOT EXISTS supply_regime (
 );
 
 -- ==========================================================================
+-- FIXTURE HEALTH (dev47 47i)
+-- Classification adapts; these do not. A degrading fixture keeps producing
+-- correctly-labelled events, so accuracy metrics stay clean while the home
+-- loses water — the label schema conflates WHICH fixture with IS IT HEALTHY.
+-- The baseline is frozen over an explicit window and moves only by an explicit
+-- unlock with a reason code; a reference that drifted with the data would let
+-- a failing fixture quietly redefine normal, which is the whole failure mode.
+-- ==========================================================================
+CREATE TABLE IF NOT EXISTS fixture_baseline (
+    circuit         TEXT NOT NULL,
+    fixture_type    TEXT NOT NULL,
+    baseline_hash   TEXT,
+    pinned_at       TEXT,
+    window_start    TEXT,
+    window_end      TEXT,
+    n_events        INTEGER,
+    stats_json      TEXT,
+    locked          INTEGER NOT NULL DEFAULT 1,
+    unlocked_reason TEXT,               -- fixture_replaced | fixture_repaired | false_alarm
+    unlocked_at     TEXT,
+    PRIMARY KEY (circuit, fixture_type)
+);
+
+-- Append-only nightly observations: the evidence a health card is built from.
+CREATE TABLE IF NOT EXISTS fixture_health_stat (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit      TEXT NOT NULL,
+    fixture_type TEXT NOT NULL,
+    as_of_day    TEXT NOT NULL,
+    stats_json   TEXT,
+    UNIQUE (circuit, fixture_type, as_of_day)
+);
+
+CREATE TABLE IF NOT EXISTS fixture_health_alert (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    circuit      TEXT NOT NULL,
+    fixture_type TEXT NOT NULL,
+    signal       TEXT NOT NULL,
+    opened_at    TEXT NOT NULL,
+    resolved_at  TEXT,
+    resolution   TEXT,
+    detail_json  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_fixture_health_alert_open
+    ON fixture_health_alert (circuit, fixture_type, resolved_at);
+CREATE INDEX IF NOT EXISTS idx_fixture_health_stat_day
+    ON fixture_health_stat (circuit, fixture_type, as_of_day);
+
+-- ==========================================================================
 -- DATA RETENTION CONFIGURATION
 -- Controls how aggressively old history is pruned.
 -- Training-era data is always protected regardless of these settings.
@@ -7485,20 +7535,42 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
             if rule_hit is not None:
                 new_type, new_via = rule_hit
             else:
+                # dev47 (47b) — TinyModel tier, in the same ladder position the
+                # live path uses (anchors -> model -> fingerprint/k-NN). The
+                # batch pass uses MATURE burst features: every event's siblings
+                # are already in the table here, which is exactly the context
+                # the live pass could not have.
+                _tm_hit = None
+                try:
+                    from . import tinymodel as _tm
+                    _tm_hit = _tm.classify(conn, circuit, r["id"], feats,
+                                           burst_config=_tm.bf.CONFIG_MATURE)
+                except Exception as _tm_exc:
+                    log.debug("tinymodel tier unavailable in reclassify: %s",
+                              _tm_exc)
                 # Fingerprint tier (2026-07 audit Phase 3) — whole-waveform NN
                 # against USER-labeled events, tight-threshold only. Sits between
                 # the structural rules and the scalar k-NN: stronger evidence
                 # than a scalar vote, weaker than cycle/session context above.
-                fp_hit = None
-                if _fp_library is not None:
-                    from .fingerprint_matcher import match_event_fingerprint
-                    try:
-                        fp_hit = match_event_fingerprint(
-                            conn, circuit, r["id"], library=_fp_library)
-                    except Exception as e:  # noqa: BLE001 — never break reclassify
-                        log.debug("[%s] fingerprint match failed for %s: %s",
-                                  circuit, r["id"], e)
-                if fp_hit is not None:
+                if _tm_hit is not None:
+                    # The model claimed it; the tiers below are its fallback,
+                    # not its reviewers.
+                    new_type = _canonical_fixture_type(_tm_hit[0])
+                    new_via = "tinymodel" if new_type is not None else None
+                    fp_hit = None
+                else:
+                    fp_hit = None
+                    if _fp_library is not None:
+                        from .fingerprint_matcher import match_event_fingerprint
+                        try:
+                            fp_hit = match_event_fingerprint(
+                                conn, circuit, r["id"], library=_fp_library)
+                        except Exception as e:  # noqa: BLE001 — never break reclassify
+                            log.debug("[%s] fingerprint match failed for %s: %s",
+                                      circuit, r["id"], e)
+                if _tm_hit is not None:
+                    pass                      # decided above
+                elif fp_hit is not None:
                     new_type = _canonical_fixture_type(fp_hit["fixture_type"])
                     new_via = "fingerprint" if new_type is not None else None
                 else:
