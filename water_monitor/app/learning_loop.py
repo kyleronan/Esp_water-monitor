@@ -335,20 +335,51 @@ def _score_artifact(art: tm.Artifact, rows: Sequence[dict]) -> Score:
 
 def split_holdout(pool: Sequence[dict], fraction: float = 0.25
                   ) -> Tuple[List[dict], List[dict]]:
-    """Day-grouped split.
+    """Day-grouped split whose holdout carries USER labels only.
 
-    Grouped by day because an appliance cycle's fills are near-duplicates of
-    one another: splitting a day would let the challenger be scored on events
-    it effectively memorised, which is the degenerate comparison V6d measured
-    (champion 0.0 / challenger 1.0 in every row).
+    Two invariants, and the interesting part is how they interact.
+
+    DAY-GROUPED. A day is never split, because an appliance cycle's fills are
+    near-duplicates of one another, and scoring the challenger on an event it
+    effectively memorised is the degenerate comparison V6d measured (champion
+    0.0 / challenger 1.0 in every row).
+
+    USER-ONLY HOLDOUT. This holdout is the only measurement of precision
+    against human truth anywhere in the loop: ``tm.train`` calibrates the
+    serving threshold on it, and it is the referee's recent leg. An anchor row
+    in it converts both into machine-vs-machine agreement — the same mistake
+    that put "399/399 rule_toilet precision" into the dev47 plan's first
+    revision, when the real figure was model-vs-model agreement on unlabelled
+    events.
+
+    Satisfying only the second gives a subtly broken split. Filtering anchors
+    out of an already-built holdout leaves that day's ANCHOR rows sitting in
+    ``train_rows`` while its user rows are scored — reintroducing, through the
+    back door, exactly the near-duplicate leak the day-grouping exists to
+    prevent. So the partition happens BEFORE the split: an anchor landing on a
+    held-out day is DROPPED rather than moved across the boundary. That costs a
+    little training signal (anchors are free and capped anyway) and buys an
+    honest measurement, which is the scarcer thing.
+
+    Held-out days are chosen among days that actually carry user labels. An
+    anchor-only day would otherwise consume a holdout slot and contribute
+    nothing to it, shrinking the very sample whose size already binds — the
+    tier serves at the 0.90 grid ceiling because the Wilson lower bound at
+    n≈200 will not clear the 0.85 target, so every holdout row is coverage.
     """
-    days = sorted({str(r.get("start_ts"))[:10] for r in pool})
-    if len(days) < 4:
+    def _day(row: dict) -> str:
+        return str(row.get("start_ts"))[:10]
+
+    def _is_user(row: dict) -> bool:
+        return (row.get("fixture_label_source") or "direct") != ANCHOR_SOURCE
+
+    user_days = sorted({_day(r) for r in pool if _is_user(r)})
+    if len(user_days) < 4:
         return list(pool), []
     step = max(int(1 / max(fraction, 1e-6)), 2)
-    held_days = set(days[::step])
-    train = [r for r in pool if str(r.get("start_ts"))[:10] not in held_days]
-    hold = [r for r in pool if str(r.get("start_ts"))[:10] in held_days]
+    held_days = set(user_days[::step])
+    train = [r for r in pool if _day(r) not in held_days]
+    hold = [r for r in pool if _day(r) in held_days and _is_user(r)]
     return train, hold
 
 
