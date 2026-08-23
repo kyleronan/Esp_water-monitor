@@ -226,6 +226,25 @@ async def lifespan(app: FastAPI):
         _build = "version unknown"
     log.info("Water Monitor %s starting — %d circuits configured",
              _build, len(cfg.circuits))
+    # dev47 — say at BOOT whether the model tier can serve. It is optional by
+    # design (an image without scikit-learn falls back to the kNN ladder), and
+    # scikit-learn ships no musllinux wheel, so whether it is present depends on
+    # Alpine's py3-scikit-learn resolving at build time. Without this line the
+    # only way to find out is to wait for the weekly retrain — which is exactly
+    # the "is my deploy actually doing what I think" problem the version line
+    # above was added to solve.
+    try:
+        from .tinymodel import sklearn_available
+        if sklearn_available():
+            import sklearn as _sk
+            log.info("TinyModel tier available (scikit-learn %s) — it serves "
+                     "once a circuit has enough labels", _sk.__version__)
+        else:
+            log.info("TinyModel tier NOT available (scikit-learn absent from "
+                     "this image) — the kNN ladder serves, exactly as before "
+                     "dev47. Everything else in dev47 is unaffected.")
+    except Exception as _tm_exc:            # never block boot on a report
+        log.debug("could not report TinyModel availability: %s", _tm_exc)
     # RBAC trusts the ingress X-Remote-User-Id header ONLY because the ingress-IP
     # guard rejects non-Supervisor clients. If that guard is disabled in production
     # (INGRESS_ALLOWED_IP cleared while DEV_MODE is off), the header could be forged

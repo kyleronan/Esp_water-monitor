@@ -1,4 +1,10 @@
-ARG BUILD_FROM
+# The Supervisor always passes --build-arg BUILD_FROM for the target arch, so
+# this default is only used by a plain `docker build`. It exists to silence
+# Docker's InvalidDefaultArgInFrom warning and to make a manual build work;
+# the multi-arch `base` manifest resolves to the right image either way.
+# Pinned to 3.20 deliberately — the add-on's dependency set (notably Alpine's
+# py3-scikit-learn) is resolved against that release.
+ARG BUILD_FROM=ghcr.io/home-assistant/base:3.20
 FROM ${BUILD_FROM}
 
 ENV LANG=C.UTF-8 \
