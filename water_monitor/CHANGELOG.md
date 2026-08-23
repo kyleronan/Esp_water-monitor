@@ -5,10 +5,26 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev47 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev48 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
+
+- **It can tell a washing machine filling from a toilet flushing** — a washer
+  fills in stages, and the middle stage moves about as much water, about as
+  fast, as a flush. Judged on its own it is a flush; judged alongside the draws
+  around it, it plainly is not. The add-on now takes that company into account
+  before calling something a toilet, and hands the doubtful ones to the part
+  that learns your home. A flush on its own is unaffected — on the reference
+  home this changed none of the confirmed toilets.
+- **It measures how fast a fixture runs, not just how much it used** — a short
+  top-off that spends half its time not flowing averages far below the rate it
+  actually runs at, and a single momentary spike is not that rate either. The
+  add-on now records the rate a draw settles at, which depends on the fixture's
+  valve and your water pressure rather than on how long it happened to run.
+  Recognition improves most where two fixtures use similar amounts of water at
+  similar average rates. Draws recorded before this update are measured from
+  their stored waveform where one exists.
 
 - **It learns your home instead of being tuned to one** — the add-on now fits
   its own classifier from the labels you give it, rather than relying on

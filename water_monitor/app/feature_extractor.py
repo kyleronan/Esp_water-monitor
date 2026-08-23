@@ -3312,6 +3312,51 @@ def rebuild_signatures_from_waveforms(conn) -> dict:
             "pressure_upgraded": press_up}
 
 
+def flow_plateau_lpm(series) -> Optional[float]:
+    """The rate this fixture runs at once it is running, or None.
+
+    Neither of the flow numbers already stored answers that question. The
+    average is diluted by ramp-up and by any off-time — a 14 s washer top-off
+    with flow_on_ratio 0.42 averages 7.4 L/min while actually running at 9.7 —
+    and the peak is a single sample, so it takes the spikiest reading in the
+    event. The plateau is the median of the samples that are actually flowing,
+    which is a property of the valve and the supply pressure rather than of how
+    long the draw happened to last.
+
+    Measured on the reference home (3-fold day-grouped CV, 583 labelled events
+    carrying a waveform): +1.3 accuracy points, +2.3 excluding 'other'. It is
+    NOT uniformly better than what it joins — dishwasher is tighter on plain
+    average, because a pulsed fill has no plateau to speak of, and shower is
+    tighter still because people adjust the tap mid-flow. It earns its place by
+    being a DIFFERENT measurement, not a better one, and the booster picks per
+    class which to lean on.
+
+    None when there is no usable waveform; the model treats that as missing
+    rather than as zero, which is the whole reason it is NaN-native.
+    """
+    try:
+        vals = [float(v) for v in series if v is not None]
+    except (TypeError, ValueError):
+        return None
+    on = sorted(v for v in vals if v > 0)
+    if len(on) < 4:
+        return None
+
+    def _median(seq):
+        mid = len(seq) // 2
+        return seq[mid] if len(seq) % 2 else (seq[mid - 1] + seq[mid]) / 2.0
+
+    # The reference is the MEDIAN of the flowing samples, not their max. A
+    # max-anchored floor is defeated by exactly one spike: half of a 22 L/min
+    # transient is 11, which excludes a genuine 9 L/min plateau and hands back
+    # the spike — reproducing the very weakness of peak_flow_lpm this feature
+    # exists to avoid. Taking the upper half is stable under a single outlier
+    # and agrees with the max-anchored definition on a clean plateau, which is
+    # the shape the +2.3 point measurement was taken on.
+    upper = [v for v in on if v >= _median(on)]
+    return round(_median(upper), 4) if upper else None
+
+
 def classify_flow_shape(signature, *, steady_state_fraction=None,
                         flow_rise_rate=None, flow_fall_rate=None,
                         mid_event_flow_drop=None, peak=None) -> str:
@@ -3838,6 +3883,9 @@ def _enrich_from_waveform(
                         sum(1 for v in body if abs(v - med) <= thr) / len(body), 4)
             if len(ff) >= 2:
                 features["flow_variability"] = round(_safe_std(ff), 4)
+            plateau = flow_plateau_lpm(body)
+            if plateau is not None:
+                features["flow_plateau_lpm"] = plateau
             any_wf_used = True
 
         # 3b. Full-pressure waveform → recovery overshoot (from the tail)
@@ -4003,6 +4051,10 @@ _WF_UPGRADE_COLUMNS = (
     "hydraulic_resistance",
     "flow_rise_rate_lpm_s", "time_to_90pct_flow_seconds", "opening_step_lpm",
     "pressure_onset_ms", "steady_state_fraction", "flow_variability",
+    # dev48 — a late waveform is a BETTER measurement of the same draw, and
+    # the plateau is derived from exactly that series. Leaving it off this list
+    # would compute the improved value and then drop it on the floor.
+    "flow_plateau_lpm",
     "recovery_overshoot_psi",
     # dev14 — recomputed from the firmware flow+pressure arrays under the same
     # quality gate as the signatures; the periodic exclusion reprocess (rise
@@ -5553,8 +5605,24 @@ class FeatureExtractor:
                     _pump = _pga(self._db, circuit)
                 except Exception:
                     _pump = False
+                # dev48 — burst context for the toilet rule's appliance veto.
+                # IMMATURE by necessity, the same constraint the model tier
+                # below works under: a washer's FIRST fill has no siblings yet,
+                # so the veto cannot fire live on it. It fires on the batch
+                # re-derive once the rest of the cycle exists, which is what
+                # that pass is for. Failing to read context must never cost the
+                # claim, so the veto abstains rather than guesses.
+                _burst = None
+                try:
+                    from . import burst_features as _bf
+                    _burst = _bf.compute_for_events(
+                        self._db, circuit, [event_id],
+                        config=_bf.CONFIG_IMMATURE).get(event_id)
+                except Exception as _bf_exc:           # noqa: BLE001
+                    log.debug("[%s] burst context unavailable for %s: %s",
+                              circuit, event_id, _bf_exc)
                 rule_hit = rule_classify_event(features, ctype, calib=calib,
-                                               pump_mode=_pump)
+                                               pump_mode=_pump, burst=_burst)
                 if rule_hit is not None:
                     matched_fixture_type, matched_via = rule_hit
         except Exception as e:

@@ -165,6 +165,30 @@ _FLUSH_MIN_PK_LPM: float = 7.5
 # 46d), and 5.5 buys ~3 more points of precision for 3 more vetoed flushes.
 # Revisit with more labels; calibratable, never auto-fit.
 _FLUSH_MIN_AVG_FLOW_LPM: float = 5.0
+
+# dev48 — burst veto on the toilet rule. A flush judged alone is a volume and a
+# flow rate; judged in company it is often an appliance filling in stages.
+#
+# The threshold is set by BASE RATE, not by the widest separation. An earlier
+# draft used >3 heavy neighbours plus a second clause on n_ev_30m, chosen for
+# the biggest precision gap over 159 labelled rule_toilet claims — and fired on
+# 40% of every event on the reference home, denying the rule 29 of 177 real
+# flushes. A veto that routine is not a veto. Measured across the whole stream
+# instead (3,979 events, 177 labelled toilets, 128 labelled washers):
+#
+#     heavy >    all events   labelled toilets   labelled washers
+#        3          20.2%           6.8%              46.9%
+#        4          11.5%           1.7%              19.5%
+#        6           2.5%           0.0%               0.8%
+#
+# 6 costs NO labelled flush at all while still catching the case it exists for,
+# and on the claims it does veto the rule was right 0 times out of 4 and the
+# model 3. The n_ev_30m clause is gone: it fired on 36% of events by counting
+# any draw, including tiny taps, so it measured "busy household" rather than
+# "appliance cycle". n_heavy_2h is the targeted signal — it counts only
+# neighbours that are themselves fill-sized (3-25 L, >=8 L/min).
+_TOILET_VETO_HEAVY_2H: int = 6
+       # any draws within +/-30 min
 _FLUSH_MIN_DELTA_PSI: float = 1.5
 
 _DW_VOL_L: Tuple[float, float] = (0.2, 3.5)
@@ -391,6 +415,33 @@ def is_flush_shaped(features: Dict[str, Any],
     return bool(transient) or (delta is not None and delta >= _FLUSH_MIN_DELTA_PSI)
 
 
+def in_appliance_burst(burst: Optional[Dict[str, Any]]) -> bool:
+    """Is this draw sitting inside a run of activity that a flush would not be?
+
+    A toilet flushes and then the room goes quiet. An appliance fills in stages,
+    so its members arrive surrounded by siblings. The threshold counts
+    NEIGHBOURS, never the event itself, so a lone flush can never trip it
+    however large it is.
+
+    ``burst`` is the label-free burst-context dict (47a). ``None`` means the
+    caller could not compute it — a fitting path, or a stream too short — and
+    the answer is then False, so the rule behaves exactly as it did before this
+    veto existed. Silence is not evidence of a burst.
+    """
+    if not burst:
+        return False
+
+    def _n(key):
+        v = burst.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    heavy = _n("n_heavy_2h")
+    return heavy is not None and heavy > _TOILET_VETO_HEAVY_2H
+
+
 def has_flush_flow_signature(features: Dict[str, Any],
                              calib: Optional[Dict[str, Any]] = None) -> bool:
     """Does this draw move water at the RATE a flush does, throughout?
@@ -610,6 +661,7 @@ def rule_classify_event(
     features: Dict[str, Any], circuit_type: str = "fixture",
     calib: Optional[Dict[str, Any]] = None,
     pump_mode: bool = False,
+    burst: Optional[Dict[str, Any]] = None,
 ) -> Optional[Tuple[str, str]]:
     """Ordered structural rules — first hit wins; None = no rule claims the event
     (falls through to the k-NN residual). Washer is deliberately NOT here: it
@@ -633,8 +685,17 @@ def rule_classify_event(
             return "irrigation_zone", "zone_default"
         return None
 
+    # Two vetoes, and they catch different mistakes. The flow signature rejects
+    # draws that are the wrong SIZE or SHAPE for a flush; the burst check
+    # rejects draws that are the right size in the wrong COMPANY — a washer
+    # filling in stages produces a middle draw indistinguishable from a flush
+    # in isolation, which is exactly what a per-event rule cannot see. A vetoed
+    # claim is not a rejection: it falls through to the model tier, which has
+    # the burst features and was measured to be right 53% of the time on these
+    # against the rule's 24%.
     if (is_flush_shaped(features, calib, pump_mode=pump_mode)
-            and has_flush_flow_signature(features, calib)):
+            and has_flush_flow_signature(features, calib)
+            and not in_appliance_burst(burst)):
         return "toilet", "rule_toilet"
 
     dw_vol = _cv(calib, "DW_VOL_L")

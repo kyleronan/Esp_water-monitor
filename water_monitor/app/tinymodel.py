@@ -56,6 +56,12 @@ BASE_FEATURES: tuple = (
     "flow_fall_rate_lpm_s", "opening_step_lpm", "time_to_90pct_flow_seconds",
     "pressure_delta_psi", "pre_event_pressure_psi", "hour_sin", "hour_cos",
     "is_weekend",
+    # dev48 — the rate a draw runs at once running (migration 20260812).
+    # Deliberately NOT in LOG_FEATURES, which is where its sibling flow rates
+    # sit: the +2.3 point measurement was taken untransformed, and a boosted
+    # TREE is invariant to any monotone transform of a single feature anyway,
+    # so log-compressing it could only make the number harder to reproduce.
+    "flow_plateau_lpm",
 )
 LOG_FEATURES: frozenset = frozenset({
     "volume_litres", "duration_seconds", "true_avg_flow_lpm", "avg_flow_lpm",
@@ -67,7 +73,10 @@ LOG_FEATURES: frozenset = frozenset({
 REGIME_FEATURE = "supply_regime_id"
 FEATURES: tuple = BASE_FEATURES + bf.FEATURE_NAMES + (REGIME_FEATURE,)
 
-FEATURE_SET_VERSION = "dev47.1"
+# dev48.0 adds flow_plateau_lpm. Bumping this is what makes every stored
+# artifact unservable until it retrains — correct, because a model fitted
+# without the column cannot be scored against rows that have it.
+FEATURE_SET_VERSION = "dev48.0"
 
 # Model hyper-parameters. These are the exact values every dev47 measurement
 # used; changing one makes the stored benchmark numbers incomparable, so they

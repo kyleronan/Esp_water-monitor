@@ -287,6 +287,7 @@ _BASELINE_VERSION: int = 20260523
 #              circuit_profile.winterized (46h).
 #   20260810 — dev46 (46k): events.verdict_stamp + training_state
 #              .last_full_reclassify_at — lets the boot reclassify SKIP an
+#   20260812 — dev48: events.flow_plateau_lpm + waveform backfill.
 #   20260811 — dev47 (47i): fixture health baselines, nightly stats and
 #               alerts (fixture_baseline / fixture_health_stat /
 #               fixture_health_alert).
@@ -299,7 +300,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260811
+_CURRENT_VERSION: int = 20260812
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -3025,6 +3026,65 @@ def _apply_fixture_health(conn: sqlite3.Connection) -> None:
 
 
 
+# 20260812 — dev48: flow_plateau_lpm, the rate a draw runs at once running.
+def _apply_flow_plateau(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260812 — one column, backfilled from waveforms.
+
+    Neither stored flow number answers "how fast does this fixture actually
+    run": the average is diluted by ramp and off-time, the peak is one sample.
+    The plateau is the median of the flowing samples, so it describes the valve
+    and the supply pressure rather than the length of the draw.
+
+    Backfilled here rather than left to accumulate because the model can only
+    learn from it where it exists, and the history is where the labels are. Only
+    events with a stored waveform get a value; the rest stay NULL, which the
+    model reads as missing rather than as zero. On the reference home that is
+    about 60% coverage, and the feature bought +2.3 accuracy points (excluding
+    'other') on exactly that subset.
+
+    Additive and idempotent: the column is added only if absent, and the
+    backfill only ever fills rows that are still NULL, so re-running cannot
+    overwrite a value the live path has since computed."""
+    import json
+
+    from .feature_extractor import flow_plateau_lpm
+
+    if not _has_column(conn, "events", "flow_plateau_lpm"):
+        conn.execute("ALTER TABLE events ADD COLUMN flow_plateau_lpm REAL")
+        log.info("Added events.flow_plateau_lpm (REAL)")
+
+    # A database old enough to be migrating from far back may not have reached
+    # the waveform table yet — the forward-walk test migrates from every prior
+    # version, and joining a table that does not exist there is fatal. Nothing
+    # to backfill from is a normal state, not an error: the live path fills the
+    # column going forward either way.
+    if not _has_table(conn, "event_waveforms"):
+        conn.commit()
+        log.info("Migration 20260812: flow_plateau_lpm ready (no waveform "
+                 "table yet — nothing to backfill)")
+        return
+
+    rows = conn.execute(
+        "SELECT e.id, w.flow_max_json FROM events e "
+        "  JOIN event_waveforms w ON w.event_id = e.id "
+        " WHERE e.flow_plateau_lpm IS NULL AND w.flow_max_json IS NOT NULL"
+    ).fetchall()
+    filled = 0
+    for row in rows:
+        try:
+            series = json.loads(row[1] or "[]")
+        except (TypeError, ValueError):
+            continue
+        plateau = flow_plateau_lpm(series)
+        if plateau is None:
+            continue
+        conn.execute("UPDATE events SET flow_plateau_lpm = ? WHERE id = ?",
+                     (plateau, row[0]))
+        filled += 1
+    conn.commit()
+    log.info("Migration 20260812: flow_plateau_lpm ready (%d of %d waveform "
+             "row(s) backfilled)", filled, len(rows))
+
 _MIGRATIONS: tuple = (
     (20260524, _drop_retired_wf_entity_map_rows),
     (20260525, _apply_unique_events_index),
@@ -3088,6 +3148,7 @@ _MIGRATIONS: tuple = (
     (20260809, _apply_dev46_columns),
     (20260810, _apply_verdict_stamp),
     (20260811, _apply_fixture_health),
+    (20260812, _apply_flow_plateau),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

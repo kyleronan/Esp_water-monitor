@@ -1006,6 +1006,10 @@ CREATE TABLE IF NOT EXISTS events (
     time_from_90pct_to_zero_seconds  REAL DEFAULT 0,
     mid_event_flow_drop_lpm          REAL DEFAULT 0,
     steady_state_fraction            REAL DEFAULT 0,
+    -- dev48 (migration 20260812): the rate a draw runs at once it is running.
+    -- NULL, not 0 — a draw with no stored waveform has no plateau, and the
+    -- model must read that as missing rather than as "ran at zero".
+    flow_plateau_lpm                 REAL,
     -- Pressure transient features (migration 025)
     pressure_transient_energy        REAL DEFAULT 0,
     pressure_transient_duration_ms   REAL DEFAULT 0,
@@ -7562,6 +7566,20 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     abstained        = counters["abstained"]
     changed          = counters["changed"]
     veto_counts      = counters["veto_counts"]
+    # dev48 — burst context for the toilet rule's appliance veto. Computed ONCE
+    # for the whole chunk: compute_for_events does a single windowed read over
+    # the id set, so hoisting it out of the loop is the difference between one
+    # query and one per event. MATURE here for the same reason the model tier
+    # uses it below — in a batch pass every sibling is already in the table.
+    _burst_ctx = {}
+    try:
+        from . import burst_features as _bf
+        _burst_ctx = _bf.compute_for_events(
+            conn, circuit, [r["id"] for r in rows], config=_bf.CONFIG_MATURE)
+    except Exception as _bf_exc:                       # noqa: BLE001
+        # No burst context means the veto abstains and the rule behaves exactly
+        # as it did before it existed — never a reason to fail a reclassify.
+        log.debug("burst context unavailable in reclassify: %s", _bf_exc)
     for r in rows:
         scanned += 1
         new_group = None
@@ -7591,7 +7609,8 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                 resolve_regime_for_ts(_regimes, r["start_ts"]), calib)
                 if _regimes else calib)
             rule_hit = rule_classify_event(feats, circuit_type, calib=_ev_calib,
-                                           pump_mode=_pump)
+                                           pump_mode=_pump,
+                                           burst=_burst_ctx.get(r["id"]))
             if rule_hit is not None:
                 new_type, new_via = rule_hit
             else:
