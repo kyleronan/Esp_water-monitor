@@ -1,12 +1,27 @@
-# The Supervisor always passes --build-arg BUILD_FROM for the target arch, so
-# this default is only used by a plain `docker build`. It exists to silence
-# Docker's InvalidDefaultArgInFrom warning and to make a manual build work;
-# the multi-arch manifest resolves to the right image either way.
-# Debian rather than Alpine — see build.yaml for why. In short: scikit-learn
-# has no musllinux wheel at any version, and Alpine's own build cannot coexist
-# with river's numpy floor, so on musl the tier is unreachable by construction.
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm-2026.02.0
-FROM ${BUILD_FROM}
+# ── base image ─────────────────────────────────────────────────────────────
+# A plain FROM, per the Supervisor's build.yaml migration: base images are
+# published as multi-platform manifests now, so buildx picks the right one from
+# the --platform it is given and a per-arch map is unnecessary. build.yaml is
+# gone; this line is what replaced its `build_from:` block.
+#
+# Pinned rather than floating on :bookworm so the Debian release — and with it
+# the Python minor version, and therefore which manylinux wheels pip resolves —
+# cannot move under the add-on without a deliberate rebuild.
+#
+# Debian rather than Alpine is a dependency decision, not a taste one:
+# scikit-learn publishes NO musllinux wheel at any version (every release
+# through 1.9.0 is manylinux-only), and Alpine's own py3-scikit-learn is built
+# against a py3-numpy too old to satisfy river's `numpy>=2.3.4` floor. On musl
+# those two requirements are mutually exclusive and the model tier is
+# unreachable by construction; on glibc every piece resolves from a pinned
+# prebuilt wheel.
+#
+# amd64 and aarch64 only — that is the whole of what this manifest carries, and
+# it is why config.yaml no longer lists armhf/armv7/i386. Home Assistant
+# stopped publishing 32-bit Debian bases after bookworm-2025.11.1, and neither
+# scikit-learn nor river ships a wheel for those architectures on any libc, so
+# the cluster engine could not run there either.
+FROM ghcr.io/home-assistant/base-debian:bookworm-2026.08.0
 
 ENV LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1 \

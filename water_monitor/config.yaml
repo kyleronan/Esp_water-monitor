@@ -6,12 +6,16 @@ description: >-
   anomaly detection, and scheduled leak testing. Learns your home's
   normal water usage patterns and alerts on unusual events.
 url: "https://github.com/kyleronan/Esp_water-monitor"
+# amd64 and aarch64 only. Home Assistant stopped publishing 32-bit Debian base
+# images after bookworm-2025.11.1, and the multi-platform manifest the Dockerfile
+# now builds from carries these two architectures and no others. Independently,
+# neither scikit-learn nor river publishes a wheel for armhf/armv7/i386 on any
+# libc — so on those boards the learned-model tier AND the cluster engine would
+# both be unavailable. Declaring support we cannot deliver is worse than not
+# declaring it.
 arch:
   - aarch64
   - amd64
-  - armhf
-  - armv7
-  - i386
 init: false
 startup: services
 boot: auto
