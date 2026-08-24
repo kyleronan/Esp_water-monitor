@@ -20,18 +20,36 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 # `river` is a runtime dependency of ClusterEngine but not of the rest of
-# the package. Import it lazily so test modules that pull in
-# feature_extractor / event_detector still collect in environments where
-# river isn't installed (e.g. local test runs without the add-on's full
-# Dockerfile pip set). ClusterEngine.__init__ raises a clear error if river
-# is actually needed at runtime.
-try:                                   # pragma: no cover - import guard
-    from river import cluster, preprocessing
-    _RIVER_IMPORT_ERROR: Optional[BaseException] = None
-except ImportError as _exc:            # pragma: no cover - import guard
-    cluster = None                     # type: ignore[assignment]
-    preprocessing = None               # type: ignore[assignment]
-    _RIVER_IMPORT_ERROR = _exc
+# the package, and importing it eagerly pulls in scipy — ~1.3 s of import
+# cost. Nothing outside ClusterEngine needs it: feature_extractor imports
+# this module only for a constant, and most tests never instantiate the
+# engine. So defer the import to ClusterEngine.__init__ via _load_river();
+# importing this module (or feature_extractor, or event_detector) no longer
+# pays the river/scipy cost, which is the single biggest chunk of the test
+# suite's fixed startup tax. It also keeps collection working where river
+# isn't installed (local runs without the add-on's full Dockerfile pip set):
+# only code that actually constructs the engine raises a clear error.
+cluster = None                         # populated by _load_river()
+preprocessing = None                   # populated by _load_river()
+_RIVER_IMPORT_ERROR: Optional[BaseException] = None
+
+
+def _load_river() -> None:
+    """Import river on first ClusterEngine construction; cache the result.
+
+    Idempotent: after the first call ``cluster``/``preprocessing`` are bound
+    (success) or ``_RIVER_IMPORT_ERROR`` is set (failure), and subsequent
+    calls are a cheap module-global check.
+    """
+    global cluster, preprocessing, _RIVER_IMPORT_ERROR
+    if cluster is not None or _RIVER_IMPORT_ERROR is not None:
+        return                         # already attempted
+    try:
+        from river import cluster as _cluster, preprocessing as _preprocessing
+        cluster = _cluster
+        preprocessing = _preprocessing
+    except ImportError as _exc:        # pragma: no cover - import guard
+        _RIVER_IMPORT_ERROR = _exc
 
 log = logging.getLogger(__name__)
 
@@ -175,6 +193,7 @@ class ClusterEngine:
     """Per-circuit DBSTREAM clustering engine."""
 
     def __init__(self, db, cfg):
+        _load_river()
         if _RIVER_IMPORT_ERROR is not None:
             raise RuntimeError(
                 "ClusterEngine requires the 'river' package, which is not "
