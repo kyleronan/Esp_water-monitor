@@ -287,6 +287,8 @@ _BASELINE_VERSION: int = 20260523
 #              circuit_profile.winterized (46h).
 #   20260810 — dev46 (46k): events.verdict_stamp + training_state
 #              .last_full_reclassify_at — lets the boot reclassify SKIP an
+#   20260813 — dev49 (P0-4): mark daily_summary days that drifted from events
+#               (markers only — the shipped drain does the recompute).
 #   20260812 — dev48: events.flow_plateau_lpm + waveform backfill.
 #   20260811 — dev47 (47i): fixture health baselines, nightly stats and
 #               alerts (fixture_baseline / fixture_health_stat /
@@ -300,7 +302,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260812
+_CURRENT_VERSION: int = 20260813
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -3085,6 +3087,74 @@ def _apply_flow_plateau(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260812: flow_plateau_lpm ready (%d of %d waveform "
              "row(s) backfilled)", filled, len(rows))
 
+# 20260813 — dev49 (P0-4): mark days whose daily_summary drifted from `events`.
+def _apply_daily_summary_drift_markers(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260813 — MARK drifted days, recompute nothing.
+
+    ``mark_daily_summary_dirty`` had exactly one caller repo-wide while ~20
+    paths route volume through ``apply_effective_volume``, so every reprocess,
+    recompute, merge and overlap resolution left the cached day behind. dev49
+    moved the mark into the chokepoint, which stops NEW drift — it does not
+    repair the drift already recorded. Measured on the reference home:
+    17 of 92 days disagreed with `events` by more than 0.5 L, 468.5 L in total,
+    worst single day -93.2 L.
+
+    WHY THIS IS NOT A HISTORICAL VOLUME RECOMPUTE (the standing invariant).
+    ``daily_summary`` is a DERIVED CACHE over the event ledger. This migration
+    writes nothing but ``daily_summary_dirty`` markers; the recompute is done
+    later, by ``drain_daily_summary_dirty`` — already-shipped code with a
+    no-lookback contract — and it re-derives each day from events that this
+    migration does not touch. No event's ``volume_litres`` or
+    ``volume_litres_effective`` changes here or afterwards. The invariant
+    governs the ledger, and the ledger is untouched.
+
+    Marking rather than recomputing inline also keeps the migration fast and
+    interruptible: a marker left undrained is retried on the next pruner pass.
+
+    Idempotent: INSERT OR IGNORE on the (circuit, day) primary key. Days are
+    bucketed with ``local_day_of`` so the comparison matches how the summary
+    was written; a day that has since been corrected simply fails the >0.5 L
+    test and is not marked.
+    """
+    if not (_has_table(conn, "daily_summary")
+            and _has_table(conn, "daily_summary_dirty")):
+        conn.commit()
+        log.info("Migration 20260813: no daily_summary yet — nothing to mark")
+        return
+
+    from .database import local_day_of
+
+    # Bucket events by local day, the same way compute_daily_summary does.
+    totals: dict = {}
+    for r in conn.execute(
+            "SELECT circuit, start_ts, "
+            "       COALESCE(volume_litres_effective, volume_litres, 0) AS v "
+            "FROM events WHERE start_ts IS NOT NULL"):
+        day = local_day_of(r["start_ts"])
+        if not day:
+            continue
+        key = (r["circuit"], day)
+        totals[key] = totals.get(key, 0.0) + float(r["v"] or 0.0)
+
+    marked = 0
+    drift_litres = 0.0
+    for row in conn.execute(
+            "SELECT circuit, day, COALESCE(total_volume_litres, 0) AS t "
+            "FROM daily_summary").fetchall():
+        key = (row["circuit"], row["day"])
+        delta = totals.get(key, 0.0) - float(row["t"] or 0.0)
+        if abs(delta) > 0.5:
+            conn.execute(
+                "INSERT OR IGNORE INTO daily_summary_dirty (circuit, day) "
+                "VALUES (?, ?)", (row["circuit"], row["day"]))
+            marked += 1
+            drift_litres += abs(delta)
+    conn.commit()
+    log.info("Migration 20260813: marked %d drifted day(s) for recompute "
+             "(%.1f L total disagreement); the pruner's summary pass drains "
+             "them", marked, drift_litres)
+
+
 _MIGRATIONS: tuple = (
     (20260524, _drop_retired_wf_entity_map_rows),
     (20260525, _apply_unique_events_index),
@@ -3149,6 +3219,7 @@ _MIGRATIONS: tuple = (
     (20260810, _apply_verdict_stamp),
     (20260811, _apply_fixture_health),
     (20260812, _apply_flow_plateau),
+    (20260813, _apply_daily_summary_drift_markers),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

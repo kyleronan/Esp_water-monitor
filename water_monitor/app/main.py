@@ -337,13 +337,20 @@ async def lifespan(app: FastAPI):
         app.state.asset_version = _read_addon_version()
 
     # Register tojson filter (not included by default in FastAPI's Jinja2).
-    # Must return Markup so Jinja2 autoescape does not HTML-encode the JSON
-    # (which would turn & -> &amp; and break JavaScript parsing).
-    import json as _json
-    from markupsafe import Markup as _Markup
-    app.state.templates.env.filters["tojson"] = (
-        lambda v: _Markup(_json.dumps(v))
-    )
+    #
+    # Use Jinja's OWN htmlsafe_json_dumps rather than json.dumps wrapped in
+    # Markup. json.dumps escapes " and \ but NOT <, >, & or U+2028/2029, and
+    # the Markup wrapper then suppresses autoescape — so any value reaching a
+    # <script> block through this filter could close the tag and execute.
+    # dev49 (P0-5) found that live at three sinks: the cluster name in
+    # fixtures_merge.html, ?range= via CHART_RANGE, and the X-Ingress-Path
+    # header via window.INGRESS_PATH.
+    #
+    # htmlsafe_json_dumps escapes <, >, & and ' as \uXXXX and still returns
+    # Markup, so the JSON stays parseable and cannot break out of the tag.
+    # It applies the same policy as Jinja's built-in tojson.
+    from jinja2.utils import htmlsafe_json_dumps as _htmlsafe_json_dumps
+    app.state.templates.env.filters["tojson"] = _htmlsafe_json_dumps
 
     # fixture_icon: maps a cluster dict to an emoji for the fixture type.
     _FX_ICONS = {

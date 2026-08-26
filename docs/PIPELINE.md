@@ -288,9 +288,11 @@ exist as dormant calib keys but the detector no longer reads them. Its reprocess
 it flags newly-sub-floor rows *and restores* rows the old triple-gate wrongly zeroed.
 
 **Envelope cap (dev10, guards 7j).** A degraded/pulsing envelope estimate can badly over-read, so
-`_cap_envelope_estimate()` limits it to `max(1.5 × flow_integral_litres, 2.0 L)`
-(`_ENVELOPE_CAP_FLOW_MULT = 1.5`, `_ENVELOPE_CAP_FLOOR_L = 2.0`); the uncapped value + cap base go to
-`degraded_diagnostic_json` for audit.
+`_cap_envelope_estimate()` limits it to `max(1.0 × flow_integral_litres, 2.0 L)`
+(`_ENVELOPE_CAP_FLOW_MULT = 1.0`, `_ENVELOPE_CAP_FLOOR_L = 2.0`); the uncapped value + cap base go to
+`degraded_diagnostic_json` for audit. (This doc said **1.5** until dev49 — the multiplier dev33
+removed *as the bug*, after it let an envelope estimate read 2.9× the metered volume. The code has
+been 1.0 since dev33; only the documentation lagged.)
 
 **Suppression-averted backstop (dev10, wraps 7d).** A leak-safety guard: when the phantom rule would
 fire but the event actually **measured `volume_litres ≥ 10 L`** (`_PHANTOM_REVIEW_FLAG_LITRES = 10.0`),
@@ -515,12 +517,29 @@ The *only* path by which any event's litres reach totals:
 2. If the new effective volume > 0, post it to the hour of `start_ts`. If it's 0, the bucket is NULL —
    the event contributes nowhere.
 
-**Callers (the complete list):** live insert (step 9), `volume_recompute.py`, `recorder_reconcile.py`,
-the low-flow coalescer, and relabel/reprocess paths. **Invariant:** `volume_ledger_discrepancy()` ≈ 0
-(sum of applied amounts = sum of `hourly_volume`).
+**Callers:** live insert (step 9), `volume_recompute.py`, `recorder_reconcile.py`,
+`overlap_guard.py` (wrapper zeroing / partial remainder), `db_migrations.py` (volume-touching
+backfills), the low-flow coalescer, and relabel/reprocess paths.
+
+> This list used to be published as "the complete list" while omitting `overlap_guard.py` and
+> `db_migrations.py` — the two writers where the 2026-08-25 review found the worst volume bugs,
+> directly under an instruction telling auditors to use this list when totals drift. Treat it as
+> a guide, not a proof: **verify with a grep for `apply_effective_volume(`**, and if you add a
+> caller, add it here.
+
+**Invariant:** `volume_ledger_discrepancy()` ≈ 0 (sum of applied amounts = sum of `hourly_volume`).
+Note that the check as written sums *globally*, so once the pruner has dropped `hourly_volume` rows
+on retention it reports the pruned history as drift — measured −19,914.5 L on the reference home,
+against 0.0 within the window `hourly_volume` actually covers. Window the comparison before
+believing a non-zero answer.
+
+**Cache invalidation (dev49):** `apply_effective_volume()` also marks the event's local day dirty
+(`daily_summary_dirty`), because changing a day's water invalidates that day's cached summary.
+Paths that DELETE events rather than repricing them — `dedup_events`, `delete_events_in_range` —
+bypass this function and must reverse the hourly contribution and mark the day themselves.
 
 > **If it breaks here:** totals drifting from the sum of events means a writer bypassed this function —
-> run the discrepancy check first.
+> run the discrepancy check first (windowed, per the note above).
 
 #### Branch · Meter audit (the reconciliation loop)
 **`app/recorder_reconcile.py · reconcile_circuit_volumes()`**

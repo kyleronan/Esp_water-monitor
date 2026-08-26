@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev48 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev49 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -402,8 +402,48 @@ makes the add-on survive that.
   that caused it, and the hi-res upgrade now runs whenever the capture can
   draw an honest axis (~93% of events) instead of being blocked by an
   always-true point-count check left over from 32-point signatures.
+- **Daily totals could drift away from the events behind them** — the daily
+  figure is a cached number, and only one of the twenty-odd paths that change
+  a day's water ever told it to refresh. A reprocess, a recompute, a duplicate
+  cleanup or an overlap resolution left that day's total frozen at its old
+  value, permanently, because a finished day is never recalculated on its own.
+  Measured here: 17 of 92 days disagreed with their own events, 468.5 L in
+  total, the worst day off by 93 L. Every volume change now flags its day for
+  recalculation, removing a duplicate event now takes its litres back out of
+  the running totals instead of leaving them behind, and migration 20260813
+  flags the days that already drifted so each is recalculated once. Your
+  stored events are not altered — only the cached daily figure is rebuilt from
+  them.
+
+### Security
+
+- **Text you did not write could run as code on your own pages** — a fixture
+  name, a History link someone sent you, and the add-on's own web address were
+  each dropped into a page's scripts without being made safe first, so a value
+  containing the right characters could end the script early and run whatever
+  came after it. Home Assistant displays the add-on inside its own page, which
+  means such code ran with your Home Assistant session rather than in a
+  sandbox. One shared fix closes all three.
+- **A file left in the shared folder could take over the add-on, with no Home
+  Assistant account at all** — the Backup page listed `/share` archives by
+  assembling raw HTML around each filename, so a crafted name ran the moment
+  the list was drawn. Any other add-on able to write that folder could plant
+  one. The list is now built as plain text that cannot execute.
 
 ### Bug Fixes
+
+- **A failed restore reported "rolled back" and deleted your settings anyway**
+  — the setup wizard's restore ran outside the database thread, so an ordinary
+  background save landing at the wrong moment made its deletions permanent
+  while the wizard still reported that nothing had changed. Reproduced with
+  the device connection, circuit mapping and home profile all gone. The
+  restore now runs as one unit on the database thread and holds the write
+  lock, so a failure really does leave the database untouched — and it can no
+  longer run at the same time as a recalculation.
+- **Every page could come up dead for a moment after a restart** — until the
+  security token existed, the code that hands it to the page produced invalid
+  JavaScript, and one bad line stops the entire script. Buttons and tabs did
+  nothing until you reloaded.
 
 - **Automatic fixture grouping died silently after a restart** — live cluster
   matching stopped cold while the database showed 30 healthy clusters and no

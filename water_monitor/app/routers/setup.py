@@ -183,49 +183,80 @@ async def setup_restore(request: Request):
     total  = 0
     db     = orch.db
 
-    # PRAGMA foreign_keys must be set outside the transaction — SQLite ignores
-    # it when a transaction is already open.  We disable it for the bulk
-    # restore so that cross-table FK ordering (e.g. events → fixtures) does
-    # not block the DELETE pass, then re-enable immediately after.
-    db.execute("PRAGMA foreign_keys = OFF")
-    # Wrap the entire restore in a single transaction so a partial failure
-    # leaves the database unchanged rather than in a half-restored state.
+    def _restore_sync() -> int:
+        """dev49 (P1-2 / C-2): the ENTIRE restore — PRAGMA toggles, the bulk
+        transaction, the events normalize/dedup pass and the circuit-label
+        restore — in ONE DB-thread callable, exactly as ``backup.py``'s
+        ``_restore_sync`` already does (rule 46a/N2a).
+
+        THE BUG THIS FIXES. This body used to run on the EVENT-LOOP thread,
+        outside ``run_db``, against the shared ``orch.db``. ``with db:`` is a
+        connection-global commit, not a scope — so any commit from the DB
+        worker landing mid-block made the already-executed DELETEs durable.
+        ``yield_write_lock`` fires one every 300 reclassify rows and
+        ``save_admin_ids_cache`` every 600 s, so the window was wide open.
+        Reproduced: ``device_config``, ``circuit_entity_map`` and
+        ``home_profile`` permanently gone while the handler logged
+        "transaction rolled back" and told the user the DB was unchanged.
+
+        The comment that used to sit here — "a partial failure leaves the
+        database unchanged" — was false whenever anything else was running.
+        On the single DB thread it is true, because no foreign statement can
+        interleave.
+        """
+        inserted = 0
+        # PRAGMA foreign_keys must be set outside the transaction — SQLite
+        # silently ignores it when a transaction is already open (which is also
+        # why the re-enable below must not be inside the `with`).
+        # Disabled for the bulk restore so cross-table FK ordering
+        # (e.g. events → fixtures) does not block the DELETE pass.
+        db.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with db:
+                for tbl in groups_to_restore:
+                    # Always clear the table first so the DB reflects the exact
+                    # state of the backup — stale rows from a prior restore
+                    # cannot bleed through when the backup has an empty array
+                    # or the table is absent from the backup entirely.
+                    db.execute(f"DELETE FROM {tbl}")
+                    rows = tables.get(tbl)
+                    if not rows:
+                        continue
+                    inserted += safe_insert_rows(db, tbl, rows)
+
+                # Normalize and deduplicate events after import so the DB is
+                # consistent even if the backup contained pre-dedup duplicates
+                # or mixed-timezone timestamps. commit=False keeps everything
+                # inside the outer transaction so a failure here rolls the
+                # whole restore back instead of leaving a half-imported DB.
+                if import_history == "1" and tables.get("events"):
+                    normalize_events_utc(db, commit=False)
+                    removed = dedup_events(db, commit=False)
+                    if removed:
+                        log.warning(
+                            "Setup restore: removed %d duplicate event(s) "
+                            "from backup", removed,
+                        )
+
+                # Restore circuit display labels atomically with the table data.
+                restore_circuit_labels(db, payload, commit=False)
+        finally:
+            db.execute("PRAGMA foreign_keys = ON")
+        return inserted
+
+    # The write lock makes this restore exclusive against the other admin
+    # writes (recompute, reclassify, the backup router's own restore). The
+    # read-only export already takes it; the two paths that DESTROY data did
+    # not, which was backwards.
+    from ..database import get_write_lock, run_db
     try:
-        with db:
-            for tbl in groups_to_restore:
-                # Always clear the table first so the DB reflects the exact
-                # state of the backup — stale rows from a prior restore cannot
-                # bleed through when the backup has an empty array or the table
-                # is absent from the backup entirely.
-                db.execute(f"DELETE FROM {tbl}")
-                rows = tables.get(tbl)
-                if not rows:
-                    continue
-                total += safe_insert_rows(db, tbl, rows)
-
-            # Normalize and deduplicate events after import so the DB is
-            # consistent even if the backup contained pre-dedup duplicates
-            # or mixed-timezone timestamps. commit=False keeps everything
-            # inside the outer transaction so a failure here rolls the
-            # whole restore back instead of leaving a half-imported DB.
-            if import_history == "1" and tables.get("events"):
-                normalize_events_utc(db, commit=False)
-                removed = dedup_events(db, commit=False)
-                if removed:
-                    log.warning(
-                        "Setup restore: removed %d duplicate event(s) from backup",
-                        removed,
-                    )
-
-            # Restore circuit display labels atomically with the table data.
-            restore_circuit_labels(db, payload, commit=False)
+        async with get_write_lock():
+            total = await run_db(_restore_sync)
     except Exception as e:
         log.error("Setup restore failed — transaction rolled back: %s", e)
         errors.append("(transaction rolled back)")
         return ingress_redirect(request,
             f"/setup?restore_error={_qp(str(e))}")
-    finally:
-        db.execute("PRAGMA foreign_keys = ON")
 
     try:
         orch.reload_circuit_entities()

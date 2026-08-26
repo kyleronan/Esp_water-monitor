@@ -232,28 +232,70 @@ async function doQuickRestore() {
   }
 }
 
+// dev49 (P0-5): this list is built from DOM nodes, never innerHTML.
+//
+// A /share filename is ATTACKER-CONTROLLED with no HA account required — any
+// co-installed add-on can write that folder. The previous version interpolated
+// it twice: once into HTML, and once into an onclick attribute as a JS string
+// literal, so a crafted filename executed on render. The add-on is iframed
+// under the HA frontend origin, which puts HA's own localStorage and
+// same-origin endpoints in reach. The server-side |tojson fix does NOT cover
+// this path — no Jinja filter touches a value that arrives via fetch().
+//
+// textContent and addEventListener cannot be escaped out of. Keep it that way:
+// if this list ever needs markup, build more nodes, do not reach for innerHTML.
 async function loadShareArchives() {
   const box = document.getElementById('share-list');
+  const clear = () => { while (box.firstChild) box.removeChild(box.firstChild); };
+  const note = (text) => {
+    const em = document.createElement('em');
+    em.textContent = text;
+    return em;
+  };
+  const recheckButton = () => {
+    const b = document.createElement('button');
+    b.className = 'btn btn-ghost btn-sm';
+    b.textContent = '🔄 Check again';
+    b.addEventListener('click', loadShareArchives);
+    return b;
+  };
   try {
     const resp = await fetch(`${window.INGRESS_PATH}/backup/share-archives`);
     const data = await resp.json();
+    clear();
     if (!data.available) {
-      box.innerHTML = '<em>/share is not mapped into the add-on yet — restart the add-on after updating.</em>';
+      box.appendChild(note('/share is not mapped into the add-on yet — restart the add-on after updating.'));
       return;
     }
     if (!data.files.length) {
-      box.innerHTML = `<em>No archives found in ${data.dir}. Drop a .db or Full Export .zip there and check again.</em> ` +
-        '<button class="btn btn-ghost btn-sm" onclick="loadShareArchives()">🔄 Check again</button>';
+      box.appendChild(note(`No archives found in ${data.dir}. Drop a .db or Full Export .zip there and check again.`));
+      box.appendChild(document.createTextNode(' '));
+      box.appendChild(recheckButton());
       return;
     }
-    box.innerHTML = data.files.map(f =>
-      `<div class="bk-file-row" style="margin:.25rem 0">
-         <span class="bk-fname">${f.name} (${f.size_mb} MB)</span>
-         <button class="btn btn-warning btn-sm" onclick="doShareImport('${f.name}')">⬆ Import</button>
-       </div>`).join('') +
-      '<button class="btn btn-ghost btn-sm" onclick="loadShareArchives()">🔄 Check again</button>';
+    for (const f of data.files) {
+      const row = document.createElement('div');
+      row.className = 'bk-file-row';
+      row.style.margin = '.25rem 0';
+
+      const label = document.createElement('span');
+      label.className = 'bk-fname';
+      label.textContent = `${f.name} (${f.size_mb} MB)`;
+
+      const importBtn = document.createElement('button');
+      importBtn.className = 'btn btn-warning btn-sm';
+      importBtn.textContent = '⬆ Import';
+      // Closure over f.name — the filename never becomes markup or attribute text.
+      importBtn.addEventListener('click', () => doShareImport(f.name));
+
+      row.appendChild(label);
+      row.appendChild(importBtn);
+      box.appendChild(row);
+    }
+    box.appendChild(recheckButton());
   } catch (e) {
-    box.innerHTML = `<em>Could not list /share: ${e.message}</em>`;
+    clear();
+    box.appendChild(note(`Could not list /share: ${e.message}`));
   }
 }
 

@@ -2921,6 +2921,19 @@ def apply_effective_volume(
         "  hourly_volume_applied_bucket = ? WHERE id = ?",
         (new_effective, new_bucket, event_id),
     )
+    # dev49 (P0-4) — the day's cached daily_summary is now stale by definition:
+    # this function just changed how much water that day contains. Marking here
+    # rather than at the call sites is the whole point of a chokepoint —
+    # mark_daily_summary_dirty previously had exactly ONE caller repo-wide
+    # (record_event_features) while ~20 paths route volume through here, so
+    # every reprocess, recompute, merge and overlap resolution left the summary
+    # behind. Measured: 17 of 92 days disagreed with `events` by >0.5 L,
+    # 468.5 L total, worst day -93.2 L.
+    #
+    # Best-effort and idempotent: INSERT OR IGNORE on the (circuit, day) PK, so
+    # repeated marks inside a bulk loop cost nothing and a lost marker only
+    # defers the recompute to the next mutation.
+    mark_daily_summary_dirty(conn, circuit, start_ts)
     return new_effective
 
 
@@ -5033,6 +5046,31 @@ def dedup_events(conn: sqlite3.Connection, commit: bool = True) -> int:
             HAVING COUNT(*) > 1
         )
     """)
+    # dev49 (P0-4) — reverse each doomed row's ledger contribution BEFORE
+    # deleting it, and mark its local day dirty.
+    #
+    # This path deletes rows outright, so it never reaches
+    # apply_effective_volume — the chokepoint every other volume write goes
+    # through. The row went and the litres stayed: hourly_volume kept the
+    # duplicate's contribution forever, and the day's daily_summary was never
+    # recomputed. That is §3.3's "invariant held by convention" in one
+    # function — nineteen callers remember, dedup_events did not.
+    doomed = conn.execute("""
+        SELECT id, circuit, start_ts, hourly_volume_applied_litres,
+               hourly_volume_applied_bucket
+        FROM events
+        WHERE rowid NOT IN (
+            SELECT MAX(rowid) FROM events GROUP BY circuit, start_ts
+        )
+    """).fetchall()
+    for r in doomed:
+        litres = float(r["hourly_volume_applied_litres"] or 0.0)
+        bucket = r["hourly_volume_applied_bucket"]
+        if bucket and litres:
+            conn.execute(_HOURLY_VOLUME_DELTA_SQL,
+                         (r["circuit"], bucket, -litres))
+        mark_daily_summary_dirty(conn, r["circuit"], r["start_ts"])
+
     cursor = conn.execute("""
         DELETE FROM events
         WHERE rowid NOT IN (
