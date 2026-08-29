@@ -756,7 +756,11 @@ CREATE TABLE IF NOT EXISTS anomaly_shutoff_log (
     event_id      TEXT,
     anomaly_type  TEXT,
     score         REAL,
-    closed_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    closed_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- dev50 (migration 20260814): event_id has no FK, so a reprocess left it
+    -- dangling. Marked like overlap_audit — provenance, never deleted.
+    stale_reason  TEXT,
+    stale_at      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_anomaly_shutoff_circuit_time
     ON anomaly_shutoff_log (circuit, closed_at);
@@ -1133,6 +1137,17 @@ CREATE TABLE IF NOT EXISTS events (
     -- Cleared explicitly by anything that rewrites a classification input on
     -- one event (see invalidate_verdict_stamps).
     verdict_stamp                    TEXT,
+    -- dev50 auto-split memo (migration 20260814). What the hourly over-merge job
+    -- DECIDED about this event, so a decision is made once instead of on every
+    -- pass and every restart. The job's checked-set was in-memory only; harmless
+    -- while it scanned 24 h, but it now scans the whole HA recorder window, and a
+    -- re-check costs an HA history fetch. Outcome is one of 'split' /
+    -- 'clean' / 'untrustworthy' / 'out_of_retention' — also a plain audit trail of
+    -- why an event was left alone. NULL = never evaluated = a candidate, so no
+    -- backfill is needed; a change to the split gate ships with a migration that
+    -- clears these so every event is reconsidered once.
+    split_evaluated_at               TEXT,
+    split_evaluation_outcome         TEXT,
     -- Embedded-fixture annotation (migration 20260548). JSON array of draws
     -- found superimposed on a sustained event's waveform (a toilet flushed
     -- mid-shower) by composite_detector. Metadata ONLY — never changes the
@@ -1326,7 +1341,11 @@ CREATE TABLE IF NOT EXISTS cross_talk_audit (
     other_delta_psi REAL,            -- irrigation-circuit pressure swing
     ratio           REAL,            -- other_delta / main_delta
     volume_litres   REAL,            -- pre-zero raw volume
-    action          TEXT NOT NULL    -- 'flagged' | 'reverted'
+    action          TEXT NOT NULL,   -- 'flagged' | 'reverted'
+    -- dev50 (migration 20260814): event_id has no FK, so a reprocess left it
+    -- dangling. Marked like overlap_audit — provenance, never deleted.
+    stale_reason    TEXT,
+    stale_at        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_cross_talk_audit_event
     ON cross_talk_audit(event_id);
@@ -3237,6 +3256,49 @@ def coalesce_low_flow_events(
     return {"groups": len(groups), "absorbed": absorbed_total}
 
 
+# The purely-machine-derived events overlapping a window — the selection BOTH
+# ``delete_events_in_range`` and ``preview_events_in_range`` run. Shared as one string
+# so the reprocess probe can never disagree with the delete it is gating (params:
+# circuit, to_ts, from_ts). Selection is INTERVAL-OVERLAP, and anything the user has
+# touched is excluded; see delete_events_in_range's docstring for why both matter.
+_MACHINE_EVENTS_IN_RANGE_WHERE = (
+    "circuit = ? AND start_ts <= ? "
+    "  AND COALESCE(end_ts, start_ts) >= ? "
+    "  AND user_fixture_type IS NULL "
+    "  AND COALESCE(user_classified, 0) = 0 "
+    "  AND COALESCE(user_ignored, 0) = 0 "
+)
+
+
+def preview_events_in_range(
+    conn: sqlite3.Connection, circuit: str, from_ts: str, to_ts: str,
+) -> Dict[str, Any]:
+    """READ-ONLY: what ``delete_events_in_range`` WOULD delete over this window.
+
+    dev.50 — the reprocess is probe-first (see ``reprocess.reprocess_window``): it must
+    know the true deleted SPAN, so it can widen the window it probes, and the stored
+    VOLUME, so it can refuse a rebuild whose history cannot account for the water —
+    both BEFORE anything is deleted. Shares ``_MACHINE_EVENTS_IN_RANGE_WHERE`` with the
+    delete, so the two can never select different rows.
+
+    Returns ``{"count", "volume_litres", "span_start", "span_end"}``; a window with no
+    machine events returns zeros and ``None`` spans.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS n, "
+        "       COALESCE(SUM(COALESCE(volume_litres, 0)), 0) AS vol, "
+        "       MIN(start_ts) AS span_start, "
+        "       MAX(COALESCE(end_ts, start_ts)) AS span_end "
+        "FROM events WHERE " + _MACHINE_EVENTS_IN_RANGE_WHERE,
+        (circuit, to_ts, from_ts),
+    ).fetchone()
+    if row is None or not row["n"]:
+        return {"count": 0, "volume_litres": 0.0,
+                "span_start": None, "span_end": None}
+    return {"count": int(row["n"]), "volume_litres": float(row["vol"] or 0.0),
+            "span_start": row["span_start"], "span_end": row["span_end"]}
+
+
 def delete_events_in_range(
     conn: sqlite3.Connection, circuit: str, from_ts: str, to_ts: str,
 ) -> Dict[str, Any]:
@@ -3273,12 +3335,7 @@ def delete_events_in_range(
     meant two return shapes and two SELECTs that could drift.)
     """
     rows = conn.execute(
-        "SELECT * FROM events "
-        "WHERE circuit = ? AND start_ts <= ? "
-        "  AND COALESCE(end_ts, start_ts) >= ? "
-        "  AND user_fixture_type IS NULL "
-        "  AND COALESCE(user_classified, 0) = 0 "
-        "  AND COALESCE(user_ignored, 0) = 0 "
+        "SELECT * FROM events WHERE " + _MACHINE_EVENTS_IN_RANGE_WHERE +
         "ORDER BY start_ts ASC",
         (circuit, to_ts, from_ts),
     ).fetchall()
@@ -3319,6 +3376,23 @@ def delete_events_in_range(
                      r["id"], f'%"{r["id"]}"%'))
             except sqlite3.Error:
                 pass       # pre-20260801 schema
+            # dev.50 — the same dangling-reference problem, in the two audit tables
+            # that were missed: both carry an event_id with NO foreign key and no
+            # cleanup, so every reprocess left them pointing at an id that no longer
+            # exists. Harmless while reprocess was a rare manual action; the hourly
+            # auto-split (widened to the recorder window) makes it continuous. Same
+            # policy as overlap_audit above: MARK, never delete — these are durable
+            # provenance (a shutoff that fired, a cross-talk verdict that was applied).
+            try:
+                stale_ts = datetime.now(timezone.utc).isoformat()
+                for _tbl in ("anomaly_shutoff_log", "cross_talk_audit"):
+                    conn.execute(
+                        f"UPDATE {_tbl} SET stale_reason = "
+                        "COALESCE(stale_reason, 'superseded_by_reprocess'), "
+                        "stale_at = COALESCE(stale_at, ?) WHERE event_id = ?",
+                        (stale_ts, r["id"]))
+            except sqlite3.Error:
+                pass       # pre-20260814 schema
             conn.execute("DELETE FROM events WHERE id = ?", (r["id"],))
             d = local_day_of(r["start_ts"])
             if d:

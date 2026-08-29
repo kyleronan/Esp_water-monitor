@@ -52,10 +52,39 @@ class MaturityRecheck:
         self._ha = ha          # HA client — needed by the §2 recorder reconcile pass
         self._orch = orch      # orchestrator — needed by the dev.38 auto-split pass
         self._auto_split_checked: set = set()   # ids dry-run-checked this process (efficiency)
+        # dev50 — a daily rollup of what the auto-split actually did. The live detector
+        # still welds draws into one event on a pump-held line (the pressure-dip period
+        # source is importer-only), so this job is what de-bloats them: it is
+        # load-bearing for correctness now, not a cleanup nicety, and it sits behind a
+        # user-facing Settings switch. A pass that is dead, disabled or starved by a
+        # steady stream of newer candidates must therefore be visible in the log.
+        self._auto_split_day: str = ""
+        self._auto_split_today: int = 0
+        self._auto_split_scanned_today: int = 0
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _roll_auto_split_counter(self, res) -> None:
+        """dev50 — accumulate the auto-split's daily total, logging it when the UTC day
+        turns over. Deliberately a DAY, not a pass: an hourly line reading '0 split' is
+        normal and unreadable in bulk, while 'de-bloated N event(s) across M scanned'
+        once a day is the number that says whether this job is still doing its work —
+        including the case where a steady stream of newer candidates starves the
+        backlog at the per-pass cap. Disabled (the Settings switch off) reports
+        scanned=0 forever, which is exactly what it should look like."""
+        if not isinstance(res, dict):
+            return
+        today = datetime.now(timezone.utc).date().isoformat()
+        if self._auto_split_day and today != self._auto_split_day:
+            log.info("auto-split daily: de-bloated %d event(s) across %d scanned on %s",
+                     self._auto_split_today, self._auto_split_scanned_today,
+                     self._auto_split_day)
+            self._auto_split_today = self._auto_split_scanned_today = 0
+        self._auto_split_day = today
+        self._auto_split_today += int(res.get("split") or 0)
+        self._auto_split_scanned_today += int(res.get("scanned") or 0)
 
     async def run(self) -> None:
         """Background loop — re-check matured events once per hour."""
@@ -146,7 +175,8 @@ class MaturityRecheck:
         if self._orch is not None:
             try:
                 from .reprocess import auto_split_merged_events
-                await auto_split_merged_events(
+                res = await auto_split_merged_events(
                     self._orch, circuit, checked=self._auto_split_checked)
+                self._roll_auto_split_counter(res)
             except Exception as e:
                 log.error("[%s] auto-split error: %s", circuit, e, exc_info=True)

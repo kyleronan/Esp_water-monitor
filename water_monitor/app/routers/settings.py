@@ -965,6 +965,14 @@ async def dev_reimport_range(circuit: str, request: Request):
         return JSONResponse(
             {"error": "Another volume operation is running — try again shortly."},
             status_code=409)
+    # dev.50 — probe-first: the rebuild was refused before anything was deleted.
+    # Shares the History modal's wording so both UIs explain a refusal identically.
+    refused = result.get("refused")
+    if refused:
+        from .history import _REPROCESS_REFUSAL_TEXT
+        return JSONResponse({"error": _REPROCESS_REFUSAL_TEXT.get(
+            refused, "This range can't be rebuilt from Home Assistant history right "
+                     "now. Nothing was changed.")}, status_code=409)
     return JSONResponse({"ok": True, **result})
 
 

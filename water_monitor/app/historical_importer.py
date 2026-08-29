@@ -250,6 +250,18 @@ class HistoricalImporter:
     # untouched.
     PRESSURE_DIP_BRIDGE_LONG_SPAN_S: float = 300.0   # "long" envelope (5 min)
     PRESSURE_DIP_BRIDGE_MIN_VOLUME_L: float = 2.0    # real flow needed to earn a long bridge
+    # dev.50 — the volume gate above only drops a bridge whose flow is TRIVIAL, so a
+    # dip carrying real water bridges without limit: on a pump-held line the dip never
+    # recovers to its frozen baseline between draws, so _pressure_to_periods emits ONE
+    # envelope (observed: 182 min spanning ~14 min of flow and ~99 L — far over the 2 L
+    # gate) and _merge_periods welds every draw into a single event that no reprocess
+    # could split. A bridge exists to span the ~40 s inter-burst gaps named in this
+    # class's docstring, not a 90-minute idle, so cap the gap it may span. 300 s sits
+    # well above those bursts and above the 92 s maximum internal washer/dishwasher gap
+    # the dev.38 sawtooth study measured. Same leak/volume reasoning as the gate above:
+    # only EMPTY span is removed, never flow — and only when the history PROVES the
+    # flow stopped (see _flow_stopped_across; a dark sensor is not an idle).
+    PRESSURE_DIP_BRIDGE_MAX_GAP_S: float = 300.0     # bridges inter-burst gaps, not idles
 
     def __init__(
         self,
@@ -995,7 +1007,10 @@ class HistoricalImporter:
                          "a real bridged event",
                          (e - s).total_seconds() / 60.0, span_vol, len(overlap))
                 continue
-            kept_dips.append((s, e))
+            # dev.50 — a kept bridge may still span a LONG proven-idle gap; break it
+            # there so the draws either side reconstruct as the separate events they are.
+            kept_dips.extend(self._split_dip_on_idle_gaps(
+                s, e, overlap, flow_rate_hist, onset_hist))
         pressure_periods = kept_dips
 
         all_periods = onset_periods + rate_periods + pressure_periods
@@ -1005,6 +1020,108 @@ class HistoricalImporter:
         merged = _merge_periods(sorted(all_periods), self.MERGE_GAP_SECONDS)
         return [(s, e) for s, e in merged
                 if (e - s).total_seconds() >= self.MIN_DURATION_SECONDS]
+
+    def _flow_stopped_across(
+        self,
+        flow_rate_hist: List[Dict],
+        onset_hist: List[Dict],
+        gap_start: datetime,
+        gap_end: datetime,
+    ) -> bool:
+        """dev.50 — does the history PROVE flow stopped across ``[gap_start, gap_end]``?
+
+        A flow sensor that goes dark mid-draw looks EXACTLY like an idle here, and the
+        distinction decides whether it is safe to break a pressure-dip bridge. HA's
+        recorder logs on CHANGE, so "samples exist and read zero" cannot be the test —
+        a genuine idle emits no samples either. Worse, ``_rate_to_periods`` refuses to
+        flush a period it never saw close, so a dropout mid-draw leaves no fragment at
+        all and the stretch reads as pure idle.
+
+        The honest discriminator is the last sample AT OR BEFORE the gap — the same
+        reasoning the live detector uses for ``FLOW_SAMPLE_STALE_S`` ("the stuck-sensor
+        case goes SILENT"). Fails CLOSED: a recorder-gap marker inside, real flow
+        inside, or no sample to judge by at all all mean "not proven", and the caller
+        leaves the envelope whole.
+        """
+        last_before: Optional[float] = None
+        for entry in flow_rate_hist:
+            ts = _parse_ts(entry.get("last_changed"))
+            if ts is None:
+                continue
+            if _is_gap_marker(entry):
+                if gap_start <= ts < gap_end:
+                    return False        # recorder outage — the history is blind here
+                continue
+            try:
+                rate = float(entry["state"])
+            except (ValueError, TypeError, KeyError):
+                continue
+            # The gap is the OPEN interval between two fragments: the sample AT
+            # gap_end is the next fragment's own opening sample, not flow "inside".
+            if ts <= gap_start:
+                last_before = rate
+            elif ts < gap_end and rate >= self.MIN_FLOW_LPM:
+                return False            # real flow inside — not an idle at all
+        for entry in onset_hist:        # an onset dropout blinds us the same way
+            if not _is_gap_marker(entry):
+                continue
+            ts = _parse_ts(entry.get("last_changed"))
+            if ts is not None and gap_start <= ts < gap_end:
+                return False
+        if last_before is None:
+            return False                # nothing to judge by — refuse to split
+        return last_before < self.MIN_FLOW_LPM
+
+    def _split_dip_on_idle_gaps(
+        self,
+        dip_start: datetime,
+        dip_end: datetime,
+        overlap: List[Tuple[datetime, datetime]],
+        flow_rate_hist: List[Dict],
+        onset_hist: List[Dict],
+    ) -> List[Tuple[datetime, datetime]]:
+        """dev.50 — break one kept dip envelope wherever it bridges a long PROVEN-idle
+        gap, returning the sub-envelopes (``[(dip_start, dip_end)]`` when it bridges
+        nothing).
+
+        Boundaries land on the flow fragments themselves, so only the EMPTY span
+        between them is removed — never flow, keeping the volume and leak reasoning of
+        the drop-gate above intact. A dip with NO overlapping flow is returned whole:
+        that is a pure-pressure envelope, which the phantom guard at feature extraction
+        handles and this must never silently drop. The outer bounds stay at the dip's
+        own, so a lead-in / tail-out is preserved.
+        """
+        if not overlap:
+            return [(dip_start, dip_end)]
+        frags = sorted((max(fs, dip_start), min(fe, dip_end)) for fs, fe in overlap)
+        out: List[Tuple[datetime, datetime]] = []
+        seg_start = dip_start
+        run_end = frags[0][1]            # running max end — fragments may nest
+        for next_start, next_end in frags[1:]:
+            # Both sides must survive the MIN_DURATION filter at the end of
+            # _find_flow_periods. Splitting a bridge whose fragments are shorter than
+            # that ORPHANS them — the sub-envelopes are dropped and the flow vanishes,
+            # which is precisely the leak-safety hole dev.39's condition (d) closed.
+            # Too short on either side → keep bridging, exactly as the drop-gate does.
+            if ((next_start - run_end).total_seconds()
+                    >= self.PRESSURE_DIP_BRIDGE_MAX_GAP_S
+                    and (run_end - seg_start).total_seconds()
+                    >= self.MIN_DURATION_SECONDS
+                    and (dip_end - next_start).total_seconds()
+                    >= self.MIN_DURATION_SECONDS
+                    and self._flow_stopped_across(
+                        flow_rate_hist, onset_hist, run_end, next_start)):
+                out.append((seg_start, run_end))
+                seg_start = next_start
+            run_end = max(run_end, next_end)
+        out.append((seg_start, dip_end))
+        if len(out) > 1:
+            log.info("[importer] split a %.0f-min pressure-dip bridge into %d envelope(s) "
+                     "at %d proven-idle gap(s) >= %.0f s — the bridge spans inter-burst "
+                     "gaps, not idles",
+                     (dip_end - dip_start).total_seconds() / 60.0, len(out),
+                     len(out) - 1, self.PRESSURE_DIP_BRIDGE_MAX_GAP_S)
+        return out
 
     def _flow_volume_in_period(
         self, flow_rate_hist: List[Dict], start: datetime, end: datetime,

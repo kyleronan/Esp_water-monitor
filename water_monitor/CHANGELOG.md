@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev49 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev50 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -431,6 +431,43 @@ makes the add-on survive that.
   one. The list is now built as plain text that cannot execute.
 
 ### Bug Fixes
+
+- **Several separate uses recorded as one long event, and rebuilding it changed
+  nothing** — on a home with a booster pump the line pressure never fully
+  recovers between draws, so the add-on saw one unbroken three-hour event where
+  a shower, a flush and a few taps had actually happened minutes apart. Pressing
+  **Reprocess event** rebuilt the very same event, because the rule that stitches
+  pulsed flow together had no limit on how long a quiet stretch it would stitch
+  across. It now refuses to bridge more than five minutes of genuine idle, so
+  those uses come apart into what they really were. Short pauses inside one
+  appliance run are untouched, and no water moves — only the empty time between
+  draws is dropped. A gap is only treated as idle when the flow history actually
+  shows the flow stopping; a sensor that goes quiet mid-draw looks identical, and
+  splitting there would have cut a real draw in half.
+- **Reprocess could delete an event and rebuild nothing** — asking to rebuild an
+  event older than Home Assistant keeps detailed history for deleted it first and
+  then found nothing to rebuild from, so the event and its water simply
+  disappeared, reported as a success. It now checks what history exists *before*
+  deleting anything, and says why it stopped — history too old, gaps in it, or
+  only enough to account for part of the event's water. Nothing is removed unless
+  the rebuild can reproduce it. This needs no guesswork about your recorder
+  settings; it looks at the actual window each time.
+- **The Reprocess button did nothing on events you had labelled** — your labels
+  are deliberately never overwritten by a rebuild, so on a labelled event the
+  button had nothing to do, yet still reported "Deleted 0, re-importing 0" and
+  reloaded, which read as success. It now explains that the label is what is
+  protecting the event, and the button is hidden on those events as originally
+  intended.
+- **Buttons appeared that should have been hidden** — a styling rule quietly
+  overrode the "hide this" instruction throughout event details, so **Reset to
+  automatic** and **↩ Undo cycle labels** showed on every event, and the two
+  unusual-event answer buttons stayed on screen next to **✓ Reviewed** after you
+  had already answered.
+- **Merged events were only ever cleaned up for a day after they happened** — the
+  hourly tidy-up looked back 24 hours, so anything it missed was missed for good,
+  and clearing a label never brought the event back into its reach. It now covers
+  the whole period Home Assistant can still rebuild from, newest first, and
+  remembers what it has already decided so a restart does not redo the work.
 
 - **A failed restore reported "rolled back" and deleted your settings anyway**
   — the setup wizard's restore ran outside the database thread, so an ordinary

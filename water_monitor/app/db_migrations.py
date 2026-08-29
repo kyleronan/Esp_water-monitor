@@ -289,6 +289,9 @@ _BASELINE_VERSION: int = 20260523
 #              .last_full_reclassify_at — lets the boot reclassify SKIP an
 #   20260813 — dev49 (P0-4): mark daily_summary days that drifted from events
 #               (markers only — the shipped drain does the recompute).
+#   20260814 — dev50: events.split_evaluated_at / split_evaluation_outcome (the
+#               over-merge job's decision memo) + stale_reason / stale_at on
+#               anomaly_shutoff_log and cross_talk_audit.
 #   20260812 — dev48: events.flow_plateau_lpm + waveform backfill.
 #   20260811 — dev47 (47i): fixture health baselines, nightly stats and
 #               alerts (fixture_baseline / fixture_health_stat /
@@ -302,7 +305,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260813
+_CURRENT_VERSION: int = 20260814
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -3155,6 +3158,49 @@ def _apply_daily_summary_drift_markers(conn: sqlite3.Connection) -> None:
              "them", marked, drift_litres)
 
 
+# 20260814 — dev50: auto-split memo + stale marks for the two audit tables whose
+# event_id had no foreign key.
+def _apply_auto_split_memo(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260814 — additive, idempotent, no backfill.
+
+    Two dev50 changes make reprocess a CONTINUOUS background action rather than a
+    rare manual one (the over-merge job now scans the whole HA recorder window
+    instead of 24 h), and that turns two latent problems into ongoing ones:
+
+    * ``events.split_evaluated_at`` / ``split_evaluation_outcome`` — the job's
+      checked-set lived only in memory, so every restart re-evaluated the whole
+      backlog, and post-dev50 each re-evaluation costs an HA history fetch. NULL
+      means "never evaluated", so the columns need no backfill and every existing
+      event is considered exactly once after this lands.
+    * ``anomaly_shutoff_log`` / ``cross_talk_audit`` ``stale_reason`` + ``stale_at``
+      — both carry an ``event_id`` with no FK and no cleanup, so each reprocess left
+      them pointing at an id that no longer exists. Marked, never deleted, exactly
+      as ``overlap_audit`` has been since 20260801: these rows are provenance (a
+      shutoff that fired, a cross-talk verdict that was applied).
+    """
+    if _has_table(conn, "events"):
+        for col in ("split_evaluated_at", "split_evaluation_outcome"):
+            if not _has_column(conn, "events", col):
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    for tbl in ("anomaly_shutoff_log", "cross_talk_audit"):
+        if not _has_table(conn, tbl):
+            continue
+        for col in ("stale_reason", "stale_at"):
+            if not _has_column(conn, tbl, col):
+                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT")
+    conn.commit()
+    # Belt-and-braces re-create of the wf-claim index — LAST-migration
+    # convention (see 20260574/20260804/20260806/20260807/20260808).
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+        conn.commit()
+    log.info("Migration 20260814: auto-split memo columns + audit stale marks ready")
+
+
 _MIGRATIONS: tuple = (
     (20260524, _drop_retired_wf_entity_map_rows),
     (20260525, _apply_unique_events_index),
@@ -3220,6 +3266,7 @@ _MIGRATIONS: tuple = (
     (20260811, _apply_fixture_health),
     (20260812, _apply_flow_plateau),
     (20260813, _apply_daily_summary_drift_markers),
+    (20260814, _apply_auto_split_memo),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

@@ -1298,6 +1298,28 @@ async def dismiss_leak_test(test_id: int, request: Request):
     return ingress_redirect(request, "/history")
 
 
+# dev.50 — plain-language text for each reprocess.  _probe_refusal reason. Every one of
+# these means the SAME thing operationally: nothing was deleted and the event is
+# untouched, because HA's history could not prove it can rebuild the water.
+_REPROCESS_REFUSAL_TEXT = {
+    "nothing_to_do":
+        "There are no automatic events in this window to rebuild.",
+    "fetch_failed":
+        "Couldn't read Home Assistant's history just now — nothing was changed. "
+        "Try again shortly.",
+    "no_history":
+        "Home Assistant no longer keeps flow history this far back, so this event "
+        "can't be rebuilt. Nothing was changed — the event is still here.",
+    "gappy_history":
+        "Home Assistant's history has gaps across this event (a restart or a sensor "
+        "dropout), so a rebuild would read the gap as no-flow and lose water. "
+        "Nothing was changed.",
+    "volume_unaccounted":
+        "The history that's left only accounts for part of this event's water, so a "
+        "rebuild would under-count it. Nothing was changed.",
+}
+
+
 @router.post("/api/events/{circuit}/{event_id}/reprocess")
 async def reprocess_event_api(circuit: str, event_id: str, request: Request):
     """dev.26 — rebuild ONE event from HA history.
@@ -1330,11 +1352,28 @@ async def reprocess_event_api(circuit: str, event_id: str, request: Request):
     from ..database import run_db
     row = await run_db(                                       # dev46 (46a)
         lambda: db.execute(
-            "SELECT start_ts, end_ts FROM events WHERE id = ? AND circuit = ?",
+            "SELECT start_ts, end_ts, user_fixture_type, user_classified, "
+            "       user_ignored FROM events WHERE id = ? AND circuit = ?",
             (event_id, circuit),
         ).fetchone())
     if row is None:
         return JSONResponse({"error": "Event not found"}, status_code=404)
+    # dev.50 — delete_events_in_range PRESERVES anything the user has touched, so a
+    # reprocess of such an event deletes nothing and rebuilds nothing. That used to
+    # return deleted=0/imported=0, which the modal rendered as "✓ Deleted 0,
+    # re-importing 0 run(s)" — indistinguishable from success, and the reason a user
+    # could press this repeatedly on a labelled event and watch nothing happen. Say so
+    # instead. (The modal also hides this control for such events — that had been
+    # defeated by a CSS `display` rule outranking the `hidden` attribute; both ends are
+    # fixed, because an API caller must not get the hollow success either.)
+    if (row["user_fixture_type"] or row["user_classified"]
+            or row["user_ignored"]):
+        return JSONResponse(
+            {"error": "This event has your own label or classification on it, so it "
+                      "is never rebuilt — that is what keeps your labels safe. Clear "
+                      "the fixture type (set it to “— no assignment —”) and save, "
+                      "then reprocess."},
+            status_code=409)
     start = _parse_event_ts(row["start_ts"])
     if start is None:
         return JSONResponse({"error": "Event has no usable timestamp"},
@@ -1360,4 +1399,12 @@ async def reprocess_event_api(circuit: str, event_id: str, request: Request):
         return JSONResponse(
             {"error": "Another volume operation is running — try again shortly."},
             status_code=409)
+    # dev.50 — the probe refused BEFORE anything was deleted. Each reason is a real
+    # answer, not a failure: the event is still there, intact, and rebuilding it from
+    # the history that exists would have lost water.
+    refused = result.get("refused")
+    if refused:
+        return JSONResponse({"error": _REPROCESS_REFUSAL_TEXT.get(
+            refused, "This event can't be rebuilt from Home Assistant history right "
+                     "now. Nothing was changed.")}, status_code=409)
     return JSONResponse({"ok": True, **result})

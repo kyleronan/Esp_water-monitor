@@ -3,6 +3,18 @@
    ============================================================ */
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
+/* dev50 — the `hidden` attribute must actually hide.
+   The browser's own [hidden] rule is `display: none` at USER-AGENT weight, so ANY
+   author `display:` on the element beats it. Two of ours did — `.btn` (inline-flex)
+   and `.evt-modal-section` (flex) — plus one inline `style="display:inline-flex"`,
+   so `el.hidden = true` on those four event-modal controls was silently a no-op:
+   #emd-reprocess-section, #emd-review-btns, #emd-classify-reset-btn and
+   #emd-undo-cycle-btn. Visible symptom: the modal showed "✓ Normal use" /
+   "? Don't recognize it" alongside "✓ Reviewed", and offered "Reprocess from HA
+   history" on user-labelled events, where a rebuild can only ever be a no-op.
+   `!important` is what also beats that inline style on the anomaly-verdict row. */
+[hidden] { display: none !important; }
+
 :root {
   /* Surfaces */
   --bg:             oklch(97% 0.006 240);
