@@ -382,9 +382,13 @@ class HistoricalImporter:
         whether the window's history can be TRUSTED to reproduce the stored water.
 
         Returns ``{"periods": [(start_dt, end_dt), ...],
+                   "period_volumes_l": [<litres per period, same order>],
                    "flow_volume_l": <integrated flow over the window>,
                    "fetch_failed": bool,   # transient — retry next pass
                    "gappy": bool}``        # 'unavailable'/'unknown' samples in window
+        dev52 — ``period_volumes_l`` integrates the SAME history slice per period, so
+        the reprocess probe can weigh a period a kept event would block against that
+        event's stored water without re-deriving anything from stored rows.
         On an unconfigured circuit or a fetch failure the periods are empty and
         ``fetch_failed`` is set (fail-safe — a dry-run that can't see history must
         never trigger a split)."""
@@ -392,7 +396,7 @@ class HistoricalImporter:
         pressure_entity = cfg and (cfg.pressure_history_sensor or cfg.pressure_avg_sensor)
         if (not cfg or not self._circuit_has_sensors(cfg)
                 or not (cfg.flow_onset_sensor or cfg.flow_sensor)):
-            return {"periods": [], "flow_volume_l": 0.0,
+            return {"periods": [], "period_volumes_l": [], "flow_volume_l": 0.0,
                     "fetch_failed": True, "gappy": False}
         entities = [e for e in (cfg.flow_onset_sensor, cfg.flow_sensor,
                                 pressure_entity) if e]
@@ -400,7 +404,7 @@ class HistoricalImporter:
             histories = await self._ha.get_history_batch(entities, start, end)
         except Exception as exc:
             log.warning("[%s] auto-split dry-run history fetch failed: %s", circuit, exc)
-            return {"periods": [], "flow_volume_l": 0.0,
+            return {"periods": [], "period_volumes_l": [], "flow_volume_l": 0.0,
                     "fetch_failed": True, "gappy": False}
         onset_hist     = histories.get(cfg.flow_onset_sensor, [])
         flow_rate_hist = histories.get(cfg.flow_sensor, [])
@@ -416,6 +420,9 @@ class HistoricalImporter:
         gappy = any(_is_gap_marker(e) for h in (onset_hist, flow_rate_hist,
                                                 pressure_hist) for e in h)
         return {"periods": periods,
+                "period_volumes_l": [
+                    self._flow_volume_in_period(flow_rate_hist, ps, pe)
+                    for ps, pe in periods],
                 "flow_volume_l": self._flow_volume_in_period(
                     flow_rate_hist, start, end),
                 "fetch_failed": False, "gappy": gappy}

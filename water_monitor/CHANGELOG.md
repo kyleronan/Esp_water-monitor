@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev50 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev52 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -496,6 +496,14 @@ makes the add-on survive that.
   only enough to account for part of the event's water. Nothing is removed unless
   the rebuild can reproduce it. This needs no guesswork about your recorder
   settings; it looks at the actual window each time.
+- **Reprocess now explains when your own labels block a rebuild** — reprocessing
+  a span whose reconstructed draws all sit on top of events you labelled used to
+  delete the event, find nothing it was allowed to insert, restore it, and report
+  "see addon log". The check now runs before the delete and says plainly that
+  labelled events are kept. It also refuses when the rebuilt draw is larger than
+  the label that blocks it, so a partial rebuild can no longer drop the
+  difference, and clearing the label lets the hourly auto-split look at the span
+  again — dev52.
 - **The Reprocess button did nothing on events you had labelled** — your labels
   are deliberately never overwritten by a rebuild, so on a labelled event the
   button had nothing to do, yet still reported "Deleted 0, re-importing 0" and

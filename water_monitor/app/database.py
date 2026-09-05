@@ -3325,22 +3325,73 @@ def preview_events_in_range(
     both BEFORE anything is deleted. Shares ``_MACHINE_EVENTS_IN_RANGE_WHERE`` with the
     delete, so the two can never select different rows.
 
-    Returns ``{"count", "volume_litres", "span_start", "span_end"}``; a window with no
-    machine events returns zeros and ``None`` spans.
+    Returns ``{"count", "volume_litres", "span_start", "span_end", "ids"}``; a window
+    with no machine events returns zeros, ``None`` spans and an empty ``ids`` list.
+
+    dev52 — ``ids`` is the exact row set the delete would take, in start order. The
+    reprocess probe passes it to ``find_overlapping_event`` as the exclusion set, so
+    "would a kept event block this rebuilt period?" is answered against precisely the
+    rows that will SURVIVE the delete — the same question the importer asks at insert
+    time, only asked before anything is deleted.
+    """
+    rows = conn.execute(
+        "SELECT id, start_ts, COALESCE(end_ts, start_ts) AS end_ts_eff, "
+        "       COALESCE(volume_litres, 0) AS vol "
+        "FROM events WHERE " + _MACHINE_EVENTS_IN_RANGE_WHERE +
+        "ORDER BY start_ts ASC",
+        (circuit, to_ts, from_ts),
+    ).fetchall()
+    if not rows:
+        return {"count": 0, "volume_litres": 0.0,
+                "span_start": None, "span_end": None, "ids": []}
+    return {"count": len(rows),
+            "volume_litres": float(sum(float(r["vol"] or 0.0) for r in rows)),
+            "span_start": rows[0]["start_ts"],
+            "span_end": max(r["end_ts_eff"] for r in rows),
+            "ids": [r["id"] for r in rows]}
+
+
+# dev52 — the two auto-split memo outcomes that depend on the user's labels rather
+# than on HA history. Literal matches reprocess.py (no import: reprocess imports us).
+_KEPT_EVENT_MEMO_REASONS: tuple = ("blocked_by_kept_events", "kept_events_underfit")
+
+
+def release_kept_event_memos(
+    conn: sqlite3.Connection, circuit: str, event_id: str,
+) -> int:
+    """dev52 — un-settle auto-split memos that a change to THIS event's user label /
+    ignore flag may have invalidated. Does not commit.
+
+    The reprocess probe refuses a window as ``blocked_by_kept_events`` or
+    ``kept_events_underfit`` when the rows the delete would leave behind sit on top
+    of every rebuilt period. The auto-split memoises that as settled — correct until
+    the user clears, widens or ignores/restores the blocking event, after which the
+    memo is stale and the window would never be looked at again. So on any label or
+    ignore change, every machine event whose span overlaps this one and whose memo is
+    one of those two reasons is reset to unevaluated (both columns NULL — the
+    auto-split's candidate filter is ``split_evaluated_at IS NULL``). History-derived
+    memos (no_history, gappy_history, clean, ...) are untouched: labels can't change
+    them. Range query on existing columns; no blocker-id list is stored anywhere.
+    Returns the number of memos released; 0 on a pre-20260814 schema.
     """
     row = conn.execute(
-        "SELECT COUNT(*) AS n, "
-        "       COALESCE(SUM(COALESCE(volume_litres, 0)), 0) AS vol, "
-        "       MIN(start_ts) AS span_start, "
-        "       MAX(COALESCE(end_ts, start_ts)) AS span_end "
-        "FROM events WHERE " + _MACHINE_EVENTS_IN_RANGE_WHERE,
-        (circuit, to_ts, from_ts),
-    ).fetchone()
-    if row is None or not row["n"]:
-        return {"count": 0, "volume_litres": 0.0,
-                "span_start": None, "span_end": None}
-    return {"count": int(row["n"]), "volume_litres": float(row["vol"] or 0.0),
-            "span_start": row["span_start"], "span_end": row["span_end"]}
+        "SELECT start_ts, COALESCE(end_ts, start_ts) AS end_ts_eff "
+        "FROM events WHERE id = ? AND circuit = ?", (event_id, circuit)).fetchone()
+    if row is None or not row["start_ts"]:
+        return 0
+    try:
+        cur = conn.execute(
+            "UPDATE events SET split_evaluated_at = NULL, split_evaluation_outcome = NULL "
+            "WHERE circuit = ? AND id <> ? "
+            "  AND split_evaluation_outcome IN (?, ?) "
+            "  AND start_ts <= ? AND COALESCE(end_ts, start_ts) >= ?",
+            (circuit, event_id, *_KEPT_EVENT_MEMO_REASONS,
+             row["end_ts_eff"], row["start_ts"]),
+        )
+    except sqlite3.OperationalError as e:
+        log.debug("kept-event memo release skipped (pre-20260814 schema?): %s", e)
+        return 0
+    return cur.rowcount
 
 
 def delete_events_in_range(
@@ -4138,6 +4189,15 @@ def patch_event(
             "WHERE id = ? AND circuit = ?",
             (ign, excluded, ign, excluded, event_id, circuit),
         )
+    if user_fixture_type is not _PATCH_UNSET or user_ignored is not _PATCH_UNSET:
+        # dev52 — a label or ignore change on this event may unblock (or newly
+        # block) a reprocess of the span around it: both flags decide whether the
+        # delete keeps this row. Re-open any auto-split memo that was settled on
+        # the old answer. See release_kept_event_memos.
+        _freed = release_kept_event_memos(conn, circuit, event_id)
+        if _freed:
+            log.debug("[%s] label/ignore change on %s re-opened %d auto-split "
+                      "memo(s) blocked by kept events", circuit, event_id[:8], _freed)
     if excluded_from_training is not _PATCH_UNSET:
         _ex = 1 if excluded_from_training else 0
         conn.execute(
@@ -4953,12 +5013,17 @@ def get_event_cadence_seconds(
     return float(median(gaps))
 
 
+# dev52 — hard cap on find_overlapping_event's exclusion list (see its docstring).
+_OVERLAP_EXCLUDE_MAX_IDS: int = 900
+
+
 def find_overlapping_event(
     conn: sqlite3.Connection,
     circuit: str,
     start_ts: str,
     end_ts: str,
     exclude_event_id: Optional[str] = None,
+    exclude_event_ids: Optional[Iterable[str]] = None,
 ) -> Optional[dict]:
     """Return an existing event row that meaningfully overlaps [start_ts, end_ts].
 
@@ -4975,6 +5040,15 @@ def find_overlapping_event(
 
     Returns None when no meaningful overlap exists.  When a row is found it is
     returned as a dict so callers can log which event blocked the insert.
+
+    dev52 — ``exclude_event_ids`` (any iterable of ids) is the reprocess probe's
+    "pretend these rows are already deleted" set; ``exclude_event_id`` (one id) is
+    the older spelling and both may be given. Exclusion happens IN the query, not by
+    post-filtering in Python, so the first-match / most-protected-first semantics are
+    exactly what the importer sees after a real delete. The set is capped at 900 ids:
+    SQLite builds before 3.32 cap host parameters at 999, and a silent truncation
+    here would let a blocker through. A caller passes one window's deletable rows,
+    so the cap is never met in practice — it exists to fail loudly if it ever is.
     """
     try:
         start = datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
@@ -4990,18 +5064,28 @@ def find_overlapping_event(
     end_epoch   = int(end.timestamp())
     new_dur     = end_epoch - start_epoch
 
-    excl = "AND e.id != ?" if exclude_event_id is not None else ""
-    params: list = [circuit, start_epoch, end_epoch]
+    excl_ids: list = []
     if exclude_event_id is not None:
-        params.append(exclude_event_id)
+        excl_ids.append(exclude_event_id)
+    if exclude_event_ids is not None:
+        excl_ids.extend(str(i) for i in exclude_event_ids)
+    if len(excl_ids) > _OVERLAP_EXCLUDE_MAX_IDS:
+        raise ValueError(
+            f"find_overlapping_event: {len(excl_ids)} excluded ids exceeds the "
+            f"{_OVERLAP_EXCLUDE_MAX_IDS}-parameter cap — narrow the window")
+    excl = ("AND e.id NOT IN (" + ",".join("?" for _ in excl_ids) + ")"
+            if excl_ids else "")
+    params: list = [circuit, start_epoch, end_epoch, *excl_ids]
 
     rows = conn.execute(f"""
         SELECT e.id,
                e.start_ts,
                e.end_ts,
                e.duration_seconds,
+               e.volume_litres,
                e.fixture_id,
                e.user_fixture_type,
+               e.user_ignored,
                f.user_locked,
                CAST(strftime('%s', e.start_ts) AS INTEGER) AS ex_start_epoch,
                CAST(strftime('%s', e.end_ts)   AS INTEGER) AS ex_end_epoch

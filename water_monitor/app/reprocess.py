@@ -25,9 +25,9 @@ from .config import DB_PATH
 from .detector_validation import HA_HIGH_FIDELITY_DAYS
 from .event_rules import NOT_ARTIFACT_SQL
 from .feature_extractor import SPARSE_ENVELOPE_REASON
-from .database import (delete_events_in_range, get_home_profile, get_write_lock,
-                       preview_events_in_range, restore_deleted_events, run_db,
-                       run_isolated_write)
+from .database import (delete_events_in_range, find_overlapping_event,
+                       get_home_profile, get_write_lock, preview_events_in_range,
+                       restore_deleted_events, run_db, run_isolated_write)
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +113,89 @@ def _probe_refusal(dry: Dict[str, Any], stored_volume_l: float) -> Optional[str]
         if rebuilt < _SPLIT_MIN_VOLUME_COVERAGE * stored_volume_l:
             return "volume_unaccounted"
     return None
+
+
+# dev52 — reasons the KEPT rows (not HA history) refuse a rebuild. Literals are
+# mirrored in database._KEPT_EVENT_MEMO_REASONS (label changes re-open these memos).
+BLOCKED_BY_KEPT_EVENTS = "blocked_by_kept_events"
+KEPT_EVENTS_UNDERFIT = "kept_events_underfit"
+
+
+def _kept_event_blockers(
+    conn: sqlite3.Connection, circuit: str, periods: list, deletable_ids: list,
+    min_duration_s: float,
+) -> Tuple[int, list]:
+    """dev52 — simulate the importer's insert-time overlap skip BEFORE the delete.
+
+    ``_import_range`` drops a reconstructed period shorter than the importer's
+    minimum, and skips one that meaningfully overlaps an existing event
+    (``find_overlapping_event`` — most-protected row first, 3× stub escape hatch).
+    After a reprocess delete the only rows left to collide with are the ones the
+    delete KEEPS: user-labelled, user-classified, user-ignored, or machine rows
+    outside its selection. This asks that exact question against those exact rows by
+    excluding the deletable ids in-query, so its answer is the importer's answer.
+
+    One connection, one loop — never one ``run_db`` per period (the dev46 interleave
+    window). Returns ``(rebuildable_count, blockers)`` where ``blockers`` is a list of
+    ``(period_index, blocking_row)`` for the periods that would be skipped.
+    """
+    rebuildable = 0
+    blockers: list = []
+    for idx, (ps, pe) in enumerate(periods):
+        if (pe - ps).total_seconds() < min_duration_s:
+            continue
+        row = find_overlapping_event(
+            conn, circuit, ps.isoformat(), pe.isoformat(),
+            exclude_event_ids=deletable_ids)
+        if row is None:
+            rebuildable += 1
+        else:
+            blockers.append((idx, row))
+    return rebuildable, blockers
+
+
+def _kept_event_refusal(
+    dry: Dict[str, Any], rebuildable: int, blockers: list,
+) -> Tuple[Optional[str], float, float]:
+    """dev52 — turn ``_kept_event_blockers``'s answer into a refusal reason.
+
+    * no rebuildable period at all → ``blocked_by_kept_events`` (the delete would
+      remove the event and the importer would then insert nothing — the
+      delete / 0 imported / restore / "see addon log" loop this fixes);
+    * some periods blocked → compare the water HA shows in the blocked periods
+      against the stored water on the distinct rows blocking them. If the kept rows
+      cover it (within the same coverage tolerance as the volume gate) the rebuild
+      may proceed: the importer skips those periods and their water is already on
+      the record. If they don't, ``kept_events_underfit`` — deleting the wrapper
+      would make the difference vanish, and the truth pipeline never makes real
+      water invisible.
+    A dry-run that carries no ``period_volumes_l`` (an older caller) can't be
+    weighed, so it is only ever refused on the no-period case.
+    Returns ``(reason_or_None, blocked_period_volume_l, blocker_volume_l)``.
+    """
+    if rebuildable == 0:
+        return BLOCKED_BY_KEPT_EVENTS, 0.0, 0.0
+    if not blockers:
+        return None, 0.0, 0.0
+    vols = dry.get("period_volumes_l")
+    if not vols:
+        return None, 0.0, 0.0
+    blocked_l = 0.0
+    for idx, _row in blockers:
+        try:
+            blocked_l += float(vols[idx] or 0.0)
+        except (IndexError, TypeError, ValueError):
+            pass
+    seen: Set[str] = set()
+    kept_l = 0.0
+    for _idx, row in blockers:
+        if row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        kept_l += float(row.get("volume_litres") or 0.0)
+    if blocked_l > 0.0 and kept_l < _SPLIT_MIN_VOLUME_COVERAGE * blocked_l:
+        return KEPT_EVENTS_UNDERFIT, blocked_l, kept_l
+    return None, blocked_l, kept_l
 
 
 async def reprocess_window(
@@ -201,6 +284,30 @@ async def reprocess_window(
                 "from": imp_from.isoformat(), "to": imp_to.isoformat(),
                 "refused": refused}
 
+    # 3b) dev52 — would the rows the delete KEEPS block the rebuild? History said
+    #     the water is there; this asks whether the importer would be ALLOWED to
+    #     insert it once the machine rows are gone. Answered against the exact
+    #     surviving row set (deletable ids excluded in-query), one connection.
+    min_dur = float(getattr(importer, "MIN_DURATION_SECONDS", 0.0) or 0.0)
+    rebuildable, blockers = await run_db(
+        _kept_event_blockers, orch.db, circuit, list(dry.get("periods") or []),
+        list(preview.get("ids") or []), min_dur)
+    kept_reason, blocked_l, kept_l = _kept_event_refusal(dry, rebuildable, blockers)
+    if kept_reason is not None:
+        who = ", ".join(
+            f"{row['id'][:8]}({row.get('user_fixture_type') or 'kept'})"
+            for _i, row in blockers) or "none"
+        log.warning(
+            "[%s] reprocess %s..%s REFUSED (%s) — %d event(s) / %.1f L left intact; "
+            "%d of %d rebuilt period(s) would be blocked by kept event(s) %s; "
+            "blocked periods carry %.1f L, kept blockers hold %.1f L",
+            circuit, imp_from.isoformat(), imp_to.isoformat(), kept_reason,
+            preview["count"], preview["volume_litres"],
+            len(blockers), len(blockers) + rebuildable, who, blocked_l, kept_l)
+        return {"deleted": 0, "imported": 0, "widened": widened,
+                "from": imp_from.isoformat(), "to": imp_to.isoformat(),
+                "refused": kept_reason}
+
     # 4) Only now delete, under the write lock (sync, isolated). The deleted_rows
     #    snapshot still backs a restore if the re-import raises.
     res = await run_isolated_write(
@@ -209,14 +316,15 @@ async def reprocess_window(
     # 5) Reconstruct from HA. The reconstructed events queue onto the live pipeline;
     #    the FeatureExtractor worker stores + classifies them. import_range RAISES on
     #    a history-fetch failure — we then restore, so the reprocess is all-or-nothing.
-    #    A zero return can now only mean the history changed under us between probe
-    #    and import (a purge landing mid-rebuild), which is treated the same way.
+    #    A zero return now means the history was purged or changed between probe
+    #    and import (dev52 closed the other cause: kept rows blocking every period
+    #    are refused at 3b), which is treated the same way.
     try:
         imported = await importer.import_range(circuit, imp_from, imp_to)
         if res["deleted"] and not imported:
             raise RuntimeError(
-                "re-import produced 0 events for a window the probe said was "
-                "rebuildable — history changed under the reprocess")
+                "re-import produced 0 events after the probe passed — history "
+                "purged or changed between probe and import")
     except Exception:
         deleted_rows = res.get("deleted_rows") or []
         if deleted_rows:

@@ -1351,6 +1351,17 @@ _REPROCESS_REFUSAL_TEXT = {
     "volume_unaccounted":
         "The history that's left only accounts for part of this event's water, so a "
         "rebuild would under-count it. Nothing was changed.",
+    # dev52 — the KEPT rows, not HA history, refuse the rebuild.
+    "blocked_by_kept_events":
+        "This span already holds an event you labelled or marked yourself, and the "
+        "rebuilt draw would land on top of it. Your labelled events are always kept, "
+        "so there is nothing here to rebuild. Nothing was changed. To rebuild this "
+        "span, clear that label first.",
+    "kept_events_underfit":
+        "This span holds an event you labelled yourself, but the rebuilt draw here is "
+        "larger than what that label covers. Deleting the recorded event would lose "
+        "the difference, so nothing was changed. To rebuild this span, widen or clear "
+        "that label first.",
 }
 
 
