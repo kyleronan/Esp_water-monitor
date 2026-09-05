@@ -432,6 +432,50 @@ makes the add-on survive that.
 
 ### Bug Fixes
 
+- **The learned model can improve again** — every weekly re-fit had been
+  rejected in favour of the model already running, for weeks, with an identical
+  result each time. The check that decides between them was unfair in three
+  ways: the reference set of pre-labelled events it was designed to use had
+  never actually been connected, the running model was being scored on days it
+  had trained on while the new fit was scored on days it had not, and a new fit
+  that answered more cautiously was counted as *worse* rather than merely
+  quieter. All three are corrected, the reference events are kept out of
+  training for both models (a model scored on questions it has memorised wins
+  every time — the release gate proved that on the first run), the reference
+  set is loaded once from the developer tools, and when the check has nothing
+  to measure it keeps the running model instead of promoting an untested one.
+  The model already running was fitted before that rule existed, so its first
+  comparisons rest on the recent leg alone until the first change-over. Each decision is
+  recorded permanently, the weekly re-fit no longer re-runs after every
+  restart, and machine-propagated appliance labels are treated as the hints
+  they are rather than as your answers — dev51.
+
+- **You can see what the learned model has been deciding** — the Water Use
+  page now says when the model was last checked, whether a new fit took over
+  or the running one was kept, and how long since anything changed. If four
+  weekly checks in a row keep the old model it says so plainly, because a
+  model that has quietly stopped improving looks exactly like a healthy one
+  from the outside. Developer tools gain **Restore previous model**, an undo
+  for a change-over that turned out badly — dev51.
+
+- **Saving a label no longer fails while the add-on is tidying up in the
+  background** — the hourly re-check used to hold the database long enough
+  that a label saved at the wrong moment came back "NOT saved, try again in a
+  minute", precisely while you were doing the one thing that teaches it. It now
+  releases the database every few seconds, and a save that does collide waits
+  and retries on its own before ever telling you. The same re-check now works
+  through old un-decided events oldest-first instead of forever chasing the
+  newest, so history that had been waiting since July finally gets its turn,
+  and it waits for a busy moment to pass rather than skipping the hour
+  — dev51.
+
+- **Every event kept out of training now says why** — about two hundred events
+  had been excluded with no reason recorded (an ignore, a degraded reading, a
+  suppressed phantom), which is the one thing the quarantine bookkeeping exists
+  to prevent. The reason is now written at the moment of exclusion, and
+  existing silent exclusions are labelled from their own flags at the next
+  start — dev51.
+
 - **Several separate uses recorded as one long event, and rebuilding it changed
   nothing** — on a home with a booster pump the line pressure never fully
   recovers between draws, so the add-on saw one unbroken three-hour event where

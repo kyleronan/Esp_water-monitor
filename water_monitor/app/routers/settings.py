@@ -905,6 +905,106 @@ async def dev_retrain_model(circuit: str, request: Request):
     return ingress_redirect(request, "/settings#sett-dev")
 
 
+@router.post("/dev/rollback-model/{circuit}")
+async def dev_rollback_model(circuit: str, request: Request):
+    """DEV/testing only — put the PREVIOUS learned model back into service.
+
+    The counterpart of "Re-fit now": if a swap turns out badly, this restores
+    the retained artifact, re-derives the verdicts the restored model would
+    answer differently, and records the action in the decision ledger. Plain
+    form POST → redirect, outcome as a toast via the jobs table, like the
+    other dev buttons. Gated behind ``dev_tools``."""
+    from ..config import DEV_TOOLS
+    if not DEV_TOOLS:
+        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+    from .. import tinymodel as tm
+    from ..config import DATA_DIR
+    from ..database import finish_job, get_write_lock, start_job
+    from ..learning_loop import rollback_serving_model
+
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    job = await run_db(start_job, orch.db, "tinymodel_rollback", circuit,
+                       "Restoring the previous learned model…")
+    try:
+        async with get_write_lock():
+            res = await run_db(rollback_serving_model, orch.db, circuit,
+                               str(DATA_DIR))
+        tm.invalidate_cache(circuit)
+        if res.get("status") == "rolled_back":
+            msg = (f"{circuit}: previous model restored ({res.get('model_hash')}); "
+                   f"{res.get('invalidated', 0)} verdict(s) queued for re-check")
+        else:
+            msg = f"{circuit}: nothing to roll back — no previous model is retained"
+        await run_db(finish_job, orch.db, job, "done", msg)
+    except Exception as e:                                  # noqa: BLE001
+        log.exception("[%s] model rollback failed", circuit)
+        await run_db(finish_job, orch.db, job, "error",
+                     f"{circuit}: rollback failed — {e}")
+    return ingress_redirect(request, "/settings#sett-dev")
+
+
+@router.post("/dev/import-referee-benchmark/{circuit}")
+async def dev_import_referee_benchmark(circuit: str, request: Request):
+    """DEV/testing only — load the referee's frozen benchmark for a circuit.
+
+    The pinned benchmark (dev47's eval harness writes it as JSON with
+    ``event_ids`` + ``benchmark_hash``) is a record of when this household used
+    water, so it lives outside the repo. Until dev51 nothing ever loaded it and
+    the referee's primary leg never ran. This stores the ids in the DB —
+    delete-then-insert for the circuit, under the same write lock a retrain
+    takes — and returns ``{circuit, source_hash, requested_n, inserted_n}``.
+
+    Accepts the document pasted into the form field or attached as a file
+    (multipart form POST with ``_csrf``, like the Re-fit button), or a JSON
+    body. Gated behind ``dev_tools``."""
+    from ..config import DEV_TOOLS
+    if not DEV_TOOLS:
+        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+    import json as _json
+    from ..database import get_write_lock
+    from ..learning_loop import import_referee_benchmark
+
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    payload = None
+    if "application/json" in request.headers.get("content-type", ""):
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Body is not valid JSON"}, status_code=400)
+    else:
+        form = await request.form()
+        upload = form.get("benchmark_file")
+        raw = ""
+        if upload is not None and getattr(upload, "filename", ""):
+            raw = (await upload.read()).decode("utf-8", errors="replace")
+        else:
+            raw = str(form.get("benchmark_json") or "")
+        if raw.strip():
+            try:
+                payload = _json.loads(raw)
+            except ValueError:
+                return JSONResponse({"error": "That is not valid JSON"},
+                                    status_code=400)
+    if not payload:
+        return JSONResponse(
+            {"error": "Paste the benchmark JSON or choose the file"},
+            status_code=400)
+    try:
+        async with get_write_lock():
+            result = await run_db(import_referee_benchmark, orch.db, circuit,
+                                  payload)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:                                  # noqa: BLE001
+        log.error("[%s] referee benchmark import failed: %s", circuit, e,
+                  exc_info=True)
+        return JSONResponse({"error": "Import failed — see addon log."},
+                            status_code=500)
+    return JSONResponse(result)
+
+
 @router.post("/dev/validate-detectors/{circuit}")
 async def dev_validate_detectors(circuit: str, request: Request):
     """DEV/testing only — run the detector self-validation (P6) against HA history on

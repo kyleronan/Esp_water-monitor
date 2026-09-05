@@ -1086,3 +1086,18 @@ that as a nightly instrument.
 | A verdict looks stale / ignores a feature you fixed | Part 6 | whether that column is in the invalidation trigger's watch list — an unwatched input leaves the row stamped |
 | Study export refuses right after a restart | Part 6 | `startup_cluster_work_done` — the background classification is still writing; it clears when the boot log says "background classification complete" |
 | A leak test says "indeterminate" | not this pipeline | `addon_measure_status` — too few samples or the other valve was open; no leak rate is inferred |
+
+## The referee's reference benchmark (dev51)
+
+The weekly re-fit is judged on two legs: a **pinned reference set** of ~165
+labelled events, and a recent held-out slice. The reference set is *not* in the
+repository (it encodes real water-use timestamps); it is created once with
+`python -m water_monitor.tools.eval_tinymodel --db <export.db> --pin-benchmark <path.json>`
+and loaded into the running add-on through **Settings → developer tools →
+Import referee benchmark** (paste the JSON). Its events are then **reserved** —
+neither the running model nor a challenger trains on them — because a model
+scored on rows it has memorised wins every comparison (the dev51 release gate
+caught exactly that). Until it is imported the benchmark leg abstains and the
+referee keeps the incumbent; the Water Use page says so after four such weeks.
+Re-run the gate before any change to the referee, the card policy or the
+thresholds: `--only cv,holdout,health --benchmark <path.json>` must pass G1/G2.

@@ -1456,13 +1456,61 @@
         <div class="dev-refit-row"
              style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
           <div><strong>{{ c.display_name }}</strong></div>
-          <form method="post"
-                action="{{ ingress_path }}/settings/dev/retrain-model/{{ c.circuit }}"
-                style="margin:0">
-            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-            <button type="submit" class="btn btn-secondary btn-sm">Re-fit now</button>
-          </form>
+          <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
+            <form method="post"
+                  action="{{ ingress_path }}/settings/dev/retrain-model/{{ c.circuit }}"
+                  style="margin:0">
+              <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+              <button type="submit" class="btn btn-secondary btn-sm">Re-fit now</button>
+            </form>
+            {#- dev51: the undo. Restores the model that was serving before the
+                last swap; the events that model would answer differently are
+                re-checked, and the action is recorded beside the automatic
+                decisions. #}
+            <form method="post"
+                  action="{{ ingress_path }}/settings/dev/rollback-model/{{ c.circuit }}"
+                  style="margin:0"
+                  onsubmit="return confirm('Put the previous learned model back into service for {{ c.display_name }}?');">
+              <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+              <button type="submit" class="btn btn-ghost btn-sm">Restore previous model</button>
+            </form>
+          </div>
         </div>
+        {% endfor %}
+        <p class="sett-help" style="margin:.5rem 0 0">
+          <em>Restore previous model</em> puts back the model that was running
+          before the last change-over, if one is retained, and re-checks the
+          events it would answer differently.
+        </p>
+      </div>
+
+      <div class="sett-card">
+        <h3 class="sett-card-title">Load the model's reference benchmark</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          When the learned model is re-fitted, the new fit is checked against a
+          fixed set of events labelled before it existed, so a fit that quietly
+          got worse is not put into service. That reference set is not built in
+          — paste the benchmark file's contents (or attach the file) once for
+          each circuit. Without one, a re-fit can never replace the model that
+          is already running. Loading a new file replaces the previous set.
+          The result is shown as a short summary.
+        </p>
+        {% for c in circuits %}
+        <form method="post" enctype="multipart/form-data"
+              action="{{ ingress_path }}/settings/dev/import-referee-benchmark/{{ c.circuit }}"
+              style="margin:.6rem 0">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          <div style="display:flex;gap:.5rem;align-items:flex-start;justify-content:space-between;flex-wrap:wrap">
+            <div><strong>{{ c.display_name }}</strong></div>
+            <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
+              <input type="file" name="benchmark_file" accept="application/json,.json">
+              <button type="submit" class="btn btn-secondary btn-sm">Load benchmark</button>
+            </div>
+          </div>
+          <textarea name="benchmark_json" rows="3" spellcheck="false"
+                    placeholder='or paste the file contents here: {"event_ids": [...], "benchmark_hash": "..."}'
+                    style="width:100%;margin-top:.4rem;font-family:monospace;font-size:.8rem"></textarea>
+        </form>
         {% endfor %}
       </div>
 

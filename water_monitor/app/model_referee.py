@@ -175,7 +175,8 @@ def decide(
     Both legs are NON-INFERIORITY tests: the challenger ships unless it is
     measurably worse. The frozen benchmark is the primary guard (it is the only
     reference the challenger did not learn from); the recent-labelled leg is a
-    secondary guard that abstains when its sample is too small.
+    secondary guard that abstains when its sample is too small. If BOTH abstain
+    the incumbent is kept — an unmeasured challenger is not a passed one.
 
     ``recent_holdout_ids`` / ``challenger_pool_ids`` are the anti-degeneracy
     check. If both are supplied and they intersect, the "holdout" contains
@@ -209,6 +210,16 @@ def decide(
     vetoes = [leg for leg in legs if leg.vetoed]
     if vetoes:
         return RefereeVerdict(False, f"{vetoes[0].name}: {vetoes[0].detail}",
+                              tuple(legs))
+    # dev51 (dev49 P-2): abstention is not consent. When NO leg could score —
+    # an empty benchmark AND a holdout below the floor — nothing has been
+    # measured, and "nothing vetoed" would promote an unexamined challenger.
+    # That was the shipped state for weeks (the benchmark leg was never
+    # wired), so the safe direction is the one every other failure takes here:
+    # keep the incumbent. A leg that abstains while another scores still
+    # neither vetoes nor endorses — that behaviour is unchanged.
+    if all(leg.outcome == "no_contest" for leg in legs):
+        return RefereeVerdict(False, "no leg could score — keeping incumbent",
                               tuple(legs))
     return RefereeVerdict(True, "no leg vetoed", tuple(legs))
 

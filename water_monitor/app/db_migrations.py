@@ -292,6 +292,11 @@ _BASELINE_VERSION: int = 20260523
 #   20260814 — dev50: events.split_evaluated_at / split_evaluation_outcome (the
 #               over-merge job's decision memo) + stale_reason / stale_at on
 #               anomaly_shutoff_log and cross_talk_audit.
+#   20260815 — dev51: the model referee's tables — referee_benchmark +
+#               referee_benchmark_meta (the pinned frozen benchmark, imported
+#               once via Dev Tools; its ids never enter the repo) and
+#               retrain_ledger (every referee decision, durably — the jobs
+#               table prunes after two days).
 #   20260812 — dev48: events.flow_plateau_lpm + waveform backfill.
 #   20260811 — dev47 (47i): fixture health baselines, nightly stats and
 #               alerts (fixture_baseline / fixture_health_stat /
@@ -305,7 +310,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260814
+_CURRENT_VERSION: int = 20260815
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -3201,6 +3206,64 @@ def _apply_auto_split_memo(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260814: auto-split memo columns + audit stale marks ready")
 
 
+# 20260815 — dev51: the model referee's benchmark + decision ledger.
+_REFEREE_TABLES_DDL: tuple = (
+    ("referee_benchmark",
+     "CREATE TABLE IF NOT EXISTS referee_benchmark ("
+     "circuit TEXT NOT NULL, event_id TEXT NOT NULL, "
+     "source_hash TEXT NOT NULL, imported_at TEXT NOT NULL, "
+     "PRIMARY KEY (circuit, event_id))"),
+    ("referee_benchmark_meta",
+     "CREATE TABLE IF NOT EXISTS referee_benchmark_meta ("
+     "circuit TEXT PRIMARY KEY, source_hash TEXT NOT NULL, "
+     "requested_n INTEGER NOT NULL, imported_at TEXT NOT NULL)"),
+    ("retrain_ledger",
+     "CREATE TABLE IF NOT EXISTS retrain_ledger ("
+     "id INTEGER PRIMARY KEY, circuit TEXT NOT NULL, decided_at TEXT NOT NULL, "
+     "trigger TEXT NOT NULL, status TEXT NOT NULL, swap INTEGER NOT NULL, "
+     "challenger_hash TEXT, champion_hash TEXT, reason TEXT, "
+     "benchmark_hash TEXT, benchmark_n INTEGER, detail_json TEXT)"),
+)
+
+
+def _apply_referee_tables(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260815 — three new tables, no backfill, idempotent.
+
+    The referee (dev47) was designed with two legs: a pinned frozen benchmark
+    as the primary guard and a recent labelled holdout as the secondary. In
+    production the benchmark leg never ran — nothing wired the pinned file in —
+    and the referee rejected the identical challenger night after night. dev51
+    moves the benchmark INTO the database (``referee_benchmark`` + one
+    ``referee_benchmark_meta`` row per circuit holding the import's hash and
+    requested count), imported once through Dev Tools so the ids never enter
+    the repo, and adds ``retrain_ledger`` because the jobs table prunes at two
+    days and "a run of rejections" was therefore invisible. Empty tables are
+    the correct state on a fresh install: the benchmark leg abstains, and an
+    abstaining referee keeps the incumbent.
+    """
+    for _name, ddl in _REFEREE_TABLES_DDL:
+        conn.execute(ddl)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_retrain_ledger_circuit_decided "
+        "ON retrain_ledger (circuit, decided_at)")
+    conn.commit()
+    # Belt-and-braces re-create of the wf-claim index — LAST-migration
+    # convention (see 20260574/20260804/20260806/20260807/20260808/20260814).
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+        conn.commit()
+    log.info("Migration 20260815: referee benchmark + retrain ledger tables ready")
+
+
+def _missing_referee_tables(conn: sqlite3.Connection) -> set[str]:
+    """Verifier for the 20260815 DDL (current-version guard set)."""
+    return {name for name, _ in _REFEREE_TABLES_DDL if not _has_table(conn, name)}
+
+
 _MIGRATIONS: tuple = (
     (20260524, _drop_retired_wf_entity_map_rows),
     (20260525, _apply_unique_events_index),
@@ -3267,6 +3330,7 @@ _MIGRATIONS: tuple = (
     (20260812, _apply_flow_plateau),
     (20260813, _apply_daily_summary_drift_markers),
     (20260814, _apply_auto_split_memo),
+    (20260815, _apply_referee_tables),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -3346,6 +3410,7 @@ def _run_migrations_impl(
             | _missing_local_day_columns(conn)
             | _missing_wf_claim_columns(conn)
             | _missing_202608_columns(conn)
+            | _missing_referee_tables(conn)
         )
         if missing:
             raise RuntimeError(

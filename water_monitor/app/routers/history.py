@@ -66,6 +66,33 @@ async def _bg_reclassify(circuit: str) -> None:
 # we never cancel an already-running one (idempotent, but cancellation mid-write
 # is messy), we just let superseded delays no-op.
 _RECLASSIFY_DEBOUNCE_S: float = 8.0
+
+# dev51 (3.5) — how long a label save keeps trying when the database is busy
+# with a background job before it gives up and tells the user. The hourly
+# backlog drain now yields the file write-lock every ~40 rows (~3-4 s), so one
+# retry almost always suffices; three cover a reprocess landing at the same
+# moment. Total worst case ~7 s of waiting plus the per-attempt busy timeout.
+_PATCH_RETRY_BACKOFF_S: tuple = (1.0, 2.0, 4.0)
+
+
+async def _patch_with_retry(db, event_id: str, circuit: str, payload: dict,
+                            sleep=None) -> dict:
+    """Run the PATCH's DB step, retrying with backoff while it reports
+    ``locked``. Split out so the retry policy is testable without a Request.
+    ``sleep`` is injectable for tests; defaults to ``asyncio.sleep``."""
+    import asyncio
+    from ..database import run_db
+    _sleep = sleep or asyncio.sleep
+    outcome = await run_db(_patch_event_sync, db, event_id, circuit, payload)
+    attempt = 0
+    while outcome.get("locked") and attempt < len(_PATCH_RETRY_BACKOFF_S):
+        delay = _PATCH_RETRY_BACKOFF_S[attempt]
+        attempt += 1
+        log.info("[%s] label save for %s hit a busy database — retry %d/%d in %ss",
+                 circuit, event_id, attempt, len(_PATCH_RETRY_BACKOFF_S), delay)
+        await _sleep(delay)
+        outcome = await run_db(_patch_event_sync, db, event_id, circuit, payload)
+    return outcome
 _reclassify_gen: dict = {}
 
 
@@ -955,8 +982,15 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
     # PATCH that races the chunked startup reclassify (see the write-time
     # re-check in set_event_matched_fixture_type): it must never touch the
     # shared connection from the loop thread while the DB worker holds it.
-    from ..database import run_db
-    outcome = await run_db(_patch_event_sync, db, event_id, circuit, payload)
+    # dev51 (3.5) — a label must never lose to background maintenance. The
+    # hourly backlog drain holds the file write-lock in short bursts; the old
+    # behaviour answered the FIRST collision with "your change was NOT saved …
+    # restart the add-on" (observed live 2026-08-31, while the operator was
+    # labelling — the one activity that unfreezes the learning loop). Retry a
+    # few times with backoff, awaiting between attempts so the DB worker and
+    # the event loop stay free; the 503 is now the last resort, not the first
+    # response. The sync step is idempotent (a plain UPDATE of user fields).
+    outcome = await _patch_with_retry(db, event_id, circuit, payload)
     if "error" in outcome:
         return JSONResponse(outcome["error"], status_code=outcome["status"])
     if outcome.get("reclassify"):
@@ -1075,7 +1109,7 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
                 "error": "The database is busy with a background job — "
                          "your change was NOT saved. Try again in a minute; "
                          "if this keeps happening, restart the add-on."},
-                "status": 503}
+                "status": 503, "locked": True}
         if not found:
             return {"error": {"error": "Event not found"}, "status": 404}
 

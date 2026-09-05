@@ -41,6 +41,12 @@ log = logging.getLogger(__name__)
 _INTERVAL_SECONDS = 3600          # re-check hourly (matches the "an hour later" intent)
 _SETTLE_HORIZON_HOURS = 6         # only re-evaluate events newer than this; > the 3.5 h
 #                                   softener max span, so a matured event ages out settled
+# dev51 (3.4) — when the write lock is busy at the top of the hour, WAIT for it
+# (bounded) instead of skipping the tick. A skipped tick silently forfeited
+# that hour's whole 400-row backlog slice with no catch-up; a retrain or a
+# reprocess landing at :00 cost a full hour of drain every time.
+_LOCK_WAIT_SECONDS = 300
+_LOCK_POLL_SECONDS = 5
 
 
 class MaturityRecheck:
@@ -106,12 +112,22 @@ class MaturityRecheck:
         from .database import (get_write_lock, recompute_cycle_pulse_counts,
                                reclassify_all_events_from_signatures,
                                resuggest_all_clusters, run_isolated_write)
-        # Skip this tick if a manual reprocess (or a still-running re-check) holds the
-        # write lock — try again next hour rather than queue behind a multi-second job
-        # (mirrors the /recompute route's best-effort busy guard).
+        # If a manual reprocess / retrain (or a still-running re-check) holds
+        # the write lock, wait a bounded while for it rather than forfeit the
+        # hour (dev51, 3.4). Still never queues behind a genuinely wedged
+        # writer: after _LOCK_WAIT_SECONDS it gives up, and says so at INFO —
+        # a forfeited slice must be visible, not a DEBUG line nobody reads.
+        waited = 0
+        while get_write_lock().locked() and waited < _LOCK_WAIT_SECONDS:
+            await asyncio.sleep(_LOCK_POLL_SECONDS)
+            waited += _LOCK_POLL_SECONDS
         if get_write_lock().locked():
-            log.debug("[%s] maturity re-check skipped — write lock busy", circuit)
+            log.info("[%s] maturity re-check skipped — write lock still busy after "
+                     "%ds; this hour's backlog slice is forfeited", circuit, waited)
             return
+        if waited:
+            log.debug("[%s] maturity re-check waited %ds for the write lock",
+                      circuit, waited)
         window_start = (datetime.now(timezone.utc)
                         - timedelta(hours=_SETTLE_HORIZON_HOURS)).isoformat()
 

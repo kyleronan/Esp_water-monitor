@@ -96,6 +96,19 @@ MODEL_PARAMS: dict = {
 MIN_USER_LABELS: int = 100
 MIN_LABELS_PER_CLASS: int = 3
 
+# dev51 (1.5) — which `fixture_label_source` values are MACHINE labels. 'anchor'
+# was the designed value and is never actually written; 'cycle' is what
+# propagate_cycle_label writes, and until dev51 it counted as human truth in
+# both the training pool and the referee's holdout — the dev40 bad-machine-
+# label lesson, one level up. 'training' (the wizard) is deliberate human
+# ground truth and stays human. One predicate, used by eligibility, the pool
+# partition and the holdout, so the three cannot disagree.
+MACHINE_LABEL_SOURCES: tuple = ("anchor", "cycle")
+
+
+def is_machine_label(row: dict) -> bool:
+    return (row.get("fixture_label_source") or "direct") in MACHINE_LABEL_SOURCES
+
 # Precision-first thresholding (F8). The operator contract is precision, so
 # precision is what stays fixed and coverage floats. The bound is a lower
 # confidence bound, not the point estimate: at n≈100-500 an uncorrected
@@ -197,6 +210,14 @@ class Artifact:
     # train and serve. A booster cannot bin an all-NaN column, so without this
     # a home that never populates one feature cannot train a model at all.
     zero_filled: List[str] = field(default_factory=list)
+    # dev51 — the local calendar days this artifact was fitted on. The referee
+    # scores the recent leg only on days NEITHER model trained on; without this
+    # the champion was scored on days it had memorised while the challenger was
+    # scored clean, a one-directional bias that rejected every challenger.
+    # Additive: artifacts written before dev51 load with an empty list and the
+    # referee falls back to "days after trained_at". Deliberately NOT part of
+    # model_hash — it describes the fit, it does not change it.
+    train_days: List[str] = field(default_factory=list)
     model_blob: Optional[str] = None            # base64 joblib/pickle payload
     _estimator: object = field(default=None, repr=False, compare=False)
 
@@ -297,8 +318,7 @@ def choose_threshold(scored: Sequence[Tuple[str, str, float]],
 # ── training ────────────────────────────────────────────────────────────────
 def eligible(rows: Sequence[dict]) -> Tuple[bool, str]:
     """Is this home ready for the model tier? USER labels only (47c)."""
-    user_rows = [r for r in rows
-                 if (r.get("fixture_label_source") or "direct") != "anchor"]
+    user_rows = [r for r in rows if not is_machine_label(r)]
     if len(user_rows) < MIN_USER_LABELS:
         return False, (f"{len(user_rows)} user labels < {MIN_USER_LABELS} "
                        "— kNN ladder still serves")
@@ -374,6 +394,8 @@ def train(rows: Sequence[dict], circuit: str,
         circuit=circuit,
         notes=notes,
         zero_filled=list(empty),
+        train_days=sorted({str(r.get("start_ts"))[:10] for r in rows
+                           if r.get("start_ts")}),
         model_blob=_serialize(clf),
     )
     art._estimator = clf
@@ -395,8 +417,15 @@ def predict_one(art: Artifact, row: dict) -> Tuple[Optional[str], float]:
     return label, conf
 
 
-def _predict_batch(art: Artifact, rows: Sequence[dict]
+def _predict_batch(art: Artifact, rows: Sequence[dict],
+                   threshold: Optional[float] = None
                    ) -> List[Tuple[Optional[str], float]]:
+    """``threshold`` overrides the artifact's serving threshold for this call
+    only; ``0.0`` means argmax (never abstain). Default — no override — is the
+    serving contract and is what every classification path uses. The override
+    exists for the referee (dev51): two artifacts that chose different serving
+    thresholds cannot be compared on an abstention-punishing metric, because a
+    coverage difference reads as a quality difference."""
     if not rows:
         return []
     import numpy as np
@@ -404,17 +433,19 @@ def _predict_batch(art: Artifact, rows: Sequence[dict]
     proba = clf.predict_proba(
         design_matrix(rows, art.features, zero_filled=art.zero_filled))
     classes = list(clf.classes_)
+    thr = art.threshold if threshold is None else float(threshold)
     out: List[Tuple[Optional[str], float]] = []
     for p in proba:
         j = int(np.argmax(p))
         conf = float(p[j])
-        out.append((classes[j] if conf >= art.threshold else None, conf))
+        out.append((classes[j] if conf >= thr else None, conf))
     return out
 
 
-def predict_many(art: Artifact, rows: Sequence[dict]
+def predict_many(art: Artifact, rows: Sequence[dict],
+                 threshold: Optional[float] = None
                  ) -> List[Tuple[Optional[str], float]]:
-    return _predict_batch(art, rows)
+    return _predict_batch(art, rows, threshold=threshold)
 
 
 # ── persistence ─────────────────────────────────────────────────────────────

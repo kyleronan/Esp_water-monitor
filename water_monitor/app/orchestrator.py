@@ -1030,6 +1030,13 @@ class Orchestrator:
             if res.get("dribbles_flagged"):
                 log.info("startup: flagged %d low-flow dribble event(s)",
                          res["dribbles_flagged"])
+            # dev51 (Phase 5) — AFTER the exclusion reprocess above, so any
+            # exclusion that pass just rewrote gets its reason in the same
+            # boot. Idempotent; a no-op once the backlog is stamped.
+            from .feature_extractor import backfill_silent_exclusion_reasons
+            await _timed_startup_job(
+                "backfill_silent_exclusion_reasons",
+                run_db(backfill_silent_exclusion_reasons, self._db))
             # dev46 (46k) — PAGES OPEN HERE, not after the reclassify.
             # Everything the pages need is now in place: the cluster engine is
             # rebuilt and wired, and the exclusion verdicts are current. What

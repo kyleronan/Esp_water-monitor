@@ -104,6 +104,8 @@ class LearningScheduler:
         which is something the operator should be able to see.
         """
         from . import tinymodel as tm
+        from .database import run_db
+        from .learning_loop import weekly_retrain_recorded
 
         today = datetime.now(timezone.utc).strftime("%G-W%V")
         if self._last_retrain_day == today:
@@ -113,14 +115,27 @@ class LearningScheduler:
                      "in this image — the kNN ladder is serving")
             self._last_retrain_day = today
             return
+        # dev51 — the in-memory marker above is lost on every redeploy, which is
+        # how production re-judged the identical challenger on consecutive
+        # nights. The ledger is the durable record of "already ran this week".
+        if await run_db(weekly_retrain_recorded, self._db, today):
+            log.info("tinymodel retrain already recorded for %s — skipping", today)
+            self._last_retrain_day = today
+            return
         for circ in self._cfg.circuits:
             if self._stop.is_set():
                 return
-            await self.retrain_circuit(circ.circuit, "weekly scheduled retrain")
+            await self.retrain_circuit(circ.circuit, "weekly scheduled retrain",
+                                       trigger="weekly")
         self._last_retrain_day = today
 
-    async def retrain_circuit(self, circuit: str, reason: str):
+    async def retrain_circuit(self, circuit: str, reason: str,
+                              trigger: Optional[str] = None):
         """Put ONE circuit through the referee, and return its outcome.
+
+        ``trigger`` is what the ledger records — ``weekly`` or ``on_demand``;
+        derived from ``reason`` when not given so the existing callers need
+        no change.
 
         Shared by the weekly pass and the on-demand Dev Tools button, so the
         two cannot drift: same write lock, same single DB hop (46a), same cache
@@ -135,8 +150,11 @@ class LearningScheduler:
         from . import tinymodel as tm
         from .config import DATA_DIR
         from .database import finish_job, get_write_lock, run_db, start_job
-        from .learning_loop import retrain
+        from .learning_loop import (STALL_STREAK, benchmark_ids_for_circuit,
+                                    learning_status, record_retrain_decision,
+                                    retrain)
 
+        trigger = trigger or ("weekly" if reason.startswith("weekly") else "on_demand")
         # Every outcome gets a job row, not just the ones that swap the model.
         # A referee that rejects week after week is a model that has stopped
         # improving, and V6d's finding was that this failure is SILENT: a frozen
@@ -148,10 +166,16 @@ class LearningScheduler:
                            "Re-fitting the learned model…")
         try:
             async with get_write_lock():
+                # dev51 — the pinned benchmark lives in the DB (referee_benchmark,
+                # imported once via Dev Tools). Before this the call passed None
+                # here and the referee's PRIMARY leg had never run in production.
+                # An empty table yields [] → the benchmark leg abstains, and an
+                # abstaining referee now KEEPS the incumbent rather than promoting.
+                ref = await run_db(benchmark_ids_for_circuit, self._db, circuit)
                 out = await run_db(retrain, self._db, circuit,
-                                   str(DATA_DIR), None,
+                                   str(DATA_DIR), ref["ids"],
                                    tm.DEFAULT_TARGET_PRECISION, None, True,
-                                   reason)
+                                   reason, benchmark_meta=ref)
         except Exception as e:                              # noqa: BLE001
             await run_db(finish_job, self._db, job, "error",
                          f"{circuit}: retrain failed — {e}")
@@ -161,4 +185,19 @@ class LearningScheduler:
         await run_db(finish_job, self._db, job,
                      "error" if out.status == "unavailable" else "done",
                      f"{circuit}: {out.status} — {out.reason}")
+        # dev51 — the durable record (the job row above is pruned after two
+        # days), and the stall check that V6d showed nothing else would raise.
+        # Both best-effort: a ledger problem must not fail a finished retrain.
+        try:
+            await run_db(record_retrain_decision, self._db, circuit, trigger, out)
+            status = await run_db(learning_status, self._db, circuit)
+            if status.get("stalled"):
+                log.warning("[%s] the referee has kept the incumbent %d time(s) in "
+                            "a row (threshold %d) — the learned model has stopped "
+                            "improving. Check the benchmark is imported and that "
+                            "new labels are arriving.", circuit,
+                            status.get("kept_streak"), STALL_STREAK)
+        except Exception as e:                              # noqa: BLE001
+            log.warning("[%s] retrain ledger/status step failed (non-fatal): %s",
+                        circuit, e)
         return out

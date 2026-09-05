@@ -190,6 +190,44 @@
 {% endfor %}
 {% endif %}
 
+{# ── dev51 (2.1): what the learning loop has been deciding, from its ledger.
+     The V6d finding was that a model which has stopped improving is SILENT —
+     a frozen fit serves exactly like a healthy one — so this is the one place
+     the operator can see a run of rejections. A banner, never a knob: the
+     referee is not relaxed from here. ─────────────────────────────────── #}
+{% if health and health.learning %}
+{% for cid, l in health.learning.items() %}
+<div class="fx-msg {{ 'fx-msg-warn' if l.stalled else 'fx-msg-ok' }}"
+     style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <span>
+    {%- if l.stalled %}
+    <strong>The learned model on {{ l.circuit_name }} has stopped improving</strong> —
+    the last {{ l.kept_streak }} weekly re-fits were all judged no better than the
+    model already running. That usually means the reference benchmark has not
+    been loaded (Settings → developer tools), or no new labels have arrived for
+    it to learn from.
+    {%- else %}
+    Learned model on {{ l.circuit_name }}: last checked {{ (l.last_decided_at or '')[:10] }} —
+    {%- if l.last_swapped %} a new fit took over.
+    {%- elif l.last_status == 'kept' %} the running model was kept
+      {%- if l.kept_streak > 1 %} ({{ l.kept_streak }} checks in a row){% endif %}.
+    {%- else %} nothing to decide yet ({{ l.last_reason }}).
+    {%- endif %}
+    {%- if l.days_since_swap is not none %}
+      Last change-over {{ l.days_since_swap }} day{{ '' if l.days_since_swap == 1 else 's' }} ago.
+    {%- endif %}
+    {%- endif %}
+    {%- if l.coverage_warning %}
+    The newest fit answers noticeably fewer events on its own than the previous one did.
+    {%- endif %}
+    {%- if l.serving_hash %}
+    <span style="opacity:.65;font-family:monospace;font-size:.85em"> model {{ l.serving_hash }}</span>
+    {%- endif %}
+  </span>
+</div>
+{% endfor %}
+{% endif %}
+
 {# ── Time-range selector — rescopes every card's windowed total. Reuses the #}
 {# History page's hist-range-btn styling; server-side nav via ?range=. ──── #}
 <div class="fx-range-btns hist-range-btns" role="group" aria-label="Time range"

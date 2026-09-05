@@ -228,12 +228,24 @@ def _fixtures_page_payload(orch, range_start_utc):
     # hop as everything else this page reads. Both are strictly best-effort:
     # a home that has not pinned a baseline, or an install predating the
     # migration, must render the page exactly as before rather than 500.
-    health_ctx = {"alerts": [], "queue": {}}
+    health_ctx = {"alerts": [], "queue": {}, "learning": {}}
     try:
         from ..fixture_health import load_baseline, open_alerts
         from ..review_queue import build_card
         for circ in circuits_ctx:
             cid = circ["circuit"]
+            # dev51 (2.1) — what the learning loop has been deciding, from the
+            # ledger. Best-effort like everything else here; absent on a home
+            # with no decision on record.
+            try:
+                from ..config import DATA_DIR
+                from ..learning_loop import learning_status
+                st = learning_status(orch.db, cid, str(DATA_DIR))
+                if st.get("available"):
+                    st["circuit_name"] = circ.get("display_name") or cid
+                    health_ctx["learning"][cid] = st
+            except Exception:                       # noqa: BLE001
+                pass
             for alert in open_alerts(orch.db, cid):
                 detail = {}
                 try:

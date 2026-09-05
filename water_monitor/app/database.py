@@ -1613,6 +1613,50 @@ CREATE TABLE IF NOT EXISTS daily_summary_dirty (
 CREATE INDEX IF NOT EXISTS idx_events_circuit_span
     ON events (circuit, start_ts, end_ts);
 
+-- dev51 (migration 20260815): the model referee's frozen benchmark and its
+-- decision record.
+--   referee_benchmark       — event ids of the pinned benchmark, per circuit.
+--                             Imported once through Dev Tools; the ids never
+--                             enter the repo (they are a record of when this
+--                             household used water). Empty = the referee's
+--                             benchmark leg abstains.
+--   referee_benchmark_meta  — ONE row per circuit: the import's hash and the
+--                             number of ids it asked for, so a retrain can say
+--                             "165 requested, 151 matched the pool" and the
+--                             ledger has one unambiguous hash to quote.
+--   retrain_ledger          — every referee decision, durably. The jobs table
+--                             prunes after two days, so "a run of rejections"
+--                             was invisible; this is the record.
+CREATE TABLE IF NOT EXISTS referee_benchmark (
+    circuit      TEXT NOT NULL,
+    event_id     TEXT NOT NULL,
+    source_hash  TEXT NOT NULL,
+    imported_at  TEXT NOT NULL,
+    PRIMARY KEY (circuit, event_id)
+);
+CREATE TABLE IF NOT EXISTS referee_benchmark_meta (
+    circuit      TEXT PRIMARY KEY,
+    source_hash  TEXT NOT NULL,
+    requested_n  INTEGER NOT NULL,
+    imported_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS retrain_ledger (
+    id               INTEGER PRIMARY KEY,
+    circuit          TEXT NOT NULL,
+    decided_at       TEXT NOT NULL,
+    trigger          TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    swap             INTEGER NOT NULL,
+    challenger_hash  TEXT,
+    champion_hash    TEXT,
+    reason           TEXT,
+    benchmark_hash   TEXT,
+    benchmark_n      INTEGER,
+    detail_json      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_retrain_ledger_circuit_decided
+    ON retrain_ledger (circuit, decided_at);
+
 -- dev46 (46k) — verdict-stamp invalidation, enforced at the TABLE.
 --
 -- The stamp says "this row's stored verdict was derived from these inputs".
@@ -4080,15 +4124,30 @@ def patch_event(
         excluded = 1 if (ign or row["is_pressure_restoration_phantom"]
                          or row["degraded_supply"]
                          or row["is_low_flow_dribble"]) else 0
+        # dev51 (Phase 5) — an Ignore records WHY the row left training. On
+        # ignore, an existing (more specific) reason is kept and a bare row
+        # gets 'user_ignored'; on restore, only a reason this button wrote is
+        # cleared, and only if nothing else still excludes the row. Literal
+        # matches feature_extractor.USER_IGNORED_REASON (no import: circular).
         conn.execute(
-            "UPDATE events SET user_ignored = ?, excluded_from_training = ? "
+            "UPDATE events SET user_ignored = ?, excluded_from_training = ?, "
+            "  match_rejection_reason = CASE "
+            "    WHEN ? = 1 THEN COALESCE(match_rejection_reason, 'user_ignored') "
+            "    WHEN match_rejection_reason = 'user_ignored' AND ? = 0 THEN NULL "
+            "    ELSE match_rejection_reason END "
             "WHERE id = ? AND circuit = ?",
-            (ign, excluded, event_id, circuit),
+            (ign, excluded, ign, excluded, event_id, circuit),
         )
     if excluded_from_training is not _PATCH_UNSET:
+        _ex = 1 if excluded_from_training else 0
         conn.execute(
-            "UPDATE events SET excluded_from_training = ? WHERE id = ? AND circuit = ?",
-            (1 if excluded_from_training else 0, event_id, circuit),
+            "UPDATE events SET excluded_from_training = ?, "
+            "  match_rejection_reason = CASE "
+            "    WHEN ? = 1 THEN COALESCE(match_rejection_reason, 'user_ignored') "
+            "    WHEN match_rejection_reason = 'user_ignored' THEN NULL "
+            "    ELSE match_rejection_reason END "
+            "WHERE id = ? AND circuit = ?",
+            (_ex, _ex, event_id, circuit),
         )
     if training_excluded_by_user is not _PATCH_UNSET:
         # dev46 (46f): "keep my label, but don't train on this event."
@@ -6742,6 +6801,7 @@ def set_event_matched_fixture_type(
     fixture_type: Optional[str],
     via: Optional[str] = None,
     cycle_group_id: Optional[str] = None,
+    confidence: Optional[float] = None,
 ) -> None:
     """Write ``events.matched_fixture_type`` (+ its ``matched_via`` provenance and
     ``cycle_group_id`` rollup key) for one event. ``via`` and ``cycle_group_id``
@@ -6749,6 +6809,16 @@ def set_event_matched_fixture_type(
     stale provenance / group can never outlive its match. ``cycle_group_id`` is
     the History rollup key (washer anchor id / softener session id) and is NULL
     for non-cycle matches; recomputed by every reclassify.
+
+    dev51 (3.1): ``confidence`` is written too — NULL on abstain, like ``via``.
+    Until dev51 this writer could not carry it, so every TinyModel verdict the
+    batch pass produced had ``match_confidence NULL`` while the live path set
+    it. Two things read that column and were misled: the review card ranks
+    candidates by uncertainty (a NULL sorted as "most uncertain"), and the
+    learning loop's scoped invalidation treats ``COALESCE(match_confidence,0)
+    < threshold`` as "the new model might answer this differently" — so ONE
+    label re-opened 1,828 peers (observed 2026-08-31) and refilled the drain
+    that then blocked the next label save.
 
     Does not commit — caller batches with surrounding writes.
 
@@ -6764,11 +6834,12 @@ def set_event_matched_fixture_type(
     """
     conn.execute(
         "UPDATE events SET matched_fixture_type = ?, matched_via = ?, "
-        "cycle_group_id = ? WHERE id = ? AND circuit = ? "
+        "cycle_group_id = ?, match_confidence = ? WHERE id = ? AND circuit = ? "
         "  AND user_fixture_type IS NULL",
         (fixture_type,
          via if fixture_type is not None else None,
          cycle_group_id if fixture_type is not None else None,
+         confidence if fixture_type is not None else None,
          event_id, circuit),
     )
 
@@ -7338,7 +7409,51 @@ def _new_reclassify_counters() -> Dict[str, Any]:
     """
     return {"scanned": 0, "matched": 0, "rule_matched": 0,
             "softener_matched": 0, "cleared": 0, "abstained": 0,
-            "changed": 0, "veto_counts": {}}
+            "changed": 0, "veto_counts": {},
+            # dev51 (3.2) — real buckets. Everything that was not softener or
+            # plain k-NN used to be logged as "via rules", so a TinyModel hit,
+            # a fingerprint hit and a k-NN-invariant hit were all invisible in
+            # the reclassify summary — the one line that says which tier did
+            # the work.
+            "tinymodel_matched": 0, "fingerprint_matched": 0, "knn_matched": 0}
+
+
+def _match_bucket(via: Optional[str]) -> str:
+    """Which reclassify counter a matched verdict belongs to, by tier."""
+    if via == "softener_session":
+        return "softener_matched"
+    if via == "tinymodel":
+        return "tinymodel_matched"
+    if via == "fingerprint":
+        return "fingerprint_matched"
+    if via in ("knn", "knn_invariant"):
+        return "knn_matched"
+    return "rule_matched"          # rule_*, washer_cycle, dishwasher_cycle, composite
+
+
+# dev51 (3.3) — the backlog slice: NULL-stamp rows first and newest-first
+# (someone is waiting on those); the stale-stamp group OLDEST-first so the
+# historical tail drains front-to-back instead of being starved by fresh
+# invalidations. Kept as a constant so the ordering rule is unit-testable
+# without standing up the whole reclassify context.
+_BACKLOG_ORDER_BY = ("(verdict_stamp IS NOT NULL), "
+                     "CASE WHEN verdict_stamp IS NULL THEN start_ts END DESC, "
+                     "start_ts ASC")
+
+
+def _forced_reopen_allowed(since_ts: Optional[str]) -> bool:
+    """dev51 (3.4): the periodic full re-open may fire only from an
+    UNWINDOWED pass (boot, the hourly backlog slice) — never from the hourly
+    settle-window call, which used to re-open a whole circuit from inside a
+    6-hour window."""
+    return since_ts is None
+
+
+# dev51 (3.5) — how often the SYNC reclassify path commits so the SQLite file
+# write-lock is released. The default cadence (300 rows ≈ 26 s at ~87 ms/row)
+# was far longer than a user save's 5 s busy timeout, so a label landing
+# mid-slice was refused. ~40 rows ≈ 3-4 s keeps every hold under that timeout.
+_SYNC_YIELD_EVERY_ROWS: int = 40
 
 
 # dev46 (46k) — how many events one pass may re-derive. The backlog left by a
@@ -7536,7 +7651,14 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     # restarts HERE, at the start, because the invalidation is what guarantees
     # the coverage happens — the rows cannot be skipped again until they are
     # re-stamped, one slice at a time.
-    forced = _verdict_stamp_pass_is_due(conn, circuit)
+    # dev51 (3.4) — only the UNWINDOWED invocations (boot, the hourly backlog
+    # slice) may fire the periodic full re-open. The hourly settle-window pass
+    # also reached here and, when the week rolled over, re-opened the WHOLE
+    # circuit from inside a 6-hour-windowed call — ~5,000 rows dumped back into
+    # the backlog at once, ~12 h to re-drain at 400/hr, and the write lock held
+    # by that pass for the duration (2026-08-31 23:21: "1440 still queued" and
+    # a label save refused in the same hour).
+    forced = _forced_reopen_allowed(since_ts) and _verdict_stamp_pass_is_due(conn, circuit)
     if forced:
         n = conn.execute(
             "UPDATE events SET verdict_stamp = NULL "
@@ -7573,6 +7695,8 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         ("id", "start_ts", "matched_fixture_type", "matched_via",
          "cycle_group_id", "excluded_from_training",
          "match_rejection_reason",       # dev33: abstention marker mark/retract
+         "match_confidence",             # dev51 (3.1): so an unchanged model
+                                         # verdict is not rewritten every pass
          "active_flow_segment_count")
         + qfeats + _SCORE_COLS))
     # dev46 (46k) — TRICKLE. With a budget, take the highest-priority slice
@@ -7593,10 +7717,18 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         total = conn.execute("SELECT COUNT(*) FROM events " + where,
                              qparams).fetchone()[0]
         backlog_remaining = max(0, total - backlog_limit)
+        # dev51 (3.3) — two queues, two directions. NULL-stamp rows (new,
+        # settling, freed by a label) go first and NEWEST-first, because
+        # someone is waiting on those. The STALE-stamp group — events a new
+        # build or a promotion re-opened — drains OLDEST-first. Newest-first
+        # there meant a steady trickle of fresh invalidations kept pushing the
+        # historical tail to the back of every slice: the ~1,041 July events
+        # were examined by no pass for weeks, not because the budget was too
+        # small but because they never reached the front of it.
         rows = conn.execute(
             "SELECT " + ", ".join(select_cols) + " FROM events "
             "WHERE id IN (SELECT id FROM events " + where + " "
-            "             ORDER BY (verdict_stamp IS NOT NULL), start_ts DESC "
+            "             ORDER BY " + _BACKLOG_ORDER_BY + " "
             "             LIMIT ?) "
             "ORDER BY start_ts",
             qparams + [backlog_limit],
@@ -7675,6 +7807,9 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     matched          = counters["matched"]
     rule_matched     = counters["rule_matched"]
     softener_matched = counters["softener_matched"]
+    tinymodel_matched   = counters.get("tinymodel_matched", 0)
+    fingerprint_matched = counters.get("fingerprint_matched", 0)
+    knn_matched         = counters.get("knn_matched", 0)
     cleared          = counters["cleared"]
     abstained        = counters["abstained"]
     changed          = counters["changed"]
@@ -7684,6 +7819,11 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     # the id set, so hoisting it out of the loop is the difference between one
     # query and one per event. MATURE here for the same reason the model tier
     # uses it below — in a batch pass every sibling is already in the table.
+    # dev51 (3.1) — the model tier's confidence for the current row. Assigned
+    # in the TinyModel branch; the writer only consumes it when the verdict's
+    # provenance is 'tinymodel', so a value can never leak onto a row that
+    # another tier claimed.
+    new_conf = None
     _burst_ctx = {}
     try:
         from . import burst_features as _bf
@@ -7760,6 +7900,9 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                     # not its reviewers.
                     new_type = _canonical_fixture_type(_tm_hit[0])
                     new_via = "tinymodel" if new_type is not None else None
+                    # dev51 (3.1) — carry the model's confidence to the row,
+                    # as the live path does. Only this tier has one.
+                    new_conf = float(_tm_hit[1]) if new_type is not None else None
                     fp_hit = None
                 else:
                     fp_hit = None
@@ -7814,10 +7957,13 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                         veto_counts.get(why.split(" (")[0], 0) + 1)
                     new_type, new_via = None, None
         prev = r["matched_fixture_type"]
-        if (new_type, new_via, new_group) != (
-                prev, r["matched_via"], r["cycle_group_id"]):
+        _prev_conf = r["match_confidence"] if "match_confidence" in r.keys() else None
+        _conf = new_conf if new_via == "tinymodel" else None
+        if (new_type, new_via, new_group, _conf) != (
+                prev, r["matched_via"], r["cycle_group_id"], _prev_conf):
             set_event_matched_fixture_type(conn, circuit, r["id"], new_type,
-                                           via=new_via, cycle_group_id=new_group)
+                                           via=new_via, cycle_group_id=new_group,
+                                           confidence=_conf)
             # dev46 (46k) — this branch IS the pass's real output. Counting it
             # costs nothing and is the only way to see how much of the boot
             # pass was necessary.
@@ -7860,9 +8006,16 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                 (r["id"],))
         if new_type is not None:
             matched += 1
-            if new_via == "softener_session":
+            _b = _match_bucket(new_via)
+            if _b == "softener_matched":
                 softener_matched += 1
-            elif new_via != "knn":
+            elif _b == "tinymodel_matched":
+                tinymodel_matched += 1
+            elif _b == "fingerprint_matched":
+                fingerprint_matched += 1
+            elif _b == "knn_matched":
+                knn_matched += 1
+            else:
                 rule_matched += 1
         else:
             abstained += 1
@@ -7893,11 +8046,14 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
         # "database is locked" (observed 2026-08-18 22:47 onward: a label save
         # and the supply-regime sampler both refused for minutes).
         if yield_lock:
-            yield_write_lock(conn, scanned)
+            yield_write_lock(conn, scanned, every=_SYNC_YIELD_EVERY_ROWS)
     conn.commit()
     counters.update(scanned=scanned, matched=matched,
                     rule_matched=rule_matched,
                     softener_matched=softener_matched,
+                    tinymodel_matched=tinymodel_matched,
+                    fingerprint_matched=fingerprint_matched,
+                    knn_matched=knn_matched,
                     cleared=cleared, abstained=abstained, changed=changed)
 
 
@@ -7947,6 +8103,9 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
         "events_matched": matched,
         "events_rule_matched": rule_matched,
         "events_softener_matched": softener_matched,
+        "events_tinymodel_matched": counters.get("tinymodel_matched", 0),
+        "events_fingerprint_matched": counters.get("fingerprint_matched", 0),
+        "events_knn_matched": counters.get("knn_matched", 0),
         "events_cleared": cleared,
         "events_abstained": abstained,
         # dev46 (46k) — rows whose verdict actually differed from the stored
@@ -7960,9 +8119,12 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
     }
     log.info(
         "[%s] reclassify: trained %d signature(s); scanned %d unlabelled "
-        "event(s) → %d matched (%d via rules), %d abstained (%d stale cleared) "
-        "— %d verdict(s) CHANGED, %d re-promoted composite",
-        circuit, signatures_trained, scanned, matched, rule_matched, abstained,
+        "event(s) → %d matched (%d via rules, %d model, %d fingerprint, %d k-NN, "
+        "%d softener), %d abstained (%d stale cleared) — %d verdict(s) CHANGED, "
+        "%d re-promoted composite",
+        circuit, signatures_trained, scanned, matched, rule_matched,
+        counters.get("tinymodel_matched", 0), counters.get("fingerprint_matched", 0),
+        counters.get("knn_matched", 0), softener_matched, abstained,
         cleared, changed, embedded_other,
     )
     # dev46 (46k) — the boot pass costs ~145 s on this install, so what it

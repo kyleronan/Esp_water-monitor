@@ -1174,6 +1174,17 @@ def _detect_pressure_silent_flow(duration_s, volume_litres, pressure_delta_psi,
 # a sawtooth. NOTE: the metered slug is ~half the true slug (street-meter
 # calibration factor 1.9) — PUMP_SLUG_MAX_L bounds the METERED number.
 PUMP_RECHARGE_REASON = "pump_recharge"
+# dev51 (Phase 5) — provenance for exclusions that used to be SILENT. The
+# finalizer ORed these three causes into excluded_from_training but its reason
+# chain had no branch for them, the dribble-restore path actively NULLed the
+# reason on every boot, and the Ignore button wrote the flag bare. ~198 rows
+# on the 2026-09-01 export were excluded with no recorded reason — exactly the
+# unexplained exclusion the quarantine columns exist to prevent.
+USER_IGNORED_REASON = "user_ignored"
+INTEGRATION_DEGRADED_REASON = "integration_degraded"
+PHANTOM_AVERTED_REASON = "phantom_averted"
+COMPOSITE_REASON = "composite"
+LEGACY_EXCLUDED_REASON = "excluded_legacy"      # backfill: cause not recoverable
 PUMP_SLUG_MAX_L: float = 0.6          # metered; 2x the largest observed slug
 _PUMP_SLUG_MAX_DURATION_S: float = 60.0
 _PUMP_SLUG_MIN_CORR: float = 0.5      # flow-during-rise (phase-aligned)
@@ -1754,8 +1765,54 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         else "pulsing_supply" if is_degraded
         else BELOW_METER_FLOOR_REASON if is_dribble
         else SPARSE_ENVELOPE_REASON if is_sparse_envelope
+        # dev51 (Phase 5) — the three causes the exclusion ORs in but this
+        # chain never named. Ranked below every physical-artifact reason so an
+        # artifact keeps its more specific provenance; an exclusion may now
+        # never be written without a reason from this finalizer.
+        else USER_IGNORED_REASON if user_ignored
+        else INTEGRATION_DEGRADED_REASON if integration_unusable
+        else PHANTOM_AVERTED_REASON if phantom_averted
         else None
     )
+
+
+def backfill_silent_exclusion_reasons(conn: sqlite3.Connection) -> dict:
+    """dev51 (Phase 5) — give every excluded-without-reason row a reason.
+
+    Idempotent and cheap (one indexed-ish scan of the excluded set). The
+    reason is derived from the row's own flags in the same priority order the
+    live finalizer now uses; a row whose cause is not recoverable from its
+    columns gets LEGACY_EXCLUDED_REASON so it stops being *silent* even though
+    it cannot be *explained*. Never touches a row that already has a reason,
+    and never changes ``excluded_from_training`` itself.
+    """
+    from .database import transaction
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+    if "match_rejection_reason" not in cols:
+        return {"backfilled": 0}
+    has = lambda c: c in cols                                           # noqa: E731
+    cases = []
+    if has("user_ignored"):
+        cases.append(f"WHEN COALESCE(user_ignored,0)=1 THEN '{USER_IGNORED_REASON}'")
+    if has("integration_quality"):
+        cases.append(f"WHEN integration_quality='degraded' "
+                     f"THEN '{INTEGRATION_DEGRADED_REASON}'")
+    if has("phantom_suppression_averted"):
+        cases.append(f"WHEN COALESCE(phantom_suppression_averted,0)=1 "
+                     f"THEN '{PHANTOM_AVERTED_REASON}'")
+    if has("is_composite"):
+        cases.append(f"WHEN COALESCE(is_composite,0)=1 THEN '{COMPOSITE_REASON}'")
+    case_sql = " ".join(cases)
+    with transaction(conn):
+        n = conn.execute(
+            "UPDATE events SET match_rejection_reason = CASE " + case_sql +
+            f" ELSE '{LEGACY_EXCLUDED_REASON}' END "
+            "WHERE COALESCE(excluded_from_training,0) = 1 "
+            "  AND match_rejection_reason IS NULL").rowcount or 0
+    if n:
+        log.info("exclusion provenance backfill: %d excluded event(s) had no recorded "
+                 "reason — now stamped from their own flags", n)
+    return {"backfilled": n}
 
 
 def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
@@ -2159,6 +2216,13 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                 raw_vol = float(row["volume_litres"] or 0.0)
                 restored_excluded = 1 if (
                     row["ui"] or row["integration_quality"] == "degraded") else 0
+                # dev51 (Phase 5): an exclusion that survives the restore keeps
+                # a reason. This ran on EVERY boot and wrote NULL regardless —
+                # the busiest producer of "excluded, no reason recorded".
+                restored_reason = (
+                    USER_IGNORED_REASON if row["ui"]
+                    else INTEGRATION_DEGRADED_REASON if restored_excluded
+                    else None)
                 with transaction(conn):
                     conn.execute(
                         "UPDATE events SET "
@@ -2166,9 +2230,10 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                         "  volume_litres_effective = ?, "
                         "  volume_estimation_method = 'raw', "
                         "  excluded_from_training = ?, "
-                        "  match_rejection_reason = NULL "
+                        "  match_rejection_reason = ? "
                         "WHERE id = ?",
-                        (round(raw_vol, 3), restored_excluded, row["id"]),
+                        (round(raw_vol, 3), restored_excluded, restored_reason,
+                         row["id"]),
                     )
                     apply_effective_volume(conn, row["id"], row["circuit"],
                                            row["start_ts"], raw_vol)

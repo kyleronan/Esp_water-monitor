@@ -107,6 +107,29 @@ ANCHOR_TIER_TARGET: Dict[str, str] = {
 ANCHOR_SOURCE = "anchor"
 USER_SOURCES = ("user", "training", "direct")
 
+# dev51 (1.5) — machine-propagated 'cycle' labels are ANCHORS, not user truth.
+# They enter the anchor half of the pool (capped, per-tier precision gate,
+# dropped from held-out days) instead of the user half, which also revives the
+# label-free growth the loop was designed around: the pool hash can now move
+# without a human labelling anything. Guarded by the live pre-check (≥ 100
+# genuinely human pool-eligible labels; circuit_1 had 768 on 2026-09-01). If a
+# home falls under that floor the one-line fallback is to set this False: the
+# holdout still excludes 'cycle' (that never depends on this flag) and the
+# pool treats 'cycle' as it did before.
+DEMOTE_CYCLE_TO_ANCHOR: bool = True
+
+
+def pool_machine_sources() -> tuple:
+    """Sources that partition into the ANCHOR half of the training pool."""
+    return tm.MACHINE_LABEL_SOURCES if DEMOTE_CYCLE_TO_ANCHOR else (ANCHOR_SOURCE,)
+
+
+# A referee that rejects this many weekly challengers in a row has stopped
+# improving. The V6d finding was that this state is SILENT — a frozen champion
+# serves exactly like a healthy one — so the scheduler logs a WARNING and the
+# Water Use page shows a banner. It never relaxes the referee.
+STALL_STREAK: int = 4
+
 _POOL_COLUMNS = (
     "id", "start_ts", "user_fixture_type", "fixture_label_source",
     "matched_fixture_type", "matched_via", "match_confidence",
@@ -181,6 +204,21 @@ class RetrainOutcome:
     artifact: Optional[tm.Artifact] = None
     pool: Optional[PoolStats] = None
     invalidated: int = 0
+    # dev51 — what the referee actually measured. Carried here so the ledger
+    # (S2) can record it without re-plumbing the retrain.
+    benchmark_hash: Optional[str] = None
+    benchmark_requested_n: int = 0        # ids the import asked for
+    benchmark_matched_n: int = 0          # of those, present in tonight's pool
+    recent_holdout_n: int = 0             # day-grouped holdout, pre-cleaning
+    recent_clean_n: int = 0               # rows on days NEITHER model trained on
+    coverage_delta: Optional[float] = None    # challenger − champion, serving thr
+    scores: Optional[dict] = None         # argmax + serving-threshold score sets
+    challenger_hash: Optional[str] = None
+    champion_hash: Optional[str] = None   # the incumbent BEFORE this decision
+
+    @property
+    def swapped(self) -> bool:
+        return self.status in ("trained", "rolled_back")
 
     def as_dict(self) -> dict:
         return {"status": self.status, "reason": self.reason,
@@ -188,7 +226,16 @@ class RetrainOutcome:
                 "threshold": self.artifact.threshold if self.artifact else None,
                 "pool": self.pool.as_dict() if self.pool else None,
                 "invalidated": self.invalidated,
-                "referee": self.verdict.describe() if self.verdict else None}
+                "referee": self.verdict.describe() if self.verdict else None,
+                "challenger_hash": self.challenger_hash,
+                "champion_hash": self.champion_hash,
+                "benchmark_hash": self.benchmark_hash,
+                "benchmark_requested_n": self.benchmark_requested_n,
+                "benchmark_matched_n": self.benchmark_matched_n,
+                "recent_holdout_n": self.recent_holdout_n,
+                "recent_clean_n": self.recent_clean_n,
+                "coverage_delta": self.coverage_delta,
+                "scores": self.scores}
 
 
 # ── pool assembly ───────────────────────────────────────────────────────────
@@ -256,17 +303,20 @@ def build_training_pool(conn: sqlite3.Connection, circuit: str,
         r["_y"] = (r["user_fixture_type"] or "").strip().lower()
     rows = [r for r in rows if r["_y"]]
 
-    user_rows = [r for r in rows
-                 if (r["fixture_label_source"] or "direct") != ANCHOR_SOURCE]
+    machine = pool_machine_sources()
+
+    def _is_anchor(r: dict) -> bool:
+        return (r["fixture_label_source"] or "direct") in machine
+
+    user_rows = [r for r in rows if not _is_anchor(r)]
     eligible_tiers = anchor_eligible_tiers(conn, circuit,
                                            since_ts=anchor_since_ts)
     anchor_rows = [r for r in rows
-                   if (r["fixture_label_source"] or "direct") == ANCHOR_SOURCE
+                   if _is_anchor(r)
                    and (r.get("matched_via") or "") in eligible_tiers]
     rejected_anchors = sum(
         1 for r in rows
-        if (r["fixture_label_source"] or "direct") == ANCHOR_SOURCE
-        and (r.get("matched_via") or "") not in eligible_tiers)
+        if _is_anchor(r) and (r.get("matched_via") or "") not in eligible_tiers)
 
     user_per_class: Dict[str, int] = {}
     for r in user_rows:
@@ -324,13 +374,105 @@ def build_training_pool(conn: sqlite3.Connection, circuit: str,
 
 
 # ── the referee's two references ────────────────────────────────────────────
-def _score_artifact(art: tm.Artifact, rows: Sequence[dict]) -> Score:
+def _score_artifact(art: tm.Artifact, rows: Sequence[dict],
+                    threshold: Optional[float] = None) -> Score:
+    """Accuracy with abstention counted as wrong.
+
+    ``threshold=None`` scores at the artifact's own serving threshold — the
+    number the operator experiences. ``threshold=0.0`` scores at argmax, which
+    is what the referee compares (dev51): two artifacts that chose different
+    serving thresholds differ in COVERAGE, and on this metric a coverage gap
+    reads as a quality gap. The logged 0.096 "regression" that froze the
+    champion for weeks was exactly that.
+    """
     if not rows:
         return Score(0, 0)
-    preds = tm.predict_many(art, rows)
+    preds = tm.predict_many(art, rows, threshold=threshold)
     correct = sum(1 for r, (label, _) in zip(rows, preds)
                   if label is not None and label == r["_y"])
     return Score(correct, len(rows))
+
+
+def _pack_score(s: Score) -> dict:
+    return {"correct": s.correct, "total": s.total, "rate": round(s.rate, 4)}
+
+
+def _serving_meta(art: tm.Artifact) -> dict:
+    # ``achieved_precision``/``coverage`` are None when choose_threshold fell
+    # back (nothing cleared the target) — that is a real state, kept nullable.
+    return {"threshold": art.threshold,
+            "achieved_precision": art.achieved_precision,
+            "coverage": art.coverage_at_threshold,
+            "threshold_fell_back": art.achieved_precision is None}
+
+
+def score_sets(champion: tm.Artifact, challenger: tm.Artifact,
+               benchmark: Sequence[dict], holdout: Sequence[dict]) -> dict:
+    """Both score sets, both legs, both models.
+
+    ``argmax`` is what the referee decides on. ``serving`` is what previous
+    audits measured (the 71.7% agreement baseline was taken at serving
+    threshold), kept so the two stay comparable in the ledger.
+    """
+    out: dict = {"argmax": {}, "serving": {}}
+    for leg, rows in (("benchmark", benchmark), ("recent", holdout)):
+        out["argmax"][leg] = {
+            "n": len(rows),
+            "champion": _pack_score(_score_artifact(champion, rows, threshold=0.0)),
+            "challenger": _pack_score(_score_artifact(challenger, rows, threshold=0.0)),
+        }
+        out["serving"][leg] = {
+            "n": len(rows),
+            "champion": _pack_score(_score_artifact(champion, rows)),
+            "challenger": _pack_score(_score_artifact(challenger, rows)),
+        }
+    out["serving"]["champion_threshold"] = _serving_meta(champion)
+    out["serving"]["challenger_threshold"] = _serving_meta(challenger)
+    return out
+
+
+def coverage_delta(champion: tm.Artifact, challenger: tm.Artifact
+                   ) -> Optional[float]:
+    """Challenger minus champion coverage at their serving thresholds; None
+    when either artifact's threshold calibration fell back. A warning signal
+    for the ledger — never a referee input."""
+    a, b = champion.coverage_at_threshold, challenger.coverage_at_threshold
+    if a is None or b is None:
+        return None
+    return round(float(b) - float(a), 4)
+
+
+def clean_recent_holdout(holdout: Sequence[dict], champion: tm.Artifact,
+                         challenger: tm.Artifact) -> Tuple[List[dict], str]:
+    """Holdout rows on days NEITHER model trained on (dev51).
+
+    The recent leg used to score the champion on the same holdout as the
+    challenger — but the champion was fitted on an earlier pool that generally
+    INCLUDED those days (a different day stride, more labels since), while the
+    challenger is holdout-free by construction. The leak check only guarded
+    the challenger's side, so the incumbent was scored on memorised days and
+    won every night. Day-granular because leakage is day-level — the same
+    reason ``split_holdout`` groups by day.
+
+    Legacy fallback: an artifact from before ``train_days`` existed reports an
+    empty list, so the only honest "days it did not see" are days strictly
+    after it was trained. On the FIRST retrain after this ships that set is
+    normally EMPTY (the challenger trained on everything up to today), the leg
+    abstains, and the referee keeps the incumbent — a known property of the
+    first cycle, not a fault.
+    """
+    def _day(r: dict) -> str:
+        return str(r.get("start_ts"))[:10]
+
+    chal_days = set(challenger.train_days or [])
+    if champion.train_days:
+        champ_days = set(champion.train_days)
+        clean = [r for r in holdout
+                 if _day(r) not in champ_days and _day(r) not in chal_days]
+        return clean, "train_days"
+    cutoff = (champion.trained_at or "")[:10]
+    clean = [r for r in holdout if _day(r) > cutoff and _day(r) not in chal_days]
+    return clean, f"legacy champion — days after {cutoff or 'unknown'}"
 
 
 def split_holdout(pool: Sequence[dict], fraction: float = 0.25
@@ -371,7 +513,9 @@ def split_holdout(pool: Sequence[dict], fraction: float = 0.25
         return str(row.get("start_ts"))[:10]
 
     def _is_user(row: dict) -> bool:
-        return (row.get("fixture_label_source") or "direct") != ANCHOR_SOURCE
+        # dev51: 'cycle' rows are machine labels and never measure the model —
+        # regardless of DEMOTE_CYCLE_TO_ANCHOR, which governs the POOL only.
+        return not tm.is_machine_label(row)
 
     user_days = sorted({_day(r) for r in pool if _is_user(r)})
     if len(user_days) < 4:
@@ -412,6 +556,29 @@ def scoped_invalidation_ids(conn: sqlite3.Connection, circuit: str,
     return sorted(set(ids))
 
 
+def parse_benchmark_payload(data) -> Tuple[List[str], Optional[str]]:
+    """``(event_ids, benchmark_hash)`` from a pinned-benchmark JSON document.
+
+    ONE parser for the file loader and the Dev Tools import, so the two cannot
+    drift. Ids are de-duplicated in first-seen order; the hash is whatever the
+    document declares (the eval harness writes ``benchmark_hash``).
+    """
+    if not isinstance(data, dict):
+        raise ValueError("benchmark JSON must be an object with an 'event_ids' list")
+    raw = data.get("event_ids")
+    if not isinstance(raw, list):
+        raise ValueError("benchmark JSON has no 'event_ids' list")
+    ids: List[str] = []
+    seen: set = set()
+    for x in raw:
+        s = str(x).strip()
+        if s and s not in seen:
+            seen.add(s)
+            ids.append(s)
+    h = data.get("benchmark_hash")
+    return ids, (str(h) if h else None)
+
+
 def load_benchmark_ids(path: str) -> List[str]:
     """Event ids of the pinned frozen benchmark, if one is configured.
 
@@ -424,11 +591,85 @@ def load_benchmark_ids(path: str) -> List[str]:
     import json as _json
     try:
         with open(path, encoding="utf-8") as fh:
-            return [str(x) for x in _json.load(fh).get("event_ids", [])]
+            ids, _ = parse_benchmark_payload(_json.load(fh))
+            return ids
     except (OSError, ValueError) as exc:
         log.warning("pinned benchmark %s unreadable (%s); referee will run "
                     "without its primary reference", path, exc)
         return []
+
+
+_NO_BENCHMARK: dict = {"ids": [], "source_hash": None, "requested_n": 0}
+
+
+def benchmark_ids_for_circuit(conn: Optional[sqlite3.Connection],
+                              circuit: str) -> dict:
+    """The imported benchmark for one circuit, from ``referee_benchmark``.
+
+    ``{"ids": [...], "source_hash": ..., "requested_n": ...}``; the empty shape
+    when nothing was imported, the table predates the DB, or ``conn`` is None.
+    Empty ids make the referee's benchmark leg abstain — which (dev51) keeps
+    the incumbent rather than promoting an unmeasured challenger.
+    """
+    if conn is None:
+        return dict(_NO_BENCHMARK)
+    try:
+        ids = [str(r[0]) for r in conn.execute(
+            "SELECT event_id FROM referee_benchmark WHERE circuit = ? "
+            "ORDER BY event_id", (circuit,))]
+        meta = conn.execute(
+            "SELECT source_hash, requested_n FROM referee_benchmark_meta "
+            "WHERE circuit = ?", (circuit,)).fetchone()
+    except sqlite3.Error as exc:
+        log.warning("[%s] referee benchmark unavailable (%s); benchmark leg "
+                    "abstains", circuit, exc)
+        return dict(_NO_BENCHMARK)
+    if not ids:
+        return dict(_NO_BENCHMARK)
+    return {"ids": ids,
+            "source_hash": meta[0] if meta else None,
+            "requested_n": int(meta[1]) if meta else len(ids)}
+
+
+def import_referee_benchmark(conn: sqlite3.Connection, circuit: str,
+                             payload, now: Optional[str] = None) -> dict:
+    """Replace the circuit's benchmark with the ids in ``payload``.
+
+    Delete-then-insert on BOTH tables in one transaction, so a failed import
+    leaves the previous benchmark intact rather than half of each. The
+    document's ``benchmark_hash`` becomes ``source_hash`` — the one value the
+    ledger quotes — and an unidentified document is refused: a benchmark whose
+    provenance cannot be named is not a reference.
+    """
+    ids, source_hash = parse_benchmark_payload(payload)
+    if not ids:
+        raise ValueError("benchmark has no event ids")
+    if not source_hash:
+        raise ValueError("benchmark JSON carries no 'benchmark_hash' — "
+                         "refusing to import an unidentified reference")
+    stamp = now or datetime.now(timezone.utc).isoformat()
+    try:
+        conn.execute("DELETE FROM referee_benchmark WHERE circuit = ?", (circuit,))
+        conn.execute("DELETE FROM referee_benchmark_meta WHERE circuit = ?",
+                     (circuit,))
+        cur = conn.executemany(
+            "INSERT INTO referee_benchmark (circuit, event_id, source_hash, "
+            "imported_at) VALUES (?, ?, ?, ?)",
+            [(circuit, i, source_hash, stamp) for i in ids])
+        inserted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 \
+            else len(ids)
+        conn.execute(
+            "INSERT INTO referee_benchmark_meta (circuit, source_hash, "
+            "requested_n, imported_at) VALUES (?, ?, ?, ?)",
+            (circuit, source_hash, len(ids), stamp))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    log.info("[%s] referee benchmark imported: %d id(s), hash %s", circuit,
+             inserted, source_hash)
+    return {"circuit": circuit, "source_hash": source_hash,
+            "requested_n": len(ids), "inserted_n": int(inserted)}
 
 
 # ── the retrain ─────────────────────────────────────────────────────────────
@@ -437,13 +678,18 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
             target_precision: float = tm.DEFAULT_TARGET_PRECISION,
             referee_config: Optional[RefereeConfig] = None,
             apply_invalidation: bool = True,
-            reason: str = "") -> RetrainOutcome:
+            reason: str = "",
+            benchmark_meta: Optional[dict] = None) -> RetrainOutcome:
     """Train a challenger and let the referee decide whether it serves.
 
     Synchronous — the caller submits it through ``run_db`` (46a). Returns an
     outcome rather than raising for the ordinary "not yet" cases: a home below
     the graduation floor, or an image without scikit-learn, are STATES, and the
     k-NN ladder keeps serving in both.
+
+    ``benchmark_meta`` (dev51) is the import record behind ``benchmark_ids`` —
+    ``source_hash`` and ``requested_n`` — carried onto the outcome so a retrain
+    can say how much of the pinned reference actually met tonight's pool.
     """
     if not tm.sklearn_available():
         return RetrainOutcome("unavailable",
@@ -456,17 +702,34 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
     bench_ids = {str(x) for x in (benchmark_ids or [])}
     benchmark = [r for r in pool if str(r["id"]) in bench_ids]
     trainable = [r for r in pool if str(r["id"]) not in bench_ids]
+    meta = benchmark_meta or {}
+    bench_hash = meta.get("source_hash")
+    requested_n = int(meta.get("requested_n") or len(bench_ids))
+    bench_fields = dict(benchmark_hash=bench_hash,
+                        benchmark_requested_n=requested_n,
+                        benchmark_matched_n=len(benchmark))
+    if bench_ids:
+        # Quarantine, exclusion or deletion can shrink the leg silently; say so.
+        log.info("[%s] referee benchmark: %d requested, %d matched the training "
+                 "pool (hash %s)%s", circuit, requested_n, len(benchmark),
+                 bench_hash or "?",
+                 "" if len(benchmark) == requested_n
+                 else " — the rest are quarantined, excluded or gone")
+    else:
+        log.info("[%s] referee benchmark: none imported — benchmark leg "
+                 "abstains", circuit)
+
     train_rows, holdout = split_holdout(trainable)
     if not train_rows:
         return RetrainOutcome("ineligible", "no trainable rows after splits",
-                              pool=stats)
+                              pool=stats, **bench_fields)
 
     try:
         challenger = tm.train(train_rows, circuit, holdout=holdout,
                               target_precision=target_precision,
                               notes=reason)
     except tm.TinyModelUnavailable as exc:
-        return RetrainOutcome("ineligible", str(exc), pool=stats)
+        return RetrainOutcome("ineligible", str(exc), pool=stats, **bench_fields)
 
     champion = tm.load(data_dir, circuit)
     if champion is None:
@@ -477,25 +740,66 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
         log.info("[%s] first tinymodel artifact installed at %s", circuit, art_path)
         return RetrainOutcome("trained", "no incumbent — installed",
                               artifact=challenger, pool=stats,
-                              invalidated=invalidated)
+                              invalidated=invalidated,
+                              recent_holdout_n=len(holdout),
+                              challenger_hash=challenger.model_hash,
+                              **bench_fields)
 
-    bench_champ = _score_artifact(champion, benchmark)
-    bench_chal = _score_artifact(challenger, benchmark)
-    recent_champ = _score_artifact(champion, holdout)
-    recent_chal = _score_artifact(challenger, holdout)
+    # dev51 — symmetric leak fix: score the recent leg only on days NEITHER
+    # model trained on. See clean_recent_holdout for why the old comparison
+    # was one-sided.
+    clean_holdout, basis = clean_recent_holdout(holdout, champion, challenger)
+    log.info("[%s] referee recent leg: holdout %d row(s), %d clean of both "
+             "models' training days (%s)", circuit, len(holdout),
+             len(clean_holdout), basis)
+
+    # dev51 — threshold-fair scoring: the referee compares DISCRIMINATION
+    # (argmax), never coverage. Serving precision stays choose_threshold's
+    # contract; the serving-threshold scores are kept alongside for the ledger.
+    # dev51 (gate finding, 2026-09-04) — the benchmark is RESERVED from
+    # training as of dev51, but an incumbent fitted BEFORE that rule (no
+    # train_days recorded) trained on those very rows and has memorised them:
+    # the V6d gate measured a ~14-point head start on a set it had already
+    # seen. Scoring such a champion on the benchmark is not a comparison, so
+    # the leg abstains until the first dev51 promotion installs a clean one;
+    # the recent leg (clean days after the champion's fit) decides meanwhile.
+    bench_for_referee = benchmark
+    if benchmark and not getattr(champion, "train_days", None):
+        log.info("[%s] referee benchmark leg abstains: incumbent predates the "
+                 "reserved benchmark (fitted %s, no training-day record) and "
+                 "trained on those rows — the recent leg decides until the first "
+                 "promotion", circuit, champion.trained_at)
+        bench_for_referee = []
+    bench_champ = _score_artifact(champion, bench_for_referee, threshold=0.0)
+    bench_chal = _score_artifact(challenger, bench_for_referee, threshold=0.0)
+    recent_champ = _score_artifact(champion, clean_holdout, threshold=0.0)
+    recent_chal = _score_artifact(challenger, clean_holdout, threshold=0.0)
     verdict = decide(
         benchmark_champion=bench_champ, benchmark_challenger=bench_chal,
         recent_champion=recent_champ, recent_challenger=recent_chal,
-        recent_holdout_ids=[str(r["id"]) for r in holdout],
+        recent_holdout_ids=[str(r["id"]) for r in clean_holdout],
         challenger_pool_ids=[str(r["id"]) for r in train_rows],
         config=referee_config)
+
+    sets = score_sets(champion, challenger, benchmark, clean_holdout)
+    cov = coverage_delta(champion, challenger)
+    if cov is not None and cov < -0.05:
+        log.warning("[%s] challenger covers %.1f pts LESS than the incumbent at "
+                    "its serving threshold (%.2f vs %.2f) — a warning, not a "
+                    "veto", circuit, -100 * cov, challenger.threshold,
+                    champion.threshold)
+    measured = dict(recent_holdout_n=len(holdout),
+                    recent_clean_n=len(clean_holdout),
+                    coverage_delta=cov, scores=sets,
+                    challenger_hash=challenger.model_hash,
+                    champion_hash=champion.model_hash, **bench_fields)
 
     if not verdict.swap:
         log.warning("[%s] challenger %s REJECTED — %s. Incumbent %s keeps "
                     "serving.", circuit, challenger.model_hash, verdict.reason,
                     champion.model_hash)
         return RetrainOutcome("kept", verdict.reason, verdict=verdict,
-                              artifact=champion, pool=stats)
+                              artifact=champion, pool=stats, **measured)
 
     tm.save(challenger, data_dir)
     invalidated = _invalidate(conn, circuit, challenger) if apply_invalidation else 0
@@ -504,7 +808,7 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
              invalidated)
     return RetrainOutcome("trained", verdict.reason, verdict=verdict,
                           artifact=challenger, pool=stats,
-                          invalidated=invalidated)
+                          invalidated=invalidated, **measured)
 
 
 def _invalidate(conn: sqlite3.Connection, circuit: str,
@@ -514,3 +818,156 @@ def _invalidate(conn: sqlite3.Connection, circuit: str,
     if not ids:
         return 0
     return invalidate_verdict_stamps(conn, ids)
+
+
+# ── the decision ledger (dev51, 1.6) ────────────────────────────────────────
+# The jobs table prunes finished rows after two days, so "the referee has
+# rejected every challenger for a month" left no trace anywhere. This is the
+# record: one row per decision, never pruned, read by the weekly cadence, the
+# Water Use page and the audit.
+def _iso_week(ts: str) -> Optional[str]:
+    try:
+        return datetime.fromisoformat(str(ts)).strftime("%G-W%V")
+    except (TypeError, ValueError):
+        return None
+
+
+def record_retrain_decision(conn: Optional[sqlite3.Connection], circuit: str,
+                            trigger: str, out: RetrainOutcome,
+                            now: Optional[str] = None) -> Optional[int]:
+    """Append one ledger row. Best-effort by design: a ledger write must never
+    turn a completed retrain into a failed one, so DB errors log and return
+    None. ``conn`` may be None (the scheduler's tests stub the DB hop)."""
+    if conn is None:
+        return None
+    import json as _json
+    try:
+        cur = conn.execute(
+            "INSERT INTO retrain_ledger (circuit, decided_at, trigger, status, swap, "
+            " challenger_hash, champion_hash, reason, benchmark_hash, benchmark_n, "
+            " detail_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (circuit, now or datetime.now(timezone.utc).isoformat(), trigger,
+             out.status, 1 if out.swapped else 0, out.challenger_hash,
+             out.champion_hash, out.reason, out.benchmark_hash,
+             out.benchmark_matched_n, _json.dumps(out.as_dict(), default=str)))
+        conn.commit()
+        return int(cur.lastrowid)
+    except sqlite3.Error as exc:
+        log.warning("[%s] retrain ledger write failed (non-fatal): %s", circuit, exc)
+        return None
+
+
+def weekly_retrain_recorded(conn: Optional[sqlite3.Connection],
+                            iso_week: str) -> bool:
+    """Has the WEEKLY pass already run in ``iso_week``, per the ledger?
+
+    This is what makes the cadence restart-proof: the in-memory marker is lost
+    on every redeploy, which is why production re-judged the same challenger on
+    consecutive nights.
+    """
+    if conn is None:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT decided_at FROM retrain_ledger WHERE trigger = 'weekly' "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row) and _iso_week(row[0]) == iso_week
+
+
+def learning_status(conn: Optional[sqlite3.Connection], circuit: str,
+                    data_dir: Optional[str] = None) -> dict:
+    """What the operator should be able to see about the loop, from the ledger.
+
+    ``available`` is False when there is no decision on record (fresh install,
+    pre-migration DB, or a home that has never been eligible) — the page then
+    says nothing rather than something empty.
+    """
+    import json as _json
+    out: dict = {"available": False}
+    if conn is None:
+        return out
+    try:
+        rows = conn.execute(
+            "SELECT decided_at, trigger, status, swap, challenger_hash, "
+            "       champion_hash, reason, detail_json FROM retrain_ledger "
+            "WHERE circuit = ? ORDER BY id DESC LIMIT 60", (circuit,)).fetchall()
+    except sqlite3.Error:
+        return out
+    if not rows:
+        return out
+    last = rows[0]
+    streak = 0
+    for r in rows:                              # newest first
+        if r[2] == "kept":
+            streak += 1
+        elif r[2] in ("ineligible", "unavailable"):
+            continue                            # not a decision about a challenger
+        else:
+            break
+    last_swap_at = next((r[0] for r in rows if r[3]), None)
+    days_since_swap = None
+    if last_swap_at:
+        try:
+            dt = datetime.fromisoformat(str(last_swap_at))
+            days_since_swap = max((datetime.now(timezone.utc) - dt).days, 0)
+        except (TypeError, ValueError):
+            pass
+    try:
+        detail = _json.loads(last[7] or "{}")
+    except (TypeError, ValueError):
+        detail = {}
+    cov = detail.get("coverage_delta")
+    serving_hash = None
+    if data_dir:
+        try:
+            art = tm.load(data_dir, circuit)
+            serving_hash = art.model_hash if art else None
+        except Exception:                                   # noqa: BLE001
+            serving_hash = None
+    out.update({
+        "available": True,
+        "last_decided_at": last[0], "last_trigger": last[1],
+        "last_status": last[2], "last_swapped": bool(last[3]),
+        "last_reason": last[6],
+        "kept_streak": streak, "stalled": streak >= STALL_STREAK,
+        "stall_streak": STALL_STREAK,
+        "last_swap_at": last_swap_at, "days_since_swap": days_since_swap,
+        # after a swap the challenger serves (a rollback records the restored
+        # model as the incumbent, with no challenger); after a keep the
+        # incumbent does.
+        "serving_hash": (serving_hash
+                         or ((last[4] or last[5]) if last[3] else (last[5] or last[4]))),
+        "coverage_delta": cov,
+        "coverage_warning": (cov is not None and cov < -0.05),
+        "benchmark_n": detail.get("benchmark_matched_n"),
+        "decisions_on_record": len(rows),
+    })
+    return out
+
+
+def rollback_serving_model(conn: sqlite3.Connection, circuit: str,
+                           data_dir: str) -> dict:
+    """Promote the retained previous artifact back to serving (dev51, 2.2).
+
+    ``tm.rollback`` had existed since dev47 with no caller. Now that swaps can
+    actually happen, an undo earns its keep: file swap, the same scoped
+    invalidation a promotion performs (so verdicts the rolled-back model
+    would answer differently are re-derived), and a ledger row so the
+    operator's action is on the record beside the referee's.
+    """
+    art = tm.rollback(data_dir, circuit)
+    if art is None:
+        return {"status": "nothing_to_roll_back",
+                "reason": "no retained previous model for this circuit"}
+    invalidated = _invalidate(conn, circuit, art)
+    out = RetrainOutcome("rolled_back", "operator rollback (Dev Tools)",
+                         artifact=art, invalidated=invalidated,
+                         champion_hash=art.model_hash)
+    record_retrain_decision(conn, circuit, "rollback", out)
+    log.warning("[%s] rolled back to tinymodel %s (trained %s); %d verdict(s) "
+                "queued for re-derivation", circuit, art.model_hash,
+                art.trained_at, invalidated)
+    return {"status": "rolled_back", "model_hash": art.model_hash,
+            "trained_at": art.trained_at, "invalidated": invalidated}
