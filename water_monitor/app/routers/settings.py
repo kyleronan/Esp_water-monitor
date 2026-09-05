@@ -411,15 +411,39 @@ async def settings_page(request: Request):
                 }
         except Exception:
             pass
+        # dev53 — per-circuit reference-set status for the Dev Tools card,
+        # including any open health alerts the confirm dialog must name.
+        benchmark_status = {}
+        try:
+            from ..learning_loop import (benchmark_ids_for_circuit,
+                                         count_human_pool_labels,
+                                         open_health_alerts_for)
+            from ..referee_benchmark import PIN_MIN_HUMAN_LABELS
+            for _c in orch._cfg.circuits:
+                _ref = benchmark_ids_for_circuit(orch.db, _c.circuit)
+                benchmark_status[_c.circuit] = {
+                    "hash": _ref["source_hash"], "n": len(_ref["ids"]),
+                    "source": _ref["source"],
+                    "pinned_at": (_ref["pinned_at"] or "")[:10],
+                    "pending": _ref["pending"],
+                    "human_labels": count_human_pool_labels(orch.db, _c.circuit),
+                    "threshold": PIN_MIN_HUMAN_LABELS,
+                    "open_alerts": sorted({a["fixture_type"] for a in
+                                           open_health_alerts_for(orch.db, _c.circuit)}),
+                }
+        except Exception:
+            pass
         return (pump_floor, supply_regime_ctx,
                 dict(get_home_profile(orch.db) or {}),
-                get_data_retention(orch.db))
+                get_data_retention(orch.db), benchmark_status)
 
-    pump_floor, supply_regime_ctx, _profile, _retention = await run_db(_tail_db)
+    (pump_floor, supply_regime_ctx, _profile, _retention,
+     benchmark_status) = await run_db(_tail_db)
 
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
         "dev_tools": DEV_TOOLS,
+        "benchmark_status": benchmark_status,
         "pump_floor": pump_floor,
         "supply_regime": supply_regime_ctx,
         "profile": _profile,
@@ -941,6 +965,48 @@ async def dev_rollback_model(circuit: str, request: Request):
         log.exception("[%s] model rollback failed", circuit)
         await run_db(finish_job, orch.db, job, "error",
                      f"{circuit}: rollback failed — {e}")
+    return ingress_redirect(request, "/settings#sett-dev")
+
+
+@router.post("/dev/pin-referee-benchmark/{circuit}")
+async def dev_pin_referee_benchmark(circuit: str, request: Request):
+    """DEV/testing only — pin (or re-pin) the referee's reference set from the
+    circuit's own labels, the way the weekly pass does it automatically once a
+    home has enough labels (dev53). Over an active set the result is PENDING
+    until the next change-over. Exempt from the health-alert gate — the
+    confirm dialog names any open alert so the operator decides with eyes
+    open. Outcome as a toast via the jobs table; gated behind ``dev_tools``."""
+    from ..config import DEV_TOOLS
+    if not DEV_TOOLS:
+        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+    from ..database import finish_job, get_write_lock, start_job
+    from ..learning_loop import benchmark_ids_for_circuit, pin_benchmark_for_circuit
+
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    job = await run_db(start_job, orch.db, "referee_benchmark_pin", circuit,
+                       "Pinning the model's reference set…")
+    try:
+        async with get_write_lock():
+            ref = await run_db(benchmark_ids_for_circuit, orch.db, circuit)
+            trigger = "re-pin" if ref["ids"] else "pin"
+            res = await run_db(pin_benchmark_for_circuit, orch.db, circuit,
+                               trigger=trigger, source="auto",
+                               reason="operator pressed the Dev Tools button")
+        if res.get("status") == "pinned":
+            msg = (f"{circuit}: reference set pinned — {res.get('requested_n')} events "
+                   f"over {res.get('n_days')} days (hash {res.get('source_hash')})")
+        elif res.get("status") == "pending":
+            msg = (f"{circuit}: new reference set is waiting for the next change-over — "
+                   f"{res.get('requested_n')} events (hash {res.get('source_hash')}); "
+                   f"the current set keeps judging until then")
+        else:
+            msg = f"{circuit}: not pinned — {res.get('reason')}"
+        await run_db(finish_job, orch.db, job, "done", msg)
+    except Exception as e:                                  # noqa: BLE001
+        log.exception("[%s] benchmark pin failed", circuit)
+        await run_db(finish_job, orch.db, job, "error",
+                     f"{circuit}: benchmark pin failed — {e}")
     return ingress_redirect(request, "/settings#sett-dev")
 
 

@@ -130,6 +130,35 @@ def pool_machine_sources() -> tuple:
 # Water Use page shows a banner. It never relaxes the referee.
 STALL_STREAK: int = 4
 
+# dev53 — the ONE definition of "eligible for the training pool". The benchmark
+# selector, the cheap auto-pin pre-check and the pool loader all read it, so
+# they cannot drift apart (the dev-box tool used to skip two of these filters
+# and would have pinned rows the pool never trains on).
+POOL_ELIGIBLE_WHERE: str = (
+    "user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
+    "AND COALESCE(excluded_from_training,0) = 0 "
+    "AND COALESCE(training_excluded_by_user,0) = 0 "
+    "AND COALESCE(is_pressure_restoration_phantom,0) = 0 "
+    "AND COALESCE(is_low_flow_dribble,0) = 0 "
+    "AND COALESCE(is_cross_talk,0) = 0 "
+    "AND training_quarantine_reason IS NULL")
+
+
+def count_human_pool_labels(conn: Optional[sqlite3.Connection], circuit: str) -> int:
+    """Human-source, pool-eligible labels — the H every sizing rule uses.
+    Cheap (one COUNT), so the weekly hook can ask before building a pool."""
+    if conn is None:
+        return 0
+    placeholders = ",".join("?" * len(tm.MACHINE_LABEL_SOURCES))
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE circuit = ? AND " + POOL_ELIGIBLE_WHERE +
+            f" AND COALESCE(fixture_label_source,'direct') NOT IN ({placeholders})",
+            (circuit, *tm.MACHINE_LABEL_SOURCES)).fetchone()
+    except sqlite3.Error:
+        return 0
+    return int(row[0]) if row else 0
+
 _POOL_COLUMNS = (
     "id", "start_ts", "user_fixture_type", "fixture_label_source",
     "matched_fixture_type", "matched_via", "match_confidence",
@@ -198,7 +227,10 @@ class PoolStats:
 
 @dataclass
 class RetrainOutcome:
-    status: str                      # trained | kept | ineligible | unavailable
+    # trained | kept | ineligible | unavailable | rolled_back | pinned (dev53: a
+    # benchmark pin / re-pin / import / activation — swap=0, never a decision
+    # about a challenger, so learning_status' streak loop steps over it)
+    status: str
     reason: str
     verdict: Optional[RefereeVerdict] = None
     artifact: Optional[tm.Artifact] = None
@@ -215,6 +247,12 @@ class RetrainOutcome:
     scores: Optional[dict] = None         # argmax + serving-threshold score sets
     challenger_hash: Optional[str] = None
     champion_hash: Optional[str] = None   # the incumbent BEFORE this decision
+    # dev53 — free-form provenance for pin/activate rows and for the advisory
+    # benchmark scores; and whether the benchmark leg was demoted to advisory
+    # (a supply-regime re-pin is pending, so the active set is scored and
+    # recorded but cannot veto).
+    detail: Optional[dict] = None
+    benchmark_advisory: bool = False
 
     @property
     def swapped(self) -> bool:
@@ -229,6 +267,8 @@ class RetrainOutcome:
                 "referee": self.verdict.describe() if self.verdict else None,
                 "challenger_hash": self.challenger_hash,
                 "champion_hash": self.champion_hash,
+                "detail": self.detail,
+                "benchmark_advisory": self.benchmark_advisory,
                 "benchmark_hash": self.benchmark_hash,
                 "benchmark_requested_n": self.benchmark_requested_n,
                 "benchmark_matched_n": self.benchmark_matched_n,
@@ -290,15 +330,7 @@ def build_training_pool(conn: sqlite3.Connection, circuit: str,
     recency would quietly drop every pre-pump exemplar and re-create the drift
     the regime feature exists to handle.
     """
-    rows = _load_rows(
-        conn, circuit,
-        "user_fixture_type IS NOT NULL AND user_fixture_type <> '' "
-        "AND COALESCE(excluded_from_training,0) = 0 "
-        "AND COALESCE(training_excluded_by_user,0) = 0 "
-        "AND COALESCE(is_pressure_restoration_phantom,0) = 0 "
-        "AND COALESCE(is_low_flow_dribble,0) = 0 "
-        "AND COALESCE(is_cross_talk,0) = 0 "
-        "AND training_quarantine_reason IS NULL", ())
+    rows = _load_rows(conn, circuit, POOL_ELIGIBLE_WHERE, ())
     for r in rows:
         r["_y"] = (r["user_fixture_type"] or "").strip().lower()
     rows = [r for r in rows if r["_y"]]
@@ -599,47 +631,114 @@ def load_benchmark_ids(path: str) -> List[str]:
         return []
 
 
-_NO_BENCHMARK: dict = {"ids": [], "source_hash": None, "requested_n": 0}
+_NO_BENCHMARK: dict = {
+    "ids": [], "pending_ids": [], "reserved_ids": [],
+    "source_hash": None, "requested_n": 0, "pinned_at": None, "source": None,
+    "pinned_from_n": None, "repin_dismissed_at": None, "repin_dismissed_keys": None,
+    "pending": None,
+}
 
 
 def benchmark_ids_for_circuit(conn: Optional[sqlite3.Connection],
                               circuit: str) -> dict:
-    """The imported benchmark for one circuit, from ``referee_benchmark``.
+    """The circuit's benchmark state, from ``referee_benchmark`` (+ meta).
 
-    ``{"ids": [...], "source_hash": ..., "requested_n": ...}``; the empty shape
-    when nothing was imported, the table predates the DB, or ``conn`` is None.
-    Empty ids make the referee's benchmark leg abstain — which (dev51) keeps
-    the incumbent rather than promoting an unmeasured challenger.
+    ``ids`` is the ACTIVE set the referee scores; ``pending_ids`` a re-pin
+    waiting for the next promotion (dev53); ``reserved_ids`` their union —
+    what training must hold out. The empty shape when nothing is pinned, the
+    tables predate the DB, or ``conn`` is None. Empty ids make the benchmark
+    leg abstain — which (dev51) keeps the incumbent rather than promoting an
+    unmeasured challenger.
     """
     if conn is None:
         return dict(_NO_BENCHMARK)
     try:
-        ids = [str(r[0]) for r in conn.execute(
-            "SELECT event_id FROM referee_benchmark WHERE circuit = ? "
-            "ORDER BY event_id", (circuit,))]
+        rows = conn.execute(
+            "SELECT event_id, role FROM referee_benchmark WHERE circuit = ? "
+            "ORDER BY event_id", (circuit,)).fetchall()
         meta = conn.execute(
-            "SELECT source_hash, requested_n FROM referee_benchmark_meta "
-            "WHERE circuit = ?", (circuit,)).fetchone()
+            "SELECT source_hash, requested_n, imported_at, source, pinned_from_n, "
+            "       repin_dismissed_at, repin_dismissed_keys, pending_hash, "
+            "       pending_pinned_at, pending_pinned_from_n, pending_trigger, "
+            "       pending_reason FROM referee_benchmark_meta WHERE circuit = ?",
+            (circuit,)).fetchone()
     except sqlite3.Error as exc:
         log.warning("[%s] referee benchmark unavailable (%s); benchmark leg "
                     "abstains", circuit, exc)
         return dict(_NO_BENCHMARK)
-    if not ids:
+    active = [str(r[0]) for r in rows if (r[1] or "active") == "active"]
+    pending = [str(r[0]) for r in rows if r[1] == "pending"]
+    if not active and not pending:
         return dict(_NO_BENCHMARK)
-    return {"ids": ids,
-            "source_hash": meta[0] if meta else None,
-            "requested_n": int(meta[1]) if meta else len(ids)}
+    out = dict(_NO_BENCHMARK)
+    out.update({
+        "ids": active, "pending_ids": pending,
+        "reserved_ids": sorted(set(active) | set(pending)),
+        "source_hash": meta[0] if meta else None,
+        "requested_n": int(meta[1]) if meta and meta[1] is not None else len(active),
+        "pinned_at": meta[2] if meta else None,
+        "source": meta[3] if meta else None,
+        "pinned_from_n": meta[4] if meta else None,
+        "repin_dismissed_at": meta[5] if meta else None,
+        "repin_dismissed_keys": meta[6] if meta else None,
+    })
+    if meta and meta[7]:
+        out["pending"] = {"hash": meta[7], "pinned_at": meta[8],
+                          "pinned_from_n": meta[9], "trigger": meta[10],
+                          "reason": meta[11], "n": len(pending)}
+    return out
+
+
+def _install_benchmark(conn: sqlite3.Connection, circuit: str, ids: Sequence[str],
+                       source_hash: str, *, source: str, pinned_from_n: Optional[int],
+                       trigger: str, reason: str, stamp: str) -> dict:
+    """Write a benchmark. With no active set it becomes ACTIVE at once; over an
+    existing active set it becomes PENDING (dev53 handover) — the active set
+    keeps judging until the next promotion, and a later pending write simply
+    replaces the earlier one (latest wins, no queue). One transaction, so a
+    failure leaves the previous state intact rather than half of each."""
+    existing = benchmark_ids_for_circuit(conn, circuit)
+    role = "pending" if existing["ids"] else "active"
+    try:
+        conn.execute("DELETE FROM referee_benchmark WHERE circuit = ? AND role = ?",
+                     (circuit, role))
+        cur = conn.executemany(
+            "INSERT INTO referee_benchmark (circuit, event_id, source_hash, "
+            "imported_at, role) VALUES (?, ?, ?, ?, ?)",
+            [(circuit, i, source_hash, stamp, role) for i in ids])
+        inserted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 \
+            else len(ids)
+        if role == "active":
+            conn.execute("DELETE FROM referee_benchmark_meta WHERE circuit = ?",
+                         (circuit,))
+            conn.execute(
+                "INSERT INTO referee_benchmark_meta (circuit, source_hash, "
+                "requested_n, imported_at, source, pinned_from_n) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (circuit, source_hash, len(ids), stamp, source, pinned_from_n))
+        else:
+            conn.execute(
+                "UPDATE referee_benchmark_meta SET pending_hash = ?, "
+                "  pending_pinned_at = ?, pending_pinned_from_n = ?, "
+                "  pending_trigger = ?, pending_reason = ? WHERE circuit = ?",
+                (source_hash, stamp, pinned_from_n, trigger, reason, circuit))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"role": role, "inserted_n": int(inserted),
+            "previous_hash": existing["source_hash"],
+            "replaced_pending_hash": (existing["pending"] or {}).get("hash")}
 
 
 def import_referee_benchmark(conn: sqlite3.Connection, circuit: str,
                              payload, now: Optional[str] = None) -> dict:
-    """Replace the circuit's benchmark with the ids in ``payload``.
+    """Install the ids in ``payload`` as the circuit's benchmark (dev override).
 
-    Delete-then-insert on BOTH tables in one transaction, so a failed import
-    leaves the previous benchmark intact rather than half of each. The
-    document's ``benchmark_hash`` becomes ``source_hash`` — the one value the
-    ledger quotes — and an unidentified document is refused: a benchmark whose
-    provenance cannot be named is not a reference.
+    The document's ``benchmark_hash`` becomes ``source_hash`` — the one value
+    the ledger quotes — and an unidentified document is refused: a benchmark
+    whose provenance cannot be named is not a reference. Over an existing
+    active set the import lands as PENDING (dev53), like any other re-pin.
     """
     ids, source_hash = parse_benchmark_payload(payload)
     if not ids:
@@ -648,28 +747,221 @@ def import_referee_benchmark(conn: sqlite3.Connection, circuit: str,
         raise ValueError("benchmark JSON carries no 'benchmark_hash' — "
                          "refusing to import an unidentified reference")
     stamp = now or datetime.now(timezone.utc).isoformat()
+    human_n = count_human_pool_labels(conn, circuit) or None
+    res = _install_benchmark(conn, circuit, ids, source_hash, source="import",
+                             pinned_from_n=human_n, trigger="import",
+                             reason="manual import (Dev Tools)", stamp=stamp)
+    log.info("[%s] referee benchmark imported as %s: %d id(s), hash %s", circuit,
+             res["role"].upper(), res["inserted_n"], source_hash)
+    record_retrain_decision(
+        conn, circuit, "import",
+        RetrainOutcome("pinned", f"benchmark imported ({res['role']})",
+                       benchmark_hash=source_hash, benchmark_requested_n=len(ids),
+                       benchmark_matched_n=len(ids),
+                       detail={"source": "import", "role": res["role"],
+                               "pinned_from_n": human_n,
+                               "previous_hash": res["previous_hash"]}),
+        now=stamp)
+    return {"circuit": circuit, "source_hash": source_hash,
+            "requested_n": len(ids), "inserted_n": res["inserted_n"],
+            "role": res["role"]}
+
+
+# ── dev53: the add-on pins its own benchmark ────────────────────────────────
+def pin_benchmark_for_circuit(conn: sqlite3.Connection, circuit: str, *,
+                              trigger: str, source: str = "auto", reason: str = "",
+                              now: Optional[str] = None) -> dict:
+    """Select and install a benchmark from the circuit's own labelled pool.
+
+    Sizing is derived (``referee_benchmark.plan_size``): the pin must leave the
+    training pool eligible after the holdout split, with headroom, and must
+    not starve the recent leg — otherwise it is REFUSED with the reason
+    surfaced, never trimmed silently. Over an active set the result is a
+    PENDING pin (handover at the next promotion), sized with the active set
+    still reserved. Every pin writes a ``retrain_ledger`` row.
+    """
+    from . import referee_benchmark as rb
+    pool, _stats = build_training_pool(conn, circuit)
+    humans = rb.human_rows(pool)
+    human_n = len(humans)
+    existing = benchmark_ids_for_circuit(conn, circuit)
+    b_other = len(existing["ids"])                 # the active set stays reserved
+    plan = rb.plan_size(human_n, b_other)
+    if not plan.ok:
+        log.info("[%s] benchmark pin refused (%s): %s", circuit, trigger, plan.reason)
+        return {"status": "refused", "reason": plan.reason, "plan": plan.as_dict()}
+    gate = _health_gate_reason(conn, circuit, trigger)
+    if gate:
+        log.info("[%s] benchmark pin refused (%s): %s", circuit, trigger, gate)
+        return {"status": "refused", "reason": gate, "plan": plan.as_dict(),
+                "detail": {"reason": gate}}
+    sel = rb.select_benchmark(humans, b_other=b_other)
+    if sel is None:
+        why = f"fewer than {rb.PIN_FLOOR} events selectable under the ceiling {plan.ceiling}"
+        log.info("[%s] benchmark pin refused (%s): %s", circuit, trigger, why)
+        return {"status": "refused", "reason": why, "plan": plan.as_dict()}
+    stamp = now or datetime.now(timezone.utc).isoformat()
+    res = _install_benchmark(conn, circuit, sel.ids, sel.hash, source=source,
+                             pinned_from_n=human_n, trigger=trigger, reason=reason,
+                             stamp=stamp)
+    status = "pending" if res["role"] == "pending" else "pinned"
+    log.info("[%s] referee benchmark %s: %d event(s) over %d day(s), hash %s, "
+             "from %d human labels (%s)", circuit,
+             "PENDING re-pin" if status == "pending" else "pinned",
+             len(sel.ids), len(sel.days), sel.hash, human_n, trigger)
+    record_retrain_decision(
+        conn, circuit, trigger,
+        RetrainOutcome("pinned", reason or f"benchmark {status}",
+                       benchmark_hash=sel.hash, benchmark_requested_n=len(sel.ids),
+                       benchmark_matched_n=len(sel.ids),
+                       detail={"source": source, "role": res["role"],
+                               "pinned_from_n": human_n, "n_days": len(sel.days),
+                               "target": sel.target, "ceiling": sel.ceiling,
+                               "previous_hash": res["previous_hash"],
+                               "replaced_pending_hash": res["replaced_pending_hash"],
+                               "class_counts": sel.class_counts}),
+        now=stamp)
+    return {"status": status, "circuit": circuit, "source_hash": sel.hash,
+            "requested_n": len(sel.ids), "n_days": len(sel.days), "pinned_from_n": human_n,
+            "previous_hash": res["previous_hash"], "role": res["role"]}
+
+
+def maybe_auto_pin_benchmark(conn: Optional[sqlite3.Connection],
+                             circuit: str) -> Optional[dict]:
+    """The weekly hook: pin ONCE, when a home first has enough labels, and
+    never touch an existing benchmark (decayed or not — replacing one is an
+    operator decision, D3). Cheap when there is nothing to do."""
+    from . import referee_benchmark as rb
+    if conn is None:
+        return None
+    try:
+        has_meta = conn.execute(
+            "SELECT 1 FROM referee_benchmark_meta WHERE circuit = ?",
+            (circuit,)).fetchone() is not None
+    except sqlite3.Error:
+        return None
+    if has_meta:
+        return None
+    if count_human_pool_labels(conn, circuit) < rb.PIN_MIN_HUMAN_LABELS:
+        return None
+    res = pin_benchmark_for_circuit(
+        conn, circuit, trigger="pin", source="auto",
+        reason="auto-pin: first eligible retrain with margin")
+    return res if res.get("status") in ("pinned", "pending") else None
+
+
+def activate_pending_benchmark(conn: Optional[sqlite3.Connection], circuit: str,
+                               data_dir: Optional[str] = None,
+                               now: Optional[str] = None) -> Optional[dict]:
+    """After a PROMOTION: the pending set takes over and the old one retires.
+
+    A pending set can wait months; its rows decay exactly like the active
+    set's, but nothing measures them (decay reads the active hash's ledger
+    rows). So activation first recomputes the pending set's matched count
+    against the current pool; below the 70 % line it is NOT activated as-is —
+    a fresh selection is drawn (around the new champion's training days, so
+    it is clean for the model it will judge) with the same, already
+    operator-confirmed trigger and reason, and both hashes are logged. That
+    stays inside D3: the operator confirmed the intent; the row selection was
+    never what they were asked to approve. ``pinned_from_n`` is refreshed to
+    current H so the growth prompt measures from the set's birth.
+    """
+    from . import referee_benchmark as rb
+    if conn is None:
+        return None
+    ref = benchmark_ids_for_circuit(conn, circuit)
+    pend = ref.get("pending")
+    if not pend or not ref["pending_ids"]:
+        return None
+    pool, _stats = build_training_pool(conn, circuit)
+    pool_ids = {str(r["id"]) for r in pool}
+    humans = rb.human_rows(pool)
+    pending_ids = list(ref["pending_ids"])
+    matched = len(set(pending_ids) & pool_ids)
+    requested = len(pending_ids)
+    new_ids, new_hash, reselected = pending_ids, pend["hash"], False
+    champion = None
+    if data_dir:
+        try:
+            champion = tm.load(data_dir, circuit)
+        except Exception:                                   # noqa: BLE001
+            champion = None
+    if matched < rb.REPIN_DECAY_RATIO * requested:
+        sel = rb.select_benchmark(
+            humans, b_other=0,
+            exclude_days=getattr(champion, "train_days", None) or ())
+        if sel is not None:
+            new_ids, new_hash, reselected = sel.ids, sel.hash, True
+            log.warning("[%s] pending benchmark %s decayed while waiting (%d of %d "
+                        "still trainable) — re-selected as %s before activating",
+                        circuit, pend["hash"], matched, requested, new_hash)
+        else:
+            log.warning("[%s] pending benchmark %s decayed (%d of %d) and no fresh "
+                        "selection is possible — activating it as-is", circuit,
+                        pend["hash"], matched, requested)
+    stamp = now or datetime.now(timezone.utc).isoformat()
+    source = "import" if (pend.get("trigger") == "import" and not reselected) else "auto"
+    pinned_at = stamp if reselected else (pend.get("pinned_at") or stamp)
     try:
         conn.execute("DELETE FROM referee_benchmark WHERE circuit = ?", (circuit,))
-        conn.execute("DELETE FROM referee_benchmark_meta WHERE circuit = ?",
-                     (circuit,))
-        cur = conn.executemany(
+        conn.executemany(
             "INSERT INTO referee_benchmark (circuit, event_id, source_hash, "
-            "imported_at) VALUES (?, ?, ?, ?)",
-            [(circuit, i, source_hash, stamp) for i in ids])
-        inserted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 \
-            else len(ids)
+            "imported_at, role) VALUES (?, ?, ?, ?, 'active')",
+            [(circuit, i, new_hash, pinned_at) for i in new_ids])
         conn.execute(
-            "INSERT INTO referee_benchmark_meta (circuit, source_hash, "
-            "requested_n, imported_at) VALUES (?, ?, ?, ?)",
-            (circuit, source_hash, len(ids), stamp))
+            "UPDATE referee_benchmark_meta SET source_hash = ?, requested_n = ?, "
+            "  imported_at = ?, source = ?, pinned_from_n = ?, "
+            "  repin_dismissed_at = NULL, repin_dismissed_keys = NULL, "
+            "  pending_hash = NULL, pending_pinned_at = NULL, "
+            "  pending_pinned_from_n = NULL, pending_trigger = NULL, "
+            "  pending_reason = NULL WHERE circuit = ?",
+            (new_hash, len(new_ids), pinned_at, source, len(humans), circuit))
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    log.info("[%s] referee benchmark imported: %d id(s), hash %s", circuit,
-             inserted, source_hash)
-    return {"circuit": circuit, "source_hash": source_hash,
-            "requested_n": len(ids), "inserted_n": int(inserted)}
+    log.info("[%s] referee benchmark activated: %s -> %s (%d event(s)%s)", circuit,
+             ref["source_hash"], new_hash, len(new_ids),
+             ", re-selected" if reselected else "")
+    record_retrain_decision(
+        conn, circuit, "activate",
+        RetrainOutcome("pinned", "pending benchmark activated after promotion",
+                       benchmark_hash=new_hash, benchmark_requested_n=len(new_ids),
+                       benchmark_matched_n=len(set(new_ids) & pool_ids),
+                       detail={"from_hash": ref["source_hash"],
+                               "pending_hash": pend["hash"], "to_hash": new_hash,
+                               "reselected": reselected,
+                               "pending_matched": matched, "pending_requested": requested,
+                               "trigger": pend.get("trigger"),
+                               "reason": pend.get("reason"),
+                               "pinned_from_n": len(humans)}),
+        now=stamp)
+    return {"status": "activated", "from_hash": ref["source_hash"],
+            "pending_hash": pend["hash"], "to_hash": new_hash,
+            "reselected": reselected, "requested_n": len(new_ids)}
+
+
+def _benchmark_clean_for(champion, benchmark: Sequence[dict]):
+    """May ``champion`` be scored on ``benchmark``? Only if it provably never
+    trained on those days. A pre-dev51 incumbent has no ``train_days`` record
+    and DID train on them (the V6d gate measured a ~14-point head start on a
+    memorised set); a dev51+ incumbent installed before the first pin has the
+    benchmark's days in its record. Day-based, not clock-based — no timestamp
+    parsing can go wrong here, and an activation re-selection drawn around the
+    new champion's training days passes by construction."""
+    from . import referee_benchmark as rb
+    train_days = getattr(champion, "train_days", None)
+    if not train_days:
+        return False, ("incumbent has no training-day record (fitted before the "
+                       "benchmark was reserved) and trained on those rows")
+    bdays = {rb.day_of(r) for r in benchmark}
+    if "" in bdays:
+        return False, ("benchmark rows without a usable start_ts — cannot prove the "
+                       "incumbent never saw them")
+    overlap = bdays & set(train_days)
+    if overlap:
+        return False, f"incumbent trained on {len(overlap)} of the benchmark's days"
+    return True, ""
 
 
 # ── the retrain ─────────────────────────────────────────────────────────────
@@ -699,10 +991,16 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
     if not ok:
         return RetrainOutcome("ineligible", why, pool=stats)
 
-    bench_ids = {str(x) for x in (benchmark_ids or [])}
-    benchmark = [r for r in pool if str(r["id"]) in bench_ids]
-    trainable = [r for r in pool if str(r["id"]) not in bench_ids]
     meta = benchmark_meta or {}
+    bench_ids = {str(x) for x in (benchmark_ids or [])}
+    # dev53 — training holds out the ACTIVE set and any PENDING re-pin (the
+    # pending set must be clean for the challenger that will one day be
+    # judged against it); the referee scores the active set only.
+    reserved = (bench_ids
+                | {str(x) for x in (meta.get("reserved_ids") or [])}
+                | {str(x) for x in (meta.get("pending_ids") or [])})
+    benchmark = [r for r in pool if str(r["id"]) in bench_ids]
+    trainable = [r for r in pool if str(r["id"]) not in reserved]
     bench_hash = meta.get("source_hash")
     requested_n = int(meta.get("requested_n") or len(bench_ids))
     bench_fields = dict(benchmark_hash=bench_hash,
@@ -721,15 +1019,22 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
 
     train_rows, holdout = split_holdout(trainable)
     if not train_rows:
-        return RetrainOutcome("ineligible", "no trainable rows after splits",
-                              pool=stats, **bench_fields)
+        cause = _reservation_cause(pool, train_rows, reserved)
+        return RetrainOutcome("ineligible",
+                              cause.get("reason") or "no trainable rows after splits",
+                              pool=stats, detail=cause.get("detail"), **bench_fields)
 
     try:
         challenger = tm.train(train_rows, circuit, holdout=holdout,
                               target_precision=target_precision,
                               notes=reason)
     except tm.TinyModelUnavailable as exc:
-        return RetrainOutcome("ineligible", str(exc), pool=stats, **bench_fields)
+        # dev53 (F3b) — if un-reserving the benchmark would restore
+        # eligibility, say so: this is erosion, not a small pool, and the
+        # fix is labels or a smaller re-pin — never a silent auto-shrink.
+        cause = _reservation_cause(pool, train_rows, reserved)
+        return RetrainOutcome("ineligible", cause.get("reason") or str(exc),
+                              pool=stats, detail=cause.get("detail"), **bench_fields)
 
     champion = tm.load(data_dir, circuit)
     if champion is None:
@@ -763,13 +1068,39 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
     # seen. Scoring such a champion on the benchmark is not a comparison, so
     # the leg abstains until the first dev51 promotion installs a clean one;
     # the recent leg (clean days after the champion's fit) decides meanwhile.
+    # dev53 — day-based, not clock-based: the leg scores only if the incumbent
+    # provably never trained on the benchmark's days (first pin over a legacy
+    # or pre-pin champion → abstain until the first promotion). A pending
+    # re-pin never darkens the active leg — EXCEPT a supply-regime re-pin,
+    # where the active set encodes pre-regime signatures and is no longer a
+    # valid reference: it is scored and recorded (advisory) but cannot veto,
+    # and the recent leg — post-regime data — decides alone until activation.
     bench_for_referee = benchmark
-    if benchmark and not getattr(champion, "train_days", None):
-        log.info("[%s] referee benchmark leg abstains: incumbent predates the "
-                 "reserved benchmark (fitted %s, no training-day record) and "
-                 "trained on those rows — the recent leg decides until the first "
-                 "promotion", circuit, champion.trained_at)
-        bench_for_referee = []
+    advisory = False
+    advisory_scores = None
+    pend = meta.get("pending") or {}
+    if benchmark:
+        clean, why = _benchmark_clean_for(champion, benchmark)
+        if not clean:
+            log.info("[%s] referee benchmark leg abstains: %s (incumbent fitted %s) "
+                     "— the recent leg decides until the first promotion",
+                     circuit, why, champion.trained_at)
+            bench_for_referee = []
+        elif pend.get("trigger") == "regime":
+            advisory = True
+            a_ch = _score_artifact(champion, benchmark, threshold=0.0)
+            a_cl = _score_artifact(challenger, benchmark, threshold=0.0)
+            advisory_scores = {"champion_rate": a_ch.rate, "challenger_rate": a_cl.rate,
+                               "n": a_ch.total}
+            # (wording: the audit harness's p15 counts learning_loop lines that
+            # mention "challenger" as swap decisions — this one is not, so it
+            # says "new fit" instead)
+            log.info("[%s] referee benchmark leg ADVISORY: a supply-regime re-pin is "
+                     "pending (%s) and the active set predates the regime — scored "
+                     "(incumbent %.3f vs new fit %.3f on %d) but it cannot veto; "
+                     "the recent leg decides until the next promotion", circuit,
+                     pend.get("hash"), a_ch.rate, a_cl.rate, a_ch.total)
+            bench_for_referee = []
     bench_champ = _score_artifact(champion, bench_for_referee, threshold=0.0)
     bench_chal = _score_artifact(challenger, bench_for_referee, threshold=0.0)
     recent_champ = _score_artifact(champion, clean_holdout, threshold=0.0)
@@ -792,7 +1123,11 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
                     recent_clean_n=len(clean_holdout),
                     coverage_delta=cov, scores=sets,
                     challenger_hash=challenger.model_hash,
-                    champion_hash=champion.model_hash, **bench_fields)
+                    champion_hash=champion.model_hash,
+                    benchmark_advisory=advisory,
+                    detail=({"benchmark_advisory": advisory_scores}
+                            if advisory_scores else None),
+                    **bench_fields)
 
     if not verdict.swap:
         log.warning("[%s] challenger %s REJECTED — %s. Incumbent %s keeps "
@@ -899,13 +1234,37 @@ def learning_status(conn: Optional[sqlite3.Connection], circuit: str,
         return out
     last = rows[0]
     streak = 0
+    streak_rows = []
     for r in rows:                              # newest first
         if r[2] == "kept":
             streak += 1
-        elif r[2] in ("ineligible", "unavailable"):
+            streak_rows.append(r)
+        elif r[2] in ("ineligible", "unavailable", "pinned"):
             continue                            # not a decision about a challenger
         else:
             break
+    # dev53 (R2-3) — a streak of kept decisions is only a STUCK signal when
+    # the challenger never changed (no new labels) or the benchmark leg could
+    # not score for at least half of it. Four fair fights lost by four
+    # different challengers is a good champion, and renders as neutral.
+    stall_reason = None
+    if streak >= STALL_STREAK:
+        hashes = {r[4] for r in streak_rows}
+        dead = 0
+        for r in streak_rows:
+            try:
+                d = _json.loads(r[7] or "{}")
+            except (TypeError, ValueError):
+                d = {}
+            ref_txt = str(d.get("referee") or "")
+            if (d.get("benchmark_advisory") or "benchmark=no_contest" in ref_txt
+                    or not ref_txt):
+                dead += 1
+        if len(hashes) <= 1:
+            stall_reason = "unchanged_challenger"
+        elif dead * 2 >= streak:
+            stall_reason = "benchmark_leg_dead"
+    stuck = stall_reason is not None
     last_swap_at = next((r[0] for r in rows if r[3]), None)
     days_since_swap = None
     if last_swap_at:
@@ -931,7 +1290,8 @@ def learning_status(conn: Optional[sqlite3.Connection], circuit: str,
         "last_decided_at": last[0], "last_trigger": last[1],
         "last_status": last[2], "last_swapped": bool(last[3]),
         "last_reason": last[6],
-        "kept_streak": streak, "stalled": streak >= STALL_STREAK,
+        "kept_streak": streak, "stalled": stuck, "stall_reason": stall_reason,
+        "fair_fight_streak": (streak >= STALL_STREAK and not stuck),
         "stall_streak": STALL_STREAK,
         "last_swap_at": last_swap_at, "days_since_swap": days_since_swap,
         # after a swap the challenger serves (a rollback records the restored
@@ -944,6 +1304,40 @@ def learning_status(conn: Optional[sqlite3.Connection], circuit: str,
         "benchmark_n": detail.get("benchmark_matched_n"),
         "decisions_on_record": len(rows),
     })
+    # dev53 — the benchmark's own state and whether a re-pin is worth asking
+    # for. Best-effort: a pre-migration DB still renders dev51's shape.
+    try:
+        from . import referee_benchmark as rb
+        ref = benchmark_ids_for_circuit(conn, circuit)
+        human_n = count_human_pool_labels(conn, circuit)
+        bench = None
+        triggers: list = []
+        if ref["ids"]:
+            m = benchmark_match_from_ledger(conn, circuit, ref["source_hash"])
+            ratio = (m[0] / m[1]) if (m and m[1]) else None
+            bench = {"hash": ref["source_hash"], "source": ref["source"],
+                     "pinned_at": ref["pinned_at"], "requested_n": ref["requested_n"],
+                     "n_active": len(ref["ids"]),
+                     "matched_n": m[0] if m else None, "decay_ratio": ratio,
+                     "decay_warning": ratio is not None and ratio < rb.DECAY_REPORT_RATIO,
+                     "decay_actionable": ratio is not None and ratio < rb.REPIN_DECAY_RATIO,
+                     "pending": ref["pending"]}
+            triggers = repin_triggers(conn, circuit, ref, human_n)
+        inner = detail.get("detail") or {}
+        paused = (last[2] == "ineligible"
+                  and isinstance(inner, dict)
+                  and inner.get("cause") == "benchmark_reservation")
+        out.update({
+            "benchmark": bench,
+            "repin_suggested": [t for t in triggers if not t["suppressed"]],
+            "repin_suppressed": [t for t in triggers if t["suppressed"]],
+            "human_labels": human_n,
+            "pin_threshold": rb.PIN_MIN_HUMAN_LABELS,
+            "paused_by_reservation": paused,
+            "reservation_shortfall": inner.get("shortfall") if paused else None,
+        })
+    except Exception as exc:                                # noqa: BLE001
+        log.debug("[%s] benchmark status unavailable: %s", circuit, exc)
     return out
 
 
@@ -971,3 +1365,229 @@ def rollback_serving_model(conn: sqlite3.Connection, circuit: str,
                 art.trained_at, invalidated)
     return {"status": "rolled_back", "model_hash": art.model_hash,
             "trained_at": art.trained_at, "invalidated": invalidated}
+
+
+# ── dev53 Phase 2: when a re-pin is worth asking for (D3/D4/F2/F3b) ──────────
+REPIN_TRIGGER_REASONS = ("regime", "decay", "growth", "shrink")
+_ALERT_GATED_TRIGGERS = ("decay", "growth", "shrink")
+
+
+def open_health_alerts_for(conn: Optional[sqlite3.Connection], circuit: str) -> list:
+    """Open fixture-health alerts on the circuit (fixture, signal, opened_at)."""
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT fixture_type, signal, opened_at FROM fixture_health_alert "
+            "WHERE circuit = ? AND resolved_at IS NULL ORDER BY opened_at",
+            (circuit,)).fetchall()
+    except sqlite3.Error:
+        return []
+    return [{"fixture_type": r[0], "signal": r[1], "opened_at": r[2]} for r in rows]
+
+
+def latest_regime(conn: Optional[sqlite3.Connection]) -> Optional[dict]:
+    """The newest confirmed-or-detected (never bootstrap, never dismissed)
+    supply regime, with its start parsed through ``ts_utc``; None when there is
+    none or its start cannot be ordered (fail-closed: no regime prompt)."""
+    from . import referee_benchmark as rb
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT id, started_at, source FROM supply_regime "
+            "WHERE source <> 'bootstrap' AND dismissed_at IS NULL "
+            "ORDER BY started_at DESC LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    st = rb.ts_utc(row[1])
+    if st is None:
+        log.warning("supply regime %s has an unreadable started_at %r — the "
+                    "regime re-pin prompt stays off until it is fixed", row[0], row[1])
+        return None
+    return {"id": int(row[0]), "started_at": row[1], "started_at_utc": st,
+            "source": row[2]}
+
+
+def benchmark_match_from_ledger(conn: Optional[sqlite3.Connection], circuit: str,
+                                bench_hash: Optional[str]):
+    """(matched, requested) from the newest decision scored against this hash,
+    or None. Decay is read here, not recomputed: it is what the leg actually
+    had on the night, and it costs one indexed read."""
+    import json as _json
+    if conn is None or not bench_hash:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT detail_json FROM retrain_ledger WHERE circuit = ? "
+            "AND benchmark_hash = ? AND status IN ('trained', 'kept') "
+            "ORDER BY id DESC LIMIT 1", (circuit, bench_hash)).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    try:
+        d = _json.loads(row[0] or "{}")
+    except (TypeError, ValueError):
+        return None
+    req = d.get("benchmark_requested_n")
+    mat = d.get("benchmark_matched_n")
+    if req is None or mat is None:
+        return None
+    return int(mat), int(req)
+
+
+def _dismissed_keys(ref: dict) -> set:
+    import json as _json
+    try:
+        return set(_json.loads(ref.get("repin_dismissed_keys") or "[]"))
+    except (TypeError, ValueError):
+        return set()
+
+
+def repin_triggers(conn: Optional[sqlite3.Connection], circuit: str,
+                   ref: Optional[dict] = None,
+                   human_n: Optional[int] = None) -> list:
+    """Why the operator might want a fresh reference set — each with a key
+    that embeds the triggering value, so a dismissal silences only that
+    instance (``growth:388`` dismissed does not silence ``growth:776``).
+
+    Nothing is suggested while a pending set already waits (the answer to
+    every trigger is the same handover). F2: while a fixture-health alert is
+    open, decay/growth/shrink are SUPPRESSED (a set drawn now would freeze a
+    quarantined class's skew in) and the regime prompt is shown but
+    ``deferred`` when an alert predates the regime.
+    """
+    from . import referee_benchmark as rb
+    ref = ref or benchmark_ids_for_circuit(conn, circuit)
+    if not ref.get("ids") or ref.get("pending"):
+        return []
+    if human_n is None:
+        human_n = count_human_pool_labels(conn, circuit)
+    dismissed = _dismissed_keys(ref)
+    alerts = open_health_alerts_for(conn, circuit)
+    alert_fixtures = sorted({a["fixture_type"] for a in alerts})
+    out: list = []
+
+    pinned_at = rb.ts_utc(ref.get("pinned_at"))
+    if ref.get("pinned_at") and pinned_at is None:
+        log.warning("[%s] benchmark pinned_at %r is unreadable — the regime "
+                    "re-pin prompt is disabled (fail-closed)", circuit, ref.get("pinned_at"))
+    reg = latest_regime(conn) if pinned_at is not None else None
+    if reg and reg["started_at_utc"] > pinned_at:
+        predating = sorted({a["fixture_type"] for a in alerts
+                            if rb.ts_utc(a["opened_at"]) is None
+                            or rb.ts_utc(a["opened_at"]) < reg["started_at_utc"]})
+        out.append({"reason": "regime", "key": f"regime:{reg['id']}",
+                    "detail": (f"the supply pressure changed on "
+                               f"{str(reg['started_at'])[:10]} and the reference set "
+                               f"was pinned before it"),
+                    "deferred": bool(predating), "suppressed": False,
+                    "waiting_on": predating})
+
+    m = benchmark_match_from_ledger(conn, circuit, ref.get("source_hash"))
+    if m and m[1] and (m[0] / m[1]) < rb.REPIN_DECAY_RATIO:
+        out.append({"reason": "decay", "key": f"decay:{ref['source_hash']}",
+                    "detail": (f"only {m[0]} of the {m[1]} pinned events still count "
+                               f"({m[0] / m[1]:.0%}) — the comparison has lost its "
+                               f"resolution"),
+                    "deferred": False, "suppressed": False, "waiting_on": []})
+
+    base_n = ref.get("pinned_from_n")
+    if base_n and human_n >= rb.REPIN_GROWTH_FACTOR * int(base_n):
+        # the doubling level reached (400, 800, 1600 ...), so a dismissal of
+        # one level never silences the next
+        thr = rb.REPIN_GROWTH_FACTOR * int(base_n)
+        while thr * rb.REPIN_GROWTH_FACTOR <= human_n:
+            thr *= rb.REPIN_GROWTH_FACTOR
+        out.append({"reason": "growth", "key": f"growth:{thr}",
+                    "detail": (f"you have labelled {human_n} events, up from {base_n} "
+                               f"when the set was pinned — a larger set would judge "
+                               f"more finely"),
+                    "deferred": False, "suppressed": False, "waiting_on": []})
+
+    try:
+        import json as _json
+        row = conn.execute(
+            "SELECT status, detail_json FROM retrain_ledger WHERE circuit = ? "
+            "AND status IN ('trained', 'kept', 'ineligible') ORDER BY id DESC LIMIT 1",
+            (circuit,)).fetchone()
+        if row and row[0] == "ineligible":
+            inner = (_json.loads(row[1] or "{}").get("detail") or {})
+            if isinstance(inner, dict) and inner.get("cause") == "benchmark_reservation":
+                out.append({"reason": "shrink", "key": f"shrink:{ref['source_hash']}",
+                            "detail": ("the reserved set now leaves too few labels to "
+                                       "re-fit the model — a smaller set would let "
+                                       "re-fits resume"),
+                            "deferred": False, "suppressed": False, "waiting_on": []})
+    except (sqlite3.Error, TypeError, ValueError, AttributeError):
+        pass
+
+    for t in out:
+        if t["reason"] in _ALERT_GATED_TRIGGERS and alert_fixtures:
+            t["suppressed"] = True
+            t["waiting_on"] = alert_fixtures
+    return [t for t in out if t["key"] not in dismissed]
+
+
+def dismiss_repin_prompt(conn: sqlite3.Connection, circuit: str, keys,
+                         now: Optional[str] = None) -> list:
+    """'Not now' — union the keys into the meta row. Per-instance: the same
+    trigger with a new value prompts again."""
+    import json as _json
+    ref = benchmark_ids_for_circuit(conn, circuit)
+    merged = sorted(_dismissed_keys(ref) | {str(k) for k in keys if k})
+    conn.execute(
+        "UPDATE referee_benchmark_meta SET repin_dismissed_keys = ?, "
+        "  repin_dismissed_at = ? WHERE circuit = ?",
+        (_json.dumps(merged), now or datetime.now(timezone.utc).isoformat(), circuit))
+    conn.commit()
+    return merged
+
+
+def _health_gate_reason(conn: Optional[sqlite3.Connection], circuit: str,
+                        trigger: str) -> Optional[str]:
+    """F2 belt-and-braces on the pin itself. Decay/growth/shrink pins are
+    refused under ANY open alert; a regime pin only under alerts that predate
+    the regime (R2-1b: alerts the regime opened ARE the regime — the recal job
+    restarts usage baselines only, so it never closes them). Dev Tools
+    ('pin'/'re-pin') and imports are exempt: eyes open, by design."""
+    from . import referee_benchmark as rb
+    alerts = open_health_alerts_for(conn, circuit)
+    if not alerts:
+        return None
+    if trigger in _ALERT_GATED_TRIGGERS:
+        names = ", ".join(sorted({a["fixture_type"] for a in alerts}))
+        return f"open health alert: {names}"
+    if trigger == "regime":
+        reg = latest_regime(conn)
+        if reg is None:
+            return None
+        predating = sorted({a["fixture_type"] for a in alerts
+                            if rb.ts_utc(a["opened_at"]) is None
+                            or rb.ts_utc(a["opened_at"]) < reg["started_at_utc"]})
+        if predating:
+            return ("open health alert from before the pressure change: "
+                    + ", ".join(predating))
+    return None
+
+
+def _reservation_cause(pool: Sequence[dict], train_rows: Sequence[dict],
+                       reserved: set) -> dict:
+    """F3b — is the benchmark reservation what made the pool ineligible?
+    True only when un-reserving would restore eligibility; a genuinely small
+    pool is left exactly as it reads today."""
+    if not reserved:
+        return {}
+    human_train = sum(1 for r in train_rows if not tm.is_machine_label(r))
+    reserved_in_pool = sum(1 for r in pool if str(r["id"]) in reserved)
+    if human_train >= tm.MIN_USER_LABELS or human_train + reserved_in_pool < tm.MIN_USER_LABELS:
+        return {}
+    shortfall = tm.MIN_USER_LABELS - human_train
+    return {"detail": {"cause": "benchmark_reservation", "shortfall": shortfall,
+                       "human_train_rows": human_train,
+                       "reserved_in_pool": reserved_in_pool},
+            "reason": (f"paused: benchmark reservation exceeds pool headroom — label "
+                       f"~{shortfall} more events or re-pin smaller")}

@@ -1627,18 +1627,34 @@ CREATE INDEX IF NOT EXISTS idx_events_circuit_span
 --   retrain_ledger          — every referee decision, durably. The jobs table
 --                             prunes after two days, so "a run of rejections"
 --                             was invisible; this is the record.
+-- dev53 (migration 20260816): the add-on pins its own benchmark. A re-pin is
+-- written as role='pending' and only becomes active at the next promotion, so
+-- the leg is never dark; both sets are reserved from training meanwhile.
+-- referee_benchmark_meta grows the provenance (source 'import'|'auto',
+-- pinned_from_n = human labels at pin time), the pending slot, and the
+-- Water Use prompt's dismissal record.
 CREATE TABLE IF NOT EXISTS referee_benchmark (
     circuit      TEXT NOT NULL,
     event_id     TEXT NOT NULL,
     source_hash  TEXT NOT NULL,
     imported_at  TEXT NOT NULL,
-    PRIMARY KEY (circuit, event_id)
+    role         TEXT NOT NULL DEFAULT 'active',
+    PRIMARY KEY (circuit, event_id, role)
 );
 CREATE TABLE IF NOT EXISTS referee_benchmark_meta (
-    circuit      TEXT PRIMARY KEY,
-    source_hash  TEXT NOT NULL,
-    requested_n  INTEGER NOT NULL,
-    imported_at  TEXT NOT NULL
+    circuit               TEXT PRIMARY KEY,
+    source_hash           TEXT NOT NULL,
+    requested_n           INTEGER NOT NULL,
+    imported_at           TEXT NOT NULL,
+    source                TEXT NOT NULL DEFAULT 'import',
+    pinned_from_n         INTEGER,
+    repin_dismissed_at    TEXT,
+    repin_dismissed_keys  TEXT,
+    pending_hash          TEXT,
+    pending_pinned_at     TEXT,
+    pending_pinned_from_n INTEGER,
+    pending_trigger       TEXT,
+    pending_reason        TEXT
 );
 CREATE TABLE IF NOT EXISTS retrain_ledger (
     id               INTEGER PRIMARY KEY,

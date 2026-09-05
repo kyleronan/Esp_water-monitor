@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev52 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev53 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -475,6 +475,32 @@ makes the add-on survive that.
   to prevent. The reason is now written at the moment of exclusion, and
   existing silent exclusions are labelled from their own flags at the next
   start — dev51.
+
+- **The add-on now builds the learned model's reference set itself** — the
+  fixed set of your own labelled events that every re-fit is judged against
+  used to be created on a developer's machine and loaded by hand, so a second
+  home could never have one and its re-fits could never be trusted to replace
+  the running model. Once a circuit has about two hundred of your own labels
+  the weekly pass pins a set on its own — a quarter of the labelled days,
+  capped at 150 events, always sized so the re-fit still has enough left to
+  learn from — and keeps those events out of training from then on. It is
+  never replaced quietly: when the water supply changes, when too many of the
+  pinned events have since been excluded, or when you have labelled twice as
+  much as when it was pinned, Water Use asks first, with **Re-pin benchmark
+  now** and **Not now**, and a fresh set only takes over at the next
+  change-over so the comparison you have is never interrupted. While a
+  fixture-health alert is open the add-on holds off suggesting a re-pin, since a
+  set drawn then would bake the alert in. Developer tools gain **Pin benchmark
+  now** / **Re-pin benchmark**; loading a file stays as the override — dev53.
+
+- **"Stopped improving" now means stuck, not merely unbeaten** — the Water
+  Use warning used to fire after any four weekly checks that kept the running
+  model, which is also what a good model fairly beating four different
+  candidates looks like. It now fires only when the candidate never changed (no
+  new labels) or the reference set could not be scored for most of the run;
+  four fair contests render as a plain line instead. If the reference set ever
+  holds back more labels than a re-fit can spare, the page says so and offers
+  a smaller re-pin rather than pausing silently — dev53.
 
 - **Several separate uses recorded as one long event, and rebuilding it changed
   nothing** — on a home with a booster pump the line pressure never fully

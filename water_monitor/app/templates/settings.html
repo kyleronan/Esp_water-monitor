@@ -1485,16 +1485,44 @@
       </div>
 
       <div class="sett-card">
-        <h3 class="sett-card-title">Load the model's reference benchmark</h3>
+        <h3 class="sett-card-title">The model's reference benchmark</h3>
         <p class="sett-help" style="margin:.25rem 0 .75rem">
           When the learned model is re-fitted, the new fit is checked against a
           fixed set of events labelled before it existed, so a fit that quietly
-          got worse is not put into service. That reference set is not built in
-          — paste the benchmark file's contents (or attach the file) once for
-          each circuit. Without one, a re-fit can never replace the model that
-          is already running. Loading a new file replaces the previous set.
-          The result is shown as a short summary.
+          got worse is not put into service. The add-on pins that reference set
+          itself from your own labels once there are enough of them, and asks
+          on Water Use before ever replacing it. The buttons here do the same
+          by hand; over an existing set the new one waits for the next
+          change-over. Loading a file below is the developer override.
         </p>
+        {#- dev53: per-circuit status + Pin / Re-pin. The confirm names any open
+            health alert, so a set drawn during one is drawn with eyes open. #}
+        {% for c in circuits %}
+        {% set bs = benchmark_status.get(c.circuit) if benchmark_status else none %}
+        <div style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
+          <div>
+            <strong>{{ c.display_name }}</strong>
+            {%- if bs and bs.n %}
+            <span class="sett-help"> — {{ bs.n }} events pinned {{ bs.pinned_at }}
+              {%- if bs.source == 'import' %} (loaded from a file){% else %} (pinned by the add-on){% endif %}
+              {%- if bs.pending %}; a refreshed set is waiting for the next change-over{% endif %}
+              <span style="opacity:.65;font-family:monospace;font-size:.85em"> {{ bs.hash }}</span></span>
+            {%- elif bs %}
+            <span class="sett-help"> — no reference set yet ({{ bs.human_labels }} of the
+              {{ bs.threshold }} labels needed before one is pinned automatically)</span>
+            {%- endif %}
+          </div>
+          <form method="post"
+                action="{{ ingress_path }}/settings/dev/pin-referee-benchmark/{{ c.circuit }}"
+                style="margin:0"
+                onsubmit="return confirm('{% if bs and bs.n %}Re-pin{% else %}Pin{% endif %} the reference set for {{ c.display_name }}?{% if bs and bs.open_alerts %} {{ bs.open_alerts | length }} health alert(s) are open ({{ bs.open_alerts | join(', ') }}) — a set drawn now will reflect that.{% endif %}{% if bs and bs.n %} Earlier comparisons hand over at the next change-over.{% endif %}');">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">
+              {%- if bs and bs.n %}Re-pin benchmark{% else %}Pin benchmark now{% endif -%}
+            </button>
+          </form>
+        </div>
+        {% endfor %}
         {% for c in circuits %}
         <form method="post" enctype="multipart/form-data"
               action="{{ ingress_path }}/settings/dev/import-referee-benchmark/{{ c.circuit }}"

@@ -448,6 +448,61 @@ async def resolve_health_alert(alert_id: int, request: Request):
     return ingress_redirect(request, "/fixtures?msg=health_resolved")
 
 
+# ── dev53: the reference-set prompt ("Re-pin benchmark now" / "Not now") ─────
+
+@router.post("/repin-benchmark/{circuit}")
+async def repin_benchmark(circuit: str, request: Request):
+    """Operator-confirmed re-pin from the Water Use prompt (D3).
+
+    The trigger names WHY (regime / decay / growth / shrink) and is recorded
+    on the ledger row. Over an active set the new selection lands as PENDING
+    and takes over at the next model change-over; a refusal (pool headroom,
+    open health alert) comes back as a message, never a silent no-op.
+    """
+    orch = _orch(request)
+    form = await request.form()
+    trigger = str(form.get("trigger") or "").strip()
+    from ..learning_loop import REPIN_TRIGGER_REASONS, pin_benchmark_for_circuit
+    if trigger not in REPIN_TRIGGER_REASONS:
+        return ingress_redirect(request, "/fixtures?msg=error")
+    circuit = resolve_circuit(circuit)
+    try:
+        from ..database import get_write_lock, run_db
+        async with get_write_lock():
+            res = await run_db(pin_benchmark_for_circuit, orch.db, circuit,
+                               trigger=trigger, source="auto",
+                               reason=f"operator confirmed the {trigger} prompt on Water Use")
+    except Exception as e:                          # noqa: BLE001
+        log.error("[%s] benchmark re-pin failed: %s", circuit, e, exc_info=True)
+        return ingress_redirect(request, "/fixtures?msg=error")
+    if res.get("status") == "refused":
+        from urllib.parse import quote
+        return ingress_redirect(
+            request, f"/fixtures?msg=benchmark_refused&why={quote(str(res.get('reason') or ''))}")
+    msg = "benchmark_pending" if res.get("status") == "pending" else "benchmark_pinned"
+    return ingress_redirect(request, f"/fixtures?msg={msg}")
+
+
+@router.post("/repin-benchmark/{circuit}/dismiss")
+async def dismiss_repin_benchmark(circuit: str, request: Request):
+    """'Not now' — silences this instance of the prompt only."""
+    orch = _orch(request)
+    form = await request.form()
+    key = str(form.get("key") or "").strip()
+    if not key:
+        return ingress_redirect(request, "/fixtures?msg=error")
+    circuit = resolve_circuit(circuit)
+    from ..learning_loop import dismiss_repin_prompt
+    try:
+        from ..database import get_write_lock, run_db
+        async with get_write_lock():
+            await run_db(dismiss_repin_prompt, orch.db, circuit, [key])
+    except Exception as e:                          # noqa: BLE001
+        log.error("[%s] dismissing the re-pin prompt failed: %s", circuit, e, exc_info=True)
+        return ingress_redirect(request, "/fixtures?msg=error")
+    return ingress_redirect(request, "/fixtures?msg=repin_dismissed")
+
+
 @router.post("/repair-stale-links")
 async def repair_stale_links(request: Request):
     """dev42 (U4 cleanup) — null events whose fixture-group id points at a

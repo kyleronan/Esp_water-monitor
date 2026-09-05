@@ -310,7 +310,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260815
+_CURRENT_VERSION: int = 20260816
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -3264,6 +3264,85 @@ def _missing_referee_tables(conn: sqlite3.Connection) -> set[str]:
     return {name for name, _ in _REFEREE_TABLES_DDL if not _has_table(conn, name)}
 
 
+# 20260816 — dev53: the add-on pins its own benchmark (provenance + pending slot).
+_REFEREE_META_COLUMNS: tuple = (
+    ("source", "TEXT NOT NULL DEFAULT 'import'"),
+    ("pinned_from_n", "INTEGER"),
+    ("repin_dismissed_at", "TEXT"),
+    ("repin_dismissed_keys", "TEXT"),
+    ("pending_hash", "TEXT"),
+    ("pending_pinned_at", "TEXT"),
+    ("pending_pinned_from_n", "INTEGER"),
+    ("pending_trigger", "TEXT"),
+    ("pending_reason", "TEXT"),
+)
+
+
+def _apply_referee_meta_columns(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260816 — additive, idempotent, no backfill.
+
+    dev51 stored ONE hand-imported benchmark per circuit. dev53 lets the add-on
+    pin its own and, deliberately, re-pin it. Two shape changes:
+
+    * ``referee_benchmark`` gains ``role`` ('active' | 'pending') and its
+      primary key becomes (circuit, event_id, role). A re-pin is written as
+      pending and only takes over at the next promotion, so the benchmark leg
+      is never dark; an event may sit in both sets across a handover. SQLite
+      cannot alter a primary key, so this is a table rebuild that copies every
+      existing row as 'active'.
+    * ``referee_benchmark_meta`` gains provenance (``source``,
+      ``pinned_from_n``), the pending slot, and the Water Use prompt's
+      dismissal record. Existing import rows read as source='import' with an
+      unknown ``pinned_from_n`` — the growth trigger simply cannot fire for
+      them, which is correct: nothing knows what label count they were drawn
+      from.
+    """
+    # a 20260814 DB runs 20260815 first, so the tables exist; be defensive anyway
+    for _name, ddl in _REFEREE_TABLES_DDL:
+        conn.execute(ddl)
+    for col, decl in _REFEREE_META_COLUMNS:
+        if not _has_column(conn, "referee_benchmark_meta", col):
+            conn.execute(f"ALTER TABLE referee_benchmark_meta ADD COLUMN {col} {decl}")
+    if not _has_column(conn, "referee_benchmark", "role"):
+        conn.execute("BEGIN")
+        conn.execute(
+            "CREATE TABLE referee_benchmark__dev53 ("
+            "circuit TEXT NOT NULL, event_id TEXT NOT NULL, "
+            "source_hash TEXT NOT NULL, imported_at TEXT NOT NULL, "
+            "role TEXT NOT NULL DEFAULT 'active', "
+            "PRIMARY KEY (circuit, event_id, role))")
+        conn.execute(
+            "INSERT INTO referee_benchmark__dev53 "
+            "(circuit, event_id, source_hash, imported_at, role) "
+            "SELECT circuit, event_id, source_hash, imported_at, 'active' "
+            "FROM referee_benchmark")
+        conn.execute("DROP TABLE referee_benchmark")
+        conn.execute("ALTER TABLE referee_benchmark__dev53 RENAME TO referee_benchmark")
+    conn.commit()
+    # Belt-and-braces re-create of the wf-claim index — LAST-migration
+    # convention (see 20260574/20260804/20260806/20260807/20260808/20260814/20260815).
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+        conn.commit()
+    log.info("Migration 20260816: referee benchmark provenance + pending slot ready")
+
+
+def _missing_referee_meta_columns(conn: sqlite3.Connection) -> set[str]:
+    """Verifier for the 20260816 shape (current-version guard set)."""
+    missing: set[str] = set()
+    if _has_table(conn, "referee_benchmark_meta"):
+        missing |= {f"referee_benchmark_meta.{c}" for c, _ in _REFEREE_META_COLUMNS
+                    if not _has_column(conn, "referee_benchmark_meta", c)}
+    if _has_table(conn, "referee_benchmark") and not _has_column(
+            conn, "referee_benchmark", "role"):
+        missing.add("referee_benchmark.role")
+    return missing
+
+
 _MIGRATIONS: tuple = (
     (20260524, _drop_retired_wf_entity_map_rows),
     (20260525, _apply_unique_events_index),
@@ -3331,6 +3410,7 @@ _MIGRATIONS: tuple = (
     (20260813, _apply_daily_summary_drift_markers),
     (20260814, _apply_auto_split_memo),
     (20260815, _apply_referee_tables),
+    (20260816, _apply_referee_meta_columns),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -3411,6 +3491,7 @@ def _run_migrations_impl(
             | _missing_wf_claim_columns(conn)
             | _missing_202608_columns(conn)
             | _missing_referee_tables(conn)
+            | _missing_referee_meta_columns(conn)
         )
         if missing:
             raise RuntimeError(

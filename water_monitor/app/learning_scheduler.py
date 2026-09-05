@@ -150,9 +150,10 @@ class LearningScheduler:
         from . import tinymodel as tm
         from .config import DATA_DIR
         from .database import finish_job, get_write_lock, run_db, start_job
-        from .learning_loop import (STALL_STREAK, benchmark_ids_for_circuit,
-                                    learning_status, record_retrain_decision,
-                                    retrain)
+        from .learning_loop import (STALL_STREAK, activate_pending_benchmark,
+                                    benchmark_ids_for_circuit, learning_status,
+                                    maybe_auto_pin_benchmark,
+                                    record_retrain_decision, retrain)
 
         trigger = trigger or ("weekly" if reason.startswith("weekly") else "on_demand")
         # Every outcome gets a job row, not just the ones that swap the model.
@@ -166,6 +167,21 @@ class LearningScheduler:
                            "Re-fitting the learned model…")
         try:
             async with get_write_lock():
+                # dev53 — a home that has enough labels pins its own benchmark
+                # here, BEFORE the benchmark is read and BEFORE retrain runs, so
+                # the very first champion is trained with the set already
+                # reserved. No-op once a benchmark exists (replacing one is an
+                # operator decision). A pin fault must not fail the retrain.
+                try:
+                    pinned = await run_db(maybe_auto_pin_benchmark, self._db, circuit)
+                    if pinned:
+                        log.info("[%s] referee benchmark auto-pinned: %d event(s) over "
+                                 "%d day(s), hash %s (from %d human labels)", circuit,
+                                 pinned.get("requested_n"), pinned.get("n_days"),
+                                 pinned.get("source_hash"), pinned.get("pinned_from_n"))
+                except Exception as e:                      # noqa: BLE001
+                    log.warning("[%s] benchmark auto-pin failed (non-fatal); retrain "
+                                "continues without it: %s", circuit, e)
                 # dev51 — the pinned benchmark lives in the DB (referee_benchmark,
                 # imported once via Dev Tools). Before this the call passed None
                 # here and the referee's PRIMARY leg had never run in production.
@@ -189,12 +205,26 @@ class LearningScheduler:
         # days), and the stall check that V6d showed nothing else would raise.
         # Both best-effort: a ledger problem must not fail a finished retrain.
         try:
+            # The decision row is written FIRST and carries the benchmark hash
+            # the leg was actually scored on (captured inside retrain); only
+            # then may a pending re-pin take over (dev53 handover). A promotion
+            # is never recorded under a hash that did not judge it.
             await run_db(record_retrain_decision, self._db, circuit, trigger, out)
+            if getattr(out, "swapped", False):
+                async with get_write_lock():
+                    act = await run_db(activate_pending_benchmark, self._db, circuit,
+                                       str(DATA_DIR))
+                if act:
+                    log.info("[%s] pending benchmark took over after the promotion: "
+                             "%s -> %s%s", circuit, act.get("from_hash"),
+                             act.get("to_hash"),
+                             " (re-selected: the pending set had decayed)"
+                             if act.get("reselected") else "")
             status = await run_db(learning_status, self._db, circuit)
             if status.get("stalled"):
                 log.warning("[%s] the referee has kept the incumbent %d time(s) in "
                             "a row (threshold %d) — the learned model has stopped "
-                            "improving. Check the benchmark is imported and that "
+                            "improving. Check that a benchmark is pinned and that "
                             "new labels are arriving.", circuit,
                             status.get("kept_streak"), STALL_STREAK)
         except Exception as e:                              # noqa: BLE001

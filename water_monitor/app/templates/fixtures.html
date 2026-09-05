@@ -38,6 +38,18 @@
 <div class="fx-msg fx-msg-ok">Thanks — noted. If you replaced or repaired the
   fixture, the app will start measuring it against how it behaves from now on;
   that takes a few weeks of normal use to settle.</div>
+{% elif msg == 'benchmark_pinned' %}
+<div class="fx-msg fx-msg-ok">Reference set pinned — from now on each re-fit of the
+  learned model is judged against it.</div>
+{% elif msg == 'benchmark_pending' %}
+<div class="fx-msg fx-msg-ok">Reference set refreshed — the new set takes over at the
+  next model change-over; until then the current one keeps judging.</div>
+{% elif msg == 'benchmark_refused' %}
+<div class="fx-msg fx-msg-warn">The reference set was not re-pinned:
+  {{ request.query_params.get('why', 'see the addon log') }}.</div>
+{% elif msg == 'repin_dismissed' %}
+<div class="fx-msg fx-msg-ok">Okay — the reference set stays as it is. You will only be
+  asked again if something else changes.</div>
 {% elif msg == 'error' %}
 <div class="fx-msg fx-msg-err">Action failed — check the addon log for details.</div>
 {% endif %}
@@ -197,20 +209,35 @@
      referee is not relaxed from here. ─────────────────────────────────── #}
 {% if health and health.learning %}
 {% for cid, l in health.learning.items() %}
-<div class="fx-msg {{ 'fx-msg-warn' if l.stalled else 'fx-msg-ok' }}"
+<div class="fx-msg {{ 'fx-msg-warn' if (l.stalled or l.paused_by_reservation) else 'fx-msg-ok' }}"
      style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
   <span>
     {%- if l.stalled %}
     <strong>The learned model on {{ l.circuit_name }} has stopped improving</strong> —
     the last {{ l.kept_streak }} weekly re-fits were all judged no better than the
-    model already running. That usually means the reference benchmark has not
-    been loaded (Settings → developer tools), or no new labels have arrived for
-    it to learn from.
+    model already running
+    {%- if l.stall_reason == 'unchanged_challenger' %}, and every one of them was the
+    same fit: no new labels have arrived for it to learn from.
+    {%- elif l.benchmark %}, and for most of them the reference set could not be
+    scored — it is waiting for the first change-over.
+    {%- else %}, and there is no reference set to judge them against yet
+    {%- if l.pin_threshold %} (one is pinned automatically once about
+    {{ l.pin_threshold }} of your own labels exist; you have {{ l.human_labels or 0 }}){% endif %}.
+    {%- endif %}
+    {%- elif l.paused_by_reservation %}
+    <strong>Re-fits of the learned model on {{ l.circuit_name }} are paused</strong> —
+    the reference set holds back more labels than the pool can spare right now.
+    Label about {{ l.reservation_shortfall or 'a few' }} more events, or re-pin a
+    smaller set.
+    {%- elif l.fair_fight_streak %}
+    Learned model on {{ l.circuit_name }}: {{ l.kept_streak }} new fits judged, the
+    running model retained each time — reference set active.
     {%- else %}
     Learned model on {{ l.circuit_name }}: last checked {{ (l.last_decided_at or '')[:10] }} —
     {%- if l.last_swapped %} a new fit took over.
     {%- elif l.last_status == 'kept' %} the running model was kept
       {%- if l.kept_streak > 1 %} ({{ l.kept_streak }} checks in a row){% endif %}.
+    {%- elif l.last_status == 'pinned' %} the reference set was pinned.
     {%- else %} nothing to decide yet ({{ l.last_reason }}).
     {%- endif %}
     {%- if l.days_since_swap is not none %}
@@ -220,10 +247,52 @@
     {%- if l.coverage_warning %}
     The newest fit answers noticeably fewer events on its own than the previous one did.
     {%- endif %}
+    {#- dev53: the reference set's own state #}
+    {%- if l.benchmark and l.benchmark.pending %}
+    A refreshed reference set is waiting for the next change-over.
+    {%- elif l.benchmark and l.benchmark.decay_warning and not l.repin_suggested %}
+    The reference set is thinning ({{ l.benchmark.matched_n }} of
+    {{ l.benchmark.requested_n }} pinned events still count).
+    {%- endif %}
+    {%- if l.repin_suppressed %}
+    Re-pin suggested — waiting for the open
+    {{ l.repin_suppressed[0].waiting_on | join(', ') }} alert to resolve.
+    {%- endif %}
     {%- if l.serving_hash %}
     <span style="opacity:.65;font-family:monospace;font-size:.85em"> model {{ l.serving_hash }}</span>
     {%- endif %}
   </span>
+  {#- dev53 (D3): never re-pinned silently. Same shape as the health-alert
+      controls above: inline forms, CSRF, admin-only, outcome via ?msg=. #}
+  {% if is_admin and l.repin_suggested %}
+  {% for t in l.repin_suggested %}
+  <span>Worth refreshing the reference set: {{ t.detail }}.
+    {%- if t.deferred %} A {{ t.waiting_on | join(', ') }} alert opened before the
+    pressure change is still open — settle that first.{% endif %}</span>
+  {% if not t.deferred %}
+  <form method="post" action="{{ ingress_path }}/fixtures/repin-benchmark/{{ cid }}"
+        style="display:inline"
+        onsubmit="return confirm('Re-pin the reference set for {{ l.circuit_name }}? Earlier comparisons hand over at the next change-over.');">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <input type="hidden" name="trigger" value="{{ t.reason }}">
+    <input type="hidden" name="key" value="{{ t.key }}">
+    <button type="submit" class="btn btn-ghost btn-sm"
+            title="Draw a fresh reference set from your current labels.">
+      Re-pin benchmark now
+    </button>
+  </form>
+  {% endif %}
+  <form method="post" action="{{ ingress_path }}/fixtures/repin-benchmark/{{ cid }}/dismiss"
+        style="display:inline">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <input type="hidden" name="key" value="{{ t.key }}">
+    <button type="submit" class="btn btn-ghost btn-sm"
+            title="Keep the current reference set. You will be asked again only if something else changes.">
+      Not now
+    </button>
+  </form>
+  {% endfor %}
+  {% endif %}
 </div>
 {% endfor %}
 {% endif %}

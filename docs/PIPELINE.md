@@ -1087,17 +1087,71 @@ that as a nightly instrument.
 | Study export refuses right after a restart | Part 6 | `startup_cluster_work_done` — the background classification is still writing; it clears when the boot log says "background classification complete" |
 | A leak test says "indeterminate" | not this pipeline | `addon_measure_status` — too few samples or the other valve was open; no leak rate is inferred |
 
-## The referee's reference benchmark (dev51)
+## The referee's reference benchmark (dev51, self-pinned since dev53)
 
-The weekly re-fit is judged on two legs: a **pinned reference set** of ~165
-labelled events, and a recent held-out slice. The reference set is *not* in the
-repository (it encodes real water-use timestamps); it is created once with
-`python -m water_monitor.tools.eval_tinymodel --db <export.db> --pin-benchmark <path.json>`
-and loaded into the running add-on through **Settings → developer tools →
-Import referee benchmark** (paste the JSON). Its events are then **reserved** —
-neither the running model nor a challenger trains on them — because a model
-scored on rows it has memorised wins every comparison (the dev51 release gate
-caught exactly that). Until it is imported the benchmark leg abstains and the
-referee keeps the incumbent; the Water Use page says so after four such weeks.
-Re-run the gate before any change to the referee, the card policy or the
-thresholds: `--only cv,holdout,health --benchmark <path.json>` must pass G1/G2.
+The weekly re-fit is judged on two legs: a **pinned reference set** of the
+home's own labelled events, and a recent held-out slice. The reference set is
+*not* in the repository (it encodes real water-use timestamps). Its events are
+**reserved** — neither the running model nor a challenger trains on them —
+because a model scored on rows it has memorised wins every comparison (the
+dev51 release gate caught exactly that).
+
+**How it comes to exist (dev53).** The add-on pins it itself, in
+`learning_scheduler.retrain_circuit` immediately before the weekly re-fit, once
+a circuit has **209** human-source pool-eligible labels
+(`referee_benchmark.PIN_MIN_HUMAN_LABELS` = floor 60 + 134 rows that must survive
+the every-4th-day holdout split with `MIN_USER_LABELS = 100` + 15 of headroom).
+Selection is one pure module, `app/referee_benchmark.py`: whole **UTC** days
+(`start_ts[:10]`, the same basis as `split_holdout` and `train_days`), human
+rows only ('cycle'/'anchor' never pinned), a quarter of the labelled days,
+capped at 150 events and at whatever leaves the training pool eligible after
+the split, hash `sha256("\n".join(sorted ids))[:16]`. Because auto-pin runs
+*before* the first fit, the first champion is trained with the set already
+held out and the benchmark leg scores from the first comparison. The leg
+abstains only while the incumbent provably trained on the set's days (a
+pre-dev51 champion with no `train_days`, or a champion fitted before a
+first-ever pin) — until the first promotion installs a clean one.
+
+**It is never replaced quietly (D3).** Existing sets — decayed or not — are left
+alone by the weekly hook. A re-pin comes from the Water Use prompt
+(**Re-pin benchmark now** / **Not now**) or the Dev Tools buttons
+(**Pin benchmark now** / **Re-pin benchmark**). Prompts fire on: a confirmed or
+detected (never bootstrap) supply regime opened after the pin; decay below 70 %
+of the pinned events still matching the pool (85 % is reported on the page
+without a prompt); the human-label count doubling since the pin; and the
+reservation itself making the pool ineligible ("paused … re-pin smaller").
+Trigger keys embed the value (`growth:800`, `decay:<hash>`, `regime:<id>`,
+`shrink:<hash>`) so "Not now" silences one instance. While a fixture-health
+alert is open, decay/growth/shrink prompts are suppressed (and such pins
+refused); a regime pin is gated only by alerts that *predate* the regime — the
+recalibration job restarts usage baselines, not the per-fixture health
+baselines, so alerts the regime opened are the regime.
+
+**Handover.** A re-pin over an active set is written as **pending**
+(`referee_benchmark.role = 'pending'`, `referee_benchmark_meta.pending_*`).
+Both sets are reserved from training; the referee keeps scoring the **active**
+set, so nothing goes dark. On the next *promotion* — after the `trained` ledger
+row is written under the hash that actually judged it — `activate_pending_benchmark`
+flips the pending set in (ledger `trigger='activate'`). If the pending set
+itself decayed below 70 % while waiting, a fresh selection is drawn around the
+new champion's training days under the same operator-confirmed trigger, and
+both hashes are logged. A **regime** re-pin is the one exception to "the old set
+keeps judging": until activation the active leg is *advisory* — scored and
+recorded (`benchmark_advisory`) but passed as `no_contest`, so post-regime
+recent data decides alone.
+
+**Stall banner (R2-3).** Four kept decisions are a warning only when the
+challenger hash never changed or the benchmark leg was `no_contest`/advisory for
+at least half of them; four fair contests render as a neutral line.
+
+**Developer override.** `--pin-benchmark` in `eval_tinymodel.py` now delegates
+to the same module, so a set pinned on the dev box and one the add-on pins from
+the same rows are byte-identical (verified 2026-09-05 on a live-DB copy: both
+`dd69ebf8826a3634`). Before dev53 the tool tested the cap *before* adding a day,
+so `--pin-target 150` produced ~165 events — a hash mismatch against a pin made
+before dev53 (this home's `6998c34f373fe686`) is expected, not drift. **Settings
+→ developer tools → Load benchmark** still imports a file; over an active set the
+import lands as pending like any other re-pin. Re-run the gate before any change
+to the referee, the card policy or the thresholds:
+`--only cv,holdout,health --benchmark-from-db` (add `--pending` to gate a waiting
+set) must pass G1/G2.
