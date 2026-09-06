@@ -960,6 +960,17 @@ CREATE TABLE IF NOT EXISTS events (
     --   'excluded_from_training' — caller skipped match_and_learn entirely
     -- NULL when the event matched cleanly.
     match_rejection_reason      TEXT,
+    -- dev56 — PINNED VERDICT (migration 20260818). A verdict reached from
+    -- CROSS-event evidence that single-event re-derives cannot reproduce and
+    -- therefore must not overturn. verdict_pin names the family ('overlap_duplicate'
+    -- today; dev57 may add a user family), verdict_pin_veff is the effective
+    -- volume the pin prescribes (0 for a full duplicate, the uncovered remainder
+    -- for a partial one), verdict_pin_set_at when it was (re)derived. Preserved
+    -- across re-imports like the bookkeeping columns; released by the overlap
+    -- guard when the covering events disappear, or by deleting the row.
+    verdict_pin                 TEXT,
+    verdict_pin_veff            REAL,
+    verdict_pin_set_at          TEXT,
     -- Cluster match quality (written by _cluster_event after insert)
     match_confidence            REAL,    -- 0.0–1.0; NULL = unmatched
     match_level                 TEXT,    -- 'preliminary'|'confirmed'|NULL
@@ -1247,6 +1258,8 @@ CREATE INDEX IF NOT EXISTS idx_events_start_ts
 -- here — it indexes waveform_boot_id, a column older DBs only gain during
 -- migration 20260573, and this script also runs against those. Migration
 -- 20260573 creates it; the fresh-DB path runs the whole chain too.
+-- NOTE: idx_events_verdict_pin (dev56) is deliberately NOT here for the same
+-- reason — verdict_pin arrives with migration 20260818, which creates it.
 
 -- ==========================================================================
 -- HOURLY VOLUME (pre-aggregated for fast chart queries)
@@ -2857,6 +2870,12 @@ _EVENT_APPLIED_BOOKKEEPING_COLUMNS: frozenset[str] = frozenset({
     "hourly_volume_applied_litres",
     "hourly_volume_applied_bucket",
 })
+# dev56 — the pinned verdict survives every re-import / re-store the same way
+# the bookkeeping does: no writer that goes through the upsert can clear it by
+# omission. Only overlap_guard (release / re-derive) and a row delete change it.
+_EVENT_PINNED_VERDICT_COLUMNS: frozenset[str] = frozenset({
+    "verdict_pin", "verdict_pin_veff", "verdict_pin_set_at",
+})
 
 
 def _hour_bucket_for(start_ts) -> str:
@@ -2940,6 +2959,7 @@ def _do_event_upsert(conn: sqlite3.Connection, event: dict) -> None:
         if c != "id"
         and c not in _EVENT_USER_COLUMNS
         and c not in _EVENT_APPLIED_BOOKKEEPING_COLUMNS
+        and c not in _EVENT_PINNED_VERDICT_COLUMNS          # dev56
     ]
     if set_cols:
         set_clause = ", ".join(f"{c}=excluded.{c}" for c in set_cols)
@@ -3312,6 +3332,7 @@ def coalesce_low_flow_events(
                     "DELETE FROM training_capture_candidates WHERE event_id = ?",
                     (m["id"],))
                 conn.execute("DELETE FROM events WHERE id = ?", (m["id"],))
+                _reevaluate_wrappers_after_delete(conn, circuit, m["start_ts"], m["end_ts"])
             for m in g:
                 d = local_day_of(m["start_ts"])
                 if d:
@@ -3562,6 +3583,7 @@ def delete_events_in_range(
             except sqlite3.Error:
                 pass       # pre-20260814 schema
             conn.execute("DELETE FROM events WHERE id = ?", (r["id"],))
+            _reevaluate_wrappers_after_delete(conn, circuit, r["start_ts"], r["end_ts"])
             d = local_day_of(r["start_ts"])
             if d:
                 affected_days.add(d)
@@ -3899,7 +3921,11 @@ _NOTE_KIND_SQL: Dict[str, str] = {
                   "OR e.volume_estimation_method = 'pulsing_supply_envelope')"),
     "not_real":  ("(COALESCE(e.is_pressure_restoration_phantom, 0) = 1 "
                   "OR COALESCE(e.is_cross_talk, 0) = 1 "
-                  "OR COALESCE(e.is_low_flow_dribble, 0) = 1)"),
+                  "OR COALESCE(e.is_low_flow_dribble, 0) = 1 "
+                  # dev56 — a fully de-duplicated wrapper (no phantom bit any
+                  # more); a partial wrapper keeps real water and stays out.
+                  "OR (e.match_rejection_reason = 'overlap_duplicate' "
+                  "    AND COALESCE(e.volume_litres_effective, 0) < 0.1))"),
     "sparse":    "e.match_rejection_reason = 'sparse_envelope'",
     # Leak-test refill is its OWN filter rather than part of 'not_real': it is
     # never hidden by the not-real-use toggle (see leak_test_refill), so folding
@@ -4073,7 +4099,11 @@ def get_recent_events(
 _NOT_REAL_SQL = (
     "(COALESCE(e.is_pressure_restoration_phantom, 0) = 1 "
     " OR COALESCE(e.is_cross_talk, 0) = 1 "
-    " OR COALESCE(e.is_low_flow_dribble, 0) = 1)"
+    " OR COALESCE(e.is_low_flow_dribble, 0) = 1 "
+    # dev56 — a fully de-duplicated overlap wrapper hides with the rest;
+    # a partial wrapper (real remainder) does not.
+    " OR (e.match_rejection_reason = 'overlap_duplicate' "
+    "     AND COALESCE(e.volume_litres_effective, 0) < 0.1))"
 )
 
 
@@ -4345,7 +4375,7 @@ def _apply_event_verdicts(
     """
     row = conn.execute(
         "SELECT volume_litres, volume_litres_estimated, flow_integral_litres, "
-        "       user_ignored, "
+        "       user_ignored, verdict_pin, verdict_pin_veff, "
         "       hourly_volume_applied_litres, hourly_volume_applied_bucket, start_ts "
         "FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit),
@@ -4389,6 +4419,17 @@ def _apply_event_verdicts(
         else "low_flow_dribble" if new_dribble
         else None
     )
+    # dev56 — a pinned overlap verdict outranks the boxes' "count it in full"
+    # outcome: un-ticking "Not real water use" says "this is not a phantom",
+    # not "count this water twice". An artifact box the user DID tick still
+    # wins (it zeroes anyway) and its reason is recorded; the pin columns are
+    # untouched either way, so un-ticking later falls back to the pin, not raw.
+    if (row["verdict_pin"] == "overlap_duplicate"
+            and not (new_phantom or new_cross_talk or new_dribble)):
+        pin_veff = float(row["verdict_pin_veff"] or 0.0)
+        if new_effective > pin_veff:
+            new_effective, method, reason = pin_veff, "overlap_duplicate", "overlap_duplicate"
+        excluded = 1
 
     with transaction(conn):
         conn.execute(
@@ -5126,6 +5167,39 @@ def _union_covered_fraction(spans, lo: int, hi: int) -> float:
     if cur_e is not None:
         covered += cur_e - cur_s
     return min(1.0, covered / total)
+
+
+def _reevaluate_wrappers_after_delete(conn: sqlite3.Connection, circuit: str,
+                                      start_ts, end_ts) -> None:
+    """dev56 — a deleted row may have been a covering child of a pinned overlap
+    wrapper; the wrapper's remainder (or its very pin) depends on it. Re-derive
+    inside the caller's transaction. Best-effort: never fails the delete."""
+    try:
+        from .overlap_guard import reevaluate_containing_wrappers
+        reevaluate_containing_wrappers(conn, circuit, start_ts, end_ts,
+                                       source="child_deleted")
+    except Exception as e:                                  # noqa: BLE001
+        log.debug("[%s] wrapper re-evaluation after delete skipped: %s", circuit, e)
+
+
+def contained_stored_rows(
+    conn: sqlite3.Connection, circuit: str, start_ts: str, end_ts: str,
+) -> List[dict]:
+    """dev56 — the stored, closed events on ``circuit`` that intersect
+    ``[start_ts, end_ts]`` (ISO 'T' form, as the importer passes). The importer's
+    containment rule decides from these whether a reconstructed period is already
+    on the record (drop), partly on it (split around them) or new (keep) — BEFORE
+    ``find_overlapping_event`` sees it, so a long pressure-dip bridge over live
+    draws never reaches the gate, and the water inside it that nobody recorded
+    is kept as its own event instead of being refused with the bridge.
+    Raw ``volume_litres`` is returned on purpose: the question is "was this water
+    recorded", not "is it currently counted"."""
+    rows = conn.execute(
+        "SELECT id, start_ts, end_ts, volume_litres, user_fixture_type "
+        "FROM events WHERE circuit = ? AND end_ts IS NOT NULL "
+        "  AND start_ts < ? AND end_ts > ? ORDER BY start_ts",
+        (circuit, end_ts, start_ts)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def find_overlapping_event(
@@ -6906,7 +6980,10 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
         "FROM events "
         "WHERE is_pressure_restoration_phantom = 1 "
         "  AND pressure_delta_psi >= ? "
-        "  AND COALESCE(user_classified, 0) = 0",
+        "  AND COALESCE(user_classified, 0) = 0 "
+        # dev56 — an overlap wrapper of a REAL draw has a real pressure drop;
+        # that is not a misflag, it is water counted by another row.
+        "  AND COALESCE(match_rejection_reason, '') <> 'overlap_duplicate'",
         (_PHANTOM_MAX_DELTA_PSI,),
     ).fetchall()
 
@@ -8499,6 +8576,10 @@ def promote_embedded_composites(
     to the exact serialization. Returns the promoted count."""
     where = ("WHERE circuit = ? AND user_fixture_type IS NULL "
              "AND matched_fixture_type IS NULL "
+             # dev56 — an excluded row (overlap wrapper, artifact) carries no
+             # fixture identity; the reclassify already honours that, this
+             # promotion path did not and stamped matched_via='composite'.
+             "AND COALESCE(excluded_from_training, 0) = 0 "
              "AND embedded_fixtures_json IS NOT NULL "
              "AND embedded_fixtures_json <> '[]'")
     params: list = [circuit]

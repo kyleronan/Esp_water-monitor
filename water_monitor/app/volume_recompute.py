@@ -130,6 +130,7 @@ def recompute_volume_and_active_flow(
         "       degraded_supply, is_composite, user_classified, user_ignored, "
         "       is_pressure_restoration_phantom, is_cross_talk, is_low_flow_dribble, "
         "       excluded_from_training, match_rejection_reason, user_fixture_type, "
+        "       verdict_pin, verdict_pin_veff, "
         "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
         "FROM events WHERE circuit = ? ORDER BY start_ts",
         (circuit,),
@@ -213,6 +214,10 @@ def recompute_volume_and_active_flow(
                 # over the cross-talk zeroing" escape hatch can actually fire here
                 # (without it a recompute re-zeroed a user-corrected event).
                 "user_fixture_type": r["user_fixture_type"],
+                # dev56 — the pinned overlap verdict (a full recompute re-derives
+                # single-event verdicts; it cannot re-derive a cross-event one).
+                "verdict_pin": r["verdict_pin"],
+                "verdict_pin_veff": r["verdict_pin_veff"],
             }
             from .config import pump_gates_active as _pga
             try:

@@ -554,6 +554,14 @@ def _collect_circuit_history_sync(
         # reading like a loss. Display-only.
         _dup_ids = [e["id"] for e in events
                     if e.get("match_rejection_reason") == "overlap_duplicate"]
+        # dev56 — the UI keys the duplicate surfaces on the REASON, not the
+        # phantom bit (wrappers no longer carry it). Full vs partial matters:
+        # a partial wrapper still holds real water and must not read as zeroed.
+        for e in events:
+            _mrr_dup = e.get("match_rejection_reason") == "overlap_duplicate"
+            _veff = float(e.get("volume_litres_effective") or 0.0)
+            e["is_zeroed_duplicate"] = _mrr_dup and _veff < 0.1
+            e["is_partial_duplicate"] = _mrr_dup and _veff >= 0.1
         _covering: dict = {}
         if _dup_ids:
             _ph = ",".join("?" * len(_dup_ids))
@@ -655,7 +663,8 @@ def _collect_circuit_history_sync(
                     and float(e.get("volume_litres_effective") or 0.0) < 0.1
                     and (e.get("is_pressure_restoration_phantom")
                          or e.get("is_cross_talk")
-                         or e.get("is_low_flow_dribble"))):
+                         or e.get("is_low_flow_dribble")
+                         or e.get("match_rejection_reason") == "overlap_duplicate")):
                 _tier_peak = None
             e["magnitude_tier"] = classify_magnitude_tier(
                 peak_flow_lpm=_tier_peak,

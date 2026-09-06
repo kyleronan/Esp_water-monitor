@@ -88,6 +88,23 @@ _EPS = 1e-6
 _EVENT_COLS = ("id, circuit, start_ts, end_ts, volume_litres, "
                "volume_litres_effective, user_fixture_type, user_reviewed, "
                "match_rejection_reason")
+# dev56 — the pin columns exist from migration 20260818 on. The 20260817 re-sweep
+# runs cleanup_all_overlaps BEFORE that migration, so every read and write here
+# must work on both shapes: select the pin columns when present, write them when
+# present, and otherwise behave exactly as dev55 did.
+_PIN_COLS = "verdict_pin, verdict_pin_veff"
+
+
+def _has_pin_columns(conn: sqlite3.Connection) -> bool:
+    try:
+        return any(r[1] == "verdict_pin" for r in
+                   conn.execute("PRAGMA table_info(events)").fetchall())
+    except sqlite3.Error:
+        return False
+
+
+def _event_cols(conn: sqlite3.Connection) -> str:
+    return _EVENT_COLS + (", " + _PIN_COLS if _has_pin_columns(conn) else "")
 
 
 def _ts(value) -> Optional[datetime]:
@@ -181,7 +198,7 @@ def find_overlap_groups(conn: sqlite3.Connection,
         where += " AND circuit = ?"
         params.append(circuit)
     rows = [dict(r) for r in conn.execute(
-        f"SELECT {_EVENT_COLS} FROM events {where} "
+        f"SELECT {_event_cols(conn)} FROM events {where} "
         "ORDER BY circuit, start_ts", params)]
     groups: List[List[dict]] = []
     cur: List[dict] = []
@@ -208,10 +225,17 @@ def find_overlap_groups(conn: sqlite3.Connection,
 
 def _audit(conn, circuit: str, wrapper_id: str, kept_ids: List[str],
            vol_zeroed: float, resolution: str, source: str) -> None:
+    # dev56 — a re-application refreshes the row (kept ids, litres, timestamp)
+    # and revives a stale one, so the History "counted by" chips point at the
+    # children as they stand now. The UNIQUE key stays (wrapper, resolution).
     conn.execute(
-        "INSERT OR IGNORE INTO overlap_audit "
+        "INSERT INTO overlap_audit "
         "(circuit, wrapper_event_id, kept_event_ids, vol_zeroed, "
-        " resolution, source, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        " resolution, source, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(wrapper_event_id, resolution) DO UPDATE SET "
+        "  kept_event_ids = excluded.kept_event_ids, vol_zeroed = excluded.vol_zeroed, "
+        "  source = excluded.source, created_ts = excluded.created_ts, "
+        "  stale_reason = NULL, stale_at = NULL",
         (circuit, wrapper_id, json.dumps(kept_ids), round(vol_zeroed, 3),
          resolution, source, datetime.now(timezone.utc).isoformat()))
 
@@ -301,7 +325,8 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
         #     raw volume unreal — and the UPDATE below would clear that detector's
         #     flag while doing it. Measured on 2026-09-06: the re-sweep put ~10.9 L
         #     back onto 10 phantom-zeroed wrappers exactly this way.
-        ours = w["match_rejection_reason"] == OVERLAP_DUPLICATE_REASON
+        ours = (w["match_rejection_reason"] == OVERLAP_DUPLICATE_REASON
+                or w.get("verdict_pin") == OVERLAP_DUPLICATE_REASON)
         foreign_reduction = not ours and prior_eff < vol_w - _EPS
         if ours and abs(new_eff - prior_eff) <= _EPS:
             resolved = True                       # already correct
@@ -313,17 +338,31 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
                       w["match_rejection_reason"] or "another verdict", prior_eff)
             resolved = True
             break
-        # The phantom flag marks the ZEROED family (hide/zero UI plumbing); a
-        # wrapper that keeps an uncovered remainder still carries real water,
-        # so it is excluded from training but NOT flagged as zeroed.
-        conn.execute(
-            "UPDATE events SET is_pressure_restoration_phantom = ?, "
-            "  volume_litres_effective = ?, "
-            "  volume_estimation_method = ?, excluded_from_training = 1, "
-            "  match_rejection_reason = ?, matched_fixture_type = NULL, "
-            "  matched_via = NULL WHERE id = ?",
-            (1 if full_duplicate else 0, new_eff, OVERLAP_DUPLICATE_REASON,
-             OVERLAP_DUPLICATE_REASON, w["id"]))
+        # dev56 — wrappers are NOT phantoms: their water is real, merely counted
+        # by another row. The phantom bit used to mark the zeroed family and it
+        # dragged wrappers into the phantom repair (restores on a real ΔP —
+        # exactly what a wrapper of a real draw has) and the phantom pill. The
+        # verdict now lives in the PIN (preserved across re-stores) and the UI
+        # keys on match_rejection_reason.
+        if _has_pin_columns(conn):
+            conn.execute(
+                "UPDATE events SET is_pressure_restoration_phantom = 0, "
+                "  volume_litres_effective = ?, "
+                "  volume_estimation_method = ?, excluded_from_training = 1, "
+                "  match_rejection_reason = ?, matched_fixture_type = NULL, "
+                "  matched_via = NULL, verdict_pin = ?, verdict_pin_veff = ?, "
+                "  verdict_pin_set_at = ? WHERE id = ?",
+                (new_eff, OVERLAP_DUPLICATE_REASON, OVERLAP_DUPLICATE_REASON,
+                 OVERLAP_DUPLICATE_REASON, new_eff,
+                 datetime.now(timezone.utc).isoformat(), w["id"]))
+        else:                                   # pre-20260818 shape (re-sweep)
+            conn.execute(
+                "UPDATE events SET is_pressure_restoration_phantom = 0, "
+                "  volume_litres_effective = ?, "
+                "  volume_estimation_method = ?, excluded_from_training = 1, "
+                "  match_rejection_reason = ?, matched_fixture_type = NULL, "
+                "  matched_via = NULL WHERE id = ?",
+                (new_eff, OVERLAP_DUPLICATE_REASON, OVERLAP_DUPLICATE_REASON, w["id"]))
         apply_effective_volume(conn, w["id"], w["circuit"], w["start_ts"],
                                new_eff)
         _audit(conn, w["circuit"], w["id"], kept, prior_eff - new_eff,
@@ -378,7 +417,7 @@ def guard_new_event(conn: sqlite3.Connection, event_id: str, circuit: str,
     if not end_ts:
         return
     rows = [dict(r) for r in conn.execute(
-        f"SELECT {_EVENT_COLS} FROM events "
+        f"SELECT {_event_cols(conn)} FROM events "
         "WHERE circuit = ? AND end_ts IS NOT NULL "
         "  AND start_ts < ? AND end_ts > ?",
         (circuit, end_ts, start_ts))]
@@ -386,6 +425,200 @@ def guard_new_event(conn: sqlite3.Connection, event_id: str, circuit: str,
         return
     resolve_group(conn, rows, source="live_guard")
     conn.commit()
+
+
+def reevaluate_event(conn: sqlite3.Connection, event_id: str,
+                     source: str = "reevaluate") -> Optional[dict]:
+    """dev56 — re-derive one row's overlap standing against the rows that
+    overlap it NOW. A pinned wrapper that no longer contains any other row has
+    lost its covering children: the pin is RELEASED and the water comes back to
+    this row (it is the only record of that draw again). Otherwise the group is
+    resolved with the normal policy (the guard's own reduction may move up or
+    down; a foreign reduction only down)."""
+    if not _has_pin_columns(conn):
+        return None
+    row = conn.execute(f"SELECT {_event_cols(conn)} FROM events WHERE id = ?",
+                       (event_id,)).fetchone()
+    if row is None or not row["end_ts"]:
+        return None
+    row = dict(row)
+    group = [dict(r) for r in conn.execute(
+        f"SELECT {_event_cols(conn)} FROM events "
+        "WHERE circuit = ? AND end_ts IS NOT NULL AND start_ts < ? AND end_ts > ?",
+        (row["circuit"], row["end_ts"], row["start_ts"]))]
+    pinned = row.get("verdict_pin") == OVERLAP_DUPLICATE_REASON
+    if pinned:
+        w_span = _span(row)
+        still_covering = [r for r in group if r["id"] != row["id"]
+                          and _span(r) is not None and w_span is not None
+                          and _contained_fraction(_span(r), w_span) >= _CONTAINMENT_FRACTION]
+        if not still_covering:
+            return release_verdict_pin(conn, row, reason="wrapper_released")
+    if len(group) < 2:
+        return None
+    return resolve_group(conn, group, source=source)
+
+
+def reevaluate_containing_wrappers(conn: sqlite3.Connection, circuit: str,
+                                   start_ts, end_ts, source: str) -> int:
+    """dev56 — after a row over ``[start_ts, end_ts]`` changed or vanished,
+    re-derive every PINNED wrapper on the circuit whose span intersects it. One
+    indexed read (circuit, verdict_pin); returns how many were re-examined."""
+    if not _has_pin_columns(conn) or not start_ts:
+        return 0
+    end_ts = end_ts or start_ts
+    ids = [r[0] for r in conn.execute(
+        "SELECT id FROM events WHERE circuit = ? AND verdict_pin IS NOT NULL "
+        "  AND end_ts IS NOT NULL AND start_ts < ? AND end_ts > ?",
+        (circuit, end_ts, start_ts)).fetchall()]
+    for wid in ids:
+        reevaluate_event(conn, wid, source=source)
+    return len(ids)
+
+
+def release_verdict_pin(conn: sqlite3.Connection, row: dict, *,
+                        reason: str) -> dict:
+    """dev56 — the covering children are gone: this row is the only record of
+    its draw again. Clear the pin; if the reduction was the guard's own, restore
+    the raw volume through the ledger chokepoint and clear the reason /
+    exclusion (a user Ignore still excludes). A FOREIGN reduction (phantom,
+    cross-talk, dribble …) is left exactly as that detector decided — only the
+    pin columns are cleared. The wrapper's live audit rows are marked stale with
+    ``reason`` (MARK, never delete — provenance)."""
+    from .database import apply_effective_volume, compute_daily_summary, local_day_of
+    ours = row.get("match_rejection_reason") == OVERLAP_DUPLICATE_REASON
+    raw = float(row.get("volume_litres") or 0.0)
+    if ours:
+        conn.execute(
+            "UPDATE events SET verdict_pin = NULL, verdict_pin_veff = NULL, "
+            "  verdict_pin_set_at = NULL, volume_litres_effective = ?, "
+            "  volume_estimation_method = 'raw', match_rejection_reason = NULL, "
+            "  excluded_from_training = CASE WHEN COALESCE(user_ignored, 0) = 1 "
+            "                              THEN 1 ELSE 0 END "
+            "WHERE id = ?", (raw, row["id"]))
+        apply_effective_volume(conn, row["id"], row["circuit"], row["start_ts"], raw)
+    else:
+        conn.execute(
+            "UPDATE events SET verdict_pin = NULL, verdict_pin_veff = NULL, "
+            "  verdict_pin_set_at = NULL WHERE id = ?", (row["id"],))
+    conn.execute(
+        "UPDATE overlap_audit SET stale_reason = COALESCE(stale_reason, ?), "
+        "  stale_at = COALESCE(stale_at, ?) WHERE wrapper_event_id = ? "
+        "  AND stale_reason IS NULL",
+        (reason, datetime.now(timezone.utc).isoformat(), row["id"]))
+    day = local_day_of(row["start_ts"])
+    if day:
+        try:
+            compute_daily_summary(conn, row["circuit"], day)
+        except Exception:
+            pass
+    log.info("[%s] overlap pin released on %s (%s): %s", row["circuit"], row["id"],
+             reason, ("%.2f L restored" % raw) if ours else "other verdict kept")
+    return {"released": row["id"], "restored_l": raw if ours else 0.0,
+            "reason": reason}
+
+
+def group_excess_litres(group: List[dict]) -> float:
+    """dev56 — litres this group still counts twice: everything APPLIED to the
+    hourly ledger beyond the largest member (one meter, one draw)."""
+    applied = sorted((float(r.get("hourly_volume_applied_litres") or 0.0) for r in group),
+                     reverse=True)
+    return round(sum(applied[1:]), 2) if len(applied) > 1 else 0.0
+
+
+def classify_group(conn: sqlite3.Connection, group: List[dict]) -> str:
+    """dev56 — one vocabulary for the offline scanner and the in-app surfaces:
+    ``resolved`` (a de-duplication stands AND nothing meaningful is still counted
+    twice), ``double_zeroed`` (two members zeroed — the dev49 C-1 signature),
+    ``user_flagged`` (a user-labelled wrapper keeps its litres by policy),
+    ``ambiguous`` (partial overlap, both kept by dev49 D4), else ``unresolved``.
+    Unlike the pre-dev56 scanner, an audit row alone is NOT proof: the 49
+    restored wrappers all had one."""
+    zeroed = [r for r in group if r.get("match_rejection_reason") == OVERLAP_DUPLICATE_REASON
+              and float(r.get("volume_litres_effective") or 0.0) <= OVERLAP_NEGLIGIBLE_L]
+    pinned = [r for r in group if r.get("verdict_pin") == OVERLAP_DUPLICATE_REASON
+              or r.get("match_rejection_reason") == OVERLAP_DUPLICATE_REASON]
+    excess = group_excess_litres(group)
+    if len(zeroed) > 1:
+        return "double_zeroed"
+    if pinned and excess < OVERLAP_NEGLIGIBLE_L:
+        return "resolved"
+    if excess < OVERLAP_NEGLIGIBLE_L:
+        return "resolved"
+    if any(str(r.get("user_fixture_type") or "").strip() for r in group):
+        return "user_flagged"
+    try:
+        ph = ",".join("?" * len(group))
+        res = {r[0] for r in conn.execute(
+            f"SELECT DISTINCT resolution FROM overlap_audit WHERE wrapper_event_id IN ({ph}) "
+            "AND stale_reason IS NULL", [r["id"] for r in group]).fetchall()}
+    except sqlite3.Error:
+        res = set()
+    if "flagged_ambiguous" in res:
+        return "ambiguous"
+    return "unresolved"
+
+
+def summarize_overlap_groups(conn: sqlite3.Connection, circuit: Optional[str] = None,
+                             retention_hours: Optional[float] = None) -> List[dict]:
+    """dev56 — every same-circuit overlap group with what the operator needs to
+    decide about it: span, members, litres counted twice, state, and whether HA
+    history still reaches it (``retention_hours``, the caller passes
+    reprocess._SPLIT_LOOKBACK_H — this module must not import reprocess)."""
+    where = "WHERE end_ts IS NOT NULL"
+    params: list = []
+    if circuit:
+        where += " AND circuit = ?"
+        params.append(circuit)
+    pin = ", verdict_pin" if _has_pin_columns(conn) else ""
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, circuit, start_ts, end_ts, volume_litres, volume_litres_effective, "
+            "       hourly_volume_applied_litres, user_fixture_type, user_classified, "
+            f"       user_ignored, match_rejection_reason{pin} "
+            f"FROM events {where} ORDER BY circuit, start_ts", params)]
+    except sqlite3.Error:
+        return []
+    cutoff = None
+    if retention_hours:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=retention_hours)).isoformat()
+    out: List[dict] = []
+    cur: List[dict] = []
+    cur_end: Optional[datetime] = None
+    cur_circuit: Optional[str] = None
+
+    def _flush(g):
+        if len(g) < 2:
+            return
+        applied = [float(r.get("hourly_volume_applied_litres") or 0.0) for r in g]
+        out.append({
+            "circuit": g[0]["circuit"],
+            "span_start": min(r["start_ts"] for r in g),
+            "span_end": max(r["end_ts"] for r in g),
+            "member_ids": [r["id"] for r in g], "n": len(g),
+            "applied_l": round(sum(applied), 2), "max_l": round(max(applied), 2),
+            "excess_l": group_excess_litres(g),
+            "state": classify_group(conn, g),
+            "within_retention": bool(cutoff and min(r["start_ts"] for r in g) >= cutoff),
+            "has_user_rows": any(str(r.get("user_fixture_type") or "").strip()
+                                 or r.get("user_classified") or r.get("user_ignored")
+                                 for r in g),
+        })
+
+    for r in rows:
+        span = _span(r)
+        if span is None:
+            continue
+        s0, e0 = span
+        if cur and r["circuit"] == cur_circuit and cur_end and s0 < cur_end:
+            cur.append(r)
+            cur_end = max(cur_end, e0)
+        else:
+            _flush(cur)
+            cur, cur_end, cur_circuit = [r], e0, r["circuit"]
+    _flush(cur)
+    return out
 
 
 def cleanup_all_overlaps(conn: sqlite3.Connection,

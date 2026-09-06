@@ -297,6 +297,23 @@
 {% endfor %}
 {% endif %}
 
+{# ── dev56: overlapping events that both still count their water. dev49 D4:
+     visibility only — no volume policy is changed from here. ─────────── #}
+{% if health and health.overlaps %}
+{% for cid, o in health.overlaps.items() %}
+<div class="fx-msg fx-msg-warn" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <span><strong>Some water on {{ o.circuit_name }} is counted twice</strong> —
+    {{ o.groups }} span{{ '' if o.groups == 1 else 's' }} hold overlapping events that
+    both still count their water, about {{ o.litres }} L in your totals.
+    {%- if o.within_retention %} {{ o.within_retention }} of them can still be rebuilt
+    from Home Assistant's history.{% endif %}</span>
+  {% if dev_tools and is_admin and o.within_retention %}
+  <a class="btn btn-ghost btn-sm" href="{{ ingress_path }}/settings#sett-dev">Rebuild duplicated spans in Dev Tools</a>
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+
 {# ── Time-range selector — rescopes every card's windowed total. Reuses the #}
 {# History page's hist-range-btn styling; server-side nav via ?range=. ──── #}
 <div class="fx-range-btns hist-range-btns" role="group" aria-label="Time range"

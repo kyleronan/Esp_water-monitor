@@ -109,7 +109,13 @@ async def fixtures_page(request: Request, preview: bool = False):
         "range_label":         range_label,
         "stale_link_count":    stale_link_count,
         "health":              health_ctx,
+        "dev_tools":           _dev_tools_enabled(),
     })
+
+
+def _dev_tools_enabled() -> bool:
+    from ..config import DEV_TOOLS
+    return bool(DEV_TOOLS)
 
 
 def _fixtures_page_payload(orch, range_start_utc):
@@ -228,7 +234,7 @@ def _fixtures_page_payload(orch, range_start_utc):
     # hop as everything else this page reads. Both are strictly best-effort:
     # a home that has not pinned a baseline, or an install predating the
     # migration, must render the page exactly as before rather than 500.
-    health_ctx = {"alerts": [], "queue": {}, "learning": {}}
+    health_ctx = {"alerts": [], "queue": {}, "learning": {}, "overlaps": {}}
     try:
         from ..fixture_health import load_baseline, open_alerts
         from ..review_queue import build_card
@@ -244,6 +250,24 @@ def _fixtures_page_payload(orch, range_start_utc):
                 if st.get("available"):
                     st["circuit_name"] = circ.get("display_name") or cid
                     health_ctx["learning"][cid] = st
+            except Exception:                       # noqa: BLE001
+                pass
+            # dev56 — water still counted twice (dev49 D4: visibility only). The
+            # re-open condition for a volume policy was "this surface has reported
+            # counts for a few weeks"; it was never built, so it never could.
+            try:
+                from ..overlap_guard import summarize_overlap_groups
+                from ..reprocess import _SPLIT_LOOKBACK_H
+                _og = [g for g in summarize_overlap_groups(
+                            orch.db, cid, retention_hours=_SPLIT_LOOKBACK_H)
+                       if g["state"] != "resolved"]
+                if _og:
+                    health_ctx["overlaps"][cid] = {
+                        "circuit_name": circ.get("display_name") or cid,
+                        "groups": len(_og),
+                        "litres": round(sum(g["excess_l"] for g in _og), 1),
+                        "within_retention": sum(1 for g in _og if g["within_retention"]),
+                    }
             except Exception:                       # noqa: BLE001
                 pass
             for alert in open_alerts(orch.db, cid):

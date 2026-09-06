@@ -1465,6 +1465,31 @@ def _merge_degraded_diag(features: dict, extra: dict) -> None:
     features["degraded_diagnostic_json"] = json.dumps(diag, allow_nan=False)
 
 
+def apply_pinned_verdict(features: dict) -> bool:
+    """dev56 — enforce ``verdict_pin`` on a features dict. Returns True when a
+    pin decided the volume (callers return early). The overlap family: the
+    effective volume is whatever the pin prescribes (0 for a full duplicate,
+    the uncovered remainder for a partial one), the row stays out of training
+    and carries no phantom bit. A user fixture label does NOT lift it —
+    labelling a wrapper says what it was, not that its water should count twice
+    (the children still exist); release comes from the overlap guard when the
+    children disappear, or from deleting the row. Identity fields are left
+    alone. Unknown pin values are ignored (a later family may claim them)."""
+    if features.get("verdict_pin") != "overlap_duplicate":
+        return False
+    veff = float(features.get("verdict_pin_veff") or 0.0)
+    raw = float(features.get("volume_litres") or 0.0)
+    features["volume_litres_effective"] = round(min(veff, raw) if raw else veff, 3)
+    features["volume_estimation_method"] = "overlap_duplicate"
+    features["match_rejection_reason"] = "overlap_duplicate"
+    features["excluded_from_training"] = 1
+    features["is_pressure_restoration_phantom"] = 0
+    features["is_cross_talk"] = 0
+    features["is_low_flow_dribble"] = 0
+    features["phantom_suppression_averted"] = 0
+    return True
+
+
 def _finalize_derived_verdicts(features: dict, calib=None,
                                min_flow_lpm: float = 0.15,
                                pump_gates: bool = False) -> None:
@@ -1548,22 +1573,11 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         features["phantom_suppression_averted"] = 0
         return
 
-    # Durable overlap-duplicate verdict (dev28, overlap_guard) — set
-    # out-of-band by the overlap guard from CROSS-EVENT evidence (another
-    # event on the same circuit already counts this water). The single-event
-    # detectors below cannot reproduce it, so a recompute would wrongly
-    # restore the double-counted volume. Preserve — unless the user has
-    # since applied a real fixture label (real water wins).
-    if (features.get("match_rejection_reason") == "overlap_duplicate"
-            and not str(features.get("user_fixture_type") or "").strip()):
-        features["is_pressure_restoration_phantom"] = 1
-        features["volume_litres_effective"] = 0.0
-        features["volume_estimation_method"] = "overlap_duplicate"
-        features["excluded_from_training"] = 1
-        features["match_rejection_reason"] = "overlap_duplicate"
-        features["is_cross_talk"] = 0
-        features["is_low_flow_dribble"] = 0
-        features["phantom_suppression_averted"] = 0
+    # dev56 — a PINNED verdict (cross-event evidence the single-event detectors
+    # below cannot reproduce) outranks everything from here on. It used to be
+    # keyed on match_rejection_reason, which a re-store never loaded, and it
+    # forced veff to 0 even for a partial-remainder wrapper (PIPELINE 7d hazard).
+    if apply_pinned_verdict(features):
         return
 
     is_degraded  = bool(features.get("degraded_supply"))
@@ -4644,6 +4658,7 @@ class FeatureExtractor:
                 event: RawEvent = await asyncio.wait_for(
                     self._queue.get(), timeout=5.0)
                 await self._process(event)
+                await self._maybe_drain_closed_days()
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -4653,6 +4668,30 @@ class FeatureExtractor:
 
     def stop(self) -> None:
         self._running = False
+
+    _CLOSED_DAY_DRAIN_EVERY_S = 60.0
+
+    async def _maybe_drain_closed_days(self) -> None:
+        """dev56 (audit item 8) — a reprocessed or backfilled event lands on a
+        CLOSED day, whose cached summary then reads low until the 03:00 pruner
+        pass. Recompute the dirty closed days as soon as the queue drains, and
+        at most once a minute during a long backfill (once per distinct day, not
+        per event). Today's open day keeps the nightly path
+        (drain_daily_summary_dirty skips it). Best-effort."""
+        import time as _time
+        now = _time.monotonic()
+        last = getattr(self, "_closed_day_drain_at", 0.0)
+        if not self._queue.empty() and now - last < self._CLOSED_DAY_DRAIN_EVERY_S:
+            return
+        self._closed_day_drain_at = now
+        try:
+            from .database import drain_daily_summary_dirty, run_db
+            res = await run_db(drain_daily_summary_dirty, self._db)
+            if res.get("recomputed"):
+                log.info("daily summary refreshed for %d closed day(s) after a store",
+                         res["recomputed"])
+        except Exception as e:                              # noqa: BLE001
+            log.debug("closed-day summary drain skipped: %s", e)
 
     async def _enrich_propagation_delay(self, event: RawEvent) -> None:
         """Refine propagation_delay_ms with the precise server-side last_changed
@@ -4838,11 +4877,15 @@ class FeatureExtractor:
                 event.end_ts.isoformat(),
                 exclude_event_id=event_id,
             )
+        # dev56 — the pin columns ride along so the finalizer can honour them
+        # on a re-store; guarded for hand-rolled test schemas that predate them.
+        _pin_cols = (", verdict_pin, verdict_pin_veff"
+                     if _events_has_column(self._db, "verdict_pin") else "")
         existing = self._db.execute(
             "SELECT user_ignored, user_classified, "
             "       is_pressure_restoration_phantom, degraded_supply, "
             "       is_cross_talk, is_low_flow_dribble, "
-            "       is_composite, volume_litres_effective "
+            "       is_composite, volume_litres_effective" + _pin_cols + " "
             "FROM events WHERE id = ?",
             (event_id,),
         ).fetchone()
@@ -5100,6 +5143,11 @@ class FeatureExtractor:
                 features["user_ignored"] = (
                     int(existing["user_ignored"] or 0) if existing is not None else 0
                 )
+                # dev56 — carry the pinned verdict into the re-derive (the
+                # upsert preserves the columns; the finalizer must SEE them).
+                if existing is not None and "verdict_pin" in existing.keys():
+                    features["verdict_pin"] = existing["verdict_pin"]
+                    features["verdict_pin_veff"] = existing["verdict_pin_veff"]
                 _vi = await run_db(self._verdict_inputs_sync,
                                    features.get("circuit"))
                 _acal, _pump = _vi["acal"], _vi["pump"]

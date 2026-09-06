@@ -336,7 +336,7 @@
   {% endfor %}
   {% set ns.total_events = ns.total_events + (ch.event_count or 0) %}
   {% if ch.events %}{% set ns.has_events = true %}{% endif %}
-  {% if ch.events | selectattr('is_pressure_restoration_phantom') | list %}{% set ns.has_phantom = true %}{% endif %}
+  {% if (ch.events | selectattr('is_pressure_restoration_phantom') | list) or (ch.events | selectattr('is_zeroed_duplicate') | list) %}{% set ns.has_phantom = true %}{% endif %}
   {% if ch.events | selectattr('is_cross_talk') | list %}{% set ns.has_crosstalk = true %}{% endif %}
   {% if ch.events | selectattr('degraded_supply') | list %}{% set ns.has_degraded = true %}{% endif %}
   {% if ch.events | selectattr('is_low_flow_dribble') | list %}{% set ns.has_dribble = true %}{% endif %}
@@ -625,7 +625,7 @@
         {% for e in ch.events %}
         {% set _fix_label = fixture_type_labels.get(e.user_fixture_type, '') if e.user_fixture_type else '' %}
         {% set _disp_flow = e.true_avg_flow_lpm if e.true_avg_flow_lpm is not none else e.avg_flow_lpm %}
-        <tr class="hist-event-row{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.is_pressure_restoration_phantom %} hist-row-phantom{% endif %}{% if e.excluded_from_training and e.match_rejection_reason != 'sparse_envelope' %} hist-row-ignored{% endif %}{% if loop.index > 25 %} hist-extra-row{% endif %}"{% if loop.index > 25 %} style="display:none"{% endif %}
+        <tr class="hist-event-row{% if e.degraded_supply %} hist-row-degraded{% endif %}{% if e.is_pressure_restoration_phantom or e.is_zeroed_duplicate %} hist-row-phantom{% endif %}{% if e.excluded_from_training and e.match_rejection_reason != 'sparse_envelope' %} hist-row-ignored{% endif %}{% if loop.index > 25 %} hist-extra-row{% endif %}"{% if loop.index > 25 %} style="display:none"{% endif %}
             tabindex="0" role="button" aria-label="Event detail"
             data-event-id="{{ e.id }}"
             data-circuit="{{ ch.circuit }}"
@@ -738,7 +738,8 @@
           {% if _has_flags %}
           <td class="hist-td">
             <div class="hist-note-cell">
-              {% if e.is_pressure_restoration_phantom %}<span class="pill pill-neutral" title="{% if e.match_rejection_reason == 'overlap_duplicate' %}Duplicate reading — this event overlaps another event on the same line that already counts this water (the same draw was recorded twice). Volume removed here so nothing is double-counted. If this really was a separate use, open it and relabel.{% elif e.match_rejection_reason == 'pump_recharge' %}Booster pump top-up — your pump briefly pushed water to re-pressurize the pipes; this isn't a tap or appliance being used. Volume removed from your usage totals (any leak it feeds is tracked separately). If water was actually running, open it and relabel.{% elif e.match_rejection_reason == 'pressure_silent_flow' %}Not real water use — the meter registered flow but the water pressure never responded, which is physically impossible for a real draw (usually air in the line or a valve test spinning the meter). Volume removed from your totals. If water was running, open it and relabel.{% else %}Not real water use — a city water-pressure blip, not a tap or appliance. Volume removed from your totals. If water was running, open it and relabel.{% endif %}">{% if e.match_rejection_reason == 'overlap_duplicate' %}⧉ Duplicate — not extra water{% elif e.match_rejection_reason == 'pump_recharge' %}🔄 Pump top-up — not real use{% else %}👻 Not real use{% endif %}</span>{% endif %}
+              {% if e.is_partial_duplicate %}<span class="pill pill-neutral" title="Part of this span was also recorded as separate event(s); only the part they do not cover is counted here. If this really was one separate use, open it and relabel.">⧉ Partly duplicate — {{ (e.volume_litres_effective * vol_factor)|round(vol_decimals) }} {{ vol_unit }} counted</span>{% endif %}
+              {% if e.is_pressure_restoration_phantom or e.is_zeroed_duplicate %}<span class="pill pill-neutral" title="{% if e.match_rejection_reason == 'overlap_duplicate' %}Duplicate reading — this event overlaps another event on the same line that already counts this water (the same draw was recorded twice). Volume removed here so nothing is double-counted. If this really was a separate use, open it and relabel.{% elif e.match_rejection_reason == 'pump_recharge' %}Booster pump top-up — your pump briefly pushed water to re-pressurize the pipes; this isn't a tap or appliance being used. Volume removed from your usage totals (any leak it feeds is tracked separately). If water was actually running, open it and relabel.{% elif e.match_rejection_reason == 'pressure_silent_flow' %}Not real water use — the meter registered flow but the water pressure never responded, which is physically impossible for a real draw (usually air in the line or a valve test spinning the meter). Volume removed from your totals. If water was running, open it and relabel.{% else %}Not real water use — a city water-pressure blip, not a tap or appliance. Volume removed from your totals. If water was running, open it and relabel.{% endif %}">{% if e.match_rejection_reason == 'overlap_duplicate' %}⧉ Duplicate — not extra water{% elif e.match_rejection_reason == 'pump_recharge' %}🔄 Pump top-up — not real use{% else %}👻 Not real use{% endif %}</span>{% endif %}
               {% if e.is_cross_talk %}<span class="pill pill-neutral" title="Caused by the other water line — its draw briefly dropped this line's pressure; no real flow here, volume removed. If water was running here, open it and relabel.{% if e.other_valve_open %} The other line was drawing.{% endif %}">↔ Not real use</span>{% endif %}
               {% if e.degraded_supply %}<span class="pill pill-amber" title="Unsteady water pressure — pressure was pulsing, so this volume is an estimate, not exact.">〰 Estimated</span>{% endif %}
               {% if e.is_low_flow_dribble %}<span class="pill pill-neutral" title="Not real water use — the flow stayed below what this water meter can reliably measure, so the reading is sensor noise rather than a real tap or appliance. Volume removed from your totals. If water was running here, open it and relabel.">Drip — not real use</span>{% endif %}
@@ -1236,7 +1237,12 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       const first = members[0];                        // latest (start_ts DESC)
       let totVol = 0, unit = '';
       members.forEach(m => {
-        const dv = (m.getAttribute('data-volume') || '').split(' ');
+        // dev56: effective volume when present, so a de-duplicated wrapper
+        // does not inflate the group's total
+        const effStr = m.getAttribute('data-volume-effective');
+        const dv = ((effStr !== null && effStr !== '')
+                    ? (effStr + ' ' + ((m.getAttribute('data-volume') || '').split(' ')[1] || ''))
+                    : (m.getAttribute('data-volume') || '')).split(' ');
         const n = parseFloat(dv[0]); if (!isNaN(n)) totVol += n;
         if (dv[1]) unit = dv[1];
       });
@@ -1507,22 +1513,30 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     // Shown when the phantom guard flagged this event. Surfaces the two
     // discriminating values plus the raw sensor volume that was discarded.
     const phSection = document.getElementById('emd-phantom-section');
-    if (d.phantom === '1') {
+    if (d.phantom === '1' || d.mrr === 'overlap_duplicate') {
       // Verdict-specific copy (mirrors the list pill wording). Reset on every
-      // open — the modal is reused across rows.
+      // open — the modal is reused across rows. dev56: wrappers carry no
+      // phantom bit any more; the duplicate banner opens on the reason.
       const phTitle = document.getElementById('emd-ph-title');
       const phText = document.getElementById('emd-ph-text');
       const phCov = document.getElementById('emd-ph-covering');
       phCov.hidden = true;
       phCov.innerHTML = '';
       if (d.mrr === 'overlap_duplicate') {
-        phTitle.textContent = '⧉ Removed: duplicate reading — not extra water';
-        phText.innerHTML = 'This span overlaps other event(s) that already ' +
-          'count this water — the same draw was recorded twice, so this ' +
-          'copy was zeroed to prevent double-counting. Nothing was lost: ' +
-          'the water is counted by the event(s) below. <strong>If this ' +
-          'really was a separate use, open Classification below and relabel ' +
-          'it</strong> — your label overrides this call.';
+        const partly = parseFloat(d.volumeEffective || '0') >= 0.1;
+        phTitle.textContent = partly
+          ? '⧉ Partly duplicate — only the uncovered part is counted'
+          : '⧉ Removed: duplicate reading — not extra water';
+        phText.innerHTML = (partly
+          ? 'Part of this span was also recorded as the separate event(s) below, ' +
+            'which count that water. Only the part they do not cover is counted here. '
+          : 'This span overlaps other event(s) that already count this water — the ' +
+            'same draw was recorded twice, so this copy was zeroed to prevent ' +
+            'double-counting. Nothing was lost: the water is counted by the ' +
+            'event(s) below. ') +
+          '<strong>A label you set here says what this was; it does not count the ' +
+          'water twice.</strong> If the separate event(s) are the mistake, mark ' +
+          'those as not real water and this one takes the water back.';
         let covering = [];
         try { covering = JSON.parse(d.covering || '[]'); } catch (e) { /* noop */ }
         if (covering.length) {

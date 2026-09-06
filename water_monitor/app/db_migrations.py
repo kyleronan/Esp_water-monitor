@@ -310,7 +310,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260817
+_CURRENT_VERSION: int = 20260818
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -3379,6 +3379,75 @@ def _apply_overlap_resweep(conn: sqlite3.Connection) -> None:
              totals["litres_recovered"], totals["flag_only"])
 
 
+_VERDICT_PIN_COLUMNS: tuple = (
+    ("verdict_pin", "TEXT"),
+    ("verdict_pin_veff", "REAL"),
+    ("verdict_pin_set_at", "TEXT"),
+)
+
+
+def _apply_verdict_pin(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260818 — dev56. The PINNED VERDICT.
+
+    Three columns on ``events`` (``verdict_pin``, ``verdict_pin_veff``,
+    ``verdict_pin_set_at``) plus an index on (circuit, verdict_pin). Backfill is
+    TAG ONLY: every row already carrying ``match_rejection_reason =
+    'overlap_duplicate'`` gets the pin with ``verdict_pin_veff`` = its CURRENT
+    effective volume — no litre is rewritten (a partial-remainder wrapper keeps its
+    remainder). The phantom bit is cleared on those rows: wrappers are not
+    phantoms — their water is real, merely counted by another row — and carrying
+    the bit put them in the phantom repair's path and under the phantom pill. That
+    is a one-time semantic change of the bit; the History surfaces key on the
+    reason from dev56 on. Idempotent: guarded ALTERs, an UPDATE whose WHERE is
+    empty on a second run.
+    """
+    if not _has_table(conn, "events"):
+        conn.commit()
+        return
+    for col, ctype in _VERDICT_PIN_COLUMNS:
+        if not _has_column(conn, "events", col):
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {ctype}")
+    # Stub schemas in older tests lack even `circuit`; guard like 20260802-04 do.
+    if _has_column(conn, "events", "circuit"):
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_verdict_pin "
+                     "ON events (circuit, verdict_pin)")
+    if not all(_has_column(conn, "events", c) for c in
+               ("match_rejection_reason", "volume_litres_effective",
+                "is_pressure_restoration_phantom")):
+        conn.commit()
+        log.info("Migration 20260818: pinned verdict columns ready (stub schema — "
+                 "no backfill)")
+        return
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc).isoformat()
+    cur = conn.execute(
+        "UPDATE events SET verdict_pin = 'overlap_duplicate', "
+        "  verdict_pin_veff = COALESCE(volume_litres_effective, 0), "
+        "  verdict_pin_set_at = ?, is_pressure_restoration_phantom = 0 "
+        "WHERE match_rejection_reason = 'overlap_duplicate' "
+        "  AND verdict_pin IS NULL", (now,))
+    conn.commit()
+    # Belt-and-braces re-create of the wf-claim index — LAST-migration
+    # convention (see 20260574/…/20260815/20260816).
+    if (_has_table(conn, "events")
+            and all(_has_column(conn, "events", c) for c in
+                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+        conn.commit()
+    log.info("Migration 20260818: pinned verdict columns ready (%d overlap "
+             "wrapper(s) tagged, no volume rewritten)", cur.rowcount or 0)
+
+
+def _missing_verdict_pin_columns(conn: sqlite3.Connection) -> set[str]:
+    """Verifier for the 20260818 shape (current-version guard set)."""
+    if not _has_table(conn, "events"):
+        return set()
+    return {f"events.{c}" for c, _ in _VERDICT_PIN_COLUMNS
+            if not _has_column(conn, "events", c)}
+
+
 _MIGRATIONS: tuple = (
     (20260524, _drop_retired_wf_entity_map_rows),
     (20260525, _apply_unique_events_index),
@@ -3448,6 +3517,7 @@ _MIGRATIONS: tuple = (
     (20260815, _apply_referee_tables),
     (20260816, _apply_referee_meta_columns),
     (20260817, _apply_overlap_resweep),
+    (20260818, _apply_verdict_pin),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -3529,6 +3599,7 @@ def _run_migrations_impl(
             | _missing_202608_columns(conn)
             | _missing_referee_tables(conn)
             | _missing_referee_meta_columns(conn)
+            | _missing_verdict_pin_columns(conn)
         )
         if missing:
             raise RuntimeError(

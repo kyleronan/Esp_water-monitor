@@ -279,8 +279,19 @@ start — nothing is zeroed because nothing is ever stored.
   or a manual range.
 - **Sources:** `flow_pulse_onset` ON/OFF transitions first (bridging gaps < 15 s of turbine chatter),
   then a sustained-flow-threshold fallback.
+- **Containment rule (dev56, runs first):** a reconstructed period that *contains* rows already
+  stored (≥70 % of a row's span inside it) is not new water. If those rows' raw volume reaches
+  `VOLUME_COVERAGE_FRACTION` (0.9) of the period's integrated flow it is **dropped**; otherwise it is
+  **split around them** and only flow-rate fragments in the uncovered gaps come back — each re-merged
+  with the 15 s gap rule, ≥ `MIN_DURATION_SECONDS`, ≥ `OVERLAP_NEGLIGIBLE_L` (0.20 L), at most 10 per
+  period (a gap is not a draw; a pressure sag tail alone is not a draw). Log lines: `importer:
+  dropping … already account for` / `importer: split … remainder(s) kept`. `dry_run_reconstruction`
+  is NOT split (the reprocess probe compares raw history against stored rows itself).
 - **Duplicate gate:** a period overlapping an existing event by ≥30 s (or ≥10 s **and** ≥80% of the
-  shorter) is skipped — safe to re-run.
+  shorter) is skipped — safe to re-run. The 2026-05 "incoming ≥ 3× an unlabeled stub may insert"
+  heal is judged over the WHOLE candidate set since dev55 (blocks once stubs cover ≥50 % of the
+  span; it fired 46×/day with inverted polarity before that) and sits behind the containment rule
+  as defence in depth.
 - **Irrigation cross-talk post-pass:** flags main-circuit events overlapping irrigation activity when
   the pressure-swing ratio (irrigation Δ ÷ main Δ) ≥ 1.3, with the frozen ≤1.5 L cap →
   `match_rejection_reason = 'irrigation_cross_talk'`.
@@ -301,7 +312,7 @@ first match wins and sets the effective volume.
 | 7a | **You already classified it** | `user_classified = 1` | your verdict stands; auto-detection never re-flags |
 | 7b | **Durable irrigation cross-talk** | `match_rejection_reason = 'irrigation_cross_talk'` (from the importer) | `veff = 0`; survives every reprocess unless you relabel it real |
 | 7c | **Durable leak-test refill** (dev35) | `mrr = 'leak_test_refill'`, stamped out-of-band by `leak_test_refill.reconcile_leak_test_refills()` from the add-on's own test timing (reopening the valve refills the isolated line through the meter: real water, not a fixture). Window = test end −15 s → +120 s, budgeted ≈1.0 L per test; skipped when the test's `draw_verdict = 'demand'` | `veff = 0`, method + `mrr = 'leak_test_refill'`, excluded — but **no artifact flag bit**, so it stays **visible** in History with its own `leak_test` note filter. Provenance column `events.leak_test_id` (migration `20260570`) |
-| 7d | **Durable overlap-duplicate** (dev28) | `mrr = 'overlap_duplicate'` already stamped out-of-band by the overlap guard | joins phantom flag, `veff = 0`; preserved through reprocess. **Caveat:** since dev33 the guard also stamps this reason on a *partial-remainder* wrapper that keeps a non-zero volume — so `overlap_duplicate` no longer implies `veff = 0`, and a finalizer re-derive seeded from the stored reason will re-zero such a row |
+| 7d | **Pinned overlap verdict** (dev28 → dev56) | `verdict_pin = 'overlap_duplicate'` + `verdict_pin_veff`, written by the overlap guard from CROSS-event evidence; preserved across every re-store like the hourly bookkeeping columns (migration 20260818 tagged existing rows, no litre rewritten) | `veff = verdict_pin_veff` (0 for a full duplicate, the uncovered remainder for a partial one), excluded, **no phantom bit** (wrappers are not phantoms — one-time semantic change in dev56; the History pill/modal/`not_real` filter key on the reason). The finalizer (`apply_pinned_verdict`), the PATCH toggles, volume recompute and the phantom repair all defer to it; a user label does NOT lift it (identity ≠ volume). Released only when the covering children disappear (`overlap_guard.reevaluate_containing_wrappers`, hooked into every delete path — the water returns to the row that is left) or the row is deleted. Ambiguous partial overlaps keep both volumes (dev49 D4) and are reported on Water Use / Dev Tools instead |
 | 7e | **Phantom (pressure restoration)** | duration ≥120 s (`_PHANTOM_NOFLOW_MIN_DURATION_S`; a legacy event with no active-flow metrics needs the frozen 30-min floor instead) ∧ ΔP < 2.0 psi (frozen — leak safety) ∧ `flow_integral` < 1.0 L ∧ `flow_on_ratio` < 0.05. Rescue: true avg flow ≥ 2.0 L/min → real brief draw, not phantom | `is_pressure_restoration_phantom = 1`, `veff = 0`, `mrr = 'pressure_restoration_phantom'`, excluded |
 | 7f | **Pump recharge** (dev24, *pump mode only*) | fires only when pump mode is active (see Part 5). Shared envelope: 0 < vol ≤ 0.6 L (`PUMP_SLUG_MAX_L`) ∧ 0 < dur ≤ 60 s. Then **any one of three prongs**: `flow_pressure_corr` ≥ 0.5; or \|ΔP\| ≤ 0.8 psi; or the **sawtooth micro-cycle** (dev37) — pressure-triggered ∧ dur ≥ 5 s ∧ \|ΔP\| ≤ 2.5 psi ∧ a real transient ∧ fall rate ≤ 0.7 PSI/s (`_PUMP_SAWTOOTH_MAX_FALL_PSI_S`) ∧ corr not ≤ −0.1 (a steeper fall or negative corr is demand, so the water is kept) | joins phantom flag, `veff = 0`, `mrr = 'pump_recharge'`, excluded |
 | 7g | **Rising-pressure phantom** (dev14) | the *opposite* of 7e — flow **tracked a pressure rise** (turbine spun on climbing supply pressure, not demand). `flow_pressure_corr` ≥ 0.6 (`_RISE_PHANTOM_MIN_CORR`) ∧ 0 < vol < 1.0 L turbine / 2.5 L positive-displacement (frozen leak guard) ∧ dur ≤ 120 s. `corr = None` → never fires; **waived in pump mode** | joins phantom flag, `veff = 0`, `mrr = 'rising_pressure_phantom'`, excluded |

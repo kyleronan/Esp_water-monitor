@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev55 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev56 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -451,6 +451,34 @@ makes the add-on survive that.
   cleans up what had already accumulated: on the developer's own system 165
   double-counted runs, about 260 litres, were reconciled, while runs holding
   labels set by hand were left untouched — dev55.
+
+- **A rebuilt run keeps the water the live recording missed** — when the add-on
+  catches up on Home Assistant history and finds a long draw it has already
+  recorded as separate fills, it no longer refuses the whole thing: it splits the
+  reconstruction around what is already on file and adds only the part nobody
+  recorded, as its own event. A fill that stands alone between two recorded ones
+  comes back as a draw; a few seconds of pressure sag around a recorded fill does
+  not. If the recorded events already account for the water, nothing is added
+  — dev56.
+
+- **A "counted elsewhere" verdict now sticks** — when two recordings of the same
+  draw overlapped, the add-on correctly zeroed the duplicate, but a later re-store
+  of the same event, un-ticking a classification box or recomputing volumes
+  could quietly hand the water back, so the same litres were counted twice again
+  (49 events, about 300 litres on the developer's system). That verdict is now
+  pinned to the event and survives all of those; it is released only when the
+  other recording disappears, at which point the water returns to the event that
+  is left. Labelling such an event says what it was — it does not count its water
+  twice. These events no longer show as "not real use": History says
+  "Duplicate — not extra water", or "Partly duplicate" with the litres that do
+  count — dev56.
+
+- **You can see, and fix, water that is still counted twice** — Water Use says
+  when overlapping events on a circuit both still count their water and how
+  many litres that is; developer tools list those spans and offer **Rebuild
+  duplicated spans**, which rebuilds up to ten of them from Home Assistant
+  history in one press, never removing anything you labelled. A rebuilt day's
+  total now refreshes right away instead of after the nightly pass — dev56.
 
 - **The learned model can improve again** — every weekly re-fit had been
   rejected in favour of the model already running, for weeks, with an identical

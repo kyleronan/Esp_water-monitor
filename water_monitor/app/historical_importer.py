@@ -64,8 +64,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .config import AddonConfig, CircuitConfig
 from .event_detector import RawEvent, CircuitEventDetector as _CED
+from .overlap_guard import (OVERLAP_NEGLIGIBLE_L, VOLUME_COVERAGE_FRACTION,
+                            contained_fraction)
 from .database import (
-    run_db,
+    run_db, contained_stored_rows,
     get_import_state, update_import_state,
     get_last_event_ts, find_overlapping_event,
     mark_event_irrigation_cross_talk,
@@ -207,6 +209,17 @@ class HistoricalImporter:
     CHECK_INTERVAL_MINUTES: int = 30
     MERGE_GAP_SECONDS: int = 15       # bridge flow_pulse_onset gaps shorter than this
     MIN_DURATION_SECONDS: float = 3.0
+    # dev56 — containment rule (docs/PIPELINE.md "Duplicate gate"). A reconstructed
+    # period that CONTAINS rows already stored is either already on the record
+    # (stored rows hold >= CONTAINED_ROWS_COVERAGE of its water → dropped) or is
+    # split AROUND those rows so only the water nobody recorded becomes an event.
+    # Runs before find_overlapping_event, whose dev55 coverage block stays behind
+    # it as defence in depth. Remainders below the negligible floor, without a
+    # flow-rate fragment inside them (a pressure sag tail is not a draw), or beyond
+    # the per-period cap are dropped and logged — never written on top of a row.
+    CONTAINED_ROWS_COVERAGE: float = VOLUME_COVERAGE_FRACTION
+    CONTAINED_REMAINDER_MIN_L: float = OVERLAP_NEGLIGIBLE_L
+    MAX_REMAINDERS_PER_PERIOD: int = 10     # = reprocess._SPLIT_MAX_PERIODS (a test pins it)
     MIN_FLOW_LPM: float = _CED.MIN_FLOW_LPM
     MIN_EVENT_VOLUME_L: float = _CED.MIN_EVENT_VOLUME_L
     PRE_PRESSURE_WINDOW_SECONDS: int = 30   # look-back for baseline pressure
@@ -833,6 +846,14 @@ class HistoricalImporter:
         log.debug("[%s] found %d candidate period(s) in history window",
                   cfg.circuit, len(periods))
 
+        # dev56 — a period that contains rows already stored is not new water.
+        # Drop it when they account for it, split it around them when they do
+        # not; the per-period gate below then sees only genuinely new spans.
+        periods = await self._apply_containment_rule(
+            cfg, periods, flow_rate_hist, query_end=end)
+        if not periods:
+            return 0, active_since
+
         imported = 0
         retry_from: Optional[datetime] = None
         for period_start, period_end in periods:
@@ -916,6 +937,136 @@ class HistoricalImporter:
             retry_from = (active_since if retry_from is None
                           else min(retry_from, active_since))
         return imported, retry_from
+
+    # ------------------------------------------------------------------ #
+    # dev56 — containment rule                                            #
+    # ------------------------------------------------------------------ #
+
+    async def _apply_containment_rule(
+        self, cfg, periods: List[Tuple[datetime, datetime]],
+        flow_rate_hist: List[Dict], query_end: Optional[datetime] = None,
+    ) -> List[Tuple[datetime, datetime]]:
+        """Expand ``periods`` into the spans that are genuinely new water.
+
+        For each period: the stored closed rows intersecting it are fetched (one
+        DB hop), and ``_split_period_around_rows`` decides keep / drop / split.
+        Only ``_import_range`` calls this — ``dry_run_reconstruction`` describes
+        history and must NOT be split (the reprocess probe compares it against
+        the stored rows itself)."""
+        fragments = self._rate_to_periods(flow_rate_hist, query_end=query_end)
+        out: List[Tuple[datetime, datetime]] = []
+        for ps, pe in periods:
+            if (pe - ps).total_seconds() < self.MIN_DURATION_SECONDS:
+                out.append((ps, pe))            # the gate below drops it as today
+                continue
+            rows = await run_db(contained_stored_rows, self._db, cfg.circuit,
+                                ps.isoformat(), pe.isoformat())
+            action, subs, info = self._split_period_around_rows(
+                (ps, pe), rows, flow_rate_hist, fragments)
+            dur = int((pe - ps).total_seconds())
+            if action == "keep":
+                out.append((ps, pe))
+            elif action == "drop":
+                log.info("[%s] importer: dropping %ds reconstruction %s..%s — %d stored "
+                         "event(s) already account for %.2f of %.2f L",
+                         cfg.circuit, dur, ps.strftime("%H:%M:%S"), pe.strftime("%H:%M:%S"),
+                         info["n_rows"], info["stored_l"], info["period_l"])
+            else:
+                log.info("[%s] importer: split %ds reconstruction %s..%s around %d stored "
+                         "event(s) (%.2f of %.2f L on record) → %d remainder(s) kept "
+                         "(%.2f L), %d dropped (<%.0fs, <%.2f L, no flow, or over the cap)",
+                         cfg.circuit, dur, ps.strftime("%H:%M:%S"), pe.strftime("%H:%M:%S"),
+                         info["n_rows"], info["stored_l"], info["period_l"], len(subs),
+                         info["kept_l"], info["dropped"], self.MIN_DURATION_SECONDS,
+                         self.CONTAINED_REMAINDER_MIN_L)
+                out.extend(subs)
+        return out
+
+    def _split_period_around_rows(
+        self, period: Tuple[datetime, datetime], rows: List[Dict],
+        flow_rate_hist: List[Dict],
+        flow_fragments: List[Tuple[datetime, datetime]],
+    ) -> Tuple[str, List[Tuple[datetime, datetime]], Dict]:
+        """Pure decision for one reconstructed period against stored rows.
+
+        Returns ``("keep", [period], {})`` when no stored row is >=70 % inside the
+        period; ``("drop", [], info)`` when the contained rows' RAW volume reaches
+        ``CONTAINED_ROWS_COVERAGE`` of the period's integrated flow; otherwise
+        ``("split", remainders, info)`` — the flow-rate fragments lying in the parts
+        of the period NOT covered by the union of the contained rows, clipped to
+        those gaps and re-merged with ``MERGE_GAP_SECONDS`` (a gap is not a draw; a
+        pressure sag tail alone is not a draw), each kept only if it lasts
+        ``MIN_DURATION_SECONDS`` and integrates to at least
+        ``CONTAINED_REMAINDER_MIN_L``; the ``MAX_REMAINDERS_PER_PERIOD`` largest by
+        volume survive, returned in time order."""
+        ps, pe = period
+        contained: List[Tuple[datetime, datetime, float]] = []
+        for r in rows:
+            s0 = _parse_ts(r.get("start_ts"))
+            e0 = _parse_ts(r.get("end_ts"))
+            if s0 is None or e0 is None or e0 <= s0:
+                continue
+            if contained_fraction((s0, e0), (ps, pe)) >= 0.70:
+                contained.append((s0, e0, float(r.get("volume_litres") or 0.0)))
+        if not contained:
+            return "keep", [period], {}
+        # top-level rows only: a row nested inside another contained row is the
+        # same water again (dev33 §1.3) and must not inflate the stored total.
+        contained.sort(key=lambda t: (t[0], -(t[1] - t[0]).total_seconds()))
+        top: List[Tuple[datetime, datetime, float]] = []
+        for s0, e0, v in contained:
+            if top and s0 >= top[-1][0] and e0 <= top[-1][1]:
+                continue
+            top.append((s0, e0, v))
+        stored_l = sum(v for _, _, v in top)
+        period_l = self._flow_volume_in_period(flow_rate_hist, ps, pe)
+        info: Dict = {"n_rows": len(top), "stored_l": round(stored_l, 3),
+                      "period_l": round(period_l, 3), "kept_l": 0.0, "dropped": 0}
+        if period_l <= 0.0 or stored_l >= self.CONTAINED_ROWS_COVERAGE * period_l:
+            return "drop", [], info
+        # complement of the union of the top-level spans inside the period
+        merged: List[List[datetime]] = []
+        for s0, e0, _ in top:
+            if merged and s0 <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e0)
+            else:
+                merged.append([s0, e0])
+        gaps: List[Tuple[datetime, datetime]] = []
+        cursor = ps
+        for s0, e0 in merged:
+            if s0 > cursor:
+                gaps.append((cursor, min(s0, pe)))
+            cursor = max(cursor, e0)
+        if cursor < pe:
+            gaps.append((cursor, pe))
+        # A gap between stored rows is NOT itself a draw: a 30-minute idle with an
+        # 8 s pressure-sag tail at each end must not become a 30-minute event of
+        # 0.3 L. Candidates are the flow-rate fragments INSIDE the gap, clipped to
+        # it and re-merged with the importer's own gap rule, so each real draw
+        # between two stored rows becomes one tight remainder and a sag tail is
+        # judged alone (and fails the volume floor).
+        kept: List[Tuple[datetime, datetime, float]] = []
+        dropped = 0
+        for gs, ge in gaps:
+            inside = sorted((max(fs, gs), min(fe, ge)) for fs, fe in flow_fragments
+                            if fe > gs and fs < ge)
+            if not inside:
+                dropped += 1                    # envelope only — no flow
+                continue
+            for cs, ce in _merge_periods(inside, self.MERGE_GAP_SECONDS):
+                dur = (ce - cs).total_seconds()
+                vol = self._flow_volume_in_period(flow_rate_hist, cs, ce)
+                if (dur >= self.MIN_DURATION_SECONDS
+                        and vol >= self.CONTAINED_REMAINDER_MIN_L):
+                    kept.append((cs, ce, vol))
+                else:
+                    dropped += 1
+        kept.sort(key=lambda t: -t[2])
+        dropped += max(0, len(kept) - self.MAX_REMAINDERS_PER_PERIOD)
+        kept = sorted(kept[:self.MAX_REMAINDERS_PER_PERIOD], key=lambda t: t[0])
+        info["kept_l"] = round(sum(v for _, _, v in kept), 3)
+        info["dropped"] = dropped
+        return "split", [(gs, ge) for gs, ge, _ in kept], info
 
     # ------------------------------------------------------------------ #
     # Period detection                                                     #

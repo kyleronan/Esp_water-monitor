@@ -433,17 +433,35 @@ async def settings_page(request: Request):
                 }
         except Exception:
             pass
+        # dev56 — duplicated spans per circuit for the Dev Tools card.
+        overlap_repair = {}
+        try:
+            from ..overlap_guard import summarize_overlap_groups
+            from ..reprocess import _SPLIT_LOOKBACK_H
+            for _c in orch._cfg.circuits:
+                _og = sorted((g for g in summarize_overlap_groups(
+                                  orch.db, _c.circuit, retention_hours=_SPLIT_LOOKBACK_H)
+                              if g["state"] != "resolved"),
+                             key=lambda g: g["span_start"], reverse=True)
+                overlap_repair[_c.circuit] = {
+                    "groups": _og,
+                    "litres": round(sum(g["excess_l"] for g in _og), 1),
+                    "rebuildable": sum(1 for g in _og if g["within_retention"]),
+                }
+        except Exception:
+            pass
         return (pump_floor, supply_regime_ctx,
                 dict(get_home_profile(orch.db) or {}),
-                get_data_retention(orch.db), benchmark_status)
+                get_data_retention(orch.db), benchmark_status, overlap_repair)
 
     (pump_floor, supply_regime_ctx, _profile, _retention,
-     benchmark_status) = await run_db(_tail_db)
+     benchmark_status, overlap_repair) = await run_db(_tail_db)
 
     return _tmpl(request).TemplateResponse("settings.html", {
         "request": request,
         "dev_tools": DEV_TOOLS,
         "benchmark_status": benchmark_status,
+        "overlap_repair": overlap_repair,
         "pump_floor": pump_floor,
         "supply_regime": supply_regime_ctx,
         "profile": _profile,
@@ -1007,6 +1025,79 @@ async def dev_pin_referee_benchmark(circuit: str, request: Request):
         log.exception("[%s] benchmark pin failed", circuit)
         await run_db(finish_job, orch.db, job, "error",
                      f"{circuit}: benchmark pin failed — {e}")
+    return ingress_redirect(request, "/settings#sett-dev")
+
+
+_OVERLAP_REBUILD_MAX_PER_PRESS = 10
+_OVERLAP_REBUILD_BACKOFF_S: tuple = (1.0, 2.0, 4.0)
+
+
+@router.post("/dev/rebuild-overlaps/{circuit}")
+async def dev_rebuild_overlaps(circuit: str, request: Request):
+    """DEV/testing only — rebuild duplicated spans from Home Assistant history.
+
+    dev56: for every overlap group still counting water twice and still inside
+    the recorder window, run the dev54 reprocess (probe-first: history must
+    account for the water, and rows you labelled / classified / ignored are never
+    deleted — they refuse the rebuild instead). Capped per press; a busy
+    database is retried with the same backoff the label PATCH uses before the
+    press stops. Older groups are reported, not touched. Toast via the jobs table;
+    gated behind ``dev_tools``."""
+    from ..config import DEV_TOOLS
+    if not DEV_TOOLS:
+        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+    import asyncio
+    from datetime import datetime as _dt
+    from ..database import finish_job, start_job
+    from ..overlap_guard import summarize_overlap_groups
+    from ..reprocess import _SPLIT_LOOKBACK_H, reprocess_window
+
+    circuit = resolve_circuit(circuit)
+    orch = _orch(request)
+    job = await run_db(start_job, orch.db, "overlap_rebuild", circuit,
+                       "Rebuilding duplicated spans…")
+    try:
+        groups = await run_db(summarize_overlap_groups, orch.db, circuit,
+                              retention_hours=_SPLIT_LOOKBACK_H)
+        pending = [g for g in groups if g["state"] != "resolved"]
+        todo = sorted((g for g in pending if g["within_retention"]),
+                      key=lambda g: g["span_start"], reverse=True)
+        older = sum(1 for g in pending if not g["within_retention"])
+        attempted = rebuilt = 0
+        refused: dict = {}
+        stopped_busy = False
+        for g in todo[:_OVERLAP_REBUILD_MAX_PER_PRESS]:
+            attempted += 1
+            res = {}
+            for i, delay in enumerate((0.0,) + _OVERLAP_REBUILD_BACKOFF_S):
+                if delay:
+                    await asyncio.sleep(delay)
+                res = await reprocess_window(
+                    orch, circuit, _dt.fromisoformat(g["span_start"]),
+                    _dt.fromisoformat(g["span_end"])) or {}
+                if not res.get("busy"):
+                    break
+            if res.get("busy"):
+                stopped_busy = True
+                break
+            if res.get("refused"):
+                refused[res["refused"]] = refused.get(res["refused"], 0) + 1
+            else:
+                rebuilt += 1
+        parts = [f"{circuit}: rebuilt {rebuilt} of {attempted} duplicated span(s)"]
+        if refused:
+            parts.append("refused " + ", ".join(f"{k} ×{v}" for k, v in sorted(refused.items())))
+        if len(todo) > attempted and not stopped_busy:
+            parts.append(f"{len(todo) - attempted} more next press")
+        if older:
+            parts.append(f"{older} older than history, listed only")
+        if stopped_busy:
+            parts.append("stopped — database busy, try again shortly")
+        await run_db(finish_job, orch.db, job, "done", "; ".join(parts))
+    except Exception as e:                                  # noqa: BLE001
+        log.exception("[%s] duplicated-span rebuild failed", circuit)
+        await run_db(finish_job, orch.db, job, "error",
+                     f"{circuit}: rebuild failed — {e}")
     return ingress_redirect(request, "/settings#sett-dev")
 
 

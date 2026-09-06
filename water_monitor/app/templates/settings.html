@@ -1641,6 +1641,47 @@
       </div>
 
       <div class="sett-card">
+        <h3 class="sett-card-title">Duplicated spans</h3>
+        <p class="sett-help" style="margin:.25rem 0 .75rem">
+          Spans where the add-on recorded the same water twice and both copies
+          still count. Those inside Home Assistant's history window can be rebuilt
+          from that history (your own labels are never removed — a span they block
+          is refused, not forced); older ones are listed only. Rebuilt events arrive
+          through the live pipeline, so this list updates on the next page load.
+        </p>
+        {% for c in circuits %}
+        {% set og = overlap_repair.get(c.circuit) if overlap_repair else none %}
+        <div style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
+          <div><strong>{{ c.display_name }}</strong>
+            {%- if og and og.groups %} <span class="sett-help">— {{ og.groups|length }} span(s), about
+              {{ og.litres }} L counted twice, {{ og.rebuildable }} rebuildable</span>
+            {%- else %} <span class="sett-help">— none on the books</span>{% endif %}</div>
+          {% if og and og.rebuildable %}
+          <form method="post" action="{{ ingress_path }}/settings/dev/rebuild-overlaps/{{ c.circuit }}"
+                style="margin:0"
+                onsubmit="return confirm('Rebuild up to 10 duplicated spans on {{ c.display_name }} from Home Assistant history? Your own labels are never removed.');">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">Rebuild duplicated spans</button>
+          </form>
+          {% endif %}
+        </div>
+        {% if og and og.groups %}
+        <table style="width:100%;font-size:.82em;border-collapse:collapse;margin:.2rem 0 .8rem">
+          <thead><tr style="text-align:left;opacity:.7"><th>Span (UTC)</th><th>Events</th><th>Counted twice</th><th>State</th><th></th></tr></thead>
+          <tbody>
+          {% for g in og.groups[:12] %}
+          <tr><td>{{ g.span_start[:16]|replace('T', ' ') }} → {{ g.span_end[11:16] }}</td>
+              <td>{{ g.n }}</td><td>{{ g.excess_l }} L</td><td>{{ g.state|replace('_', ' ') }}</td>
+              <td>{% if g.within_retention %}rebuildable{% else %}older than history{% endif %}</td></tr>
+          {% endfor %}
+          {% if og.groups|length > 12 %}<tr><td colspan="5" class="sett-help">… and {{ og.groups|length - 12 }} more</td></tr>{% endif %}
+          </tbody>
+        </table>
+        {% endif %}
+        {% endfor %}
+      </div>
+
+      <div class="sett-card">
         <h3 class="sett-card-title">Reprocess range</h3>
         <p class="sett-help" style="margin:.25rem 0 .75rem">
           Delete a circuit's auto events in a date range and rebuild them from HA
