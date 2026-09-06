@@ -26,6 +26,9 @@ Resolution policy (shared by the live guard and the one-shot cleanup):
     2026-07-25. Child volumes are de-duplicated by span nesting first
     (dev33 §1.3), so equal-start / nested members are subtracted once.
   * USER-LABELED wrappers are never zeroed — audit row only.
+  * dev55: a wrapper reduced to a remainder is RE-EXAMINED on later writes, so a
+    group completed by a child that arrived after the wrapper still resolves; the
+    effective volume may only ever shrink.
   * AMBIGUOUS partial overlaps keep both volumes (over-count + flag beats
     silently dropping possibly-real water) — audit row only.
 Every decision writes an overlap_audit row (cross_talk_audit precedent).
@@ -47,6 +50,18 @@ OVERLAP_DUPLICATE_REASON = "overlap_duplicate"
 # second gate; 0.70 span containment matches the observed physics.
 _CONTAINMENT_FRACTION = 0.70
 _VOL_TOLERANCE = 0.40
+# dev55 — the two numbers the importer's containment rule, the reprocess probe
+# and the overlap summary all share. They live HERE (a module that imports
+# nothing from the app at import time) so the importer never has to import
+# reprocess, and so "the same water" means one thing everywhere:
+#   * VOLUME_COVERAGE_FRACTION — stored rows (or rebuilt flow) account for a
+#     span's water once they reach this share of it (was reprocess'
+#     _SPLIT_MIN_VOLUME_COVERAGE; same value, now one object).
+#   * OVERLAP_NEGLIGIBLE_L — below this the importer will not mint a remainder
+#     event, and an overlap group counts as resolved ("below what the importer
+#     would even record as a draw").
+VOLUME_COVERAGE_FRACTION: float = 0.9
+OVERLAP_NEGLIGIBLE_L: float = 0.20
 # dev33 §1.2 — how much of the wrapper's water may go UNACCOUNTED FOR by its
 # children and still be called the same draw. Derived from the two verified
 # incidents, which span coverage almost identically and are separated cleanly
@@ -92,6 +107,11 @@ def _contained_fraction(inner, outer) -> float:
     if dur <= 0:
         return 1.0 if outer[0] <= inner[0] <= outer[1] else 0.0
     return max(0.0, (hi - lo).total_seconds()) / dur
+
+
+def contained_fraction(inner, outer) -> float:
+    """Public spelling of ``_contained_fraction`` for the importer (dev55)."""
+    return _contained_fraction(inner, outer)
 
 
 def _union_coverage(outer, spans) -> float:
@@ -235,7 +255,15 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
         if not full_duplicate and remainder <= 0:
             continue          # nothing to keep and not a clean duplicate
         kept = [r["id"] for r in top]
-        if w["match_rejection_reason"] == OVERLAP_DUPLICATE_REASON:
+        # dev55 — was: any wrapper already carrying the reason is finished. That
+        # also caught a wrapper merely REDUCED TO A REMAINDER against the child
+        # set as it stood at the time, so children arriving later never shrank it
+        # again and the group stayed part-duplicated forever. Only a fully-zeroed
+        # wrapper is finished; a remainder is re-examined against the current
+        # children below, and may only ever shrink.
+        already_zeroed = (w["match_rejection_reason"] == OVERLAP_DUPLICATE_REASON
+                          and float(w["volume_litres_effective"] or 0.0) <= 0.0)
+        if already_zeroed:
             resolved = True                       # already handled (idempotent)
             break
         if (str(w["user_fixture_type"] or "").strip()
@@ -249,6 +277,14 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
                           if w["volume_litres_effective"] is not None
                           else vol_w)
         new_eff = 0.0 if full_duplicate else remainder
+        # dev55 — monotonic: re-resolving an already-reduced wrapper may lower its
+        # effective volume as more children appear, never raise it. Without this a
+        # re-run against a SMALLER child set (a child deleted by reprocess, say)
+        # would hand double-counted water back.
+        if (w["match_rejection_reason"] == OVERLAP_DUPLICATE_REASON
+                and new_eff >= prior_eff):
+            resolved = True
+            break
         # The phantom flag marks the ZEROED family (hide/zero UI plumbing); a
         # wrapper that keeps an uncovered remainder still carries real water,
         # so it is excluded from training but NOT flagged as zeroed.
@@ -293,10 +329,17 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
 
 def guard_new_event(conn: sqlite3.Connection, event_id: str, circuit: str,
                     start_ts: str, end_ts) -> None:
-    """Live/import write guard: after a genuinely-new event is inserted,
-    resolve any same-circuit overlap it created. Insertion is never blocked —
-    the guard only decides whose volume counts (symmetric across orderings).
-    Best-effort by contract: a guard failure must never break the write."""
+    """Live/import write guard: after an event is written, resolve any
+    same-circuit overlap it created or completed. Insertion is never blocked here
+    — the guard only decides whose volume counts (symmetric across orderings).
+    Best-effort by contract: a guard failure must never break the write.
+
+    dev55 — runs on every write that has an end_ts, not only genuinely-new rows:
+    the write that completes a group is often an upsert of a row that already
+    existed, and those groups were never resolved at all. Returns immediately
+    when fewer than two rows share the span, so the usual cost is one indexed
+    query. Refusing an outright duplicate is find_overlapping_event's job
+    (database.py), upstream of this."""
     if not end_ts:
         return
     rows = [dict(r) for r in conn.execute(

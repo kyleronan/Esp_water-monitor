@@ -25,6 +25,7 @@ from .config import DB_PATH
 from .detector_validation import HA_HIGH_FIDELITY_DAYS
 from .event_rules import NOT_ARTIFACT_SQL
 from .feature_extractor import SPARSE_ENVELOPE_REASON
+from .overlap_guard import VOLUME_COVERAGE_FRACTION
 from .database import (delete_events_in_range, find_overlapping_event,
                        get_home_profile, get_write_lock, preview_events_in_range,
                        restore_deleted_events, run_db, run_isolated_write)
@@ -51,7 +52,7 @@ _SPLIT_RETENTION_MARGIN_H: int = 12
 _SPLIT_LOOKBACK_H: int = HA_HIGH_FIDELITY_DAYS * 24 - _SPLIT_RETENTION_MARGIN_H
 _SPLIT_SETTLE_MIN: int = 60       # ...older than this, so the event is done being extended
 _SPLIT_DEFAULT_LIMIT: int = 20    # per-pass cap (HA-history rate-limit)
-_SPLIT_MIN_VOLUME_COVERAGE: float = 0.9   # dev.41: reconstructed flow must account for
+_SPLIT_MIN_VOLUME_COVERAGE: float = VOLUME_COVERAGE_FRACTION   # dev55: ONE object with the importer's containment rule (dev.41: reconstructed flow must account for
                                           # this share of the stored volume, else the
                                           # window's history can't be trusted (skip)
 
@@ -129,7 +130,8 @@ def _kept_event_blockers(
 
     ``_import_range`` drops a reconstructed period shorter than the importer's
     minimum, and skips one that meaningfully overlaps an existing event
-    (``find_overlapping_event`` — most-protected row first, 3× stub escape hatch).
+    (``find_overlapping_event`` — most-protected row first; dev55 removed the 3× stub
+    escape hatch, so a contained machine row now blocks like any other).
     After a reprocess delete the only rows left to collide with are the ones the
     delete KEEPS: user-labelled, user-classified, user-ignored, or machine rows
     outside its selection (dev54: a row whose label the cycle/anchor detectors

@@ -310,7 +310,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260816
+_CURRENT_VERSION: int = 20260817
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -3343,6 +3343,42 @@ def _missing_referee_meta_columns(conn: sqlite3.Connection) -> set[str]:
     return missing
 
 
+def _apply_overlap_resweep(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260817 — dev55. Re-run the same-circuit overlap
+    sweep over all history.
+
+    20260561 (dev28) ran this once. Since then the importer kept writing a long
+    reconstructed parent on top of the live children inside it: each child is
+    individually >= 3x shorter than the parent, so find_overlapping_event's
+    "longer wins over short unlabeled stub" heal waved every one of them through
+    one at a time. dev55 refuses those writes going forward; this clears what
+    already accumulated. Measured on a 2026-09-05 copy of the live DB: 323
+    overlap groups, 249 unresolved, of which 179 carry no user label and hold
+    ~265 L of double-counted water — replaying the resolver's own policy
+    de-duplicates 165 of them.
+
+    Idempotent by contract: an already-zeroed wrapper is a no-op and audit rows
+    are INSERT OR IGNORE. User-labelled wrappers get an audit row only and keep
+    every litre. Guarded for stub DBs. No schema change, so _create_schema needs
+    no mirroring.
+    """
+    has_events = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+    ).fetchone()
+    has_audit = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+        "name='overlap_audit'").fetchone()
+    if not (has_events and has_audit):
+        conn.commit()
+        return
+    from .overlap_guard import cleanup_all_overlaps
+    totals = cleanup_all_overlaps(conn, source="cleanup_migration_dev55")
+    log.info("Migration 20260817: overlap re-sweep done (%d group(s), "
+             "%d wrapper(s) de-duplicated, %.1f L recovered, %d user-labelled "
+             "flagged only)", totals["groups"], totals["wrappers_zeroed"],
+             totals["litres_recovered"], totals["flag_only"])
+
+
 _MIGRATIONS: tuple = (
     (20260524, _drop_retired_wf_entity_map_rows),
     (20260525, _apply_unique_events_index),
@@ -3411,6 +3447,7 @@ _MIGRATIONS: tuple = (
     (20260814, _apply_auto_split_memo),
     (20260815, _apply_referee_tables),
     (20260816, _apply_referee_meta_columns),
+    (20260817, _apply_overlap_resweep),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

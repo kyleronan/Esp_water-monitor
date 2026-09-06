@@ -841,9 +841,13 @@ class HistoricalImporter:
                 continue
 
             # Skip if a meaningfully-overlapping event already exists.
-            # Meaningful = overlap >= 30 s OR >= 50% of the shorter event.
+            # Meaningful = overlap >= 30 s, OR >= 10 s and >= 80% of the shorter
+            # event (the comment said 50% for a long time; the code has always
+            # used 80% — see find_overlapping_event's docstring).
             # This catches importer catch-up duplicates whose start_ts drifted
-            # by minutes — well beyond the old ±30 s point-match.
+            # by minutes — well beyond the old ±30 s point-match. dev55: it also
+            # now refuses a long reconstruction whose span existing unlabeled
+            # rows already account for.
             existing = await run_db(
                 find_overlapping_event,
                 self._db, cfg.circuit,

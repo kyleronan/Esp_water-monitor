@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev54 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev55 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -431,6 +431,23 @@ makes the add-on survive that.
   one. The list is now built as plain text that cannot execute.
 
 ### Bug Fixes
+
+- **The same water is no longer recorded twice on one circuit** — a dishwasher
+  run could be stored both as the individual fills the add-on saw live and as a
+  single long event covering all of them, so a day's total counted that water
+  twice. The check that refuses a duplicate looked at one stored event at a
+  time, and each individual fill is short enough next to the long one to look
+  like a harmless fragment, so every one of them was waved through and the long
+  event was written on top of the lot. It now weighs them together: once the
+  events already on file account for half of the span being added, the add-on
+  recognises the water as already recorded and declines to add it again.
+  Nothing already stored is deleted, and an event you labelled always wins. The
+  separate check that decides whose litres count when an overlap does slip
+  through now also gets a second look at a run as later fills arrive, instead
+  of settling the question on the first one and never revisiting it. Upgrading
+  cleans up what had already accumulated: on the developer's own system 165
+  double-counted runs, about 260 litres, were reconciled, while runs holding
+  labels set by hand were left untouched — dev55.
 
 - **The learned model can improve again** — every weekly re-fit had been
   rejected in favour of the model already running, for weeks, with an identical

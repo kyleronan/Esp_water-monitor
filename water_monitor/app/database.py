@@ -3086,14 +3086,24 @@ def upsert_event_and_apply_hourly_volume(
     # wrapper vs import, ~127 L in the 2026-07 incident). The guard resolves
     # whose volume counts — insertion is never blocked, and a guard failure
     # must never break the write path.
-    if is_new:
+    # dev55 — was `if is_new`. An upsert that re-stores an existing id can be the
+    # write that COMPLETES a group (the last child landing inside a parent that
+    # was already stored), and under the old gate that group was never resolved:
+    # 165 of 179 machine-only overlap groups measured on 2026-09-05 would have
+    # de-duplicated cleanly had the resolver simply run. The guard returns after
+    # one indexed query when fewer than two rows share the span, so running it on
+    # every completed write is cheap.
+    if event.get("end_ts"):
         try:
             from .overlap_guard import guard_new_event
             guard_new_event(conn, event_id, circuit, event["start_ts"],
                             event.get("end_ts"))
         except Exception as e:
-            log.warning("[%s] overlap guard failed (non-fatal): %s",
-                        circuit, e)
+            # Contract: a guard failure must never break the write. Log loudly
+            # enough that a systematically failing guard is visible rather than
+            # silently leaving history double-counted.
+            log.warning("[%s] overlap guard failed (non-fatal) for event %s: %s",
+                        circuit, event_id, e)
 
     return is_new
 
@@ -5079,6 +5089,44 @@ def get_event_cadence_seconds(
 # dev52 — hard cap on find_overlapping_event's exclusion list (see its docstring).
 _OVERLAP_EXCLUDE_MAX_IDS: int = 900
 
+# dev55 — how much of an incoming event's span may ALREADY be accounted for by
+# short unlabeled rows before the "longer wins over short stub" heal is refused.
+#
+# The heal exists for the C0 case: the importer stored a truncated partial before
+# the live event closed, so one stub sits inside a much longer real event. By the
+# 3x rule that stub can cover at most a third of the incoming span. Several live
+# children TILING the span are a different animal entirely — the same meter water
+# already recorded — and the observed 2026-09-05 case tiles ~125 s of a 194 s
+# parent (~64%). Half the span separates the two cleanly.
+_HATCH_MAX_COVERED_FRACTION: float = 0.5
+
+
+def _union_covered_fraction(spans, lo: int, hi: int) -> float:
+    """Fraction of [lo, hi) covered by the UNION of ``spans`` (epoch seconds).
+
+    Union, not sum: overlapping or nested stubs must count once, or two rows
+    describing the same seconds would look like twice the coverage. Mirrors
+    overlap_guard._union_coverage, which works in datetimes; database.py cannot
+    import overlap_guard at module level (overlap_guard imports from database).
+    """
+    total = hi - lo
+    if total <= 0:
+        return 1.0
+    clipped = sorted((max(s, lo), min(e, hi)) for s, e in spans
+                     if e > lo and s < hi)
+    covered = 0
+    cur_s = cur_e = None
+    for s, e in clipped:
+        if cur_e is not None and s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            if cur_e is not None:
+                covered += cur_e - cur_s
+            cur_s, cur_e = s, e
+    if cur_e is not None:
+        covered += cur_e - cur_s
+    return min(1.0, covered / total)
+
 
 def find_overlapping_event(
     conn: sqlite3.Connection,
@@ -5097,6 +5145,12 @@ def find_overlapping_event(
     Short independent events (< 10 s absolute overlap) are never blocked
     regardless of ratio — this preserves fridge-fill / toilet events that
     happen to start near the end of a longer shower.
+
+    dev55 — the "longer wins over short unlabeled stub" heal is judged over the
+    whole candidate set: once the stubs it would wave through already cover
+    ``_HATCH_MAX_COVERED_FRACTION`` of the incoming span, the incoming event is
+    blocked instead. A truncation stub covers at most a third of the span; live
+    children tiling the span cover far more.
 
     When multiple rows overlap, returns the most-protected one first:
     user-labeled rows → user-locked rows → longest event.
@@ -5167,6 +5221,10 @@ def find_overlapping_event(
                 CAST(strftime('%s', e.start_ts) AS INTEGER)) DESC
     """, params).fetchall()
 
+    # dev55 — the spans of the short unlabeled rows waved through by the heal
+    # below, accumulated so they are judged TOGETHER rather than one at a time.
+    healed_spans: list = []
+
     for row in rows:
         ex_start = row["ex_start_epoch"]
         ex_end   = row["ex_end_epoch"]
@@ -5186,14 +5244,36 @@ def find_overlapping_event(
             # insert. The orphan stub stays in the DB; the caller is expected
             # to log it. This auto-heals the C0 historical_importer truncation
             # case where the partial was stored before the live event closed.
+            #
+            # dev55 — judged over the WHOLE candidate set, not one row at a
+            # time. Each of several live children is individually ≥ 3× shorter
+            # than an importer-reconstructed parent, so row-at-a-time this waved
+            # every one of them through and the parent inserted on top of the
+            # lot (measured 2026-09-05: 329 of 385 duplicate rows entered here).
+            # Once the stubs already account for half the incoming span they are
+            # not a truncation stub, they are the same water already recorded —
+            # so the incoming event is refused instead. Nothing is deleted: the
+            # rows that block stay exactly as they are.
             user_locked = bool(row["user_locked"]) if "user_locked" in row.keys() else False
             if (new_dur >= ex_dur * 3
                     and row["user_fixture_type"] is None
                     and not user_locked):
+                healed_spans.append((max(ex_start, start_epoch),
+                                     min(ex_end, end_epoch)))
+                covered = _union_covered_fraction(healed_spans,
+                                                  start_epoch, end_epoch)
+                if covered >= _HATCH_MAX_COVERED_FRACTION:
+                    log.info(
+                        "[overlap] blocking %d s event: %d unlabeled row(s) "
+                        "already cover %.0f%% of its span (last %s) — the same "
+                        "water is already recorded",
+                        new_dur, len(healed_spans), 100.0 * covered, row["id"],
+                    )
+                    return dict(row)
                 log.info(
                     "[overlap] not blocking %d s event by %d s unlabeled stub %s "
-                    "— allowing the longer event to insert",
-                    new_dur, ex_dur, row["id"],
+                    "— allowing the longer event to insert (span %.0f%% covered)",
+                    new_dur, ex_dur, row["id"], 100.0 * covered,
                 )
                 continue
             return dict(row)
