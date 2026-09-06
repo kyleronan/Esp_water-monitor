@@ -3434,26 +3434,11 @@ def _apply_verdict_pin(conn: sqlite3.Connection) -> None:
     # did not set means zero. The other eight rows' original verdicts are
     # unrecoverable (the phantom bit was overwritten); they stay as the
     # guard's own remainder (I-4: over-count-and-flag beats guessing).
-    repaired = 0
+    from .database import rezero_rows_with_zeroing_flag
     try:
-        from .database import apply_effective_volume
-        rows = conn.execute(
-            "SELECT id, circuit, start_ts, is_cross_talk, is_low_flow_dribble, "
-            "       is_pressure_restoration_phantom FROM events "
-            "WHERE (COALESCE(is_cross_talk,0)=1 OR COALESCE(is_low_flow_dribble,0)=1 "
-            "       OR COALESCE(is_pressure_restoration_phantom,0)=1) "
-            "  AND COALESCE(volume_litres_effective,0) > 0.05 "
-            "  AND COALESCE(user_classified,0)=0").fetchall()
-        for r in rows:
-            reason = ("cross_talk" if r[3] else "low_flow_dribble" if r[4]
-                      else "pressure_restoration_phantom")
-            conn.execute(
-                "UPDATE events SET volume_litres_effective = 0, "
-                "  volume_estimation_method = ?, match_rejection_reason = ?, "
-                "  excluded_from_training = 1 WHERE id = ?", (reason, reason, r[0]))
-            apply_effective_volume(conn, r[0], r[1], r[2], 0.0)
-            repaired += 1
+        repaired = rezero_rows_with_zeroing_flag(conn)
     except sqlite3.Error as e:
+        repaired = 0
         log.info("Migration 20260818: flag/volume consistency pass skipped: %s", e)
     conn.commit()
     # Belt-and-braces re-create of the wf-claim index — LAST-migration

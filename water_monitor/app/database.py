@@ -5169,6 +5169,37 @@ def _union_covered_fraction(spans, lo: int, hi: int) -> float:
     return min(1.0, covered / total)
 
 
+def rezero_rows_with_zeroing_flag(conn: sqlite3.Connection) -> int:
+    """dev56 — a zeroing flag the operator did not set means zero. The 20260817
+    re-sweep raised wrappers another verdict had zeroed (the guard's UPDATE never
+    touches is_cross_talk / is_low_flow_dribble), leaving rows that say
+    "cross-talk" with water still counted; nothing else re-derives cross-talk.
+    Idempotent; skips user-classified rows. Returns rows repaired."""
+    try:
+        rows = conn.execute(
+            # dribble rows are NOT here: the startup dribble backfill re-zeroes
+            # them itself with its own reason (below_meter_floor).
+            "SELECT id, circuit, start_ts, is_cross_talk, is_low_flow_dribble, "
+            "       is_pressure_restoration_phantom FROM events "
+            "WHERE (COALESCE(is_cross_talk,0)=1 "
+            "       OR COALESCE(is_pressure_restoration_phantom,0)=1) "
+            "  AND COALESCE(is_low_flow_dribble,0)=0 "
+            "  AND COALESCE(volume_litres_effective,0) > 0.05 "
+            "  AND COALESCE(user_classified,0)=0").fetchall()
+    except sqlite3.Error:
+        return 0
+    n = 0
+    for r in rows:
+        reason = "cross_talk" if r[3] else "pressure_restoration_phantom"
+        conn.execute(
+            "UPDATE events SET volume_litres_effective = 0, volume_estimation_method = ?, "
+            "  match_rejection_reason = ?, excluded_from_training = 1 WHERE id = ?",
+            (reason, reason, r[0]))
+        apply_effective_volume(conn, r[0], r[1], r[2], 0.0)
+        n += 1
+    return n
+
+
 def _reevaluate_wrappers_after_delete(conn: sqlite3.Connection, circuit: str,
                                       start_ts, end_ts) -> None:
     """dev56 — a deleted row may have been a covering child of a pinned overlap

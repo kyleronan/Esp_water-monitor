@@ -1984,10 +1984,16 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
         )
         pairs_resolved += 1
 
-    if excluded_fixed or pairs_resolved or unresolved:
+    # C (dev56). A single zeroing flag with water still counted: the row says
+    # "not real water" and counts it anyway. Section B only sees >= 2 flags, so
+    # this shape sat contradictory forever (two rows on the reference home).
+    from .database import rezero_rows_with_zeroing_flag
+    rezeroed = rezero_rows_with_zeroing_flag(conn)
+    if excluded_fixed or pairs_resolved or unresolved or rezeroed:
         conn.commit()
         log.info("flag-repair: %d excluded-from-training fixed, %d flag collisions "
-                 "resolved, %d unresolved", excluded_fixed, pairs_resolved, unresolved)
+                 "resolved, %d unresolved, %d zeroing-flag rows re-zeroed",
+                 excluded_fixed, pairs_resolved, unresolved, rezeroed)
     return {"excluded_fixed": excluded_fixed, "pairs_resolved": pairs_resolved,
             "unresolved": unresolved}
 
