@@ -3426,6 +3426,35 @@ def _apply_verdict_pin(conn: sqlite3.Connection) -> None:
         "  verdict_pin_set_at = ?, is_pressure_restoration_phantom = 0 "
         "WHERE match_rejection_reason = 'overlap_duplicate' "
         "  AND verdict_pin IS NULL", (now,))
+    # dev56 — the 20260817 re-sweep ran before the direction rule (6322179)
+    # existed and raised ten wrappers another verdict had zeroed; the guard's
+    # UPDATE never touches is_cross_talk / is_low_flow_dribble, so two rows
+    # were left saying "cross-talk" with 0.71 / 0.57 L still counted, and no
+    # sweep re-derives cross-talk. Generic rule: a zeroing flag the operator
+    # did not set means zero. The other eight rows' original verdicts are
+    # unrecoverable (the phantom bit was overwritten); they stay as the
+    # guard's own remainder (I-4: over-count-and-flag beats guessing).
+    repaired = 0
+    try:
+        from .database import apply_effective_volume
+        rows = conn.execute(
+            "SELECT id, circuit, start_ts, is_cross_talk, is_low_flow_dribble, "
+            "       is_pressure_restoration_phantom FROM events "
+            "WHERE (COALESCE(is_cross_talk,0)=1 OR COALESCE(is_low_flow_dribble,0)=1 "
+            "       OR COALESCE(is_pressure_restoration_phantom,0)=1) "
+            "  AND COALESCE(volume_litres_effective,0) > 0.05 "
+            "  AND COALESCE(user_classified,0)=0").fetchall()
+        for r in rows:
+            reason = ("cross_talk" if r[3] else "low_flow_dribble" if r[4]
+                      else "pressure_restoration_phantom")
+            conn.execute(
+                "UPDATE events SET volume_litres_effective = 0, "
+                "  volume_estimation_method = ?, match_rejection_reason = ?, "
+                "  excluded_from_training = 1 WHERE id = ?", (reason, reason, r[0]))
+            apply_effective_volume(conn, r[0], r[1], r[2], 0.0)
+            repaired += 1
+    except sqlite3.Error as e:
+        log.info("Migration 20260818: flag/volume consistency pass skipped: %s", e)
     conn.commit()
     # Belt-and-braces re-create of the wf-claim index — LAST-migration
     # convention (see 20260574/…/20260815/20260816).
@@ -3437,7 +3466,8 @@ def _apply_verdict_pin(conn: sqlite3.Connection) -> None:
             "ON events (circuit, waveform_boot_id, waveform_event_id)")
         conn.commit()
     log.info("Migration 20260818: pinned verdict columns ready (%d overlap "
-             "wrapper(s) tagged, no volume rewritten)", cur.rowcount or 0)
+             "wrapper(s) tagged, no volume rewritten; %d row(s) whose zeroing flag "
+             "disagreed with their volume re-zeroed)", cur.rowcount or 0, repaired)
 
 
 def _missing_verdict_pin_columns(conn: sqlite3.Connection) -> set[str]:
