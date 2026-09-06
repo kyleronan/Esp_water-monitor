@@ -27,8 +27,13 @@ Resolution policy (shared by the live guard and the one-shot cleanup):
     (dev33 §1.3), so equal-start / nested members are subtracted once.
   * USER-LABELED wrappers are never zeroed — audit row only.
   * dev55: a wrapper reduced to a remainder is RE-EXAMINED on later writes, so a
-    group completed by a child that arrived after the wrapper still resolves; the
-    effective volume may only ever shrink.
+    group completed by a child that arrived after the wrapper still resolves. Its
+    volume moves in EITHER direction (a removed child must be reabsorbed, or that
+    water leaves the books), capped at the wrapper's own raw volume. But a wrapper
+    another verdict reduced — phantom / cross-talk / dribble / degraded — may only
+    be lowered here: this module never reads history, so it cannot know a
+    measurement was wrong, and raising one would override that verdict and clear
+    its flag.
   * AMBIGUOUS partial overlaps keep both volumes (over-count + flag beats
     silently dropping possibly-real water) — audit row only.
 Every decision writes an overlap_audit row (cross_talk_audit precedent).
@@ -77,6 +82,8 @@ OVERLAP_NEGLIGIBLE_L: float = 0.20
 # remainder instead of being zeroed outright; union coverage is still recorded
 # in the audit row for diagnosis.
 _FULL_DUPLICATE_REMAINDER_FRACTION = 0.10
+# dev55 — litre comparisons; stored volumes are rounded to 3 dp upstream.
+_EPS = 1e-6
 
 _EVENT_COLS = ("id, circuit, start_ts, end_ts, volume_litres, "
                "volume_litres_effective, user_fixture_type, user_reviewed, "
@@ -276,13 +283,34 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
         prior_eff = float(w["volume_litres_effective"]
                           if w["volume_litres_effective"] is not None
                           else vol_w)
-        new_eff = 0.0 if full_duplicate else remainder
-        # dev55 — monotonic: re-resolving an already-reduced wrapper may lower its
-        # effective volume as more children appear, never raise it. Without this a
-        # re-run against a SMALLER child set (a child deleted by reprocess, say)
-        # would hand double-counted water back.
-        if (w["match_rejection_reason"] == OVERLAP_DUPLICATE_REASON
-                and new_eff >= prior_eff):
+        new_eff = min(0.0 if full_duplicate else remainder, vol_w)
+        # dev55 — which direction may this move?
+        #
+        # This function never reads recorder history; it only subtracts stored
+        # child volumes from a stored wrapper volume. So it can never discover
+        # that an earlier measurement was wrong — that is reprocess's job, and it
+        # raises volumes through the event-write path, not here.
+        #
+        #   * Prior reduction was OURS: recompute freely, up or down, capped at
+        #     the row's own raw volume. A child removed by reprocess must let the
+        #     wrapper reabsorb the litres that child was accounting for, or that
+        #     water silently leaves the books.
+        #   * Prior reduction came from ANOTHER verdict (phantom / cross-talk /
+        #     dribble / degraded, all of which record veff below raw): only lower.
+        #     Raising it would override a detector that has already judged this
+        #     raw volume unreal — and the UPDATE below would clear that detector's
+        #     flag while doing it. Measured on 2026-09-06: the re-sweep put ~10.9 L
+        #     back onto 10 phantom-zeroed wrappers exactly this way.
+        ours = w["match_rejection_reason"] == OVERLAP_DUPLICATE_REASON
+        foreign_reduction = not ours and prior_eff < vol_w - _EPS
+        if ours and abs(new_eff - prior_eff) <= _EPS:
+            resolved = True                       # already correct
+            break
+        if foreign_reduction and new_eff >= prior_eff - _EPS:
+            log.debug("[%s] overlap wrapper %s left alone: %s already reduced it "
+                      "to %.2f L and de-duplication would not lower that",
+                      w["circuit"], w["id"],
+                      w["match_rejection_reason"] or "another verdict", prior_eff)
             resolved = True
             break
         # The phantom flag marks the ZEROED family (hide/zero UI plumbing); a
@@ -311,10 +339,17 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
         if not full_duplicate:
             stats["partial_remainder"] += 1
         stats["litres_recovered"] += prior_eff - new_eff
-        log.info("[%s] overlap wrapper %s (%s): %s — %.2f L de-duplicated, "
+        # dev55 — a rise reads as a reabsorb, not a negative de-duplication. The
+        # old wording logged "-3.57 L de-duplicated", which is how the override
+        # bug hid in plain sight.
+        moved = prior_eff - new_eff
+        verb = ("zeroed" if full_duplicate
+                else "reduced to remainder" if moved >= 0
+                else "reabsorbed a removed child's water")
+        log.info("[%s] overlap wrapper %s (%s): %s — %.2f L %s, "
                  "%.2f L kept (coverage %.0f%%), children %s",
-                 w["circuit"], "zeroed" if full_duplicate else "reduced to remainder",
-                 source, w["id"], prior_eff - new_eff, new_eff,
+                 w["circuit"], verb, source, w["id"], abs(moved),
+                 "de-duplicated" if moved >= 0 else "restored", new_eff,
                  100.0 * coverage, kept)
         resolved = True
         break

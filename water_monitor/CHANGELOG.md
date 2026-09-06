@@ -444,7 +444,10 @@ makes the add-on survive that.
   Nothing already stored is deleted, and an event you labelled always wins. The
   separate check that decides whose litres count when an overlap does slip
   through now also gets a second look at a run as later fills arrive, instead
-  of settling the question on the first one and never revisiting it. Upgrading
+  of settling the question on the first one and never revisiting it. That check
+  can only ever move water it discounted itself: if a fill is later rebuilt from
+  history the long event takes those litres back, but a run some other check had
+  already set aside as not-real water is left exactly as it was. Upgrading
   cleans up what had already accumulated: on the developer's own system 165
   double-counted runs, about 260 litres, were reconciled, while runs holding
   labels set by hand were left untouched — dev55.
