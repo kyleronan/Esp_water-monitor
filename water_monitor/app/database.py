@@ -3321,13 +3321,54 @@ def coalesce_low_flow_events(
 # so the reprocess probe can never disagree with the delete it is gating (params:
 # circuit, to_ts, from_ts). Selection is INTERVAL-OVERLAP, and anything the user has
 # touched is excluded; see delete_events_in_range's docstring for why both matter.
+# dev54 — label sources that are the DETECTORS' own output, not the operator's.
+# Mirrors tinymodel.MACHINE_LABEL_SOURCES (a test pins the two equal; database
+# cannot import tinymodel). A cycle-tagged fill inside a garbled parent used to
+# count as "kept" and veto the very rebuild that would un-duplicate it, and the
+# refusal then claimed the operator had labelled it. The detector re-tags the
+# rebuilt draws on the next pass, so nothing the operator said is lost.
+_MACHINE_LABEL_SOURCES_SQL = "('anchor', 'cycle')"
+
 _MACHINE_EVENTS_IN_RANGE_WHERE = (
     "circuit = ? AND start_ts <= ? "
     "  AND COALESCE(end_ts, start_ts) >= ? "
-    "  AND user_fixture_type IS NULL "
+    "  AND (user_fixture_type IS NULL "
+    "       OR COALESCE(fixture_label_source, 'direct') IN " + _MACHINE_LABEL_SOURCES_SQL + ") "
     "  AND COALESCE(user_classified, 0) = 0 "
     "  AND COALESCE(user_ignored, 0) = 0 "
 )
+
+
+def _overlap_aware_volume(rows: list) -> Dict[str, Any]:
+    """dev54 — the stored water a delete would remove, counted the way ONE meter
+    can have produced it.
+
+    Rows that overlap in time are the same seconds of the same meter: a garbled
+    parent plus the children the detector recorded inside it hold the same
+    water twice. Summing them inflated the denominator of the rebuild-coverage
+    gate, so the more duplicated a span was, the more firmly the gate refused
+    the one action that removes the duplication (measured 2026-09-05: parent
+    5.1 L + child 2.1 L vs 5.2 L rebuilt → refused at 72 %). Each group of
+    mutually overlapping rows counts once, at its largest member; rows that do
+    not overlap are summed exactly as before. ``rows`` must be start-ordered
+    and carry ``start_ts``, ``end_ts_eff``, ``vol``.
+    """
+    groups: list = []                        # [max_end, max_vol, n]
+    for r in rows:
+        st, en = str(r["start_ts"]), str(r["end_ts_eff"])
+        vol = float(r["vol"] or 0.0)
+        if groups and st < groups[-1][0]:    # starts before the group ends
+            g = groups[-1]
+            g[0] = max(g[0], en)
+            g[1] = max(g[1], vol)
+            g[2] += 1
+        else:
+            groups.append([en, vol, 1])
+    summed = float(sum(float(r["vol"] or 0.0) for r in rows))
+    counted = float(sum(g[1] for g in groups))
+    return {"volume_litres": counted, "volume_litres_summed": summed,
+            "overlapping": any(g[2] > 1 for g in groups),
+            "overlap_groups": len(groups)}
 
 
 def preview_events_in_range(
@@ -3344,6 +3385,10 @@ def preview_events_in_range(
     Returns ``{"count", "volume_litres", "span_start", "span_end", "ids"}``; a window
     with no machine events returns zeros, ``None`` spans and an empty ``ids`` list.
 
+    dev54 — ``volume_litres`` is OVERLAP-AWARE (see ``_overlap_aware_volume``):
+    rows stacked on the same seconds count once. ``volume_litres_summed`` keeps the
+    plain sum and ``overlapping`` says whether the two differ, for the log line.
+
     dev52 — ``ids`` is the exact row set the delete would take, in start order. The
     reprocess probe passes it to ``find_overlapping_event`` as the exclusion set, so
     "would a kept event block this rebuilt period?" is answered against precisely the
@@ -3358,13 +3403,15 @@ def preview_events_in_range(
         (circuit, to_ts, from_ts),
     ).fetchall()
     if not rows:
-        return {"count": 0, "volume_litres": 0.0,
+        return {"count": 0, "volume_litres": 0.0, "volume_litres_summed": 0.0,
+                "overlapping": False, "overlap_groups": 0,
                 "span_start": None, "span_end": None, "ids": []}
-    return {"count": len(rows),
-            "volume_litres": float(sum(float(r["vol"] or 0.0) for r in rows)),
-            "span_start": rows[0]["start_ts"],
-            "span_end": max(r["end_ts_eff"] for r in rows),
-            "ids": [r["id"] for r in rows]}
+    out = {"count": len(rows),
+           "span_start": rows[0]["start_ts"],
+           "span_end": max(r["end_ts_eff"] for r in rows),
+           "ids": [r["id"] for r in rows]}
+    out.update(_overlap_aware_volume(rows))
+    return out
 
 
 # dev52 — the two auto-split memo outcomes that depend on the user's labels rather

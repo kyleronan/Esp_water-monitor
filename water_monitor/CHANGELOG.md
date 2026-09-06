@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev53 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev54 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -501,6 +501,18 @@ makes the add-on survive that.
   four fair contests render as a plain line instead. If the reference set ever
   holds back more labels than a re-fit can spare, the page says so and offers
   a smaller re-pin rather than pausing silently — dev53.
+
+- **Reprocess can now un-duplicate a run the app recorded twice** — a dishwasher
+  fill train stored as one three-minute "Other" event with its individual fills
+  also stored inside it was impossible to rebuild: the safety check added up the
+  water of every event in the span, so the duplicates made it look as if history
+  could only account for two thirds of the water, and the rebuild was refused
+  *because* the span was duplicated. Events that overlap in time are the same
+  seconds of the same meter, so the check now counts each such group once; a
+  genuine gap in history is refused exactly as before. Fills the app's own cycle
+  detector had tagged also no longer count as events you labelled — they are
+  rebuilt with the rest and re-tagged on the next pass, and only labels you set
+  yourself hold a rebuild back — dev54.
 
 - **Several separate uses recorded as one long event, and rebuilding it changed
   nothing** — on a home with a booster pump the line pressure never fully

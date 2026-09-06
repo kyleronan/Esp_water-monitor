@@ -1356,7 +1356,8 @@ _REPROCESS_REFUSAL_TEXT = {
         "This span already holds an event you labelled or marked yourself, and the "
         "rebuilt draw would land on top of it. Your labelled events are always kept, "
         "so there is nothing here to rebuild. Nothing was changed. To rebuild this "
-        "span, clear that label first.",
+        "span, clear that label first. (Labels the app's own cycle detectors "
+        "applied do not block a rebuild — only yours do.)",
     "kept_events_underfit":
         "This span holds an event you labelled yourself, but the rebuilt draw here is "
         "larger than what that label covers. Deleting the recorded event would lose "

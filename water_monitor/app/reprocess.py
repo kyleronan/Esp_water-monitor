@@ -132,7 +132,8 @@ def _kept_event_blockers(
     (``find_overlapping_event`` — most-protected row first, 3× stub escape hatch).
     After a reprocess delete the only rows left to collide with are the ones the
     delete KEEPS: user-labelled, user-classified, user-ignored, or machine rows
-    outside its selection. This asks that exact question against those exact rows by
+    outside its selection (dev54: a row whose label the cycle/anchor detectors
+    wrote is machine output and IS in the delete selection — it no longer blocks). This asks that exact question against those exact rows by
     excluding the deletable ids in-query, so its answer is the importer's answer.
 
     One connection, one loop — never one ``run_db`` per period (the dev46 interleave
@@ -272,13 +273,21 @@ async def reprocess_window(
     dry = probe if (probe is not None and not widened) else None
     if dry is None:
         dry = await importer.dry_run_reconstruction(circuit, imp_from, imp_to)
+    # dev54 — the stored volume is overlap-aware: rows stacked on the same seconds
+    # (a garbled parent and the children recorded inside it) count once, so a
+    # duplicated span can be un-duplicated instead of being refused BECAUSE it is
+    # duplicated. Non-overlapping rows are summed exactly as before.
     refused = _probe_refusal(dry, preview["volume_litres"])
     if refused is not None:
+        overlap_note = ""
+        if preview.get("overlapping"):
+            overlap_note = (" (rows overlap: %.1f L summed, counted once per overlap "
+                            "group)" % float(preview.get("volume_litres_summed") or 0.0))
         log.warning(
-            "[%s] reprocess %s..%s REFUSED (%s) — %d event(s) / %.1f L left intact; "
+            "[%s] reprocess %s..%s REFUSED (%s) — %d event(s) / %.1f L left intact%s; "
             "rebuilt flow would be %.1f L across %d period(s)",
             circuit, imp_from.isoformat(), imp_to.isoformat(), refused,
-            preview["count"], preview["volume_litres"],
+            preview["count"], preview["volume_litres"], overlap_note,
             dry.get("flow_volume_l", 0.0), len(dry.get("periods") or []))
         return {"deleted": 0, "imported": 0, "widened": widened,
                 "from": imp_from.isoformat(), "to": imp_to.isoformat(),
