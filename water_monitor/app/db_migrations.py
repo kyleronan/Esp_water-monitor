@@ -310,6 +310,12 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
+#
+# EXCEPTION ON THE RECORD: 20260819 landed in SEPTEMBER but reused August's
+# prefix. It stays as-is because it shipped and stamped live databases, and
+# "never reuse or reorder a shipped number" outranks tidiness — renumbering it
+# would make those DBs fail the _UPGRADEABLE_VERSIONS check below and be told to
+# delete themselves. THE NEXT MIGRATION IS 20260901, NOT 20260820.
 _CURRENT_VERSION: int = 20260819
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
