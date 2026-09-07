@@ -301,6 +301,29 @@ globals:
     restore_value: yes   # Fault must survive power-cycle — manual reset required
     initial_value: 'false'
 
+  # Consecutive FAILED close attempts — a close that ran the full 90s travel
+  # window without reaching the closed end stop. Bounds the fault-driven
+  # auto-close retry: the fault re-arms the close on every pressure publish
+  # (500ms), so without a cap a jammed valve is driven 90s on / ~0.5s off
+  # indefinitely. There is NO current or stall detection anywhere on this board
+  # — no sense resistor, no current entity — so a stall has no electrical
+  # backstop and this counter is the only bound.
+  #
+  # Cleared when a stop is actually reached (the motor is proven good) or when
+  # the operator resets the safety fault.
+  #
+  # restore_value: yes deliberately: a stalled motor can brown out the ESP, and
+  # a reboot must not hand the retry budget back and resume driving it.
+  - id: close_attempts_main
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0'
+
+  - id: close_attempts_irr
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0'
+
   # True while leak test mode is active on the main valve circuit.
   # Enables pressure decay monitoring on the main pressure sensor.
   - id: leak_test_active_main
@@ -1312,7 +1335,7 @@ sensor:
         # for the full travel time and indefinitely after a motor fault.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running();'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running() && id(close_attempts_main) < 3;'
             then:
               - valve.close: main_water_valve
 
@@ -1476,7 +1499,7 @@ sensor:
         # for the full travel time and indefinitely after a motor fault.
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running();'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running() && id(close_attempts_irr) < 3;'
             then:
               - valve.close: irrigation_water_valve
 
@@ -1734,7 +1757,7 @@ sensor:
         # close_sequence_main not-running is the gate; see leak-test handler above.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running();'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running() && id(close_attempts_main) < 3;'
             then:
               - valve.close: main_water_valve
 
@@ -1801,7 +1824,7 @@ sensor:
         # Gated on close_sequence_main not-running: retries at most once per travel window.
         - if:
             condition:
-              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running();'
+              lambda: 'return id(fault_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running() && id(close_attempts_main) < 3;'
             then:
               - valve.close: main_water_valve
 
@@ -1856,7 +1879,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(trickle_alert_main) && id(trickle_shutoff_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running();'
+              lambda: 'return id(trickle_alert_main) && id(trickle_shutoff_main) && !id(closed_end_stop_valve1).state && !id(close_sequence_main).is_running() && id(close_attempts_main) < 3;'
             then:
               - valve.close: main_water_valve
 
@@ -1930,7 +1953,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running();'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running() && id(close_attempts_irr) < 3;'
             then:
               - valve.close: irrigation_water_valve
 
@@ -1980,7 +2003,7 @@ sensor:
         # Gated on close_sequence_irr not-running: retries at most once per travel window.
         - if:
             condition:
-              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running();'
+              lambda: 'return id(fault_irrigation) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running() && id(close_attempts_irr) < 3;'
             then:
               - valve.close: irrigation_water_valve
 
@@ -2013,7 +2036,7 @@ sensor:
             }
         - if:
             condition:
-              lambda: 'return id(trickle_alert_irr) && id(trickle_shutoff_irr) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running();'
+              lambda: 'return id(trickle_alert_irr) && id(trickle_shutoff_irr) && !id(closed_end_stop_valve2).state && !id(close_sequence_irr).is_running() && id(close_attempts_irr) < 3;'
             then:
               - valve.close: irrigation_water_valve
 
@@ -3488,6 +3511,7 @@ button:
     on_press:
       - lambda: |-
           id(fault_main) = false;
+          id(close_attempts_main) = 0;   // hand the close-retry budget back
           id(fault_reason_main_str) = "";
           id(fault_reason_main).publish_state("");
       - logger.log: "Main safety fault manually reset"
@@ -3501,6 +3525,7 @@ button:
     on_press:
       - lambda: |-
           id(fault_irrigation) = false;
+          id(close_attempts_irr) = 0;   // hand the close-retry budget back
           id(fault_reason_irr_str) = "";
           id(fault_reason_irr).publish_state("");
       - logger.log: "Irrigation safety fault manually reset"
@@ -4196,10 +4221,21 @@ script:
             lambda: 'return !id(closed_end_stop_valve1).state && !id(open_sequence_main).is_running();'
           then:
             - lambda: |-
+                id(close_attempts_main)++;
                 id(fault_main) = true;
-                id(fault_reason_main_str) = "Motor fault — closed end stop not reached";
+                if (id(close_attempts_main) >= 3) {
+                  id(fault_reason_main_str) = "Motor fault — closed end stop not reached (3 attempts, retries stopped)";
+                  ESP_LOGE("valve", "MAIN: closed end stop not reached after %u attempts — retries STOPPED. "
+                    "The coil is no longer driven; reset the safety fault to try again.",
+                    (unsigned) id(close_attempts_main));
+                } else {
+                  id(fault_reason_main_str) = "Motor fault — closed end stop not reached";
+                  ESP_LOGE("valve", "MAIN: closed end stop not reached within 90s (attempt %u of 3) — motor/wiring fault",
+                    (unsigned) id(close_attempts_main));
+                }
                 id(fault_reason_main).publish_state(id(fault_reason_main_str));
-                ESP_LOGE("valve", "MAIN: closed end stop not reached within 90s — motor/wiring fault");
+      # A stop actually reached proves the motor drives — clear the budget.
+      - lambda: 'if (id(closed_end_stop_valve1).state) id(close_attempts_main) = 0;'
 
   - id: open_sequence_irr
     mode: single
@@ -4240,10 +4276,21 @@ script:
             lambda: 'return !id(closed_end_stop_valve2).state && !id(open_sequence_irr).is_running();'
           then:
             - lambda: |-
+                id(close_attempts_irr)++;
                 id(fault_irrigation) = true;
-                id(fault_reason_irr_str) = "Motor fault — closed end stop not reached";
+                if (id(close_attempts_irr) >= 3) {
+                  id(fault_reason_irr_str) = "Motor fault — closed end stop not reached (3 attempts, retries stopped)";
+                  ESP_LOGE("valve", "IRRIGATION: closed end stop not reached after %u attempts — retries STOPPED. "
+                    "The coil is no longer driven; reset the safety fault to try again.",
+                    (unsigned) id(close_attempts_irr));
+                } else {
+                  id(fault_reason_irr_str) = "Motor fault — closed end stop not reached";
+                  ESP_LOGE("valve", "IRRIGATION: closed end stop not reached within 90s (attempt %u of 3) — motor/wiring fault",
+                    (unsigned) id(close_attempts_irr));
+                }
                 id(fault_reason_irr).publish_state(id(fault_reason_irr_str));
-                ESP_LOGE("valve", "IRRIGATION: closed end stop not reached within 90s — motor/wiring fault");
+      # A stop actually reached proves the motor drives — clear the budget.
+      - lambda: 'if (id(closed_end_stop_valve2).state) id(close_attempts_irr) = 0;'
 
   # ---------------------------------------------------------------------------
   # LEAK TEST RUN — Main circuit
