@@ -43,3 +43,44 @@ def coerce_int(
     if hi is not None and parsed > hi:
         return default
     return parsed
+
+
+def coerce_float(
+    value: Any,
+    lo: Optional[float] = None,
+    hi: Optional[float] = None,
+    default: float = 0.0,
+) -> float:
+    """Parse a form value into a float bounded to ``[lo, hi]``.
+
+    The float twin of :func:`coerce_int`, and it exists for the same reason:
+    bare ``float(form.get(key, preset))`` raises on any non-numeric POST (a
+    500, not a 4xx) and silently accepts anything that parses, however absurd.
+
+    That matters most on the sensitivity form, whose values authorise an
+    automatic valve close. Those inputs already declare ``min``/``max`` in the
+    HTML — but that is client-side only, so the bounds were never actually
+    enforced. Passing them here makes the form's own declared range real.
+
+    NaN and infinity are rejected: they compare False against every bound, so
+    an unguarded range check would let them through, and a NaN threshold makes
+    every later comparison against it false in ways that differ by how the
+    comparison happens to be written.
+    """
+    if value is None:
+        return default
+    try:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return default
+        parsed = float(value)
+    except (ValueError, TypeError):
+        return default
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return default
+    if lo is not None and parsed < lo:
+        return default
+    if hi is not None and parsed > hi:
+        return default
+    return parsed

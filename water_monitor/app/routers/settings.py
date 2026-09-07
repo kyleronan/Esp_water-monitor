@@ -5,7 +5,8 @@ import logging
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from ._helpers import coerce_int, ingress_redirect, startup_gate
+from ._helpers import (coerce_float, coerce_int, ingress_redirect,
+                       startup_gate)
 
 from ..auth import require_admin
 from ..circuit_compat import resolve_circuit
@@ -789,22 +790,55 @@ async def sensitivity_update(circuit: str, request: Request):
             orch.db, circuit,
             mode=mode,
             simple_level="custom",
-            pressure_drop_event_psi=float(form.get(
-                "pressure_drop_event_psi", preset["pressure_drop_event_psi"])),
-            min_event_duration_seconds=float(form.get(
-                "min_event_duration_seconds", preset["min_event_duration_seconds"])),
-            score_alert=float(form.get("score_alert", preset["score_alert"])),
-            score_shutoff=float(form.get("score_shutoff", preset["score_shutoff"])),
-            flow_tolerance_pct=float(form.get(
-                "flow_tolerance_pct", preset["flow_tolerance_pct"])),
-            duration_tolerance_pct=float(form.get(
-                "duration_tolerance_pct", preset["duration_tolerance_pct"])),
-            schedule_window_minutes=float(form.get(
-                "schedule_window_minutes", preset["schedule_window_minutes"])),
-            sustained_alert_minutes=float(form.get(
-                "sustained_alert_minutes", preset["sustained_alert_minutes"])),
-            max_shutoffs_per_12h=int(form.get(
-                "max_shutoffs_per_12h", preset["max_shutoffs_per_12h"])),
+            # Bounds are the ones the FORM ITSELF declares (min/max on each
+            # <input> in settings.html) — client-side only until now, so a
+            # crafted POST bypassed every one of them. These values authorise an
+            # automatic valve close, and the bare float()/int() below them also
+            # raised on any non-numeric input, turning a typo into a 500 rather
+            # than a rejected field. Out-of-range now falls back to the preset,
+            # matching coerce_int's established contract.
+            #
+            # Nine lines below, anomaly_response is whitelist-validated in this
+            # same router — so the inconsistency was file-level, not a policy.
+            pressure_drop_event_psi=coerce_float(
+                form.get("pressure_drop_event_psi"), lo=0.5, hi=10.0,
+                default=preset["pressure_drop_event_psi"]),
+            min_event_duration_seconds=coerce_float(
+                form.get("min_event_duration_seconds"), lo=1.0, hi=30.0,
+                default=preset["min_event_duration_seconds"]),
+            # score_alert / score_shutoff are the anomaly-score gates. The form
+            # declares min=0.1: a stored 0.0 would make shape_severe true for
+            # every event that has an envelope at all.
+            score_alert=coerce_float(
+                form.get("score_alert"), lo=0.1, hi=1.0,
+                default=preset["score_alert"]),
+            score_shutoff=coerce_float(
+                form.get("score_shutoff"), lo=0.1, hi=1.0,
+                default=preset["score_shutoff"]),
+            flow_tolerance_pct=coerce_float(
+                form.get("flow_tolerance_pct"), lo=5.0, hi=80.0,
+                default=preset["flow_tolerance_pct"]),
+            # The three below have NO <input> in settings.html — they are
+            # reachable only by a hand-crafted POST. Bounds are derived from the
+            # low/medium/high presets with headroom, and are documented here
+            # because there is no form to read them off.
+            duration_tolerance_pct=coerce_float(          # presets 15 / 30 / 50
+                form.get("duration_tolerance_pct"), lo=1.0, hi=100.0,
+                default=preset["duration_tolerance_pct"]),
+            schedule_window_minutes=coerce_float(         # presets 5 / 15 / 30
+                form.get("schedule_window_minutes"), lo=1.0, hi=240.0,
+                default=preset["schedule_window_minutes"]),
+            sustained_alert_minutes=coerce_float(
+                form.get("sustained_alert_minutes"), lo=1.0, hi=60.0,
+                default=preset["sustained_alert_minutes"]),
+            # lo=0 deliberately: whether a stored 0 means "never auto-close" or
+            # "fall back to the default" is an open decision (the `or 2` in
+            # feature_extractor makes 0 behave as 2 today). This unit only
+            # guarantees the form cannot 500 or store nonsense; it does not
+            # settle that meaning.
+            max_shutoffs_per_12h=coerce_int(             # presets 1 / 2 / 3
+                form.get("max_shutoffs_per_12h"), lo=0, hi=20,
+                default=preset["max_shutoffs_per_12h"]),
         )
 
     # Refresh event detector thresholds
