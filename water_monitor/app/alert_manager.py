@@ -23,7 +23,7 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 log = logging.getLogger(__name__)
 
@@ -35,11 +35,50 @@ log = logging.getLogger(__name__)
 _TARGET_FAILURE_THRESHOLD = 3
 _TARGET_BACKOFF = timedelta(hours=1)
 
+
+class _PushRejected(Exception):
+    """HAClient.call_service reported failure WITHOUT raising.
+
+    That is its normal failure mode: it catches everything and returns False
+    (see ha_client.call_service). Carrying a real exception object keeps
+    _record_push_failure's existing signature and log format usable.
+    """
+
+
+class AlertResult(NamedTuple):
+    """Two INDEPENDENT facts about one fire() call. Do not collapse them.
+
+    ``sent`` is the original meaning of fire()'s bool and must not change:
+    "not suppressed by the per-type enable config".
+
+    ``delivered`` is new and answers a different question: did the PRIMARY
+    channel — the Home Assistant persistent notification — actually go out.
+
+    Overloading ``sent`` to mean delivery breaks two real cases:
+
+      * ``_send_mobile_push`` returns False merely for being in COOLDOWN, which
+        is normal and healthy, so aggregating channel results would report a
+        perfectly good alert as undelivered; and
+      * a household with NO mobile targets configured would report undelivered
+        even though the persistent notification went out fine.
+
+    ``__bool__`` preserves the old truthiness for existing
+    ``if await fire(...)`` callers. It is NOT cosmetic: a 2-tuple is
+    unconditionally truthy, so without it every suppressed alert would start
+    stamping ``events.triggered_alert``.
+    """
+
+    sent: bool
+    delivered: bool
+
+    def __bool__(self) -> bool:
+        return self.sent
+
 # Exception types we expect when calling HA's notify service. Anything
 # outside this set falls through to a broad-except that logs at ERROR
 # (with type and traceback) so unknown failure modes don't get
 # swallowed silently.
-_EXPECTED_PUSH_EXCEPTIONS = (asyncio.TimeoutError, OSError)
+_EXPECTED_PUSH_EXCEPTIONS = (_PushRejected, asyncio.TimeoutError, OSError)
 try:
     import aiohttp
     _EXPECTED_PUSH_EXCEPTIONS = _EXPECTED_PUSH_EXCEPTIONS + (
@@ -141,9 +180,16 @@ class AlertManager:
         critical=True bypasses the enabled check — used for safety shutoffs
         where we always want to notify regardless of user preference.
 
-        Returns True when the notification was dispatched, False when it was
-        suppressed by the per-type enable config — so callers can record
-        "this event actually notified" (events.triggered_alert).
+        Returns an :class:`AlertResult` — ``sent`` (not suppressed by the
+        per-type enable config) and ``delivered`` (the HA persistent
+        notification actually went out). Truthiness is ``sent``, which is what
+        this used to return.
+
+        Callers recording "this event actually notified"
+        (``events.triggered_alert``) must test ``.delivered``: HA being
+        unreachable, or the notify service being misconfigured, previously left
+        the database claiming the user had been warned about a leak when nothing
+        was sent.
 
         dev46 (46a): ``prep`` is the caller's already-fetched
         ``_fire_prep_sync`` bundle. Callers that need the unit context to
@@ -157,13 +203,23 @@ class AlertManager:
         if not critical and not prep["enabled"]:
             log.debug("[%s] alert '%s' suppressed (disabled in config)",
                       circuit, alert_type)
-            return False
+            return AlertResult(sent=False, delivered=False)
 
         nid = notification_id or f"water_{alert_type}_{circuit}"
 
-        # 1. HA persistent notification (sidebar)
-        await self._ha.notify(title=title, message=message,
-                              notification_id=nid)
+        # 1. HA persistent notification (sidebar) — the PRIMARY channel.
+        # notify() returns call_service's bool and never raises, so discarding
+        # it (as this did) meant a completely undelivered alert still reported
+        # success and got stamped into events.triggered_alert.
+        delivered = bool(await self._ha.notify(
+            title=title, message=message, notification_id=nid))
+        if not delivered:
+            log.warning(
+                "[%s] alert '%s' was NOT delivered — the HA persistent "
+                "notification call failed (HA unreachable, or the notify "
+                "service is misconfigured). The user has not been told; "
+                "events.triggered_alert will not be stamped.",
+                circuit, alert_type)
 
         # 2. Mobile push (all configured targets)
         for target in prep["targets"]:
@@ -173,7 +229,10 @@ class AlertManager:
                     "tag":             nid,
                 },
             )
-        return True
+        # Mobile results are deliberately NOT folded into `delivered` — see
+        # AlertResult. Cooldown returns False, and a home with no targets
+        # configured would otherwise look like a delivery failure.
+        return AlertResult(sent=True, delivered=delivered)
 
     async def _send_mobile_push(
         self,
@@ -209,10 +268,20 @@ class AlertManager:
             return False
 
         try:
-            await self._ha.call_service(
+            ok = await self._ha.call_service(
                 "notify", target,
                 {"title": title, "message": message, "data": data or {}},
             )
+            if not ok:
+                # call_service catches EVERYTHING and returns False rather than
+                # raising, so the except clauses below are unreachable for the
+                # ordinary failures (non-200, transport error). Without this
+                # branch _record_push_failure never ran, which means
+                # _TARGET_FAILURE_THRESHOLD and _TARGET_BACKOFF below were dead
+                # code: a permanently broken target was retried on every alert,
+                # forever, and never reported.
+                raise _PushRejected(
+                    "call_service returned False (non-200 or transport error)")
         except _EXPECTED_PUSH_EXCEPTIONS as e:
             self._record_push_failure(target, e, level="warning")
             return False
@@ -364,7 +433,10 @@ class AlertManager:
             )
         # Audit trail: record that this event actually notified. Best-effort —
         # a DB hiccup must never fail (or retry-spam) the alert itself.
-        if dispatched and event_id:
+        # .delivered, NOT the truthiness: `dispatched` is true whenever the
+        # alert was not suppressed by config, which says nothing about whether
+        # it reached anyone.
+        if dispatched.delivered and event_id:
             # dev46 (46a): the stamp follows a non-DB await (the notify
             # dispatch above), so it is its own hop — a write bundle, run on
             # the DB thread. Idempotent single-column set, so nothing here
