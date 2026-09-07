@@ -2775,53 +2775,23 @@ number:
           args: ['x']
 
   # ---------------------------------------------------------------------------
-  # §1.4 VALVE-TRAVEL TIMEOUT — how long to wait for the motor to reach its end
-  # stop before declaring a motor/wiring fault. Per-circuit + configurable so a
-  # slow motor / low supply voltage no longer latches a FALSE motor fault. The
-  # default 15000 ms is the historical hardcoded value (zero behaviour change on
-  # an existing install); raise it for a slower valve. The travel lambdas fall
-  # back to 15000 ms if the value is unset/NaN, so the fault logic is never
-  # disabled by a bad number.
+  # NO "Valve Travel Timeout" CONTROL — deliberately removed, not disabled.
+  #
+  # valve_travel_ms_main/_irr existed here as writable, NVS-backed number
+  # entities (range 3000-30000 ms, default 15000) whose description claimed they
+  # governed motor-fault detection. They governed nothing: 3.13.1 replaced the
+  # travel lambdas with a hardcoded `timeout: 90s` on every open/close
+  # wait_until, and the entities were left behind reading nothing.
+  #
+  # They are not merely dead — wiring them back in would be HARMFUL. Real
+  # travel on this valve is ~38-62s, so the entity's MAXIMUM (30000 ms) sat
+  # below the true travel time. Successful moves got branded "Motor fault — end
+  # stop not reached", and those phantom faults are what armed the auto-close /
+  # guard-wedge cascade (field-diagnosed 2026-07-26).
+  #
+  # If a configurable timeout is ever wanted again, its range must START at
+  # 90000 ms, not 30000.
   # ---------------------------------------------------------------------------
-  - platform: template
-    name: "Valve Travel Timeout - ${circuit_1_name}"
-    entity_category: config
-    web_server:
-      sorting_group_id: group_main_settings
-      sorting_weight: 2
-    id: valve_travel_ms_main
-    icon: mdi:timer-cog-outline
-    unit_of_measurement: "ms"
-    min_value: 3000
-    max_value: 30000
-    step: 500
-    initial_value: 15000
-    restore_value: yes
-    optimistic: true
-    set_action:
-      - logger.log:
-          format: "Main valve travel timeout set to %.0f ms"
-          args: ['x']
-
-  - platform: template
-    name: "Valve Travel Timeout - ${circuit_2_name}"
-    entity_category: config
-    web_server:
-      sorting_group_id: group_irr_settings
-      sorting_weight: 2
-    id: valve_travel_ms_irr
-    icon: mdi:timer-cog-outline
-    unit_of_measurement: "ms"
-    min_value: 3000
-    max_value: 30000
-    step: 500
-    initial_value: 15000
-    restore_value: yes
-    optimistic: true
-    set_action:
-      - logger.log:
-          format: "Irrigation valve travel timeout set to %.0f ms"
-          args: ['x']
 
   # ---------------------------------------------------------------------------
   # RAPID PRESSURE DROP THRESHOLD
