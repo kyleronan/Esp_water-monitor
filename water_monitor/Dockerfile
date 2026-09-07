@@ -61,7 +61,6 @@ RUN apt-get update \
         python-multipart==0.0.22 \
         river==0.24.2 \
         dtaidistance==2.3.13 \
-        paho-mqtt==2.1.0 \
  && { pip3 install --no-cache-dir --break-system-packages --only-binary=:all: \
         scikit-learn==1.7.2 && echo 'SKLEARN: installed from manylinux wheel' \
       || echo 'SKLEARN: no wheel for this arch - TinyModel tier stays off'; }

@@ -359,9 +359,14 @@ async def category_publish_toggle(
       5. Unchecked checkbox (form field absent) → publish_to_ha = 0.
 
     On success: persist via ``set_category_publish`` (which also re-validates
-    defensively) and call ``fixture_publisher.publish_category`` /
-    ``retract_category`` so the HA entity flips immediately rather than
-    waiting for the next 60 s state tick.
+    defensively).
+
+    NOTE (MQTT removed 2026-09-07): this checkbox used to also flip a live HA
+    entity through the MQTT publisher. That publisher never worked on this
+    install — no `services:` block meant the Supervisor refused the broker
+    credentials with 403 — and the roadmap it belonged to was abandoned. The
+    value is still persisted, but nothing consumes it; the column and the
+    control are scheduled for removal with the rest of the MQTT schema.
     """
     from ..database import set_category_publish
     from ..fixtures import (fixture_user_selectable_types,
@@ -388,20 +393,6 @@ async def category_publish_toggle(
     from ..database import run_db
     await run_db(set_category_publish, orch.db, circuit,      # dev46 (46a)
                  fixture_type, publish_to_ha)
-
-    # Apply to the live HA broker immediately (no wait for the periodic tick).
-    fp = getattr(orch, "_fixture_publisher", None) or getattr(orch, "fixture_publisher", None)
-    if fp is not None:
-        try:
-            if publish_to_ha:
-                fp.publish_category(circuit, fixture_type)
-            else:
-                fp.retract_category(circuit, fixture_type)
-        except Exception as e:
-            # Don't fail the request if the publisher is offline — the DB
-            # state is what governs the next tick.
-            log.warning("category_publish_toggle: publisher call failed "
-                        "for %s/%s: %s", circuit, fixture_type, e)
 
     return ingress_redirect(request, f"/fixtures#cat-{fixture_type}")
 
@@ -628,14 +619,10 @@ async def confirm_cluster(request: Request, cluster_id: int, circuit: str = Depe
 
     orch = _orch(request)
     from ..database import run_db, upsert_fixture_from_cluster
-    fixture_id = await run_db(                                # dev46 (46a)
+    await run_db(                                             # dev46 (46a)
         upsert_fixture_from_cluster,
         orch.db, circuit, cluster_id, name, fixture_type, publish
     )
-    if publish and fixture_id:
-        fp = getattr(orch, "_fixture_publisher", None)
-        if fp:
-            fp.publish_fixture(fixture_id)
     # Notify the cluster engine so the type-aware match gate takes effect
     # immediately — no restart needed.
     engine = orch.cluster_engine
@@ -684,15 +671,6 @@ async def relink_orphaned_fixture(
         log.error("[%s] relink %s → cluster %d failed: %s",
                   circuit, fixture_id, cluster_id, e, exc_info=True)
         return ingress_redirect(request, "/fixtures?msg=error")
-
-    # Re-publish to HA so the entity reappears for this fixture.
-    fp = getattr(orch, "_fixture_publisher", None)
-    if fp:
-        try:
-            fp.publish_fixture(fixture_id)
-        except Exception as e:
-            log.error("[%s] publish_fixture %s after relink failed: %s",
-                      circuit, fixture_id, e)
 
     # Tell the cluster engine to apply the type-aware match gate to events
     # landing in this cluster going forward.
@@ -762,11 +740,9 @@ async def delete_cluster_endpoint(request: Request, cluster_id: int, circuit: st
         delete_cluster(orch.db, circuit, cluster_id)
         return fid
 
-    fixture_id = await run_db(_lookup_and_delete)
-    if fixture_id:
-        fp = getattr(orch, "_fixture_publisher", None)
-        if fp:
-            fp.retract_fixture(fixture_id)
+    # The id is no longer bound: it existed only to retract the fixture's MQTT
+    # entity, and the delete itself is what matters.
+    await run_db(_lookup_and_delete)
     # Drop the cluster from the type cache so the gate no longer applies
     # to any subsequent river center that re-maps to this slot.
     engine = orch.cluster_engine
@@ -840,7 +816,7 @@ async def merge_clusters_endpoint(
         return ingress_redirect(request, "/fixtures?msg=error")
 
     orch = _orch(request)
-    from ..database import merge_clusters, get_fixture_id_for_cluster
+    from ..database import merge_clusters
 
     # Collect non-survivor fixture IDs before merge, for HA retraction only.
     deleted_ids = [i for i in ids if i != survivor_id]
@@ -848,28 +824,17 @@ async def merge_clusters_endpoint(
     def _collect_and_merge():
         # dev46 (46a/N2a): the pre-merge id sweep and the merge itself are one
         # transaction's worth of work — one callable on the single DB thread.
-        retract = [fid for i in deleted_ids
-                   if (fid := get_fixture_id_for_cluster(orch.db, circuit, i))]
-        return retract, merge_clusters(orch.db, circuit, survivor_id, ids)
+        return merge_clusters(orch.db, circuit, survivor_id, ids)
 
     from ..database import run_db
     try:
-        retract_fixture_ids, summary = await run_db(_collect_and_merge)
+        summary = await run_db(_collect_and_merge)
     except ValueError as e:
         log.warning("[%s] merge validation failed: %s", circuit, e)
         return ingress_redirect(request, "/fixtures?msg=merge_failed")
     except Exception as e:
         log.error("[%s] merge_clusters error: %s", circuit, e, exc_info=True)
         return ingress_redirect(request, "/fixtures?msg=merge_failed")
-
-    # Retract deleted HA fixture entities.
-    fp = getattr(orch, "_fixture_publisher", None)
-    if fp:
-        for fid in retract_fixture_ids:
-            try:
-                fp.retract_fixture(fid)
-            except Exception as e:
-                log.error("[%s] retract_fixture %s failed: %s", circuit, fid, e)
 
     # Rebuild engine state to heal river_id_map and type_cache.
     engine = getattr(orch, "cluster_engine", None)

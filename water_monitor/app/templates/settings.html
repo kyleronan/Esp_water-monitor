@@ -72,12 +72,6 @@
       <span class="sett-nav-label">History &amp; Events</span>
     </button>
 
-    <button class="sett-nav-btn sett-nav-adv" id="sett-btn-integrations"
-            onclick="settNav('integrations')">
-      <span class="sett-nav-icon">🔗</span>
-      <span class="sett-nav-label">Integrations</span>
-    </button>
-
     <button class="sett-nav-btn sett-nav-adv" id="sett-btn-retention"
             onclick="settNav('retention')">
       <span class="sett-nav-icon">🗄️</span>
@@ -1172,59 +1166,6 @@
       </div>
     </div>
 
-    {# ── Integrations ──────────────────────────────────────────────── #}
-    <div class="sett-section sett-adv-section" id="sett-integrations" style="display:none">
-      <div class="sett-adv-banner">
-        <span>⚙</span>
-        <div class="sett-adv-banner-inner">
-          <strong>Installer settings</strong>
-          Changes here affect leak detection and automatic shutoff.
-        </div>
-      </div>
-      <h2 class="sett-section-title">Integrations</h2>
-      <p class="sett-section-desc">
-        Publish confirmed fixtures to Home Assistant via MQTT Discovery.
-        Each fixture appears as native HA entities (Energy panel, automations, dashboards).
-      </p>
-      <div class="sett-card">
-        <form method="post" action="{{ ingress_path }}/settings/integrations/update">
-          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-
-          <div class="sett-toggle-row">
-            <div class="sett-toggle-info">
-              <span class="sett-toggle-label">Publish fixtures to Home Assistant via MQTT</span>
-              <span class="sett-toggle-desc">
-                Sends Discovery payloads for each confirmed fixture — count today,
-                volume today, and a running binary sensor. Requires Mosquitto broker add-on.
-              </span>
-            </div>
-            <label class="toggle">
-              <input type="checkbox" name="mqtt_publish_enabled" value="1"
-                     {% if profile.mqtt_publish_enabled %}checked{% endif %}>
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-
-          <div class="sett-toggle-row" style="margin-top:.75rem;padding-top:.75rem;border-top:1px solid var(--border)">
-            <span class="sett-toggle-label">MQTT broker status</span>
-            {% if mqtt_status == 'connected' %}
-              <span class="pill pill-green">Connected</span>
-            {% elif mqtt_status == 'broker_error' %}
-              <span class="pill pill-red">Broker error</span>
-            {% elif mqtt_status == 'disconnected' %}
-              <span class="pill pill-amber">Disconnected</span>
-            {% else %}
-              <span class="pill pill-neutral">Not configured</span>
-            {% endif %}
-          </div>
-
-          <div style="margin-top:1rem">
-            <button type="submit" class="btn btn-primary btn-sm">Save</button>
-          </div>
-        </form>
-      </div>
-    </div>
-
     {# ── Data Retention ────────────────────────────────────────────── #}
     <div class="sett-section sett-adv-section" id="sett-retention" style="display:none">
       <div class="sett-adv-banner">
@@ -2055,7 +1996,7 @@ function _applySettMode(mode) {
   const btn = document.getElementById('sett-mode-btn');
   if (btn) btn.textContent = mode === 'basic' ? '⚙ Show Advanced' : '⚙ Hide Advanced';
   if (mode === 'basic') {
-    const advSections = ['general', 'integrations', 'retention'];
+    const advSections = ['general', 'retention'];
     const current = location.hash.slice(1);
     if (advSections.includes(current)) settNav('profile');
   }
@@ -2075,7 +2016,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Sections under "Advanced" are hidden in basic mode. If the user lands
   // on one (e.g. via the "Setup is locked" banner deep-linking to #resetup),
   // force Advanced mode on so the section is actually visible.
-  const advSections = ['general', 'integrations', 'retention', 'resetup'];
+  const advSections = ['general', 'retention', 'resetup'];
   if (advSections.includes(id) && savedMode !== 'advanced') {
     _applySettMode('advanced');
   }

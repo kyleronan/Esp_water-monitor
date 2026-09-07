@@ -364,12 +364,6 @@ async def settings_page(request: Request):
             "active_exclusion": _row["exclusion"],
         })
 
-    # MQTT status for the Integrations section status pill
-    mqtt_status = None
-    fp = getattr(orch, "_fixture_publisher", None)
-    if fp is not None:
-        mqtt_status = fp.status()
-
     from ..fixtures import (CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP,
                             ZONE_ONLY_ALERT_TYPES,
                             VALVE_TYPES, VALVE_TYPE_LABELS, VALVE_TYPE_HELP)
@@ -470,7 +464,6 @@ async def settings_page(request: Request):
         "general_entities": entities_by_circuit.get("general", []),
         "presets": SENSITIVITY_PRESETS,
         "retention": _retention,
-        "mqtt_status": mqtt_status,
         "circuit_types": CIRCUIT_TYPES,
         "circuit_type_labels": CIRCUIT_TYPE_LABELS,
         "circuit_type_help": CIRCUIT_TYPE_HELP,
@@ -1631,25 +1624,6 @@ async def water_softener_update(request: Request):
         softener_circuit=circuit if enabled else None,
     )
     return ingress_redirect(request, "/settings#water-softener")
-
-
-@router.post("/integrations/update")
-async def integrations_update(request: Request):
-    form = await request.form()
-    enabled = 1 if form.get("mqtt_publish_enabled") == "1" else 0
-    orch = _orch(request)
-    # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
-    from ..database import run_db
-
-    def _save():
-        orch.db.execute(
-            """UPDATE home_profile SET mqtt_publish_enabled = ? WHERE id = 1""",
-            (enabled,)
-        )
-        orch.db.commit()
-
-    await run_db(_save)
-    return ingress_redirect(request, "/settings#integrations")
 
 
 # ------------------------------------------------------------------

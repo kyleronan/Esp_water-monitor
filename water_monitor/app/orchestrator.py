@@ -35,7 +35,6 @@ from .learning_scheduler import LearningScheduler
 from .maturity_recheck import MaturityRecheck
 from .rise_corr_backfill import RiseCorrBackfill
 from .wf_repair_backfill import WfRepairBackfill
-from .fixture_publisher import FixturePublisher
 
 log = logging.getLogger(__name__)
 
@@ -132,7 +131,6 @@ class Orchestrator:
         self._learning: Optional[LearningScheduler] = None
         self._rise_corr_backfill: Optional[RiseCorrBackfill] = None
         self._wf_repair_backfill: Optional[WfRepairBackfill] = None
-        self._fixture_publisher: Optional[FixturePublisher] = None
         self._stop = asyncio.Event()
         #: name -> {state, restarts, last_error, last_error_at}, written by
         #: _supervise and read by /health/detail. In-memory only: it describes
@@ -1148,12 +1146,6 @@ class Orchestrator:
             settled_getter=self._event_detector.settled_pressure,
             ha_tz=self._ha_tz, alert_manager=self._alert_manager)
 
-        # Fixture publisher — MQTT Discovery for confirmed fixtures
-        self._fixture_publisher = FixturePublisher(self._db, self._cfg, self._ha)
-        try:
-            await self._fixture_publisher.start()
-        except Exception as e:
-            log.warning("FixturePublisher start failed (non-fatal): %s", e)
 
         # Run all background tasks concurrently, each under its own supervisor
         # so a crash in one subsystem restarts only that subsystem instead of
