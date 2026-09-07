@@ -193,6 +193,29 @@ esphome:
                 id: irrigation_water_valve
                 state: CLOSED
 
+      # --- Recover from a reboot during a leak test ---
+      # leak_test_result_* is the ONLY leak-test global with restore_value:
+      # yes, so it is the only evidence an interrupted test ever happened.
+      # active/preparing have already reset to false by the time this runs,
+      # which is exactly why nothing else would ever reopen the valve: the
+      # test closed it and the reboot erased the state that would restore it.
+      # Codes 8 (Preparing) and 1 (In progress) both mean the valve was
+      # closed by the test. leak_test_restore_* is itself gated on !fault_*,
+      # so a latched fault still holds the valve shut.
+      - lambda: |-
+          if (id(leak_test_result_main) == 8 || id(leak_test_result_main) == 1) {
+            id(leak_test_result_main) = 13;  // Aborted — device restarted mid-test
+            ESP_LOGW("leak_test", "MAIN: rebooted during a leak test — "
+              "reopening the valve (the test cannot be resumed).");
+            id(leak_test_restore_main).execute();
+          }
+          if (id(leak_test_result_irr) == 8 || id(leak_test_result_irr) == 1) {
+            id(leak_test_result_irr) = 13;  // Aborted — device restarted mid-test
+            ESP_LOGW("leak_test", "IRRIGATION: rebooted during a leak test — "
+              "reopening the valve (the test cannot be resumed).");
+            id(leak_test_restore_irr).execute();
+          }
+
 esp32:
   board: esp32-s3-devkitc-1
   framework:
@@ -698,6 +721,11 @@ globals:
   #   9 — Aborted — demand detected (sudden pressure drop)
   #  10 — Aborted — valve failed to close (closed end stop never reached;
   #       motor/relay fault — measuring would produce a false pass/fail)
+  #  11 — Not run — water in use
+  #  12 — Aborted — water used while closing
+  #  13 — Aborted — device restarted mid-test (on_boot reopens the valve and
+  #       stamps this; no other leak-test global survives the reboot, so
+  #       this code is the only evidence the test was interrupted)
   # ---------------------------------------------------------------------------
   - id: leak_test_result_main
     type: int
@@ -2218,6 +2246,7 @@ text_sensor:
         case 10: return {"Aborted — valve failed to close"};
         case 11: return {"Not run — water in use"};
         case 12: return {"Aborted — water used while closing"};
+        case 13: return {"Aborted — device restarted mid-test"};
         default: return {"No test run"};
       }
 
@@ -2244,6 +2273,7 @@ text_sensor:
         case 10: return {"Aborted — valve failed to close"};
         case 11: return {"Not run — water in use"};
         case 12: return {"Aborted — water used while closing"};
+        case 13: return {"Aborted — device restarted mid-test"};
         default: return {"No test run"};
       }
 

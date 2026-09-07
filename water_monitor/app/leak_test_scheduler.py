@@ -50,6 +50,10 @@ TERMINAL_RESULTS = {
     # refused because water was already running.
     "Not run — water in use",
     "Aborted — water used while closing",
+    # The ESP rebooted mid-test: on_boot reopens the valve and stamps code
+    # 13, so the row terminates here instead of waiting out the poll window
+    # and recording a misleading "Timed out".
+    "Aborted — device restarted mid-test",
 }
 
 # Results that mean "a fixture was running, so this tells us nothing about a
