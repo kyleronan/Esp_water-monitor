@@ -324,6 +324,30 @@ globals:
     restore_value: yes
     initial_value: '0'
 
+  # Calibrated pressure BEFORE the clamp filter, per circuit.
+  #
+  # The calibration maps 0.0 V — -9.4359 PSI, which is good design: a
+  # disconnected or shorted transducer produces a value OUTSIDE the physical
+  # range, exactly the NAMUR NE 43 structure (fault band outside the live
+  # measurement band). `clamp: min_value: 0` then throws that away and
+  # publishes 0.00 PSI — so a dead sensor becomes indistinguishable from a
+  # depressurised system, which for a leak monitor is the "nothing is
+  # happening" state. ESPHome's clamp also maps NaN to the lower bound, so an
+  # ADC read failure lands on the same benign zero.
+  #
+  # These globals keep the pre-clamp value so the fault can be DETECTED. What
+  # the pressure sensors publish is deliberately unchanged — see the
+  # binary_sensors below.
+  - id: pressure_unclamped_psi_main
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: pressure_unclamped_psi_irr
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
   # True while leak test mode is active on the main valve circuit.
   # Enables pressure decay monitoring on the main pressure sensor.
   - id: leak_test_active_main
@@ -1081,6 +1105,12 @@ sensor:
           datapoints:
             - ${pressure_cal_main_zero_raw} -> ${pressure_cal_main_zero_psi}
             - ${pressure_cal_main_max_raw} -> ${pressure_cal_main_max_psi}
+      # Pass-through: records the calibrated value BEFORE the clamp below can
+      # fold an under-range fault onto 0.00 PSI. Returns x unchanged, so the
+      # published pressure is bit-for-bit what it was.
+      - lambda: |-
+          id(pressure_unclamped_psi_main) = x;
+          return x;
       - clamp:
           min_value: 0
           max_value: 104
@@ -1100,6 +1130,12 @@ sensor:
           datapoints:
             - ${pressure_cal_irr_zero_raw} -> ${pressure_cal_irr_zero_psi}
             - ${pressure_cal_irr_max_raw} -> ${pressure_cal_irr_max_psi}
+      # Pass-through: records the calibrated value BEFORE the clamp below can
+      # fold an under-range fault onto 0.00 PSI. Returns x unchanged, so the
+      # published pressure is bit-for-bit what it was.
+      - lambda: |-
+          id(pressure_unclamped_psi_irr) = x;
+          return x;
       - clamp:
           min_value: 0
           max_value: 104
@@ -2474,6 +2510,49 @@ binary_sensor:
     lambda: 'return id(last_pulse_ms_irr) != 0 && (millis() - id(last_pulse_ms_irr)) < 1000;'
     filters:
       - delayed_off: 2s
+
+  # ---------------------------------------------------------------------------
+  # PRESSURE SENSOR FAULT — NAMUR NE 43 style under-range detection
+  #
+  # Fires when the CALIBRATED, PRE-CLAMP pressure sits below -1.0 PSI. Valid
+  # readings start at 0 PSI (258 mV); a disconnected transducer reads ~-9.44
+  # PSI (0 V), so the threshold has ~9x margin from the fault value and sits
+  # well below plausible noise around a genuine zero.
+  #
+  # delayed_on 4s is the NE 43 persistence requirement: a momentary glitch must
+  # not masquerade as a broken wire, and a broken wire must not masquerade as a
+  # valid reading. delayed_off matches so the state cannot chatter.
+  #
+  # ADDITIVE ONLY: this reports the fault, it does not act on it. The clamp
+  # still publishes 0.00 PSI for a dead sensor — changing that touches burst
+  # detection, the trickle band, the waveform flow_on gate and the leak test,
+  # and is a separate decision.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Pressure Sensor Fault - ${circuit_1_name}"
+    id: pressure_sensor_fault_main
+    device_class: problem
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 6
+    lambda: 'return id(pressure_unclamped_psi_main) < -1.0f;'
+    filters:
+      - delayed_on: 4s
+      - delayed_off: 4s
+
+  - platform: template
+    name: "Pressure Sensor Fault - ${circuit_2_name}"
+    id: pressure_sensor_fault_irr
+    device_class: problem
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 6
+    lambda: 'return id(pressure_unclamped_psi_irr) < -1.0f;'
+    filters:
+      - delayed_on: 4s
+      - delayed_off: 4s
 
   # ---------------------------------------------------------------------------
   # FAULT STATUS SENSORS
