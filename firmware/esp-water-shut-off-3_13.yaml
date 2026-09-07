@@ -4323,6 +4323,8 @@ script:
                                     id(leak_test_result_main) = 10;  // Aborted — valve failed to close
                                     id(leak_test_preparing_main) = false;
                                     id(leak_test_active_main) = false;
+                                    // Abort must not leave the valve closed (no-op while a fault is latched).
+                                    id(leak_test_restore_main).execute();
                                     ESP_LOGE("leak_test", "MAIN: valve did not reach the closed end stop — "
                                       "aborting test (motor/relay fault?). Result would be meaningless.");
                                     return;
@@ -4332,6 +4334,8 @@ script:
                                     id(leak_test_result_main) = 6;  // Not run — sensor not ready
                                     id(leak_test_preparing_main) = false;
                                     id(leak_test_active_main) = false;
+                                    // Abort must not leave the valve closed (no-op while a fault is latched).
+                                    id(leak_test_restore_main).execute();
                                     ESP_LOGW("leak_test", "MAIN: baseline invalid (%.1f PSI) — "
                                       "ADC not settled after close, aborting test", baseline);
                                     return;
@@ -4450,6 +4454,8 @@ script:
                                     id(leak_test_result_irr) = 10;  // Aborted — valve failed to close
                                     id(leak_test_preparing_irr) = false;
                                     id(leak_test_active_irr) = false;
+                                    // Abort must not leave the valve closed (no-op while a fault is latched).
+                                    id(leak_test_restore_irr).execute();
                                     ESP_LOGE("leak_test", "IRRIGATION: valve did not reach the closed end stop — "
                                       "aborting test (motor/relay fault?). Result would be meaningless.");
                                     return;
@@ -4459,6 +4465,8 @@ script:
                                     id(leak_test_result_irr) = 6;  // Not run — sensor not ready
                                     id(leak_test_preparing_irr) = false;
                                     id(leak_test_active_irr) = false;
+                                    // Abort must not leave the valve closed (no-op while a fault is latched).
+                                    id(leak_test_restore_irr).execute();
                                     ESP_LOGW("leak_test", "IRRIGATION: baseline invalid (%.1f PSI) — "
                                       "ADC not settled after close, aborting test", baseline);
                                     return;
