@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 from .database import (
@@ -26,6 +26,38 @@ from .database import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _local_wall_to_utc(wall: datetime, tz) -> datetime:
+    """Resolve a NAIVE local wall-clock time to an unambiguous UTC instant.
+
+    PEP 495 is the trap here. A wall time inside the spring-forward gap does
+    not exist, and one inside the fall-back overlap happens twice — and
+    ``datetime`` raises for NEITHER. It silently picks an offset using
+    ``fold``, and ``fold`` is then IGNORED by ``timedelta`` arithmetic, so
+    anything built by adding a day to a previous target quietly drifts.
+    Resolve both cases here, explicitly, once:
+
+      * overlap (the wall time round-trips, but the two folds disagree):
+        take the FIRST occurrence, so the nightly job runs once, not twice.
+      * gap (the wall time does not round-trip at all): take the later of the
+        two candidates, i.e. the first real instant at or after the requested
+        wall time, so the job is never skipped outright.
+
+    In practice the caller asks for 03:00, which is the safe END of the US
+    spring-forward gap (02:00 -> 03:00) and an hour clear of the fall-back
+    overlap (02:00 -> 01:00), so on America/Denver neither branch is ever
+    taken. That is a deliberate choice of hour, not luck — but zones that
+    shift at 03:00 or 04:00 local (parts of Europe) do hit both branches, so
+    the handling is real rather than decorative.
+    """
+    a = wall.replace(tzinfo=tz, fold=0).astimezone(timezone.utc)
+    b = wall.replace(tzinfo=tz, fold=1).astimezone(timezone.utc)
+    if a == b:
+        return a                                   # ordinary, unambiguous
+    if a.astimezone(tz).replace(tzinfo=None) == wall:
+        return min(a, b)                           # overlap -> first pass
+    return max(a, b)                               # gap -> after the jump
 
 
 class DataPruner:
@@ -52,17 +84,22 @@ class DataPruner:
         from .database import run_db
         await run_db(self._startup_backfill_sync)
 
-        await self._wait_until_3am()
+        # The wait is INSIDE the loop, and re-derives 03:00 from the wall clock
+        # every iteration. It used to be awaited once, before the loop, after
+        # which the loop slept a flat ``timeout=86400`` forever — and asyncio
+        # sleeps on the MONOTONIC clock, so that is 86400 true SI seconds no
+        # matter what the wall clock does. A 23 h or 25 h DST day therefore
+        # shifted the nightly prune, summary rebuild and auto-backup to 02:00
+        # or 04:00 permanently, with no way to self-correct short of a restart.
         while not self._stop.is_set():
+            await self._wait_until_3am()
+            if self._stop.is_set():
+                break
             try:
                 await run_db(self.prune_now)
                 await self._run_auto_backup()
             except Exception as e:
                 log.error("Data pruner nightly error: %s", e, exc_info=True)
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=86400)
-            except asyncio.TimeoutError:
-                pass
 
     # ── Startup backfill ────────────────────────────────────────────────────
 
@@ -410,6 +447,15 @@ class DataPruner:
 
     def _snapshot_tables_sync(self, cutoff: str) -> dict:
         """dev46 (46a) — the Quick Restore table snapshot, one hop."""
+        # Imported HERE, not inherited. This helper was hoisted out of
+        # _run_auto_backup for run_db, but the import it depends on stayed
+        # behind in the caller's body — so the loop below raised NameError,
+        # caught by _run_auto_backup's broad ``except Exception`` and logged
+        # as "Auto-backup failed". The nightly backup has been writing nothing
+        # ever since. Same defect shape as FixturePublisher's
+        # _update_state_reads_sync.
+        from .routers.backup import QUICK_RESTORE_TABLES
+
         tables = {}
         for tbl in QUICK_RESTORE_TABLES:
             rows = self._db.execute(f"SELECT * FROM {tbl}").fetchall()
@@ -430,7 +476,13 @@ class DataPruner:
             return
 
         target_dow = int(cfg.get("auto_backup_day_of_week", 0))
-        if datetime.now().weekday() != target_dow:
+        # Home timezone, not the container's naive clock — the user picks this
+        # day on a local-time calendar and the job now fires at local 03:00.
+        # (West of UTC the two agree at 03:00 and this was harmless; east of
+        # UTC 03:00 local is still the PREVIOUS UTC day, which fired the weekly
+        # backup a day early.)
+        from .database import _home_tz
+        if datetime.now(_home_tz()).weekday() != target_dow:
             return
 
         backup_path = Path(cfg.get("auto_backup_path",
@@ -443,9 +495,7 @@ class DataPruner:
             return
 
         try:
-            from .routers.backup import (
-                QUICK_RESTORE_TABLES, QUICK_RESTORE_DAYS)
-            from datetime import timedelta
+            from .routers.backup import QUICK_RESTORE_DAYS
 
             cutoff = (datetime.now(timezone.utc)
                       - timedelta(days=QUICK_RESTORE_DAYS)).isoformat()
@@ -488,20 +538,63 @@ class DataPruner:
             log.error("Auto-backup failed: %s", e, exc_info=True)
 
     async def _wait_until_3am(self) -> None:
-        """Sleep until 03:00 local time.  Recalculates in 1-hour chunks so
-        DST transitions (spring-forward / fall-back) never cause the job to
-        be skipped or fire an hour early."""
-        while True:
-            now    = datetime.now()
-            target = now.replace(hour=3, minute=0, second=0, microsecond=0)
-            if target <= now:
-                target += timedelta(days=1)
-            # Sleep at most 1 hour at a time so a DST change is picked up
-            # within the next chunk rather than after the full calculated gap.
-            sleep_secs = min((target - now).total_seconds(), 3600)
+        """Sleep until the next local 03:00, then return.
+
+        Returns early (without waiting out the remainder) when stop is set.
+
+        Everything here is computed in UTC and converted at the edges. The
+        previous version used a naive ``datetime.now()``, i.e. the CONTAINER's
+        clock: no ``TZ`` is set in the Dockerfile, config.yaml or rootfs/, so
+        that was UTC in production regardless of where the home actually is —
+        a third timezone in a codebase that already keys every rollup on the
+        home's local day. It now uses the SAME zone as those rollups (the one
+        the orchestrator caches at tz detection).
+        """
+        while not self._stop.is_set():
+            now    = datetime.now(timezone.utc)
+            target = self._next_run_utc(now)
+            remaining = (target - now).total_seconds()
+            if remaining <= 0:
+                return
+            # Wake at least hourly. asyncio.wait_for sleeps on the MONOTONIC
+            # clock, which by design does not notice wall-clock jumps — a DST
+            # transition, an NTP step, or a container resumed from suspend.
+            # Chunking means the target is re-derived from the wall clock at
+            # least once an hour, so any such jump corrects itself inside the
+            # hour instead of persisting until the next restart.
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=sleep_secs)
+                await asyncio.wait_for(self._stop.wait(),
+                                       timeout=min(remaining, 3600.0))
                 return   # stop requested
             except asyncio.TimeoutError:
-                if datetime.now() >= target:
-                    return   # it's 03:00 (or past it)
+                continue
+
+    _NIGHTLY_LOCAL_HOUR = 3
+
+    def _next_run_utc(self, now_utc: datetime = None) -> datetime:
+        """UTC instant of the next local 03:00 strictly after ``now_utc``.
+
+        Pure and side-effect free so the DST behaviour is testable without a
+        clock: pass any instant, get the instant the job should next fire.
+        """
+        from .database import _home_tz          # the one home-timezone source
+        tz = _home_tz()
+        now_utc = now_utc or datetime.now(timezone.utc)
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(tzinfo=timezone.utc)
+        now_local = now_utc.astimezone(tz)
+
+        day = now_local.date()
+        target = _local_wall_to_utc(
+            datetime.combine(day, time(self._NIGHTLY_LOCAL_HOUR)), tz)
+        if target <= now_utc:
+            # Advance by one CALENDAR day, never by timedelta(hours=24): a
+            # spring-forward day is 23 h wide and a fall-back day 25 h, and
+            # adding 24 h to an aware datetime is wall-clock arithmetic that
+            # ignores the transition entirely (see the PEP 495 note in
+            # _local_wall_to_utc). Re-anchoring on the next local DATE is what
+            # local_day_bounds_utc does for the same reason.
+            day = day + timedelta(days=1)
+            target = _local_wall_to_utc(
+                datetime.combine(day, time(self._NIGHTLY_LOCAL_HOUR)), tz)
+        return target
