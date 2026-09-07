@@ -535,6 +535,19 @@ def observed_rate(events: Sequence[dict]) -> float:
 
 
 # ── persistence ─────────────────────────────────────────────────────────────
+# NONE OF THE WRITERS BELOW COMMIT, AND THAT IS THE CONTRACT (dev46 rule N2a).
+# Each is a leaf; the caller that owns the ``run_db`` hop owns the transaction
+# and issues the commit — ``health_job.run_nightly`` for the nightly pass,
+# ``routers/fixtures.resolve_health_alert``'s ``_job`` for the operator path.
+# Adding a commit here would break both: the nightly pass would stop being one
+# atomic verdict, and resolve+unlock+delete would stop being one.
+#
+# The cost of getting this wrong is silent, which is why it is written down.
+# ``database.get_connection`` never sets ``isolation_level``, so sqlite3 opens
+# an implicit transaction before the first write and never closes it. A writer
+# whose caller forgets to commit does not raise, does not log, and reads back
+# perfectly on its own connection — it simply never reaches disk. That was
+# live for the whole nightly pass until dev57.
 def save_baseline(conn: sqlite3.Connection, baseline: FrozenBaseline) -> None:
     conn.execute(
         "INSERT INTO fixture_baseline (circuit, fixture_type, baseline_hash, "

@@ -265,31 +265,58 @@ def run_nightly(conn: sqlite3.Connection, circuit: str,
     Synchronous — the caller submits it through ``run_db`` (46a). Returns a
     per-fixture summary; the caller logs or surfaces it. Never raises for the
     ordinary "not enough history yet" cases, which are states, not errors.
+
+    THE COMMIT LIVES HERE (dev46 rule N2a)
+    --------------------------------------
+    One ``run_db`` callable, one transaction, ending in its own commit. This
+    pass is the ONLY production caller of ``fh.save_baseline``,
+    ``fh.open_alert`` and ``fh.record_nightly_stats``, and none of those leaves
+    commits — deliberately, so that pinning a baseline, raising its alert and
+    appending the night's evidence are one atomic verdict rather than three
+    writes that can be torn apart by a crash.
+
+    Until dev57 nothing committed at all. ``database.get_connection`` never
+    sets ``isolation_level``, so sqlite3's default opens an implicit
+    transaction before the first write and never closes it; the whole nightly
+    pass sat unwritten on the shared connection, surviving only if some
+    unrelated code path happened to commit it later and vanishing on the next
+    ``_rollback_quietly``. Every existing test missed it because they all
+    assert through the SAME connection, where an open transaction reads back
+    exactly like a committed one — see
+    ``tests/test_health_job_commits.py``, which asserts from a second one.
+
+    ``transaction()`` also supplies the other half: a failure part-way through
+    fixture three rolls back fixtures one and two instead of leaving a
+    half-applied pass behind for the next writer to inherit.
     """
+    from .database import transaction
     day = as_of_day or _utc_now().strftime("%Y-%m-%d")
-    stream = load_attributed_stream(conn, circuit)
     out: Dict[str, dict] = {}
-    if not stream:
-        return out
-    for fixture_type in watched:
-        baseline = ensure_baseline(conn, circuit, fixture_type, stream)
-        if baseline is None:
-            mine = [e for e in stream if e["cls"] == fixture_type]
-            out[fixture_type] = FixtureResult(
-                fixture_type=fixture_type, n_events=len(mine),
-                note="no baseline yet — needs a closed window with "
-                     f"{fh.MIN_BASELINE_EVENTS}+ events").as_dict()
-            continue
-        result = evaluate_fixture(conn, circuit, fixture_type, stream, baseline,
-                                  enable_share=enable_share,
-                                  enable_unsolicited=enable_unsolicited)
-        fh.record_nightly_stats(conn, circuit, fixture_type, day, {
-            "n_events": result.n_events,
-            "events_per_day": result.events_per_day,
-            "under_covered": result.under_covered,
-            "baseline_hash": baseline.baseline_hash,
-            "alarms": [a.signal for a in result.alarms if a.fired],
-            "observed": {a.signal: a.observed for a in result.alarms},
-        })
-        out[fixture_type] = result.as_dict()
+    # The commit fires on every exit path, including the empty-stream return:
+    # a pass that wrote nothing must still leave the connection clean.
+    with transaction(conn):
+        stream = load_attributed_stream(conn, circuit)
+        if not stream:
+            return out
+        for fixture_type in watched:
+            baseline = ensure_baseline(conn, circuit, fixture_type, stream)
+            if baseline is None:
+                mine = [e for e in stream if e["cls"] == fixture_type]
+                out[fixture_type] = FixtureResult(
+                    fixture_type=fixture_type, n_events=len(mine),
+                    note="no baseline yet — needs a closed window with "
+                         f"{fh.MIN_BASELINE_EVENTS}+ events").as_dict()
+                continue
+            result = evaluate_fixture(conn, circuit, fixture_type, stream,
+                                      baseline, enable_share=enable_share,
+                                      enable_unsolicited=enable_unsolicited)
+            fh.record_nightly_stats(conn, circuit, fixture_type, day, {
+                "n_events": result.n_events,
+                "events_per_day": result.events_per_day,
+                "under_covered": result.under_covered,
+                "baseline_hash": baseline.baseline_hash,
+                "alarms": [a.signal for a in result.alarms if a.fired],
+                "observed": {a.signal: a.observed for a in result.alarms},
+            })
+            out[fixture_type] = result.as_dict()
     return out
