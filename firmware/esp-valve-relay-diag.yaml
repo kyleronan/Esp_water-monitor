@@ -37,7 +37,13 @@ substitutions:
   circuit_2_name: "Irrigation"
 
 esphome:
-  name: esp-water-shut-off
+  # DISTINCT from the production config's `name: esp-water-shut-off`.
+  # `name` (plus name_add_mac_suffix) is what Home Assistant keys a device on,
+  # so when this shared that name, flashing the bench firmware onto a deployed
+  # board TOOK OVER the production device's HA identity — and because this
+  # config has no `api:` block, every production entity went unavailable under
+  # it while the add-on silently lost its feed. Keep these names different.
+  name: esp-valve-relay-diag
   friendly_name: ESP Valve Relay Diag
   min_version: 2026.6.1
   name_add_mac_suffix: true
