@@ -90,7 +90,7 @@ flowchart TD
 ## Part 1 — Capture (raw water → stored event)
 
 ### 1 · ESP32 senses
-**`firmware/esp-water-shut-off-3_13.yaml`** (firmware 3.13 rewrote flow measurement)
+**`firmware/esp-water-shut-off-3_14.yaml`** (firmware 3.13 rewrote flow measurement)
 
 - **Flow chain:** ESPHome **`pulse_meter`** — times the interval *between pulse edges* (100 µs bounce
   filter), so the rate is already period-smoothed; no fixed sampling window. Rate (pulses/min) ÷

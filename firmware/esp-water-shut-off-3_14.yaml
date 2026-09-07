@@ -109,7 +109,7 @@ substitutions:
 
 esphome:
   name: esp-water-shut-off
-  friendly_name: ESP Water Shut off 3.13
+  friendly_name: ESP Water Shut off 3.14
   min_version: 2026.6.1
   name_add_mac_suffix: true
   platformio_options:
@@ -117,7 +117,7 @@ esphome:
     board_build.flash_mode: dio
   project:
     name: ronan.esp-water-monitor
-    version: "3.13.2"   # leak test: no fault on failure, flow pre-check, settle after seal, fall-rate demand classifier, baseline/close-pressure sensors
+    version: "3.14.0"   # safety: leak-test aborts restore the valve, reboot recovery, bounded close retry, NE 43 pressure-fault detection, end-stop plausibility, non-latching LEDs
 
   # ---------------------------------------------------------------------------
   # BOOT SEQUENCE
@@ -249,7 +249,7 @@ dashboard_import:
   # IMPORTANT: this URL must point at an immutable tag (e.g. @v3.13.0)
   # before each release. scripts/check_firmware_release.py enforces this
   # — it fails the release if the ref ends with @main or any branch ref.
-  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_13.yaml@v3.13.2
+  package_import_url: github://kyleronan/Esp_water-monitor/firmware/esp-water-shut-off-3_14.yaml@v3.14.0
   import_full_config: true
 
 esp32_improv:

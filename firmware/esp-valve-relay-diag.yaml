@@ -20,7 +20,7 @@
 #
 # SAFETY / USAGE NOTES
 #   - This firmware has NO valve logic, NO safety shutoffs, NO leak testing.
-#     Bench diagnosis only. Reflash esp-water-shut-off-3_13.yaml when done.
+#     Bench diagnosis only. Reflash esp-water-shut-off-3_14.yaml when done.
 #   - A successful coil drive LATCHES the relay — the valve may start moving
 #     if motor power is connected. Expect water valves to actuate.
 #   - Keep holds short (≤ 10 s) out of ordinary coil-thermal courtesy.

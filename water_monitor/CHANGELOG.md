@@ -749,6 +749,61 @@ makes the add-on survive that.
   no setting that escapes it. The fix is a feature-space redesign, queued
   deliberately rather than another hopeful re-seed.
 
+## [firmware 3.14.0] — 2026-09-07
+
+A safety release. Every item is a case where the firmware could leave the water
+in a state it never reported, or stop protecting without saying so.
+
+- **A leak test can no longer walk away from a closed valve.** Two abort paths
+  — "valve failed to close" and an invalid baseline — set their flags and
+  returned without reopening, so the main stayed shut while the UI read "Not run
+  — valve was closed". The invalid-baseline case is the worse one: it is only
+  reached *after* the closed end stop is confirmed, and a baseline under 1 PSI is
+  what a large leak downstream of the valve looks like.
+- **A reboot during a test reopens the valve.** The test closed it, then the
+  reboot erased every global that would have restored it — only the result code
+  survives NVS. Boot now restores from that, and reports the new result
+  "Aborted — device restarted mid-test" instead of sitting at "Preparing"
+  forever.
+- **The auto-close retry is bounded to 3 attempts.** A fault re-armed the close
+  on every pressure publish, so a jammed valve was driven 90 s on, half a second
+  off, indefinitely — and there is no current or stall detection on this board
+  to stop it. After three failed closes the coil is left alone and the fault says
+  so. Resetting the fault hands the budget back.
+- **A dead pressure sensor no longer looks like an empty pipe.** The calibration
+  already put a disconnected transducer outside the physical range (−9.4 PSI);
+  the clamp folded that onto a clean 0.00 PSI, which for a leak monitor is the
+  "nothing is happening" reading. New "Pressure Sensor Fault" entities detect it
+  before the clamp, with a 4 s hold so a glitch cannot masquerade as a broken
+  wire. What the pressure sensors publish is unchanged.
+- **A saturated line aborts the leak test.** Pressure clamps at 104 PSI, so
+  thermal expansion past the ceiling read as a perfectly flat line — exactly the
+  condition the "pressure rose" abort exists to catch.
+- **Burst detection no longer trips on a single sample.** The throttled flow
+  check faulted on one reading, while the per-pulse check beside it had always
+  required two hits and a 1.5× margin.
+- **A failed end-stop switch is now visible.** Two of the three burst detectors
+  are gated on the open end stop, so if it failed they quietly stopped detecting.
+  New "Valve Position Unknown" entities report neither stop reading with no
+  travel in progress.
+- **The panel LEDs stop lying.** They had no release handlers, so the green OPEN
+  lamp stayed lit through the entire close travel and indefinitely if the motor
+  stalled — wrong precisely when it mattered.
+- **Over-range flow readings are counted** rather than silently discarded as
+  zero. The rate is unchanged for now; the counters exist to establish whether
+  those readings are real before changing what a burst detector sees.
+- **Removed: the "Valve Travel Timeout" controls.** They were writable and
+  NVS-backed and governed nothing — 3.13.1 replaced the travel lambdas with a
+  fixed 90 s timeout. Their maximum (30 s) was below real travel (~38–62 s), so
+  wiring them back would reintroduce the phantom motor faults of 2026-07-26.
+- **The bench diagnostic firmware has its own device name.** It shared
+  `esp-water-shut-off`, so flashing it took over the deployed device's Home
+  Assistant identity — and having no API block, it left every entity
+  unavailable while the add-on lost its feed.
+
+After flashing, delete the two now-unavailable **Valve Travel Timeout** entities
+from Home Assistant.
+
 ## [firmware 3.13.0] — 2026-07-04
 
 Both circuits migrate from `pulse_counter` (windowed counting, quantized to

@@ -45,7 +45,7 @@ fit; calibrating per-circuit eliminates the bias and makes the leak
 test more sensitive.
 
 Each circuit has four substitutions in
-`firmware/esp-water-shut-off-3_10.yaml` (search for "PRESSURE
+`firmware/esp-water-shut-off-3_14.yaml` (search for "PRESSURE
 TRANSDUCER CALIBRATION"). Override them after bench measurement:
 
 ```yaml
