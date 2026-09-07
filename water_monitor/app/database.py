@@ -1297,7 +1297,8 @@ CREATE TABLE IF NOT EXISTS event_waveforms (
     -- INDEPENDENTLY from streams of different cadences (audit §3.5: 18.2%
     -- of events misaligned on a shared index axis). *_src_n = source sample
     -- count before binning; *_src_hz = fixed sample rate when one exists
-    -- (200.0 for ESP captures; NULL for the event-driven software series,
+    -- (50.0 for ESP captures — the firmware's 20 ms waveform_capture tick,
+    -- NOT the 200 Hz ADC read loop; NULL for the event-driven software series,
     -- whose spacing is NOT uniform and has no recoverable axis).
     flow_src_n            INTEGER,
     press_src_n           INTEGER,

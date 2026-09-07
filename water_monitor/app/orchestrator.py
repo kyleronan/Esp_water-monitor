@@ -481,6 +481,25 @@ class Orchestrator:
         for cfg in self._cfg.circuits:
             entity = getattr(cfg, "flow_meter_ppl_entity", "")
             if not entity:
+                # No firmware PPL entity bound for this circuit. We then run on
+                # circuit_profile.pulses_per_litre, whose column DEFAULT is also
+                # 396.0 — so on a fresh install with an unbound entity the add-on
+                # silently assumes a reference turbine. Nothing else ever corrects
+                # it: this subscription is the ONLY write path for PPL, so the
+                # error is permanent and every derived volume, the low-flow floor
+                # (60 / ppl) and every threshold scaled from them are wrong
+                # together — which is exactly why it looks plausible. Logged at
+                # ERROR because there is no other symptom.
+                from .database import DEFAULT_PULSES_PER_LITRE
+                log.error(
+                    "[%s] flow-meter PPL entity is NOT bound — using %.1f "
+                    "pulses/litre from the local cache (column default %.1f). "
+                    "If that is not this meter's real k-factor, EVERY volume on "
+                    "this circuit is mis-scaled: a 72 ppl oval-gear meter left "
+                    "on the default reads 5.5x high. Firmware 3.12.0+ publishes "
+                    "this entity — assign it in Setup if discovery missed it.",
+                    cfg.circuit, float(cfg.pulses_per_litre or 0.0),
+                    DEFAULT_PULSES_PER_LITRE)
                 continue
             raw = await self._ha.get_state_value(entity, None)
             await self._apply_ppl_change(cfg, raw, reason="startup")

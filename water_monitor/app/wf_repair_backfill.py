@@ -213,7 +213,21 @@ def repair_misattached_waveforms(conn: sqlite3.Connection) -> Dict[str, Any]:
 # rightful owner was likely pruned/merged/zeroed and NO member keeps the claim.
 _SHARED_NO_WINNER_FRAC = 0.25
 _SHARED_NO_WINNER_MIN_S = 30.0
-_ESP_CAPTURE_HZ = 200.0
+_ESP_CAPTURE_HZ = 50.0     # firmware waveform_capture interval is 20 ms
+
+# ⛔ SCHEDULING DISABLED — do not flip back to True without reading this.
+#
+# BOTH defects behind this flag are now FIXED (the 4x constant above, and the
+# binned-length span premise below, which now uses the stored per-row source
+# sample count and rate instead). The flag stays False until the damage the
+# old sweep already did has been counted:
+#
+#   SELECT COUNT(*), SUM(signature_source IS NULL)
+#     FROM events WHERE wf_repair_verdict = 'shared_capture';
+#
+# Re-enabling replays the sweep over history with the corrected span, so that
+# count is the baseline to compare against afterwards.
+_SHARED_CAPTURE_SWEEP_ENABLED = False
 _SHARED_MIN_ARRAY_CHARS = 300      # matches the audit's LEN>300 fingerprint gate
 
 
@@ -228,7 +242,8 @@ def repair_shared_captures(conn: sqlite3.Connection) -> Dict[str, Any]:
     plausible value. Array identity is the decisive test.
 
     Winner rule (deterministic): within a group, the claim stays with the
-    event whose ``|duration_seconds − n_points/200 Hz|`` is smallest; ties
+    event whose ``|duration_seconds − capture_span|`` is smallest, where the
+    span comes from the stored source sample count and rate; ties
     break on earliest ``start_ts``. Escape hatch: when even the best mismatch
     exceeds ``max(0.25·duration, 30 s)`` the group has NO winner — the
     rightful owner is gone (pruned/merged/zeroed) — and every member is
@@ -252,7 +267,7 @@ def repair_shared_captures(conn: sqlite3.Connection) -> Dict[str, Any]:
                       e.peak_flow_lpm, e.true_avg_flow_lpm, e.avg_flow_lpm,
                       e.signature_source, e.cluster_id, e.prev_cluster_id,
                       e.match_rejection_reason, e.wf_repair_verdict,
-                      w.flow_max_json
+                      w.flow_max_json, w.flow_src_n, w.flow_src_hz
                FROM event_waveforms w
                JOIN events e ON e.id = w.event_id
                WHERE LENGTH(w.flow_max_json) > ?
@@ -262,7 +277,7 @@ def repair_shared_captures(conn: sqlite3.Connection) -> Dict[str, Any]:
     except sqlite3.Error as e:
         log.debug("wf-shared: candidate query unavailable (%s)", e)
         return {"groups": 0, "losers": 0, "winners": 0, "no_winner_groups": 0,
-                "envelopes_deleted": 0, "circuits": []}
+                "envelopes_deleted": 0, "unjudgeable_groups": 0, "circuits": []}
 
     groups: Dict[str, list] = {}
     for r in rows:
@@ -270,15 +285,29 @@ def repair_shared_captures(conn: sqlite3.Connection) -> Dict[str, Any]:
     shared_groups = [g for g in groups.values() if len(g) > 1]
     if not shared_groups:
         return {"groups": 0, "losers": 0, "winners": 0, "no_winner_groups": 0,
-                "envelopes_deleted": 0, "circuits": []}
+                "envelopes_deleted": 0, "unjudgeable_groups": 0, "circuits": []}
 
     now_iso = datetime.now(timezone.utc).isoformat()
     losers = winners = no_winner_groups = envelopes = 0
     circuits: set = set()
 
+    unjudgeable = 0
     for members in shared_groups:
-        n_pts = members[0]["flow_max_json"].count(",") + 1
-        span_s = n_pts / _ESP_CAPTURE_HZ
+        # The capture span must come from the SOURCE sample count and rate, not
+        # from the length of flow_max_json — that is a min/max envelope binned to
+        # MAX_WAVEFORM_BINS = 1000, so it saturates and says nothing about
+        # duration. flow_src_n / flow_src_hz are written per row precisely so a
+        # consumer can rebuild an honest axis.
+        src_n = members[0]["flow_src_n"]
+        src_hz = members[0]["flow_src_hz"]
+        if not src_n or not src_hz:
+            # Pre-dev38 row, or a software-sourced series whose spacing is not
+            # uniform: the span is not recoverable, so this group cannot be
+            # judged. Skip it — this sweep deletes waveforms and NULLs
+            # signatures, so "cannot measure" must mean "do not act".
+            unjudgeable += 1
+            continue
+        span_s = float(src_n) / float(src_hz)
 
         def _mismatch(m) -> float:
             return abs(float(m["duration_seconds"] or 0.0) - span_s)
@@ -343,12 +372,15 @@ def repair_shared_captures(conn: sqlite3.Connection) -> Dict[str, Any]:
     conn.commit()
     log.info(
         "wf-shared: %d group(s) — %d loser(s) de-enriched (%d envelope(s) "
-        "dropped), %d winner(s) kept, %d group(s) with no credible owner",
+        "dropped), %d winner(s) kept, %d group(s) with no credible owner, "
+        "%d group(s) skipped as unmeasurable",
         len(shared_groups), losers, envelopes, winners, no_winner_groups,
+        unjudgeable,
     )
     return {
         "groups": len(shared_groups), "losers": losers, "winners": winners,
         "no_winner_groups": no_winner_groups, "envelopes_deleted": envelopes,
+        "unjudgeable_groups": unjudgeable,
         "circuits": sorted(circuits),
     }
 
@@ -402,14 +434,21 @@ class WfRepairBackfill:
         except Exception as e:
             log.error("wf-repair sweep failed: %s", e, exc_info=True)
 
-        try:
-            from .database import run_isolated_write
-            res2 = await run_isolated_write(self._db_path,
-                                            repair_shared_captures)
-            if res2.get("losers"):
-                affected.update(res2.get("circuits") or [])
-        except Exception as e:
-            log.error("wf-shared sweep failed: %s", e, exc_info=True)
+        if _SHARED_CAPTURE_SWEEP_ENABLED:
+            try:
+                from .database import run_isolated_write
+                res2 = await run_isolated_write(self._db_path,
+                                                repair_shared_captures)
+                if res2.get("losers"):
+                    affected.update(res2.get("circuits") or [])
+            except Exception as e:
+                log.error("wf-shared sweep failed: %s", e, exc_info=True)
+        else:
+            log.warning(
+                "wf-shared sweep SKIPPED — _SHARED_CAPTURE_SWEEP_ENABLED is "
+                "False because _ESP_CAPTURE_HZ is 4x wrong and the no-winner "
+                "branch destroys signatures and waveforms. See the comment on "
+                "the flag.")
 
         if affected and self._cluster_engine is not None:
             await self._replay_clusters(sorted(affected))

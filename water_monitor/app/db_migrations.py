@@ -310,7 +310,7 @@ _BASELINE_VERSION: int = 20260523
 # month stuck at 05 (it drifted into a plain sequence); everything stays
 # strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
 # reorder a shipped number.
-_CURRENT_VERSION: int = 20260818
+_CURRENT_VERSION: int = 20260819
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -3463,6 +3463,38 @@ def _missing_verdict_pin_columns(conn: sqlite3.Connection) -> set[str]:
             if not _has_column(conn, "events", c)}
 
 
+def _apply_wf_src_hz_correction(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260819 — correct the stored ESP capture rate.
+
+    ``event_waveforms.flow_src_hz`` / ``press_src_hz`` record the fixed sample
+    rate of an ESP-sourced series so a renderer can build an honest time axis.
+    They were written as 200.0, which is the pressure ADC READ rate, not the
+    capture rate: the firmware's waveform_capture interval is 20 ms (~50 Hz),
+    stated in its own header and matched by ``event_detector._SAMPLE_MS = 20``.
+
+    Every ESP-sourced waveform therefore rendered on a 4x-compressed time axis —
+    a 30 s capture drawn as 7.5 s. This rewrites the stored metadata; the sample
+    arrays themselves were always correct and are untouched.
+
+    Idempotent: only rows still holding exactly 200.0 are changed, and the write
+    is value-scoped rather than blanket, so a genuinely different stored rate
+    (none exist today) would survive. No schema change, so _create_schema needs
+    no mirroring. Guarded for stub DBs.
+    """
+    if not _has_table(conn, "event_waveforms"):
+        conn.commit()
+        return
+    cur = conn.execute(
+        "UPDATE event_waveforms SET "
+        "  flow_src_hz  = CASE WHEN flow_src_hz  = 200.0 THEN 50.0 ELSE flow_src_hz  END, "
+        "  press_src_hz = CASE WHEN press_src_hz = 200.0 THEN 50.0 ELSE press_src_hz END "
+        "WHERE flow_src_hz = 200.0 OR press_src_hz = 200.0"
+    )
+    conn.commit()
+    log.info("Migration 20260819: corrected ESP capture rate 200 Hz -> 50 Hz "
+             "on %d waveform row(s)", cur.rowcount or 0)
+
+
 _MIGRATIONS: tuple = (
     (20260524, _drop_retired_wf_entity_map_rows),
     (20260525, _apply_unique_events_index),
@@ -3533,6 +3565,7 @@ _MIGRATIONS: tuple = (
     (20260816, _apply_referee_meta_columns),
     (20260817, _apply_overlap_resweep),
     (20260818, _apply_verdict_pin),
+    (20260819, _apply_wf_src_hz_correction),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

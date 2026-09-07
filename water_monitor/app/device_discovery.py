@@ -31,7 +31,14 @@ log = logging.getLogger(__name__)
 # Checked against the device registry sw_version field (set via project.version
 # in the ESPHome YAML). Non-numeric versions (e.g. "dev") are treated as unknown
 # — setup is not blocked, but a warning is shown.
-MIN_FIRMWARE_VERSION: tuple = (3, 9, 0)
+#
+# 3.13.0 is the floor because it is the last change that altered what the add-on
+# READS, not just what the firmware does: 3.12.0 added the runtime flow_meter_ppl
+# number entity (without it the add-on falls back to a 396 ppl default, which on
+# a 72 ppl oval-gear meter mis-scales every volume by 5.5x — see
+# Orchestrator._sync_ppl_and_watch), and 3.13.0 rewrote flow measurement from
+# pulse_counter to pulse_meter. This is ADVISORY: it warns, it does not block.
+MIN_FIRMWARE_VERSION: tuple = (3, 13, 0)
 
 # Roles that are optional — wizard will show them as optional dropdowns
 # and they won't block setup completion if unmatched.

@@ -3124,7 +3124,7 @@ def _persist_waveform(
     Skips silently if both reading lists are empty (historical events).
 
     When a usable ESP capture matched the event, its full-window arrays
-    (200 Hz onboard, ~thousands of points) replace the add-on's HA-sampled
+    (~50 Hz onboard, ~thousands of points) replace the add-on's HA-sampled
     readings — the detector series is ~5 s cadence and every-5th downsampled
     past 120 s, which erases short pulses (washer fill pauses) that the ESP
     capture resolves.
@@ -3134,7 +3134,13 @@ def _persist_waveform(
     # each channel's source count and (when fixed-rate) sample frequency to
     # build an honest time axis. hz stays NULL for the event-driven software
     # series, whose spacing has no recoverable axis.
-    _ESP_HZ = 200.0
+    # ~50 Hz, NOT 200 Hz. The firmware's waveform_capture interval is 20 ms
+    # (`- interval: 20ms`); 200 Hz is the pressure ADC read loop, which the
+    # firmware header explicitly distinguishes from capture. This value is
+    # stored as event_waveforms.flow_src_hz / press_src_hz and is what a
+    # renderer divides by to build the time axis, so 200 rendered every ESP
+    # waveform 4x time-compressed. event_detector._SAMPLE_MS = 20 agrees.
+    _ESP_HZ = 50.0
     flow_hz = press_hz = None
     if _wf_full_res_usable(esp_record):
         flow_readings = esp_record.full_flow
