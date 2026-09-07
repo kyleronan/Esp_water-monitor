@@ -90,9 +90,10 @@ from fastapi.responses import RedirectResponse
 # Re-export coerce_int so existing `from ._helpers import coerce_int`
 # imports keep working. The implementation lives in `..forms` so it
 # can be unit-tested without pulling in FastAPI.
-from ..forms import coerce_int
+from ..forms import coerce_float, coerce_int
 
-__all__ = ["coerce_int", "ingress_redirect", "run_blocking", "startup_gate"]
+__all__ = ["coerce_float", "coerce_int", "ingress_redirect", "run_blocking",
+           "startup_gate"]
 
 
 T = TypeVar("T")
