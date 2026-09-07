@@ -42,6 +42,22 @@ ports:
   8765/tcp: null
 ports_description:
   8765/tcp: "Web UI (use Ingress)"
+# Supervisor liveness probe. /health is deliberately SHALLOW — it asserts the
+# HTTP server is answering and nothing else. It must stay that way: a probe that
+# checked HA reachability or worker health would restart the whole add-on during
+# a brief HA outage, and a restart LOSES the in-flight water event (the detector
+# holds it in memory only). Per-subsystem state lives at /health/detail, which
+# is guarded and is NOT a probe.
+#
+# A literal port, not [PORT:8765]: that placeholder resolves to the HOST-mapped
+# port, and 8765/tcp above is null (ingress-only), so it would resolve to
+# nothing. The Supervisor shares the add-on's Docker network and reaches the
+# container port directly. /health is exempted from the ingress-IP guard in
+# main.py precisely so this works.
+#
+# If this ever misfires the symptom is a restart loop — deleting this one line
+# disables it.
+watchdog: "http://[HOST]:8765/health"
 options:
   log_level: "info"
   esp_device_name: "ESP Water Shut off"

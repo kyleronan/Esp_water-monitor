@@ -372,6 +372,28 @@ async def lifespan(app: FastAPI):
 
     runner = asyncio.create_task(orch.run())
 
+    # Without this the add-on can be dead and green at the same time. The
+    # lifespan frame keeps `runner` referenced, so asyncio never emits its
+    # "exception was never retrieved" warning either — orch.run() could raise on
+    # the first tick and the only symptom would be that nothing ever happens.
+    def _runner_done(task: "asyncio.Task") -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            app.state.orchestrator_state = "stopped"
+            log.critical("Orchestrator run() RETURNED — no monitoring is "
+                         "happening. The web UI will keep serving stale data.")
+            return
+        app.state.orchestrator_state = "crashed"
+        app.state.orchestrator_error = "%s: %s" % (type(exc).__name__, exc)
+        log.critical("Orchestrator run() CRASHED — no monitoring is happening",
+                     exc_info=exc)
+
+    app.state.orchestrator_state = "running"
+    app.state.orchestrator_error = None
+    runner.add_done_callback(_runner_done)
+
     try:
         yield
     finally:
@@ -691,4 +713,43 @@ async def _http_403_html(request: Request, exc: HTTPException):
 
 @app.get("/health")
 async def health():
+    """LIVENESS ONLY — deliberately shallow. Do not add dependency checks.
+
+    This is what `watchdog:` in config.yaml polls. Making it assert that HA is
+    reachable, or that a worker is alive, turns a soft dependency into a hard
+    one: a brief HA outage would restart the whole add-on, and a restart LOSES
+    the in-flight water event (the detector holds it in memory only). Depth
+    belongs in /health/detail, which is a human surface, not a probe.
+    """
     return {"status": "ok"}
+
+
+@app.get("/health/detail")
+async def health_detail(request: Request):
+    """Per-subsystem state for humans. NOT a probe.
+
+    Deliberately NOT exempted from the ingress-IP and RBAC guards: subsystem
+    names, versions and error strings should not be readable by anything that
+    can reach the port. `_is_health_path` matches "/health" exactly, so this
+    path falls through to the normal guarded pipeline — which is why it cannot
+    be used as a watchdog target.
+
+    Reads only in-memory state written by Orchestrator._supervise, so it does
+    no I/O and cannot itself be the thing that hangs.
+    """
+    orch = getattr(request.app.state, "orchestrator", None)
+    workers = dict(getattr(orch, "worker_health", {}) or {}) if orch else {}
+    unhealthy = sorted(n for n, h in workers.items()
+                       if h.get("state") in ("crashed", "stopped"))
+    run_state = getattr(request.app.state, "orchestrator_state", "unknown")
+    return {
+        # draft-inadarei-api-health-check shape: pass / warn / fail
+        "status": ("fail" if run_state != "running"
+                   else "warn" if unhealthy else "pass"),
+        "orchestrator": {
+            "state": run_state,
+            "error": getattr(request.app.state, "orchestrator_error", None),
+        },
+        "workers": workers,
+        "unhealthy": unhealthy,
+    }

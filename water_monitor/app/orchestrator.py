@@ -134,6 +134,11 @@ class Orchestrator:
         self._wf_repair_backfill: Optional[WfRepairBackfill] = None
         self._fixture_publisher: Optional[FixturePublisher] = None
         self._stop = asyncio.Event()
+        #: name -> {state, restarts, last_error, last_error_at}, written by
+        #: _supervise and read by /health/detail. In-memory only: it describes
+        #: THIS process, and a restart is exactly the event that makes the old
+        #: values meaningless.
+        self.worker_health: Dict[str, dict] = {}
         self._live_state_cache: Dict[str, Any] = {}
         self._ha_tz = timezone.utc
         # Strong refs for fire-and-forget PPL-change re-baseline tasks (scheduled
@@ -1181,13 +1186,33 @@ class Orchestrator:
             await self._ha.__aexit__(None, None, None)
 
     async def _supervise(self, name: str, coro_fn) -> None:
-        """Run coro_fn() in a restart loop. A crash restarts after 5s."""
+        """Run coro_fn() in a restart loop. A crash restarts after 5s.
+
+        Also records per-worker state in ``self.worker_health`` so a crash is
+        VISIBLE, not just logged. A supervised worker can die and restart-loop
+        indefinitely while every surface still reports a healthy add-on; the
+        only evidence was a log line nobody reads.
+        """
+        h = self.worker_health.setdefault(
+            name, {"state": "starting", "restarts": 0,
+                   "last_error": None, "last_error_at": None})
         while not self._stop.is_set():
             try:
+                h["state"] = "running"
                 await coro_fn()
+                # A normally-returning worker is not an error, but it IS the
+                # end of that worker for this process — say so rather than
+                # leaving it reported as "running".
+                h["state"] = "stopped"
+                return
             except asyncio.CancelledError:
+                h["state"] = "cancelled"
                 raise
-            except Exception:
+            except Exception as exc:
+                h["state"] = "crashed"
+                h["restarts"] += 1
+                h["last_error"] = "%s: %s" % (type(exc).__name__, exc)
+                h["last_error_at"] = datetime.now(timezone.utc).isoformat()
                 log.exception("%s crashed — restarting in 5s", name)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=5)
