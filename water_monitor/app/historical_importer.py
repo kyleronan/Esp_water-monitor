@@ -1386,9 +1386,27 @@ class HistoricalImporter:
             ts = _parse_ts(entry.get("last_changed"))
             if ts is None:
                 continue
+            if _is_gap_marker(entry):
+                # A recorder/sensor gap is the ABSENCE of a reading, not a
+                # reading of zero. Falling through to `rate = 0.0` below closed
+                # the period at the dropout, truncating a draw that was still
+                # running — the water after the gap then became a separate event
+                # or none at all. _flow_stopped_across already refuses to read
+                # absence of data as absence of water ("a dark sensor looks
+                # EXACTLY like an idle here"); this applies the same rule where
+                # the periods are BUILT rather than where they are judged.
+                #
+                # Bridging is bounded, not open-ended: flow_integral clamps any
+                # inter-sample gap to _FLOW_INTEGRAL_MAX_DT_SECONDS (120 s) and
+                # sets `capped`, so an outage adds at most 120 s of the last
+                # known rate to the volume and flags that it did.
+                continue
             try:
                 rate = float(entry["state"])
             except (ValueError, TypeError, KeyError):
+                # Unparseable but NOT a gap marker — genuinely garbage numeric
+                # state. Keep the original behaviour and treat it as off; only
+                # the "we are blind here" case changes above.
                 rate = 0.0
 
             if rate >= self.MIN_FLOW_LPM:
@@ -1668,10 +1686,40 @@ class HistoricalImporter:
         # Prefer the cumulative sensor delta over avg_flow × duration to avoid
         # downsampling errors in long events with fill-pause-fill patterns. The
         # cumulative-delta computation is shared with the §2 recorder reconcile
-        # (single source of truth); the importer consumes only the litres.
-        from .recorder_reconcile import firmware_volume_delta
+        # (single source of truth).
+        #
+        # ENDPOINT-GAP GUARD — the importer used to consume only the litres and
+        # discard a_ts/b_ts, which firmware_volume_delta returns *specifically*
+        # so the caller can apply this. The delta is measured between the FIRST
+        # and LAST recorder samples inside the window, so any water that moved
+        # before the first sample or after the last is simply not in it. That is
+        # a silent UNDER-COUNT, and it wins: feature_extractor prefers
+        # volume_litres_measured over the flow integral. Declining here falls
+        # back to the integral, which is the honest answer when the recorder did
+        # not bracket the event.
+        #
+        # Known residual: the tolerance is absolute (120 s), and a sample can
+        # only land inside the window, so the guard cannot fire on an event
+        # shorter than the tolerance. A 30 s draw whose first sample arrives 25 s
+        # in still yields a delta covering ~5 s. Bounding the long-event case is
+        # a strict improvement on bounding nothing; a coverage-fraction rule
+        # would need a threshold nobody has measured yet.
+        from .recorder_reconcile import ENDPOINT_TOL_S, firmware_volume_delta
         _vd = firmware_volume_delta(volume_hist, start, end, vol_unit)
-        volume_litres_measured: Optional[float] = _vd[0] if _vd else None
+        volume_litres_measured: Optional[float] = None
+        if _vd:
+            _litres, _a_ts, _b_ts = _vd
+            _lead = (_a_ts - start).total_seconds()
+            _lag = (end - _b_ts).total_seconds()
+            if _lead > ENDPOINT_TOL_S or _lag > ENDPOINT_TOL_S:
+                log.debug(
+                    "[%s] firmware volume delta declined for %s–%s: recorder "
+                    "samples do not bracket the event (%.0f s lead, %.0f s lag, "
+                    "tolerance %.0f s) — using the flow integral instead.",
+                    circuit, start.isoformat(), end.isoformat(),
+                    _lead, _lag, ENDPOINT_TOL_S)
+            else:
+                volume_litres_measured = _litres
 
         # Volume floor — mirrors CircuitEventDetector._end_event
         avg_flow = sum(flow_readings) / len(flow_readings) if flow_readings else 0.0
