@@ -436,19 +436,6 @@
   <p class="fx-cat-empty-note muted">No water use recorded here yet — this fills in once
     the app sees it. If you don't have this fixture, you can ignore the card.</p>
   {% endif %}
-  {% if is_admin %}
-  <form method="post" class="fx-cat-publish"
-        action="{{ ingress_path }}/fixtures/{{ circ.circuit }}/category/{{ cat.type }}/publish">
-    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-    <label class="toggle" title="Publish this category as a Home Assistant entity">
-      <input type="checkbox" name="publish_to_ha" value="1"
-             onchange="this.form.submit()"
-             {% if cat.publish_to_ha %}checked{% endif %}>
-      <span class="toggle-slider"></span>
-    </label>
-    <span class="fx-cat-publish-label">Publish to Home Assistant</span>
-  </form>
-  {% endif %}
 </div>
 {% endfor %}
 </div>

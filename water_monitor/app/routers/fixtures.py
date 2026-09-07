@@ -126,7 +126,7 @@ def _fixtures_page_payload(orch, range_start_utc):
     dev47's health and review reads ride the SAME hop for the same reason.
     """
     from ..database import (get_active_exclusion_window, get_category_rollup,
-                            get_category_publish_map, get_orphaned_fixtures)
+                            get_orphaned_fixtures)
     from ..fixtures import (FIXTURE_TYPE_LABELS,
                             fixture_user_selectable_types,
                             normalize_fixture_type_for_circuit,
@@ -171,14 +171,12 @@ def _fixtures_page_payload(orch, range_start_utc):
                 "lifetime_volume_l":    0.0,
                 "lifetime_event_count": 0,
                 "last_seen_at":         None,
-                "publish_to_ha":        True,    # default; overwritten from map
             }
             for t in allowed
         }
 
-        # Pull rollup + publish gate map.
+        # Pull the per-category rollup.
         raw_rows = get_category_rollup(orch.db, c, range_start_utc)
-        publish_map = get_category_publish_map(orch.db, c)
 
         # Merge SQL rows through the normalizer so legacy / wrong-kind types
         # fold into 'other' rather than producing extra cards.
@@ -191,10 +189,6 @@ def _fixtures_page_payload(orch, range_start_utc):
             bucket["range_event_count"]    += row["range_event_count"]
             bucket["last_seen_at"] = _max_iso(bucket["last_seen_at"],
                                               row["last_seen_at"])
-
-        # Per-category publish gate — missing rows default to True (publish on).
-        for typ, bucket in categories.items():
-            bucket["publish_to_ha"] = bool(publish_map.get(typ, True))
 
         # Lifetime-desc order; empty cards last so the user sees real usage
         # first.
@@ -340,62 +334,6 @@ def _max_iso(a, b):
 
 
 # ── Sprint F: per-category publish toggle ────────────────────────────────────
-
-@router.post("/{circuit}/category/{fixture_type}/publish")
-async def category_publish_toggle(
-    fixture_type: str,
-    request: Request,
-    circuit: str = Depends(_valid_circuit),
-):
-    """Flip the HA-publish gate for one (circuit, fixture_type).
-
-    Validation, in order:
-      1. CSRF — enforced by the project-wide middleware (POST routes covered).
-      2. circuit exists — handled by the ``_valid_circuit`` dependency.
-      3. circuit_kind resolved from the configured circuit_type ('zone' vs
-         'fixture').
-      4. fixture_type allowed for that kind — rejects e.g. ``dishwasher`` on
-         a zone circuit or ``irrigation_zone`` on a fixture circuit.
-      5. Unchecked checkbox (form field absent) → publish_to_ha = 0.
-
-    On success: persist via ``set_category_publish`` (which also re-validates
-    defensively).
-
-    NOTE (MQTT removed 2026-09-07): this checkbox used to also flip a live HA
-    entity through the MQTT publisher. That publisher never worked on this
-    install — no `services:` block meant the Supervisor refused the broker
-    credentials with 403 — and the roadmap it belonged to was abandoned. The
-    value is still persisted, but nothing consumes it; the column and the
-    control are scheduled for removal with the rest of the MQTT schema.
-    """
-    from ..database import set_category_publish
-    from ..fixtures import (fixture_user_selectable_types,
-                            zone_user_selectable_types)
-
-    orch = _orch(request)
-    circ_cfg = next((c for c in orch._cfg.circuits if c.circuit == circuit), None)
-    if circ_cfg is None:
-        # Defence-in-depth — _valid_circuit already returned 404 for
-        # unknown circuits, but keep this branch obvious to a reader.
-        raise HTTPException(status_code=404, detail=f"Unknown circuit: {circuit!r}")
-    circuit_kind = "zone" if circ_cfg.circuit_type == "zone" else "fixture"
-    allowed = set(zone_user_selectable_types() if circuit_kind == "zone"
-                  else fixture_user_selectable_types())
-    if fixture_type not in allowed:
-        raise HTTPException(
-            status_code=400,
-            detail=(f"fixture_type {fixture_type!r} not allowed on "
-                    f"{circuit_kind} circuit {circuit!r}"),
-        )
-
-    form = await request.form()
-    publish_to_ha = 1 if form.get("publish_to_ha") == "1" else 0
-    from ..database import run_db
-    await run_db(set_category_publish, orch.db, circuit,      # dev46 (46a)
-                 fixture_type, publish_to_ha)
-
-    return ingress_redirect(request, f"/fixtures#cat-{fixture_type}")
-
 
 # ── LEGACY per-cluster routes (kept registered but unlinked from the Sprint F
 #    template). Backend helpers they call (upsert_fixture_from_cluster,

@@ -69,7 +69,7 @@ QUICK_RESTORE_TABLES = [
     "data_retention", "training_state", "fixtures",
     "fixture_signatures", "fixture_clusters", "cluster_cooccurrence",
     "leak_test_history", "threshold_history",
-    "daily_summary", "fixture_ha_entity_map", "fixture_daily_summary",
+    "daily_summary", "fixture_daily_summary",
 ]
 
 # events + hourly_volume included with 90-day filter in quick-restore

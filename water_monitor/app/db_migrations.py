@@ -316,7 +316,7 @@ _BASELINE_VERSION: int = 20260523
 # "never reuse or reorder a shipped number" outranks tidiness — renumbering it
 # would make those DBs fail the _UPGRADEABLE_VERSIONS check below and be told to
 # delete themselves. THE NEXT MIGRATION IS 20260901, NOT 20260820.
-_CURRENT_VERSION: int = 20260819
+_CURRENT_VERSION: int = 20260901
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -1558,14 +1558,6 @@ def _missing_phantom_columns(conn: sqlite3.Connection) -> set[str]:
 # Table added by the 20260533 category-publish migration (Sprint F).
 # A "missing column" here is actually a missing TABLE check — the verifier
 # treats the table's absence as a single missing-column-equivalent entry.
-def _missing_category_publish_columns(conn: sqlite3.Connection) -> set[str]:
-    row = conn.execute(
-        "SELECT name FROM sqlite_master "
-        "WHERE type = 'table' AND name = 'category_publish'"
-    ).fetchone()
-    return set() if row else {"category_publish"}
-
-
 # Columns added by the 20260534 manual-classification migration (Sprint H).
 _MANUAL_CLASSIFICATION_COLUMNS: frozenset = frozenset({"user_ignored", "user_classified"})
 
@@ -3501,6 +3493,70 @@ def _apply_wf_src_hz_correction(conn: sqlite3.Connection) -> None:
              "on %d waveform row(s)", cur.rowcount or 0)
 
 
+
+def _apply_drop_mqtt_schema(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260901 — remove the MQTT publisher's schema.
+
+    MQTT was part of an original roadmap the operator is no longer pursuing
+    (decided 2026-09-07). It had never worked on this install in any case:
+    ``config.yaml`` declared no ``services:`` block, so the Supervisor answered
+    the broker-credentials query with 403 and the publisher returned at
+    ``status=not_configured`` without ever connecting.
+
+    Drops, in order of how sure we are they are unused:
+
+    * ``home_profile.mqtt_publish_enabled`` and
+      ``home_profile.publish_fixtures_to_ha`` — zero readers even before the
+      code removal; a repo-wide grep found only their DDL lines.
+    * ``fixture_ha_entity_map`` — the audit's schema census found it had never
+      held a row: a CREATE, one DELETE, and nothing else.
+    * ``category_publish`` — backed the per-category "publish to HA" checkbox,
+      which controlled only MQTT output.
+
+    ``fixtures.publish_to_ha`` is deliberately LEFT ALONE. Unlike these it is
+    written by the live confirm path (``upsert_fixture_from_cluster``) and read
+    back at database.py's fixture rollup, so removing it is a change to that
+    flow rather than to MQTT.
+
+    Idempotent: DROP ... IF EXISTS, and each column is checked first. Column
+    drops are wrapped because ``ALTER TABLE ... DROP COLUMN`` needs SQLite
+    3.35+; on anything older the columns are simply left in place, which is
+    harmless — nothing reads them. No data is migrated: every object here is
+    either empty or write-only.
+
+    NOTE: ``fixture_ha_entity_map`` was also removed from QUICK_RESTORE_TABLES
+    (routers/backup.py) and RESTORABLE_TABLES (restore_utils.py) in the same
+    commit. Those lists are NOT optional to update: the restore path runs
+    ``DELETE FROM {tbl}`` for every name in the quick-restore list with no
+    existence check, so a dropped-but-still-listed table makes Quick Restore
+    fail outright.
+    """
+    for table in ("category_publish", "fixture_ha_entity_map"):
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        except sqlite3.Error as e:            # noqa: PERF203 — one per table
+            log.warning("Migration 20260901: could not drop %s: %s", table, e)
+
+    dropped = []
+    for col in ("mqtt_publish_enabled", "publish_fixtures_to_ha"):
+        if not _has_column(conn, "home_profile", col):
+            continue
+        try:
+            conn.execute(f"ALTER TABLE home_profile DROP COLUMN {col}")
+            dropped.append(col)
+        except sqlite3.Error as e:
+            # SQLite < 3.35 has no DROP COLUMN. Leaving the column costs
+            # nothing: it has no reader, and _create_schema no longer emits it
+            # so fresh installs never gain one.
+            log.warning("Migration 20260901: leaving home_profile.%s in place "
+                        "(%s)", col, e)
+
+    conn.commit()
+    log.info("Migration 20260901: MQTT schema removed "
+             "(tables dropped, %d home_profile column(s) dropped: %s)",
+             len(dropped), ", ".join(dropped) or "none")
+
+
 _MIGRATIONS: tuple = (
     (20260524, _drop_retired_wf_entity_map_rows),
     (20260525, _apply_unique_events_index),
@@ -3572,6 +3628,7 @@ _MIGRATIONS: tuple = (
     (20260817, _apply_overlap_resweep),
     (20260818, _apply_verdict_pin),
     (20260819, _apply_wf_src_hz_correction),
+    (20260901, _apply_drop_mqtt_schema),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.
@@ -3621,7 +3678,6 @@ def _run_migrations_impl(
             | _missing_suggestion_source_columns(conn)
             | _missing_signature_matcher_columns(conn)
             | _missing_phantom_columns(conn)
-            | _missing_category_publish_columns(conn)
             | _missing_manual_classification_columns(conn)
             | _missing_low_flow_dribble_columns(conn)
             | _missing_active_flow_columns(conn)

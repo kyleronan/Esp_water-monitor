@@ -30,7 +30,7 @@ RESTORABLE_TABLES: frozenset[str] = frozenset({
     "zone_schedules", "data_retention", "training_state", "fixtures",
     "fixture_signatures", "fixture_clusters", "cluster_cooccurrence",
     "leak_test_history", "threshold_history", "daily_summary",
-    "fixture_ha_entity_map", "fixture_daily_summary",
+    "fixture_daily_summary",
     # quick restore — recent history
     "events", "hourly_volume",
     # history archive

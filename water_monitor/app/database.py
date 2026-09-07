@@ -288,7 +288,6 @@ CREATE TABLE IF NOT EXISTS home_profile (
     flow_unit               TEXT DEFAULT 'L/min',
     pressure_unit           TEXT DEFAULT 'psi',
     -- Phase 2.1 fixture publishing
-    publish_fixtures_to_ha  INTEGER DEFAULT 1,
     -- Mobile push notification targets (comma-separated HA notify service names)
     mobile_notify_targets   TEXT DEFAULT '',
     -- HA presence tracking — auto-toggle away mode from HA entity state changes.
@@ -301,8 +300,6 @@ CREATE TABLE IF NOT EXISTS home_profile (
     ha_presence_entities    TEXT DEFAULT '',
     ha_away_state           TEXT DEFAULT 'not_home',
     ha_home_state           TEXT DEFAULT 'home',
-    -- MQTT publishing toggle (Phase 2.1)
-    mqtt_publish_enabled    INTEGER NOT NULL DEFAULT 0,
     -- History display: hide pressure-restoration phantom events from the
     -- History list (Sprint E). Off by default — phantoms are shown with a
     -- flag. This is display-only; it never affects volume totals (phantom
@@ -799,19 +796,6 @@ CREATE TABLE IF NOT EXISTS reconcile_state (
 
 -- ==========================================================================
 -- CATEGORY PUBLISH (Sprint F) — per-(circuit, fixture_type) HA publish gate.
--- Replaces the per-fixture `fixtures.publish_to_ha` flag as the source of
--- truth for the fixture_publisher. Each row toggles whether the HA discovery
--- entity set for that category on that circuit is published. publish_to_ha=1
--- by default; missing rows default to True at the caller via .get(typ, True).
--- ==========================================================================
-CREATE TABLE IF NOT EXISTS category_publish (
-    circuit         TEXT NOT NULL,
-    fixture_type    TEXT NOT NULL,
-    publish_to_ha   INTEGER NOT NULL DEFAULT 1,
-    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (circuit, fixture_type)
-);
-
 -- ==========================================================================
 -- FIXTURE CLUSTERS (Phase 2.1) — raw DBSTREAM clustering output
 -- ==========================================================================
@@ -1866,18 +1850,6 @@ CREATE TABLE IF NOT EXISTS circuit_labels (
 
 -- ==========================================================================
 -- FIXTURE HA ENTITY MAP (added migration 025)
--- Tracks MQTT Discovery entities published to HA for each fixture.
--- ==========================================================================
-CREATE TABLE IF NOT EXISTS fixture_ha_entity_map (
-    fixture_id          TEXT REFERENCES fixtures(id),
-    ha_entity_id        TEXT NOT NULL,
-    device_class        TEXT,
-    unit_of_measurement TEXT,
-    last_published_at   TIMESTAMP,
-    retracted_at        TIMESTAMP,
-    PRIMARY KEY (fixture_id, ha_entity_id)
-);
-
 -- ==========================================================================
 -- FIXTURE DAILY SUMMARY (added migration 027)
 -- Aggregated per-fixture daily stats used for analytics and MQTT publishing.
@@ -6926,57 +6898,6 @@ def get_category_rollup(
         for r in rows
     ]
 
-
-def get_category_publish_map(
-    conn: sqlite3.Connection, circuit: str,
-) -> Dict[str, bool]:
-    """Return {fixture_type: bool} for one circuit's per-category publish gates.
-
-    Only returns rows that exist — missing keys MUST be defaulted to True
-    (publish on) at the call site via ``publish_map.get(typ, True)``. This
-    contract is pinned by ``test_category_publish_missing_row_defaults_true``.
-    """
-    rows = conn.execute(
-        "SELECT fixture_type, publish_to_ha FROM category_publish "
-        "WHERE circuit = ?",
-        (circuit,),
-    ).fetchall()
-    return {r["fixture_type"]: bool(r["publish_to_ha"]) for r in rows}
-
-
-def set_category_publish(
-    conn: sqlite3.Connection,
-    circuit: str,
-    fixture_type: str,
-    publish_to_ha: int,
-) -> None:
-    """Upsert the publish gate for one (circuit, fixture_type).
-
-    Defensive: validates ``fixture_type`` against the union of fixture-
-    selectable and zone-selectable types. Raises ``ValueError`` on unknown
-    or empty input so a stray internal caller cannot persist garbage rows
-    even if it skipped the route-level validation.
-    """
-    # Local import to avoid widening the module-load import surface.
-    from .fixtures import (fixture_user_selectable_types,
-                           zone_user_selectable_types)
-    allowed = set(fixture_user_selectable_types()) | set(zone_user_selectable_types())
-    if fixture_type not in allowed:
-        raise ValueError(
-            f"set_category_publish: unknown fixture_type {fixture_type!r}; "
-            f"expected one of {sorted(allowed)}"
-        )
-    conn.execute(
-        "INSERT INTO category_publish "
-        "  (circuit, fixture_type, publish_to_ha, updated_at) "
-        "VALUES (?, ?, ?, ?) "
-        "ON CONFLICT (circuit, fixture_type) DO UPDATE SET "
-        "  publish_to_ha = excluded.publish_to_ha, "
-        "  updated_at = excluded.updated_at",
-        (circuit, fixture_type, 1 if publish_to_ha else 0,
-         datetime.now(timezone.utc).isoformat()),
-    )
-    conn.commit()
 
 
 def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:

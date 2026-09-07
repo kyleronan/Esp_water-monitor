@@ -571,7 +571,6 @@ def save_discovery(
         # without ON DELETE CASCADE, so they must be cleared before deleting fixtures.
         # NOTE: MQTT Discovery entities already published to HA are not retracted here
         # — the setup wizard does not perform HA teardown on reset.
-        db.execute("DELETE FROM fixture_ha_entity_map")
         db.execute("DELETE FROM fixture_daily_summary")
         # events.fixture_id references fixtures(id) with no ON DELETE action,
         # so events must be unlinked BEFORE fixtures are deleted.
