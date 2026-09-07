@@ -23,8 +23,28 @@ esac
 
 cd /opt/water_monitor || exit 1
 
+# --no-proxy-headers is LOAD-BEARING for RBAC, not a tuning knob.
+#
+# The whole trust model rests on main.py comparing request.client.host
+# against the ingress IP (172.30.32.2) and, only then, believing the
+# X-Remote-User-Id header. request.client.host is the real TCP peer ONLY
+# while uvicorn's ProxyHeadersMiddleware leaves it alone -- and that
+# middleware is ON BY DEFAULT. It is inert today purely because
+# --forwarded-allow-ips defaults to 127.0.0.1 and the ingress peer is not
+# 127.0.0.1.
+#
+# Setting FORWARDED_ALLOW_IPS=* (one of the most common container idioms
+# there is) would make scope["client"] come from X-Forwarded-For, which the
+# Supervisor builds from the CLIENT'S OWN value. The IP guard would then be
+# comparing a browser-controlled string, X-Remote-User-Id becomes forgeable,
+# and any HA user gets admin -- including valve control. This flag makes
+# that impossible rather than merely unlikely.
+#
+# Safe for the cookie logic: _is_secure_request reads X-Forwarded-Proto from
+# request.headers directly, not from scope["scheme"], so it is unaffected.
 exec python3 -m uvicorn app.main:app \
     --host 0.0.0.0 \
     --port 8765 \
-    --log-level "${UVICORN_LOG}" \
+    --no-proxy-headers \
+    --no-proxy-headers \n    --log-level "${UVICORN_LOG}" \
     --no-access-log
