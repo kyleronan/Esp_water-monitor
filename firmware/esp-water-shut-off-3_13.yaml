@@ -348,6 +348,23 @@ globals:
     restore_value: no
     initial_value: '0.0'
 
+  # Over-range FLOW readings discarded per circuit (x > flow_max_lpm).
+  # Such a reading is currently mapped to 0.0 L/min — i.e. an impossible-high
+  # value becomes the value meaning "no water is moving", which suppresses burst
+  # detection exactly when flow is most extreme. Whether that is right depends
+  # on whether these are real (a burst) or bounced-edge garbage, which nobody
+  # has measured. Counting them first: if this stays at 0 in normal operation,
+  # the branch can safely clamp to max instead of returning 0.
+  - id: flow_overrange_count_main
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: flow_overrange_count_irr
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
   # True while leak test mode is active on the main valve circuit.
   # Enables pressure decay monitoring on the main pressure sensor.
   - id: leak_test_active_main
@@ -1296,6 +1313,38 @@ sensor:
             id(leak_test_prev_psi_main) = x;
             id(leak_test_prev_ms_main)  = now_ms;
 
+            // --- Sensor saturated: a rise past the ceiling is invisible ---
+            // pressure is clamped to 104 PSI, so once the line saturates `drop`
+            // can never go more negative and thermal expansion past the ceiling
+            // reads as a perfectly stable line — the exact condition the rise
+            // abort below exists to catch. Checked against the PRE-clamp value.
+            if (id(pressure_unclamped_psi_main) > 104.0f) {
+              id(leak_test_active_main) = false;
+              id(leak_test_elapsed_main) = 0.0f;
+              id(leak_test_result_main) = 4;  // Aborted — external pressure influence
+              id(leak_test_restore_main).execute();
+              ESP_LOGW("leak_test", "MAIN: leak test aborted — pressure sensor is saturated "
+                "(%.1f PSI before clamping, ceiling 104). A rise beyond the ceiling cannot be "
+                "measured, so the result would be meaningless.", id(pressure_unclamped_psi_main));
+              return;
+            }
+
+            // --- Sensor saturated: a rise past the ceiling is invisible ---
+            // pressure is clamped to 104 PSI, so once the line saturates `drop`
+            // can never go more negative and thermal expansion past the ceiling
+            // reads as a perfectly stable line — the exact condition the rise
+            // abort below exists to catch. Checked against the PRE-clamp value.
+            if (id(pressure_unclamped_psi_irr) > 104.0f) {
+              id(leak_test_active_irr) = false;
+              id(leak_test_elapsed_irr) = 0.0f;
+              id(leak_test_result_irr) = 4;  // Aborted — external pressure influence
+              id(leak_test_restore_irr).execute();
+              ESP_LOGW("leak_test", "IRRIGATION: leak test aborted — pressure sensor is saturated "
+                "(%.1f PSI before clamping, ceiling 104). A rise beyond the ceiling cannot be "
+                "measured, so the result would be meaningless.", id(pressure_unclamped_psi_irr));
+              return;
+            }
+
             // --- Pressure increase detected ---
             // A rising pressure with the valve closed means something external is
             // influencing the system (thermal expansion, water hammer, upstream pump,
@@ -1831,6 +1880,9 @@ sensor:
       # Returning 0.0 keeps the output well-behaved and prevents open-forever
       # event detection bugs in the companion addon.
       - lambda: |-
+          // Count the HIGH rejections before discarding them — see
+          // flow_overrange_count_* in globals. The returned value is unchanged.
+          if (std::isfinite(x) && x > ${flow_max_lpm}f) id(flow_overrange_count_main)++;
           if (!std::isfinite(x) || x < ${flow_min_lpm}f || x > ${flow_max_lpm}f) return 0.0f;
           return x;
       # NO smoothing window (3.13): pulse_meter's rate is already period-derived
@@ -2016,6 +2068,9 @@ sensor:
           return x / ppl;
       # Clamp — same guard as water_usage1; see comments there.
       - lambda: |-
+          // Count the HIGH rejections before discarding them — see
+          // flow_overrange_count_* in globals. The returned value is unchanged.
+          if (std::isfinite(x) && x > ${flow_max_lpm}f) id(flow_overrange_count_irr)++;
           if (!std::isfinite(x) || x < ${flow_min_lpm}f || x > ${flow_max_lpm}f) return 0.0f;
           return x;
       # NO smoothing window (3.13) — matches water_usage1; see comments there.
@@ -2189,6 +2244,26 @@ sensor:
   # counter that stops advancing names the broken stage. Cheap (one uint32
   # increment per stage); kept permanently as deployment health signals.
   # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Flow Over-Range Rejections - ${circuit_1_name}"
+    id: flow_overrange_main
+    entity_category: diagnostic
+    icon: mdi:speedometer-slow
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: 60s
+    lambda: 'return (float) id(flow_overrange_count_main);'
+
+  - platform: template
+    name: "Flow Over-Range Rejections - ${circuit_2_name}"
+    id: flow_overrange_irr
+    entity_category: diagnostic
+    icon: mdi:speedometer-slow
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: 60s
+    lambda: 'return (float) id(flow_overrange_count_irr);'
+
   - platform: template
     name: "Waveform Captures Started"
     id: waveform_diag_captures
