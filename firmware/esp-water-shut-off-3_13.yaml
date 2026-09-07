@@ -365,6 +365,21 @@ globals:
     restore_value: no
     initial_value: '0'
 
+  # Consecutive over-threshold samples on the THROTTLED flow check ("Check 1").
+  # That check used to fault on a single reading, while the instant per-pulse
+  # check beside it already required 2 hits AND a 1.5x margin. Two strikes at
+  # the 250ms throttle costs ~250ms of extra latency on a real burst and
+  # removes the one-sample trip.
+  - id: burst_slow_hits_main
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: burst_slow_hits_irr
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
   # True while leak test mode is active on the main valve circuit.
   # Enables pressure decay monitoring on the main pressure sensor.
   - id: leak_test_active_main
@@ -1898,7 +1913,12 @@ sensor:
       then:
         # --- Check 1: Burst pipe high flow fault ---
         - lambda: |-
-            if (!id(fault_main) && x > id(burst_threshold_main).state) {
+            // 2-strike guard: matches the instant per-pulse check below, which
+            // has always required two hits. A single throttled sample above the
+            // threshold is not enough to close the house water main.
+            bool over = x > id(burst_threshold_main).state;
+            if (over) id(burst_slow_hits_main) += 1; else id(burst_slow_hits_main) = 0;
+            if (!id(fault_main) && over && id(burst_slow_hits_main) >= 2) {
               if (id(alert_high_flow_main)) {
                 id(fault_main) = true;
                 id(fault_reason_main_str) = "High flow — burst pipe";
@@ -2080,7 +2100,12 @@ sensor:
       then:
         # --- Check 1: Burst pipe high flow fault ---
         - lambda: |-
-            if (!id(fault_irrigation) && x > id(burst_threshold_irr).state) {
+            // 2-strike guard: matches the instant per-pulse check below, which
+            // has always required two hits. A single throttled sample above the
+            // threshold is not enough to close the house water main.
+            bool over = x > id(burst_threshold_irr).state;
+            if (over) id(burst_slow_hits_irr) += 1; else id(burst_slow_hits_irr) = 0;
+            if (!id(fault_irrigation) && over && id(burst_slow_hits_irr) >= 2) {
               if (id(alert_high_flow_irr)) {
                 id(fault_irrigation) = true;
                 id(fault_reason_irr_str) = "High flow — burst pipe";
@@ -2587,6 +2612,53 @@ binary_sensor:
       - delayed_off: 2s
 
   # ---------------------------------------------------------------------------
+  # VALVE POSITION UNKNOWN — end-stop plausibility
+  #
+  # Neither end stop reading, with no travel in progress, means the valve is
+  # not at either stop: a stall mid-travel, or a failed/disconnected switch.
+  # It matters beyond display, because TWO of the three burst detectors are
+  # gated on `open_end_stop_valve*`. If that switch fails open they silently
+  # stop detecting — and nothing said so. This makes it say so.
+  #
+  # There is already a plausibility check for the opposite failure (BOTH stops
+  # active = shorted switch) in the valve template lambda; this is the missing
+  # half. delayed_on 120s clears real travel (~38-62s) plus the 90s timeout.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "Valve Position Unknown - ${circuit_1_name}"
+    id: valve_position_unknown_main
+    device_class: problem
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_main_status
+      sorting_weight: 7
+    lambda: |-
+      return !id(open_end_stop_valve1).state
+          && !id(closed_end_stop_valve1).state
+          && !id(open_sequence_main).is_running()
+          && !id(close_sequence_main).is_running();
+    filters:
+      - delayed_on: 120s
+      - delayed_off: 5s
+
+  - platform: template
+    name: "Valve Position Unknown - ${circuit_2_name}"
+    id: valve_position_unknown_irr
+    device_class: problem
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: group_irr_status
+      sorting_weight: 7
+    lambda: |-
+      return !id(open_end_stop_valve2).state
+          && !id(closed_end_stop_valve2).state
+          && !id(open_sequence_irr).is_running()
+          && !id(close_sequence_irr).is_running();
+    filters:
+      - delayed_on: 120s
+      - delayed_off: 5s
+
+  # ---------------------------------------------------------------------------
   # PRESSURE SENSOR FAULT — NAMUR NE 43 style under-range detection
   #
   # Fires when the CALIBRATED, PRE-CLAMP pressure sits below -1.0 PSI. Valid
@@ -2746,6 +2818,13 @@ binary_sensor:
         - valve.template.publish:
             id: main_water_valve
             state: OPEN
+    # Without this the lamp latches: the open LED stayed lit through the
+    # whole opposite travel and indefinitely if the motor stalled — i.e. it
+    # lied precisely during the failure it should have signalled. The diag
+    # firmware has always had on_release on all four.
+    on_release:
+      then:
+        - output.turn_off: led_open_valve1
 
   - platform: gpio
     pin:
@@ -2765,6 +2844,13 @@ binary_sensor:
         - valve.template.publish:
             id: main_water_valve
             state: CLOSED
+    # Without this the lamp latches: the closed LED stayed lit through the
+    # whole opposite travel and indefinitely if the motor stalled — i.e. it
+    # lied precisely during the failure it should have signalled. The diag
+    # firmware has always had on_release on all four.
+    on_release:
+      then:
+        - output.turn_off: led_closed_valve1
 
   # ---------------------------------------------------------------------------
   # END STOP SWITCHES — Valve 2 (Irrigation)
@@ -2788,6 +2874,13 @@ binary_sensor:
         - valve.template.publish:
             id: irrigation_water_valve
             state: OPEN
+    # Without this the lamp latches: the open LED stayed lit through the
+    # whole opposite travel and indefinitely if the motor stalled — i.e. it
+    # lied precisely during the failure it should have signalled. The diag
+    # firmware has always had on_release on all four.
+    on_release:
+      then:
+        - output.turn_off: led_open_valve2
 
   - platform: gpio
     pin:
@@ -2807,6 +2900,13 @@ binary_sensor:
         - valve.template.publish:
             id: irrigation_water_valve
             state: CLOSED
+    # Without this the lamp latches: the closed LED stayed lit through the
+    # whole opposite travel and indefinitely if the motor stalled — i.e. it
+    # lied precisely during the failure it should have signalled. The diag
+    # firmware has always had on_release on all four.
+    on_release:
+      then:
+        - output.turn_off: led_closed_valve2
 
 # =============================================================================
 # OUTPUTS — Panel indicator LEDs
