@@ -238,6 +238,7 @@ ota:         # Enable over-the-air firmware updates
 improv_serial:   # Allows Wi-Fi provisioning via USB serial on first setup
 
 wifi:
+  use_address:
   ap:
     # Fallback hotspot — protected. Password lives in secrets.yaml.
     password: !secret fallback_ap_password
