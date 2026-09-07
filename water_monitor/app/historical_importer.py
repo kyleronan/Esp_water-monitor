@@ -361,7 +361,10 @@ class HistoricalImporter:
         if not cfg or not self._circuit_has_sensors(cfg):
             log.warning("[%s] import_range: circuit not configured", circuit)
             return 0
-        n, _ = await self._import_range(cfg, start, end)
+        # retry_from is intentionally dropped: this is a caller-driven range
+        # import with no checkpoint of its own, and the caller only wants the
+        # count. Anything left unstored is re-covered by the next catch-up.
+        n, _retry_from = await self._import_range(cfg, start, end)
         return n
 
     async def import_all_circuits_range(
@@ -376,7 +379,7 @@ class HistoricalImporter:
             if not self._circuit_has_sensors(cfg):
                 continue
             try:
-                n, _ = await self._import_range(cfg, start, end)
+                n, _retry_from = await self._import_range(cfg, start, end)
             except Exception as exc:
                 log.warning("[%s] range import fetch failed: %s", cfg.circuit, exc)
                 continue
@@ -489,8 +492,10 @@ class HistoricalImporter:
             window_start = start
             while window_start < now:
                 window_end = min(window_start + timedelta(days=1), now)
+                retry_from = None
                 try:
-                    n, _ = await self._import_range(cfg, window_start, window_end)
+                    n, retry_from = await self._import_range(
+                        cfg, window_start, window_end)
                 except Exception as exc:
                     # Best-effort per chunk (the backfill keeps no checkpoint to
                     # hold); the periodic catch-up / next restart re-covers it.
@@ -499,7 +504,36 @@ class HistoricalImporter:
                                 window_end.isoformat(), exc)
                     n = 0
                 total += n
-                window_start = window_end
+                # A draw crossing a chunk boundary was being stored as its TAIL
+                # only: the period builders never emit a still-active period, so
+                # this chunk stored nothing for it, and the next chunk saw it
+                # already running and opened the event at the boundary. That
+                # truncated stub is exactly the shape the 3x overlap heal was
+                # invented to work around.
+                #
+                # `retry_from` is the earliest point whose events were NOT
+                # stored — it is set only when an event was dropped to a full
+                # queue (which `continue`s before `imported += 1`) or when a
+                # period was still active at the window end (never emitted). So
+                # rewinding to it re-fetches ONLY things that were never
+                # written, and cannot duplicate. That is what makes this safe
+                # here even though the backfill, unlike _catch_up, has no
+                # persistent checkpoint to hold.
+                #
+                # The `> window_start` test is the loop-progress guard: an event
+                # active from the very start of a chunk would otherwise rewind
+                # to where we already are and spin forever. That case means a
+                # draw longer than the chunk itself, and is left to a later run.
+                if retry_from is not None and retry_from > window_start:
+                    log.info(
+                        "[%s] backfill: rewinding chunk boundary %s → %s "
+                        "(an event was still running there; advancing would "
+                        "store only its tail)",
+                        cfg.circuit, window_end.isoformat(),
+                        retry_from.isoformat())
+                    window_start = retry_from
+                else:
+                    window_start = window_end
             if total:
                 log.info("[%s] backfill: imported %d event(s)", cfg.circuit, total)
 
