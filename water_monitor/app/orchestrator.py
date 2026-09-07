@@ -1280,12 +1280,31 @@ class Orchestrator:
                         circuit, e)
         return zone_floor, pump_floor
 
+    def _circuit_display_name(self, circuit: str) -> str:
+        """Human-facing name for ``circuit`` — its configured label.
+
+        Both pressure-alert callbacks below used to ask
+        ``hasattr(self, "get_display_name")`` and fall back to the raw circuit
+        id. No such method has ever existed — not on this class, not on a
+        mixin, nowhere in the repo — so the hasattr was unconditionally False
+        and every low-pressure / pump-fail alert went out naming "circuit_1"
+        where a person expected "Main House".
+
+        ``CircuitConfig.label`` is what the rest of this file already uses for
+        exactly this (see the live-state ``display_name`` further down), and it
+        resolves off config already held in memory. That matters here: these
+        callbacks run ON THE EVENT LOOP, so reading the labels back out of the
+        database instead would add a fresh instance of the single-connection
+        violation dev46 exists to remove.
+        """
+        cfg = self._cfg.get_circuit(circuit) if self._cfg else None
+        return cfg.label if cfg else circuit
+
     def _on_low_pressure_alert(self, circuit: str, psi: float) -> None:
         """6a callback (runs on the event loop from the WS callback)."""
         if self._alert_manager is None:
             return
-        name = self.get_display_name(circuit) if hasattr(
-            self, "get_display_name") else circuit
+        name = self._circuit_display_name(circuit)
         # dev46 (46a): the WS handler invokes this callback ON THE EVENT
         # LOOP, so the pump-mode read cannot happen here. It moves into the
         # task that was already being spawned — no behaviour change, the
@@ -1310,8 +1329,7 @@ class Orchestrator:
         """6b callback (runs on the event loop from the WS callback)."""
         if self._alert_manager is None:
             return
-        name = self.get_display_name(circuit) if hasattr(
-            self, "get_display_name") else circuit
+        name = self._circuit_display_name(circuit)
         asyncio.ensure_future(self._alert_manager.alert_pump_low_pressure(
             circuit, psi, kind, name))
 
@@ -1962,10 +1980,38 @@ class Orchestrator:
 
         uc = dbst["unit_context"]
 
+        # The lifetime tile reads the SAME entity as ha_volume_total above, but
+        # it skipped that block's vol_to_litres step and handed the RAW HA
+        # state straight to uc['vol_factor'] — a factor units.py:22 documents
+        # as "multiply stored L value by this to get display volume". The
+        # firmware publishes device_class: water, so HA re-presents the entity
+        # in the user's own unit system: on a US install the state arrives in
+        # GALLONS, and putting gallons through the L→gal factor left the tile
+        # 3.785x adrift from the daily/weekly figures printed beside it.
+        #
+        # Same root cause as the two defects already scarred into this
+        # codebase: the "today = meter_litres − baseline_gallons inflated
+        # ~3.8x" baseline bug in _init_volume_baselines above, and the daily
+        # 3.785x "over-count" in volume_drift.py. Both were fixed by converting
+        # with the entity's OWN unit first, via the one shared helper — so do
+        # that here rather than inventing a third idiom.
+        #
+        # The volume_daily / volume_weekly lines below are deliberately NOT
+        # changed: they come out of compute_ha_daily_volume(), which was fed
+        # the already-normalised ha_volume_total, so those really are stored
+        # litres and vol_factor alone is correct for them.
         _vt_raw = states.get(circuit_cfg.volume_sensor, "")
         try:
-            _vt = f"{float(_vt_raw) * uc['vol_factor']:.{uc['vol_decimals']}f}" \
-                  if _vt_raw not in ("", "unknown", "unavailable") else "—"
+            if _vt_raw in ("", "unknown", "unavailable"):
+                _vt = "—"
+            else:
+                from .ha_client import vol_to_litres as _v2l_tile
+                _vt_attrs = (full_states.get(circuit_cfg.volume_sensor)
+                             or {}).get("attributes") or {}
+                _vt_litres = _v2l_tile(
+                    float(_vt_raw),
+                    _vt_attrs.get("unit_of_measurement", ""))
+                _vt = f"{_vt_litres * uc['vol_factor']:.{uc['vol_decimals']}f}"
         except (ValueError, TypeError):
             _vt = "—"
 
