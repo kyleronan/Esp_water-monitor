@@ -26,7 +26,10 @@ log = logging.getLogger(__name__)
 WS_URL = "ws://supervisor/core/websocket"
 REST_URL = "http://supervisor/core/api"
 
-_GAL_UNITS = {"gal", "us gal", "gallon", "gallons", "us gallon", "us liquid gallon"}
+# Single source of truth lives in units.py so this and the calibration path
+# cannot drift apart (they had: this accepted six spellings, the calibration
+# reader accepted exactly one).
+from .units import GAL_UNITS as _GAL_UNITS
 
 
 def vol_to_litres(value: float, unit: str) -> float:

@@ -16,6 +16,34 @@ HA unit system auto-detection maps:
 from __future__ import annotations
 from typing import Any, Dict, Optional
 
+# ── HA volume-unit strings → the canonical vol_label below ──────────────
+#
+# Home Assistant entities are free to label a volume however their
+# integration likes ("gallons", "gal", "ft3"...). Two places used to key on
+# EXACT strings and silently treat anything unrecognised as litres, which on
+# a gallons meter is a 3.785x error — and on the calibration path that error
+# was written back into the firmware as pulses-per-litre.
+#
+# Keep every spelling here so the parsers cannot drift apart again.
+VOL_UNIT_ALIASES: Dict[str, str] = {
+    # litres
+    "l": "L", "liter": "L", "liters": "L", "litre": "L", "litres": "L",
+    # US gallons
+    "gal": "gal", "gals": "gal", "gallon": "gal", "gallons": "gal",
+    "us gal": "gal", "us gallon": "gal", "us gallons": "gal",
+    "us liquid gallon": "gal",
+    # cubic feet
+    "ft\u00b3": "ft\u00b3", "ft3": "ft\u00b3", "cu ft": "ft\u00b3",
+    "cubic foot": "ft\u00b3", "cubic feet": "ft\u00b3",
+    # cubic metres
+    "m\u00b3": "m\u00b3", "m3": "m\u00b3", "cu m": "m\u00b3",
+    "cubic meter": "m\u00b3", "cubic meters": "m\u00b3",
+    "cubic metre": "m\u00b3", "cubic metres": "m\u00b3",
+}
+
+#: Every spelling that means US gallons (kept as a set for ha_client).
+GAL_UNITS = frozenset(k for k, v in VOL_UNIT_ALIASES.items() if v == "gal")
+
 # ── Flow rate options ──────────────────────────────────────────────────────
 # factor      : multiply stored L/min value by this to get display value
 # vol_label   : unit label for volumes  (L, gal, ft³, m³)
@@ -57,6 +85,31 @@ FLOW_OPTIONS: Dict[str, Dict[str, Any]] = {
         "vol_decimals": 3,
     },
 }
+
+
+#: Canonical vol_label -> vol_factor (display value = stored litres x factor).
+VOL_LABEL_FACTORS: Dict[str, float] = {
+    opt["vol_label"]: opt["vol_factor"] for opt in FLOW_OPTIONS.values()
+}
+
+
+def resolve_vol_factor(unit: str) -> Optional[float]:
+    """HA unit_of_measurement string -> vol_factor, or None if unrecognised.
+
+    ``None`` means "do not guess". A caller converting a METER reading must
+    treat it as a hard failure: assuming litres for an unrecognised unit is how
+    a gallons meter produced a 3.785x-wrong pulses-per-litre value that was then
+    written into the firmware, where every downstream volume inherits it.
+
+    An empty/absent unit resolves to litres, matching the firmware's own output.
+    """
+    u = (unit or "").strip()
+    if not u:
+        return VOL_LABEL_FACTORS["L"]
+    label = VOL_UNIT_ALIASES.get(u.lower())
+    if label is None:
+        return None
+    return VOL_LABEL_FACTORS.get(label)
 
 # ── Pressure options ───────────────────────────────────────────────────────
 # factor  : multiply stored PSI value by this to get display value

@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 from ..auth import require_admin
 from ..circuit_compat import resolve_circuit
 from ..database import run_db
-from ..units import load_unit_context
+from ..units import load_unit_context, resolve_vol_factor
 from ..calibration_math import (
     BUCKET_MIN_L, MUNICIPAL_MIN_L, METER_UNIT_FACTORS, gate, pooled, run_ppl, to_litres,
 )
@@ -71,8 +71,26 @@ async def _read_volume_l(orch, cfg) -> Optional[float]:
     except (TypeError, ValueError):
         return None  # 'unknown' / 'unavailable'
     unit = ((st.get("attributes") or {}).get("unit_of_measurement") or "L").strip()
-    factor = METER_UNIT_FACTORS.get(unit)   # firmware reports L; convert if HA exposed another
-    if factor and factor != 1.0:
+    factor = resolve_vol_factor(unit)
+    if factor is None:
+        # REFUSE rather than assume litres. This value becomes `measured_l`,
+        # which run_ppl divides by the user's actual volume to produce the
+        # pulses-per-litre written into the firmware — so a mis-scaled reading
+        # does not merely report a wrong number, it permanently mis-scales every
+        # volume the add-on computes afterwards. The old code fell through to
+        # "treat as litres", and a "gallons" entity is 3.785x off.
+        #
+        # It also survived every downstream guard: 396 x 3.785 = 1499 sits inside
+        # clamp_ppl(1.0, 5000.0), and the "3 consistent runs" gate passes because
+        # all three runs agree on the same wrong answer.
+        log.error(
+            "[%s] volume sensor %s reports unit %r, which is not a recognised "
+            "volume unit — refusing to use it for calibration. Assuming litres "
+            "would write a wrong pulses-per-litre into the firmware. Add the "
+            "spelling to units.VOL_UNIT_ALIASES if it is legitimate.",
+            getattr(cfg, "circuit", "?"), ent, unit)
+        return None
+    if factor != 1.0:
         val = to_litres(val, factor)
     return val
 
