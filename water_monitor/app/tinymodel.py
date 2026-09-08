@@ -175,7 +175,7 @@ def transform(feature: str, value) -> float:
     """log1p the right-skewed features, identity for the rest.
 
     Applied identically at fit and at predict — the same contract as
-    ``database._sig_transform``. Non-numeric and non-finite become NaN, which
+    ``database._knn_transform``. Non-numeric and non-finite become NaN, which
     the booster handles natively; they are NOT coerced to 0.0, because 0 is a
     meaningful value for most of these columns and a missing reading is not.
     """

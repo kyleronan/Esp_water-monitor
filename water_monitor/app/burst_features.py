@@ -29,7 +29,7 @@ event is first classified. Rather than pretend otherwise:
 Both are applied identically to the query event and to every neighbour, at fit
 time and at serve time. That symmetry is the whole contract: a feature computed
 one way in training and another way in production is a silent accuracy leak,
-which is why ``_sig_transform`` exists in database.py and why there is no third,
+which is why ``_knn_transform`` exists in database.py and why there is no third,
 ad-hoc variant here.
 
 COST
