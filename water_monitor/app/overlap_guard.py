@@ -14,11 +14,18 @@ raw flow: 2026-07-20 10:03 UTC, wrapper f5cd02c7 3.92 L vs real flush
 Resolution policy (shared by the live guard and the one-shot cleanup):
   * WRAPPER: an event whose span CONTAINS (>=70%) the other member(s) and
     whose raw volume reconciles with theirs (within 40% of the larger side)
-    AND which those member(s) SPAN (>=90% union coverage, dev33) describes the
-    same water — its effective volume is zeroed through the §2.5 ledger
-    chokepoint with match_rejection_reason='overlap_duplicate' (it joins the
-    phantom flag family so hide/zero plumbing applies), and the tight
-    member(s) keep theirs.
+    AND whose UNACCOUNTED remainder (raw minus the de-duplicated child volumes)
+    is at most _FULL_DUPLICATE_REMAINDER_FRACTION of its own raw volume
+    describes the same water — its effective volume is zeroed through the §2.5
+    ledger chokepoint with match_rejection_reason='overlap_duplicate', and the
+    tight member(s) keep theirs.
+    The gate is on VOLUME, not span. dev57 (§2.36) corrected this paragraph:
+    it claimed a ">=90% union coverage (dev33)" span gate that has never
+    existed in the code. _union_coverage IS computed, but only to be printed in
+    the decision's log line and audit row — see the constants block below, where
+    dev33 records span coverage as measurably the WRONG discriminator (the good
+    case covers 47% of the wrapper, the 704.7 L bad case 72%). Reinstating a
+    span gate from this docstring would zero real water.
   * PARTIALLY-COVERED WRAPPER (dev33 §1.2): children that do not span the
     wrapper only account for part of it — the wrapper keeps the UNCOVERED
     remainder (raw minus the de-duplicated child volumes) instead of being
@@ -53,7 +60,13 @@ OVERLAP_DUPLICATE_REASON = "overlap_duplicate"
 # wrapper only contains 77% of the real flush's span (the genuine draw's tail
 # extends past the wrapper's close). Volume reconciliation is the strong
 # second gate; 0.70 span containment matches the observed physics.
-_CONTAINMENT_FRACTION = 0.70
+# dev57 (§2.36) — public spelling too. The importer's containment rule
+# (historical_importer._split_period_around_rows) asks the SAME question of the
+# same spans and had its own hardcoded 0.70; it already imported
+# ``contained_fraction`` from here, so it imported the function without the
+# threshold and the two could drift apart with nothing to catch it.
+CONTAINMENT_FRACTION: float = 0.70
+_CONTAINMENT_FRACTION = CONTAINMENT_FRACTION
 _VOL_TOLERANCE = 0.40
 # dev55 — the two numbers the importer's containment rule, the reprocess probe
 # and the overlap summary all share. They live HERE (a module that imports
@@ -240,13 +253,39 @@ def _audit(conn, circuit: str, wrapper_id: str, kept_ids: List[str],
          resolution, source, datetime.now(timezone.utc).isoformat()))
 
 
+def _refresh_daily_summary(conn: sqlite3.Connection, circuit: str,
+                           start_ts, *, where: str) -> None:
+    """Recompute ``start_ts``'s local daily_summary after a volume-changing write.
+
+    This module's two ledger writes used to end in a bare ``except Exception:
+    pass``. The drift class that costs (dev49 P0-4: 17 of 92 days out by 468.5 L,
+    worst day -93.2 L) is exactly "a volume moved and the day's cached summary
+    did not", so a failure here must never be SILENT and must never be the last
+    word: it is logged, and the day is left marked dirty so the pruner's
+    ``drain_daily_summary_dirty`` pass recomputes it. Still best-effort by
+    contract — a summary refresh may not break a de-duplication that has already
+    written the ledger.
+    """
+    from .database import (compute_daily_summary, local_day_of,
+                           mark_daily_summary_dirty)
+    day = local_day_of(start_ts)
+    if not day:
+        return
+    try:
+        compute_daily_summary(conn, circuit, day)
+    except Exception as e:                                      # noqa: BLE001
+        log.warning("[%s] daily summary for %s not recomputed after %s (%s) — "
+                    "left marked dirty for the pruner's drain pass",
+                    circuit, day, where, e)
+        mark_daily_summary_dirty(conn, circuit, start_ts)
+
+
 def resolve_group(conn: sqlite3.Connection, group: List[dict],
                   source: str) -> Dict[str, Any]:
     """Apply the resolution policy to one overlap group. Returns counters.
     Idempotent: an already-zeroed wrapper (mrr='overlap_duplicate') is a
     no-op, and audit rows are INSERT OR IGNORE on the wrapper id."""
-    from .database import (apply_effective_volume, compute_daily_summary,
-                           local_day_of)
+    from .database import apply_effective_volume
     stats = {"wrappers_zeroed": 0, "flag_only": 0, "ambiguous": 0,
              "partial_remainder": 0, "litres_recovered": 0.0}
     spans = {r["id"]: _span(r) for r in group}
@@ -368,12 +407,8 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
         _audit(conn, w["circuit"], w["id"], kept, prior_eff - new_eff,
                "wrapper_zeroed" if full_duplicate else "wrapper_partial_remainder",
                source)
-        day = local_day_of(w["start_ts"])
-        if day:
-            try:
-                compute_daily_summary(conn, w["circuit"], day)
-            except Exception:
-                pass
+        _refresh_daily_summary(conn, w["circuit"], w["start_ts"],
+                               where="overlap de-duplication")
         stats["wrappers_zeroed"] += 1
         if not full_duplicate:
             stats["partial_remainder"] += 1
@@ -485,7 +520,7 @@ def release_verdict_pin(conn: sqlite3.Connection, row: dict, *,
     cross-talk, dribble …) is left exactly as that detector decided — only the
     pin columns are cleared. The wrapper's live audit rows are marked stale with
     ``reason`` (MARK, never delete — provenance)."""
-    from .database import apply_effective_volume, compute_daily_summary, local_day_of
+    from .database import apply_effective_volume
     ours = row.get("match_rejection_reason") == OVERLAP_DUPLICATE_REASON
     raw = float(row.get("volume_litres") or 0.0)
     if ours:
@@ -506,12 +541,8 @@ def release_verdict_pin(conn: sqlite3.Connection, row: dict, *,
         "  stale_at = COALESCE(stale_at, ?) WHERE wrapper_event_id = ? "
         "  AND stale_reason IS NULL",
         (reason, datetime.now(timezone.utc).isoformat(), row["id"]))
-    day = local_day_of(row["start_ts"])
-    if day:
-        try:
-            compute_daily_summary(conn, row["circuit"], day)
-        except Exception:
-            pass
+    _refresh_daily_summary(conn, row["circuit"], row["start_ts"],
+                           where="overlap pin release")
     log.info("[%s] overlap pin released on %s (%s): %s", row["circuit"], row["id"],
              reason, ("%.2f L restored" % raw) if ours else "other verdict kept")
     return {"released": row["id"], "restored_l": raw if ours else 0.0,
@@ -536,13 +567,13 @@ def classify_group(conn: sqlite3.Connection, group: List[dict]) -> str:
     restored wrappers all had one."""
     zeroed = [r for r in group if r.get("match_rejection_reason") == OVERLAP_DUPLICATE_REASON
               and float(r.get("volume_litres_effective") or 0.0) <= OVERLAP_NEGLIGIBLE_L]
-    pinned = [r for r in group if r.get("verdict_pin") == OVERLAP_DUPLICATE_REASON
-              or r.get("match_rejection_reason") == OVERLAP_DUPLICATE_REASON]
     excess = group_excess_litres(group)
     if len(zeroed) > 1:
         return "double_zeroed"
-    if pinned and excess < OVERLAP_NEGLIGIBLE_L:
-        return "resolved"
+    # dev57 (§2.36) — a `pinned and excess < NEGLIGIBLE` branch used to sit here,
+    # strictly subsumed by the bare `excess < NEGLIGIBLE` below it and returning
+    # the same string, so it could never decide anything; `pinned` had no other
+    # reader. Removed — zero behavioural change.
     if excess < OVERLAP_NEGLIGIBLE_L:
         return "resolved"
     if any(str(r.get("user_fixture_type") or "").strip() for r in group):

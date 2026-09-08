@@ -7,7 +7,7 @@ Every step below names the responsible **file/function**, the **gates with their
 the **DB columns written**, and an **"if it breaks here"** symptom so you can jump from a wrong number
 straight to the code that produced it.
 
-> Verified against **0.3.1-dev49 + firmware 3.13.2**. Since the dev31 revision this
+> Verified against **0.3.1-dev56 + firmware 3.14.0**. Since the dev31 revision this
 > doc last described: the training pool gained two independent exclusion filters
 > (dev40 quarantine, dev46 user flag), the labeling ladder gained validated shape
 > gates for dishwasher cycles and toilet flushes, the fingerprint tier began
@@ -17,7 +17,11 @@ straight to the code that produced it.
 > surprise you *now*: a **learned per-home model** sits inside the ladder above
 > the fingerprint and k-NN tiers, so classification is no longer a pure function
 > of the code plus the frozen bands — it also depends on which model artifact is
-> currently serving. If you touch this pipeline, re-check the constants
+> currently serving. Since then: dev51 added the referee's reference benchmark and
+> dev53 made the add-on pin it itself (Part 6); dev55 hardened the importer's
+> overlap check against re-recording the same water; and dev56 introduced the
+> **pinned overlap verdict** (`verdict_pin`, step 7d), the first verdict a user
+> label does not lift. If you touch this pipeline, re-check the constants
 > cited here against the code before trusting them.
 
 Three invariants hold the whole thing together:
@@ -381,12 +385,32 @@ step. Sequence context (`seconds_since_prev_event`, `cycle_pulse_count`) is fill
 #### Branch · Hygiene auto-split loop
 **`app/reprocess.py`**
 
-- **Candidates:** unlabeled events whose actual flow is < 25% of their span (including inflated
-  `sparse_envelope` singles).
-- **Dry-run:** the importer counts real draws inside; if 2–10 are found →
+- **Feature flag:** the whole loop is opt-in — `home_profile.auto_split_enabled` (dev38), read fresh
+  on every pass by `_auto_split_enabled()` so a Settings toggle takes effect with no restart. Absent
+  column or absent profile ⇒ **OFF**. If the loop appears dead, check this first.
+- **Candidates:** unlabeled events with an **absolute internal idle gap of ≥ 60 s** —
+  `duration_seconds - COALESCE(active_flow_duration_seconds, 0) >= _SPLIT_MIN_IDLE_S` (60.0). This is
+  a threshold in *seconds*, **not a ratio**: there is no percentage-of-span test anywhere in
+  `reprocess.py`. Also required: `active_flow_segment_count >= 1` (dev39 lowered this from 2 so an
+  inflated *single* draw is a candidate too — the idle gap is the real selector), and
+  `split_evaluated_at IS NULL` (dev50, migration 20260814 — a settled decision is memoed and filtered
+  out *before* any HA history fetch, so a restart costs one query rather than a fetch storm).
+  Inflated `sparse_envelope` singles are deliberately let back in (dev40).
+- **Window:** `end_ts` within the recorder lookback (`HA_HIGH_FIDELITY_DAYS × 24 − 12 h`) and older
+  than a 60-minute settle margin, newest first, 20 per pass.
+- **Dry-run + volume probe:** the importer reconstructs the window; `_probe_refusal()` refuses unless
+  the rebuilt flow re-integrates **≥ 90 %** of the stored volume (`_SPLIT_MIN_VOLUME_COVERAGE`, the
+  same `VOLUME_COVERAGE_FRACTION = 0.9` object the importer's containment rule uses, dev55) with no
+  recorder-gap markers. A refusal is memoed as settled; a `fetch_failed` is transient and retried.
+- **Two ways to act** — the doc long described only the first:
+  - **SPLIT** — 2–10 reconstructed draws (`_SPLIT_MIN_PERIODS`…`_SPLIT_MAX_PERIODS`); more is chatter.
+  - **SHRINK** — exactly 1 reconstructed draw at least 60 s shorter than the stored span (an inflated
+    single: two blips a spurious pressure dip welded into one long event collapse to the real use).
+  Neither ⇒ memoed `"clean"`, no churn.
 - **Atomic `reprocess_window()`:** delete → auto-widen to engulf the deleted spans → re-import →
   restore the originals on any failure (all-or-nothing, no lost water).
-- **Never touches** user-labeled, artifact-flagged, anomaly-flagged, or softener-session events.
+- **Never touches** user-labeled, user-ignored, artifact-flagged, anomaly-flagged (`flagged = 1`,
+  dev39 leak-safety), or softener-session events.
 - Loops back through step 6.
 
 ---
@@ -599,14 +623,24 @@ The *only* path by which any event's litres reach totals:
 2. If the new effective volume > 0, post it to the hour of `start_ts`. If it's 0, the bucket is NULL —
    the event contributes nowhere.
 
-**Callers:** live insert (step 9), `volume_recompute.py`, `recorder_reconcile.py`,
-`overlap_guard.py` (wrapper zeroing / partial remainder), `db_migrations.py` (volume-touching
-backfills), the low-flow coalescer, and relabel/reprocess paths.
+**Callers — 25 call sites across 6 modules** (all under `app/`):
 
-> This list used to be published as "the complete list" while omitting `overlap_guard.py` and
-> `db_migrations.py` — the two writers where the 2026-08-25 review found the worst volume bugs,
-> directly under an instruction telling auditors to use this list when totals drift. Treat it as
-> a guide, not a proof: **verify with a grep for `apply_effective_volume(`**, and if you add a
+| Module | Call sites | Functions |
+|---|---|---|
+| `feature_extractor.py` | **10** | `reprocess_event_exclusion_verdicts` (**6**), `reprocess_degraded_supply_verdicts` (2), `reprocess_rising_pressure_phantoms`, `backfill_sawtooth_pump_recharge` — the artifact/phantom cascade zeroing, un-zeroing and re-applying volume as each verdict lands (step 7) |
+| `database.py` | **9** | `upsert_event_and_apply_hourly_volume` (live insert, step 9), `_apply_event_verdicts`, `coalesce_low_flow_events`, `mark_event_irrigation_cross_talk`, `mark_event_leak_test_refill`, `revert_irrigation_cross_talk`, `revert_artifact_zeroing_on_relabel`, `rezero_rows_with_zeroing_flag`, `repair_misflagged_phantom_events` |
+| `overlap_guard.py` | 2 | `resolve_group` (wrapper zeroing / partial remainder), `reevaluate_containing_wrappers` (pin release) |
+| `recorder_reconcile.py` | 2 | `_apply`, `apply_flagged_backlog` |
+| `db_migrations.py` | 1 | `_apply_phantom_suppression_averted` (volume-touching backfill) |
+| `volume_recompute.py` | 1 | `recompute_volume_and_active_flow` |
+
+> This list has twice been published in a form an auditor could not rely on. It was once billed as
+> "the complete list" while omitting `overlap_guard.py` and `db_migrations.py` — the two writers where
+> the 2026-08-25 review found the worst volume bugs. It then named 4 modules while 6 were calling, and
+> silently omitted the **largest single caller**, `feature_extractor.py` (10 of the 25) — directly
+> under an instruction telling auditors to use this list when totals drift. Treat it as a guide, not
+> a proof: **verify with a grep for `apply_effective_volume(`** (the counts above are AST call-site
+> counts, not grep-line counts — the raw grep also matches imports and comments), and if you add a
 > caller, add it here.
 
 **Invariant:** `volume_ledger_discrepancy()` ≈ 0 (sum of applied amounts = sum of `hourly_volume`).
@@ -696,7 +730,7 @@ settle once cycle-mates exist. Any volume change re-enters at step 12.
 | **Fixture health alerts** (Water Use) | `fixture_health.py`, `routers/fixtures.py` | per-signal wording, observed vs frozen reference (only when units match), and an events-to-fire count; admin resolves as `fixture_repaired` or `false_alarm` |
 | **Supply-pressure banner** (Dashboard / Settings) | `routers/dashboard.py`, `routers/settings.py` | "supply pressure changed — recalibrate?" with old/new psi and per-type labels-needed; Confirm runs the `regime_recalibration` job (Part 5a) |
 | **Clear stale group links** (Water Use) | `POST /fixtures/repair-stale-links` | amber banner when orphaned events exist; repairs orphans **then rebuilds the in-memory matcher per circuit** — without that second step live matching immediately re-mints them |
-| **Help page** | `routers/help.py` | task-organised control reference (Everyday / After a pressure change / Winterizing / Leak tests / Warnings). Control names are extracted from the templates that render them, so a rename **fails the build** rather than silently drifting |
+| **Help page** | `routers/help.py` | task-organised control reference (Everyday / After a pressure change / Winterizing / Leak tests / Warnings). Control names are **not** extracted from the templates: `tests/test_help_runbook.py` carries a **hand-maintained 16-entry `CONTROLS` list** and asserts each label appears both in `help.html` and in the named template. So a rename is caught **only if you run pytest and only if the label is one of the 16** — there is no CI in this repository (no `.github/`, no pipeline config) and the `Dockerfile` never invokes pytest, so **nothing fails a build**. Adding a control means adding it to that list by hand |
 | **Study snapshot** (Backup) | `routers/backup.py · export_study_snapshot` | whole-DB copy stamped with schema + add-on version, taken via SQLite's own backup on a separate short-lived connection. For analysis, not for restoring |
 | **History page** | `routers/history.py` | reads `events` rows directly. A **filter bar** (dev15) queries by date / duration / avg flow / ΔP / volume / fixture / note, pushed into `get_recent_events()` SQL. The standalone **"Shape" column was dropped** (the flow sparkline moved inline). The "hide not-real events" toggle now filters **in SQL** (`exclude_not_real`, dev22) — before dev22 it post-filtered *after* the 100-row limit, so a storm of pump artifacts starved the page to ~18 visible rows; `count_not_real_events()` backs the "N hidden — show them" badge. Totals never change either way — litres were decided at step 7 |
 

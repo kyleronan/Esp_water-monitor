@@ -5211,13 +5211,33 @@ def rezero_rows_with_zeroing_flag(conn: sqlite3.Connection) -> int:
     re-sweep raised wrappers another verdict had zeroed (the guard's UPDATE never
     touches is_cross_talk / is_low_flow_dribble), leaving rows that say
     "cross-talk" with water still counted; nothing else re-derives cross-talk.
-    Idempotent; skips user-classified rows. Returns rows repaired."""
+    Idempotent; skips user-classified rows. Returns rows repaired.
+
+    Two callers: migration 20260818, and ``repair_artifact_flag_consistency``
+    on every boot (a home already stamped at 20260818 never re-runs the
+    migration, so the boot carrier is what actually repairs it — see the note
+    at that call site).
+
+    dev57 (§2.36) — it must not FLATTEN the verdict while it re-zeroes. Both
+    flags it reads are flag FAMILIES: the phantom bit is shared by
+    rising_pressure_phantom / pressure_silent_flow / pump_recharge, and the
+    cross-talk bit by irrigation_cross_talk. ``match_rejection_reason`` is the
+    ONLY place those specific verdicts are recorded, and their survival across
+    reprocessing rests entirely on that string — so an existing in-family reason
+    is KEPT, and the generic family name is written only where the row records
+    no verdict at all."""
+    from .feature_extractor import (PUMP_RECHARGE_REASON, PRESSURE_SILENT_REASON,
+                                    RISE_PHANTOM_REASON)
+    _PHANTOM_FAMILY = {"pressure_restoration_phantom", RISE_PHANTOM_REASON,
+                       PRESSURE_SILENT_REASON, PUMP_RECHARGE_REASON}
+    _XTALK_FAMILY = {"cross_talk", "irrigation_cross_talk"}
     try:
         rows = conn.execute(
             # dribble rows are NOT here: the startup dribble backfill re-zeroes
             # them itself with its own reason (below_meter_floor).
             "SELECT id, circuit, start_ts, is_cross_talk, is_low_flow_dribble, "
-            "       is_pressure_restoration_phantom FROM events "
+            "       is_pressure_restoration_phantom, match_rejection_reason "
+            "FROM events "
             "WHERE (COALESCE(is_cross_talk,0)=1 "
             "       OR COALESCE(is_pressure_restoration_phantom,0)=1) "
             "  AND COALESCE(is_low_flow_dribble,0)=0 "
@@ -5227,11 +5247,18 @@ def rezero_rows_with_zeroing_flag(conn: sqlite3.Connection) -> int:
         return 0
     n = 0
     for r in rows:
-        reason = "cross_talk" if r[3] else "pressure_restoration_phantom"
+        family = _XTALK_FAMILY if r[3] else _PHANTOM_FAMILY
+        generic = "cross_talk" if r[3] else "pressure_restoration_phantom"
+        stored = (r[6] or "").strip()
+        reason = stored if stored in family else generic
+        # Mirror _finalize_derived_verdicts' own method mapping so the two
+        # columns cannot disagree about which verdict zeroed the row.
+        method = (reason if reason in (PUMP_RECHARGE_REASON, PRESSURE_SILENT_REASON)
+                  else "cross_talk" if r[3] else "pressure_restoration_phantom")
         conn.execute(
             "UPDATE events SET volume_litres_effective = 0, volume_estimation_method = ?, "
             "  match_rejection_reason = ?, excluded_from_training = 1 WHERE id = ?",
-            (reason, reason, r[0]))
+            (method, reason, r[0]))
         apply_effective_volume(conn, r[0], r[1], r[2], 0.0)
         n += 1
     return n
@@ -5412,7 +5439,14 @@ def find_overlapping_event(
                         new_dur, len(healed_spans), 100.0 * covered, row["id"],
                     )
                     return dict(row)
-                log.info(
+                # dev57 (§2.36) — DEBUG, not info. This fires once per stub
+                # waved through, inside this loop, inside a function that
+                # reprocess._kept_event_blockers itself calls in a loop
+                # (measured 46x/day of "not blocking" noise). It records a
+                # NON-decision; the decision this function actually makes is
+                # logged at info either by the blocking branch above or by the
+                # caller that acts on the returned row.
+                log.debug(
                     "[overlap] not blocking %d s event by %d s unlabeled stub %s "
                     "— allowing the longer event to insert (span %.0f%% covered)",
                     new_dur, ex_dur, row["id"], 100.0 * covered,
@@ -6986,10 +7020,33 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
     never zeroes volume and lives on low-pressure rows that can't satisfy the
     ``pressure_delta_psi >= 2.0`` filter below, so dribbles are never touched.
 
+    dev57 (§2.30) — that scope has to be enforced by the QUERY, not just stated
+    here. ``is_pressure_restoration_phantom`` is a FLAG FAMILY, not one verdict:
+    ``_finalize_derived_verdicts`` sets the same bit for the rising-pressure
+    phantom (``_detect_rising_pressure_phantom`` — no ΔP gate at all),
+    pressure-silent flow, and the pump-recharge absorber (prong 3 admits ΔP up
+    to 2.5). For those three, ``ΔP >= 2.0`` is not a contradiction, it is the
+    normal shape — so this repair un-flagged and restored them while
+    ``reprocess_rising_pressure_phantoms`` / the pump sweep re-flagged and
+    re-zeroed them on the next pass, oscillating the row's verdict and churning
+    the ledger both ways. The family members keep their own
+    ``match_rejection_reason``, which is what tells them apart, so the filter
+    below reads it: only the long phantom's own reason (or a legacy row that
+    records no reason at all) can be a misflag here.
+
     Returns ``{"repaired": N, "litres_restored": L}``.
     """
-    from .feature_extractor import _PHANTOM_MAX_DELTA_PSI
+    from .feature_extractor import (_PHANTOM_MAX_DELTA_PSI, PUMP_RECHARGE_REASON,
+                                    PRESSURE_SILENT_REASON, RISE_PHANTOM_REASON)
 
+    # Reasons that share the phantom BIT but not the phantom's ΔP premise. A row
+    # carrying one of these is doing exactly what its detector intends.
+    _not_a_misflag = (RISE_PHANTOM_REASON, PRESSURE_SILENT_REASON,
+                      PUMP_RECHARGE_REASON,
+                      # dev56 — an overlap wrapper of a REAL draw has a real
+                      # pressure drop; that is not a misflag, it is water
+                      # counted by another row.
+                      "overlap_duplicate")
     rows = conn.execute(
         "SELECT id, circuit, start_ts, volume_litres, volume_litres_estimated, "
         "       degraded_supply, user_ignored, "
@@ -6998,10 +7055,9 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
         "WHERE is_pressure_restoration_phantom = 1 "
         "  AND pressure_delta_psi >= ? "
         "  AND COALESCE(user_classified, 0) = 0 "
-        # dev56 — an overlap wrapper of a REAL draw has a real pressure drop;
-        # that is not a misflag, it is water counted by another row.
-        "  AND COALESCE(match_rejection_reason, '') <> 'overlap_duplicate'",
-        (_PHANTOM_MAX_DELTA_PSI,),
+        "  AND COALESCE(match_rejection_reason, '') NOT IN "
+        f"      ({','.join('?' * len(_not_a_misflag))})",
+        (_PHANTOM_MAX_DELTA_PSI, *_not_a_misflag),
     ).fetchall()
 
     repaired = 0

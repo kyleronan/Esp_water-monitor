@@ -216,9 +216,11 @@ button:
 
 # -----------------------------------------------------------------------------
 # END STOPS — live valve-position feedback. NO internal pull (field fix
-# 2026-07-26): the end stops are ACTIVE-HIGH with an ONBOARD pulldown (~10 k,
-# R16 family) — the switch feeds 3.3 V when pressed, the board holds the line
-# low otherwise. The internal pullup the firmware used to enable fought that
+# 2026-07-26): the end stops are ACTIVE-HIGH through an ONBOARD 10 K series /
+# 20 K pulldown divider — R16 = 10 K series, R15 = 20 K to GND (see
+# docs/hardware/pinouts.md and docs/hardware/bom.md) — the switch feeds the line
+# when pressed (~3.3 V at the GPIO after the divider), the 20 K pulldown holds
+# it low otherwise. The internal pullup the firmware used to enable fought that
 # pulldown into a ~1.3-1.4 V divider — the ESP32-S3's UNDEFINED logic band —
 # making every end-stop read a coin flip. With no internal pull:
 #   sensor ON  = pin HIGH (~3.3 V) — switch pressed and feeding the line.

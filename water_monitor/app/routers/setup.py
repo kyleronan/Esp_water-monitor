@@ -263,6 +263,15 @@ async def setup_restore(request: Request):
     except Exception as e:
         log.warning("Restore: reload_circuit_entities: %s", e)
 
+    # dev57 (2.18): the restore replaces whole tables, so it can rewrite
+    # device_config.setup_complete without going through
+    # device_discovery's mark/unmark (which bump the epoch every cached copy
+    # watches). Re-read it explicitly, on the DB worker.
+    try:
+        await orch.refresh_setup_complete_cache()
+    except Exception as e:
+        log.warning("Restore: setup-complete refresh failed (non-fatal): %s", e)
+
     # Re-run unit auto-detection after restore.
     # The backup may contain flow_unit='L/min' (schema default) which would
     # overwrite the correctly auto-detected value from startup.  Re-running
@@ -428,6 +437,10 @@ async def setup_discover(device_id: str, request: Request):
     )
     from ..database import run_db
     await run_db(save_discovery, orch.db, result)            # dev46 (46a)
+    # dev57 (2.18): save_discovery clears device_config.setup_complete. It
+    # bumps the epoch itself, so the cache is already unknown; re-prime on the
+    # DB worker so the re-read does not land on the event loop.
+    await orch.refresh_setup_complete_cache()
 
     # Convert matches to serialisable form
     circuit_data = {}
@@ -822,6 +835,11 @@ async def setup_home_details_save(request: Request):
 
     # Mark setup complete and reload entity IDs into live circuit configs
     await run_db(mark_setup_complete, orch.db)                # dev46 (46a)
+    # dev57 (2.18): mark_setup_complete() already invalidated every cached copy
+    # of the flag (the device_discovery epoch moved). Re-prime it here so the
+    # one read that costs happens on the DB worker rather than on the event
+    # loop inside whichever request reads the property next.
+    await orch.refresh_setup_complete_cache()
     await orch.reload_circuit_entities_async()   # dev57 (2.10)
 
     # If the user opted out of historical import, stamp import_state to NOW

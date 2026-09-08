@@ -804,6 +804,93 @@ in a state it never reported, or stop protecting without saying so.
 After flashing, delete the two now-unavailable **Valve Travel Timeout** entities
 from Home Assistant.
 
+## [firmware 3.13.2] — 2026-08-02
+
+Leak-test rework, driven by a controlled bench study. The add-on-side half of
+this work — the demand ladder, the bench constants, and the no-fault-on-fail
+rule — is described under **0.3.1 → Leak test rework (firmware 3.13.2 +
+add-on)** above; the firmware's contribution is the post-settle baseline the
+add-on now reads instead of a pre-close reading that folded in the closing
+transient.
+
+## [firmware 3.13.1] — 2026-07-26
+
+**The most safety-relevant firmware release in this tree.** It was shipped as a
+field fix on the day a week-long fault was found, and until now it had no
+changelog entry at all — while 3.14.0 above refers back to it. Recorded here
+retrospectively, from the firmware's own annotations.
+
+Background: the rebuilt valve board does not behave like the original. The
+original used true bistable latching relays that transferred on a 15 ms pulse.
+The rebuilt board's gear motors move **only while a coil is held**, and cut
+their own power at end of travel. The firmware was still pulsing. The result
+was a main-water valve that reported state changes it had not made — and a
+close path that had been silently failing since 2026-07-18.
+
+- **Hold-to-drive replaces pulse-to-latch.** Coil pulses (15 ms, 100 ms and 1 s
+  were all field-tested) do **not** move this valve; a held coil does. Each
+  open/close sequence now holds its coil until the target end stop fires, with a
+  90 s timeout, then releases. The motor self-stops at end of travel, so the
+  extra held time is harmless. Both coils of one valve are never energised
+  together — every sequence drops the opposing coil and waits 20 ms first.
+- **The in-flight guard globals are gone — they were the silent-failure
+  mechanism.** Added 2026-05-23 to stop level-triggered fault handlers
+  re-calling `valve.close` on every sensor tick, the hand-managed latch could
+  only be cleared by an end-stop *edge*. So any close where the valve never
+  physically moved latched the guard **forever**, and every later command was
+  swallowed without a log until a reboot. That is what produced a week of
+  silently-ignored closes. Their two jobs now use ESPHome primitives that cannot
+  wedge: `mode: single` scripts for duplicate suppression, and
+  `!is_running()` checks for tick gating — so a failed close now simply retries
+  once per travel window, bounded and logged, instead of disabling the valve.
+- **`restore_mode: ALWAYS_OFF` on all four relay coil switches — load-bearing.**
+  ESPHome's default is `RESTORE_DEFAULT_OFF`, which persists the last switch
+  state to flash and restores it at boot. A coil caught ON at the wrong instant
+  (reboot, OTA, or an automation cancelled mid-pulse) was persisted, and every
+  subsequent boot drove that coil HIGH continuously. A dual-coil relay cannot
+  transfer while its opposing coil is energised, so every later command became a
+  silent no-op — no click, no movement, surviving reboots, and invisible in Home
+  Assistant because the switches were internal. `ALWAYS_OFF` guarantees all four
+  coils start LOW.
+- **Coil switches are now diagnostic entities** (they were internal), so a
+  stuck-ON coil is visible in the web UI and in Home Assistant rather than
+  invisible.
+- **End-stop pull fix.** The end stops are **active-high** — they reach the GPIO
+  through an onboard 10 K series / 20 K pulldown divider (R16 / R15). The
+  firmware had been enabling the ESP32-S3's **internal pullup**, which fought the
+  onboard pulldown into a ~1.3–1.4 V divider: squarely inside the S3's undefined
+  logic band, making every end-stop read a coin flip — and end-stop reads are
+  what tell the firmware, and Home Assistant, whether the main is actually shut.
+  These inputs now use **no internal pull**.
+- **Irrigation coil pins corrected** — GPIO21 is OPEN and GPIO14 is CLOSE. They
+  had been swapped relative to the physical board wiring, so irrigation
+  open/close commands drove the opposite direction.
+- **Valve actions became thin dispatchers.** The full sequence moved into
+  `mode: single` scripts, so a double-press can no longer cancel a pending coil
+  release or the fault check. The pre-3.13.1 inline actions were restartable —
+  a re-trigger mid-pulse cancelled the pending `switch.turn_off` and left the
+  coil GPIO latched HIGH, which `RESTORE_DEFAULT_OFF` then persisted.
+- **The leak test verifies the closed end stop before measuring**, and reports a
+  new result — **"Aborted — valve failed to close"** — instead of a false pass or
+  fail. This is how the fault stayed hidden: a valve that never shut produced
+  *passing* leak tests, so the one instrument that should have caught it was
+  reporting all-clear. **Leak-test results recorded between 2026-07-18 and
+  2026-07-26 should be treated as invalid.**
+- **Travel timeouts fixed at 90 s in the drive lambdas**, superseding the
+  writable "Valve Travel Timeout" controls, whose 30 s maximum sat below real
+  travel (~38–62 s). The now-vestigial controls were removed in 3.14.0.
+- **New: `firmware/esp-valve-relay-diag.yaml`** — a bench diagnostic firmware
+  with coil HOLD switches, drive-to-end-stop tests and per-edge end-stop
+  logging, written to characterise this failure. (It shared the production
+  device name until 3.14.0 gave it its own — do not flash it at a deployed
+  device before then.)
+- Add-on side: `leak_test_scheduler` recognises the new abort result as
+  terminal.
+
+Not all of this was firmware. The four firmware bugs sat on top of **three
+solder faults** — cold joints on ULN2003 pins 3B/4B and a solder bridge to
+ground under C6 — repaired on the bench the same day.
+
 ## [firmware 3.13.0] — 2026-07-04
 
 Both circuits migrate from `pulse_counter` (windowed counting, quantized to

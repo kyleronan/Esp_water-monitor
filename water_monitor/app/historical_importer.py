@@ -64,8 +64,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .config import AddonConfig, CircuitConfig
 from .event_detector import RawEvent, CircuitEventDetector as _CED
-from .overlap_guard import (OVERLAP_NEGLIGIBLE_L, VOLUME_COVERAGE_FRACTION,
-                            contained_fraction)
+from .overlap_guard import (CONTAINMENT_FRACTION, OVERLAP_NEGLIGIBLE_L,
+                            VOLUME_COVERAGE_FRACTION, contained_fraction)
 from .database import (
     run_db, contained_stored_rows,
     get_import_state, update_import_state,
@@ -1040,7 +1040,10 @@ class HistoricalImporter:
             e0 = _parse_ts(r.get("end_ts"))
             if s0 is None or e0 is None or e0 <= s0:
                 continue
-            if contained_fraction((s0, e0), (ps, pe)) >= 0.70:
+            # dev57 (§2.36) — the guard's own threshold, not a second copy of
+            # the number: this is the same containment question over the same
+            # spans, so it must move with _CONTAINMENT_FRACTION.
+            if contained_fraction((s0, e0), (ps, pe)) >= CONTAINMENT_FRACTION:
                 contained.append((s0, e0, float(r.get("volume_litres") or 0.0)))
         if not contained:
             return "keep", [period], {}

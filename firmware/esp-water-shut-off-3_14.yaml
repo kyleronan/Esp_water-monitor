@@ -2793,12 +2793,14 @@ binary_sensor:
   # ---------------------------------------------------------------------------
   # END STOP SWITCHES — Valve 1 (Main)
   # Physical microswitches that close when the valve reaches fully open or
-  # fully closed position. Pins use internal pullup — switch closes to GND.
+  # fully closed position.
   # on_press fires only on the leading edge (valve arriving at position).
   # ---------------------------------------------------------------------------
-  # End stops are ACTIVE-HIGH with an ONBOARD ~10 k pulldown (3.13.1 field
-  # fix 2026-07-26): the switch feeds 3.3 V when pressed; the board holds the
-  # line low otherwise. NO internal pull — the internal pullup previously
+  # End stops are ACTIVE-HIGH through an ONBOARD 10 K series / 20 K pulldown
+  # divider — R16 = 10 K series, R15 = 20 K to GND (see docs/hardware/pinouts.md
+  # and docs/hardware/bom.md; 3.13.1 field fix 2026-07-26): the switch feeds the
+  # line when pressed (~3.3 V at the GPIO after the divider); the 20 K pulldown
+  # holds it low otherwise. NO internal pull — the internal pullup previously
   # enabled here fought the onboard pulldown into a ~1.3-1.4 V divider, the
   # ESP32-S3's undefined logic band, making end-stop reads unreliable.
   - platform: gpio

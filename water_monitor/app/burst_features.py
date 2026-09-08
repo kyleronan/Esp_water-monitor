@@ -61,6 +61,16 @@ SIM_LOG_PEAK: float = 0.6              # |dlog(peak flow)| — about a 1.8x band
 HEAVY_MIN_L, HEAVY_MAX_L, HEAVY_MIN_PEAK = 3.0, 25.0, 8.0
 GAP_CAP_MIN: float = 120.0             # "no sibling" sentinel, in minutes
 
+# ── context exclusions ──────────────────────────────────────────────────────
+# dev57 (§2.31) — verdicts that make a row NOT a draw but deliberately set none
+# of the three artifact BITS ``compute_for_events`` filters on, so nothing but
+# the reason string can exclude them. Spelled literally rather than imported:
+# this module is imported by the DB worker and stays free of app-layer imports
+# at module scope (the strings are OVERLAP_DUPLICATE_REASON in overlap_guard and
+# LEAK_TEST_REFILL_REASON in leak_test_refill; the round-trip is asserted in
+# test_dev57_ledger_verdict.py so a rename cannot drift them apart silently).
+_EXCLUDED_REASONS: tuple = ("overlap_duplicate", "leak_test_refill")
+
 FEATURE_NAMES: tuple = (
     "n_ev_30m", "n_sim_90m", "gap_prev_sim", "gap_next_sim", "burst_size",
     "burst_pos", "burst_span", "near_big_draw", "n_heavy_2h",
@@ -165,6 +175,17 @@ def _epoch(ts) -> Optional[float]:
         return None
 
 
+def _has_column(conn: sqlite3.Connection, column: str) -> bool:
+    """True when ``events`` carries ``column``. ``verdict_pin`` only exists from
+    migration 20260818 on, and a missing-column OperationalError here would take
+    the whole burst-feature read down."""
+    try:
+        return any(r[1] == column for r in
+                   conn.execute("PRAGMA table_info(events)").fetchall())
+    except sqlite3.Error:
+        return False
+
+
 def compute_for_events(conn: sqlite3.Connection, circuit: str,
                        event_ids: Optional[Iterable[str]] = None,
                        config: str = CONFIG_MATURE,
@@ -177,9 +198,20 @@ def compute_for_events(conn: sqlite3.Connection, circuit: str,
     of its own feature values — narrowing the read to just the targets would
     silently compute every edge event as if the stream started there.
 
-    Artifact rows (phantom / dribble / cross-talk) are excluded from the
-    context: they are not draws, and counting them would inflate every
-    neighbour statistic. This mirrors the pool filters used everywhere else.
+    Artifact rows are excluded from the context: they are not draws, and
+    counting them would inflate every neighbour statistic. This mirrors the pool
+    filters used everywhere else. Three flag bits are not the whole set —
+    ``_EXCLUDED_REASONS`` covers the two verdicts that deliberately carry NO bit:
+
+      * ``overlap_duplicate`` (dev55/dev56) — a wrapper is the SAME water as the
+        children inside it, recorded twice. Left in, it is a phantom sibling of
+        every child it wraps: it inflates ``n_ev_30m`` / ``n_sim_90m``, splices
+        two real bursts into one, and shrinks ``gap_prev_sim``/``gap_next_sim``.
+        It carries no flag by design (dev56 cleared the phantom bit — wrappers
+        are not phantoms), so the bit filter cannot see it.
+      * ``leak_test_refill`` — the refill after a leak test is real water but
+        not fixture usage, and it stays VISIBLE in History on purpose, so it too
+        carries no bit (see ``_finalize_derived_verdicts``).
 
     Synchronous by design — callers submit it through ``run_db`` (46a).
     """
@@ -210,6 +242,15 @@ def compute_for_events(conn: sqlite3.Connection, circuit: str,
     lo_iso = datetime.fromtimestamp(lo_t - pad, timezone.utc).isoformat()
     hi_iso = datetime.fromtimestamp(hi_t + pad, timezone.utc).isoformat()
 
+    reason_ph = ",".join("?" * len(_EXCLUDED_REASONS))
+    reason_sql, reason_params = "", []
+    # match_rejection_reason carries the live verdict; verdict_pin (20260818)
+    # carries it across a re-store, and dev56 rows can have the pin while the
+    # reason has been overwritten — so both are read.
+    for col in ("match_rejection_reason", "verdict_pin"):
+        if _has_column(conn, col):
+            reason_sql += f"  AND COALESCE({col},'') NOT IN ({reason_ph}) "
+            reason_params.extend(_EXCLUDED_REASONS)
     stream = []
     for r in conn.execute(
             "SELECT id, start_ts, volume_litres, peak_flow_lpm FROM events "
@@ -217,7 +258,9 @@ def compute_for_events(conn: sqlite3.Connection, circuit: str,
             "  AND COALESCE(is_pressure_restoration_phantom,0) = 0 "
             "  AND COALESCE(is_low_flow_dribble,0) = 0 "
             "  AND COALESCE(is_cross_talk,0) = 0 "
-            "ORDER BY start_ts", (circuit, lo_iso, hi_iso)):
+            + reason_sql +
+            "ORDER BY start_ts",
+            (circuit, lo_iso, hi_iso, *reason_params)):
         t = _epoch(r[1])
         if t is None:
             continue

@@ -58,18 +58,41 @@ ENV LANG=C.UTF-8 \
 # larger image, for a tier designed to be optional. And do NOT substitute
 # river's own classifiers — ARF/Hoeffding were measured against this home's
 # 848 labels and lose ~10 points on the refit-on-cadence arm that ships.
+#
+# `--only-binary=:all:` on the main line is a FAIL-LOUD switch, not an
+# optimisation. There is no compiler in this base, so a package with no wheel
+# for the arch being built silently fell back to an sdist and failed deep in a
+# build log the Supervisor only prints when the whole build dies. With the flag
+# pip refuses at resolution time and says which package and which arch. It was
+# unsafe to add while dtaidistance was here — that was the one dependency with
+# no linux aarch64 wheel at ANY version, against a config.yaml that declares
+# aarch64 — so its removal and this flag are the same change.
+#
+# dtaidistance was dropped because nothing ever imported it: it was installed
+# in anticipation of a DTW stage (cluster_engine.py) that was never built. The
+# comments in cluster_engine.py and fingerprint_matcher.py still describe it as
+# present and are now stale.
+#
+# numpy is pinned because it is a DIRECT dependency — pump_regime_math.py
+# imports it at module scope, and fingerprint_matcher / pump_regime_detector /
+# tinymodel import it lazily — while being declared nowhere. It was arriving
+# only as a transitive of river (and, in the comment above, of dtaidistance,
+# which is now gone), so the version the app runs against was whatever the
+# resolver happened to pick that day. 2.3.4 is river 0.24.2's own declared
+# floor and satisfies scikit-learn 1.7.2 (numpy>=1.22); do not raise it
+# casually — see the three failed shapes recorded above.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 python3-pip \
  && rm -rf /var/lib/apt/lists/* \
- && pip3 install --no-cache-dir --break-system-packages \
+ && pip3 install --no-cache-dir --break-system-packages --only-binary=:all: \
         fastapi==0.115.0 \
         uvicorn==0.30.6 \
         websockets==13.1 \
         jinja2==3.1.6 \
-        aiohttp==3.10.11 \
-        python-multipart==0.0.22 \
+        aiohttp==3.14.3 \
+        python-multipart==0.0.32 \
+        numpy==2.3.4 \
         river==0.24.2 \
-        dtaidistance==2.3.13 \
  && { pip3 install --no-cache-dir --break-system-packages --only-binary=:all: \
         scikit-learn==1.7.2 && echo 'SKLEARN: installed from manylinux wheel' \
       || echo 'SKLEARN: no wheel for this arch - TinyModel tier stays off'; }

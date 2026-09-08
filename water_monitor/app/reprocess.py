@@ -174,21 +174,27 @@ def _kept_event_refusal(
       water invisible.
     A dry-run that carries no ``period_volumes_l`` (an older caller) can't be
     weighed, so it is only ever refused on the no-period case.
+
+    Both volumes are computed BEFORE any branch returns, so the caller's log
+    never prints a figure that was not measured -- see the comment below.
     Returns ``(reason_or_None, blocked_period_volume_l, blocker_volume_l)``.
     """
-    if rebuildable == 0:
-        return BLOCKED_BY_KEPT_EVENTS, 0.0, 0.0
-    if not blockers:
-        return None, 0.0, 0.0
+    # Weigh the water FIRST, so every branch reports what it actually measured.
+    # The rebuildable==0 branch used to `return BLOCKED_BY_KEPT_EVENTS, 0.0, 0.0`
+    # before either figure was computed, and the caller logs both — so the
+    # operator saw "5 event(s) / 24.1 L left intact ... blocked periods carry
+    # 0.0 L, kept blockers hold 0.0 L" and reasonably read it as the water
+    # having gone missing. The zeros were never a measurement. A log line that
+    # states a quantity it never took is the same defect class as a comment
+    # that describes code it does not govern.
     vols = dry.get("period_volumes_l")
-    if not vols:
-        return None, 0.0, 0.0
     blocked_l = 0.0
-    for idx, _row in blockers:
-        try:
-            blocked_l += float(vols[idx] or 0.0)
-        except (IndexError, TypeError, ValueError):
-            pass
+    if vols:
+        for idx, _row in blockers:
+            try:
+                blocked_l += float(vols[idx] or 0.0)
+            except (IndexError, TypeError, ValueError):
+                pass
     seen: Set[str] = set()
     kept_l = 0.0
     for _idx, row in blockers:
@@ -196,6 +202,17 @@ def _kept_event_refusal(
             continue
         seen.add(row["id"])
         kept_l += float(row.get("volume_litres") or 0.0)
+
+    if rebuildable == 0:
+        # Nothing could be rebuilt at all: the delete would remove the event
+        # and the importer would insert nothing in its place.
+        return BLOCKED_BY_KEPT_EVENTS, blocked_l, kept_l
+    if not blockers:
+        return None, 0.0, 0.0
+    # A dry run with no period_volumes_l (an older caller) cannot be weighed,
+    # so it is only ever refused on the no-period case above.
+    if not vols:
+        return None, 0.0, kept_l
     if blocked_l > 0.0 and kept_l < _SPLIT_MIN_VOLUME_COVERAGE * blocked_l:
         return KEPT_EVENTS_UNDERFIT, blocked_l, kept_l
     return None, blocked_l, kept_l

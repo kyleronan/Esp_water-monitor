@@ -586,6 +586,47 @@ def save_discovery(
                     VALUES (?, ?, ?, ?, 0)
                 """, (circuit, m.role, m.entity_id, m.original_name))
 
+    # This UPDATE cleared setup_complete above — tell every cached copy.
+    bump_setup_complete_epoch()
+
+
+# ── dev57 (2.18) — wizard-completion epoch ──────────────────────────────────
+# is_setup_complete() below is a real SQLite SELECT, and ingress_middleware ran
+# it on the EVENT-LOOP thread for every non-setup request (app.js polls
+# /api/dashboard/live every 5 s per open tab) — the highest-frequency instance
+# of the single-connection violation dev46 (46a) exists to prevent. The
+# Orchestrator now keeps the answer in memory; this counter is how that cache
+# learns it is stale.
+#
+# Why a module counter rather than only calling an invalidation method at each
+# writer: every statement that writes device_config.setup_complete lives in
+# THIS module (save_discovery, mark_setup_complete, unmark_setup_complete), so
+# bumping here covers all of them — including Settings → Re-run Setup, which
+# reaches the column only through unmark_setup_complete(). A cache carrying an
+# older epoch is treated as unknown and re-read; it can never answer from a
+# value that predates a write.
+_SETUP_COMPLETE_EPOCH = 0
+
+
+def setup_complete_epoch() -> int:
+    """Monotone counter, bumped on every write to device_config.setup_complete.
+
+    Cheap in-memory read. A cached copy of the flag is valid only while the
+    epoch it was read at still matches this.
+    """
+    return _SETUP_COMPLETE_EPOCH
+
+
+def bump_setup_complete_epoch() -> None:
+    """Invalidate every in-memory copy of the wizard-completion flag.
+
+    The three writers in this module call it themselves. Call it directly from
+    anything else that writes device_config.setup_complete another way — a
+    table-level restore, or a test poking the column on a side connection.
+    """
+    global _SETUP_COMPLETE_EPOCH
+    _SETUP_COMPLETE_EPOCH += 1
+
 
 def mark_setup_complete(db: sqlite3.Connection) -> None:
     from datetime import datetime, timezone
@@ -595,6 +636,7 @@ def mark_setup_complete(db: sqlite3.Connection) -> None:
         WHERE id = 1
     """, (now,))
     db.commit()
+    bump_setup_complete_epoch()
 
 
 def unmark_setup_complete(db: sqlite3.Connection) -> None:
@@ -610,6 +652,7 @@ def unmark_setup_complete(db: sqlite3.Connection) -> None:
         WHERE id = 1
     """, (now,))
     db.commit()
+    bump_setup_complete_epoch()
 
 
 def load_circuit_entities(

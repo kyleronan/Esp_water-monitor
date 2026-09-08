@@ -1833,9 +1833,10 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
     """One-time idempotent repair of cross-cutting artifact-flag invariants (P2).
 
     Two fixes, both safe to re-run:
-      A. Any row with a volume-ZEROING flag (phantom or cross-talk) set must have
-         ``excluded_from_training = 1`` — repairs rows where a recompute path left a
-         zeroed event still feeding training (the is_cross_talk=1 / excluded=0 case).
+      A. Any row with a volume-ZEROING flag (phantom, cross-talk or dribble) set
+         must have ``excluded_from_training = 1`` — repairs rows where a recompute
+         path left a zeroed event still feeding training (the is_cross_talk=1 /
+         excluded=0 case).
       B. A row must not carry more than one of the mutually-exclusive verdict flags
          {phantom, cross_talk, dribble}. Stale auto-flags can be left set under a later
          manual classification. Resolve by the row's RECORDED EFFECT — its stored
@@ -1857,19 +1858,29 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
 
     Column-guarded so it is a no-op on a schema predating is_cross_talk /
     is_low_flow_dribble. Returns
-    ``{"excluded_fixed", "pairs_resolved", "unresolved"}``.
+    ``{"excluded_fixed", "pairs_resolved", "unresolved", "rezeroed"}``.
     """
     if not (_events_has_column(conn, "is_cross_talk")
             and _events_has_column(conn, "is_low_flow_dribble")):
-        return {"excluded_fixed": 0, "pairs_resolved": 0, "unresolved": 0}
+        return {"excluded_fixed": 0, "pairs_resolved": 0, "unresolved": 0,
+                "rezeroed": 0}
 
     EPS = 1e-6
 
     # ── A: a zeroing flag ⇒ excluded_from_training = 1 ──────────────────────────
+    # dev57 (§2.31) — is_low_flow_dribble belongs in this list. Section B's own
+    # docstring above says all three zeroing verdicts zero volume (the dribble
+    # flag has zeroed since 2026-06-19 / below_meter_floor), and section B's
+    # ``new_excluded`` already ORs new_dr in — but section A, which is what fixes
+    # the SINGLE-flag rows section B never looks at (it selects >= 2 flags only),
+    # named just two of the three, so a dribble-flagged row left excluded=0 by a
+    # recompute path went on feeding training with a reading the meter's own
+    # registration floor says is false information.
     cur = conn.execute(
         "UPDATE events SET excluded_from_training = 1 "
         "WHERE (COALESCE(is_pressure_restoration_phantom,0) = 1 "
-        "       OR COALESCE(is_cross_talk,0) = 1) "
+        "       OR COALESCE(is_cross_talk,0) = 1 "
+        "       OR COALESCE(is_low_flow_dribble,0) = 1) "
         "  AND COALESCE(excluded_from_training,0) = 0"
     )
     excluded_fixed = cur.rowcount or 0
@@ -1987,6 +1998,22 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
     # C (dev56). A single zeroing flag with water still counted: the row says
     # "not real water" and counts it anyway. Section B only sees >= 2 flags, so
     # this shape sat contradictory forever (two rows on the reference home).
+    #
+    # dev57 (§2.36) — this call STAYS on the boot path, deliberately. It was
+    # proposed for removal as "a one-shot repair that now runs on every boot",
+    # but the rule has to have a carrier here: migration 20260818 is the only
+    # other caller, and a home already stamped at 20260818 never re-runs it (see
+    # test_verdict_pin.test_boot_flag_repair_rezeroes_a_lone_zeroing_flag_with_volume
+    # — that is how the reference home's own two rows were repaired, in e4316da,
+    # by THIS path and not by the migration). The cost objection does not survive
+    # contact with the function it is made about: sections A and B above already
+    # scan the same table twice on the same boot, so C's scan is not a new order
+    # of cost. What DID need fixing is the flattening — that scan rewrote
+    # match_rejection_reason with its flag's generic family name, erasing
+    # irrigation_cross_talk / rising_pressure_phantom / pump_recharge, whose
+    # survival across reprocessing rests entirely on that string. Fixed inside
+    # rezero_rows_with_zeroing_flag, which fixes it for the migration caller too
+    # — fencing this call would only have hidden it from one of the two.
     from .database import rezero_rows_with_zeroing_flag
     rezeroed = rezero_rows_with_zeroing_flag(conn)
     if excluded_fixed or pairs_resolved or unresolved or rezeroed:
@@ -1994,8 +2021,11 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
         log.info("flag-repair: %d excluded-from-training fixed, %d flag collisions "
                  "resolved, %d unresolved, %d zeroing-flag rows re-zeroed",
                  excluded_fixed, pairs_resolved, unresolved, rezeroed)
+    # dev57 (§2.36) — ``rezeroed`` is returned, not just logged. It was counted,
+    # named in the log line, and then dropped from the dict, so the only caller
+    # that reports this repair (reprocess_event_exclusion_verdicts) could not.
     return {"excluded_fixed": excluded_fixed, "pairs_resolved": pairs_resolved,
-            "unresolved": unresolved}
+            "unresolved": unresolved, "rezeroed": rezeroed}
 
 
 def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
@@ -2606,7 +2636,9 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "relabel_review": relabel_review,
             "excluded_fixed": repair["excluded_fixed"],
             "flag_pairs_resolved": repair["pairs_resolved"],
-            "flag_pairs_unresolved": repair["unresolved"]}
+            "flag_pairs_unresolved": repair["unresolved"],
+            # dev57 (§2.36) — section C's count reaches the caller now.
+            "flag_rows_rezeroed": repair.get("rezeroed", 0)}
 
 
 def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:

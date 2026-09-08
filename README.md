@@ -185,6 +185,44 @@ Before tagging a firmware release, run
 fails if any credential is missing or if `dashboard_import` still
 points at a mutable branch ref.
 
+## Access control
+
+**Read this before you install.** The add-on ships with `panel_admin: false`
+in `water_monitor/config.yaml`. That is deliberate, but it has a consequence
+worth stating plainly:
+
+> **Every Home Assistant user on your instance can open the Water Monitor
+> panel — not just HA administrators.**
+
+Home Assistant's `panel_admin` option is what normally hides an add-on's
+sidebar panel from non-admin users. This add-on turns it off so that
+household members who are not HA admins can still see water usage, and
+enforces its own three-tier model *inside* the panel instead:
+
+| Role | Who gets it | What they can do |
+|---|---|---|
+| **admin** | every Home Assistant administrator, auto-detected | everything |
+| **operator** | an in-app allow-list — **Settings → Access** (admins only) | read-only, **plus opening and closing the main valve** for emergencies |
+| **viewer** | every other HA user — this is the default | read-only: Dashboard, History, Water Use, Device status |
+
+How it is enforced:
+
+- Roles derive from the `X-Remote-User-Id` header the Supervisor's ingress
+  proxy injects. The add-on is ingress-only, which is what makes that header
+  trustworthy — **do not expose port 8765 directly**, as that bypasses the
+  proxy that supplies the identity.
+- Enforcement is server-side, default-deny, at a single middleware
+  chokepoint (`water_monitor/app/auth.py`); it is not a UI-hiding trick.
+- The HA admin list is cached last-known-good and refreshed every 10 minutes,
+  so an HA hiccup cannot silently downgrade a real admin.
+- `bootstrap_admin_user_id` is the lockout escape hatch if no admin can be
+  resolved.
+
+**If you would rather restrict the whole UI to HA administrators**, set
+`panel_admin: true` in `water_monitor/config.yaml` and rebuild the add-on.
+The in-panel roles keep working; the panel simply stops being reachable by
+non-admins at all.
+
 ## Project status
 
 | Phase | Scope | Status |
@@ -193,13 +231,18 @@ points at a mutable branch ref.
 | **0.2.0** | Fixture identification — clustering engine live, naming UI complete | Shipped |
 | **0.2.1** | ESP-side waveform capture & feature enrichment, event detail modal, merge-clusters UI, Basic/Advanced settings split, auto dark mode, hardware docs (PCB v1.2a) | Shipped |
 | **0.2.2** | Runtime per-circuit flow-meter PPL + guided flow-calibration helper (bucket / municipal), Phase 2.3 anomaly detection, degraded-supply guard, per-circuit valve type (2-port / 3-port), per-session CSRF refactor, autocorrelation correctness fix, firmware release-gate script, migration transaction safety, async/blocking SQLite audit, live-capture reliability fixes (importer catch-up checkpoint + stuck no-flow phantom close) | Shipped |
-| **0.3.x** | Per-circuit pressure-sensor calibration, esp_idf framework migration with proper task watchdog | Planned |
+| **0.3.0** | Role-based access control — viewer / operator / admin (see [Access control](#access-control)) | Shipped |
+| **0.3.1** | Pressure-aware classification that survives a change in water supply, full booster-pump support, a learned per-home classifier, and a long run of volume-accounting fixes. Per-circuit pressure-sensor calibration **infrastructure** shipped in firmware 3.14 (eight `pressure_cal_*` substitutions + a documented bench procedure) — performing the calibration on a given install is a manual hardware step | Shipping incrementally (currently `0.3.1-dev56`, unreleased) |
+| **0.3.x** | esp_idf framework migration with a proper top-level task watchdog (the arduino framework this firmware uses does not expose one — see [`docs/TODO.md`](docs/TODO.md)) | Planned |
 | **0.4.x** | Native Home Assistant integration (alongside the addon, eventually replacing the WebSocket bridge for users who prefer pip-installable components) | Planned |
 
-See `CHANGELOG.md` for detailed release notes, and
-[`docs/TODO.md`](docs/TODO.md) for the running list of manual follow-ups
-(real-sample capture for the degraded-supply detector, per-circuit
-pressure calibration, etc).
+Firmware ships on its own version line and has its own entries in the same
+changelog (currently **3.14.0**).
+
+See [`water_monitor/CHANGELOG.md`](water_monitor/CHANGELOG.md) for detailed
+release notes, and [`docs/TODO.md`](docs/TODO.md) for the running list of
+manual follow-ups (real-sample capture for the degraded-supply detector,
+per-circuit pressure calibration, etc).
 
 ## License
 

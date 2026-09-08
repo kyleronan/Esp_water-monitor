@@ -20,7 +20,8 @@ from typing import Any, Dict, Optional
 from .config import AddonConfig, SENSITIVITY_PRESETS, DB_PATH
 from .database import (get_sensitivity_config, ensure_circuit_defaults, init_db)
 from .device_discovery import (load_circuit_entities, is_setup_complete,
-                                get_device_config, rescan_optional_roles)
+                                get_device_config, rescan_optional_roles,
+                                setup_complete_epoch)
 from .event_detector import EventDetector
 from .feature_extractor import FeatureExtractor
 from .ha_client import HaClient
@@ -155,6 +156,25 @@ class Orchestrator:
         # in-memory first-sight guard so seen_users is logged once per user/process.
         self.admin_ids: set = set()
         self.operator_ids: set = set()
+        # dev57 (2.18) — last-known-good wizard-completion flag, same shape as
+        # admin_ids above. `setup_complete` used to be a live SQLite SELECT on
+        # every read, and ingress_middleware reads it on EVERY non-setup,
+        # non-static, non-health request from the event-loop thread — the
+        # single highest-frequency touch of the shared connection off the DB
+        # worker. Primed on the DB worker at boot (_boot_db_preamble_sync) and
+        # after each write; served from memory thereafter.
+        #
+        # None means UNKNOWN and is NEVER guessed at. A flag that goes stale
+        # towards True is far worse than the query it replaces: on a fresh
+        # install it would skip the setup wizard and leave the add-on
+        # unusable. So unknown either re-reads the database (when there is a
+        # connection) or answers False — showing the wizard, the recoverable
+        # direction. _setup_complete_epoch pairs the value with the
+        # device_discovery epoch it was read at; any write to
+        # device_config.setup_complete moves that epoch and makes this cache
+        # unknown again, Settings → Re-run Setup included.
+        self._setup_complete_cache: Optional[bool] = None
+        self._setup_complete_epoch: int = -1
         # dev46 (46h) — per-circuit post-winterization grace starts.
         self._winterize_cleared_at: dict = {}
         self._seen_uids: set = set()
@@ -304,10 +324,63 @@ class Orchestrator:
 
     @property
     def setup_complete(self) -> bool:
-        """True once the setup wizard has been completed."""
+        """True once the setup wizard has been completed.
+
+        dev57 (2.18): served from memory. This is read by ingress_middleware on
+        every non-setup request — a per-request SQLite SELECT on the shared
+        connection, from the event-loop thread. The cache is primed on the DB
+        worker at boot and re-primed after each write, and is only ever filled
+        from a real read: a cached value whose epoch predates the last write to
+        device_config.setup_complete counts as unknown, and unknown with no
+        connection answers False (show the wizard), never True.
+        """
+        if (self._setup_complete_cache is not None
+                and self._setup_complete_epoch == setup_complete_epoch()):
+            return self._setup_complete_cache
         if not self._db:
             return False
-        return is_setup_complete(self._db)
+        # Unknown but readable: answer from the database rather than from a
+        # guess, and keep the answer. Costs one read per write to the flag —
+        # not one per request, which is the whole point of the unit.
+        return self._prime_setup_complete()
+
+    def _prime_setup_complete(self) -> bool:
+        """Read device_config.setup_complete and (re)prime the cache.
+
+        Touches the shared connection, so it belongs on the DB worker: call it
+        through ``run_db(self._setup_complete_sync)`` wherever an await is
+        available. The epoch is sampled BEFORE the read, so a write landing
+        while the read is in flight leaves the cache stale-marked rather than
+        silently absorbing it.
+        """
+        epoch = setup_complete_epoch()
+        value = is_setup_complete(self._db)
+        self._setup_complete_cache = value
+        self._setup_complete_epoch = epoch
+        return value
+
+    def invalidate_setup_complete_cache(self) -> None:
+        """Forget the cached wizard-completion flag; the next read re-reads.
+
+        The three writers in ``device_discovery`` (save_discovery,
+        mark_setup_complete, unmark_setup_complete) already invalidate every
+        cache in the process through the module epoch, so routers do not
+        normally need this. It is the explicit hook for a caller that writes
+        the column another way — e.g. a table-level restore of device_config.
+        Pure memory: safe from any thread.
+        """
+        self._setup_complete_cache = None
+        self._setup_complete_epoch = -1
+
+    async def refresh_setup_complete_cache(self) -> bool:
+        """Re-read the wizard-completion flag on the DB worker and re-prime.
+
+        Call this after completing or re-opening the wizard so the ONE read the
+        write costs happens over the wall, instead of on the event loop inside
+        whichever request reads the property next.
+        """
+        from .database import run_db
+        return await run_db(self._setup_complete_sync)
 
     # ── dev57 (2.10) — loop-safe wrappers for the three sync reloaders ──────
     # reload_circuit_entities / _labels / _profiles each read the shared
@@ -685,8 +758,16 @@ class Orchestrator:
     def _setup_complete_sync(self) -> bool:
         """dev46 (46a) — ``setup_complete`` is a PROPERTY that queries the DB
         on every access, so reading it from the loop is a connection touch
-        like any other. This wrapper gives run_db something to call."""
-        return self.setup_complete
+        like any other. This wrapper gives run_db something to call.
+
+        dev57 (2.18) — and this is now the ONLY place the read is supposed to
+        happen: it primes the in-memory cache the property serves, so it does
+        the real read unconditionally rather than deferring to the property
+        (which would return the cached value and never refresh it).
+        """
+        if not self._db:
+            return False
+        return self._prime_setup_complete()
 
     def _reload_config_and_roles_sync(self) -> None:
         """dev46 (46a) — entity/label/profile reloads + RBAC roles, one hop.
@@ -709,6 +790,16 @@ class Orchestrator:
         (rule N2a); each sub-step keeps its own best-effort try/except so a
         failure in one does not skip the others.
         """
+        # dev57 (2.18) — prime the wizard-completion cache FIRST. This is the
+        # first DB-worker hop after the connection is opened, and uvicorn is
+        # already serving by the time it runs (run() is a task; main.py yields
+        # straight after creating it), so every microsecond before this is a
+        # window in which ingress_middleware would read the flag off the loop.
+        try:
+            self._prime_setup_complete()
+        except Exception as _e:                 # unknown, so it re-reads later
+            log.warning("setup-complete prime failed (non-fatal): %s", _e)
+
         # Ensure per-circuit defaults exist
         for circuit_cfg in self._cfg.circuits:
             ensure_circuit_defaults(

@@ -153,6 +153,14 @@ def recompute_volume_and_active_flow(
 
         samples, no_prestate, max_gap = _prepare_samples(raw, start, end)
         new_litres, capped = integrate_litres(samples)
+        # ``flow_integral_litres`` is the TIME-INTEGRAL of the flow trace and
+        # nothing else (database.py's events DDL; feature_extractor's
+        # _detect_cross_talk / _detect_pressure_restoration_phantom read it as
+        # frozen leak-safety proof that no water moved). The recorder-delta
+        # preference below replaces ``new_litres`` with a DIFFERENT quantity,
+        # so the integral is captured here, before that can happen, and is what
+        # gets written to the column and handed to the detectors.
+        integral_litres = new_litres
         af = active_flow_features(samples, (end - start).total_seconds())
         degraded = capped or no_prestate or max_gap > _MAX_GAP_DEGRADED_S
         quality = "degraded" if degraded else "ok"
@@ -161,6 +169,8 @@ def recompute_volume_and_active_flow(
         # for a healthy event — prefer it over this (re-integrated, lossy) value so a
         # manual Recompute can't undo a recorder reconcile. Healthy only (un-flagged +
         # not degraded); the verdict/effective logic below is unchanged.
+        # Scope: this substitution moves ``volume_litres`` ONLY. It must not reach
+        # ``flow_integral_litres`` — see ``integral_litres`` above.
         rec = r["volume_recorder_litres"]
         if (rec is not None and float(rec) > 0 and not degraded
                 and not (r["is_pressure_restoration_phantom"] or r["is_cross_talk"]
@@ -198,7 +208,7 @@ def recompute_volume_and_active_flow(
                 "volume_litres": new_litres,
                 "volume_litres_estimated": est,
                 "true_avg_flow_lpm": af["true_avg_flow_lpm"],
-                "flow_integral_litres": new_litres,
+                "flow_integral_litres": integral_litres,
                 "flow_on_ratio": af["flow_on_ratio"],
                 "integration_quality": quality,
                 # Carry the provenance so a durable irrigation zone-switch cross-talk
@@ -247,7 +257,7 @@ def recompute_volume_and_active_flow(
                    "excluded_from_training = ?, match_rejection_reason = ?")
                 + " WHERE id = ? AND circuit = ?",
                 (
-                    round(new_litres, 3), round(new_litres, 3),
+                    round(new_litres, 3), round(integral_litres, 3),
                     af["active_flow_duration_seconds"], af["true_avg_flow_lpm"],
                     af["flow_on_ratio"], af["active_flow_segment_count"],
                     af["flow_cv_on_segments"], quality,

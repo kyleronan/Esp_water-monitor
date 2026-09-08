@@ -688,6 +688,16 @@ async def ingress_middleware(request: Request, call_next):
     # The redirect-skip set still uses startswith for /setup so wizard
     # sub-paths don't bounce-redirect into themselves; /health is now
     # exact-match.
+    #
+    # dev57 (2.18): `orch.setup_complete` used to be a live SQLite SELECT on
+    # the shared connection, executed HERE — on the event-loop thread, on every
+    # non-setup, non-static, non-health request, with app.js polling
+    # /api/dashboard/live every 5 s per open tab. That is the same
+    # single-connection violation dev46 (46a) exists to prevent, at the highest
+    # frequency in the app. It is now an in-memory read off the orchestrator's
+    # last-known-good cache (primed on the DB worker; see Orchestrator.
+    # setup_complete). Membership/attribute reads only on this path, like
+    # admin_ids above — do not reintroduce a DB call here.
     skip_redirect = (
         path.startswith("/setup")
         or _is_static_path(path)
