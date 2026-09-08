@@ -1275,8 +1275,8 @@ _EVENT_PINNED_VERDICT_COLUMNS: frozenset[str] = frozenset({
 
 
 def _hour_bucket_for(start_ts) -> str:
-    """Return the hour_ts string in the canonical format used by
-    update_hourly_volume(): UTC-normalised '%Y-%m-%dT%H:00:00' (no tz suffix).
+    """Return the hour_ts string in the canonical format used by the
+    hourly_volume ledger: UTC-normalised '%Y-%m-%dT%H:00:00' (no tz suffix).
     Mirrors the production format from feature_extractor.py line ~1066 so
     aggregate queries (get_daily_volume / get_weekly_volume) keep working.
 
@@ -1482,8 +1482,9 @@ def upsert_event_and_apply_hourly_volume(
 ) -> bool:
     """Atomically upsert an event row AND keep hourly_volume in sync.
 
-    Replaces the previous two-step pattern (insert_event then update_hourly_volume)
-    which made it easy to lose idempotency on reprocessing. All work happens
+    Replaces the previous two-step pattern (insert_event, then a bare
+    hourly_volume upsert) which made it easy to lose idempotency on
+    reprocessing — the loose upsert was deleted in dev59. All work happens
     inside a single transaction:
 
       1. Read prior (litres, bucket) from the existing event row, if any.
@@ -2110,21 +2111,6 @@ def get_hourly_volumes(
     return [dict(r) for r in rows]
 
 
-def update_hourly_volume(
-    conn: sqlite3.Connection,
-    circuit: str,
-    hour_ts: str,
-    volume_litres: float
-) -> None:
-    conn.execute("""
-        INSERT INTO hourly_volume (circuit, hour_ts, volume_litres)
-        VALUES (?, ?, ?)
-        ON CONFLICT (circuit, hour_ts)
-        DO UPDATE SET volume_litres = volume_litres + excluded.volume_litres
-    """, (circuit, hour_ts, volume_litres))
-    conn.commit()
-
-
 def _get_volume_baseline(
     conn: sqlite3.Connection,
     circuit: str,
@@ -2350,35 +2336,62 @@ _EFFECTIVE_FIXTURE_SQL_TMPL = ("COALESCE(NULLIF(e.user_fixture_type, ''), "
                                "f.fixture_type, e.matched_fixture_type, "
                                "{suggested})")
 
-# Note filter: categorical over the pill kinds the History "Note" column renders.
-# Each entry is a self-contained predicate; 'none' = a row with no pills at all.
-_NOTE_KIND_SQL: Dict[str, str] = {
-    "unusual":   "e.flagged = 1",
-    "estimated": ("(e.degraded_supply = 1 "
-                  "OR e.volume_estimation_method = 'pulsing_supply_envelope')"),
-    "not_real":  ("(COALESCE(e.is_pressure_restoration_phantom, 0) = 1 "
-                  "OR COALESCE(e.is_cross_talk, 0) = 1 "
-                  "OR COALESCE(e.is_low_flow_dribble, 0) = 1 "
-                  # dev56 — a fully de-duplicated wrapper (no phantom bit any
-                  # more); a partial wrapper keeps real water and stays out.
-                  "OR (e.match_rejection_reason = 'overlap_duplicate' "
-                  "    AND COALESCE(e.volume_litres_effective, 0) < 0.1))"),
-    "sparse":    "e.match_rejection_reason = 'sparse_envelope'",
+# One expression for "this row is a volume-zeroed not-real-use verdict"
+# (phantom / cross-talk / below-meter-floor dribble) — shared by the
+# exclude_not_real pushdown, the hidden-count badge AND the History "Note"
+# pill filter, so they can never disagree with each other or with the router's
+# per-row display logic. That promise used to be false: the dict below carried
+# a second, hand-typed copy of this predicate, free to drift from it. There is
+# now exactly one object — _NOTE_KIND_SQL["not_real"] IS _NOT_REAL_SQL, and
+# test_note_filter_shares_the_not_real_predicate asserts identity, so a
+# re-typed copy fails even when the two strings happen to be equal.
+#
+# Every leg is COALESCE-wrapped so the expression is TWO-VALUED. It was not:
+# on a row with match_rejection_reason NULL and volume_litres_effective < 0.1
+# the overlap leg evaluated to NULL, the whole OR-chain to NULL, and
+# `<expr> = 0` to NULL as well — so exclude_not_real dropped that real row
+# from History while count_not_real_events, testing the same NULL, did not
+# count it into the "N hidden — show them" badge either. The row vanished
+# with nothing to say it had. Two-valuedness is also what lets 'none' below be
+# a mechanical NOT of these predicates.
+_NOT_REAL_SQL = (
+    "(COALESCE(e.is_pressure_restoration_phantom, 0) = 1 "
+    " OR COALESCE(e.is_cross_talk, 0) = 1 "
+    " OR COALESCE(e.is_low_flow_dribble, 0) = 1 "
+    # dev56 — a fully de-duplicated overlap wrapper hides with the rest;
+    # a partial wrapper (real remainder) does not.
+    " OR (COALESCE(e.match_rejection_reason, '') = 'overlap_duplicate' "
+    "     AND COALESCE(e.volume_litres_effective, 0) < 0.1))"
+)
+
+# Note filter: categorical over the pill kinds the History "Note" column
+# renders. Each entry is a self-contained, NULL-SAFE predicate.
+_NOTE_PILL_SQL: Dict[str, str] = {
+    "unusual":   "COALESCE(e.flagged, 0) = 1",
+    "estimated": ("(COALESCE(e.degraded_supply, 0) = 1 "
+                  "OR COALESCE(e.volume_estimation_method, '') "
+                  "   = 'pulsing_supply_envelope')"),
+    "not_real":  _NOT_REAL_SQL,
+    "sparse":    "COALESCE(e.match_rejection_reason, '') = 'sparse_envelope'",
     # Leak-test refill is its OWN filter rather than part of 'not_real': it is
     # never hidden by the not-real-use toggle (see leak_test_refill), so folding
     # it in would make the two disagree.
-    "leak_test": "e.match_rejection_reason = 'leak_test_refill'",
-    "none":      ("(COALESCE(e.flagged, 0) = 0 "
-                  "AND COALESCE(e.degraded_supply, 0) = 0 "
-                  "AND COALESCE(e.volume_estimation_method, 'raw') "
-                  "    <> 'pulsing_supply_envelope' "
-                  "AND COALESCE(e.is_pressure_restoration_phantom, 0) = 0 "
-                  "AND COALESCE(e.is_cross_talk, 0) = 0 "
-                  "AND COALESCE(e.is_low_flow_dribble, 0) = 0 "
-                  "AND COALESCE(e.match_rejection_reason, '') <> 'sparse_envelope' "
-                  "AND COALESCE(e.match_rejection_reason, '') <> 'leak_test_refill' "
-                  "AND COALESCE(e.user_reviewed, 0) = 0)"),
+    "leak_test": "COALESCE(e.match_rejection_reason, '') = 'leak_test_refill'",
 }
+
+# Reviewed rows render no pill of their own but are not "plain" either, so this
+# keeps them out of 'none' without making them a selectable kind.
+_NOTE_NONE_EXTRA_SQL: str = "COALESCE(e.user_reviewed, 0) = 0"
+
+# 'none' = a row with no pills at all, DERIVED as the conjunction of the pill
+# predicates' negations rather than re-typed. The hand-written complement had
+# already drifted: it omitted the de-duplicated-wrapper leg, so such a row
+# matched BOTH 'not_real' and 'none'. Adding a pill above now updates 'none'
+# for free — which is the property the hand copy could not offer.
+_NOTE_KIND_SQL: Dict[str, str] = dict(_NOTE_PILL_SQL)
+_NOTE_KIND_SQL["none"] = (
+    "(" + " AND ".join(f"NOT ({p})" for p in _NOTE_PILL_SQL.values())
+    + f" AND {_NOTE_NONE_EXTRA_SQL})")
 
 
 
@@ -2571,21 +2584,6 @@ def get_recent_events(
         params.append(int(limit))
     rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
-
-
-# One expression for "this row is a volume-zeroed not-real-use verdict"
-# (phantom / cross-talk / below-meter-floor dribble) — shared by the
-# exclude_not_real pushdown and the hidden-count badge so they can never
-# disagree with each other or with the router's per-row display logic.
-_NOT_REAL_SQL = (
-    "(COALESCE(e.is_pressure_restoration_phantom, 0) = 1 "
-    " OR COALESCE(e.is_cross_talk, 0) = 1 "
-    " OR COALESCE(e.is_low_flow_dribble, 0) = 1 "
-    # dev56 — a fully de-duplicated overlap wrapper hides with the rest;
-    # a partial wrapper (real remainder) does not.
-    " OR (e.match_rejection_reason = 'overlap_duplicate' "
-    "     AND COALESCE(e.volume_litres_effective, 0) < 0.1))"
-)
 
 
 def upsert_pump_regime_night(conn: sqlite3.Connection, circuit: str,
@@ -4924,53 +4922,24 @@ _SIGNATURE_MATCH_FEATURES: tuple = (
     "steady_state_fraction",
 )
 
-# Signature matcher distance threshold — Euclidean over the feature subset
-# above. Heuristic value picked so a clear toilet-shaped event (3 gal, 60s,
-# ~2 lpm, ~5 psi drop) doesn't accidentally match a washing-machine
-# signature (~6 gal, ~3 min, ~2 lpm, ~6 psi). Compared after subtracting
-# centroid means and dividing each feature by its rough scale below.
-_SIGNATURE_MATCH_THRESHOLD: float = 1.5
-_SIGNATURE_MATCH_SCALES: dict = {
-    "avg_flow_lpm":           2.0,    # 0.5–5 gal/min typical range
-    "peak_flow_lpm":          3.0,
-    "duration_seconds":     120.0,    # 30s – several min
-    "volume_litres":         10.0,
-    "pressure_delta_psi":     5.0,
-    "steady_state_fraction":  0.5,
-}
-
 # ── Label-trained k-NN matcher (2026-05-31) ─────────────────────────────────
-# The mean-centroid matcher above scored ~70% leave-one-out on the May-2026
-# labelled archive; a weighted k-NN over the labelled events themselves scored
-# ~80% (and stays in sync with labels — no stale centroid). The k-NN is the
-# production path (live classify + backfill); the mean-centroid is retained for
-# the Signatures UI display and back-compat tests.
+# The mean-centroid matcher scored ~70% leave-one-out on the May-2026 labelled
+# archive; a weighted k-NN over the labelled events themselves scored ~80% (and
+# stays in sync with labels — no stale centroid), so the k-NN took over the
+# production path (live classify + backfill). dev59 deleted the centroid matcher
+# (``match_event_to_signature``) and its two exclusive tuning constants: nothing
+# had called it since, and a second matcher nobody runs is a second set of
+# thresholds to keep honest. The signature RECORDS stay — upsert /
+# get_fixture_type_signatures still back the Signatures UI, and
+# _SIGNATURE_MATCH_FEATURES is still the k-NN's legacy-tier feature list.
 #
-# Right-skewed features are log1p-compressed so the centroid + Euclidean
-# distance behave on log-normal data. The transform is applied identically to
-# the query event AND every labelled neighbour at query time, so train/serve
-# are consistent by construction (nothing log-space is persisted).
+# Right-skewed features are log1p-compressed so Euclidean distance behaves on
+# log-normal data. ``_knn_transform`` applies it identically to the query event
+# AND every labelled neighbour at query time, so train/serve are consistent by
+# construction (nothing log-space is persisted).
 _SIGNATURE_LOG_FEATURES: frozenset = frozenset({
     "volume_litres", "duration_seconds", "avg_flow_lpm", "peak_flow_lpm",
 })
-
-
-def _sig_transform(feat: str, value) -> float:
-    """log1p the right-skewed signature features; identity for the rest.
-
-    MUST be applied identically in training (the labelled neighbours) and
-    serving (the query event). None / non-numeric → 0.0 in the (already
-    non-negative) transformed space.
-    """
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    if not math.isfinite(v):
-        return 0.0
-    if feat in _SIGNATURE_LOG_FEATURES:
-        return math.log1p(max(0.0, v))
-    return v
 
 
 # k-NN tuning. All values derived from the May-2026 labelled archive (104
@@ -5587,67 +5556,6 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
     return {"repaired": repaired, "litres_restored": round(litres_restored, 3)}
 
 
-def match_event_to_signature(
-    conn: sqlite3.Connection,
-    circuit: str,
-    event_features: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    """Return the closest signature within
-    ``_SIGNATURE_MATCH_THRESHOLD`` on ``circuit``, or None.
-
-    Distance is computed in scale-normalised space:
-    sqrt(sum_i ((event_i - centroid_i) / scale_i)^2) over the matcher
-    feature subset. ``_SIGNATURE_MATCH_SCALES`` provides per-feature
-    typical ranges; the threshold is then in "rough fixture-typical-range
-    units" so it's interpretable.
-
-    Caller is responsible for deciding *when* to call this (e.g. only as
-    a fallback after cluster matching). The matcher itself doesn't gate
-    on whether the cluster matched.
-    """
-    sigs = get_fixture_type_signatures(conn, circuit)
-    if not sigs:
-        return None
-
-    best: Optional[Dict[str, Any]] = None
-    best_dist = float("inf")
-    for sig in sigs:
-        cen = sig["centroid"]
-        if not cen:
-            continue
-        sq = 0.0
-        used = 0
-        for feat in _SIGNATURE_MATCH_FEATURES:
-            ev_v = event_features.get(feat)
-            cn_v = cen.get(feat)
-            if ev_v is None or cn_v is None:
-                continue
-            scale = _SIGNATURE_MATCH_SCALES.get(feat, 1.0)
-            try:
-                delta = (float(ev_v) - float(cn_v)) / scale
-            except (TypeError, ValueError):
-                continue
-            sq += delta * delta
-            used += 1
-        if used == 0:
-            continue
-        # Normalise distance by feature count so signatures with sparse
-        # centroids (only a few features populated) aren't unfairly
-        # penalised vs full-feature ones.
-        dist = (sq / used) ** 0.5
-        if dist < best_dist:
-            best_dist = dist
-            best = sig
-
-    if best is None or best_dist > _SIGNATURE_MATCH_THRESHOLD:
-        return None
-    return {
-        "fixture_type": best["fixture_type"],
-        "distance": best_dist,
-        "member_count": best["member_count"],
-    }
-
-
 def set_event_matched_fixture_type(
     conn: sqlite3.Connection,
     circuit: str,
@@ -5733,10 +5641,10 @@ def match_event_to_signature_knn(
 ) -> Optional[Dict[str, Any]]:
     """Inverse-distance weighted k-NN over the circuit's labelled events.
 
-    The production fixture-type matcher (replaces the mean-centroid
-    ``match_event_to_signature`` on the live + backfill paths). Pulls every
-    labelled, non-excluded event on ``circuit``, log-compresses the skewed
-    features (``_sig_transform``), and votes with weight ``1/(distance+eps)``.
+    THE fixture-type matcher (it replaced a mean-centroid matcher on the live
+    + backfill paths; that one was deleted in dev59). Pulls every labelled,
+    non-excluded event on ``circuit``, log-compresses the skewed features
+    (``_knn_transform``), and votes with weight ``1/(distance+eps)``.
 
     Abstains (returns ``None``) when:
       • fewer than ``_SIGNATURE_KNN_MIN_TOTAL_LABELS`` labelled events exist;
