@@ -440,6 +440,16 @@ async def lifespan(app: FastAPI):
     def _runner_done(task: "asyncio.Task") -> None:
         if task.cancelled():
             return
+        # A clean shutdown reaches here NOT cancelled, twice over: orch.stop()
+        # runs before runner.cancel(), so the supervised workers can exit on
+        # their own and gather() returns normally; and run()'s own
+        # `except CancelledError: pass` absorbs the cancel when it does land.
+        # Either way task.cancelled() is False and exception() is None, so
+        # without this the "no monitoring is happening" CRITICAL fired on every
+        # restart — which is exactly how an alarm gets ignored when it is real.
+        if getattr(app.state, "shutting_down", False):
+            log.info("Orchestrator stopped as part of shutdown")
+            return
         exc = task.exception()
         if exc is None:
             app.state.orchestrator_state = "stopped"
@@ -453,12 +463,14 @@ async def lifespan(app: FastAPI):
 
     app.state.orchestrator_state = "running"
     app.state.orchestrator_error = None
+    app.state.shutting_down = False
     runner.add_done_callback(_runner_done)
 
     try:
         yield
     finally:
         log.info("Water Monitor shutting down")
+        app.state.shutting_down = True      # before stop(): the callback reads it
         orch.stop()
         runner.cancel()
         try:
