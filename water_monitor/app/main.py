@@ -167,6 +167,7 @@ def _is_static_path(path: str) -> bool:
 from .build_info import _read_addon_version, _read_git_commit
 from .db_migrations import run_migrations
 from .orchestrator import Orchestrator
+from .task_registry import spawn
 from .routers import (dashboard, device, history, fixtures, settings, setup,
                       backup, help, training, calibration, access)
 from .units import build_unit_context, load_unit_context
@@ -582,7 +583,11 @@ async def ingress_middleware(request: Request, call_next):
                 except Exception:
                     seen.discard(u)   # retry on a later request
 
-            asyncio.get_running_loop().create_task(_log_seen_user(uid, _uname))
+            # dev57 (2.24): via task_registry.spawn. RUF006 does NOT flag the
+            # chained `get_running_loop().create_task(...)` form, but the bug is
+            # identical — nothing held this task, so the seen-user write could
+            # be collected before the serialized writer ever ran it.
+            spawn(_log_seen_user(uid, _uname), name=f"record_seen_user[{uid}]")
 
     # Central mutation gate: reject any state-changing request the role isn't
     # allowed to make (viewer: none; operator: valve open/close only; admin: all).

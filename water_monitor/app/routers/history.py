@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from ..circuit_compat import resolve_circuit
 from ..fixtures import FIXTURE_TYPE_LABELS, user_selectable_types
 from ..database import patch_event as _patch_event
+from ..task_registry import spawn
 from ._helpers import (coerce_float, ingress_redirect, run_blocking,
                        startup_gate)
 
@@ -117,7 +118,11 @@ def _schedule_reclassify(circuit: str) -> None:
             return                      # a newer save superseded this one
         await _bg_reclassify(circuit)
 
-    asyncio.create_task(_delayed())
+    # dev57 (2.24): via task_registry.spawn. A bare create_task() left the
+    # only reference to this task in asyncio's weak set, so the debounced
+    # reclassify could be collected mid-sleep and the just-saved label would
+    # never propagate — silently, with no traceback.
+    spawn(_delayed(), name=f"history_reclassify[{circuit}]")
 
 
 @router.get("", response_class=HTMLResponse)

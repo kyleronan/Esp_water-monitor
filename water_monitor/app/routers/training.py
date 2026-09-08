@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..auth import require_admin
+from ..task_registry import spawn
 from ..fixtures import (FIXTURE_TYPE_LABELS, fixture_user_selectable_types,
                         zone_user_selectable_types)
 from ..database import (
@@ -210,7 +211,13 @@ async def start_regime_recalibration(orch) -> bool:
             _RECAL_IN_FLIGHT = False
 
     _RECAL_IN_FLIGHT = True
-    asyncio.create_task(_guarded())
+    # dev57 (2.24): via task_registry.spawn — a bare create_task() left this
+    # minutes-long re-fit collectable mid-flight, and because the flag is
+    # cleared in _guarded's `finally`, a collected task would ALSO have
+    # wedged the button on for the life of the process.
+    if spawn(_guarded(), name="regime_recalibration") is None:
+        _RECAL_IN_FLIGHT = False   # no running loop — nothing was scheduled
+        return False
     return True
 
 
@@ -359,8 +366,9 @@ async def confirm_api(circuit: str, request: Request):
     res = await run_db(confirm_training_capture,              # dev46 (46a)
                        _orch(request).db, circuit)
     if res.get("labeled"):
-        import asyncio
-        asyncio.create_task(_bg_reclassify_training(circuit))
+        # dev57 (2.24): spawn() holds the strong reference (see task_registry).
+        spawn(_bg_reclassify_training(circuit),
+              name=f"training_reclassify[{circuit}]")
     return JSONResponse({"ok": True, **res})
 
 
@@ -378,8 +386,9 @@ async def reject_api(circuit: str, request: Request):
     res = await run_db(reject_training_capture,               # dev46 (46a)
                        orch.db, circuit, int(cid))
     if res.get("cleared"):
-        import asyncio
-        asyncio.create_task(_bg_reclassify_training(circuit))
+        # dev57 (2.24): spawn() holds the strong reference (see task_registry).
+        spawn(_bg_reclassify_training(circuit),
+              name=f"training_reclassify[{circuit}]")
     return JSONResponse({"ok": True, **res})
 
 
