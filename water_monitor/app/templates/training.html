@@ -70,7 +70,6 @@
 <script>
 (function () {
   const INGRESS = "{{ ingress_path }}";
-  const CSRF = window.CSRF_TOKEN || "";
   const INSTANT = new Set(["toilet", "tap"]);
   const SUB_MSG = {
     waiting:    "ready when you are — run it now, then come back",
@@ -81,15 +80,11 @@
   const justCaptured = {};   // circuit -> fixture_type held on the "capture another?" prompt
   const sessionCount = {};   // circuit -> instant samples captured this sitting
 
-  async function post(url, body) {
-    const r = await fetch(INGRESS + url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-CSRF-Token": CSRF },
-      body: JSON.stringify(body || {}),
-    });
-    let d = null; try { d = await r.json(); } catch (_) {}
-    return { ok: r.ok, status: r.status, data: d };
-  }
+  // NOTE: this page deliberately has no local post() helper. It used to carry a
+  // copy that omitted the 403 handling, which silently dropped BOTH the RBAC
+  // denial message and the stale-CSRF reload. Use the shared post() from
+  // app.js (loaded in base.html before this block); same {ok,status,data}
+  // shape, same ingress prefix (window.INGRESS_PATH === ingress_path).
 
   document.querySelectorAll(".tr-arm").forEach(btn => {
     btn.addEventListener("click", async () => {
@@ -102,7 +97,7 @@
         body.window_minutes = sel ? parseInt(sel.value, 10) : null;
       }
       const res = await post(`/training/api/${circuit}/arm`, body);
-      if (!res.ok) { alert((res.data && res.data.error) || "Could not start capture"); poll(); return; }
+      if (!res.ok) { alert((res.data && (res.data.message || res.data.error)) || "Could not start capture"); poll(); return; }
       if (wasHolding) location.reload(); else poll();   // pick-another-fixture refreshes the ✓ pill
     });
   });
@@ -127,7 +122,7 @@
       justCaptured[circuit] = null;
       if (ft) {
         const res = await post(`/training/api/${circuit}/arm`, { fixture_type: ft });
-        if (!res.ok) alert((res.data && res.data.error) || "Could not start capture");
+        if (!res.ok) alert((res.data && (res.data.message || res.data.error)) || "Could not start capture");
       }
       poll();
     });

@@ -304,7 +304,7 @@
         </label>
         {% endfor %}
         <p class="sett-card-desc" id="circuit-type-saving-{{ c.circuit }}"
-           style="display:none;color:var(--color-warn);margin-top:.5rem">Saving…</p>
+           style="display:none;color:var(--amber-text);margin-top:.5rem">Saving…</p>
       </div>
 
       {# Valve type #}
@@ -331,9 +331,9 @@
         </label>
         {% endfor %}
         <p class="sett-card-desc" id="valve-type-saving-{{ c.circuit }}"
-           style="display:none;color:var(--color-warn);margin-top:.5rem">Saving…</p>
+           style="display:none;color:var(--amber-text);margin-top:.5rem">Saving…</p>
         {% if c.valve_type == "3_port" %}
-        <p class="sett-card-desc" style="margin-top:.5rem;color:var(--color-warn)">
+        <p class="sett-card-desc" style="margin-top:.5rem;color:var(--amber-text)">
           <strong>Note:</strong> Micro leak test is disabled for this circuit —
           3-port drain-capable valves are not compatible with the test (the
           drain port would always read as a constant leak). The existing
@@ -388,7 +388,7 @@
           season. While it is on, this circuit records no water use, runs no
           leak tests, and is left out of pressure learning.
         </p>
-        <p class="sett-card-desc" style="color:var(--color-warn)">
+        <p class="sett-card-desc" style="color:var(--amber-text)">
           <strong>Turn it on BEFORE you drain the line</strong> — switching it
           on afterwards is too late to prevent the alarm.
         </p>
@@ -405,7 +405,7 @@
           </span>
         </label>
         <p class="sett-card-desc" id="winterized-saving-{{ c.circuit }}"
-           style="display:none;color:var(--color-warn);margin-top:.5rem">Saving…</p>
+           style="display:none;color:var(--amber-text);margin-top:.5rem">Saving…</p>
       </div>
 
       {# ── Flow Meter (read-only; the PPL is set in Home Assistant) ── #}
@@ -798,7 +798,7 @@
           </div>
           <label class="toggle">
             <input type="checkbox" {% if alert.enabled %}checked{% endif %}
-                   onchange="settingsAlertToggle('{{ alert.id }}', this.checked)">
+                   onchange="settingsAlertToggle('{{ alert.id }}', this.checked, this)">
             <span class="toggle-slider"></span>
           </label>
         </div>
@@ -1788,7 +1788,7 @@
       </div>
     </div>
 
-    <p id="cal-error" style="color:var(--color-warn);font-size:.85rem;display:none"></p>
+    <p id="cal-error" style="color:var(--amber-text);font-size:.85rem;display:none"></p>
   </div>
 </div>
 
@@ -2175,14 +2175,36 @@ async function settingsWinterizedUpdate(circuit, box) {
   }
 }
 
-async function settingsAlertToggle(alertId, enabled) {
+// unit 2.33 — this awaited the fetch and then checked NOTHING, so a 403 (RBAC
+// denial, or a stale CSRF token after the add-on restarted with this tab open)
+// left the checkbox visibly ON while the alert stayed disabled. The user is
+// then told an alert is armed when it is not, on a leak monitor.
+//
+// Mirrors settingsWinterizedToggle directly above: read the JSON, revert the
+// box on anything other than a confirmed update, and say why. `box` is the
+// input element, passed as `this` from the onchange handler, so the revert
+// targets the control the user actually clicked.
+async function settingsAlertToggle(alertId, enabled, box) {
   const parts = alertId.split('_');
   const circuit = parts[parts.length - 1];
-  await fetch(`${window.INGRESS_PATH}/settings/alert/${circuit}/${alertId}/toggle`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&enabled=${enabled}`
-  });
+  try {
+    const resp = await fetch(`${window.INGRESS_PATH}/settings/alert/${circuit}/${alertId}/toggle`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&enabled=${enabled}`
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (data.status === 'updated') return;
+    toast('Could not update: ' + (data.message || data.error || 'unknown error'),
+          'error');
+    if (box) box.checked = !enabled;
+  } catch (e) {
+    // Network failure — the request may or may not have been applied, so the
+    // honest thing is to revert the control and let the user retry rather
+    // than leave it showing a state the server never confirmed.
+    toast('Could not update: ' + e.message, 'error');
+    if (box) box.checked = !enabled;
+  }
 }
 
 async function updateDeviceEntity(entityId, value, nativeStep) {
@@ -2238,7 +2260,15 @@ async function pruneNow(evt) {
       method: 'POST',
       headers: { 'X-CSRF-Token': window.CSRF_TOKEN || '' },
     });
-    const data = await resp.json();
+    const data = await resp.json().catch(() => ({}));
+    // unit 2.33 — this used to read the body and report success regardless of
+    // status. A 403 (RBAC denial, or a stale CSRF token) has no `deleted` key,
+    // so the sum came out 0 and the user was told "Pruning complete — 0 rows
+    // deleted" for an operation that never ran. Same class as the alert
+    // toggle above: a destructive action reporting success it never got.
+    if (!resp.ok) {
+      throw new Error(data.message || data.error || `HTTP ${resp.status}`);
+    }
     const total = Object.values(data.deleted || {}).reduce((a, b) => a + b, 0);
     toast(`Pruning complete — ${total} rows deleted.`, 'success');
   } catch (e) {

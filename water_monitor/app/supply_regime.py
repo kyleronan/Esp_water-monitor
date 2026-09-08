@@ -674,13 +674,15 @@ class SupplyRegimeTracker:
                      current["center_psi"], verdict["new_center"],
                      verdict["shift_day"])
             if self._alert_manager is not None:
-                try:
-                    asyncio.get_running_loop().create_task(
-                        self._alert_manager.alert_supply_regime_shift(
-                            circuit, current["center_psi"],
-                            verdict["new_center"]))
-                except RuntimeError:
-                    pass   # no loop (sync tests) — banner still shows
+                # dev57 (2.24): task_registry.spawn holds the strong reference
+                # the bare loop.create_task() did not, and returns None (having
+                # closed the coroutine) when there is no running loop — sync
+                # tests reach here, and the banner still shows regardless.
+                from .task_registry import spawn
+                spawn(self._alert_manager.alert_supply_regime_shift(
+                          circuit, current["center_psi"],
+                          verdict["new_center"]),
+                      name=f"supply_regime_shift_alert[{circuit}]")
 
         else:
             refit_regime_band(self._db, circuit, current, self._ha_tz)

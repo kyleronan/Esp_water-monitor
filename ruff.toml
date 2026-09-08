@@ -1,0 +1,32 @@
+# Ruff configuration.
+#
+# There is NO CI in this repo and ruff is not currently installed, so this
+# file is configuration only — it does nothing until somebody runs:
+#
+#     py -m pip install --user ruff
+#     py -m ruff check .
+#
+# It exists so the one rule below is enforced MECHANICALLY rather than by eye.
+#
+# RUF006 (asyncio-dangling-task) is the whole point of the file: asyncio holds
+# only a weak reference to a running task, so a bare
+# `asyncio.create_task(...)` / `asyncio.ensure_future(...)` /
+# `loop.create_task(...)` whose result is thrown away can be collected
+# mid-flight and the coroutine silently stops. Use `app.task_registry.spawn()`,
+# which holds the strong reference and logs failures.
+#
+# The select list is deliberately minimal. Turning on ruff's defaults across a
+# ~50k-line codebase would produce thousands of findings and drown the one
+# rule that encodes a real, observed failure mode.
+
+target-version = "py311"
+line-length = 100
+
+exclude = [
+    "water_monitor/tests",
+    "firmware",
+    "integration",
+]
+
+[lint]
+select = ["RUF006"]

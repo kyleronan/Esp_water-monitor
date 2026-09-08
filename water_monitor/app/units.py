@@ -14,7 +14,10 @@ HA unit system auto-detection maps:
   volume="m³"  → flow=m³/min,  pressure=kPa   (some EU meters)
 """
 from __future__ import annotations
+import logging
 from typing import Any, Dict, Optional
+
+log = logging.getLogger(__name__)
 
 # ── HA volume-unit strings → the canonical vol_label below ──────────────
 #
@@ -195,6 +198,9 @@ def build_unit_context(flow_key: str, pressure_key: str) -> Dict[str, Any]:
 _UNIT_CACHE: Optional[Dict[str, Any]] = None
 _UNIT_CACHE_AT: float = 0.0
 _UNIT_CACHE_TTL: float = 30.0   # seconds
+# Consecutive failed reads, so the log reports the condition once rather
+# than once per circuit per poll. Reset on the first success.
+_UNIT_LOAD_FAILURES: int = 0
 
 
 def invalidate_unit_cache() -> None:
@@ -219,8 +225,31 @@ def load_unit_context(db) -> Dict[str, Any]:
         ).fetchone()
         flow_key     = (row["flow_unit"]     if row else None) or "L/min"
         pressure_key = (row["pressure_unit"] if row else None) or "psi"
-    except Exception:
-        flow_key, pressure_key = "L/min", "psi"
+    except Exception as e:
+        # unit 2.33 — this used to swallow silently AND cache the fallback for
+        # the full TTL, so one transient DB error rendered EVERY number on the
+        # page in the wrong unit for 30 s: a US household reading litres as
+        # gallons with nothing on screen or in the log to say so. Wrong units
+        # are indistinguishable from wrong data to the person reading them.
+        #
+        # Return the fallback WITHOUT caching it, so the next request retries
+        # and correct units come back the moment the DB does. Log the first
+        # occurrence at WARNING and the rest at DEBUG: load_unit_context runs
+        # once per circuit on every dashboard poll, so an unconditional
+        # warning would flood the log during exactly the outage it reports.
+        global _UNIT_LOAD_FAILURES
+        _UNIT_LOAD_FAILURES += 1
+        if _UNIT_LOAD_FAILURES == 1:
+            log.warning(
+                "unit preferences could not be read (%s); falling back to "
+                "L/min + psi for this request. Displayed numbers may be in "
+                "the wrong unit until this clears. Further occurrences at "
+                "DEBUG.", e)
+        else:
+            log.debug("unit preferences unreadable (%d consecutive): %s",
+                      _UNIT_LOAD_FAILURES, e)
+        return build_unit_context("L/min", "psi")
+    _UNIT_LOAD_FAILURES = 0
     _UNIT_CACHE    = build_unit_context(flow_key, pressure_key)
     _UNIT_CACHE_AT = now
     return _UNIT_CACHE

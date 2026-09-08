@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -1469,6 +1470,68 @@ def _has_table(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
+# ---------------------------------------------------------------------------
+# Best-effort backfill failures — loud, and on the record.
+# ---------------------------------------------------------------------------
+# Several one-shot DATA repairs (20260570/72, 20260802/03/04) are deliberately
+# best-effort: a backfill must never keep the add-on from booting. What was
+# NOT deliberate is that they used to fail at log.warning and vanish — the
+# chain still stamps _CURRENT_VERSION afterwards, and the `_missing_*`
+# verifiers only check SCHEMA, so a DB reporting itself fully current could be
+# one where the repair never ran and never will. These failures are now logged
+# at ERROR with the migration id and recorded here, so "did the repair run?"
+# is an answerable question instead of a guess.
+#
+# Created on demand (nothing reads it on the happy path, so _create_schema
+# deliberately does not mirror it) and never itself allowed to break boot.
+_MIGRATION_FAILURES_DDL = (
+    "CREATE TABLE IF NOT EXISTS migration_failures ("
+    " version INTEGER NOT NULL,"
+    " step TEXT NOT NULL,"
+    " error TEXT NOT NULL,"
+    " first_failed_at TEXT NOT NULL,"
+    " last_failed_at TEXT NOT NULL,"
+    " failures INTEGER NOT NULL DEFAULT 1,"
+    " PRIMARY KEY (version, step))"
+)
+
+
+def _record_migration_failure(
+    conn: sqlite3.Connection,
+    version: int,
+    step: str,
+    exc: BaseException,
+) -> None:
+    """Log a skipped best-effort migration step at ERROR and record it.
+
+    Never raises: it is called from an except handler on the boot path, and a
+    failure to record a failure must not escalate into a failure to boot.
+    """
+    log.error(
+        "Migration %d: %s FAILED and was SKIPPED — the data repair it performs "
+        "has NOT run and nothing re-runs it automatically (the schema version "
+        "is still stamped current). Recorded in migration_failures. %s: %s",
+        version, step, type(exc).__name__, exc, exc_info=True,
+    )
+    try:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        conn.execute(_MIGRATION_FAILURES_DDL)
+        conn.execute(
+            "INSERT INTO migration_failures "
+            " (version, step, error, first_failed_at, last_failed_at, failures) "
+            "VALUES (?, ?, ?, ?, ?, 1) "
+            "ON CONFLICT(version, step) DO UPDATE SET "
+            " error = excluded.error, last_failed_at = excluded.last_failed_at, "
+            " failures = migration_failures.failures + 1",
+            (int(version), str(step), f"{type(exc).__name__}: {exc}"[:500],
+             now, now),
+        )
+        conn.commit()
+    except Exception as rec_exc:  # pragma: no cover - defensive
+        log.error("Migration %d: could not record the failure above: %s",
+                  version, rec_exc)
+
+
 # Required columns in the events table that only exist in the baseline schema.
 # Checking multiple columns is more robust — an old DB might have some
 # backfilled but not others.
@@ -2091,7 +2154,9 @@ def _apply_leak_test_refill_column(conn: sqlite3.Connection) -> None:
                  "%d refill event(s) over %d test(s)",
                  res.get("tagged", 0), res.get("tests_scanned", 0))
     except Exception as e:
-        log.warning("Migration 20260570: refill backfill skipped (non-fatal): %s", e)
+        # Loud + recorded: the periodic reconcile is what retries this, so a
+        # silent skip here is indistinguishable from "there was nothing to tag".
+        _record_migration_failure(conn, 20260570, "leak-test refill backfill", e)
 
 
 def _missing_leak_test_refill_columns(conn: sqlite3.Connection) -> set[str]:
@@ -2144,8 +2209,8 @@ def _apply_sawtooth_recharge_backfill(conn: sqlite3.Connection) -> None:
         log.info("Migration 20260572: sawtooth recharge backfill tagged "
                  "%d event(s)", res.get("tagged", 0))
     except Exception as e:
-        log.warning("Migration 20260572: sawtooth backfill skipped "
-                    "(non-fatal): %s", e)
+        _record_migration_failure(
+            conn, 20260572, "sawtooth pump-recharge re-verdict backfill", e)
 
 
 # 20260574 — leak-watch window bounds.
@@ -2274,7 +2339,11 @@ def _apply_peak_consistency_backfill(conn: sqlite3.Connection) -> None:
         log.info("Migration 20260802: peak-consistency backfill raised "
                  "%d row(s)", len(rows))
     except Exception as e:
-        log.warning("Migration 20260802: peak backfill skipped (non-fatal): %s", e)
+        # NOTE: nothing re-runs this one. The live write path stops the
+        # population regrowing, but rows already carrying true_avg > peak stay
+        # impossible until someone acts on this record.
+        _record_migration_failure(
+            conn, 20260802, "peak-consistency (true_avg > peak) backfill", e)
 
 
 # 20260803 — stale hydraulic_resistance backfill.
@@ -2303,8 +2372,10 @@ def _apply_resistance_backfill(conn: sqlite3.Connection) -> None:
         log.info("Migration 20260803: resistance backfill updated %d row(s)",
                  cur.rowcount)
     except Exception as e:
-        log.warning("Migration 20260803: resistance backfill skipped "
-                    "(non-fatal): %s", e)
+        # Nothing re-runs this one either: the stale ΔP-derived resistance
+        # stays on those rows and keeps feeding the classifier.
+        _record_migration_failure(
+            conn, 20260803, "hydraulic-resistance recompute backfill", e)
 
 
 # 20260804 — retro-fix the dev37-repaired rows' contaminated signatures.
@@ -2332,8 +2403,10 @@ def _apply_misattached_signature_null(conn: sqlite3.Connection) -> None:
         log.info("Migration 20260804: nulled contaminated signatures on "
                  "%d misattached row(s)", cur.rowcount)
     except Exception as e:
-        log.warning("Migration 20260804: signature retro-fix skipped "
-                    "(non-fatal): %s", e)
+        # Nothing re-runs this one: on failure, mis-attached rows keep a
+        # FOREIGN draw's signature bytes under an 'esp' provenance label.
+        _record_migration_failure(
+            conn, 20260804, "mis-attached signature retro-fix", e)
     # Belt-and-braces re-create of the wf-claim index — LAST migration of the
     # dev38 group, same rationale as 20260574 for dev37: the base schema
     # deliberately omits it, so every forward walk that ends here must still
@@ -2778,33 +2851,78 @@ def _apply_regime_calibration(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260565 — rebuild rule_calibration with
     PRIMARY KEY (circuit, regime_id). The existing per-circuit row is copied
     as regime_id=0 (the legacy/pre-regime row, still the fallback when a
-    regime has no fit of its own). Guarded + idempotent."""
-    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
-                        "name='rule_calibration'").fetchone():
+    regime has no fit of its own). Guarded + idempotent.
+
+    ATOMICITY: SQLite's own DDL is transactional, but Python 3.11's sqlite3
+    opens an implicit transaction only ahead of DML — a bare CREATE / DROP /
+    ALTER autocommits one statement at a time, and the trailing conn.commit()
+    below buys nothing. Before this was fixed, a crash mid-rebuild left the DB
+    in a state no re-run could repair:
+
+      * crash after the CREATE — ``rule_calibration_new`` already exists on the
+        next boot, the unguarded CREATE raises, and the migration chain fails
+        forever (the version is never stamped, so every boot retries and dies);
+      * crash after the DROP — ``rule_calibration`` is GONE, the table-exists
+        early-out below then declares success, the chain stamps itself current,
+        and the user's calibration is permanently destroyed.
+
+    The rebuild now runs inside an explicit ``BEGIN IMMEDIATE`` (the pattern
+    _apply_referee_meta_columns uses in this same file), so it is all-or-nothing
+    even against a hard kill. The two branches ahead of it repair a DB already
+    left in either state by the old code.
+    """
+    if not _has_table(conn, "rule_calibration"):
+        if (_has_table(conn, "rule_calibration_new")
+                and _has_column(conn, "rule_calibration_new", "regime_id")):
+            # Interrupted between DROP and RENAME by the pre-fix code: every
+            # row survives in the scratch table, so finish the rename rather
+            # than early-out and let the chain stamp over the loss.
+            conn.execute(
+                "ALTER TABLE rule_calibration_new RENAME TO rule_calibration")
+            conn.commit()
+            log.warning("Migration 20260565: recovered an interrupted "
+                        "rule_calibration rebuild — the scratch table held the "
+                        "rows and has been renamed into place")
+            return
         conn.commit()
         return
     if _has_column(conn, "rule_calibration", "regime_id"):
+        # Already migrated. Clear any scratch table an interrupted earlier
+        # attempt left behind — otherwise a later re-run of the CREATE below
+        # (or a hand repair) trips over it.
+        if _has_table(conn, "rule_calibration_new"):
+            conn.execute("DROP TABLE rule_calibration_new")
         conn.commit()
         return
-    conn.execute("""
-        CREATE TABLE rule_calibration_new (
-            circuit     TEXT NOT NULL,
-            regime_id   INTEGER NOT NULL DEFAULT 0,
-            params      TEXT NOT NULL DEFAULT '{}',
-            report      TEXT,
-            source      TEXT,
-            locked_at   TIMESTAMP,
-            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (circuit, regime_id)
-        )""")
-    conn.execute(
-        "INSERT INTO rule_calibration_new "
-        " (circuit, regime_id, params, report, source, locked_at, updated_at) "
-        "SELECT circuit, 0, params, report, source, locked_at, updated_at "
-        "FROM rule_calibration")
-    conn.execute("DROP TABLE rule_calibration")
-    conn.execute("ALTER TABLE rule_calibration_new RENAME TO rule_calibration")
-    conn.commit()
+    conn.commit()  # nothing pending — BEGIN IMMEDIATE must be the outer txn
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DROP TABLE IF EXISTS rule_calibration_new")
+        conn.execute("""
+            CREATE TABLE rule_calibration_new (
+                circuit     TEXT NOT NULL,
+                regime_id   INTEGER NOT NULL DEFAULT 0,
+                params      TEXT NOT NULL DEFAULT '{}',
+                report      TEXT,
+                source      TEXT,
+                locked_at   TIMESTAMP,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (circuit, regime_id)
+            )""")
+        conn.execute(
+            "INSERT INTO rule_calibration_new "
+            " (circuit, regime_id, params, report, source, locked_at, updated_at) "
+            "SELECT circuit, 0, params, report, source, locked_at, updated_at "
+            "FROM rule_calibration")
+        conn.execute("DROP TABLE rule_calibration")
+        conn.execute(
+            "ALTER TABLE rule_calibration_new RENAME TO rule_calibration")
+        conn.commit()
+    except BaseException:
+        # Includes KeyboardInterrupt: an operator Ctrl-C mid-rebuild must not
+        # be the one crash window that leaves the table half-swapped.
+        conn.rollback()
+        raise
     log.info("Migration 20260565: rule_calibration keyed per (circuit, regime)")
 
 
@@ -3751,12 +3869,41 @@ def _run_migrations_impl(
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return
 
-    if version not in _UPGRADEABLE_VERSIONS:
-        # Any version 1–31 (or an unknown stamp): old incremental pre-squash DB.
+    if version > _CURRENT_VERSION:
+        # A DOWNGRADE, not a corrupt DB: this database was written by a NEWER
+        # add-on version. There is no backward chain, so we stop — but we must
+        # never tell the user to delete a database that is perfectly intact and
+        # simply ahead of us. Re-installing the newer version reads it fine.
         raise RuntimeError(
-            f"Database schema version {version} is a pre-squash version. "
-            f"Delete the database file and restart the add-on to create a fresh "
-            f"schema. (Expected {_CURRENT_VERSION}, found {version}.){_db_hint}"
+            f"Database schema version {version} is NEWER than this add-on "
+            f"understands ({_CURRENT_VERSION}). The database was written by a "
+            f"newer version of the add-on and CANNOT be downgraded. Your data "
+            f"is intact — do NOT delete the database. Re-install the newer "
+            f"add-on version to use it, or restore a backup taken at schema "
+            f"version {_CURRENT_VERSION} or older.{_db_hint}"
+        )
+
+    if version not in _UPGRADEABLE_VERSIONS:
+        if version < _BASELINE_VERSION:
+            # Any version 1–31 (or an unknown pre-baseline stamp): old
+            # incremental pre-squash DB, with no forward path from here.
+            raise RuntimeError(
+                f"Database schema version {version} is a pre-squash version. "
+                f"Delete the database file and restart the add-on to create a "
+                f"fresh schema. (Expected {_CURRENT_VERSION}, found "
+                f"{version}.){_db_hint}"
+            )
+        # Between the baseline and current, but not a version this add-on ever
+        # shipped (a dev build, or a hand-edited stamp). Unknown provenance, so
+        # we refuse to guess which steps already ran — but the data is not
+        # known-bad, so this is not a delete-the-database situation either.
+        raise RuntimeError(
+            f"Database schema version {version} is not a version this add-on "
+            f"ever shipped (expected {_CURRENT_VERSION}, or one of the known "
+            f"upgrade steps). The database was most likely written by a "
+            f"development build. Your data is intact — do NOT delete the "
+            f"database; restore a backup stamped at a released schema version, "
+            f"or re-install the build that wrote it.{_db_hint}"
         )
 
     if version == _BASELINE_VERSION:

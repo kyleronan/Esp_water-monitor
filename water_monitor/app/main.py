@@ -23,16 +23,16 @@ from .auth import (
     REMOTE_USER_ID_HEADER,
     REMOTE_USER_NAME_HEADER,
     VIEWER,
+    check_csrf_token,
     is_mutation_allowed,
+    issue_csrf_token,
     role_for_request,
 )
 from .config import load_config
 from .database import (
-    derive_csrf_token,
     get_or_create_csrf_server_secret,
     record_seen_user,
     run_isolated_write,
-    validate_csrf_token,
 )
 
 # Ingress IP guard — only accept requests from the HA supervisor ingress proxy.
@@ -42,12 +42,35 @@ _DEV_MODE    = _os.environ.get("DEV_MODE", "false").lower() in ("true", "1", "ye
 
 # Session cookie used to bind a browser to its CSRF token via HMAC
 # double-submit. Persistent (30 days) and re-set on first response only.
-SESSION_COOKIE         = "wm_session"
+#
+# The name changed from "wm_session" in unit 2.28, and it had to. The old cookie
+# was scoped path="/", and a browser that already holds it keeps sending it —
+# so the middleware never sees a cookie-less client, never calls set_cookie
+# again, and the new path/SameSite would have reached NOBODY who had ever opened
+# the add-on. A new name forces exactly one re-issue per browser, under the new
+# scope; the stale one is explicitly deleted below.
+SESSION_COOKIE         = "wm_sid"
+LEGACY_SESSION_COOKIE  = "wm_session"   # pre-2.28, path="/" — deleted on sight
 SESSION_COOKIE_MAX_AGE = 30 * 86400  # 30 days
 
 # Session ids are 64 hex chars (32 bytes). Anything shorter / different
 # format means the cookie was tampered with or rotated — treat as new.
 SESSION_COOKIE_MIN_LEN = 16
+
+# Cookie path. The Supervisor serves every ingress add-on under
+# /api/hassio_ingress/<token>/, so this prefix is the narrowest scope that is
+# still STABLE: the <token> segment is per-add-on and the add-on cannot assume
+# it is durable, and it only ever reaches us through the X-Ingress-Path REQUEST
+# header, which this codebase already treats as untrusted (see the sanitising
+# re.sub on the setup redirect below). Deriving a cookie path from that header
+# would mean one odd value breaks every POST in the app — for zero security
+# gain, because scoping to our own token does NOT keep a sibling add-on out
+# (see the ACCEPTED RISK note in ingress_middleware).
+#
+# What it does buy, which path="/" did not: the cookie stops riding along on
+# Home Assistant's OWN requests — /api/websocket, /api/states, /auth/*, and
+# every frontend fetch on the HA origin.
+INGRESS_PATH_PREFIX = "/api/hassio_ingress/"
 
 
 def _new_session_id() -> str:
@@ -73,21 +96,59 @@ def _is_secure_request(request: Request) -> bool:
     return True
 
 
+def _cookie_path(request: Request) -> str:
+    """Scope for the session cookie — see INGRESS_PATH_PREFIX.
+
+    Returns the ingress prefix when this request actually arrived through the
+    Supervisor ingress proxy, and "/" otherwise (DEV_MODE / local runs / pytest,
+    where the app is served from the root and a prefix-scoped cookie would never
+    come back). Only ever one of two constant values, so a browser can never end
+    up holding two same-named cookies at different paths.
+    """
+    if _DEV_MODE:
+        return "/"
+    if request.headers.get("X-Ingress-Path", "").startswith(
+            INGRESS_PATH_PREFIX):
+        return INGRESS_PATH_PREFIX
+    # Reached only if HA ever moves ingress off /api/hassio_ingress/. Falling
+    # back to the pre-2.28 scope keeps the add-on working rather than 403-ing
+    # every POST behind a cookie the browser will not send back.
+    return "/"
+
+
 def _set_session_cookie(response, request: Request, session_id: str) -> None:
     """Attach the session cookie. Shared by the normal new-session response and the
     CSRF-reject 403 so a cookie-less client always leaves with a session it can reuse.
     The reject path returns before the normal cookie-set, so without this a client
     whose cookie never round-trips could never present a matching token — the frontend
-    reloads on 403, which then derives a valid token for this same session."""
+    reloads on 403, which then derives a valid token for this same session.
+
+    ``samesite="strict"`` (was "lax", unit 2.28): ingress is served from the Home
+    Assistant origin itself, and the panel is entered as a same-origin iframe from
+    the HA sidebar, so every legitimate request to this add-on — navigation, form
+    POST and fetch alike — is same-site and carries a Strict cookie. The one case
+    Strict withholds it that Lax would not is a top-level navigation arriving from
+    a genuinely different site (an emailed deep link); that request simply mints a
+    new session and renders a page whose token matches it, so nothing breaks.
+    """
     response.set_cookie(
         SESSION_COOKIE,
         session_id,
         httponly=True,
-        samesite="lax",
+        samesite="strict",
         secure=_is_secure_request(request),
         max_age=SESSION_COOKIE_MAX_AGE,
-        path="/",
+        path=_cookie_path(request),
     )
+    # One-time cleanup of the pre-2.28 path="/" cookie, which is still being sent
+    # to every path on the HA origin until it expires. Conditional on the browser
+    # actually presenting it, so this costs nothing once the fleet has rolled over.
+    if LEGACY_SESSION_COOKIE in request.cookies:
+        # secure/httponly mirrored from the original set so the overwrite is not
+        # refused by a browser's "leave secure cookies alone" rule.
+        response.delete_cookie(
+            LEGACY_SESSION_COOKIE, path="/",
+            secure=_is_secure_request(request), httponly=True)
 
 
 def _is_health_path(path: str) -> bool:
@@ -448,11 +509,24 @@ async def ingress_middleware(request: Request, call_next):
         log.info("POST %s (ingress=%r)", path, ingress_path)
 
     # ----- Session + CSRF token derivation ---------------------------
-    # Stateless HMAC double-submit (see plan A-1):
+    # Stateless HMAC double-submit (see plan A-1, revised by unit 2.28):
     #   - browser carries a random session_id in a cookie
     #   - server caches the persistent HMAC secret on app.state
-    #   - csrf_token = HMAC(server_secret, session_id)
+    #   - csrf_token = "<nonce>.<HMAC(server_secret, session_id + '!' + nonce)>"
+    #     with a fresh nonce per request (auth.issue_csrf_token)
     # No DB write per request; no shared process-wide cache.
+    #
+    # ACCEPTED RISK — a compromised sibling add-on. Every ingress add-on is
+    # served from the Home Assistant ORIGIN, not just the same site. A page from
+    # any other ingress add-on is therefore same-origin with this UI: it can
+    # fetch() our pages with credentials, read the CSRF token straight out of the
+    # returned HTML, and POST with it. No CSRF token, no SameSite value, no
+    # Origin/Referer check and no cookie path can prevent that — it is a property
+    # of the ingress architecture, and the only real mitigations live in Home
+    # Assistant (per-add-on origins) or in not installing untrusted add-ons.
+    # This is recorded deliberately and is NOT to be engineered around here; the
+    # measures below defend against genuinely CROSS-site attackers, which is the
+    # threat they can actually address.
     orch = getattr(request.app.state, "orchestrator", None)
     server_secret: str = getattr(
         request.app.state, "csrf_server_secret", ""
@@ -472,10 +546,9 @@ async def ingress_middleware(request: Request, call_next):
         session_id = _new_session_id()
         new_session = True
     request.state.session_id = session_id
-    request.state.csrf_token = (
-        derive_csrf_token(server_secret, session_id)
-        if server_secret else ""
-    )
+    # Fresh nonce per request: the token a page renders is no longer the same
+    # string for the cookie's entire 30-day life.
+    request.state.csrf_token = issue_csrf_token(server_secret, session_id)
 
     # ----- Role resolution + RBAC mutation gate ----------------------
     # Resolve the caller's role from the trusted ingress user header (see auth.py)
@@ -537,6 +610,27 @@ async def ingress_middleware(request: Request, call_next):
     # session cookie and provides the token.
     if request.method in ("POST", "PUT", "PATCH", "DELETE") and not (
             _is_health_path(path) or _is_static_path(path)):
+        # 0. Fetch Metadata (defence in depth, ~98% of browsers). The browser —
+        #    not the page — states where the request came from, so it cannot be
+        #    spoofed by script. "cross-site" can never describe a legitimate
+        #    request to this add-on: the UI is served from the HA origin and only
+        #    ever talks to itself. Absent header (old browser, curl, our own
+        #    TestClient) falls through to the CSRF token check, which is still
+        #    the primary control. Note this does NOT help against the sibling
+        #    add-on above — that attacker is same-origin, so it sends
+        #    Sec-Fetch-Site: same-origin.
+        if request.headers.get("Sec-Fetch-Site", "") == "cross-site":
+            log.warning("Fetch-Metadata rejected cross-site %s %s",
+                        request.method, path)
+            resp = JSONResponse(
+                {"status": "error", "error": "cross_site",
+                 "message": "Cross-site requests are not accepted."},
+                status_code=403,
+            )
+            if new_session:
+                _set_session_cookie(resp, request, session_id)
+            return resp
+
         # 1. Header first (covers JSON, no-body, and all fetch POSTs)
         token = request.headers.get("X-CSRF-Token", "")
         # 2. Fall back to form/multipart body
@@ -563,7 +657,7 @@ async def ingress_middleware(request: Request, call_next):
                 if hasattr(request, "_form"):
                     request._form = None
 
-        if not validate_csrf_token(server_secret, session_id, token):
+        if not check_csrf_token(server_secret, session_id, token):
             log.warning("CSRF invalid on %s %s", request.method, path)
             resp = HTMLResponse(
                 "<h1>403 — Invalid or missing security token</h1>"

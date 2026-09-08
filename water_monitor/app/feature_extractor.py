@@ -2376,8 +2376,17 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                 from .config import pump_gates_active as _pga_sweep
                 if _pga_sweep(conn, row["circuit"]):
                     continue
-            except Exception:
-                pass
+            except Exception as e:   # noqa: BLE001
+                # §2.29 — the gate exists BECAUSE a real draw during a recharge
+                # upswing can look pressure-silent. If it cannot be evaluated we
+                # do not know whether the premise holds, and unusable data must
+                # not authorise the destructive action (zeroing measured water).
+                # Skip the row with a loud diagnostic; volume is preserved.
+                log.warning("[%s] pressure-silent sweep: pump-gate check failed "
+                            "for event %s (%s) — SKIPPING the row, volume kept "
+                            "(re-run the sweep once the pump state is readable)",
+                            row["circuit"], row["id"], e)
+                continue
             # Re-run the canonical detector (SQL is only a prefilter) — it adds
             # the registration-floor requirement the SQL can't express per-circuit.
             if not _detect_pressure_silent_flow(
@@ -2660,8 +2669,15 @@ def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
             from .config import pump_gates_active as _pga_sweep
             if _pga_sweep(conn, row["circuit"]):
                 continue
-        except Exception:
-            pass
+        except Exception as e:   # noqa: BLE001
+            # §2.29 — same rule as the pressure-silent sweep above: an
+            # unevaluable pump gate must not fall through into zeroing real
+            # measured water. Skip the row loudly and keep the volume.
+            log.warning("[%s] rise-phantom sweep: pump-gate check failed for "
+                        "event %s (%s) — SKIPPING the row, volume kept "
+                        "(re-run the sweep once the pump state is readable)",
+                        row["circuit"], row["id"], e)
+            continue
         # Re-run the canonical detector (SQL is only a prefilter) — single
         # source of truth for the thresholds, and it re-rejects bad data.
         # min_flow selects the meter-class volume cap (PD 2.5 L / turbine 1.0 L).

@@ -2389,7 +2389,16 @@ def is_baseline_locked(conn: sqlite3.Connection, circuit: str) -> bool:
     locked-baseline design): once locked, a user relabel must NOT re-walk history. So a
     label change spreads only to the event's own cycle-mates (applied synchronously) —
     the full label-triggered reclassify is skipped. Mirrors the anomaly-shutoff state
-    gate so the two notions of 'locked' can't drift."""
+    gate so the two notions of 'locked' can't drift.
+
+    §2.29 — this predicate is ALSO the hard gate behind an automated valve close
+    (``FeatureExtractor._anomaly_shutoff_state_ok``), where True = shut-off
+    permitted. So it fails CLOSED on bad data: an unparseable
+    ``accelerated_adaptation_until`` means we cannot demonstrate that the
+    adaptation window has ended, and per IEC 61511 degraded-mode handling
+    unusable data must never AUTHORISE an actuation. It returns False (not
+    locked → no auto-shutoff) and logs a distinct diagnostic. The cost on the
+    other caller is a redundant label-triggered reclassify, which is safe."""
     row = conn.execute(
         "SELECT state FROM training_state WHERE circuit = ?", (circuit,)).fetchone()
     if not row or row["state"] != "live":
@@ -2401,12 +2410,18 @@ def is_baseline_locked(conn: sqlite3.Connection, circuit: str) -> bool:
     if until:
         try:
             t = datetime.fromisoformat(str(until).replace("Z", "+00:00"))
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=timezone.utc)
-            if t > datetime.now(timezone.utc):
-                return False   # active (re)calibration / adaptation window
         except (ValueError, TypeError):
-            pass
+            # Unusable timestamp → cannot prove the window closed → DENY.
+            # Distinct diagnostic; deliberately NOT folded into any leak alert.
+            log.warning(
+                "[%s] learning_config.accelerated_adaptation_until is unparseable "
+                "(%r) — treating the baseline as NOT locked: automated shut-off is "
+                "denied until the value is repaired", circuit, until)
+            return False
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        if t > datetime.now(timezone.utc):
+            return False   # active (re)calibration / adaptation window
     return True
 
 

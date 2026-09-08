@@ -259,7 +259,7 @@ async def setup_restore(request: Request):
             f"/setup?restore_error={_qp(str(e))}")
 
     try:
-        orch.reload_circuit_entities()
+        await orch.reload_circuit_entities_async()   # dev57 (2.10)
     except Exception as e:
         log.warning("Restore: reload_circuit_entities: %s", e)
 
@@ -409,7 +409,7 @@ async def setup_discover(device_id: str, request: Request):
         # dev46 (46a): N label upserts in one DB-thread callable.
         await run_db(lambda: [upsert_circuit_label(orch.db, cid, lbl)
                               for cid, lbl in diag_labels.items()])
-        orch.reload_circuit_labels()
+        await orch.reload_circuit_labels_async()   # dev57 (2.10)
 
     circuit_matches, prefix = match_entities_to_roles(
         device_id, entities, circuits, labels=diag_labels)
@@ -671,8 +671,8 @@ async def setup_circuit_names_save(request: Request):
         ctx["request"] = request
         return _tmpl(request).TemplateResponse("setup.html", ctx)
 
-    orch.reload_circuit_labels()
-    orch.reload_circuit_profiles()
+    await orch.reload_circuit_labels_async()     # dev57 (2.10)
+    await orch.reload_circuit_profiles_async()   # dev57 (2.10)
     log.info("Setup: circuit names, types, and valve types saved")
     return ingress_redirect(request, "/setup/units")
 
@@ -822,7 +822,7 @@ async def setup_home_details_save(request: Request):
 
     # Mark setup complete and reload entity IDs into live circuit configs
     await run_db(mark_setup_complete, orch.db)                # dev46 (46a)
-    orch.reload_circuit_entities()
+    await orch.reload_circuit_entities_async()   # dev57 (2.10)
 
     # If the user opted out of historical import, stamp import_state to NOW
     # for every circuit.  _backfill() and _catch_up() both clamp to this

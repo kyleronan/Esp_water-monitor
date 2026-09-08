@@ -764,8 +764,6 @@ class CircuitEventDetector:
     # ------------------------------------------------------------------ #
 
     def on_flow_rate(self, entity_id: str, state: str, attributes: dict) -> None:
-        if self.winterized:
-            return          # dev46 (46h) — drained for the season
         """
         1 Hz smoothed flow rate.
 
@@ -773,6 +771,11 @@ class CircuitEventDetector:
         - Drives the FLOW start trigger via a sustained-flow timer.
         - Resets the timer when flow drops below MIN_FLOW_LPM.
         """
+        # NOTE: the winterized guard must stay BELOW the docstring — above it,
+        # the string literal is no longer the first statement and Python parses
+        # it as a discarded expression, leaving __doc__ == None.
+        if self.winterized:
+            return          # dev46 (46h) — drained for the season
         try:
             raw_flow = float(state)
         except (ValueError, TypeError):
@@ -825,11 +828,11 @@ class CircuitEventDetector:
                 ev.low_flow_hold_until = None
                 log.debug("[%s] low-flow hold released — flow resumed (%.3f L/min)",
                           self.circuit, self._current_flow_lpm)
-            elif self._maybe_finalize_held_low_flow(now):
-                return
-            if self._maybe_close_sawtooth_hold(now):         # recharge hold-open
-                return
-            if self._maybe_force_close_overlong(now):        # over-long watchdog
+            # unit 2.34: one ordered ladder, shared with on_pressure_fast, so
+            # the end_ts never depends on which sensor ticked first. (Clearing
+            # the hold above makes the ladder's rung 1 a no-op, exactly as the
+            # previous `elif` did.)
+            if self._run_close_ladder(now):
                 return
             elapsed = (now - self._active_event.start_ts).total_seconds()
             self._flow_sample_count += 1
@@ -882,8 +885,6 @@ class CircuitEventDetector:
                 self._flow_start_dips = 0
 
     def on_pressure_fast(self, entity_id: str, state: str, attributes: dict) -> None:
-        if self.winterized:
-            return          # dev46 (46h) — drained for the season
         """
         40 Hz fast pressure sensor.
 
@@ -898,6 +899,11 @@ class CircuitEventDetector:
           short within-event baseline so the settled post-drop pressure is
           the reference, not the original pre-event baseline.
         """
+        # NOTE: the winterized guard must stay BELOW the docstring — above it,
+        # the string literal is no longer the first statement and Python parses
+        # it as a discarded expression, leaving __doc__ == None.
+        if self.winterized:
+            return          # dev46 (46h) — drained for the season
         if state in ("unavailable", "unknown"):
             # ESP reconnected or went offline — stale buffer readings would mix
             # with new data and could trigger a false pressure transient.
@@ -973,13 +979,9 @@ class CircuitEventDetector:
             # dev.24 low-flow off-grace backstop: flow_rate can stop ticking at 0
             # during a dip, but the fast-pressure sensor keeps sampling — so a
             # held event whose grace expired is finalized here too.
-            if self._maybe_finalize_held_low_flow(now):
-                return
-            if self._maybe_force_close_overlong(now):    # over-long watchdog
-                return
-            if self._maybe_close_settled_noflow(now):    # stuck no-flow phantom
-                return
-            if self._maybe_close_sawtooth_hold(now):     # recharge hold-open
+            # unit 2.34: one ordered ladder, shared with on_flow_rate, so the
+            # end_ts never depends on which sensor ticked first.
+            if self._run_close_ladder(now):
                 return
             elapsed_p = (now - self._active_event.start_ts).total_seconds()
             self._pressure_sample_count += 1
@@ -1486,6 +1488,44 @@ class CircuitEventDetector:
         )
         self._end_event(last_real, force=True)
         return True
+
+    def _run_close_ladder(self, now: datetime) -> bool:
+        """Evaluate every non-recovery close path in ONE fixed order.
+
+        unit 2.34. Both sensor callbacks used to test these paths in their own
+        hand-maintained order (on_flow_rate ran sawtooth before the watchdog and
+        never ran the settled-no-flow path at all; on_pressure_fast ran the
+        watchdog before both). An event that satisfied two rungs therefore got a
+        different ``end_ts`` depending on which sensor happened to tick first —
+        live nondeterminism in event boundaries. The two lists are now one list.
+
+        Order is most-informed close first, generic watchdog last:
+
+          1. ``_maybe_finalize_held_low_flow`` -> end_ts = the recorded dip time.
+             An explicit decision already taken (a deadline is pending) with an
+             exact end time; nothing may pre-empt it.
+          2. ``_maybe_close_settled_noflow``   -> end_ts = now. Narrowest rung:
+             a pure-pressure transient that never moved water, so no metered
+             water can be lost here whatever it pre-empts.
+          3. ``_maybe_close_sawtooth_hold``    -> end_ts = last real activity.
+          4. ``_maybe_force_close_overlong``   -> end_ts = now.
+
+        (4) is LAST because it is a failure path, not a close reason: it means
+        "we missed the end signal". If any of (1)-(3) fired, the end signal was
+        not missed — we know when the draw ended — and letting the watchdog win
+        would stamp the full 6 h cap onto an event that really ended earlier,
+        feeding a garbage duration to the classifier. This also makes the
+        pressure callback agree with the order the flow callback already shipped
+        (sawtooth before watchdog), so the common flow-sensor-ticking path keeps
+        its current behaviour and only the pressure path changes.
+
+        Returns True when an event was finalized — the caller must then stop
+        touching ``self._active_event``.
+        """
+        return (self._maybe_finalize_held_low_flow(now)
+                or self._maybe_close_settled_noflow(now)
+                or self._maybe_close_sawtooth_hold(now)
+                or self._maybe_force_close_overlong(now))
 
     def _end_event(self, ts: datetime, force: bool = False) -> None:
         ev = self._active_event

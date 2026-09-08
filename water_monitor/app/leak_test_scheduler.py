@@ -56,6 +56,12 @@ TERMINAL_RESULTS = {
     "Aborted — device restarted mid-test",
 }
 
+# dev57 (2.24) — the add-on's own dispatch failure. The firmware never saw the
+# request, so this is a "Not run", not a "Timed out": the `Not run` prefix is
+# what routers/history.py:classify_leak_test keys on for the neutral "Not run"
+# pill and the hist-row-skip styling.
+LEAK_TEST_START_FAILED = "Not run — failed to start (device unreachable)"
+
 # Results that mean "a fixture was running, so this tells us nothing about a
 # leak" — the row is presented as an abort, not a failure. The firmware
 # reaches these three different ways: refusing to start (11), catching meter
@@ -606,7 +612,21 @@ class LeakTestScheduler:
 
         # --- Start the firmware leak test ---
         log.info("[%s] starting leak test (triggered_by=%s)", circuit, triggered_by)
-        await self._ha.turn_on(circuit_cfg.leak_test_switch)
+        # dev57 (2.24): turn_on() returns False when the HA service call did
+        # not succeed (no HTTP session, non-200, transport error). Discarding
+        # that bool meant a test that was never dispatched still entered the
+        # poll loop, sat out the full 60 s + duration + 2 min window, and was
+        # written to leak_test_history as "Timed out — no terminal result
+        # received" — an unrun test recorded as an inconclusive run. Report
+        # what actually happened instead, and skip the pointless wait.
+        started = await self._ha.turn_on(circuit_cfg.leak_test_switch)
+        if not started:
+            log.error("[%s] leak test could not be started — HA service call "
+                      "for %s failed", circuit, circuit_cfg.leak_test_switch)
+            result = LEAK_TEST_START_FAILED
+            await self._store_result(circuit, run_at, triggered_by, result,
+                                     None, None, None, None)
+            return {"result": result, "skipped": True}
 
         # Wait for result — firmware takes 60s settle + up to configured duration + 2min buffer.
         # Fetch the firmware-configured test duration from the HA sensor entity.

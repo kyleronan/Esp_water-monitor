@@ -46,5 +46,5 @@ exec python3 -m uvicorn app.main:app \
     --host 0.0.0.0 \
     --port 8765 \
     --no-proxy-headers \
-    --no-proxy-headers \n    --log-level "${UVICORN_LOG}" \
+    --log-level "${UVICORN_LOG}" \
     --no-access-log

@@ -34,6 +34,7 @@ from .cluster_metrics import ClusterMetrics
 from .learning_scheduler import LearningScheduler
 from .maturity_recheck import MaturityRecheck
 from .rise_corr_backfill import RiseCorrBackfill
+from .task_registry import spawn
 from .wf_repair_backfill import WfRepairBackfill
 
 log = logging.getLogger(__name__)
@@ -273,10 +274,16 @@ class Orchestrator:
         """, (enabled_int, enabled_int, now_iso, now_iso))
         self._db.commit()
 
-    def reload_presence_watcher(self) -> None:
-        """Re-subscribe after the user updates presence entity settings."""
+    async def reload_presence_watcher(self) -> None:
+        """Re-subscribe after the user updates presence entity settings.
+
+        dev57 (2.10): async because PresenceWatcher.reload() is — its profile
+        read now goes through run_db instead of touching the shared connection
+        from the request handler's thread. The one caller
+        (routers/settings.py presence_update) is already ``async def``.
+        """
         if self._presence_watcher:
-            self._presence_watcher.reload()
+            await self._presence_watcher.reload()
             log.info("Presence watcher reloaded")
 
     @property
@@ -302,11 +309,40 @@ class Orchestrator:
             return False
         return is_setup_complete(self._db)
 
+    # ── dev57 (2.10) — loop-safe wrappers for the three sync reloaders ──────
+    # reload_circuit_entities / _labels / _profiles each read the shared
+    # connection directly. That is correct when they are already ON the DB
+    # worker (_reload_config_and_roles_sync, and the `run_db(...)` call in
+    # start()), and a single-connection violation when a request handler calls
+    # them from the event loop — the same class of bug as dev46 (46a), which
+    # produced `sqlite3.InterfaceError: bad parameter or other API misuse` and
+    # 500'd the History page. The sync forms are KEPT (the DB-thread callers
+    # need them); loop-side callers use these.
+
+    async def reload_circuit_entities_async(self) -> None:
+        """``reload_circuit_entities`` on the DB worker. Call this from the loop."""
+        from .database import run_db
+        await run_db(self.reload_circuit_entities)
+
+    async def reload_circuit_labels_async(self) -> None:
+        """``reload_circuit_labels`` on the DB worker. Call this from the loop."""
+        from .database import run_db
+        await run_db(self.reload_circuit_labels)
+
+    async def reload_circuit_profiles_async(self) -> None:
+        """``reload_circuit_profiles`` on the DB worker. Call this from the loop."""
+        from .database import run_db
+        await run_db(self.reload_circuit_profiles)
+
     def reload_circuit_entities(self) -> None:
         """
         Re-load entity IDs from circuit_entity_map into the live
         CircuitConfig objects. Called after the setup wizard completes
         or after manual entity overrides.
+
+        SYNC — touches the shared connection. Only call this from the DB
+        worker thread; from the event loop use
+        ``reload_circuit_entities_async``.
         """
         if not self._db:
             return
@@ -823,6 +859,23 @@ class Orchestrator:
                              ul["suggested"] + ul["abstained"], ul["cleared"])
         except Exception as e:
             log.warning("startup reclassify/reprocess failed (non-fatal): %s", e)
+            # dev57 (2.33) — the OTHER half of the same bullet. The audit
+            # pointed at the boot-time handler (which only fires when this
+            # pass never got scheduled at all); this one is the likelier
+            # path, and it was worse: the failure was swallowed, the gate
+            # flag below was set anyway, and the very next line logged
+            # "background classification complete". Gate semantics are
+            # unchanged — the flag is a one-way latch nothing else sets, so
+            # withholding it would wedge the repair route and the study
+            # export shut for the process's life. Make it VISIBLE instead.
+            self.mark_subsystem_degraded(
+                "startup_reclassify", e,
+                detail="the background classification pass did not finish; "
+                       "fixture labels and exclusion verdicts were not "
+                       "refreshed this boot")
+            _pass_failed = True
+        else:
+            _pass_failed = False
 
         # dev44 — the startup cluster work (rebuild → reclassify → backfill)
         # runs against a snapshot of the DB taken at boot. Any repair that
@@ -838,7 +891,11 @@ class Orchestrator:
         # that touches cluster references has finished. Pages use the earlier
         # `startup_pages_ready` instead — a different question, honestly asked.
         self.startup_cluster_work_done = True
-        log.info("startup: background classification complete")
+        if _pass_failed:
+            log.warning("startup: background classification finished DEGRADED "
+                        "— fixture labels were not refreshed this boot")
+        else:
+            log.info("startup: background classification complete")
 
 
     async def run(self) -> None:
@@ -1022,6 +1079,19 @@ class Orchestrator:
             log.info("ClusterEngine initialised and wired to feature extractor")
         except Exception as e:
             log.error("ClusterEngine init failed (non-fatal): %s", e, exc_info=True)
+            # dev57 (2.33): "non-fatal" was doing a lot of work here. The
+            # engine stays None for the whole process, so the feature
+            # extractor's cluster_engine is never wired and EVERY subsequent
+            # event is stored with no cluster_id — silently, with the add-on
+            # reporting itself healthy. Record it so /health/detail says
+            # "warn" and names the subsystem. Deliberately NOT fatal: event
+            # detection, leak tests and auto-shutoff all work without
+            # clustering, and refusing to boot over it would be worse.
+            self._cluster_engine = None
+            self.mark_subsystem_degraded(
+                "cluster_engine", e,
+                detail="events will be stored unmatched (no cluster_id) "
+                       "until the add-on is restarted")
 
         # Auto-exclusion verdicts + label-trained fixture typing. Runs after the
         # cluster engine so matched_fixture_type reflects the newest user labels.
@@ -1081,8 +1151,26 @@ class Orchestrator:
             # The background pass never got scheduled, so nothing else will
             # ever set the cluster-work flag — release the repair/export gates
             # rather than wedging them shut for the process's lifetime.
+            #
+            # dev57 (2.33) — the flags STAY True, deliberately. Both are
+            # one-way latches that only this block and the background pass
+            # ever set; flipping them False here would leave the repair route,
+            # the study export and every page gate blocked until the operator
+            # restarts, with no path back. That trades a silent wrong answer
+            # for a silent dead UI, which is not an improvement.
+            #
+            # What was actually missing is that the failure left NO trace on
+            # any surface: readiness read "ready", /health/detail read "pass",
+            # and the precondition had not run. So keep the gates open and
+            # make the degradation visible instead — /health/detail now
+            # reports "warn" and names this subsystem plus the error.
             self.startup_pages_ready = True
             self.startup_cluster_work_done = True
+            self.mark_subsystem_degraded(
+                "startup_reclassify", e,
+                detail="exclusion verdicts and fixture labels were NOT "
+                       "refreshed this boot; readiness gates were released "
+                       "anyway so the UI stays usable")
 
         # Initialise daily/weekly volume baselines from HA history so that
         # the dashboard shows accurate totals from the first page load.
@@ -1176,6 +1264,28 @@ class Orchestrator:
             pass
         finally:
             await self._ha.__aexit__(None, None, None)
+
+    def mark_subsystem_degraded(self, name: str, exc: BaseException,
+                                *, detail: str = "") -> None:
+        """dev57 (2.33) — record a startup subsystem that failed, so it is
+        VISIBLE rather than merely logged as "non-fatal".
+
+        Writes the same record shape ``_supervise`` writes, into the same
+        ``worker_health`` dict, so ``GET /health/detail`` picks it up with no
+        change to main.py: the name lands in ``unhealthy`` and the endpoint's
+        overall status drops from "pass" to "warn".
+
+        ``state="crashed"`` (not "stopped") is deliberate — /health/detail
+        counts both as unhealthy, and "crashed" is the truthful one for a
+        subsystem that raised. ``restarts`` stays 0: nothing retries these.
+        """
+        h = self.worker_health.setdefault(
+            name, {"state": "starting", "restarts": 0,
+                   "last_error": None, "last_error_at": None})
+        h["state"] = "crashed"
+        h["last_error"] = "%s: %s%s" % (
+            type(exc).__name__, exc, (" — " + detail) if detail else "")
+        h["last_error_at"] = datetime.now(timezone.utc).isoformat()
 
     async def _supervise(self, name: str, coro_fn) -> None:
         """Run coro_fn() in a restart loop. A crash restarts after 5s.
@@ -1301,8 +1411,11 @@ class Orchestrator:
         # LOOP, so the pump-mode read cannot happen here. It moves into the
         # task that was already being spawned — no behaviour change, the
         # alert was always fired asynchronously.
-        asyncio.ensure_future(
-            self._low_pressure_alert_async(circuit, psi, name))
+        # dev57 (2.24): via task_registry.spawn — a bare ensure_future() here
+        # left the alert task with no strong reference, so the GC could drop
+        # a low-pressure alert mid-flight.
+        spawn(self._low_pressure_alert_async(circuit, psi, name),
+              name=f"low_pressure_alert[{circuit}]")
 
     async def _low_pressure_alert_async(self, circuit: str, psi: float,
                                         name: str) -> None:
@@ -1322,8 +1435,10 @@ class Orchestrator:
         if self._alert_manager is None:
             return
         name = self._circuit_display_name(circuit)
-        asyncio.ensure_future(self._alert_manager.alert_pump_low_pressure(
-            circuit, psi, kind, name))
+        # dev57 (2.24): strong ref — see _on_low_pressure_alert above.
+        spawn(self._alert_manager.alert_pump_low_pressure(
+                  circuit, psi, kind, name),
+              name=f"pump_fail_alert[{circuit}]")
 
     def note_winterize_cleared(self, circuit: str) -> None:
         """dev46 (46h) — start the post-winterization grace for ``circuit``.

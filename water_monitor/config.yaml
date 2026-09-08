@@ -60,6 +60,17 @@ ports_description:
 watchdog: "http://[HOST]:8765/health"
 options:
   log_level: "info"
+  # SEED VALUE ONLY — read on first setup, then ignored.
+  #
+  # The wizard stores the device it actually bound to in
+  # device_config.esp_device_name, and every reader prefers that row
+  # over this option (routers/setup.py). Editing this afterwards has no
+  # effect: to point the add-on at a different ESP, use
+  # Settings -> Re-run Setup.
+  #
+  # It is left writable rather than removed because it IS the value a
+  # first-time install searches for, and a fresh install with a
+  # renamed device needs to set it before the wizard runs.
   esp_device_name: "ESP Water Shut off"
   debug_capture_propagation: false
   dev_tools: false

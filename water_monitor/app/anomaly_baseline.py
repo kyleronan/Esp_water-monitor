@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -50,6 +51,11 @@ MIN_N_FOR_SHUTOFF = 30
 # for at least this many days since activation — earned trust before it can close
 # the user's water. Below this, shut-off levels degrade to notify.
 MIN_LIVE_DAYS_FOR_SHUTOFF = 7
+# §2.29 — 2oo3 voting for the shape (envelope) channel. At least this many of
+# {volume, duration, peak} must be usable before ``event_novelty`` scores at all;
+# below it the channel abstains. A 1-of-1 outlier used to read as novelty 1.0 →
+# severe → shut-off authorised, i.e. maximal confidence from minimal evidence.
+_MIN_METRICS_FOR_SHAPE = 2
 # Verdict flags that mark an event as already-known-not-real-water (or explicitly
 # excluded). Such an event is inert for anomaly scoring — it must never score or
 # shut off (a cross-talk pressure transient closing the main would be absurd).
@@ -347,41 +353,110 @@ def load_usage_baselines(conn: sqlite3.Connection, circuit: str,
     return data
 
 
+def _finite(v: Any) -> Optional[float]:
+    """§2.29 / MISRA C:2023 Dir 4.15 — validate at the BOUNDARY.
+
+    Returns ``v`` as a float when it is a real, finite number; ``None`` for
+    anything unusable (None, non-numeric, bool, NaN, ±inf).
+
+    A NaN must never reach an ordered comparison. IEEE 754 makes every ordered
+    comparison against NaN false, so whether a guard treats it as "in band" or
+    "out of band" is an accident of how the comparison happens to be written —
+    this module used to have it both ways (a NaN metric scored as *outside* and
+    could authorise a valve close, while a NaN volume scored as *not exceeding*
+    and suppressed the alert entirely). The fix is not to pick a side; it is to
+    stop the value at the boundary so both paths ABSTAIN.
+    """
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _usable_band(band: Any) -> Optional[Tuple[float, float]]:
+    """A stored envelope band as a finite (lo, hi) pair, or None when the band is
+    malformed (missing, too short, non-numeric, NaN/inf, or inverted)."""
+    if not isinstance(band, (list, tuple)) or len(band) < 2:
+        return None
+    lo, hi = _finite(band[0]), _finite(band[1])
+    if lo is None or hi is None or lo > hi:
+        return None
+    return lo, hi
+
+
 def event_novelty(features: Dict[str, Any],
                   baselines: Dict[str, Any]) -> Dict[str, Any]:
     """Score a typed event against its type's FROZEN envelope (read-only).
 
-    Returns ``{fixture_type, fits_baseline, novelty, outside}``:
-      * ``fits_baseline`` True when vol/dur/peak all fall inside the envelope,
-        False when any is outside, or None when there's no envelope for the type.
+    Returns ``{fixture_type, fits_baseline, novelty, outside, checked,
+    n_metrics, evidence, unusable}``:
+      * ``fits_baseline`` True when the usable metrics all fall inside the
+        envelope, False when any is outside, or None when unscorable.
       * ``novelty`` = fraction of checked metrics outside the band (0.0–1.0), or
-        None when unscorable. This is the hook the future leak/odd-usage detector
+        None when unscorable. This is the hook the leak/odd-usage detector
         consumes — it is NOT an alert by itself.
+      * ``evidence`` = the count WITH its denominator ("2 of 3"). A bare ratio
+        erases the information that says what the number is worth: 1/1 and 3/3
+        are both 1.0, and only one of them is evidence.
+
+    §2.29 — 2oo3 voting. ``novelty`` feeds the severe/shut-off threshold, so a
+    single populated metric with a single outlier used to yield novelty = 1.0 →
+    severe → shut-off authorised: *maximal* confidence from the weakest possible
+    evidence. At least ``_MIN_METRICS_FOR_SHAPE`` of {volume, duration, peak}
+    must be usable or the shape channel ABSTAINS (novelty None) rather than
+    scoring. With the existing shut-off threshold (0.80) an abstain floor of 2
+    also means severe requires ≥2 metrics actually exceeded — 2 of 2, or 3 of 3;
+    2 of 3 is 0.667, which notifies but cannot close the valve.
     """
     ftype = features.get("user_fixture_type") or features.get("matched_fixture_type")
     env = baselines.get(ftype) if ftype else None
-    if not env:
-        return {"fixture_type": ftype, "fits_baseline": None,
-                "novelty": None, "outside": []}
     checks = (("vol", "volume_litres"), ("dur", "duration_seconds"),
               ("peak", "peak_flow_lpm"))
+    n_metrics = len(checks)
+
+    def _abstain(checked: int, unusable: List[str]) -> Dict[str, Any]:
+        return {"fixture_type": ftype, "fits_baseline": None, "novelty": None,
+                "outside": [], "checked": checked, "n_metrics": n_metrics,
+                "evidence": f"abstained ({checked} of {n_metrics} usable)",
+                "unusable": unusable}
+
+    if not env:
+        return _abstain(0, [])
     checked = 0
     outside: List[str] = []
+    unusable: List[str] = []
     for ekey, fkey in checks:
-        band = env.get(ekey)
-        val = features.get(fkey)
-        # len(band) < 2 guard: a malformed/partial stored envelope band (e.g. an
-        # empty list) must skip, not raise IndexError on band[0]/band[1] below.
-        if band is None or len(band) < 2 or val is None:
+        # Boundary validation, both sides: a malformed/partial stored band (e.g.
+        # an empty list — the IndexError that broke rescore during retrain) and a
+        # non-finite value are BOTH unusable, and an unusable metric is skipped,
+        # never counted as evidence in either direction.
+        bounds = _usable_band(env.get(ekey))
+        raw = features.get(fkey)
+        val = _finite(raw)
+        if bounds is None or val is None:
+            if raw is not None and val is None:
+                unusable.append(ekey)      # present but not a finite number
             continue
         checked += 1
-        if not (band[0] <= float(val) <= band[1]):
+        if not (bounds[0] <= val <= bounds[1]):
             outside.append(ekey)
-    if checked == 0:
-        return {"fixture_type": ftype, "fits_baseline": None,
-                "novelty": None, "outside": []}
+    if unusable:
+        log.warning("novelty: %s metric(s) %s are present but not finite — "
+                    "excluded from scoring (they can neither raise nor suppress)",
+                    ftype, unusable)
+    if checked < _MIN_METRICS_FOR_SHAPE:
+        # Not enough independent evidence to vote. Abstain — a thin shape channel
+        # must never authorise an actuation, and must never mask one either.
+        log.debug("novelty: %s abstained — only %d of %d metric(s) usable "
+                  "(need %d)", ftype, checked, n_metrics, _MIN_METRICS_FOR_SHAPE)
+        return _abstain(checked, unusable)
     return {"fixture_type": ftype, "fits_baseline": not outside,
-            "novelty": round(len(outside) / checked, 3), "outside": outside}
+            "novelty": round(len(outside) / checked, 3), "outside": outside,
+            "checked": checked, "n_metrics": n_metrics,
+            "evidence": f"{len(outside)} of {checked}", "unusable": unusable}
 
 
 def _is_artifact(features: Dict[str, Any]) -> bool:
@@ -404,7 +479,22 @@ def _row_get(row, key, default=None):
 
 
 _INERT = {"score": None, "anomaly_type": None, "is_anomalous": False,
-          "is_severe": False, "shutoff_ok_severe": False, "shutoff_ok_any": False}
+          "is_severe": False, "shutoff_ok_severe": False, "shutoff_ok_any": False,
+          "data_quality": None, "shape_evidence": None}
+
+
+def _threshold(sens_row, key: str, default: float) -> float:
+    """A configured threshold, boundary-validated (§2.29). A NaN/inf/garbage
+    threshold silently disables the comparison it guards (every ordered
+    comparison against NaN is false), so fall back to the documented default
+    and say so, rather than running with a dead gate."""
+    raw = _row_get(sens_row, key, default)
+    v = _finite(raw)
+    if v is None:
+        log.warning("sensitivity_config.%s is not a finite number (%r) — using "
+                    "the default %s", key, raw, default)
+        return default
+    return v
 
 
 def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
@@ -420,6 +510,13 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
       * ``shutoff_ok_*`` — the firing signal is backed by a baseline fit from
         ≥ ``MIN_N_FOR_SHUTOFF`` events, so it may authorise a valve close. A thin /
         default baseline yields False → the response degrades to notify.
+      * ``data_quality`` — §2.29 DIAGNOSTIC channel: a '+'-joined tag naming the
+        input that could not be scored (``non_finite_volume``,
+        ``non_finite_metric``, ``thin_shape_evidence``), or None. Deliberately
+        SEPARATE from ``is_anomalous``/``is_severe``: per IEC 61511 degraded-mode
+        handling, unusable data must never authorise an actuation and must never
+        be folded into the leak alarm either — it abstains and reports itself.
+      * ``shape_evidence`` — the envelope vote with its denominator ("2 of 3").
 
     Inert (everything False/None) for artifact / excluded events, or when no
     baseline exists for the event. NEVER raises an alert or closes a valve — the
@@ -434,37 +531,63 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
     if features.get("phantom_suppression_averted"):
         return {"score": 1.0, "anomaly_type": "suppression_averted",
                 "is_anomalous": True, "is_severe": False,
-                "shutoff_ok_severe": False, "shutoff_ok_any": False}
+                "shutoff_ok_severe": False, "shutoff_ok_any": False,
+                "data_quality": None, "shape_evidence": None}
     if _is_artifact(features):
         return dict(_INERT)
 
     level = (_row_get(sens_row, "simple_level", "medium") or "medium")
-    score_alert = float(_row_get(sens_row, "score_alert", 0.60))
-    score_shutoff = float(_row_get(sens_row, "score_shutoff", 0.80))
-    p85 = _row_get(sens_row, "baseline_anomaly_p85")
-    p95 = _row_get(sens_row, "baseline_anomaly_p95")
-    p99 = _row_get(sens_row, "baseline_anomaly_p99")
+    score_alert = _threshold(sens_row, "score_alert", 0.60)
+    score_shutoff = _threshold(sens_row, "score_shutoff", 0.80)
+    # Percentiles are boundary-validated too: a non-finite stored percentile
+    # makes every ``eff_vol > p`` false, i.e. it silently disables the volume
+    # channel. Treat it as absent (unscorable) and say so.
+    p85 = _finite(_row_get(sens_row, "baseline_anomaly_p85"))
+    p95 = _finite(_row_get(sens_row, "baseline_anomaly_p95"))
+    p99 = _finite(_row_get(sens_row, "baseline_anomaly_p99"))
     notify_p = {"p85": p85, "p95": p95, "p99": p99}.get(
         _NOTIFY_PCT_BY_LEVEL.get(level, "p95"))
 
-    eff_vol = features.get("volume_litres_effective")
-    if eff_vol is None:
-        eff_vol = features.get("volume_litres")
-    eff_vol = float(eff_vol or 0.0)
+    # ── §2.29: the volume boundary ──────────────────────────────────────────────
+    # A non-finite volume used to make ``eff_vol > p`` false and suppress the leak
+    # alert ENTIRELY — the mirror image of the envelope path, where the same NaN
+    # counted as "outside" and could close the valve. Both now abstain, and bad
+    # data raises its OWN diagnostic instead of being folded into the alarm.
+    raw_vol = features.get("volume_litres_effective")
+    if raw_vol is None:
+        raw_vol = features.get("volume_litres")
+    dq: List[str] = []
+    if raw_vol is None:
+        eff_vol: Optional[float] = 0.0        # absent volume: scores as zero, as before
+    else:
+        eff_vol = _finite(raw_vol)
+        if eff_vol is None:
+            dq.append("non_finite_volume")
+            log.warning("anomaly scoring: event volume is not a finite number "
+                        "(%r) — the volume channel ABSTAINS (no alert, no "
+                        "shut-off) pending data repair", raw_vol)
 
     nov = event_novelty(features, baselines or {})
-    shape = nov.get("novelty")            # 0..1 or None (no envelope for the type)
+    shape = _finite(nov.get("novelty"))   # 0..1 or None (unscorable / abstained)
     outside = nov.get("outside") or []
+    if nov.get("unusable"):
+        dq.append("non_finite_metric")
+    if nov.get("checked", 0) and nov.get("novelty") is None:
+        dq.append("thin_shape_evidence")
 
-    vol_notify = notify_p is not None and eff_vol > float(notify_p)
-    vol_severe = p99 is not None and eff_vol > float(p99)
+    vol_scorable = eff_vol is not None
+    vol_notify = vol_scorable and notify_p is not None and eff_vol > notify_p
+    vol_severe = vol_scorable and p99 is not None and eff_vol > p99
     shape_notify = shape is not None and shape >= score_alert
     shape_severe = shape is not None and shape >= score_shutoff
 
     is_anomalous = vol_notify or shape_notify
     is_severe = vol_severe or shape_severe
     if not is_anomalous and not is_severe:
-        return dict(_INERT)
+        out = dict(_INERT)
+        out["data_quality"] = "+".join(dq) or None
+        out["shape_evidence"] = nov.get("evidence")
+        return out
 
     # ── Shut-off confidence gate — the firing signal must be WELL-FIT ────────────
     baseline_n = _row_get(sens_row, "baseline_anomaly_n")
@@ -482,4 +605,9 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
         reasons.append("envelope_" + "_".join(outside) if outside else "abnormal_shape")
     return {"score": round(score, 3), "anomaly_type": "+".join(reasons) or None,
             "is_anomalous": is_anomalous, "is_severe": is_severe,
-            "shutoff_ok_severe": shutoff_ok_severe, "shutoff_ok_any": shutoff_ok_any}
+            "shutoff_ok_severe": shutoff_ok_severe, "shutoff_ok_any": shutoff_ok_any,
+            # §2.29 — the count WITH its denominator ("2 of 3"), and a diagnostic
+            # channel for unusable input that is deliberately kept OUT of
+            # is_anomalous / is_severe so bad data can never masquerade as a leak.
+            "data_quality": "+".join(dq) or None,
+            "shape_evidence": nov.get("evidence")}

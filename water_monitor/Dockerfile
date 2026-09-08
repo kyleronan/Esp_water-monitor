@@ -23,6 +23,15 @@
 # the cluster engine could not run there either.
 FROM ghcr.io/home-assistant/base-debian:bookworm-2026.08.0
 
+# Supplied by the Home Assistant add-on builder from config.yaml's
+# `version`. Declared with no default ON PURPOSE: a default is just a
+# second copy of the version number, and a second copy is what drifted
+# (the label read 0.3.0 while the manifest read 0.3.1-dev56, with
+# nothing comparing them). An unset value on an ad-hoc local build is
+# an empty label, which is honest; the Supervisor reads config.yaml for
+# the version it actually acts on, never this label.
+ARG BUILD_VERSION
+
 ENV LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
@@ -88,4 +97,4 @@ LABEL \
     io.hass.name="Water Monitor" \
     io.hass.description="Intelligent water monitoring with fixture signature recognition" \
     io.hass.type="addon" \
-    io.hass.version="0.3.0"
+    io.hass.version="${BUILD_VERSION}"

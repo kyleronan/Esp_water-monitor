@@ -93,12 +93,22 @@ class PresenceWatcher:
 
         await self._evaluate(profile)
 
-    def reload(self) -> None:
+    async def reload(self) -> None:
         """
         Re-read config and re-subscribe.
         Call this after the user saves new presence settings.
+
+        dev57 (2.10): async, like its three siblings. This is called from
+        ``POST /settings/presence/update`` — i.e. from a request handler ON
+        THE EVENT LOOP — and it used to call ``_load_profile()`` directly,
+        touching the shared ``sqlite3.Connection`` from a second thread while
+        the DB worker could be mid-statement on it. That is exactly the
+        ``InterfaceError: bad parameter or other API misuse`` that dev46 (46a)
+        exists to prevent; see the header of database.py. The read now goes
+        through ``run_db`` like every other one.
         """
-        profile = self._load_profile()
+        from .database import run_db
+        profile = await run_db(self._load_profile)
         if not profile:
             return
         entities = self._parse_entities(profile.get("ha_presence_entities", ""))

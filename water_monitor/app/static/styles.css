@@ -1609,7 +1609,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: .05em;
-  color: var(--text-muted);
+  color: var(--text-3);
 }
 .wf-esp-badge {
   font-size: 0.65rem;
@@ -1634,7 +1634,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 .evt-modal-wf-meta {
   margin-top: 0.3rem;
   font-size: 0.68rem;
-  color: var(--text-muted);
+  color: var(--text-3);
   line-height: 1.45;
 }
 
@@ -2846,7 +2846,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 }
 .role-admin    { background: var(--green-bg, #e6f4ea); border-color: var(--green-border, #b7e1c4); color: var(--green-text, #1c6b35); }
 .role-operator { background: var(--amber-bg, #fdf3e2); border-color: var(--amber-border, #f0d3a0); color: var(--amber-text, #8a5a00); }
-.role-viewer   { background: var(--neutral-bg, #eef0f2); border-color: var(--border, #d7dbe0); color: var(--text-muted, #5b6470); }
+.role-viewer   { background: var(--surface-2); border-color: var(--border); color: var(--text-2); }
 .nav-role-badge {
   margin-left: auto;
   align-self: center;
@@ -2856,8 +2856,8 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   letter-spacing: .03em;
   padding: 2px 8px;
   border-radius: 999px;
-  background: var(--neutral-bg, #eef0f2);
-  color: var(--text-muted, #5b6470);
+  background: var(--surface-2);
+  color: var(--text-2);
 }
 .banner {
   border-radius: var(--radius-sm, 8px);

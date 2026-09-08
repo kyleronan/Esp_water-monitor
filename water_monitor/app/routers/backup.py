@@ -926,13 +926,13 @@ async def import_quick_restore(
                             status_code=500)
 
     try:
-        orch.reload_circuit_entities()
+        await orch.reload_circuit_entities_async()   # dev57 (2.10)
     except Exception as e:
         log.warning("Import reload: %s", e)
 
     # Reload circuit labels into the in-memory config
     try:
-        orch.reload_circuit_labels()
+        await orch.reload_circuit_labels_async()   # dev57 (2.10)
     except Exception as e:
         log.warning("Import reload labels: %s", e)
 

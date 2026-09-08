@@ -25,7 +25,9 @@ Enforcement is centralised in two places (defence in depth):
      *GET* routers (settings/backup/setup/…), which the method-based gate can't catch.
 
 This module is import-light (no DB / FastAPI app imports beyond the request type)
-so it stays unit-testable offline.
+so it stays unit-testable offline. The CSRF helpers at the bottom pull two pure
+HMAC functions out of ``database`` lazily, inside the call, so importing this
+module still costs nothing.
 """
 from __future__ import annotations
 
@@ -172,3 +174,86 @@ def require_operator(request: Request) -> None:
     if getattr(request.state, "role", VIEWER) not in (ADMIN, OPERATOR):
         from fastapi import HTTPException
         raise HTTPException(status_code=403, detail="Operator access required.")
+
+
+# ── CSRF token: OWASP "HMAC CSRF Token" recipe (unit 2.28) ────────────────────
+#
+# The MECHANISM is unchanged and deliberately so: signed double-submit is the
+# OWASP-recommended pattern (only the *naive* unsigned variant is deprecated),
+# and it needs no server-side state. What changed is the HMAC *message*.
+#
+# Before: message = session_id. The token was therefore a pure function of the
+# session cookie, i.e. one constant string for the cookie's whole 30-day life —
+# it appeared in every rendered page, every form, every fetch header, unchanged,
+# for a month.
+#
+# Now:    message = session_id + "!" + nonce, and the token is transmitted as
+#         "<nonce>.<hmac>". The nonce travels inside the token, so the server can
+#         still verify it with nothing but the secret and the cookie — the
+#         double-submit property (no server state) is preserved exactly.
+#
+# A fresh nonce is minted per request, so no two renders emit the same token.
+#
+# NOT included: OWASP's optional timestamp component. It would bound an
+# individual token's lifetime, but at the price of a hard expiry on any page
+# left open (a wall-mounted HA dashboard is a normal deployment here) for a
+# threat — a token leaked out of the page's own HTML — that the same-origin
+# sibling-add-on exposure documented in main.py makes moot anyway. The lever for
+# bounding token lifetime is ``main.SESSION_COOKIE_MAX_AGE``, which bounds the
+# session the token is tied to.
+CSRF_NONCE_BYTES = 16
+# The message separator is a character the nonce can never contain (the nonce is
+# hex, enforced by _CSRF_NONCE_RE below), so the message determines exactly one
+# (session_id, nonce) pair: a token for session "ab" + nonce "cd" can never also
+# be a valid token for session "abcd" + nonce "". Without a separator that
+# ambiguity would be real, since the cookie value is attacker-chosen.
+_CSRF_MSG_SEP = "!"
+_CSRF_TOKEN_SEP = "."
+# 8..64 hex chars: accepts our own 32-char nonce, rejects anything oversized
+# before it reaches the HMAC.
+_CSRF_NONCE_RE = re.compile(r"^[0-9a-f]{8,64}$")
+
+
+def _csrf_message(session_id: str, nonce: str) -> str:
+    return f"{session_id}{_CSRF_MSG_SEP}{nonce}"
+
+
+def issue_csrf_token(server_secret: str, session_id: str,
+                     nonce: str = "") -> str:
+    """Mint a CSRF token for ``session_id``.
+
+    Returns ``"<nonce>.<hmac>"``, or "" when there is no secret/session yet
+    (the pre-boot window — templates render an empty token and the middleware
+    rejects every mutation, which is fail-closed).
+
+    ``nonce`` is for tests only; production always mints a fresh one.
+    """
+    if not server_secret or not session_id:
+        return ""
+    if not nonce:
+        import secrets as _secrets
+        nonce = _secrets.token_hex(CSRF_NONCE_BYTES)
+    # Reuse database.derive_csrf_token rather than re-implementing the HMAC, so
+    # the two can never drift. Imported lazily to keep this module import-light.
+    from .database import derive_csrf_token
+    mac = derive_csrf_token(server_secret, _csrf_message(session_id, nonce))
+    return f"{nonce}{_CSRF_TOKEN_SEP}{mac}"
+
+
+def check_csrf_token(server_secret: str, session_id: str, token: str) -> bool:
+    """Verify a token minted by :func:`issue_csrf_token`. Fails closed.
+
+    Tokens in the pre-2.28 format (a bare HMAC with no nonce) are NOT accepted:
+    they have no separator, so they fall out at the split. A browser holding one
+    gets a single 403, and both the 403 page and ``app.js``'s fetch wrapper tell
+    it to reload — the same path already taken whenever the add-on restarts with
+    a tab open.
+    """
+    if not server_secret or not session_id or not token:
+        return False
+    nonce, sep, mac = token.partition(_CSRF_TOKEN_SEP)
+    if not sep or not _CSRF_NONCE_RE.match(nonce) or not mac:
+        return False
+    from .database import validate_csrf_token
+    return validate_csrf_token(
+        server_secret, _csrf_message(session_id, nonce), mac)

@@ -1,13 +1,13 @@
 """Device router — valve controls, thresholds, alert toggles, leak tests."""
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from ._helpers import coerce_int, ingress_redirect
 from ..circuit_compat import resolve_circuit
+from ..task_registry import spawn
 
 log = logging.getLogger(__name__)
 
@@ -163,13 +163,21 @@ async def valve_open(circuit: str, request: Request):
             status_code=404,
         )
     ok = await orch.ha.open_valve(cfg.valve_entity)
-    return JSONResponse({
-        "status": "ok" if ok else "error",
-        "entity_id": cfg.valve_entity,
-        "message": "Valve open command sent." if ok
-                   else f"Failed to open valve {cfg.valve_entity}. "
-                        "Check the addon log for details.",
-    })
+    # dev57 (2.33): 502, not 200. A failed HA round-trip is exactly the
+    # documented 502 case (_helpers.py) and the other four device routes
+    # already use it. Returning 200 with {"status":"error"} means every
+    # `fetch(...).ok` check, every automation, and every log scrape reads a
+    # valve command that never reached the hardware as a success.
+    return JSONResponse(
+        {
+            "status": "ok" if ok else "error",
+            "entity_id": cfg.valve_entity,
+            "message": "Valve open command sent." if ok
+                       else f"Failed to open valve {cfg.valve_entity}. "
+                            "Check the addon log for details.",
+        },
+        status_code=200 if ok else 502,
+    )
 
 
 @router.post("/valve/{circuit}/close")
@@ -187,13 +195,19 @@ async def valve_close(circuit: str, request: Request):
             status_code=404,
         )
     ok = await orch.ha.close_valve(cfg.valve_entity)
-    return JSONResponse({
-        "status": "ok" if ok else "error",
-        "entity_id": cfg.valve_entity,
-        "message": "Valve close command sent." if ok
-                   else f"Failed to close valve {cfg.valve_entity}. "
-                        "Check the addon log for details.",
-    })
+    # dev57 (2.33): 502 on failure — see valve_open above. This one matters
+    # most: a close is the safety action, and a silent 200 on a close that
+    # never happened is the worst possible lie this API can tell.
+    return JSONResponse(
+        {
+            "status": "ok" if ok else "error",
+            "entity_id": cfg.valve_entity,
+            "message": "Valve close command sent." if ok
+                       else f"Failed to close valve {cfg.valve_entity}. "
+                            "Check the addon log for details.",
+        },
+        status_code=200 if ok else 502,
+    )
 
 
 # ------------------------------------------------------------------
@@ -402,9 +416,21 @@ async def leaktest_run(circuit: str, request: Request):
 
     # Delegate to the scheduler — it triggers the switch, monitors the result
     # sensor, saves to leak_test_history, and sends the HA notification.
-    asyncio.create_task(
-        orch.leak_test_scheduler.run_now(circuit, triggered_by="manual")
-    )
+    #
+    # dev57 (2.24): via task_registry.spawn. A bare create_task() left the ONLY
+    # reference to this task with asyncio's weak set, so the GC was free to
+    # collect a running leak test mid-flight — while this handler had already
+    # told the operator "started". spawn() holds the strong reference and logs
+    # any exception the fire-and-forget task raises.
+    if spawn(orch.leak_test_scheduler.run_now(circuit, triggered_by="manual"),
+             name=f"leak_test_manual[{circuit}]") is None:
+        # No running loop — cannot happen under uvicorn, but never claim a
+        # test started when nothing was scheduled.
+        return JSONResponse(
+            {"status": "error",
+             "message": "Could not start the leak test — no event loop."},
+            status_code=503,
+        )
     log.info("Leak test scheduled via run_now for circuit=%s", circuit)
 
     return JSONResponse({

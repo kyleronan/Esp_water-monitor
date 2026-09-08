@@ -1384,13 +1384,20 @@ async def device_entity_update(request: Request):
             status_code=400,
         )
 
-    return JSONResponse({
-        "status": "ok" if ok else "error",
-        "entity_id": entity_id,
-        "value": value,
-        "message": "Updated." if ok
-                   else f"Failed to update {entity_id}. Check the addon log.",
-    })
+    # dev57 (2.33): 502 on failure — an HA round-trip that failed is the
+    # documented 502 case (_helpers.py), and the device router's fault-reset /
+    # trickle-reset / button routes already answer that way. A 200 here told
+    # the settings page the ESP had accepted a threshold it never received.
+    return JSONResponse(
+        {
+            "status": "ok" if ok else "error",
+            "entity_id": entity_id,
+            "value": value,
+            "message": "Updated." if ok
+                       else f"Failed to update {entity_id}. Check the addon log.",
+        },
+        status_code=200 if ok else 502,
+    )
 
 
 # ── Data retention ─────────────────────────────────────────────────────────
@@ -1532,7 +1539,7 @@ async def presence_update(request: Request):
         orch.db.commit()
 
     await run_db(_save)
-    orch.reload_presence_watcher()
+    await orch.reload_presence_watcher()   # dev57 (2.10) — now async
     return ingress_redirect(request, "/settings#away")
 
 # ── Display units ─────────────────────────────────────────────────────────────
@@ -1653,7 +1660,7 @@ async def circuit_rename(circuit: str, request: Request):
 
     from ..database import upsert_circuit_label
     await run_db(upsert_circuit_label, orch.db, circuit, display_name)
-    orch.reload_circuit_labels()
+    await orch.reload_circuit_labels_async()   # dev57 (2.10) — off the loop
 
     return JSONResponse({"status": "renamed", "circuit": circuit, "display_name": display_name})
 
@@ -1747,7 +1754,7 @@ async def circuit_type_update(circuit: str, request: Request):
         log.error("[%s] set_circuit_type failed: %s", circuit, exc)
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
 
-    orch.reload_circuit_profiles()
+    await orch.reload_circuit_profiles_async()   # dev57 (2.10) — off the loop
     log.info("[%s] circuit_type changed to %r", circuit, circuit_type)
 
     return JSONResponse({
