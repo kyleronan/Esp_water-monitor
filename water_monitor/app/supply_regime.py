@@ -587,17 +587,40 @@ class SupplyRegimeTracker:
         self._db = db
         self._cfg = cfg
         self._settled_getter = settled_getter
-        self._ha_tz = ha_tz or timezone.utc
+        # 2.25 (e): a SEED, not the answer — see the _ha_tz property.
+        self._tz_seed = ha_tz
         self._alert_manager = alert_manager
         self._stop = asyncio.Event()
         self._bucket_day: Optional[str] = None
         self._bucket: List[float] = []
 
+    @property
+    def _ha_tz(self):
+        """The home timezone, read LIVE from the ``event_rules`` registry.
+
+        2.25 (e): this used to be a plain attribute snapshotted at __init__
+        (``ha_tz or timezone.utc``). Every other local-day surface in the addon
+        reads ``event_rules.get_home_timezone()``, which the orchestrator sets
+        once HA reports its zone — so whenever that detection landed AFTER this
+        worker was constructed the two silently disagreed, and this tracker
+        kept bucketing days, evaluating shifts and re-fitting bands on a
+        different calendar from the rest of the addon. Nothing reconciled them:
+        ``set_timezone`` had no callers anywhere in the tree.
+
+        The registry is therefore authoritative. The constructor argument and
+        ``set_timezone`` only supply a value for the window before detection
+        (and for tests); UTC remains the last resort, exactly as before.
+        """
+        from .event_rules import get_home_timezone
+        return get_home_timezone() or self._tz_seed or timezone.utc
+
     def stop(self) -> None:
         self._stop.set()
 
     def set_timezone(self, tz) -> None:
-        self._ha_tz = tz
+        """Set the pre-detection fallback zone. Once HA's timezone has been
+        detected the registry wins over this (see the _ha_tz property)."""
+        self._tz_seed = tz
 
     def _primary_circuit(self) -> Optional[str]:
         circuits = [c.circuit for c in self._cfg.circuits]

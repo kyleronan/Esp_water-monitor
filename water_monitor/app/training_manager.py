@@ -928,6 +928,12 @@ class TrainingManager:
                     ends_at = ends_at.replace(tzinfo=timezone.utc)
                 remaining_td   = max(ends_at - now, timedelta(0))
                 remaining_days = remaining_td.days
+                # NB `.seconds`, not `.total_seconds()`: days_remaining carries
+                # the whole-days component and this is the WITHIN-DAY hour
+                # remainder. settings.html / setup.html render the pair as
+                # "{{ days_remaining }}d {{ hours_remaining }}h"; total_seconds()
+                # here would print "3d 77h". Audited as a bug in 2.25 (d) and
+                # rejected — see test_remaining_over_24h_keeps_its_whole_days_component.
                 remaining_hours = remaining_td.seconds // 3600
                 total_days = state_row["calibration_days"] or 14
                 time_pct = min(100, int(elapsed_days / max(total_days, 1) * 100))
@@ -989,6 +995,8 @@ class TrainingManager:
 
             remaining_td = max(ends_at - now, timedelta(0))
             result["days_remaining"]  = remaining_td.days
+            # Paired within-day remainder — see the note in
+            # _publish_training_status above. NOT a .total_seconds() bug.
             result["hours_remaining"] = remaining_td.seconds // 3600
             # Percent complete is purely time-based — events_collected
             # / minimum_events is an internal metric and doesn't affect
