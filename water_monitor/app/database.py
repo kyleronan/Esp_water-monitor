@@ -4071,12 +4071,21 @@ def get_recent_events(
         else:
             conditions.append("e.id IN (%s)" % ",".join("?" * len(_ids)))
             params.extend(_ids)
+    # date_from / date_to are LOCAL calendar days from the History filter bar;
+    # start_ts is stored UTC. Comparing them directly shifts the window by the
+    # UTC offset — in Denver that returned the previous evening from 18:00 and
+    # cut the selected day off at 17:59, which is what a user saw when 9/2
+    # showed 9/1 events and hid an 18:49 draw. local_day_bounds_utc has existed
+    # for this since dev36 and is DST-correct (a spring-forward day is 23 h
+    # wide); the unification reached daily_summary and the dashboard tile but
+    # never this filter. Half-open [lo, hi) — matching the helper's contract,
+    # and it uses the index instead of scanning.
     if date_from:
         conditions.append("e.start_ts >= ?")
-        params.append(date_from)
+        params.append(local_day_bounds_utc(date_from)[0])
     if date_to:
-        conditions.append("e.start_ts <= ?")
-        params.append(date_to + "T23:59:59")
+        conditions.append("e.start_ts < ?")
+        params.append(local_day_bounds_utc(date_to)[1])
     if dur_min_s is not None:
         conditions.append("e.duration_seconds >= ?")
         params.append(dur_min_s)
@@ -4209,12 +4218,21 @@ def count_not_real_events(
     legitimate state."""
     conditions = ["e.circuit = ?", _NOT_REAL_SQL]
     params: list = [circuit]
+    # date_from / date_to are LOCAL calendar days from the History filter bar;
+    # start_ts is stored UTC. Comparing them directly shifts the window by the
+    # UTC offset — in Denver that returned the previous evening from 18:00 and
+    # cut the selected day off at 17:59, which is what a user saw when 9/2
+    # showed 9/1 events and hid an 18:49 draw. local_day_bounds_utc has existed
+    # for this since dev36 and is DST-correct (a spring-forward day is 23 h
+    # wide); the unification reached daily_summary and the dashboard tile but
+    # never this filter. Half-open [lo, hi) — matching the helper's contract,
+    # and it uses the index instead of scanning.
     if date_from:
         conditions.append("e.start_ts >= ?")
-        params.append(date_from)
+        params.append(local_day_bounds_utc(date_from)[0])
     if date_to:
-        conditions.append("e.start_ts <= ?")
-        params.append(date_to + "T23:59:59")
+        conditions.append("e.start_ts < ?")
+        params.append(local_day_bounds_utc(date_to)[1])
     if since_ts:
         conditions.append("e.start_ts >= ?")
         params.append(since_ts)

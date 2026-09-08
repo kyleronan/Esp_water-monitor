@@ -355,7 +355,7 @@
     <span class="hist-summary-value">{{ ns.total_vol | round(vol_decimals) }} {{ vol_unit or 'L' }}</span>
   </div>
   <div class="hist-summary-item">
-    <span class="hist-summary-label">Events ({% if using_range %}filtered, newest {{ default_limit }}{% else %}recent {{ default_limit }}{% endif %})</span>
+    <span class="hist-summary-label">Events ({% if using_range %}filtered{% else %}recent {{ default_limit }} each{% endif %})</span>
     <span class="hist-summary-value">{{ ns.total_events }}</span>
   </div>
   <div class="hist-summary-item">
@@ -576,7 +576,11 @@
     Recent Events
     <span class="hist-event-count">
       — {{ ch.event_count }} event{{ 's' if ch.event_count != 1 else '' }}
-      (most recent {{ default_limit }})
+      {# Only claim a cap when the list ACTUALLY hit it. Saying
+         "47 events (most recent 100)" reads as though the list were
+         cut short when it was not — the condition is truncation, not
+         whether a date filter is set. #}
+      {% if ch.event_count >= default_limit %}(most recent {{ default_limit }}){% endif %}
     </span>
   </h3>
   {# Rows the "Hide not-real-use events" setting removed never vanish without a
