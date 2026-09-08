@@ -537,12 +537,17 @@ def _collect_circuit_history_sync(
                 db, circuit_cfg.circuit,
                 date_from=date_from or None,
                 date_to=date_to or None,
-                # The visible list is now capped in BOTH branches (the
-                # date-range case no longer lifts the LIMIT), so the
-                # oldest displayed row is the right floor either way —
-                # which is what count_not_real_events' own docstring
-                # says since_ts is for. ANDed with the date bounds.
-                since_ts=(events[-1]["start_ts"] if events else None),
+                # Floor the count at the oldest visible row ONLY when the
+                # list was actually truncated. The condition is truncation,
+                # not "is there a date range": if every matching row is on
+                # screen, a hidden row OLDER than the oldest visible one is
+                # still inside what the user asked for, and flooring would
+                # undercount it. Verified against a real 12 h window — 27
+                # events, the oldest of which is hidden, so the badge read 5
+                # instead of 6.
+                since_ts=(events[-1]["start_ts"]
+                          if events and len(events) >= DEFAULT_EVENT_LIMIT
+                          else None),
             )
         # Display-time signature upgrade: historical events store a 32-pt
         # signature, but many carry a hi-res event_waveforms envelope with real
