@@ -640,7 +640,34 @@ def save(art: Artifact, data_dir: str) -> str:
         except OSError:
             pass
         raise
+    # A retrain supersedes any earlier refusal. The (mtime, size) key would
+    # normally notice on its own, but not if a coarse-resolution filesystem
+    # reports the same mtime AND the new artifact happens to be the same size
+    # — and the cost of that miss is the tier staying dark until a restart.
+    forget_refusals()
     return path
+
+
+
+# Artifacts we have already judged and refused, keyed by path -> (mtime_ns,
+# size). load() is called PER EVENT (database.py, feature_extractor.py), so
+# without this a refused artifact is re-opened, re-parsed and re-verified for
+# every classification — and, as first deployed, re-logged at ERROR each time:
+# hundreds of identical lines a minute during a reclassify, drowning the log
+# the operator needs to see the actual refusal in. The stat key means a
+# retrain (which writes a NEW file) is picked up immediately, so this caches
+# the VERDICT, never the file.
+_REFUSED: Dict[str, Tuple[int, int]] = {}
+
+
+def _stat_key(path: str) -> Tuple[int, int]:
+    st = os.stat(path)
+    return (st.st_mtime_ns, st.st_size)
+
+
+def forget_refusals() -> None:
+    """Drop the refusal cache (called after a successful train/save)."""
+    _REFUSED.clear()
 
 
 def load(data_dir: str, circuit: str, allow_previous: bool = True
@@ -659,6 +686,14 @@ def load(data_dir: str, circuit: str, allow_previous: bool = True
         if not os.path.exists(path):
             continue
         try:
+            stat_key = _stat_key(path)
+        except OSError:
+            continue
+        if _REFUSED.get(path) == stat_key:
+            # Already judged, and the file has not changed since. Silent by
+            # design: the reason was logged once when the verdict was reached.
+            continue
+        try:
             with open(path, encoding="utf-8") as fh:
                 art = Artifact.from_json(json.load(fh))
             if art.feature_set_version != FEATURE_SET_VERSION:
@@ -671,14 +706,26 @@ def load(data_dir: str, circuit: str, allow_previous: bool = True
             # corruption: say so plainly, because the operator's next step
             # (retrain) differs from "the file is truncated".
             if not verify_signature(art, data_dir):
-                log.error(
-                    "tinymodel artifact %s is %s — refusing to load its "
-                    "model payload. Retrain to install a signed artifact.",
-                    path,
-                    "unsigned (written before artifact signing existed, or "
-                    "placed there by something else)" if not art.model_signature
-                    else "signed by a DIFFERENT key or has been modified since "
-                         "it was written")
+                _REFUSED[path] = stat_key
+                if not art.model_signature:
+                    # An artifact written before signing existed. This is an
+                    # EXPECTED upgrade state, not a fault: it self-heals on the
+                    # next retrain, and the k-NN/fingerprint rungs keep serving
+                    # meanwhile (staged bootstrap). WARNING, not ERROR — an
+                    # ERROR here trains the operator to ignore the level that a
+                    # real tamper below needs.
+                    log.warning(
+                        "tinymodel artifact %s predates artifact signing — the "
+                        "TinyModel tier is skipped for this circuit until the "
+                        "next retrain writes a signed one. The other tiers are "
+                        "unaffected. Logged once per artifact.", path)
+                else:
+                    # A signature that is present and WRONG is a different
+                    # claim: a foreign artifact or a modified one.
+                    log.error(
+                        "tinymodel artifact %s is signed by a DIFFERENT key or "
+                        "has been modified since it was written — refusing to "
+                        "load its model payload.", path)
                 continue
             # The hash must also still describe the bytes: a payload swap that
             # left model_hash alone would otherwise keep every verdict keyed to
@@ -686,16 +733,26 @@ def load(data_dir: str, circuit: str, allow_previous: bool = True
             expected = _model_hash(art.label_pool_hash, art.classes,
                                    art.threshold, _blob_digest(art.model_blob))
             if art.model_hash != expected:
+                _REFUSED[path] = stat_key
                 log.error("tinymodel artifact %s does not match its own "
                           "model_hash (%s != %s) — refusing it", path,
                           art.model_hash, expected)
                 continue
             art._trusted = True
+            _REFUSED.pop(path, None)
             if is_prev:
                 log.warning("serving the PREVIOUS tinymodel artifact for %s "
                             "(current one failed to load)", circuit)
             return art
         except Exception as exc:
+            # Cached for the same reason as the refusals above: this branch is
+            # also on the per-event path, so a corrupt or shape-changed
+            # artifact would otherwise be re-parsed and re-logged for every
+            # classification.
+            try:
+                _REFUSED[path] = _stat_key(path)
+            except OSError:
+                pass
             log.warning("tinymodel artifact %s unreadable (%s)", path, exc)
     return None
 
