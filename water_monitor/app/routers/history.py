@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -17,6 +18,10 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/history")
 
 DEFAULT_EVENT_LIMIT = 100
+# Ceiling for the caller-supplied ?limit= on the JSON route. Every DB
+# call goes through the single serialized executor, so an unbounded
+# limit is a process-wide stall, not just a slow response.
+MAX_EVENT_LIMIT = 1000
 
 
 def _orch(r): return r.app.state.orchestrator
@@ -969,6 +974,34 @@ async def events_api(
 ):
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
+    # The plan wants this route DELETED — it has zero callers inside the
+    # add-on. That is blocked on a fact the codebase does not contain: whether
+    # an HA automation, Node-RED flow or curl habit calls it. Until that is
+    # answered the treatment is to HARDEN, not remove.
+    #
+    # `limit` arrives straight from the query string with no ceiling, and
+    # every DB call runs on the single serialized executor — so one
+    # ?limit=999999 stalls page renders process-wide for every open tab.
+    # NOT `int(limit or DEFAULT_EVENT_LIMIT)`: 0 is falsy, so `or` would
+    # turn an explicit ?limit=0 back into 100 — the same falsy-default
+    # slip that puts a stored 0 back to 2 on the shutoff cap. FastAPI
+    # already supplies the default when the parameter is absent, so the
+    # only job here is the range.
+    limit = max(1, min(int(limit), MAX_EVENT_LIMIT))
+    # A malformed bound used to be an inert string comparison. Now that it
+    # is parsed into a UTC window it has to be checked, and checked HERE —
+    # the DB layer drops what it cannot parse, which silently widens the
+    # result set rather than telling the caller their filter is wrong.
+    for name, raw in (("date_from", date_from), ("date_to", date_to)):
+        if not raw:
+            continue
+        try:
+            datetime.strptime(raw, "%Y-%m-%d")
+        except ValueError:
+            return JSONResponse(
+                {"error": "bad_date",
+                 "message": f"{name} must be a real date as YYYY-MM-DD"},
+                status_code=400)
     from ..database import get_recent_events, run_db
     events = await run_db(                                    # dev46 (46a)
         get_recent_events, orch.db, circuit,

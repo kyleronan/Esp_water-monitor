@@ -2369,6 +2369,31 @@ _NOTE_KIND_SQL: Dict[str, str] = {
 }
 
 
+
+def _local_day_bound_or_none(day, which: int):
+    """One end of a LOCAL day as a UTC bound, or None if it cannot be parsed.
+
+    These bounds come from the History filter bar as local calendar days while
+    ``start_ts`` is stored UTC, so they must go through local_day_bounds_utc()
+    — comparing them raw shifted the window by the UTC offset and hid every
+    event after 18:00 in Denver.
+
+    But local_day_bounds_utc() RAISES on a malformed day, and the value is
+    user-supplied (``?date_from=`` on the JSON route is unvalidated), so
+    routing it there turned a previously harmless bad filter into a 500. An
+    unparseable FILTER is not a safety verdict: dropping the bound widens the
+    result set, which is visible and recoverable, whereas a 500 is neither.
+    Log it and carry on; the route layer is where a bad date earns a 4xx.
+    """
+    if not day:
+        return None
+    try:
+        return local_day_bounds_utc(day)[which]
+    except (ValueError, TypeError) as exc:
+        log.warning("ignoring unparseable date bound %r (%s)", day, exc)
+        return None
+
+
 def get_recent_events(
     conn: sqlite3.Connection,
     circuit: str,
@@ -2476,12 +2501,14 @@ def get_recent_events(
     # wide); the unification reached daily_summary and the dashboard tile but
     # never this filter. Half-open [lo, hi) — matching the helper's contract,
     # and it uses the index instead of scanning.
-    if date_from:
+    lo_bound = _local_day_bound_or_none(date_from, 0)
+    if lo_bound is not None:
         conditions.append("e.start_ts >= ?")
-        params.append(local_day_bounds_utc(date_from)[0])
-    if date_to:
+        params.append(lo_bound)
+    hi_bound = _local_day_bound_or_none(date_to, 1)
+    if hi_bound is not None:
         conditions.append("e.start_ts < ?")
-        params.append(local_day_bounds_utc(date_to)[1])
+        params.append(hi_bound)
     if dur_min_s is not None:
         conditions.append("e.duration_seconds >= ?")
         params.append(dur_min_s)
@@ -2623,12 +2650,14 @@ def count_not_real_events(
     # wide); the unification reached daily_summary and the dashboard tile but
     # never this filter. Half-open [lo, hi) — matching the helper's contract,
     # and it uses the index instead of scanning.
-    if date_from:
+    lo_bound = _local_day_bound_or_none(date_from, 0)
+    if lo_bound is not None:
         conditions.append("e.start_ts >= ?")
-        params.append(local_day_bounds_utc(date_from)[0])
-    if date_to:
+        params.append(lo_bound)
+    hi_bound = _local_day_bound_or_none(date_to, 1)
+    if hi_bound is not None:
         conditions.append("e.start_ts < ?")
-        params.append(local_day_bounds_utc(date_to)[1])
+        params.append(hi_bound)
     if since_ts:
         conditions.append("e.start_ts >= ?")
         params.append(since_ts)
