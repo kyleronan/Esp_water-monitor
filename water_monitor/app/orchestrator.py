@@ -23,7 +23,7 @@ from .device_discovery import (load_circuit_entities, is_setup_complete,
                                 get_device_config, rescan_optional_roles,
                                 setup_complete_epoch)
 from .event_detector import EventDetector
-from .feature_extractor import FeatureExtractor
+from .feature_extractor_service import FeatureExtractor
 from .ha_client import HaClient
 from .leak_test_scheduler import LeakTestScheduler
 from .training_manager import TrainingManager
