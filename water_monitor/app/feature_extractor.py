@@ -1790,6 +1790,94 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     )
 
 
+# ── Batch-pass driver for the zeroing-verdict sweeps (unit 6.4) ──────────────
+# Five passes below re-derive a VOLUME-ZEROING verdict over stored events and
+# were, line for line, the same walk: skip pump-gated circuits, re-run the
+# canonical detector (the SQL is only ever a prefilter), write the verdict in
+# the row's OWN transaction, zero the ledger through the §2.5
+# ``apply_effective_volume`` chokepoint, count it, remember the home-local day,
+# then rebuild each affected day's summary once and commit.
+#
+# The driver owns ONLY that mechanism. Each pass still supplies its own
+# candidate query, its own canonical predicate, its own SET clause and its own
+# counters/log lines, and the passes are never merged into one another: they
+# are separate verdicts and stay separately auditable. Two behaviours are
+# deliberately NOT generalised here — the bidirectional dribble scan (which
+# also RESTORES volume) and the relabel-repair scan (which restores rather than
+# zeroes) keep their own loops.
+#
+# Rule N2a: one write = one transaction ending in its own commit. The per-row
+# ``transaction(conn)`` below is exactly that, and is what lets a user's label
+# save win the write lock between rows — so this driver must never be
+# "simplified" into a single transaction around the whole walk.
+
+def _pump_gate_blocks(conn, row, label: str) -> bool:
+    """True when a sweep must SKIP ``row`` on pump-gate grounds (dev25/§2.29).
+
+    In confirmed vfd pump mode the pressure-silent and rise-phantom premises
+    are false (a real draw on a recharge upswing looks like both), so the live
+    path routes those through the pump_recharge absorber and the sweep must not
+    re-apply the verdict out-of-band. If the gate cannot be EVALUATED we do not
+    know whether the premise holds, and unusable data must not authorise the
+    destructive action — skip loudly and keep the volume.
+    """
+    try:
+        from .config import pump_gates_active as _pga_sweep
+        return bool(_pga_sweep(conn, row["circuit"]))
+    except Exception as e:   # noqa: BLE001
+        log.warning("[%s] %s sweep: pump-gate check failed for event %s (%s) "
+                    "— SKIPPING the row, volume kept (re-run the sweep once "
+                    "the pump state is readable)",
+                    row["circuit"], label, row["id"], e)
+        return True
+
+
+def _sweep_zeroing_verdict(conn, rows, *, detect, set_sql, set_params=None,
+                           pump_gate=None, on_flag=None, veff_key=None):
+    """Walk ``rows``, applying one zeroing verdict. See the block comment above.
+
+    ``detect(row)``      canonical predicate; the SQL is only a prefilter.
+    ``set_sql``          the UPDATE's SET clause body (no ``WHERE``).
+    ``set_params(row)``  params for ``set_sql``'s placeholders, if any.
+    ``pump_gate``        sweep label enabling the dev25 pump-gate skip.
+    ``on_flag(row)``     per-row logging, called after the row is counted.
+    ``veff_key``         row key whose value accumulates into ``litres``.
+
+    Returns ``(flagged, litres, days)`` — ``days`` is the set of
+    ``(circuit, home-local day)`` pairs whose summary was rebuilt.
+    """
+    from .database import (transaction, compute_daily_summary,
+                           apply_effective_volume, local_day_of)
+    flagged = 0
+    litres = 0.0
+    days: set = set()
+    for row in rows:
+        if pump_gate and _pump_gate_blocks(conn, row, pump_gate):
+            continue
+        if not detect(row):
+            continue
+        params = tuple(set_params(row)) if set_params else ()
+        with transaction(conn):
+            conn.execute("UPDATE events SET " + set_sql + " WHERE id = ?",
+                         params + (row["id"],))
+            # §2.5 — zero the ledger contribution via the one chokepoint.
+            apply_effective_volume(conn, row["id"], row["circuit"],
+                                   row["start_ts"], 0)
+        flagged += 1
+        if veff_key:
+            litres += float(row[veff_key] or 0.0)
+        day = local_day_of(row["start_ts"])
+        if day:
+            days.add((row["circuit"], day))
+        if on_flag:
+            on_flag(row)
+    for circ, day in days:
+        compute_daily_summary(conn, circ, day)
+    if flagged:
+        conn.commit()
+    return flagged, litres, days
+
+
 def backfill_silent_exclusion_reasons(conn: sqlite3.Connection) -> dict:
     """dev51 (Phase 5) — give every excluded-without-reason row a reason.
 
@@ -2130,55 +2218,35 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
         dur_params + (_PHANTOM_MAX_DELTA_PSI,),
     ).fetchall()
 
-    flagged = 0
-    affected_days: set = set()   # (circuit, 'YYYY-MM-DD') to recompute
-    for row in rows:
-        # Re-run the canonical detector rather than trusting the SQL filter
-        # alone — keeps the threshold logic in one place and guards bad data.
-        if not _detect_pressure_restoration_phantom(
+    # The driver re-runs the canonical detector rather than trusting the SQL
+    # prefilter — thresholds stay in one place and bad data is guarded — and
+    # recomputes the daily_summary for every affected day so the History
+    # charts/totals shed the false volume immediately (compute_daily_summary
+    # reads volume_litres_effective, which the driver just zeroed; the hourly
+    # ledger was already corrected by its per-event reversal).
+    flagged, _litres, affected_days = _sweep_zeroing_verdict(
+        conn, rows,
+        detect=lambda row: _detect_pressure_restoration_phantom(
             row["duration_seconds"], row["pressure_delta_psi"],
             true_avg_flow_lpm=(row["true_avg_flow_lpm"] if has_af else None),
             flow_integral_litres=(row["flow_integral_litres"] if has_af else None),
             flow_on_ratio=(row["flow_on_ratio"] if has_af else None),
-        ):
-            continue
-
-        with transaction(conn):
-            conn.execute(
-                "UPDATE events SET "
-                "  is_pressure_restoration_phantom = 1, "
-                "  is_cross_talk = 0, is_low_flow_dribble = 0, "   # phantom has precedence
-                "  volume_litres_effective = 0, "
-                "  volume_estimation_method = 'pressure_restoration_phantom', "
-                "  excluded_from_training = 1, "
-                "  match_rejection_reason = 'pressure_restoration_phantom' "
-                "WHERE id = ?",
-                (row["id"],),
-            )
-            # §2.5 — zero the ledger contribution via the one chokepoint.
-            apply_effective_volume(conn, row["id"], row["circuit"], row["start_ts"], 0)
-
-        flagged += 1
-        day = local_day_of(row["start_ts"])   # HOME-LOCAL day of the UTC ts
-        if day:
-            affected_days.add((row["circuit"], day))
-        log.info(
+        ),
+        set_sql=("  is_pressure_restoration_phantom = 1, "
+                 "  is_cross_talk = 0, is_low_flow_dribble = 0, "  # phantom wins
+                 "  volume_litres_effective = 0, "
+                 "  volume_estimation_method = 'pressure_restoration_phantom', "
+                 "  excluded_from_training = 1, "
+                 "  match_rejection_reason = 'pressure_restoration_phantom' "),
+        on_flag=lambda row: log.info(
             "phantom-reprocess: event %s flagged (duration=%.0fs ΔP=%.2f); "
             "reversed %.3f L from hourly bucket %s",
             row["id"], row["duration_seconds"] or 0.0,
             row["pressure_delta_psi"] or 0.0,
             float(row["hourly_volume_applied_litres"] or 0.0),
             row["hourly_volume_applied_bucket"],
-        )
-
-    # Recompute the daily_summary for every affected day so the History
-    # charts/totals shed the false volume immediately (compute_daily_summary
-    # now reads volume_litres_effective, which we just zeroed). hourly_volume
-    # was already corrected by the per-event reversal above.
-    for circ, day in affected_days:
-        compute_daily_summary(conn, circ, day)
-    if affected_days:
-        conn.commit()
+        ),
+    )
 
     if flagged:
         log.info("phantom-reprocess: flagged %d event(s) total across %d day(s)",
@@ -2327,33 +2395,17 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             (_XTALK_MIN_DURATION_S, _PHANTOM_MAX_FLOW_INTEGRAL_L,
              _PHANTOM_MAX_FLOW_ON_RATIO, _PHANTOM_MAX_DELTA_PSI),
         ).fetchall()
-        for row in xrows:
-            # Re-run the canonical detector (SQL is only a prefilter).
-            if not _detect_cross_talk(
+        cross_talk_flagged, _litres, xt_days = _sweep_zeroing_verdict(
+            conn, xrows,
+            detect=lambda row: _detect_cross_talk(
                 row["duration_seconds"], row["pressure_delta_psi"],
-                row["flow_integral_litres"], row["flow_on_ratio"]
-            ):
-                continue
-            with transaction(conn):
-                conn.execute(
-                    "UPDATE events SET "
-                    "  is_cross_talk = 1, is_low_flow_dribble = 0, "   # xtalk has precedence
-                    "  volume_litres_effective = 0, "
-                    "  volume_estimation_method = 'cross_talk', "
-                    "  excluded_from_training = 1, "
-                    "  match_rejection_reason = 'cross_talk' "
-                    "WHERE id = ?",
-                    (row["id"],),
-                )
-                # §2.5 — zero the ledger contribution via the one chokepoint.
-                apply_effective_volume(conn, row["id"], row["circuit"],
-                                       row["start_ts"], 0)
-            cross_talk_flagged += 1
-            day = local_day_of(row["start_ts"])
-            if day:
-                xt_days.add((row["circuit"], day))
-        for circ, day in xt_days:
-            compute_daily_summary(conn, circ, day)
+                row["flow_integral_litres"], row["flow_on_ratio"]),
+            set_sql=("  is_cross_talk = 1, is_low_flow_dribble = 0, "  # xtalk wins
+                     "  volume_litres_effective = 0, "
+                     "  volume_estimation_method = 'cross_talk', "
+                     "  excluded_from_training = 1, "
+                     "  match_rejection_reason = 'cross_talk' "),
+        )
         if cross_talk_flagged:
             conn.commit()
             log.info("cross-talk-reprocess: flagged %d event(s) across %d day(s)",
@@ -2397,29 +2449,12 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             (_PSILENT_MAX_CORR, _PSILENT_MAX_DELTA_PSI,
              _PSILENT_MAX_DURATION_S, _PSILENT_MAX_VOLUME_L),
         ).fetchall()
-        for row in psrows:
-            # dev25: in confirmed vfd pump mode this detector's premise is
-            # false (a real draw during a recharge upswing can look
-            # pressure-silent) — the live path skips it, so the sweep must
-            # not re-apply it out-of-band.
-            try:
-                from .config import pump_gates_active as _pga_sweep
-                if _pga_sweep(conn, row["circuit"]):
-                    continue
-            except Exception as e:   # noqa: BLE001
-                # §2.29 — the gate exists BECAUSE a real draw during a recharge
-                # upswing can look pressure-silent. If it cannot be evaluated we
-                # do not know whether the premise holds, and unusable data must
-                # not authorise the destructive action (zeroing measured water).
-                # Skip the row with a loud diagnostic; volume is preserved.
-                log.warning("[%s] pressure-silent sweep: pump-gate check failed "
-                            "for event %s (%s) — SKIPPING the row, volume kept "
-                            "(re-run the sweep once the pump state is readable)",
-                            row["circuit"], row["id"], e)
-                continue
-            # Re-run the canonical detector (SQL is only a prefilter) — it adds
-            # the registration-floor requirement the SQL can't express per-circuit.
-            if not _detect_pressure_silent_flow(
+        # The driver's pump_gate carries the dev25/§2.29 skip, and its detect
+        # re-runs the canonical predicate (SQL is only a prefilter) — that adds
+        # the registration-floor requirement SQL can't express per-circuit.
+        psilent_flagged, ps_litres, ps_days = _sweep_zeroing_verdict(
+            conn, psrows, pump_gate="pressure-silent", veff_key="veff",
+            detect=lambda row: _detect_pressure_silent_flow(
                 row["duration_seconds"], row["volume_litres"],
                 row["pressure_delta_psi"], row["flow_pressure_corr"],
                 row["hpt"],
@@ -2427,30 +2462,16 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
                 peak_flow_lpm=row["peak_flow_lpm"],
                 avg_flow_lpm=row["avg_flow_lpm"],
                 min_flow_lpm=_circuit_min_flow(conn, row["circuit"]),
-            ):
-                continue
-            with transaction(conn):
-                conn.execute(
-                    "UPDATE events SET "
-                    "  is_pressure_restoration_phantom = 1, "
-                    "  is_cross_talk = 0, is_low_flow_dribble = 0, "
-                    "  volume_litres_effective = 0, "
-                    "  volume_estimation_method = ?, "
-                    "  excluded_from_training = 1, "
-                    "  match_rejection_reason = ? "
-                    "WHERE id = ?",
-                    (PRESSURE_SILENT_REASON, PRESSURE_SILENT_REASON, row["id"]),
-                )
-                # §2.5 — zero the ledger contribution via the one chokepoint.
-                apply_effective_volume(conn, row["id"], row["circuit"],
-                                       row["start_ts"], 0)
-            psilent_flagged += 1
-            ps_litres += float(row["veff"] or 0.0)
-            day = local_day_of(row["start_ts"])
-            if day:
-                ps_days.add((row["circuit"], day))
-        for circ, day in ps_days:
-            compute_daily_summary(conn, circ, day)
+            ),
+            set_sql=("  is_pressure_restoration_phantom = 1, "
+                     "  is_cross_talk = 0, is_low_flow_dribble = 0, "
+                     "  volume_litres_effective = 0, "
+                     "  volume_estimation_method = ?, "
+                     "  excluded_from_training = 1, "
+                     "  match_rejection_reason = ? "),
+            set_params=lambda row: (PRESSURE_SILENT_REASON,
+                                    PRESSURE_SILENT_REASON),
+        )
         if psilent_flagged:
             conn.commit()
             log.info("pressure-silent reprocess: flagged %d event(s) "
@@ -2664,9 +2685,6 @@ def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
 
     Returns ``{"rise_flagged": <n>}``.
     """
-    from .database import (transaction, compute_daily_summary,
-                           apply_effective_volume, local_day_of)
-
     if not _events_has_column(conn, "flow_pressure_corr"):
         return {"rise_flagged": 0}
 
@@ -2690,62 +2708,32 @@ def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
                                            # the detector applies the per-circuit one
     ).fetchall()
 
-    rise_flagged = 0
-    days: set = set()
-    for row in rows:
-        # dev25: sweep must not re-apply the rise-phantom verdict to circuits
-        # in confirmed vfd pump mode — the live path routes these through the
-        # pump_recharge absorber instead (a real draw on a recharge upswing
-        # earns positive corr and would be wrongly zeroed here).
-        try:
-            from .config import pump_gates_active as _pga_sweep
-            if _pga_sweep(conn, row["circuit"]):
-                continue
-        except Exception as e:   # noqa: BLE001
-            # §2.29 — same rule as the pressure-silent sweep above: an
-            # unevaluable pump gate must not fall through into zeroing real
-            # measured water. Skip the row loudly and keep the volume.
-            log.warning("[%s] rise-phantom sweep: pump-gate check failed for "
-                        "event %s (%s) — SKIPPING the row, volume kept "
-                        "(re-run the sweep once the pump state is readable)",
-                        row["circuit"], row["id"], e)
-            continue
-        # Re-run the canonical detector (SQL is only a prefilter) — single
-        # source of truth for the thresholds, and it re-rejects bad data.
-        # min_flow selects the meter-class volume cap (PD 2.5 L / turbine 1.0 L).
-        if not _detect_rising_pressure_phantom(
-                row["duration_seconds"], row["volume_litres"],
-                row["flow_pressure_corr"],
-                min_flow_lpm=_circuit_min_flow(conn, row["circuit"])):
-            continue
-        with transaction(conn):
-            conn.execute(
-                "UPDATE events SET "
-                "  is_pressure_restoration_phantom = 1, "
-                "  is_cross_talk = 0, is_low_flow_dribble = 0, "
-                "  volume_litres_effective = 0, "
-                "  volume_estimation_method = 'pressure_restoration_phantom', "
-                "  excluded_from_training = 1, "
-                "  match_rejection_reason = ? "
-                "WHERE id = ?",
-                (RISE_PHANTOM_REASON, row["id"]),
-            )
-            # §2.5 — zero the ledger contribution via the one chokepoint.
-            apply_effective_volume(conn, row["id"], row["circuit"],
-                                   row["start_ts"], 0)
-        rise_flagged += 1
-        day = local_day_of(row["start_ts"])
-        if day:
-            days.add((row["circuit"], day))
-        log.info("rise-phantom-reprocess: event %s flagged "
-                 "(corr=%+.2f dur=%.0fs vol=%.3f L)",
-                 row["id"], row["flow_pressure_corr"] or 0.0,
-                 row["duration_seconds"] or 0.0, row["volume_litres"] or 0.0)
-
-    for circ, day in days:
-        compute_daily_summary(conn, circ, day)
+    # pump_gate carries the dev25 skip (the live path routes a pump-era row
+    # through the pump_recharge absorber instead — a real draw on a recharge
+    # upswing earns positive corr and would be wrongly zeroed here) plus the
+    # §2.29 fail-closed rule. detect re-runs the canonical predicate — single
+    # source of truth for the thresholds, and it re-rejects bad data; min_flow
+    # selects the meter-class volume cap (PD 2.5 L / turbine 1.0 L).
+    rise_flagged, _litres, days = _sweep_zeroing_verdict(
+        conn, rows, pump_gate="rise-phantom",
+        detect=lambda row: _detect_rising_pressure_phantom(
+            row["duration_seconds"], row["volume_litres"],
+            row["flow_pressure_corr"],
+            min_flow_lpm=_circuit_min_flow(conn, row["circuit"])),
+        set_sql=("  is_pressure_restoration_phantom = 1, "
+                 "  is_cross_talk = 0, is_low_flow_dribble = 0, "
+                 "  volume_litres_effective = 0, "
+                 "  volume_estimation_method = 'pressure_restoration_phantom', "
+                 "  excluded_from_training = 1, "
+                 "  match_rejection_reason = ? "),
+        set_params=lambda row: (RISE_PHANTOM_REASON,),
+        on_flag=lambda row: log.info(
+            "rise-phantom-reprocess: event %s flagged "
+            "(corr=%+.2f dur=%.0fs vol=%.3f L)",
+            row["id"], row["flow_pressure_corr"] or 0.0,
+            row["duration_seconds"] or 0.0, row["volume_litres"] or 0.0),
+    )
     if rise_flagged:
-        conn.commit()
         log.info("rise-phantom-reprocess: flagged %d event(s) across %d day(s)",
                  rise_flagged, len(days))
     return {"rise_flagged": rise_flagged}
@@ -2987,8 +2975,6 @@ def backfill_sawtooth_pump_recharge(conn) -> dict:
     volume still applied). Volume moves through ``apply_effective_volume``
     and every affected day's summary is rebuilt, same as the dev33 sweep.
     """
-    from .database import (transaction, apply_effective_volume,
-                           compute_daily_summary, local_day_of)
     from .supply_regime import pump_era_start
     era_start = pump_era_start(conn)
     if not era_start:
@@ -3011,37 +2997,20 @@ def backfill_sawtooth_pump_recharge(conn) -> dict:
         (era_start,),
     ).fetchall()
 
-    tagged = 0
-    affected_days: set = set()
-    for row in rows:
-        if not _detect_pump_recharge(
-                row["duration_seconds"], row["volume_litres"],
-                row["flow_pressure_corr"], row["pressure_delta_psi"],
-                pressure_transient_duration_ms=row[
-                    "pressure_transient_duration_ms"],
-                start_trigger=row["start_trigger"]):
-            continue
-        with transaction(conn):
-            conn.execute(
-                "UPDATE events SET is_pressure_restoration_phantom = 1, "
-                "  volume_litres_effective = 0.0, "
-                "  volume_estimation_method = ?, "
-                "  match_rejection_reason = ?, "
-                "  excluded_from_training = 1 "
-                "WHERE id = ?",
-                (PUMP_RECHARGE_REASON, PUMP_RECHARGE_REASON, row["id"]),
-            )
-            apply_effective_volume(conn, row["id"], row["circuit"],
-                                   row["start_ts"], 0.0)
-        tagged += 1
-        day = local_day_of(row["start_ts"])
-        if day:
-            affected_days.add((row["circuit"], day))
-
-    for circ, day in affected_days:
-        compute_daily_summary(conn, circ, day)
-    if affected_days:
-        conn.commit()
+    tagged, _litres, affected_days = _sweep_zeroing_verdict(
+        conn, rows,
+        detect=lambda row: _detect_pump_recharge(
+            row["duration_seconds"], row["volume_litres"],
+            row["flow_pressure_corr"], row["pressure_delta_psi"],
+            pressure_transient_duration_ms=row["pressure_transient_duration_ms"],
+            start_trigger=row["start_trigger"]),
+        set_sql=("is_pressure_restoration_phantom = 1, "
+                 "  volume_litres_effective = 0.0, "
+                 "  volume_estimation_method = ?, "
+                 "  match_rejection_reason = ?, "
+                 "  excluded_from_training = 1 "),
+        set_params=lambda row: (PUMP_RECHARGE_REASON, PUMP_RECHARGE_REASON),
+    )
     log.info("sawtooth recharge backfill: tagged %d of %d candidate(s), "
              "%d day summar(ies) rebuilt", tagged, len(rows),
              len(affected_days))

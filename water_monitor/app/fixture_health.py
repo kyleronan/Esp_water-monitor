@@ -58,11 +58,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +107,6 @@ SIGNAL_VOLUME = "volume_trend"
 SIGNAL_DURATION = "duration_trend"
 SIGNAL_UNSOLICITED = "unsolicited_refills"
 SIGNAL_SHARE = "class_share"
-SIGNAL_ANCHOR = "anchor_claim_rate"
 
 # Reason codes for unlocking a baseline (47i-2). A baseline may move only by
 # explicit confirmation, and the code is what distinguishes the three kinds of

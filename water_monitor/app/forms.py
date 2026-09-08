@@ -5,7 +5,12 @@ whole web stack — see tests/test_coerce_int.py.
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar, Union
+
+# The fallback's type flows straight through to the return type, so a caller
+# that passes `default=None` is typed `float | None` while every caller that
+# passes a real number is still typed `float`. See coerce_float.
+_D = TypeVar("_D")
 
 
 def coerce_int(
@@ -49,8 +54,8 @@ def coerce_float(
     value: Any,
     lo: Optional[float] = None,
     hi: Optional[float] = None,
-    default: float = 0.0,
-) -> float:
+    default: _D = 0.0,          # type: ignore[assignment]
+) -> Union[float, _D]:
     """Parse a form value into a float bounded to ``[lo, hi]``.
 
     The float twin of :func:`coerce_int`, and it exists for the same reason:
@@ -66,6 +71,13 @@ def coerce_float(
     an unguarded range check would let them through, and a NaN threshold makes
     every later comparison against it false in ways that differ by how the
     comparison happens to be written.
+
+    ``default`` is returned as given, so ``default=None`` makes this an
+    "optional float" parse: ``None`` back means *this field was not usable*,
+    which is distinct from any value the field could legitimately hold. Unit
+    6.6 uses that to retire ``history._parse_float``, whose filter-bar callers
+    must tell "no filter" apart from "a filter of zero" — a fallback number
+    there would silently invent a filter the user never asked for.
     """
     if value is None:
         return default

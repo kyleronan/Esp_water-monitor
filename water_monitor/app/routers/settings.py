@@ -1446,22 +1446,28 @@ async def retention_update(request: Request):
     orch = _orch(request)
     form = await request.form()
 
-    def _int(key: str, default: int) -> int:
-        try:
-            return int(form.get(key, default))
-        except (ValueError, TypeError):
-            return default
-
+    # Unit 6.6 retired the local `_int` here in favour of the shared
+    # `coerce_int`. The local one caught the 500 but applied NO bounds, and
+    # these are the numbers the nightly pruner deletes by: data_pruner
+    # computes `events_cutoff = now - events_retain_years * 365 days`, so a
+    # crafted POST of 0 (or a negative) put the cutoff at or after "now" and
+    # the next prune would have deleted EVERY event row. The browser can't
+    # send that — both are `<input type="range" min="1" max="10">` — which is
+    # exactly the 2.6 situation: the bounds the form already declares were
+    # client-side only. day_of_week is a 7-option <select>, so [0, 6].
     await run_db(                                             # dev46 (46a)
         update_data_retention,
         orch.db,
-        events_retain_years=_int("events_retain_years", 1),
-        hourly_volume_retain_years=_int("hourly_volume_retain_years", 2),
+        events_retain_years=coerce_int(
+            form.get("events_retain_years"), lo=1, hi=10, default=1),
+        hourly_volume_retain_years=coerce_int(
+            form.get("hourly_volume_retain_years"), lo=1, hi=10, default=2),
         enabled=1 if form.get("enabled") == "1" else 0,
         auto_backup_enabled=1 if form.get("auto_backup_enabled") == "1" else 0,
         auto_backup_path=form.get("auto_backup_path",
                                    "/share/water_monitor_backups").strip(),
-        auto_backup_day_of_week=_int("auto_backup_day_of_week", 0),
+        auto_backup_day_of_week=coerce_int(
+            form.get("auto_backup_day_of_week"), lo=0, hi=6, default=0),
     )
     return ingress_redirect(request, "/settings#retention")
 

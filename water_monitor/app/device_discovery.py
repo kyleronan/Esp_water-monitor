@@ -107,12 +107,6 @@ OPTIONAL_ROLES = {
 # the entity's original_name from the HA entity registry.
 # ------------------------------------------------------------------
 
-# Default display names for each circuit ID (used in setup wizard).
-CIRCUIT_DISPLAY_DEFAULTS: Dict[str, str] = {
-    "circuit_1": "Main",
-    "circuit_2": "Irrigation",
-}
-
 # Role → (name pattern, domain)
 # Pattern is matched against original_name (case-insensitive).
 # Domain narrows the match when multiple entities share a similar name.

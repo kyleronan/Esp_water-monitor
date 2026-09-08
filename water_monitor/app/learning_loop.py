@@ -105,7 +105,6 @@ ANCHOR_TIER_TARGET: Dict[str, str] = {
 }
 
 ANCHOR_SOURCE = "anchor"
-USER_SOURCES = ("user", "training", "direct")
 
 # dev51 (1.5) — machine-propagated 'cycle' labels are ANCHORS, not user truth.
 # They enter the anchor half of the pool (capped, per-tier precision gate,

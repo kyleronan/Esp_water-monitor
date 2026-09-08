@@ -98,26 +98,19 @@ _FULL_DUPLICATE_REMAINDER_FRACTION = 0.10
 # dev55 — litre comparisons; stored volumes are rounded to 3 dp upstream.
 _EPS = 1e-6
 
+# dev57 — ONE shape. The pin columns (verdict_pin, verdict_pin_veff,
+# verdict_pin_set_at) arrive with migration 20260818, but the 20260817 re-sweep
+# replays cleanup_all_overlaps and this resolver WRITES the pin — so this module
+# used to carry a parallel pre-pin path (a column sniff, a narrower SELECT list
+# and a duplicated UPDATE) purely to survive that one migration window.
+# db_migrations._ensure_verdict_pin_columns now runs at the top of BOTH 20260817
+# and 20260818 (hoisted DDL — the migration numbers are deliberately NOT
+# swapped; see that helper's docstring for why a swap bricks a DB stamped
+# exactly 20260817). The window is closed, so every read and write here assumes
+# the columns are there.
 _EVENT_COLS = ("id, circuit, start_ts, end_ts, volume_litres, "
                "volume_litres_effective, user_fixture_type, user_reviewed, "
-               "match_rejection_reason")
-# dev56 — the pin columns exist from migration 20260818 on. The 20260817 re-sweep
-# runs cleanup_all_overlaps BEFORE that migration, so every read and write here
-# must work on both shapes: select the pin columns when present, write them when
-# present, and otherwise behave exactly as dev55 did.
-_PIN_COLS = "verdict_pin, verdict_pin_veff"
-
-
-def _has_pin_columns(conn: sqlite3.Connection) -> bool:
-    try:
-        return any(r[1] == "verdict_pin" for r in
-                   conn.execute("PRAGMA table_info(events)").fetchall())
-    except sqlite3.Error:
-        return False
-
-
-def _event_cols(conn: sqlite3.Connection) -> str:
-    return _EVENT_COLS + (", " + _PIN_COLS if _has_pin_columns(conn) else "")
+               "match_rejection_reason, verdict_pin, verdict_pin_veff")
 
 
 def _ts(value) -> Optional[datetime]:
@@ -211,7 +204,7 @@ def find_overlap_groups(conn: sqlite3.Connection,
         where += " AND circuit = ?"
         params.append(circuit)
     rows = [dict(r) for r in conn.execute(
-        f"SELECT {_event_cols(conn)} FROM events {where} "
+        f"SELECT {_EVENT_COLS} FROM events {where} "
         "ORDER BY circuit, start_ts", params)]
     groups: List[List[dict]] = []
     cur: List[dict] = []
@@ -383,25 +376,16 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
         # exactly what a wrapper of a real draw has) and the phantom pill. The
         # verdict now lives in the PIN (preserved across re-stores) and the UI
         # keys on match_rejection_reason.
-        if _has_pin_columns(conn):
-            conn.execute(
-                "UPDATE events SET is_pressure_restoration_phantom = 0, "
-                "  volume_litres_effective = ?, "
-                "  volume_estimation_method = ?, excluded_from_training = 1, "
-                "  match_rejection_reason = ?, matched_fixture_type = NULL, "
-                "  matched_via = NULL, verdict_pin = ?, verdict_pin_veff = ?, "
-                "  verdict_pin_set_at = ? WHERE id = ?",
-                (new_eff, OVERLAP_DUPLICATE_REASON, OVERLAP_DUPLICATE_REASON,
-                 OVERLAP_DUPLICATE_REASON, new_eff,
-                 datetime.now(timezone.utc).isoformat(), w["id"]))
-        else:                                   # pre-20260818 shape (re-sweep)
-            conn.execute(
-                "UPDATE events SET is_pressure_restoration_phantom = 0, "
-                "  volume_litres_effective = ?, "
-                "  volume_estimation_method = ?, excluded_from_training = 1, "
-                "  match_rejection_reason = ?, matched_fixture_type = NULL, "
-                "  matched_via = NULL WHERE id = ?",
-                (new_eff, OVERLAP_DUPLICATE_REASON, OVERLAP_DUPLICATE_REASON, w["id"]))
+        conn.execute(
+            "UPDATE events SET is_pressure_restoration_phantom = 0, "
+            "  volume_litres_effective = ?, "
+            "  volume_estimation_method = ?, excluded_from_training = 1, "
+            "  match_rejection_reason = ?, matched_fixture_type = NULL, "
+            "  matched_via = NULL, verdict_pin = ?, verdict_pin_veff = ?, "
+            "  verdict_pin_set_at = ? WHERE id = ?",
+            (new_eff, OVERLAP_DUPLICATE_REASON, OVERLAP_DUPLICATE_REASON,
+             OVERLAP_DUPLICATE_REASON, new_eff,
+             datetime.now(timezone.utc).isoformat(), w["id"]))
         apply_effective_volume(conn, w["id"], w["circuit"], w["start_ts"],
                                new_eff)
         _audit(conn, w["circuit"], w["id"], kept, prior_eff - new_eff,
@@ -452,7 +436,7 @@ def guard_new_event(conn: sqlite3.Connection, event_id: str, circuit: str,
     if not end_ts:
         return
     rows = [dict(r) for r in conn.execute(
-        f"SELECT {_event_cols(conn)} FROM events "
+        f"SELECT {_EVENT_COLS} FROM events "
         "WHERE circuit = ? AND end_ts IS NOT NULL "
         "  AND start_ts < ? AND end_ts > ?",
         (circuit, end_ts, start_ts))]
@@ -470,15 +454,13 @@ def reevaluate_event(conn: sqlite3.Connection, event_id: str,
     this row (it is the only record of that draw again). Otherwise the group is
     resolved with the normal policy (the guard's own reduction may move up or
     down; a foreign reduction only down)."""
-    if not _has_pin_columns(conn):
-        return None
-    row = conn.execute(f"SELECT {_event_cols(conn)} FROM events WHERE id = ?",
+    row = conn.execute(f"SELECT {_EVENT_COLS} FROM events WHERE id = ?",
                        (event_id,)).fetchone()
     if row is None or not row["end_ts"]:
         return None
     row = dict(row)
     group = [dict(r) for r in conn.execute(
-        f"SELECT {_event_cols(conn)} FROM events "
+        f"SELECT {_EVENT_COLS} FROM events "
         "WHERE circuit = ? AND end_ts IS NOT NULL AND start_ts < ? AND end_ts > ?",
         (row["circuit"], row["end_ts"], row["start_ts"]))]
     pinned = row.get("verdict_pin") == OVERLAP_DUPLICATE_REASON
@@ -499,7 +481,7 @@ def reevaluate_containing_wrappers(conn: sqlite3.Connection, circuit: str,
     """dev56 — after a row over ``[start_ts, end_ts]`` changed or vanished,
     re-derive every PINNED wrapper on the circuit whose span intersects it. One
     indexed read (circuit, verdict_pin); returns how many were re-examined."""
-    if not _has_pin_columns(conn) or not start_ts:
+    if not start_ts:
         return 0
     end_ts = end_ts or start_ts
     ids = [r[0] for r in conn.execute(
@@ -601,12 +583,11 @@ def summarize_overlap_groups(conn: sqlite3.Connection, circuit: Optional[str] = 
     if circuit:
         where += " AND circuit = ?"
         params.append(circuit)
-    pin = ", verdict_pin" if _has_pin_columns(conn) else ""
     try:
         rows = [dict(r) for r in conn.execute(
             "SELECT id, circuit, start_ts, end_ts, volume_litres, volume_litres_effective, "
             "       hourly_volume_applied_litres, user_fixture_type, user_classified, "
-            f"       user_ignored, match_rejection_reason{pin} "
+            "       user_ignored, match_rejection_reason, verdict_pin "
             f"FROM events {where} ORDER BY circuit, start_ts", params)]
     except sqlite3.Error:
         return []

@@ -8,7 +8,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from ..circuit_compat import resolve_circuit
 from ..fixtures import FIXTURE_TYPE_LABELS, user_selectable_types
 from ..database import patch_event as _patch_event
-from ._helpers import ingress_redirect, run_blocking, startup_gate
+from ._helpers import (coerce_float, ingress_redirect, run_blocking,
+                       startup_gate)
 
 _VALID_USER_FIXTURE_TYPES: frozenset = frozenset(user_selectable_types())
 
@@ -176,14 +177,16 @@ FILTER_BAR_PARAMS = ("dur_min", "dur_max", "dp_min", "dp_max",
                      "fixture", "note")
 
 
-def _parse_float(value) -> float | None:
-    """Lenient positive-float parse for filter inputs; garbage/blank → None."""
-    import math
-    try:
-        v = float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-    return v if math.isfinite(v) and v >= 0 else None
+# Unit 6.6 retired the local `_parse_float` in favour of the shared
+# `forms.coerce_float`. Same contract, one implementation: `lo=0.0` drops
+# negatives (a negative duration/volume filter is not a thing the bar can
+# mean), `default=None` keeps "unusable" distinguishable from a real 0, and
+# the NaN/inf rejection that `_parse_float`'s `math.isfinite` provided now
+# comes from the shared helper — which grew it for the sensitivity form,
+# where a NaN sails past an unguarded range check.
+def _filter_float(value):
+    """Lenient non-negative float for the filter bar; garbage/blank → None."""
+    return coerce_float(value, lo=0.0, default=None)
 
 
 def _filters_to_storage(raw: dict, vol_factor: float,
@@ -202,26 +205,26 @@ def _filters_to_storage(raw: dict, vol_factor: float,
     from ..database import _NOTE_KIND_SQL
     from ..fixtures import FIXTURE_TYPE_LABELS
     out: dict = {}
-    dur_min = _parse_float(raw.get("dur_min"))
-    dur_max = _parse_float(raw.get("dur_max"))
+    dur_min = _filter_float(raw.get("dur_min"))
+    dur_max = _filter_float(raw.get("dur_max"))
     if dur_min is not None:
         out["dur_min_s"] = dur_min * 60.0
     if dur_max is not None:
         out["dur_max_s"] = dur_max * 60.0
-    dp_min = _parse_float(raw.get("dp_min"))
-    dp_max = _parse_float(raw.get("dp_max"))
+    dp_min = _filter_float(raw.get("dp_min"))
+    dp_max = _filter_float(raw.get("dp_max"))
     if dp_min is not None and pressure_factor:
         out["dp_min"] = dp_min / pressure_factor
     if dp_max is not None and pressure_factor:
         out["dp_max"] = dp_max / pressure_factor
-    vol_min = _parse_float(raw.get("vol_min"))
-    vol_max = _parse_float(raw.get("vol_max"))
+    vol_min = _filter_float(raw.get("vol_min"))
+    vol_max = _filter_float(raw.get("vol_max"))
     if vol_min is not None and vol_factor:
         out["vol_min_l"] = vol_min / vol_factor
     if vol_max is not None and vol_factor:
         out["vol_max_l"] = vol_max / vol_factor
-    flow_min = _parse_float(raw.get("flow_min"))
-    flow_max = _parse_float(raw.get("flow_max"))
+    flow_min = _filter_float(raw.get("flow_min"))
+    flow_max = _filter_float(raw.get("flow_max"))
     if flow_min is not None and flow_factor:
         out["flow_min_lpm"] = flow_min / flow_factor
     if flow_max is not None and flow_factor:

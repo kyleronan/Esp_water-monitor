@@ -63,7 +63,6 @@ DTW_TEMPLATE_MIN_MEMBERS      = 10   # Stage 3
 DTW_DISTANCE_WEIGHT           = 0.4  # Stage 3
 LEVEL_PRELIMINARY_MAX         = 50
 LEVEL_LEARNING_MAX            = 200
-METRICS_WINDOW_HOURS          = 24
 
 # ── Stage 3 hook: DTW transient templates ─────────────────────────────────────
 # dtaidistance is installed (see Dockerfile).  Stage 3 will add:

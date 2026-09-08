@@ -1473,6 +1473,108 @@ def _has_table(conn: sqlite3.Connection, table: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# The waveform-claim index — the one index every tail migration re-adds.
+# ---------------------------------------------------------------------------
+_WF_CLAIM_INDEX_COLUMNS: tuple = ("circuit", "waveform_boot_id",
+                                  "waveform_event_id")
+_WF_CLAIM_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+    "ON events (circuit, waveform_boot_id, waveform_event_id)"
+)
+
+
+def _ensure_wf_claim_index(conn: sqlite3.Connection) -> None:
+    """Create ``idx_events_wf_claim`` when the columns it covers exist.
+
+    ⛔ THIS INDEX MUST NOT MOVE INTO THE SCHEMA DDL SCRIPT. ⛔
+    ``_create_schema`` / ``schema.sql`` runs against UPGRADE databases too, and
+    it runs BEFORE any migration. The index covers ``events.waveform_boot_id``,
+    a column that only arrives with migration 20260573, so an index statement in
+    the DDL script executes against a pre-20260573 database that does not have
+    the column yet — SQLite raises, and the add-on cannot boot. That is not
+    hypothetical; it is the failure dev56 learned the hard way (see the matching
+    NOTE beside the events DDL in database.py). The same argument applies to
+    ``idx_events_verdict_pin`` (20260818) and to the two indexes 20260902 adds.
+
+    Consequence: the index can only ever come from a migration, so 20260573
+    creates it and every LAST migration since re-adds it belt-and-braces — a
+    documented convention, not copy-paste. A database stamped at a version AFTER
+    20260573 is built by the current schema script (which omits the index) and
+    never walks back through 20260573, so without the re-add on the tail
+    migration it would end the walk without the index and every claim lookup
+    would table-scan ``events`` on add-on hardware.
+    ``test_migrations_forward.py`` asserts the index after a walk that passes
+    through 20260573.
+
+    Plain, NOT unique: the live path writes events through a wide upsert, and a
+    constraint violation there would abort event storage entirely. The
+    check-first SELECT in ``_wf_already_claimed`` is the enforcement.
+
+    NOTE for the schema-drift check: this index is present in a migration-built
+    database and deliberately ABSENT from the schema DDL, so a drift test must
+    carry an allowlist entry for ``idx_events_wf_claim`` (likewise
+    ``idx_events_verdict_pin``, ``idx_events_circuit_cluster`` and
+    ``idx_events_fixture``). Grep for ``_ensure_wf_claim_index``.
+
+    Guarded on every indexed column: other migration tests exercise this chain
+    against stub ``events`` tables carrying only the columns their own step
+    needs, and an index over a missing column aborts the whole run. Idempotent
+    (``IF NOT EXISTS``) and safe to call from any migration body.
+    """
+    if not _has_table(conn, "events"):
+        return
+    if not all(_has_column(conn, "events", c)
+               for c in _WF_CLAIM_INDEX_COLUMNS):
+        return
+    conn.execute(_WF_CLAIM_INDEX_DDL)
+    conn.commit()
+
+
+_VERDICT_PIN_COLUMNS: tuple = (
+    ("verdict_pin", "TEXT"),
+    ("verdict_pin_veff", "REAL"),
+    ("verdict_pin_set_at", "TEXT"),
+)
+
+
+def _ensure_verdict_pin_columns(conn: sqlite3.Connection) -> None:
+    """Add the dev56 pin columns (+ their index) when absent. Idempotent.
+
+    Called from the TOP of BOTH 20260817 and 20260818, and the ordering is
+    load-bearing. 20260817 replays ``cleanup_all_overlaps`` over all history,
+    and that resolver WRITES the pin — but the columns nominally arrive one
+    migration later, so overlap_guard used to carry a parallel pre-pin code path
+    (a column sniff, a narrower SELECT list and a duplicated UPDATE) purely to
+    survive that one window. Creating the columns here closes the window: by the
+    time any overlap code runs, the shape is the current shape, everywhere.
+
+    ⛔ The obvious-looking alternative — SWAPPING 20260817 and 20260818 so the
+    columns simply land first — is a BOOT-BREAKER, and must never be done.
+    ``_run_migrations_impl`` selects ``[fn for v, fn in _MIGRATIONS if v >
+    version]`` and then stamps ``_CURRENT_VERSION`` unconditionally. A database
+    stamped exactly 20260817 is a REAL state (dev55 shipped as its own commits,
+    ahead of dev56). After a swap that database would run only the re-sweep,
+    never receive these three ALTERs, and still be stamped current — then fail
+    every subsequent boot on the current-version guard with "Delete the database
+    file." Shipped migration numbers do not move; an idempotent ensure-helper
+    called from both steps reaches the same end state with no renumbering.
+
+    Guarded for stub ``events`` tables (older migration tests build one with
+    only the columns their own step needs), and the index is created only once
+    ``circuit`` exists — same guard 20260802-04 use.
+    """
+    if not _has_table(conn, "events"):
+        return
+    for col, ctype in _VERDICT_PIN_COLUMNS:
+        if not _has_column(conn, "events", col):
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {ctype}")
+    if _has_column(conn, "events", "circuit"):
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_verdict_pin "
+                     "ON events (circuit, verdict_pin)")
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
 # Best-effort backfill failures — loud, and on the record.
 # ---------------------------------------------------------------------------
 # Several one-shot DATA repairs (20260570/72, 20260802/03/04) are deliberately
@@ -1950,7 +2052,16 @@ def _missing_leak_test_measurement_columns(conn: sqlite3.Connection) -> set[str]
 def _apply_overlap_cleanup(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260561 — resolve historical
     same-circuit event overlaps (idempotent: already-zeroed wrappers no-op
-    and audit rows are INSERT OR IGNORE). Guarded for stub DBs."""
+    and audit rows are INSERT OR IGNORE). Guarded for stub DBs.
+
+    Calls ``_ensure_verdict_pin_columns`` first for the same reason 20260817
+    does: this is the EARLIEST step that replays ``cleanup_all_overlaps``, and
+    that resolver writes the dev56 pin. A database stamped below 20260561
+    predates those columns entirely, so without the hoist the sweep would fail
+    on `no such column: verdict_pin` in the middle of the chain. What it writes
+    here is exactly what 20260818's TAG backfill would have written later, and
+    that backfill is a no-op on rows already pinned."""
+    _ensure_verdict_pin_columns(conn)
     has_events = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
     ).fetchone()
@@ -2066,7 +2177,9 @@ def _apply_pump_era_column(conn: sqlite3.Connection) -> None:
 
 
 def _missing_pump_era_columns(conn: sqlite3.Connection) -> set[str]:
-    if not _has_column(conn, "home_profile", "pump_era_start"):
+    """Verifier for the 20260566 shape. Table-guarded like its migration."""
+    if (_has_table(conn, "home_profile")
+            and not _has_column(conn, "home_profile", "pump_era_start")):
         return {"home_profile.pump_era_start"}
     return set()
 
@@ -2089,7 +2202,9 @@ def _apply_leak_watch_ack_column(conn: sqlite3.Connection) -> None:
 
 
 def _missing_leak_watch_columns(conn: sqlite3.Connection) -> set[str]:
-    if not _has_column(conn, "home_profile", "leak_watch_ack"):
+    """Verifier for the 20260567 shape. Table-guarded like its migration."""
+    if (_has_table(conn, "home_profile")
+            and not _has_column(conn, "home_profile", "leak_watch_ack")):
         return {"home_profile.leak_watch_ack"}
     return set()
 
@@ -2110,7 +2225,10 @@ def _apply_cluster_features_mode(conn: sqlite3.Connection) -> None:
 
 
 def _missing_cluster_mode_columns(conn: sqlite3.Connection) -> set[str]:
-    if not _has_column(conn, "training_state", "cluster_features_mode"):
+    """Verifier for the 20260568 shape. Table-guarded like its migration."""
+    if (_has_table(conn, "training_state")
+            and not _has_column(conn, "training_state",
+                                "cluster_features_mode")):
         return {"training_state.cluster_features_mode"}
     return set()
 
@@ -2226,18 +2344,7 @@ def _apply_regime_window_bounds(conn: sqlite3.Connection) -> None:
             if not _has_column(conn, "pump_regime_nightly", col):
                 conn.execute(
                     f"ALTER TABLE pump_regime_nightly ADD COLUMN {col} TEXT")
-    # Belt-and-braces re-create of the 20260573 wf-claim index: the base
-    # schema deliberately omits it (it references waveform_boot_id, which
-    # pre-20260573 DBs lack when the schema script runs), so a DB stamped at
-    # 20260573 without having walked through it would miss the index. By this
-    # point in the ladder the columns exist on every path — IF NOT EXISTS
-    # makes it a no-op everywhere else.
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+    _ensure_wf_claim_index(conn)
     conn.commit()
     log.info("Migration 20260574: regime window-bound columns ready")
 
@@ -2409,17 +2516,7 @@ def _apply_misattached_signature_null(conn: sqlite3.Connection) -> None:
         # FOREIGN draw's signature bytes under an 'esp' provenance label.
         _record_migration_failure(
             conn, 20260804, "mis-attached signature retro-fix", e)
-    # Belt-and-braces re-create of the wf-claim index — LAST migration of the
-    # dev38 group, same rationale as 20260574 for dev37: the base schema
-    # deliberately omits it, so every forward walk that ends here must still
-    # end up with it regardless of which intermediate version it started at.
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
-        conn.commit()
+    _ensure_wf_claim_index(conn)
 
 
 # 20260805 — dev40 training quarantine for the over-firing dishwasher-cycle tier.
@@ -2472,17 +2569,7 @@ def _apply_training_quarantine(conn: sqlite3.Connection) -> None:
         log.info("Migration 20260805: label/provenance columns absent — "
                  "quarantine backfill skipped (nothing to flag)")
     conn.commit()
-    # Belt-and-braces re-create of the wf-claim index — kept here per the
-    # last-migration convention (see 20260574/20260804) even though 20260806
-    # now follows: every forward walk must end up with the index regardless
-    # of start version, because the base schema deliberately omits it.
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
-        conn.commit()
+    _ensure_wf_claim_index(conn)
 
 
 # 20260806 — dev41 quarantine sweep: ALL remaining unreviewed machine
@@ -2533,17 +2620,7 @@ def _apply_training_quarantine_sweep(conn: sqlite3.Connection) -> None:
         log.info("Migration 20260806: label/provenance columns absent — "
                  "quarantine sweep skipped (nothing to flag)")
     conn.commit()
-    # Belt-and-braces re-create of the wf-claim index — this is now the LAST
-    # migration, and the convention (see 20260574/20260804) is that every
-    # forward walk must end up with the index regardless of start version,
-    # because the base schema deliberately omits it.
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
-        conn.commit()
+    _ensure_wf_claim_index(conn)
 
 
 # 20260807 — dev41 conformance-review DDL (all in one step, dev38 pattern).
@@ -2635,15 +2712,7 @@ def _apply_dev41_conformance_ddl(conn: sqlite3.Connection) -> None:
             " 'audit_2026-08_pressure_witness_inversion', ?)",
             (lo, hi, ratio, now))
     conn.commit()
-    # Belt-and-braces re-create of the wf-claim index — this is now the LAST
-    # migration (convention: see 20260574/20260804/20260806).
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
-        conn.commit()
+    _ensure_wf_claim_index(conn)
     log.info("Migration 20260807: dev41 conformance-review DDL ready")
 
 
@@ -2660,15 +2729,7 @@ def _apply_reseed_marker_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE training_state "
                      "ADD COLUMN reseed_in_progress TEXT")
     conn.commit()
-    # Belt-and-braces re-create of the wf-claim index — LAST-migration
-    # convention (see 20260574/20260804/20260806/20260807).
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
-        conn.commit()
+    _ensure_wf_claim_index(conn)
     log.info("Migration 20260808: reseed-in-progress marker column ready")
 
 
@@ -2707,15 +2768,7 @@ def _apply_dev46_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE circuit_profile "
                      "ADD COLUMN winterized INTEGER DEFAULT 0")
     conn.commit()
-    # Belt-and-braces re-create of the wf-claim index — LAST-migration
-    # convention (see 20260574/20260804/20260806/20260807/20260808).
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
-        conn.commit()
+    _ensure_wf_claim_index(conn)
     log.info("Migration 20260809: training-exclusion flag, signature spans "
              "and winterized flag ready")
 
@@ -2773,14 +2826,7 @@ def _apply_verdict_stamp(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_verdict_stamp "
             "ON events (circuit, user_fixture_type, verdict_stamp)")
-    # Belt-and-braces re-create of the wf-claim index — LAST-migration
-    # convention (see 20260574/20260804/20260806/20260807/20260808/20260809).
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+    _ensure_wf_claim_index(conn)
     conn.commit()
     # Recreated (not IF NOT EXISTS alone) so that changing the watched-column
     # list in a later release replaces the old trigger instead of silently
@@ -2929,7 +2975,14 @@ def _apply_regime_calibration(conn: sqlite3.Connection) -> None:
 
 
 def _missing_regime_calibration_columns(conn: sqlite3.Connection) -> set[str]:
-    if not _has_column(conn, "rule_calibration", "regime_id"):
+    """Verifier for the 20260565 shape (current-version guard set).
+
+    Table-guarded because the migration is: _apply_regime_calibration returns
+    early when rule_calibration is absent, so demanding the column on a DB that
+    has no such table would fail a boot the migration itself was happy with.
+    """
+    if (_has_table(conn, "rule_calibration")
+            and not _has_column(conn, "rule_calibration", "regime_id")):
         return {"rule_calibration.regime_id"}
     return set()
 
@@ -2987,19 +3040,7 @@ def _apply_wf_claim_and_repair_columns(conn: sqlite3.Connection) -> None:
     for col, ddl in _WF_CLAIM_COLUMNS:
         if not _has_column(conn, "events", col):
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} {ddl}")
-    # Plain, NOT unique: the live path writes events through a wide upsert, and
-    # a constraint violation there would abort event storage entirely. The
-    # check-first SELECT in _wf_already_claimed is the enforcement.
-    #
-    # Guarded on every indexed column: other migration tests exercise this
-    # chain against stub `events` tables that carry only the columns their own
-    # step needs, and an index over a missing column aborts the whole run.
-    if all(_has_column(conn, "events", c)
-           for c in ("circuit", "waveform_boot_id", "waveform_event_id")):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)"
-        )
+    _ensure_wf_claim_index(conn)
     conn.commit()
     log.info("Migration 20260573: waveform claim ledger + repair audit columns ready")
 
@@ -3142,17 +3183,9 @@ def _apply_fixture_health(conn: sqlite3.Connection) -> None:
     #  20260902, which also DROPs it — it duplicated the table's own
     #  UNIQUE (circuit, fixture_type, as_of_day) index column for column.
     #  Removing it from database.py alone would have been a silent no-op.)
-    # Belt-and-braces re-create of the wf-claim index — LAST-migration
-    # convention (see 20260574/20260804/.../20260810).
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
+    _ensure_wf_claim_index(conn)
     conn.commit()
     log.info("Migration 20260811: fixture health baselines ready")
-
 
 
 # 20260812 — dev48: flow_plateau_lpm, the rate a draw runs at once running.
@@ -3313,15 +3346,7 @@ def _apply_auto_split_memo(conn: sqlite3.Connection) -> None:
             if not _has_column(conn, tbl, col):
                 conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT")
     conn.commit()
-    # Belt-and-braces re-create of the wf-claim index — LAST-migration
-    # convention (see 20260574/20260804/20260806/20260807/20260808).
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
-        conn.commit()
+    _ensure_wf_claim_index(conn)
     log.info("Migration 20260814: auto-split memo columns + audit stale marks ready")
 
 
@@ -3366,15 +3391,7 @@ def _apply_referee_tables(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_retrain_ledger_circuit_decided "
         "ON retrain_ledger (circuit, decided_at)")
     conn.commit()
-    # Belt-and-braces re-create of the wf-claim index — LAST-migration
-    # convention (see 20260574/20260804/20260806/20260807/20260808/20260814).
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
-        conn.commit()
+    _ensure_wf_claim_index(conn)
     log.info("Migration 20260815: referee benchmark + retrain ledger tables ready")
 
 
@@ -3438,15 +3455,7 @@ def _apply_referee_meta_columns(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE referee_benchmark")
         conn.execute("ALTER TABLE referee_benchmark__dev53 RENAME TO referee_benchmark")
     conn.commit()
-    # Belt-and-braces re-create of the wf-claim index — LAST-migration
-    # convention (see 20260574/20260804/20260806/20260807/20260808/20260814/20260815).
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
-        conn.commit()
+    _ensure_wf_claim_index(conn)
     log.info("Migration 20260816: referee benchmark provenance + pending slot ready")
 
 
@@ -3478,9 +3487,12 @@ def _apply_overlap_resweep(conn: sqlite3.Connection) -> None:
 
     Idempotent by contract: an already-zeroed wrapper is a no-op and audit rows
     are INSERT OR IGNORE. User-labelled wrappers get an audit row only and keep
-    every litre. Guarded for stub DBs. No schema change, so _create_schema needs
-    no mirroring.
+    every litre. Guarded for stub DBs. No schema change of its OWN — but it does
+    call ``_ensure_verdict_pin_columns`` first, because the resolver it replays
+    writes the 20260818 pin columns and they must exist before it runs (see that
+    helper: the columns are hoisted, the migration numbers are NOT swapped).
     """
+    _ensure_verdict_pin_columns(conn)
     has_events = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
     ).fetchone()
@@ -3498,13 +3510,6 @@ def _apply_overlap_resweep(conn: sqlite3.Connection) -> None:
              totals["litres_recovered"], totals["flag_only"])
 
 
-_VERDICT_PIN_COLUMNS: tuple = (
-    ("verdict_pin", "TEXT"),
-    ("verdict_pin_veff", "REAL"),
-    ("verdict_pin_set_at", "TEXT"),
-)
-
-
 def _apply_verdict_pin(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260818 — dev56. The PINNED VERDICT.
 
@@ -3519,17 +3524,15 @@ def _apply_verdict_pin(conn: sqlite3.Connection) -> None:
     is a one-time semantic change of the bit; the History surfaces key on the
     reason from dev56 on. Idempotent: guarded ALTERs, an UPDATE whose WHERE is
     empty on a second run.
+
+    The DDL itself lives in ``_ensure_verdict_pin_columns``, which 20260817 also
+    calls — the re-sweep replays a resolver that writes these columns. Only the
+    TAG backfill below is unique to this step.
     """
+    _ensure_verdict_pin_columns(conn)
     if not _has_table(conn, "events"):
         conn.commit()
         return
-    for col, ctype in _VERDICT_PIN_COLUMNS:
-        if not _has_column(conn, "events", col):
-            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {ctype}")
-    # Stub schemas in older tests lack even `circuit`; guard like 20260802-04 do.
-    if _has_column(conn, "events", "circuit"):
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_verdict_pin "
-                     "ON events (circuit, verdict_pin)")
     if not all(_has_column(conn, "events", c) for c in
                ("match_rejection_reason", "volume_litres_effective",
                 "is_pressure_restoration_phantom")):
@@ -3560,15 +3563,7 @@ def _apply_verdict_pin(conn: sqlite3.Connection) -> None:
         repaired = 0
         log.info("Migration 20260818: flag/volume consistency pass skipped: %s", e)
     conn.commit()
-    # Belt-and-braces re-create of the wf-claim index — LAST-migration
-    # convention (see 20260574/…/20260815/20260816).
-    if (_has_table(conn, "events")
-            and all(_has_column(conn, "events", c) for c in
-                    ("circuit", "waveform_boot_id", "waveform_event_id"))):
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-            "ON events (circuit, waveform_boot_id, waveform_event_id)")
-        conn.commit()
+    _ensure_wf_claim_index(conn)
     log.info("Migration 20260818: pinned verdict columns ready (%d overlap "
              "wrapper(s) tagged, no volume rewritten; %d row(s) whose zeroing flag "
              "disagreed with their volume re-zeroed)", cur.rowcount or 0, repaired)
@@ -3800,13 +3795,7 @@ def _apply_dead_schema_and_event_indexes(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_events_fixture "
                 "ON events (fixture_id)")
-        # Belt-and-braces re-create of the wf-claim index — LAST-migration
-        # convention (see 20260574/20260804/.../20260811).
-        if all(_has_column(conn, "events", c) for c in
-               ("circuit", "waveform_boot_id", "waveform_event_id")):
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
-                "ON events (circuit, waveform_boot_id, waveform_event_id)")
+        _ensure_wf_claim_index(conn)
 
     conn.commit()
     log.info("Migration 20260902: dropped %d dead table(s) + %d redundant "
@@ -3962,6 +3951,15 @@ def _run_migrations_impl(
             | _missing_overlap_audit_table(conn)
             | _missing_leak_test_dismissed_column(conn)
             | _missing_leak_test_measurement_columns(conn)
+            # 20260564-68 (dev32/33/34). These five verifiers were written with
+            # their migrations and then never wired in here, so a DB stamped
+            # CURRENT with any of those five bodies un-run passed this guard and
+            # only failed later, at the first query against the missing column.
+            | _missing_supply_regime_tables(conn)
+            | _missing_regime_calibration_columns(conn)
+            | _missing_pump_era_columns(conn)
+            | _missing_leak_watch_columns(conn)
+            | _missing_cluster_mode_columns(conn)
             | _missing_leak_test_refill_columns(conn)
             | _missing_local_day_columns(conn)
             | _missing_wf_claim_columns(conn)
