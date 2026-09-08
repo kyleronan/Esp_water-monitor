@@ -1,13 +1,49 @@
-#!/usr/bin/execlineb -S0
-# s6-overlay v3: halt, do NOT stop the supervision tree.
+#!/usr/bin/with-contenv sh
+# s6-overlay v3 finish script. Runs when the water_monitor service exits.
 #
+# s6 calls this with two arguments:
+#   $1  the service's exit code, or 256 if it was killed by a signal
+#   $2  the signal number, when $1 is 256
+#
+# WHY THIS INSPECTS $1. It used to call `halt` unconditionally, so EVERY exit
+# tore the whole container down — including a normal shutdown, and including a
+# transient crash. On a box whose job is closing the water main, a one-off
+# uvicorn fault became a dead valve controller until somebody noticed.
+#
+# The two cases have to be told apart:
+#
+#   * exit 0, or 256 (a signal, which is how a Supervisor-requested stop
+#     arrives) — this is a NORMAL stop. Do not halt: s6 is already running the
+#     shutdown it started, and halting again cuts across it. This is the same
+#     class of mistake as the v2 `s6-svscanctl -t` call documented below, which
+#     tore the supervision tree down underneath services that were still
+#     stopping.
+#
+#   * anything else — a real crash. Halt, so the container exits and the
+#     Supervisor sees a stopped add-on. `watchdog:` in config.yaml then brings
+#     it back, which is the restart path the repo previously did not have.
+#
+# HISTORY, kept because it is why the shebang and the halt path look like this.
 # This was `s6-svscanctl -t /var/run/s6/services`, the v2 idiom. v3 moved the
 # scandir, so that call failed with "No such file or directory" on every
-# shutdown — noisy, but inert: it never actually did anything. Repointing it at
+# shutdown - noisy, but inert: it never actually did anything. Repointing it at
 # the v3 scandir (/run/service) was worse, because then it WORKED: it tore the
 # supervision tree down underneath the services still stopping, and
 # legacy-cont-init failed with "command exited 111".
 #
 # v3 documents halt as the way to bring the container down from a finish
 # script, precisely so the shutdown sequence is not disrupted.
-/run/s6/basedir/bin/halt
+#
+# `sh` rather than execlineb or bashio, matching the sibling `run` script:
+# execline conditionals are easy to get subtly wrong in a file that can only
+# fail in production, and bashio needs a different shebang for no gain here.
+
+if [ "${1}" = "0" ] || [ "${1}" = "256" ]; then
+    echo "[finish] water_monitor stopped normally (code ${1}, signal ${2:-none});"
+    echo "[finish] leaving the shutdown to s6."
+    exit 0
+fi
+
+echo "[finish] water_monitor exited abnormally (code ${1}, signal ${2:-none})."
+echo "[finish] halting the container so the Supervisor watchdog restarts it."
+exec /run/s6/basedir/bin/halt

@@ -121,3 +121,16 @@ LABEL \
     io.hass.description="Intelligent water monitoring with fixture signature recognition" \
     io.hass.type="addon" \
     io.hass.version="${BUILD_VERSION}"
+# Liveness only, and deliberately shallow - it hits the same hardcoded
+# {"status": "ok"} that `watchdog:` in config.yaml polls. A liveness probe that
+# checks subsystems turns a brief HA API outage into a restart loop, and on this
+# box a restart also LOSES the in-flight water event, which the detector holds
+# in memory only. Per-subsystem state belongs on /health/detail, which sits
+# behind auth precisely so a probe cannot enumerate subsystems and error strings.
+#
+# The Supervisor restarts this add-on from `watchdog:`, NOT from this line -
+# Docker's HEALTHCHECK is not what the Supervisor reads. This exists so that
+# `docker ps` tells the truth to somebody debugging the container by hand, and
+# so the container's own health is not silently unknown.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python3 -c "import urllib.request as u, sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8765/health', timeout=4).status == 200 else 1)"
