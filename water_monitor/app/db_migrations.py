@@ -316,8 +316,9 @@ _BASELINE_VERSION: int = 20260523
 # prefix. It stays as-is because it shipped and stamped live databases, and
 # "never reuse or reorder a shipped number" outranks tidiness — renumbering it
 # would make those DBs fail the _UPGRADEABLE_VERSIONS check below and be told to
-# delete themselves. THE NEXT MIGRATION IS 20260901, NOT 20260820.
-_CURRENT_VERSION: int = 20260901
+# delete themselves. 20260901 followed it (September 2026, #01), 20260902 after
+# that; THE NEXT MIGRATION IS 20260903.
+_CURRENT_VERSION: int = 20260902
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
 # but still need the unique index applied.
@@ -548,10 +549,11 @@ def _apply_signature_matcher(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (circuit, fixture_type)
         )"""
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_type_signatures_circuit "
-        "ON fixture_type_signatures (circuit)"
-    )
+    # (idx_type_signatures_circuit was created here; removed with migration
+    #  20260902, which also DROPs it — PRIMARY KEY (circuit, fixture_type)
+    #  already indexes `circuit` as its leading column. Removing it from
+    #  database.py alone would have been a silent no-op, because this line
+    #  re-created it on every forward walk.)
     if not _has_column(conn, "events", "matched_fixture_type"):
         conn.execute(
             "ALTER TABLE events ADD COLUMN matched_fixture_type TEXT"
@@ -3136,9 +3138,10 @@ def _apply_fixture_health(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_fixture_health_alert_open "
         "ON fixture_health_alert (circuit, fixture_type, resolved_at)")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_fixture_health_stat_day "
-        "ON fixture_health_stat (circuit, fixture_type, as_of_day)")
+    # (idx_fixture_health_stat_day was created here; removed with migration
+    #  20260902, which also DROPs it — it duplicated the table's own
+    #  UNIQUE (circuit, fixture_type, as_of_day) index column for column.
+    #  Removing it from database.py alone would have been a silent no-op.)
     # Belt-and-braces re-create of the wf-claim index — LAST-migration
     # convention (see 20260574/20260804/.../20260810).
     if (_has_table(conn, "events")
@@ -3675,6 +3678,143 @@ def _apply_drop_mqtt_schema(conn: sqlite3.Connection) -> None:
              len(dropped), ", ".join(dropped) or "none")
 
 
+# Objects removed by 20260902. Kept as module constants so the migration and
+# its test name the same things.
+_V20260902_DROP_TABLES: tuple = ("csrf_tokens", "cluster_sequences")
+_V20260902_DROP_INDEXES: tuple = (
+    "idx_hourly_volume_circuit_ts",     # == PRIMARY KEY (circuit, hour_ts)
+    "idx_daily_summary_circuit_day",    # == PRIMARY KEY (circuit, day)
+    "idx_clusters_circuit",             # prefix of PK (circuit, id)
+    "idx_type_signatures_circuit",      # prefix of PK (circuit, fixture_type)
+    "idx_jobs_id",                      # jobs.id is a rowid alias
+    "idx_fixture_health_stat_day",      # == UNIQUE (circuit, fixture_type, as_of_day)
+)
+
+
+def _apply_dead_schema_and_event_indexes(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260902 — drop dead schema, fix events' indexes.
+
+    Three unrelated pieces of work that all need the same one migration.
+
+    (1) DEAD OBJECTS. Two tables and one column with no reader and no writer
+    anywhere in the repo:
+
+    * ``csrf_tokens`` — a pre-HMAC leftover. CSRF has been stateless
+      double-submit off ``csrf_server_secret`` for a long time; nothing ever
+      issued or checked a row here. Its only other mention in the tree is
+      ``EXPORT_EXCLUDED_TABLES`` in ``routers/backup.py``, which DELETEs from
+      each listed table inside a ``try/except sqlite3.Error: continue`` whose
+      own comment reads "table absent in this schema version" — so unlike the
+      quick-restore allowlist (which has no existence check and WOULD 500),
+      leaving the name there after the drop is exactly the handled case. That
+      file is not touched here.
+    * ``cluster_sequences`` — a Phase 2.2 placeholder that never gained a
+      writer; a repo-wide grep found its CREATE and nothing else.
+    * ``events.flow_onset_delay_seconds`` — never in the feature dict the live
+      upsert builds its column list from, so dropping it cannot break event
+      ingestion, and no query selects it.
+
+    NOT dropped, though the audit proposed them:
+
+    * ``zone_flow_history`` — it IS in ``RESTORABLE_TABLES`` (restore_utils.py)
+      and ``HISTORY_ARCHIVE_TABLES`` (routers/backup.py), and data_pruner
+      prunes it by ``recorded_at``. Never-populated is not the same as
+      unreferenced.
+    * ``events.propagation_delay_seconds`` — no reader in the add-on, but
+      ``tools/audit/scripts/p4_fields.py`` SELECTs it by name against a copy of
+      the live database, so dropping it would break the audit harness.
+
+    (2) REDUNDANT INDEXES (``_V20260902_DROP_INDEXES``). Six non-UNIQUE indexes
+    whose key is already indexed, column for column, by the table's own PRIMARY
+    KEY / UNIQUE constraint (or, for ``jobs``, by the rowid the INTEGER PRIMARY
+    KEY aliases). No ``ON CONFLICT`` target can depend on them — a conflict
+    target must be UNIQUE — and every one of them cost a write on tables the
+    live path writes to constantly. Two of the six were ALSO created inside
+    earlier migrations (20260530, 20260811); those CREATE lines are removed in
+    the same commit, because dropping here while a forward walk re-created them
+    two steps earlier would have been a silent no-op.
+
+    NOT dropped: ``idx_cross_talk_audit_event``. The audit listed it, but it is
+    not redundant — ``cross_talk_audit`` has no other index on ``event_id``, and
+    the reprocess delete loop in database.py runs
+    ``UPDATE cross_talk_audit SET stale_reason = … WHERE event_id = ?`` once per
+    deleted event. Dropping it would have turned that into a table scan per row.
+
+    (3) THE TWO MISSING EVENTS INDEXES.
+
+    * ``idx_events_circuit_cluster (circuit, cluster_id)`` — ``cluster_id`` is
+      the join key of the whole clustering layer and had no index at all. Nearly
+      every filter site pairs it with ``circuit`` (``WHERE circuit = ? AND
+      cluster_id = ?``, ``… AND cluster_id IS NULL``), and cluster ids are only
+      unique per circuit, so the composite is the right key rather than a bare
+      one.
+    * ``idx_events_fixture (fixture_id)`` — ``fixture_id`` is a declared FK to
+      ``fixtures(id)`` with no ON DELETE action, so SQLite must check the child
+      rows on every fixture delete or merge. Unindexed that was a full scan of
+      ``events``; the FK check keys on ``fixture_id`` alone, so this index is
+      deliberately NOT circuit-led.
+
+    Both live here rather than in ``_create_schema`` for the reason the
+    ``idx_events_wf_claim`` / ``idx_events_verdict_pin`` notes in database.py
+    give: that DDL script also runs against upgrade databases, and an index
+    statement there executes before any ALTER has run. Fresh installs still get
+    them — the version==0 path runs this whole chain.
+
+    Idempotent throughout: ``DROP … IF EXISTS``, ``CREATE INDEX IF NOT EXISTS``,
+    and the column drop is checked with ``_has_column`` first and wrapped
+    (``ALTER TABLE … DROP COLUMN`` needs SQLite 3.35+; on anything older the
+    column is simply left in place, which is harmless now that ``_create_schema``
+    no longer emits it). No data is migrated — every object removed here is
+    empty or write-never-read.
+    """
+    for table in _V20260902_DROP_TABLES:
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        except sqlite3.Error as e:            # noqa: PERF203 — one per table
+            log.warning("Migration 20260902: could not drop table %s: %s",
+                        table, e)
+
+    for idx in _V20260902_DROP_INDEXES:
+        try:
+            conn.execute(f"DROP INDEX IF EXISTS {idx}")
+        except sqlite3.Error as e:            # noqa: PERF203 — one per index
+            log.warning("Migration 20260902: could not drop index %s: %s",
+                        idx, e)
+
+    dropped_col = False
+    if _has_column(conn, "events", "flow_onset_delay_seconds"):
+        try:
+            conn.execute(
+                "ALTER TABLE events DROP COLUMN flow_onset_delay_seconds")
+            dropped_col = True
+        except sqlite3.Error as e:
+            log.warning("Migration 20260902: leaving "
+                        "events.flow_onset_delay_seconds in place (%s)", e)
+
+    if _has_table(conn, "events"):
+        if all(_has_column(conn, "events", c) for c in ("circuit", "cluster_id")):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_circuit_cluster "
+                "ON events (circuit, cluster_id)")
+        if _has_column(conn, "events", "fixture_id"):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_fixture "
+                "ON events (fixture_id)")
+        # Belt-and-braces re-create of the wf-claim index — LAST-migration
+        # convention (see 20260574/20260804/.../20260811).
+        if all(_has_column(conn, "events", c) for c in
+               ("circuit", "waveform_boot_id", "waveform_event_id")):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_wf_claim "
+                "ON events (circuit, waveform_boot_id, waveform_event_id)")
+
+    conn.commit()
+    log.info("Migration 20260902: dropped %d dead table(s) + %d redundant "
+             "index(es)%s; events cluster_id/fixture_id now indexed",
+             len(_V20260902_DROP_TABLES), len(_V20260902_DROP_INDEXES),
+             " + events.flow_onset_delay_seconds" if dropped_col else "")
+
+
 _MIGRATIONS: tuple = (
     (20260524, _drop_retired_wf_entity_map_rows),
     (20260525, _apply_unique_events_index),
@@ -3747,6 +3887,7 @@ _MIGRATIONS: tuple = (
     (20260818, _apply_verdict_pin),
     (20260819, _apply_wf_src_hz_correction),
     (20260901, _apply_drop_mqtt_schema),
+    (20260902, _apply_dead_schema_and_event_indexes),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

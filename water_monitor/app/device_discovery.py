@@ -80,6 +80,24 @@ OPTIONAL_ROLES = {
     # single-event transport.
     "wf_overflow_count_sensor",
     "wf_chunk_drop_count_sensor",
+    # Phase 3 (3.1) — the firmware's three waveform STAGE counters. Together
+    # with the add-on's own transport_stats they turn "no waveforms" from a
+    # guess into an arithmetic statement: captures started → chunks staged →
+    # events fired (firmware) → assembled / gaps (add-on). Device-wide, not
+    # per-circuit, so — like the two counters above — they are mapped under
+    # circuit_1 only. Optional: older firmware doesn't publish them.
+    "wf_captures_started_sensor",
+    "wf_chunks_staged_sensor",
+    "wf_events_fired_sensor",
+    # Phase 3 (3.2) — VALVE TRUTH. The end stops are the only ground truth for
+    # where the valve physically is (the `valve.*` entity is a template the
+    # firmware publishes FROM these), and the seal alerts are the firmware's
+    # own "flow against a closed valve" detector. Read-only here: nothing gates
+    # on them, they are surfaced on /health/detail so unit 8.5 has something to
+    # decide from. Optional so a partial/older mapping never blocks setup.
+    "open_end_stop_sensor",
+    "closed_end_stop_sensor",
+    "valve_seal_alert_sensor",
 }
 
 
@@ -154,6 +172,19 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         # chunk drop count was added in 3.9.0 alongside the chunked streaming transport.
         "wf_overflow_count_sensor":   (r"waveform overflow dropped count.*main",       "sensor"),
         "wf_chunk_drop_count_sensor": (r"waveform chunk drop count.*main",             "sensor"),
+        # Phase 3 (3.1) — firmware waveform stage counters. These carry NO
+        # circuit keyword in the firmware (`name: "Waveform Captures Started"`),
+        # so there is nothing for _make_label_pattern to substitute and the
+        # entity_id fallback never fires either — original_name is the only
+        # thing that matches. Mapped under circuit_1 by convention, like the
+        # two counters above.
+        "wf_captures_started_sensor": (r"waveform captures started",                   "sensor"),
+        "wf_chunks_staged_sensor":    (r"waveform chunks staged",                      "sensor"),
+        "wf_events_fired_sensor":     (r"waveform events fired",                       "sensor"),
+        # Phase 3 (3.2) — valve truth (end stops) + the valve-seal alert.
+        "open_end_stop_sensor":       (r"open end stop.*main",                         "binary_sensor"),
+        "closed_end_stop_sensor":     (r"closed end stop.*main",                       "binary_sensor"),
+        "valve_seal_alert_sensor":    (r"valve seal alert.*main",                      "binary_sensor"),
     },
     "circuit_2": {   # was "irrigation" — regex patterns match default firmware names
         "flow_sensor":             (r"water flow rate.*irrigation",                           "sensor"),
@@ -194,6 +225,13 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "leak_settle_number":         (r"leak test settle time.*irrigation|leak_settle_s_irr\b",               "number"),
         # Runtime per-circuit flow-meter pulses-per-litre (firmware 3.12.0+).
         "flow_meter_ppl":             (r"flow meter ppl.*irrigation|ppl_irr\b",                                "number"),
+        # Phase 3 (3.2) — valve truth (end stops) + the valve-seal alert.
+        # The firmware ids are open_end_stop_valve2 / closed_end_stop_valve2,
+        # but HA derives the entity_id from the NAME ("Open End Stop -
+        # Irrigation"), so the display term is what matches on both tiers.
+        "open_end_stop_sensor":       (r"open end stop.*irrigation",                                           "binary_sensor"),
+        "closed_end_stop_sensor":     (r"closed end stop.*irrigation",                                         "binary_sensor"),
+        "valve_seal_alert_sensor":    (r"valve seal alert.*irrigation",                                        "binary_sensor"),
     },
 }
 
@@ -522,6 +560,22 @@ def _derive_prefix(entities: List[Dict[str, Any]]) -> str:
                     log.debug("Derived ESP prefix: %r", prefix)
                     return prefix
 
+    # Phase 3 (3.2) — this return was SILENT, and it is not a harmless one.
+    # The empty string is stored as device_config.esp_device_prefix, becomes
+    # the waveform accumulator's `expected_node`, and the accumulator's
+    # identity guard reads `if self._expected_node and node != ...` — so an
+    # empty prefix does not reject chunks, it DISABLES the node-identity check
+    # for the life of the process, with no log line and no UI difference.
+    # Say so here, and see WaveformChunkAccumulator.transport_stats()
+    # ("node_check_enabled"), which is where /health/detail reads it back.
+    log.warning(
+        "Could not derive an ESP device prefix from %d entity id(s) — none "
+        "ended in a known suffix (%s). The waveform node-identity check will "
+        "be DISABLED (any node's chunks are accepted), and anything else "
+        "keying on the prefix will misbehave. Re-run device discovery, or "
+        "extend _derive_prefix's known_suffixes for this firmware.",
+        len(entities), ", ".join(known_suffixes),
+    )
     return ""
 
 

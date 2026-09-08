@@ -463,6 +463,22 @@ class Orchestrator:
             log.debug("[%s] entity IDs loaded from DB — fully_configured=%s",
                       circuit_cfg.circuit, circuit_cfg.is_fully_configured)
 
+    def _circuit_entities_for(self, circuit: str) -> Dict[str, str]:
+        """{role: entity_id} for one circuit, straight from circuit_entity_map.
+
+        SYNC — touches the shared connection. Handed to EventDetector as
+        ``entities_getter`` and invoked ONLY from its collect_circuit_inputs,
+        which every caller submits through run_db (same contract as the
+        sensitivity / pump-gate / low-pressure getters above).
+
+        Exists so the Phase 3 device-truth roles (end stops, valve-seal
+        alerts, waveform stage counters) can be subscribed without adding six
+        more fields to CircuitConfig for entities nothing else consumes.
+        """
+        if not self._db:
+            return {}
+        return load_circuit_entities(self._db, circuit)
+
     def reload_circuit_labels(self) -> None:
         """
         Re-load circuit display names from circuit_labels into the live
@@ -1103,6 +1119,12 @@ class Orchestrator:
             low_pressure_cb=self._on_low_pressure_alert,
             winterized_getter=self._is_circuit_winterized,  # audit-ok(run_db): invoked only inside EventDetector.collect_circuit_inputs, which is submitted via run_db
             pump_fail_cb=self._on_pump_fail_alert,
+            entities_getter=self._circuit_entities_for,  # audit-ok(run_db): invoked only inside EventDetector.collect_circuit_inputs, which is submitted via run_db
+            # Phase 3 (3.2): a waveform-transport condition that is otherwise
+            # invisible (a rejected transport_version drops 100% of chunks at
+            # log.debug) lands in worker_health — the surface /health/detail
+            # already reads — instead of in a second bespoke mechanism.
+            subsystem_degraded_cb=self.mark_subsystem_degraded,
         )
         if await run_db(self._setup_complete_sync):
             await self._event_detector.setup()

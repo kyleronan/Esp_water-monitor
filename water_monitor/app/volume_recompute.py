@@ -75,12 +75,27 @@ async def build_flow_fetch(ha, flow_sensor: str, range_start: datetime,
 
 
 def _parse_ts(s) -> Optional[datetime]:
+    """Parse a stored/HA timestamp to a UTC-AWARE datetime (None if unparseable).
+
+    unit 2.32 — this used to hand back whatever ``fromisoformat`` produced. HA
+    history timestamps always carry an offset, but legacy ``events.start_ts``
+    rows (pre-dev38) do not, so the naive value met the aware sample times in
+    ``build_flow_fetch``'s ``fetch()`` bisect and raised
+    ``TypeError: can't compare offset-naive and offset-aware datetimes`` —
+    aborting the whole "Fix volume totals" job on the FIRST legacy row (the
+    router catches it and redirects to a bare ``?msg=error``).
+
+    Naive input is treated as UTC, which is the storage convention (see the
+    same assumption in ``cluster_engine._extract_features``).
+    """
     if isinstance(s, datetime):
-        return s
-    try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
+        dt = s
+    else:
+        try:
+            dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
 def _prepare_samples(

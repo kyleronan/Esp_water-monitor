@@ -24,7 +24,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from .config import AddonConfig, compute_suggested_calibration_days, compute_minimum_events
+from .config import AddonConfig, compute_minimum_events
 from .database import (get_training_state, upsert_training_state,
                        get_home_profile, ensure_circuit_defaults,
                        get_circuit_type, get_event_cadence_seconds, run_db)
@@ -321,18 +321,6 @@ class TrainingManager:
         log.info("[%s] calibration started — %d days, minimum %d events",
                  circuit, calibration_days, minimum_events)
         return True
-
-    async def stop_calibration(self, circuit: str) -> None:
-        """Cancel calibration and return to idle."""
-        await run_db(
-            upsert_training_state,
-            self._db, circuit,
-            state="idle",
-            started_at=None,
-            calibration_ends_at=None,
-        )
-        await self._publish_status(circuit)
-        log.info("[%s] calibration cancelled", circuit)
 
     async def complete_calibration(self, circuit: str) -> None:
         """Transition calibrating → labelling.
@@ -1019,14 +1007,3 @@ class TrainingManager:
             result["hours_remaining"]   = 0
 
         return result
-
-    @staticmethod
-    def suggest_calibration_days(
-        bathrooms_full: int,
-        bathrooms_half: int,
-        floors: int,
-        occupants: int,
-        supply_type: str,
-    ) -> tuple[int, str]:
-        return compute_suggested_calibration_days(
-            bathrooms_full, bathrooms_half, floors, occupants, supply_type)

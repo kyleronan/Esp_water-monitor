@@ -343,22 +343,32 @@ class ClusterEngine:
         """Build the full feature dict from an event DB row. Returns None if unusable."""
         if event.get('avg_flow_lpm') is None or not event.get('duration_seconds'):
             return None
+        # unit 2.32: an unparseable / missing start_ts used to fall back to
+        # ``hour = 0``, which is not "unknown" — it is a CONFIRMED midnight
+        # local, and hour_sin/hour_cos are real clustering features. A row that
+        # actually ran at 19:00 was placed at the far side of the time-of-day
+        # circle from where it belongs and dragged the DBSTREAM centre with it.
+        # There is no honest fallback for a time feature, so refuse the event:
+        # _extract_features is already Optional and BOTH call sites handle None
+        # (_match_and_learn_impl → 'features_missing'; the replay loop skips).
         start_ts = event.get('start_ts')
-        if start_ts:
-            try:
-                # dev38: stored start_ts is UTC — convert to the HOME timezone
-                # before taking .hour (second instance of the audit's UTC
-                # time-feature bug; naive timestamps are treated as UTC, the
-                # storage convention).
-                _dt = datetime.fromisoformat(str(start_ts))
-                if _dt.tzinfo is None:
-                    _dt = _dt.replace(tzinfo=timezone.utc)
-                from .event_rules import get_home_timezone
-                hour = _dt.astimezone(get_home_timezone() or timezone.utc).hour
-            except (ValueError, TypeError):
-                hour = 0
-        else:
-            hour = 0
+        if not start_ts:
+            return None
+        try:
+            # dev38: stored start_ts is UTC — convert to the HOME timezone
+            # before taking .hour (second instance of the audit's UTC
+            # time-feature bug; naive timestamps are treated as UTC, the
+            # storage convention).
+            _dt = datetime.fromisoformat(str(start_ts))
+        except (ValueError, TypeError):
+            log.warning("cluster: event %s has an unparseable start_ts (%r) — "
+                        "not clustered (no honest time-of-day feature)",
+                        event.get('id'), start_ts)
+            return None
+        if _dt.tzinfo is None:
+            _dt = _dt.replace(tzinfo=timezone.utc)
+        from .event_rules import get_home_timezone
+        hour = _dt.astimezone(get_home_timezone() or timezone.utc).hour
         hour_sin = math.sin(2 * math.pi * hour / 24)
         hour_cos = math.cos(2 * math.pi * hour / 24)
 

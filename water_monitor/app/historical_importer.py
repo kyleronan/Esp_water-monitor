@@ -367,25 +367,6 @@ class HistoricalImporter:
         n, _retry_from = await self._import_range(cfg, start, end)
         return n
 
-    async def import_all_circuits_range(
-        self,
-        start: datetime,
-        end: datetime,
-    ) -> int:
-        """Import for all circuits over a date range. Returns total count.
-        Best-effort per circuit: one circuit's fetch failure doesn't skip the rest."""
-        total = 0
-        for cfg in self._cfg.circuits:
-            if not self._circuit_has_sensors(cfg):
-                continue
-            try:
-                n, _retry_from = await self._import_range(cfg, start, end)
-            except Exception as exc:
-                log.warning("[%s] range import fetch failed: %s", cfg.circuit, exc)
-                continue
-            total += n
-        return total
-
     async def dry_run_reconstruction(
         self,
         circuit: str,

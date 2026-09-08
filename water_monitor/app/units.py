@@ -255,25 +255,9 @@ def load_unit_context(db) -> Dict[str, Any]:
     return _UNIT_CACHE
 
 
-def convert_flow(value: float, uc: Dict[str, Any]) -> str:
-    """Format a L/min value using the given unit context."""
-    try:
-        return f"{float(value) * uc['flow_factor']:.{uc['flow_decimals']}f}"
-    except (ValueError, TypeError):
-        return "—"
-
-
 def convert_pressure(value: float, uc: Dict[str, Any]) -> str:
     """Format a PSI value using the given unit context."""
     try:
         return f"{float(value) * uc['pressure_factor']:.{uc['pressure_decimals']}f}"
-    except (ValueError, TypeError):
-        return "—"
-
-
-def convert_volume(value: float, uc: Dict[str, Any]) -> str:
-    """Format a litre value using the given unit context."""
-    try:
-        return f"{float(value) * uc['vol_factor']:.{uc['vol_decimals']}f}"
     except (ValueError, TypeError):
         return "—"

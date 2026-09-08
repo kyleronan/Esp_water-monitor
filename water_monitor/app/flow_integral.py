@@ -142,11 +142,6 @@ def registration_curve_version() -> int:
     return _curve_version
 
 
-def registration_curve_status() -> str:
-    """'unvalidated' until a low-flow anchor confirms the curve (E2)."""
-    return _curve_status
-
-
 def _registration_ratio(flow_lpm: float) -> float:
     """metered/true ratio for one sample's flow rate; 1.0 outside 1–∞."""
     for lo, hi, ratio in _curve_bands:

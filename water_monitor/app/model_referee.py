@@ -48,7 +48,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional
 
 log = logging.getLogger(__name__)
 
@@ -222,17 +222,3 @@ def decide(
         return RefereeVerdict(False, "no leg could score — keeping incumbent",
                               tuple(legs))
     return RefereeVerdict(True, "no leg vetoed", tuple(legs))
-
-
-def score_predictions(rows: Sequence, predictions: Sequence,
-                      truth_key=lambda r: r.get("user_fixture_type")) -> Score:
-    """Convenience: count exact-match predictions over rows.
-
-    ``predictions`` may contain ``None`` for abstentions; an abstention counts
-    against the model, matching how the ladder is scored everywhere else.
-    """
-    if len(rows) != len(predictions):
-        raise ValueError("rows and predictions differ in length")
-    correct = sum(1 for r, p in zip(rows, predictions)
-                  if p is not None and p == truth_key(r))
-    return Score(correct, len(rows))

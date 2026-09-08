@@ -644,15 +644,3 @@ def open_alerts(conn: sqlite3.Connection, circuit: str) -> List[dict]:
         "SELECT id, fixture_type, signal, opened_at, detail_json "
         "FROM fixture_health_alert WHERE circuit = ? AND resolved_at IS NULL "
         "ORDER BY opened_at", (circuit,))]
-
-
-def alerting_classes(conn: sqlite3.Connection, circuit: str) -> set:
-    """Fixture classes with an open alert.
-
-    The retrain reads this: while a class is alerting, its recent events are
-    excluded from the referee's holdout (hygiene) and can be quarantined from
-    the pool during post-repair cleanup. Note this is NOT the detection
-    mechanism — detection already happened, downstream, against the frozen
-    baseline. See the plan's rev-4 demotion of quarantine.
-    """
-    return {r["fixture_type"] for r in open_alerts(conn, circuit)}

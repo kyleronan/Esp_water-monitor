@@ -358,6 +358,14 @@ def refit_regime_band(db: sqlite3.Connection, circuit: str,
     if regime.get("band_lo_psi") is not None:
         return False
     start_day = _utc_iso_to_local_day(regime["started_at"], tz)
+    if start_day is None:
+        # No trustworthy local day for this regime's start → the
+        # ``day_date >= start_day`` filter below cannot be honest. Refuse to
+        # fit rather than fit against a UTC date pretending to be a local one.
+        log.warning("supply-regime: regime %s has an unparseable started_at "
+                    "(%r) — band not fitted", regime.get("id"),
+                    regime.get("started_at"))
+        return False
     rows = [d for d in reversed(get_supply_days(db, circuit, limit=400))
             if d["day_date"] >= start_day
             and (d["sample_count"] or 0) >= _MIN_DAY_SAMPLES]
@@ -416,6 +424,7 @@ def supply_banner_state(db: sqlite3.Connection,
     copy inputs. Shows while the CURRENT regime was auto-detected and the user
     has neither confirmed (recalibrated) nor dismissed it. With a ``circuit``,
     also reports which fixture types still need post-shift labels."""
+    from .database import local_day_of as _local_day_of
     regimes = get_regimes(db)
     current = next((r for r in reversed(regimes) if r["ended_at"] is None), None)
     if (current is None or current["source"] != "detected"
@@ -428,7 +437,10 @@ def supply_banner_state(db: sqlite3.Connection,
         "regime_id": current["id"],
         "old_psi": round(prev["center_psi"]) if prev else None,
         "new_psi": round(current["center_psi"]),
-        "since": current["started_at"][:10],
+        # unit 2.32 — ``started_at`` is a UTC instant (a local midnight), so the
+        # [:10] slice was the UTC date: identical west of UTC, a day early east
+        # of it. ``database.local_day_of`` is the DST-correct converter.
+        "since": _local_day_of(current["started_at"]),
     }
     if circuit:
         try:
@@ -440,22 +452,43 @@ def supply_banner_state(db: sqlite3.Connection,
 
 # ── local-day helpers ─────────────────────────────────────────────────────────
 
-def _utc_iso_to_local_day(ts: str, tz) -> str:
+def _utc_iso_to_local_day(ts: str, tz) -> Optional[str]:
+    """UTC ISO timestamp → the HOME-local calendar day, or None if unparseable.
+
+    unit 2.32 — the old fallback was ``str(ts)[:10]``: the raw **UTC** date
+    handed back labelled as a **local** day. In Denver that is silently wrong
+    for every timestamp between 00:00Z and 07:00Z (17:00–23:59 local the day
+    before), and the result feeds ``supply_pressure_daily.day_date`` and the
+    ``day_date >= start_day`` band-fit filter — a wrong answer presented as a
+    right one. Returning None makes the caller decide; it must NEVER substitute.
+    """
     try:
         dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(tz).date().isoformat()
     except (ValueError, TypeError):
-        return str(ts)[:10]
+        log.warning("supply-regime: unparseable UTC timestamp %r — no local day", ts)
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).date().isoformat()
 
 
-def _local_day_to_utc_iso(day_date: str, tz) -> str:
+def _local_day_to_utc_iso(day_date: str, tz) -> Optional[str]:
+    """HOME-local calendar day → the UTC ISO instant of its local midnight,
+    or None if ``day_date`` is not a date.
+
+    unit 2.32 — the old fallback was ``f"{day_date}T00:00:00+00:00"``, i.e. the
+    local day RE-INTERPRETED as UTC midnight: a 6–7 h error in Denver written
+    straight into ``supply_regime.started_at`` / ``ended_at``, which are then
+    compared against event ``start_ts``. Return None instead of a plausible
+    wrong instant.
+    """
     try:
-        local_midnight = datetime.fromisoformat(day_date).replace(tzinfo=tz)
-        return local_midnight.astimezone(timezone.utc).isoformat()
+        local_midnight = datetime.fromisoformat(str(day_date)).replace(tzinfo=tz)
     except (ValueError, TypeError):
-        return f"{day_date}T00:00:00+00:00"
+        log.warning("supply-regime: unparseable local day %r — no UTC instant",
+                    day_date)
+        return None
+    return local_midnight.astimezone(timezone.utc).isoformat()
 
 
 # ── bootstrap ─────────────────────────────────────────────────────────────────
@@ -477,7 +510,10 @@ def bootstrap_from_events(db: sqlite3.Connection, circuit: str, tz) -> int:
         "  AND start_ts >= ? ORDER BY start_ts", (circuit, since)).fetchall()
     by_day: Dict[str, List[float]] = {}
     for ts, psi in rows:
-        by_day.setdefault(_utc_iso_to_local_day(ts, tz), []).append(float(psi))
+        day = _utc_iso_to_local_day(ts, tz)
+        if day is None:                  # unit 2.32 — drop, never bucket by a guess
+            continue
+        by_day.setdefault(day, []).append(float(psi))
     for day, samples in by_day.items():
         # Never clobber a real settled-sample row with the cruder event proxy.
         exists = db.execute(
@@ -496,7 +532,12 @@ def bootstrap_from_events(db: sqlite3.Connection, circuit: str, tz) -> int:
     # Initial regime from the earliest settle window.
     seed = days_old_to_new[:_SETTLE_FIT_DAYS]
     center = _median([float(d["median_psi"]) for d in seed])
-    _open_regime(db, _local_day_to_utc_iso(seed[0]["day_date"], tz), center,
+    seed_start = _local_day_to_utc_iso(seed[0]["day_date"], tz)
+    if seed_start is None:               # unit 2.32 — no invented started_at
+        log.warning("supply-regime: bootstrap aborted — seed day %r is not a "
+                    "date", seed[0]["day_date"])
+        return 0
+    _open_regime(db, seed_start, center,
                  source="bootstrap", note="bootstrapped from event history")
     created = 1
 
@@ -509,6 +550,10 @@ def bootstrap_from_events(db: sqlite3.Connection, circuit: str, tz) -> int:
         verdict = evaluate_regime_shift(newest_first, current["center_psi"])
         if verdict is not None:
             shift_at = _local_day_to_utc_iso(verdict["shift_day"], tz)
+            if shift_at is None:         # unit 2.32 — never close/open at a guess
+                log.warning("supply-regime: replay skipped a shift — shift_day "
+                            "%r is not a date", verdict["shift_day"])
+                continue
             _close_regime(db, current["id"], shift_at)
             _open_regime(db, shift_at, verdict["new_center"],
                          source="detected", detected=True,
@@ -654,10 +699,13 @@ class SupplyRegimeTracker:
             if len(evaluated) >= _SETTLE_FIT_DAYS:
                 seed = evaluated[:_SETTLE_FIT_DAYS]
                 center = _median([float(d["median_psi"]) for d in seed])
-                _open_regime(self._db,
-                             _local_day_to_utc_iso(min(d["day_date"]
-                                                       for d in seed),
-                                                   self._ha_tz),
+                started_at = _local_day_to_utc_iso(
+                    min(d["day_date"] for d in seed), self._ha_tz)
+                if started_at is None:   # unit 2.32 — no invented started_at
+                    log.warning("supply-regime: first live regime not opened — "
+                                "seed day is not a date")
+                    return
+                _open_regime(self._db, started_at,
                              center, source="bootstrap",
                              note="first live regime")
                 log.info("supply-regime: initial regime opened at %.1f psi",
@@ -666,6 +714,10 @@ class SupplyRegimeTracker:
         verdict = evaluate_regime_shift(days, current["center_psi"])
         if verdict is not None:
             shift_at = _local_day_to_utc_iso(verdict["shift_day"], self._ha_tz)
+            if shift_at is None:         # unit 2.32 — never close/open at a guess
+                log.warning("supply-regime: shift NOT applied — shift_day %r is "
+                            "not a date", verdict["shift_day"])
+                return
             _close_regime(self._db, current["id"], shift_at)
             _open_regime(self._db, shift_at, verdict["new_center"],
                          source="detected", detected=True)

@@ -131,11 +131,6 @@ class AlertManager:
         return [t.strip() for t in row["mobile_notify_targets"].split(",")
                 if t.strip()]
 
-    def _away_mode(self) -> bool:
-        row = self._db.execute(
-            "SELECT away_mode FROM home_profile WHERE id = 1").fetchone()
-        return bool(row["away_mode"]) if row else False
-
     def _fire_prep_sync(self, circuit: str, alert_type: str) -> Dict[str, Any]:
         """dev46 (46a) — every DB read ``fire`` needs, in one DB-thread hop.
 
@@ -334,66 +329,6 @@ class AlertManager:
             )
 
     # ── Convenience methods for each alert type ────────────────────────
-
-    async def alert_pressure_drop(self, circuit: str, drop_psi: float,
-                                   circuit_name: str) -> None:
-        from .database import run_db
-        from .units import load_unit_context, convert_pressure
-        _prep = await run_db(self._fire_prep_sync, circuit, "pressure_drop")
-        uc = _prep["unit_context"]
-        val = convert_pressure(drop_psi, uc)
-        await self.fire(
-            circuit, "pressure_drop",
-            title=f"⚠ Pressure drop — {circuit_name}",
-            message=(f"Rapid pressure drop of {val} {uc['pressure_unit']} detected. "
-                     "Possible burst pipe or demand surge."),
-            prep=_prep,
-        )
-
-    async def alert_high_flow(self, circuit: str, flow_lpm: float,
-                               threshold_lpm: float,
-                               circuit_name: str) -> None:
-        from .database import run_db
-        from .units import load_unit_context, convert_flow
-        _prep = await run_db(self._fire_prep_sync, circuit, "high_flow")
-        uc = _prep["unit_context"]
-        val = convert_flow(flow_lpm, uc)
-        thr = convert_flow(threshold_lpm, uc)
-        await self.fire(
-            circuit, "high_flow",
-            title=f"🚨 High flow alert — {circuit_name}",
-            message=(f"Flow rate {val} {uc['flow_unit']} exceeds "
-                     f"threshold {thr} {uc['flow_unit']}. "
-                     "Possible burst pipe. Valve has been closed."),
-            critical=True,
-            prep=_prep,
-        )
-
-    async def alert_trickle(self, circuit: str, duration_min: float,
-                             flow_lpm: float, circuit_name: str) -> None:
-        from .database import run_db
-        from .units import load_unit_context, convert_flow
-        _prep = await run_db(self._fire_prep_sync, circuit, "trickle")
-        uc = _prep["unit_context"]
-        val = convert_flow(flow_lpm, uc)
-        await self.fire(
-            circuit, "trickle",
-            title=f"💧 Trickle flow alert — {circuit_name}",
-            message=(f"Sustained low flow of {val} {uc['flow_unit']} "
-                     f"for {duration_min:.0f} minutes. "
-                     "Possible running toilet or dripping tap."),
-            prep=_prep,
-        )
-
-    async def alert_flow_anomaly(self, circuit: str, score: float,
-                                  circuit_name: str) -> None:
-        await self.fire(
-            circuit, "flow_anomaly",
-            title=f"🔍 Unusual flow pattern — {circuit_name}",
-            message=(f"Flow pattern did not match any known fixture "
-                     f"(anomaly score {score:.0%}). "
-                     "Review the History page for details."),
-        )
 
     async def alert_unusual_usage(self, circuit: str, score: float,
                                   anomaly_type: Optional[str], circuit_name: str,

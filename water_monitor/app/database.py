@@ -389,12 +389,12 @@ CREATE TABLE IF NOT EXISTS home_profile (
 
 INSERT OR IGNORE INTO home_profile (id) VALUES (1);
 
--- CSRF tokens (legacy — kept for backward compat; new code uses HMAC
--- double-submit, see csrf_server_secret below).
-CREATE TABLE IF NOT EXISTS csrf_tokens (
-    token       TEXT PRIMARY KEY,
-    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+-- NOTE: the legacy `csrf_tokens` table was dropped by migration 20260902.
+-- It was created here and never touched again: the only other mention of the
+-- name in the whole repo was EXPORT_EXCLUDED_TABLES (routers/backup.py), which
+-- DELETEs from it inside a try/except that already treats "table absent in this
+-- schema version" as normal. Nothing issued or verified a token against it —
+-- CSRF has been stateless HMAC double-submit off csrf_server_secret.
 
 -- HMAC server secret for stateless CSRF double-submit. One row
 -- (id = 1). The secret is generated once on first use and never
@@ -667,8 +667,11 @@ CREATE TABLE IF NOT EXISTS fixture_type_signatures (
     PRIMARY KEY (circuit, fixture_type)
 );
 
-CREATE INDEX IF NOT EXISTS idx_type_signatures_circuit
-    ON fixture_type_signatures (circuit);
+-- NOTE: idx_type_signatures_circuit (circuit) was dropped by migration
+-- 20260902 — the PRIMARY KEY (circuit, fixture_type) already provides an
+-- index whose leading column is `circuit`, so it served no query the PK
+-- index did not. It was also created by migration 20260530; that copy is
+-- gone too (a DDL-only deletion would have been a silent no-op).
 
 -- ==========================================================================
 -- RULE CALIBRATION (Phase 1) — per-home fit of the structural-rules-tier bands
@@ -777,7 +780,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_jobs_id ON jobs (id);
+-- NOTE: idx_jobs_id (id) was dropped by migration 20260902. `id INTEGER
+-- PRIMARY KEY AUTOINCREMENT` is a rowid alias, so lookups by id already use
+-- the table's own rowid B-tree; the extra index only cost a write per job row.
 
 -- ==========================================================================
 -- RECORDER RECONCILIATION CHECKPOINT (Phase 3 §2) — per-circuit position the
@@ -825,8 +830,8 @@ CREATE TABLE IF NOT EXISTS fixture_clusters (
     PRIMARY KEY (circuit, id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_clusters_circuit
-    ON fixture_clusters (circuit);
+-- NOTE: idx_clusters_circuit (circuit) was dropped by migration 20260902 —
+-- PRIMARY KEY (circuit, id) already indexes `circuit` as its leading column.
 CREATE INDEX IF NOT EXISTS idx_clusters_fixture
     ON fixture_clusters (fixture_id);
 
@@ -843,18 +848,9 @@ CREATE TABLE IF NOT EXISTS cluster_cooccurrence (
     PRIMARY KEY (circuit, from_cluster_id, to_cluster_id)
 );
 
--- ==========================================================================
--- CLUSTER SEQUENCES (Phase 2.2 placeholder, empty in 2.1)
--- ==========================================================================
-CREATE TABLE IF NOT EXISTS cluster_sequences (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    circuit           TEXT NOT NULL,
-    pattern_hash      TEXT,
-    event_chain       TEXT,                 -- JSON list of cluster IDs
-    occurrence_count  INTEGER DEFAULT 0,
-    confidence        REAL DEFAULT 0,
-    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+-- NOTE: `cluster_sequences` (a Phase 2.2 placeholder that stayed empty) was
+-- dropped by migration 20260902. It had exactly one mention in the repo — this
+-- CREATE — so nothing read it, wrote it, exported it or restored it.
 
 -- ==========================================================================
 -- PLUMBING-EVENT EXCLUSION WINDOWS (Phase 2.1)
@@ -911,7 +907,8 @@ CREATE TABLE IF NOT EXISTS events (
     resistance_curve_shape      TEXT,
     propagation_delay_seconds   REAL,
     propagation_delay_ms        REAL DEFAULT 0,
-    flow_onset_delay_seconds    REAL,
+    -- (flow_onset_delay_seconds was here; dropped by migration 20260902 —
+    --  never written by any code path, never read by any query.)
     start_trigger               TEXT DEFAULT 'unknown',
     has_pressure_transient      BOOLEAN DEFAULT 0,
     hour_of_day                 INTEGER,
@@ -1244,6 +1241,11 @@ CREATE INDEX IF NOT EXISTS idx_events_start_ts
 -- 20260573 creates it; the fresh-DB path runs the whole chain too.
 -- NOTE: idx_events_verdict_pin (dev56) is deliberately NOT here for the same
 -- reason — verdict_pin arrives with migration 20260818, which creates it.
+-- NOTE: idx_events_circuit_cluster (circuit, cluster_id) and idx_events_fixture
+-- (fixture_id) follow the same convention and are created by migration
+-- 20260902. cluster_id is the clustering layer's join key and had no index at
+-- all; fixture_id is a declared FK to fixtures(id), so without a backing index
+-- every fixture delete or merge made SQLite scan all of events.
 
 -- ==========================================================================
 -- HOURLY VOLUME (pre-aggregated for fast chart queries)
@@ -1255,8 +1257,9 @@ CREATE TABLE IF NOT EXISTS hourly_volume (
     PRIMARY KEY (circuit, hour_ts)
 );
 
-CREATE INDEX IF NOT EXISTS idx_hourly_volume_circuit_ts
-    ON hourly_volume (circuit, hour_ts);
+-- NOTE: idx_hourly_volume_circuit_ts (circuit, hour_ts) was dropped by
+-- migration 20260902 — it duplicated PRIMARY KEY (circuit, hour_ts) column
+-- for column, and hourly_volume takes a write on every event.
 
 -- ==========================================================================
 -- EVENT WAVEFORMS — high-resolution min/max envelopes for the event detail
@@ -1379,8 +1382,8 @@ CREATE TABLE IF NOT EXISTS daily_summary (
     PRIMARY KEY (circuit, day)
 );
 
-CREATE INDEX IF NOT EXISTS idx_daily_summary_circuit_day
-    ON daily_summary (circuit, day);
+-- NOTE: idx_daily_summary_circuit_day (circuit, day) was dropped by migration
+-- 20260902 — an exact duplicate of PRIMARY KEY (circuit, day).
 
 -- ==========================================================================
 -- LEAK TEST SCHEDULE AND HISTORY
@@ -1812,8 +1815,10 @@ CREATE TABLE IF NOT EXISTS fixture_health_alert (
 
 CREATE INDEX IF NOT EXISTS idx_fixture_health_alert_open
     ON fixture_health_alert (circuit, fixture_type, resolved_at);
-CREATE INDEX IF NOT EXISTS idx_fixture_health_stat_day
-    ON fixture_health_stat (circuit, fixture_type, as_of_day);
+-- NOTE: idx_fixture_health_stat_day was dropped by migration 20260902 — it
+-- duplicated the table's own UNIQUE (circuit, fixture_type, as_of_day)
+-- constraint index column for column. It was also created by migration
+-- 20260811; that copy is gone too.
 
 -- ==========================================================================
 -- DATA RETENTION CONFIGURATION
@@ -1888,13 +1893,15 @@ def _apply_post_create_migrations(conn: sqlite3.Connection) -> None:
             log.warning("ALTER TABLE events.match_rejection_reason: %s", e)
 
     # Migration 026 — propagation_delay in ms + pressure transient shape features.
+    # The backfill `SET propagation_delay_ms = propagation_delay_seconds * 1000`
+    # that used to live here was removed: nothing in the add-on has ever written
+    # events.propagation_delay_seconds (the detector and feature extractor both
+    # produce propagation_delay_ms only), so the WHERE clause matched zero rows
+    # on the one boot where the ALTER above can actually succeed.
     try:
         conn.execute("ALTER TABLE events ADD COLUMN propagation_delay_ms REAL DEFAULT 0")
-        conn.execute(
-            "UPDATE events SET propagation_delay_ms = propagation_delay_seconds * 1000 "
-            "WHERE propagation_delay_seconds IS NOT NULL")
         conn.commit()
-        log.info("Migration: added events.propagation_delay_ms (backfilled from seconds column)")
+        log.info("Migration: added events.propagation_delay_ms")
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e).lower():
             log.warning("ALTER TABLE events.propagation_delay_ms: %s", e)
@@ -5368,6 +5375,38 @@ def find_overlapping_event(
     end_epoch   = int(end.timestamp())
     new_dur     = end_epoch - start_epoch
 
+    # ── Sargable prefilter for idx_events_circuit_span (circuit, start_ts, end_ts)
+    # The epoch predicates below are the AUTHORITY on which rows overlap; they
+    # are timezone-absolute and separator-agnostic (see is_duplicate_event's
+    # note). But strftime() around a column makes the whole term unindexable,
+    # so the planner could only seek on `circuit` — on this schema it did not
+    # even pick the span index, it took idx_events_verdict_pin (circuit=?) and
+    # then read every event on the circuit. This lookup runs once per stored
+    # event during an import.
+    #
+    # These two extra terms are a LOOSE, purely lexicographic bracket that runs
+    # BEFORE the epoch maths and gives the planner a range to seek on. They can
+    # never exclude a row the epoch predicates would have kept:
+    #   * The stored text may use 'T' or ' ' as the separator and may carry any
+    #     UTC offset (-12:00 … +14:00), so its DATE field can differ from the
+    #     true UTC date by at most one day. Two days of slack on each side
+    #     absorbs that with a full day to spare, and also covers a value stored
+    #     as a bare 'YYYY-MM-DD' with no time part.
+    #   * A bare date string sorts BELOW every timestamp that starts with the
+    #     same date ('2026-01-03' < '2026-01-03T00:00:00'), which is exactly the
+    #     inclusive-on-the-low-side / exclusive-on-the-high-side behaviour these
+    #     two comparisons need.
+    #   * A row whose text is not a parseable timestamp at all is dropped by the
+    #     epoch predicates anyway (strftime returns NULL), so the bracket cannot
+    #     change the result set for it either.
+    # ``contained_stored_rows`` (dev56) already queries this same table with the
+    # same plain text comparison, so this is the shape the newest code in this
+    # area had settled on.
+    start_ts_hi = (end   + timedelta(days=2)).astimezone(
+        timezone.utc).strftime("%Y-%m-%d")
+    end_ts_lo   = (start - timedelta(days=2)).astimezone(
+        timezone.utc).strftime("%Y-%m-%d")
+
     excl_ids: list = []
     if exclude_event_id is not None:
         excl_ids.append(exclude_event_id)
@@ -5379,7 +5418,8 @@ def find_overlapping_event(
             f"{_OVERLAP_EXCLUDE_MAX_IDS}-parameter cap — narrow the window")
     excl = ("AND e.id NOT IN (" + ",".join("?" for _ in excl_ids) + ")"
             if excl_ids else "")
-    params: list = [circuit, start_epoch, end_epoch, *excl_ids]
+    params: list = [circuit, start_ts_hi, end_ts_lo,
+                    start_epoch, end_epoch, *excl_ids]
 
     rows = conn.execute(f"""
         SELECT e.id,
@@ -5398,6 +5438,10 @@ def find_overlapping_event(
          WHERE e.circuit = ?
            AND e.start_ts IS NOT NULL
            AND e.end_ts IS NOT NULL
+           -- loose lexicographic bracket: seekable on idx_events_circuit_span
+           AND e.start_ts < ?
+           AND e.end_ts   > ?
+           -- exact, timezone-absolute overlap test (the authority)
            AND CAST(strftime('%s', e.end_ts)   AS INTEGER) > ?
            AND CAST(strftime('%s', e.start_ts) AS INTEGER) < ?
                {excl}

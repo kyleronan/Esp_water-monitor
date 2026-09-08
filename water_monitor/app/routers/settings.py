@@ -11,7 +11,8 @@ from ._helpers import (coerce_float, coerce_int, ingress_redirect,
 from ..auth import require_admin
 from ..circuit_compat import resolve_circuit
 from ..config import SENSITIVITY_PRESETS
-from ..database import get_data_retention, run_db, update_data_retention
+from ..database import (get_data_retention, local_day_of as _local_day_of,
+                        run_db, update_data_retention)
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +109,13 @@ async def settings_page(request: Request):
     # Fetch configurable device entities (number + select) from HA
     from ..database import run_db
     device_cfg = await run_db(get_device_config, orch.db)   # dev46 (46a)
-    prefix = device_cfg.get("esp_device_prefix", "") if device_cfg else ""
+    # ``or ""`` not ``get(..., "")``: device_config row 1 exists as soon as
+    # discovery writes anything, and esp_device_prefix is a NULLABLE column, so
+    # dict.get returns an explicit None (the default only fires for a MISSING
+    # key). That None then reached str.startswith in circuit_of / _enrich_entity
+    # and 500'd the whole Settings page. Found while adding the unit-2.32
+    # device-entity precision test, which reproduced it exactly.
+    prefix = (device_cfg.get("esp_device_prefix") or "") if device_cfg else ""
     try:
         device_entities = await orch.ha.get_device_configurable_entities(prefix)
     except Exception:
@@ -141,8 +148,28 @@ async def settings_page(request: Request):
     _uc              = await run_db(load_unit_context, orch.db)  # dev46 (46a)
     _flow_label      = _uc["flow_unit"]       # e.g. "gal/min"
     _flow_factor     = _uc["flow_factor"]     # multiply L/min → display
+    _flow_dec        = _uc["flow_decimals"]   # display precision for that unit
     _pressure_label  = _uc["pressure_unit"]   # e.g. "bar"
     _pressure_factor = _uc["pressure_factor"] # multiply PSI → display
+    _pressure_dec    = _uc["pressure_decimals"]
+
+    # unit 2.32 — display truth. This block used to hardcode ``round(..., 3)``
+    # for every unit, so the ESP Device Settings numbers disagreed with every
+    # other flow/pressure display in the app, which all use
+    # ``uc['flow_decimals']`` / ``uc['pressure_decimals']`` (units.fmt_flow,
+    # orchestrator's tile, app.js, history.html). 3 happens to match ft³/min
+    # and bar; it is too FINE for L/min, gal/min, PSI and kPa (0.264 where the
+    # rest of the UI shows 0.26) and too COARSE for m³/min (4 decimals).
+    # Rounding the *step* to display precision can land on 0.0 — an invalid
+    # HTML step attribute the browser silently replaces with 1, which then
+    # rejects every fractional entry — so a step is floored at one unit in the
+    # last displayed place. The POST handler re-snaps to ``native_step``
+    # before it reaches HA, so display rounding never changes the stored value.
+    def _disp(value, factor: float, decimals: int, *, is_step: bool = False):
+        out = round(float(value) * factor, decimals)
+        if is_step and out <= 0:
+            return round(10.0 ** -decimals, decimals)
+        return out
 
     # Entity patterns that carry flow or pressure values (internal L/min / PSI).
     _FLOW_PATTERNS     = {"burst pipe flow threshold", "burst threshold",
@@ -200,13 +227,14 @@ async def settings_page(request: Request):
                     e["unit"]        = _flow_label
                     e["native_step"] = e.get("step")
                     try:
-                        e["state"] = round(float(e["state"]) * _flow_factor, 3)
+                        e["state"] = _disp(e["state"], _flow_factor, _flow_dec)
                     except (TypeError, ValueError):
                         pass
                     for attr in ("min", "max", "step"):
                         if e.get(attr) is not None:
                             try:
-                                e[attr] = round(float(e[attr]) * _flow_factor, 3)
+                                e[attr] = _disp(e[attr], _flow_factor, _flow_dec,
+                                                is_step=(attr == "step"))
                             except (TypeError, ValueError):
                                 pass
                 elif pattern in _PRESSURE_PATTERNS:
@@ -214,13 +242,16 @@ async def settings_page(request: Request):
                     e["unit"]        = _pressure_label
                     e["native_step"] = e.get("step")
                     try:
-                        e["state"] = round(float(e["state"]) * _pressure_factor, 3)
+                        e["state"] = _disp(e["state"], _pressure_factor,
+                                           _pressure_dec)
                     except (TypeError, ValueError):
                         pass
                     for attr in ("min", "max", "step"):
                         if e.get(attr) is not None:
                             try:
-                                e[attr] = round(float(e[attr]) * _pressure_factor, 3)
+                                e[attr] = _disp(e[attr], _pressure_factor,
+                                                _pressure_dec,
+                                                is_step=(attr == "step"))
                             except (TypeError, ValueError):
                                 pass
                 else:
@@ -399,7 +430,10 @@ async def settings_page(request: Request):
                 supply_regime_ctx = {
                     "exists": True,
                     "center_psi": round(_cur["center_psi"]),
-                    "since": _cur["started_at"][:10],
+                    # unit 2.32 — started_at is a UTC instant (local midnight);
+                    # [:10] happens to agree west of UTC and is a day early
+                    # east of it. Convert properly instead of relying on that.
+                    "since": _local_day_of(_cur["started_at"]),
                     "labels_needed": (regime_labels_needed(orch.db, _primary,
                                                            _cur)
                                       if _primary else ""),
@@ -419,7 +453,12 @@ async def settings_page(request: Request):
                 benchmark_status[_c.circuit] = {
                     "hash": _ref["source_hash"], "n": len(_ref["ids"]),
                     "source": _ref["source"],
-                    "pinned_at": (_ref["pinned_at"] or "")[:10],
+                    # unit 2.32 — ``pinned_at`` is datetime.now(UTC).isoformat();
+                    # slicing [:10] showed the UTC date as if it were the
+                    # calendar date, so anything pinned 18:00-23:59 Denver
+                    # displayed as TOMORROW. local_day_bounds_utc's sibling
+                    # local_day_of is the DST-correct converter.
+                    "pinned_at": _local_day_of(_ref["pinned_at"]),
                     "pending": _ref["pending"],
                     "human_labels": count_human_pool_labels(orch.db, _c.circuit),
                     "threshold": PIN_MIN_HUMAN_LABELS,

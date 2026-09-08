@@ -262,13 +262,6 @@ def rise_is_flow_aligned(flow_1hz_lpm: Sequence[float],
     return has_flow_in_rise and before <= ALIGN_MAX_PRE_FLOW_LPM
 
 
-def aligned_rises(pressure_1hz: Sequence[float],
-                  flow_1hz_lpm: Sequence[float]) -> List[RechargeRise]:
-    """Recharge rises that pass the flow-phase test."""
-    return [r for r in segment_recharge_rises(pressure_1hz)
-            if rise_is_flow_aligned(flow_1hz_lpm, r)]
-
-
 def fit_decay_ramp(pressure_1hz: Sequence[float]) -> Tuple[float, float]:
     """Least-squares linear fit over the window.
 

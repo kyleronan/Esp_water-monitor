@@ -850,8 +850,10 @@ async def health_detail(request: Request):
     path falls through to the normal guarded pipeline — which is why it cannot
     be used as a watchdog target.
 
-    Reads only in-memory state written by Orchestrator._supervise, so it does
-    no I/O and cannot itself be the thing that hangs.
+    Reads only in-memory state written by Orchestrator._supervise and the
+    event detector's own mirrors, so it does no I/O and cannot itself be the
+    thing that hangs. Every field is a REPORT: nothing here is a gate, and
+    nothing in the add-on branches on what this returns.
     """
     orch = getattr(request.app.state, "orchestrator", None)
     workers = dict(getattr(orch, "worker_health", {}) or {}) if orch else {}
@@ -868,4 +870,32 @@ async def health_detail(request: Request):
         },
         "workers": workers,
         "unhealthy": unhealthy,
+        # Phase 3 (3.1) — waveform-transport counters the accumulator has
+        # always collected and nobody read: assembled / degraded / gaps, the
+        # reassembly-bound trips, and (3.2) the two conditions that were
+        # silent by construction — a rejected transport_version, and a
+        # node-identity check disabled by an empty esp_device_prefix.
+        "waveform_transport": _detector_report(orch, "waveform_transport_stats_all"),
+        # Phase 3 (3.2) — firmware signals now mirrored read-only: all four
+        # end stops (the only ground truth for valve position), both
+        # valve-seal alerts (flow against a closed valve), and the firmware's
+        # own waveform stage counters. Surfaced so unit 8.5 can decide what to
+        # do about them; NOTHING gates on them today.
+        "device_signals": _detector_report(orch, "device_signals"),
     }
+
+
+def _detector_report(orch, method: str) -> dict:
+    """Call an in-memory EventDetector reporter, or return {}.
+
+    /health/detail must answer even when the detector was never built (setup
+    incomplete) or is mid-teardown — a health page that 500s is worse than one
+    reporting less. Never does I/O; never raises.
+    """
+    try:
+        ed = getattr(orch, "event_detector", None) if orch else None
+        fn = getattr(ed, method, None) if ed else None
+        return fn() if callable(fn) else {}
+    except Exception as e:      # pragma: no cover - defensive
+        log.debug("health detail: %s unavailable (%s)", method, e)
+        return {}

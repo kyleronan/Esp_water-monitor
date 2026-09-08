@@ -67,7 +67,10 @@ async def device_page(request: Request):
         # sample count. Surfaces the silently-lossy waveform stream.
         ed = orch.event_detector
         wf = (ed.waveform_transport_stats(circuit_cfg.circuit)
-              if ed else {"assembled": 0, "degraded": 0, "gaps": 0})
+              if ed else {"assembled": 0, "degraded": 0, "gaps": 0,
+                          "rejected_seq": 0, "overflow_evicted": 0,
+                          "rejected_transport_version": 0,
+                          "node_check_enabled": False, "expected_node": ""})
         wf["fw_chunk_drops"] = None
         drop_sensor = getattr(circuit_cfg, "wf_chunk_drop_count_sensor", "")
         if drop_sensor and orch.ha:

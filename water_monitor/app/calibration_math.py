@@ -16,7 +16,14 @@ BUCKET_MIN_L = 2.0              # below this the 0.01 L sensor resolution is too
 MUNICIPAL_MIN_L = 38.0         # ~10 US gal — coarse meter resolution is beaten by volume
 LARGE_CORRECTION_PCT = 3.0      # a >3% bucket correction triggers the sample-count gate
 MIN_RUNS_FOR_LARGE = 3
-REBASELINE_PCT = 10.0          # mirrors orchestrator._PPL_REBASELINE_FRACTION (UI message only)
+# unit 2.32 — the SAME threshold as orchestrator._PPL_REBASELINE_FRACTION (0.10),
+# written in percent here and as a fraction there. This one drives the UI's
+# "this will re-baseline" warning; that one drives the actual re-baseline and the
+# multi-day auto-shutoff pause. Nothing but
+# tests/test_unit232_time_and_display.py::test_rebaseline_threshold_is_the_same_number_in_both_files
+# stops them drifting apart, at which point the UI promises one thing and the
+# runtime does another. Change one → change both.
+REBASELINE_PCT = 10.0          # == orchestrator._PPL_REBASELINE_FRACTION * 100
 PPL_MIN = 1.0
 PPL_MAX = 5000.0
 

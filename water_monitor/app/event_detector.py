@@ -1963,7 +1963,8 @@ class WaveformChunkAccumulator:
     """
 
     def __init__(self, circuit: str, expected_node: str,
-                 on_record_assembled: Optional[Callable[[WaveformRecord], None]] = None) -> None:
+                 on_record_assembled: Optional[Callable[[WaveformRecord], None]] = None,
+                 on_degraded: Optional[Callable[[str, str], None]] = None) -> None:
         self._circuit = circuit
         # Normalize once so every comparison is cheap.
         self._expected_node = _normalize_node_name(expected_node)
@@ -1983,10 +1984,53 @@ class WaveformChunkAccumulator:
         # so the condition is visible without tailing DEBUG.
         self._n_rejected_seq = 0        # chunk dropped: seq >= _WF_MAX_TOTAL_CHUNKS
         self._n_overflow_evicted = 0    # in-flight set dropped: table at capacity
+        # Phase 3 (3.2) — the transport_version gate is the STRICTEST test in
+        # this class (exact string "1") and, until now, the least observable:
+        # a firmware that bumps it drops 100% of chunks at log.debug, with no
+        # counter, no warning, and no visible difference from "the ESP is
+        # quiet". Counted here and surfaced via transport_stats(); the first
+        # occurrence also escalates through `on_degraded` so /health/detail
+        # names it instead of merely reporting zero waveforms.
+        self._n_rejected_version = 0
+        self._on_degraded = on_degraded
+        self._degraded_reported: set = set()
+        if not self._expected_node:
+            # See device_discovery._derive_prefix: an empty prefix does not
+            # reject anything, it turns the node-identity guard below
+            # (`if self._expected_node and ...`) into a no-op. Surfaced as
+            # transport_stats()["node_check_enabled"] = False.
+            log.warning(
+                "waveform[%s]: no expected node name (esp_device_prefix is "
+                "empty) — the waveform node-identity check is DISABLED; "
+                "chunks from ANY ESPHome node will be accepted for this "
+                "circuit. Re-run device discovery to repopulate the prefix.",
+                self._circuit,
+            )
         # Optional sink fired once a record finishes assembling (late-waveform
         # upgrade, Fix 1). Kept DB-free; invoked in a try/except in _assemble so a
         # sink bug can never corrupt assembly. None in most tests.
         self._on_record_assembled = on_record_assembled
+
+    def _report_degraded(self, key: str, message: str) -> None:
+        """Escalate a transport condition ONCE per process, best-effort.
+
+        Wired by EventDetector to Orchestrator.mark_subsystem_degraded, which
+        writes _supervise's record shape into ``worker_health`` — the surface
+        /health/detail already reads. Deliberately no second mechanism, and
+        deliberately fire-once: the conditions this reports are all-or-nothing
+        (a version bump drops every chunk), so repeating adds nothing and a
+        flood must never become a log/notification amplifier.
+        """
+        if key in self._degraded_reported:
+            return
+        self._degraded_reported.add(key)
+        if self._on_degraded is None:
+            return
+        try:
+            self._on_degraded(key, message)
+        except Exception as e:      # pragma: no cover - never fatal
+            log.debug("waveform[%s]: degraded-report sink raised: %s",
+                      self._circuit, e)
 
     # ------------------------------------------------------------------
     # Public callback
@@ -2003,8 +2047,24 @@ class WaveformChunkAccumulator:
                       self._circuit, data.get("schema"))
             return
         if str(data.get("transport_version", "")) != "1":
-            log.debug("waveform[%s]: chunk rejected — unsupported transport_version %r",
-                      self._circuit, data.get("transport_version"))
+            self._n_rejected_version += 1
+            got = data.get("transport_version")
+            if self._n_rejected_version == 1:
+                log.warning(
+                    "waveform[%s]: chunk rejected — unsupported "
+                    "transport_version %r (this add-on speaks \"1\"). EVERY "
+                    "chunk carrying this version is dropped, so waveform "
+                    "enrichment is off until the add-on is updated. Counted "
+                    "as transport_stats.rejected_transport_version.",
+                    self._circuit, got)
+                self._report_degraded(
+                    "waveform_transport_version",
+                    "firmware sends waveform transport_version %r; this "
+                    "add-on accepts \"1\" only — 100%% of waveform chunks on "
+                    "circuit %s are being dropped" % (got, self._circuit))
+            else:
+                log.debug("waveform[%s]: chunk rejected — unsupported transport_version %r",
+                          self._circuit, got)
             return
         node = _normalize_node_name(data.get("node", ""))
         if self._expected_node and node != self._expected_node:
@@ -2361,13 +2421,30 @@ class WaveformChunkAccumulator:
                     self._circuit, k[0], k[1], len(cs.chunks), cs.total,
                 )
 
-    def transport_stats(self) -> Dict[str, int]:
+    def transport_stats(self) -> Dict[str, Any]:
         """Phase 3 waveform-transport health since boot: how many waveforms
         assembled, how many were firmware-flagged degraded, and how many were lost
-        to transport gaps (a final chunk arrived but predecessors never did)."""
+        to transport gaps (a final chunk arrived but predecessors never did).
+
+        Also reports the two conditions that are otherwise SILENT BY
+        CONSTRUCTION (unit 3.2) — a rejected transport_version, and a
+        node-identity check that is switched off because the derived ESP
+        prefix was empty. Both used to be indistinguishable from "the device
+        is quiet". Values are ints plus two non-counter fields; read it as a
+        report, never as a gate."""
         return {"assembled": self._n_assembled,
                 "degraded": self._n_degraded,
                 "gaps": self._n_gaps,
+                # Chunks dropped by the exact-match transport_version gate.
+                # Non-zero means a firmware/add-on transport mismatch and NO
+                # waveform will ever assemble until one side is updated.
+                "rejected_transport_version": self._n_rejected_version,
+                # False = `_expected_node` is empty, so the identity guard in
+                # on_waveform_chunk is inert and chunks from any node are
+                # accepted. Comes from device_config.esp_device_prefix, i.e.
+                # from device_discovery._derive_prefix.
+                "node_check_enabled": bool(self._expected_node),
+                "expected_node": self._expected_node,
                 # Reassembly-bound trips (see _WF_MAX_INFLIGHT_SETS): chunks
                 # dropped for an out-of-range seq, and in-flight sets dropped
                 # because the table was at capacity. Non-zero means either a
@@ -2403,6 +2480,45 @@ class WaveformChunkAccumulator:
         return None
 
 
+# ── Phase 3 (3.2) — firmware signals the add-on subscribes to for OBSERVABILITY
+#
+# Every one of these was already on the wire and read by nobody. They are
+# mirrored into EventDetector._device_signals and surfaced on /health/detail.
+#
+# HARD RULE: nothing in this process may branch on them. They are not gates,
+# not preconditions, and not inputs to any actuation decision — the whole
+# point of Phase 3 is to make silent things VISIBLE before Phase 8 decides
+# what to do about them. Adding a read of _device_signals to a code path that
+# opens or closes a valve is a behaviour change and belongs in unit 8.5.
+#
+# Per-circuit. Keys are roles in circuit_entity_map (see device_discovery).
+_DEVICE_TRUTH_ROLES: Tuple[str, ...] = (
+    # The only ground truth for valve position: physical microswitches. The
+    # `valve.*` entity is a firmware template PUBLISHED FROM these, so it can
+    # report a position the valve never reached (stall mid-travel, dead
+    # switch); the stops themselves cannot.
+    "open_end_stop_sensor",
+    "closed_end_stop_sensor",
+    # device_class: problem — flow still detected 90 s after the CLOSED end
+    # stop went active, i.e. the valve did not seat. The one signal that says
+    # a close command "succeeded" but the water did not stop.
+    "valve_seal_alert_sensor",
+)
+
+# Device-wide waveform stage counters (firmware publishes them once, and
+# discovery maps them under circuit_1). Read alongside the accumulator's own
+# transport_stats they make the pipeline arithmetic: captures started →
+# chunks staged → events fired (firmware) → assembled / gaps (add-on). A stage
+# where the number stops moving is the stage that is broken.
+_DEVICE_DIAG_ROLES: Tuple[str, ...] = (
+    "wf_captures_started_sensor",
+    "wf_chunks_staged_sensor",
+    "wf_events_fired_sensor",
+    "wf_overflow_count_sensor",
+    "wf_chunk_drop_count_sensor",
+)
+
+
 class EventDetector:
     """
     Top-level coordinator. Owns one CircuitEventDetector per circuit
@@ -2421,6 +2537,8 @@ class EventDetector:
         low_pressure_cb: Optional[Callable[[str, float], None]] = None,
         winterized_getter: Optional[Callable[[str], bool]] = None,
         pump_fail_cb: Optional[Callable[[str, float, str], None]] = None,
+        entities_getter: Optional[Callable[[str], Dict[str, str]]] = None,
+        subsystem_degraded_cb: Optional[Callable[..., None]] = None,
     ) -> None:
         self._circuits = circuits
         self._ha = ha_client
@@ -2456,6 +2574,23 @@ class EventDetector:
         # Wired by the orchestrator to FeatureExtractor.handle_late_waveform;
         # left None in tests / import → assembly notifies nothing.
         self._waveform_upgrade_sink: Optional[Callable[[str, WaveformRecord], None]] = None
+        # ── Phase 3 (3.2) — device-truth signals ──────────────────────────
+        # Returns {role: entity_id} for a circuit. Injected like the other
+        # DB-backed getters (this class owns no connection — 46a); invoked
+        # ONLY from collect_circuit_inputs, which the callers submit through
+        # run_db. audit-ok(run_db).
+        self._entities_getter = entities_getter
+        # Wired by the orchestrator to mark_subsystem_degraded, so a transport
+        # condition lands in the SAME worker_health record /health/detail
+        # already reads rather than in a second bespoke surface.
+        self._subsystem_degraded_cb = subsystem_degraded_cb
+        #: circuit -> role -> {entity_id, state, changed_at}. Mirror of the
+        #: firmware's end stops / valve-seal alerts / waveform stage counters.
+        #: OBSERVABILITY ONLY — nothing in this process may branch on it. Unit
+        #: 8.5 owns the decision about acting on valve truth; 3.2 only makes
+        #: it visible, so that decision has evidence to be made from.
+        self._device_signals: Dict[str, Dict[str, dict]] = {}
+        self._device_signals_subscribed: bool = False
 
     def min_flow_for(self, circuit: str) -> float:
         """Per-circuit meter-derived low-flow floor (60 ÷ ppl). Falls back to the
@@ -2507,9 +2642,19 @@ class EventDetector:
                               if self._winterized_getter else False)
             except Exception:
                 winterized = False
+            # Phase 3 (3.2): {role: entity_id} for this circuit, read on the
+            # DB thread with everything else this method collects. Best-effort
+            # — an unconfigured / partially-mapped install just yields {} and
+            # the device-signal subscriptions below are skipped.
+            try:
+                entities = (dict(self._entities_getter(circuit))
+                            if self._entities_getter else {})
+            except Exception:
+                entities = {}
             out[circuit] = {"sens": self._sensitivity_getter(circuit),
                             "gate": gate, "floors": floors,
-                            "winterized": winterized}
+                            "winterized": winterized,
+                            "entities": entities}
         return out
 
     async def setup(self, inputs=None) -> None:
@@ -2575,8 +2720,14 @@ class EventDetector:
             accumulator = WaveformChunkAccumulator(
                 cfg.circuit, expected_node=expected_node,
                 on_record_assembled=self._on_waveform_assembled,
+                on_degraded=self._on_transport_degraded,
             )
             self._chunk_accumulators[cfg.circuit] = accumulator
+
+            # Phase 3 (3.2) — mirror the firmware's valve-truth + waveform
+            # stage entities. Read-only: see _DEVICE_TRUTH_ROLES.
+            self._subscribe_device_signals(
+                cfg.circuit, inputs[cfg.circuit].get("entities") or {})
 
             # Register the HA event subscription once (shared across all circuits).
             if not self._wf_event_subscribed:
@@ -2627,6 +2778,109 @@ class EventDetector:
                 log.warning("[%s] low-pressure resolve failed (non-fatal): %s",
                             circuit, e)
 
+    # ------------------------------------------------------------------
+    # Phase 3 — device-truth signals (OBSERVABILITY ONLY)
+    # ------------------------------------------------------------------
+
+    def _subscribe_device_signals(self, circuit: str,
+                                  entities: Dict[str, str]) -> None:
+        """Register state subscriptions for this circuit's truth/diag roles.
+
+        Cheap by construction. `HaClient.subscribe_entities` puts every id into
+        ONE ``subscribe_entities`` WebSocket subscription, so this adds list
+        entries, not connections or round-trips; unmapped roles (older
+        firmware, partial discovery) are simply skipped.
+        """
+        slots = self._device_signals.setdefault(circuit, {})
+        # The waveform diagnostics are device-wide and discovery maps them
+        # under the first circuit only; asking for them on circuit_2 would
+        # just skip every role.
+        first = self._circuits[0].circuit if self._circuits else circuit
+        roles = _DEVICE_TRUTH_ROLES + (
+            _DEVICE_DIAG_ROLES if circuit == first else ())
+        for role in roles:
+            entity_id = (entities.get(role) or "").strip()
+            if not entity_id or role in slots:
+                continue
+            slots[role] = {"entity_id": entity_id, "state": None,
+                           "changed_at": None}
+            self._ha.subscribe_entity(
+                entity_id,
+                lambda eid, state, attrs, c=circuit, r=role:
+                    self._on_device_signal(c, r, state),
+            )
+            self._device_signals_subscribed = True
+        if slots:
+            log.info("[%s] device-truth signals mirrored (read-only): %s",
+                     circuit, ", ".join(sorted(slots)))
+
+    def _on_device_signal(self, circuit: str, role: str, state: str) -> None:
+        """Record a device-signal state change. Records; decides nothing."""
+        slot = self._device_signals.get(circuit, {}).get(role)
+        if slot is None:
+            return
+        slot["state"] = state
+        slot["changed_at"] = datetime.now(timezone.utc).isoformat()
+
+    async def prime_device_signals(self) -> None:
+        """Seed device-signal states from current HA state.
+
+        Same subscribe-then-prime shape as prime_valve_states (dev38): an end
+        stop that never changes after boot would otherwise read `null` forever,
+        which is indistinguishable from "not mapped". Best-effort per entity.
+        """
+        for circuit, slots in self._device_signals.items():
+            for role, slot in slots.items():
+                if slot["state"] is not None:
+                    continue   # a real change event beat us here — it wins
+                try:
+                    state = await self._ha.get_state_value(slot["entity_id"])
+                except Exception as e:
+                    log.debug("[%s] %s prime failed (non-fatal): %s",
+                              circuit, role, e)
+                    continue
+                if state is None:
+                    continue
+                if slot["state"] is None:      # re-check after the await
+                    slot["state"] = str(state)
+                    slot["changed_at"] = datetime.now(timezone.utc).isoformat()
+
+    def device_signals(self) -> Dict[str, Dict[str, dict]]:
+        """Snapshot of the mirrored firmware signals, for /health/detail.
+
+        Returns copies: a caller must not be able to write back into the live
+        mirror, and this is read from a request handler while the WS callback
+        thread may be updating it.
+        """
+        return {c: {r: dict(slot) for r, slot in slots.items()}
+                for c, slots in self._device_signals.items()}
+
+    def waveform_transport_stats_all(self) -> Dict[str, Dict[str, Any]]:
+        """Per-circuit transport_stats for every accumulator built so far.
+
+        In-memory only — safe to call from a request handler (/health/detail
+        does no I/O, deliberately).
+        """
+        return {c: acc.transport_stats()
+                for c, acc in self._chunk_accumulators.items()}
+
+    def _on_transport_degraded(self, key: str, message: str) -> None:
+        """Bridge an accumulator transport condition to worker_health.
+
+        Reuses Orchestrator.mark_subsystem_degraded rather than inventing a
+        second health surface: the name lands in /health/detail's ``unhealthy``
+        list and the endpoint's status drops "pass" → "warn". Reporting only —
+        no detection, actuation or storage path consults this.
+        """
+        cb = self._subsystem_degraded_cb
+        if cb is None:
+            log.warning("waveform transport degraded (%s): %s", key, message)
+            return
+        try:
+            cb("waveform_transport", RuntimeError(message), detail=key)
+        except Exception as e:  # pragma: no cover - never fatal
+            log.warning("degraded-report failed (non-fatal): %s", e)
+
     def _on_waveform_chunk(self, data: dict) -> None:
         """Route an esphome.water_monitor_waveform_chunk event to the correct circuit."""
         circuit = data.get("circuit", "")
@@ -2666,7 +2920,19 @@ class EventDetector:
         a confirmed 0 — the 2026-08 audit found the column was only ever
         1 or NULL across all 6,124 events. A change event that races in
         during priming wins (checked before AND after the await).
+
+        Phase 3 (3.2) also primes the mirrored device-truth signals from here,
+        rather than from a new call site: this method is already invoked on
+        BOTH paths that follow ``setup()`` — orchestrator boot and the setup
+        wizard's completion handler — so the end stops are populated in the
+        same two places the valve states are, with no third thing to remember.
         """
+        try:
+            await self.prime_device_signals()
+        except Exception as e:      # pragma: no cover - never fatal
+            # An observability prime must never cost us the valve-state seed
+            # that this method exists for.
+            log.warning("device-signal prime failed (non-fatal): %s", e)
         for cfg in self._circuits:
             if not cfg.valve_entity or cfg.circuit in self._valve_open:
                 continue
@@ -2741,11 +3007,18 @@ class EventDetector:
         accumulator = self._chunk_accumulators.get(circuit)
         return accumulator.recent_records() if accumulator else []
 
-    def waveform_transport_stats(self, circuit: str) -> Dict[str, int]:
-        """Phase 3 — per-circuit waveform-transport health counters (or zeros)."""
+    def waveform_transport_stats(self, circuit: str) -> Dict[str, Any]:
+        """Phase 3 — per-circuit waveform-transport health counters (or zeros).
+
+        The no-accumulator fallback carries every key transport_stats() emits,
+        so a caller that reads one by name (routers/device.py, /health/detail)
+        can't KeyError on an unconfigured circuit."""
         accumulator = self._chunk_accumulators.get(circuit)
         if accumulator is None:
-            return {"assembled": 0, "degraded": 0, "gaps": 0}
+            return {"assembled": 0, "degraded": 0, "gaps": 0,
+                    "rejected_seq": 0, "overflow_evicted": 0,
+                    "rejected_transport_version": 0,
+                    "node_check_enabled": False, "expected_node": ""}
         return accumulator.transport_stats()
 
     def pop_waveform_record(
