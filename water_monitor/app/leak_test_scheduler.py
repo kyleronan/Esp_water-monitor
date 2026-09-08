@@ -1330,8 +1330,10 @@ def _sustained_drop(baseline_psi, samples):
     tail = list(samples)[-3:]
     if not tail or baseline_psi is None:
         return None, None, None
-    vals = sorted(p for _, p in tail)
-    median_psi = vals[len(vals) // 2]
+    # 2.25 (f): this open-coded ``vals[len(vals) // 2]``, the upper middle on
+    # an even-length tail (a 2-sample window). Delegated to _median so there is
+    # ONE even-n convention in this module.
+    median_psi = _median([p for _, p in tail])
     window_s = round((tail[-1][0] - tail[0][0]).total_seconds(), 1)
     return round(baseline_psi - median_psi, 2), window_s, tail[-1][0]
 
@@ -1348,8 +1350,24 @@ _NOISE_FLOOR_MIN_PSI = 0.15
 
 
 def _median(vals):
+    """Median with the STANDARD even-n convention: the mean of the two middle
+    elements, not the upper one.
+
+    2.25 (f): this returned ``s[len(s) // 2]`` unconditionally, which is the
+    upper middle for an even-length list. On the two even-n call sites below
+    (the detrended residuals and their absolute deviations, both length n of
+    the whole monitor window) that biased the MAD — and therefore the noise
+    floor — HIGH, so a genuine held decay could be written off as
+    'within_noise'. Empty input still returns None: that contract is relied on
+    by nothing here but is deliberately unchanged, and this median is NOT
+    interchangeable with ``fixture_health._median`` / ``_mad`` (which scale by
+    MAD_SCALE). Do not merge them.
+    """
     s = sorted(vals)
-    return s[len(s) // 2] if s else None
+    if not s:
+        return None
+    mid = len(s) // 2
+    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2.0
 
 
 def _samples_json(samples) -> Optional[str]:
