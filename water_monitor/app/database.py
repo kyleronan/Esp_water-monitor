@@ -219,6 +219,51 @@ def transaction(conn: sqlite3.Connection) -> Generator:
         raise
 
 
+@contextmanager
+def verdict_write(conn: sqlite3.Connection, circuit: str,
+                  start_ts: Optional[str],
+                  *, recompute_summary: bool = True) -> Generator:
+    """A verdict write and the daily rollup it invalidates, in ONE transaction.
+
+    Unit 6.11, ONE extraction instead of six copies. The whole verdict
+    mark/revert family — ``_apply_event_verdicts``,
+    ``mark_event_irrigation_cross_talk``, ``mark_event_leak_test_refill``,
+    ``revert_irrigation_cross_talk``, ``revert_artifact_zeroing_on_relabel``
+    and ``repair_misflagged_phantom_events`` — wrote the event row and the
+    hourly ledger inside ``with transaction(conn)`` and then recomputed
+    ``daily_summary`` AFTER that block, under a second bare ``conn.commit()``.
+    Six copies of one hole: a failure in the recompute left the event zeroed
+    (or restored) with the day's rollup still showing the old number, and no
+    rollback path — the event write had already committed one line earlier.
+
+    So the recompute happens HERE, on the way out, inside the same transaction.
+    ``compute_daily_summary`` issues no COMMIT of its own, which is what makes
+    that possible; if it ever grows one this context manager stops being
+    atomic and ``tests/test_unit611_verdict_transaction_scope.py`` says so.
+
+    ⛔ STILL ONE TRANSACTION PER ``run_db`` CALLABLE (rule N2a). This REPLACES
+    the transaction those functions already had — it does not nest inside one,
+    and ``transaction()`` has no savepoints to make nesting work.
+
+    ⛔ NOT FOR CHUNKED WRITERS. ``yield_write_lock`` exists to commit MID-loop
+    so a waiting user save can win the file write-lock; wrapping such a loop in
+    a transaction defeats it and reintroduces the "database is locked" stalls
+    dev46 fixed. Those loops own their own commits and must keep them.
+
+    ``recompute_summary=False`` is the importer's batch path: skip the
+    per-event rollup and do ONE per affected day after its own loop.
+    """
+    try:
+        yield conn
+        day = local_day_of(start_ts) if recompute_summary else None
+        if day:
+            compute_daily_summary(conn, circuit, day)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def init_db(db_path: Path) -> sqlite3.Connection:
     """Create database and all tables. Safe to call on existing database."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -255,57 +300,26 @@ def _create_schema(conn: sqlite3.Connection) -> None:
 
     ``executescript()`` COMMITs before it runs and ignores ``isolation_level``,
     so never call this from inside an open transaction.
+
+    ⛔ NO ``ALTER TABLE`` BELONGS IN THIS MODULE (unit 6.9). Until 2026-09 a
+    ``_apply_post_create_migrations`` step ran here and issued six
+    ``ALTER TABLE events ADD COLUMN`` statements — match_rejection_reason,
+    propagation_delay_ms, pressure_onset_ms, recovery_overshoot_psi,
+    pressure_oscillation_count, user_fixture_type. All six are declared in
+    schema.sql, so every one of them raised ``duplicate column name`` on every
+    boot of every install and was swallowed by its own ``except``: 42 lines
+    that could only ever fail. They could not fire on an upgrade DB either.
+    All six predate the squashed baseline (``db_migrations._BASELINE_VERSION``
+    = 20260523), which requires ``_BASELINE_EVENT_COLUMNS`` — columns added by
+    the LATER migrations 029/031 — so any database old enough to lack these
+    six is rejected by ``run_migrations`` as pre-squash ("delete the database
+    file and restart") before it can use them. Column adds belong to
+    ``db_migrations`` behind ``_has_column``; see
+    ``tests/test_unit69_no_post_create_alters.py``.
     """
     conn.executescript(_SCHEMA_SQL_PATH.read_text(encoding="utf-8"))
     conn.commit()
-    _apply_post_create_migrations(conn)
     log.info("Schema created/verified")
-
-
-def _apply_post_create_migrations(conn: sqlite3.Connection) -> None:
-    """Add columns introduced after the initial schema for existing DBs.
-
-    Each block uses ``ALTER TABLE … ADD COLUMN`` wrapped in try/except so it
-    is idempotent: on fresh installs the column is already in CREATE TABLE
-    (the ALTER raises ``OperationalError: duplicate column name`` and we
-    swallow it); on upgrade installs the ALTER actually adds the column.
-    """
-    # Phase 2.1 — explain why an event has cluster_id IS NULL.
-    try:
-        conn.execute("ALTER TABLE events ADD COLUMN match_rejection_reason TEXT")
-        conn.commit()
-        log.info("Migration: added events.match_rejection_reason")
-    except sqlite3.OperationalError as e:
-        if "duplicate column name" not in str(e).lower():
-            log.warning("ALTER TABLE events.match_rejection_reason: %s", e)
-
-    # Migration 026 — propagation_delay in ms + pressure transient shape features.
-    # The backfill `SET propagation_delay_ms = propagation_delay_seconds * 1000`
-    # that used to live here was removed: nothing in the add-on has ever written
-    # events.propagation_delay_seconds (the detector and feature extractor both
-    # produce propagation_delay_ms only), so the WHERE clause matched zero rows
-    # on the one boot where the ALTER above can actually succeed.
-    try:
-        conn.execute("ALTER TABLE events ADD COLUMN propagation_delay_ms REAL DEFAULT 0")
-        conn.commit()
-        log.info("Migration: added events.propagation_delay_ms")
-    except sqlite3.OperationalError as e:
-        if "duplicate column name" not in str(e).lower():
-            log.warning("ALTER TABLE events.propagation_delay_ms: %s", e)
-
-    for col, definition in [
-        ("pressure_onset_ms",          "REAL DEFAULT 0"),
-        ("recovery_overshoot_psi",     "REAL DEFAULT 0"),
-        ("pressure_oscillation_count", "INTEGER DEFAULT 0"),
-        ("user_fixture_type",          "TEXT"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
-            conn.commit()
-            log.info("Migration: added events.%s", col)
-        except sqlite3.OperationalError as e:
-            if "duplicate column name" not in str(e).lower():
-                log.warning("ALTER TABLE events.%s: %s", col, e)
 
 
 # ==========================================================================
@@ -2909,7 +2923,7 @@ def _apply_event_verdicts(
             new_effective, method, reason = pin_veff, "overlap_duplicate", "overlap_duplicate"
         excluded = 1
 
-    with transaction(conn):
+    with verdict_write(conn, circuit, row["start_ts"]):
         conn.execute(
             "UPDATE events SET "
             "  is_pressure_restoration_phantom = ?, is_cross_talk = ?, "
@@ -2927,11 +2941,6 @@ def _apply_event_verdicts(
         )
         # §2.5 — the ledger reverse/apply/bookkeep goes through the one chokepoint.
         apply_effective_volume(conn, event_id, circuit, row["start_ts"], new_effective)
-
-    day = local_day_of(row["start_ts"])
-    if day:
-        compute_daily_summary(conn, circuit, day)
-        conn.commit()
     return True
 
 
@@ -3098,7 +3107,8 @@ def mark_event_irrigation_cross_talk(
         return False
 
     raw_volume = float(row["volume_litres"] or 0.0)
-    with transaction(conn):
+    with verdict_write(conn, circuit, row["start_ts"],
+                       recompute_summary=recompute_summary):
         conn.execute(
             "INSERT INTO cross_talk_audit "
             "  (event_id, circuit, reconciled_at, interval_start, interval_end, "
@@ -3117,11 +3127,6 @@ def mark_event_irrigation_cross_talk(
             (_IRRIGATION_XTALK_REASON, event_id, circuit),
         )
         apply_effective_volume(conn, event_id, circuit, row["start_ts"], 0.0)
-
-    day = local_day_of(row["start_ts"])
-    if day and recompute_summary:
-        compute_daily_summary(conn, circuit, day)
-        conn.commit()
     return True
 
 
@@ -3183,7 +3188,8 @@ def mark_event_leak_test_refill(
     if reason is not None and reason not in _RELABEL_REVERTIBLE_REASONS:
         return False    # e.g. overlap_duplicate — a sibling counts this water
 
-    with transaction(conn):
+    with verdict_write(conn, circuit, row["start_ts"],
+                       recompute_summary=recompute_summary):
         conn.execute(
             "UPDATE events SET "
             "  is_pressure_restoration_phantom = 0, is_cross_talk = 0, "
@@ -3196,11 +3202,6 @@ def mark_event_leak_test_refill(
              event_id, circuit),
         )
         apply_effective_volume(conn, event_id, circuit, row["start_ts"], 0.0)
-
-    day = local_day_of(row["start_ts"])
-    if day and recompute_summary:
-        compute_daily_summary(conn, circuit, day)
-        conn.commit()
     log.info("[%s] leak-test refill: event %s zeroed (%.3f L, test #%s)",
              circuit, event_id, float(row["volume_litres"] or 0.0), leak_test_id)
     return True
@@ -3230,7 +3231,7 @@ def revert_irrigation_cross_talk(
 
     raw_volume = float(row["volume_litres"] or 0.0)
     now_iso = datetime.now(timezone.utc).isoformat()
-    with transaction(conn):
+    with verdict_write(conn, circuit, row["start_ts"]):
         conn.execute(
             "INSERT INTO cross_talk_audit "
             "  (event_id, circuit, reconciled_at, volume_litres, action) "
@@ -3246,11 +3247,6 @@ def revert_irrigation_cross_talk(
             (round(raw_volume, 3), event_id, circuit),
         )
         apply_effective_volume(conn, event_id, circuit, row["start_ts"], raw_volume)
-
-    day = local_day_of(row["start_ts"])
-    if day:
-        compute_daily_summary(conn, circuit, day)
-        conn.commit()
     return True
 
 
@@ -3315,7 +3311,7 @@ def revert_artifact_zeroing_on_relabel(
     if raw <= 0.0 or abs(eff - raw) < 1e-6:
         return None   # nothing was zeroed (or nothing to restore)
 
-    with transaction(conn):
+    with verdict_write(conn, circuit, row["start_ts"]):
         conn.execute(
             "UPDATE events SET "
             "  is_pressure_restoration_phantom = 0, is_low_flow_dribble = 0, "
@@ -3331,11 +3327,6 @@ def revert_artifact_zeroing_on_relabel(
              event_id, circuit),
         )
         apply_effective_volume(conn, event_id, circuit, row["start_ts"], raw)
-
-    day = local_day_of(row["start_ts"])
-    if day:
-        compute_daily_summary(conn, circuit, day)
-        conn.commit()
     log.info("[%s] relabel reverted %s zeroing on %s (restored %.3f L)",
              circuit, reason, event_id, raw)
     return reason
@@ -4218,7 +4209,19 @@ def upsert_fixture_from_cluster(
     fixture_type: str,
     publish_to_ha: int = 1,
 ) -> str:
-    """Create or update a fixture linked to a cluster. Returns fixture_id."""
+    """Create or update a fixture linked to a cluster. Returns fixture_id.
+
+    ⛔ THE INSERT AND THE BACK-LINK ARE ONE TRANSACTION (unit 6.11). They used
+    to be two bare statements with a single ``conn.commit()`` after them, so a
+    failure in the window between them committed a ``fixtures`` row that no
+    cluster points at — which is precisely the Class-2 orphan
+    ``find_orphaned_cluster_references`` exists to detect and repair, ~300
+    lines below in this same file. One transaction per call is correct here
+    under rule N2a: the only caller
+    (``migrate_consolidate_duplicate_fixture_types``) opens none of its own,
+    and this is not a chunked writer, so nothing is relying on a mid-loop
+    commit.
+    """
     import uuid as _uuid
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
@@ -4229,34 +4232,34 @@ def upsert_fixture_from_cluster(
     ).fetchone()
     fixture_id = row["fixture_id"] if row else None
 
-    if fixture_id:
-        conn.execute(
-            """
-            UPDATE fixtures
-            SET name = ?, fixture_type = ?, confirmed = 1, user_locked = 1,
-                display_name = ?, publish_to_ha = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (name, fixture_type, name, publish_to_ha, now, fixture_id),
-        )
-    else:
-        fixture_id = str(_uuid.uuid4())
-        conn.execute(
-            """
-            INSERT INTO fixtures
-                (id, circuit, name, auto_name, fixture_type, display_name,
-                 confirmed, user_locked, publish_to_ha, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
-            """,
-            (fixture_id, circuit, name, name, fixture_type, name,
-             publish_to_ha, now, now),
-        )
-        conn.execute(
-            "UPDATE fixture_clusters SET fixture_id = ? WHERE circuit = ? AND id = ?",
-            (fixture_id, circuit, cluster_id),
-        )
-
-    conn.commit()
+    with transaction(conn):
+        if fixture_id:
+            conn.execute(
+                """
+                UPDATE fixtures
+                SET name = ?, fixture_type = ?, confirmed = 1, user_locked = 1,
+                    display_name = ?, publish_to_ha = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (name, fixture_type, name, publish_to_ha, now, fixture_id),
+            )
+        else:
+            fixture_id = str(_uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO fixtures
+                    (id, circuit, name, auto_name, fixture_type, display_name,
+                     confirmed, user_locked, publish_to_ha, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
+                """,
+                (fixture_id, circuit, name, name, fixture_type, name,
+                 publish_to_ha, now, now),
+            )
+            conn.execute(
+                "UPDATE fixture_clusters SET fixture_id = ? "
+                "WHERE circuit = ? AND id = ?",
+                (fixture_id, circuit, cluster_id),
+            )
     return fixture_id
 
 
@@ -5540,7 +5543,6 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
 
     repaired = 0
     litres_restored = 0.0
-    affected_days: set = set()
     for row in rows:
         is_degraded = bool(row["degraded_supply"])
         raw = float(row["volume_litres"] or 0.0)
@@ -5552,7 +5554,7 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
         ) else 0
         new_reason = "pulsing_supply" if is_degraded else None
 
-        with transaction(conn):
+        with verdict_write(conn, row["circuit"], row["start_ts"]):
             conn.execute(
                 "UPDATE events SET "
                 "  is_pressure_restoration_phantom = 0, "
@@ -5569,9 +5571,6 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
 
         repaired += 1
         litres_restored += restored
-        day = local_day_of(row["start_ts"])
-        if day:
-            affected_days.add((row["circuit"], day))
         log.info(
             "phantom-repair: event %s un-flagged (restored %.3f L to bucket %s)",
             row["id"], restored,
@@ -5581,11 +5580,6 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
             # that has already committed rows.
             (_hour_bucket_for(row["start_ts"]) if restored else None),
         )
-
-    for circ, day in affected_days:
-        compute_daily_summary(conn, circ, day)
-    if affected_days:
-        conn.commit()
 
     if repaired:
         log.info("phantom-repair: un-flagged %d event(s), restored %.1f L total",
