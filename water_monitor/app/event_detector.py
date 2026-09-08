@@ -47,7 +47,6 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, Deque, List, Literal, Optional, Tuple
 
 from .event_rules import LOWFLOW_OFF_GRACE_S, is_low_flow_chatter
@@ -138,30 +137,12 @@ def _valve_meta_kwargs(meta: "Optional[Tuple[str, str]]") -> dict:
 # Propagation-delay scan — shared by live detection and the offline replay tool
 # --------------------------------------------------------------------------- #
 
-def _read_addon_version() -> Optional[str]:
-    """Best-effort add-on version from config.yaml — None if unavailable."""
-    try:
-        cfg = Path(__file__).resolve().parents[1] / "config.yaml"
-        for line in cfg.read_text(encoding="utf-8").splitlines():
-            if line.startswith("version:"):
-                return line.split(":", 1)[1].strip().strip('"').strip("'")
-    except Exception:
-        pass
-    return None
-
-
-def _read_git_commit() -> Optional[str]:
-    """Best-effort git short commit — None when not in a git checkout."""
-    try:
-        git_dir = Path(__file__).resolve().parents[2] / ".git"
-        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
-        if head.startswith("ref:"):
-            ref = head.split(":", 1)[1].strip()
-            return (git_dir / ref).read_text(encoding="utf-8").strip()[:12]
-        return head[:12]
-    except Exception:
-        return None
-
+# Build identity lives in build_info (dev59 unit 6.12 — it had two
+# implementations, and main.py used both). Re-exported here because
+# database._code_fingerprint and routers/backup import it from this module;
+# when unit 7.3 splits this file, the re-export is what moves, not a body.
+from .build_info import (_read_addon_version,  # noqa: F401 — re-export
+                         _read_git_commit)
 
 _ADDON_VERSION = _read_addon_version()
 _GIT_COMMIT = _read_git_commit()

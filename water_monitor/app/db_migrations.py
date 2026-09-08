@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -408,10 +410,7 @@ def _apply_degraded_supply_columns(conn: sqlite3.Connection) -> None:
         ("hourly_volume_applied_bucket",  "TEXT"),
         ("degraded_diagnostic_json",      "TEXT"),
     )
-    for col, decl in new_cols:
-        if not _has_column(conn, "events", col):
-            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
-            log.info("Added events.%s", col)
+    _add_columns(conn, "events", new_cols)
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_degraded "
@@ -507,12 +506,8 @@ def _apply_valve_type_column(conn: sqlite3.Connection) -> None:
     afterward handles any oddly migrated DB where the new column ended up
     NULL or empty.
     """
-    if not _has_column(conn, "circuit_profile", "valve_type"):
-        conn.execute(
-            "ALTER TABLE circuit_profile "
-            "ADD COLUMN valve_type TEXT DEFAULT '2_port'"
-        )
-        log.info("Added circuit_profile.valve_type (default '2_port')")
+    _add_columns(conn, "circuit_profile",
+                 (("valve_type", "TEXT DEFAULT '2_port'"),))
     # Defensive backfill — handles legacy / hand-altered rows.
     conn.execute(
         "UPDATE circuit_profile SET valve_type = '2_port' "
@@ -554,11 +549,7 @@ def _apply_signature_matcher(conn: sqlite3.Connection) -> None:
     #  already indexes `circuit` as its leading column. Removing it from
     #  database.py alone would have been a silent no-op, because this line
     #  re-created it on every forward walk.)
-    if not _has_column(conn, "events", "matched_fixture_type"):
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN matched_fixture_type TEXT"
-        )
-        log.info("Added events.matched_fixture_type (TEXT, NULL)")
+    _add_columns(conn, "events", (("matched_fixture_type", "TEXT"),))
     conn.commit()
     log.info("Migration 20260530: signature-matcher infrastructure ready")
 
@@ -627,18 +618,11 @@ def _apply_phantom_event_column(conn: sqlite3.Connection) -> None:
     Idempotent — both column adds are guarded by ``_has_column``; the
     reprocess helper skips already-flagged events.
     """
-    if not _has_column(conn, "events", "is_pressure_restoration_phantom"):
-        conn.execute(
-            "ALTER TABLE events "
-            "ADD COLUMN is_pressure_restoration_phantom INTEGER DEFAULT 0"
-        )
-        log.info("Added events.is_pressure_restoration_phantom (default 0)")
-    if not _has_column(conn, "home_profile", "hide_pressure_artifact_events"):
-        conn.execute(
-            "ALTER TABLE home_profile "
-            "ADD COLUMN hide_pressure_artifact_events INTEGER NOT NULL DEFAULT 0"
-        )
-        log.info("Added home_profile.hide_pressure_artifact_events (default 0)")
+    _add_columns(conn, "events",
+                 (("is_pressure_restoration_phantom", "INTEGER DEFAULT 0"),))
+    _add_columns(conn, "home_profile",
+                 (("hide_pressure_artifact_events",
+                   "INTEGER NOT NULL DEFAULT 0"),))
     conn.commit()
 
     # Lazy import — keeps this module importable without feature_extractor
@@ -712,9 +696,8 @@ def _apply_manual_classification_columns(conn: sqlite3.Connection) -> None:
     Idempotent — column adds guarded by ``_has_column``; the repair skips rows
     that are already consistent and rows the user has manually classified.
     """
-    if not _has_column(conn, "events", "user_ignored"):
-        conn.execute("ALTER TABLE events ADD COLUMN user_ignored INTEGER DEFAULT 0")
-        log.info("Added events.user_ignored (default 0)")
+    if _add_columns(conn, "events",
+                    (("user_ignored", "INTEGER DEFAULT 0"),)):
         # Backfill the explicit Ignore intent from the legacy combined column:
         # rows excluded with no auto reason were excluded by a user Ignore.
         conn.execute(
@@ -726,9 +709,8 @@ def _apply_manual_classification_columns(conn: sqlite3.Connection) -> None:
             "  AND (match_rejection_reason IS NULL "
             "       OR match_rejection_reason = 'excluded_from_training')"
         )
-    if not _has_column(conn, "events", "user_classified"):
-        conn.execute("ALTER TABLE events ADD COLUMN user_classified INTEGER DEFAULT 0")
-        log.info("Added events.user_classified (default 0)")
+    _add_columns(conn, "events",
+                 (("user_classified", "INTEGER DEFAULT 0"),))
     conn.commit()
 
     from .database import repair_misflagged_phantom_events
@@ -758,12 +740,8 @@ def _apply_low_flow_dribble_column(conn: sqlite3.Connection) -> None:
     Idempotent — the column add is guarded by ``_has_column`` and both indexes
     use ``CREATE INDEX IF NOT EXISTS``.
     """
-    if not _has_column(conn, "events", "is_low_flow_dribble"):
-        conn.execute(
-            "ALTER TABLE events "
-            "ADD COLUMN is_low_flow_dribble INTEGER NOT NULL DEFAULT 0"
-        )
-        log.info("Added events.is_low_flow_dribble (default 0)")
+    _add_columns(conn, "events",
+                 (("is_low_flow_dribble", "INTEGER NOT NULL DEFAULT 0"),))
     # Indexes live here (not _create_schema) because idx_events_unlabelled_
     # reclassify references matched_fixture_type, which a baseline DB doesn't
     # have until _apply_signature_matcher runs earlier in the same upgrade.
@@ -803,10 +781,7 @@ def _apply_active_flow_columns(conn: sqlite3.Connection) -> None:
 
     Idempotent — each add is guarded by ``_has_column``.
     """
-    for col, decl in _ACTIVE_FLOW_NEW_COLUMNS:
-        if not _has_column(conn, "events", col):
-            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
-            log.info("Added events.%s (%s)", col, decl)
+    _add_columns(conn, "events", _ACTIVE_FLOW_NEW_COLUMNS)
     conn.commit()
     log.info("Migration 20260536: active-flow feature columns ready")
 
@@ -826,10 +801,7 @@ def _apply_cycle_pulse_column(conn: sqlite3.Connection) -> None:
 
     Idempotent — each add is guarded by ``_has_column``.
     """
-    for col, decl in _CYCLE_PULSE_NEW_COLUMNS:
-        if not _has_column(conn, "events", col):
-            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
-            log.info("Added events.%s (%s)", col, decl)
+    _add_columns(conn, "events", _CYCLE_PULSE_NEW_COLUMNS)
     conn.commit()
     log.info("Migration 20260537: cycle_pulse_count column ready")
 
@@ -848,10 +820,7 @@ def _apply_label_source_column(conn: sqlite3.Connection) -> None:
 
     Idempotent — each add is guarded by ``_has_column``.
     """
-    for col, decl in _LABEL_SOURCE_NEW_COLUMNS:
-        if not _has_column(conn, "events", col):
-            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
-            log.info("Added events.%s (%s)", col, decl)
+    _add_columns(conn, "events", _LABEL_SOURCE_NEW_COLUMNS)
     conn.commit()
     log.info("Migration 20260538: fixture_label_source column ready")
 
@@ -901,15 +870,10 @@ def _apply_cross_talk_columns(conn: sqlite3.Connection) -> None:
     guarded by ``_has_column``). The flag backfill runs from the startup /
     manual-recompute paths.
     """
-    if not _has_column(conn, "events", "is_cross_talk"):
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN is_cross_talk INTEGER NOT NULL DEFAULT 0")
-        log.info("Added events.is_cross_talk (INTEGER DEFAULT 0)")
-    if not _has_column(conn, "home_profile", "hide_cross_talk_events"):
-        conn.execute(
-            "ALTER TABLE home_profile ADD COLUMN hide_cross_talk_events "
-            "INTEGER NOT NULL DEFAULT 0")
-        log.info("Added home_profile.hide_cross_talk_events (default 0)")
+    _add_columns(conn, "events",
+                 (("is_cross_talk", "INTEGER NOT NULL DEFAULT 0"),))
+    _add_columns(conn, "home_profile",
+                 (("hide_cross_talk_events", "INTEGER NOT NULL DEFAULT 0"),))
     conn.commit()
     log.info("Migration 20260540: cross-talk columns ready")
 
@@ -927,9 +891,7 @@ def _apply_matched_via_column(conn: sqlite3.Connection) -> None:
     The live trailing washer scan is served by the existing
     ``idx_events_circuit_start_unique`` (circuit, start_ts) index, so no new index.
     """
-    if not _has_column(conn, "events", "matched_via"):
-        conn.execute("ALTER TABLE events ADD COLUMN matched_via TEXT")
-        log.info("Added events.matched_via (TEXT, nullable)")
+    _add_columns(conn, "events", (("matched_via", "TEXT"),))
     conn.commit()
     log.info("Migration 20260541: matched_via column ready")
 
@@ -948,19 +910,12 @@ def _apply_dev24_columns(conn: sqlite3.Connection) -> None:
     softener detection is off until enabled, and cycle_group_id is stamped by
     the next reclassify.
     """
-    if not _has_column(conn, "home_profile", "has_water_softener"):
-        conn.execute("ALTER TABLE home_profile ADD COLUMN has_water_softener "
-                     "INTEGER NOT NULL DEFAULT 0")
-        log.info("Added home_profile.has_water_softener (default 0)")
-    if not _has_column(conn, "home_profile", "softener_regen_start"):
-        conn.execute("ALTER TABLE home_profile ADD COLUMN softener_regen_start TEXT")
-        log.info("Added home_profile.softener_regen_start (TEXT)")
-    if not _has_column(conn, "home_profile", "softener_circuit"):
-        conn.execute("ALTER TABLE home_profile ADD COLUMN softener_circuit TEXT")
-        log.info("Added home_profile.softener_circuit (TEXT)")
-    if not _has_column(conn, "events", "cycle_group_id"):
-        conn.execute("ALTER TABLE events ADD COLUMN cycle_group_id TEXT")
-        log.info("Added events.cycle_group_id (TEXT, nullable)")
+    _add_columns(conn, "home_profile", (
+        ("has_water_softener",   "INTEGER NOT NULL DEFAULT 0"),
+        ("softener_regen_start", "TEXT"),
+        ("softener_circuit",     "TEXT"),
+    ))
+    _add_columns(conn, "events", (("cycle_group_id", "TEXT"),))
     conn.commit()
     log.info("Migration 20260542: dev.24 columns ready")
 
@@ -978,14 +933,10 @@ def _apply_anomaly_response_columns(conn: sqlite3.Connection) -> None:
     'notify' is the correct default and ``baseline_anomaly_n`` is written by the
     next activation freeze (NULL until then → shut-off degrades to notify).
     """
-    if not _has_column(conn, "sensitivity_config", "anomaly_response"):
-        conn.execute("ALTER TABLE sensitivity_config "
-                     "ADD COLUMN anomaly_response TEXT DEFAULT 'notify'")
-        log.info("Added sensitivity_config.anomaly_response (default 'notify')")
-    if not _has_column(conn, "sensitivity_config", "baseline_anomaly_n"):
-        conn.execute("ALTER TABLE sensitivity_config "
-                     "ADD COLUMN baseline_anomaly_n INTEGER")
-        log.info("Added sensitivity_config.baseline_anomaly_n (INTEGER)")
+    _add_columns(conn, "sensitivity_config", (
+        ("anomaly_response",   "TEXT DEFAULT 'notify'"),
+        ("baseline_anomaly_n", "INTEGER"),
+    ))
     conn.commit()
     log.info("Migration 20260543: anomaly-response columns ready")
 
@@ -1002,13 +953,9 @@ def _apply_recorder_reconcile_columns(conn: sqlite3.Connection) -> None:
     DDL only; idempotent (each add guarded by ``_has_column``). No backfill — NULL /
     default 1 are correct; the hourly reconcile pass fills them going forward.
     """
-    if not _has_column(conn, "events", "volume_recorder_litres"):
-        conn.execute("ALTER TABLE events ADD COLUMN volume_recorder_litres REAL")
-        log.info("Added events.volume_recorder_litres (REAL)")
-    if not _has_column(conn, "sensitivity_config", "recorder_reconcile_auto"):
-        conn.execute("ALTER TABLE sensitivity_config "
-                     "ADD COLUMN recorder_reconcile_auto INTEGER DEFAULT 1")
-        log.info("Added sensitivity_config.recorder_reconcile_auto (default 1)")
+    _add_columns(conn, "events", (("volume_recorder_litres", "REAL"),))
+    _add_columns(conn, "sensitivity_config",
+                 (("recorder_reconcile_auto", "INTEGER DEFAULT 1"),))
     conn.commit()
     log.info("Migration 20260544: recorder-reconcile columns ready")
 
@@ -1022,13 +969,9 @@ def _apply_dev38_columns(conn: sqlite3.Connection) -> None:
     """
     # home_profile is created by _create_schema before migrations in every real upgrade;
     # guard for minimal synthetic DBs that walk the chain without it.
-    has_table = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='home_profile'"
-    ).fetchone()
-    if has_table and not _has_column(conn, "home_profile", "auto_split_enabled"):
-        conn.execute("ALTER TABLE home_profile ADD COLUMN auto_split_enabled "
-                     "INTEGER NOT NULL DEFAULT 0")
-        log.info("Added home_profile.auto_split_enabled (default 0)")
+    _add_columns(conn, "home_profile",
+                 (("auto_split_enabled", "INTEGER NOT NULL DEFAULT 0"),),
+                 if_table_exists=True)
     conn.commit()
     log.info("Migration 20260545: dev.38 auto-split flag ready")
 
@@ -1044,16 +987,9 @@ def _apply_ppl_column(conn: sqlite3.Connection) -> None:
     """
     # circuit_profile is created by _create_schema before migrations in every real
     # upgrade; guard for minimal synthetic DBs that walk the chain without it.
-    has_table = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='circuit_profile'"
-    ).fetchone()
-    if has_table:
-        if not _has_column(conn, "circuit_profile", "pulses_per_litre"):
-            conn.execute(
-                "ALTER TABLE circuit_profile "
-                "ADD COLUMN pulses_per_litre REAL DEFAULT 396.0"
-            )
-            log.info("Added circuit_profile.pulses_per_litre (default 396.0)")
+    if _has_table(conn, "circuit_profile"):
+        _add_columns(conn, "circuit_profile",
+                     (("pulses_per_litre", "REAL DEFAULT 396.0"),))
         # Defensive backfill — handles legacy / hand-altered rows.
         conn.execute(
             "UPDATE circuit_profile SET pulses_per_litre = 396.0 "
@@ -1109,11 +1045,7 @@ def _apply_embedded_fixtures_column(conn: sqlite3.Connection) -> None:
     written by ``recompute_embedded_fixtures`` on the next reclassify pass, which
     needs the event_waveforms rows the bare DDL step doesn't touch).
     """
-    if not _has_column(conn, "events", "embedded_fixtures_json"):
-        conn.execute(
-            "ALTER TABLE events ADD COLUMN embedded_fixtures_json TEXT"
-        )
-        log.info("Added events.embedded_fixtures_json (TEXT, NULL)")
+    _add_columns(conn, "events", (("embedded_fixtures_json", "TEXT"),))
     conn.commit()
     log.info("Migration 20260548: embedded_fixtures_json column ready")
 
@@ -1197,9 +1129,8 @@ def _apply_phantom_suppression_averted(conn: sqlite3.Connection) -> None:
     Leak-safety: restoring volume can never mask a leak (only zeroing could),
     and the firmware trickle sensor is independent of stored events anyway.
     """
-    if not _has_column(conn, "events", "phantom_suppression_averted"):
-        conn.execute("ALTER TABLE events "
-                     "ADD COLUMN phantom_suppression_averted INTEGER DEFAULT 0")
+    _add_columns(conn, "events",
+                 (("phantom_suppression_averted", "INTEGER DEFAULT 0"),))
     # Backfill needs the modern event shape; a stub/ancient DB (pre-verdict
     # columns) has no phantom-zeroed rows to restore — DDL above is enough.
     for _needed in ("circuit", "start_ts", "volume_litres",
@@ -1242,13 +1173,10 @@ def _apply_fingerprint_labeling_flag(conn: sqlite3.Connection) -> None:
     shipped eval-gated at 96% measured precision). Guarded + idempotent; a
     stub DB without home_profile just gets the version stamp.
     """
-    has_profile = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='home_profile'"
-    ).fetchone()
-    if has_profile and not _has_column(conn, "home_profile",
-                                       "fingerprint_labeling_enabled"):
-        conn.execute("ALTER TABLE home_profile ADD COLUMN "
-                     "fingerprint_labeling_enabled INTEGER NOT NULL DEFAULT 1")
+    _add_columns(conn, "home_profile",
+                 (("fingerprint_labeling_enabled",
+                   "INTEGER NOT NULL DEFAULT 1"),),
+                 if_table_exists=True)
     conn.commit()
     log.info("Migration 20260552: fingerprint_labeling_enabled ready (default ON)")
 
@@ -1263,8 +1191,7 @@ def _apply_review_verdict_column(conn: sqlite3.Connection) -> None:
     (existing user_reviewed=1 rows deliberately keep NULL — their intent
     wasn't recorded and must not be invented). Guarded + idempotent.
     """
-    if not _has_column(conn, "events", "review_verdict"):
-        conn.execute("ALTER TABLE events ADD COLUMN review_verdict TEXT")
+    _add_columns(conn, "events", (("review_verdict", "TEXT"),))
     conn.commit()
     log.info("Migration 20260553: events.review_verdict ready")
 
@@ -1284,15 +1211,10 @@ def _apply_flow_pressure_corr(conn: sqlite3.Connection) -> None:
     is a supervised worker (needs HA fetches), never a migration.
     Guarded + idempotent.
     """
-    if not _has_column(conn, "events", "flow_pressure_corr"):
-        conn.execute("ALTER TABLE events ADD COLUMN flow_pressure_corr REAL")
-    has_profile = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='home_profile'"
-    ).fetchone()
-    if has_profile and not _has_column(conn, "home_profile",
-                                       "rise_corr_backfill_done"):
-        conn.execute("ALTER TABLE home_profile ADD COLUMN "
-                     "rise_corr_backfill_done INTEGER NOT NULL DEFAULT 0")
+    _add_columns(conn, "events", (("flow_pressure_corr", "REAL"),))
+    _add_columns(conn, "home_profile",
+                 (("rise_corr_backfill_done", "INTEGER NOT NULL DEFAULT 0"),),
+                 if_table_exists=True)
     conn.commit()
     log.info("Migration 20260554: flow_pressure_corr + rise_corr_backfill_done ready")
 
@@ -1308,13 +1230,9 @@ def _apply_epa_flush_cap_flag(conn: sqlite3.Connection) -> None:
     single-refill shape veto are structural and unaffected by this flag.
     DDL only. Guarded + idempotent.
     """
-    has_profile = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='home_profile'"
-    ).fetchone()
-    if has_profile and not _has_column(conn, "home_profile",
-                                       "epa_flush_cap_enabled"):
-        conn.execute("ALTER TABLE home_profile ADD COLUMN "
-                     "epa_flush_cap_enabled INTEGER NOT NULL DEFAULT 1")
+    _add_columns(conn, "home_profile",
+                 (("epa_flush_cap_enabled", "INTEGER NOT NULL DEFAULT 1"),),
+                 if_table_exists=True)
     conn.commit()
     log.info("Migration 20260555: epa_flush_cap_enabled ready")
 
@@ -1353,9 +1271,8 @@ def _apply_edge_signatures(conn: sqlite3.Connection) -> None:
     ``event_waveforms`` envelope (coarse envelopes smear onto the grid — the
     validated configuration). Guarded + idempotent.
     """
-    for col in ("onset_signature_json", "offset_signature_json"):
-        if not _has_column(conn, "events", col):
-            conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    _add_columns(conn, "events", (("onset_signature_json",  "TEXT"),
+                                  ("offset_signature_json", "TEXT")))
     has_wf = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_waveforms'"
     ).fetchone()
@@ -1385,11 +1302,7 @@ def _apply_suggestion_source_column(conn: sqlite3.Connection) -> None:
     Idempotent — column add is guarded by ``_has_column``; the backfill
     only touches rows where ``suggestion_source IS NULL``.
     """
-    if not _has_column(conn, "fixture_clusters", "suggestion_source"):
-        conn.execute(
-            "ALTER TABLE fixture_clusters ADD COLUMN suggestion_source TEXT"
-        )
-        log.info("Added fixture_clusters.suggestion_source (TEXT, NULL)")
+    _add_columns(conn, "fixture_clusters", (("suggestion_source", "TEXT"),))
     conn.execute(
         "UPDATE fixture_clusters SET suggestion_source = 'heuristic' "
         "WHERE suggestion_source IS NULL AND suggested_type IS NOT NULL"
@@ -1415,12 +1328,8 @@ def _apply_orphan_repair(conn: sqlite3.Connection) -> None:
     Idempotent — column add is guarded by ``_has_column``; the repair
     helper itself yields zero counts on a second invocation.
     """
-    if not _has_column(conn, "fixtures", "cluster_backfill_needed"):
-        conn.execute(
-            "ALTER TABLE fixtures "
-            "ADD COLUMN cluster_backfill_needed INTEGER DEFAULT 0"
-        )
-        log.info("Added fixtures.cluster_backfill_needed (default 0)")
+    _add_columns(conn, "fixtures",
+                 (("cluster_backfill_needed", "INTEGER DEFAULT 0"),))
     conn.commit()
 
     # Lazy import — keeps this module importable without database.py
@@ -1458,11 +1367,82 @@ def _set_version(conn: sqlite3.Connection, version: int) -> None:
     conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# Column lookups — one PRAGMA per table per schema change, not one per question.
+# ---------------------------------------------------------------------------
+# The chain asks `_has_column` 106 times on an ordinary boot (a DB already at
+# the current version, re-verifying every column it must have), and every
+# question used to build and throw away its own `PRAGMA table_info` result set —
+# 122 rows of it for `events`, 160 µs a call. Measured on this schema:
+#
+#     ordinary boot   106 questions / 15 tables : 106 PRAGMAs -> 14
+#     full walk from the baseline               : 259 PRAGMAs -> 40
+#     the boot guard itself                     : 11.1 ms -> 1.65 ms
+#
+# `PRAGMA schema_version` costs 1.5 µs against those 160, which is what makes
+# re-validating on every question affordable.
+#
+# ⛔ THE DANGER, WRITTEN DOWN: MIGRATIONS ADD COLUMNS AS THEY RUN. A cache that
+# answers a stale "that column is missing" makes a later step re-run an ALTER
+# that already happened, or run a backfill guarded on the column being new —
+# i.e. it corrupts the schema in the middle of the chain, which is the one place
+# in this codebase where a wrong answer costs the user their database. Two
+# INDEPENDENT guards, either sufficient on its own:
+#
+#   1. `PRAGMA schema_version` is SQLite's own schema cookie. It increments on
+#      every schema change — ALTER ADD/DROP COLUMN, CREATE/DROP TABLE or INDEX,
+#      RENAME — and never on plain DML (verified on the 3.39 this ships with).
+#      The snapshot carries the cookie it was read at and is dropped whole the
+#      moment the cookie moves, so a change made by ANY code path — this module,
+#      database.py, a helper nobody remembered — invalidates it. Nothing has to
+#      remember to call an invalidate function; that is the point.
+#   2. A snapshot may only ever answer TRUE. "Column is missing" always re-reads
+#      the PRAGMA first, so the stale-False failure above is unreachable even if
+#      guard 1 were wrong somewhere (a SQLite build that does not bump the
+#      cookie, say). Missing-column answers therefore cost exactly what they
+#      cost today; present-column answers — the every-boot case, where the
+#      schema is already current — become a dict lookup.
+#
+# The snapshot holds ONE connection at a time, by strong reference, compared
+# with `is`. Keying on `id(conn)` would be a correctness bug rather than a style
+# one: sqlite3.Connection supports neither weak references nor attributes, ids
+# are recycled once a connection is freed, and cookie values are small integers
+# that collide readily across the many databases one test run builds.
+_SNAPSHOT_LOCK = threading.Lock()
+_COLUMN_SNAPSHOT: dict = {"conn": None, "cookie": None, "tables": {}}
+
+
+def _schema_cookie(conn: sqlite3.Connection) -> Optional[int]:
+    """SQLite's schema cookie, or None when it cannot be read (→ no caching)."""
+    try:
+        row = conn.execute("PRAGMA schema_version").fetchone()
+    except sqlite3.Error:                   # pragma: no cover - defensive
+        return None
+    return int(row[0]) if row else None
+
+
+def _table_columns(conn: sqlite3.Connection, table: str,
+                   _force: bool = False) -> frozenset:
+    """Column names of ``table`` — from the snapshot when it is still valid."""
+    cookie = _schema_cookie(conn)
+    with _SNAPSHOT_LOCK:
+        snap = _COLUMN_SNAPSHOT
+        if snap["conn"] is not conn or snap["cookie"] != cookie:
+            snap["conn"], snap["cookie"], snap["tables"] = conn, cookie, {}
+        cols = None if _force else snap["tables"].get(table)
+        if cols is None:
+            cols = frozenset(
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})"))
+            if cookie is not None:
+                snap["tables"][table] = cols
+    return cols
+
+
 def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
-    return any(
-        row[1] == column
-        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-    )
+    if column in _table_columns(conn, table):
+        return True
+    # Guard 2: never answer "missing" out of the snapshot.
+    return column in _table_columns(conn, table, _force=True)
 
 
 def _has_table(conn: sqlite3.Connection, table: str) -> bool:
@@ -1470,6 +1450,37 @@ def _has_table(conn: sqlite3.Connection, table: str) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
         (table,),
     ).fetchone() is not None
+
+
+def _add_columns(conn: sqlite3.Connection, table: str, columns,
+                 *, if_table_exists: bool = False) -> list:
+    """ADD COLUMN every ``(name, decl)`` pair ``table`` is missing.
+
+    Returns the columns actually added, so a caller whose backfill must run
+    only for a NEWLY added column can keep that coupling explicit.
+
+    This is the preamble 48 migrations wrote out by hand — guard on
+    ``_has_column``, ``ALTER TABLE … ADD COLUMN``, sometimes log it, sometimes
+    not. Twenty of them looped, twenty-eight repeated the block per column.
+
+    ``if_table_exists=True`` reproduces the ``sqlite_master`` probe the later
+    migrations wrote in front of their adds. It is NOT the default, and the
+    difference matters: a step that raises today on a missing table must keep
+    raising, because the chain stamps the schema version only after every step
+    RETURNS. A step that silently skipped instead would let the DB stamp itself
+    current with the column absent, and the next boot's guard answers that with
+    "Delete the database file and restart the add-on."
+    """
+    if if_table_exists and not _has_table(conn, table):
+        return []
+    added = []
+    for col, decl in columns:
+        if _has_column(conn, table, col):
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        log.info("Added %s.%s (%s)", table, col, decl)
+        added.append(col)
+    return added
 
 
 # ---------------------------------------------------------------------------
@@ -1565,9 +1576,7 @@ def _ensure_verdict_pin_columns(conn: sqlite3.Connection) -> None:
     """
     if not _has_table(conn, "events"):
         return
-    for col, ctype in _VERDICT_PIN_COLUMNS:
-        if not _has_column(conn, "events", col):
-            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {ctype}")
+    _add_columns(conn, "events", _VERDICT_PIN_COLUMNS)
     if _has_column(conn, "events", "circuit"):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_verdict_pin "
                      "ON events (circuit, verdict_pin)")
@@ -1939,14 +1948,7 @@ def _apply_pump_mode_columns(conn: sqlite3.Connection) -> None:
     """
     for table, cols in (("home_profile", _PUMP_MODE_HOME_COLUMNS),
                         ("sensitivity_config", _PUMP_MODE_SENS_COLUMNS)):
-        has_table = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-            (table,)).fetchone()
-        if not has_table:
-            continue
-        for col, ddl in cols:
-            if not _has_column(conn, table, col):
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+        _add_columns(conn, table, cols, if_table_exists=True)
     conn.commit()
     log.info("Migration 20260558: pump-mode columns ready (profile/ack/"
              "provenance plumbing; detection ships separately)")
@@ -1963,14 +1965,8 @@ _LEAK_TEST_PUMP_COLUMNS: tuple = (
 def _apply_leak_test_pump_columns(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260559 — dev26 pump plan Phase 5b.
     Guarded + idempotent; stub DBs just get the version stamp."""
-    has_table = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND "
-        "name='leak_test_history'").fetchone()
-    if has_table:
-        for col, ddl in _LEAK_TEST_PUMP_COLUMNS:
-            if not _has_column(conn, "leak_test_history", col):
-                conn.execute(
-                    f"ALTER TABLE leak_test_history ADD COLUMN {col} {ddl}")
+    _add_columns(conn, "leak_test_history", _LEAK_TEST_PUMP_COLUMNS,
+                 if_table_exists=True)
     conn.commit()
     log.info("Migration 20260559: leak-test pump-verdict columns ready")
 
@@ -1984,11 +1980,9 @@ def _missing_leak_test_pump_columns(conn: sqlite3.Connection) -> set[str]:
 # 20260562 (dev30) — dismissible failed leak tests.
 def _apply_leak_test_dismissed_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260562. Guarded + idempotent."""
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
-                    "name='leak_test_history'").fetchone():
-        if not _has_column(conn, "leak_test_history", "user_dismissed"):
-            conn.execute("ALTER TABLE leak_test_history ADD COLUMN "
-                         "user_dismissed INTEGER DEFAULT 0")
+    _add_columns(conn, "leak_test_history",
+                 (("user_dismissed", "INTEGER DEFAULT 0"),),
+                 if_table_exists=True)
     conn.commit()
     log.info("Migration 20260562: leak-test dismissed flag ready")
 
@@ -2021,20 +2015,13 @@ def _apply_leak_test_measurement_columns(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260563. Guarded + idempotent; DDL only.
     Historical rows keep their inflated pressures — no backfill is possible,
     the firmware never published what they were measured against."""
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
-                    "name='leak_test_history'").fetchone():
-        for col, ddl in _LEAK_TEST_MEASUREMENT_COLUMNS:
-            if not _has_column(conn, "leak_test_history", col):
-                conn.execute(
-                    f"ALTER TABLE leak_test_history ADD COLUMN {col} {ddl}")
+    _add_columns(conn, "leak_test_history", _LEAK_TEST_MEASUREMENT_COLUMNS,
+                 if_table_exists=True)
     # Per-circuit compliance (mL per PSI of the isolated section) — converts
     # the decay rate into a leak rate. Seeded from the reopen refill; NULL
     # means "not yet calibrated" and the leak rate is simply not shown.
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
-                    "name='sensitivity_config'").fetchone():
-        if not _has_column(conn, "sensitivity_config", "compliance_ml_psi"):
-            conn.execute("ALTER TABLE sensitivity_config ADD COLUMN "
-                         "compliance_ml_psi REAL")
+    _add_columns(conn, "sensitivity_config",
+                 (("compliance_ml_psi", "REAL"),), if_table_exists=True)
     conn.commit()
     log.info("Migration 20260563: leak-test measurement columns ready")
 
@@ -2090,17 +2077,11 @@ def _missing_overlap_audit_table(conn: sqlite3.Connection) -> set[str]:
 def _apply_pump_low_pressure_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260560 — dev27 pump plan Phase 6b.
     Guarded + idempotent; stub DBs just get the version stamp."""
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
-                    "name='sensitivity_config'").fetchone():
-        if not _has_column(conn, "sensitivity_config",
-                           "pump_low_pressure_alert_psi"):
-            conn.execute("ALTER TABLE sensitivity_config ADD COLUMN "
-                         "pump_low_pressure_alert_psi REAL")
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
-                    "name='pump_regime_nightly'").fetchone():
-        if not _has_column(conn, "pump_regime_nightly", "min_psi"):
-            conn.execute("ALTER TABLE pump_regime_nightly ADD COLUMN "
-                         "min_psi REAL")
+    _add_columns(conn, "sensitivity_config",
+                 (("pump_low_pressure_alert_psi", "REAL"),),
+                 if_table_exists=True)
+    _add_columns(conn, "pump_regime_nightly", (("min_psi", "REAL"),),
+                 if_table_exists=True)
     conn.commit()
     log.info("Migration 20260560: pump low-pressure alert columns ready")
 
@@ -2167,11 +2148,8 @@ def _apply_pump_era_column(conn: sqlite3.Connection) -> None:
     thereafter, so re-bootstrapping/merging supply regimes can never move a
     boundary that gates historical verdicts. DDL only; resolution happens
     lazily in supply_regime.pump_era_start. Guarded + idempotent."""
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
-                    "name='home_profile'").fetchone():
-        if not _has_column(conn, "home_profile", "pump_era_start"):
-            conn.execute("ALTER TABLE home_profile ADD COLUMN "
-                         "pump_era_start TEXT")
+    _add_columns(conn, "home_profile", (("pump_era_start", "TEXT"),),
+                 if_table_exists=True)
     conn.commit()
     log.info("Migration 20260566: pump_era_start column ready")
 
@@ -2192,11 +2170,8 @@ def _apply_leak_watch_ack_column(conn: sqlite3.Connection) -> None:
     feature: a later night carrying a fresh estimate re-shows the tile, which
     is what keeps a real leak from being silenced by one click. DDL only;
     guarded + idempotent."""
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
-                    "name='home_profile'").fetchone():
-        if not _has_column(conn, "home_profile", "leak_watch_ack"):
-            conn.execute("ALTER TABLE home_profile ADD COLUMN "
-                         "leak_watch_ack TEXT")
+    _add_columns(conn, "home_profile", (("leak_watch_ack", "TEXT"),),
+                 if_table_exists=True)
     conn.commit()
     log.info("Migration 20260567: leak_watch_ack column ready")
 
@@ -2215,11 +2190,9 @@ def _apply_cluster_features_mode(conn: sqlite3.Connection) -> None:
     `training_state.cluster_features_mode`, the feature space this circuit's
     cluster centers live in ('full' default, 'pressure_blind' after the
     pump-era re-seed). DDL only; guarded + idempotent."""
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
-                    "name='training_state'").fetchone():
-        if not _has_column(conn, "training_state", "cluster_features_mode"):
-            conn.execute("ALTER TABLE training_state ADD COLUMN "
-                         "cluster_features_mode TEXT DEFAULT 'full'")
+    _add_columns(conn, "training_state",
+                 (("cluster_features_mode", "TEXT DEFAULT 'full'"),),
+                 if_table_exists=True)
     conn.commit()
     log.info("Migration 20260568: cluster_features_mode column ready")
 
@@ -2264,8 +2237,7 @@ def _apply_leak_test_refill_column(conn: sqlite3.Connection) -> None:
     export that is one ~0.04 L event per test night). Best-effort: a backfill
     failure must never block boot — the periodic reconcile retries it.
     """
-    if not _has_column(conn, "events", "leak_test_id"):
-        conn.execute("ALTER TABLE events ADD COLUMN leak_test_id INTEGER")
+    _add_columns(conn, "events", (("leak_test_id", "INTEGER"),))
     conn.commit()
     try:
         from .leak_test_refill import reconcile_leak_test_refills
@@ -2300,17 +2272,15 @@ def _apply_local_day_boundary(conn: sqlite3.Connection) -> None:
     DDL only; both are additive, idempotent, and skipped when the table is
     absent (the partial-schema fixtures the forward-walk tests build).
     """
-    if (_has_table(conn, "volume_snapshots")
-            and not _has_column(conn, "volume_snapshots", "last_reading")):
-        conn.execute("ALTER TABLE volume_snapshots ADD COLUMN last_reading REAL")
+    if _add_columns(conn, "volume_snapshots", (("last_reading", "REAL"),),
+                    if_table_exists=True):
         # Seed the high-water mark at the baseline: a reset before the first
         # live read then carries 0 L, which is the old behaviour and never
         # invents water. Every subsequent read raises it to the true maximum.
         conn.execute("UPDATE volume_snapshots SET last_reading = ha_volume "
                      "WHERE last_reading IS NULL")
-    if (_has_table(conn, "home_profile")
-            and not _has_column(conn, "home_profile", "daily_summary_tz")):
-        conn.execute("ALTER TABLE home_profile ADD COLUMN daily_summary_tz TEXT")
+    _add_columns(conn, "home_profile", (("daily_summary_tz", "TEXT"),),
+                 if_table_exists=True)
     conn.commit()
     log.info("Migration 20260571: local-day boundary columns ready "
              "(daily_summary rebuild deferred to tz detection)")
@@ -2339,11 +2309,9 @@ def _apply_regime_window_bounds(conn: sqlite3.Connection) -> None:
     window_start_ts / window_end_ts (UTC ISO bounds of the analyzed quiet
     window). Additive, idempotent, skipped when the table is absent (the
     partial-schema fixtures the forward-walk tests build)."""
-    if _has_table(conn, "pump_regime_nightly"):
-        for col in ("window_start_ts", "window_end_ts"):
-            if not _has_column(conn, "pump_regime_nightly", col):
-                conn.execute(
-                    f"ALTER TABLE pump_regime_nightly ADD COLUMN {col} TEXT")
+    _add_columns(conn, "pump_regime_nightly",
+                 (("window_start_ts", "TEXT"), ("window_end_ts", "TEXT")),
+                 if_table_exists=True)
     _ensure_wf_claim_index(conn)
     conn.commit()
     log.info("Migration 20260574: regime window-bound columns ready")
@@ -2399,23 +2367,13 @@ def _apply_dev38_audit_columns(conn: sqlite3.Connection) -> None:
       daily_summary_dirty            — days needing a summary recompute
 
     Additive, idempotent, tables-absent-safe (forward-walk fixtures)."""
-    if _has_table(conn, "events"):
-        for col, typ in _202608_EVENT_COLUMNS:
-            if not _has_column(conn, "events", col):
-                conn.execute(f"ALTER TABLE events ADD COLUMN {col} {typ}")
-    if _has_table(conn, "event_waveforms"):
-        for col, typ in _202608_WAVEFORM_COLUMNS:
-            if not _has_column(conn, "event_waveforms", col):
-                conn.execute(
-                    f"ALTER TABLE event_waveforms ADD COLUMN {col} {typ}")
-    if _has_table(conn, "leak_test_history"):
-        for col, typ in _202608_LEAK_TEST_COLUMNS:
-            if not _has_column(conn, "leak_test_history", col):
-                conn.execute(
-                    f"ALTER TABLE leak_test_history ADD COLUMN {col} {typ}")
-    if (_has_table(conn, "overlap_audit")
-            and not _has_column(conn, "overlap_audit", "stale_reason")):
-        conn.execute("ALTER TABLE overlap_audit ADD COLUMN stale_reason TEXT")
+    _add_columns(conn, "events", _202608_EVENT_COLUMNS, if_table_exists=True)
+    _add_columns(conn, "event_waveforms", _202608_WAVEFORM_COLUMNS,
+                 if_table_exists=True)
+    _add_columns(conn, "leak_test_history", _202608_LEAK_TEST_COLUMNS,
+                 if_table_exists=True)
+    _add_columns(conn, "overlap_audit", (("stale_reason", "TEXT"),),
+                 if_table_exists=True)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS daily_summary_dirty ("
         "circuit TEXT NOT NULL, day TEXT NOT NULL, "
@@ -2541,9 +2499,8 @@ def _apply_training_quarantine(conn: sqlite3.Connection) -> None:
     NOT flagged here: it is sequenced for re-attribution off the reseeded
     cluster model first. Idempotent (only NULL-reason rows are stamped)."""
     from datetime import datetime, timezone
-    for col in ("training_quarantine_reason", "training_quarantined_at"):
-        if not _has_column(conn, "events", col):
-            conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    _add_columns(conn, "events", (("training_quarantine_reason", "TEXT"),
+                                  ("training_quarantined_at",  "TEXT")))
     # The backfill reads columns older migrations add (a DB walking forward
     # from a mid-ladder version gains them earlier in the same run, but a
     # test-stripped schema may lack them) — without any of them no row can
@@ -2596,9 +2553,8 @@ def _apply_training_quarantine_sweep(conn: sqlite3.Connection) -> None:
     flagged rows lift identically regardless of reason. Idempotent (only
     NULL-reason rows are stamped); labels, verdicts and volumes untouched."""
     from datetime import datetime, timezone
-    for col in ("training_quarantine_reason", "training_quarantined_at"):
-        if not _has_column(conn, "events", col):
-            conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    _add_columns(conn, "events", (("training_quarantine_reason", "TEXT"),
+                                  ("training_quarantined_at",  "TEXT")))
     if all(_has_column(conn, "events", c) for c in
            ("matched_via", "fixture_label_source", "user_reviewed",
             "user_fixture_type")):
@@ -2672,18 +2628,11 @@ def _apply_dev41_conformance_ddl(conn: sqlite3.Connection) -> None:
 
     Additive, idempotent, tables-absent-safe."""
     from datetime import datetime, timezone
-    if _has_table(conn, "events"):
-        for col, typ in _DEV41_EVENT_COLUMNS:
-            if not _has_column(conn, "events", col):
-                conn.execute(f"ALTER TABLE events ADD COLUMN {col} {typ}")
-    if _has_table(conn, "leak_test_history"):
-        for col, typ in _DEV41_LEAK_TEST_COLUMNS:
-            if not _has_column(conn, "leak_test_history", col):
-                conn.execute(
-                    f"ALTER TABLE leak_test_history ADD COLUMN {col} {typ}")
-    if (_has_table(conn, "overlap_audit")
-            and not _has_column(conn, "overlap_audit", "stale_at")):
-        conn.execute("ALTER TABLE overlap_audit ADD COLUMN stale_at TEXT")
+    _add_columns(conn, "events", _DEV41_EVENT_COLUMNS, if_table_exists=True)
+    _add_columns(conn, "leak_test_history", _DEV41_LEAK_TEST_COLUMNS,
+                 if_table_exists=True)
+    _add_columns(conn, "overlap_audit", (("stale_at", "TEXT"),),
+                 if_table_exists=True)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS utility_register_readings ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -2724,10 +2673,8 @@ def _apply_reseed_marker_column(conn: sqlite3.Connection) -> None:
     mid-replay leaves it set (the 2026-08-15 11:56 reseed crash stranded a
     part-cleared model with no persistent trace); boot and the post-rebuild
     health pass warn loudly until a rerun succeeds. Additive, idempotent."""
-    if (_has_table(conn, "training_state")
-            and not _has_column(conn, "training_state", "reseed_in_progress")):
-        conn.execute("ALTER TABLE training_state "
-                     "ADD COLUMN reseed_in_progress TEXT")
+    _add_columns(conn, "training_state", (("reseed_in_progress", "TEXT"),),
+                 if_table_exists=True)
     conn.commit()
     _ensure_wf_claim_index(conn)
     log.info("Migration 20260808: reseed-in-progress marker column ready")
@@ -2757,16 +2704,13 @@ def _apply_dev46_columns(conn: sqlite3.Connection) -> None:
     and leak-test scheduling for the circuit while set.
 
     All additive and idempotent."""
-    if _has_table(conn, "events"):
-        for col, decl in (("training_excluded_by_user", "INTEGER DEFAULT 0"),
-                          ("flow_sig_span_s", "REAL"),
-                          ("pressure_sig_span_s", "REAL")):
-            if not _has_column(conn, "events", col):
-                conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
-    if (_has_table(conn, "circuit_profile")
-            and not _has_column(conn, "circuit_profile", "winterized")):
-        conn.execute("ALTER TABLE circuit_profile "
-                     "ADD COLUMN winterized INTEGER DEFAULT 0")
+    _add_columns(conn, "events",
+                 (("training_excluded_by_user", "INTEGER DEFAULT 0"),
+                  ("flow_sig_span_s",           "REAL"),
+                  ("pressure_sig_span_s",       "REAL")),
+                 if_table_exists=True)
+    _add_columns(conn, "circuit_profile",
+                 (("winterized", "INTEGER DEFAULT 0"),), if_table_exists=True)
     conn.commit()
     _ensure_wf_claim_index(conn)
     log.info("Migration 20260809: training-exclusion flag, signature spans "
@@ -2809,14 +2753,11 @@ def _apply_verdict_stamp(conn: sqlite3.Connection) -> None:
     days rather than forever.
 
     Both additive and idempotent."""
-    if (_has_table(conn, "events")
-            and not _has_column(conn, "events", "verdict_stamp")):
-        conn.execute("ALTER TABLE events ADD COLUMN verdict_stamp TEXT")
-    if (_has_table(conn, "training_state")
-            and not _has_column(conn, "training_state",
-                                "last_full_reclassify_at")):
-        conn.execute("ALTER TABLE training_state "
-                     "ADD COLUMN last_full_reclassify_at TIMESTAMP")
+    _add_columns(conn, "events", (("verdict_stamp", "TEXT"),),
+                 if_table_exists=True)
+    _add_columns(conn, "training_state",
+                 (("last_full_reclassify_at", "TIMESTAMP"),),
+                 if_table_exists=True)
     # The pass's candidate query filters circuit + user_fixture_type +
     # verdict_stamp; without this it degrades to a full scan of every event
     # on every boot, which is the cost this migration exists to remove.
@@ -3037,9 +2978,7 @@ def _apply_wf_claim_and_repair_columns(conn: sqlite3.Connection) -> None:
     """
     if not _has_table(conn, "events"):
         return
-    for col, ddl in _WF_CLAIM_COLUMNS:
-        if not _has_column(conn, "events", col):
-            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {ddl}")
+    _add_columns(conn, "events", _WF_CLAIM_COLUMNS)
     _ensure_wf_claim_index(conn)
     conn.commit()
     log.info("Migration 20260573: waveform claim ledger + repair audit columns ready")
@@ -3211,9 +3150,7 @@ def _apply_flow_plateau(conn: sqlite3.Connection) -> None:
 
     from .feature_extractor import flow_plateau_lpm
 
-    if not _has_column(conn, "events", "flow_plateau_lpm"):
-        conn.execute("ALTER TABLE events ADD COLUMN flow_plateau_lpm REAL")
-        log.info("Added events.flow_plateau_lpm (REAL)")
+    _add_columns(conn, "events", (("flow_plateau_lpm", "REAL"),))
 
     # A database old enough to be migrating from far back may not have reached
     # the waveform table yet — the forward-walk test migrates from every prior
@@ -3335,16 +3272,13 @@ def _apply_auto_split_memo(conn: sqlite3.Connection) -> None:
       as ``overlap_audit`` has been since 20260801: these rows are provenance (a
       shutoff that fired, a cross-talk verdict that was applied).
     """
-    if _has_table(conn, "events"):
-        for col in ("split_evaluated_at", "split_evaluation_outcome"):
-            if not _has_column(conn, "events", col):
-                conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    _add_columns(conn, "events", (("split_evaluated_at",       "TEXT"),
+                                  ("split_evaluation_outcome", "TEXT")),
+                 if_table_exists=True)
     for tbl in ("anomaly_shutoff_log", "cross_talk_audit"):
-        if not _has_table(conn, tbl):
-            continue
-        for col in ("stale_reason", "stale_at"):
-            if not _has_column(conn, tbl, col):
-                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT")
+        _add_columns(conn, tbl, (("stale_reason", "TEXT"),
+                                 ("stale_at",     "TEXT")),
+                     if_table_exists=True)
     conn.commit()
     _ensure_wf_claim_index(conn)
     log.info("Migration 20260814: auto-split memo columns + audit stale marks ready")
@@ -3436,9 +3370,7 @@ def _apply_referee_meta_columns(conn: sqlite3.Connection) -> None:
     # a 20260814 DB runs 20260815 first, so the tables exist; be defensive anyway
     for _name, ddl in _REFEREE_TABLES_DDL:
         conn.execute(ddl)
-    for col, decl in _REFEREE_META_COLUMNS:
-        if not _has_column(conn, "referee_benchmark_meta", col):
-            conn.execute(f"ALTER TABLE referee_benchmark_meta ADD COLUMN {col} {decl}")
+    _add_columns(conn, "referee_benchmark_meta", _REFEREE_META_COLUMNS)
     if not _has_column(conn, "referee_benchmark", "role"):
         conn.execute("BEGIN")
         conn.execute(
@@ -3884,6 +3816,38 @@ _UPGRADEABLE_VERSIONS: frozenset = frozenset(
     {_BASELINE_VERSION} | {v for v, _ in _MIGRATIONS})
 
 
+def _run_migration_step(conn: sqlite3.Connection, version: int, fn) -> None:
+    """Run one migration body and NAME IT in the log, before and after.
+
+    Until dev59 the chain logged one summary line ("Database upgraded X → Y,
+    N forward step(s)") and nothing else, so 26 of the 48 migrations were
+    completely silent: any migration whose body logs nothing left no trace it
+    had run. That makes crash resumption unauditable — after a boot that died
+    mid-chain there was no way to say from the log which step was running when
+    it died, and the chain deliberately re-runs every step it predates on the
+    next boot (nothing is stamped until the end), so "did 20260807 already
+    run?" could only be answered by inspecting the schema by hand.
+
+    The BEFORE line is the load-bearing one: it is the last thing in the log
+    when a step hangs or is killed. The AFTER line separates "crashed INSIDE
+    20260807" from "finished 20260807 and crashed on the step after it".
+    """
+    log.info("Migration %d: running %s", version, fn.__name__)
+    _t0 = time.monotonic()
+    try:
+        fn(conn)
+    except BaseException:
+        log.error(
+            "Migration %d: %s RAISED after %.0f ms — the chain stops here and "
+            "the schema version is NOT stamped, so the next boot re-runs from "
+            "this step.",
+            version, fn.__name__, (time.monotonic() - _t0) * 1000.0,
+        )
+        raise
+    log.info("Migration %d: %s applied in %.0f ms",
+             version, fn.__name__, (time.monotonic() - _t0) * 1000.0)
+
+
 def run_migrations(
     conn: sqlite3.Connection,
     db_path: Optional[Path] = None,
@@ -4002,8 +3966,11 @@ def _run_migrations_impl(
         # the fresh schema already ships the unique index and the dedup scan
         # would only rescan an empty table.
         for _v, _fn in _MIGRATIONS:
-            if _fn is not _apply_unique_events_index:
-                _fn(conn)
+            if _fn is _apply_unique_events_index:
+                log.info("Migration %d: skipped on a fresh DB — the schema "
+                         "already ships the unique index", _v)
+                continue
+            _run_migration_step(conn, _v, _fn)
         _set_version(conn, _CURRENT_VERSION)
         log.info("New database — schema version %d applied", _CURRENT_VERSION)
         return
@@ -4059,9 +4026,12 @@ def _run_migrations_impl(
     # Ordered chain: apply exactly the steps this version predates (see
     # _MIGRATIONS — every fn is idempotent, so a re-run after a mid-chain
     # crash is safe).
-    steps = [fn for v, fn in _MIGRATIONS if v > version]
-    for fn in steps:
-        fn(conn)
+    steps = [(v, fn) for v, fn in _MIGRATIONS if v > version]
+    log.info("Database upgrade %d → %d: %d forward step(s) to run — %s",
+             version, _CURRENT_VERSION, len(steps),
+             ", ".join(str(v) for v, _fn in steps))
+    for _v, _fn in steps:
+        _run_migration_step(conn, _v, _fn)
     _set_version(conn, _CURRENT_VERSION)
     log.info("Database upgraded %d → %d (%d forward step(s))",
              version, _CURRENT_VERSION, len(steps))
