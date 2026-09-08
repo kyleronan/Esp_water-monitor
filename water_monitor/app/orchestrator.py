@@ -84,6 +84,18 @@ def _fmt_sensor(
 _PPL_REBASELINE_FRACTION: float = 0.10
 
 
+
+class UnboundFlowMeterPPL(RuntimeError):
+    """Carrier for the "no PPL entity bound" health record.
+
+    Never raised. ``mark_subsystem_degraded`` takes an exception because every
+    other caller HAS one, and it renders ``type(exc).__name__: exc`` into
+    ``last_error``. A bare RuntimeError there would read as an internal fault;
+    this name states the actual condition on the health page, which is the only
+    place an operator will ever see it.
+    """
+
+
 class Orchestrator:
     """Top-level runtime — owns all components."""
 
@@ -606,6 +618,7 @@ class Orchestrator:
         if not self._ha:
             return
         watched = False
+        unbound: list = []
         for cfg in self._cfg.circuits:
             entity = getattr(cfg, "flow_meter_ppl_entity", "")
             if not entity:
@@ -628,6 +641,9 @@ class Orchestrator:
                     "this entity — assign it in Setup if discovery missed it.",
                     cfg.circuit, float(cfg.pulses_per_litre or 0.0),
                     DEFAULT_PULSES_PER_LITRE)
+                unbound.append(
+                    "%s (using %.1f)"
+                    % (cfg.circuit, float(cfg.pulses_per_litre or 0.0)))
                 continue
             raw = await self._ha.get_state_value(entity, None)
             await self._apply_ppl_change(cfg, raw, reason="startup")
@@ -636,6 +652,25 @@ class Orchestrator:
                 lambda eid, state, attrs, c=cfg.circuit: self._on_ppl_state(c, state),
             )
             watched = True
+        if unbound:
+            # ONE record for all of them: mark_subsystem_degraded keys on the
+            # name, so a call per circuit would let the second silently
+            # overwrite the first and report half the problem.
+            #
+            # Unit 0.9 closed the SETUP path — no new install can reach this
+            # state, since an unmatched PPL now blocks the wizard. This is for
+            # the installs configured BEFORE that landed, which boot straight
+            # past it. Marking degraded is deliberately NOT a refusal to run:
+            # an add-on that stops measuring is worse than one measuring at a
+            # scale the operator can now see and correct, and the cached value
+            # may well be right. What changes is that it stops being invisible.
+            self.mark_subsystem_degraded(
+                "flow_meter_ppl",
+                UnboundFlowMeterPPL(
+                    "no firmware PPL entity bound for " + ", ".join(unbound)),
+                detail="volumes on these circuits are scaled by a cached "
+                       "pulses/litre that nothing can correct; assign the "
+                       "entity in Setup")
         if watched:
             # Pick up the new subscriptions on the already-running WS connection.
             self._ha.request_reconnect()
