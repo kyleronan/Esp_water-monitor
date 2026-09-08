@@ -2856,18 +2856,31 @@ def _hour_bucket_for(start_ts) -> str:
     update_hourly_volume(): UTC-normalised '%Y-%m-%dT%H:00:00' (no tz suffix).
     Mirrors the production format from feature_extractor.py line ~1066 so
     aggregate queries (get_daily_volume / get_weekly_volume) keep working.
+
+    RAISES ValueError on anything it cannot turn into a bucket. It used to
+    return "" there, and "" is FALSY: apply_effective_volume would then skip
+    the hourly_volume write (`if new_bucket and new_effective`) while still
+    recording hourly_volume_applied_litres = X on the event, and the empty
+    bucket also defeated the NEXT reversal (`if prev_bucket and prev_litres`),
+    so the drift could never be undone either. That is precisely the
+    events <-> hourly_volume divergence volume_ledger_discrepancy() exists to
+    detect, injected at the single chokepoint the whole ledger flows through.
+    Mixed timestamp formats in this DB make an unparseable value genuinely
+    reachable, so it has to fail loudly instead of silently.
     """
-    if start_ts is None:
-        return ""
-    if isinstance(start_ts, str):
+    if isinstance(start_ts, datetime):
+        dt = start_ts
+    elif isinstance(start_ts, str):
         try:
             dt = datetime.fromisoformat(start_ts)
-        except ValueError:
-            return ""
-    elif isinstance(start_ts, datetime):
-        dt = start_ts
+        except ValueError as exc:
+            raise ValueError(
+                "_hour_bucket_for: unparseable start_ts %r" % (start_ts,)
+            ) from exc
     else:
-        return ""
+        raise ValueError(
+            "_hour_bucket_for: unusable start_ts %r (%s)"
+            % (start_ts, type(start_ts).__name__))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:00:00')
@@ -2973,6 +2986,15 @@ def apply_effective_volume(
     transaction. Returns the rounded effective volume actually applied.
     """
     new_effective = round(float(new_effective or 0.0), 3)
+    # NaN/inf guard. bool(nan) is True, so a NaN passes every truthiness guard
+    # below, then binds to sqlite as NULL: the bucket becomes
+    # `volume_litres + NULL` = NULL, hourly_volume_applied_litres is NULL too,
+    # and the next reversal (which needs a prior amount) can no longer repair
+    # either side. No effect whatsoever on a finite value.
+    if not math.isfinite(new_effective):
+        raise ValueError(
+            "apply_effective_volume: non-finite volume %r for event %r"
+            % (new_effective, event_id))
     # NULL bucket when nothing is applied (a phantom/cross-talk zero) — "no
     # contribution lives anywhere", the convention the reprocess paths already used.
     new_bucket = _hour_bucket_for(start_ts) if new_effective else None
@@ -3730,7 +3752,18 @@ def _get_volume_baseline(
                 (circuit, period_ts, current_ha_value, current_ha_value),
             )
             conn.commit()
-        except sqlite3.OperationalError as e:
+        except sqlite3.DatabaseError as e:
+            # DatabaseError, NOT OperationalError. "another row available"
+            # arrives as a bare sqlite3.DatabaseError — a SIBLING of
+            # OperationalError — so the narrow catch that used to be here
+            # missed it entirely; that is how a live event was dropped instead
+            # of retried on 2026-08-22 at 11:12. is_retryable_db_error() is the
+            # module's one answer to "would waiting help?": a lock or a cursor
+            # left mid-iteration is tolerated here, while a schema error or a
+            # constraint violation now propagates instead of being swallowed at
+            # debug level and returning a silently wrong baseline.
+            if not is_retryable_db_error(e):
+                raise
             _rollback_quietly(conn)
             log.debug("volume-baseline seed skipped (non-fatal): %s", e)
         return current_ha_value
@@ -3773,7 +3806,11 @@ def _get_volume_baseline(
                 circuit, period_ts, last_reading if last_reading is not None
                 else baseline, current_ha_value, accumulated, new_baseline,
             )
-        except sqlite3.OperationalError as e:
+        except sqlite3.DatabaseError as e:
+            # Same widening as the seed handler above (2026-08-22 11:12):
+            # catch DatabaseError, tolerate only what a retry could clear.
+            if not is_retryable_db_error(e):
+                raise
             _rollback_quietly(conn)
             log.debug("volume-baseline reset write skipped (non-fatal): %s", e)
         return new_baseline
@@ -3788,7 +3825,11 @@ def _get_volume_baseline(
                 (current_ha_value, circuit, period_ts),
             )
             conn.commit()
-        except sqlite3.OperationalError as e:
+        except sqlite3.DatabaseError as e:
+            # Same widening as the seed handler above (2026-08-22 11:12):
+            # catch DatabaseError, tolerate only what a retry could clear.
+            if not is_retryable_db_error(e):
+                raise
             _rollback_quietly(conn)
             log.debug("volume high-water update skipped (non-fatal): %s", e)
 
@@ -3920,7 +3961,7 @@ _NOTE_KIND_SQL: Dict[str, str] = {
 def get_recent_events(
     conn: sqlite3.Connection,
     circuit: str,
-    limit: int = 100,
+    limit: Optional[int] = 100,
     date_from: str = None,
     date_to: str = None,
     flagged_only: bool = False,
@@ -3941,9 +3982,10 @@ def get_recent_events(
 ) -> List[Dict[str, Any]]:
     """
     Return events for a circuit ordered newest first.
-    If date_from / date_to are provided (ISO strings) they act as a
-    range filter and limit is ignored so the full range is returned.
-    Otherwise returns the most recent `limit` rows.
+    date_from / date_to (ISO strings) act as a range filter. `limit` ALWAYS
+    applies — inside a date range too — so the result is the newest `limit`
+    MATCHING rows. Pass limit=None to opt out explicitly and take the whole
+    result set; that is the only way to ask for an unbounded scan.
 
     flagged_only / degraded_only back the History filter views
     (?filter=anomaly / ?filter=degraded). They must live in the WHERE
@@ -4058,9 +4100,16 @@ def get_recent_events(
     if exclude_not_real:
         conditions.append(_NOT_REAL_SQL + " = 0")
     sql = f"{_select} WHERE {' AND '.join(conditions)} ORDER BY e.start_ts DESC"
-    if not (date_from or date_to):
+    # The cap is UNCONDITIONAL. It used to be skipped whenever a date bound was
+    # present ("a range means give me the whole range"), so any filtered History
+    # load — the only path with a From/To set — became an unbounded scan of every
+    # matching row. All DB work is serialized onto the single db executor thread
+    # (get_db_executor), so one wide range stalls page renders process-wide.
+    # A caller that genuinely wants everything now says limit=None instead of
+    # smuggling it in through a date bound.
+    if limit is not None:
         sql += " LIMIT ?"
-        params.append(limit)
+        params.append(int(limit))
     rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
@@ -6976,7 +7025,12 @@ def repair_misflagged_phantom_events(conn: sqlite3.Connection) -> dict:
             affected_days.add((row["circuit"], day))
         log.info(
             "phantom-repair: event %s un-flagged (restored %.3f L to bucket %s)",
-            row["id"], restored, _hour_bucket_for(row["start_ts"]),
+            row["id"], restored,
+            # Mirror apply_effective_volume's own rule — no bucket is derived
+            # when nothing is applied. _hour_bucket_for now RAISES on a bad
+            # timestamp; a log line must not be the thing that aborts a sweep
+            # that has already committed rows.
+            (_hour_bucket_for(row["start_ts"]) if restored else None),
         )
 
     for circ, day in affected_days:

@@ -26,6 +26,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 import sqlite3
 import tempfile
 import zipfile
@@ -37,7 +38,7 @@ from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from ..auth import require_admin
-from ..config import DB_PATH
+from ..config import DATA_DIR, DB_PATH
 from ..database import get_data_retention
 from ..restore_utils import (
     normalize_restore_row as _normalize_row,
@@ -58,10 +59,92 @@ MAX_BACKUP_BYTES = 50 * 1024 * 1024  # 50 MB hard limit
 SHARE_DIR = Path("/share/water_monitor")
 _SHARE_SUFFIXES = {".db", ".zip"}
 
+# ── /share import hardening (2.17) ──────────────────────────────────────────
+# "Size stops mattering" was true of the COMPRESSED input — it is read from
+# disk, not through ingress — and was silently carried over to the
+# DECOMPRESSED output, which nothing bounded at all. /share is writable by
+# every add-on holding `share:rw`, so the zip is attacker-supplied even though
+# the endpoint is admin-only.
+MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024   # 2 GB of decompressed database
+# A single member expanding more than this is the classic bomb signature and is
+# cheap to reject early. It is NOT the control: Fifield's non-recursive bomb
+# builds a huge archive out of members that each sit under any sane ratio, so
+# the ABSOLUTE streamed cap above is what actually holds. This only produces a
+# better error message, sooner.
+MAX_COMPRESSION_RATIO = 100
+
+# Where the zip member is unpacked. NOT the system temp dir: on Home Assistant
+# OS a container's /tmp can be tmpfs, i.e. RAM, so an unbounded (or merely
+# large) extraction there wedges the container — and this container is the one
+# that drives the main water valve. /data is the add-on's real disk.
+def _extract_dir() -> Path:
+    d = Path(DATA_DIR) / "import_tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    # Moving off /tmp means nothing reclaims an orphan on reboot any more, and
+    # an import killed mid-stream (restart, OOM) leaves a whole database
+    # behind. Sweep anything older than a day: no import runs that long, and
+    # /data is the same disk the live DB needs.
+    cutoff = datetime.now(timezone.utc).timestamp() - 86400
+    for stale in d.iterdir():
+        try:
+            if stale.is_file() and stale.stat().st_mtime < cutoff:
+                stale.unlink()
+        except OSError:                 # best-effort housekeeping only
+            pass
+    return d
+
+
+# A /share filename is attacker-chosen and is about to become part of a SQLite
+# connect string. `?` and `#` are legal Linux filename characters, so
+# `x?mode=rwc&.db` passes a bare-basename + suffix check, then turns
+# `file:/share/water_monitor/x?mode=rwc&.db?mode=ro` into a READ-WRITE open of
+# a DIFFERENT file (`x`) — measured, not theorised: SQLite takes the path up to
+# the first `?` and honours the attacker's `mode`. URI mode is dropped below;
+# this allowlist is the belt to that braces, and also keeps `%` (URI escapes),
+# newlines and quoting out of the path entirely.
+_SHARE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+# Tables the full export must NOT carry off the add-on's own disk. /share is
+# readable by every add-on that maps it, so exporting there publishes whatever
+# is in the file.
+#   csrf_server_secret — the HMAC key behind every CSRF token. Regenerable and
+#     of no value in a restore, so there is nothing to trade off: exclude it.
+#     (Encrypting the export instead would only move the key problem.)
+#   seen_users.display_name — Home Assistant account names, harvested by
+#     first-sight upsert. Nothing restores from them; the user_id is what the
+#     RBAC tables key on, so the names are pure disclosure.
+EXPORT_EXCLUDED_TABLES = ("csrf_server_secret", "csrf_tokens")
+# operator_users.display_name is deliberately KEPT: it is the label an admin
+# attached to a grant, and a restored install that lost it shows a bare user id
+# on the Access page. admin_ids_cache is re-derived from HA on every role sync,
+# so its names carry nothing a restore needs.
+EXPORT_SCRUBBED_COLUMNS = (("seen_users", "display_name"),
+                           ("admin_ids_cache", "display_name"))
+
+# QUICK_RESTORE_TABLES is not just "settings" — see the invariant note on the
+# list itself. Named here so the test that guards it and the humans reading the
+# restore UI are looking at the same words.
+RETARGETING_RESTORE_TABLES = ("device_config", "circuit_entity_map",
+                              "leak_test_schedule")
+
 
 # ── Table groups ─────────────────────────────────────────────────────────────
 
-# Included in the quick-restore JSON (full rows, no date filter)
+# Included in the quick-restore JSON (full rows, no date filter).
+#
+# INVARIANT (2.17) — this list is PRIVILEGED, not merely "settings". Three of
+# its members change what the add-on does to the house rather than what it
+# remembers about it:
+#   device_config / circuit_entity_map — WHICH Home Assistant entities the
+#       add-on reads and drives, valve switches included. A restore can point
+#       the valve control at a different entity.
+#   leak_test_schedule — WHEN the add-on closes the main valve by itself.
+# So importing a quick-restore file is a control-plane change, not a data
+# import. That is defensible — it is admin-only, behind an explicit "restore
+# settings" checkbox, and a restore that could not re-point entities would be
+# useless after a rebuild — but it must be a DECISION, not a side effect of
+# whatever happens to be in this list. Adding another table with the same
+# reach means updating RETARGETING_RESTORE_TABLES and its test, deliberately.
 QUICK_RESTORE_TABLES = [
     "device_config", "circuit_entity_map", "home_profile",
     "circuit_profile", "learning_config", "sensitivity_config",
@@ -107,6 +190,74 @@ def _row_counts(db, tables: List[str]) -> Dict[str, int]:
 
 # ── Export: study snapshot (dev46 46p) ────────────────────────────────────────
 
+def scrub_export_copy(conn: sqlite3.Connection) -> Dict[str, int]:
+    """Strip the add-on's own secrets from a SNAPSHOT (never the live DB).
+
+    2.17(c). A full export lands in /share, which every add-on holding
+    `share:rw` can read, so anything in the file is published to them. The
+    answer is exclusion rather than encryption: the CSRF server secret is
+    regenerated on first use after a restore and carries no user value, so
+    there is nothing to weigh against removing it, and encrypting would only
+    replace one key-custody problem with another.
+
+    The caller MUST ``VACUUM`` afterwards. A DELETE moves pages onto the
+    freelist; it does not erase them, and a freelist page in a shipped .db is
+    trivially recoverable — the scrub would be cosmetic without the rewrite.
+    """
+    removed: Dict[str, int] = {}
+    for tbl in EXPORT_EXCLUDED_TABLES:
+        try:
+            n = conn.execute(f"DELETE FROM {tbl}").rowcount
+        except sqlite3.Error:
+            continue                      # table absent in this schema version
+        if n and n > 0:
+            removed[tbl] = n
+    for tbl, col in EXPORT_SCRUBBED_COLUMNS:
+        try:
+            n = conn.execute(
+                f"UPDATE {tbl} SET {col} = NULL WHERE {col} IS NOT NULL"
+            ).rowcount
+        except sqlite3.Error:
+            continue
+        if n and n > 0:
+            removed[f"{tbl}.{col}"] = n
+    return removed
+
+
+def _sanitized_snapshot(dest: Path) -> Dict[str, int]:
+    """Write a scrubbed, consistent copy of the live DB to ``dest``.
+
+    ``VACUUM INTO`` gives a consistent copy in one statement without touching
+    the shared connection; the backup API is the fallback for a SQLite older
+    than 3.27. Either way the scrub, and the rewrite that makes it real, run
+    on the COPY — the live database is never written to by an export.
+    """
+    src = sqlite3.connect(str(DB_PATH))
+    try:
+        try:
+            src.execute("VACUUM INTO ?", (str(dest),))
+        except sqlite3.DatabaseError:
+            dst = sqlite3.connect(str(dest))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+    finally:
+        src.close()
+
+    conn = sqlite3.connect(str(dest))
+    try:
+        removed = scrub_export_copy(conn)
+        conn.commit()
+        conn.execute("VACUUM")            # see scrub_export_copy's contract
+    finally:
+        conn.close()
+    if removed:
+        log.info("Export scrub: %s",
+                 ", ".join(f"{k}={v}" for k, v in removed.items()))
+    return removed
+
+
 async def _snapshot_db(db_path) -> bytes:
     """Consistent copy of the whole DB, WITHOUT touching the shared connection.
 
@@ -137,6 +288,17 @@ async def _snapshot_db(db_path) -> bytes:
                     src.backup(dst, pages=512, sleep=0.005)
                 finally:
                     dst.close()
+                # 2.17(c) — a study snapshot is a file that gets copied to a
+                # laptop and passed around. It is read-only by intent and has
+                # no use for the CSRF key or for HA account names, so it leaves
+                # without them. Same helper, same VACUUM contract.
+                scrub = _sq.connect(str(dest_path))
+                try:
+                    scrub_export_copy(scrub)
+                    scrub.commit()
+                    scrub.execute("VACUUM")
+                finally:
+                    scrub.close()
                 return dest_path.read_bytes()
         finally:
             src.close()
@@ -337,25 +499,14 @@ async def export_full(request: Request):
 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
 
-        # Consistent SQLite snapshot using the backup API.
-        # This works even while the DB is being written to — no torn reads.
-        import sqlite3 as _sqlite3
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as _tf:
-            snap_path = Path(_tf.name)
-        try:
-            src_conn  = _sqlite3.connect(str(DB_PATH))
-            mem_conn  = _sqlite3.connect(":memory:")
-            disk_conn = _sqlite3.connect(str(snap_path))
-            try:
-                src_conn.backup(mem_conn)
-                mem_conn.backup(disk_conn)
-            finally:
-                src_conn.close()
-                mem_conn.close()
-                disk_conn.close()
+        # Consistent SQLite snapshot, scrubbed of the add-on's own secrets
+        # (2.17(c)) — this zip can be written straight into /share, which every
+        # add-on with `share:rw` can read. VACUUM INTO needs a destination that
+        # does not exist yet, so a private directory rather than mkstemp.
+        with tempfile.TemporaryDirectory() as _td:
+            snap_path = Path(_td) / "water_monitor.db"
+            _sanitized_snapshot(snap_path)
             zf.write(str(snap_path), "water_monitor.db")
-        finally:
-            snap_path.unlink(missing_ok=True)
 
         # Quick Restore JSON — included so the ZIP is self-contained for reinstall
         cutoff = (datetime.now(timezone.utc)
@@ -440,6 +591,14 @@ def _resolve_share_file(filename: str) -> Path:
     the filename crosses a trust boundary (it names a server-side path)."""
     if not filename or Path(filename).name != filename:
         raise ValueError("Filename must be a bare name, not a path.")
+    # 2.17 — allowlist, not a denylist of the characters we happened to think
+    # of. Anything outside [A-Za-z0-9._-] is rejected before the name can be
+    # concatenated into a path or (historically) a SQLite URI. See
+    # _SHARE_NAME_RE for the `x?mode=rwc&.db` case this stops.
+    if not _SHARE_NAME_RE.fullmatch(filename):
+        raise ValueError(
+            "Filename may only contain letters, digits, dot, dash and "
+            "underscore. Rename the file in /share and try again.")
     if Path(filename).suffix.lower() not in _SHARE_SUFFIXES:
         raise ValueError("Only .db and .zip files can be imported.")
     p = (SHARE_DIR / filename).resolve()
@@ -448,6 +607,109 @@ def _resolve_share_file(filename: str) -> Path:
     if not p.is_file():
         raise ValueError(f"Not found: {SHARE_DIR}/{filename}")
     return p
+
+
+class _ArchiveRejected(ValueError):
+    """A supplied archive/database is not usable — answer 400, not 500."""
+
+
+def _precheck_member(info: zipfile.ZipInfo) -> None:
+    """Cheap metadata rejects, before a single byte is decompressed.
+
+    Both figures here come from the archive's central directory, i.e. from
+    whoever wrote the file. They buy a fast, well-worded refusal and nothing
+    more; the enforcement is the running byte counter in _extract_db_member.
+    Kept as a separate function so a test can neuter it and prove the counter
+    stands on its own.
+    """
+    if info.file_size > MAX_EXTRACTED_BYTES:
+        raise _ArchiveRejected(
+            f"The database inside this zip declares "
+            f"{info.file_size / 1048576:.0f} MB, over the "
+            f"{MAX_EXTRACTED_BYTES // 1048576} MB import limit.")
+    if (info.compress_size > 0
+            and info.file_size / info.compress_size > MAX_COMPRESSION_RATIO):
+        raise _ArchiveRejected(
+            "This zip expands more than "
+            f"{MAX_COMPRESSION_RATIO}x — refusing to unpack it.")
+
+
+def _extract_db_member(src: Path) -> Path:
+    """Stream `water_monitor.db` out of a /share zip under a hard byte cap.
+
+    The cap is a running counter on what ``ZipExtFile.read`` actually hands
+    back — decompressed bytes. ``ZipInfo.file_size`` is metadata the archive
+    author chose, so it is only ever a pre-filter (``_precheck_member``).
+
+    Note for anyone re-reading this: CPython's ``ZipExtFile`` happens to clamp
+    its own output to the declared ``file_size`` and then fails the CRC, so on
+    CPython an UNDERSTATED size cannot actually overrun. That is an
+    implementation detail of one interpreter, not a guarantee of the format —
+    the counter below is what this code depends on.
+
+    Zip-slip is deliberately not checked for, and adding a check would be
+    cargo cult: no member name reaches the filesystem. The name is compared
+    against the literal "water_monitor.db" to pick the member, and the output
+    path is a ``mkstemp`` name we generate. Verified by reading every use of
+    ``member`` below.
+    """
+    with zipfile.ZipFile(src) as zf:
+        info = next((i for i in zf.infolist()
+                     if Path(i.filename).name == "water_monitor.db"), None)
+        if info is None:
+            raise _ArchiveRejected(
+                "No water_monitor.db inside this zip — is it a Water Monitor "
+                "full export?")
+        _precheck_member(info)
+
+        fd, tmp_name = tempfile.mkstemp(dir=str(_extract_dir()), suffix=".db")
+        tmp_path = Path(tmp_name)
+        written = 0
+        try:
+            with open(fd, "wb") as out, zf.open(info) as member:
+                while chunk := member.read(1 << 20):
+                    written += len(chunk)
+                    if written > MAX_EXTRACTED_BYTES:
+                        raise _ArchiveRejected(
+                            "The database inside this zip is larger than the "
+                            f"{MAX_EXTRACTED_BYTES // 1048576} MB import "
+                            "limit (it kept expanding past its declared "
+                            "size) — refusing to unpack it.")
+                    out.write(chunk)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+    return tmp_path
+
+
+def _validate_sqlite_file(path: Path) -> None:
+    """Reject a non-database before anything opens it as one.
+
+    Without this a text file (or a truncated download) surfaces as a
+    ``DatabaseError`` from somewhere deep in the merge — a 500 and a stack
+    trace where the honest answer is "that is not a Water Monitor archive".
+    """
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(16)
+    except OSError as exc:
+        raise _ArchiveRejected(f"Could not read the archive: {exc}") from exc
+    if magic != b"SQLite format 3\x00":
+        raise _ArchiveRejected(
+            "That file is not a SQLite database (wrong file header).")
+    probe = sqlite3.connect(str(path))
+    try:
+        probe.execute("PRAGMA query_only = ON")
+        row = probe.execute("PRAGMA quick_check(1)").fetchone()
+    except sqlite3.DatabaseError as exc:
+        raise _ArchiveRejected(
+            f"That database could not be opened: {exc}") from exc
+    finally:
+        probe.close()
+    if not row or str(row[0]).lower() != "ok":
+        raise _ArchiveRejected(
+            "That database failed SQLite's integrity check — it looks "
+            "truncated or corrupt.")
 
 
 @router.get("/share-archives")
@@ -491,23 +753,21 @@ async def import_share_archive(
     extracted = None
     if src.suffix.lower() == ".zip":
         try:
-            with zipfile.ZipFile(src) as zf:
-                member = next((n for n in zf.namelist()
-                               if Path(n).name == "water_monitor.db"), None)
-                if member is None:
-                    return JSONResponse(
-                        {"ok": False, "error": "No water_monitor.db inside "
-                         "this zip — is it a Water Monitor full export?"},
-                        status_code=400)
-                with tempfile.NamedTemporaryFile(suffix=".db",
-                                                 delete=False) as tmp:
-                    with zf.open(member) as m:
-                        while chunk := m.read(1 << 20):
-                            tmp.write(chunk)
-                    extracted = tmp_path = Path(tmp.name)
+            extracted = tmp_path = _extract_db_member(src)
         except zipfile.BadZipFile:
             return JSONResponse({"ok": False, "error": "Not a valid zip file."},
                                 status_code=400)
+        except _ArchiveRejected as e:
+            log.warning("Rejected /share zip %s: %s", src, e)
+            return JSONResponse({"ok": False, "error": str(e)},
+                                status_code=400)
+    try:
+        _validate_sqlite_file(tmp_path)
+    except _ArchiveRejected as e:
+        log.warning("Rejected /share archive %s: %s", src, e)
+        if extracted is not None:
+            extracted.unlink(missing_ok=True)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     try:
         log.info("Importing history from %s (labels_only=%s)", src, labels_only)
         # dev46 (46a): the whole merge — including its single `with orch.db:`
@@ -722,9 +982,18 @@ async def import_history_archive(
                              "error": "File too large (max 50 MB)."},
                             status_code=413)
 
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+    # /data, not the system temp dir: a container's /tmp can be tmpfs on HA OS,
+    # and this container drives the valve. Bounded here by MAX_BACKUP_BYTES
+    # already, but the destination should not differ between the two paths.
+    fd, tmp_name = tempfile.mkstemp(dir=str(_extract_dir()), suffix=".db")
+    tmp_path = Path(tmp_name)
+    with open(fd, "wb") as tmp:
         tmp.write(raw)
-        tmp_path = Path(tmp.name)
+    try:
+        _validate_sqlite_file(tmp_path)
+    except _ArchiveRejected as e:
+        tmp_path.unlink(missing_ok=True)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     try:
         # dev46 (46a): the whole merge — including its single `with orch.db:`
         # transaction — runs in ONE run_db callable, so no foreign statement
@@ -746,7 +1015,17 @@ def _merge_archive_from_path(orch, db_path: Path,
     arc = None
 
     try:
-        arc = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # 2.17 — NOT a URI open. `sqlite3.connect(uri=True)` re-parses the
+        # path, so any `?`/`#`/`%` in a /share filename is interpreted as URI
+        # syntax: `x?mode=rwc&.db` truncates the path at the `?` and hands
+        # SQLite the attacker's own mode, opening a DIFFERENT file READ-WRITE.
+        # That defeats the one thing `mode=ro` was there for. A plain path plus
+        # `query_only` gives the same read-only guarantee with no parser
+        # between us and the filename. (`_resolve_share_file` also rejects such
+        # names outright now — this is the half that does not depend on the
+        # caller having validated anything.)
+        arc = sqlite3.connect(str(db_path))
+        arc.execute("PRAGMA query_only = ON")
         arc.row_factory = sqlite3.Row
 
         in_archive = {r[0] for r in arc.execute(

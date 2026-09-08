@@ -537,8 +537,12 @@ def _collect_circuit_history_sync(
                 db, circuit_cfg.circuit,
                 date_from=date_from or None,
                 date_to=date_to or None,
-                since_ts=(events[-1]["start_ts"] if events
-                          and not (date_from or date_to) else None),
+                # The visible list is now capped in BOTH branches (the
+                # date-range case no longer lifts the LIMIT), so the
+                # oldest displayed row is the right floor either way —
+                # which is what count_not_real_events' own docstring
+                # says since_ts is for. ANDed with the date bounds.
+                since_ts=(events[-1]["start_ts"] if events else None),
             )
         # Display-time signature upgrade: historical events store a 32-pt
         # signature, but many carry a hi-res event_waveforms envelope with real

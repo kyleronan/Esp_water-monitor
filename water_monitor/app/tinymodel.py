@@ -34,11 +34,14 @@ back. Retention also gives 47i a rollback target when a health alert opens.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import math
 import os
+import secrets
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -120,6 +123,39 @@ FALLBACK_THRESHOLD: float = 0.60
 
 ARTIFACT_FILENAME = "tinymodel.json"
 PREVIOUS_FILENAME = "tinymodel.previous.json"
+
+# ── artifact authenticity (2.16) ────────────────────────────────────────────
+# The estimator is persisted as a pickle, and `pickle.loads` on the live event
+# path is arbitrary code execution on whoever can write the artifact file. That
+# is not theoretical here: a Home Assistant add-on backup captures /data
+# verbatim, so a crafted backup carries a chosen artifact and it executes on the
+# next classification — inside a container that holds SUPERVISOR_TOKEN and
+# drives the main water valve, with no admin ever opening the UI.
+#
+# `skops.io` is upstream's recommended pickle replacement and would be the
+# textbook fix. It is deliberately NOT used: this add-on's Dockerfile records
+# three failed attempts at moving the scikit-learn / numpy / river dependency
+# set, so adding another ML dependency to close this is disproportionate to the
+# hole. An HMAC over the payload closes it with the standard library.
+#
+# The key follows the `csrf_server_secret` shape (database.py): 256 bits of
+# hex, created once on first use, NEVER regenerated automatically — rotating it
+# would invalidate every stored artifact and force an unnecessary retrain. It
+# lives beside the artifacts in /data rather than in the DB because save/load
+# take a data_dir, not a connection, and threading a connection through the
+# serving path for this would be worse than the file.
+SECRET_FILENAME = "tinymodel.secret"
+
+# Legacy (pre-2.16) artifacts carry no signature. They are REFUSED, not
+# accepted-once-and-re-signed. "Accept once" is precisely the attacker's
+# happy path: the crafted backup plants an *unsigned* artifact, and nothing
+# distinguishes it from a genuinely old one — re-signing would bless it with
+# this install's key and make the compromise permanent. The cost of refusing
+# is one retrain, which the learning loop performs on its own schedule, and
+# the k-NN ladder is a complete classifier while that happens (staged
+# bootstrap). A security control whose bypass is "have no signature" is not a
+# control.
+ALLOW_UNSIGNED_LEGACY_ARTIFACTS = False
 
 
 class TinyModelUnavailable(RuntimeError):
@@ -219,7 +255,16 @@ class Artifact:
     # model_hash — it describes the fit, it does not change it.
     train_days: List[str] = field(default_factory=list)
     model_blob: Optional[str] = None            # base64 joblib/pickle payload
+    # HMAC-SHA256 of model_blob under this install's signing secret (2.16).
+    # Stamped by ``save`` and checked by ``load``; an artifact that arrives
+    # without one, or with one that does not verify, is never unpickled.
+    model_signature: Optional[str] = None
     _estimator: object = field(default=None, repr=False, compare=False)
+    # True only for an artifact this process fitted, or one whose signature
+    # ``load`` verified. Gates the unpickle — so a code path that builds an
+    # Artifact straight from untrusted JSON and calls ``estimator()`` still
+    # cannot execute the payload.
+    _trusted: bool = field(default=False, repr=False, compare=False)
 
     def to_json(self) -> dict:
         d = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
@@ -233,6 +278,10 @@ class Artifact:
 
     def estimator(self):
         if self._estimator is None:
+            if not self._trusted:
+                raise TinyModelUnavailable(
+                    "refusing to deserialize an unverified tinymodel payload "
+                    "— load() must verify its signature first")
             self._estimator = _deserialize(self.model_blob)
         return self._estimator
 
@@ -248,7 +297,79 @@ def _deserialize(blob: Optional[str]):
         raise TinyModelUnavailable("artifact carries no model payload")
     import base64
     import pickle
+    # Callers MUST have verified the signature first — see Artifact.estimator.
     return pickle.loads(base64.b64decode(blob))
+
+
+# ── payload authenticity ────────────────────────────────────────────────────
+def secret_path(data_dir: str) -> str:
+    return os.path.join(data_dir, SECRET_FILENAME)
+
+
+def get_or_create_signing_secret(data_dir: str) -> str:
+    """The per-install artifact-signing key (see SECRET_FILENAME).
+
+    Same contract as ``database.get_or_create_csrf_server_secret``: 64 hex
+    characters, created on first use, never rotated automatically. Written
+    temp-file-plus-rename so a concurrent reader never sees half a key, and
+    chmod 0600 so the key is not readable by anything that merely gets a
+    directory listing of /data.
+    """
+    path = secret_path(data_dir)
+    try:
+        with open(path, encoding="ascii") as fh:
+            existing = fh.read().strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    os.makedirs(data_dir, exist_ok=True)
+    fresh = secrets.token_hex(32)
+    fd, tmp = tempfile.mkstemp(dir=data_dir, suffix=".tmp")
+    try:
+        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "w", encoding="ascii") as fh:
+            fh.write(fresh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # os.replace is atomic, but two processes racing here would each keep
+        # their own key. Re-read after the rename and defer to whoever landed
+        # first, so the losing writer signs with the key that will be loaded.
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    with open(path, encoding="ascii") as fh:
+        return fh.read().strip()
+
+
+def _blob_signature(secret: str, blob: str) -> str:
+    return hmac.new(secret.encode("ascii"), blob.encode("ascii"),
+                    hashlib.sha256).hexdigest()
+
+
+def verify_signature(art: "Artifact", data_dir: str) -> bool:
+    """Constant-time check that this install signed exactly these bytes."""
+    if not art.model_blob:
+        return False
+    if not art.model_signature:
+        return bool(ALLOW_UNSIGNED_LEGACY_ARTIFACTS)
+    try:
+        secret = get_or_create_signing_secret(data_dir)
+    except OSError as exc:                  # unwritable /data — fail closed
+        log.error("cannot read the tinymodel signing secret (%s); refusing "
+                  "to load a model payload", exc)
+        return False
+    return hmac.compare_digest(_blob_signature(secret, art.model_blob),
+                               art.model_signature)
+
+
+def _blob_digest(blob: Optional[str]) -> str:
+    """Plain SHA-256 over the served bytes, folded into ``model_hash``."""
+    return hashlib.sha256((blob or "").encode("ascii")).hexdigest()[:16]
 
 
 def label_pool_hash(rows: Sequence[dict]) -> str:
@@ -263,11 +384,32 @@ def label_pool_hash(rows: Sequence[dict]) -> str:
     return h.hexdigest()[:16]
 
 
-def _model_hash(pool_hash: str, classes: Sequence[str], threshold: float) -> str:
+def _model_hash(pool_hash: str, classes: Sequence[str], threshold: float,
+                blob_digest: str = "") -> str:
+    """Identity of the served artifact.
+
+    2.16 — ``blob_digest`` is new and load-bearing: before it, the hash
+    described the RECIPE (pool, params, classes, threshold) and not the bytes,
+    so swapping ``model_blob`` for a different payload left the hash — and
+    therefore every verdict keyed to it — completely unchanged. Covering the
+    payload makes the hash an identity of what is actually served.
+
+    A plain digest rather than the HMAC signature, deliberately: two identical
+    fits of the same pool must still produce the same hash, or every retrain
+    would invalidate its own predecessor's verdicts for no reason, and the
+    referee could not compare a champion against a re-fit challenger.
+    """
     h = hashlib.sha256()
     h.update(f"fs={FEATURE_SET_VERSION};pool={pool_hash};".encode())
     h.update(f"params={sorted(MODEL_PARAMS.items())};".encode())
-    h.update(f"classes={sorted(classes)};thr={threshold:.4f}".encode())
+    # str() every class: sklearn hands back numpy.str_, whose repr is
+    # ``np.str_('shower')`` under numpy 2, while the same list read back out of
+    # the artifact JSON is plain ``'shower'``. Before 2.16 nothing recomputed
+    # the hash, so the two never met and the discrepancy was invisible; the
+    # self-check below meets it on every load.
+    h.update(f"classes={sorted(str(c) for c in classes)};"
+             f"thr={threshold:.4f}".encode())
+    h.update(f";blob={blob_digest}".encode())
     return h.hexdigest()[:16]
 
 
@@ -379,14 +521,19 @@ def train(rows: Sequence[dict], circuit: str,
     for label in y:
         counts[label] = counts.get(label, 0) + 1
     pool_hash = label_pool_hash(rows)
+    # Serialize BEFORE hashing — model_hash now covers the payload (2.16).
+    blob = _serialize(clf)
     art = Artifact(
-        model_hash=_model_hash(pool_hash, list(clf.classes_), threshold),
+        model_hash=_model_hash(pool_hash, list(clf.classes_), threshold,
+                               _blob_digest(blob)),
         trained_at=datetime.now(timezone.utc).isoformat(),
         feature_set_version=FEATURE_SET_VERSION,
         features=list(FEATURES),
-        classes=list(clf.classes_),
+        classes=[str(c) for c in clf.classes_],
         label_pool_hash=pool_hash,
         class_counts=counts,
+        # (classes is stored below as plain str for the same round-trip
+        # reason — see _model_hash.)
         threshold=threshold,
         achieved_precision=precision,
         coverage_at_threshold=coverage,
@@ -396,9 +543,10 @@ def train(rows: Sequence[dict], circuit: str,
         zero_filled=list(empty),
         train_days=sorted({str(r.get("start_ts"))[:10] for r in rows
                            if r.get("start_ts")}),
-        model_blob=_serialize(clf),
+        model_blob=blob,
     )
     art._estimator = clf
+    art._trusted = True                 # we fitted it; nothing to verify
     log.info("[%s] tinymodel trained: %d events, %d classes, threshold %.2f "
              "(precision %s, coverage %s), hash %s", circuit, len(rows),
              len(counts), threshold, precision, coverage, art.model_hash)
@@ -463,8 +611,16 @@ def save(art: Artifact, data_dir: str) -> str:
     Temp file + rename: a reader either sees the whole old artifact or the
     whole new one, never a truncated file. The retained copy is what makes a
     health-alert rollback (47i) and a load-failure fallback possible.
+
+    2.16 — signing happens HERE rather than in ``train`` because this is the
+    first point that knows which /data the artifact belongs to, and a key is
+    per-install. An artifact that is never saved is never unpickled, so it
+    never needs a signature.
     """
     os.makedirs(data_dir, exist_ok=True)
+    if art.model_blob:
+        art.model_signature = _blob_signature(
+            get_or_create_signing_secret(data_dir), art.model_blob)
     path = artifact_path(data_dir, art.circuit)
     if os.path.exists(path):
         try:
@@ -510,6 +666,31 @@ def load(data_dir: str, circuit: str, allow_previous: bool = True
                             "build serves %s — ignoring it", path,
                             art.feature_set_version, FEATURE_SET_VERSION)
                 continue
+            # 2.16 — authenticity, checked BEFORE anything can unpickle the
+            # payload. A failure here is a tamper or a foreign artifact, not a
+            # corruption: say so plainly, because the operator's next step
+            # (retrain) differs from "the file is truncated".
+            if not verify_signature(art, data_dir):
+                log.error(
+                    "tinymodel artifact %s is %s — refusing to load its "
+                    "model payload. Retrain to install a signed artifact.",
+                    path,
+                    "unsigned (written before artifact signing existed, or "
+                    "placed there by something else)" if not art.model_signature
+                    else "signed by a DIFFERENT key or has been modified since "
+                         "it was written")
+                continue
+            # The hash must also still describe the bytes: a payload swap that
+            # left model_hash alone would otherwise keep every verdict keyed to
+            # the old, honest model.
+            expected = _model_hash(art.label_pool_hash, art.classes,
+                                   art.threshold, _blob_digest(art.model_blob))
+            if art.model_hash != expected:
+                log.error("tinymodel artifact %s does not match its own "
+                          "model_hash (%s != %s) — refusing it", path,
+                          art.model_hash, expected)
+                continue
+            art._trusted = True
             if is_prev:
                 log.warning("serving the PREVIOUS tinymodel artifact for %s "
                             "(current one failed to load)", circuit)

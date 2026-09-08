@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
@@ -165,7 +164,19 @@ async def dashboard(request: Request):
     return templates.TemplateResponse("dashboard.html", {
         "request":             request,
         "circuits":            circuit_states,
-        "chart_data_json":     json.dumps(chart_data),
+        # Passed as an OBJECT, not a pre-serialised string. The template
+        # renders it through the registered `tojson` filter
+        # (jinja2.utils.htmlsafe_json_dumps), which escapes <, >, & and \'
+        # so the value cannot close the <script> tag it sits inside.
+        #
+        # json.dumps does NOT escape those, which is why this previously
+        # needed |safe in the template — and |safe is exactly what
+        # suppresses autoescaping. It was the only |safe left in any
+        # template. Not exploitable today (labels and rounded floats),
+        # but it is the classic </script> breakout one refactor away, and
+        # a nonce-based CSP would not help: the nonce authorises that very
+        # block. dev49 (P0-5) already found this live at three other sinks.
+        "chart_data":          chart_data,
         "page":                "dashboard",
         "profile":             profile,
         "away_mode":           profile.get("away_mode", False),

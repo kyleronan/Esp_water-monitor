@@ -1629,6 +1629,28 @@ _WF_FINAL_GAP_TIMEOUT_S: float = 120.0
 _WF_FL_RESOLUTION_REDUCED: int = 0x04   # firmware dropped/decimated samples (a hole)
 _WF_MAX_CHUNK_SAMPLES: int = 1500       # firmware buffer cap; bound decoded-payload length defensively
 _WF_MAX_TOTAL_CHUNKS: int = 600         # bound for the 'total' field (~5 hour event at 30s cadence)
+# Receiver-side reassembly bounds. Chunks arrive from a device over the HA
+# event bus; from this process's point of view the sender is untrusted input,
+# and unbounded reassembly state is a textbook denial-of-service primitive
+# (CVE-2018-5391 "FragmentSmack": IP fragments parked in a reassembly queue by
+# a sender that never completes them). Two dimensions must be bounded
+# INDEPENDENTLY, because bounding either one alone still leaves a way to grow
+# memory without limit:
+#   * how large ONE in-flight set may become  -> _WF_MAX_TOTAL_CHUNKS, now
+#     enforced against `seq` on every chunk (see on_waveform_chunk), not just
+#     against the wire `total` field that only arrives on the FINAL chunk.
+#   * how MANY in-flight sets may exist       -> _WF_MAX_INFLIGHT_SETS below.
+# The TTL sweep (_evict_stale) bounds TIME but not either of these: it only
+# runs when a chunk arrives, and a sender that keeps sending is exactly the
+# sender that never trips it.
+#
+# High/low water marks follow the Linux ipfrag_high_thresh / ipfrag_low_thresh
+# shape: at the high mark, evict oldest-first down to the low mark, so the
+# table cannot be pinned at capacity with one eviction per arriving chunk.
+# Normal operation holds ONE in-flight set per circuit (occasionally two
+# across a boot_id change), so 16 is far above any legitimate working set.
+_WF_MAX_INFLIGHT_SETS: int = 16         # high-water mark on len(self._inflight)
+_WF_INFLIGHT_LOW_WATER: int = 12        # evict oldest-first down to this
 
 
 @dataclass
@@ -1913,6 +1935,14 @@ class WaveformChunkAccumulator:
         self._n_assembled = 0
         self._n_degraded = 0
         self._n_gaps = 0
+        # Reassembly-bound counters. Rejections/evictions are COUNTED rather
+        # than logged per chunk: the whole point of the bounds is to survive a
+        # flood, and a log line per rejected chunk would just move the
+        # denial-of-service from the heap to the log. Surfaced via
+        # transport_stats(); the first occurrence of each is logged at WARNING
+        # so the condition is visible without tailing DEBUG.
+        self._n_rejected_seq = 0        # chunk dropped: seq >= _WF_MAX_TOTAL_CHUNKS
+        self._n_overflow_evicted = 0    # in-flight set dropped: table at capacity
         # Optional sink fired once a record finishes assembling (late-waveform
         # upgrade, Fix 1). Kept DB-free; invoked in a try/except in _assemble so a
         # sink bug can never corrupt assembly. None in most tests.
@@ -1979,12 +2009,45 @@ class WaveformChunkAccumulator:
             flow, press = decoded_flow, decoded_press
 
         key = (sc["b"], sc["id"])
+        seq = sc["seq"]
+
+        # Bound 1 — absolute cap on `seq`, enforced BEFORE `cs.total` is known.
+        # `total` only arrives on the FINAL chunk, so the `seq >= cs.total`
+        # guard below is dead until then: a sender that streams non-final
+        # chunks with ever-increasing seq previously grew ONE set without
+        # limit (each entry up to _WF_MAX_CHUNK_SAMPLES floats x2 arrays) and
+        # held it for the full 2 h TTL. Because cs.chunks is keyed by seq,
+        # capping seq here also caps len(cs.chunks) at _WF_MAX_TOTAL_CHUNKS,
+        # which is the size the wire format already declares as the maximum.
+        # Checked before the in-flight set is looked up/created so a junk
+        # chunk cannot even allocate one.
+        if seq >= _WF_MAX_TOTAL_CHUNKS:
+            self._n_rejected_seq += 1
+            if self._n_rejected_seq == 1:
+                log.warning(
+                    "waveform[%s]: chunk seq=%d rejected — exceeds hard cap %d "
+                    "(boot=%d id=%d); further occurrences counted only "
+                    "(transport_stats.rejected_seq)",
+                    self._circuit, seq, _WF_MAX_TOTAL_CHUNKS, sc["b"], sc["id"],
+                )
+            else:
+                log.debug(
+                    "waveform[%s]: chunk seq=%d rejected — exceeds hard cap %d "
+                    "(boot=%d id=%d)",
+                    self._circuit, seq, _WF_MAX_TOTAL_CHUNKS, sc["b"], sc["id"],
+                )
+            return
+
         cs = self._inflight.get(key)
         if cs is None:
+            # Bound 2 — admission control on the NUMBER of in-flight sets.
+            # Every distinct (boot_id, event_id) past the node/circuit guards
+            # allocates a set, and nothing previously capped how many. Make
+            # room before allocating so the table can never exceed the high
+            # water mark.
+            self._enforce_inflight_capacity()
             cs = _InflightChunkSet(first_received_at=now)
             self._inflight[key] = cs
-
-        seq = sc["seq"]
 
         # Reject seq values that exceed any already-known total (catches
         # corrupted/duplicate-event_id misroutes).
@@ -2176,6 +2239,56 @@ class WaveformChunkAccumulator:
                             "(non-fatal): %s", self._circuit, e)
 
     # ------------------------------------------------------------------
+    # Capacity eviction (bound on the NUMBER of in-flight sets)
+    # ------------------------------------------------------------------
+
+    def _enforce_inflight_capacity(self) -> None:
+        """Evict oldest-first so a new set can be admitted within the cap.
+
+        Called only from the allocation path in on_waveform_chunk. Modelled on
+        the Linux IP-fragment reassembly thresholds: at
+        _WF_MAX_INFLIGHT_SETS, drop the OLDEST sets (by first_received_at,
+        the same stamp the TTL sweep uses) down to _WF_INFLIGHT_LOW_WATER - 1
+        so there is room for the caller's new set. Batching to a low-water
+        mark — rather than evicting exactly one per arrival — means a sender
+        cannot hold the table pinned at capacity and force an eviction for
+        every chunk it sends.
+
+        Oldest-first is deliberate: the newest sets are the ones an event
+        actually in progress is still adding to, and the oldest is the most
+        likely to be abandoned. This bounds RETAINED memory even when the
+        stream stops entirely, which the TTL sweep cannot do on its own
+        (_evict_stale only runs when a chunk arrives).
+        """
+        if len(self._inflight) < _WF_MAX_INFLIGHT_SETS:
+            return
+        n_drop = len(self._inflight) - _WF_INFLIGHT_LOW_WATER + 1
+        by_age = sorted(self._inflight.items(),
+                        key=lambda kv: kv[1].first_received_at)
+        for k, _cs in by_age[:n_drop]:
+            cs = self._inflight.pop(k, None)
+            if cs is None:
+                continue
+            self._n_overflow_evicted += 1
+            # A set whose final chunk had already arrived is a waveform we are
+            # now losing — count it the same way the TTL sweep does.
+            if cs.final_metadata is not None:
+                self._n_gaps += 1
+        if self._n_overflow_evicted == n_drop:
+            log.warning(
+                "waveform[%s]: in-flight table hit cap %d — evicted %d oldest "
+                "set(s) down to %d; further occurrences counted only "
+                "(transport_stats.overflow_evicted)",
+                self._circuit, _WF_MAX_INFLIGHT_SETS, n_drop,
+                _WF_INFLIGHT_LOW_WATER - 1,
+            )
+        else:
+            log.debug(
+                "waveform[%s]: in-flight table hit cap %d — evicted %d oldest set(s)",
+                self._circuit, _WF_MAX_INFLIGHT_SETS, n_drop,
+            )
+
+    # ------------------------------------------------------------------
     # TTL eviction
     # ------------------------------------------------------------------
 
@@ -2214,7 +2327,14 @@ class WaveformChunkAccumulator:
         to transport gaps (a final chunk arrived but predecessors never did)."""
         return {"assembled": self._n_assembled,
                 "degraded": self._n_degraded,
-                "gaps": self._n_gaps}
+                "gaps": self._n_gaps,
+                # Reassembly-bound trips (see _WF_MAX_INFLIGHT_SETS): chunks
+                # dropped for an out-of-range seq, and in-flight sets dropped
+                # because the table was at capacity. Non-zero means either a
+                # misbehaving/garbled sender or an attempt to grow receiver
+                # memory without bound.
+                "rejected_seq": self._n_rejected_seq,
+                "overflow_evicted": self._n_overflow_evicted}
 
     # ------------------------------------------------------------------
     # Lookup interface

@@ -443,7 +443,7 @@
 {% block scripts %}
 <script>
 // Chart data from server
-const chartData = {{ chart_data_json | safe }};
+const chartData = {{ chart_data | tojson }};
 
 // Read a CSS custom property from :root so Chart.js / Canvas pick up the
 // live theme (light or dark, switched by prefers-color-scheme).
