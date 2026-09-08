@@ -2787,7 +2787,7 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
 
     Returns a summary dict with the counts the endpoint relays to the UI.
     """
-    from .database import (_hour_bucket_for, transaction, apply_effective_volume,
+    from .database import (transaction, apply_effective_volume,
                            compute_daily_summary, local_day_of)
     from .supply_regime import pump_era_start
     era_start = pump_era_start(conn)
@@ -3800,9 +3800,6 @@ _WF_PEAK_SANITY_RATIO: float = 0.95
 _WF_FL_START_COMPLETE:     int = 0x01  # pre-roll covers full start-window span
 _WF_FL_FULL_COMPLETE:      int = 0x02  # full-window capture is complete
 _WF_FL_RESOLUTION_REDUCED: int = 0x04  # buffer decimated; lower sample rate
-_WF_FL_EVENT_TOO_SHORT:    int = 0x10  # firmware duration < 1 s
-_WF_FL_EVENT_TOO_LONG:     int = 0x20  # decimation factor >= 4×
-_WF_FL_CLAMPED_SAMPLE:     int = 0x40  # at least one sample hit ADC rail
 
 _WF_FLOW_SIG_MIN_PEAK_LPM:   float = 0.05   # ignore near-zero / noisy full_flow arrays
 _WF_PRESS_SIG_MIN_DELTA_PSI:  float = 0.15   # ignore pressure noise below this drop
@@ -5098,8 +5095,6 @@ class FeatureExtractor:
 
         try:
             from .database import (upsert_event_and_apply_hourly_volume,
-                                   is_event_in_exclusion_window,
-                                   find_overlapping_event,
                                    is_retryable_db_error)
 
             # Writer-boundary duplicate guard: two importer catch-up runs can

@@ -29,7 +29,7 @@ from .config import AddonConfig
 from .database import (get_leak_test_schedule, upsert_leak_test_schedule,
                        insert_leak_test_history, get_leak_test_history, run_db)
 from .ha_client import HaClient
-from .leak_test_refill import (POST_RESTORE_WATCH_S, POST_RESTORE_LEAD_S,
+from .leak_test_refill import (POST_RESTORE_WATCH_S,
                                POST_RESTORE_DEMAND_L,
                                reconcile_leak_test_refills)
 

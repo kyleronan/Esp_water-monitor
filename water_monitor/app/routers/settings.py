@@ -675,7 +675,6 @@ async def leak_banner_dismiss(request: Request):
     alert path (evaluate_leak_alert) is untouched by this.
     """
     orch = _orch(request)
-    from ..config import pump_gates_active
     from ..database import get_pump_regime_nights, update_home_profile
     nights = await run_db(get_pump_regime_nights, orch.db, limit=14)
     latest = next((n for n in nights if n.get("est_leak_lpd")), None)

@@ -144,7 +144,6 @@ class AlertManager:
         ``self._db`` — no ``conn`` argument to spot. Async-calls-sync-helper is
         the same violation; grep for it by helper name, not just by conn.
         """
-        from .database import run_db
         from .units import load_unit_context
         return {
             "enabled":       self._is_enabled(circuit, alert_type),
@@ -421,7 +420,7 @@ class AlertManager:
                                         pump_active: bool) -> None:
         """Phase 6a — sustained low pressure while a zone is flowing."""
         from .database import run_db
-        from .units import load_unit_context, convert_pressure
+        from .units import convert_pressure
         _prep = await run_db(self._fire_prep_sync, circuit, "low_pressure_supply")
         uc = _prep["unit_context"]
         val = convert_pressure(psi, uc)
@@ -443,7 +442,7 @@ class AlertManager:
         kind='failure' (low/zero flow, no recharge rise) vs 'overload' (a
         maxed-out VFD serving heavy demand — NOT a dead pump)."""
         from .database import run_db
-        from .units import load_unit_context, convert_pressure
+        from .units import convert_pressure
         _prep = await run_db(self._fire_prep_sync, circuit, "pump_low_pressure")
         uc = _prep["unit_context"]
         val = convert_pressure(psi, uc)
@@ -474,7 +473,6 @@ class AlertManager:
         meters' floors, so the firmware cannot corroborate). The copy teaches
         the valve bisect that located the 2026-07 zone-valve leak."""
         from .database import run_db
-        from .units import load_unit_context
         _prep = await run_db(self._fire_prep_sync, circuit, "pump_leak")
         uc = _prep["unit_context"]
         gal = lpd / 3.785
@@ -506,7 +504,7 @@ class AlertManager:
         when the tracker opens the new regime. Informational: nothing changes
         until the user confirms the dashboard banner's recalibration."""
         from .database import run_db
-        from .units import convert_pressure, load_unit_context
+        from .units import convert_pressure
         _prep = await run_db(self._fire_prep_sync, circuit, "supply_regime_shift")
         uc = _prep["unit_context"]
         old_v = convert_pressure(old_psi, uc)
@@ -531,7 +529,7 @@ class AlertManager:
                                       pressure_drop_psi: float,
                                       circuit_name: str) -> None:
         from .database import run_db
-        from .units import load_unit_context, convert_pressure
+        from .units import convert_pressure
         _prep = await run_db(self._fire_prep_sync, circuit, "leak_test")
         uc = _prep["unit_context"]
         val = convert_pressure(pressure_drop_psi, uc)

@@ -320,8 +320,6 @@ class PumpRegimeDetector:
         if self._alert_manager is None:
             return
         try:
-            from .config import pump_gates_active
-            from .database import get_pump_regime_nights
             circuits = [c.circuit for c in self._cfg.circuits]
             # dev46 (46a): the gate check and the nights read are adjacent —
             # one hop.
@@ -382,7 +380,6 @@ class PumpRegimeDetector:
         return None
 
     async def _analyze_circuit_night(self, circuit_cfg, night: str) -> bool:
-        import numpy as np
         from .pump_regime_math import (detect_pump_regime,
                                        estimate_leak_rate_lph, quiet_windows)
 

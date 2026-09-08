@@ -93,8 +93,6 @@ async def run_db(fn, *args, **kwargs):
     return await loop.run_in_executor(
         get_db_executor(), functools.partial(fn, *args, **kwargs))
 
-SCHEMA_VERSION = 1
-
 
 def get_connection(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -6387,10 +6385,9 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     #    active-flow features so the matcher uses whichever it can (active when
     #    backfilled). An event now excluded_from_training carries no fixture
     #    identity → its matched_fixture_type is cleared (stale-match carry-forward).
-    from .event_rules import (CYCLE_ONLY_FIXTURE_TYPES, detect_dishwasher_cycles,
+    from .event_rules import (detect_dishwasher_cycles,
                               detect_softener_sessions, detect_washer_cycles,
-                              get_home_timezone, parse_hhmm_to_minutes,
-                              rule_classify_event)
+                              get_home_timezone, parse_hhmm_to_minutes)
     from .rule_calibration import load_rule_calibration
 
     # Frozen per-home rule bands (empty dict → predicates use shipped defaults).
@@ -6402,8 +6399,7 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     # regime where new events land. (v1 limitation: a full reprocess spanning
     # a regime boundary scans historical cycles with current bands; per-event
     # rules, where the observed staleness actually bit, are fully resolved.)
-    from .supply_regime import (get_current_regime_id, get_regimes,
-                                resolve_regime_for_ts)
+    from .supply_regime import get_current_regime_id, get_regimes
     _regimes = get_regimes(conn)
     _calib_cache: Dict[int, Dict[str, Any]] = {
         0: load_rule_calibration(conn, circuit)}
@@ -6458,7 +6454,7 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     # only; reclassify NEVER notifies or shuts off). Baseline + sensitivity loaded
     # once for the whole pass; the extra SELECT columns the scorer needs are deduped
     # into the query so a column already in qfeats isn't selected twice.
-    from .anomaly_baseline import load_usage_baselines, score_event_anomaly
+    from .anomaly_baseline import load_usage_baselines
     _baselines = load_usage_baselines(conn, circuit)
     _sens = get_sensitivity_config(conn, circuit)
     _SCORE_COLS = ("volume_litres_effective", "volume_litres", "duration_seconds",
@@ -6485,7 +6481,6 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
             log.warning("[%s] fingerprint library unavailable: %s", circuit, e)
 
     # Toilet physics veto (dev17) — cap computed once for the whole pass.
-    from .event_rules import toilet_veto_reason
     _toilet_cap = get_toilet_flush_cap_litres(conn)
 
     where = "WHERE circuit = ? AND user_fixture_type IS NULL"

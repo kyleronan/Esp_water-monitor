@@ -217,7 +217,7 @@ class Orchestrator:
 
     async def set_away_mode(self, enabled: bool) -> None:
         """Enable or disable away mode. Notifies via HA when toggled."""
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
 
@@ -2138,8 +2138,6 @@ class Orchestrator:
         # hourly_volume table (which only counts detected events).
         # Fall back to the internal table if the sensor isn't configured or
         # hasn't returned a usable reading yet.
-        from .database import (get_daily_volume, get_weekly_volume,
-                               compute_ha_daily_volume, compute_ha_weekly_volume)
         ha_volume_raw = states.get(circuit_cfg.volume_sensor, "")
         try:
             if ha_volume_raw not in ("", "unknown", None):

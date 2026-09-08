@@ -363,7 +363,7 @@ async def resolve_health_alert(alert_id: int, request: Request):
     orch = _orch(request)
     form = await request.form()
     reason = str(form.get("reason") or "").strip()
-    from ..fixture_health import (REASON_FALSE_ALARM, REASON_REPAIRED,
+    from ..fixture_health import (REASON_REPAIRED,
                                   UNLOCK_REASONS, resolve_alert,
                                   unlock_baseline)
     if reason not in UNLOCK_REASONS:
@@ -471,7 +471,6 @@ async def repair_stale_links(request: Request):
     if not getattr(orch, "startup_cluster_work_done", True):
         return ingress_redirect(request, "/fixtures?msg=starting")
     try:
-        import asyncio
         from ..database import run_db
         # dev46 (46a/N2c): the write lock is async and is acquired OUTSIDE
         # run_db — never inside a callable on the single DB worker.
