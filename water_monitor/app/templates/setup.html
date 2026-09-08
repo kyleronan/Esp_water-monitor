@@ -159,8 +159,10 @@
             {% if d.model %} · {{ d.model }}{% endif %}
             {% if d.is_esphome %} · ESPHome{% endif %}
             {% if d.sw_version %} · v{{ d.sw_version }}{% endif %}
-            {% if not d.firmware_ok %}
+            {% if d.firmware_status == 'too_old' %}
             <span class="badge badge-warn" title="Firmware below minimum supported version">Firmware too old</span>
+            {% elif d.firmware_status == 'unknown' %}
+            <span class="badge badge-warn" title="Firmware version could not be read — compatibility is unverified">Firmware version unknown</span>
             {% endif %}
           </div>
         </div>
@@ -187,10 +189,21 @@
     {% if device.model %} · {{ device.model }}{% endif %}
     {% if device.sw_version %} · Firmware v{{ device.sw_version }}{% endif %}
   </p>
-  {% if not device.firmware_ok %}
-  <div class="callout callout-warn" style="margin-bottom:1rem">
+  {% if error %}
+  <div class="alert-banner alert-fault" style="margin-bottom:1rem">⚠ {{ error }}</div>
+  {% endif %}
+
+  {% if firmware_blocks %}
+  <div class="alert-banner alert-fault" style="margin-bottom:1rem">
     ⚠ Firmware v{{ device.sw_version }} is below the minimum supported version
-    (v{{ min_fw }}). Some features may not work correctly. Please flash the latest firmware.
+    (v{{ min_fw }}). Setup cannot continue on this firmware — flash v{{ min_fw }}
+    or later, then reload this page.
+  </div>
+  {% elif firmware_status == 'unknown' %}
+  <div class="callout callout-warn" style="margin-bottom:1rem">
+    ⚠ This device does not report a readable firmware version, so compatibility
+    with the minimum supported version (v{{ min_fw }}) is unverified. Setup can
+    continue, but check the device is running v{{ min_fw }} or later.
   </div>
   {% endif %}
 
@@ -294,7 +307,11 @@
 
     <div class="setup-step-actions">
       <a href="{{ ingress_path }}/setup" class="btn btn-ghost btn-sm">← Back</a>
-      <button type="submit" class="btn btn-primary btn-sm">Continue →</button>
+      {# 2.3 unit 0.9 — a verified sub-floor firmware cannot proceed. The POST
+         handler re-checks this AND the flow-meter PPL assignment server-side,
+         so this attribute is a courtesy, not the gate. #}
+      <button type="submit" class="btn btn-primary btn-sm"
+              {% if firmware_blocks %}disabled{% endif %}>Continue →</button>
     </div>
 
   </form>

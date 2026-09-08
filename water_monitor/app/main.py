@@ -164,6 +164,7 @@ def _is_static_path(path: str) -> bool:
     return path.startswith("/static/")
 
 
+from .build_info import _read_addon_version, _read_git_commit
 from .db_migrations import run_migrations
 from .orchestrator import Orchestrator
 from .routers import (dashboard, device, history, fixtures, settings, setup,
@@ -172,23 +173,6 @@ from .units import build_unit_context, load_unit_context
 
 APP_DIR = Path(__file__).resolve().parent
 log = logging.getLogger(__name__)
-
-
-def _read_addon_version() -> str:
-    """Read the addon `version:` from config.yaml (one line, no YAML dep).
-
-    Used as the static-asset cache-buster so a version bump on deploy busts
-    the browser's cached styles.css/JS. Falls back to 'dev' if unreadable.
-    """
-    try:
-        cfg_path = APP_DIR.parent / "config.yaml"
-        for line in cfg_path.read_text(encoding="utf-8").splitlines():
-            s = line.strip()
-            if s.startswith("version:"):
-                return s.split(":", 1)[1].strip().strip("\"'") or "dev"
-    except Exception:
-        pass
-    return "dev"
 
 
 class IngressTemplates(Jinja2Templates):
@@ -220,7 +204,7 @@ class IngressTemplates(Jinja2Templates):
             context.setdefault("role", _role)
             context.setdefault("is_admin", _role == ADMIN)
             context.setdefault("can_control_valve", _role in (ADMIN, OPERATOR))
-            # Static-asset cache-buster (see _read_addon_version). Defaults to
+            # Static-asset cache-buster (see build_info). Defaults to
             # 'dev' before lifespan sets it / outside the app context.
             context.setdefault(
                 "asset_version",
@@ -270,7 +254,6 @@ async def lifespan(app: FastAPI):
     # only tell was a missing migration. Best-effort: version/commit read
     # failures must never block boot.
     try:
-        from .event_detector import _read_addon_version, _read_git_commit
         _ver = _read_addon_version() or "unknown"
         _commit = _read_git_commit()
         _build = f"v{_ver}" + (f" ({_commit})" if _commit else "")
@@ -390,12 +373,15 @@ async def lifespan(app: FastAPI):
     # the condition under which cached assets must be discarded. (Same root
     # cause as the verdict stamp's code component — a version string is not a
     # build identity inside a dev cycle.)
+    # 'dev' is the fallback the templates expect when config.yaml is
+    # unreadable — build_info returns None there rather than inventing a
+    # version string, so the sentinel is applied here, at the display edge.
+    _asset_ver = _read_addon_version() or "dev"
     try:
         from .database import _code_fingerprint
-        app.state.asset_version = (f"{_read_addon_version()}-"
-                                   f"{_code_fingerprint()[:8]}")
+        app.state.asset_version = f"{_asset_ver}-{_code_fingerprint()[:8]}"
     except Exception:                       # noqa: BLE001 — never block boot
-        app.state.asset_version = _read_addon_version()
+        app.state.asset_version = _asset_ver
 
     # Register tojson filter (not included by default in FastAPI's Jinja2).
     #
@@ -882,7 +868,43 @@ async def health_detail(request: Request):
         # own waveform stage counters. Surfaced so unit 8.5 can decide what to
         # do about them; NOTHING gates on them today.
         "device_signals": _detector_report(orch, "device_signals"),
+        # 2.3 unit 0.9 — METERING TRUTH. An unbound flow-meter PPL entity used
+        # to have no symptom at all: the circuit silently ran on
+        # circuit_profile.pulses_per_litre (column default 396.0), and on a
+        # 72-ppl oval-gear meter that is every volume 5.5x high. Setup now
+        # refuses to produce that configuration; this is how an install that
+        # ALREADY has it says so. Report only — nothing branches on it, and it
+        # reads in-memory config, so it does no I/O.
+        "metering": _metering_report(orch),
     }
+
+
+def _metering_report(orch) -> dict:
+    """Per-circuit pulses-per-litre provenance for /health/detail.
+
+    ``ppl_verified`` is the whole point: False means the pulses-per-litre in
+    use came from the local cache / column default rather than from the
+    firmware's own ``ppl_main`` / ``ppl_irr`` number entity, so every volume on
+    that circuit is only as right as that default happens to be.
+    """
+    try:
+        cfg = getattr(orch, "_cfg", None) if orch else None
+        circuits = list(getattr(cfg, "circuits", []) or []) if cfg else []
+        out = {}
+        unverified = []
+        for c in circuits:
+            entity = (getattr(c, "flow_meter_ppl_entity", "") or "").strip()
+            out[c.circuit] = {
+                "ppl_entity": entity,
+                "ppl_in_use": float(getattr(c, "pulses_per_litre", 0.0) or 0.0),
+                "ppl_verified": bool(entity),
+            }
+            if not entity:
+                unverified.append(c.circuit)
+        return {"circuits": out, "unverified_ppl": sorted(unverified)}
+    except Exception as e:      # pragma: no cover - defensive
+        log.debug("health detail: metering unavailable (%s)", e)
+        return {}
 
 
 def _detector_report(orch, method: str) -> dict:

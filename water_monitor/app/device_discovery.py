@@ -29,16 +29,63 @@ log = logging.getLogger(__name__)
 
 # Minimum firmware version required for full feature support.
 # Checked against the device registry sw_version field (set via project.version
-# in the ESPHome YAML). Non-numeric versions (e.g. "dev") are treated as unknown
-# — setup is not blocked, but a warning is shown.
+# in the ESPHome YAML).
 #
 # 3.13.0 is the floor because it is the last change that altered what the add-on
 # READS, not just what the firmware does: 3.12.0 added the runtime flow_meter_ppl
 # number entity (without it the add-on falls back to a 396 ppl default, which on
 # a 72 ppl oval-gear meter mis-scales every volume by 5.5x — see
 # Orchestrator._sync_ppl_and_watch), and 3.13.0 rewrote flow measurement from
-# pulse_counter to pulse_meter. This is ADVISORY: it warns, it does not block.
+# pulse_counter to pulse_meter.
+#
+# 2.3 unit 0.9 — this used to be ADVISORY IN BOTH DIRECTIONS: `firmware_ok`
+# returned True for a version it could not parse AND nothing branched on the
+# False case either, so the two Jinja warnings in setup.html were the entire
+# mechanism. Now there are THREE states, not two, because they deserve
+# different answers:
+#
+#   "ok"       parsed and >= floor.
+#   "too_old"  parsed and < floor.  VERIFIED bad → blocks setup.
+#   "unknown"  absent, or not parseable as N.N.N ("dev", "", "unknown").
+#              NOT verified bad → warns loudly, does not block.
+#
+# Why "unknown" does not block, with the evidence: ESPHome's project.version is
+# a free-form string the operator writes in their own YAML, HA appends
+# " (ESPHome x.y.z)" to it, and a device_registry entry created before the
+# `project:` block existed carries no sw_version at all. Every one of those is
+# a correctly-flashed device. Blocking there would strand a working install
+# with no escape hatch inside the wizard — the add-on would refuse to finish
+# setup and the operator's only recourse would be editing the DB. Blocking on
+# "too_old" is safe because it is a positive measurement: we parsed a version
+# and it is genuinely below the floor, and the fix (flash newer firmware) is
+# the one the operator has to do anyway.
+#
+# What DID change for "unknown": `firmware_ok` no longer lies about it. It is
+# now strictly "verified at or above the floor", so an unknown version is False
+# and the UI says so in its own words instead of showing a green nothing.
 MIN_FIRMWARE_VERSION: tuple = (3, 13, 0)
+
+#: sw_version strings that carry no version information at all.
+_UNKNOWN_FW_SENTINELS = {"", "unknown", "unavailable", "none", "null", "dev"}
+
+
+def parse_firmware_version(sw_version: Optional[str]) -> Optional[Tuple[int, ...]]:
+    """Parse an HA ``sw_version`` into a comparable tuple, or None if unknown.
+
+    Handles the HA suffix ("3.14.0 (ESPHome 2026.6.1)" → ``(3, 14, 0)``).
+    Returns None — never a guess — for anything non-numeric, so callers can
+    tell "below the floor" apart from "cannot tell".
+    """
+    if not sw_version:
+        return None
+    version_str = str(sw_version).split("(")[0].strip()
+    if version_str.lower() in _UNKNOWN_FW_SENTINELS:
+        return None
+    try:
+        parts = tuple(int(x) for x in version_str.split(".")[:3])
+    except ValueError:
+        return None
+    return parts or None
 
 # Roles that are optional — wizard will show them as optional dropdowns
 # and they won't block setup completion if unmatched.
@@ -70,10 +117,10 @@ OPTIONAL_ROLES = {
     "leak_test_baseline_sensor",
     "leak_test_closed_sensor",
     "leak_settle_number",
-    # Runtime per-circuit flow-meter pulses-per-litre (firmware 3.12.0+). Optional so
-    # older firmware (compile-time k-factor) still adopts; the add-on falls back to its
-    # cached pulses_per_litre / 396 default when this role is unmatched.
-    "flow_meter_ppl",
+    # NOTE: "flow_meter_ppl" WAS here. It is now REQUIRED — see PPL_ROLE and the
+    # refusal note below. It stays fillable by the optional-role rescan via
+    # RESCAN_FILLABLE_ROLES so an existing install still heals after a firmware
+    # upgrade; it just can no longer be silently skipped at setup.
     # Waveform diagnostic counters (firmware 3.7.0+ / 3.9.0+, circuit_1 only).
     # The 5 chunked text sensors were replaced by an HA event in firmware 3.8.0.
     # Chunk drop count was added in 3.9.0 when chunked streaming replaced the
@@ -99,6 +146,57 @@ OPTIONAL_ROLES = {
     "closed_end_stop_sensor",
     "valve_seal_alert_sensor",
 }
+
+#: The runtime per-circuit flow-meter pulses-per-litre number entity
+#: (firmware 3.12.0+, `ppl_main` / `ppl_irr`). Named because three separate
+#: things key on it.
+PPL_ROLE = "flow_meter_ppl"
+
+# ── 2.3 unit 0.9 — why PPL is REQUIRED, and what "refuse" means here ────────
+#
+# THE FAILURE. The firmware invites the operator to change `circuit_1_name`
+# ("Display name for circuit 1 — change to suit your install"). Every entity
+# NAME on that circuit is `${circuit_1_name}`-interpolated, and HA derives the
+# entity_id from the name — so a rename moves both handles the ROLE_PATTERNS
+# regexes below match on. About sixty patterns stop binding at once. Most of
+# those failures are loud: an unmatched REQUIRED role stops the setup wizard
+# dead and the operator picks the entity by hand.
+#
+# `flow_meter_ppl` was the exception. It was optional, so an unbound ppl sailed
+# through setup, and the add-on then ran on circuit_profile.pulses_per_litre —
+# whose column DEFAULT is 396.0. On this install the MAIN meter is a 72-ppl
+# oval-gear PD meter. 396 / 72 = 5.5, so every computed volume, the low-flow
+# floor (60 / ppl) and every threshold scaled off them were wrong by 5.5x
+# TOGETHER — which is precisely why the result looks plausible instead of
+# broken. Nothing else ever corrects it: the HA number-entity subscription is
+# the only write path for ppl, and it is skipped when the entity is unbound.
+#
+# WHAT "REFUSE" MEANS. Not an exception, and not a crash-loop — a stuck
+# add-on measures nothing at all, which is strictly worse than one that has
+# not finished setup. Refusal here is: the wizard will not hand back a
+# runnable configuration.
+#
+#   * Removing the role from OPTIONAL_ROLES makes DiscoveryResult.all_matched
+#     False when ppl is unbound, which makes setup.html render its entity
+#     <select> with `required` — the browser will not submit step 3 and the
+#     operator assigns the entity from the device's own entity list.
+#   * A LIVE install that predates this (ppl row empty) is not killed. It keeps
+#     running on its cached ppl, `unbound_ppl_circuits()` names the circuits,
+#     and /health/detail reports them under "metering" so the condition has a
+#     symptom for the first time.
+#
+# NOT DONE HERE, deliberately: Orchestrator._sync_ppl_and_watch is the place
+# that could call `mark_subsystem_degraded("flow_meter_ppl", ...)` and stop the
+# circuit's detector outright. That file is owned by another in-flight unit, so
+# this unit stops at the discovery boundary and leaves the runtime hook as a
+# named follow-up rather than editing across the seam.
+
+#: Roles the optional-role rescan may FILL IN on an already-configured install.
+#: Superset of OPTIONAL_ROLES: `flow_meter_ppl` is required at setup but must
+#: still self-heal on an install that was set up before firmware 3.12.0 ever
+#: published the entity. merge_optional_roles is fill-only — it never overwrites
+#: a confirmed or non-empty mapping — so widening it cannot clobber anything.
+RESCAN_FILLABLE_ROLES = OPTIONAL_ROLES | {PPL_ROLE}
 
 
 # ------------------------------------------------------------------
@@ -253,23 +351,38 @@ class DiscoveredDevice:
         )
 
     @property
-    def firmware_ok(self) -> bool:
-        """True if sw_version meets MIN_FIRMWARE_VERSION, or version is unknown."""
-        if not self.sw_version:
-            return True   # can't determine — don't block setup
-        try:
-            # HA appends "(ESPHome x.y.z)" to the project version — strip it
-            version_str = self.sw_version.split("(")[0].strip()
-            parts = tuple(int(x) for x in version_str.split(".")[:3])
-            return parts >= MIN_FIRMWARE_VERSION
-        except ValueError:
+    def firmware_status(self) -> str:
+        """One of "ok" / "too_old" / "unknown" — see MIN_FIRMWARE_VERSION."""
+        parts = parse_firmware_version(self.sw_version)
+        if parts is None:
             log.warning(
-                "Firmware version %r is non-numeric — cannot verify compatibility "
-                "(minimum required: %s). Proceeding, but some features may not work.",
+                "Firmware version %r cannot be parsed — compatibility is "
+                "UNVERIFIED (minimum required: %s). Setup is not blocked, but "
+                "nothing has confirmed this device publishes the entities the "
+                "add-on reads.",
                 self.sw_version,
                 ".".join(str(x) for x in MIN_FIRMWARE_VERSION),
             )
-            return True   # non-numeric (e.g. "dev") — don't block setup
+            return "unknown"
+        return "ok" if parts >= MIN_FIRMWARE_VERSION else "too_old"
+
+    @property
+    def firmware_ok(self) -> bool:
+        """True ONLY when sw_version was parsed and meets MIN_FIRMWARE_VERSION.
+
+        This used to return True for an unknown/non-numeric version, so "we
+        could not tell" was rendered identically to "verified good". It is now
+        strictly a positive statement. Use :attr:`firmware_blocks_setup` for
+        the "may this device proceed" question — an unverifiable version is not
+        ok, but it is not a reason to refuse either.
+        """
+        return self.firmware_status == "ok"
+
+    @property
+    def firmware_blocks_setup(self) -> bool:
+        """True only for a VERIFIED sub-floor firmware. See MIN_FIRMWARE_VERSION
+        for why "unknown" is warned about rather than blocked."""
+        return self.firmware_status == "too_old"
 
 
 @dataclass
@@ -352,30 +465,108 @@ def find_matching_devices(
     return None, suggestions
 
 
+# The four diagnostic identity sensors are the ONLY entities on the device
+# whose own names are not `${circuit_N_name}`-interpolated — the firmware
+# hardcodes "Circuit 1 ID" / "Circuit 1 Label" / "Circuit 2 ID" / "Circuit 2
+# Label". That makes them the only rename-stable handles the add-on has, which
+# is exactly what they were added for. Anchor on them.
+_CIRCUIT_ID_SENSOR_RE = re.compile(r"circuit\s+(\d+)\s+id\b", re.IGNORECASE)
+_CIRCUIT_LABEL_SENSOR_RE = re.compile(r"circuit\s+(\d+)\s+label\b", re.IGNORECASE)
+#: The ID sensor publishes a literal circuit key ("circuit_1"). Anything else
+#: is a stale/unavailable state and is not trusted.
+_CIRCUIT_KEY_RE = re.compile(r"^circuit_\d+$")
+#: HA state strings that mean "no value", not a label.
+_NO_STATE = {"", "unknown", "unavailable", "none"}
+
+
+async def resolve_circuit_identity(
+    ha,
+    entity_registry_entities: List[Dict[str, Any]],
+) -> Tuple[Dict[str, str], List[str]]:
+    """Resolve circuit identity from the v3.6+ diagnostic sensors.
+
+    Returns ``(labels, circuits_seen)``:
+
+    * ``labels``       {circuit_id: display_label}, e.g. {"circuit_1": "Zone A"}
+    * ``circuits_seen`` every circuit the DEVICE says it has, whether or not
+      its label resolved.
+
+    Binding is anchored on the **ID** sensor, not the Label sensor's name: the
+    ID sensor's STATE is the firmware's own circuit key ("circuit_1"), so a
+    duplex/swapped install attaches its label to the circuit the device claims
+    rather than to the ordinal in the sensor's name. The Label sensor is paired
+    to it by that ordinal (both are hardcoded "Circuit N ..." names).
+
+    The second return value is the point of the split: a device can report
+    "circuit_1 exists" while its Label sensor is still `unknown` (both template
+    sensors have `update_interval: 60s`, so there is a real window after boot
+    where identity is known and the label is not). Previously that produced an
+    empty labels dict and the caller could not tell it apart from "older
+    firmware, no diagnostic sensors" — it just fell back to the "main" /
+    "irrigation" regexes, which is the path that fails silently on a renamed
+    circuit. Callers can now distinguish the two.
+
+    Returns ``({}, [])`` when no diagnostic sensors are present at all.
+    """
+    id_entities: Dict[str, Dict[str, Any]] = {}
+    label_entities: Dict[str, Dict[str, Any]] = {}
+    for entity in entity_registry_entities:
+        name = entity.get("original_name") or entity.get("name") or ""
+        m = _CIRCUIT_ID_SENSOR_RE.search(name)
+        if m:
+            id_entities[m.group(1)] = entity
+            continue
+        m = _CIRCUIT_LABEL_SENSOR_RE.search(name)
+        if m:
+            label_entities[m.group(1)] = entity
+
+    # Ordinal ("1") → circuit key ("circuit_1"), from the ID sensor's state.
+    identity: Dict[str, str] = {}
+    for ordinal, entity in id_entities.items():
+        state = (await ha.get_state_value(entity["entity_id"], None) or "")
+        state = str(state).strip()
+        if _CIRCUIT_KEY_RE.match(state):
+            identity[ordinal] = state
+        else:
+            # Sensor exists (so the circuit exists) but its state is not usable
+            # yet. Fall back to the ordinal in its own hardcoded name.
+            identity[ordinal] = f"circuit_{ordinal}"
+
+    labels: Dict[str, str] = {}
+    for ordinal, entity in label_entities.items():
+        circuit_id = identity.get(ordinal, f"circuit_{ordinal}")
+        state = (await ha.get_state_value(entity["entity_id"], None) or "")
+        state = str(state).strip()
+        if state.lower() in _NO_STATE:
+            continue
+        labels[circuit_id] = state
+
+    circuits_seen = sorted(
+        set(identity.values())
+        | {f"circuit_{o}" for o in label_entities if o not in identity}
+        | set(labels.keys())
+    )
+    if circuits_seen:
+        log.info("Diagnostic circuit identity resolved: circuits=%s labels=%s",
+                 circuits_seen, labels)
+        for circuit in circuits_seen:
+            if circuit not in labels:
+                log.warning(
+                    "Circuit %s is reported by its diagnostic ID sensor but its "
+                    "display label did not resolve — entity matching will fall "
+                    "back to the default \"main\"/\"irrigation\" name patterns, "
+                    "which do NOT match a renamed circuit.", circuit)
+    return labels, circuits_seen
+
+
 async def _resolve_labels_from_diagnostics(
     ha,
     entity_registry_entities: List[Dict[str, Any]],
 ) -> Dict[str, str]:
-    """Fetch live circuit display labels from v3.6+ diagnostic text sensors.
-
-    Looks up "Circuit N Label" sensors by original_name in the entity registry
-    (metadata-first — never guesses entity_ids), then fetches their live state
-    from HA.  Returns {circuit_id: label_string}, e.g. {"circuit_1": "Zone A"}.
-    Returns an empty dict when no diagnostic sensors are present (older firmware).
-    """
-    labels: Dict[str, str] = {}
-    for entity in entity_registry_entities:
-        name = (entity.get("original_name") or "").lower()
-        if not re.search(r"circuit [12] label", name):
-            continue
-        state = await ha.get_state_value(entity["entity_id"], None)
-        if not state:
-            continue
-        n = re.search(r"circuit (\d+)", name)
-        if n:
-            labels[f"circuit_{n.group(1)}"] = state
-    if labels:
-        log.info("Diagnostic circuit labels resolved: %s", labels)
+    """{circuit_id: label} from the diagnostic sensors — see
+    :func:`resolve_circuit_identity`, of which this is the labels-only view
+    kept for existing callers."""
+    labels, _seen = await resolve_circuit_identity(ha, entity_registry_entities)
     return labels
 
 
@@ -533,6 +724,17 @@ def _derive_prefix(entities: List[Dict[str, Any]]) -> str:
     # If the firmware adds new entity types, extend this list or switch to
     # a longest-common-prefix approach across all device entity IDs.
     known_suffixes = [
+        # 2.3 unit 0.9 — the four diagnostic identity sensors first. Every other
+        # suffix below is `${circuit_N_name}`-derived, so renaming a circuit
+        # deletes ALL of them and the prefix silently becomes "" (which, per the
+        # note at the bottom of this function, DISABLES the waveform
+        # node-identity check). The firmware hardcodes these four names, so they
+        # survive any rename. They also have no trap variants: nothing else on
+        # the device ends in "circuit_1_id".
+        "circuit_1_id",
+        "circuit_2_id",
+        "circuit_1_label",
+        "circuit_2_label",
         "water_flow_rate_main",
         "water_flow_rate_irrigation",
         "water_volume_total_main",
@@ -741,6 +943,37 @@ def get_device_config(db: sqlite3.Connection) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+def unbound_ppl_circuits(
+    db: sqlite3.Connection,
+    circuits: Optional[List[str]] = None,
+) -> List[str]:
+    """Circuits whose flow-meter PPL entity is NOT bound in circuit_entity_map.
+
+    A non-empty result means those circuits are computing volumes from an
+    UNVERIFIED pulses-per-litre — the circuit_profile cache, whose column
+    default is 396.0. On a 72-ppl oval-gear meter that is a silent 5.5x
+    over-count of every volume on the circuit.
+
+    Both shapes count as unbound: no row at all (setup never matched the role)
+    and a row with an empty entity_id (matched=False was persisted). Read-only
+    and cheap; /health/detail and the setup wizard both use it to REPORT the
+    condition rather than let it stay invisible.
+    """
+    rows = db.execute(
+        "SELECT circuit, entity_id FROM circuit_entity_map WHERE role = ?",
+        (PPL_ROLE,),
+    ).fetchall()
+    bound = {r[0] for r in rows if (r[1] or "").strip()}
+
+    if circuits is None:
+        known = [r[0] for r in db.execute(
+            "SELECT DISTINCT circuit FROM circuit_entity_map ORDER BY circuit"
+        ).fetchall()]
+    else:
+        known = list(circuits)
+    return [c for c in known if c not in bound]
+
+
 # ------------------------------------------------------------------
 # Optional-role re-discovery after firmware upgrades
 # ------------------------------------------------------------------
@@ -760,7 +993,9 @@ def merge_optional_roles(
 
     Rules (applied in order per match):
     1. Skip if ``not m.matched``, ``not m.entity_id``, or
-       ``m.role not in OPTIONAL_ROLES``.
+       ``m.role not in RESCAN_FILLABLE_ROLES`` (OPTIONAL_ROLES plus the
+       now-required ``flow_meter_ppl``, which must still heal on an install
+       set up before firmware 3.12.0 published the entity).
     2. Row missing → INSERT with confirmed=0.
     3. Row exists, entity_id NULL/empty, confirmed=0 → UPDATE entity_id and entity_name.
     4. Row exists, entity_id non-empty → do NOT overwrite.
@@ -773,7 +1008,7 @@ def merge_optional_roles(
     cursor = db.cursor()
 
     for m in matches:
-        if not m.matched or not m.entity_id or m.role not in OPTIONAL_ROLES:
+        if not m.matched or not m.entity_id or m.role not in RESCAN_FILLABLE_ROLES:
             continue
 
         row = cursor.execute(

@@ -25,7 +25,11 @@ from ..device_discovery import (
     save_discovery,
     mark_setup_complete,
     get_device_config,
+    parse_firmware_version,
+    unbound_ppl_circuits,
     DiscoveredDevice,
+    MIN_FIRMWARE_VERSION,
+    PPL_ROLE,
 )
 
 log = logging.getLogger(__name__)
@@ -391,7 +395,7 @@ async def setup_select(
 # Step 3 — discover entities for the selected device
 # ------------------------------------------------------------------
 @router.get("/discover/{device_id}", response_class=HTMLResponse)
-async def setup_discover(device_id: str, request: Request):
+async def setup_discover(device_id: str, request: Request, error: str = ""):
     orch = _orch(request)
     circuits = [c.circuit for c in orch._cfg.circuits]
 
@@ -478,6 +482,13 @@ async def setup_discover(device_id: str, request: Request):
         "unmatched_roles": result.unmatched_roles,
         "prefix": prefix,
         "min_fw": min_fw,
+        # 2.3 unit 0.9 — a VERIFIED sub-floor firmware blocks step 3. An
+        # unparseable version does not (see MIN_FIRMWARE_VERSION for why); it
+        # renders the "unknown" badge instead. Mirrored server-side in
+        # setup_confirm — the disabled button is a courtesy, not the gate.
+        "firmware_blocks": device.firmware_blocks_setup,
+        "firmware_status": device.firmware_status,
+        "error": error,
         "page": "setup",
     })
 
@@ -528,6 +539,50 @@ async def setup_confirm(device_id: str, request: Request):
 
     from ..database import run_db
     await run_db(_save_map)
+
+    # ── 2.3 unit 0.9 — the two server-side refusals ────────────────────────
+    # setup.html marks unmatched required roles `required` and hides Continue
+    # when the firmware is verifiably too old, but both live in the browser.
+    # These re-check the same two things against what actually got written, so
+    # a hand-crafted POST cannot produce a running add-on with a wrong ppl.
+    from urllib.parse import quote_plus as _qp
+
+    def _post_confirm_checks():
+        cfg = get_device_config(orch.db) or {}
+        circuits = [c.circuit for c in orch._cfg.circuits]
+        return (cfg.get("fw_version"),
+                unbound_ppl_circuits(orch.db, circuits))
+
+    fw_version, unbound = await run_db(_post_confirm_checks)
+
+    parts = parse_firmware_version(fw_version)
+    if parts is not None and parts < MIN_FIRMWARE_VERSION:
+        min_fw = ".".join(str(x) for x in MIN_FIRMWARE_VERSION)
+        log.error(
+            "setup_confirm: refusing to continue — firmware %r is below the "
+            "minimum supported version %s.", fw_version, min_fw)
+        return ingress_redirect(request, "/setup/discover/%s?error=%s" % (
+            device_id,
+            _qp("Firmware v%s is below the minimum supported version (v%s). "
+                "Flash newer firmware before finishing setup."
+                % (fw_version, min_fw))))
+
+    if unbound:
+        # THE 5.5x BUG. An unbound ppl entity means the circuit falls back to
+        # circuit_profile.pulses_per_litre, column default 396.0 — on this
+        # install's 72-ppl oval-gear main meter that is every volume 5.5x high,
+        # with no error anywhere. Refuse the configuration instead.
+        log.error(
+            "setup_confirm: refusing to continue — no flow-meter PPL entity "
+            "assigned for %s. Running without it would compute every volume "
+            "from an unverified default pulses-per-litre.", ", ".join(unbound))
+        return ingress_redirect(request, "/setup/discover/%s?error=%s" % (
+            device_id,
+            _qp("No flow meter pulses-per-litre entity is assigned for %s. "
+                "Pick the device's \"Flow Meter PPL\" number entity for each "
+                "circuit — without it every volume is computed from an "
+                "unverified default." % ", ".join(unbound))))
+
     log.info("Entity mapping confirmed for device %s — proceeding to circuit names", device_id)
     return ingress_redirect(request, "/setup/circuit-names")
 
@@ -1009,7 +1064,12 @@ def _device_to_dict(d: DiscoveredDevice) -> Dict[str, Any]:
         "manufacturer": d.manufacturer or "",
         "is_esphome": d.is_esphome,
         "sw_version": d.sw_version or "",
+        # firmware_ok is now STRICT ("verified at or above the floor"), so an
+        # unknown version is False here — the template distinguishes the two
+        # via firmware_status rather than calling both "too old".
         "firmware_ok": d.firmware_ok,
+        "firmware_status": d.firmware_status,
+        "firmware_blocks_setup": d.firmware_blocks_setup,
     }
 
 
@@ -1028,6 +1088,12 @@ def _role_label(role: str) -> str:
         "leak_test_result_sensor":   "Leak Test Result",
         "leak_test_duration_sensor": "Leak Test Duration",
         "volume_sensor":           "Volume Total",
+        # Without an entry here the default title-caser renders "Flow Meter
+        # Ppl". This is now a REQUIRED row the operator has to recognise and
+        # pick an entity for, so use the firmware's own entity name verbatim
+        # ("Flow Meter PPL - ${circuit_N_name}") — that is the string they are
+        # looking at in the dropdown.
+        PPL_ROLE:                  "Flow Meter PPL",
     }
     return labels.get(role, role.replace("_", " ").title())
 
