@@ -444,11 +444,16 @@ class WfRepairBackfill:
             except Exception as e:
                 log.error("wf-shared sweep failed: %s", e, exc_info=True)
         else:
-            log.warning(
-                "wf-shared sweep SKIPPED — _SHARED_CAPTURE_SWEEP_ENABLED is "
-                "False because _ESP_CAPTURE_HZ is 4x wrong and the no-winner "
-                "branch destroys signatures and waveforms. See the comment on "
-                "the flag.")
+            # Keep this message in step with the comment on the flag — the
+            # two drifted once already: this said "_ESP_CAPTURE_HZ is 4x
+            # wrong" for the whole life of the fix that corrected it.
+            log.info(
+                "wf-shared sweep is disabled (_SHARED_CAPTURE_SWEEP_ENABLED). "
+                "The two defects that made it destructive are FIXED; it stays "
+                "off until the damage the old sweep already did has been "
+                "counted, because that count is the baseline to compare "
+                "against once it replays. Query and reasoning are on the flag "
+                "in wf_repair_backfill.py.")
 
         if affected and self._cluster_engine is not None:
             await self._replay_clusters(sorted(affected))
