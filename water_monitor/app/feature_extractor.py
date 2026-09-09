@@ -2355,12 +2355,9 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
             "FROM events "
             "WHERE (is_cross_talk = 0 OR is_cross_talk IS NULL) "
-            # uc_guard/uft_guard, NOT a re-typed pair: uft_guard is where
-            # _LEAK_REFILL_GUARD_SQL rides. Typed out by hand this scan
-            # silently dropped that guard, and a leak-test reopen refill
-            # sets none of the artifact FLAG bits (it stays visible), so
-            # nothing else here held it off: a refill whose shape tripped
-            # cross-talk was re-claimed and its provenance overwritten.
+            # scan_guards, not a hand-typed pair: it carries the leak-refill
+            # guard too. A refill sets no artifact flag bit, so nothing else
+            # here holds it off — typing the guards out drops its provenance.
             + scan_guards
             + _NO_PHANTOM_SQL + _NO_DEGRADED_SQL +
             "  AND duration_seconds >= ? "
@@ -2521,7 +2518,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     # ── Scan 6 (dev33 §1.1): restore user-labelled real water that an artifact
     # verdict zeroed while `user_classified=1` held every other sweep off it.
     #
-    # These rows are unreachable by Scans 1-5 (all carry uc_guard/uft_guard) and
+    # These rows are unreachable by Scans 1-5 (all carry scan_guards) and
     # by repair_artifact_flag_consistency (which HONOURS mrr on user_classified
     # rows, cementing the bad state). They exist because the History modal
     # pre-checked its classification boxes from the row's AUTO flags and posted
@@ -2610,8 +2607,8 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     # Runs LAST so it sees the verdicts the scans above just settled and can
     # take the automatic ones over: inside a leak test's reopen window the test
     # is ground truth about causation, while those detectors are inferring from
-    # shape. The scans in turn skip rows already tagged here (uft_guard carries
-    # _LEAK_REFILL_GUARD_SQL), so the precedence holds in both directions.
+    # shape. The scans in turn skip rows already tagged here (scan_guards
+    # carries _LEAK_REFILL_GUARD_SQL), so precedence holds in both directions.
     # Self-healing: a reprocess that dropped a refill's verdict gets it back.
     try:
         from .leak_test_refill import reconcile_leak_test_refills

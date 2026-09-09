@@ -67,10 +67,10 @@ class RawEvent:
 
     end_ts: Optional[datetime] = None
 
-    # Pressure transient fields — populated only when a transient is detected.
-    # May be absent for flow-only events.
-    # pre_event_pressure_psi is None when the baseline was not trustworthy
-    # (e.g. cold start before a settled baseline exists) — see _start_flow_event.
+    # Pressure transient fields — populated only when a transient is detected,
+    # so absent for flow-only events. pre_event_pressure_psi is None when the
+    # baseline was not trustworthy (e.g. cold start before a settled baseline
+    # exists) — see _start_flow_event.
     has_pressure_transient: bool = False
     pre_event_pressure_psi: Optional[float] = 0.0
     min_pressure_psi: float = 0.0
@@ -327,17 +327,12 @@ class CircuitEventDetector:
 
     # Historical baseline window: a transient check compares current pressure
     # against an average of samples BASELINE_LOOKBACK_SAMPLES to
-    # BASELINE_LOOKBACK_SAMPLES + BASELINE_WINDOW_SAMPLES old.
-    #
-    # With the defaults below:
-    #   baseline source : pressure from 3-5 s ago
-    #   lookback start  : 3 s  (120 samples x 25 ms)
-    #   lookback window : 2 s  ( 80 samples x 25 ms)
-    #
-    # A transient that takes up to 5 s to reach minimum is still compared
-    # against a baseline that pre-dates the dip entirely.
-    # Detection begins once LOOKBACK + WINDOW samples have accumulated
-    # (~5 s warm-up, well inside the 30 s firmware startup grace period).
+    # BASELINE_LOOKBACK_SAMPLES + BASELINE_WINDOW_SAMPLES old. At the defaults
+    # that sources the baseline from 3-5 s ago (120 x 25 ms lookback, 80 x
+    # 25 ms window), so a transient taking up to 5 s to reach minimum is still
+    # compared against a baseline pre-dating the dip entirely. Detection begins
+    # once LOOKBACK + WINDOW samples have accumulated (~5 s warm-up, well
+    # inside the 30 s firmware startup grace period).
     BASELINE_LOOKBACK_SAMPLES: int = 120    # 3 s lookback
     BASELINE_WINDOW_SAMPLES: int = 80       # 2 s averaging window
 
@@ -351,12 +346,12 @@ class CircuitEventDetector:
     # (e.g. 1.58e+36 L/min from ESP ADC overflow) and are clamped to 0.0.
     MAX_FLOW_LPM: float = 200.0   # matches firmware v3.5 ADC overflow clamp ceiling
 
-    # Minimum physically meaningful flow rate from this sensor.
     # The pulse counter cannot produce a non-zero value below 1 pulse/second,
-    # which converts to 60 counts/min ÷ ppl (≈0.15 L/min at 396 ppl, ≈0.83 at
-    # 72 ppl) — that floor is the per-circuit MIN_FLOW_LPM. MIN_NOISE_LPM below is a
-    # meter-independent float-underflow guard: values in (0, MIN_NOISE_LPM) are
-    # noise (e.g. 1.58e-36 L/min from ESPHome ADC underflow) and are treated as zero.
+    # i.e. 60 counts/min ÷ ppl (≈0.15 L/min at 396 ppl, ≈0.83 at 72 ppl) — that
+    # floor is the per-circuit MIN_FLOW_LPM. MIN_NOISE_LPM is a
+    # meter-independent float-underflow guard instead: values in
+    # (0, MIN_NOISE_LPM) are noise (e.g. 1.58e-36 L/min from ESPHome ADC
+    # underflow) and are treated as zero.
     MIN_NOISE_LPM: float = 0.05
 
     # Seconds of sustained flow required to open a flow-triggered event
@@ -451,10 +446,10 @@ class CircuitEventDetector:
     # artefact caused by a surge (pump, water hammer) rather than real flow.
     PRESSURE_SURGE_PHANTOM_PSI: float = 0.5
 
-    # Gate for updating the settled-pressure baseline.
-    # Only accept a sample as "resting" when historical vs. current pressure
-    # is within this margin — blocks updates during post-event recovery where
-    # the historical baseline still lags below the rising actual pressure.
+    # Gate for updating the settled-pressure baseline: accept a sample as
+    # "resting" only when historical vs. current pressure is within this
+    # margin. Blocks updates during post-event recovery, where the historical
+    # baseline still lags below the rising actual pressure.
     SETTLED_STABILITY_PSI: float = 0.3
     # Minimum pressure drop (PSI below baseline) that marks the onset of a
     # pressure event when scanning the buffer to compute propagation delay.

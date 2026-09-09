@@ -8,7 +8,8 @@ keeps the dependency graph acyclic — ``event_detector`` -> ``event_waveform``
 Every ``_WF_*`` constant here is FIRMWARE WIRE-FORMAT VOCABULARY: the values are
 fixed by what the ESP publishes, so this module is the one place they may be
 defined. ``test_unit73_event_detector_split`` pins
-``_WF_FL_RESOLUTION_REDUCED`` against feature_extractor's copy.
+``_WF_FL_RESOLUTION_REDUCED`` against feature_extractor's copy, and
+``test_dead_symbols_dev59`` pins its LINE NUMBER — do not shift it.
 """
 from __future__ import annotations
 

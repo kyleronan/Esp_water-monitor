@@ -180,7 +180,7 @@ class Orchestrator:
         # unknown again, Settings → Re-run Setup included.
         self._setup_complete_cache: Optional[bool] = None
         self._setup_complete_epoch: int = -1
-        # dev46 (46h) — per-circuit post-winterization grace starts.
+        # Per-circuit post-winterization grace starts.
         self._winterize_cleared_at: dict = {}
         self._seen_uids: set = set()
 
@@ -198,7 +198,7 @@ class Orchestrator:
 
     @property
     def learning(self) -> Optional["LearningScheduler"]:
-        """The dev47 learning jobs. None until start() has wired them, so
+        """The learning jobs. None until start() has wired them, so
         callers must check — a settings page can be served before it exists."""
         return self._learning
 
@@ -238,7 +238,7 @@ class Orchestrator:
         log.info("Away mode %s", "enabled" if enabled else "disabled")
 
     def _set_away_mode_sync(self, enabled: bool, now, now_iso: str) -> None:
-        """dev46 (46a) — the away-mode DB work, on the DB thread.
+        """The away-mode DB work, on the DB thread.
 
         Self-contained transaction: the calibration extensions and the
         home_profile flip commit together, so a crash between them cannot
@@ -301,7 +301,7 @@ class Orchestrator:
     async def reload_presence_watcher(self) -> None:
         """Re-subscribe after the user updates presence entity settings.
 
-        dev57 (2.10): async because PresenceWatcher.reload() is — its profile
+        Async because PresenceWatcher.reload() is — its profile
         read now goes through run_db instead of touching the shared connection
         from the request handler's thread. The one caller
         (routers/settings.py presence_update) is already ``async def``.
@@ -556,7 +556,7 @@ class Orchestrator:
         admins = [(u.get("id"), u.get("name") or "")
                   for u in users if u.get("is_admin")]
         if admins != getattr(self, "_last_saved_admins", None):
-            # dev46 (46a): change-gated write, over the wall like every other.
+            # Change-gated write, over the wall like every other.
             from .database import run_db
             await run_db(save_admin_ids_cache, self._db,
                          [u for u in users if u.get("is_admin")])
@@ -811,7 +811,7 @@ class Orchestrator:
         return self._prime_setup_complete()
 
     def _reload_config_and_roles_sync(self) -> None:
-        """dev46 (46a) — entity/label/profile reloads + RBAC roles, one hop.
+        """Entity/label/profile reloads + RBAC roles, one hop.
 
         Load entity IDs, display labels, and circuit types from the DB into
         the circuit configs, then refresh the RBAC role sets against the
@@ -824,7 +824,7 @@ class Orchestrator:
         self.load_roles_from_db(self._db)
 
     def _boot_db_preamble_sync(self) -> None:
-        """dev46 (46a) — the boot DB work that precedes the HA client.
+        """The boot DB work that precedes the HA client.
 
         Per-circuit defaults, the read-only orphan-reference check, and the
         F-C2 incomplete-reseed warning. One callable, one transaction
@@ -869,7 +869,7 @@ class Orchestrator:
                 "Orphan-reference integrity check failed (non-fatal): %s", _e
             )
 
-        # dev42 (F-C2): a reseed that crashed mid-replay leaves its marker
+        # A reseed that crashed mid-replay leaves its marker
         # stamped — the cluster model was part-cleared and never finished
         # rebuilding. Warn on every boot until a rerun succeeds.
         try:
@@ -930,7 +930,7 @@ class Orchestrator:
                     log.info("[%s] startup: re-opened %d recent event(s) for "
                              "the settle re-check the hourly pass may have "
                              "missed", c.circuit, reopened)
-                # dev.22: cycle-pulse backfill MUST precede reclassify so the
+                # Cycle-pulse backfill MUST precede reclassify so the
                 # matcher's cycle_pulse_count feature is populated before it types.
                 cyc = await _timed_startup_job(
                     f"recompute_cycle_pulse_counts[{c.circuit}]",
@@ -964,9 +964,10 @@ class Orchestrator:
                     if bf:
                         log.info("[%s] startup post-reprocess backfill: "
                                  "%d event(s) clustered", c.circuit, bf)
-                # Re-run the heuristic suggestion over the patched centroids, then
-                # the GATED user-label suggestion to un-poison mixed clusters
-                # (dev.22) — the only path that clears a stale 'user_labels' vote.
+                # Re-run the heuristic suggestion over the patched centroids,
+                # then the GATED user-label suggestion to un-poison mixed
+                # clusters — the only path that clears a stale 'user_labels'
+                # vote.
                 rs = await _timed_startup_job(
                     f"resuggest_all_clusters[{c.circuit}]",
                     run_db(resuggest_all_clusters, self._db, c.circuit))
@@ -1014,7 +1015,7 @@ class Orchestrator:
 
     async def run(self) -> None:
         """Initialise and run all components concurrently."""
-        # dev46 (46k) — so the readiness line states its own elapsed time.
+        # So the readiness line states its own elapsed time.
         # Reading it used to mean subtracting two timestamps several hundred
         # log lines apart, which is exactly how a 61 s time-to-usable got
         # reported (by me) as the 24 s that the flag flipped at.
@@ -1125,7 +1126,7 @@ class Orchestrator:
             winterized_getter=self._is_circuit_winterized,  # audit-ok(run_db): invoked only inside EventDetector.collect_circuit_inputs, which is submitted via run_db
             pump_fail_cb=self._on_pump_fail_alert,
             entities_getter=self._circuit_entities_for,  # audit-ok(run_db): invoked only inside EventDetector.collect_circuit_inputs, which is submitted via run_db
-            # Phase 3 (3.2): a waveform-transport condition that is otherwise
+            # A waveform-transport condition that is otherwise
             # invisible (a rejected transport_version drops 100% of chunks at
             # log.debug) lands in worker_health — the surface /health/detail
             # already reads — instead of in a second bespoke mechanism.
@@ -1134,7 +1135,7 @@ class Orchestrator:
         if await run_db(self._setup_complete_sync):
             await self._event_detector.setup()
             log.info("Event detection active")
-            # dev38: seed valve states AFTER the change subscriptions are wired
+            # Seed valve states AFTER the change subscriptions are wired
             # (subscribe-then-prime) so other_valve_open can record a confirmed
             # 0 even for valves that never transition after boot.
             try:
@@ -1172,7 +1173,7 @@ class Orchestrator:
             from .database import run_db
             self._cluster_engine = ClusterEngine(self._db, self._cfg)
             for c in self._cfg.circuits:
-                # dev46 (46a): every DB touch goes through the single DB
+                # Every DB touch goes through the single DB
                 # thread. Interleave-safe by construction — the live matching
                 # path can't reach the engine yet (feature_extractor's
                 # cluster_engine is wired below, and it guards on that).
@@ -1182,7 +1183,7 @@ class Orchestrator:
                 log.info("[%s] cluster state rebuilt — %d events replayed",
                          c.circuit, count)
                 # Backfill events that had no cluster_id (e.g. v0.1.x upgrades).
-                # dev46 (46a/C2a): the chunked variant — it already submits one
+                # The chunked variant — it already submits one
                 # run_db call per batch, so a queued page render interleaves at
                 # each chunk instead of waiting out the whole backlog.
                 backfilled = await _timed_startup_job(
@@ -1236,7 +1237,7 @@ class Orchestrator:
             if res.get("dribbles_flagged"):
                 log.info("startup: flagged %d low-flow dribble event(s)",
                          res["dribbles_flagged"])
-            # dev51 (Phase 5) — AFTER the exclusion reprocess above, so any
+            # AFTER the exclusion reprocess above, so any
             # exclusion that pass just rewrote gets its reason in the same
             # boot. Idempotent; a no-op once the backlog is stamped.
             from .feature_extractor import backfill_silent_exclusion_reasons
@@ -1306,13 +1307,13 @@ class Orchestrator:
         # labels once an event's cycle-mates have had time to occur (Branch-2.2).
         self._maturity_recheck = MaturityRecheck(self._db, self._cfg, self._ha,
                                                  orch=self)
-        # dev47 — the nightly fixture-health pass and the weekly
+        # The nightly fixture-health pass and the weekly
         # referee'd retrain. Both are off the classification path: a
         # failure here means no model refresh tonight, never that
         # events stop being classified.
         self._learning = LearningScheduler(self._db, self._cfg, self)
 
-        # One-shot rise-corr backfill (dev14) — fills flow_pressure_corr for
+        # One-shot rise-corr backfill — fills flow_pressure_corr for
         # historical candidate events from HA history, then stamps itself done.
         self._rise_corr_backfill = RiseCorrBackfill(self._db, self._cfg, self._ha)
 
@@ -1432,7 +1433,7 @@ class Orchestrator:
                     pass
 
     def _get_pump_osc_gate(self, circuit: str):
-        """Pump-mode oscillation gate for the live detector (dev25), or None.
+        """Pump-mode oscillation gate for the live detector, or None.
 
         Active only under confirmed vfd pump mode. Amplitude-derived
         (plan round-1 #14): max(2.0, 0.15 × latest measured sawtooth band)
@@ -1453,10 +1454,11 @@ class Orchestrator:
             return None
 
     def _get_low_pressure_floors(self, circuit: str):
-        """Phase 6 (dev27): (zone_floor_psi|None, pump_fail_floor_psi|None).
+        """The low-pressure floors: (zone_floor_psi|None,
+        pump_fail_floor_psi|None).
 
-        6a zone floor: zone circuits only, from sensitivity_config (default
-        25). 6b pump-fail floor: the FIRST fixture circuit only (shared
+        Zone floor: zone circuits only, from sensitivity_config (default
+        25). Pump-fail floor: the FIRST fixture circuit only (shared
         supply — ANY-circuit resolution), and only when vfd pump mode is
         active AND the alert is ARMED (post-feature supply answer or
         persisted evidence stamp — the arming rule). NULL user floor resolves
@@ -1518,7 +1520,7 @@ class Orchestrator:
 
     async def _low_pressure_alert_async(self, circuit: str, psi: float,
                                         name: str) -> None:
-        """dev46 (46a) — the DB half of the 6a low-pressure alert."""
+        """The DB half of the 6a low-pressure alert."""
         from .config import pump_mode_effective_cached
         from .database import run_db
         try:
@@ -1534,13 +1536,13 @@ class Orchestrator:
         if self._alert_manager is None:
             return
         name = self._circuit_display_name(circuit)
-        # dev57 (2.24): strong ref — see _on_low_pressure_alert above.
+        # Strong ref — see _on_low_pressure_alert above.
         spawn(self._alert_manager.alert_pump_low_pressure(
                   circuit, psi, kind, name),
               name=f"pump_fail_alert[{circuit}]")
 
     def note_winterize_cleared(self, circuit: str) -> None:
-        """dev46 (46h) — start the post-winterization grace for ``circuit``.
+        """Start the post-winterization grace for ``circuit``.
 
         Refilling a drained line looks exactly like the catastrophic pressure
         event the detector exists to catch, so alarms stay quiet briefly after
@@ -1562,7 +1564,7 @@ class Orchestrator:
         return age < WINTERIZE_UNSET_GRACE_S
 
     def _is_circuit_winterized(self, circuit: str) -> bool:
-        """dev46 (46h) — is this circuit deliberately drained for the season?
+        """Is this circuit deliberately drained for the season?
 
         Handed to EventDetector as a getter (it has no connection of its own),
         alongside the sensitivity / pump-gate / low-pressure getters.
@@ -1665,9 +1667,9 @@ class Orchestrator:
                                   pressure_key: str) -> bool:
         """Write the HA-derived display units, re-checking the precondition.
 
-        dev46 (46a) hop-2 re-check: the gate is re-evaluated inside the same
-        callable as the write, so a preference saved during the HA await wins
-        instead of being clobbered. Returns False when it declined to write.
+        HOP-2 RE-CHECK: the gate is re-evaluated inside the same callable as
+        the write, so a preference saved during the HA await wins instead of
+        being clobbered. Returns False when it declined to write.
         """
         if not self._display_units_are_default_sync():
             return False
@@ -1699,14 +1701,14 @@ class Orchestrator:
             from datetime import timezone as _tz
             self._ha_tz = _tz.utc
             log.warning("Could not determine HA timezone (%s) — using UTC", e)
-        # dev.24 — cache for the softener regen-band match (reclassify + live path
+        # Cache for the softener regen-band match (reclassify + live path
         # read this without threading a tzinfo through every caller).
         set_home_timezone(self._ha_tz)
         await self._resync_daily_summary_boundary(tz_name)
         await self._backfill_time_features(tz_name)
 
     def _resync_boundary_sync(self, tz_name: str):
-        """dev46 (46a) — read the stored zone, rebuild day totals, stamp it.
+        """Read the stored zone, rebuild day totals, stamp it.
 
         One DB-thread callable, one transaction (rule N2a). Returns ``None``
         when the stored zone already matches, so the caller can skip its log
@@ -1893,7 +1895,7 @@ class Orchestrator:
 
                 # At startup only fix baselines still at the 0.0 placeholder; on
                 # a forced rollover always re-derive from HA history.
-                # dev46 (46a) — hop 1 of a two-hop handler (the HA history
+                # Hop 1 of a two-hop handler (the HA history
                 # fetch below is the non-DB await).
                 from .database import run_db
                 if not await run_db(self._volume_baseline_needs_fix_sync,
@@ -1964,9 +1966,9 @@ class Orchestrator:
                                     force: bool) -> bool:
         """Write an HA-derived baseline, re-checking the precondition.
 
-        dev46 (46a) hop-2 re-check: the gate is re-evaluated inside the same
-        callable as the write, so a real baseline seeded during the HA await
-        is not overwritten from stale premises. Returns False when it declined.
+        HOP-2 RE-CHECK: the gate is re-evaluated inside the same callable as
+        the write, so a real baseline seeded during the HA await is not
+        overwritten from stale premises. Returns False when it declined.
         """
         if not self._volume_baseline_needs_fix_sync(circuit, period_ts, force):
             return False
@@ -2038,7 +2040,7 @@ class Orchestrator:
 
     def _live_state_db_sync(self, circuit: str, ha_volume_total,
                             today_ts, week_ts):
-        """dev46 (46a) — every DB read behind one live-state poll, one hop.
+        """Every DB read behind one live-state poll, one hop.
 
         Read-only, so no transaction to own. Bundling also makes the poll
         internally consistent: the volumes, valve type and degraded/anomaly
@@ -2351,7 +2353,7 @@ class Orchestrator:
 
     def _purge_waveforms_sync(self, cutoff: str) -> int:
         """DELETE old event_waveforms rows. Runs on the single DB thread —
-        the calling async wrapper submits it via run_db (dev46 46a)."""
+        the calling async wrapper submits it via run_db."""
         cur = self._db.execute(
             "DELETE FROM event_waveforms WHERE created_at < ?",
             (cutoff,),

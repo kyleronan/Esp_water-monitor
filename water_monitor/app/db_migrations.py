@@ -1,14 +1,11 @@
-"""
-Database schema version guard — squashed baseline 20260523.
+"""Database schema version guard — squashed baseline 20260523.
 
-Startup order (confirmed from main.py):
-  1. database.py init_db() → _create_schema() creates all tables
-  2. run_migrations() is called → verifies/stamps version
+Startup order: database.py init_db() → _create_schema() creates all tables,
+then run_migrations() verifies/stamps the version.
 
-Fresh database: tables created by step 1 include all baseline columns
-(including signature_source); this module stamps baseline version.
-
-Old pre-squash database: startup fails fast. Delete the DB and restart.
+A fresh database gets every baseline column (signature_source included) from
+step 1 and is stamped at the baseline version here. An old pre-squash database
+fails fast at startup: delete the DB and restart.
 """
 from __future__ import annotations
 
@@ -26,300 +23,227 @@ log = logging.getLogger(__name__)
 _BASELINE_VERSION: int = 20260523
 # Version bumps:
 #   20260524 — retired text-sensor waveform roles
-#   20260525 — added UNIQUE(circuit, start_ts) on events (dedup first)
-#   20260526 — degraded-supply guard: new event columns, event_waveforms
-#              table, rebuild hourly_volume from events
-#   20260527 — per-circuit valve_type column on circuit_profile
-#   20260528 — Sprint A orphan repair: fixtures.cluster_backfill_needed
-#              column + one-shot repair of orphaned cluster/fixture refs
-#   20260529 — Sprint B label propagation: fixture_clusters.suggestion_source
-#              column ('heuristic' | 'user_labels' | NULL)
+#   20260525 — UNIQUE(circuit, start_ts) on events (dedup runs first)
+#   20260526 — degraded-supply guard: new event columns, event_waveforms table,
+#              rebuild hourly_volume from events
+#   20260527 — circuit_profile.valve_type
+#   20260528 — Sprint A orphan repair: fixtures.cluster_backfill_needed + a
+#              one-shot repair of orphaned cluster/fixture refs
+#   20260529 — Sprint B: fixture_clusters.suggestion_source
+#              ('heuristic' | 'user_labels' | NULL)
 #   20260530 — Sprint C signature matcher: fixture_type_signatures table +
-#              events.matched_fixture_type column
-#   20260531 — Sprint D taxonomy consolidation: 23 → 8 fixture types;
-#              rewrites stored type strings in events, fixtures,
-#              fixture_clusters, and clears fixture_type_signatures
-#   20260532 — Sprint E pressure-restoration phantom guard:
-#              events.is_pressure_restoration_phantom +
-#              home_profile.hide_pressure_artifact_events columns; one-shot
-#              reprocess zeros phantom volume + reverses hourly_volume
-#   20260533 — Sprint F per-category Fixtures rollup: new category_publish
-#              table (per-(circuit, fixture_type) HA publish gate). Seeded
-#              from MIN(fixtures.publish_to_ha) so any existing off
-#              preference carries over to the new category-level gate.
-#   20260534 — Sprint H phantom misclassification fix + manual classification:
-#              events.user_ignored + events.user_classified columns; one-shot
-#              repair un-flags wrongly-flagged phantoms (delta>=2.0) and
-#              restores their real volume to hourly_volume + daily_summary.
-#   20260535 — Low-flow dribble exclusion: events.is_low_flow_dribble column
-#              (non-zeroing training-exclusion flag for brief low-flow
-#              trickles) + two indexes backing the label-training and
-#              reclassify-backfill queries. Lightweight DDL only; the verdict
-#              backfill runs from the startup / import / manual reprocess paths.
-#   20260536 — Active-flow features: flow_integral_litres, active_flow_duration_
-#              seconds, true_avg_flow_lpm, flow_on_ratio, active_flow_segment_
-#              count, flow_cv_on_segments, integration_quality + the volume audit
-#              columns (volume_litres_original, volume_recomputed_at). All
-#              NULLABLE. Lightweight DDL only; the per-event recompute runs from
-#              the startup / import / manual recompute paths after migration.
-#   20260537 — Temporal appliance signal: events.cycle_pulse_count (nullable
-#              INTEGER, count of similar-volume neighbours within ±45 min). DDL
-#              only; the count backfill + cluster re-suggest run from the startup
-#              / manual recompute paths after migration.
-#   20260538 — Label provenance: events.fixture_label_source (nullable TEXT,
-#              'user'/'cycle'/'training'; NULL = legacy/explicit). DDL only — no
-#              backfill (NULL is the correct default for pre-existing labels).
-#   20260539 — Training-helper capture (2b): training_capture +
-#              training_capture_candidates tables. DDL only.
-#   20260540 — Cross-talk event category: events.is_cross_talk +
-#              home_profile.hide_cross_talk_events. DDL only; the flag backfill
-#              runs from the startup / manual recompute paths after migration.
-#   20260541 — Match provenance: events.matched_via (nullable TEXT — 'knn',
-#              'washer_cycle', 'rule_toilet', 'rule_dishwasher', 'rule_shower',
-#              'zone_default'; NULL = legacy/cluster). DDL only — no backfill
-#              (NULL is correct for pre-existing matches; the rules tier and
-#              reclassify stamp it going forward).
-#   20260542 — dev.24: opt-in water-softener config (home_profile.has_water_softener
-#              + softener_regen_start + softener_circuit) and the History cycle-rollup
-#              grouping key (events.cycle_group_id). DDL only — no backfill (softener
-#              off until enabled; cycle_group_id stamped by the next reclassify).
-#   20260543 — Phase 2.3 anomaly response: sensitivity_config.anomaly_response
-#              (TEXT DEFAULT 'notify') + sensitivity_config.baseline_anomaly_n
-#              (INTEGER — event count behind the frozen percentiles, read by the
-#              shut-off confidence gate). DDL only; no backfill (defaults are
-#              correct — 'notify', and NULL n until the next activation freeze).
-#   20260544 — Phase 3 §2 recorder volume reconciliation: events.volume_recorder_litres
-#              (REAL — the firmware cumulative-sensor delta for the event; NULL = not
-#              reconciled) + sensitivity_config.recorder_reconcile_auto (INTEGER DEFAULT 1
-#              — per-circuit auto-correct vs flag-only toggle). DDL only; no backfill
-#              (NULL/default are correct; reconciliation fills them going forward).
-#   20260545 — dev.38: guarded auto-split opt-in (home_profile.auto_split_enabled)
-#   20260546 — runtime per-circuit flow meter: circuit_profile.pulses_per_litre
-#              (REAL DEFAULT 396.0) — add-on cache of the firmware PPL number
-#              entity; the low-flow floor is derived (60 ÷ ppl). DDL only; the
-#              DEFAULT is correct for existing rows (reference turbine).
-#   20260547 — RBAC (viewer/operator/admin): operator_users (operator allow-list),
-#              admin_ids_cache (last-known-good HA admin set), seen_users (Access
-#              page fallback pick-list). DDL only — CREATE TABLE IF NOT EXISTS,
-#              idempotent; no backfill (empty allow-list = everyone non-admin is a
-#              viewer until promoted).
-#   20260548 — composite labeling: events.embedded_fixtures_json (nullable TEXT —
-#              JSON array of fixtures found superimposed on a sustained event's
-#              waveform by composite_detector; metadata only, never alters volume
-#              or the primary label). DDL only; the annotation backfill runs from
-#              the startup / manual reprocess reclassify path after migration.
-#   20260549 — dev.39: enable auto-hygiene by default — backfill
-#              home_profile.auto_split_enabled = 1 (the background over-merged/inflated
-#              event re-import, now safe to run by default: reprocess is atomic +
-#              dry-run-gated). Value backfill only; no DDL (column exists since 20260545).
-#   20260551 — 2026-07 audit Phase 2b: events.phantom_suppression_averted column +
-#              one-time re-evaluation of already-zeroed LARGE phantom draws
-#              (>= 10 L measured): volume restored through apply_effective_volume,
-#              flagged 'suppression_averted' for review. User-classified phantoms
-#              are never touched.
-#   20260552 — 2026-07 audit Phase 3: home_profile.fingerprint_labeling_enabled
-#              (DEFAULT 1) — the tight-fingerprint label-propagation tier toggle.
-#              DDL only; the tier reads live labels, no backfill needed (the next
-#              reclassify pass stamps matched_via='fingerprint' hits).
-#   20260553 — events.review_verdict (TEXT: 'normal'/'unknown'/NULL) — two-option
-#              anomaly triage. 'unknown' events are held out of anomaly-baseline
-#              refits (fit_usage_baselines). DDL only; existing user_reviewed=1
-#              rows keep NULL (= reviewed before verdicts existed).
-#   20260554 — rising-pressure phantom detector (dev14): events.flow_pressure_corr
-#              (REAL, nullable — Pearson r of flow vs index-binned pressure over the
-#              event window; the rise-phantom discriminator) + home_profile.
-#              rise_corr_backfill_done (one-shot stamp for the HA-history corr
-#              backfill worker). DDL only; the column backfill is the
-#              rise_corr_backfill worker, NOT a migration (needs HA fetches).
-#   20260555 — toilet physics veto (dev17): home_profile.epa_flush_cap_enabled
-#              (DEFAULT 1) — derive the veto's flush-volume ceiling from
-#              build_year via the EPA/federal flush-standard eras. DDL only; the
-#              veto applies at display/rollup/classify time, no backfill (the
-#              next reclassify pass clears vetoed stored toilet matches).
-#   20260556 — dev18: 256-pt signatures. No DDL; one-shot rebuild of stored
-#              flow/pressure signatures from event_waveforms envelopes where the
-#              envelope is finer than the stored signature (long events stop
-#              collapsing to rectangles). No-waveform rows keep shorter sigs
-#              (all consumers resample on load).
-#   20260557 — dev19: edge signatures. events.onset_signature_json /
-#              offset_signature_json (TEXT — 32×1 s fixed-time shape cells for
-#              the k-NN edge tier) + one-shot backfill from every
-#              event_waveforms envelope (the validated configuration).
-#   20260562 — dev30: leak_test_history.user_dismissed — user-acknowledged
-#              failed leak tests (benign causes: update interrupted the
-#              test, known coincident draw) render amber instead of red.
-#              Display-only flag; DDL only.
-#   20260561 — dev28: overlap-guard cleanup (plan overlap-guard-invariant).
-#              One-shot sweep over history for same-circuit overlapping
-#              events (same water recorded twice — ~127 L in the 2026-07
-#              pump incident): wrapper events whose span+volume reconcile
+#              events.matched_fixture_type
+#   20260531 — Sprint D taxonomy consolidation: 23 → 8 fixture types; rewrites
+#              stored type strings in events, fixtures and fixture_clusters, and
+#              clears fixture_type_signatures
+#   20260532 — Sprint E phantom guard: events.is_pressure_restoration_phantom +
+#              home_profile.hide_pressure_artifact_events; one-shot reprocess
+#              zeroes phantom volume and reverses hourly_volume
+#   20260533 — Sprint F: category_publish table (per-(circuit, fixture_type) HA
+#              publish gate), seeded from MIN(fixtures.publish_to_ha) so an
+#              existing off preference carries over
+#   20260534 — Sprint H: events.user_ignored + user_classified; one-shot repair
+#              un-flags wrongly-flagged phantoms (delta>=2.0) and restores their
+#              real volume to hourly_volume + daily_summary
+#   20260535 — events.is_low_flow_dribble + two indexes backing the
+#              label-training and reclassify-backfill queries. DDL only; the
+#              verdict backfill runs from the startup / import / reprocess paths
+#   20260536 — active-flow features (flow_integral_litres,
+#              active_flow_duration_seconds, true_avg_flow_lpm, flow_on_ratio,
+#              active_flow_segment_count, flow_cv_on_segments,
+#              integration_quality) + the volume audit columns
+#              (volume_litres_original, volume_recomputed_at). All NULLABLE,
+#              DDL only — the per-event recompute runs after migration
+#   20260537 — events.cycle_pulse_count (similar-volume neighbours within
+#              ±45 min). DDL only; the backfill + cluster re-suggest run after
+#   20260538 — events.fixture_label_source ('user'/'cycle'/'training';
+#              NULL = legacy/explicit). No backfill — NULL is correct
+#   20260539 — training_capture + training_capture_candidates tables
+#   20260540 — events.is_cross_talk + home_profile.hide_cross_talk_events. DDL
+#              only; the flag backfill runs from the startup / recompute paths
+#   20260541 — events.matched_via ('knn', 'washer_cycle', 'rule_toilet',
+#              'rule_dishwasher', 'rule_shower', 'zone_default';
+#              NULL = legacy/cluster). No backfill
+#   20260542 — opt-in water-softener config (home_profile.has_water_softener,
+#              softener_regen_start, softener_circuit) + events.cycle_group_id
+#   20260543 — sensitivity_config.anomaly_response (DEFAULT 'notify') +
+#              baseline_anomaly_n (the event count behind the frozen
+#              percentiles, read by the shut-off confidence gate)
+#   20260544 — events.volume_recorder_litres (the firmware cumulative-sensor
+#              delta; NULL = not reconciled) + sensitivity_config.
+#              recorder_reconcile_auto (DEFAULT 1 — auto-correct vs flag-only)
+#   20260545 — home_profile.auto_split_enabled
+#   20260546 — circuit_profile.pulses_per_litre (REAL DEFAULT 396.0) — the
+#              add-on cache of the firmware PPL entity; the low-flow floor is
+#              derived as 60 ÷ ppl. The DEFAULT is correct for existing rows
+#   20260547 — RBAC: operator_users, admin_ids_cache, seen_users. An empty
+#              allow-list means everyone non-admin is a viewer until promoted
+#   20260548 — events.embedded_fixtures_json (composite_detector's annotation;
+#              metadata only, never alters volume or the primary label). The
+#              annotation backfill runs from the reclassify path after migration
+#   20260549 — backfill home_profile.auto_split_enabled = 1 (reprocess is atomic
+#              and dry-run-gated, so the background re-import is safe by default)
+#   20260551 — events.phantom_suppression_averted + a one-time re-evaluation of
+#              already-zeroed LARGE phantom draws (>= 10 L measured): volume
+#              restored through apply_effective_volume and flagged
+#              'suppression_averted' for review. User-classified rows untouched
+#   20260552 — home_profile.fingerprint_labeling_enabled (DEFAULT 1)
+#   20260553 — events.review_verdict ('normal'/'unknown'/NULL). 'unknown' events
+#              are held out of anomaly-baseline refits (fit_usage_baselines);
+#              existing user_reviewed=1 rows keep NULL
+#   20260554 — events.flow_pressure_corr (Pearson r of flow vs index-binned
+#              pressure — the rise-phantom discriminator) + home_profile.
+#              rise_corr_backfill_done. The column backfill is the
+#              rise_corr_backfill worker, NOT a migration (it needs HA fetches)
+#   20260555 — home_profile.epa_flush_cap_enabled (DEFAULT 1): the toilet
+#              physics veto's flush ceiling, derived from build_year via the
+#              EPA/federal flush-standard eras. The veto applies at
+#              display/rollup/classify time, so no backfill
+#   20260556 — 256-pt signatures: one-shot rebuild from event_waveforms
+#              envelopes where the envelope is finer than the stored signature.
+#              No-waveform rows keep shorter sigs (consumers resample on load)
+#   20260557 — events.onset_signature_json / offset_signature_json (32×1 s
+#              fixed-time cells for the k-NN edge tier) + a one-shot backfill
+#              from every event_waveforms envelope
+#   20260558 — pump-aware detection Phase 1. home_profile: pump_mode_detected
+#              /_at, pump_detect_period_s, pump_mode_ack, pump_profile,
+#              supply_type_set_at (answer provenance — the alert arming rule must
+#              not trust pre-feature supply answers), pump_alert_armed_at.
+#              sensitivity_config: pump_mode ('auto'|'on'|'off' per-circuit
+#              override), low_pressure_alert_psi (irrigation under-load floor,
+#              default 25)
+#   20260559 — leak_test_history cross-circuit pump verdict columns
+#              (other_circuit_cycles, other_circuit_period_s, pump_verdict):
+#              during a valve-closed test on circuit A, recharge cycling on the
+#              UNTESTED circuit B means the leak is on the other line, upstream,
+#              or inside the pump's own check valve
+#   20260560 — sensitivity_config.pump_low_pressure_alert_psi (DEFAULT NULL —
+#              NULL resolves the per-supply default at read time, so only
+#              explicit user action writes a value, which doubles as the arming
+#              rule's "user-set floor" signal) + pump_regime_nightly.min_psi (the
+#              quiet-window pressure floor ≈ pump cut-in)
+#   20260561 — overlap-guard cleanup: a one-shot sweep for same-circuit
+#              overlapping events (the same water recorded twice — ~127 L in the
+#              2026-07 pump incident). Wrapper events whose span+volume reconcile
 #              with their contained members are zeroed through the ledger
 #              chokepoint with mrr='overlap_duplicate'; user-labeled and
-#              ambiguous cases are audit-flagged only. overlap_audit table +
-#              the (circuit, start_ts, end_ts) index ship via _create_schema
-#              (new objects need no DDL migration); idempotent.
-#   20260560 — dev27: pump plan Phase 6b. sensitivity_config.
-#              pump_low_pressure_alert_psi (DEFAULT NULL — NULL resolves the
-#              per-supply default at read time; only explicit user action
-#              writes a value, which doubles as the arming rule's
-#              "user-set floor" signal) + pump_regime_nightly.min_psi (the
-#              quiet-window pressure floor ≈ pump cut-in — feeds the
-#              suggested-floor hint). DDL only.
-#   20260559 — dev26: pump plan Phase 5b. leak_test_history gains the
-#              cross-circuit pump verdict columns (other_circuit_cycles,
-#              other_circuit_period_s, pump_verdict) — during a valve-closed
-#              leak test on circuit A, recharge cycling observed on the
-#              UNTESTED circuit B means the leak is on the other line /
-#              upstream / inside the pump's own check valve. DDL only.
-#   20260558 — dev21: pump-aware detection Phase 1 (plan
-#              yes-write-up-the-elegant-kettle). home_profile: pump_mode_detected
-#              /_at, pump_detect_period_s, pump_mode_ack, pump_profile,
-#              supply_type_set_at (answer provenance — the alert arming rule
-#              must not trust pre-feature supply answers), pump_alert_armed_at
-#              (persisted arming stamp). sensitivity_config: pump_mode
-#              ('auto'|'on'|'off' per-circuit override), low_pressure_alert_psi
-#              (irrigation under-load floor, default 25). DDL only, no backfill.
+#              ambiguous cases are audit-flagged only. Idempotent
+#   20260562 — leak_test_history.user_dismissed: an acknowledged failed test
+#              (benign cause) renders amber instead of red. Display-only
 #   20260563 — leak test measures the right interval and reports a rate.
 #              leak_test_history: closed_psi, settle_loss_psi, monitor_minutes,
 #              threshold_psi, est_leak_ml_min, post_restore_volume_l,
-#              draw_verdict; sensitivity_config.compliance_ml_psi (mL per PSI
-#              of the isolated section, calibrated from the reopen refill).
-#              baseline_psi was previously read BEFORE the valve closed, so
-#              every row carried the close transient plus the settle-phase
-#              loss. DDL only — historical rows cannot be corrected.
-#   20260564 — supply-pressure regime tracking: supply_pressure_daily (daily
-#              settled-pressure median/p10/p90 per circuit) + supply_regime
-#              (discrete supply-band intervals; a booster-pump install or
-#              removal opens a new regime instead of silently degrading
-#              classification). Table-create only, no backfill — the tracker
-#              worker bootstraps history from events.pre_event_pressure_psi
-#              on first run.
+#              draw_verdict; sensitivity_config.compliance_ml_psi (mL per PSI of
+#              the isolated section, calibrated from the reopen refill).
+#              baseline_psi was read BEFORE the valve closed, so every historical
+#              row carries the close transient plus the settle-phase loss and
+#              cannot be corrected
+#   20260564 — supply_pressure_daily + supply_regime tables (a booster-pump
+#              install or removal opens a new regime instead of silently
+#              degrading classification). No backfill — the tracker bootstraps
+#              from events.pre_event_pressure_psi on first run
 #   20260565 — rule_calibration rebuilt with PRIMARY KEY (circuit, regime_id):
-#              rule bands are fitted once PER SUPPLY REGIME. The existing row
-#              is copied as regime_id=0 (legacy fallback), so behavior with no
-#              regimes recorded is bit-identical to before.
+#              rule bands are fitted once PER SUPPLY REGIME. The existing row is
+#              copied as regime_id=0, so behaviour with no regimes recorded is
+#              bit-identical to before
 #   20260566 — home_profile.pump_era_start: the PINNED start of this home's
 #              booster-pump era. Retroactive pump-era sweeps (the VFD-ripple
 #              exemption) gate on it instead of live pump state or the current
 #              regime, so neither a gate flip nor a later supply transition can
-#              re-flag events that were already exempted. DDL only; resolved
-#              lazily by supply_regime.pump_era_start.
-#   20260567 — home_profile.leak_watch_ack: the night a user dismissed on the
-#              leak-watch tile ('dismissed:<night_date>'). The tile was the one
-#              home banner with no dismiss control, and it had no age bound
-#              either — it showed the newest night carrying an estimate out of
-#              the last 14, so a single stale reading stayed on screen for two
-#              weeks after the cycling stopped. DDL only.
+#              re-flag events that were already exempted
+#   20260567 — home_profile.leak_watch_ack ('dismissed:<night_date>')
 #   20260568 — training_state.cluster_features_mode ('full' | 'pressure_blind'):
-#              which feature space this circuit's cluster centers were seeded
-#              in. Persisted because the startup replay must rebuild the SAME
-#              space the centers were learned in — replaying pressure-blind
-#              centers with pressure features on shifts every distance and
-#              breaks the id-map rebuild. Set by the pump-era cluster re-seed.
+#              the startup replay must rebuild the SAME space the centers were
+#              learned in — replaying pressure-blind centers with pressure
+#              features on shifts every distance and breaks the id-map rebuild
 #   20260569 — baseline_snapshot table: the frozen usage baseline + anomaly
-#              percentiles as they stood before each freeze, so a regime refit
-#              that lands badly is revertable. Table-create only.
+#              percentiles before each freeze, so a bad regime refit is revertable
 #   20260570 — events.leak_test_id: provenance for the reopen-refill verdict
 #              (the add-on's own leak test cycling the valve logs a short flow
 #              burst that is neither fixture use nor a sensor phantom). DDL plus
-#              a one-time backfill over leak_test_history.
-#   20260571 — one day boundary. volume_snapshots.last_reading (high-water mark
-#              per period, so a meter reset carries the period's volume over
-#              instead of zeroing the dashboard's TODAY tile) plus
-#              home_profile.daily_summary_tz (which zone daily_summary rows are
-#              bucketed in — the rows themselves move from the UTC day to the
-#              home-local day, rebuilt by the orchestrator once HA has answered
-#              with the timezone). DDL only.
-#   20260572 — sawtooth pump-recharge backfill: one-shot re-verdict of stored
+#              a one-time backfill over leak_test_history
+#   20260571 — one day boundary. volume_snapshots.last_reading (a high-water
+#              mark per period, so a meter reset carries the period's volume over
+#              instead of zeroing the TODAY tile) + home_profile.daily_summary_tz
+#              (daily_summary rows move from the UTC day to the home-local day,
+#              rebuilt by the orchestrator once HA answers with the timezone)
+#   20260572 — sawtooth pump-recharge backfill: a one-shot re-verdict of stored
 #              pump-era events under the widened third prong of
-#              _detect_pump_recharge (slow-decay pressure-triggered restart
-#              slugs the 2026-08 micro-event audit surfaced). Data-only.
+#              _detect_pump_recharge. Data-only
 #   20260573 — waveform claim ledger + mis-attachment repair audit:
 #              events.waveform_boot_id (completes the firmware-capture identity
-#              so one capture can enrich only one event), the
-#              *_pre_repair audit trio, wf_repair_at / wf_repair_verdict, and
-#              idx_events_wf_claim. DDL only — the repair sweep itself runs as
-#              the wf_repair_backfill worker after boot.
-#   20260574 — pump_regime_nightly.window_start_ts / window_end_ts: the UTC
-#              bounds of the analyzed quiet window, so the leak-watch banner
-#              can say WHEN the cycling was observed ("between 1:05 and 2:11
-#              AM") instead of the ambiguous "night of <date>". DDL only;
-#              old rows stay NULL and the banner falls back to date-only copy.
-#   20260801 — dev38 audit-fix DDL, all in one step: events.time_features_tz
-#              (deferred local-time feature backfill marker) +
-#              events.registration_est_litres (annotate-only meter-registration
-#              estimate); event_waveforms per-channel source metadata
-#              (flow/press _src_n, _src_hz) for an honest waveform time axis;
-#              overlap_audit.stale_reason (dangling refs are MARKED, never
-#              deleted); leak_test_history measurement-provenance columns
-#              (baseline/final read timestamps, final_window_s,
-#              sustained_drop_psi, monitor_started_at); daily_summary_dirty
-#              table (days needing a summary recompute).
-#   20260802 — data backfill: raise peak_flow_lpm to ceil(true_avg*1000)/1000
-#              where true_avg_flow_lpm > peak_flow_lpm (825 physically
-#              impossible software-sourced rows; live path now clamps too).
-#   20260803 — data backfill: recompute hydraulic_resistance = ΔP/avg on
-#              ESP-enriched rows (1,324 rows carried the pre-enrichment ΔP
-#              ratio; the finalize/enrich paths now keep it current).
-#   20260804 — data retro-fix: NULL the contaminated (foreign-draw) signatures
-#              + signature_source on the 31 dev37 'misattached' rows the
-#              repair sweep left labelled esp_* (their signature bytes came
-#              from the mis-attached ESP capture; envelopes already deleted).
+#              so one capture can enrich only one event), the *_pre_repair audit
+#              trio, wf_repair_at / wf_repair_verdict, idx_events_wf_claim. The
+#              repair sweep itself runs as the wf_repair_backfill worker
+#   20260574 — pump_regime_nightly.window_start_ts / window_end_ts, so the
+#              leak-watch banner can say WHEN the cycling was observed instead of
+#              the ambiguous "night of <date>". Old rows stay NULL and the banner
+#              falls back to date-only copy
+#   20260801 — dev38 audit-fix DDL: events.time_features_tz (the deferred
+#              local-time feature backfill marker) + events.registration_est_litres;
+#              event_waveforms per-channel source metadata (flow/press _src_n,
+#              _src_hz) for an honest waveform time axis; overlap_audit.stale_reason
+#              (dangling refs are MARKED, never deleted); leak_test_history
+#              measurement-provenance columns; daily_summary_dirty table
+#   20260802 — backfill: raise peak_flow_lpm to ceil(true_avg*1000)/1000 where
+#              true_avg_flow_lpm > peak_flow_lpm (825 physically impossible
+#              software-sourced rows; the live path now clamps too)
+#   20260803 — backfill: recompute hydraulic_resistance = ΔP/avg on ESP-enriched
+#              rows (1,324 rows carried the pre-enrichment ΔP ratio)
+#   20260804 — NULL the contaminated (foreign-draw) signatures + signature_source
+#              on the 31 dev37 'misattached' rows the repair sweep left labelled
+#              esp_* (their signature bytes came from the mis-attached capture)
 #   20260805 — dev40 training quarantine: events.training_quarantine_reason /
-#              training_quarantined_at + backfill flagging unreviewed machine
-#              dishwasher-cycle labels (pre-outage + post-reseed windows) out
-#              of every training/exemplar pool (measured 9/19 and 1/10
-#              precision on user reviews; the labels had widened the fitted
-#              DW band 3.75→8.32 LPM). Labels/verdicts/volumes untouched.
+#              training_quarantined_at + a backfill flagging unreviewed machine
+#              dishwasher-cycle labels (pre-outage + post-reseed windows) out of
+#              every training/exemplar pool — measured 9/19 and 1/10 precision on
+#              user reviews, and the labels had widened the fitted DW band
+#              3.75→8.32 LPM. Labels/verdicts/volumes untouched
 #   20260806 — dev41 quarantine sweep: flag ALL remaining unreviewed machine
-#              dishwasher-cycle labels (no time bounds — the 20260805
-#              mid-window exemption protected nothing, since re-attribution
-#              touches cluster ids, never labels; ~48 pre-July rows from the
-#              same over-firing gate ride along). Distinct reason string
-#              'dev40_precision_quarantine_sweep'; lift is reason-agnostic.
-#   20260807 — dev41 conformance-review DDL: other_valve_open provenance,
-#              registration_curve_version, leak-test measurement-quality
-#              columns (sustainedness/status/noise/raw samples),
-#              overlap_audit.stale_at, utility_register_readings,
-#              meter_anchor_points, registration_curve (v1 seeded
-#              'unvalidated' from the audit inversion).
-#   20260808 — dev42: training_state.reseed_in_progress marker (F-C2) — a
-#              crashed re-seed leaves it set; boot warns until a rerun.
+#              dishwasher-cycle labels, no time bounds — the 20260805 mid-window
+#              exemption protected nothing, since re-attribution touches cluster
+#              ids and never labels (~48 pre-July rows from the same over-firing
+#              gate ride along). Distinct reason string
+#              'dev40_precision_quarantine_sweep'; lift is reason-agnostic
+#   20260807 — dev41 conformance DDL: other_valve_open provenance,
+#              registration_curve_version, leak-test measurement-quality columns
+#              (sustainedness/status/noise/raw samples), overlap_audit.stale_at,
+#              utility_register_readings, meter_anchor_points, registration_curve
+#              (v1 seeded 'unvalidated' from the audit inversion)
+#   20260808 — training_state.reseed_in_progress marker (F-C2): a crashed
+#              re-seed leaves it set and boot warns until a rerun
 #   20260809 — dev46: events.training_excluded_by_user (46f), events
 #              flow_sig_span_s / pressure_sig_span_s (46i), and
-#              circuit_profile.winterized (46h).
+#              circuit_profile.winterized (46h)
 #   20260810 — dev46 (46k): events.verdict_stamp + training_state
-#              .last_full_reclassify_at — lets the boot reclassify SKIP an
+#              .last_full_reclassify_at — lets the boot reclassify SKIP an event
+#              whose verdict provably cannot have changed
+#   20260811 — dev47 (47i): fixture health baselines, nightly stats and alerts
+#              (fixture_baseline / fixture_health_stat / fixture_health_alert)
+#   20260812 — dev48: events.flow_plateau_lpm + waveform backfill
 #   20260813 — dev49 (P0-4): mark daily_summary days that drifted from events
-#               (markers only — the shipped drain does the recompute).
+#              (markers only — the shipped drain does the recompute)
 #   20260814 — dev50: events.split_evaluated_at / split_evaluation_outcome (the
-#               over-merge job's decision memo) + stale_reason / stale_at on
-#               anomaly_shutoff_log and cross_talk_audit.
+#              over-merge job's decision memo) + stale_reason / stale_at on
+#              anomaly_shutoff_log and cross_talk_audit
 #   20260815 — dev51: the model referee's tables — referee_benchmark +
-#               referee_benchmark_meta (the pinned frozen benchmark, imported
-#               once via Dev Tools; its ids never enter the repo) and
-#               retrain_ledger (every referee decision, durably — the jobs
-#               table prunes after two days).
-#   20260812 — dev48: events.flow_plateau_lpm + waveform backfill.
-#   20260811 — dev47 (47i): fixture health baselines, nightly stats and
-#               alerts (fixture_baseline / fixture_health_stat /
-#               fixture_health_alert).
-#              event whose verdict provably cannot have changed.
+#              referee_benchmark_meta (the pinned frozen benchmark, imported once
+#              via Dev Tools; its ids never enter the repo) and retrain_ledger
+#              (every referee decision, durably — the jobs table prunes after two
+#              days)
 #
-# VERSION-NUMBER CONVENTION (2026-08-12, decided with the operator): from the
-# next migration onward, versions are YYYYMM + a 2-digit per-month sequence —
-# the NEXT one is 20260801 (August 2026, #01), then 20260802, and September
-# rolls to 20260901. The historical 202605xx run reads the same way with the
-# month stuck at 05 (it drifted into a plain sequence); everything stays
-# strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
-# reorder a shipped number.
+# VERSION-NUMBER CONVENTION: versions are YYYYMM + a 2-digit per-month sequence
+# (20260801 = August 2026 #01; September rolls to 20260901). The historical
+# 202605xx run reads the same way with the month stuck at 05 (it drifted into a
+# plain sequence). Everything stays strictly increasing, so stamped DBs walk
+# forward unchanged. Never reuse or reorder a shipped number.
 #
 # EXCEPTION ON THE RECORD: 20260819 landed in SEPTEMBER but reused August's
 # prefix. It stays as-is because it shipped and stamped live databases, and
 # "never reuse or reorder a shipped number" outranks tidiness — renumbering it
 # would make those DBs fail the _UPGRADEABLE_VERSIONS check below and be told to
-# delete themselves. 20260901 followed it (September 2026, #01), 20260902 after
-# that; THE NEXT MIGRATION IS 20260903.
+# delete themselves. 20260901 followed it (September 2026, #01), then 20260902;
+# THE NEXT MIGRATION IS 20260903.
 _CURRENT_VERSION: int = 20260902
 # Intermediate stepping-stone version for the dedup-then-unique-index
 # migration. Existing DBs at this version have had their wf rows dropped
@@ -1382,12 +1306,12 @@ def _set_version(conn: sqlite3.Connection, version: int) -> None:
 # `PRAGMA schema_version` costs 1.5 µs against those 160, which is what makes
 # re-validating on every question affordable.
 #
-# ⛔ THE DANGER, WRITTEN DOWN: MIGRATIONS ADD COLUMNS AS THEY RUN. A cache that
-# answers a stale "that column is missing" makes a later step re-run an ALTER
-# that already happened, or run a backfill guarded on the column being new —
-# i.e. it corrupts the schema in the middle of the chain, which is the one place
-# in this codebase where a wrong answer costs the user their database. Two
-# INDEPENDENT guards, either sufficient on its own:
+# ⛔ MIGRATIONS ADD COLUMNS AS THEY RUN. A cache that answers a stale "that
+# column is missing" makes a later step re-run an ALTER that already happened,
+# or run a backfill guarded on the column being new — it corrupts the schema in
+# the middle of the chain, the one place in this codebase where a wrong answer
+# costs the user their database. Two INDEPENDENT guards, either sufficient on
+# its own:
 #
 #   1. `PRAGMA schema_version` is SQLite's own schema cookie. It increments on
 #      every schema change — ALTER ADD/DROP COLUMN, CREATE/DROP TABLE or INDEX,
@@ -1400,8 +1324,8 @@ def _set_version(conn: sqlite3.Connection, version: int) -> None:
 #      the PRAGMA first, so the stale-False failure above is unreachable even if
 #      guard 1 were wrong somewhere (a SQLite build that does not bump the
 #      cookie, say). Missing-column answers therefore cost exactly what they
-#      cost today; present-column answers — the every-boot case, where the
-#      schema is already current — become a dict lookup.
+#      cost today; present-column answers — the every-boot case — become a dict
+#      lookup.
 #
 # The snapshot holds ONE connection at a time, by strong reference, compared
 # with `is`. Keying on `id(conn)` would be a correctness bug rather than a style
@@ -1502,20 +1426,18 @@ def _ensure_wf_claim_index(conn: sqlite3.Connection) -> None:
     it runs BEFORE any migration. The index covers ``events.waveform_boot_id``,
     a column that only arrives with migration 20260573, so an index statement in
     the DDL script executes against a pre-20260573 database that does not have
-    the column yet — SQLite raises, and the add-on cannot boot. That is not
-    hypothetical; it is the failure dev56 learned the hard way (see the matching
+    the column yet — SQLite raises, and the add-on cannot boot (see the matching
     NOTE beside the events DDL in database.py). The same argument applies to
     ``idx_events_verdict_pin`` (20260818) and to the two indexes 20260902 adds.
 
-    Consequence: the index can only ever come from a migration, so 20260573
-    creates it and every LAST migration since re-adds it belt-and-braces — a
-    documented convention, not copy-paste. A database stamped at a version AFTER
-    20260573 is built by the current schema script (which omits the index) and
-    never walks back through 20260573, so without the re-add on the tail
-    migration it would end the walk without the index and every claim lookup
-    would table-scan ``events`` on add-on hardware.
-    ``test_migrations_forward.py`` asserts the index after a walk that passes
-    through 20260573.
+    So the index can only ever come from a migration: 20260573 creates it and
+    every LAST migration since re-adds it belt-and-braces — a documented
+    convention, not copy-paste. A database stamped at a version AFTER 20260573
+    is built by the current schema script (which omits the index) and never
+    walks back through 20260573, so without the re-add on the tail migration it
+    would end the walk without the index and every claim lookup would table-scan
+    ``events`` on add-on hardware. ``test_migrations_forward.py`` asserts the
+    index after a walk that passes through 20260573.
 
     Plain, NOT unique: the live path writes events through a wide upsert, and a
     constraint violation there would abort event storage entirely. The
@@ -1551,28 +1473,25 @@ _VERDICT_PIN_COLUMNS: tuple = (
 def _ensure_verdict_pin_columns(conn: sqlite3.Connection) -> None:
     """Add the dev56 pin columns (+ their index) when absent. Idempotent.
 
-    Called from the TOP of BOTH 20260817 and 20260818, and the ordering is
-    load-bearing. 20260817 replays ``cleanup_all_overlaps`` over all history,
-    and that resolver WRITES the pin — but the columns nominally arrive one
-    migration later, so overlap_guard used to carry a parallel pre-pin code path
-    (a column sniff, a narrower SELECT list and a duplicated UPDATE) purely to
-    survive that one window. Creating the columns here closes the window: by the
-    time any overlap code runs, the shape is the current shape, everywhere.
+    Called from the TOP of BOTH 20260817 and 20260818, and that is load-bearing.
+    20260817 replays ``cleanup_all_overlaps`` over all history and that resolver
+    WRITES the pin, but the columns nominally arrive one migration later —
+    creating them here closes the window, so by the time any overlap code runs
+    the shape is the current shape, everywhere.
 
-    ⛔ The obvious-looking alternative — SWAPPING 20260817 and 20260818 so the
-    columns simply land first — is a BOOT-BREAKER, and must never be done.
-    ``_run_migrations_impl`` selects ``[fn for v, fn in _MIGRATIONS if v >
-    version]`` and then stamps ``_CURRENT_VERSION`` unconditionally. A database
-    stamped exactly 20260817 is a REAL state (dev55 shipped as its own commits,
-    ahead of dev56). After a swap that database would run only the re-sweep,
-    never receive these three ALTERs, and still be stamped current — then fail
-    every subsequent boot on the current-version guard with "Delete the database
-    file." Shipped migration numbers do not move; an idempotent ensure-helper
-    called from both steps reaches the same end state with no renumbering.
+    ⛔ SWAPPING 20260817 and 20260818 so the columns simply land first is a
+    BOOT-BREAKER and must never be done. ``_run_migrations_impl`` selects
+    ``[fn for v, fn in _MIGRATIONS if v > version]`` and then stamps
+    ``_CURRENT_VERSION`` unconditionally. A database stamped exactly 20260817 is
+    a REAL state (dev55 shipped as its own commits, ahead of dev56); after a
+    swap it would run only the re-sweep, never receive these three ALTERs, still
+    be stamped current, and then fail every subsequent boot on the
+    current-version guard with "Delete the database file." Shipped migration
+    numbers do not move.
 
     Guarded for stub ``events`` tables (older migration tests build one with
     only the columns their own step needs), and the index is created only once
-    ``circuit`` exists — same guard 20260802-04 use.
+    ``circuit`` exists — the same guard 20260802-04 use.
     """
     if not _has_table(conn, "events"):
         return
@@ -3547,19 +3466,19 @@ def _apply_wf_src_hz_correction(conn: sqlite3.Connection) -> None:
 def _apply_drop_mqtt_schema(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260901 — remove the MQTT publisher's schema.
 
-    MQTT was part of an original roadmap the operator is no longer pursuing
-    (decided 2026-09-07). It had never worked on this install in any case:
-    ``config.yaml`` declared no ``services:`` block, so the Supervisor answered
-    the broker-credentials query with 403 and the publisher returned at
-    ``status=not_configured`` without ever connecting.
+    MQTT was part of an original roadmap the operator is no longer pursuing. It
+    had never worked on this install in any case: ``config.yaml`` declared no
+    ``services:`` block, so the Supervisor answered the broker-credentials query
+    with 403 and the publisher returned at ``status=not_configured`` without
+    ever connecting.
 
     Drops, in order of how sure we are they are unused:
 
     * ``home_profile.mqtt_publish_enabled`` and
       ``home_profile.publish_fixtures_to_ha`` — zero readers even before the
       code removal; a repo-wide grep found only their DDL lines.
-    * ``fixture_ha_entity_map`` — the audit's schema census found it had never
-      held a row: a CREATE, one DELETE, and nothing else.
+    * ``fixture_ha_entity_map`` — the schema census found it had never held a
+      row: a CREATE, one DELETE, and nothing else.
     * ``category_publish`` — backed the per-category "publish to HA" checkbox,
       which controlled only MQTT output.
 
@@ -3623,8 +3542,6 @@ _V20260902_DROP_INDEXES: tuple = (
 def _apply_dead_schema_and_event_indexes(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260902 — drop dead schema, fix events' indexes.
 
-    Three unrelated pieces of work that all need the same one migration.
-
     (1) DEAD OBJECTS. Two tables and one column with no reader and no writer
     anywhere in the repo:
 
@@ -3632,11 +3549,9 @@ def _apply_dead_schema_and_event_indexes(conn: sqlite3.Connection) -> None:
       double-submit off ``csrf_server_secret`` for a long time; nothing ever
       issued or checked a row here. Its only other mention in the tree is
       ``EXPORT_EXCLUDED_TABLES`` in ``routers/backup.py``, which DELETEs from
-      each listed table inside a ``try/except sqlite3.Error: continue`` whose
-      own comment reads "table absent in this schema version" — so unlike the
-      quick-restore allowlist (which has no existence check and WOULD 500),
-      leaving the name there after the drop is exactly the handled case. That
-      file is not touched here.
+      each listed table inside a ``try/except sqlite3.Error: continue`` — so
+      unlike the quick-restore allowlist (which has no existence check and WOULD
+      500), leaving the name there after the drop is exactly the handled case.
     * ``cluster_sequences`` — a Phase 2.2 placeholder that never gained a
       writer; a repo-wide grep found its CREATE and nothing else.
     * ``events.flow_onset_delay_seconds`` — never in the feature dict the live
@@ -3646,9 +3561,8 @@ def _apply_dead_schema_and_event_indexes(conn: sqlite3.Connection) -> None:
     NOT dropped, though the audit proposed them:
 
     * ``zone_flow_history`` — it IS in ``RESTORABLE_TABLES`` (restore_utils.py)
-      and ``HISTORY_ARCHIVE_TABLES`` (routers/backup.py), and data_pruner
-      prunes it by ``recorded_at``. Never-populated is not the same as
-      unreferenced.
+      and ``HISTORY_ARCHIVE_TABLES`` (routers/backup.py), and data_pruner prunes
+      it by ``recorded_at``. Never-populated is not the same as unreferenced.
     * ``events.propagation_delay_seconds`` — no reader in the add-on, but
       ``tools/audit/scripts/p4_fields.py`` SELECTs it by name against a copy of
       the live database, so dropping it would break the audit harness.
@@ -3692,9 +3606,9 @@ def _apply_dead_schema_and_event_indexes(conn: sqlite3.Connection) -> None:
     Idempotent throughout: ``DROP … IF EXISTS``, ``CREATE INDEX IF NOT EXISTS``,
     and the column drop is checked with ``_has_column`` first and wrapped
     (``ALTER TABLE … DROP COLUMN`` needs SQLite 3.35+; on anything older the
-    column is simply left in place, which is harmless now that ``_create_schema``
-    no longer emits it). No data is migrated — every object removed here is
-    empty or write-never-read.
+    column is simply left in place, harmless now that ``_create_schema`` no
+    longer emits it). No data is migrated — every object removed here is empty
+    or write-never-read.
     """
     for table in _V20260902_DROP_TABLES:
         try:

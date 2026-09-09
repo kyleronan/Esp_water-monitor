@@ -72,7 +72,7 @@ class FeatureExtractor:
         # Callback → True while a bucket / municipal calibration test runs on a circuit.
         # The deliberate test draw must not trip auto-shutoff or feed training / anomaly.
         self._is_calibrating = is_calibrating or (lambda c: False)
-        # Home timezone (dev.24) — converts UTC-stored event timestamps to LOCAL
+        # Home timezone — converts UTC-stored event timestamps to LOCAL
         # for the water-softener regen band match. None → compare in UTC (the
         # batch reclassify will still detect it once a tz-aware caller runs).
         self._ha_tz = ha_tz
@@ -100,7 +100,7 @@ class FeatureExtractor:
         self._last_anomaly_alert_at: dict[str, datetime] = {}
         # Set by orchestrator after ClusterEngine is initialised and rebuilt.
         self.cluster_engine = None
-        # dev.23: per-circuit circuit_type cache for the structural rules tier
+        # Per-circuit circuit_type cache for the structural rules tier
         # (one DB read per circuit per process lifetime, not per event).
         self._circuit_type_cache: dict[str, str] = {}
 
@@ -141,7 +141,7 @@ class FeatureExtractor:
     _CLOSED_DAY_DRAIN_EVERY_S = 60.0
 
     async def _maybe_drain_closed_days(self) -> None:
-        """dev56 (audit item 8) — a reprocessed or backfilled event lands on a
+        """A reprocessed or backfilled event lands on a
         CLOSED day, whose cached summary then reads low until the 03:00 pruner
         pass. Recompute the dirty closed days as soon as the queue drains, and
         at most once a minute during a long backfill (once per distinct day, not
@@ -316,7 +316,7 @@ class FeatureExtractor:
                       circuit, upgraded_id)
 
     def _pre_store_reads_sync(self, event) -> dict:
-        """dev46 (46a) — pump-era/gate state plus the waveform lookup, one hop."""
+        """Pump-era/gate state plus the waveform lookup, one hop."""
         from .config import pump_gates_active
         from .supply_regime import pump_era_start
         try:
@@ -331,7 +331,7 @@ class FeatureExtractor:
                 "wf_record": self._find_waveform(event)}
 
     def _store_preflight_sync(self, event, event_id: str) -> dict:
-        """dev46 (46a) — the duplicate guard and the stored-intent read.
+        """The duplicate guard and the stored-intent read.
 
         Both are reads taken as close to the INSERT as the architecture
         allows; bundling them keeps that property while removing two
@@ -346,7 +346,7 @@ class FeatureExtractor:
                 event.end_ts.isoformat(),
                 exclude_event_id=event_id,
             )
-        # dev56 — the pin columns ride along so the finalizer can honour them
+        # The pin columns ride along so the finalizer can honour them
         # on a re-store; guarded for hand-rolled test schemas that predate them.
         _pin_cols = (", verdict_pin, verdict_pin_veff"
                      if _events_has_column(self._db, "verdict_pin") else "")
@@ -361,7 +361,7 @@ class FeatureExtractor:
         return {"blocking": blocking, "existing": existing}
 
     def _verdict_inputs_sync(self, circuit) -> dict:
-        """dev46 (46a) — frozen artifact calibration + pump-gate state."""
+        """Frozen artifact calibration + pump-gate state."""
         from .artifact_calibration import load_artifact_calibration
         from .config import pump_gates_active
         acal = load_artifact_calibration(self._db, circuit)
@@ -373,7 +373,7 @@ class FeatureExtractor:
 
     def _post_store_sync(self, event, features: dict, wf_record, wf_applied,
                          is_new_event) -> None:
-        """dev46 (46a) — post-upsert DB work, one hop, one transaction.
+        """Post-upsert DB work, one hop, one transaction.
 
         Mutates ``features`` in place (exclusion flags) — safe because the
         caller is awaiting this call and nothing else reads the dict meanwhile.
@@ -448,7 +448,7 @@ class FeatureExtractor:
 
 
     def _post_cluster_sync(self, circuit: str, features: dict) -> dict:
-        """dev46 (46a) — training-capture hook + the live-state read, one hop.
+        """Training-capture hook + the live-state read, one hop.
 
         The capture hook is best-effort exactly as it was inline: a bug in
         capture logic must never block event storage.
@@ -465,7 +465,7 @@ class FeatureExtractor:
         return {"state": row["state"] if row else None}
 
     def _degraded_count_sync(self, circuit: str, cutoff_30min: str) -> int:
-        """dev46 (46a) — degraded-event count for the pulsing-supply limiter."""
+        """Degraded-event count for the pulsing-supply limiter."""
         row = self._db.execute(
             "SELECT COUNT(*) FROM events "
             "WHERE circuit = ? AND degraded_supply = 1 "
@@ -608,7 +608,7 @@ class FeatureExtractor:
                 features["user_ignored"] = (
                     int(existing["user_ignored"] or 0) if existing is not None else 0
                 )
-                # dev56 — carry the pinned verdict into the re-derive (the
+                # Carry the pinned verdict into the re-derive (the
                 # upsert preserves the columns; the finalizer must SEE them).
                 if existing is not None and "verdict_pin" in existing.keys():
                     features["verdict_pin"] = existing["verdict_pin"]
@@ -634,7 +634,7 @@ class FeatureExtractor:
             is_new_event = None
             for _attempt in range(6):
                 try:
-                    # dev46 (46a): one run_db hop PER ATTEMPT. The retry loop
+                    # One run_db hop PER ATTEMPT. The retry loop
                     # and its sleep stay on the event loop deliberately —
                     # sleeping inside the DB worker would block the single
                     # thread this retry is waiting on, turning a recoverable
@@ -657,7 +657,7 @@ class FeatureExtractor:
                              event.circuit, _db_err, _attempt + 1)
                     await asyncio.sleep(8)
 
-            # dev46 (46a): exclusion window, calibration exclusion, waveform
+            # Exclusion window, calibration exclusion, waveform
             # persist and the training-state increment are one contiguous run
             # of DB work — ONE hop, one transaction (N2a). It mutates
             # ``features`` in place; that is safe because the loop is awaiting
@@ -681,7 +681,7 @@ class FeatureExtractor:
                               event.circuit, e)
 
 
-            # ── Phase 2: sequence context + cluster matching ───────────────
+            # ── Sequence context + cluster matching ───────────────
             await self._cluster_event(event.circuit, features)
             # ──────────────────────────────────────────────────────────────
 
@@ -722,7 +722,7 @@ class FeatureExtractor:
                 now = datetime.now(timezone.utc)
                 cutoff_30min = (now - timedelta(minutes=30)).isoformat()
                 try:
-                    # dev46 (46a): a READ after the anomaly-response await.
+                    # A READ after the anomaly-response await.
                     # No re-check needed — re-checks guard stale WRITES, and
                     # this only feeds a rate-limited alert decision.
                     count = await run_db(self._degraded_count_sync,
@@ -776,7 +776,7 @@ class FeatureExtractor:
 
     async def _apply_anomaly_response(self, circuit: str, features: dict,
                                       anomaly: dict) -> None:
-        """Phase 2.3 — graduated response to a LIVE baseline-deviation event.
+        """Graduated response to a LIVE baseline-deviation event.
 
         The shut-off paths carry guardrails the notify paths do not: a thin/default
         baseline (``shutoff_ok_*`` False) or a circuit that has not been live for
@@ -803,7 +803,7 @@ class FeatureExtractor:
             (response == "shutoff_any" and anomaly.get("shutoff_ok_any"))
             or (response == "notify_shutoff_severe" and anomaly.get("shutoff_ok_severe"))
         )
-        # dev46 (46a): the two DB-backed shut-off gates go over the wall
+        # The two DB-backed shut-off gates go over the wall
         # together, and ONLY when want_shutoff is true — evaluating them
         # eagerly would preserve thread-safety but change behaviour, adding
         # two reads to every anomaly event on a notify-only install. The
@@ -977,7 +977,7 @@ class FeatureExtractor:
         return False
 
     def _shutoff_preflight_sync(self, circuit: str) -> dict:
-        """dev46 (46a) — the two DB reads that must precede actuation.
+        """The two DB reads that must precede actuation.
 
         Returned together so the hard state gate and the valve lookup describe
         the same instant; the caller still checks the gate first.
@@ -1080,7 +1080,7 @@ class FeatureExtractor:
     async def _cluster_event(self, circuit: str, features: dict) -> None:
         """Compute sequence context, run cluster matching, write results back.
 
-        dev46 (46a): the body is ~360 lines of DB work whose ONLY await was
+        The body is ~360 lines of DB work whose ONLY await was
         the matcher hop, so the whole thing goes over the wall as ONE
         callable rather than 23 separate loop-thread touches. Bundling also
         makes the write-back atomic: sequence context, cluster assignment,
@@ -1154,7 +1154,7 @@ class FeatureExtractor:
                     "SELECT * FROM events WHERE id = ?", (event_id,)
                 ).fetchone()
                 if event_row:
-                    # dev46 (46a/N2b): we are ALREADY on the DB thread, so
+                    # We are ALREADY on the DB thread, so
                     # the matcher is called directly. Re-submitting to run_db
                     # from inside a run_db callable would deadlock the single
                     # worker — the no-re-entry rule, and this is exactly the
@@ -1177,7 +1177,7 @@ class FeatureExtractor:
         # doesn't strongly match a known fixture, which is most of what a real
         # home produces.
 
-        # dev.23 — structural rules tier (rules-first; Pass-5 semantics). Runs
+        # Structural rules tier (rules-first; Pass-5 semantics). Runs
         # BEFORE the k-NN regardless of cluster strength, mirroring the batch
         # reclassify. The trailing washer scan is pre-gated to fixture circuits
         # AND peaks inside the family envelope, so micro/gentle events skip it.
@@ -1208,7 +1208,7 @@ class FeatureExtractor:
             from .supply_regime import get_current_regime_id
             calib = load_rule_calibration(self._db, circuit,
                                           regime_id=get_current_regime_id(self._db))
-            # dev.24 — water-softener session (precedence: softener → washer →
+            # Water-softener session (precedence: softener → washer →
             # rules → knn). Profile read FRESH (NOT cached) so a Settings toggle
             # takes effect on the next event with no restart. Hard-gated.
             prof = get_home_profile(self._db)
@@ -1326,7 +1326,7 @@ class FeatureExtractor:
                 log.warning("[%s] tinymodel tier failed (non-fatal): %s",
                             circuit, e)
 
-        # Sprint C — signature-matcher (k-NN) residual. Runs when no structural
+        # Signature-matcher (k-NN) residual. Runs when no structural
         # rule claimed the event AND the cluster matcher either returned no
         # cluster_id or a low-confidence match. Caught broadly because
         # matcher-or-DB failure must NEVER block the regular cluster_id write.
@@ -1390,7 +1390,7 @@ class FeatureExtractor:
                     circuit, e,
                 )
 
-        # Toilet physics veto (dev17): whatever tier proposed 'toilet' (rule /
+        # Toilet physics veto: whatever tier proposed 'toilet' (rule /
         # fingerprint / k-NN), the event must be physically able to BE a single
         # cistern refill — hard volume floor, era-capped ceiling (EPA flush
         # standards keyed on home_profile.build_year), peak floor, one segment.

@@ -373,9 +373,8 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
 
     Returns ``(ctx, rows)``.
     """
-    # 1. Retrain the per-type centroids (for the Signatures UI display). The
-    #    k-NN itself reads events directly, so this is purely cosmetic but keeps
-    #    the Signatures page in sync.
+    # 1. Retrain the per-type centroids for the Signatures UI display. The
+    #    k-NN reads events directly, so this only keeps that page in sync.
     signatures_trained = 0
     type_rows = conn.execute(
         "SELECT DISTINCT user_fixture_type FROM events "
@@ -387,10 +386,10 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         if _db.upsert_fixture_signature(conn, circuit, tr[0]) is not None:
             signatures_trained += 1
 
-    # 2. Backfill over unlabelled events. Query carries BOTH the legacy and the
-    #    active-flow features so the matcher uses whichever it can (active when
-    #    backfilled). An event now excluded_from_training carries no fixture
-    #    identity → its matched_fixture_type is cleared (stale-match carry-forward).
+    # 2. Backfill over unlabelled events. The query carries BOTH the legacy and
+    #    the active-flow features so the matcher uses whichever it can. An event
+    #    now excluded_from_training carries no fixture identity, so its
+    #    matched_fixture_type is cleared.
     from .event_rules import (detect_dishwasher_cycles,
                               detect_softener_sessions, detect_washer_cycles,
                               get_home_timezone, parse_hhmm_to_minutes)
