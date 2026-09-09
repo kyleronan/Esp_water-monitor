@@ -1,5 +1,4 @@
-"""
-Feature extractor — Phase 2.
+"""Feature extractor — Phase 2.
 
 Consumes RawEvent objects from the detection queue and:
   1. Computes the full feature vector for each event
@@ -10,7 +9,7 @@ Consumes RawEvent objects from the detection queue and:
      cluster matching and sequence context recording
 
 Algorithm: DBSTREAM via river.cluster.DBSTREAM (online, no fixed K).
-DBSCAN batch clustering was considered and rejected — see ADR 003.
+DBSCAN batch clustering does not fit here — see ADR 003.
 
 Feature vector:
   Temporal:
@@ -38,13 +37,9 @@ Feature vector:
     propagation_delay_s    seconds between event start and flow onset
                            (only meaningful for pressure-triggered events)
 
-Resistance shape classification
----------------------------------
-Shape is computed on the TRUE hydraulic resistance curve ΔP/Q, where
-ΔP = pre_event_pressure - pressure[i] (the actual pressure drop due to
-demand, not the absolute line pressure).
-
-The first and last 20% of readings are excluded before classification
+Resistance shape is computed on the TRUE hydraulic resistance curve ΔP/Q, where
+ΔP = pre_event_pressure - pressure[i]: the actual pressure drop due to demand,
+not the absolute line pressure. The first and last 20% of readings are excluded
 so ramp-up and ramp-down transients don't corrupt the trend analysis.
 
   steady  — CV < 0.55 and trend change < 15%
@@ -86,9 +81,7 @@ def _safe_float(values: list, default: float = 0.0) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Resistance-shape classification constants (extracted 2026-05-27 from
-# inline magic numbers; original calibration was during the Phase-2
-# resistance-shape work circa 2026-04).
+# Resistance-shape classification constants.
 #
 # All four values are tunable and ALL affect _classify_resistance_shape().
 # Keep them here so changes in one place don't drift from related ones
@@ -112,12 +105,9 @@ RAMP_EXCLUSION_FRACTION      = 5     # used as n // RAMP_EXCLUSION_FRACTION
 # into thirds and needs at least 2 samples per third.
 MIN_RESISTANCE_SAMPLES       = 6
 
-# Coefficient of variation threshold for "pulsed". 0.55 is calibrated to
-# reject sensor noise at the pressure trough while still catching real
-# oscillating appliances (dishwashers, washing machines) which typically
-# produce CV > 0.80. Was raised from 0.40 when the autocorr
-# normalisation bug was discovered — see plan A-3 in
-# zany-yawning-church.md.
+# Coefficient of variation threshold for "pulsed". 0.55 rejects sensor noise at
+# the pressure trough while still catching real oscillating appliances
+# (dishwashers, washing machines), which typically produce CV > 0.80.
 RESISTANCE_PULSED_CV         = 0.55
 
 # Trend threshold for rising / falling. ΔP/Q changing by more than this
@@ -215,15 +205,13 @@ def _classify_resistance_shape(
     pre_event_pressure_psi: float,
     min_flow: float = 0.15,
 ) -> str:
-    """
-    Classify the hydraulic resistance curve shape.
+    """Classify the hydraulic resistance curve shape.
 
-    Uses TRUE resistance: ΔP/Q where ΔP = pre_event_pressure - pressure[i].
-    This isolates the fixture's hydraulic load from the absolute line pressure,
-    making the classification independent of household supply pressure.
-
-    Ramp phases (first and last 20% of readings) are excluded so the
-    classification reflects steady-state behaviour only.
+    Uses TRUE resistance: ΔP/Q where ΔP = pre_event_pressure - pressure[i]. That
+    isolates the fixture's hydraulic load from the absolute line pressure, making
+    the classification independent of household supply pressure. Ramp phases
+    (first and last 20% of readings) are excluded so the classification reflects
+    steady-state behaviour only.
 
     Returns one of: steady | rising | falling | pulsed | unknown
     """
@@ -237,10 +225,9 @@ def _classify_resistance_shape(
     p_mid = pressure_readings[ramp: n - ramp]
     f_mid = flow_readings[ramp: n - ramp]
 
-    # Compute true ΔP/Q resistance at each steady-state point.
-    # Skip readings where flow is below noise floor to avoid division
-    # by near-zero inflating variance.
-    # L/min noise floor — per-circuit, matches event_detector MIN_FLOW_LPM (60 ÷ ppl).
+    # True ΔP/Q resistance at each steady-state point. Skip readings below the
+    # noise floor (per-circuit, matches event_detector MIN_FLOW_LPM = 60 ÷ ppl)
+    # so division by near-zero doesn't inflate the variance.
     resistance = []
     for p, f in zip(p_mid, f_mid):
         if f >= min_flow:
@@ -274,16 +261,14 @@ def _classify_resistance_shape(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Degraded-supply guard (added 2026-05-26)
+# Degraded-supply guard
 #
 # Detects when an event was captured during supply-pulsation conditions, in
-# which case the paddlewheel flow sensor produces chaotic readings (forward
-# and reverse pulses both count as positive; brief zero-velocity transitions
-# register as 0 L/min). See plan: zany-yawning-church.md for full design.
-#
-# Constants below are site-tunable. Defaults calibrated against the
-# 2026-05-25 diagnostic session where pulse period was ~4 s; the range
-# permits per-installation variation.
+# which case the paddlewheel flow sensor produces chaotic readings (forward and
+# reverse pulses both count as positive; brief zero-velocity transitions
+# register as 0 L/min). Constants below are site-tunable; the defaults are
+# calibrated against a diagnostic session where the pulse period was ~4 s, and
+# the range permits per-installation variation.
 # ─────────────────────────────────────────────────────────────────────────────
 SUPPLY_PULSE_PERIOD_MIN_S    = 1.0
 SUPPLY_PULSE_PERIOD_MAX_S    = 6.0
@@ -297,18 +282,18 @@ APPLIANCE_FLOW_PRESSURE_RATIO = 30.0
 # dev33 — constant-pressure (VFD) booster-pump ripple exemption.
 #
 # The ESYBOX's control loop hunts around its setpoint at ~1 Hz with ±1.4-2.1 psi
-# of mid-event pressure wobble. That is invisible at a fixture and leaves the
-# meter perfectly trustworthy, but it satisfies every pulsing-supply gate — the
-# 2026-07 install drove degraded events from 0 to 27-68/week, each one needlessly
+# of mid-event pressure wobble: invisible at a fixture, the meter still perfectly
+# trustworthy, but it satisfies every pulsing-supply gate — the pump install
+# drove degraded events from 0 to 27-68/week, each one needlessly
 # volume-estimated and excluded.
 #
 # 1.5 s is INSIDE the observed distribution, not a gap: measured pump ripple runs
-# 0.93-2.0 s (all but 2 of 121 post-pump events below 1.5 s), and pre-pump GENUINE
-# pulsing runs 0.81-2.0 s. Period alone therefore cannot discriminate — which is
-# why the exemption is additionally gated on the pump ERA (see
-# supply_regime.pump_era_start). Re-derive this constant if the pump's setpoint
-# or hunting frequency changes: histogram pressure_dominant_period_s over
-# degraded events in the pump era and take the upper edge of the fast mode.
+# 0.93-2.0 s (all but 2 of 121 post-pump events below 1.5 s) and pre-pump GENUINE
+# pulsing runs 0.81-2.0 s, so period alone cannot discriminate — hence the
+# additional gate on the pump ERA (supply_regime.pump_era_start). Re-derive this
+# constant if the pump's setpoint or hunting frequency changes: histogram
+# pressure_dominant_period_s over degraded events in the pump era and take the
+# upper edge of the fast mode.
 #
 # Interim measure. The principled fix is a narrowband spectral discriminator
 # (FFT the 6.2 Hz idle-pressure stream and gate on the ripple line) — that also
@@ -331,14 +316,11 @@ FIXTURE_CYCLE_PERIOD_MAX_S   = 30.0
 MAX_WAVEFORM_BINS            = 1000
 
 # Points in the stored flow/pressure shape signatures (events.flow_signature_json
-# / pressure_signature_json). 32 → 64 (2026-07-05) so short pulses (washer fill
-# pauses) survive; 64 → 256 (2026-07-06) so LONG events stop collapsing into
-# rectangles (at 64 pts a 45-min shower gets one point per ~42 s — valve ramps
-# and fill tapers vanish; at 256 it's ~10.5 s/pt, matching the software capture
-# cadence). Every consumer (sparkline, classify_flow_shape, cluster_engine's
-# resample-on-expand, the History display-upgrade path) is length-agnostic, so
-# historical shorter rows keep working; the dev18 one-shot backfill regenerates
-# them at 256 from event_waveforms where a finer envelope exists.
+# / pressure_signature_json). At 64 pts a 45-min shower gets one point per ~42 s
+# and valve ramps / fill tapers vanish; at 256 it is ~10.5 s/pt, matching the
+# software capture cadence. Every consumer (sparkline, classify_flow_shape,
+# cluster_engine's resample-on-expand, the History display-upgrade path) is
+# length-agnostic, so historical shorter rows keep working.
 SIGNATURE_POINTS             = 256
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -422,7 +404,7 @@ _SPARSE_ENVELOPE_MAX_FLOW_ON_RATIO: float = 0.10
 _XTALK_MIN_DURATION_S: float = 120.0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Low-flow "dribble" guard (added 2026-05-31)
+# Low-flow "dribble" guard
 #
 # A DIFFERENT phenomenon from the long-duration phantom above: brief, tiny-
 # volume, low-flow trickles with no real pressure load — sensor noise or
@@ -432,17 +414,15 @@ _XTALK_MIN_DURATION_S: float = 120.0
 # rule caught only 1 of 49. These thresholds (derived from that labelled set,
 # ~76% recall / ~73% precision) catch them.
 #
-# A dribble is a VOLUME-ZEROING verdict (changed 2026-06-19): it sets
-# is_low_flow_dribble + excluded_from_training AND zeroes volume_litres_effective,
-# removing the brief blip from totals like a phantom does. (Previously it kept the
-# volume as a benign "Drip"; users were hand-marking these short ~0-ΔP blips as
-# "not real use" to suppress them, so the auto-verdict now does it.) Leak-safe
-# because the flow<1 L·min⁻¹ gate excludes real small draws (icemaker / fridge
-# dispenser run ~3 L·min⁻¹) and a sustained slow flow accumulates past
-# _DRIBBLE_MAX_VOLUME_L, so it stays a counted long event — a continuous leak is
-# never fragmented into zeroed dribbles (verified on the archive: 0 / 347 auto
-# dribbles moved >= SUSPECT_ZERO_LITRES of real HA flow). detector_validation now
-# holds dribble to the same suspect-zeroing leak-safety bar as phantom/cross-talk.
+# A dribble is a VOLUME-ZEROING verdict: it sets is_low_flow_dribble +
+# excluded_from_training AND zeroes volume_litres_effective, removing the brief
+# blip from totals like a phantom does. Leak-safe because the flow<1 L·min⁻¹
+# gate excludes real small draws (icemaker / fridge dispenser run ~3 L·min⁻¹)
+# and a sustained slow flow accumulates past _DRIBBLE_MAX_VOLUME_L, so it stays
+# a counted long event — a continuous leak is never fragmented into zeroed
+# dribbles (verified on the archive: 0 / 347 auto dribbles moved
+# >= SUSPECT_ZERO_LITRES of real HA flow). detector_validation holds dribble to
+# the same suspect-zeroing leak-safety bar as phantom/cross-talk.
 # Re-tune here as more labelled data arrives.
 _DRIBBLE_MAX_VOLUME_L:  float = 0.5   # legacy calib key — no longer read by the detector
 _DRIBBLE_MAX_FLOW_LPM:  float = 1.0   # legacy calib key — no longer read by the detector
@@ -708,27 +688,20 @@ def _detrend_linear(values: List[float]) -> List[float]:
 def _autocorr_at_lag(values: List[float], lag: int) -> float:
     """Normalized autocorrelation of `values` at the given sample lag.
 
-    Returns an overlap-weighted Pearson correlation in [-1, 1] between
-    the head window ``values[:n]`` and the tail window
-    ``values[lag:lag+n]``, where ``n = len(values) - lag``.
+    Returns an overlap-weighted Pearson correlation in [-1, 1] between the head
+    window ``values[:n]`` and the tail window ``values[lag:lag+n]``, where
+    ``n = len(values) - lag``. Each window is centred by its own mean and the
+    covariance divided by ``sqrt(var_head * var_tail)``: normalising by the
+    variance of the FULL array is not a proper correlation coefficient and is
+    biased for any signal with non-zero DC drift in the tail.
 
-    The previous implementation normalised the covariance (computed
-    over only the first ``n`` samples) by the variance of the FULL
-    array. With unequal sample windows the result wasn't a proper
-    correlation coefficient and was biased for any signal with
-    non-zero DC drift in the tail.
+    The result is then multiplied by ``n / len(values)`` (an overlap weight).
+    That weight biases toward shorter lags on purpose — for a periodic signal
+    the fundamental and every harmonic score equally on raw Pearson, but the
+    fundamental has more overlap and should win the peak-pick in
+    ``_dominant_period_s``.
 
-    This version centres each window by its own mean and divides by
-    ``sqrt(var_head * var_tail)`` so the result is a proper Pearson
-    correlation, then multiplies by ``n / len(values)`` (an overlap
-    weight). The weight preserves the older implementation's bias
-    toward shorter lags — important because for a periodic signal the
-    fundamental and every harmonic score equally on raw Pearson, but
-    the fundamental has more overlap and should be preferred by the
-    peak-pick in ``_dominant_period_s``.
-
-    Returns 0.0 when the lag is too large to evaluate or when one of
-    the windows is constant.
+    Returns 0.0 when the lag is too large to evaluate or a window is constant.
     """
     n = len(values) - lag
     if n <= 1:
@@ -990,13 +963,12 @@ def _evaluate_degraded_from_diag(diag: dict, pump_mode: bool = False):
     if "flow_trough_episode_rate_hz" not in diag:
         return False, diag.get("reason", "unknown")
 
-    # dev33 — VFD ripple exemption. A constant-pressure pump hunts around its
-    # setpoint at ~1 Hz; that ripple pattern-matches "pulsing supply" while the
-    # meter stays perfectly trustworthy, and it drove degraded events from 0 to
-    # 27-68/week after the 2026-07 install. Exempt the fast band, but ONLY for
-    # events captured in the pump era: pre-pump genuine pulsing occupies the
-    # SAME 0.8-2.0 s band, so period alone cannot discriminate — era + period
-    # can. Slower supply pulsation (>= 1.5 s) stays detectable under the pump.
+    # VFD ripple exemption: a constant-pressure pump hunts around its setpoint
+    # at ~1 Hz, and that ripple pattern-matches "pulsing supply" while the meter
+    # stays perfectly trustworthy. Exempt the fast band, but ONLY for events
+    # captured in the pump era — pre-pump genuine pulsing occupies the SAME
+    # 0.8-2.0 s band, so period alone cannot discriminate. Slower supply
+    # pulsation (>= 1.5 s) stays detectable under the pump.
     if pump_mode:
         _p = diag.get("pressure_dominant_period_s")
         try:
@@ -1195,9 +1167,8 @@ PUMP_RECHARGE_REASON = "pump_recharge"
 # dev51 (Phase 5) — provenance for exclusions that used to be SILENT. The
 # finalizer ORed these three causes into excluded_from_training but its reason
 # chain had no branch for them, the dribble-restore path actively NULLed the
-# reason on every boot, and the Ignore button wrote the flag bare. ~198 rows
-# on the 2026-09-01 export were excluded with no recorded reason — exactly the
-# unexplained exclusion the quarantine columns exist to prevent.
+# reason on every boot, and the Ignore button wrote the flag bare — ~198 rows on
+# one export were excluded with no recorded reason.
 USER_IGNORED_REASON = "user_ignored"
 INTEGRATION_DEGRADED_REASON = "integration_degraded"
 PHANTOM_AVERTED_REASON = "phantom_averted"
@@ -1533,14 +1504,13 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     Reads: duration_seconds, pressure_delta_psi, degraded_supply, is_composite,
     user_ignored, volume_litres, volume_litres_estimated.
     """
-    # dev38: hydraulic_resistance must always match the CURRENT ΔP. ESP
-    # enrichment overwrites pressure_delta_psi AFTER extract_features computed
-    # resistance, so the stored ratio went stale on every ESP-enriched event
-    # (1,324 rows in the 2026-08 audit). Pinned definition — identical to
-    # extract_features: ΔP / avg_flow_lpm, gated on avg >= 0.15,
-    # has_pressure_transient, ΔP > 0; NULL otherwise, including NULL ΔP on
-    # de-enriched shared-capture rows. Runs BEFORE the user_classified guard:
-    # resistance is a measurement, not a classification, so a manual label
+    # hydraulic_resistance must always match the CURRENT ΔP. ESP enrichment
+    # overwrites pressure_delta_psi AFTER extract_features computed resistance,
+    # so the stored ratio went stale on every ESP-enriched event (1,324 rows).
+    # Pinned definition — identical to extract_features: ΔP / avg_flow_lpm, gated
+    # on avg >= 0.15, has_pressure_transient, ΔP > 0; NULL otherwise, including
+    # NULL ΔP on de-enriched shared-capture rows. Runs BEFORE the user_classified
+    # guard: resistance is a measurement, not a classification, so a manual label
     # must not preserve a stale ratio.
     _res_dp = features.get("pressure_delta_psi")
     _res_avg = features.get("avg_flow_lpm")
@@ -1591,10 +1561,8 @@ def _finalize_derived_verdicts(features: dict, calib=None,
         features["phantom_suppression_averted"] = 0
         return
 
-    # dev56 — a PINNED verdict (cross-event evidence the single-event detectors
-    # below cannot reproduce) outranks everything from here on. It used to be
-    # keyed on match_rejection_reason, which a re-store never loaded, and it
-    # forced veff to 0 even for a partial-remainder wrapper (PIPELINE 7d hazard).
+    # A PINNED verdict (cross-event evidence the single-event detectors below
+    # cannot reproduce) outranks everything from here on.
     if apply_pinned_verdict(features):
         return
 
@@ -1816,13 +1784,12 @@ def _finalize_derived_verdicts(features: dict, calib=None,
 # ``apply_effective_volume`` chokepoint, count it, remember the home-local day,
 # then rebuild each affected day's summary once and commit.
 #
-# The driver owns ONLY that mechanism. Each pass still supplies its own
-# candidate query, its own canonical predicate, its own SET clause and its own
-# counters/log lines, and the passes are never merged into one another: they
-# are separate verdicts and stay separately auditable. Two behaviours are
-# deliberately NOT generalised here — the bidirectional dribble scan (which
-# also RESTORES volume) and the relabel-repair scan (which restores rather than
-# zeroes) keep their own loops.
+# The driver owns ONLY that mechanism. Each pass supplies its own candidate
+# query, canonical predicate, SET clause and counters/log lines, and the passes
+# are never merged into one another: they are separate verdicts and stay
+# separately auditable. The bidirectional dribble scan (which also RESTORES
+# volume) and the relabel-repair scan (which restores rather than zeroes) keep
+# their own loops.
 #
 # Rule N2a: one write = one transaction ending in its own commit. The per-row
 # ``transaction(conn)`` below is exactly that, and is what lets a user's label
@@ -1974,14 +1941,12 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
     EPS = 1e-6
 
     # ── A: a zeroing flag ⇒ excluded_from_training = 1 ──────────────────────────
-    # dev57 (§2.31) — is_low_flow_dribble belongs in this list. Section B's own
-    # docstring above says all three zeroing verdicts zero volume (the dribble
-    # flag has zeroed since 2026-06-19 / below_meter_floor), and section B's
-    # ``new_excluded`` already ORs new_dr in — but section A, which is what fixes
-    # the SINGLE-flag rows section B never looks at (it selects >= 2 flags only),
-    # named just two of the three, so a dribble-flagged row left excluded=0 by a
-    # recompute path went on feeding training with a reading the meter's own
-    # registration floor says is false information.
+    # All three zeroing verdicts belong in this list, is_low_flow_dribble
+    # included (the dribble flag has zeroed volume since below_meter_floor).
+    # Section A is what fixes the SINGLE-flag rows section B never looks at (B
+    # selects >= 2 flags only), so naming just two of the three left a
+    # dribble-flagged row at excluded=0 feeding training with a reading the
+    # meter's own registration floor says is false information.
     cur = conn.execute(
         "UPDATE events SET excluded_from_training = 1 "
         "WHERE (COALESCE(is_pressure_restoration_phantom,0) = 1 "
@@ -2101,25 +2066,20 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
         )
         pairs_resolved += 1
 
-    # C (dev56). A single zeroing flag with water still counted: the row says
-    # "not real water" and counts it anyway. Section B only sees >= 2 flags, so
-    # this shape sat contradictory forever (two rows on the reference home).
+    # C. A single zeroing flag with water still counted: the row says "not real
+    # water" and counts it anyway. Section B only sees >= 2 flags, so this shape
+    # sat contradictory forever.
     #
-    # dev57 (§2.36) — this call STAYS on the boot path, deliberately. It was
-    # proposed for removal as "a one-shot repair that now runs on every boot",
-    # but the rule has to have a carrier here: migration 20260818 is the only
-    # other caller, and a home already stamped at 20260818 never re-runs it (see
-    # test_verdict_pin.test_boot_flag_repair_rezeroes_a_lone_zeroing_flag_with_volume
-    # — that is how the reference home's own two rows were repaired, in e4316da,
-    # by THIS path and not by the migration). The cost objection does not survive
-    # contact with the function it is made about: sections A and B above already
-    # scan the same table twice on the same boot, so C's scan is not a new order
-    # of cost. What DID need fixing is the flattening — that scan rewrote
-    # match_rejection_reason with its flag's generic family name, erasing
+    # This call STAYS on the boot path. Migration 20260818 is the only other
+    # caller and a home already stamped at 20260818 never re-runs it, so the boot
+    # carrier is what actually repairs the rows (see
+    # test_verdict_pin.test_boot_flag_repair_rezeroes_a_lone_zeroing_flag_with_volume).
+    # Sections A and B already scan the same table twice on the same boot, so C's
+    # scan is not a new order of cost. The flattening it used to cause — rewriting
+    # match_rejection_reason with the flag's generic family name, erasing
     # irrigation_cross_talk / rising_pressure_phantom / pump_recharge, whose
-    # survival across reprocessing rests entirely on that string. Fixed inside
-    # rezero_rows_with_zeroing_flag, which fixes it for the migration caller too
-    # — fencing this call would only have hidden it from one of the two.
+    # survival across reprocessing rests entirely on that string — is fixed inside
+    # rezero_rows_with_zeroing_flag, which fixes it for the migration caller too.
     from .database import rezero_rows_with_zeroing_flag
     rezeroed = rezero_rows_with_zeroing_flag(conn)
     if excluded_fixed or pairs_resolved or unresolved or rezeroed:
@@ -2127,9 +2087,8 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
         log.info("flag-repair: %d excluded-from-training fixed, %d flag collisions "
                  "resolved, %d unresolved, %d zeroing-flag rows re-zeroed",
                  excluded_fixed, pairs_resolved, unresolved, rezeroed)
-    # dev57 (§2.36) — ``rezeroed`` is returned, not just logged. It was counted,
-    # named in the log line, and then dropped from the dict, so the only caller
-    # that reports this repair (reprocess_event_exclusion_verdicts) could not.
+    # ``rezeroed`` is returned, not just logged: reprocess_event_exclusion_verdicts
+    # is the only caller that reports this repair.
     return {"excluded_fixed": excluded_fixed, "pairs_resolved": pairs_resolved,
             "unresolved": unresolved, "rezeroed": rezeroed}
 
@@ -2142,37 +2101,28 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
          them, ZERO volume_litres_effective, mark excluded_from_training, and
          reverse any prior hourly_volume contribution so daily totals shed the
          false volume.
-      2. Low-flow dribbles (brief low-flow / low-volume / near-zero ΔP) — flag
-         is_low_flow_dribble + excluded_from_training, ZERO volume_litres_effective,
-         and reverse any prior hourly_volume contribution (same shape as scan 1):
-         a dribble is sensor / pressure-equalisation noise, removed from totals.
+      2. Low-flow dribbles — flag is_low_flow_dribble + excluded_from_training,
+         ZERO volume_litres_effective, and reverse any prior hourly_volume
+         contribution (same shape as scan 1): a dribble is sensor /
+         pressure-equalisation noise, removed from totals.
 
-    Both scans skip ``user_classified`` rows (manual classification wins) and
-    are idempotent — already-flagged events are excluded by their WHERE clauses.
-
-    The dribble scan is guarded by a column-existence check so this stays safe
-    to call from the phantom-only wrapper during a sequential upgrade where the
-    is_low_flow_dribble column hasn't been added yet (caution A: the migration
-    only adds DDL; this backfill runs from startup / import / manual paths).
+    Both scans skip ``user_classified`` rows (manual classification wins) and are
+    idempotent — already-flagged events are excluded by their WHERE clauses. The
+    dribble scan is column-guarded so this stays safe to call from the
+    phantom-only wrapper during a sequential upgrade where the
+    is_low_flow_dribble column has not been added yet.
 
     Returns {"flagged": <phantoms>, "dribbles_flagged": <dribbles>}.
 
-    Derived-stats notes (phantom scan):
-      • Volume aggregates — hourly_volume and daily_summary.total_volume_litres
-        — are both corrected here (hourly_volume via the reversal INSERT,
-        daily_summary via a recompute of each affected day). Both now read
-        volume_litres_effective, which is zeroed for phantoms.
-      • fixture_type_signatures: upsert_fixture_signature already excludes
-        excluded_from_training=1 rows, so flagged phantoms can never pollute a
-        signature centroid; no rebuild needed.
-      • Cluster centroids: maintained as an incremental running mean. NEW
-        phantoms are gated out of match_and_learn by excluded_from_training
-        before they ever reach the clusterer, so they never contribute. Any
-        pre-existing phantom already folded into a centroid is left in place —
-        cluster_id is intentionally NOT nulled (preserving existing
-        assignments), and the residual influence of at most a handful of
-        extreme outliers is negligible and not worth a full retrain. This is a
-        deliberate scope decision, not an oversight.
+    Derived stats after the phantom scan: hourly_volume and
+    daily_summary.total_volume_litres are both corrected here, and both read
+    volume_litres_effective. fixture_type_signatures needs no rebuild —
+    upsert_fixture_signature already excludes excluded_from_training=1 rows.
+    Cluster centroids are left alone: NEW phantoms are gated out of
+    match_and_learn by excluded_from_training before they reach the clusterer,
+    and a pre-existing phantom already folded into a centroid stays (cluster_id
+    is intentionally NOT nulled, preserving existing assignments) — a deliberate
+    scope decision, not an oversight.
     """
     from .database import (transaction, compute_daily_summary,
                            apply_effective_volume, local_day_of)
@@ -2208,19 +2158,11 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     # deliberately clear (it stays visible), so the scans' flag filters below
     # would otherwise let another detector re-claim it and lose the provenance.
     #
-    # ⚠️ This used to be `uft_guard += _LEAK_REFILL_GUARD_SQL`, and that one
-    # line is the root cause of the same bug three times over. Appending it
-    # INTO a variable named for the user-fixture-type guard meant any scan that
-    # legitimately did not need a fixture-type guard dropped the refill guard
-    # with it, invisibly. Scan 3 hand-typed the user guards and lost it (6.5);
-    # the capped re-include never had it; the degraded-supply scan never had
-    # any user guard at all and so silently erased provenance on a route with
-    # no self-heal behind it.
-    #
-    # So the guards a zeroing scan must carry now have ONE name that says so.
-    # Concatenation order is unchanged, so every emitted statement is
-    # byte-identical to before — this buys nothing at runtime and makes the
-    # omission visible in review, which is where all three were missed.
+    # ⛔ Do NOT fold this into ``uft_guard``. Appending it INTO a variable named
+    # for the user-fixture-type guard means any scan that legitimately needs no
+    # fixture-type guard drops the refill guard with it, invisibly — which is how
+    # three separate scans lost it. The guards a zeroing scan must carry have ONE
+    # name that says so.
     scan_guards = uc_guard + uft_guard + _LEAK_REFILL_GUARD_SQL
     # Duration prefilter is metric-gated: legacy rows (no active-flow metrics) stay at the
     # frozen 1800 s floor, while rows that HAVE the no-flow metrics also qualify from 120 s.
@@ -2835,21 +2777,16 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
         # re-verdict un-zero a pressure-restoration phantom's volume.
         + _NO_PHANTOM_SQL
         # And never re-verdict a row whose provenance this scan would erase.
-        # The UPDATE below writes match_rejection_reason unconditionally - None
-        # on the not-degraded branch - and recomputes excluded_from_training
-        # from (composite OR degraded) alone. For a leak-test refill that means
-        # the verdict string is wiped AND the row is re-admitted to training at
-        # zero volume.
-        #
-        # A refill reaches this scan because degraded_diagnostic_json is
-        # written for EVERY extracted event, not just degraded ones, and a
-        # refill deliberately sets none of the three artifact bits, so
-        # _NO_PHANTOM_SQL does not exclude it. That is the same premise unit
-        # 6.5 established for the cross-talk scan.
-        #
-        # Guarded at the SELECT, the way the other scans do it, rather than by
-        # special-casing the UPDATE: this scan should not form an opinion about
-        # a row it must not rewrite.
+        # The UPDATE below writes match_rejection_reason unconditionally — None
+        # on the not-degraded branch — and recomputes excluded_from_training from
+        # (composite OR degraded) alone, so for a leak-test refill the verdict
+        # string is wiped AND the row is re-admitted to training at zero volume.
+        # A refill reaches this scan because degraded_diagnostic_json is written
+        # for EVERY extracted event, not just degraded ones, and a refill
+        # deliberately sets none of the three artifact bits, so _NO_PHANTOM_SQL
+        # does not exclude it. Guarded at the SELECT, the way the other scans do
+        # it: this scan should not form an opinion about a row it must not
+        # rewrite.
         + _LEAK_REFILL_GUARD_SQL
         + _NOT_USER_CLASSIFIED_SQL
         + _NO_USER_FIXTURE_TYPE_SQL
@@ -3075,27 +3012,23 @@ def _estimate_volume_smoothed(
 ) -> float:
     """Spike-resistant smoothed volume estimate for degraded events.
 
-    Strategy: cap a rolling-max envelope at the 95th percentile of positive
-    samples (rejects single-sample spikes), then take the MEDIAN across
-    windows (rejects sub-event high outliers). The result is a "typical
-    sustained flow" estimate that's robust to both the artefact zero-troughs
-    AND any phantom-pulse spikes that paddlewheel rectification might
-    introduce.
+    Caps a rolling-max envelope at the 95th percentile of positive samples
+    (rejects single-sample spikes), then takes the MEDIAN across windows
+    (rejects sub-event high outliers). The result is a "typical sustained flow"
+    estimate robust to both the artefact zero-troughs AND any phantom-pulse
+    spikes paddlewheel rectification might introduce.
 
-    dev33 (§8.5): this became load-bearing when the envelope cap dropped to
-    1.0x, because the `base is None` branch of ``_cap_envelope_estimate`` is
-    now the ONLY path whose result may exceed the metered volume. Two honesty
-    fixes:
+    Load-bearing since the envelope cap dropped to 1.0x, because the
+    ``base is None`` branch of ``_cap_envelope_estimate`` is now the ONLY path
+    whose result may exceed the metered volume. So:
 
-      * few-sample / very short events used ``mean x duration``, which for a
-        burst-shaped draw over-counts the idle remainder — prefer the measured
-        flow integral when one exists;
-      * the windowed path takes the median of window MAXES, which for an event
-        with only a handful of windows approximates ``peak x duration``. Use
-        the window MEAN so a short event's estimate reflects sustained flow
-        rather than its peak. (Trough rejection is preserved: the percentile
-        cap still clips spikes, and the median across windows still rejects
-        sub-event outliers.)
+      * few-sample / very short events prefer the measured flow integral over
+        ``mean x duration``, which over-counts the idle remainder of a
+        burst-shaped draw;
+      * the windowed path takes the median of window MEANS, not MAXES — with
+        only a handful of windows the latter approximates ``peak x duration``.
+        Trough rejection is preserved: the percentile cap still clips spikes and
+        the median across windows still rejects sub-event outliers.
     """
     if not flow_readings or duration_s <= 0:
         return 0.0
@@ -3852,17 +3785,11 @@ _WF_PEAK_SANITY_RATIO: float = 0.95
 _WF_FL_START_COMPLETE:     int = 0x01  # pre-roll covers full start-window span
 _WF_FL_FULL_COMPLETE:      int = 0x02  # full-window capture is complete
 # _WF_FL_RESOLUTION_REDUCED is NOT redefined here. It is one bit in the
-# firmware's wire format, and it was defined twice - once here and once in
-# the detector - with nothing pinning the two equal. A wire-format
-# vocabulary split across two modules is a vocabulary that will drift, and
-# the drift would be silent: the two copies only disagree once the firmware
-# changes the bit. Unit 7.3 left the detector side with a single definition
-# in event_waveform; this takes it from there.
-#
-# Import direction is the reason it comes from event_waveform and not from
-# the event_detector facade: event_waveform imports only
-# event_detector_core, whereas this module already does
-# `from .event_detector import RawEvent, WaveformRecord` at module level,
+# firmware's wire format; defined twice with nothing pinning the two equal, the
+# copies drift silently — they only disagree once the firmware changes the bit.
+# It comes from event_waveform rather than the event_detector facade because
+# event_waveform imports only event_detector_core, whereas this module already
+# does `from .event_detector import RawEvent, WaveformRecord` at module level,
 # so sourcing it from there would close a real cycle.
 from .event_waveform import _WF_FL_RESOLUTION_REDUCED  # noqa: E402
 
@@ -4671,13 +4598,12 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
 
 # ── back-compat re-export (unit 7.2) ─────────────────────────────────────────
 # ``FeatureExtractor`` and its alert cooldown moved to
-# :mod:`.feature_extractor_service`. Every existing
-# ``from .feature_extractor import FeatureExtractor`` keeps resolving through
-# this hook, so the split cost no caller a change except the one real importer.
+# :mod:`.feature_extractor_service`; every existing
+# ``from .feature_extractor import FeatureExtractor`` keeps resolving here.
 #
 # A PEP 562 module ``__getattr__`` rather than a plain bottom-of-file import ON
 # PURPOSE: the service module imports 14 names OUT of this module at its top
-# level. An eager import here would close that loop and raise ImportError
+# level, so an eager import here would close that loop and raise ImportError
 # whenever the service module was imported first — which is exactly what
 # ``orchestrator`` does. Resolving lazily keeps the edge one-way at import time.
 _MOVED_TO_SERVICE = ("FeatureExtractor", "_ANOMALY_ALERT_COOLDOWN_MIN")

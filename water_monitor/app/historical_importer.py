@@ -357,17 +357,17 @@ class HistoricalImporter:
         end: datetime,
     ) -> dict:
         """Dry-run: what would the importer reconstruct over [start, end], WITHOUT
-        deleting or storing anything. The guarded auto-split (dev.38/41) uses this to
-        decide whether ONE stored event is really several distinct draws — and, dev.41,
-        whether the window's history can be TRUSTED to reproduce the stored water.
+        deleting or storing anything. The guarded auto-split uses this to decide
+        whether ONE stored event is really several distinct draws, and whether the
+        window's history can be TRUSTED to reproduce the stored water.
 
         Returns ``{"periods": [(start_dt, end_dt), ...],
                    "period_volumes_l": [<litres per period, same order>],
                    "flow_volume_l": <integrated flow over the window>,
                    "fetch_failed": bool,   # transient — retry next pass
                    "gappy": bool}``        # 'unavailable'/'unknown' samples in window
-        dev52 — ``period_volumes_l`` integrates the SAME history slice per period, so
-        the reprocess probe can weigh a period a kept event would block against that
+        ``period_volumes_l`` integrates the SAME history slice per period, so the
+        reprocess probe can weigh a period a kept event would block against that
         event's stored water without re-deriving anything from stored rows.
         On an unconfigured circuit or a fetch failure the periods are empty and
         ``fetch_failed`` is set (fail-safe — a dry-run that can't see history must
@@ -394,7 +394,7 @@ class HistoricalImporter:
             onset_hist, flow_rate_hist, query_end=end,
             pressure_hist=pressure_hist, using_avg_pressure=using_avg_pressure,
         ) or []
-        # dev.41: recorder-gap markers ('unavailable'/'unknown' at HA restarts, sensor
+        # Recorder-gap markers ('unavailable'/'unknown' at HA restarts, sensor
         # dropouts) mean the window's history is INCOMPLETE — a reconstruction from it
         # would read the gap as flow-off and shrink/split away real recorded water.
         gappy = any(_is_gap_marker(e) for h in (onset_hist, flow_rate_hist,
@@ -558,9 +558,9 @@ class HistoricalImporter:
 
     async def _reconcile_cross_talk(self) -> None:
         """Irrigation cross-talk reconciliation — ONE watermark-driven pass that is
-        both the backfill and the periodic catch-up (dev.41: they were two
-        near-identical methods whose watermark advanced even when every history
-        fetch failed, permanently skipping outage windows).
+        both the backfill and the periodic catch-up. Two near-identical methods
+        here let the watermark advance even when every history fetch failed,
+        permanently skipping outage windows.
 
         Per eligible main circuit: reconcile [watermark − margin, now] — or the full
         HA-retention window when no watermark exists yet — in ≤1-day chunks (a
@@ -611,7 +611,7 @@ class HistoricalImporter:
 
     def _xtalk_candidates_sync(self, circuit: str, start_iso: str,
                                end_iso: str):
-        """dev46 (46a) — cross-talk reconcile candidates, one hop."""
+        """Cross-talk reconcile candidates, one hop."""
         return self._db.execute(
             "SELECT id, start_ts, end_ts, duration_seconds, volume_litres "
             "FROM events "
@@ -624,7 +624,7 @@ class HistoricalImporter:
         ).fetchall()
 
     def _recompute_days_sync(self, circuit: str, days) -> None:
-        """dev46 (46a) — one daily-summary recompute per affected day."""
+        """One daily-summary recompute per affected day."""
         from .database import compute_daily_summary
         for day in days:
             compute_daily_summary(self._db, circuit, day)
@@ -643,8 +643,8 @@ class HistoricalImporter:
         for BOTH candidate selection and the detector's ``irrigation_active``; PiΔ and
         PmΔ are computed from one history batch over the SAME padded window per event.
         Returns the count flagged — or **None on a history-fetch failure**, so the
-        caller can hold the watermark and retry (a swallowed failure used to be
-        recorded as "reconciled", permanently skipping outage windows).
+        caller can hold the watermark and retry. A swallowed failure is recorded
+        as "reconciled" and permanently skips the outage window.
 
         Cheapest checks first (this runs every catch-up tick, mostly finding
         nothing): the local candidate SQL, then the small irrigation-flow series,
@@ -655,8 +655,8 @@ class HistoricalImporter:
         if not (main_press_e and irr_press_e and irr_flow_e):
             return 0
 
-        # dev46 (46a): the candidate read happens BEFORE the HA history
-        # fetches below — its own hop.
+        # The candidate read happens BEFORE the HA history fetches below —
+        # its own hop.
         rows = await run_db(self._xtalk_candidates_sync, main_cfg.circuit,
                             start.isoformat(), end.isoformat())
         if not rows:
@@ -719,9 +719,9 @@ class HistoricalImporter:
                 day = local_day_of(ev["start_ts"])
                 if day:
                     affected_days.add(day)
-        # One daily-summary recompute per affected DAY, not per event (the
-        # 2026-08-13 backfill flagged 185 events over 12 days — 185 full-table
-        # scans where 12 would do). dev46 (46a): one hop for the whole set.
+        # One daily-summary recompute per affected DAY, not per event: a
+        # backfill flagged 185 events over 12 days, i.e. 185 full-table scans
+        # where 12 would do. One hop for the whole set.
         if affected_days:
             await run_db(self._recompute_days_sync, main_cfg.circuit,
                          sorted(affected_days))
@@ -840,7 +840,7 @@ class HistoricalImporter:
         log.debug("[%s] found %d candidate period(s) in history window",
                   cfg.circuit, len(periods))
 
-        # dev56 — a period that contains rows already stored is not new water.
+        # A period that contains rows already stored is not new water.
         # Drop it when they account for it, split it around them when they do
         # not; the per-period gate below then sees only genuinely new spans.
         periods = await self._apply_containment_rule(
@@ -931,7 +931,7 @@ class HistoricalImporter:
         return imported, retry_from
 
     # ------------------------------------------------------------------ #
-    # dev56 — containment rule                                            #
+    # Containment rule                                                    #
     # ------------------------------------------------------------------ #
 
     async def _apply_containment_rule(

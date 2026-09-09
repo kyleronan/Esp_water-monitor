@@ -230,7 +230,7 @@ class TrainingManager:
         return deleted
 
     def _profile_and_kind_sync(self, circuit: str, default_kind: str) -> dict:
-        """dev46 (46a) — home profile + circuit kind, one hop."""
+        """Home profile + circuit kind, one hop."""
         return {"profile": get_home_profile(self._db),
                 "kind": get_circuit_type(self._db, circuit,
                                          default=default_kind)}
@@ -582,8 +582,8 @@ class TrainingManager:
         half-torn with nothing recording it. Returns the number of assignments
         cleared.
         """
-        self._set_reseed_marker(circuit, True)      # F-C2, at clear
-        eng.begin_reseed(circuit)                   # F-C1 defer
+        self._set_reseed_marker(circuit, True)      # marker set at clear
+        eng.begin_reseed(circuit)                   # defer live matches
         # Persist the feature mode FIRST so a crash mid-seed restarts
         # into the same space and the re-run is a clean redo.
         eng.set_pressure_blind(circuit, True)
@@ -723,7 +723,7 @@ class TrainingManager:
         return await self.start_calibration(circuit, days)
 
     def _clear_for_recalibration_sync(self, circuit: str) -> None:
-        """dev46 (46a) — drop this circuit's learned state, on the DB thread."""
+        """Drop this circuit's learned state, on the DB thread."""
         for table, col in [
             ("events",           "circuit"),
             ("hourly_volume",    "circuit"),
@@ -740,7 +740,7 @@ class TrainingManager:
         self._db.commit()
 
     def _away_mode_row_sync(self):
-        """dev46 (46a) — the away-mode flag read."""
+        """The away-mode flag read."""
         return self._db.execute(
             "SELECT away_mode FROM home_profile WHERE id = 1").fetchone()
 

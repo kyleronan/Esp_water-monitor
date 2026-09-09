@@ -1,5 +1,5 @@
 """
-Orchestrator — ties together all Phase 1 components:
+Orchestrator — ties the components together:
   - HaClient (WebSocket + REST)
   - EventDetector (pressure transient + flow onset detection)
   - FeatureExtractor (event → SQLite)
@@ -42,13 +42,11 @@ log = logging.getLogger(__name__)
 
 
 async def _timed_startup_job(name: str, awaitable):
-    """dev46 (46a/C2a) — time one startup job and log how long it held.
+    """Time one startup job and log how long it held the DB worker.
 
-    C2a chunked the two jobs known to be expensive (reclassify, cluster
-    backfill). The rest were left whole on a JUDGEMENT that they are cheap,
-    which is exactly the kind of claim that should be a number instead. Each
-    boot now prints its own evidence, so the tripwires recorded in the plan
-    can be checked against a real boot log rather than re-argued.
+    Only reclassify and the cluster backfill are chunked; the rest are whole on
+    the assumption they are cheap. Each boot prints its own evidence so that
+    assumption can be checked against a real boot log.
 
     Failure is not swallowed — the timing line is emitted either way and the
     exception propagates to the caller's existing handler.
@@ -101,28 +99,23 @@ class Orchestrator:
 
     def __init__(self, cfg: AddonConfig):
         self._cfg = cfg
-        # dev46 (46c) — MUST start False, and the reason is the whole gate.
-        # Readers ask `getattr(orch, "startup_cluster_work_done", True)`: that
-        # default protects a caller holding some other object, but if this
-        # attribute only ever came into existence at the END of the boot pass
-        # (which is how it shipped in dev44), then during boot — the one window
-        # the flag exists for — it is ABSENT and every reader defaults to
-        # "startup is done". The gate then waves the request through and the
-        # page queues behind a ~2 min boot pass instead of rendering the notice.
-        # Observed 2026-08-17 19:14: History hung on a spinner while
-        # reclassify[circuit_1] held the DB worker.
+        # MUST start False. Readers ask
+        # `getattr(orch, "startup_cluster_work_done", True)`; that default
+        # protects a caller holding some other object, but if the attribute only
+        # came into existence at the END of the boot pass then during boot — the
+        # one window the flag exists for — it is ABSENT and every reader defaults
+        # to "startup is done". The gate waves the request through and the page
+        # queues behind a ~2 min boot pass instead of rendering the notice.
         self.startup_cluster_work_done = False
-        # dev46 (46k) — SEPARATE from the flag above, and the split is the
-        # whole of option B. `startup_cluster_work_done` keeps its exact dev44
-        # meaning: every startup job that mutates cluster references has
-        # finished. The repair route and the study export depend on that
-        # meaning and are untouched.
+        # SEPARATE from the flag above. `startup_cluster_work_done` means every
+        # startup job that mutates cluster references has finished; the repair
+        # route and the study export depend on exactly that.
         #
-        # This flag answers the different, earlier question the PAGES actually
-        # ask — "can you render me?" — which becomes true as soon as the
-        # cluster replay is wired, ~22 s in. The ~145 s reclassify that follows
-        # runs in the background: it is chunked (C2a), so a page render
-        # interleaves at the next ~1 s seam instead of waiting out the pass.
+        # This flag answers the different, earlier question the PAGES ask —
+        # "can you render me?" — which becomes true as soon as the cluster
+        # replay is wired, ~22 s in. The ~145 s reclassify that follows runs in
+        # the background, chunked, so a page render interleaves at the next
+        # ~1 s seam instead of waiting out the pass.
         self.startup_pages_ready = False
         # Strong ref for the background classification task — without it the
         # only reference is create_task's return value and Python may GC the
@@ -168,13 +161,13 @@ class Orchestrator:
         # in-memory first-sight guard so seen_users is logged once per user/process.
         self.admin_ids: set = set()
         self.operator_ids: set = set()
-        # dev57 (2.18) — last-known-good wizard-completion flag, same shape as
-        # admin_ids above. `setup_complete` used to be a live SQLite SELECT on
-        # every read, and ingress_middleware reads it on EVERY non-setup,
-        # non-static, non-health request from the event-loop thread — the
-        # single highest-frequency touch of the shared connection off the DB
-        # worker. Primed on the DB worker at boot (_boot_db_preamble_sync) and
-        # after each write; served from memory thereafter.
+        # Last-known-good wizard-completion flag, same shape as admin_ids above.
+        # ingress_middleware reads `setup_complete` on EVERY non-setup,
+        # non-static, non-health request from the event-loop thread — as a live
+        # SQLite SELECT that is the single highest-frequency touch of the shared
+        # connection off the DB worker. Primed on the DB worker at boot
+        # (_boot_db_preamble_sync) and after each write; served from memory
+        # thereafter.
         #
         # None means UNKNOWN and is NEVER guessed at. A flag that goes stale
         # towards True is far worse than the query it replaces: on a fresh
@@ -233,11 +226,10 @@ class Orchestrator:
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
 
-        # dev46 (46a): every DB touch in this method — the away-since read,
-        # the per-circuit calibration extension, and the profile write — goes
-        # over the wall in ONE hop. They all precede the single HA await at
-        # the end, so there is nothing to split: one callable, one
-        # transaction (rule N2a).
+        # Every DB touch in this method — the away-since read, the per-circuit
+        # calibration extension and the profile write — goes over the wall in
+        # ONE hop. They all precede the single HA await at the end: one
+        # callable, one transaction.
         from .database import run_db
         await run_db(self._set_away_mode_sync, enabled, now, now_iso)
 
@@ -338,9 +330,9 @@ class Orchestrator:
     def setup_complete(self) -> bool:
         """True once the setup wizard has been completed.
 
-        dev57 (2.18): served from memory. This is read by ingress_middleware on
-        every non-setup request — a per-request SQLite SELECT on the shared
-        connection, from the event-loop thread. The cache is primed on the DB
+        Served from memory: ingress_middleware reads this on every non-setup
+        request, which as a live SELECT is a per-request touch of the shared
+        connection from the event-loop thread. The cache is primed on the DB
         worker at boot and re-primed after each write, and is only ever filled
         from a real read: a cached value whose epoch predates the last write to
         device_config.setup_complete counts as unknown, and unknown with no
@@ -394,15 +386,14 @@ class Orchestrator:
         from .database import run_db
         return await run_db(self._setup_complete_sync)
 
-    # ── dev57 (2.10) — loop-safe wrappers for the three sync reloaders ──────
+    # ── Loop-safe wrappers for the three sync reloaders ──────
     # reload_circuit_entities / _labels / _profiles each read the shared
     # connection directly. That is correct when they are already ON the DB
     # worker (_reload_config_and_roles_sync, and the `run_db(...)` call in
     # start()), and a single-connection violation when a request handler calls
-    # them from the event loop — the same class of bug as dev46 (46a), which
-    # produced `sqlite3.InterfaceError: bad parameter or other API misuse` and
-    # 500'd the History page. The sync forms are KEPT (the DB-thread callers
-    # need them); loop-side callers use these.
+    # them from the event loop — which produces `sqlite3.InterfaceError: bad
+    # parameter or other API misuse` and 500s the History page. The sync forms
+    # are KEPT for the DB-thread callers; loop-side callers use these.
 
     async def reload_circuit_entities_async(self) -> None:
         """``reload_circuit_entities`` on the DB worker. Call this from the loop."""
@@ -483,9 +474,9 @@ class Orchestrator:
         which every caller submits through run_db (same contract as the
         sensitivity / pump-gate / low-pressure getters above).
 
-        Exists so the Phase 3 device-truth roles (end stops, valve-seal
-        alerts, waveform stage counters) can be subscribed without adding six
-        more fields to CircuitConfig for entities nothing else consumes.
+        Exists so the device-truth roles (end stops, valve-seal alerts,
+        waveform stage counters) can be subscribed without adding six more
+        fields to CircuitConfig for entities nothing else consumes.
         """
         if not self._db:
             return {}
@@ -622,17 +613,16 @@ class Orchestrator:
         for cfg in self._cfg.circuits:
             entity = getattr(cfg, "flow_meter_ppl_entity", "")
             if not entity:
-                # No firmware PPL entity bound for this circuit. We then run on
-                # circuit_profile.pulses_per_litre, whose column DEFAULT is also
-                # 396.0 — so on a fresh install with an unbound entity the add-on
-                # silently assumes a reference turbine. Nothing else ever corrects
-                # it: this subscription is the ONLY write path for PPL, so the
-                # error is permanent and every derived volume, the low-flow floor
+                # No firmware PPL entity bound for this circuit, so the add-on
+                # runs on circuit_profile.pulses_per_litre, whose column DEFAULT
+                # is also 396.0 — on a fresh install with an unbound entity it
+                # silently assumes a reference turbine. Nothing corrects it: this
+                # subscription is the ONLY write path for PPL, so the error is
+                # permanent, and every derived volume, the low-flow floor
                 # (60 / ppl) and every threshold scaled from them are wrong
-                # together — which is exactly why it looks plausible. Logged at
-                # ERROR, and — since 0.9's follow-up — also marked as a degraded
-                # subsystem below, so it surfaces on /health/detail rather than
-                # living only in a log nobody reads.
+                # TOGETHER, which is why it looks plausible. Logged at ERROR and
+                # marked as a degraded subsystem below so it surfaces on
+                # /health/detail.
                 from .database import DEFAULT_PULSES_PER_LITRE
                 log.error(
                     "[%s] flow-meter PPL entity is NOT bound — using %.1f "
@@ -659,13 +649,12 @@ class Orchestrator:
             # name, so a call per circuit would let the second silently
             # overwrite the first and report half the problem.
             #
-            # Unit 0.9 closed the SETUP path — no new install can reach this
-            # state, since an unmatched PPL now blocks the wizard. This is for
-            # the installs configured BEFORE that landed, which boot straight
-            # past it. Marking degraded is deliberately NOT a refusal to run:
-            # an add-on that stops measuring is worse than one measuring at a
-            # scale the operator can now see and correct, and the cached value
-            # may well be right. What changes is that it stops being invisible.
+            # No new install can reach this state — an unmatched PPL blocks the
+            # wizard — so this is for installs configured before that gate
+            # existed. Marking degraded is deliberately NOT a refusal to run: an
+            # add-on that stops measuring is worse than one measuring at a scale
+            # the operator can now see and correct, and the cached value may
+            # well be right.
             self.mark_subsystem_degraded(
                 "flow_meter_ppl",
                 UnboundFlowMeterPPL(
@@ -779,12 +768,11 @@ class Orchestrator:
 
     def stop(self) -> None:
         self._stop.set()
-        # dev46 (46k) — the background classification pass outlives boot, so
-        # shutdown has to cancel it explicitly or the process waits out a
-        # ~145 s pass nobody is going to read the results of. Cancelling
-        # between chunks is safe by construction: chunk = transaction, each
-        # one committed before the next is submitted, so the work already done
-        # is durable and the rest is simply re-derived on the next boot.
+        # The background classification pass outlives boot, so shutdown must
+        # cancel it explicitly or the process waits out a ~145 s pass nobody
+        # will read. Cancelling between chunks is safe by construction: chunk =
+        # transaction, each committed before the next is submitted, so the work
+        # already done is durable and the rest is re-derived on the next boot.
         if self._startup_classify_task is not None:
             self._startup_classify_task.cancel()
         if self._feature_extractor:
@@ -809,14 +797,14 @@ class Orchestrator:
             self._ha.stop()
 
     def _setup_complete_sync(self) -> bool:
-        """dev46 (46a) — ``setup_complete`` is a PROPERTY that queries the DB
-        on every access, so reading it from the loop is a connection touch
-        like any other. This wrapper gives run_db something to call.
+        """``setup_complete`` is a PROPERTY that queries the DB on every
+        access, so reading it from the loop is a connection touch like any
+        other; this wrapper gives run_db something to call.
 
-        dev57 (2.18) — and this is now the ONLY place the read is supposed to
-        happen: it primes the in-memory cache the property serves, so it does
-        the real read unconditionally rather than deferring to the property
-        (which would return the cached value and never refresh it).
+        It is the ONLY place the read is supposed to happen: it primes the
+        in-memory cache the property serves, so it does the real read
+        unconditionally rather than deferring to the property, which would
+        return the cached value and never refresh it.
         """
         if not self._db:
             return False
@@ -843,11 +831,11 @@ class Orchestrator:
         (rule N2a); each sub-step keeps its own best-effort try/except so a
         failure in one does not skip the others.
         """
-        # dev57 (2.18) — prime the wizard-completion cache FIRST. This is the
-        # first DB-worker hop after the connection is opened, and uvicorn is
-        # already serving by the time it runs (run() is a task; main.py yields
-        # straight after creating it), so every microsecond before this is a
-        # window in which ingress_middleware would read the flag off the loop.
+        # Prime the wizard-completion cache FIRST. This is the first DB-worker
+        # hop after the connection is opened, and uvicorn is already serving by
+        # the time it runs (run() is a task; main.py yields straight after
+        # creating it), so every microsecond before this is a window in which
+        # ingress_middleware would read the flag off the loop.
         try:
             self._prime_setup_complete()
         except Exception as _e:                 # unknown, so it re-reads later
@@ -858,14 +846,12 @@ class Orchestrator:
             ensure_circuit_defaults(
                 self._db, circuit_cfg.circuit, circuit_cfg.circuit_type)
 
-        # Sprint A — boot-time orphan-reference integrity check.
-        # Migration 20260528 already ran the repair once. This pass is
-        # READ-ONLY (repair=False) — it only logs when something has
-        # drifted since (e.g. user restored an older backup, or future
-        # bugs introduce new orphans). The fix-at-boot button is left
-        # off intentionally so a surprising DB state stays observable
-        # rather than getting silently mutated; the Fixtures-page banner
-        # is the user-facing fix path.
+        # Boot-time orphan-reference integrity check. Migration 20260528 ran
+        # the repair once; this pass is READ-ONLY (repair=False) and only logs
+        # when something has drifted since (a restored older backup, a new bug).
+        # Repair-at-boot is intentionally off so a surprising DB state stays
+        # observable rather than silently mutated; the Fixtures-page banner is
+        # the user-facing fix path.
         try:
             from .database import find_orphaned_cluster_references
             _orphans = find_orphaned_cluster_references(self._db, repair=False)
@@ -900,27 +886,24 @@ class Orchestrator:
 
 
     async def _run_startup_classification(self) -> None:
-        """The ~145 s label-derivation pass, off the critical path (46k).
+        """The ~145 s label-derivation pass, off the critical path.
 
-        WHY THIS IS SAFE TO RUN CONCURRENTLY WITH LIVE TRAFFIC — the analysis
-        is the plan's N1 interleave-tolerance table, and every job here was
-        already classified there:
+        Safe to run concurrently with live traffic because every job here
+        tolerates interleaving:
 
-        * ``reclassify`` — (c), needs a write-time guard, and HAS one: the
+        * ``reclassify`` — needs a write-time guard and HAS one: the
           ``user_fixture_type IS NULL`` re-check inside
-          ``set_event_matched_fixture_type``. That guard was called
-          load-bearing because the PATCH API is not startup-gated; backgrounding
-          the pass widens exactly the window it was written for, so it is now
-          load-bearing twice over. Do not remove it.
-        * ``backfill_unmatched_async`` — (a) tolerant: touches only
-          ``cluster_id IS NULL`` rows, so a live event clustered concurrently
-          simply falls out of scope.
+          ``set_event_matched_fixture_type``. The PATCH API is not
+          startup-gated and backgrounding this pass widens exactly the window
+          that guard was written for. Do not remove it.
+        * ``backfill_unmatched_async`` — touches only ``cluster_id IS NULL``
+          rows, so a live event clustered concurrently falls out of scope.
         * ``resuggest_all_clusters`` / ``recompute_all_user_label_suggestions``
-          — (a) tolerant, eventually consistent: a mid-pass label edit yields a
-          stale suggestion until the next recompute, exactly as today.
+          — eventually consistent: a mid-pass label edit yields a stale
+          suggestion until the next recompute.
 
-        The pass is chunked (C2a), so it releases the single DB worker every
-        ~1 s and a queued page render never waits longer than one chunk.
+        The pass is chunked, so it releases the single DB worker every ~1 s and
+        a queued page render never waits longer than one chunk.
         """
         from .database import (reclassify_all_events_from_signatures_async,
                                recompute_cycle_pulse_counts,
@@ -931,17 +914,13 @@ class Orchestrator:
         from .maturity_recheck import _SETTLE_HORIZON_HOURS
         try:
             for c in self._cfg.circuits:
-                # dev46 (46k) — CATCH-UP, and the only reason boot re-derives
-                # anything by default any more.
-                #
-                # The hourly maturity re-check re-evaluates the last few hours,
-                # because an event's cycle context lands after it closes. If
-                # the add-on was off — power cut, redeploy, crash — those hours
-                # got no re-check, and the stamp cannot tell: those events were
-                # stamped when first classified, so they look settled. So boot
-                # re-opens the same window. A handful of events, and it means a
-                # restart can never strand an event on a verdict taken before
-                # its cycle context arrived.
+                # CATCH-UP — the only reason boot re-derives anything by
+                # default. The hourly maturity re-check re-evaluates the last
+                # few hours because an event's cycle context lands after it
+                # closes. If the add-on was off those hours got no re-check, and
+                # the stamp cannot tell: those events were stamped when first
+                # classified, so they look settled. Boot re-opens the same
+                # window — a handful of events.
                 #
                 # Events missed entirely come back as NEW rows from the
                 # historical importer, already unstamped, so they need nothing.
@@ -956,13 +935,12 @@ class Orchestrator:
                 cyc = await _timed_startup_job(
                     f"recompute_cycle_pulse_counts[{c.circuit}]",
                     run_db(recompute_cycle_pulse_counts, self._db, c.circuit))
-                # dev46 (46k) — boot takes a SLICE, never the whole backlog.
-                # A new build legitimately invalidates every stamp, but nobody
-                # is waiting for that work: it needs doing eventually, not at
-                # the one moment the operator wants to look at the add-on.
-                # Deliberately-released rows (settle window, new events, a
-                # label's cluster peers) sort first inside the budget, so the
-                # things someone IS waiting on still land immediately.
+                # Boot takes a SLICE, never the whole backlog. A new build
+                # legitimately invalidates every stamp, but that work needs
+                # doing eventually, not at the moment the operator wants to look
+                # at the add-on. Deliberately-released rows (settle window, new
+                # events, a label's cluster peers) sort first inside the budget,
+                # so the things someone IS waiting on land immediately.
                 from .database import _VERDICT_BACKLOG_PER_PASS
                 r = await _timed_startup_job(
                     f"reclassify[{c.circuit}]",
@@ -974,12 +952,12 @@ class Orchestrator:
                         "[%s] startup reclassify: %d matched, %d abstained, "
                         "%d stale cleared", c.circuit, r["events_matched"],
                         r["events_abstained"], r["events_cleared"])
-                # dev.37 — backfill cluster_id over events the reprocess just
-                # un-excluded (capped-rescued) and any accumulated NULL backlog. The
-                # ~line-440 backfill ran BEFORE reprocess, so those events never got a
-                # cluster and user labels on them had nothing to propagate into. This
-                # pass assigns them. Idempotent: backfill_unmatched only touches
-                # cluster_id IS NULL rows, so it skips everything already clustered.
+                # Backfill cluster_id over events the reprocess just un-excluded
+                # (capped-rescued) and any accumulated NULL backlog. The earlier
+                # backfill runs BEFORE reprocess, so those events have no cluster
+                # and user labels on them have nothing to propagate into.
+                # Idempotent: backfill_unmatched only touches cluster_id IS NULL
+                # rows, so it skips everything already clustered.
                 if self._cluster_engine is not None:
                     bf = await self._cluster_engine.backfill_unmatched_async(
                         c.circuit)
@@ -1003,15 +981,11 @@ class Orchestrator:
                              ul["suggested"] + ul["abstained"], ul["cleared"])
         except Exception as e:
             log.warning("startup reclassify/reprocess failed (non-fatal): %s", e)
-            # dev57 (2.33) — the OTHER half of the same bullet. The audit
-            # pointed at the boot-time handler (which only fires when this
-            # pass never got scheduled at all); this one is the likelier
-            # path, and it was worse: the failure was swallowed, the gate
-            # flag below was set anyway, and the very next line logged
-            # "background classification complete". Gate semantics are
-            # unchanged — the flag is a one-way latch nothing else sets, so
-            # withholding it would wedge the repair route and the study
-            # export shut for the process's life. Make it VISIBLE instead.
+            # Do not swallow this: the gate flag below is set regardless and
+            # the next line logs "background classification complete". The flag
+            # is a one-way latch nothing else sets, so withholding it would
+            # wedge the repair route and the study export shut for the
+            # process's life — make the failure VISIBLE instead.
             self.mark_subsystem_degraded(
                 "startup_reclassify", e,
                 detail="the background classification pass did not finish; "
@@ -1021,19 +995,15 @@ class Orchestrator:
         else:
             _pass_failed = False
 
-        # dev44 — the startup cluster work (rebuild → reclassify → backfill)
-        # runs against a snapshot of the DB taken at boot. Any repair that
-        # mutates cluster references while it's in flight gets silently
-        # overwritten when the stale replay finishes (observed: the stale-link
-        # repair clicked 15 s after a restart lost the race and the orphans
-        # returned). Routes that rebuild engine state gate on this flag.
-        #
-        # dev46 (46k) — the flag KEEPS that meaning exactly; it just lands here
-        # now, at the end of the background pass, instead of at the end of a
-        # blocking one. That is what lets the repair route and the study export
-        # stay correct with no change: they still refuse until the last job
-        # that touches cluster references has finished. Pages use the earlier
-        # `startup_pages_ready` instead — a different question, honestly asked.
+        # The startup cluster work (rebuild → reclassify → backfill) runs
+        # against a snapshot of the DB taken at boot. Any repair that mutates
+        # cluster references while it is in flight is silently overwritten when
+        # the stale replay finishes (a stale-link repair clicked 15 s after a
+        # restart lost the race and the orphans returned). Routes that rebuild
+        # engine state gate on this flag, which lands at the END of the
+        # background pass so they refuse until the last job touching cluster
+        # references has finished. Pages use the earlier `startup_pages_ready`
+        # instead — a different question.
         self.startup_cluster_work_done = True
         if _pass_failed:
             log.warning("startup: background classification finished DEGRADED "
@@ -1053,12 +1023,12 @@ class Orchestrator:
         # Database
         self._db = init_db(DB_PATH)
 
-        # dev46 (46a): the whole pre-HA boot block — per-circuit defaults, the
-        # orphan-reference integrity check, and the incomplete-reseed warning —
-        # is one contiguous run of DB work with no awaits in it, so it goes
-        # over the wall in ONE hop. NOTE this is NOT startup-before-loop:
-        # main.py creates run() as a task and immediately yields to uvicorn, so
-        # request handlers are already submitting to run_db while this executes.
+        # The whole pre-HA boot block — per-circuit defaults, the
+        # orphan-reference integrity check and the incomplete-reseed warning —
+        # is one contiguous run of DB work with no awaits, so it goes over the
+        # wall in ONE hop. This is NOT startup-before-loop: main.py creates
+        # run() as a task and immediately yields to uvicorn, so request handlers
+        # are already submitting to run_db while this executes.
         from .database import run_db
         await run_db(self._boot_db_preamble_sync)
 
@@ -1066,11 +1036,9 @@ class Orchestrator:
         self._ha = HaClient()
         await self._ha.__aenter__()
 
-        # dev46 (46a): the three config reloads and the RBAC role load are all
-        # DB reads with no awaits between them — one hop. Each of these
-        # reaches the connection through a closed-over helper rather than a
-        # conn argument, which is exactly the class the attribute-only audit
-        # could not see.
+        # The three config reloads and the RBAC role load are all DB reads with
+        # no awaits between them — one hop. Each reaches the connection through
+        # a closed-over helper rather than a conn argument.
         await run_db(self._reload_config_and_roles_sync)
         # Kick off the FIRST HA admin-set fetch NOW (right after the HA client is
         # up), before the heavy startup work below, so admins are recognised before
@@ -1229,14 +1197,13 @@ class Orchestrator:
             log.info("ClusterEngine initialised and wired to feature extractor")
         except Exception as e:
             log.error("ClusterEngine init failed (non-fatal): %s", e, exc_info=True)
-            # dev57 (2.33): "non-fatal" was doing a lot of work here. The
-            # engine stays None for the whole process, so the feature
-            # extractor's cluster_engine is never wired and EVERY subsequent
-            # event is stored with no cluster_id — silently, with the add-on
-            # reporting itself healthy. Record it so /health/detail says
-            # "warn" and names the subsystem. Deliberately NOT fatal: event
-            # detection, leak tests and auto-shutoff all work without
-            # clustering, and refusing to boot over it would be worse.
+            # "Non-fatal" is doing a lot of work here: the engine stays None
+            # for the whole process, so the feature extractor's cluster_engine
+            # is never wired and EVERY subsequent event is stored with no
+            # cluster_id, silently, with the add-on reporting itself healthy.
+            # Record it so /health/detail says "warn" and names the subsystem.
+            # Deliberately NOT fatal: event detection, leak tests and
+            # auto-shutoff all work without clustering.
             self._cluster_engine = None
             self.mark_subsystem_degraded(
                 "cluster_engine", e,
@@ -1248,21 +1215,18 @@ class Orchestrator:
         # Both passes are idempotent and best-effort — a failure must not block
         # boot. The 20260535 migration only adds the dribble column (lightweight
         # DDL); the verdict + typing backfill lands here.
-        # dev46 (46a/C2a) — these passes run on the single DB worker via
-        # run_db, and the expensive one is submitted CHUNK-WISE.
         #
-        # With one DB worker, a monolithic submission makes every queued page
-        # render wait for the whole pass — the ~2-minute startup reclassify
-        # would turn the old crash into a hang. reclassify_..._async slices the
-        # row loop into batches (chunk = transaction = one run_db call), so the
-        # queue gets a seam every ~200 rows and small pages stay responsive
-        # through boot. The whole-circuit cycle detectors still run once, in
-        # the pass's prepare step — they were never the obstacle to batching.
+        # These passes run on the single DB worker via run_db, and the expensive
+        # one is submitted CHUNK-WISE: a monolithic submission makes every
+        # queued page render wait for the whole ~2-minute pass.
+        # reclassify_..._async slices the row loop into batches (chunk =
+        # transaction = one run_db call) so the queue gets a seam every ~200
+        # rows. The whole-circuit cycle detectors still run once, in the pass's
+        # prepare step.
         #
-        # dev46 (46k) — chunking made the pass INTERRUPTIBLE; backgrounding it
-        # (below) is what makes the app usable during it. The two go together:
-        # a backgrounded monolith would still hold the worker for ~145 s, so a
-        # page would wait just as long with no gate to explain why.
+        # Chunking makes the pass INTERRUPTIBLE; backgrounding it (below) is
+        # what makes the app usable during it. Both are needed — a backgrounded
+        # monolith still holds the worker for ~145 s.
         try:
             from .database import run_db
             from .feature_extractor import reprocess_event_exclusion_verdicts
@@ -1279,17 +1243,15 @@ class Orchestrator:
             await _timed_startup_job(
                 "backfill_silent_exclusion_reasons",
                 run_db(backfill_silent_exclusion_reasons, self._db))
-            # dev46 (46k) — PAGES OPEN HERE, not after the reclassify.
-            # Everything the pages need is now in place: the cluster engine is
-            # rebuilt and wired, and the exclusion verdicts are current. What
-            # remains (~145 s of it) re-derives fixture LABELS, which a page
-            # can render around — it shows the stored verdict, and the pass
-            # updates it underneath if it changed.
+            # PAGES OPEN HERE, not after the reclassify. Everything the pages
+            # need is in place: the cluster engine is rebuilt and wired, and the
+            # exclusion verdicts are current. The remaining ~145 s re-derives
+            # fixture LABELS, which a page can render around — it shows the
+            # stored verdict and the pass updates it underneath.
             #
-            # Measured 2026-08-17: boot reached this point in ~22 s and then
-            # spent a further ~148 s in reclassify, during which the operator
-            # got a spinner and could do nothing. On a repeat boot that entire
-            # 145 s changed ZERO verdicts (see events_changed, database.py).
+            # Measured: boot reaches this point in ~22 s and then spends a
+            # further ~148 s in reclassify. On a repeat boot that entire 145 s
+            # changed ZERO verdicts (see events_changed).
             self.startup_pages_ready = True
             log.info("startup: pages are ready after %.1fs — classification "
                      "continues in the background", _time.monotonic() - _run_t0)
@@ -1302,18 +1264,15 @@ class Orchestrator:
             # ever set the cluster-work flag — release the repair/export gates
             # rather than wedging them shut for the process's lifetime.
             #
-            # dev57 (2.33) — the flags STAY True, deliberately. Both are
-            # one-way latches that only this block and the background pass
-            # ever set; flipping them False here would leave the repair route,
-            # the study export and every page gate blocked until the operator
-            # restarts, with no path back. That trades a silent wrong answer
-            # for a silent dead UI, which is not an improvement.
+            # The flags STAY True, deliberately. Both are one-way latches that
+            # only this block and the background pass ever set; flipping them
+            # False here would leave the repair route, the study export and
+            # every page gate blocked until the operator restarts, with no path
+            # back — trading a silent wrong answer for a silent dead UI.
             #
-            # What was actually missing is that the failure left NO trace on
-            # any surface: readiness read "ready", /health/detail read "pass",
-            # and the precondition had not run. So keep the gates open and
-            # make the degradation visible instead — /health/detail now
-            # reports "warn" and names this subsystem plus the error.
+            # Keep the gates open and make the degradation visible instead:
+            # /health/detail reports "warn" and names this subsystem plus the
+            # error.
             self.startup_pages_ready = True
             self.startup_cluster_work_done = True
             self.mark_subsystem_degraded(
@@ -1364,11 +1323,11 @@ class Orchestrator:
         self._wf_repair_backfill = WfRepairBackfill(
             self._db, self._cluster_engine)
 
-        # Nightly pump-regime detector (dev23, pump plan Phase 3) — analyzes
-        # the quiet-hour pressure/flow window with the study-validated math
-        # and maintains the banner+confirm home flag. Detection only; no
-        # detector behavior changes until the user confirms (Phase 4 gates on
-        # pump_mode_effective, which ignores unconfirmed detection).
+        # Nightly pump-regime detector — analyzes the quiet-hour
+        # pressure/flow window and maintains the banner+confirm home flag.
+        # Detection only; no detector behaviour changes until the user
+        # confirms (the gates read pump_mode_effective, which ignores
+        # unconfirmed detection).
         from .pump_regime_detector import PumpRegimeDetector
         self._pump_regime = PumpRegimeDetector(self._db, self._cfg, self._ha,
                                                ha_tz=self._ha_tz,
@@ -1417,8 +1376,8 @@ class Orchestrator:
 
     def mark_subsystem_degraded(self, name: str, exc: BaseException,
                                 *, detail: str = "") -> None:
-        """dev57 (2.33) — record a startup subsystem that failed, so it is
-        VISIBLE rather than merely logged as "non-fatal".
+        """Record a startup subsystem that failed, so it is VISIBLE rather
+        than merely logged as "non-fatal".
 
         Writes the same record shape ``_supervise`` writes, into the same
         ``worker_health`` dict, so ``GET /health/detail`` picks it up with no
@@ -1535,19 +1494,11 @@ class Orchestrator:
     def _circuit_display_name(self, circuit: str) -> str:
         """Human-facing name for ``circuit`` — its configured label.
 
-        Both pressure-alert callbacks below used to ask
-        ``hasattr(self, "get_display_name")`` and fall back to the raw circuit
-        id. No such method has ever existed — not on this class, not on a
-        mixin, nowhere in the repo — so the hasattr was unconditionally False
-        and every low-pressure / pump-fail alert went out naming "circuit_1"
-        where a person expected "Main House".
-
-        ``CircuitConfig.label`` is what the rest of this file already uses for
-        exactly this (see the live-state ``display_name`` further down), and it
-        resolves off config already held in memory. That matters here: these
-        callbacks run ON THE EVENT LOOP, so reading the labels back out of the
-        database instead would add a fresh instance of the single-connection
-        violation dev46 exists to remove.
+        ``CircuitConfig.label`` is what the rest of this file uses for exactly
+        this (see the live-state ``display_name`` further down), and it resolves
+        off config already held in memory. That matters: the pressure-alert
+        callbacks below run ON THE EVENT LOOP, so reading the labels back out of
+        the database would be a single-connection violation.
         """
         cfg = self._cfg.get_circuit(circuit) if self._cfg else None
         return cfg.label if cfg else circuit
@@ -1557,13 +1508,11 @@ class Orchestrator:
         if self._alert_manager is None:
             return
         name = self._circuit_display_name(circuit)
-        # dev46 (46a): the WS handler invokes this callback ON THE EVENT
-        # LOOP, so the pump-mode read cannot happen here. It moves into the
-        # task that was already being spawned — no behaviour change, the
-        # alert was always fired asynchronously.
-        # dev57 (2.24): via task_registry.spawn — a bare ensure_future() here
-        # left the alert task with no strong reference, so the GC could drop
-        # a low-pressure alert mid-flight.
+        # The WS handler invokes this callback ON THE EVENT LOOP, so the
+        # pump-mode read cannot happen here; it moves into the spawned task.
+        # Spawned via task_registry.spawn — a bare ensure_future() leaves the
+        # alert task with no strong reference, so the GC can drop a low-pressure
+        # alert mid-flight.
         spawn(self._low_pressure_alert_async(circuit, psi, name),
               name=f"low_pressure_alert[{circuit}]")
 
@@ -1677,15 +1626,13 @@ class Orchestrator:
         Uses INSERT … ON CONFLICT DO UPDATE so the detection also works on a
         fresh install where home_profile row may not exist yet.
         """
-        # dev46 (46a) — TWO-HOP handler: read, await HA, write.
-        # HOP-2 RE-CHECK (named): _write_display_units_sync re-asserts
-        # "both units still at schema defaults" INSIDE the write callable.
-        # Without it, a user who picks gal/min on the Settings page while
-        # get_ha_unit_system() is in flight would have their choice silently
-        # overwritten by HA's default — the exact stale-premises class R1
-        # exists to prevent. This is NOT exemption-class material: the write
-        # is a value-set, not monotonic, so an interleaved write absolutely
-        # can change the right outcome.
+        # TWO-HOP handler: read, await HA, write. HOP-2 RE-CHECK:
+        # _write_display_units_sync re-asserts "both units still at schema
+        # defaults" INSIDE the write callable. Without it, a user who picks
+        # gal/min on the Settings page while get_ha_unit_system() is in flight
+        # has their choice silently overwritten by HA's default. Not
+        # exemption-class: the write is a value-set, not monotonic, so an
+        # interleaved write can change the right outcome.
         from .database import run_db
         from .units import defaults_from_ha, invalidate_unit_cache
         if not await run_db(self._display_units_are_default_sync):
@@ -1778,17 +1725,16 @@ class Orchestrator:
         return res
 
     async def _run_recorder_reconcile(self) -> None:
-        """dev46 (46v) — daily volume reconciliation against the firmware total.
+        """Daily volume reconciliation against the firmware total.
 
         Runs a few minutes after the local day rolls over, so "yesterday" is
-        complete (dev36 boundary). Annotate-only: it reports drift and never
-        rewrites a volume — correcting history from this would violate
-        annotate-don't-modify AND destroy the evidence the next run needs.
+        complete. Annotate-only: it reports drift and never rewrites a volume —
+        correcting history from here would violate annotate-don't-modify AND
+        destroy the evidence the next run needs.
 
-        This is the only check in the add-on that compares stored data against
-        something the add-on did not produce. Everything else compares our
-        numbers with our other numbers, which cannot notice the detector going
-        quiet — the July live-miss class, or dev46's own boot regression.
+        The only check in the add-on that compares stored data against something
+        the add-on did not produce. Everything else compares our numbers with
+        our other numbers, which cannot notice the detector going quiet.
         """
         import asyncio
         from .volume_drift import check_yesterdays_drift
@@ -1827,11 +1773,11 @@ class Orchestrator:
         rather than silently keeping mis-bucketed rows.
         """
         try:
-            # dev46 (46a): read the stored zone, rebuild, and stamp the new
-            # zone in ONE hop. Bundling is not only about thread-safety here —
-            # the stamp must not outlive a failed rebuild, and inside a single
-            # callable it cannot (rule N2a: one callable, one transaction).
-            # None means the stored zone already matches and nothing was done.
+            # Read the stored zone, rebuild, and stamp the new zone in ONE hop.
+            # Not only for thread-safety: the stamp must not outlive a failed
+            # rebuild, and inside a single callable (one callable, one
+            # transaction) it cannot. None means the stored zone already matches
+            # and nothing was done.
             from .database import run_db
             res = await run_db(self._resync_boundary_sync, tz_name)
             if res is None:
@@ -1842,16 +1788,16 @@ class Orchestrator:
                         "boot, non-fatal): %s", e)
 
     async def _backfill_time_features(self, tz_name: str) -> None:
-        """dev38 — deferred local-time rewrite of the per-event time features.
+        """Deferred local-time rewrite of the per-event time features.
 
         Same shape as _resync_daily_summary_boundary: migrations run before HA
         answers, so migration 20260801 only added the events.time_features_tz
-        marker and the rewrite happens here once the zone is known. The
-        function itself only touches rows whose marker mismatches, so this is
-        a fast no-op on every boot after the first. Best-effort — a failure
-        leaves markers alone and the next boot retries. MUST run before the
-        waveform-repair workers' cluster rebuild (their supervised chain
-        starts at +240 s; this completes in seconds for ~6k rows).
+        marker and the rewrite happens here once the zone is known. Only rows
+        whose marker mismatches are touched, so this is a fast no-op on every
+        boot after the first. Best-effort — a failure leaves markers alone and
+        the next boot retries. MUST run before the waveform-repair workers'
+        cluster rebuild (their supervised chain starts at +240 s; this completes
+        in seconds for ~6k rows).
         """
         from .database import backfill_time_features_tz, run_db
         try:
@@ -1927,10 +1873,10 @@ class Orchestrator:
             circuit = cfg.circuit
 
             # get_history() is fetched with no_attributes=True, so historical
-            # readings carry NO unit_of_measurement. Converting them with that
-            # empty unit left a gallon reading UNCONVERTED in the litres column,
-            # so "today" (= meter_litres − baseline_gallons) inflated ~3.8x. The
-            # sensor's unit doesn't change over time, so fetch the current unit
+            # readings carry NO unit_of_measurement. Converting with that empty
+            # unit leaves a gallon reading UNCONVERTED in the litres column, so
+            # "today" (= meter_litres − baseline_gallons) inflates ~3.8x. The
+            # sensor's unit does not change over time, so fetch the current unit
             # and convert the historical readings with it.
             sensor_unit = ""
             try:
@@ -1982,15 +1928,14 @@ class Orchestrator:
                 # The next live read raises it to the true maximum within
                 # seconds, so the only exposure is a reset in that window —
                 # which carries 0 L, never invented water.
-                # HOP-2 RE-CHECK (named): _write_volume_baseline_sync
-                # re-evaluates the same "still a 0.0 placeholder (or forced)"
-                # gate inside the write callable. If a live read seeded a real
-                # baseline while the HA history fetch was in flight, this
-                # write stands down rather than overwriting it from stale
-                # premises — and since a baseline shifts every daily total
-                # measured against it, that is volume-accounting correctness,
-                # not just tidiness. Not exemption-class: the write is a
-                # value-set, so an interleaved write changes the right answer.
+                # HOP-2 RE-CHECK: _write_volume_baseline_sync re-evaluates the
+                # same "still a 0.0 placeholder (or forced)" gate inside the
+                # write callable. If a live read seeded a real baseline while
+                # the HA history fetch was in flight, this write stands down
+                # rather than overwriting it from stale premises — a baseline
+                # shifts every daily total measured against it. Not
+                # exemption-class: the write is a value-set, so an interleaved
+                # write changes the right answer.
                 if not await run_db(self._write_volume_baseline_sync, circuit,
                                     period_ts, midnight_val, force):
                     log.info("[%s] volume baseline for %s left alone — a real "
@@ -2039,12 +1984,11 @@ class Orchestrator:
     async def _recompute_leak_test_schedules(self) -> None:
         """Recompute next_run_at for every enabled leak-test schedule.
 
-        Called once on startup so stale next_run_at values — from prior
-        bad scheduler state, timezone changes, or the auto-learn same-
-        day-duplicate bug — are corrected before the scheduler task
-        starts polling. Unconditional by design: the cost (one
-        learn_best_hour pass per circuit) is small and the upside
-        (deterministic, predictable next-run after boot) is worth it.
+        Called once on startup so stale next_run_at values — from prior bad
+        scheduler state or a timezone change — are corrected before the
+        scheduler task starts polling. Unconditional by design: one
+        learn_best_hour pass per circuit is cheap and the next-run after boot
+        becomes deterministic.
 
         Invalid or unparsable existing values are logged and overwritten;
         naive datetimes are treated as UTC for the diff log.
@@ -2180,12 +2124,11 @@ class Orchestrator:
         today_ts = self._local_midnight_utc(days_ago=0)
         week_ts  = self._local_midnight_utc(days_ago=7)
 
-        # dev46 (46a): every DB read this method needs — volumes, unit
-        # context, setup flag, valve type, degraded + anomaly state — is
-        # gathered in ONE hop. They are all reads and all independent of the
-        # HA state fetch above, so there is no split to make; done separately
-        # they were nine event-loop-thread touches on a dashboard poll that
-        # runs for every circuit on a timer.
+        # Every DB read this method needs — volumes, unit context, setup flag,
+        # valve type, degraded + anomaly state — is gathered in ONE hop. They
+        # are all reads and all independent of the HA state fetch above; done
+        # separately they are nine event-loop-thread touches on a dashboard poll
+        # that runs for every circuit on a timer.
         from .database import run_db
         dbst = await run_db(self._live_state_db_sync, circuit,
                             ha_volume_total, today_ts, week_ts)
@@ -2224,26 +2167,21 @@ class Orchestrator:
 
         uc = dbst["unit_context"]
 
-        # The lifetime tile reads the SAME entity as ha_volume_total above, but
-        # it skipped that block's vol_to_litres step and handed the RAW HA
-        # state straight to uc['vol_factor'] — a factor units.py:22 documents
-        # as "multiply stored L value by this to get display volume". The
-        # firmware publishes device_class: water, so HA re-presents the entity
-        # in the user's own unit system: on a US install the state arrives in
-        # GALLONS, and putting gallons through the L→gal factor left the tile
-        # 3.785x adrift from the daily/weekly figures printed beside it.
-        #
-        # Same root cause as the two defects already scarred into this
-        # codebase: the "today = meter_litres − baseline_gallons inflated
-        # ~3.8x" baseline bug in _init_volume_baselines above, and the daily
-        # 3.785x "over-count" in volume_drift.py. Both were fixed by converting
-        # with the entity's OWN unit first, via the one shared helper — so do
-        # that here rather than inventing a third idiom.
+        # The lifetime tile reads the SAME entity as ha_volume_total above and
+        # must go through vol_to_litres first. uc['vol_factor'] multiplies a
+        # STORED LITRE value to get display volume; the firmware publishes
+        # device_class: water, so HA re-presents the entity in the user's own
+        # unit system and on a US install the state arrives in GALLONS. Putting
+        # gallons through the L→gal factor leaves the tile 3.785x adrift from
+        # the daily/weekly figures beside it. Same root cause as the
+        # _init_volume_baselines inflation above and the daily 3.785x
+        # over-count in volume_drift.py; all three convert with the entity's
+        # OWN unit first, via the one shared helper.
         #
         # The volume_daily / volume_weekly lines below are deliberately NOT
-        # changed: they come out of compute_ha_daily_volume(), which was fed
-        # the already-normalised ha_volume_total, so those really are stored
-        # litres and vol_factor alone is correct for them.
+        # changed: they come out of compute_ha_daily_volume(), which was fed the
+        # already-normalised ha_volume_total, so those really are stored litres
+        # and vol_factor alone is correct for them.
         _vt_raw = states.get(circuit_cfg.volume_sensor, "")
         try:
             if _vt_raw in ("", "unknown", "unavailable"):

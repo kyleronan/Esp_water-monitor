@@ -218,9 +218,9 @@ class FeatureExtractor:
         Scans ALL buffered records for the circuit (not just the latest): a
         pulsed fixture (washer fill pauses) splits one add-on event into
         several firmware captures, and a tiny trailing capture can land AFTER
-        the one that actually spans the event — picking "latest" would discard
-        the real match (observed 2026-07-05: washer fw-event 21, full=7249,
-        superseded by 9-second fw-event 23 five seconds before completion).
+        the one that actually spans the event — picking "latest" discards the
+        real match (a washer's fw-event 21, full=7249, was superseded by a
+        9-second fw-event 23 five seconds before completion).
 
         Returns the record with the highest duration-overlap score among those
         assembled within _WF_MATCH_WINDOW_S, when that score reaches
@@ -818,23 +818,18 @@ class FeatureExtractor:
         self._notify_anomaly(circuit, circuit_name, score, atype, event_id)
 
     def _anomaly_shutoff_gates_sync(self, circuit: str, sens) -> bool:
-        """dev46 (46a) — the DB-backed shut-off gate, one hop.
+        """The DB-backed shut-off gate, one hop.
 
-        Was two gates. The per-12h rate limiter was deleted 2026-09-08 by
-        operator decision: it refused a further automatic close once N had
-        happened in 12 hours, but there is NO automatic reopen in this add-on
-        — the only open path is the manual, operator-gated
-        `/device/valve/{circuit}/open` route. So the counter could not reach 2
-        unless the operator personally reopened the valve in between, which
-        means it never guarded against an unnoticed runaway; a shut valve is
-        the loudest notification the system has. What it actually bounded was
-        how many times the add-on may overrule a human who has just
-        deliberately reopened, and the standing decision is that a close —
-        right or wrong — gets dealt with when it happens.
+        There is deliberately NO per-12h rate limit. The add-on has no
+        automatic reopen — the only open path is the manual, operator-gated
+        `/device/valve/{circuit}/open` route — so such a counter could only
+        reach 2 if the operator personally reopened the valve in between. It
+        would bound how often the add-on may overrule a human who has just
+        deliberately reopened, not guard an unnoticed runaway; a shut valve is
+        the loudest notification the system has.
 
-        ``anomaly_shutoff_log`` is unaffected and still written: it is the
-        audit record that the valve was physically closed, and it is worth
-        more now that nothing gates on it.
+        ``anomaly_shutoff_log`` is still written: it is the audit record that
+        the valve was physically closed.
         """
         return self._anomaly_shutoff_state_ok(circuit)
 
@@ -899,10 +894,10 @@ class FeatureExtractor:
         """Read the valve position back after commanding a close.
 
         ``close_valve`` returns True on HTTP 200 from the service call — "HA
-        accepted the request", not "the valve closed". Nothing verified it, so
-        the add-on could report the water shut off while it was still running.
-        This installation has a documented close-path hardware fault
-        (2026-07-18), which is what that failure looks like in practice.
+        accepted the request", not "the valve closed". Without this the add-on
+        reports the water shut off while it is still running. This installation
+        has a documented close-path hardware fault, which is what that failure
+        looks like in practice.
 
         Returns True (confirmed shut), False (did not confirm), or None
         (no end-stop entity bound — cannot verify, and says so rather than
@@ -911,9 +906,7 @@ class FeatureExtractor:
         Two distinct failures are checked, because they are different faults:
           * the closed end stop never reads on — the valve did not travel;
           * the end stop reads on but ``valve_seal_alert`` is also on — the
-            valve reports shut and water is still moving past it. That is the
-            signal §6.0-E identified as the one the firmware already had and
-            the add-on never read.
+            valve reports shut and water is still moving past it.
         """
         from .database import run_db
         stop_entity = await run_db(
@@ -994,19 +987,15 @@ class FeatureExtractor:
 
     def _log_shutoff_sync(self, circuit: str, event_id, atype,
                           score: float) -> None:
-        """dev46 (46a) — append the shut-off audit row, on the DB thread.
+        """Append the shut-off audit row, on the DB thread.
 
         Store closed_at as an explicit UTC ISO timestamp, NOT the
         CURRENT_TIMESTAMP default. SQLite's default renders
         'YYYY-MM-DD HH:MM:SS' — space-separated — and ' ' (0x20) sorts BELOW
         'T' (0x54), so a space-format row compares as EARLIER than every
-        T-format row regardless of the instant it records. Any range query
-        over this column would silently mis-select.
-
-        The original comment justified this by the per-12h rate limiter's
-        cutoff; that limiter was deleted 2026-09-08. The reason is broader and
-        outlives it: this is the repo's canonical timestamp form, and the
-        project has already paid for the mixed-format hazard elsewhere.
+        T-format row regardless of the instant it records, and any range query
+        over this column silently mis-selects. The T form is the repo's
+        canonical timestamp shape.
         """
         self._db.execute(
             "INSERT INTO anomaly_shutoff_log "

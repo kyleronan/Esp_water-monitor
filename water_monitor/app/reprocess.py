@@ -51,7 +51,7 @@ _SPLIT_RETENTION_MARGIN_H: int = 12
 _SPLIT_LOOKBACK_H: int = HA_HIGH_FIDELITY_DAYS * 24 - _SPLIT_RETENTION_MARGIN_H
 _SPLIT_SETTLE_MIN: int = 60       # ...older than this, so the event is done being extended
 _SPLIT_DEFAULT_LIMIT: int = 20    # per-pass cap (HA-history rate-limit)
-_SPLIT_MIN_VOLUME_COVERAGE: float = VOLUME_COVERAGE_FRACTION   # dev55: ONE object with the importer's containment rule (dev.41: reconstructed flow must account for
+_SPLIT_MIN_VOLUME_COVERAGE: float = VOLUME_COVERAGE_FRACTION   # ONE object with the importer's containment rule: reconstructed flow must account for
                                           # this share of the stored volume, else the
                                           # window's history can't be trusted (skip)
 
@@ -367,7 +367,7 @@ async def reprocess_window(
 
 
 def _auto_split_enabled(conn: sqlite3.Connection) -> bool:
-    """Read the dev.38 opt-in flag fresh (so a Settings toggle takes effect with no
+    """Read the opt-in flag fresh (so a Settings toggle takes effect with no
     restart). Defaults OFF / absent-column-safe."""
     try:
         prof = get_home_profile(conn)

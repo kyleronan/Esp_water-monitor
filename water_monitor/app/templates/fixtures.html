@@ -85,7 +85,7 @@
   <a href="{{ ingress_path }}/training">Training helper</a>.
 </p>
 
-{# ── Fixture health. Classification adapts; these baselines do
+{# ── dev47 (47i): fixture health. Classification adapts; these baselines do
      not — so a fixture whose draws are drifting shows up here even though its
      events are still labelled correctly. Wording avoids diagnosing the cause:
      the add-on can see that refills grew, not why. ─────────────────────── #}
@@ -201,11 +201,11 @@
 {% endfor %}
 {% endif %}
 
-{# ── What the learning loop has been deciding, from its ledger. A model that
-     has stopped improving is SILENT — a frozen fit serves exactly like a
-     healthy one — so this is the one place the operator can see a run of
-     rejections. A banner, never a knob: the referee is not relaxed from
-     here. ──────────────────────────────────────────────────────────────── #}
+{# ── dev51 (2.1): what the learning loop has been deciding, from its ledger.
+     A model that has stopped improving is SILENT — a frozen fit serves exactly
+     like a healthy one — so this is the one place the operator can see a run
+     of rejections. A banner, never a knob: the referee is not relaxed from
+     here. ─────────────────────────────────────────────────────────────── #}
 {% if health and health.learning %}
 {% for cid, l in health.learning.items() %}
 <div class="fx-msg {{ 'fx-msg-warn' if (l.stalled or l.paused_by_reservation) else 'fx-msg-ok' }}"

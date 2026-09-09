@@ -97,7 +97,7 @@ def _block_if_setup_complete(request: Request):
 async def setup_home(request: Request):
     orch = _orch(request)
     from ..database import run_db
-    device_cfg = await run_db(get_device_config, orch.db)   # dev46 (46a)
+    device_cfg = await run_db(get_device_config, orch.db)
     initial_name = (
         device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
     )
@@ -119,7 +119,7 @@ async def setup_home(request: Request):
 async def setup_new(request: Request):
     orch = _orch(request)
     from ..database import run_db
-    device_cfg = await run_db(get_device_config, orch.db)   # dev46 (46a)
+    device_cfg = await run_db(get_device_config, orch.db)
     initial_name = (
         device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
     )
@@ -256,7 +256,7 @@ async def setup_restore(request: Request):
             f"/setup?restore_error={_qp(str(e))}")
 
     try:
-        await orch.reload_circuit_entities_async()   # dev57 (2.10)
+        await orch.reload_circuit_entities_async()
     except Exception as e:
         log.warning("Restore: reload_circuit_entities: %s", e)
 
@@ -289,7 +289,7 @@ async def setup_restore(request: Request):
 
     # Pull the saved device name so step 1 pre-fills it
     from ..database import run_db
-    device_cfg   = await run_db(get_device_config, orch.db)  # dev46 (46a)
+    device_cfg   = await run_db(get_device_config, orch.db)
     initial_name = (
         device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
     )
@@ -413,7 +413,7 @@ async def setup_discover(device_id: str, request: Request, error: str = ""):
         # N label upserts in one DB-thread callable.
         await run_db(lambda: [upsert_circuit_label(orch.db, cid, lbl)
                               for cid, lbl in diag_labels.items()])
-        await orch.reload_circuit_labels_async()   # dev57 (2.10)
+        await orch.reload_circuit_labels_async()
 
     circuit_matches, prefix = match_entities_to_roles(
         device_id, entities, circuits, labels=diag_labels)
@@ -431,7 +431,7 @@ async def setup_discover(device_id: str, request: Request, error: str = ""):
         esp_device_prefix=prefix,
     )
     from ..database import run_db
-    await run_db(save_discovery, orch.db, result)            # dev46 (46a)
+    await run_db(save_discovery, orch.db, result)
     # save_discovery clears device_config.setup_complete. It
     # bumps the epoch itself, so the cache is already unknown; re-prime on the
     # DB worker so the re-read does not land on the event loop.
@@ -728,8 +728,8 @@ async def setup_circuit_names_save(request: Request):
         ctx["request"] = request
         return _tmpl(request).TemplateResponse("setup.html", ctx)
 
-    await orch.reload_circuit_labels_async()     # dev57 (2.10)
-    await orch.reload_circuit_profiles_async()   # dev57 (2.10)
+    await orch.reload_circuit_labels_async()
+    await orch.reload_circuit_profiles_async()
     log.info("Setup: circuit names, types, and valve types saved")
     return ingress_redirect(request, "/setup/units")
 
@@ -746,7 +746,7 @@ async def setup_units(request: Request):
     from ..database import get_home_profile
     from ..units import load_unit_context, FLOW_OPTIONS, PRESSURE_OPTIONS
     from ..database import run_db
-    profile, uc = await run_db(                              # dev46 (46a)
+    profile, uc = await run_db(
         lambda: (dict(get_home_profile(orch.db) or {}),
                  load_unit_context(orch.db)))
     return _tmpl(request).TemplateResponse("setup.html", {
@@ -795,7 +795,7 @@ async def setup_units_save(request: Request):
 async def setup_home_details(request: Request):
     orch = _orch(request)
     from ..database import get_home_profile, run_db
-    profile = dict(await run_db(get_home_profile, orch.db) or {})  # dev46 (46a)
+    profile = dict(await run_db(get_home_profile, orch.db) or {})
     return _tmpl(request).TemplateResponse("setup.html", {
         "request": request,
         "step": 5,
@@ -858,7 +858,7 @@ async def setup_home_details_save(request: Request):
 
     from datetime import datetime as _dt, timezone as _tzinfo
     from ..database import run_db
-    await run_db(                                             # dev46 (46a)
+    await run_db(
         update_home_profile,
         orch.db,
         bathrooms_full=bathrooms_full,
@@ -878,13 +878,13 @@ async def setup_home_details_save(request: Request):
     )
 
     # Mark setup complete and reload entity IDs into live circuit configs
-    await run_db(mark_setup_complete, orch.db)                # dev46 (46a)
+    await run_db(mark_setup_complete, orch.db)
     # mark_setup_complete() already invalidated every cached copy
     # of the flag (the device_discovery epoch moved). Re-prime it here so the
     # one read that costs happens on the DB worker rather than on the event
     # loop inside whichever request reads the property next.
     await orch.refresh_setup_complete_cache()
-    await orch.reload_circuit_entities_async()   # dev57 (2.10)
+    await orch.reload_circuit_entities_async()
 
     # If the user opted out of historical import, stamp import_state to NOW
     # for every circuit.  _backfill() and _catch_up() both clamp to this
@@ -977,7 +977,7 @@ async def setup_home_details_save(request: Request):
 async def setup_complete(request: Request):
     orch = _orch(request)
     from ..database import run_db
-    cfg = await run_db(get_device_config, orch.db)           # dev46 (46a)
+    cfg = await run_db(get_device_config, orch.db)
 
     # Pick up calibration info passed as query params from the /home POST,
     # or read from DB if the user refreshes the page.
