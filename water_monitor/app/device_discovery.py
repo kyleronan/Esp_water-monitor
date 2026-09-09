@@ -916,19 +916,6 @@ def load_circuit_entities(
     """, (circuit,)).fetchall()
     return {row["role"]: row["entity_id"] for row in rows}
 
-
-def get_all_device_entities(
-    db: sqlite3.Connection,
-) -> List[Dict[str, Any]]:
-    """Return all discovered entities for the UI selection dropdowns."""
-    rows = db.execute("""
-        SELECT circuit, role, entity_id, entity_name, confirmed
-        FROM circuit_entity_map
-        ORDER BY circuit, role
-    """).fetchall()
-    return [dict(r) for r in rows]
-
-
 def is_setup_complete(db: sqlite3.Connection) -> bool:
     row = db.execute(
         "SELECT setup_complete FROM device_config WHERE id = 1"

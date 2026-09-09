@@ -3923,42 +3923,6 @@ def find_overlapping_event(
 
     return None
 
-
-def event_exists_near(
-    conn: sqlite3.Connection,
-    circuit: str,
-    start_ts: str,
-    window_seconds: int = 30,
-) -> bool:
-    """True if an event with start_ts within ±window_seconds already exists.
-
-    Compares in Unix-epoch seconds so the result is robust against:
-    - 'T' vs space separator mismatch (SQLite datetime() uses space)
-    - mixed timezone offsets in stored data (+00:00 vs -06:00)
-    - microsecond precision differences
-
-    SQLite strftime('%s', …) understands ISO 8601 with both 'T' and space
-    separators and returns integer epoch seconds, making the comparison
-    timezone-absolute.
-    """
-    try:
-        ts = datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        return False
-    lo_epoch = int((ts - timedelta(seconds=window_seconds)).timestamp())
-    hi_epoch = int((ts + timedelta(seconds=window_seconds)).timestamp())
-    row = conn.execute("""
-        SELECT id FROM events
-        WHERE circuit = ?
-          AND start_ts IS NOT NULL
-          AND CAST(strftime('%s', start_ts) AS INTEGER) BETWEEN ? AND ?
-        LIMIT 1
-    """, (circuit, lo_epoch, hi_epoch)).fetchone()
-    return row is not None
-
-
 def normalize_events_utc(conn: sqlite3.Connection, commit: bool = True) -> int:
     """Normalize events.start_ts / end_ts to UTC ISO 8601 in-place.
 
@@ -4151,27 +4115,6 @@ def get_clusters_with_fixtures(
         (circuit,),
     ).fetchall()
     return [dict(r) for r in rows]
-
-
-def get_cluster_stats(
-    conn: sqlite3.Connection,
-    circuit: str,
-    cluster_id: int,
-) -> Dict[str, Any]:
-    row = conn.execute(
-        """
-        SELECT COUNT(*)              AS event_count,
-               AVG(volume_litres)   AS avg_volume_litres,
-               AVG(duration_seconds)AS avg_duration_s,
-               AVG(avg_flow_lpm)    AS avg_flow_lpm,
-               MAX(start_ts)        AS last_seen_at
-        FROM events
-        WHERE circuit = ? AND cluster_id = ?
-        """,
-        (circuit, cluster_id),
-    ).fetchone()
-    return dict(row) if row else {}
-
 
 def get_all_cluster_stats(
     conn: sqlite3.Connection,

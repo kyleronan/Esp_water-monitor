@@ -1651,16 +1651,6 @@ class Orchestrator:
             "max_shutoffs_per_12h":       _eff("max_shutoffs_per_12h"),
         }
 
-    def get_live_state(self, circuit: str) -> Dict[str, Any]:
-        """
-        Fetch current live state for a circuit from HA.
-        Returns a dict for use in web UI templates.
-        This is called synchronously from route handlers —
-        the actual HA calls happen async in background tasks
-        and results are cached implicitly via HA's state machine.
-        """
-        return {"circuit": circuit}
-
     async def get_live_state_async(self, circuit: str) -> Dict[str, Any]:
         """Async version — fetches fresh state from HA REST API, cached for 3s."""
         import time

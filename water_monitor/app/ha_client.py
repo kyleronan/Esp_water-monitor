@@ -505,19 +505,6 @@ class HaClient:
             return default
         return result.get("state", default)
 
-    async def get_multiple_states(
-        self, entity_ids: List[str]
-    ) -> Dict[str, Optional[Dict]]:
-        """Fetch multiple entity states concurrently."""
-        results = await asyncio.gather(
-            *[self.get_state(eid) for eid in entity_ids],
-            return_exceptions=True,
-        )
-        return {
-            eid: (None if isinstance(r, Exception) else r)
-            for eid, r in zip(entity_ids, results)
-        }
-
     async def get_ha_config(self) -> Dict[str, Any]:
         """GET /api/config — returns HA instance config including time_zone."""
         if not self._http:
@@ -605,13 +592,6 @@ class HaClient:
         service = "set_value"
         return await self.call_service(domain, service,
                                        {"entity_id": entity_id, "value": value})
-
-    async def set_select(self, entity_id: str, option: str) -> bool:
-        """Set a select entity option."""
-        domain = entity_id.split(".", 1)[0]
-        service = "select_option"
-        return await self.call_service(domain, service,
-                                       {"entity_id": entity_id, "option": option})
 
     # ------------------------------------------------------------------
     # REST API — state publish
