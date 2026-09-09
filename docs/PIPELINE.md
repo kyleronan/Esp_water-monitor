@@ -417,7 +417,7 @@ step. Sequence context (`seconds_since_prev_event`, `cycle_pulse_count`) is fill
 
 ## Part 3 — Labeling (which fixture?)
 
-**`app/database.py · reclassify_all_events_from_signatures()`** — a ladder; the first rung to claim an
+**`app/reclassify.py · reclassify_all_events_from_signatures()`** — a ladder; the first rung to claim an
 event stamps `matched_fixture_type` + `matched_via` and the event exits. Cycle/session fixtures also
 get a `cycle_group_id` (the History rollup key).
 
