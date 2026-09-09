@@ -2207,7 +2207,21 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     # A leak-test reopen refill already has its verdict, and its FLAG bits are
     # deliberately clear (it stays visible), so the scans' flag filters below
     # would otherwise let another detector re-claim it and lose the provenance.
-    uft_guard += _LEAK_REFILL_GUARD_SQL
+    #
+    # ⚠️ This used to be `uft_guard += _LEAK_REFILL_GUARD_SQL`, and that one
+    # line is the root cause of the same bug three times over. Appending it
+    # INTO a variable named for the user-fixture-type guard meant any scan that
+    # legitimately did not need a fixture-type guard dropped the refill guard
+    # with it, invisibly. Scan 3 hand-typed the user guards and lost it (6.5);
+    # the capped re-include never had it; the degraded-supply scan never had
+    # any user guard at all and so silently erased provenance on a route with
+    # no self-heal behind it.
+    #
+    # So the guards a zeroing scan must carry now have ONE name that says so.
+    # Concatenation order is unchanged, so every emitted statement is
+    # byte-identical to before — this buys nothing at runtime and makes the
+    # omission visible in review, which is where all three were missed.
+    scan_guards = uc_guard + uft_guard + _LEAK_REFILL_GUARD_SQL
     # Duration prefilter is metric-gated: legacy rows (no active-flow metrics) stay at the
     # frozen 1800 s floor, while rows that HAVE the no-flow metrics also qualify from 120 s.
     # The canonical _detect_pressure_restoration_phantom re-runs inside the loop and does the
@@ -2232,7 +2246,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
         "  AND pressure_delta_psi < ? "
         "  AND (is_pressure_restoration_phantom = 0 "
         "       OR is_pressure_restoration_phantom IS NULL)"
-        + uc_guard + uft_guard,
+        + scan_guards,
         dur_params + (_PHANTOM_MAX_DELTA_PSI,),
     ).fetchall()
 
@@ -2299,7 +2313,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             + af_cols +
             " FROM events "
             "WHERE 1=1 "
-            + _NOT_USER_CLASSIFIED_SQL + uft_guard
+            + _NOT_USER_CLASSIFIED_SQL + uft_guard + _LEAK_REFILL_GUARD_SQL
             + _NO_PHANTOM_SQL + _NO_CROSS_TALK_SQL + _NO_DEGRADED_SQL +
             "  AND (COALESCE(is_low_flow_dribble, 0) = 1 "
             "       OR (COALESCE(peak_flow_lpm, avg_flow_lpm, 0) < 1.2 "
@@ -2312,7 +2326,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "       COALESCE(volume_litres_effective, volume_litres, 0) AS veff "
             "FROM events "
             "WHERE 1=1 "
-            + _NOT_USER_CLASSIFIED_SQL + uft_guard
+            + _NOT_USER_CLASSIFIED_SQL + uft_guard + _LEAK_REFILL_GUARD_SQL
             + _NO_PHANTOM_SQL + _NO_CROSS_TALK_SQL + _NO_DEGRADED_SQL +
             "  AND (COALESCE(is_low_flow_dribble, 0) = 1 "
             "       OR COALESCE(peak_flow_lpm, avg_flow_lpm, 0) < 1.2)"
@@ -2405,7 +2419,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             # sets none of the artifact FLAG bits (it stays visible), so
             # nothing else here held it off: a refill whose shape tripped
             # cross-talk was re-claimed and its provenance overwritten.
-            + uc_guard + uft_guard
+            + scan_guards
             + _NO_PHANTOM_SQL + _NO_DEGRADED_SQL +
             "  AND duration_seconds >= ? "
             "  AND flow_integral_litres < ? AND flow_on_ratio < ? "
@@ -2462,7 +2476,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "  AND COALESCE(has_pressure_transient, 0) = 0 "
             "  AND duration_seconds <= ? "
             "  AND volume_litres > 0 AND volume_litres <= ?"
-            + uc_guard + uft_guard,
+            + scan_guards,
             (_PSILENT_MAX_CORR, _PSILENT_MAX_DELTA_PSI,
              _PSILENT_MAX_DURATION_S, _PSILENT_MAX_VOLUME_L),
         ).fetchall()
@@ -2510,7 +2524,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "  AND flow_on_ratio > 0 AND flow_on_ratio <= ? "
             + _NO_PHANTOM_SQL +
             "  AND match_rejection_reason IS NULL"
-            + uc_guard + uft_guard,
+            + scan_guards,
             (_SPARSE_ENVELOPE_MIN_DURATION_S, _SPARSE_ENVELOPE_MAX_FLOW_ON_RATIO),
         ).fetchall()
         for row in sprows:
