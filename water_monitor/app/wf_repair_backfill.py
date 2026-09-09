@@ -215,44 +215,14 @@ _SHARED_NO_WINNER_FRAC = 0.25
 _SHARED_NO_WINNER_MIN_S = 30.0
 _ESP_CAPTURE_HZ = 50.0     # firmware waveform_capture interval is 20 ms
 
-# ⛔ SCHEDULING DISABLED. Read this before flipping it back — the reason is no
-# longer the one the previous comment gave, and that reason is now MET.
-#
-# 1. BOTH defects that made this sweep destructive are FIXED: the 4x
-#    _ESP_CAPTURE_HZ constant above, and the binned-length span premise, which
-#    now derives the span from the stored per-row source sample count and rate
-#    with an `unjudgeable` skip for rows that lack them.
-#
-# 2. The damage the OLD sweep did has been counted, which is what the previous
-#    comment said this flag was waiting for. Measured 2026-09-07 against the
-#    live database:
-#
-#      433 events carry wf_repair_verdict = 'shared_capture'
-#      ALL 433 have signature_source IS NULL
-#      ZERO of them still have an event_waveforms row
-#
-#    Window 2026-07-05 .. 2026-08-09, 5.4% of the corpus. They CANNOT be
-#    re-enriched — the loser branch deleted the source arrays — so re-enabling
-#    recovers nothing. That loss is closed, not pending.
-#
-# 3. So the gate is met and the flag STILL stays False, for a better reason:
-#    THE DEFECT IT REPAIRS IS NO LONGER OCCURRING. Same measurement, same day:
-#
-#      3,213 stored waveforms over the LENGTH > 300 gate
-#      0 groups sharing a byte-identical flow_max_json
-#
-#    Zero. The condition this worker exists to detect does not appear in the
-#    database at all any more — dev37's shared-capture enrichment addressed it
-#    at the source. Turning this on today would scan 3,213 rows on a schedule
-#    and find nothing, forever.
-#
-# The consequence for anyone reconsidering: the safety case for the fixed
-# winner rule is currently UNTESTABLE on real data, because there is no group
-# left to exercise it against. If shared captures ever return — watch for
-# duplicate flow_max_json hashes, or the Phase 3 waveform counters diverging —
-# this flag is one line, and the two defects behind the original damage are
-# fixed. Until then this is a repair worker for a condition that stopped
-# happening, and a deletion candidate rather than a scheduling decision.
+# ⛔ OFF, and re-enabling recovers nothing.
+# Measured 2026-09-07: 433 events tagged 'shared_capture', all with
+# signature_source NULL and no surviving event_waveforms row — the old
+# sweep deleted the source arrays, so they cannot be re-enriched.
+# The defect it repairs also stopped occurring: 3,213 stored waveforms,
+# 0 sharing a flow_max_json. dev37 fixed it at the source.
+# Both original defects (the 4x _ESP_CAPTURE_HZ, the binned-span premise)
+# are fixed, so this is a deletion candidate, not a scheduling decision.
 _SHARED_CAPTURE_SWEEP_ENABLED = False
 _SHARED_MIN_ARRAY_CHARS = 300      # matches the audit's LEN>300 fingerprint gate
 
