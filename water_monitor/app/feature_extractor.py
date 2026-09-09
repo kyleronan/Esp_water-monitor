@@ -605,6 +605,23 @@ _LEAK_TEST_REFILL_REASON: str = "leak_test_refill"
 # they would re-claim a refill whose shape happens to trip another detector.
 _LEAK_REFILL_GUARD_SQL: str = (
     "  AND COALESCE(match_rejection_reason, '') <> 'leak_test_refill' ")
+# The rest of the verdict guards every artifact reprocess scan re-tests. They
+# were typed out at ~30 sites and one hand-typed pair silently dropped the
+# refill guard above (unit 6.5), so they live here once, exactly as the scans
+# spelled them. Each is a self-contained AND clause with a leading AND trailing
+# space, safe to concatenate after any WHERE term; where a guard would be the
+# FIRST term the scan opens "WHERE 1=1". Two NULL-explicit spellings of the
+# same tests stay inline where they lead a WHERE (Scans 1 and 3) — SQLite
+# treats "x = 0 OR x IS NULL" and "COALESCE(x,0) = 0" identically.
+_NO_PHANTOM_SQL: str = (
+    "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 ")
+_NO_CROSS_TALK_SQL: str = "  AND COALESCE(is_cross_talk, 0) = 0 "
+_NO_DRIBBLE_SQL: str = "  AND COALESCE(is_low_flow_dribble, 0) = 0 "
+_NO_DEGRADED_SQL: str = "  AND COALESCE(degraded_supply, 0) = 0 "
+_NOT_USER_CLASSIFIED_SQL: str = "  AND COALESCE(user_classified, 0) = 0 "
+_NOT_USER_IGNORED_SQL: str = "  AND COALESCE(user_ignored, 0) = 0 "
+_NO_USER_FIXTURE_TYPE_SQL: str = (
+    "  AND (user_fixture_type IS NULL OR user_fixture_type = '') ")
 # The "brief use, long idle tail" inflated-envelope reason. ONE constant for every
 # writer/matcher (finalizer, sparse-reprocess scan, capped re-include, auto-split
 # candidate query) — the dev6 bug was one predicate not knowing this string.
@@ -2169,7 +2186,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     # wrapper is called from the 20260532 migration, before user_classified
     # exists in a sequential upgrade.
     uc_guard = (
-        " AND COALESCE(user_classified, 0) = 0"
+        _NOT_USER_CLASSIFIED_SQL
         if _events_has_column(conn, "user_classified") else ""
     )
     # The hardened phantom guard needs the active-flow features so a REAL
@@ -2184,7 +2201,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     # A user-applied fixture type means confirmed-real water — never auto-zero it
     # (mirrors _is_real_label + the live finalizer's has_user_type gate).
     uft_guard = (
-        " AND (user_fixture_type IS NULL OR user_fixture_type = '')"
+        _NO_USER_FIXTURE_TYPE_SQL
         if _events_has_column(conn, "user_fixture_type") else ""
     )
     # A leak-test reopen refill already has its verdict, and its FLAG bits are
@@ -2281,11 +2298,9 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "       COALESCE(volume_litres_effective, volume_litres, 0) AS veff"
             + af_cols +
             " FROM events "
-            "WHERE COALESCE(user_classified, 0) = 0 "
-            + uft_guard +
-            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
-            "  AND COALESCE(is_cross_talk, 0) = 0 "
-            "  AND COALESCE(degraded_supply, 0) = 0 "
+            "WHERE 1=1 "
+            + _NOT_USER_CLASSIFIED_SQL + uft_guard
+            + _NO_PHANTOM_SQL + _NO_CROSS_TALK_SQL + _NO_DEGRADED_SQL +
             "  AND (COALESCE(is_low_flow_dribble, 0) = 1 "
             "       OR (COALESCE(peak_flow_lpm, avg_flow_lpm, 0) < 1.2 "
             "           AND COALESCE(true_avg_flow_lpm, avg_flow_lpm, 0) < 1.2))"
@@ -2296,11 +2311,9 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "       COALESCE(is_low_flow_dribble, 0) AS dr, "
             "       COALESCE(volume_litres_effective, volume_litres, 0) AS veff "
             "FROM events "
-            "WHERE COALESCE(user_classified, 0) = 0 "
-            + uft_guard +
-            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
-            "  AND COALESCE(is_cross_talk, 0) = 0 "
-            "  AND COALESCE(degraded_supply, 0) = 0 "
+            "WHERE 1=1 "
+            + _NOT_USER_CLASSIFIED_SQL + uft_guard
+            + _NO_PHANTOM_SQL + _NO_CROSS_TALK_SQL + _NO_DEGRADED_SQL +
             "  AND (COALESCE(is_low_flow_dribble, 0) = 1 "
             "       OR COALESCE(peak_flow_lpm, avg_flow_lpm, 0) < 1.2)"
         ).fetchall()
@@ -2386,10 +2399,14 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "       hourly_volume_applied_litres, hourly_volume_applied_bucket "
             "FROM events "
             "WHERE (is_cross_talk = 0 OR is_cross_talk IS NULL) "
-            "  AND COALESCE(user_classified, 0) = 0 "
-            "  AND (user_fixture_type IS NULL OR user_fixture_type = '') "
-            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
-            "  AND COALESCE(degraded_supply, 0) = 0 "
+            # uc_guard/uft_guard, NOT a re-typed pair: uft_guard is where
+            # _LEAK_REFILL_GUARD_SQL rides. Typed out by hand this scan
+            # silently dropped that guard, and a leak-test reopen refill
+            # sets none of the artifact FLAG bits (it stays visible), so
+            # nothing else here held it off: a refill whose shape tripped
+            # cross-talk was re-claimed and its provenance overwritten.
+            + uc_guard + uft_guard
+            + _NO_PHANTOM_SQL + _NO_DEGRADED_SQL +
             "  AND duration_seconds >= ? "
             "  AND flow_integral_litres < ? AND flow_on_ratio < ? "
             "  AND pressure_delta_psi >= ?",
@@ -2437,10 +2454,9 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "       true_avg_flow_lpm, peak_flow_lpm, avg_flow_lpm, "
             "       COALESCE(volume_litres_effective, volume_litres, 0) AS veff "
             "FROM events "
-            "WHERE COALESCE(is_pressure_restoration_phantom, 0) = 0 "
-            "  AND COALESCE(is_cross_talk, 0) = 0 "
-            "  AND COALESCE(is_low_flow_dribble, 0) = 0 "
-            "  AND COALESCE(degraded_supply, 0) = 0 "
+            "WHERE 1=1 "
+            + _NO_PHANTOM_SQL + _NO_CROSS_TALK_SQL
+            + _NO_DRIBBLE_SQL + _NO_DEGRADED_SQL +
             "  AND flow_pressure_corr IS NOT NULL AND flow_pressure_corr < ? "
             "  AND pressure_delta_psi IS NOT NULL AND pressure_delta_psi < ? "
             "  AND COALESCE(has_pressure_transient, 0) = 0 "
@@ -2492,7 +2508,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "SELECT id, duration_seconds, flow_on_ratio FROM events "
             "WHERE duration_seconds >= ? "
             "  AND flow_on_ratio > 0 AND flow_on_ratio <= ? "
-            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+            + _NO_PHANTOM_SQL +
             "  AND match_rejection_reason IS NULL"
             + uc_guard + uft_guard,
             (_SPARSE_ENVELOPE_MIN_DURATION_S, _SPARSE_ENVELOPE_MAX_FLOW_ON_RATIO),
@@ -2527,15 +2543,17 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "UPDATE events SET excluded_from_training = 0 "
             "WHERE integration_quality = 'capped' "
             "  AND COALESCE(excluded_from_training, 0) = 1 "
-            "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
-            "  AND COALESCE(is_cross_talk, 0) = 0 "
-            "  AND COALESCE(is_low_flow_dribble, 0) = 0 "
-            "  AND COALESCE(degraded_supply, 0) = 0 "
-            "  AND COALESCE(user_ignored, 0) = 0 "
-            "  AND COALESCE(user_classified, 0) = 0 "
+            + _NO_PHANTOM_SQL + _NO_CROSS_TALK_SQL + _NO_DRIBBLE_SQL
+            + _NO_DEGRADED_SQL + _NOT_USER_IGNORED_SQL
+            + _NOT_USER_CLASSIFIED_SQL +
             "  AND (match_rejection_reason IS NULL "
             "       OR match_rejection_reason <> ?) "
-            "  AND true_avg_flow_lpm IS NOT NULL",
+            "  AND true_avg_flow_lpm IS NOT NULL"
+            # A refill clears every other term here (no flag bit, not
+            # user-classified, reason != sparse_envelope), so without this
+            # a zero-volume event the add-on itself caused was handed back
+            # to training.
+            + _LEAK_REFILL_GUARD_SQL,
             (SPARSE_ENVELOPE_REASON,),
         )
         capped_reincluded = cur.rowcount or 0
@@ -2574,7 +2592,7 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
             "       match_rejection_reason, is_composite "
             "FROM events "
             "WHERE COALESCE(user_classified, 0) = 1 "
-            "  AND COALESCE(user_ignored, 0) = 0 "
+            + _NOT_USER_IGNORED_SQL +
             "  AND volume_litres > ? "
             "  AND COALESCE(volume_litres_effective, 0) < volume_litres "
             "  AND match_rejection_reason IS NOT NULL",
@@ -2697,13 +2715,9 @@ def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
         "  AND flow_pressure_corr >= ? "
         "  AND duration_seconds <= ? "
         "  AND volume_litres > 0 AND volume_litres < ? "
-        "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
-        "  AND COALESCE(is_cross_talk, 0) = 0 "
-        "  AND COALESCE(is_low_flow_dribble, 0) = 0 "
-        "  AND COALESCE(degraded_supply, 0) = 0 "
-        "  AND COALESCE(user_classified, 0) = 0 "
-        "  AND (user_fixture_type IS NULL OR user_fixture_type = '')"
-        + _LEAK_REFILL_GUARD_SQL,
+        + _NO_PHANTOM_SQL + _NO_CROSS_TALK_SQL + _NO_DRIBBLE_SQL
+        + _NO_DEGRADED_SQL + _NOT_USER_CLASSIFIED_SQL
+        + _NO_USER_FIXTURE_TYPE_SQL + _LEAK_REFILL_GUARD_SQL,
         (_RISE_PHANTOM_MIN_CORR, _RISE_PHANTOM_MAX_DURATION_S,
          _RISE_PHANTOM_MAX_VOLUME_PD_L),   # loose prefilter = the larger PD cap;
                                            # the detector applies the per-circuit one
@@ -2805,7 +2819,7 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
         "  AND degraded_diagnostic_json != '' "
         # Phantom takes precedence over degraded: never let a degraded
         # re-verdict un-zero a pressure-restoration phantom's volume.
-        "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0"
+        + _NO_PHANTOM_SQL
     ).fetchall()
 
     skipped_legacy_row = conn.execute(
@@ -2988,9 +3002,11 @@ def backfill_sawtooth_pump_recharge(conn) -> dict:
         "FROM events "
         "WHERE start_ts >= ? "
         "  AND start_trigger LIKE 'pressure%' "
-        "  AND COALESCE(degraded_supply, 0) = 0 "
-        "  AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
-        "  AND COALESCE(user_classified, 0) = 0 "
+        + _NO_DEGRADED_SQL + _NO_PHANTOM_SQL + _NOT_USER_CLASSIFIED_SQL +
+        # Deliberately NOT _NO_USER_FIXTURE_TYPE_SQL. This sweep tests IS NULL
+        # only, which is STRICTER than the shared guard's "IS NULL OR = ''" —
+        # widening it would newly zero empty-string-labelled rows, so it stays
+        # as typed (unit 6.5).
         "  AND user_fixture_type IS NULL "
         "  AND (match_rejection_reason IS NULL "
         "       OR match_rejection_reason = 'no_tier_matched') "
@@ -3800,7 +3816,20 @@ _WF_PEAK_SANITY_RATIO: float = 0.95
 # Waveform flag bits (must match firmware wire format).
 _WF_FL_START_COMPLETE:     int = 0x01  # pre-roll covers full start-window span
 _WF_FL_FULL_COMPLETE:      int = 0x02  # full-window capture is complete
-_WF_FL_RESOLUTION_REDUCED: int = 0x04  # buffer decimated; lower sample rate
+# _WF_FL_RESOLUTION_REDUCED is NOT redefined here. It is one bit in the
+# firmware's wire format, and it was defined twice - once here and once in
+# the detector - with nothing pinning the two equal. A wire-format
+# vocabulary split across two modules is a vocabulary that will drift, and
+# the drift would be silent: the two copies only disagree once the firmware
+# changes the bit. Unit 7.3 left the detector side with a single definition
+# in event_waveform; this takes it from there.
+#
+# Import direction is the reason it comes from event_waveform and not from
+# the event_detector facade: event_waveform imports only
+# event_detector_core, whereas this module already does
+# `from .event_detector import RawEvent, WaveformRecord` at module level,
+# so sourcing it from there would close a real cycle.
+from .event_waveform import _WF_FL_RESOLUTION_REDUCED  # noqa: E402
 
 _WF_FLOW_SIG_MIN_PEAK_LPM:   float = 0.05   # ignore near-zero / noisy full_flow arrays
 _WF_PRESS_SIG_MIN_DELTA_PSI:  float = 0.15   # ignore pressure noise below this drop
