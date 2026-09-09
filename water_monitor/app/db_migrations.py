@@ -3516,7 +3516,9 @@ def _apply_wf_src_hz_correction(conn: sqlite3.Connection) -> None:
     rate of an ESP-sourced series so a renderer can build an honest time axis.
     They were written as 200.0, which is the pressure ADC READ rate, not the
     capture rate: the firmware's waveform_capture interval is 20 ms (~50 Hz),
-    stated in its own header and matched by ``event_detector._SAMPLE_MS = 20``.
+    stated in its own header. The add-on's matching constant is a function-local
+    ``_SAMPLE_MS = 20`` in ``event_waveform.py`` (unit 7.3 moved it there); it
+    is NOT importable from ``event_detector`` and never was module-level.
 
     Every ESP-sourced waveform therefore rendered on a 4x-compressed time axis —
     a 30 s capture drawn as 7.5 s. This rewrites the stored metadata; the sample

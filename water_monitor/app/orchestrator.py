@@ -630,7 +630,9 @@ class Orchestrator:
                 # error is permanent and every derived volume, the low-flow floor
                 # (60 / ppl) and every threshold scaled from them are wrong
                 # together — which is exactly why it looks plausible. Logged at
-                # ERROR because there is no other symptom.
+                # ERROR, and — since 0.9's follow-up — also marked as a degraded
+                # subsystem below, so it surfaces on /health/detail rather than
+                # living only in a log nobody reads.
                 from .database import DEFAULT_PULSES_PER_LITRE
                 log.error(
                     "[%s] flow-meter PPL entity is NOT bound — using %.1f "

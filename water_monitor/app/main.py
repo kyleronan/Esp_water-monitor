@@ -391,8 +391,10 @@ async def lifespan(app: FastAPI):
     # the Markup wrapper then suppresses autoescape — so any value reaching a
     # <script> block through this filter could close the tag and execute.
     # dev49 (P0-5) found that live at three sinks: the cluster name in
-    # fixtures_merge.html, ?range= via CHART_RANGE, and the X-Ingress-Path
-    # header via window.INGRESS_PATH.
+    # fixtures_merge.html (that template has since been deleted with the
+    # merge routes), ?range= via CHART_RANGE, and the X-Ingress-Path header
+    # via window.INGRESS_PATH. Kept as the reason this filter is shaped the
+    # way it is — the sinks are historical, the hazard is not.
     #
     # htmlsafe_json_dumps escapes <, >, & and ' as \uXXXX and still returns
     # Markup, so the JSON stays parseable and cannot break out of the tag.

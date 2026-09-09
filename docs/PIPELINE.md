@@ -136,7 +136,7 @@ cumulative meter — the raw material replayed later by the importer (step 6) an
 > timestamps in the add-on log near the gap.
 
 ### 3 · Does an event start?
-**`app/event_detector.py · CircuitEventDetector`** — first trigger to fire wins.
+**`app/event_detector_core.py · CircuitEventDetector`** — first trigger to fire wins.
 
 | Trigger | Condition |
 |---|---|
@@ -156,7 +156,7 @@ inflated event.
 > backdated event → the stale-timer guard. Compare event start times against raw `water_usage` history.
 
 ### 4 · While the event is open
-**`app/event_detector.py · RawEvent`**
+**`app/event_detector_core.py · RawEvent`**
 
 Two flow records accumulate in parallel: a 1 Hz `flow_readings` list (→ the 256-point signature) and
 timestamped `flow_samples` (→ the volume integral). A 400-sample pressure ring buffer (10 s @ 40 Hz)
@@ -203,7 +203,7 @@ wide live upsert would abort event storage), and `flow_sig_span_s` / `pressure_s
 > (warning-level; 1,842 legacy NULLs stay as honest unknowns).
 
 ### 5 · How does the event end?
-**`app/event_detector.py`** — any one of six exits closes it.
+**`app/event_detector_core.py`** — any one of six exits closes it.
 
 | Exit | Condition |
 |---|---|
@@ -227,7 +227,7 @@ outright and both the flow and fast-pressure handlers return early while it is s
 start — nothing is zeroed because nothing is ever stored.
 
 ### 6 · Features computed
-**`app/feature_extractor.py · FeatureExtractor`**
+**`app/feature_extractor_service.py · FeatureExtractor`**
 
 - **Volume:** time integral of the timestamped samples (`flow_integral.integrate_litres`). A gap > 300 s
   marks `integration_quality = 'degraded'` (kept out of training).
@@ -707,7 +707,7 @@ is already net of every zeroing, correction, split, and relabel above, and is wh
 chart reads.
 
 #### Branch · Your labels (the feedback loop)
-**`app/routers/history.py · patch_event()`**
+**`app/database.py · patch_event()`** (called from `routers/history.py`)
 
 Saving a label writes `user_fixture_type` + `user_classified = 1` — never overwritten by any machine
 pass. Appliance labels propagate to cycle-mates (±45 min, tagged `fixture_label_source = 'cycle'`). 8 s
@@ -725,7 +725,7 @@ settle once cycle-mates exist. Any volume change re-enters at step 12.
 |---|---|---|
 | **Daily summary** | `database.py · compute_daily_summary()` | `SUM(COALESCE(volume_litres_effective, volume_litres, 0))` per circuit-day; phantoms excluded from the event *count* only (their litres are already 0). **The day is the home-local day** (dev36): `local_day_of()` / `local_day_bounds_utc()` give a DST-correct half-open UTC range (a spring-forward day is 23 h, a fall-back day 25 h), replacing the old `start_ts[:10]` string slice — before dev36 four surfaces reported four different daily totals. A day emptied of events deletes its stale row |
 | **Water Use page** | `database.py · get_category_rollup()` | groups by effective type — precedence `user_fixture_type` → confirmed fixture → `matched_fixture_type` → cluster hint → `other`; `WHERE is_pressure_restoration_phantom = 0`; lifetime + windowed sums per fixture |
-| **Dashboard + HA** | `routers/dashboard.py`, `fixture_publisher.py` | 24 h chart straight from the hour buckets (labels in local time, "Past 24 hours (rolling)"); per-fixture and per-category totals published to Home Assistant as `total_increasing` sensors. **Meter-reset carry-over (dev36):** `volume_snapshots.last_reading` is a per-period high-water mark; when the meter reads *backwards* (reflash, stale republish) the baseline is pushed **negative** by the carried amount so `current − baseline` continues the period, matching HA `utility_meter` semantics — the old "rebase to current" zeroed the period mid-day |
+| **Dashboard + HA** | `routers/dashboard.py` | 24 h chart straight from the hour buckets (labels in local time, "Past 24 hours (rolling)"); per-fixture and per-category totals published to Home Assistant as `total_increasing` sensors. **Meter-reset carry-over (dev36):** `volume_snapshots.last_reading` is a per-period high-water mark; when the meter reads *backwards* (reflash, stale republish) the baseline is pushed **negative** by the carried amount so `current − baseline` continues the period, matching HA `utility_meter` semantics — the old "rebase to current" zeroed the period mid-day |
 | **Review card** (Water Use) | `review_queue.py`, `routers/fixtures.py` | "N events would be worth a quick look" — 10 identity slots + 2 anchor slots (the latter are *confirmations* of confidently-typed events, not unknowns). Its link carries `?filter=review`, and **History rebuilds the card server-side** rather than trusting ids from the URL (they go stale as soon as the card regenerates); the filter is pushed into SQL because these events are chosen for teaching value, not recency |
 | **Fixture health alerts** (Water Use) | `fixture_health.py`, `routers/fixtures.py` | per-signal wording, observed vs frozen reference (only when units match), and an events-to-fire count; admin resolves as `fixture_repaired` or `false_alarm` |
 | **Supply-pressure banner** (Dashboard / Settings) | `routers/dashboard.py`, `routers/settings.py` | "supply pressure changed — recalibrate?" with old/new psi and per-type labels-needed; Confirm runs the `regime_recalibration` job (Part 5a) |

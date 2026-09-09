@@ -4167,7 +4167,7 @@ def upsert_fixture_from_cluster(
     ``find_orphaned_cluster_references`` exists to detect and repair, ~300
     lines below in this same file. One transaction per call is correct here
     under rule N2a: the only caller
-    (``migrate_consolidate_duplicate_fixture_types``) opens none of its own,
+    (``migrate_to_type_level_clusters``, ~line 6877) opens none of its own,
     and this is not a chunked writer, so nothing is relying on a mid-loop
     commit.
     """
@@ -4880,9 +4880,19 @@ _SIGNATURE_MATCH_FEATURES: tuple = (
 # production path (live classify + backfill). dev59 deleted the centroid matcher
 # (``match_event_to_signature``) and its two exclusive tuning constants: nothing
 # had called it since, and a second matcher nobody runs is a second set of
-# thresholds to keep honest. The signature RECORDS stay — upsert /
-# get_fixture_type_signatures still back the Signatures UI, and
-# _SIGNATURE_MATCH_FEATURES is still the k-NN's legacy-tier feature list.
+# thresholds to keep honest. _SIGNATURE_MATCH_FEATURES is still the k-NN's
+# legacy-tier feature list.
+#
+# ⚠️ CORRECTED 2026-09-08: this used to say the signature RECORDS stay
+# because upsert / get_fixture_type_signatures "still back the Signatures
+# UI". There is no Signatures UI. Those routes and templates were pruned
+# (see routers/fixtures.py:339), and get_fixture_type_signatures now has
+# ZERO callers outside tests. So the table is written on every reclassify
+# and read by nothing in production — the same written-never-read shape as
+# cluster_cooccurrence and fixture_health_stat. Whether to stop writing it
+# is a decision, not a cleanup, so it is recorded here rather than acted
+# on: deleting the writer would also delete the only record of what the
+# per-type centroids were.
 #
 # Right-skewed features are log1p-compressed so Euclidean distance behaves on
 # log-normal data. ``_knn_transform`` applies it identically to the query event

@@ -96,8 +96,12 @@ FIXTURE_TYPE_LABELS: Dict[str, str] = {
 INTERNAL_FIXTURE_TYPES: List[str] = ["leak_test"]
 
 # HA publishing categories. Each fixture type is its own category now —
-# the taxonomy IS the category set. Used only in fixture_publisher to
-# name HA entities. Never stored in the database.
+# the taxonomy IS the category set. Never stored in the database.
+#
+# It used to say "used only in fixture_publisher to name HA entities".
+# That module was deleted with the MQTT publisher, so this now has no
+# consumer at all — kept because it is the taxonomy's category mapping and
+# a future publisher would need it, not because anything reads it today.
 FIXTURE_CATEGORIES: Dict[str, Optional[str]] = {
     "toilet":           "toilet",
     "shower_tub":       "shower_tub",

@@ -3192,7 +3192,9 @@ def _persist_waveform(
     # firmware header explicitly distinguishes from capture. This value is
     # stored as event_waveforms.flow_src_hz / press_src_hz and is what a
     # renderer divides by to build the time axis, so 200 rendered every ESP
-    # waveform 4x time-compressed. event_detector._SAMPLE_MS = 20 agrees.
+    # waveform 4x time-compressed. The 20 ms figure is confirmed by the
+    # function-local _SAMPLE_MS in event_waveform.py (moved there by 7.3);
+    # it is not an importable event_detector attribute.
     _ESP_HZ = 50.0
     flow_hz = press_hz = None
     if _wf_full_res_usable(esp_record):

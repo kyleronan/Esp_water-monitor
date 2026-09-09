@@ -1359,9 +1359,17 @@ def _median(vals):
     the whole monitor window) that biased the MAD — and therefore the noise
     floor — HIGH, so a genuine held decay could be written off as
     'within_noise'. Empty input still returns None: that contract is relied on
-    by nothing here but is deliberately unchanged, and this median is NOT
-    interchangeable with ``fixture_health._median`` / ``_mad`` (which scale by
-    MAD_SCALE). Do not merge them.
+    by nothing here but is deliberately unchanged.
+
+    ⚠️ CORRECTED 2026-09-08 — the previous wording named the wrong reason.
+    It said this is not interchangeable with ``fixture_health._median`` /
+    ``_mad`` "which scale by MAD_SCALE". ``fixture_health._median`` does NOT
+    scale; only ``_mad`` does. Since 2.25(f) the two ``_median`` bodies are
+    identical except on EMPTY input — this one returns ``None``, that one
+    returns ``0.0``. That difference is the whole reason not to merge them:
+    a 0.0 median silently becomes a real data point, whereas None forces the
+    caller to decide. Merging the MADs is the separately unsafe one, because
+    only one of them applies MAD_SCALE.
     """
     s = sorted(vals)
     if not s:
