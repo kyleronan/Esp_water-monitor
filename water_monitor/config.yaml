@@ -58,6 +58,34 @@ ports_description:
 # If this ever misfires the symptom is a restart loop — deleting this one line
 # disables it.
 watchdog: "http://[HOST]:8765/health"
+
+# ── Supervisor backup (plan unit 2.27) ─────────────────────────────────────
+# The database is in WAL mode, so it is three files -- water_monitor.db, its
+# -wal and its -shm. "hot" means the Supervisor tars /data while this add-on
+# keeps writing, and a plain file copy of a live WAL database is unsafe: copy
+# only the main file and you have silently lost every transaction still in the
+# WAL. SQLite's own answer is that a live database must be copied with a SQLite
+# primitive, never with tar.
+#
+# So `backup_pre` leaves a VACUUM INTO copy -- consistent by construction, and
+# quick_check-verified before it is handed over -- beside the live files, and
+# `backup_post` deletes it again the moment the archive is written. The
+# doubled footprint in /data therefore lasts only for the length of one
+# backup; the archive keeps its clean copy. rootfs/etc/services.d/.../run
+# calls the same script with `recover` at boot, which is what makes that copy
+# count on a RESTORE rather than merely ride along in the tar.
+#
+# NOT "cold": that stops the container, so the house goes unmonitored for the
+# length of every backup, and leak detection is the product.
+#
+# The commands run in this add-on's container. They always exit 0 -- the
+# Supervisor's handling of a non-zero backup_pre is undocumented, and nothing
+# this script can fail at is worth failing the user's backup over. Read
+# rootfs/usr/lib/water_monitor/db_backup.py for what this does NOT protect
+# against; it is a real but partial mitigation and says so.
+backup: "hot"
+backup_pre: "python3 /usr/lib/water_monitor/db_backup.py pre"
+backup_post: "python3 /usr/lib/water_monitor/db_backup.py post"
 options:
   log_level: "info"
   # SEED VALUE ONLY — read on first setup, then ignored.

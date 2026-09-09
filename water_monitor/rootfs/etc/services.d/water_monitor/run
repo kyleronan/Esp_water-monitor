@@ -23,6 +23,26 @@ esac
 
 cd /opt/water_monitor || exit 1
 
+# Plan unit 2.27 -- make a RESTORED Supervisor backup count.
+#
+# `backup_pre` leaves a consistent VACUUM INTO copy of the database in /data,
+# so a restored archive can contain a torn live file set AND one good copy.
+# Nothing would ever read that copy unless something checks before the app
+# opens the database, which is here.
+#
+# It is a no-op at zero cost on an ordinary boot: `backup_post` deletes the
+# snapshot, so on a normal restart there is no snapshot and the script returns
+# immediately without opening anything. Only a boot that follows a restore
+# pays for the integrity check.
+#
+# NON-FATAL BY CONSTRUCTION, twice over: the script catches everything and
+# always exits 0, and this line tolerates a failure anyway. A box whose job is
+# closing the water main must never fail to boot over a backup helper.
+if [ -f /usr/lib/water_monitor/db_backup.py ]; then
+    python3 /usr/lib/water_monitor/db_backup.py recover \
+        || echo "[run] DB recovery check failed (non-fatal); booting anyway."
+fi
+
 # --no-proxy-headers is LOAD-BEARING for RBAC, not a tuning knob.
 #
 # The whole trust model rests on main.py comparing request.client.host
