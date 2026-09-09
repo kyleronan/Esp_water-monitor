@@ -867,9 +867,6 @@ async def sensitivity_update(circuit: str, request: Request):
             # feature_extractor makes 0 behave as 2 today). This unit only
             # guarantees the form cannot 500 or store nonsense; it does not
             # settle that meaning.
-            max_shutoffs_per_12h=coerce_int(             # presets 1 / 2 / 3
-                form.get("max_shutoffs_per_12h"), lo=0, hi=20,
-                default=preset["max_shutoffs_per_12h"]),
         )
 
     # Refresh event detector thresholds

@@ -1650,7 +1650,6 @@ class Orchestrator:
             "duration_tolerance_pct":     _eff("duration_tolerance_pct"),
             "schedule_window_minutes":    _eff("schedule_window_minutes"),
             "sustained_alert_minutes":    _eff("sustained_alert_minutes"),
-            "max_shutoffs_per_12h":       _eff("max_shutoffs_per_12h"),
         }
 
     async def get_live_state_async(self, circuit: str) -> Dict[str, Any]:

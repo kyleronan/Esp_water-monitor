@@ -825,13 +825,25 @@ class FeatureExtractor:
         self._notify_anomaly(circuit, circuit_name, score, atype, event_id)
 
     def _anomaly_shutoff_gates_sync(self, circuit: str, sens) -> bool:
-        """dev46 (46a) — both DB-backed shut-off gates, one hop.
+        """dev46 (46a) — the DB-backed shut-off gate, one hop.
 
-        Order is preserved from the inline version: valve/alert state first,
-        then the rate limiter. Short-circuits exactly as the ``and`` chain did.
+        Was two gates. The per-12h rate limiter was deleted 2026-09-08 by
+        operator decision: it refused a further automatic close once N had
+        happened in 12 hours, but there is NO automatic reopen in this add-on
+        — the only open path is the manual, operator-gated
+        `/device/valve/{circuit}/open` route. So the counter could not reach 2
+        unless the operator personally reopened the valve in between, which
+        means it never guarded against an unnoticed runaway; a shut valve is
+        the loudest notification the system has. What it actually bounded was
+        how many times the add-on may overrule a human who has just
+        deliberately reopened, and the standing decision is that a close —
+        right or wrong — gets dealt with when it happens.
+
+        ``anomaly_shutoff_log`` is unaffected and still written: it is the
+        audit record that the valve was physically closed, and it is worth
+        more now that nothing gates on it.
         """
-        return (self._anomaly_shutoff_state_ok(circuit)
-                and self._anomaly_shutoff_rate_ok(circuit, sens))
+        return self._anomaly_shutoff_state_ok(circuit)
 
     def _anomaly_seasoned(self, sens, min_days: int) -> bool:
         """Earned-trust gate — the baseline has had ≥ ``min_days`` of real usage since
@@ -847,17 +859,6 @@ class FeatureExtractor:
         if frozen.tzinfo is None:
             frozen = frozen.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - frozen) >= timedelta(days=min_days)
-
-    def _anomaly_shutoff_rate_ok(self, circuit: str, sens) -> bool:
-        """Persistent per-12h shut-off cap (counted from anomaly_shutoff_log so it
-        survives a restart)."""
-        from .anomaly_baseline import _row_get
-        cap = int(_row_get(sens, "max_shutoffs_per_12h", 2) or 2)
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
-        row = self._db.execute(
-            "SELECT COUNT(*) FROM anomaly_shutoff_log "
-            "WHERE circuit = ? AND closed_at >= ?", (circuit, cutoff)).fetchone()
-        return (int(row[0]) if row else 0) < cap
 
     def _anomaly_shutoff_state_ok(self, circuit: str) -> bool:
         """HARD safety gate — an automated valve close is permitted ONLY when the
@@ -906,11 +907,17 @@ class FeatureExtractor:
                           score: float) -> None:
         """dev46 (46a) — append the shut-off audit row, on the DB thread.
 
-        Store closed_at as an explicit UTC ISO timestamp (NOT the
-        CURRENT_TIMESTAMP default, whose 'YYYY-MM-DD HH:MM:SS' space format
-        sorts BELOW the 'YYYY-MM-DDT…+00:00' cutoff in
-        _anomaly_shutoff_rate_ok — the rate limit would never trip). Both ends
-        must use the same ISO format.
+        Store closed_at as an explicit UTC ISO timestamp, NOT the
+        CURRENT_TIMESTAMP default. SQLite's default renders
+        'YYYY-MM-DD HH:MM:SS' — space-separated — and ' ' (0x20) sorts BELOW
+        'T' (0x54), so a space-format row compares as EARLIER than every
+        T-format row regardless of the instant it records. Any range query
+        over this column would silently mis-select.
+
+        The original comment justified this by the per-12h rate limiter's
+        cutoff; that limiter was deleted 2026-09-08. The reason is broader and
+        outlives it: this is the repo's canonical timestamp form, and the
+        project has already paid for the mixed-format hazard elsewhere.
         """
         self._db.execute(
             "INSERT INTO anomaly_shutoff_log "
@@ -950,10 +957,11 @@ class FeatureExtractor:
             return False
         if not ok:
             return False
-        # Store closed_at as an explicit UTC ISO timestamp (NOT the CURRENT_TIMESTAMP
-        # default, whose 'YYYY-MM-DD HH:MM:SS' space format sorts BELOW the
-        # 'YYYY-MM-DDT…+00:00' cutoff in _anomaly_shutoff_rate_ok — the rate limit
-        # would never trip). Both ends must use the same ISO format.
+        # Store closed_at as an explicit UTC ISO timestamp, NOT the
+        # CURRENT_TIMESTAMP default: its space-separated form sorts below every
+        # T-separated row, so any range query over this column mis-selects.
+        # (This used to cite the per-12h rate limiter's cutoff — deleted
+        # 2026-09-08. The format rule stands on its own.)
         #
         # dev46 (46a) — HOP 2, after the valve await. NO re-check, and this
         # one is argued, not inherited:
@@ -963,9 +971,10 @@ class FeatureExtractor:
         #   * It is an append of an immutable fact — the log only ever grows,
         #     and no interleaved write can make this row wrong or redundant.
         #     That is exemption-class membership (monotonic), not convenience.
-        #   * Skipping it would also be unsafe in the other direction:
-        #     _anomaly_shutoff_rate_ok counts these rows, so a missing entry
-        #     under-counts the limiter and permits MORE shut-offs.
+        #   * It is the ONLY durable record that the add-on physically closed
+        #     the valve. It used to also feed the per-12h rate limiter; that
+        #     limiter was deleted 2026-09-08, which makes this row the whole
+        #     of the bookkeeping rather than half of it.
         await run_db(self._log_shutoff_sync, circuit, event_id, atype, score)
         log.warning("[%s] ANOMALY AUTO-SHUTOFF — closed valve %s (event %s, %s, "
                     "score %.2f)", circuit, valve, event_id, atype, score)

@@ -193,7 +193,6 @@ SENSITIVITY_PRESETS = {
         "duration_tolerance_pct": 50.0,
         "schedule_window_minutes": 30.0,
         "sustained_alert_minutes": 20.0,
-        "max_shutoffs_per_12h": 1,
     },
     "medium": {
         "pressure_drop_event_psi": 1.2,
@@ -204,7 +203,6 @@ SENSITIVITY_PRESETS = {
         "duration_tolerance_pct": 30.0,
         "schedule_window_minutes": 15.0,
         "sustained_alert_minutes": 10.0,
-        "max_shutoffs_per_12h": 2,
     },
     "high": {
         "pressure_drop_event_psi": 1.0,
@@ -215,7 +213,6 @@ SENSITIVITY_PRESETS = {
         "duration_tolerance_pct": 15.0,
         "schedule_window_minutes": 5.0,
         "sustained_alert_minutes": 5.0,
-        "max_shutoffs_per_12h": 3,
     },
 }
 
