@@ -48,7 +48,7 @@ async def device_page(request: Request):
     orch = _orch(request)
     cfg = orch._cfg
 
-    # dev46 (46a): every DB read this page needs, in ONE hop off the loop
+    # Every DB read this page needs, in ONE hop off the loop
     # thread. The per-circuit loop below still awaits HA (natively async) but
     # never touches the shared connection.
     from ..database import run_db
@@ -62,7 +62,7 @@ async def device_page(request: Request):
         sched = db_payload["schedules"].get(circuit_cfg.circuit)
         state["schedule"] = dict(sched) if sched else {}
 
-        # Phase 3 — waveform-transport health: addon-side counters (assembled /
+        # Waveform-transport health: addon-side counters (assembled /
         # firmware-flagged degraded / transport gaps) + the firmware's own dropped-
         # sample count. Surfaces the silently-lossy waveform stream.
         ed = orch.event_detector
@@ -82,10 +82,8 @@ async def device_page(request: Request):
                     pass
         state["waveform"] = wf
 
-        # Phase 3 §2 — recorder volume reconciliation surface: cumulative correction /
-        # flag counts + last-run time (from reconcile_state) and the current flag backlog
-        # (healthy events whose stored volume still diverges from the recorder's). Only
-        # shown when the firmware publishes a cumulative volume sensor.
+        # Recorder volume reconciliation surface. Only shown when the firmware
+        # publishes a cumulative volume sensor.
         if getattr(circuit_cfg, "volume_sensor", ""):
             reconcile = db_payload["reconcile"].get(circuit_cfg.circuit)
             if reconcile is not None:
@@ -103,9 +101,9 @@ async def device_page(request: Request):
 def _device_db_payload(db, circuits) -> dict:
     """Every DB read the device page needs, bundled into one DB-thread call.
 
-    dev46 (46a): these ran inline on the event loop, once per circuit —
-    concurrent statements on the shared connection whenever a background job
-    was mid-write. Best-effort per circuit so one bad row can't blank the page.
+    Inline per-circuit reads would run on the event loop, issuing concurrent
+    statements on the shared connection whenever a background job is mid-write.
+    Best-effort per circuit so one bad row can't blank the page.
     """
     from ..database import (get_leak_test_schedule, get_reconcile_state,
                             get_sensitivity_config)
@@ -121,7 +119,7 @@ def _device_db_payload(db, circuits) -> dict:
             schedules[c.circuit] = get_leak_test_schedule(db, c.circuit)
         except Exception:
             schedules[c.circuit] = None
-        # Phase 3 §2 — recorder volume reconciliation surface: cumulative
+        # Recorder volume reconciliation surface: cumulative
         # correction / flag counts + last-run time (from reconcile_state) and
         # the current flag backlog (healthy events whose stored volume still
         # diverges from the recorder's). Only meaningful when the firmware
@@ -166,7 +164,7 @@ async def valve_open(circuit: str, request: Request):
             status_code=404,
         )
     ok = await orch.ha.open_valve(cfg.valve_entity)
-    # dev57 (2.33): 502, not 200. A failed HA round-trip is exactly the
+    # 502, not 200. A failed HA round-trip is exactly the
     # documented 502 case (_helpers.py) and the other four device routes
     # already use it. Returning 200 with {"status":"error"} means every
     # `fetch(...).ok` check, every automation, and every log scrape reads a
@@ -198,7 +196,7 @@ async def valve_close(circuit: str, request: Request):
             status_code=404,
         )
     ok = await orch.ha.close_valve(cfg.valve_entity)
-    # dev57 (2.33): 502 on failure — see valve_open above. This one matters
+    # 502 on failure — see valve_open above. This one matters
     # most: a close is the safety action, and a silent 200 on a close that
     # never happened is the worst possible lie this API can tell.
     return JSONResponse(
@@ -223,7 +221,7 @@ async def fault_reset(circuit: str, request: Request):
     orch = _orch(request)
     from ..device_discovery import load_circuit_entities
     from ..database import run_db
-    entities = await run_db(load_circuit_entities, orch.db, circuit)  # dev46 (46a)
+    entities = await run_db(load_circuit_entities, orch.db, circuit)
     entity_id = entities.get("fault_reset_button")
     if not entity_id:
         return JSONResponse(
@@ -248,7 +246,7 @@ async def trickle_reset(circuit: str, request: Request):
     orch = _orch(request)
     from ..device_discovery import load_circuit_entities
     from ..database import run_db
-    entities = await run_db(load_circuit_entities, orch.db, circuit)  # dev46 (46a)
+    entities = await run_db(load_circuit_entities, orch.db, circuit)
     entity_id = entities.get("trickle_reset_button")
     if not entity_id:
         return JSONResponse(
@@ -288,7 +286,7 @@ async def threshold_update(
     # Build allowlist from only the writable threshold roles for this circuit
     from ..device_discovery import load_circuit_entities
     from ..database import run_db
-    entities = await run_db(load_circuit_entities, orch.db, circuit)  # dev46 (46a)
+    entities = await run_db(load_circuit_entities, orch.db, circuit)
     allowed = {v for k, v in entities.items() if k in _THRESHOLD_ROLES and v}
     if entity_id not in allowed:
         # 400 not 403 — the request is well-formed, but the supplied
@@ -340,7 +338,7 @@ async def alert_toggle(
         )
     from ..device_discovery import load_circuit_entities
     from ..database import run_db
-    entities = await run_db(load_circuit_entities, orch.db, circuit)  # dev46 (46a)
+    entities = await run_db(load_circuit_entities, orch.db, circuit)
     role = f"alert_{alert_type}_switch"
     entity_id = entities.get(role)
     if not entity_id:
@@ -359,7 +357,7 @@ async def alert_toggle(
 
     # Update local alert_config only after HA confirms
     from ..database import set_alert_enabled
-    await run_db(set_alert_enabled, orch.db,                  # dev46 (46a)
+    await run_db(set_alert_enabled, orch.db,
                  f"{alert_type}_{circuit}", enabled)
 
     return JSONResponse({"status": "updated", "enabled": enabled})
@@ -420,11 +418,11 @@ async def leaktest_run(circuit: str, request: Request):
     # Delegate to the scheduler — it triggers the switch, monitors the result
     # sensor, saves to leak_test_history, and sends the HA notification.
     #
-    # dev57 (2.24): via task_registry.spawn. A bare create_task() left the ONLY
-    # reference to this task with asyncio's weak set, so the GC was free to
-    # collect a running leak test mid-flight — while this handler had already
-    # told the operator "started". spawn() holds the strong reference and logs
-    # any exception the fire-and-forget task raises.
+    # Via task_registry.spawn. A bare create_task() leaves the ONLY reference
+    # to this task with asyncio's weak set, so the GC is free to collect a
+    # running leak test mid-flight while this handler has already told the
+    # operator "started". spawn() holds the strong reference and logs any
+    # exception the fire-and-forget task raises.
     if spawn(orch.leak_test_scheduler.run_now(circuit, triggered_by="manual"),
              name=f"leak_test_manual[{circuit}]") is None:
         # No running loop — cannot happen under uvicorn, but never claim a
@@ -508,7 +506,7 @@ async def leaktest_schedule(circuit: str, request: Request):
     #   week_of_month  1..5
     #   run_hour       0..23
     #   run_minute     0..59
-    await run_db(                                             # dev46 (46a)
+    await run_db(
         upsert_leak_test_schedule,
         orch.db, circuit,
         enabled=form.get("enabled") == "on",
@@ -525,7 +523,7 @@ async def leaktest_schedule(circuit: str, request: Request):
 
 
 # ------------------------------------------------------------------
-# Recorder volume reconciliation — apply the flagged backlog (Phase 3 §2)
+# Recorder volume reconciliation — apply the flagged backlog
 # ------------------------------------------------------------------
 @router.post("/reconcile/{circuit}/apply")
 async def reconcile_apply(circuit: str, request: Request):

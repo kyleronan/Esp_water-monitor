@@ -130,7 +130,7 @@ class PresenceWatcher:
 
         log.info("Presence: %s → %s", entity_id, state)
 
-        # dev46 (46a): HaClient invokes this callback ON THE EVENT LOOP, so it
+        # HaClient invokes this callback ON THE EVENT LOOP, so it
         # must not touch the connection. The profile read moved into
         # _evaluate, which is async and can go through run_db.
 

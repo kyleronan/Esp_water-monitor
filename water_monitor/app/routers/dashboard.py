@@ -24,14 +24,12 @@ def _get_orchestrator(request: Request):
 # evaluate_hysteresis/evaluate_leak_alert — an HA outage that skips a night
 # must not age out a live reading.
 #
-# dev34: the tile previously took the newest night carrying an estimate out of
-# the last 14, with no age test at all. When the 2026-07 pump cycling stopped
-# after the valve service, the last night that HAD an estimate kept winning and
-# the banner asserted an active leak in the present tense for six days — and,
-# because dev33's contamination gate only stops FUTURE writes, the number it
-# was showing was the one the audit had already attributed to the 02:00
-# irrigation program. Three evaluated nights of no estimate now clears it,
-# which is the behavior the tile's docstring always claimed.
+# Without an age test the newest night that HAS an estimate keeps winning: when
+# the 2026-07 pump cycling stopped after the valve service, the banner asserted
+# an active leak in the present tense for six days, showing a number the audit
+# had already attributed to the 02:00 irrigation program (the contamination
+# gate only stops FUTURE writes). Three evaluated nights of no estimate clear
+# the tile.
 _LEAK_WATCH_MAX_AGE_NIGHTS: int = 3
 
 
@@ -72,21 +70,20 @@ def _fresh_leak_estimate(nights: list, ack: str | None) -> Dict[str, Any] | None
 async def dashboard(request: Request):
     orch = _get_orchestrator(request)
 
-    # dev46 (46c) — the LANDING page needs the gate most of all, and the
-    # original three-page scope missed it. This is where ingress drops the
-    # operator after every restart, so it is the first thing hit while the
-    # boot pass owns the single DB worker; the page's own first hop then sits
-    # in the queue behind ~21 s of cluster replay and the operator sees the
-    # ingress spinner on a blank frame with nothing to explain it (observed
-    # 2026-08-17 19:22). A "still starting" notice is a worse-looking page and
-    # a far better answer.
+    # The LANDING page needs the readiness gate most of all: this is where
+    # ingress drops the operator after every restart, so it is the first thing
+    # hit while the boot pass owns the single DB worker; the page's own first
+    # hop then sits in the queue behind ~21 s of cluster replay and the
+    # operator sees the ingress spinner on a blank frame with nothing to
+    # explain it. A "still starting" notice is a worse-looking page and a far
+    # better answer.
     gated = startup_gate(request, "dashboard", "Dashboard", "/")
     if gated is not None:
         return gated
 
     cfg = orch._cfg
 
-    # dev46 (46a) — ONE hop for every DB read this page needs (charts,
+    # ONE hop for every DB read this page needs (charts,
     # profile, per-circuit training + leak schedules, both banners, the
     # pump-regime nights). Nothing below may query the shared connection
     # inline: the loop thread and the DB worker must never touch it at once.
@@ -124,7 +121,7 @@ async def dashboard(request: Request):
 
     from ..fixtures import CIRCUIT_TYPE_LABELS
 
-    # Phase 5a leak-watch tile: latest nightly street-calibrated estimate,
+    # Leak-watch tile: latest nightly street-calibrated estimate,
     # shown only when pump mode is armed and a RECENT evaluated night carried
     # an estimate. Best-effort. (Nights were fetched in the bundle above; the
     # freshness/format work below is pure Python.)
@@ -169,13 +166,12 @@ async def dashboard(request: Request):
         # (jinja2.utils.htmlsafe_json_dumps), which escapes <, >, & and \'
         # so the value cannot close the <script> tag it sits inside.
         #
-        # json.dumps does NOT escape those, which is why this previously
-        # needed |safe in the template — and |safe is exactly what
-        # suppresses autoescaping. It was the only |safe left in any
-        # template. Not exploitable today (labels and rounded floats),
-        # but it is the classic </script> breakout one refactor away, and
-        # a nonce-based CSP would not help: the nonce authorises that very
-        # block. dev49 (P0-5) already found this live at three other sinks.
+        # json.dumps does NOT escape those, so a pre-serialised string
+        # needs |safe in the template — and |safe is exactly what
+        # suppresses autoescaping. Not exploitable with this payload
+        # (labels and rounded floats), but it is the classic </script>
+        # breakout one refactor away, and a nonce-based CSP would not
+        # help: the nonce authorises that very block.
         "chart_data":          chart_data,
         "page":                "dashboard",
         "profile":             profile,
@@ -193,7 +189,7 @@ async def dashboard_live(request: Request):
     orch = _get_orchestrator(request)
     cfg = orch._cfg
 
-    # dev46 (46a): get_training_info reads training_state — a DB touch. This
+    # get_training_info reads training_state — a DB touch. This
     # endpoint is polled by the dashboard's auto-refresh, so an inline query
     # here was the most frequent loop-thread contact with the shared
     # connection in the whole addon. One run_db hop covers every circuit.
@@ -220,7 +216,7 @@ async def dashboard_live(request: Request):
 @router.get("/api/jobs")
 async def jobs_poll(request: Request, since: int = 0):
     """Recent background-job statuses with id > ``since`` for the UI poll-and-toast
-    (§2.4 reclassify / calibration feedback). Newest first."""
+    (reclassify / calibration feedback). Newest first."""
     orch = _get_orchestrator(request)
     from ..database import get_jobs_since, run_db
     # dev46 (46a): polled endpoint — off the loop thread, onto the DB worker.
@@ -286,14 +282,13 @@ def _build_dashboard_sync_payload(db, circuits, get_home_profile,
     Returns the chart_data dict (keyed by circuit id) plus the resolved
     home_profile row.
 
-    dev46 (46a) — this bundle grew to cover EVERY DB read the dashboard
-    needs: training state, leak-test schedules, both banners and the
-    pump-regime nights used to have their own inline queries on the event
-    loop. Inline sync queries touch the shared connection from the loop
-    thread while the DB worker may be mid-statement on it — the same
-    two-thread window that produced the 8/15 + 8/16 InterfaceErrors. One
-    hop, one thread. Each best-effort block keeps its own try/except so a
-    single failing widget still can't break the dashboard.
+    The bundle covers EVERY DB read the dashboard needs: training state,
+    leak-test schedules, both banners, the pump-regime nights. Nothing below
+    may query inline — an inline sync query touches the shared connection
+    from the loop thread while the DB worker may be mid-statement on it, the
+    two-thread window that produced the 8/15 + 8/16 InterfaceErrors. One hop,
+    one thread. Each best-effort block keeps its own try/except so a single
+    failing widget still can't break the dashboard.
     """
     chart_data: Dict[str, Any] = {}
     for c in circuits:
@@ -315,7 +310,7 @@ def _build_dashboard_sync_payload(db, circuits, get_home_profile,
         except Exception:
             schedules[c.circuit] = None
 
-    # Pump-regime detection banner (dev23) — banner+confirm: shows only while
+    # Pump-regime detection banner — banner+confirm: shows only while
     # detection is unacknowledged; confirming is the sole auto-path into pump
     # mode. Best-effort; a failure must never break the dashboard.
     try:
@@ -333,7 +328,7 @@ def _build_dashboard_sync_payload(db, circuits, get_home_profile,
     except Exception:
         supply_banner = {"show": False}
 
-    # Phase 5a leak-watch tile: the nights feeding the latest nightly
+    # Leak-watch tile: the nights feeding the latest nightly
     # street-calibrated estimate, only when pump mode is armed.
     try:
         from ..config import pump_gates_active
@@ -361,9 +356,8 @@ def _build_chart_data(db, circuit: str) -> Dict[str, Any]:
     Returns {labels: [...], values: [...], total: float}.
 
     Buckets are UTC hours (that's how hourly_volume is keyed) but the LABELS
-    are the home's local clock. They used to be the raw UTC hour, so a 05:00
-    shower was drawn at "11:00" and the whole chart read six hours out of step
-    with every other time on the page.
+    are the home's local clock — labelling with the raw UTC hour draws a 05:00
+    shower at "11:00", six hours out of step with every other time on the page.
     """
     from ..database import get_hourly_volumes
     from ..event_rules import get_home_timezone

@@ -1,22 +1,20 @@
 """Feature-extractor SERVICE half — the async queue consumer.
 
-Unit 7.2 split :mod:`feature_extractor` at its one honest seam. Everything
-above ``class FeatureExtractor`` is pure computation and is what the rest of
-the app actually wants: 26 import sites across 11 app modules reach for the
-pure half, and exactly ONE — :mod:`orchestrator` — wanted the class. The class
-is the queue-consuming, DB-writing, alert-firing service; it lives here now.
+:mod:`feature_extractor` holds the pure computation half, which is what most
+of the app imports; this module holds ``class FeatureExtractor``, the
+queue-consuming, DB-writing, alert-firing service that only
+:mod:`orchestrator` wants.
 
 The dependency runs ONE WAY: this module reads 14 names out of
 ``feature_extractor``; ``feature_extractor`` references nothing defined here.
-That is why the back-compat re-export left behind in ``feature_extractor`` is a
-PEP 562 module ``__getattr__`` and not a bottom-of-file import — an eager
-import there would close the loop and raise ImportError whenever this module
-was the first of the pair to be imported, which is precisely what
-``orchestrator`` does.
+That is why the back-compat re-export left in ``feature_extractor`` is a PEP
+562 module ``__getattr__`` and not a bottom-of-file import — an eager import
+there closes the loop and raises ImportError whenever this module is imported
+first, which is what ``orchestrator`` does.
 
-NOT dissolved by this split: the ``database`` <-> ``feature_extractor`` import
-cycle. That cycle is between ``database`` and the PURE half (which stays put),
-it is 100% lazy on both sides today, and it survives here unchanged.
+The ``database`` <-> ``feature_extractor`` import cycle is untouched by this
+split: it sits between ``database`` and the PURE half, and is lazy on both
+sides.
 """
 from __future__ import annotations
 
@@ -41,18 +39,17 @@ from .feature_extractor import (
     _wf_millis_sub,
     _wf_overlap_score,
     extract_features,
-    # The class's log records kept the `...app.feature_extractor` channel name
-    # before the split and keep it after: this is an extraction, not a
-    # behaviour change, and operators grep the add-on log for that name.
+    # The class's log records keep the `...app.feature_extractor` channel name:
+    # operators grep the add-on log for it.
     log,
 )
 
 
-# Phase 2.3 — minimum gap between anomaly NOTIFY pushes per circuit (the shut-off
-# path is governed separately by the persistent per-12h cap, not this cooldown).
+# Minimum gap between anomaly NOTIFY pushes per circuit (the shut-off path is
+# governed separately by the persistent per-12h cap, not this cooldown).
 # Real valve travel on this hardware is 38-62 s and the firmware allows 90 s
-# before it calls a motor fault, so a confirmation window shorter than that
-# would report a healthy slow close as a failure.
+# before it calls a motor fault, so a shorter confirmation window would report
+# a healthy slow close as a failure.
 _VALVE_CONFIRM_TIMEOUT_S: float = 100.0
 _VALVE_CONFIRM_POLL_S: float = 5.0
 _ANOMALY_ALERT_COOLDOWN_MIN = 15

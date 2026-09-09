@@ -55,7 +55,7 @@ IDENTITY_SLOTS: int = 10
 ANCHOR_SLOTS: int = 2
 
 # Events younger than this may still gain burst context from siblings that have
-# not happened yet (47a), so asking about them now risks asking about an event
+# not happened yet, so asking about them now risks asking about an event
 # the add-on is about to answer correctly by itself.
 MATURITY_WINDOW_S: float = 2 * 3600.0
 
@@ -224,7 +224,7 @@ def select_anchor_items(candidates: Sequence[dict],
 def build_card(conn: sqlite3.Connection, circuit: str,
                since: Optional[str] = None,
                now: Optional[datetime] = None) -> ReviewCard:
-    """Assemble one week's card. Synchronous; submit via ``run_db`` (46a)."""
+    """Assemble one week's card. Synchronous; submit via ``run_db``."""
     candidates = load_candidates(conn, circuit, since, now)
     anchors = load_anchor_candidates(conn, circuit, since, now)
     anchor_items = select_anchor_items(anchors)

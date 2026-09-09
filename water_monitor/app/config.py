@@ -14,7 +14,7 @@ OPTIONS_PATH = Path(os.environ.get("OPTIONS_PATH", "/data/options.json"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "water_monitor.db"
 
-# Phase 1 dev/testing tools (e.g. instant rule-calibration re-fit, bypassing the
+# Dev/testing tools (e.g. instant rule-calibration re-fit, bypassing the
 # weeks-long recalibration). Gated OFF by default; the whole Settings → Dev tab and
 # its routes are hidden unless enabled. Controlled by the `dev_tools` add-on option
 # (settable from the HA add-on Configuration UI) with a WM_DEV_TOOLS env override
@@ -259,8 +259,7 @@ def compute_suggested_calibration_days(
 
 # ── Pump-aware detection (dev21 Phase 1) ───────────────────────────────────────
 
-# Valid home_profile.supply_type values. Routers validate against this — the
-# field previously accepted any string.
+# Valid home_profile.supply_type values. Routers validate against this.
 SUPPLY_TYPES: frozenset = frozenset({"mains", "well", "city_pump"})
 # supply_type values that mean "this home is pressurized by a pump".
 PUMP_SUPPLY_TYPES: frozenset = frozenset({"well", "city_pump"})
@@ -286,11 +285,10 @@ def pump_mode_effective(conn, circuit: str) -> dict:
 
     v1 ENUMERATION — consumers must NOT assume active ⇒ vfd semantics.
     "Active" with profile 'switch_tank' enables almost nothing in v1: the
-    Phase 4 detector gating, the 5b cross-circuit leak-test verdict, and the
-    6b pump-failure alert ALL additionally require profile ==
-    'vfd_constant_pressure' (a tank system's cycle math and failure signatures
-    are different instruments — see the pump plan). Unconfirmed auto-detection
-    never activates anything (banner+confirm).
+    detector gating, the cross-circuit leak-test verdict and the pump-failure
+    alert ALL additionally require profile == 'vfd_constant_pressure' (a tank
+    system's cycle math and failure signatures are different instruments).
+    Unconfirmed auto-detection never activates anything (banner+confirm).
     """
     profile_row = conn.execute(
         "SELECT supply_type, pump_profile, pump_mode_detected, pump_mode_ack "
@@ -327,8 +325,7 @@ def pump_mode_effective(conn, circuit: str) -> dict:
     return {"active": False, "profile": None, "source": "none"}
 
 
-# Per-invocation TTL cache for pump_mode_effective (pump plan round-1 #15):
-# feature_extractor and event_rules resolve the flag on EVERY event, so a raw
+# Per-invocation TTL cache for pump_mode_effective: feature_extractor and event_rules resolve the flag on EVERY event, so a raw
 # 2-query resolve per finalize is wasteful — but the flag must also flip
 # everywhere within ~one TTL of a banner confirm / override change, or the
 # event detector (build-time resolution + live reload) and the extractor
@@ -354,10 +351,10 @@ def invalidate_pump_mode_cache() -> None:
 
 
 def pump_gates_active(conn, circuit: str) -> bool:
-    """True when the vfd-profile Phase 4 detector gates apply to ``circuit``.
+    """True when the vfd-profile detector gates apply to ``circuit``.
     v1 scope: pump-aware detection adjustments require the vfd profile —
     switch_tank homes' oscillation is NOT confined to quiet windows, so these
-    gates would misfire there (see the pump plan's Architecture section)."""
+    gates would misfire there."""
     r = pump_mode_effective_cached(conn, circuit)
     return bool(r["active"] and r["profile"] == PUMP_PROFILE_VFD)
 
@@ -365,7 +362,6 @@ def pump_gates_active(conn, circuit: str) -> bool:
 # Zone (irrigation) circuits see only a handful of repetitive cycles per
 # day, so the whole-home fixture target below is unreachable for them. A
 # small fixed target is enough to characterise their flow signature.
-# Tunable.
 ZONE_MINIMUM_EVENTS = 20
 
 

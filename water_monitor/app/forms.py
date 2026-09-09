@@ -22,12 +22,10 @@ def coerce_int(
     """Parse a form value into an int bounded to ``[lo, hi]``.
 
     Returns ``default`` if the value is missing, empty, non-numeric, or
-    falls outside the bounds. The previous pattern,
-    ``int(form.get(key, default) or default)``, silently accepted
-    out-of-range values (negative bathrooms, run_hour=99, etc.) which
-    then leaked into the DB. This helper centralises the parse so
-    out-of-range inputs round-trip to a sane default rather than
-    poisoning storage.
+    falls outside the bounds. A bare ``int(form.get(key, default) or
+    default)`` silently accepts out-of-range values (negative bathrooms,
+    run_hour=99) which then leak into the DB; this centralises the parse
+    so they round-trip to a sane default instead.
 
     ``lo`` / ``hi`` may be omitted for an unbounded check. Pass them
     whenever the column has a semantic range (e.g. run_hour in [0, 23],
@@ -63,9 +61,9 @@ def coerce_float(
     500, not a 4xx) and silently accepts anything that parses, however absurd.
 
     That matters most on the sensitivity form, whose values authorise an
-    automatic valve close. Those inputs already declare ``min``/``max`` in the
-    HTML — but that is client-side only, so the bounds were never actually
-    enforced. Passing them here makes the form's own declared range real.
+    automatic valve close. Those inputs declare ``min``/``max`` in the HTML,
+    which is client-side only; passing the same bounds here makes the form's
+    declared range real.
 
     NaN and infinity are rejected: they compare False against every bound, so
     an unguarded range check would let them through, and a NaN threshold makes
@@ -74,10 +72,10 @@ def coerce_float(
 
     ``default`` is returned as given, so ``default=None`` makes this an
     "optional float" parse: ``None`` back means *this field was not usable*,
-    which is distinct from any value the field could legitimately hold. Unit
-    6.6 uses that to retire ``history._parse_float``, whose filter-bar callers
-    must tell "no filter" apart from "a filter of zero" — a fallback number
-    there would silently invent a filter the user never asked for.
+    which is distinct from any value the field could legitimately hold. The
+    history filter-bar callers rely on that — they must tell "no filter" apart
+    from "a filter of zero", and a fallback number there would silently invent
+    a filter the user never asked for.
     """
     if value is None:
         return default

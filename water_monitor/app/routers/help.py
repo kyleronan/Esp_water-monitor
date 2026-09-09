@@ -1,4 +1,4 @@
-"""Help / operator runbook page (dev46 46o).
+"""Help / operator runbook page.
 
 Deliberately its own router with NO admin dependency: this page explains what
 the controls do, and the person most likely to need that explanation is the

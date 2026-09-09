@@ -979,16 +979,15 @@ class CircuitEventDetector:
                     else:
                         rec_secs = (now - self._pressure_recovered_since).total_seconds()
                         flow_stopped = self._current_flow_lpm < self.MIN_FLOW_LPM
-                        # Normal END: pressure back >= 10 s AND flow has stopped.
-                        # Flow-override END: pressure back for a LONG time AND the
-                        # flow reading is STALE — a flow sensor that never reports
-                        # 0 on stop goes silent (HA fires on change only), leaving
-                        # _current_flow_lpm stale-high so flow<MIN never fires (the
-                        # 27.6 h irrigation event). Pressure is the authority once
-                        # it has sat at baseline this long WITH no fresh flow data.
-                        # A live flow sample vetoes the override: a VFD booster
-                        # pump restores line pressure mid-draw, and closing on
-                        # pressure alone split one 42-min shower into three events.
+                        # Normal END: pressure back >= 10 s AND flow stopped.
+                        # Flow-override END: pressure back for a LONG time AND
+                        # the flow reading is STALE — a flow sensor that never
+                        # reports 0 on stop goes silent (HA fires on change
+                        # only), leaving _current_flow_lpm stale-high so
+                        # flow<MIN never fires. A live flow sample vetoes the
+                        # override: a VFD booster pump restores line pressure
+                        # mid-draw, and closing on pressure alone split one
+                        # 42-min shower into three events.
                         flow_stale = (
                             self._last_flow_sample_ts is None
                             or (now - self._last_flow_sample_ts).total_seconds()
@@ -1105,11 +1104,10 @@ class CircuitEventDetector:
         self._pressure_recovered_since = None
 
         # Warmup gate — pressure-derived fields are only trustworthy once a
-        # settled baseline has been established.  Shortly after an addon
-        # restart (or a sensor-unavailable buffer clear) there is no clean
-        # pre-event reference, so any computed drop/delay would be fabricated.
-        # In that case the event is still recorded as a real flow event, but
-        # its pressure fields are left as honest unknowns.
+        # settled baseline exists. Shortly after an addon restart (or a
+        # sensor-unavailable buffer clear) there is no clean pre-event
+        # reference, so any computed drop/delay would be fabricated. The event
+        # is still recorded, with its pressure fields left as honest unknowns.
         trustworthy = self._settled_pressure_psi is not None
 
         if trustworthy:
@@ -1148,8 +1146,7 @@ class CircuitEventDetector:
         # Pressure gets the SAME pre-onset window. A flow seed alone starts the
         # two signature series at different times, and every consumer that
         # index-aligns them — the modal waveform overlay and the software
-        # flow_pressure_corr — then reads a time-shifted pressure curve (the
-        # "garbled pressure" micro-events, 2026-08).
+        # flow_pressure_corr — then reads a time-shifted pressure curve.
         seed_t0 = flow_seed[0][0] if flow_seed else start_ts
         pressure_seed = [
             p for (t, p) in zip(self._pressure_ts_buf, self._pressure_buf)
@@ -1373,20 +1370,20 @@ class CircuitEventDetector:
         """Close a pure-pressure transient that never moved water once pressure
         has SETTLED (stable, even at a shifted baseline below the recovery line).
 
-        Without this, a small pressure dip that settles below the recovery line —
-        e.g. an irrigation zone solenoid that nudges the steady pressure — never
-        satisfies the recovery END and stays open until the 6 h watchdog, blinding
-        the circuit to new events the whole time (observed: chronic 6 h force-closes
-        on circuit_2 blocking irrigation starts). A real draw registers flow or
-        keeps pressure actively dipping, so it is never closed here. The closed
-        event carries ~0 volume and is discarded by _end_event. Returns True when
-        it finalized (the caller must then stop touching self._active_event)."""
+        Without this, a small pressure dip that settles below the recovery line
+        — e.g. an irrigation zone solenoid that nudges the steady pressure —
+        never satisfies the recovery END and stays open until the 6 h watchdog,
+        blinding the circuit to new events the whole time (chronic 6 h
+        force-closes on circuit_2 blocked irrigation starts). A real draw
+        registers flow or keeps pressure actively dipping, so it is never closed
+        here. The closed event carries ~0 volume and is discarded by _end_event.
+        Returns True when it finalized (the caller must then stop touching
+        self._active_event)."""
         ev = self._active_event
         if ev is None:
             return False
-        # Only a PURE pressure transient that never developed flow: flow-triggered
-        # and pressure+flow events had water; an onset or any flow_rate >= MIN_FLOW
-        # means water moved. All excluded.
+        # Only a PURE pressure transient that never developed flow. An onset or
+        # any flow_rate >= MIN_FLOW means water moved: all excluded.
         if ev.start_trigger != "pressure" or ev.flow_onset_ts is not None:
             return False
         if self._current_flow_lpm >= self.MIN_FLOW_LPM:
@@ -1543,9 +1540,9 @@ class CircuitEventDetector:
         self._pressure_sample_count = 0
 
         # Discard gate uses the TIME-INTEGRAL of the timestamped flow samples,
-        # not mean(flow_readings) × duration (which over-counts brief bursts in
-        # long pressure-defined events). The stored volume is recomputed the same
-        # way in feature_extractor.
+        # not mean(flow_readings) × duration, which over-counts brief bursts in
+        # long pressure-defined events. feature_extractor recomputes the stored
+        # volume the same way.
         from .flow_integral import integrate_litres
         volume_l, _capped = integrate_litres(ev.flow_samples)
         # Degenerate-timestamp guard: if every flow sample shares ~one instant

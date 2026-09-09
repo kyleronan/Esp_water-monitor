@@ -16,7 +16,7 @@ BUCKET_MIN_L = 2.0              # below this the 0.01 L sensor resolution is too
 MUNICIPAL_MIN_L = 38.0         # ~10 US gal — coarse meter resolution is beaten by volume
 LARGE_CORRECTION_PCT = 3.0      # a >3% bucket correction triggers the sample-count gate
 MIN_RUNS_FOR_LARGE = 3
-# unit 2.32 — the SAME threshold as orchestrator._PPL_REBASELINE_FRACTION (0.10),
+# The SAME threshold as orchestrator._PPL_REBASELINE_FRACTION (0.10),
 # written in percent here and as a fraction there. This one drives the UI's
 # "this will re-baseline" warning; that one drives the actual re-baseline and the
 # multi-day auto-shutoff pause. Nothing but

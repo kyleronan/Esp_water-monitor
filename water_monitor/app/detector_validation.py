@@ -1,4 +1,4 @@
-"""Detector self-validation against HA history (P6) — DIAGNOSTIC ONLY.
+"""Detector self-validation against HA history — DIAGNOSTIC ONLY.
 
 Reconciles the detected events against the raw flow the addon can re-scrape from Home
 Assistant, to confirm the phantom / cross-talk / dribble settings are behaving well —
@@ -210,7 +210,7 @@ def validate_detectors_against_history(
     }
 
     # ── 2. Suspect zeroings — the leak-safety regression guard (EXACT window) ────
-    # A volume-zeroed event (phantom / cross-talk / dribble — all three now zero the
+    # A volume-zeroed event (phantom / cross-talk / dribble — all three zero the
     # event's volume) that actually moved real water. Split by provenance:
     #   • AUTO  (user_classified=0): the DETECTOR zeroed real water → a genuine leak-safety
     #     red flag, and what drives the per-detector WARN — this is the continuous proof the
@@ -275,11 +275,11 @@ def validate_detectors_against_history(
                           f"raw irrigation draw" if ct_events else "no cross-talk events")),
     }
 
-    # ── 4. Dribble — now a VOLUME-ZEROING verdict (it removes the event's volume
-    #       from totals), so it is held to the SAME leak-safety bar as phantom /
-    #       cross-talk via the suspect-zeroing pass above (a zeroed dribble that moved
-    #       >= SUSPECT_ZERO_LITRES of real water is a red flag and a WARN), not the old
-    #       low-stakes 2 L sanity note. ────────────────────────────────────────────
+    # ── 4. Dribble — a VOLUME-ZEROING verdict (it removes the event's volume from
+    #       totals), so it is held to the SAME leak-safety bar as phantom /
+    #       cross-talk via the suspect-zeroing pass above: a zeroed dribble that
+    #       moved >= SUSPECT_ZERO_LITRES of real water is a red flag and a WARN.
+    #       ─────────────────────────────────────────────────────────────────────────────
     report["detectors"]["dribble"] = {
         "status": "warn" if dr_bad else "ok", "zeroed": dr_n, "suspect": dr_bad,
         "summary": (f"{dr_bad} of {dr_n} zeroed dribble(s) actually moved >= "
@@ -304,8 +304,8 @@ def validate_detectors_against_history(
     report["unflagged_no_flow"] = {"count": len(sentinel), "events": sentinel[:50]}
 
     # ── overall verdict ─────────────────────────────────────────────────────────
-    # `suspects` now includes dribble suspects (dribble zeroes volume), so it drives
-    # the dribble WARN too — no separate low-stakes signal.
+    # `suspects` includes dribble suspects (dribble zeroes volume), so it drives
+    # the dribble WARN too.
     report["overall"] = (
         "warn" if (suspects or cov_warn or sentinel) else "ok")
     return report
@@ -510,7 +510,7 @@ async def run_detector_validation(db: sqlite3.Connection, ha: Any, cfg: Any,
         irrig.extend(_series(e))
     flow_histories = {"main": _series(main_entity), "irrigation": irrig}
 
-    # dev46 (46a): every DB touch in this function lives AFTER the HA fetch
+    # Every DB touch in this function lives AFTER the HA fetch
     # and is contiguous — the validation query and the report persist go over
     # the wall together in ONE hop. No hop-2 re-check is needed: this function
     # is DIAGNOSTIC ONLY (it never writes a threshold), and the report it

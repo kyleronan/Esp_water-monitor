@@ -135,7 +135,7 @@ def recompute_volume_and_active_flow(
     from .feature_extractor import _finalize_derived_verdicts
     from .artifact_calibration import load_artifact_calibration
 
-    _acal = load_artifact_calibration(conn, circuit) or None  # Phase 2.4
+    _acal = load_artifact_calibration(conn, circuit) or None
     stamp = (now or datetime.now(timezone.utc)).isoformat()
     rows = conn.execute(
         "SELECT id, start_ts, end_ts, duration_seconds, pressure_delta_psi, "
@@ -238,7 +238,7 @@ def recompute_volume_and_active_flow(
                 # over the cross-talk zeroing" escape hatch can actually fire here
                 # (without it a recompute re-zeroed a user-corrected event).
                 "user_fixture_type": r["user_fixture_type"],
-                # dev56 — the pinned overlap verdict (a full recompute re-derives
+                # The pinned overlap verdict (a full recompute re-derives
                 # single-event verdicts; it cannot re-derive a cross-event one).
                 "verdict_pin": r["verdict_pin"],
                 "verdict_pin_veff": r["verdict_pin_veff"],
@@ -293,7 +293,7 @@ def recompute_volume_and_active_flow(
                     r["id"], circuit,
                 ),
             )
-            # §2.5 — reverse/apply/bookkeep via the one chokepoint.
+            # Reverse/apply/bookkeep via the one chokepoint.
             apply_effective_volume(conn, r["id"], circuit, r["start_ts"], eff)
 
         day = local_day_of(r["start_ts"])

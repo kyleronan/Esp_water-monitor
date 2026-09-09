@@ -1,5 +1,5 @@
 """
-Cluster quality metrics — Phase 2.
+Cluster quality metrics.
 
 Background task that computes hourly health metrics for each circuit's
 clustering state and writes them to cluster_metrics_history.  The Fixtures
@@ -51,7 +51,7 @@ class ClusterMetrics:
             from .database import run_db
             for circuit_cfg in self._cfg.circuits:
                 try:
-                    # dev46 (46a): DB work runs on the single DB thread.
+                    # DB work runs on the single DB thread.
                     await run_db(self.compute_and_store, circuit_cfg.circuit)
                 except Exception as e:
                     log.error("[%s] cluster metrics error: %s",

@@ -7,11 +7,9 @@ coroutine simply stops, silently, with no traceback and no log line. On this
 add-on that trap has real teeth — the dispatch sites are a leak-test start, a
 low-pressure alert, a pump-fault alert and a supply-regime-shift banner.
 
-``leak_test_scheduler._check_and_run`` already worked around this with a local
-closure plus a per-instance set, and the comment there calls the bare form
-"a known antipattern". This module is that pattern factored out so the four
-remaining sites can use it, plus a guard so a crashing background task is
-LOGGED instead of vanishing into a never-retrieved exception.
+This module holds the strong reference for every such site, plus a guard so a
+crashing background task is LOGGED instead of vanishing into a never-retrieved
+exception.
 
 Enforcement: ruff ``RUF006`` (see ruff.toml) flags any new bare dispatch.
 """

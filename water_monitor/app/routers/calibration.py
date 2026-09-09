@@ -77,8 +77,8 @@ async def _read_volume_l(orch, cfg) -> Optional[float]:
         # which run_ppl divides by the user's actual volume to produce the
         # pulses-per-litre written into the firmware — so a mis-scaled reading
         # does not merely report a wrong number, it permanently mis-scales every
-        # volume the add-on computes afterwards. The old code fell through to
-        # "treat as litres", and a "gallons" entity is 3.785x off.
+        # volume the add-on computes afterwards. Falling through to "treat as
+        # litres" puts a "gallons" entity 3.785x off.
         #
         # It also survived every downstream guard: 396 x 3.785 = 1499 sits inside
         # clamp_ppl(1.0, 5000.0), and the "3 consistent runs" gate passes because
@@ -120,7 +120,7 @@ async def start(circuit: str, request: Request):
     if method not in ("bucket", "municipal"):
         return _err("Unknown method")
 
-    units = await run_db(load_unit_context, orch.db)   # dev46 (46a)
+    units = await run_db(load_unit_context, orch.db)
     sess = _session(circuit)
     if sess is None or sess.get("method") != method:
         sess = {"method": method, "runs": [], "actual_l": None, "meter_unit": None,
@@ -172,7 +172,7 @@ async def poll(circuit: str, request: Request):
         return _err("session expired — start over", 409)
     now_l = await _read_volume_l(orch, cfg)
     measured = max(0.0, (now_l - sess["baseline_l"]) if now_l is not None else 0.0)
-    units = await run_db(load_unit_context, orch.db)   # dev46 (46a)
+    units = await run_db(load_unit_context, orch.db)
     factor = units.get("vol_factor") or 1.0
     return JSONResponse({"ok": True, "measured_l": round(measured, 3),
                          "measured_display": round(measured * factor, 2),
@@ -264,7 +264,7 @@ async def cancel(circuit: str, request: Request):
     return JSONResponse({"ok": True})
 
 
-# ── dev41 — meter anchors + utility register readings (provenance in data) ────
+# ── meter anchors + utility register readings (provenance in data) ────────────
 # The registration curve is fit against THESE rows, never against constants
 # folded into code. Admin-only like the rest of this router; plain JSON CRUD
 # (create + list), no sessions, no firmware writes.
@@ -272,7 +272,7 @@ async def cancel(circuit: str, request: Request):
 @router.get("/anchors")
 async def list_anchors(request: Request):
     from ..database import list_meter_anchor_points
-    anchors = await run_db(list_meter_anchor_points,           # dev46 (46a)
+    anchors = await run_db(list_meter_anchor_points,
                            _orch(request).db)
     return JSONResponse({"ok": True, "anchors": anchors})
 
@@ -290,7 +290,7 @@ async def add_anchor(request: Request):
     if reference <= 0:
         return _err("reference_volume_l must be > 0")
     from ..database import insert_meter_anchor_point
-    row_id = await run_db(                                     # dev46 (46a)
+    row_id = await run_db(
         insert_meter_anchor_point,
         _orch(request).db,
         circuit=body.get("circuit"),
@@ -305,7 +305,7 @@ async def add_anchor(request: Request):
 @router.get("/register-readings")
 async def list_register_readings(request: Request):
     from ..database import list_utility_register_readings
-    readings = await run_db(list_utility_register_readings,    # dev46 (46a)
+    readings = await run_db(list_utility_register_readings,
                             _orch(request).db)
     return JSONResponse({"ok": True, "readings": readings})
 
@@ -319,7 +319,7 @@ async def add_register_reading(request: Request):
     except (KeyError, TypeError, ValueError):
         return _err("reading_value (number) and reading_ts are required")
     from ..database import insert_utility_register_reading
-    row_id = await run_db(                                     # dev46 (46a)
+    row_id = await run_db(
         insert_utility_register_reading,
         _orch(request).db,
         reading_value=value, reading_ts=ts,

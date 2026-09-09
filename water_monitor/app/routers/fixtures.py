@@ -1,4 +1,4 @@
-"""Fixtures router — Phase 2."""
+"""Fixtures router."""
 from __future__ import annotations
 
 import json
@@ -58,14 +58,14 @@ def _health_reference(base, signal):
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def fixtures_page(request: Request, preview: bool = False):
-    """Sprint F: per-category rollup (one card per fixture type per circuit).
+    """Per-category rollup (one card per fixture type per circuit).
 
     The clustering engine continues to produce micro-clusters underneath; this
     page is a pure view-layer rollup that buckets events by their effective
     type via fixtures.normalize_fixture_type_for_circuit. Correction of
-    mis-bucketed events happens on the History page (Sprint B feedback loop).
+    mis-bucketed events happens on the History page.
     """
-    # dev46 (46c): lifetime rollups over every event — gate on startup.
+    # Lifetime rollups over every event — gate on startup.
     gated = startup_gate(request, "fixtures", "Water Use", "/fixtures")
     if gated is not None:
         return gated
@@ -76,7 +76,7 @@ async def fixtures_page(request: Request, preview: bool = False):
     # to HA-local midnight N days ago — the same helper the dashboard uses for
     # get_daily_volume, so the "today" boundary matches across pages.
     # "lifetime" = no lower bound (None). Unknown/hand-edited values clamp to
-    # "today" so the page never 500s. Default "today" preserves prior behaviour.
+    # "today" so the page never 500s.
     _RANGE_DAYS = {"today": 0, "week": 7, "month": 30, "3months": 90,
                    "6months": 183, "year": 365, "2years": 730}
     _RANGE_LABELS = {"today": "today", "week": "past week", "month": "past month",
@@ -90,11 +90,10 @@ async def fixtures_page(request: Request, preview: bool = False):
                        else orch._local_midnight_utc(days_ago=_RANGE_DAYS[sel_range]))
     range_label = _RANGE_LABELS[sel_range]
 
-    # dev46 (46a) — this whole page is DB work with no awaits in the loop, so
-    # it goes over the wall in ONE hop: per-circuit rollups, publish maps,
-    # exclusion windows, orphan lists and the stale-link count all ran inline
-    # on the event loop before, contending with the DB worker statement by
-    # statement.
+    # This whole page is DB work with no awaits in the loop, so it goes over the
+    # wall in ONE hop: per-circuit rollups, publish maps, exclusion windows,
+    # orphan lists and the stale-link count. Run inline on the event loop they
+    # contend with the DB worker statement by statement.
     from ..database import run_db
     circuits_ctx, stale_link_count, health_ctx = await run_db(
         _fixtures_page_payload, orch, range_start_utc)
@@ -121,9 +120,9 @@ def _dev_tools_enabled() -> bool:
 def _fixtures_page_payload(orch, range_start_utc):
     """Every DB read behind the Water Use page, in one DB-thread callable.
 
-    Returns ``(circuits_ctx, stale_link_count, health_ctx)``. dev46 (46a):
-    extracted from the handler so no statement runs on the event-loop thread —
-    dev47's health and review reads ride the SAME hop for the same reason.
+    Returns ``(circuits_ctx, stale_link_count, health_ctx)``. Extracted from
+    the handler so no statement runs on the event-loop thread; the health and
+    review reads ride the SAME hop for the same reason.
     """
     from ..database import (get_active_exclusion_window, get_category_rollup,
                             get_orphaned_fixtures)
@@ -132,8 +131,8 @@ def _fixtures_page_payload(orch, range_start_utc):
                             normalize_fixture_type_for_circuit,
                             zone_user_selectable_types)
 
-    # Icon map — keep aligned with main.py:_FX_ICONS and the post-Sprint-D
-    # canonical type set. (Duplicated rather than imported to keep main.py's
+    # Icon map — keep aligned with main.py:_FX_ICONS and the canonical type
+    # set. (Duplicated rather than imported to keep main.py's
     # internal _FX_ICONS private; both are tiny dicts that share semantics.)
     fx_icons = {
         "toilet":          "\U0001F6BD",
@@ -204,14 +203,13 @@ def _fixtures_page_payload(orch, range_start_utc):
             "training_state":   state,
             "categories":       ordered,
             "active_exclusion": get_active_exclusion_window(orch.db, c),
-            # Sprint A banner — kept; the orphan-relink workflow lives on a
-            # different surface but the warning is still useful here.
+            # The orphan-relink workflow lives on a different surface, but the
+            # warning is still useful here.
             "orphaned_fixtures": get_orphaned_fixtures(orch.db, c),
         })
 
-    # dev42 (U4 cleanup) — events whose fixture-group id points at a deleted
-    # group. The old "relink banner" only covers unbacked FIXTURES; this class
-    # had no UI surface at all, while live matching kept re-minting them
+    # Events whose fixture-group id points at a deleted group. The relink
+    # banner only covers unbacked FIXTURES; live matching re-mints this class
     # against the dead in-memory ids (1,776 in prod by 2026-08-16).
     try:
         stale_link_count = orch.db.execute(
@@ -224,7 +222,7 @@ def _fixtures_page_payload(orch, range_start_utc):
     except Exception:
         stale_link_count = 0
 
-    # dev47 (47i / 47d) — fixture health and the review queue, on the SAME DB
+    # Fixture health and the review queue, on the SAME DB
     # hop as everything else this page reads. Both are strictly best-effort:
     # a home that has not pinned a baseline, or an install predating the
     # migration, must render the page exactly as before rather than 500.
@@ -234,7 +232,7 @@ def _fixtures_page_payload(orch, range_start_utc):
         from ..review_queue import build_card
         for circ in circuits_ctx:
             cid = circ["circuit"]
-            # dev51 (2.1) — what the learning loop has been deciding, from the
+            # What the learning loop has been deciding, from the
             # ledger. Best-effort like everything else here; absent on a home
             # with no decision on record.
             try:
@@ -246,9 +244,9 @@ def _fixtures_page_payload(orch, range_start_utc):
                     health_ctx["learning"][cid] = st
             except Exception:                       # noqa: BLE001
                 pass
-            # dev56 — water still counted twice (dev49 D4: visibility only). The
-            # re-open condition for a volume policy was "this surface has reported
-            # counts for a few weeks"; it was never built, so it never could.
+            # Overlap groups where water is still counted twice. VISIBILITY
+            # ONLY — this surface reports the litres; it applies no volume
+            # policy of its own.
             try:
                 from ..overlap_guard import summarize_overlap_groups
                 from ..reprocess import _SPLIT_LOOKBACK_H
@@ -284,8 +282,8 @@ def _fixtures_page_payload(orch, range_start_utc):
                     # The reference depends on WHICH signal fired. volume_trend
                     # and duration_trend share one rolling-median detector, so
                     # `observed` is litres for one and seconds for the other;
-                    # pairing either with volume_median unconditionally (as this
-                    # did) prints a duration against a volume. Signals with no
+                    # pairing either with volume_median unconditionally prints
+                    # a duration against a volume. Signals with no
                     # comparable scalar get None, and the template then omits the
                     # comparison rather than inventing one.
                     "baseline_median": _health_reference(base, alert["signal"]),
@@ -298,9 +296,9 @@ def _fixtures_page_payload(orch, range_start_utc):
                     # has to tell them apart: identity slots are events the
                     # ladder could not type, anchor slots are events it typed
                     # confidently and wants confirmed. Describing all of them as
-                    # "could not type confidently" was wrong for the anchors —
-                    # and wrong in the direction that matters, because it asks
-                    # the operator to identify something already named.
+                    # "could not type confidently" is wrong for the anchors, in
+                    # the direction that matters: it asks the operator to
+                    # identify something already named.
                     from ..review_queue import KIND_ANCHOR
                     n_anchor = sum(1 for it in card.items
                                    if it.kind == KIND_ANCHOR)
@@ -335,10 +333,9 @@ def _max_iso(a, b):
 
 # ── Sprint F: per-category publish toggle ────────────────────────────────────
 
-# ── Phase 5 (unit 5.2): the unlinked per-cluster routes (confirm, delete,
-#    merge, migrate, forget-signature, relink) were pruned. Their backend
-#    helpers in database.py stay — cluster_engine and the tests consume
-#    them; only the zero-caller HTTP handlers went.
+# ── The per-cluster routes (confirm, delete, merge, migrate,
+#    forget-signature, relink) have no HTTP handlers. Their backend helpers in
+#    database.py stay — cluster_engine and the tests consume them.
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -404,7 +401,7 @@ async def resolve_health_alert(alert_id: int, request: Request):
 
 @router.post("/repin-benchmark/{circuit}")
 async def repin_benchmark(circuit: str, request: Request):
-    """Operator-confirmed re-pin from the Water Use prompt (D3).
+    """Operator-confirmed re-pin from the Water Use prompt.
 
     The trigger names WHY (regime / decay / growth / shrink) and is recorded
     on the ledger row. Over an active set the new selection lands as PENDING
@@ -457,35 +454,34 @@ async def dismiss_repin_benchmark(circuit: str, request: Request):
 
 @router.post("/repair-stale-links")
 async def repair_stale_links(request: Request):
-    """dev42 (U4 cleanup) — null events whose fixture-group id points at a
-    deleted group, then rebuild the in-memory engine so its id map (derived
+    """Null events whose fixture-group id points at a deleted group, then
+    rebuild the in-memory engine so its id map (derived
     from those events' votes) can no longer resurrect the dead ids. Without
     the rebuild, live matching re-mints stale references immediately."""
     orch = _orch(request)
     from ..database import find_orphaned_cluster_references, get_write_lock
     engine = getattr(orch, "cluster_engine", None)
-    # dev44 — refuse while the startup cluster work is still replaying: it
-    # holds a pre-repair snapshot in executor threads, and whichever rebuild
-    # finishes LAST owns the in-memory map. A repair clicked 15 s after a
-    # restart lost exactly that race and the cleared references returned.
+    # Refuse while the startup cluster work is still replaying: it holds a
+    # pre-repair snapshot in executor threads, and whichever rebuild finishes
+    # LAST owns the in-memory map. A repair clicked 15 s after a restart loses
+    # that race and the cleared references come back.
     if not getattr(orch, "startup_cluster_work_done", True):
         return ingress_redirect(request, "/fixtures?msg=starting")
     try:
         from ..database import run_db
-        # dev46 (46a/N2c): the write lock is async and is acquired OUTSIDE
+        # The write lock is async and is acquired OUTSIDE
         # run_db — never inside a callable on the single DB worker.
         async with get_write_lock():
             counts = await run_db(find_orphaned_cluster_references,
                                   orch.db, repair=True)
             if engine:
                 for c in orch._cfg.circuits:
-                    # dev44: RESET before replay. rebuild_from_db does not
-                    # clear the live engine's model or river→DB id map (at
-                    # startup _init_circuit made them fresh) — replaying on
-                    # top of a poisoned map left the dominant center's stale
-                    # dead-cluster entry in place, and the very next backfill
-                    # re-minted 1,736 orphans through it (observed 8/16
-                    # 10:20:43, ninety seconds after the first repair).
+                    # RESET before replay. rebuild_from_db does not clear the
+                    # live engine's model or river→DB id map (only _init_circuit
+                    # makes them fresh), so replaying on top of a poisoned map
+                    # leaves the dominant center's stale dead-cluster entry in
+                    # place and the next backfill re-mints orphans through it
+                    # (1,736 of them, ninety seconds after a repair).
                     engine.reset_circuit(c.circuit)
                     await run_db(engine.rebuild_from_db, c.circuit)
         log.info("repair-stale-links: %s (engine reset + rebuilt)", counts)
@@ -511,7 +507,7 @@ async def retrigger_cluster(request: Request, circuit: str = Depends(_valid_circ
         from ..database import get_write_lock, run_db
         # Serialise against recompute/reclassify/other rebuilds — all share the
         # write lock so heavy DB writers never run concurrently on the engine's
-        # shared connection. (dev46 46a: the lock is held OUTSIDE run_db.)
+        # shared connection. The lock is held OUTSIDE run_db.
         async with get_write_lock():
             count = await run_db(engine.rebuild_from_db, circuit)
         log.info("[%s] manual rebuild: %d events replayed", circuit, count)
@@ -596,7 +592,7 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
         # the write lock. Best-effort UX guard; correctness is the lock itself.
         if get_write_lock().locked():
             return ingress_redirect(request, "/fixtures?msg=busy")
-        rng = await run_db(                                   # dev46 (46a)
+        rng = await run_db(
             lambda: orch.db.execute(
                 "SELECT MIN(start_ts) mn, MAX(end_ts) mx FROM events "
                 "WHERE circuit = ?", (circuit,),
@@ -616,12 +612,12 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
 
         # Run the whole recompute → cleanup → reclassify sequence on a single
         # private connection, serialised by the write lock (see
-        # database.run_isolated_write). This is what fixes the shared-connection
-        # races that crashed concurrent recomputes.
+        # database.run_isolated_write) — this is what keeps concurrent
+        # recomputes off a shared connection.
         def _job(conn):
             r = recompute_volume_and_active_flow(conn, circuit, fetch)
             cleanup_composite_flags(conn)
-            # dev.24: coalesce low-flow sensor-chatter fragments (one sustained low
+            # Coalesce low-flow sensor-chatter fragments (one sustained low
             # draw the turbine chopped into many tiny events) into one event each.
             # DESTRUCTIVE (merges + deletes rows) but volume-preserving — snapshot
             # the DB first, and only when there is actually something to merge (so
@@ -634,7 +630,7 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
                 cres = coalesce_low_flow_events(conn, circuit)
                 log.info("[%s] coalesced %d low-flow fragment(s) into %d group(s)",
                          circuit, cres["absorbed"], cres["groups"])
-            # dev.22: cycle-pulse backfill MUST precede reclassify so the matcher's
+            # Cycle-pulse backfill MUST precede reclassify so the matcher's
             # cycle_pulse_count feature is populated before it types events.
             recompute_cycle_pulse_counts(conn, circuit)
             reclassify_all_events_from_signatures(conn, circuit)

@@ -1,4 +1,4 @@
-"""Phase 3 §2 — recorder volume reconciliation ("recorder as truth").
+"""Recorder volume reconciliation ("recorder as truth").
 
 The live event detector integrates the HA flow-sensor samples for an event's volume — the
 same at-most-once stream that drops samples on a WS glitch / addon restart, so a live event
@@ -10,13 +10,13 @@ reconciles each settled live event's volume against that delta.
 Run hourly via MaturityRecheck, over HEALTHY events in a settled window. Auto-correct
 (recorder wins) by default; a per-circuit toggle switches to flag-only.
 
-SAFETY — the recorder shares the very lossiness this phase fights, so a recorder gap AT a
+SAFETY — the recorder shares the very lossiness this module fights, so a recorder gap AT a
 window boundary makes ``b − a`` span the wrong interval (plausibly-wrong, not absurd, so a
 magnitude guard misses it). The **endpoint-gap guard** requires the recorder samples to
 bracket the event edges within ``ENDPOINT_TOL_S``; insufficient coverage → decline (never
 correct — declining beats overwriting with a gap-computed value, especially on the
-unreviewed auto path). Every write routes through ``apply_effective_volume`` (the §2.5
-ledger chokepoint); compromised-flow verdicts (phantom/cross-talk/dribble/degraded/excluded)
+unreviewed auto path). Every write routes through ``apply_effective_volume`` (the ledger
+chokepoint); compromised-flow verdicts (phantom/cross-talk/dribble/degraded/excluded)
 are never reconciled; user verdicts are preserved.
 """
 from __future__ import annotations
@@ -56,8 +56,7 @@ def firmware_volume_delta(volume_hist: Any, start: datetime, end: datetime,
     Robust to dropped INTERMEDIATE samples (only the two endpoints matter). Rejects resets
     / absurd values (``0 < raw_delta < 10_000``). ``a_ts`` / ``b_ts`` are the in-window
     first/last sample times, returned so the caller can apply the endpoint-gap guard. The
-    historical importer reuses this and consumes ONLY the litres → its behaviour is
-    unchanged.
+    historical importer reuses this and consumes ONLY the litres.
     """
     pairs: List[Tuple[datetime, float]] = []
     for e in volume_hist or ():
@@ -181,7 +180,7 @@ async def reconcile_circuit_volumes(db_path: str, ha: Any, cfg: Any, circuit: st
                     c.execute("UPDATE events SET volume_litres_original = ? WHERE id = ?",
                               (stored, eid))
                 # Healthy event ⇒ effective == raw; write both, then route the ledger
-                # through the §2.5 chokepoint with the SAME value (its contract).
+                # through the ledger chokepoint with the SAME value (its contract).
                 c.execute("UPDATE events SET volume_litres = ?, "
                           "volume_litres_effective = ?, volume_recomputed_at = ? "
                           "WHERE id = ?",

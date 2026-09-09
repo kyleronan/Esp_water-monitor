@@ -115,9 +115,9 @@ class LearningScheduler:
                      "in this image — the kNN ladder is serving")
             self._last_retrain_day = today
             return
-        # dev51 — the in-memory marker above is lost on every redeploy, which is
-        # how production re-judged the identical challenger on consecutive
-        # nights. The ledger is the durable record of "already ran this week".
+        # The in-memory marker above is lost on every redeploy, which lets the
+        # identical challenger be re-judged on consecutive nights. The ledger is
+        # the durable record of "already ran this week".
         if await run_db(weekly_retrain_recorded, self._db, today):
             log.info("tinymodel retrain already recorded for %s — skipping", today)
             self._last_retrain_day = today
@@ -198,9 +198,9 @@ class LearningScheduler:
         await run_db(finish_job, self._db, job,
                      "error" if out.status == "unavailable" else "done",
                      f"{circuit}: {out.status} — {out.reason}")
-        # dev51 — the durable record (the job row above is pruned after two
-        # days), and the stall check that V6d showed nothing else would raise.
-        # Both best-effort: a ledger problem must not fail a finished retrain.
+        # The durable record (the job row above is pruned after two days), and
+        # the stall check nothing else would raise. Both best-effort: a ledger
+        # problem must not fail a finished retrain.
         try:
             # The decision row is written FIRST and carries the benchmark hash
             # the leg was actually scored on (captured inside retrain); only

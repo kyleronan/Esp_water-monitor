@@ -1,4 +1,4 @@
-"""Phase 2 — locked statistical baseline (leak / odd-usage foundation).
+"""Locked statistical baseline (leak / odd-usage foundation).
 
 At activation (alongside the rule calibration) this freezes a per-home model of
 "normal":
@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger(__name__)
 
 MIN_EVENTS_FOR_ENVELOPE = 8     # a type needs this many events to fit an envelope
-# dev34 B3 — the overall volume percentiles may window to the pump era only
+# The overall volume percentiles may window to the pump era only
 # when the era holds at least this many events; below it the era estimate of a
 # p99 is noise and the all-time fit (more data, slightly stale distribution)
 # is the lesser error. Deliberately equals MIN_N_FOR_SHUTOFF: an era window
@@ -51,10 +51,10 @@ MIN_N_FOR_SHUTOFF = 30
 # for at least this many days since activation — earned trust before it can close
 # the user's water. Below this, shut-off levels degrade to notify.
 MIN_LIVE_DAYS_FOR_SHUTOFF = 7
-# §2.29 — 2oo3 voting for the shape (envelope) channel. At least this many of
+# 2oo3 voting for the shape (envelope) channel. At least this many of
 # {volume, duration, peak} must be usable before ``event_novelty`` scores at all;
-# below it the channel abstains. A 1-of-1 outlier used to read as novelty 1.0 →
-# severe → shut-off authorised, i.e. maximal confidence from minimal evidence.
+# below it the channel abstains. Otherwise a 1-of-1 outlier reads as novelty 1.0
+# → severe → shut-off authorised: maximal confidence from minimal evidence.
 _MIN_METRICS_FOR_SHAPE = 2
 # Verdict flags that mark an event as already-known-not-real-water (or explicitly
 # excluded). Such an event is inert for anomaly scoring — it must never score or
@@ -97,7 +97,7 @@ def fit_usage_baselines(
     envelope or the overall percentiles toward "normal", even when a machine
     label matched it. A later relabel clears the verdict and readmits it.
 
-    era_start (dev34 B3): when given (the PINNED pump-era anchor — the era,
+    era_start: when given (the PINNED pump-era anchor — the era,
     not the current regime, which a recenter/merge can move), each fit prefers
     era-only events and falls back PER TYPE to all-time when the era pool is
     too thin: toilet durations shortened 2.6× under the pump, so a pre-pump
@@ -177,7 +177,7 @@ def fit_usage_baselines(
 
 def snapshot_usage_baselines(conn: sqlite3.Connection, circuit: str,
                              reason: str) -> None:
-    """dev34 B3 — copy the current frozen baseline (envelopes + overall
+    """Copy the current frozen baseline (envelopes + overall
     anomaly percentiles) into baseline_snapshot before an overwrite, so a
     regime refit that lands badly is revertable (restore_usage_baselines).
     Keeps the newest 10 per circuit. No-op when nothing is frozen yet."""
@@ -242,7 +242,7 @@ def freeze_usage_baselines(conn: sqlite3.Connection, circuit: str,
     """Fit + persist (freeze) the usage baselines for a circuit. Returns the
     per-type envelope dict.
 
-    dev34 B3: in a pump-era home the fit windows on the PINNED era anchor
+    In a pump-era home the fit windows on the PINNED era anchor
     (per-type/overall fallback inside fit_usage_baselines), and the previous
     frozen state is snapshotted first so a refit is revertable."""
     era = None
@@ -354,18 +354,18 @@ def load_usage_baselines(conn: sqlite3.Connection, circuit: str,
 
 
 def _finite(v: Any) -> Optional[float]:
-    """§2.29 / MISRA C:2023 Dir 4.15 — validate at the BOUNDARY.
+    """Validate at the BOUNDARY (MISRA C:2023 Dir 4.15).
 
     Returns ``v`` as a float when it is a real, finite number; ``None`` for
     anything unusable (None, non-numeric, bool, NaN, ±inf).
 
     A NaN must never reach an ordered comparison. IEEE 754 makes every ordered
     comparison against NaN false, so whether a guard treats it as "in band" or
-    "out of band" is an accident of how the comparison happens to be written —
-    this module used to have it both ways (a NaN metric scored as *outside* and
-    could authorise a valve close, while a NaN volume scored as *not exceeding*
-    and suppressed the alert entirely). The fix is not to pick a side; it is to
-    stop the value at the boundary so both paths ABSTAIN.
+    "out of band" is an accident of how the comparison happens to be written: a
+    NaN metric scores as *outside* and could authorise a valve close, while a
+    NaN volume scores as *not exceeding* and suppresses the alert entirely. The
+    answer is not to pick a side; it is to stop the value at the boundary so
+    both paths ABSTAIN.
     """
     if v is None or isinstance(v, bool):
         return None
@@ -402,8 +402,8 @@ def event_novelty(features: Dict[str, Any],
         erases the information that says what the number is worth: 1/1 and 3/3
         are both 1.0, and only one of them is evidence.
 
-    §2.29 — 2oo3 voting. ``novelty`` feeds the severe/shut-off threshold, so a
-    single populated metric with a single outlier used to yield novelty = 1.0 →
+    2oo3 voting. ``novelty`` feeds the severe/shut-off threshold, so a single
+    populated metric with a single outlier would otherwise yield novelty = 1.0 →
     severe → shut-off authorised: *maximal* confidence from the weakest possible
     evidence. At least ``_MIN_METRICS_FOR_SHAPE`` of {volume, duration, peak}
     must be usable or the shape channel ABSTAINS (novelty None) rather than
@@ -484,7 +484,7 @@ _INERT = {"score": None, "anomaly_type": None, "is_anomalous": False,
 
 
 def _threshold(sens_row, key: str, default: float) -> float:
-    """A configured threshold, boundary-validated (§2.29). A NaN/inf/garbage
+    """A configured threshold, boundary-validated. A NaN/inf/garbage
     threshold silently disables the comparison it guards (every ordered
     comparison against NaN is false), so fall back to the documented default
     and say so, rather than running with a dead gate."""
@@ -510,7 +510,7 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
       * ``shutoff_ok_*`` — the firing signal is backed by a baseline fit from
         ≥ ``MIN_N_FOR_SHUTOFF`` events, so it may authorise a valve close. A thin /
         default baseline yields False → the response degrades to notify.
-      * ``data_quality`` — §2.29 DIAGNOSTIC channel: a '+'-joined tag naming the
+      * ``data_quality`` — DIAGNOSTIC channel: a '+'-joined tag naming the
         input that could not be scored (``non_finite_volume``,
         ``non_finite_metric``, ``thin_shape_evidence``), or None. Deliberately
         SEPARATE from ``is_anomalous``/``is_severe``: per IEC 61511 degraded-mode
@@ -522,7 +522,7 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
     baseline exists for the event. NEVER raises an alert or closes a valve — the
     response policy in feature_extractor does that, behind a 'live' state gate.
     """
-    # Suppression-averted (Phase 2b): the phantom guard would have zeroed a
+    # Suppression-averted: the phantom guard would have zeroed a
     # LARGE measured draw; the volume was kept and the event needs the user's
     # eyes. Checked BEFORE the artifact gate (the event is excluded_from_training
     # until reviewed, which would otherwise make it inert) and deterministic
@@ -548,10 +548,10 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
     notify_p = {"p85": p85, "p95": p95, "p99": p99}.get(
         _NOTIFY_PCT_BY_LEVEL.get(level, "p95"))
 
-    # ── §2.29: the volume boundary ──────────────────────────────────────────────
-    # A non-finite volume used to make ``eff_vol > p`` false and suppress the leak
-    # alert ENTIRELY — the mirror image of the envelope path, where the same NaN
-    # counted as "outside" and could close the valve. Both now abstain, and bad
+    # ── the volume boundary ─────────────────────────────────────────────────────
+    # A non-finite volume makes ``eff_vol > p`` false, which would suppress the
+    # leak alert ENTIRELY — the mirror image of the envelope path, where the same
+    # NaN counts as "outside" and could close the valve. Both abstain, and bad
     # data raises its OWN diagnostic instead of being folded into the alarm.
     raw_vol = features.get("volume_litres_effective")
     if raw_vol is None:

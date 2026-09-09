@@ -1,13 +1,12 @@
-"""dev47 (47c) — the continuous-learning loop.
+"""The continuous-learning loop.
 
 THE GOAL THIS SERVES
 --------------------
 A home should need roughly a hundred labels in its first weeks and then run for
-years without the operator policing it. The 2026-08-22 label-efficiency curves
-showed why that cannot be a frozen model: every frozen classifier plateaus, and
-the k-NN ladder actively DEGRADES as its pool grows across a supply-regime
-change (.50 to .35 on the variant house). Homes change — this one grew a
-booster pump mid-dataset — so the thing that has to be built is a loop.
+years without the operator policing it. That cannot be a frozen model: every
+frozen classifier plateaus, and the k-NN ladder actively DEGRADES as its pool
+grows across a supply-regime change (.50 to .35 on the variant house). Homes
+change — this one grew a booster pump mid-dataset — so this is a loop.
 
 THE LOOP
 --------
@@ -16,18 +15,16 @@ THE LOOP
 3. A retrain produces a CHALLENGER; the referee decides whether it serves.
 4. A swap invalidates a SCOPED set of stored verdicts, not the whole history.
 
-WHY THE INVALIDATION IS SCOPED — AND A CORRECTION TO THE PLAN
--------------------------------------------------------------
-The dev47 plan says the 46k verdict stamp "gains the model hash". Implemented
-literally that is self-defeating: ``compute_verdict_stamp`` is a GLOBAL
-fingerprint, so putting the model hash in it makes every stored verdict stale
+WHY THE INVALIDATION IS SCOPED
+------------------------------
+The model hash must stay OUT of ``compute_verdict_stamp``. That stamp is a
+GLOBAL fingerprint, so a model hash inside it makes every stored verdict stale
 the instant a model is retrained — a full-history re-derive on every retrain,
-which is exactly what the plan's own F2 finding forbids. It is the same trap
-the stamp's docstring already describes for the label pool ("labelling 3 events
-re-derived 5,417 verdicts in 85 s and moved zero of them").
+the same trap the stamp's own docstring describes for the label pool
+("labelling 3 events re-derived 5,417 verdicts in 85 s and moved zero of them").
 
-So the model hash stays OUT of the global stamp, and a retrain instead pushes a
-targeted invalidation over the set that can actually change:
+A retrain instead pushes a targeted invalidation over the set that can actually
+change:
 
   * events with no stored classification (the backlog),
   * machine verdicts whose confidence sits below the NEW threshold,
@@ -53,16 +50,16 @@ from .model_referee import RefereeConfig, RefereeVerdict, Score, decide
 
 log = logging.getLogger(__name__)
 
-# ── anchor pool policy (R3) ─────────────────────────────────────────────────
-# The rejected policy was "anchors <= 2x user labels per class". It starves the
-# classes anchors exist to serve: dishwasher and washing-machine are
-# user-label-POOR precisely BECAUSE the cycle detectors handle them, so 2x0
-# gives zero exemplars for the two best-taught fixtures in the house.
+# ── anchor pool policy ──────────────────────────────────────────────────────
+# NOT "anchors <= 2x user labels per class": that starves the classes anchors
+# exist to serve, because dishwasher and washing-machine are user-label-POOR
+# precisely BECAUSE the cycle detectors handle them, so 2x0 gives zero exemplars
+# for the two best-taught fixtures in the house.
 #
 # Instead: a floor that guarantees every anchor-backed class real
-# representation, and ceilings that stop the daily cycle detectors from
-# out-massing a hundred-odd hand labels (they would, roughly 10:1 within two
-# years, whatever per-label weight is applied).
+# representation, and ceilings that stop the daily cycle detectors out-massing a
+# hundred-odd hand labels (they would, roughly 10:1 within two years, whatever
+# per-label weight is applied).
 ANCHOR_FLOOR_PER_CLASS: int = 50
 ANCHOR_MAX_CLASS_FRACTION: float = 2.0 / 3.0
 ANCHOR_MAX_POOL_FRACTION: float = 0.5
@@ -71,26 +68,22 @@ ANCHOR_MAX_POOL_FRACTION: float = 0.5
 # A detector earns the right to contribute training exemplars by DEMONSTRATING
 # precision on current-era events — it is not granted by a constant.
 #
-# Two measurements forced this shape (2026-08-22):
+# The cycle detectors are NOT near-perfect teachers: archive-wide, anchor
+# precision totals 0.781 and no tier reaches 0.97 even at its ceiling (assuming
+# every unlabelled claim correct), so anchors carry real label noise and cannot
+# be ingested unconditionally.
 #
-# 1. The plan assumed the cycle detectors were near-perfect teachers. Measured
-#    archive-wide they are not: anchor precision totals 0.781, and no tier
-#    reaches 0.97 even at its ceiling (assume every unlabelled claim correct).
-#    So anchors carry real label noise and cannot be ingested unconditionally.
-#
-# 2. But the archive-wide figure estimates the WRONG THING. A machine verdict
-#    is frozen when the operator labels that event (reclassify skips labelled
-#    rows), so those verdicts are never re-derived and the archive averages
-#    every code era ever shipped. Restricted to the current era,
-#    dishwasher_cycle is 14/14 where archive-wide it reads 0.742 — the low
-#    number describes code that has already been replaced.
+# But the archive-wide figure estimates the WRONG THING. A machine verdict is
+# frozen when the operator labels that event (reclassify skips labelled rows),
+# so those verdicts are never re-derived and the archive averages every code era
+# ever shipped. Restricted to the current era, dishwasher_cycle is 14/14 where
+# archive-wide it reads 0.742.
 #
 # Hence: measure per tier, over the current detector era, and require a LOWER
 # CONFIDENCE BOUND to clear the bar rather than a point estimate. Certifying a
-# teacher on 3 events would repeat exactly the small-n error the referee's
-# non-inferiority rule exists to avoid — and a tier with too little current-era
-# evidence is simply not yet eligible, which is the honest state after any
-# detector change.
+# teacher on 3 events repeats the small-n error the referee's non-inferiority
+# rule exists to avoid, and a tier with too little current-era evidence is
+# simply not yet eligible — the honest state after any detector change.
 ANCHOR_MIN_TIER_PRECISION: float = 0.80
 ANCHOR_MIN_TIER_EVENTS: int = 10
 
@@ -106,15 +99,13 @@ ANCHOR_TIER_TARGET: Dict[str, str] = {
 
 ANCHOR_SOURCE = "anchor"
 
-# dev51 (1.5) — machine-propagated 'cycle' labels are ANCHORS, not user truth.
-# They enter the anchor half of the pool (capped, per-tier precision gate,
-# dropped from held-out days) instead of the user half, which also revives the
-# label-free growth the loop was designed around: the pool hash can now move
-# without a human labelling anything. Guarded by the live pre-check (≥ 100
-# genuinely human pool-eligible labels; circuit_1 had 768 on 2026-09-01). If a
-# home falls under that floor the one-line fallback is to set this False: the
-# holdout still excludes 'cycle' (that never depends on this flag) and the
-# pool treats 'cycle' as it did before.
+# Machine-propagated 'cycle' labels are ANCHORS, not user truth. They enter the
+# anchor half of the pool (capped, per-tier precision gate, dropped from
+# held-out days) instead of the user half, which also gives the loop label-free
+# growth: the pool hash can move without a human labelling anything. Guarded by
+# a live pre-check of ≥ 100 genuinely human pool-eligible labels. A home under
+# that floor sets this False; the holdout still excludes 'cycle' (that never
+# depends on this flag).
 DEMOTE_CYCLE_TO_ANCHOR: bool = True
 
 
@@ -411,10 +402,10 @@ def _score_artifact(art: tm.Artifact, rows: Sequence[dict],
 
     ``threshold=None`` scores at the artifact's own serving threshold — the
     number the operator experiences. ``threshold=0.0`` scores at argmax, which
-    is what the referee compares (dev51): two artifacts that chose different
-    serving thresholds differ in COVERAGE, and on this metric a coverage gap
-    reads as a quality gap. The logged 0.096 "regression" that froze the
-    champion for weeks was exactly that.
+    is what the referee compares: two artifacts that chose different serving
+    thresholds differ in COVERAGE, and on this metric a coverage gap reads as a
+    quality gap (a 0.096 "regression" of exactly that kind once froze the
+    champion for weeks).
     """
     if not rows:
         return Score(0, 0)
@@ -475,22 +466,20 @@ def coverage_delta(champion: tm.Artifact, challenger: tm.Artifact
 
 def clean_recent_holdout(holdout: Sequence[dict], champion: tm.Artifact,
                          challenger: tm.Artifact) -> Tuple[List[dict], str]:
-    """Holdout rows on days NEITHER model trained on (dev51).
+    """Holdout rows on days NEITHER model trained on.
 
-    The recent leg used to score the champion on the same holdout as the
-    challenger — but the champion was fitted on an earlier pool that generally
-    INCLUDED those days (a different day stride, more labels since), while the
-    challenger is holdout-free by construction. The leak check only guarded
-    the challenger's side, so the incumbent was scored on memorised days and
-    won every night. Day-granular because leakage is day-level — the same
-    reason ``split_holdout`` groups by day.
+    Scoring the champion on the CHALLENGER's holdout is wrong: the champion was
+    fitted on an earlier pool that generally INCLUDED those days (a different
+    day stride, more labels since), while the challenger is holdout-free by
+    construction — so guarding only the challenger's side scores the incumbent
+    on memorised days and it wins every night. Day-granular because leakage is
+    day-level, the same reason ``split_holdout`` groups by day.
 
     Legacy fallback: an artifact from before ``train_days`` existed reports an
-    empty list, so the only honest "days it did not see" are days strictly
-    after it was trained. On the FIRST retrain after this ships that set is
-    normally EMPTY (the challenger trained on everything up to today), the leg
-    abstains, and the referee keeps the incumbent — a known property of the
-    first cycle, not a fault.
+    empty list, so the only honest "days it did not see" are days strictly after
+    it was trained. On the first retrain that set is normally EMPTY (the
+    challenger trained on everything up to today), the leg abstains, and the
+    referee keeps the incumbent — a property of the first cycle, not a fault.
     """
     def _day(r: dict) -> str:
         return str(r.get("start_ts"))[:10]
@@ -514,25 +503,23 @@ def split_holdout(pool: Sequence[dict], fraction: float = 0.25
 
     DAY-GROUPED. A day is never split, because an appliance cycle's fills are
     near-duplicates of one another, and scoring the challenger on an event it
-    effectively memorised is the degenerate comparison V6d measured (champion
-    0.0 / challenger 1.0 in every row).
+    effectively memorised is degenerate (champion 0.0 / challenger 1.0 in every
+    row).
 
-    USER-ONLY HOLDOUT. This holdout is the only measurement of precision
-    against human truth anywhere in the loop: ``tm.train`` calibrates the
-    serving threshold on it, and it is the referee's recent leg. An anchor row
-    in it converts both into machine-vs-machine agreement — the same mistake
-    that put "399/399 rule_toilet precision" into the dev47 plan's first
-    revision, when the real figure was model-vs-model agreement on unlabelled
-    events.
+    USER-ONLY HOLDOUT. This holdout is the only measurement of precision against
+    human truth anywhere in the loop: ``tm.train`` calibrates the serving
+    threshold on it, and it is the referee's recent leg. An anchor row in it
+    converts both into machine-vs-machine agreement, which reads as a spuriously
+    perfect score.
 
     Satisfying only the second gives a subtly broken split. Filtering anchors
     out of an already-built holdout leaves that day's ANCHOR rows sitting in
     ``train_rows`` while its user rows are scored — reintroducing, through the
-    back door, exactly the near-duplicate leak the day-grouping exists to
-    prevent. So the partition happens BEFORE the split: an anchor landing on a
-    held-out day is DROPPED rather than moved across the boundary. That costs a
-    little training signal (anchors are free and capped anyway) and buys an
-    honest measurement, which is the scarcer thing.
+    back door, the near-duplicate leak the day-grouping exists to prevent. So
+    the partition happens BEFORE the split: an anchor landing on a held-out day
+    is DROPPED rather than moved across the boundary. That costs a little
+    training signal (anchors are free and capped anyway) and buys an honest
+    measurement.
 
     Held-out days are chosen among days that actually carry user labels. An
     anchor-only day would otherwise consume a holdout slot and contribute
@@ -617,7 +604,7 @@ def load_benchmark_ids(path: str) -> List[str]:
     it is real events with real timestamps, i.e. a record of when this
     household used water. Only its hash is ever quoted. A home without one is
     normal — the referee then runs on the recent holdout alone and declines to
-    decide when that is too small (R4a).
+    decide when that is too small.
     """
     import json as _json
     try:
@@ -643,11 +630,10 @@ def benchmark_ids_for_circuit(conn: Optional[sqlite3.Connection],
     """The circuit's benchmark state, from ``referee_benchmark`` (+ meta).
 
     ``ids`` is the ACTIVE set the referee scores; ``pending_ids`` a re-pin
-    waiting for the next promotion (dev53); ``reserved_ids`` their union —
-    what training must hold out. The empty shape when nothing is pinned, the
-    tables predate the DB, or ``conn`` is None. Empty ids make the benchmark
-    leg abstain — which (dev51) keeps the incumbent rather than promoting an
-    unmeasured challenger.
+    waiting for the next promotion; ``reserved_ids`` their union — what training
+    must hold out. The empty shape when nothing is pinned, the tables predate
+    the DB, or ``conn`` is None. Empty ids make the benchmark leg abstain, which
+    keeps the incumbent rather than promoting an unmeasured challenger.
     """
     if conn is None:
         return dict(_NO_BENCHMARK)
@@ -737,7 +723,7 @@ def import_referee_benchmark(conn: sqlite3.Connection, circuit: str,
     The document's ``benchmark_hash`` becomes ``source_hash`` — the one value
     the ledger quotes — and an unidentified document is refused: a benchmark
     whose provenance cannot be named is not a reference. Over an existing
-    active set the import lands as PENDING (dev53), like any other re-pin.
+    active set the import lands as PENDING, like any other re-pin.
     """
     ids, source_hash = parse_benchmark_payload(payload)
     if not ids:
@@ -860,10 +846,10 @@ def activate_pending_benchmark(conn: Optional[sqlite3.Connection], circuit: str,
     against the current pool; below the 70 % line it is NOT activated as-is —
     a fresh selection is drawn (around the new champion's training days, so
     it is clean for the model it will judge) with the same, already
-    operator-confirmed trigger and reason, and both hashes are logged. That
-    stays inside D3: the operator confirmed the intent; the row selection was
-    never what they were asked to approve. ``pinned_from_n`` is refreshed to
-    current H so the growth prompt measures from the set's birth.
+    operator-confirmed trigger and reason, and both hashes are logged. The
+    operator confirmed the intent; the row selection was never what they were
+    asked to approve. ``pinned_from_n`` is refreshed to current H so the growth
+    prompt measures from the set's birth.
     """
     from . import referee_benchmark as rb
     if conn is None:
@@ -942,12 +928,12 @@ def activate_pending_benchmark(conn: Optional[sqlite3.Connection], circuit: str,
 
 def _benchmark_clean_for(champion, benchmark: Sequence[dict]):
     """May ``champion`` be scored on ``benchmark``? Only if it provably never
-    trained on those days. A pre-dev51 incumbent has no ``train_days`` record
-    and DID train on them (the V6d gate measured a ~14-point head start on a
-    memorised set); a dev51+ incumbent installed before the first pin has the
-    benchmark's days in its record. Day-based, not clock-based — no timestamp
-    parsing can go wrong here, and an activation re-selection drawn around the
-    new champion's training days passes by construction."""
+    trained on those days. A legacy incumbent has no ``train_days`` record and
+    DID train on them — that is a ~14-point head start on a memorised set — and
+    an incumbent installed before the first pin has the benchmark's days in its
+    record. Day-based, not clock-based, so no timestamp parsing can go wrong and
+    an activation re-selection drawn around the new champion's training days
+    passes by construction."""
     from . import referee_benchmark as rb
     train_days = getattr(champion, "train_days", None)
     if not train_days:
@@ -973,12 +959,12 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
             benchmark_meta: Optional[dict] = None) -> RetrainOutcome:
     """Train a challenger and let the referee decide whether it serves.
 
-    Synchronous — the caller submits it through ``run_db`` (46a). Returns an
-    outcome rather than raising for the ordinary "not yet" cases: a home below
-    the graduation floor, or an image without scikit-learn, are STATES, and the
-    k-NN ladder keeps serving in both.
+    Synchronous — the caller submits it through ``run_db``. Returns an outcome
+    rather than raising for the ordinary "not yet" cases: a home below the
+    graduation floor, or an image without scikit-learn, are STATES, and the k-NN
+    ladder keeps serving in both.
 
-    ``benchmark_meta`` (dev51) is the import record behind ``benchmark_ids`` —
+    ``benchmark_meta`` is the import record behind ``benchmark_ids`` —
     ``source_hash`` and ``requested_n`` — carried onto the outcome so a retrain
     can say how much of the pinned reference actually met tonight's pool.
     """
@@ -1057,23 +1043,22 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
              "models' training days (%s)", circuit, len(holdout),
              len(clean_holdout), basis)
 
-    # dev51 — threshold-fair scoring: the referee compares DISCRIMINATION
-    # (argmax), never coverage. Serving precision stays choose_threshold's
-    # contract; the serving-threshold scores are kept alongside for the ledger.
-    # dev51 (gate finding, 2026-09-04) — the benchmark is RESERVED from
-    # training as of dev51, but an incumbent fitted BEFORE that rule (no
-    # train_days recorded) trained on those very rows and has memorised them:
-    # the V6d gate measured a ~14-point head start on a set it had already
-    # seen. Scoring such a champion on the benchmark is not a comparison, so
-    # the leg abstains until the first dev51 promotion installs a clean one;
-    # the recent leg (clean days after the champion's fit) decides meanwhile.
-    # dev53 — day-based, not clock-based: the leg scores only if the incumbent
-    # provably never trained on the benchmark's days (first pin over a legacy
-    # or pre-pin champion → abstain until the first promotion). A pending
-    # re-pin never darkens the active leg — EXCEPT a supply-regime re-pin,
-    # where the active set encodes pre-regime signatures and is no longer a
-    # valid reference: it is scored and recorded (advisory) but cannot veto,
-    # and the recent leg — post-regime data — decides alone until activation.
+    # Threshold-fair scoring: the referee compares DISCRIMINATION (argmax),
+    # never coverage. Serving precision stays choose_threshold's contract; the
+    # serving-threshold scores are kept alongside for the ledger.
+    #
+    # The benchmark is RESERVED from training, but a legacy incumbent (no
+    # train_days recorded) trained on those very rows and has memorised them —
+    # a ~14-point head start on a set it had already seen. Scoring such a
+    # champion on the benchmark is not a comparison, so the leg abstains until
+    # the first promotion installs a clean one and the recent leg (clean days
+    # after the champion's fit) decides meanwhile. Day-based, not clock-based.
+    #
+    # A pending re-pin never darkens the active leg — EXCEPT a supply-regime
+    # re-pin, where the active set encodes pre-regime signatures and is no
+    # longer a valid reference: it is scored and recorded (advisory) but cannot
+    # veto, and the recent leg — post-regime data — decides alone until
+    # activation.
     bench_for_referee = benchmark
     advisory = False
     advisory_scores = None
@@ -1342,13 +1327,11 @@ def learning_status(conn: Optional[sqlite3.Connection], circuit: str,
 
 def rollback_serving_model(conn: sqlite3.Connection, circuit: str,
                            data_dir: str) -> dict:
-    """Promote the retained previous artifact back to serving (dev51, 2.2).
+    """Promote the retained previous artifact back to serving.
 
-    ``tm.rollback`` had existed since dev47 with no caller. Now that swaps can
-    actually happen, an undo earns its keep: file swap, the same scoped
-    invalidation a promotion performs (so verdicts the rolled-back model
-    would answer differently are re-derived), and a ledger row so the
-    operator's action is on the record beside the referee's.
+    File swap, the same scoped invalidation a promotion performs (so verdicts
+    the rolled-back model would answer differently are re-derived), and a ledger
+    row so the operator's action is on the record beside the referee's.
     """
     art = tm.rollback(data_dir, circuit)
     if art is None:
@@ -1454,9 +1437,9 @@ def repin_triggers(conn: Optional[sqlite3.Connection], circuit: str,
     instance (``growth:388`` dismissed does not silence ``growth:776``).
 
     Nothing is suggested while a pending set already waits (the answer to
-    every trigger is the same handover). F2: while a fixture-health alert is
-    open, decay/growth/shrink are SUPPRESSED (a set drawn now would freeze a
-    quarantined class's skew in) and the regime prompt is shown but
+    every trigger is the same handover). While a fixture-health alert is open,
+    decay/growth/shrink are SUPPRESSED — a set drawn now would freeze a
+    quarantined class's skew in — and the regime prompt is shown but
     ``deferred`` when an alert predates the regime.
     """
     from . import referee_benchmark as rb

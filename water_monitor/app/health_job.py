@@ -1,12 +1,11 @@
 """The nightly fixture-health pass.
 
-This is the job that makes the frozen baselines actually watch something. Once
-a night it reads the CLASSIFIED event stream, compares each fixture against its
-own locked reference, appends the day's observations, and opens or resolves
-alerts.
+Once a night it reads the CLASSIFIED event stream, compares each fixture
+against its own locked reference, appends the day's observations, and opens or
+resolves alerts.
 
-WHAT IT READS, AND WHY THAT EXACT THING
----------------------------------------
+WHAT IT READS
+-------------
 The input is ``COALESCE(user_fixture_type, matched_fixture_type)`` — the
 attributed stream, the add-on's own answer about what ran. Deliberately not
 ground truth (there isn't any, most events are never labelled) and deliberately
@@ -83,9 +82,8 @@ SHARE_SIGNAL_DEFAULT: bool = False
 #
 # The simulation that promoted this to the "fast signal" injected phantom
 # refills as distinct events, which is the plumbing model this meter does not
-# observe. A degrading flapper still shows up here — as the
-# flush event itself growing — and that is exactly what the volume trend reads.
-# Re-enable only against a meter (or a fixture) where refills are separately
+# observe. A degrading flapper still shows up here — as the flush event itself
+# growing — which is exactly what the volume trend reads. Re-enable only against a meter (or a fixture) where refills are separately
 # metered, or with a formulation that keys on repetition during quiet periods
 # rather than on the absence of a preceding draw.
 UNSOLICITED_SIGNAL_DEFAULT: bool = False

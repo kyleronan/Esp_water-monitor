@@ -91,9 +91,9 @@ def _xtalk(r, calib):
 
 
 def _dribble(r, calib):
-    # Below-meter-floor rule (2026-07-05): calib no longer influences it; kept
-    # for the report's positive/negative counting. Turbine-class floor default
-    # (the conservative smaller one) — this eval has no circuit meter context.
+    # Under the below-meter-floor rule calib does not influence dribble; the
+    # arg is kept for the report's positive/negative counting. Turbine-class
+    # floor default (the smaller one) — this eval has no circuit meter context.
     return _detect_low_flow_dribble(
         r["volume_litres"], r["avg_flow_lpm"], r["pressure_delta_psi"], calib=calib,
         true_avg_flow_lpm=r["true_avg_flow_lpm"], peak_flow_lpm=r["peak_flow_lpm"])

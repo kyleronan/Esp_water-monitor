@@ -112,9 +112,8 @@ async def settings_page(request: Request):
     # ``or ""`` not ``get(..., "")``: device_config row 1 exists as soon as
     # discovery writes anything, and esp_device_prefix is a NULLABLE column, so
     # dict.get returns an explicit None (the default only fires for a MISSING
-    # key). That None then reached str.startswith in circuit_of / _enrich_entity
-    # and 500'd the whole Settings page. Found while adding the unit-2.32
-    # device-entity precision test, which reproduced it exactly.
+    # key). That None reaches str.startswith in circuit_of / _enrich_entity and
+    # 500s the whole Settings page.
     prefix = (device_cfg.get("esp_device_prefix") or "") if device_cfg else ""
     try:
         device_entities = await orch.ha.get_device_configurable_entities(prefix)
@@ -153,18 +152,17 @@ async def settings_page(request: Request):
     _pressure_factor = _uc["pressure_factor"] # multiply PSI → display
     _pressure_dec    = _uc["pressure_decimals"]
 
-    # unit 2.32 — display truth. This block used to hardcode ``round(..., 3)``
-    # for every unit, so the ESP Device Settings numbers disagreed with every
-    # other flow/pressure display in the app, which all use
-    # ``uc['flow_decimals']`` / ``uc['pressure_decimals']`` (units.fmt_flow,
-    # orchestrator's tile, app.js, history.html). 3 happens to match ft³/min
-    # and bar; it is too FINE for L/min, gal/min, PSI and kPa (0.264 where the
-    # rest of the UI shows 0.26) and too COARSE for m³/min (4 decimals).
-    # Rounding the *step* to display precision can land on 0.0 — an invalid
-    # HTML step attribute the browser silently replaces with 1, which then
-    # rejects every fractional entry — so a step is floored at one unit in the
-    # last displayed place. The POST handler re-snaps to ``native_step``
-    # before it reaches HA, so display rounding never changes the stored value.
+    # Display truth. Do NOT hardcode ``round(..., 3)`` here: every other
+    # flow/pressure display in the app uses ``uc['flow_decimals']`` /
+    # ``uc['pressure_decimals']`` (units.fmt_flow, orchestrator's tile, app.js,
+    # history.html). 3 matches ft³/min and bar, but is too FINE for L/min,
+    # gal/min, PSI and kPa (0.264 where the rest of the UI shows 0.26) and too
+    # COARSE for m³/min (4 decimals).
+    # Rounding the *step* to display precision can land on 0.0 — an invalid HTML
+    # step attribute the browser silently replaces with 1, which then rejects
+    # every fractional entry — so a step is floored at one unit in the last
+    # displayed place. The POST handler re-snaps to ``native_step`` before it
+    # reaches HA, so display rounding never changes the stored value.
     def _disp(value, factor: float, decimals: int, *, is_step: bool = False):
         out = round(float(value) * factor, decimals)
         if is_step and out <= 0:
@@ -765,12 +763,12 @@ async def recalibrate_regime(circuit: str, request: Request):
 
 @router.post("/reseed-clusters/{circuit}")
 async def reseed_clusters(circuit: str, request: Request):
-    """dev34 B2 — rebuild the circuit's cluster space from pump-era events in
-    the pressure-blind feature space. The recovery path for the cluster death
-    spiral (live matching stops → the startup replay pool drains →
-    'no_centers' forever); rebuild_from_db cannot recover it. Windowed to the
-    pinned pump-era anchor. Best run with a few weeks of post-repair events —
-    the pool size is reported so a thin pool is visible, not silent."""
+    """Rebuild the circuit's cluster space from pump-era events in the
+    pressure-blind feature space. The recovery path for the cluster death spiral
+    (live matching stops → the startup replay pool drains → 'no_centers'
+    forever), which rebuild_from_db cannot recover. Windowed to the pinned
+    pump-era anchor. Best run with a few weeks of post-repair events — the pool
+    size is reported so a thin pool is visible, not silent."""
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
     if orch.training_manager is None:
@@ -822,15 +820,12 @@ async def sensitivity_update(circuit: str, request: Request):
             mode=mode,
             simple_level="custom",
             # Bounds are the ones the FORM ITSELF declares (min/max on each
-            # <input> in settings.html) — client-side only until now, so a
-            # crafted POST bypassed every one of them. These values authorise an
-            # automatic valve close, and the bare float()/int() below them also
-            # raised on any non-numeric input, turning a typo into a 500 rather
-            # than a rejected field. Out-of-range now falls back to the preset,
-            # matching coerce_int's established contract.
-            #
-            # Nine lines below, anomaly_response is whitelist-validated in this
-            # same router — so the inconsistency was file-level, not a policy.
+            # <input> in settings.html). They must be re-checked here: the HTML
+            # attributes are client-side only, a crafted POST bypasses every one
+            # of them, and these values authorise an automatic valve close. A
+            # bare float()/int() also raises on non-numeric input, turning a typo
+            # into a 500 rather than a rejected field. Out-of-range falls back to
+            # the preset, matching coerce_int's contract.
             pressure_drop_event_psi=coerce_float(
                 form.get("pressure_drop_event_psi"), lo=0.5, hi=10.0,
                 default=preset["pressure_drop_event_psi"]),
@@ -980,8 +975,8 @@ async def dev_retrain(circuit: str, request: Request):
 
 @router.post("/dev/retrain-model/{circuit}")
 async def dev_retrain_model(circuit: str, request: Request):
-    """DEV/testing only — run the dev47 learned-model retrain NOW instead of
-    waiting for the weekly pass (10:00 UTC, once per ISO week).
+    """DEV/testing only — run the learned-model retrain NOW instead of waiting
+    for the weekly pass (10:00 UTC, once per ISO week).
 
     Deliberately the same call the scheduler makes, so the button cannot drift
     from the job: same training pool, same referee, same scoped invalidation.
@@ -1052,7 +1047,7 @@ async def dev_rollback_model(circuit: str, request: Request):
 async def dev_pin_referee_benchmark(circuit: str, request: Request):
     """DEV/testing only — pin (or re-pin) the referee's reference set from the
     circuit's own labels, the way the weekly pass does it automatically once a
-    home has enough labels (dev53). Over an active set the result is PENDING
+    home has enough labels. Over an active set the result is PENDING
     until the next change-over. Exempt from the health-alert gate — the
     confirm dialog names any open alert so the operator decides with eyes
     open. Outcome as a toast via the jobs table; gated behind ``dev_tools``."""
@@ -1098,13 +1093,13 @@ _OVERLAP_REBUILD_BACKOFF_S: tuple = (1.0, 2.0, 4.0)
 async def dev_rebuild_overlaps(circuit: str, request: Request):
     """DEV/testing only — rebuild duplicated spans from Home Assistant history.
 
-    dev56: for every overlap group still counting water twice and still inside
-    the recorder window, run the dev54 reprocess (probe-first: history must
-    account for the water, and rows you labelled / classified / ignored are never
-    deleted — they refuse the rebuild instead). Capped per press; a busy
-    database is retried with the same backoff the label PATCH uses before the
-    press stops. Older groups are reported, not touched. Toast via the jobs table;
-    gated behind ``dev_tools``."""
+    For every overlap group still counting water twice and still inside the
+    recorder window, run the reprocess (probe-first: history must account for the
+    water, and rows you labelled / classified / ignored are never deleted — they
+    refuse the rebuild instead). Capped per press; a busy database is retried
+    with the same backoff the label PATCH uses before the press stops. Older
+    groups are reported, not touched. Toast via the jobs table; gated behind
+    ``dev_tools``."""
     from ..config import DEV_TOOLS
     if not DEV_TOOLS:
         return JSONResponse({"error": "dev tools disabled"}, status_code=404)
@@ -1167,12 +1162,11 @@ async def dev_rebuild_overlaps(circuit: str, request: Request):
 async def dev_import_referee_benchmark(circuit: str, request: Request):
     """DEV/testing only — load the referee's frozen benchmark for a circuit.
 
-    The pinned benchmark (dev47's eval harness writes it as JSON with
-    ``event_ids`` + ``benchmark_hash``) is a record of when this household used
-    water, so it lives outside the repo. Until dev51 nothing ever loaded it and
-    the referee's primary leg never ran. This stores the ids in the DB —
-    delete-then-insert for the circuit, under the same write lock a retrain
-    takes — and returns ``{circuit, source_hash, requested_n, inserted_n}``.
+    The pinned benchmark (the eval harness writes it as JSON with ``event_ids``
+    + ``benchmark_hash``) is a record of when this household used water, so it
+    lives outside the repo. This stores the ids in the DB — delete-then-insert
+    for the circuit, under the same write lock a retrain takes — and returns
+    ``{circuit, source_hash, requested_n, inserted_n}``.
 
     Accepts the document pasted into the form field or attached as a file
     (multipart form POST with ``_csrf``, like the Re-fit button), or a JSON
@@ -1442,15 +1436,13 @@ async def retention_update(request: Request):
     orch = _orch(request)
     form = await request.form()
 
-    # Unit 6.6 retired the local `_int` here in favour of the shared
-    # `coerce_int`. The local one caught the 500 but applied NO bounds, and
-    # these are the numbers the nightly pruner deletes by: data_pruner
-    # computes `events_cutoff = now - events_retain_years * 365 days`, so a
-    # crafted POST of 0 (or a negative) put the cutoff at or after "now" and
-    # the next prune would have deleted EVERY event row. The browser can't
-    # send that — both are `<input type="range" min="1" max="10">` — which is
-    # exactly the 2.6 situation: the bounds the form already declares were
-    # client-side only. day_of_week is a 7-option <select>, so [0, 6].
+    # `coerce_int` with BOUNDS, not a bare int(): these are the numbers the
+    # nightly pruner deletes by. data_pruner computes
+    # `events_cutoff = now - events_retain_years * 365 days`, so a crafted POST
+    # of 0 or a negative puts the cutoff at or after "now" and the next prune
+    # deletes EVERY event row. The browser cannot send that — both are
+    # `<input type="range" min="1" max="10">` — but the form's declared bounds
+    # are client-side only. day_of_week is a 7-option <select>, so [0, 6].
     await run_db(                                             # dev46 (46a)
         update_data_retention,
         orch.db,
@@ -1617,9 +1609,8 @@ async def units_update(request: Request):
 async def history_events_update(request: Request):
     """Settings → History & Events — the two event-behavior toggles.
 
-    Separate from /units/update on purpose: these used to ride inside the units
-    form (nobody looked for them there), and the shared UPDATE meant a
-    toggles-only save would clobber the unit selection. Writes ONLY the toggle
+    Separate from /units/update on purpose: sharing that form's UPDATE means a
+    toggles-only save clobbers the unit selection. Writes ONLY the toggle
     columns.
     """
     orch = _orch(request)
@@ -1807,7 +1798,7 @@ async def circuit_type_update(circuit: str, request: Request):
 
 @router.post("/circuit/{circuit}/winterized")
 async def circuit_winterized_update(circuit: str, request: Request):
-    """dev46 (46h) — mark a circuit drained for the season, or back in service.
+    """Mark a circuit drained for the season, or back in service.
 
     While set, the event detector skips the circuit, supply-regime sampling
     and the pump-regime nightly leave it out, and leak tests do not run: its

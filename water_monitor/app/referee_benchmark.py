@@ -39,7 +39,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 from . import tinymodel as tm
 
-# ── policy constants (operator-confirmed 2026-09-05; see the dev53 plan) ────
+# ── policy constants (operator-confirmed) ───────────────────────────────────
 PIN_DAY_FRACTION: float = 0.25     # aim for ~25 % of the human pool, whole days
 PIN_CAP: int = 150                 # never reserve more than this many events
 PIN_FLOOR: int = 60                # below this the leg cannot veto anything real

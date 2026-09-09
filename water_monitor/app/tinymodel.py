@@ -1,35 +1,32 @@
-"""dev47 (47b) — the per-home TinyModel classification tier.
+"""The per-home TinyModel classification tier.
 
 WHY A MODEL AT ALL, WHEN THERE IS ALREADY A LADDER
 --------------------------------------------------
 The k-NN ladder's feature scales and thresholds were fitted by leave-one-out
-sweeps on THIS home's archive. The 2026-08-22 variant-house study measured what
-that costs elsewhere: on four synthetic homes whose fixtures are shaped
-differently, a per-home-trained gradient booster beat the ladder by 13-18
-points, and the ladder gained nothing even on the EASIER homes. The constants
-are not wrong; they are simply this house's, and there is no constant that is
-every house's. A model refitted per home has no such constants to go stale.
+sweeps on THIS home's archive. On four synthetic homes whose fixtures are
+shaped differently, a per-home-trained gradient booster beat the ladder by
+13-18 points, and the ladder gained nothing even on the EASIER homes. The
+constants are not wrong; they are simply this house's, and there is no constant
+that is every house's. A model refitted per home has none to go stale.
 
 WHAT THIS TIER IS NOT
 ---------------------
 It is not the failure detector. A degrading fixture stays in its own class and
-the model will happily learn its new shape — that is desirable, because fixture
-health is measured DOWNSTREAM of attribution against a frozen baseline (47i),
-where absorbed events remain visible. Nothing here should ever be made "smart"
-about drift.
+the model will happily learn its new shape — fixture health is measured
+DOWNSTREAM of attribution against a frozen baseline, where absorbed events
+remain visible. Nothing here should ever be made "smart" about drift.
 
 It is also not mandatory. The tier reports itself unavailable when scikit-learn
-is absent or the home has too few labels, and the ladder serves as before. That
-is the staged bootstrap, and it is why an import failure is a log line rather
-than an outage.
+is absent or the home has too few labels, and the ladder serves as before, so
+an import failure is a log line rather than an outage.
 
 THE ARTIFACT LIFECYCLE
 ----------------------
 An artifact is written atomically (temp file + rename) and the previous one is
 retained as last-known-good. Both halves matter: a half-written artifact whose
 hash has already invalidated stored verdicts, with no loadable model to replace
-them, is a livelock — the system would be unable to classify AND unable to fall
-back. Retention also gives 47i a rollback target when a health alert opens.
+them, is a livelock — unable to classify AND unable to fall back. Retention
+also gives a health alert a rollback target.
 """
 from __future__ import annotations
 
@@ -59,11 +56,11 @@ BASE_FEATURES: tuple = (
     "flow_fall_rate_lpm_s", "opening_step_lpm", "time_to_90pct_flow_seconds",
     "pressure_delta_psi", "pre_event_pressure_psi", "hour_sin", "hour_cos",
     "is_weekend",
-    # dev48 — the rate a draw runs at once running (migration 20260812).
-    # Deliberately NOT in LOG_FEATURES, which is where its sibling flow rates
-    # sit: the +2.3 point measurement was taken untransformed, and a boosted
-    # TREE is invariant to any monotone transform of a single feature anyway,
-    # so log-compressing it could only make the number harder to reproduce.
+    # The rate a draw runs at once running (migration 20260812). Deliberately
+    # NOT in LOG_FEATURES, where its sibling flow rates sit: the +2.3 point
+    # measurement was taken untransformed, and a boosted TREE is invariant to
+    # any monotone transform of a single feature anyway, so log-compressing it
+    # could only make the number harder to reproduce.
     "flow_plateau_lpm",
 )
 LOG_FEATURES: frozenset = frozenset({
@@ -76,13 +73,13 @@ LOG_FEATURES: frozenset = frozenset({
 REGIME_FEATURE = "supply_regime_id"
 FEATURES: tuple = BASE_FEATURES + bf.FEATURE_NAMES + (REGIME_FEATURE,)
 
-# dev48.0 adds flow_plateau_lpm. Bumping this is what makes every stored
-# artifact unservable until it retrains — correct, because a model fitted
-# without the column cannot be scored against rows that have it.
+# Bumping this makes every stored artifact unservable until it retrains —
+# correct, because a model fitted without a column cannot be scored against
+# rows that have it.
 FEATURE_SET_VERSION = "dev48.0"
 
-# Model hyper-parameters. These are the exact values every dev47 measurement
-# used; changing one makes the stored benchmark numbers incomparable, so they
+# Model hyper-parameters. These are the exact values every benchmark
+# measurement used; changing one makes the stored numbers incomparable, so they
 # are pinned here rather than exposed as settings.
 MODEL_PARAMS: dict = {
     "max_iter": 150,
@@ -94,25 +91,24 @@ MODEL_PARAMS: dict = {
 }
 
 # Minimum USER labels before the tier is eligible. Anchor exemplars do not
-# count (47c): they are distilled from the cycle detectors, so counting them
-# would let a home "graduate" on its own teacher's output within a week.
+# count: they are distilled from the cycle detectors, so counting them would
+# let a home "graduate" on its own teacher's output within a week.
 MIN_USER_LABELS: int = 100
 MIN_LABELS_PER_CLASS: int = 3
 
-# dev51 (1.5) — which `fixture_label_source` values are MACHINE labels. 'anchor'
-# was the designed value and is never actually written; 'cycle' is what
-# propagate_cycle_label writes, and until dev51 it counted as human truth in
-# both the training pool and the referee's holdout — the dev40 bad-machine-
-# label lesson, one level up. 'training' (the wizard) is deliberate human
-# ground truth and stays human. One predicate, used by eligibility, the pool
-# partition and the holdout, so the three cannot disagree.
+# Which `fixture_label_source` values are MACHINE labels. 'anchor' was the
+# designed value and is never actually written; 'cycle' is what
+# propagate_cycle_label writes and must NOT count as human truth in either the
+# training pool or the referee's holdout. 'training' (the wizard) is deliberate
+# human ground truth and stays human. One predicate, used by eligibility, the
+# pool partition and the holdout, so the three cannot disagree.
 MACHINE_LABEL_SOURCES: tuple = ("anchor", "cycle")
 
 
 def is_machine_label(row: dict) -> bool:
     return (row.get("fixture_label_source") or "direct") in MACHINE_LABEL_SOURCES
 
-# Precision-first thresholding (F8). The operator contract is precision, so
+# Precision-first thresholding. The operator contract is precision, so
 # precision is what stays fixed and coverage floats. The bound is a lower
 # confidence bound, not the point estimate: at n≈100-500 an uncorrected
 # estimate picks a threshold that looks good on the sample and is not.
@@ -132,11 +128,11 @@ PREVIOUS_FILENAME = "tinymodel.previous.json"
 # next classification — inside a container that holds SUPERVISOR_TOKEN and
 # drives the main water valve, with no admin ever opening the UI.
 #
-# `skops.io` is upstream's recommended pickle replacement and would be the
-# textbook fix. It is deliberately NOT used: this add-on's Dockerfile records
-# three failed attempts at moving the scikit-learn / numpy / river dependency
-# set, so adding another ML dependency to close this is disproportionate to the
-# hole. An HMAC over the payload closes it with the standard library.
+# `skops.io` is upstream's recommended pickle replacement and is deliberately
+# NOT used: the scikit-learn / numpy / river dependency set in this add-on's
+# Dockerfile is fragile enough that adding another ML dependency is
+# disproportionate to the hole. An HMAC over the payload closes it with the
+# standard library.
 #
 # The key follows the `csrf_server_secret` shape (database.py): 256 bits of
 # hex, created once on first use, NEVER regenerated automatically — rotating it
@@ -246,16 +242,16 @@ class Artifact:
     # train and serve. A booster cannot bin an all-NaN column, so without this
     # a home that never populates one feature cannot train a model at all.
     zero_filled: List[str] = field(default_factory=list)
-    # dev51 — the local calendar days this artifact was fitted on. The referee
-    # scores the recent leg only on days NEITHER model trained on; without this
-    # the champion was scored on days it had memorised while the challenger was
-    # scored clean, a one-directional bias that rejected every challenger.
-    # Additive: artifacts written before dev51 load with an empty list and the
-    # referee falls back to "days after trained_at". Deliberately NOT part of
-    # model_hash — it describes the fit, it does not change it.
+    # The local calendar days this artifact was fitted on. The referee scores
+    # the recent leg only on days NEITHER model trained on; without this the
+    # champion is scored on days it memorised while the challenger is scored
+    # clean, a one-directional bias that rejects every challenger. An artifact
+    # written without it loads with an empty list and the referee falls back to
+    # "days after trained_at". Deliberately NOT part of model_hash — it
+    # describes the fit, it does not change it.
     train_days: List[str] = field(default_factory=list)
     model_blob: Optional[str] = None            # base64 joblib/pickle payload
-    # HMAC-SHA256 of model_blob under this install's signing secret (2.16).
+    # HMAC-SHA256 of model_blob under this install's signing secret.
     # Stamped by ``save`` and checked by ``load``; an artifact that arrives
     # without one, or with one that does not verify, is never unpickled.
     model_signature: Optional[str] = None
@@ -388,11 +384,11 @@ def _model_hash(pool_hash: str, classes: Sequence[str], threshold: float,
                 blob_digest: str = "") -> str:
     """Identity of the served artifact.
 
-    2.16 — ``blob_digest`` is new and load-bearing: before it, the hash
-    described the RECIPE (pool, params, classes, threshold) and not the bytes,
-    so swapping ``model_blob`` for a different payload left the hash — and
-    therefore every verdict keyed to it — completely unchanged. Covering the
-    payload makes the hash an identity of what is actually served.
+    ``blob_digest`` is load-bearing. A hash over the RECIPE alone (pool,
+    params, classes, threshold) leaves a swap of ``model_blob`` for a different
+    payload undetected — the hash, and therefore every verdict keyed to it,
+    unchanged. Covering the payload makes the hash an identity of what is
+    actually served.
 
     A plain digest rather than the HMAC signature, deliberately: two identical
     fits of the same pool must still produce the same hash, or every retrain
@@ -404,9 +400,8 @@ def _model_hash(pool_hash: str, classes: Sequence[str], threshold: float,
     h.update(f"params={sorted(MODEL_PARAMS.items())};".encode())
     # str() every class: sklearn hands back numpy.str_, whose repr is
     # ``np.str_('shower')`` under numpy 2, while the same list read back out of
-    # the artifact JSON is plain ``'shower'``. Before 2.16 nothing recomputed
-    # the hash, so the two never met and the discrepancy was invisible; the
-    # self-check below meets it on every load.
+    # the artifact JSON is plain ``'shower'``. The self-check below compares
+    # the two on every load.
     h.update(f"classes={sorted(str(c) for c in classes)};"
              f"thr={threshold:.4f}".encode())
     h.update(f";blob={blob_digest}".encode())
@@ -521,7 +516,7 @@ def train(rows: Sequence[dict], circuit: str,
     for label in y:
         counts[label] = counts.get(label, 0) + 1
     pool_hash = label_pool_hash(rows)
-    # Serialize BEFORE hashing — model_hash now covers the payload (2.16).
+    # Serialize BEFORE hashing — model_hash covers the payload.
     blob = _serialize(clf)
     art = Artifact(
         model_hash=_model_hash(pool_hash, list(clf.classes_), threshold,
@@ -571,8 +566,8 @@ def _predict_batch(art: Artifact, rows: Sequence[dict],
     """``threshold`` overrides the artifact's serving threshold for this call
     only; ``0.0`` means argmax (never abstain). Default — no override — is the
     serving contract and is what every classification path uses. The override
-    exists for the referee (dev51): two artifacts that chose different serving
-    thresholds cannot be compared on an abstention-punishing metric, because a
+    exists for the referee: two artifacts that chose different serving
+    thresholds cannot be compared on an abstention-punishing metric: a
     coverage difference reads as a quality difference."""
     if not rows:
         return []
@@ -610,10 +605,10 @@ def save(art: Artifact, data_dir: str) -> str:
 
     Temp file + rename: a reader either sees the whole old artifact or the
     whole new one, never a truncated file. The retained copy is what makes a
-    health-alert rollback (47i) and a load-failure fallback possible.
+    health-alert rollback and a load-failure fallback possible.
 
-    2.16 — signing happens HERE rather than in ``train`` because this is the
-    first point that knows which /data the artifact belongs to, and a key is
+    Signing happens HERE rather than in ``train`` because this is the first
+    point that knows which /data the artifact belongs to, and a key is
     per-install. An artifact that is never saved is never unpickled, so it
     never needs a signature.
     """
@@ -651,10 +646,10 @@ def save(art: Artifact, data_dir: str) -> str:
 
 # Artifacts we have already judged and refused, keyed by path -> (mtime_ns,
 # size). load() is called PER EVENT (database.py, feature_extractor.py), so
-# without this a refused artifact is re-opened, re-parsed and re-verified for
-# every classification — and, as first deployed, re-logged at ERROR each time:
-# hundreds of identical lines a minute during a reclassify, drowning the log
-# the operator needs to see the actual refusal in. The stat key means a
+# without this a refused artifact is re-opened, re-parsed, re-verified and
+# re-logged at ERROR for every classification: hundreds of identical lines a
+# minute during a reclassify, drowning the log the operator needs to see the
+# actual refusal in. The stat key means a
 # retrain (which writes a NEW file) is picked up immediately, so this caches
 # the VERDICT, never the file.
 _REFUSED: Dict[str, Tuple[int, int]] = {}
@@ -701,7 +696,7 @@ def load(data_dir: str, circuit: str, allow_previous: bool = True
                             "build serves %s — ignoring it", path,
                             art.feature_set_version, FEATURE_SET_VERSION)
                 continue
-            # 2.16 — authenticity, checked BEFORE anything can unpickle the
+            # Authenticity, checked BEFORE anything can unpickle the
             # payload. A failure here is a tamper or a foreign artifact, not a
             # corruption: say so plainly, because the operator's next step
             # (retrain) differs from "the file is truncated".
@@ -781,8 +776,7 @@ def rollback(data_dir: str, circuit: str) -> Optional[Artifact]:
 # batch reclassify), so they cannot drift apart. Everything about it is
 # best-effort: an absent artifact, an absent scikit-learn, or a corrupt model
 # all mean "this tier abstains", never "classification fails". The ladder below
-# it is a complete classifier on its own — that is the staged bootstrap, and it
-# is what lets this ship before the image question is settled.
+# it is a complete classifier on its own — the staged bootstrap.
 _ARTIFACT_CACHE: Dict[str, tuple] = {}
 
 

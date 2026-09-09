@@ -66,7 +66,7 @@ LEGACY_TYPE_REMAP: Dict[str, str] = {
     "refrigerator_water":    "other",
     "ro_drinking_faucet":    "other",
     "humidifier":            "other",
-    # dev.24: water_softener is a first-class type again — preserve it through
+    # water_softener is a first-class type — preserve it through
     # _canonical_fixture_type so user labels + session matches store correctly.
     "water_softener":        "water_softener",
     "ro_system_whole_house": "other",
@@ -95,13 +95,10 @@ FIXTURE_TYPE_LABELS: Dict[str, str] = {
 # they never show up as a real fixture for clustering or HA publishing.
 INTERNAL_FIXTURE_TYPES: List[str] = ["leak_test"]
 
-# HA publishing categories. Each fixture type is its own category now —
-# the taxonomy IS the category set. Never stored in the database.
-#
-# It used to say "used only in fixture_publisher to name HA entities".
-# That module was deleted with the MQTT publisher, so this now has no
-# consumer at all — kept because it is the taxonomy's category mapping and
-# a future publisher would need it, not because anything reads it today.
+# HA publishing categories. Each fixture type is its own category — the
+# taxonomy IS the category set. Never stored in the database, and nothing
+# reads it today (the MQTT publisher that did was deleted); kept as the
+# taxonomy's category mapping for a future publisher.
 FIXTURE_CATEGORIES: Dict[str, Optional[str]] = {
     "toilet":           "toilet",
     "shower_tub":       "shower_tub",
@@ -129,8 +126,8 @@ FIXTURE_CATEGORY_LABELS: Dict[str, str] = {
 def get_fixture_category(fixture_type: Optional[str]) -> Optional[str]:
     """Return the HA publishing category for a fixture type.
 
-    Since the taxonomy consolidation (Sprint D) the type IS the category,
-    so this function is effectively an identity for known types.
+    The type IS the category, so this is effectively an identity for known
+    types.
     Returns None for leak_test (never published).
     Returns 'other' for None or any type not in FIXTURE_CATEGORIES.
     """
@@ -173,8 +170,8 @@ ZONE_ONLY_ALERT_TYPES: frozenset = frozenset({
 })
 
 # Fixture types appropriate for a zone (irrigation) circuit.
-# hose_bib and pool_fill were folded into "other" during the Sprint D
-# taxonomy consolidation; zone circuits now offer only two choices.
+# hose_bib and pool_fill fold into "other", so zone circuits offer only two
+# choices.
 _ZONE_FIXTURE_TYPES: List[str] = ["irrigation_zone", "other"]
 
 
@@ -195,7 +192,7 @@ def normalize_circuit_type(value: Optional[str]) -> str:
 #         port always vents, so any test would read as a constant leak.
 #
 # Wording deliberately avoids implying the addon performs auto-drain — only
-# that the hardware supports it. Future work may add an auto-drain workflow.
+# that the hardware supports it.
 
 VALVE_TYPES: List[str] = ["2_port", "3_port"]
 DEFAULT_VALVE_TYPE: str = "2_port"
@@ -263,10 +260,10 @@ def normalize_fixture_type_for_circuit(
 ) -> str:
     """Coerce any string into a canonical category for the given circuit.
 
-    Used by the Sprint F per-category rollup (Fixtures page) to ensure stored
-    type strings — which may include legacy values predating Sprint D, user
-    typos, display labels, or wrong-circuit-kind types — always collapse to a
-    valid category for the circuit being rendered.
+    Used by the per-category rollup (Fixtures page) so that stored type
+    strings — legacy values, user typos, display labels, or wrong-circuit-kind
+    types — always collapse to a valid category for the circuit being
+    rendered.
 
     circuit_kind: ``"fixture"`` (the default) or ``"zone"``. Anything else is
     treated as ``"fixture"``. Unknown / blank / legacy / wrong-kind inputs all
@@ -277,7 +274,7 @@ def normalize_fixture_type_for_circuit(
       2. Strip whitespace, lowercase, collapse hyphens/spaces to ``_``.
       3. Strip a trailing ``/`` and split on ``/`` — take the first segment
          (catches display labels like ``"Shower / Tub"`` → ``"shower"``).
-      4. Look up in LEGACY_TYPE_REMAP (Sprint D alias map).
+      4. Look up in LEGACY_TYPE_REMAP (the alias map).
       5. If the result is in the allowed-set for this circuit kind, return
          it; otherwise return ``"other"``.
     """
@@ -296,7 +293,7 @@ def normalize_fixture_type_for_circuit(
     s = re.sub(r"[\s\-]+", "_", s).strip("_")
     if not s:
         return "other"
-    # Apply Sprint D alias map (shower→shower_tub, bathroom_tap→tap,
+    # Apply the legacy alias map (shower→shower_tub, bathroom_tap→tap,
     # hose_bib→other, etc.).
     canonical = LEGACY_TYPE_REMAP.get(s, s)
     allowed = (set(zone_user_selectable_types())
@@ -318,20 +315,18 @@ def normalize_fixture_type_for_circuit(
 #   - Programme-driven fixtures (washing_machine, dishwasher, water_softener):
 #     multimodal — quick cycle vs. cottons cycle look like two fixtures but
 #     are one appliance. The `multimodal` flag here is scaffolding for the
-#     deferred Phase 2.2 multi-cluster fixture grouping (see
-#     docs/multimodal-fixtures.md when written).
+#     deferred multi-cluster fixture grouping.
 #
 # Schema:
 #   anchor_weights:  feature_name -> weight (>1 amplifies importance)
 #   float_features:  feature names whose differences should be ignored
 #                    (assigned weight 0 in cluster_engine._build_match_weights)
 #   expected_cv:     feature_name -> coefficient-of-variation expected at
-#                    healthy operation. Scaffolding for cluster_metrics.py
-#                    (out of scope today; values inform the future drift
-#                    monitor).
-#   multimodal:      placeholder for the Phase 2.2 multi-cluster grouping.
+#                    healthy operation. Scaffolding for the future drift
+#                    monitor (cluster_metrics.py); unread today.
+#   multimodal:      placeholder for the multi-cluster grouping.
 #
-# Live FEATURE_KEYS (cluster_engine.py:45) today:
+# Live FEATURE_KEYS (cluster_engine.py) today:
 #   avg_flow_lpm, peak_flow_lpm, duration_seconds, volume_litres,
 #   pressure_delta_psi, has_pressure_transient, flow_variability,
 #   hour_sin, hour_cos
@@ -345,10 +340,10 @@ def normalize_fixture_type_for_circuit(
 FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     # ── Deterministic ────────────────────────────────────────────────────
     "toilet": {
-        # Type-level weights: lowered volume/duration/flow from 3.0/3.0/2.0 to
-        # 1.5 each so that two cisterns with slightly different flush sizes both
-        # match the type centroid. Pressure-transient anchors are unchanged —
-        # these remain the sharpest cross-type discriminators.
+        # Type-level weights: volume/duration/flow sit at 1.5 each so two
+        # cisterns with slightly different flush sizes both match the type
+        # centroid. The pressure-transient anchors are the sharpest cross-type
+        # discriminators, so they stay high.
         "anchor_weights": {
             "volume_litres":              1.5,
             "duration_seconds":           1.5,
@@ -366,10 +361,9 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
 
     # ── User-driven ──────────────────────────────────────────────────────
     "shower_tub": {
-        # Merged from old shower + bath profiles. Duration and volume are
-        # behavioural choices (whether the user showers or fills a tub);
-        # anchor on flow rate and pressure delta which are hydraulically
-        # stable per installation.
+        # Duration and volume are behavioural choices (whether the user
+        # showers or fills a tub); anchor on flow rate and pressure delta,
+        # which are hydraulically stable per installation.
         "anchor_weights": {
             "avg_flow_lpm":           3.0,
             "pressure_delta_psi":     2.0,
@@ -383,7 +377,6 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         "multimodal": False,
     },
     "tap": {
-        # Merged from old bathroom_tap + kitchen_tap + utility_tap profiles.
         # Short, low-volume events; duration and volume vary with use.
         "anchor_weights": {
             "avg_flow_lpm":           2.5,
@@ -437,9 +430,9 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     },
 
     "water_softener": {
-        # dev.24: detected by the SESSION detector (event_rules.detect_softener_
-        # sessions), never the k-NN — this profile only keeps the dict in lockstep
-        # with FIXTURE_TYPES. Uniform (like 'other'): the k-NN has no
+        # Detected by the SESSION detector (event_rules.detect_softener_
+        # sessions), never the k-NN — this profile only keeps the dict in
+        # lockstep with FIXTURE_TYPES. Uniform (like 'other'): the k-NN has no
         # water_softener centroid to match against, so the values are inert.
         "anchor_weights": {},
         "float_features": set(),
@@ -464,8 +457,7 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
     },
     "other": {
         # Uniform fallback — empty anchor_weights and float_features means
-        # _build_match_weights returns the default 1.0 for every feature,
-        # so the gate behaves identically to the old global-threshold path.
+        # _build_match_weights returns the default 1.0 for every feature.
         "anchor_weights": {},
         "float_features": set(),
         "expected_cv": {},
@@ -474,11 +466,10 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
 }
 
 
-# Per-fixture-type match thresholds (scaled-feature space).
-# Raised from individual-fixture values to type-level values so that two
-# fixtures of the same type (e.g., two different cisterns) both match a
-# single type centroid rather than splitting into separate clusters.
-# "other" is unchanged — it is a catch-all, not a named type.
+# Per-fixture-type match thresholds (scaled-feature space). Type-level rather
+# than per-fixture so two fixtures of the same type (e.g. two different
+# cisterns) both match a single type centroid instead of splitting into
+# separate clusters. "other" is looser — it is a catch-all, not a named type.
 FIXTURE_MATCH_THRESHOLDS: Dict[str, float] = {
     "toilet":           3.0,
     "shower_tub":       4.5,   # looser of old shower(4.0) + bath(4.5)
@@ -495,8 +486,8 @@ FIXTURE_MATCH_THRESHOLDS: Dict[str, float] = {
 def get_variance_profile(fixture_type: Optional[str]) -> Dict:
     """Return the variance profile for a fixture type, or `other` as fallback.
 
-    Accepts None (returned for unconfirmed clusters) and unknown types
-    (treats them as `other` — uniform behaviour matching the pre-2.1 path).
+    Accepts None (returned for unconfirmed clusters) and unknown types,
+    treating both as `other` (uniform weights).
     """
     if fixture_type is None:
         return FIXTURE_VARIANCE_PROFILES["other"]
@@ -548,10 +539,9 @@ def _safe(centroid: Dict, key: str, default: float = 0.0) -> float:
 def _rule_toilet(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Toilet flushes: 3-10 L volume, 20-120 s fill, sharp pressure transient.
 
-    Bands widened from the originals (4-9 L / 20-60 s / 4-25 L/min) to span
-    dual-flush and slow-fill cisterns across houses (observed real fills run to
-    ~98 s and down to ~2.8 L) while keeping the has_xt transient signature that
-    separates a toilet from a tap.
+    The bands span dual-flush and slow-fill cisterns across houses (real fills
+    run to ~98 s and down to ~2.8 L) while keeping the has_xt transient
+    signature that separates a toilet from a tap.
     """
     if circuit_type == "zone":
         return None
@@ -568,9 +558,8 @@ def _rule_toilet(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float
 def _rule_shower_tub(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Shower or bath fill: 15-300 L, 3-60 min, moderate flow.
 
-    Merges shower + bath. Duration ceiling raised from 20 to 60 min (real
-    showers run past 50 min) and the flow floor lowered from 5 to 4 L/min for
-    low-flow heads.
+    Merges shower + bath. The 60 min ceiling covers real showers past 50 min;
+    the 4 L/min floor covers low-flow heads.
     """
     if circuit_type == "zone":
         return None
@@ -585,9 +574,9 @@ def _rule_shower_tub(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, f
 def _rule_tap(centroid: Dict, circuit_type: str) -> Optional[Tuple[str, float]]:
     """Tap use: 0.3-6 L, 4-75 s — bathroom/kitchen/utility taps.
 
-    Deliberately kept NARROW (balanced posture): tap is the broadest, lowest-
-    confidence rule and the last in the chain, so it must not become a catch-all
-    that pulls miscellaneous small events out of 'other'.
+    Deliberately kept NARROW: tap is the broadest, lowest-confidence rule and
+    the last in the chain, so it must not become a catch-all that pulls
+    miscellaneous small events out of 'other'.
     """
     if circuit_type == "zone":
         return None

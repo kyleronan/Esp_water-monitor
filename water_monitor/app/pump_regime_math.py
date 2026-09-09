@@ -1,8 +1,8 @@
 """Pure math for pump-regime detection and recharge-cycle leak estimation.
 
-Shared by the offline validation study (tools/validate_pump_regime.py) and,
-once the study passes, the Phase 3 nightly worker — the study validates THIS
-code, not a copy (edge-signature lesson: what ships must be what was studied).
+Shared by the offline validation study (tools/validate_pump_regime.py) and the
+nightly worker — the study validates THIS code, not a copy. What ships must be
+what was studied.
 
 All functions operate on a 1 Hz-resampled pressure (and optionally flow)
 series for one analysis window. No I/O, no DB, no asyncio.
@@ -11,12 +11,11 @@ Constants below are PRIORS from the 2026-07 ESYBOX incident (53–65 PSI
 sawtooth, ~222 s recharge period, sd 3.46 overnight vs 0.47 static); the
 study tunes them and its tuned values are authoritative.
 
-SCOPE (v1): detection recognizes the CYCLING signature only
+SCOPE: detection recognizes the CYCLING signature only
 (vfd_constant_pressure profile). The decay-ramp fit is study/classifier-only —
-it must NOT feed a detection verdict (municipal diurnal drift can fit a slow
-ramp; see the pump plan, round-3 #6). switch_tank homes (~1 cycle/day, period
-1e4–1e5 s) are structurally invisible to in-window periodicity search — their
-leak signature is the ramp, handled in the switch_tank follow-up.
+it must NOT feed a detection verdict, because municipal diurnal drift fits a
+slow ramp. switch_tank homes (~1 cycle/day, period 1e4–1e5 s) are structurally
+invisible to in-window periodicity search — their leak signature is the ramp.
 """
 from __future__ import annotations
 
@@ -28,15 +27,15 @@ import numpy as np
 # ── Priors (study-tunable) ─────────────────────────────────────────────────────
 PUMP_MIN_P2P_PSI: float = 3.0      # sawtooth band floor (incident ≈ 12 PSI)
 # A sawtooth of band B has sd ≈ B/√12 ≈ 0.29·B, so the p2p floor of 3.0
-# implies sd ≈ 0.87 — the plan's original 1.5 prior contradicted its own p2p
-# prior and rejected a clean 4 PSI-band pump (study tuning, 2026-07-21).
+# implies sd ≈ 0.87. A 1.5 floor contradicts the p2p prior and rejects a clean
+# 4 PSI-band pump.
 # Static supply measured sd 0.47 stays well below 0.8.
 PUMP_MIN_SD_PSI: float = 0.8
 PUMP_PERIOD_MIN_S: float = 60.0    # disjoint from pulsing_supply's 1–6 s band
 PUMP_PERIOD_MAX_S: float = 1800.0
 AUTOCORR_MIN_PROMINENCE: float = 0.4
 AUTOCORR_STRONG_PROMINENCE: float = 0.6   # allows the reduced 3-cycle criterion
-PUMP_MIN_CYCLES: int = 5           # or >=3 with strong prominence (plan #12)
+PUMP_MIN_CYCLES: int = 5           # or >=3 with strong prominence
 PUMP_MIN_CYCLES_STRONG: int = 3
 
 # Recharge-rise segmentation: a cut-in→cut-out upswing is a fast, mostly
@@ -50,15 +49,15 @@ RISE_DIP_TOLERANCE_PSI: float = 0.3   # brief counter-dips inside a rise
 # under this; a real draw's flow is well above it).
 ALIGN_MAX_PRE_FLOW_LPM: float = 0.2
 
-# Decay-ramp fit (study/classifier-only in v1 — never a detection verdict).
+# Decay-ramp fit (study/classifier-only — never a detection verdict).
 RAMP_MIN_R2: float = 0.9
-RAMP_MIN_PSI_PER_HR: float = 0.5   # plan round-4 #7: tank C≈1.5–2 L/PSI at
+RAMP_MIN_PSI_PER_HR: float = 0.5   # tank C≈1.5–2 L/PSI at
                                    # 30 L/day decays only ~0.6–0.8 PSI/h
 
-# Quiet-window requirement for regime analysis. STUDY FINDING (2026-07-21):
-# strict zero-flow never happens on a pump+leak home — the recharge slugs
-# themselves meter flow every cycle (~7% duty at the incident's 222 s period),
-# so the first study run found ZERO quiet windows on the post-install night.
+# Quiet-window requirement for regime analysis. Strict zero-flow never happens
+# on a pump+leak home — the recharge slugs themselves meter flow every cycle
+# (~7% duty at the incident's 222 s period), so a strict definition finds ZERO
+# quiet windows on a post-install night.
 # "Quiet" therefore means: no SUSTAINED draw (no flow run longer than
 # QUIET_MAX_DRAW_SECONDS) and low overall duty — brief recharge slugs are
 # tolerated; real fixture use is not.
@@ -144,11 +143,11 @@ class RegimeVerdict:
     ramp_slope_psi_per_hr: float
     ramp_r2: float
     # Median spacing between consecutive (aligned) recharge rises. PREFER this
-    # over period_s for reporting/trending: production night 2026-07-25 showed
-    # the autocorrelation locking onto a strong 62 s sub-harmonic while the 18
-    # actual rises were ~259 s apart — detection was unaffected (cycles +
-    # prominence carried it) but the raw autocorr period would have corrupted
-    # the banner copy and the Phase 5 period-shrink trend.
+    # over period_s for reporting/trending: on 2026-07-25 the autocorrelation
+    # locked onto a strong 62 s sub-harmonic while the 18 actual rises were
+    # ~259 s apart. Detection is unaffected (cycles + prominence carry it), but
+    # the raw autocorr period corrupts the banner copy and the period-shrink
+    # trend.
     cycle_spacing_s: Optional[float] = None
 
     @property
@@ -200,7 +199,7 @@ def segment_recharge_rises(pressure_1hz: Sequence[float],
     counter-dips up to ``dip_tolerance_psi`` below its running max. A run
     qualifies when its net rise >= min_rise_psi within <= max_seconds.
 
-    NOTE (2026-08-11): do NOT add a max-rise "deadband" cap here — the
+    Do NOT add a max-rise "deadband" cap here — the
     validated 2026-07 incident regime cycled a 12 PSI band, so rise
     magnitude cannot separate real recharge cycling from demand recovery.
     The softener-regen false positive is handled by the window-length gate
@@ -239,8 +238,8 @@ def rise_is_flow_aligned(flow_1hz_lpm: Sequence[float],
                          rise: RechargeRise) -> bool:
     """True when metered flow coincides with the pressure RISE (pump pushing
     water in) rather than preceding it (a draw whose end lets pressure
-    recover). STUDY FINDING (2026-07-21): without this phase test, post-draw
-    recoveries on ordinary nights read as 'recharge cycles' (a leaky toilet
+    recover). Without this phase test, post-draw recoveries on ordinary nights
+    read as 'recharge cycles' (a leaky toilet
     fill valve produced a clean 62 s periodicity with prominence 0.98 on a
     static-supply night) and draw volumes inflate the slug math ~4×."""
     f = np.asarray(flow_1hz_lpm, dtype=float)
@@ -253,9 +252,9 @@ def rise_is_flow_aligned(flow_1hz_lpm: Sequence[float],
     # off and the sub-floor leak meters as zero, so a true recharge rise is
     # preceded by flow silence; a post-draw recovery is preceded by the draw
     # itself (softener regen pulse trains produced clean 62-79 s periodicity
-    # with prominence 0.98 — study finding #3). A during-coverage test was
-    # tried and REJECTED: the metered slug (1-10 s) is much shorter than the
-    # pressure rise it causes (10-40 s), so real recharges failed it.
+    # with prominence 0.98). A during-coverage test does NOT work: the metered
+    # slug (1-10 s) is much shorter than the pressure rise it causes (10-40 s),
+    # so real recharges fail it.
     before = float(f[pre_lo:rise.start_idx].mean()) \
         if rise.start_idx > pre_lo else 0.0
     has_flow_in_rise = bool((seg > 0.0).any())
@@ -290,14 +289,14 @@ def detect_pump_regime(pressure_1hz: Sequence[float],
     ``detected`` requires ALL of: p2p >= PUMP_MIN_P2P_PSI, sd >=
     PUMP_MIN_SD_PSI, an in-band dominant period with prominence >=
     AUTOCORR_MIN_PROMINENCE, and a period-scaled cycle count (>=5, or >=3
-    with prominence >= 0.6 — plan finding #12).
+    with prominence >= 0.6).
 
     When ``flow_1hz_lpm`` is given (production path — quiet windows tolerate
     brief draws), cycles are the FLOW-PHASE-ALIGNED rises only and at least
     half of all rises must be aligned — the discriminator that separates pump
     recharges (flow DURING the rise) from post-draw recoveries (flow before
     it). Without flow (pressure-only callers/synthetics) raw rises are used.
-    Ramp diagnostics ride along but never influence the verdict (round-3 #6).
+    Ramp diagnostics ride along but never influence the verdict.
     """
     x = np.asarray(pressure_1hz, dtype=float)
     sd = float(x.std()) if x.size else 0.0
@@ -343,8 +342,8 @@ def capacitance_samples(pressure_1hz: Sequence[float],
 
     For each recharge rise, integrates metered flow over the rise (L) and
     divides by the pressure gain (PSI). Returns [(mid_psi, slug_litres,
-    capacitance_l_per_psi), ...]. NOTE (plan round-3 #1): the slug volume is
-    METERED — capacitance inherits any meter over-registration 1:1; absolute
+    capacitance_l_per_psi), ...]. The slug volume is METERED — capacitance
+    inherits any meter over-registration 1:1; absolute
     calibration must come from street-meter/utility ground truth.
     """
     p = np.asarray(pressure_1hz, dtype=float)
@@ -371,11 +370,11 @@ def estimate_leak_rate_lph(pressure_1hz: Sequence[float],
     independent check is external ground truth, never these two vs each
     other):
 
-    - 'cycle_lph': ROBUST per-cycle math — median slug × 3600 / median period
-      (study finding: a raw slug-volume total over the window is inflated by
-      any tolerated real micro-draws; medians over flow-phase-ALIGNED rises
-      resist that contamination — the naive total is reported as
-      'gross_flow_lph' for diagnosis).
+    - 'cycle_lph': ROBUST per-cycle math — median slug × 3600 / median period.
+      A raw slug-volume total over the window is inflated by any tolerated real
+      micro-draws; medians over flow-phase-ALIGNED rises resist that
+      contamination (the naive total is reported as 'gross_flow_lph' for
+      diagnosis).
     - 'capacitance_lph': median inter-recharge decay slope × median
       capacitance (generalizes to single-ramp/tank homes).
     Plus diagnostics: cycles, median period, median slug L, median C.
@@ -421,12 +420,12 @@ def classify_cross_circuit(pressure_1hz: Sequence[float],
                            flow_1hz_lpm: Sequence[float],
                            expected_period_s: Optional[float] = None,
                            ) -> Tuple[str, int, Optional[float]]:
-    """Phase 5b — verdict for the UNTESTED circuit's window while its sibling
+    """Verdict for the UNTESTED circuit's window while its sibling
     ran a valve-closed leak test. Returns (verdict, cycles, period_s).
 
     Any registered flow on this circuit demotes to 'not_applicable' (an
     icemaker fill / softener pulse here produces cycling that says nothing
-    about a leak — plan round-1 #3). With flow silent, recharge rises are
+    about a leak). With flow silent, recharge rises are
     counted WITHOUT the flow-phase alignment test: the leak's slugs meter
     through the OTHER (tested) circuit's meter or below this one's floor, so
     this circuit sees the pressure sawtooth with zero flow — pressure-only

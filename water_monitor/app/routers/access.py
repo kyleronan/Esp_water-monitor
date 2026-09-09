@@ -46,7 +46,7 @@ async def access_page(request: Request):
     orch = _orch(request)
     from ..database import run_db
     db = orch.db
-    # dev46 (46a): every DB read on this page goes through the single DB
+    # Every DB read on this page goes through the single DB
     # thread. The seen-users fallback below is fetched here too — one hop,
     # and the branch that uses it is decided after the HA call returns.
     operator_ids, seen_users = await run_db(
@@ -121,7 +121,7 @@ async def grant_operator(
     from ..database import run_db
 
     def _grant():
-        # dev46 (46a): the write AND the allow-list reload it invalidates are
+        # The write AND the allow-list reload it invalidates are
         # both DB work — one callable on the single DB thread keeps them
         # together (reload_operator_ids re-SELECTs the operator set).
         add_operator(orch.db, user_id.strip(), display_name.strip(), actor)
@@ -143,7 +143,7 @@ async def revoke_operator(
     from ..database import run_db
 
     def _revoke():
-        # dev46 (46a): write + allow-list reload in one DB-thread callable.
+        # Write + allow-list reload in one DB-thread callable.
         remove_operator(orch.db, user_id.strip())
         orch.reload_operator_ids()
 

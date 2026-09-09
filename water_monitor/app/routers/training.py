@@ -61,8 +61,8 @@ def _applicable_types(orch, circuit) -> list:
 
 async def _bg_reclassify_training(circuit: str) -> None:
     """Single deferred reclassify after a checklist item is accepted/rejected —
-    serialized + private connection (dev.8), so it never races live writes. §2.4 —
-    tracked as a job so a FAILURE surfaces to the UI (success is silent)."""
+    serialized + private connection, so it never races live writes. Tracked as
+    a job so a FAILURE surfaces to the UI (success is silent)."""
     from ..database import (reclassify_all_events_from_signatures,
                             run_isolated_write, start_job, finish_job)
     from ..config import DB_PATH
@@ -116,7 +116,7 @@ async def start_regime_recalibration(orch) -> bool:
     from ..config import DB_PATH
     from ..database import run_db, run_isolated_write
     from ..supply_regime import get_current_regime
-    regime = await run_db(get_current_regime, orch.db)         # dev46 (46a)
+    regime = await run_db(get_current_regime, orch.db)
     if regime is None:
         return False
     circuits = [c.circuit for c in orch._cfg.circuits]
@@ -224,7 +224,7 @@ async def start_regime_recalibration(orch) -> bool:
 @router.get("/", response_class=HTMLResponse)
 async def training_page(request: Request):
     orch = _orch(request)
-    # dev46 (46a): the per-circuit type lookup + checklist are DB reads — one
+    # The per-circuit type lookup + checklist are DB reads — one
     # hop for all circuits instead of 2N inline queries on the loop thread.
     from ..database import run_db
 
@@ -280,7 +280,7 @@ def _sub_state(circuit, cap, live_flow):
 async def training_state_api(request: Request):
     orch = _orch(request)
     db = orch.db
-    # dev46 (46a): this endpoint is polled by the training wizard. The stale
+    # This endpoint is polled by the training wizard. The stale
     # expiry (a WRITE) and every circuit's active-capture read go through the
     # single DB thread in one hop, before the per-circuit HA awaits below.
     from ..database import run_db
@@ -336,7 +336,7 @@ async def arm_api(circuit: str, request: Request):
                       "complete or cancel it first."}, status_code=409)
     payload = await _json(request)
     ftype = payload.get("fixture_type")
-    # dev46 (46a): _applicable_types reads circuit_type from the DB.
+    # _applicable_types reads circuit_type from the DB.
     if ftype not in await run_db(_applicable_types, orch, circuit):
         return JSONResponse({"error": "fixture type not applicable to this circuit"},
                             status_code=400)
@@ -351,7 +351,7 @@ async def arm_api(circuit: str, request: Request):
 @router.post("/api/{circuit}/cancel")
 async def cancel_api(circuit: str, request: Request):
     from ..database import run_db
-    n = await run_db(cancel_training_capture,                 # dev46 (46a)
+    n = await run_db(cancel_training_capture,
                      _orch(request).db, circuit)
     return JSONResponse({"ok": True, "cancelled": n})
 
@@ -360,10 +360,10 @@ async def cancel_api(circuit: str, request: Request):
 @router.post("/api/{circuit}/done")
 async def confirm_api(circuit: str, request: Request):
     from ..database import run_db
-    res = await run_db(confirm_training_capture,              # dev46 (46a)
+    res = await run_db(confirm_training_capture,
                        _orch(request).db, circuit)
     if res.get("labeled"):
-        # dev57 (2.24): spawn() holds the strong reference (see task_registry).
+        # spawn() holds the strong reference (see task_registry).
         spawn(_bg_reclassify_training(circuit),
               name=f"training_reclassify[{circuit}]")
     return JSONResponse({"ok": True, **res})
@@ -380,10 +380,10 @@ async def reject_api(circuit: str, request: Request):
         cid = cap["id"] if cap else None
     if cid is None:
         return JSONResponse({"error": "no capture to reject"}, status_code=400)
-    res = await run_db(reject_training_capture,               # dev46 (46a)
+    res = await run_db(reject_training_capture,
                        orch.db, circuit, int(cid))
     if res.get("cleared"):
-        # dev57 (2.24): spawn() holds the strong reference (see task_registry).
+        # spawn() holds the strong reference (see task_registry).
         spawn(_bg_reclassify_training(circuit),
               name=f"training_reclassify[{circuit}]")
     return JSONResponse({"ok": True, **res})
@@ -393,7 +393,7 @@ async def reject_api(circuit: str, request: Request):
 async def extend_api(circuit: str, request: Request):
     payload = await _json(request)
     from ..database import run_db
-    res = await run_db(extend_training_capture,               # dev46 (46a)
+    res = await run_db(extend_training_capture,
                        _orch(request).db, circuit,
                        payload.get("add_minutes", 15))
     return JSONResponse({"ok": True, **res})

@@ -1,4 +1,4 @@
-"""dev47 (47a) — burst-context features: what ELSE was running nearby.
+"""Burst-context features: what ELSE was running nearby.
 
 WHY THIS EXISTS
 ---------------
@@ -12,15 +12,15 @@ the next hour. Judged one at a time, the information simply is not in the row.
 These nine features put it there. They are computed from the event stream's own
 timing and magnitudes — no labels, no per-home fitting — so they work on a home
 that has never been labelled, which is what makes them worth more than another
-tuned constant. The V4 variant-house test measured them helping MOST when
+tuned constant. The variant-house test measured them helping MOST when
 fixtures are re-shaped (+3.0 points over base features): when you can no longer
 trust what a dishwasher fill looks like, the fact that it arrives in a rhythm
 with its siblings is the signal that survives.
 
-THE TWO CONFIGS, AND WHY THERE ARE EXACTLY TWO
-----------------------------------------------
+THE TWO CONFIGS
+---------------
 A fill's siblings arrive AFTER it, so the full picture does not exist when the
-event is first classified. Rather than pretend otherwise:
+event is first classified:
 
 * ``immature`` — trailing side only. What is knowable the moment an event ends.
 * ``mature``   — both sides. Used by the deferred re-classify (~2 h later) and
@@ -35,8 +35,8 @@ ad-hoc variant here.
 COST
 ----
 Set-based by construction: one windowed query per call, then a linear sweep with
-two moving pointers. The old per-event-query shape is what made sweeps O(N)
-expensive on this table, so callers pass the whole batch they care about.
+two moving pointers. A per-event-query shape makes sweeps O(N) expensive on this
+table, so callers pass the whole batch they care about.
 """
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ HEAVY_MIN_L, HEAVY_MAX_L, HEAVY_MIN_PEAK = 3.0, 25.0, 8.0
 GAP_CAP_MIN: float = 120.0             # "no sibling" sentinel, in minutes
 
 # ── context exclusions ──────────────────────────────────────────────────────
-# dev57 (§2.31) — verdicts that make a row NOT a draw but deliberately set none
+# Verdicts that make a row NOT a draw but deliberately set none
 # of the three artifact BITS ``compute_for_events`` filters on, so nothing but
 # the reason string can exclude them. Spelled literally rather than imported:
 # this module is imported by the DB worker and stays free of app-layer imports
@@ -203,17 +203,17 @@ def compute_for_events(conn: sqlite3.Connection, circuit: str,
     filters used everywhere else. Three flag bits are not the whole set —
     ``_EXCLUDED_REASONS`` covers the two verdicts that deliberately carry NO bit:
 
-      * ``overlap_duplicate`` (dev55/dev56) — a wrapper is the SAME water as the
-        children inside it, recorded twice. Left in, it is a phantom sibling of
+      * ``overlap_duplicate`` — a wrapper is the SAME water as the children
+        inside it, recorded twice. Left in, it is a phantom sibling of
         every child it wraps: it inflates ``n_ev_30m`` / ``n_sim_90m``, splices
         two real bursts into one, and shrinks ``gap_prev_sim``/``gap_next_sim``.
-        It carries no flag by design (dev56 cleared the phantom bit — wrappers
+        It carries no flag by design (the phantom bit is cleared — wrappers
         are not phantoms), so the bit filter cannot see it.
       * ``leak_test_refill`` — the refill after a leak test is real water but
         not fixture usage, and it stays VISIBLE in History on purpose, so it too
         carries no bit (see ``_finalize_derived_verdicts``).
 
-    Synchronous by design — callers submit it through ``run_db`` (46a).
+    Synchronous by design — callers submit it through ``run_db``.
     """
     targets: Optional[set] = None
     if event_ids is not None:
@@ -245,7 +245,7 @@ def compute_for_events(conn: sqlite3.Connection, circuit: str,
     reason_ph = ",".join("?" * len(_EXCLUDED_REASONS))
     reason_sql, reason_params = "", []
     # match_rejection_reason carries the live verdict; verdict_pin (20260818)
-    # carries it across a re-store, and dev56 rows can have the pin while the
+    # carries it across a re-store, and a row can have the pin while the
     # reason has been overwritten — so both are read.
     for col in ("match_rejection_reason", "verdict_pin"):
         if _has_column(conn, col):
