@@ -132,7 +132,7 @@ def _contained_fraction(inner, outer) -> float:
 
 
 def contained_fraction(inner, outer) -> float:
-    """Public spelling of ``_contained_fraction`` for the importer (dev55)."""
+    """Public spelling of ``_contained_fraction`` for the importer."""
     return _contained_fraction(inner, outer)
 
 
@@ -223,9 +223,9 @@ def find_overlap_groups(conn: sqlite3.Connection,
 
 def _audit(conn, circuit: str, wrapper_id: str, kept_ids: List[str],
            vol_zeroed: float, resolution: str, source: str) -> None:
-    # dev56 — a re-application refreshes the row (kept ids, litres, timestamp)
-    # and revives a stale one, so the History "counted by" chips point at the
-    # children as they stand now. The UNIQUE key stays (wrapper, resolution).
+    # A re-application refreshes the row (kept ids, litres, timestamp) and
+    # revives a stale one, so the History "counted by" chips point at the
+    # children as they stand now. The UNIQUE key is (wrapper, resolution).
     conn.execute(
         "INSERT INTO overlap_audit "
         "(circuit, wrapper_event_id, kept_event_ids, vol_zeroed, "
@@ -292,9 +292,9 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
         vol_sum = sum(float(r["volume_litres"] or 0.0) for r in top)
         if vol_w <= 0 or vol_sum <= 0:
             continue
-        # dev33 §1.2 — how much of the WRAPPER do the children actually
-        # account for? A wrapper zeroed while its children start 42 minutes in
-        # silently dropped 704.7 L of real irrigation.
+        # How much of the WRAPPER do the children actually account for? A
+        # wrapper zeroed while its children start 42 minutes in silently
+        # dropped 704.7 L of real irrigation.
         coverage = _union_coverage(w_span, [spans[r["id"]] for r in top])
         reconciles = abs(vol_w - vol_sum) <= _VOL_TOLERANCE * max(vol_w, vol_sum)
         remainder = max(0.0, round(vol_w - vol_sum, 3))
@@ -383,9 +383,8 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
         if not full_duplicate:
             stats["partial_remainder"] += 1
         stats["litres_recovered"] += prior_eff - new_eff
-        # dev55 — a rise reads as a reabsorb, not a negative de-duplication. The
-        # old wording logged "-3.57 L de-duplicated", which is how the override
-        # bug hid in plain sight.
+        # A rise reads as a reabsorb, not a negative de-duplication: logging
+        # "-3.57 L de-duplicated" is how an override bug hides in plain sight.
         moved = prior_eff - new_eff
         verb = ("zeroed" if full_duplicate
                 else "reduced to remainder" if moved >= 0
@@ -464,8 +463,8 @@ def reevaluate_event(conn: sqlite3.Connection, event_id: str,
 
 def reevaluate_containing_wrappers(conn: sqlite3.Connection, circuit: str,
                                    start_ts, end_ts, source: str) -> int:
-    """dev56 — after a row over ``[start_ts, end_ts]`` changed or vanished,
-    re-derive every PINNED wrapper on the circuit whose span intersects it. One
+    """After a row over ``[start_ts, end_ts]`` changed or vanished, re-derive
+    every PINNED wrapper on the circuit whose span intersects it. One
     indexed read (circuit, verdict_pin); returns how many were re-examined."""
     if not start_ts:
         return 0
@@ -518,7 +517,7 @@ def release_verdict_pin(conn: sqlite3.Connection, row: dict, *,
 
 
 def group_excess_litres(group: List[dict]) -> float:
-    """dev56 — litres this group still counts twice: everything APPLIED to the
+    """Litres this group still counts twice: everything APPLIED to the
     hourly ledger beyond the largest member (one meter, one draw)."""
     applied = sorted((float(r.get("hourly_volume_applied_litres") or 0.0) for r in group),
                      reverse=True)

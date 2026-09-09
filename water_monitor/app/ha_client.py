@@ -27,8 +27,7 @@ WS_URL = "ws://supervisor/core/websocket"
 REST_URL = "http://supervisor/core/api"
 
 # Single source of truth lives in units.py so this and the calibration path
-# cannot drift apart (they had: this accepted six spellings, the calibration
-# reader accepted exactly one).
+# cannot drift apart on which spellings each accepts.
 from .units import GAL_UNITS as _GAL_UNITS
 
 
@@ -439,8 +438,7 @@ class HaClient:
 
         `significant_changes_only` thins the series at the HA recorder — the 24h
         pressure chart passes True to avoid pulling a full 2 Hz run into memory; the
-        default keeps full fidelity for the historical importer (and the WS call is
-        then byte-identical to before)."""
+        default keeps full fidelity for the historical importer."""
         extra = {"significant_changes_only": True} if significant_changes_only else {}
         result = await self.ws_request(
             "history/history_during_period",

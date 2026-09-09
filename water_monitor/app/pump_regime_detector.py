@@ -48,7 +48,7 @@ _SET_REQUIRED = 2
 _CLEAR_QUIET_NIGHTS = 7     # consecutive evaluated quiet nights to clear
 _REBANNER_EVALUATED_NIGHTS = 30   # recurring re-banner cadence post-dismissal
 
-# ── Phase 5a leak estimation + alert ──────────────────────────────────────────
+# ── Leak estimation + alert ───────────────────────────────────────────────────
 # Street-meter calibration (2026-07-25, same-window iPERL vs home estimator):
 # the oval-gear registers ~half of each recharge slug, so metered estimates
 # scale by 1.9 to report TRUE leak rate. Per-installation constant; re-derive
@@ -188,7 +188,7 @@ class PumpRegimeDetector:
         self._cfg = cfg
         self._ha = ha
         self._ha_tz = ha_tz or timezone.utc
-        self._alert_manager = alert_manager   # Phase 5a; None in tests
+        self._alert_manager = alert_manager   # None in tests
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -300,7 +300,7 @@ class PumpRegimeDetector:
             (circuit, night)).fetchone()
 
     def _leak_alert_inputs_sync(self, circuits) -> dict:
-        """dev46 (46a) — pump-gate check + the nightly history, one hop."""
+        """Pump-gate check + the nightly history, one hop."""
         from .config import pump_gates_active
         from .database import get_pump_regime_nights
         return {"any_pump": any(pump_gates_active(self._db, c)

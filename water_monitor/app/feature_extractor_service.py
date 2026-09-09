@@ -81,21 +81,18 @@ class FeatureExtractor:
         # contexts; _find_waveform handles the missing-detector case.
         self._event_detector = event_detector
         self._running = False
-        # Strong references for fire-and-forget tasks (anomaly alerts).
-        # Without this, the only ref to the task is whatever
-        # asyncio.create_task returns — Python may GC the task before it
-        # completes, silently dropping the alert. add_done_callback also
-        # gives us a place to observe and log exceptions instead of the
+        # Strong references for fire-and-forget tasks (anomaly alerts). Without
+        # them the only ref is whatever asyncio.create_task returns, and Python
+        # may GC the task before it completes, silently dropping the alert.
+        # add_done_callback also gives a place to log exceptions instead of the
         # default "Task exception was never retrieved" warning.
         self._pending_alert_tasks: set[asyncio.Task] = set()
         # Strong refs for the late-waveform upgrade tasks (Fix 1) — same GC-safety
         # pattern as the alert tasks above.
         self._pending_wf_tasks: set[asyncio.Task] = set()
         # Per-circuit cooldown timestamps for the pulsing-supply alert.
-        # In-memory only — resets on addon restart. That's acceptable for now:
-        # if a real pulsing episode persists across a restart the user will
-        # be re-alerted (mildly annoying, not dangerous). Persist to DB
-        # later if it becomes a problem.
+        # In-memory only — resets on addon restart, so a pulsing episode that
+        # persists across a restart re-alerts the user.
         self._last_pulsing_alert_at: dict[str, datetime] = {}
         # Per-circuit cooldown for the Phase 2.3 anomaly NOTIFY path (in-memory is
         # fine — at worst a few extra notifications after a restart). The shut-off
@@ -382,12 +379,11 @@ class FeatureExtractor:
         caller is awaiting this call and nothing else reads the dict meanwhile.
         """
         from .database import is_event_in_exclusion_window
-            # ── Plumbing-event exclusion window (Phase 2.1) ───────────────
+            # ── Plumbing-event exclusion window ───────────────
         # If the user opened an exclusion window (e.g. post-winterization
-        # flush), flag the event so the cluster engine skips it.  Volume
-        # tracking continues — only fixture identification is excluded.
-        # Preserves any upstream match_rejection_reason already set by
-        # feature extraction (e.g. 'pulsing_supply') — only stamps
+        # flush), flag the event so the cluster engine skips it. Volume tracking
+        # continues — only fixture identification is excluded. Preserves any
+        # upstream match_rejection_reason (e.g. 'pulsing_supply'); only stamps
         # 'excluded_from_training' when no reason was set.
         start_ts_str = features.get("start_ts")
         if (start_ts_str
@@ -490,14 +486,15 @@ class FeatureExtractor:
         min_flow_lpm = 0.15
         if self._event_detector is not None:
             min_flow_lpm = self._event_detector.min_flow_for(event.circuit)
-        # dev33 — VFD ripple exemption (see _VFD_RIPPLE_MAX_PERIOD_S). Live and
+        # VFD ripple exemption (see _VFD_RIPPLE_MAX_PERIOD_S). Live and
         # retroactive verdicts must answer the SAME question, so the live path
         # takes the era predicate too, OR'd with current gate state. Once
         # pump_era_start is pinned in the past the OR is permanently true; the
         # gate term is kept because it is the only branch that fires on a home
         # with pump mode confirmed but no era pinned yet.
-        # dev46 (46a): pump era + gate + the waveform lookup are three reads
-        # with only pure computation between them — one hop.
+        #
+        # Pump era + gate + the waveform lookup are three reads with only pure
+        # computation between them — one hop.
         from .database import run_db
         _pre = await run_db(self._pre_store_reads_sync, event)
         _pump_ripple = False
@@ -521,12 +518,11 @@ class FeatureExtractor:
         if wf_record is not None:
             score = _wf_overlap_score(event, wf_record)
             wf_applied = _enrich_from_waveform(features, wf_record, score)
-            # NOTE: enrichment overwrites pressure_delta_psi / peak_flow_lpm
-            # with ESP-measured values. The phantom verdict is re-derived
-            # below (after the existing-row read), so a real long event — e.g.
-            # a 40-min shower whose pressure drop wasn't captured in the
-            # software pass — is NOT left with a stale phantom flag + zeroed
-            # volume.
+            # Enrichment overwrites pressure_delta_psi / peak_flow_lpm with
+            # ESP-measured values. The phantom verdict is re-derived below
+            # (after the existing-row read), so a real long event — e.g. a
+            # 40-min shower whose pressure drop wasn't captured in the software
+            # pass — is NOT left with a stale phantom flag + zeroed volume.
             if wf_applied:
                 log.debug(
                     "[%s] waveform enriched — event_id=%d boot_id=%d "
@@ -545,11 +541,10 @@ class FeatureExtractor:
 
             # Writer-boundary duplicate guard: two importer catch-up runs can
             # both queue a reconstruction before either has written to the DB,
-            # so the importer-side check alone cannot prevent the race.  Check
-            # here too, as close to the INSERT as the architecture allows.
-            # dev46 (46a): the duplicate guard and the stored-intent read are
-            # both reads with nothing but pure logic between them — one hop,
-            # still "as close to the INSERT as the architecture allows".
+            # so the importer-side check alone cannot prevent the race. Check
+            # here too, as close to the INSERT as the architecture allows. The
+            # duplicate guard and the stored-intent read are both reads with
+            # nothing but pure logic between them — one hop.
             _pf = await run_db(self._store_preflight_sync, event,
                                features["id"])
             blocking = _pf["blocking"]
@@ -574,7 +569,7 @@ class FeatureExtractor:
                     )
                     return
 
-            # ── Honour stored user intent (Sprint H) ──────────────────────
+            # ── Honour stored user intent ──────────────────────
             # extract_features() computes verdicts fresh from the RawEvent and
             # has no knowledge of stored user choices. Pull them from the
             # existing row (if any) and apply BEFORE the upsert:
@@ -631,13 +626,11 @@ class FeatureExtractor:
             # Idempotent: re-imports subtract the prior contribution before
             # adding the new value, so no double-counting.
             effective_volume = float(features.get("volume_litres_effective") or 0)
-            # Lock-tolerant store (2026-08-12): a long admin write (the ~30 s
-            # "Apply my labels" reclassify) holds the DB past busy_timeout and
-            # a live event's store then fails "database is locked" — the
-            # catch-up importer recovers it later, but the primary path
-            # should outwait the writer. Retries with async sleeps so the
-            # event loop stays responsive; total wait comfortably exceeds the
-            # longest observed admin write.
+            # Lock-tolerant store: a long admin write (the ~30 s "Apply my
+            # labels" reclassify) holds the DB past busy_timeout and a live
+            # event's store then fails "database is locked". Retries with async
+            # sleeps so the event loop stays responsive; total wait comfortably
+            # exceeds the longest observed admin write.
             is_new_event = None
             for _attempt in range(6):
                 try:
@@ -652,12 +645,11 @@ class FeatureExtractor:
                     )
                     break
                 except sqlite3.DatabaseError as _db_err:
-                    # DatabaseError, not OperationalError. "another row
-                    # available" is a bare DatabaseError — a SIBLING of
-                    # OperationalError — so the narrower catch that used to be
-                    # here let it through to the outer handler, which logged it
-                    # and dropped the event. That is how a real draw was lost on
-                    # 2026-08-22 at 11:12.
+                    # DatabaseError, not OperationalError: "another row
+                    # available" is a bare DatabaseError, a SIBLING of
+                    # OperationalError. A narrower catch here lets it through to
+                    # the outer handler, which logs it and DROPS the event — a
+                    # real draw was lost that way.
                     if not is_retryable_db_error(_db_err) or _attempt == 5:
                         raise
                     log.info("[%s] event store hit a transient DB fault (%s) "
@@ -693,29 +685,27 @@ class FeatureExtractor:
             await self._cluster_event(event.circuit, features)
             # ──────────────────────────────────────────────────────────────
 
-            # 2b training-helper capture: if a capture is armed on this circuit,
+            # Training-helper capture: if a capture is armed on this circuit,
             # record this just-completed event as a candidate (writes NO label —
-            # the user confirms in the wizard). Cheap (one indexed SELECT; free when
-            # idle). Lazy import matches this module's circular-import-avoidance
-            # pattern (cf. the database imports above); best-effort — a capture-logic
+            # the user confirms in the wizard). Cheap (one indexed SELECT; free
+            # when idle). Lazy import matches this module's
+            # circular-import-avoidance pattern; best-effort — a capture-logic
             # bug must never block event storage.
-            # dev46 (46a) — HOP after the _cluster_event await. The capture
-            # write needs NO hop-2 re-check of its own: record_training_candidate
-            # re-reads the armed-capture row at write time (that IS its gate),
-            # so a capture disarmed during clustering simply records nothing.
-            # The 'live' state read is bundled with it — a read, and the two
-            # are adjacent.
+            #
+            # HOP after the _cluster_event await, with no hop-2 re-check:
+            # record_training_candidate re-reads the armed-capture row at write
+            # time (that IS its gate), so a capture disarmed during clustering
+            # records nothing. The adjacent 'live' state read is bundled with it.
             _post = await run_db(self._post_cluster_sync, event.circuit,
                                  features)
             _live_state = _post["state"]
 
-            # ── Phase 2.3 anomaly response (frozen-baseline deviation) ─────────
-            # Replaces the old match-confidence alert (which fired on anything that
-            # didn't strongly match — the false-positive source). The verdict was
-            # scored + stored in _cluster_event; here we apply the user's graduated
-            # response, but ONLY in the locked 'live' state. A circuit calibrating /
-            # labelling / mid-recalibration has no trustworthy baseline → no notify,
-            # no shut-off. Shut-off carries extra guardrails (see _apply_anomaly_response).
+            # ── Anomaly response (frozen-baseline deviation) ─────────
+            # The verdict was scored + stored in _cluster_event; here the user's
+            # graduated response is applied, but ONLY in the locked 'live'
+            # state. A circuit calibrating / labelling / mid-recalibration has no
+            # trustworthy baseline → no notify, no shut-off. Shut-off carries
+            # extra guardrails (see _apply_anomaly_response).
             am = self._alert_manager
             anomaly = features.get("_anomaly") or {}
             if am and anomaly.get("is_anomalous"):
@@ -1031,13 +1021,12 @@ class FeatureExtractor:
         """Close the valve, log it (persistent), and notify with why + a one-action
         reopen. Returns False (→ caller falls back to notify) when no valve is
         configured or the close fails — a shut-off must never silently swallow."""
-        # HARD final gate at the actuation chokepoint: the valve can NEVER close
-        # unless the circuit is live and settled (not learning / setup / recalibrating),
-        # independent of how this method was reached.
-        # dev46 (46a): the hard gate and the valve lookup are both DB reads
-        # and both must happen immediately before actuation, so they cross
-        # together in ONE hop — the gate keeps its position as the last thing
-        # checked before the valve moves.
+        # HARD final gate at the actuation chokepoint: the valve can NEVER
+        # close unless the circuit is live and settled (not learning / setup /
+        # recalibrating), independent of how this method was reached. The gate
+        # and the valve lookup are both DB reads that must happen immediately
+        # before actuation, so they cross together in ONE hop — the gate stays
+        # the last thing checked before the valve moves.
         from .database import run_db
         gate = await run_db(self._shutoff_preflight_sync, circuit)
         if not gate["state_ok"]:
@@ -1059,21 +1048,15 @@ class FeatureExtractor:
         # Store closed_at as an explicit UTC ISO timestamp, NOT the
         # CURRENT_TIMESTAMP default: its space-separated form sorts below every
         # T-separated row, so any range query over this column mis-selects.
-        # (This used to cite the per-12h rate limiter's cutoff — deleted
-        # 2026-09-08. The format rule stands on its own.)
         #
-        # dev46 (46a) — HOP 2, after the valve await. NO re-check, and this
-        # one is argued, not inherited:
+        # HOP 2, after the valve await, deliberately with NO re-check:
         #   * The valve is ALREADY CLOSED. This row records a physical action
         #     that definitively happened, so a re-check that could skip the
         #     write would make the add-on's bookkeeping lie about the valve.
         #   * It is an append of an immutable fact — the log only ever grows,
         #     and no interleaved write can make this row wrong or redundant.
-        #     That is exemption-class membership (monotonic), not convenience.
         #   * It is the ONLY durable record that the add-on physically closed
-        #     the valve. It used to also feed the per-12h rate limiter; that
-        #     limiter was deleted 2026-09-08, which makes this row the whole
-        #     of the bookkeeping rather than half of it.
+        #     the valve.
         await run_db(self._log_shutoff_sync, circuit, event_id, atype, score)
         log.warning("[%s] ANOMALY AUTO-SHUTOFF — closed valve %s (event %s, %s, "
                     "score %.2f)", circuit, valve, event_id, atype, score)
@@ -1121,13 +1104,10 @@ class FeatureExtractor:
     def _cluster_event_sync(self, circuit: str, features: dict) -> None:
         """The clustering write-back, on the single DB thread."""
         if features.get("excluded_from_training"):
-            # dev33 (§2.1): record WHY, instead of returning in silence. The
-            # schema has documented 'excluded_from_training' as a
-            # match_rejection_reason value since the matcher shipped, but
-            # nothing ever wrote it — so an excluded row and a row the
-            # classifier evaluated and declined were indistinguishable
-            # downstream. Never clobber an artifact reason (which is both more
-            # specific and the thing that caused the exclusion).
+            # Record WHY, instead of returning in silence: without it an
+            # excluded row and a row the classifier evaluated and declined are
+            # indistinguishable downstream. Never clobber an artifact reason,
+            # which is both more specific and the cause of the exclusion.
             if not features.get("match_rejection_reason"):
                 try:
                     self._db.execute(
@@ -1201,12 +1181,12 @@ class FeatureExtractor:
                 log.error("[%s] cluster matching failed: %s", circuit, e,
                           exc_info=True)
 
-        # NOTE (Phase 2.3): the old match-confidence anomaly_score (1.0 - confidence)
-        # was retired here — it fired on anything that didn't strongly match a known
-        # fixture, which is most of what a real home produces (the false-positive
-        # source). The stored anomaly_score / anomaly_type / flagged columns are now
-        # the FROZEN-BASELINE deviation verdict, computed below once the type is known
-        # (see _score_anomaly + the write-back UPDATE).
+        # anomaly_score / anomaly_type / flagged hold the FROZEN-BASELINE
+        # deviation verdict, computed below once the type is known (see
+        # _score_anomaly + the write-back UPDATE). Do NOT reinstate the old
+        # match-confidence score (1.0 - confidence): it fires on anything that
+        # doesn't strongly match a known fixture, which is most of what a real
+        # home produces.
 
         # dev.23 — structural rules tier (rules-first; Pass-5 semantics). Runs
         # BEFORE the k-NN regardless of cluster strength, mirroring the batch
@@ -1260,12 +1240,12 @@ class FeatureExtractor:
                          - timedelta(minutes=50)).isoformat()
                 washer_members = detect_washer_cycles(
                     self._db, circuit, since_ts=since, limit=400, calib=calib)
-            # dev.39 — dishwasher cycle: only worth scanning when THIS event is a
-            # gentle small fill (a cheap, deliberately-loose pre-gate; the detector
-            # then applies the precise calib-aware band AND needs >=3 such fills
-            # chained). Span covers a full cycle (~2.5h lookback). The loose bounds
-            # are DERIVED from the same calib values the detector uses (×1.4
-            # slack) — hardcoded 5.0s silently stopped invoking the detector for
+            # Dishwasher cycle: only worth scanning when THIS event is a gentle
+            # small fill (a cheap, deliberately-loose pre-gate; the detector then
+            # applies the precise calib-aware band AND needs >=3 such fills
+            # chained). Span covers a full cycle (~2.5h lookback). The loose
+            # bounds are DERIVED from the same calib values the detector uses
+            # (×1.4 slack) — a hardcoded 5.0s stops invoking the detector for
             # homes whose fitted DW_* band was calibrated wider, flipping labels
             # between the live path and batch reclassify.
             from .event_rules import _cv as _rule_cv
@@ -1299,13 +1279,12 @@ class FeatureExtractor:
                     _pump = _pga(self._db, circuit)
                 except Exception:
                     _pump = False
-                # dev48 — burst context for the toilet rule's appliance veto.
-                # IMMATURE by necessity, the same constraint the model tier
-                # below works under: a washer's FIRST fill has no siblings yet,
-                # so the veto cannot fire live on it. It fires on the batch
-                # re-derive once the rest of the cycle exists, which is what
-                # that pass is for. Failing to read context must never cost the
-                # claim, so the veto abstains rather than guesses.
+                # Burst context for the toilet rule's appliance veto. IMMATURE
+                # by necessity, the same constraint the model tier below works
+                # under: a washer's FIRST fill has no siblings yet, so the veto
+                # cannot fire live on it — it fires on the batch re-derive once
+                # the rest of the cycle exists. Failing to read context must
+                # never cost the claim, so the veto abstains rather than guesses.
                 _burst = None
                 try:
                     from . import burst_features as _bf
@@ -1333,11 +1312,11 @@ class FeatureExtractor:
             log.warning("[%s] structural rules tier failed (non-fatal): %s",
                         circuit, e)
 
-        # dev47 (47b) — TinyModel tier, between the label-free anchors above and
-        # the k-NN residual below. That position is the design: the anchors are
-        # label-free and work on day one, the model is per-home and beats the
-        # ladder's house-tuned scales once it has labels, and the k-NN remains
-        # the fallback for everything the model abstains on.
+        # TinyModel tier, between the label-free anchors above and the k-NN
+        # residual below. That position is the design: the anchors work on day
+        # one, the model is per-home and beats the ladder's house-tuned scales
+        # once it has labels, and the k-NN remains the fallback for everything
+        # the model abstains on.
         #
         # `immature` burst features here by necessity — a fill's siblings have
         # not happened yet when it is first classified. The deferred re-classify
@@ -1366,8 +1345,8 @@ class FeatureExtractor:
             cluster_id_result is None
             or (match_confidence is not None and match_confidence < 0.5)
         )
-        # Fingerprint tier (2026-07 audit Phase 3) — whole-waveform NN against
-        # USER-labeled events at a tight self-calibrated threshold. Runs under
+        # Fingerprint tier — whole-waveform NN against USER-labeled events at a
+        # tight self-calibrated threshold. Runs under
         # the same condition as the k-NN residual and outranks it (stronger
         # evidence); a fingerprint hit short-circuits the k-NN below. The
         # event's waveform was stored just before _cluster_event, so it is
@@ -1444,24 +1423,22 @@ class FeatureExtractor:
                 log.warning("[%s] toilet physics veto failed (non-fatal): %s",
                             circuit, e)
 
-        # Phase 2.3 — score the event against the FROZEN baseline now that its type
-        # is known, and persist the verdict (reviving the dormant anomaly columns +
-        # the daily anomaly_count rollup). Stash it on `features` so the _process
-        # response policy reads the same verdict without re-scoring. flagged=1 marks
-        # a genuine (non-artifact) anomaly. Side effects (notify / shut-off) are
-        # NOT done here — only in _process, behind the 'live' state gate.
+        # Score the event against the FROZEN baseline now that its type is
+        # known, and persist the verdict. Stashed on `features` so the _process
+        # response policy reads the same verdict without re-scoring. flagged=1
+        # marks a genuine (non-artifact) anomaly. Side effects (notify /
+        # shut-off) are NOT done here — only in _process, behind the 'live'
+        # state gate.
         features["matched_fixture_type"] = matched_fixture_type
         anomaly = self._score_anomaly(circuit, features)
         features["_anomaly"] = anomaly
 
-        # dev33 (§2.1) — record classification-tier abstention. When every tier
-        # (structural rules → fingerprint → k-NN) declines, the row used to be
-        # written with matched_fixture_type=NULL, matched_via=NULL and no
-        # reason: "the classifier looked and declined" was indistinguishable
-        # from "never evaluated". 933 events failed that way silently while the
-        # cluster tier was dead. Only fills an EMPTY reason (artifact and
-        # cluster-tier reasons are more specific and must win), and is cleared
-        # symmetrically the moment a later pass matches the event.
+        # Record classification-tier abstention. Without a reason, "the
+        # classifier looked and declined" is indistinguishable from "never
+        # evaluated" — 933 events failed that way silently while the cluster
+        # tier was dead. Only fills an EMPTY reason (artifact and cluster-tier
+        # reasons are more specific and must win), and is cleared symmetrically
+        # the moment a later pass matches the event.
         if matched_fixture_type is None and not match_rejection_reason:
             match_rejection_reason = NO_TIER_MATCHED_REASON
         elif (matched_fixture_type is not None
@@ -1494,13 +1471,14 @@ class FeatureExtractor:
              event_id)
         )
 
-        # dev.23/dev.24/dev.39 — trailing retro-scan: a washer cycle (~45 min), a
-        # softener session (~3 h), and a dishwasher cycle (~2 h) COMPLETE over time,
-        # so earlier members were classified before the family reached its >=3-fill
-        # threshold (there is no periodic reprocess on the live path). Retro-stamp the
-        # window's members now WITH their cycle_group_id. Cycle/session context outranks
-        # a per-event machine match, so this MAY overwrite a prior knn/rule_* match
-        # (e.g. a backwash mis-typed shower_tub); user labels are never touched.
+        # Trailing retro-scan: a washer cycle (~45 min), a softener session
+        # (~3 h) and a dishwasher cycle (~2 h) COMPLETE over time, so earlier
+        # members were classified before the family reached its >=3-fill
+        # threshold (there is no periodic reprocess on the live path).
+        # Retro-stamp the window's members now WITH their cycle_group_id.
+        # Cycle/session context outranks a per-event machine match, so this MAY
+        # overwrite a prior knn/rule_* match (e.g. a backwash mis-typed
+        # shower_tub); user labels are never touched.
         for _members, _mtype, _mvia in (
                 (softener_members, "water_softener", "softener_session"),
                 (washer_members, "washing_machine", "washer_cycle"),

@@ -625,13 +625,13 @@ class SupplyRegimeTracker:
         return circuits[0] if circuits else None
 
     def _bootstrap_and_banner_sync(self, circuit: str):
-        """dev46 (46a) — reconstruct a missed shift, then read the banner."""
+        """Reconstruct a missed shift, then read the banner."""
         created = bootstrap_from_events(self._db, circuit, self._ha_tz)
         banner = supply_banner_state(self._db) if created else {}
         return created, banner
 
     def _recentre_sync(self, circuit: str) -> None:
-        """dev46 (46a) — the dev33 one-shot recentre pair, in order."""
+        """The one-shot recentre pair, in order."""
         merge_spurious_regime(self._db)
         recenter_current_regime(self._db, circuit, self._ha_tz)
 

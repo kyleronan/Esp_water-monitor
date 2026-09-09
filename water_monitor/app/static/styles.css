@@ -3,16 +3,12 @@
    ============================================================ */
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
-/* dev50 — the `hidden` attribute must actually hide.
+/* The `hidden` attribute must actually hide.
    The browser's own [hidden] rule is `display: none` at USER-AGENT weight, so ANY
-   author `display:` on the element beats it. Two of ours did — `.btn` (inline-flex)
-   and `.evt-modal-section` (flex) — plus one inline `style="display:inline-flex"`,
-   so `el.hidden = true` on those four event-modal controls was silently a no-op:
-   #emd-reprocess-section, #emd-review-btns, #emd-classify-reset-btn and
-   #emd-undo-cycle-btn. Visible symptom: the modal showed "✓ Normal use" /
-   "? Don't recognize it" alongside "✓ Reviewed", and offered "Reprocess from HA
-   history" on user-labelled events, where a rebuild can only ever be a no-op.
-   `!important` is what also beats that inline style on the anomaly-verdict row. */
+   author `display:` on the element beats it — `.btn` (inline-flex) and
+   `.evt-modal-section` (flex) both do — which silently turns `el.hidden = true`
+   into a no-op on the event-modal controls. `!important` is also what beats an
+   inline `style="display:inline-flex"` on the anomaly-verdict row. */
 [hidden] { display: none !important; }
 
 :root {
@@ -993,9 +989,7 @@ a.dash-next-chip:hover { text-decoration: underline; }
 
 
 /* ============================================================
-   Restored shared rules (used by setup.html, settings.html, etc.)
-   that were inadvertently deleted in the device-page CSS cleanup.
-   These are kept here to avoid an even larger reshuffle.
+   Shared rules used by setup.html, settings.html, etc.
    ============================================================ */
 
 /* Status pills (legacy class — used by setup, settings) */
@@ -1791,7 +1785,6 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 /* ============================================================
    SETUP PAGE — design refresh page 6/7
    Overrides existing setup-* rules with design-token values.
-   Template HTML unchanged; just visual upgrade.
    ============================================================ */
 
 /* Container — max 680px per design spec */

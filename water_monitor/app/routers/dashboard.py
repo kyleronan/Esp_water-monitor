@@ -219,7 +219,7 @@ async def jobs_poll(request: Request, since: int = 0):
     (reclassify / calibration feedback). Newest first."""
     orch = _get_orchestrator(request)
     from ..database import get_jobs_since, run_db
-    # dev46 (46a): polled endpoint — off the loop thread, onto the DB worker.
+    # Polled endpoint — off the loop thread, onto the DB worker.
     jobs = await run_db(get_jobs_since, orch.db, since_id=since)
     return JSONResponse({"jobs": jobs})
 

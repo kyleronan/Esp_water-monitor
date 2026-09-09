@@ -833,7 +833,6 @@ class TrainingManager:
         # better before the freeze locks calibration. Best-effort, diagnostic only.
         await self._maybe_interim_validation(circuit, state_row, now)
 
-        # Check time elapsed
         ends_at_str = state_row["calibration_ends_at"]
         if ends_at_str:
             ends_at = datetime.fromisoformat(ends_at_str.replace("Z", "+00:00"))

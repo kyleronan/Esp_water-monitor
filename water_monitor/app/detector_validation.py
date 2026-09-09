@@ -7,13 +7,13 @@ online-adaptation boiling-frog risk that the freeze-at-activation design exists 
 module only produces a per-detector health report and a human decides whether to act.
 
 ``validate_detectors_against_history`` is PURE / sync: it takes already-fetched, UTC-normalised
-flow series, so it is unit-testable offline and is a direct port of the manual audit. The async
-HA fetch + the high-fidelity-retention clamp live in the caller (``training_manager``).
+flow series, so it is unit-testable offline. The async HA fetch + the high-fidelity-retention
+clamp live in the caller (``training_manager``).
 
-The single most important output is ``suspect_zeroings`` — a volume-zeroed event (phantom /
-cross-talk) that actually moved real water. That is the one outcome that must never happen, so it
-is the continuous, week-over-week proof on real data that the leak-safety invariant still holds.
-Its window integration is deliberately exact (UTC-aligned, strictly in-window, with an edge guard).
+The most important output is ``suspect_zeroings`` — a volume-zeroed event (phantom / cross-talk)
+that actually moved real water. That must never happen, so this is the continuous proof on real
+data that the leak-safety invariant still holds. Its window integration is deliberately exact
+(UTC-aligned, strictly in-window, with an edge guard).
 """
 from __future__ import annotations
 
@@ -463,7 +463,7 @@ def load_validation_report(conn: sqlite3.Connection,
 
 def _validate_and_persist_sync(db, circuit, flow_histories, window, min_flow,
                                source, now_utc, persist):
-    """dev46 (46a) — the validation query + report persist, on the DB thread."""
+    """The validation query + report persist, on the DB thread."""
     report = validate_detectors_against_history(
         db, circuit, flow_histories, window, min_flow=min_flow)
     report["source"] = source

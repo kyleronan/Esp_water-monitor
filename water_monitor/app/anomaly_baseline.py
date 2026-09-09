@@ -39,7 +39,7 @@ _LO_PCT = 5.0
 _HI_PCT = 95.0
 _PAD = 0.10                     # widen each band by 10% of its span
 
-# Phase 2.3 — anomaly scoring / shut-off guardrails.
+# Anomaly scoring / shut-off guardrails.
 # Which overall-volume percentile the NOTIFY threshold uses, by sensitivity level
 # (low = least sensitive → only the most extreme 1% alert).
 _NOTIFY_PCT_BY_LEVEL = {"low": "p99", "medium": "p95", "high": "p85"}
@@ -606,7 +606,7 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
     return {"score": round(score, 3), "anomaly_type": "+".join(reasons) or None,
             "is_anomalous": is_anomalous, "is_severe": is_severe,
             "shutoff_ok_severe": shutoff_ok_severe, "shutoff_ok_any": shutoff_ok_any,
-            # §2.29 — the count WITH its denominator ("2 of 3"), and a diagnostic
+            # The count WITH its denominator ("2 of 3"), and a diagnostic
             # channel for unusable input that is deliberately kept OUT of
             # is_anomalous / is_severe so bad data can never masquerade as a leak.
             "data_quality": "+".join(dq) or None,

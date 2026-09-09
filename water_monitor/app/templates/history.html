@@ -500,7 +500,7 @@
           <td class="hist-td">{{ t.triggered_by or '—' }}</td>
           <td class="hist-td">
             {% if t.result %}<span class="pill {{ lt.pill }}">{{ lt.label }}</span>{% else %}—{% endif %}
-            {# dev38 — sustained-drop advisory. Display-only: the firmware
+            {# Sustained-drop advisory. Display-only: the firmware
                verdict above stays primary; this only ever recommends a
                RETEST, never dismissal. #}
             {% if t.transient_note %}
@@ -532,7 +532,7 @@
           {# mL/min → volume/day in the user's unit (1440 min/day, 1000 mL/L). #}
           <td class="hist-td hist-td-mono">{{ "%.1f %s/day"|format(t.est_leak_ml_min * 1.44 * vol_factor, vol_unit) if t.est_leak_ml_min else "—" }}</td>
           <td class="hist-td">{{ "%.1f min"|format(t.duration_minutes) if t.duration_minutes else "—" }}</td>
-          {# Pump plan 5b — cross-circuit verdict while this line was isolated.
+          {# Cross-circuit verdict while this line was isolated.
              Tests are deliberately short (a long isolation window invites false
              failures from occupant draws and thermal contraction), so on a
              slow/quiet pump the in-window check can never earn 'quiet'. Rows it
@@ -615,7 +615,7 @@
         <tr>
           <th>Time</th>
           <th>Duration</th>
-          {# dev38: the tooltip is honest about the fallback — old rows without
+          {# The tooltip is honest about the fallback — old rows without
              true_avg_flow_lpm fall back to avg_flow_lpm, a plain sample mean
              that INCLUDES idle zeros (docs/PIPELINE.md §6). #}
           <th title="Average flow while water is actually running (idle gaps excluded). Older events without that measurement show the whole-event average instead, which idle gaps dilute.">Avg flow</th>
@@ -686,9 +686,8 @@
           {# Volume-zeroing verdicts (phantom / cross-talk / dribble) show their
              effective (zeroed) volume so the list doesn't display the fake reading;
              the raw value stays in the event-detail modal, clearly labelled. Other
-             rows are unchanged. The mini waveform (formerly the Shape column —
-             the word pill was dropped as unhelpful, dev15) rides along so the
-             at-a-glance flow shape survives; colors still key off flow_shape. #}
+             rows are unchanged. The mini waveform rides along so the at-a-glance
+             flow shape survives; colors still key off flow_shape. #}
           {% set _row_vol = e.volume_litres_effective if (e.is_pressure_restoration_phantom or e.is_cross_talk or e.is_low_flow_dribble or e.match_rejection_reason == 'leak_test_refill') else e.volume_litres %}
           {% set shape = e.flow_shape or 'unknown' %}
           {% set spark_stroke = {'steady': 'oklch(55% .18 240/.85)', 'rising': 'oklch(65% .18 80/.85)', 'falling': 'oklch(50% .18 145/.85)', 'pulsed': 'oklch(55% .05 240/.85)'} %}
@@ -796,13 +795,12 @@
                           <dd id="emd-flow"></dd>
       <dt>ΔP</dt>         <dd id="emd-pressure"></dd>
       <dt>Volume</dt>     <dd id="emd-volume"></dd>
-      {# dev38 — annotate-only meter-registration estimate: shown when this
-         draw spent time at 1–8 L/min, where the audit's pressure-witness
-         inversion measured the oval-gear meter reading 6–27% low. The
-         Volume above and every total stay on the metered figure.
-         dev41 (§5 decision): explicitly marked UNVALIDATED — the curve is
-         relative to the meter's own high-flow band and stays provisional
-         until a low-flow reference test (bucket test) anchors it. #}
+      {# Annotate-only meter-registration estimate: shown when this draw spent
+         time at 1–8 L/min, where the pressure-witness inversion measured the
+         oval-gear meter reading 6–27% low. The Volume above and every total
+         stay on the metered figure. Marked UNVALIDATED — the curve is relative
+         to the meter's own high-flow band and stays provisional until a
+         low-flow reference test (bucket test) anchors it. #}
       <dt id="emd-reg-est-dt" hidden
           title="Estimated true volume after correcting the meter's measured under-registration at low flow (reads ~27% low at 1.5–2.5 L/min). UNVALIDATED estimate: the correction is relative to the meter's own high-flow readings, not an absolute reference, and is pending validation against a low-flow bucket test or the utility meter. The Volume figure and all totals remain the metered values.">Est. corrected (unvalidated)</dt>
                           <dd id="emd-reg-est" hidden></dd>

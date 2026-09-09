@@ -8,8 +8,8 @@ addon was installed.
 
 Event detection strategy
 ------------------------
-(The derivation itself lives in ``importer_periods`` — this class keeps thin
-forwarding methods. See that module's docstring for the seam's rules.)
+(The derivation lives in ``importer_periods``; this class keeps thin forwarding
+methods. See that module's docstring for the seam's rules.)
 
 Primary: flow_pulse_onset ON/OFF transitions
   - HA records every binary-sensor transition (event-driven, not polled)
@@ -67,9 +67,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .config import AddonConfig, CircuitConfig
 from .event_detector import RawEvent, CircuitEventDetector as _CED
-# CONTAINMENT_FRACTION / contained_fraction went with _split_period_around_rows
-# into importer_periods (plan unit 7.4) and are no longer imported here — the
-# threshold is pinned to overlap_guard's at the call site's own module.
+# CONTAINMENT_FRACTION / contained_fraction live with _split_period_around_rows
+# in importer_periods; the threshold is pinned to overlap_guard's there.
 from .overlap_guard import OVERLAP_NEGLIGIBLE_L, VOLUME_COVERAGE_FRACTION
 from . import importer_periods as _periods
 from .importer_periods import _is_gap_marker, _parse_ts
@@ -194,14 +193,14 @@ class HistoricalImporter:
     CHECK_INTERVAL_MINUTES: int = 30
     MERGE_GAP_SECONDS: int = 15       # bridge flow_pulse_onset gaps shorter than this
     MIN_DURATION_SECONDS: float = 3.0
-    # dev56 — containment rule (docs/PIPELINE.md "Duplicate gate"). A reconstructed
+    # Containment rule (docs/PIPELINE.md "Duplicate gate"). A reconstructed
     # period that CONTAINS rows already stored is either already on the record
     # (stored rows hold >= CONTAINED_ROWS_COVERAGE of its water → dropped) or is
     # split AROUND those rows so only the water nobody recorded becomes an event.
-    # Runs before find_overlapping_event, whose dev55 coverage block stays behind
-    # it as defence in depth. Remainders below the negligible floor, without a
-    # flow-rate fragment inside them (a pressure sag tail is not a draw), or beyond
-    # the per-period cap are dropped and logged — never written on top of a row.
+    # Runs before find_overlapping_event, whose coverage block stays behind it as
+    # defence in depth. Remainders below the negligible floor, without a flow-rate
+    # fragment inside them (a pressure sag tail is not a draw), or beyond the
+    # per-period cap are dropped and logged — never written on top of a row.
     CONTAINED_ROWS_COVERAGE: float = VOLUME_COVERAGE_FRACTION
     CONTAINED_REMAINDER_MIN_L: float = OVERLAP_NEGLIGIBLE_L
     MAX_REMAINDERS_PER_PERIOD: int = 10     # = reprocess._SPLIT_MAX_PERIODS (a test pins it)
@@ -210,7 +209,7 @@ class HistoricalImporter:
     PRE_PRESSURE_WINDOW_SECONDS: int = 30   # look-back for baseline pressure
     MIN_PRESSURE_DROP_PSI: float = 0.8      # min drop to flag has_pressure_transient
 
-    # ── Irrigation zone-switch cross-talk reconciliation (2026-06-28) ──────────
+    # ── Irrigation zone-switch cross-talk reconciliation ──────────
     # Bounded by HA recorder retention: the reconciler needs the IRRIGATION
     # pressure history to compute the swing ratio, so it can only reach as far back
     # as MAX_BACKFILL_DAYS (older addon events can't be re-fetched). Self-healing &
@@ -236,28 +235,27 @@ class HistoricalImporter:
     # from only one or two pre-dip samples and triggering a spurious period.
     PRESSURE_DIP_MIN_BASELINE_SAMPLES: int = 3
     PRESSURE_DIP_MIN_BASELINE_SPAN_S: float = 5.0
-    # dev.39 — anti-noise bridge gate. The pressure-dip source exists to BRIDGE the
-    # gaps between real flow bursts (pulsed irrigation). But a LONG dip envelope that
-    # contains almost NO flow just stitches unrelated trivial blips into one bogus
-    # multi-minute event (observed: two ~0.3 L blips 20 min apart fused into a 20 min
-    # event). So a dip period only earns its bridge when (a) it is long AND (b) the
-    # real flow volume inside it is trivial → drop it; the underlying flow fragments
-    # still import on their own (subject to MIN_DURATION). Leak-safe: a real draw or a
-    # running-toilet leak's fills carry real volume and never trip this; we never drop
-    # flow, only an empty pressure envelope. Short dips and dips with real flow are
-    # untouched.
+    # Anti-noise bridge gate. The pressure-dip source exists to BRIDGE the gaps
+    # between real flow bursts (pulsed irrigation), but a LONG dip envelope
+    # containing almost NO flow stitches unrelated trivial blips into one bogus
+    # multi-minute event (two ~0.3 L blips 20 min apart fused into a 20 min
+    # event). A dip period earns its bridge only when it is NOT both long and
+    # near-empty; the underlying flow fragments still import on their own
+    # (subject to MIN_DURATION). Leak-safe: a real draw or a running-toilet
+    # leak's fills carry real volume and never trip this — only an empty
+    # pressure envelope is ever dropped, never flow.
     PRESSURE_DIP_BRIDGE_LONG_SPAN_S: float = 300.0   # "long" envelope (5 min)
     PRESSURE_DIP_BRIDGE_MIN_VOLUME_L: float = 2.0    # real flow needed to earn a long bridge
-    # dev.50 — the volume gate above only drops a bridge whose flow is TRIVIAL, so a
-    # dip carrying real water bridges without limit: on a pump-held line the dip never
-    # recovers to its frozen baseline between draws, so _pressure_to_periods emits ONE
-    # envelope (observed: 182 min spanning ~14 min of flow and ~99 L — far over the 2 L
-    # gate) and _merge_periods welds every draw into a single event that no reprocess
-    # could split. A bridge exists to span the ~40 s inter-burst gaps named in this
-    # class's docstring, not a 90-minute idle, so cap the gap it may span. 300 s sits
-    # well above those bursts and above the 92 s maximum internal washer/dishwasher gap
-    # the dev.38 sawtooth study measured. Same leak/volume reasoning as the gate above:
-    # only EMPTY span is removed, never flow — and only when the history PROVES the
+    # The volume gate above only drops a bridge whose flow is TRIVIAL, so a dip
+    # carrying real water would bridge without limit: on a pump-held line the dip
+    # never recovers to its frozen baseline between draws, _pressure_to_periods
+    # emits ONE envelope (measured: 182 min spanning ~14 min of flow and ~99 L,
+    # far over the 2 L gate) and _merge_periods welds every draw into a single
+    # event no reprocess could split. A bridge exists to span the ~40 s
+    # inter-burst gaps, not a 90-minute idle, so cap the gap it may span. 300 s
+    # sits well above those bursts and above the measured 92 s maximum internal
+    # washer/dishwasher gap. Same leak/volume reasoning as the gate above: only
+    # EMPTY span is removed, never flow — and only when the history PROVES the
     # flow stopped (see _flow_stopped_across; a dark sensor is not an idle).
     PRESSURE_DIP_BRIDGE_MAX_GAP_S: float = 300.0     # bridges inter-burst gaps, not idles
 
@@ -470,26 +468,23 @@ class HistoricalImporter:
                                 window_end.isoformat(), exc)
                     n = 0
                 total += n
-                # A draw crossing a chunk boundary was being stored as its TAIL
-                # only: the period builders never emit a still-active period, so
-                # this chunk stored nothing for it, and the next chunk saw it
-                # already running and opened the event at the boundary. That
-                # truncated stub is exactly the shape the 3x overlap heal was
-                # invented to work around.
+                # Without the rewind, a draw crossing a chunk boundary is stored
+                # as its TAIL only: the period builders never emit a still-active
+                # period, so this chunk stores nothing for it, and the next chunk
+                # sees it already running and opens the event at the boundary.
                 #
                 # `retry_from` is the earliest point whose events were NOT
-                # stored — it is set only when an event was dropped to a full
-                # queue (which `continue`s before `imported += 1`) or when a
-                # period was still active at the window end (never emitted). So
-                # rewinding to it re-fetches ONLY things that were never
-                # written, and cannot duplicate. That is what makes this safe
-                # here even though the backfill, unlike _catch_up, has no
-                # persistent checkpoint to hold.
+                # stored — set only when an event was dropped to a full queue
+                # (which `continue`s before `imported += 1`) or when a period was
+                # still active at the window end (never emitted). Rewinding to it
+                # re-fetches ONLY things that were never written, so it cannot
+                # duplicate — which is what makes it safe here even though the
+                # backfill, unlike _catch_up, has no persistent checkpoint.
                 #
                 # The `> window_start` test is the loop-progress guard: an event
-                # active from the very start of a chunk would otherwise rewind
-                # to where we already are and spin forever. That case means a
-                # draw longer than the chunk itself, and is left to a later run.
+                # active from the very start of a chunk would rewind to where we
+                # already are and spin forever. That case means a draw longer
+                # than the chunk itself, and is left to a later run.
                 if retry_from is not None and retry_from > window_start:
                     log.info(
                         "[%s] backfill: rewinding chunk boundary %s → %s "
@@ -771,12 +766,11 @@ class HistoricalImporter:
             return 0, None
 
         # Single WS request/connection for all entities in this window. A fetch
-        # failure RAISES — one error contract for every caller. The old
-        # `strict` flag made silent-swallow (`return 0, None`) the default,
-        # which is exactly the bug class the atomic reprocess fixed: "imported
-        # 0" after a failed fetch reads as "nothing to import" and, worse, let
-        # the catch-up advance its checkpoint past an unfetched window. Loop
-        # callers catch per circuit/chunk and hold their checkpoints.
+        # failure RAISES — one error contract for every caller. Do NOT swallow
+        # it into `return 0, None`: "imported 0" after a failed fetch reads as
+        # "nothing to import" and lets the catch-up advance its checkpoint past
+        # an unfetched window. Loop callers catch per circuit/chunk and hold
+        # their checkpoints.
         histories = await self._ha.get_history_batch(entities_to_fetch, start, end)
 
         onset_hist     = histories.get(cfg.flow_onset_sensor, [])
@@ -799,9 +793,9 @@ class HistoricalImporter:
         # still >= MIN_FLOW_LPM with no OFF transition after). _find_flow_periods
         # correctly refuses to flush a still-active period, but the catch-up loop
         # advances last_check_ts to `now` regardless — so an event LONGER than the
-        # catch-up interval would have its start march behind the checkpoint and
-        # could then only be recovered by a much-later startup backfill (observed:
-        # a 133-min irrigation run recovered 4 days late). Returning this start as
+        # catch-up interval has its start march behind the checkpoint and can then
+        # only be recovered by a much-later startup backfill (a 133-min irrigation
+        # run was recovered 4 days late). Returning this start as
         # retry_from holds the checkpoint at the event's start until it actually
         # ends, so the next catch-up after it closes reconstructs the full period.
         # Flow signals only (not the pressure-dip state machine) so a stuck/shifted
@@ -822,10 +816,10 @@ class HistoricalImporter:
 
         # Belt-and-braces guard: if the live EventDetector currently has an
         # active event on this circuit, drop any candidate period that overlaps
-        # it. Fix 1 (drop trailing still-active emissions in _onset/_rate) is
-        # the primary defence; this catches the rare race where the sensor
-        # briefly flickered OFF mid-event and the helper closed a period
-        # honestly inside the event window.
+        # it. The primary defence is dropping trailing still-active emissions in
+        # _onset/_rate; this catches the rare race where the sensor briefly
+        # flickered OFF mid-event and the helper closed a period honestly inside
+        # the event window.
         ev_detector = self._orch.event_detector if self._orch is not None else None
         active = ev_detector.get_active_event(cfg.circuit) if ev_detector else None
         if active is not None and active.start_ts is not None:
@@ -863,12 +857,10 @@ class HistoricalImporter:
 
             # Skip if a meaningfully-overlapping event already exists.
             # Meaningful = overlap >= 30 s, OR >= 10 s and >= 80% of the shorter
-            # event (the comment said 50% for a long time; the code has always
-            # used 80% — see find_overlapping_event's docstring).
-            # This catches importer catch-up duplicates whose start_ts drifted
-            # by minutes — well beyond the old ±30 s point-match. dev55: it also
-            # now refuses a long reconstruction whose span existing unlabeled
-            # rows already account for.
+            # event (see find_overlapping_event's docstring). This catches
+            # importer catch-up duplicates whose start_ts drifted by minutes, and
+            # refuses a long reconstruction whose span existing unlabeled rows
+            # already account for.
             existing = await run_db(
                 find_overlapping_event,
                 self._db, cfg.circuit,
@@ -983,15 +975,15 @@ class HistoricalImporter:
         return out
 
     # ------------------------------------------------------------------ #
-    # Period derivation  (bodies live in importer_periods -- see 7.4)     #
+    # Period derivation  (bodies live in importer_periods)                #
     # ------------------------------------------------------------------ #
     # These forward to the pure module. ``self`` is passed only as the
     # threshold provider, so an instance- or class-level override of any
     # constant below still reaches the calculation.
     #
-    # NOTE FOR TESTS: the pure functions call each other through
+    # FOR TESTS: the pure functions call each other through
     # ``importer_periods``' own globals, NOT back through ``self``. Rebinding
-    # e.g. ``imp._pressure_to_periods`` therefore intercepts nothing --
+    # ``imp._pressure_to_periods`` intercepts nothing — patch the module:
     # ``monkeypatch.setattr(importer_periods, "_pressure_to_periods", ...)``.
 
     def _split_period_around_rows(
@@ -1184,22 +1176,19 @@ class HistoricalImporter:
         # cumulative-delta computation is shared with the §2 recorder reconcile
         # (single source of truth).
         #
-        # ENDPOINT-GAP GUARD — the importer used to consume only the litres and
-        # discard a_ts/b_ts, which firmware_volume_delta returns *specifically*
-        # so the caller can apply this. The delta is measured between the FIRST
-        # and LAST recorder samples inside the window, so any water that moved
-        # before the first sample or after the last is simply not in it. That is
-        # a silent UNDER-COUNT, and it wins: feature_extractor prefers
-        # volume_litres_measured over the flow integral. Declining here falls
-        # back to the integral, which is the honest answer when the recorder did
-        # not bracket the event.
+        # ENDPOINT-GAP GUARD — firmware_volume_delta returns a_ts/b_ts
+        # *specifically* so the caller can apply this. The delta is measured
+        # between the FIRST and LAST recorder samples inside the window, so any
+        # water that moved before the first sample or after the last is not in
+        # it. That is a silent UNDER-COUNT that wins, because feature_extractor
+        # prefers volume_litres_measured over the flow integral. Declining here
+        # falls back to the integral, the honest answer when the recorder did not
+        # bracket the event.
         #
-        # Known residual: the tolerance is absolute (120 s), and a sample can
-        # only land inside the window, so the guard cannot fire on an event
-        # shorter than the tolerance. A 30 s draw whose first sample arrives 25 s
-        # in still yields a delta covering ~5 s. Bounding the long-event case is
-        # a strict improvement on bounding nothing; a coverage-fraction rule
-        # would need a threshold nobody has measured yet.
+        # Known residual: the tolerance is absolute (120 s) and a sample can only
+        # land inside the window, so the guard cannot fire on an event shorter
+        # than the tolerance — a 30 s draw whose first sample arrives 25 s in
+        # still yields a delta covering ~5 s.
         from .recorder_reconcile import ENDPOINT_TOL_S, firmware_volume_delta
         _vd = firmware_volume_delta(volume_hist, start, end, vol_unit)
         volume_litres_measured: Optional[float] = None
@@ -1324,20 +1313,19 @@ def _resample_step_function_1hz(
     return out
 
 
-# ── Moved to importer_periods (plan unit 7.4) ─────────────────────────────────
+# ── Moved to importer_periods ─────────────────────────────────
 # ``_parse_ts`` / ``_is_gap_marker`` are imported eagerly above because THIS
-# module's own functions still call them (a module ``__getattr__`` is not
-# consulted for a global-name lookup inside a function body -- that would be a
+# module's own functions call them, and a module ``__getattr__`` is not
+# consulted for a global-name lookup inside a function body (that would be a
 # NameError). The two below have no caller left here, only importers of this
 # module, so they resolve lazily.
 #
-# PEP 562, deliberately, not a bottom-of-file ``from .importer_periods import``:
-# an eager re-export line is the shape that broke the feature_extractor split --
-# it closes the loop the moment the other module is imported first. The direction
-# here is already one-way, and this keeps it that way by construction.
+# PEP 562, not a bottom-of-file ``from .importer_periods import``: an eager
+# re-export closes the import loop the moment the other module is imported
+# first, which is the ImportError the feature_extractor split hit.
 #
-# The ``raise AttributeError`` fall-through is load-bearing: returning None would
-# make ``hasattr(historical_importer, <anything>)`` answer True.
+# The ``raise AttributeError`` fall-through is load-bearing: returning None
+# would make ``hasattr(historical_importer, <anything>)`` answer True.
 _MOVED_TO_PERIODS = ("_GAP_MARKER_STATES", "_merge_periods")
 
 

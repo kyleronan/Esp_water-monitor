@@ -54,7 +54,7 @@ def _tmpl(r: Request):
 def _block_if_setup_complete(request: Request):
     """Return a rendered setup-locked error page when setup is already complete.
 
-    The setup wizard is intentionally CSRF-exempt (main.py:210) because no
+    The setup wizard is intentionally CSRF-exempt (main.py) because no
     session token exists on first run. That carve-out is safe ONLY while
     setup_complete=0; once setup is done these endpoints must refuse to
     mutate so a stray POST to /setup/restore (which calls DELETE FROM …
@@ -188,25 +188,19 @@ async def setup_restore(request: Request):
     db     = orch.db
 
     def _restore_sync() -> int:
-        """dev49 (P1-2 / C-2): the ENTIRE restore — PRAGMA toggles, the bulk
-        transaction, the events normalize/dedup pass and the circuit-label
-        restore — in ONE DB-thread callable, exactly as ``backup.py``'s
-        ``_restore_sync`` already does (rule 46a/N2a).
+        """The ENTIRE restore — PRAGMA toggles, the bulk transaction, the
+        events normalize/dedup pass and the circuit-label restore — in ONE
+        DB-thread callable, exactly as ``backup.py``'s ``_restore_sync`` does.
 
-        THE BUG THIS FIXES. This body used to run on the EVENT-LOOP thread,
-        outside ``run_db``, against the shared ``orch.db``. ``with db:`` is a
-        connection-global commit, not a scope — so any commit from the DB
-        worker landing mid-block made the already-executed DELETEs durable.
-        ``yield_write_lock`` fires one every 300 reclassify rows and
-        ``save_admin_ids_cache`` every 600 s, so the window was wide open.
-        Reproduced: ``device_config``, ``circuit_entity_map`` and
+        It must NOT run on the event-loop thread against the shared
+        ``orch.db``. ``with db:`` is a connection-global commit, not a scope,
+        so any commit from the DB worker landing mid-block makes the
+        already-executed DELETEs durable — and ``yield_write_lock`` fires one
+        every 300 reclassify rows, ``save_admin_ids_cache`` every 600 s.
+        Observed: ``device_config``, ``circuit_entity_map`` and
         ``home_profile`` permanently gone while the handler logged
-        "transaction rolled back" and told the user the DB was unchanged.
-
-        The comment that used to sit here — "a partial failure leaves the
-        database unchanged" — was false whenever anything else was running.
-        On the single DB thread it is true, because no foreign statement can
-        interleave.
+        "transaction rolled back". On the single DB thread the rollback
+        guarantee holds, because no foreign statement can interleave.
         """
         inserted = 0
         # PRAGMA foreign_keys must be set outside the transaction — SQLite
@@ -249,9 +243,8 @@ async def setup_restore(request: Request):
         return inserted
 
     # The write lock makes this restore exclusive against the other admin
-    # writes (recompute, reclassify, the backup router's own restore). The
-    # read-only export already takes it; the two paths that DESTROY data did
-    # not, which was backwards.
+    # writes (recompute, reclassify, the backup router's own restore) — the
+    # read-only export takes it, so the paths that DESTROY data must too.
     from ..database import get_write_lock, run_db
     try:
         async with get_write_lock():
@@ -267,7 +260,7 @@ async def setup_restore(request: Request):
     except Exception as e:
         log.warning("Restore: reload_circuit_entities: %s", e)
 
-    # dev57 (2.18): the restore replaces whole tables, so it can rewrite
+    # The restore replaces whole tables, so it can rewrite
     # device_config.setup_complete without going through
     # device_discovery's mark/unmark (which bump the epoch every cached copy
     # watches). Re-read it explicitly, on the DB worker.
@@ -276,12 +269,10 @@ async def setup_restore(request: Request):
     except Exception as e:
         log.warning("Restore: setup-complete refresh failed (non-fatal): %s", e)
 
-    # Re-run unit auto-detection after restore.
-    # The backup may contain flow_unit='L/min' (schema default) which would
-    # overwrite the correctly auto-detected value from startup.  Re-running
-    # here ensures the right units are active: if the backup had explicit
-    # non-default units the skip condition in _init_display_units preserves
-    # them; if it had defaults, detection runs again and picks the right units.
+    # Re-run unit auto-detection after restore: the backup may carry
+    # flow_unit='L/min' (the schema default), overwriting the value startup
+    # auto-detected. Explicit non-default units in the backup are preserved by
+    # the skip condition in _init_display_units; defaults trigger detection.
     try:
         await orch._init_display_units()
         from ..units import invalidate_unit_cache
@@ -330,7 +321,7 @@ async def setup_search(
     from ..database import run_db
 
     def _save_name():
-        # dev46 (46a/N2a): write + commit in one DB-thread callable.
+        # Write + commit in one DB-thread callable.
         orch.db.execute("""
             UPDATE device_config SET esp_device_name = ?,
                    updated_at = datetime('now')
@@ -419,7 +410,7 @@ async def setup_discover(device_id: str, request: Request, error: str = ""):
     diag_labels = await _resolve_labels_from_diagnostics(orch.ha, entities)
     if diag_labels:
         from ..database import run_db, upsert_circuit_label
-        # dev46 (46a): N label upserts in one DB-thread callable.
+        # N label upserts in one DB-thread callable.
         await run_db(lambda: [upsert_circuit_label(orch.db, cid, lbl)
                               for cid, lbl in diag_labels.items()])
         await orch.reload_circuit_labels_async()   # dev57 (2.10)
@@ -441,7 +432,7 @@ async def setup_discover(device_id: str, request: Request, error: str = ""):
     )
     from ..database import run_db
     await run_db(save_discovery, orch.db, result)            # dev46 (46a)
-    # dev57 (2.18): save_discovery clears device_config.setup_complete. It
+    # save_discovery clears device_config.setup_complete. It
     # bumps the epoch itself, so the cache is already unknown; re-prime on the
     # DB worker so the re-read does not land on the event loop.
     await orch.refresh_setup_complete_cache()
@@ -482,7 +473,7 @@ async def setup_discover(device_id: str, request: Request, error: str = ""):
         "unmatched_roles": result.unmatched_roles,
         "prefix": prefix,
         "min_fw": min_fw,
-        # 2.3 unit 0.9 — a VERIFIED sub-floor firmware blocks step 3. An
+        # A VERIFIED sub-floor firmware blocks step 3. An
         # unparseable version does not (see MIN_FIRMWARE_VERSION for why); it
         # renders the "unknown" badge instead. Mirrored server-side in
         # setup_confirm — the disabled button is a courtesy, not the gate.
@@ -513,9 +504,9 @@ async def setup_confirm(device_id: str, request: Request):
     _valid_roles = {r for roles in ROLE_PATTERNS.values() for r in roles}
 
     def _save_map():
-        # dev46 (46a/N2a): every INSERT plus the commit in ONE DB-thread
-        # callable — the mapping is one transaction and must not be split
-        # across queue boundaries.
+        # Every INSERT plus the commit in ONE DB-thread callable — the
+        # mapping is one transaction and must not be split across queue
+        # boundaries.
         for key, value in form.items():
             # Form fields are named: circuit__role  e.g. main__flow_sensor
             if "__" in key and value:
@@ -638,11 +629,10 @@ async def setup_circuit_names(request: Request):
 async def setup_circuit_names_save(request: Request):
     """Save circuit display name, type, and valve type per circuit.
 
-    Validates ALL inputs first; bails out before any write if any input
-    is invalid. After validation passes, writes everything. Note that
-    each setter commits internally so a runtime DB error between writes
-    can still partially persist — this is the same residual risk the
-    pre-refactor handler had. Validation errors are now fully atomic.
+    Validates ALL inputs first and bails before any write if any input is
+    invalid, so a validation error persists nothing. The writes then run in
+    ONE transaction, so a runtime DB error mid-chain rolls back every prior
+    write.
     """
     blocked = _block_if_setup_complete(request)
     if blocked is not None:
@@ -698,14 +688,13 @@ async def setup_circuit_names_save(request: Request):
         return _tmpl(request).TemplateResponse("setup.html", ctx)
 
     # ── (3) Write everything in ONE transaction ──
-    # All three setters accept commit=False, so we control the
-    # commit boundary here. A runtime DB error mid-chain rolls back
-    # every prior write — no more partial-commit risk where a circuit
-    # ends up with the new display_name but the old circuit_type.
+    # All three setters accept commit=False, so the commit boundary is here.
+    # A runtime DB error mid-chain rolls back every prior write, so a circuit
+    # cannot end up with the new display_name but the old circuit_type.
     from ..database import run_db, transaction
 
     def _save_names():
-        # dev46 (46a/N2a): the whole transaction lives in ONE callable.
+        # The whole transaction lives in ONE callable.
         with transaction(orch.db):
             for entry in pending:
                 if "display_name" in entry:
@@ -790,7 +779,7 @@ async def setup_units_save(request: Request):
     from ..database import run_db
 
     def _save_units():
-        # dev46 (46a/N2a): write + commit in one DB-thread callable.
+        # Write + commit in one DB-thread callable.
         orch.db.execute(
             "UPDATE home_profile SET flow_unit=?, pressure_unit=? WHERE id=1",
             (flow_key, pressure_key),
@@ -850,7 +839,7 @@ async def setup_home_details_save(request: Request):
     sqft                       = coerce_int(form.get("sqft"),           lo=0, hi=100000, default=0)
     historical_import_enabled  = form.get("historical_import_enabled") == "1"
 
-    # dev.24 water softener (opt-in). The regen start time is REQUIRED when
+    # Water softener (opt-in). The regen start time is REQUIRED when
     # enabled — the session detector and the leak-test blackout both key on it,
     # so re-prompt rather than silently persist has_water_softener=1 with no time.
     from ..event_rules import parse_hhmm_to_minutes
@@ -890,7 +879,7 @@ async def setup_home_details_save(request: Request):
 
     # Mark setup complete and reload entity IDs into live circuit configs
     await run_db(mark_setup_complete, orch.db)                # dev46 (46a)
-    # dev57 (2.18): mark_setup_complete() already invalidated every cached copy
+    # mark_setup_complete() already invalidated every cached copy
     # of the flag (the device_discovery epoch moved). Re-prime it here so the
     # one read that costs happens on the DB worker rather than on the event
     # loop inside whichever request reads the property next.
@@ -904,7 +893,7 @@ async def setup_home_details_save(request: Request):
         from datetime import datetime, timezone as _tz
         from ..database import update_import_state
         now_ts = datetime.now(_tz.utc).isoformat()
-        # dev46 (46a): all circuits' checkpoints in one DB-thread callable.
+        # All circuits' checkpoints in one DB-thread callable.
         await run_db(lambda: [
             update_import_state(orch.db, cc.circuit, now_ts, 0)
             for cc in orch._cfg.circuits])
@@ -920,7 +909,7 @@ async def setup_home_details_save(request: Request):
             log.info("Event detection activated after setup wizard completion")
         except Exception as e:
             log.warning("Event detector setup failed (non-fatal): %s", e)
-        # dev38: subscribe-then-prime — seed valve states so other_valve_open
+        # Subscribe-then-prime — seed valve states so other_valve_open
         # can record a confirmed 0 before any valve transitions.
         try:
             await orch.event_detector.prime_valve_states()
@@ -1064,7 +1053,7 @@ def _device_to_dict(d: DiscoveredDevice) -> Dict[str, Any]:
         "manufacturer": d.manufacturer or "",
         "is_esphome": d.is_esphome,
         "sw_version": d.sw_version or "",
-        # firmware_ok is now STRICT ("verified at or above the floor"), so an
+        # firmware_ok is STRICT ("verified at or above the floor"), so an
         # unknown version is False here — the template distinguishes the two
         # via firmware_status rather than calling both "too old".
         "firmware_ok": d.firmware_ok,
@@ -1089,7 +1078,7 @@ def _role_label(role: str) -> str:
         "leak_test_duration_sensor": "Leak Test Duration",
         "volume_sensor":           "Volume Total",
         # Without an entry here the default title-caser renders "Flow Meter
-        # Ppl". This is now a REQUIRED row the operator has to recognise and
+        # Ppl". This is a REQUIRED row the operator has to recognise and
         # pick an entity for, so use the firmware's own entity name verbatim
         # ("Flow Meter PPL - ${circuit_N_name}") — that is the string they are
         # looking at in the dropdown.

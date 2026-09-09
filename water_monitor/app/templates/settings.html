@@ -1057,9 +1057,8 @@
 
     {# ── History & Events ──────────────────────────────────────────── #}
     {# These control what the History LIST shows and the background event
-       hygiene — they used to hide inside the Display Units form, where nobody
-       thought to look for them. Own form + endpoint so saving them can't
-       touch the unit selection. #}
+       hygiene. Own form + endpoint so saving them can't touch the unit
+       selection. #}
     <div class="sett-section" id="sett-history-events" style="display:none">
       <h2 class="sett-section-title">History &amp; Events</h2>
       <p class="sett-section-desc">
@@ -1404,7 +1403,7 @@
               <input type="hidden" name="_csrf" value="{{ csrf_token }}">
               <button type="submit" class="btn btn-secondary btn-sm">Re-fit now</button>
             </form>
-            {#- dev51: the undo. Restores the model that was serving before the
+            {#- The undo. Restores the model that was serving before the
                 last swap; the events that model would answer differently are
                 re-checked, and the action is recorded beside the automatic
                 decisions. #}

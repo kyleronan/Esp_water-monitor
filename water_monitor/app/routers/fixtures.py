@@ -331,7 +331,7 @@ def _max_iso(a, b):
     return a if a >= b else b
 
 
-# ── Sprint F: per-category publish toggle ────────────────────────────────────
+# ── Per-category publish toggle ─────────────────────────────────────────────
 
 # ── The per-cluster routes (confirm, delete, merge, migrate,
 #    forget-signature, relink) have no HTTP handlers. Their backend helpers in
@@ -339,7 +339,7 @@ def _max_iso(a, b):
 # ────────────────────────────────────────────────────────────────────────────
 
 
-# ── Repair stale group links (dev42) ─────────────────────────────────────────
+# ── Repair stale group links ─────────────────────────────────────────────────
 
 @router.post("/health/{alert_id}/resolve")
 async def resolve_health_alert(alert_id: int, request: Request):
@@ -397,7 +397,7 @@ async def resolve_health_alert(alert_id: int, request: Request):
     return ingress_redirect(request, "/fixtures?msg=health_resolved")
 
 
-# ── dev53: the reference-set prompt ("Re-pin benchmark now" / "Not now") ─────
+# ── The reference-set prompt ("Re-pin benchmark now" / "Not now") ───────────
 
 @router.post("/repin-benchmark/{circuit}")
 async def repin_benchmark(circuit: str, request: Request):

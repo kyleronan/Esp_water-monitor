@@ -78,19 +78,19 @@ class DataPruner:
         prune_now() and _startup_backfill() do many sync SQLite operations
         (DELETEs + daily-summary computation across all events) which can
         block the event loop for several seconds on a populated DB. They're
-        offloaded to the single DB thread via run_db (dev46 46a) so the rest
+        offloaded to the single DB thread via run_db so the rest
         of the addon stays responsive to ingress requests.
         """
         from .database import run_db
         await run_db(self._startup_backfill_sync)
 
         # The wait is INSIDE the loop, and re-derives 03:00 from the wall clock
-        # every iteration. It used to be awaited once, before the loop, after
-        # which the loop slept a flat ``timeout=86400`` forever — and asyncio
-        # sleeps on the MONOTONIC clock, so that is 86400 true SI seconds no
-        # matter what the wall clock does. A 23 h or 25 h DST day therefore
-        # shifted the nightly prune, summary rebuild and auto-backup to 02:00
-        # or 04:00 permanently, with no way to self-correct short of a restart.
+        # every iteration. Awaiting it once before the loop and then sleeping a
+        # flat ``timeout=86400`` does NOT work: asyncio sleeps on the MONOTONIC
+        # clock, so that is 86400 true SI seconds no matter what the wall clock
+        # does, and a 23 h or 25 h DST day shifts the nightly prune, summary
+        # rebuild and auto-backup to 02:00 or 04:00 permanently, with no way to
+        # self-correct short of a restart.
         while not self._stop.is_set():
             await self._wait_until_3am()
             if self._stop.is_set():
@@ -130,7 +130,7 @@ class DataPruner:
     async def _startup_backfill(self) -> None:
         """Async wrapper kept for any external callers that expect the
         original signature. Delegates to the sync variant via the single
-        DB thread (dev46 46a) so the heavy work happens off the event loop."""
+        DB thread so the heavy work happens off the event loop."""
         from .database import run_db
         await run_db(self._startup_backfill_sync)
 
@@ -159,7 +159,7 @@ class DataPruner:
         # Only events within [calibration_started_at, calibration_ends_at] are
         # protected — events predating the device installation are not preserved.
         try:
-            # dev38 — overlap_audit rows whose events retention is about to
+            # overlap_audit rows whose events retention is about to
             # remove become permanently unreferencable: mark them
             # 'event_pruned' (distinct from reprocess supersession — here the
             # event is genuinely gone forever, not re-created under a new id).
@@ -214,7 +214,7 @@ class DataPruner:
         for tbl, col in [
             ("zone_flow_history",     "recorded_at"),
             ("threshold_history",     "recorded_at"),
-            ("cluster_cooccurrence",  "last_seen_at"),   # Phase 2
+            ("cluster_cooccurrence",  "last_seen_at"),
         ]:
             try:
                 cur = self._db.execute(
@@ -367,7 +367,7 @@ class DataPruner:
             log.info("Daily summaries computed: %d day(s)%s",
                      computed, " (backfill)" if full_backfill else "")
 
-        # dev38 — drain the dirty-day markers. The gap scan above cannot see
+        # Drain the dirty-day markers. The gap scan above cannot see
         # a stale ALREADY-computed day (it freezes anything summarised after
         # its own day_end) and never looks past the 7-day lower bound; the
         # markers written by every event write / delete carry no such limits,
@@ -446,14 +446,13 @@ class DataPruner:
     # ── Auto-backup ─────────────────────────────────────────────────────────
 
     def _snapshot_tables_sync(self, cutoff: str) -> dict:
-        """dev46 (46a) — the Quick Restore table snapshot, one hop."""
-        # Imported HERE, not inherited. This helper was hoisted out of
-        # _run_auto_backup for run_db, but the import it depends on stayed
-        # behind in the caller's body — so the loop below raised NameError,
-        # caught by _run_auto_backup's broad ``except Exception`` and logged
-        # as "Auto-backup failed". The nightly backup has been writing nothing
-        # ever since. Same defect shape as FixturePublisher's
-        # _update_state_reads_sync.
+        """The Quick Restore table snapshot, one hop."""
+        # Imported HERE, not inherited from the caller. This helper is hoisted
+        # out of _run_auto_backup for run_db; leaving the import behind in the
+        # caller's body makes the loop below raise NameError, which
+        # _run_auto_backup's broad ``except Exception`` swallows as "Auto-backup
+        # failed" while the nightly backup silently writes nothing. Same defect
+        # shape as FixturePublisher's _update_state_reads_sync.
         from .routers.backup import QUICK_RESTORE_TABLES
 
         tables = {}
@@ -477,10 +476,9 @@ class DataPruner:
 
         target_dow = int(cfg.get("auto_backup_day_of_week", 0))
         # Home timezone, not the container's naive clock — the user picks this
-        # day on a local-time calendar and the job now fires at local 03:00.
-        # (West of UTC the two agree at 03:00 and this was harmless; east of
-        # UTC 03:00 local is still the PREVIOUS UTC day, which fired the weekly
-        # backup a day early.)
+        # day on a local-time calendar and the job fires at local 03:00. West
+        # of UTC the two agree at 03:00; east of UTC 03:00 local is still the
+        # PREVIOUS UTC day, which fires the weekly backup a day early.
         from .database import _home_tz
         if datetime.now(_home_tz()).weekday() != target_dow:
             return
@@ -499,9 +497,9 @@ class DataPruner:
 
             cutoff = (datetime.now(timezone.utc)
                       - timedelta(days=QUICK_RESTORE_DAYS)).isoformat()
-            # dev46 (46a): the whole snapshot read is ONE hop, which also
-            # makes the backup internally consistent — every table now comes
-            # from the same instant instead of drifting across the dump.
+            # The whole snapshot read is ONE hop, which also makes the backup
+            # internally consistent — every table comes from the same instant
+            # instead of drifting across the dump.
             tables = await run_db(self._snapshot_tables_sync, cutoff)
 
             payload = {
@@ -516,7 +514,7 @@ class DataPruner:
             filename.write_text(
                 json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
-            # dev46 (46a) — hop after the file write. NO re-check: this
+            # Hop after the file write. NO re-check: this
             # stamps "an auto-backup was written at T", a monotonic
             # record of something that just happened on disk.
             await run_db(
@@ -542,13 +540,13 @@ class DataPruner:
 
         Returns early (without waiting out the remainder) when stop is set.
 
-        Everything here is computed in UTC and converted at the edges. The
-        previous version used a naive ``datetime.now()``, i.e. the CONTAINER's
-        clock: no ``TZ`` is set in the Dockerfile, config.yaml or rootfs/, so
-        that was UTC in production regardless of where the home actually is —
-        a third timezone in a codebase that already keys every rollup on the
-        home's local day. It now uses the SAME zone as those rollups (the one
-        the orchestrator caches at tz detection).
+        Everything here is computed in UTC and converted at the edges, in the
+        SAME zone as the rollups (the one the orchestrator caches at tz
+        detection). A naive ``datetime.now()`` is the CONTAINER's clock: no
+        ``TZ`` is set in the Dockerfile, config.yaml or rootfs/, so in
+        production that is UTC regardless of where the home actually is — a
+        third timezone in a codebase that already keys every rollup on the
+        home's local day.
         """
         while not self._stop.is_set():
             now    = datetime.now(timezone.utc)

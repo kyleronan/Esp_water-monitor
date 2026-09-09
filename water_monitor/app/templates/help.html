@@ -1,12 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
 {#
-  dev47 — the operator runbook.
+  The operator runbook.
 
-  Every control name below was taken from the templates that render it, not
-  from memory. Getting a name wrong here is worse than saying nothing: this
-  page exists BECAUSE the names were hard to keep straight, so a page that
-  invents its own vocabulary would make the original problem worse.
+  RULE: every control name here must be copied from the template that renders
+  it, never from memory. This page exists BECAUSE the names are hard to keep
+  straight, so inventing vocabulary here makes the original problem worse.
 
   Source of record for each: nav labels base.html; "Re-fit rules for current
   pressure" / "Rebuild fixture grouping for current pressure" settings.html;
@@ -15,11 +14,9 @@
   leak-test verdict strings leak_test_scheduler.py; "✓ Fixed it" / "Dismiss" /
   "★ Label on History" fixtures.html.
 
-  dev47 added a second classifier that has to be explained in terms of what the
-  operator sees, never its internals: it needs about a hundred of their labels
-  before it starts, re-checks itself weekly, and can decline its own new fit.
-  Those three facts are why "How long before your labels change anything"
-  exists — three separate questions collapse into that one gap.
+  The learned classifier is described only in terms of what the operator sees,
+  never its internals: it needs about a hundred of their labels before it
+  starts, re-checks itself weekly, and can decline its own new fit.
 #}
 <style>
   .rb-toc      { display:flex; flex-wrap:wrap; gap:.4rem; margin:.75rem 0 1.5rem }

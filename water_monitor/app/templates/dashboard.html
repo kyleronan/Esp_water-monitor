@@ -16,7 +16,7 @@
 </div>
 {% endif %}
 
-{# ── Pump-regime detection banner (dev23, banner+confirm) ─────────
+{# ── Pump-regime detection banner (banner + confirm) ──────────────
    Home-level: shows only while nightly detection is unacknowledged and no
    supply answer / override already settles the question. Confirming is the
    ONLY auto-path into pump-aware behavior. #}
@@ -81,7 +81,7 @@
 
 {# ── Pump leak-watch (Phase 5a) — nightly recharge-derived leak estimate,
    street-meter calibrated. Shows while pump mode is armed and the estimate is
-   RECENT (within the last 3 evaluated nights — dev34); clears itself once the
+   RECENT (within the last 3 evaluated nights); clears itself once the
    pump stops cycling overnight, which is what a repaired leak looks like. #}
 {% if leak_watch %}
 <div class="dash-alert dash-alert-degraded" aria-live="polite">

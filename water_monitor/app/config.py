@@ -257,7 +257,7 @@ def compute_suggested_calibration_days(
     return min(base_days, 35), tier
 
 
-# ── Pump-aware detection (dev21 Phase 1) ───────────────────────────────────────
+# ── Pump-aware detection ───────────────────────────────────────────────────────
 
 # Valid home_profile.supply_type values. Routers validate against this.
 SUPPLY_TYPES: frozenset = frozenset({"mains", "well", "city_pump"})

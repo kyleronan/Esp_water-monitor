@@ -85,7 +85,7 @@
   <a href="{{ ingress_path }}/training">Training helper</a>.
 </p>
 
-{# ── dev47 (47i): fixture health. Classification adapts; these baselines do
+{# ── Fixture health. Classification adapts; these baselines do
      not — so a fixture whose draws are drifting shows up here even though its
      events are still labelled correctly. Wording avoids diagnosing the cause:
      the add-on can see that refills grew, not why. ─────────────────────── #}
@@ -93,11 +93,11 @@
 {% for a in health.alerts %}
 <div class="fx-msg fx-msg-warn" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
   <span>
-    {#- Five signals reach this card, and they do not mean the same thing. This
-        block used to describe all of them as a volume increase, so a longer-
-        running tap and a recognition drop both read as "using more water". The
-        wording still avoids diagnosing a CAUSE — the add-on can see that a
-        number moved, not why — but it must at least name the right number. #}
+    {#- Five signals reach this card and they do not mean the same thing, so the
+        wording must name the right number rather than calling them all a volume
+        increase (a longer-running tap and a recognition drop are not the same
+        thing). It still avoids diagnosing a CAUSE — the add-on can see that a
+        number moved, not why. #}
     <strong>{{ fixture_type_labels.get(a.fixture_type, a.fixture_type) }}</strong>
     on {{ a.circuit_name }}
     {%- if a.signal == 'duration_trend' %} is running for longer than it used to.
@@ -162,10 +162,9 @@
 {% for cid, q in health.queue.items() %}
 <div class="fx-msg fx-msg-ok" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
   <span>
-    {#- Two different questions share this card. Identity slots are events the
-        ladder could not type; anchor slots are events it typed confidently and
-        wants confirmed. Calling all of them "could not type confidently" asked
-        the operator to identify things that already had a name. #}
+    {#- Two different questions share this card, and the wording must keep them
+        apart. Identity slots are events the ladder could not type; anchor slots
+        are events it typed confidently and wants confirmed. #}
     <strong>{{ q.shown }}</strong> event{{ '' if q.shown == 1 else 's' }} on
     {{ q.circuit_name }} would be worth a quick look —
     {%- if not q.n_anchor %} the app could not type
@@ -202,11 +201,11 @@
 {% endfor %}
 {% endif %}
 
-{# ── dev51 (2.1): what the learning loop has been deciding, from its ledger.
-     The V6d finding was that a model which has stopped improving is SILENT —
-     a frozen fit serves exactly like a healthy one — so this is the one place
-     the operator can see a run of rejections. A banner, never a knob: the
-     referee is not relaxed from here. ─────────────────────────────────── #}
+{# ── What the learning loop has been deciding, from its ledger. A model that
+     has stopped improving is SILENT — a frozen fit serves exactly like a
+     healthy one — so this is the one place the operator can see a run of
+     rejections. A banner, never a knob: the referee is not relaxed from
+     here. ──────────────────────────────────────────────────────────────── #}
 {% if health and health.learning %}
 {% for cid, l in health.learning.items() %}
 <div class="fx-msg {{ 'fx-msg-warn' if (l.stalled or l.paused_by_reservation) else 'fx-msg-ok' }}"
