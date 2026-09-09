@@ -1,4 +1,4 @@
-"""Training-helper wizard (2b) — capture one clean sample per fixture type.
+"""Training-helper wizard — capture one clean sample per fixture type.
 
 A finite, resumable onboarding checklist: the user runs each fixture once, the
 event-completion hook (feature_extractor) records the resulting event(s) as
@@ -88,15 +88,14 @@ _RECAL_LOCK_RETRIES: int = 30
 _RECAL_LOCK_BACKOFF_S: float = 20.0
 
 
-# dev46 (46l) — one in-flight regime recalibration at a time.
+# One in-flight regime recalibration at a time.
 #
-# Observed 2026-08-15 21:47-21:50: the same recalibration executed THREE times
-# back to back (three identical freeze lines). The retry loop below waits out a
-# busy writer for minutes, and every click during that wait queued another full
-# pass — so a user clicking again because "nothing seems to be happening" got
-# their wish three times over, each pass re-fitting and re-freezing the same
-# bands. Module-level rather than per-orchestrator: there is one process, one
-# connection, and the work is global to the home.
+# The retry loop below waits out a busy writer for minutes, and without this
+# guard every click during that wait queues another full pass — a user clicking
+# again because "nothing seems to be happening" gets three identical passes,
+# each re-fitting and re-freezing the same bands. Module-level rather than
+# per-orchestrator: there is one process, one connection, and the work is
+# global to the home.
 _RECAL_IN_FLIGHT: bool = False
 
 
@@ -135,14 +134,13 @@ async def start_regime_recalibration(orch) -> bool:
                                         regime=regime)
                 reclassify_all_events_from_signatures(
                     conn, circuit, since_ts=regime["started_at"])
-                # dev34 B3 — the anomaly side must follow the supply too: a
-                # regime refit that leaves the usage baselines fit on the OLD
-                # pressure flags every normal event of the new one (toilet
-                # durations shortened 2.6× under the pump). Era-windowed with
-                # per-type fallback inside; the previous frozen state is
-                # snapshotted, so this is revertable. Then re-score against
-                # the fresh baseline — the reclassify above ran before it
-                # existed, so its anomaly verdicts used the stale one.
+                # The anomaly side must follow the supply too: a regime refit
+                # that leaves the usage baselines fit on the OLD pressure flags
+                # every normal event of the new one (toilet durations shortened
+                # 2.6× under the pump). Era-windowed with per-type fallback
+                # inside; the previous frozen state is snapshotted, so this is
+                # revertable. Then re-score against the fresh baseline, because
+                # the reclassify above scored against the stale one.
                 try:
                     from ..anomaly_baseline import (freeze_usage_baselines,
                                                     invalidate_baseline_cache)
@@ -170,14 +168,13 @@ async def start_regime_recalibration(orch) -> bool:
                 raise
 
     async def _run():
-        # dev34 — wait out a busy writer instead of dying on the first
-        # 5 s busy_timeout. Observed twice live: the button pressed while a
-        # startup/import reclassify held the write lock → "database is
-        # locked" after 5 s, and because the job row is created INSIDE the
-        # locked work, the UI never even showed a failure. A full reclassify
-        # runs minutes, so the retry budget is sized in minutes. The work
-        # itself is idempotent — a retry after a partial failure re-fits and
-        # re-scores from scratch.
+        # Wait out a busy writer instead of dying on the first 5 s
+        # busy_timeout: the button pressed while a startup/import reclassify
+        # holds the write lock gives "database is locked" after 5 s, and
+        # because the job row is created INSIDE the locked work, the UI never
+        # even shows a failure. A full reclassify runs minutes, so the retry
+        # budget is sized in minutes. The work itself is idempotent — a retry
+        # after a partial failure re-fits and re-scores from scratch.
         import sqlite3 as _sqlite3
         for attempt in range(_RECAL_LOCK_RETRIES):
             try:
@@ -211,10 +208,10 @@ async def start_regime_recalibration(orch) -> bool:
             _RECAL_IN_FLIGHT = False
 
     _RECAL_IN_FLIGHT = True
-    # dev57 (2.24): via task_registry.spawn — a bare create_task() left this
-    # minutes-long re-fit collectable mid-flight, and because the flag is
-    # cleared in _guarded's `finally`, a collected task would ALSO have
-    # wedged the button on for the life of the process.
+    # via task_registry.spawn: a bare create_task() leaves this minutes-long
+    # re-fit collectable mid-flight, and because the flag is cleared in
+    # _guarded's `finally`, a collected task would ALSO wedge the button on for
+    # the life of the process.
     if spawn(_guarded(), name="regime_recalibration") is None:
         _RECAL_IN_FLIGHT = False   # no running loop — nothing was scheduled
         return False

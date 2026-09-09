@@ -1,4 +1,4 @@
-"""dev47 (47d) — the weekly review card: what the add-on asks, and how little.
+"""The weekly review card: what the add-on asks, and how little.
 
 THE CONTRACT
 ------------
@@ -59,15 +59,12 @@ ANCHOR_SLOTS: int = 2
 # the add-on is about to answer correctly by itself.
 MATURITY_WINDOW_S: float = 2 * 3600.0
 
-# There is deliberately no "not sure" ANSWER constant here. An earlier draft
-# carried ANSWER_NOT_SURE plus an answer_is_trainable() guard, for an inline
-# answering flow this card intentionally does not have — it points at History
-# instead, because two ways to label one event is how they drift apart. The
-# guard those symbols promised is real, but it lives in the schema, not here:
-# History's Ignore sets `user_ignored`, load_candidates() excludes it from the
-# card, and it folds into `excluded_from_training`, which build_training_pool()
-# filters on. Keeping an unused copy here made the guard look absent while it
-# was working, so it is gone; this note is what it replaced.
+# There is deliberately no "not sure" ANSWER constant here. This card has no
+# inline answering flow; it points at History instead, because two ways to
+# label one event is how they drift apart. The trainability guard lives in the
+# schema, not here: History's Ignore sets `user_ignored`, load_candidates()
+# excludes it from the card, and it folds into `excluded_from_training`, which
+# build_training_pool() filters on.
 
 KIND_IDENTITY = "identity"
 KIND_ANCHOR = "anchor_check"

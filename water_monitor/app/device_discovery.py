@@ -38,31 +38,19 @@ log = logging.getLogger(__name__)
 # Orchestrator._sync_ppl_and_watch), and 3.13.0 rewrote flow measurement from
 # pulse_counter to pulse_meter.
 #
-# 2.3 unit 0.9 — this used to be ADVISORY IN BOTH DIRECTIONS: `firmware_ok`
-# returned True for a version it could not parse AND nothing branched on the
-# False case either, so the two Jinja warnings in setup.html were the entire
-# mechanism. Now there are THREE states, not two, because they deserve
-# different answers:
+# Three states, not two:
 #
 #   "ok"       parsed and >= floor.
 #   "too_old"  parsed and < floor.  VERIFIED bad → blocks setup.
 #   "unknown"  absent, or not parseable as N.N.N ("dev", "", "unknown").
 #              NOT verified bad → warns loudly, does not block.
 #
-# Why "unknown" does not block, with the evidence: ESPHome's project.version is
-# a free-form string the operator writes in their own YAML, HA appends
-# " (ESPHome x.y.z)" to it, and a device_registry entry created before the
-# `project:` block existed carries no sw_version at all. Every one of those is
-# a correctly-flashed device. Blocking there would strand a working install
-# with no escape hatch inside the wizard — the add-on would refuse to finish
-# setup and the operator's only recourse would be editing the DB. Blocking on
-# "too_old" is safe because it is a positive measurement: we parsed a version
-# and it is genuinely below the floor, and the fix (flash newer firmware) is
-# the one the operator has to do anyway.
-#
-# What DID change for "unknown": `firmware_ok` no longer lies about it. It is
-# now strictly "verified at or above the floor", so an unknown version is False
-# and the UI says so in its own words instead of showing a green nothing.
+# "unknown" must not block: ESPHome's project.version is a free-form string the
+# operator writes in their own YAML, HA appends " (ESPHome x.y.z)" to it, and a
+# device_registry entry created before the `project:` block existed carries no
+# sw_version at all. Every one of those is a correctly-flashed device, and
+# refusing would strand a working install with no escape hatch inside the
+# wizard. "too_old" is safe to block on because it is a positive measurement.
 MIN_FIRMWARE_VERSION: tuple = (3, 13, 0)
 
 #: sw_version strings that carry no version information at all.
@@ -117,31 +105,26 @@ OPTIONAL_ROLES = {
     "leak_test_baseline_sensor",
     "leak_test_closed_sensor",
     "leak_settle_number",
-    # NOTE: "flow_meter_ppl" WAS here. It is now REQUIRED — see PPL_ROLE and the
-    # refusal note below. It stays fillable by the optional-role rescan via
-    # RESCAN_FILLABLE_ROLES so an existing install still heals after a firmware
-    # upgrade; it just can no longer be silently skipped at setup.
+    # "flow_meter_ppl" is deliberately NOT here — it is REQUIRED (see PPL_ROLE).
+    # RESCAN_FILLABLE_ROLES still lets the rescan fill it on an older install.
     # Waveform diagnostic counters (firmware 3.7.0+ / 3.9.0+, circuit_1 only).
     # The 5 chunked text sensors were replaced by an HA event in firmware 3.8.0.
     # Chunk drop count was added in 3.9.0 when chunked streaming replaced the
     # single-event transport.
     "wf_overflow_count_sensor",
     "wf_chunk_drop_count_sensor",
-    # Phase 3 (3.1) — the firmware's three waveform STAGE counters. Together
-    # with the add-on's own transport_stats they turn "no waveforms" from a
-    # guess into an arithmetic statement: captures started → chunks staged →
-    # events fired (firmware) → assembled / gaps (add-on). Device-wide, not
-    # per-circuit, so — like the two counters above — they are mapped under
-    # circuit_1 only. Optional: older firmware doesn't publish them.
+    # The firmware's three waveform STAGE counters: captures started → chunks
+    # staged → events fired, which with the add-on's own transport_stats
+    # account for every missing waveform. Device-wide, not per-circuit, so —
+    # like the two counters above — mapped under circuit_1 only.
     "wf_captures_started_sensor",
     "wf_chunks_staged_sensor",
     "wf_events_fired_sensor",
-    # Phase 3 (3.2) — VALVE TRUTH. The end stops are the only ground truth for
-    # where the valve physically is (the `valve.*` entity is a template the
-    # firmware publishes FROM these), and the seal alerts are the firmware's
-    # own "flow against a closed valve" detector. Read-only here: nothing gates
-    # on them, they are surfaced on /health/detail so unit 8.5 has something to
-    # decide from. Optional so a partial/older mapping never blocks setup.
+    # The end stops are the only ground truth for where the valve physically
+    # is — the `valve.*` entity is a template the firmware publishes FROM them.
+    # valve_seal_alert is the firmware's "flow against a closed valve"
+    # detector. Read-only: nothing gates on these, they surface on
+    # /health/detail.
     "open_end_stop_sensor",
     "closed_end_stop_sensor",
     "valve_seal_alert_sensor",
@@ -152,75 +135,62 @@ OPTIONAL_ROLES = {
 #: things key on it.
 PPL_ROLE = "flow_meter_ppl"
 
-# ── 2.3 unit 0.9 — why PPL is REQUIRED, and what "refuse" means here ────────
+# ── Why PPL is REQUIRED, and what "refuse" means here ───────────────────────
 #
-# THE FAILURE. The firmware invites the operator to change `circuit_1_name`
-# ("Display name for circuit 1 — change to suit your install"). Every entity
-# NAME on that circuit is `${circuit_1_name}`-interpolated, and HA derives the
-# entity_id from the name — so a rename moves both handles the ROLE_PATTERNS
-# regexes below match on. About sixty patterns stop binding at once. Most of
-# those failures are loud: an unmatched REQUIRED role stops the setup wizard
-# dead and the operator picks the entity by hand.
+# An unbound `flow_meter_ppl` leaves the add-on running on
+# circuit_profile.pulses_per_litre, whose column DEFAULT is 396.0. On this
+# install the MAIN meter is a 72-ppl oval-gear PD meter: 396 / 72 = 5.5, so
+# every computed volume, the low-flow floor (60 / ppl) and every threshold
+# scaled off them are wrong by 5.5x TOGETHER — which is precisely why the
+# result looks plausible instead of broken. Nothing else corrects it: the HA
+# number-entity subscription is the only write path for ppl, and it is skipped
+# when the entity is unbound.
 #
-# `flow_meter_ppl` was the exception. It was optional, so an unbound ppl sailed
-# through setup, and the add-on then ran on circuit_profile.pulses_per_litre —
-# whose column DEFAULT is 396.0. On this install the MAIN meter is a 72-ppl
-# oval-gear PD meter. 396 / 72 = 5.5, so every computed volume, the low-flow
-# floor (60 / ppl) and every threshold scaled off them were wrong by 5.5x
-# TOGETHER — which is precisely why the result looks plausible instead of
-# broken. Nothing else ever corrects it: the HA number-entity subscription is
-# the only write path for ppl, and it is skipped when the entity is unbound.
+# What unbinds it is a circuit rename: every entity NAME on a circuit is
+# `${circuit_N_name}`-interpolated and HA derives the entity_id from the name,
+# so a rename moves both handles the ROLE_PATTERNS regexes below match on and
+# about sixty patterns stop binding at once.
 #
-# WHAT "REFUSE" MEANS. Not an exception, and not a crash-loop — a stuck
-# add-on measures nothing at all, which is strictly worse than one that has
-# not finished setup. Refusal here is: the wizard will not hand back a
-# runnable configuration.
+# "REFUSE" is not an exception and not a crash-loop — a stuck add-on measures
+# nothing at all, which is strictly worse. It means the wizard will not hand
+# back a runnable configuration:
 #
-#   * Removing the role from OPTIONAL_ROLES makes DiscoveryResult.all_matched
+#   * Keeping the role out of OPTIONAL_ROLES makes DiscoveryResult.all_matched
 #     False when ppl is unbound, which makes setup.html render its entity
-#     <select> with `required` — the browser will not submit step 3 and the
-#     operator assigns the entity from the device's own entity list.
+#     <select> with `required` — the browser will not submit step 3.
 #   * A LIVE install that predates this (ppl row empty) is not killed. It keeps
 #     running on its cached ppl, `unbound_ppl_circuits()` names the circuits,
-#     and /health/detail reports them under "metering" so the condition has a
-#     symptom for the first time.
+#     and /health/detail reports them under "metering".
 #
-# NOT DONE HERE, deliberately: Orchestrator._sync_ppl_and_watch is the place
-# that could call `mark_subsystem_degraded("flow_meter_ppl", ...)` and stop the
-# circuit's detector outright. That file is owned by another in-flight unit, so
-# this unit stops at the discovery boundary and leaves the runtime hook as a
-# named follow-up rather than editing across the seam.
+# Orchestrator._sync_ppl_and_watch could additionally call
+# `mark_subsystem_degraded("flow_meter_ppl", ...)` and stop the circuit's
+# detector outright. It does not today.
 
 #: Roles the optional-role rescan may FILL IN on an already-configured install.
-#: Superset of OPTIONAL_ROLES: `flow_meter_ppl` is required at setup but must
-#: still self-heal on an install that was set up before firmware 3.12.0 ever
-#: published the entity. merge_optional_roles is fill-only — it never overwrites
-#: a confirmed or non-empty mapping — so widening it cannot clobber anything.
+#: OPTIONAL_ROLES plus `flow_meter_ppl`, which is required at setup but must
+#: still self-heal on an install set up before firmware 3.12.0 published the
+#: entity. merge_optional_roles is fill-only — it never overwrites a confirmed
+#: or non-empty mapping — so widening this cannot clobber anything.
 RESCAN_FILLABLE_ROLES = OPTIONAL_ROLES | {PPL_ROLE}
 
 
 # ------------------------------------------------------------------
-# Role patterns — what entity name pattern maps to which role
-# for each circuit.  Patterns are matched case-insensitively against
-# the entity's original_name from the HA entity registry.
+# Role patterns — circuit → role → (name pattern, domain)
 # ------------------------------------------------------------------
-
-# Role → (name pattern, domain)
-# Pattern is matched against original_name (case-insensitive).
-# Domain narrows the match when multiple entities share a similar name.
+# Patterns are matched case-insensitively against the entity's original_name
+# from the HA entity registry; the domain narrows the match when several
+# entities share a similar name.
 #
-# Keys are now stable circuit IDs (circuit_1 / circuit_2).
-# Regex patterns still search for "main" and "irrigation" because those are
-# the keywords in the DEFAULT firmware entity names (e.g. "Main Water Valve",
-# "Water Flow Rate - Irrigation"). For firmware with non-default label
-# substitutions (e.g. duplex installs), these patterns will not match and
-# the setup wizard's manual entity assignment UI must be used instead.
+# The regexes search for "main" and "irrigation" because those are the keywords
+# in the DEFAULT firmware entity names (e.g. "Main Water Valve", "Water Flow
+# Rate - Irrigation"). Firmware with non-default label substitutions (e.g.
+# duplex installs) will not match them, and the setup wizard's manual entity
+# assignment UI must be used instead.
 #
-# Discovery priority: diagnostic Circuit ID/Label text sensors (added in
-# firmware v3.6+) are checked first; these regex patterns are the fallback
-# for older firmware without those sensors.
+# Discovery priority: the diagnostic Circuit ID/Label text sensors (firmware
+# v3.6+) are checked first; these regexes are the fallback for older firmware.
 ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
-    "circuit_1": {   # was "main" — regex patterns match default firmware names
+    "circuit_1": {   # regex patterns match the default firmware entity names
         "flow_sensor":             (r"water flow rate.*main",                           "sensor"),
         # Lookahead patterns — order-insensitive so "Water Pressure (Fast) Main" and
         # "Water Pressure Main (Fast)" both match without needing a regex update.
@@ -264,21 +234,20 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         # chunk drop count was added in 3.9.0 alongside the chunked streaming transport.
         "wf_overflow_count_sensor":   (r"waveform overflow dropped count.*main",       "sensor"),
         "wf_chunk_drop_count_sensor": (r"waveform chunk drop count.*main",             "sensor"),
-        # Phase 3 (3.1) — firmware waveform stage counters. These carry NO
-        # circuit keyword in the firmware (`name: "Waveform Captures Started"`),
-        # so there is nothing for _make_label_pattern to substitute and the
-        # entity_id fallback never fires either — original_name is the only
-        # thing that matches. Mapped under circuit_1 by convention, like the
-        # two counters above.
+        # Firmware waveform stage counters. These carry NO circuit keyword
+        # (`name: "Waveform Captures Started"`), so _make_label_pattern has
+        # nothing to substitute and the entity_id fallback never fires either —
+        # original_name is the only thing that matches. Mapped under circuit_1
+        # by convention, like the two counters above.
         "wf_captures_started_sensor": (r"waveform captures started",                   "sensor"),
         "wf_chunks_staged_sensor":    (r"waveform chunks staged",                      "sensor"),
         "wf_events_fired_sensor":     (r"waveform events fired",                       "sensor"),
-        # Phase 3 (3.2) — valve truth (end stops) + the valve-seal alert.
+        # Valve truth (end stops) + the valve-seal alert.
         "open_end_stop_sensor":       (r"open end stop.*main",                         "binary_sensor"),
         "closed_end_stop_sensor":     (r"closed end stop.*main",                       "binary_sensor"),
         "valve_seal_alert_sensor":    (r"valve seal alert.*main",                      "binary_sensor"),
     },
-    "circuit_2": {   # was "irrigation" — regex patterns match default firmware names
+    "circuit_2": {   # regex patterns match the default firmware entity names
         "flow_sensor":             (r"water flow rate.*irrigation",                           "sensor"),
         "pressure_fast_sensor":    (r"water pressure(?=.*irrigation)(?=.*fast)",              "sensor"),
         "pressure_avg_sensor":     (r"water pressure(?=.*irrigation)(?=.*averaged)",          "sensor"),
@@ -317,7 +286,6 @@ ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
         "leak_settle_number":         (r"leak test settle time.*irrigation|leak_settle_s_irr\b",               "number"),
         # Runtime per-circuit flow-meter pulses-per-litre (firmware 3.12.0+).
         "flow_meter_ppl":             (r"flow meter ppl.*irrigation|ppl_irr\b",                                "number"),
-        # Phase 3 (3.2) — valve truth (end stops) + the valve-seal alert.
         # The firmware ids are open_end_stop_valve2 / closed_end_stop_valve2,
         # but HA derives the entity_id from the NAME ("Open End Stop -
         # Irrigation"), so the display term is what matches on both tiers.
@@ -370,11 +338,10 @@ class DiscoveredDevice:
     def firmware_ok(self) -> bool:
         """True ONLY when sw_version was parsed and meets MIN_FIRMWARE_VERSION.
 
-        This used to return True for an unknown/non-numeric version, so "we
-        could not tell" was rendered identically to "verified good". It is now
-        strictly a positive statement. Use :attr:`firmware_blocks_setup` for
-        the "may this device proceed" question — an unverifiable version is not
-        ok, but it is not a reason to refuse either.
+        Strictly a positive statement: an unverifiable version is not ok, but
+        it is not a reason to refuse either. Use
+        :attr:`firmware_blocks_setup` for the "may this device proceed"
+        question.
         """
         return self.firmware_status == "ok"
 
@@ -468,8 +435,7 @@ def find_matching_devices(
 # The four diagnostic identity sensors are the ONLY entities on the device
 # whose own names are not `${circuit_N_name}`-interpolated — the firmware
 # hardcodes "Circuit 1 ID" / "Circuit 1 Label" / "Circuit 2 ID" / "Circuit 2
-# Label". That makes them the only rename-stable handles the add-on has, which
-# is exactly what they were added for. Anchor on them.
+# Label". They are the only rename-stable handles the add-on has.
 _CIRCUIT_ID_SENSOR_RE = re.compile(r"circuit\s+(\d+)\s+id\b", re.IGNORECASE)
 _CIRCUIT_LABEL_SENSOR_RE = re.compile(r"circuit\s+(\d+)\s+label\b", re.IGNORECASE)
 #: The ID sensor publishes a literal circuit key ("circuit_1"). Anything else
@@ -497,14 +463,13 @@ async def resolve_circuit_identity(
     rather than to the ordinal in the sensor's name. The Label sensor is paired
     to it by that ordinal (both are hardcoded "Circuit N ..." names).
 
-    The second return value is the point of the split: a device can report
-    "circuit_1 exists" while its Label sensor is still `unknown` (both template
-    sensors have `update_interval: 60s`, so there is a real window after boot
-    where identity is known and the label is not). Previously that produced an
-    empty labels dict and the caller could not tell it apart from "older
-    firmware, no diagnostic sensors" — it just fell back to the "main" /
-    "irrigation" regexes, which is the path that fails silently on a renamed
-    circuit. Callers can now distinguish the two.
+    The second return value exists because a device can report "circuit_1
+    exists" while its Label sensor is still `unknown` (both template sensors
+    have `update_interval: 60s`, so there is a real window after boot where
+    identity is known and the label is not). Without it that case is
+    indistinguishable from "older firmware, no diagnostic sensors", which falls
+    back to the "main"/"irrigation" regexes — the path that fails silently on a
+    renamed circuit.
 
     Returns ``({}, [])`` when no diagnostic sensors are present at all.
     """
@@ -563,9 +528,8 @@ async def _resolve_labels_from_diagnostics(
     ha,
     entity_registry_entities: List[Dict[str, Any]],
 ) -> Dict[str, str]:
-    """{circuit_id: label} from the diagnostic sensors — see
-    :func:`resolve_circuit_identity`, of which this is the labels-only view
-    kept for existing callers."""
+    """{circuit_id: label} from the diagnostic sensors — the labels-only view
+    of :func:`resolve_circuit_identity`."""
     labels, _seen = await resolve_circuit_identity(ha, entity_registry_entities)
     return labels
 
@@ -609,15 +573,12 @@ def match_entities_to_roles(
         (circuit_matches, esp_device_prefix)
     """
     labels = labels or {}
-    # Filter to entities belonging to this device
     device_entities = [e for e in entities if e.get("device_id") == device_id]
 
     log.info("Device %s has %d registered entities",
              device_id, len(device_entities))
 
-    # Derive ESP device prefix from entity IDs
-    # Entity IDs look like: sensor.esp_water_shut_off_3_water_flow_rate_main
-    # Prefix is: esp_water_shut_off_3_
+    # sensor.esp_water_shut_off_3_water_flow_rate_main → esp_water_shut_off_3_
     prefix = _derive_prefix(device_entities)
 
     circuit_matches: Dict[str, List[EntityMatch]] = {}
@@ -712,25 +673,21 @@ def _derive_prefix(entities: List[Dict[str, Any]]) -> str:
     extracts 'esp_water_shut_off_3_'
     """
     # Known suffixes used to strip the device prefix from entity IDs, in
-    # PREFERENCE order. Each suffix is tried against ALL entities before
-    # falling through to the next — iterating entities first made the result
-    # depend on registry order: `button.<prefix>reset_safety_fault_main` also
-    # ends with "safety_fault_main", and when the registry yielded it before
-    # the real fault binary_sensor the derived prefix gained a bogus
-    # "reset_" tail. That wrong prefix then broke the waveform accumulator's
-    # expected-node check (chunk rejected — node != expected) and any other
-    # prefix consumer. "water_flow_rate_*" have no such trap variants, so
-    # they are tried first and effectively always win.
+    # PREFERENCE order. Each suffix MUST be tried against ALL entities before
+    # falling through to the next: with entities in the outer loop the result
+    # depends on registry order, because `button.<prefix>reset_safety_fault_main`
+    # also ends with "safety_fault_main" and yields a prefix with a bogus
+    # "reset_" tail — which breaks the waveform accumulator's expected-node
+    # check (chunk rejected — node != expected) and every other prefix
+    # consumer. "water_flow_rate_*" have no such trap variants.
     # If the firmware adds new entity types, extend this list or switch to
     # a longest-common-prefix approach across all device entity IDs.
     known_suffixes = [
-        # 2.3 unit 0.9 — the four diagnostic identity sensors first. Every other
-        # suffix below is `${circuit_N_name}`-derived, so renaming a circuit
-        # deletes ALL of them and the prefix silently becomes "" (which, per the
-        # note at the bottom of this function, DISABLES the waveform
-        # node-identity check). The firmware hardcodes these four names, so they
-        # survive any rename. They also have no trap variants: nothing else on
-        # the device ends in "circuit_1_id".
+        # The four diagnostic identity sensors first: every other suffix below
+        # is `${circuit_N_name}`-derived, so renaming a circuit deletes ALL of
+        # them and the prefix silently becomes "" (which, per the note at the
+        # bottom of this function, DISABLES the waveform node-identity check).
+        # These four are hardcoded in firmware and have no trap variants.
         "circuit_1_id",
         "circuit_2_id",
         "circuit_1_label",
@@ -749,21 +706,20 @@ def _derive_prefix(entities: List[Dict[str, Any]]) -> str:
     ]
     for suffix in known_suffixes:
         for local in locals_:
-            # e.g. esp_water_shut_off_3_water_flow_rate_main
             if local.endswith(suffix) and len(local) > len(suffix):
                 prefix = local[: len(local) - len(suffix)]
                 if prefix:
                     log.debug("Derived ESP prefix: %r", prefix)
                     return prefix
 
-    # Phase 3 (3.2) — this return was SILENT, and it is not a harmless one.
-    # The empty string is stored as device_config.esp_device_prefix, becomes
-    # the waveform accumulator's `expected_node`, and the accumulator's
-    # identity guard reads `if self._expected_node and node != ...` — so an
-    # empty prefix does not reject chunks, it DISABLES the node-identity check
-    # for the life of the process, with no log line and no UI difference.
-    # Say so here, and see WaveformChunkAccumulator.transport_stats()
-    # ("node_check_enabled"), which is where /health/detail reads it back.
+    # An empty prefix is not harmless: it is stored as
+    # device_config.esp_device_prefix and becomes the waveform accumulator's
+    # `expected_node`, whose identity guard reads
+    # `if self._expected_node and node != ...`. So an empty prefix does not
+    # reject chunks — it DISABLES the node-identity check for the life of the
+    # process, with no other symptom. Hence the warning.
+    # WaveformChunkAccumulator.transport_stats() ("node_check_enabled") is
+    # where /health/detail reads it back.
     log.warning(
         "Could not derive an ESP device prefix from %d entity id(s) — none "
         "ended in a known suffix (%s). The waveform node-identity check will "
@@ -814,13 +770,12 @@ def save_discovery(
 
         db.execute("DELETE FROM circuit_entity_map")
 
-        # Clear fixture data from the previous setup so stale clusters and fixtures
-        # don't bleed through into the new setup's labelling flow.
+        # Clear fixture data from the previous setup so stale clusters and
+        # fixtures don't bleed into the new setup's labelling flow.
         db.execute("DELETE FROM fixture_clusters")
         # fixture_ha_entity_map and fixture_daily_summary reference fixtures(id)
-        # without ON DELETE CASCADE, so they must be cleared before deleting fixtures.
-        # NOTE: MQTT Discovery entities already published to HA are not retracted here
-        # — the setup wizard does not perform HA teardown on reset.
+        # without ON DELETE CASCADE, so they must be cleared first. MQTT
+        # Discovery entities already published to HA are NOT retracted here.
         db.execute("DELETE FROM fixture_daily_summary")
         # events.fixture_id references fixtures(id) with no ON DELETE action,
         # so events must be unlinked BEFORE fixtures are deleted.
@@ -840,21 +795,16 @@ def save_discovery(
     bump_setup_complete_epoch()
 
 
-# ── dev57 (2.18) — wizard-completion epoch ──────────────────────────────────
-# is_setup_complete() below is a real SQLite SELECT, and ingress_middleware ran
-# it on the EVENT-LOOP thread for every non-setup request (app.js polls
-# /api/dashboard/live every 5 s per open tab) — the highest-frequency instance
-# of the single-connection violation dev46 (46a) exists to prevent. The
-# Orchestrator now keeps the answer in memory; this counter is how that cache
-# learns it is stale.
-#
-# Why a module counter rather than only calling an invalidation method at each
-# writer: every statement that writes device_config.setup_complete lives in
-# THIS module (save_discovery, mark_setup_complete, unmark_setup_complete), so
-# bumping here covers all of them — including Settings → Re-run Setup, which
-# reaches the column only through unmark_setup_complete(). A cache carrying an
-# older epoch is treated as unknown and re-read; it can never answer from a
-# value that predates a write.
+# ── Wizard-completion epoch ─────────────────────────────────────────────────
+# is_setup_complete() below is a real SQLite SELECT, and ingress_middleware
+# would otherwise run it on the EVENT-LOOP thread for every non-setup request
+# (app.js polls /api/dashboard/live every 5 s per open tab). The Orchestrator
+# keeps the answer in memory; this counter is how that cache learns it is
+# stale. A module counter rather than a per-writer invalidation call because
+# every statement that writes device_config.setup_complete lives in THIS module
+# (save_discovery, mark_setup_complete, unmark_setup_complete). A cache
+# carrying an older epoch is treated as unknown and re-read, so it can never
+# answer from a value that predates a write.
 _SETUP_COMPLETE_EPOCH = 0
 
 
@@ -1046,11 +996,11 @@ class OptionalRoleRescanResult:
 
 def _rescan_writes_sync(db, circuits, circuit_matches, target_device,
                         _prefix) -> dict:
-    """dev46 (46a) — every write behind an optional-role rescan, one hop.
+    """Every write behind an optional-role rescan, in one DB hop.
 
     Re-reads device_config first: the caller's copy predates the HA registry
     fetch, and both "update if changed" writes below must compare against
-    current state (see the hop-2 note at the call site).
+    current state.
     """
     cfg = get_device_config(db) or {}
     prefix_updated = False
@@ -1067,7 +1017,6 @@ def _rescan_writes_sync(db, circuits, circuit_matches, target_device,
             stored_prefix, _prefix,
         )
 
-    # Merge optional roles per circuit, counting new rows
     per_circuit: Dict[str, int] = {}
     total_changed = 0
     for circuit in circuits:
@@ -1137,7 +1086,6 @@ async def rescan_optional_roles(
         log.warning("rescan_optional_roles: failed to query HA — %s", exc)
         return zero
 
-    # Find the target DiscoveredDevice
     target_device: Optional[DiscoveredDevice] = None
     for raw in devices:
         d = _to_device(raw)
@@ -1152,37 +1100,31 @@ async def rescan_optional_roles(
         )
         return zero
 
-    # Filter entity registry to this device only (prevent cross-device contamination)
+    # Device-scoped, to prevent cross-device contamination.
     device_entities = [e for e in entity_registry if e.get("device_id") == ha_device_id]
 
-    # Resolve diagnostic circuit labels scoped to this device's entities
     try:
         diag_labels = await _resolve_labels_from_diagnostics(ha, device_entities)
     except Exception as exc:  # pragma: no cover
         log.warning("rescan_optional_roles: label resolution failed — %s", exc)
         diag_labels = {}
 
-    # Match entities to roles (uses device-scoped entity list)
     circuit_matches, _prefix = match_entities_to_roles(
         ha_device_id, device_entities, circuits, labels=diag_labels
     )
 
-    # Heal a stale/mis-derived esp_device_prefix. The prefix is only otherwise
-    # written by save_discovery (setup wizard), so a bad stored value — e.g.
-    # the registry-order bug that glued "reset_" onto the prefix — persisted
-    # across restarts and kept the waveform accumulator rejecting every chunk
-    # (expected-node check). Same pattern as the fw_version heal below.
-    # dev46 (46a): every write in this function lands AFTER the HA fetches
-    # above and they are contiguous — one hop, one transaction.
+    # Heal a stale/mis-derived esp_device_prefix. The prefix is otherwise only
+    # written by save_discovery (setup wizard), so a bad stored value persists
+    # across restarts and keeps the waveform accumulator rejecting every chunk
+    # on its expected-node check.
     #
-    # HOP-2 RE-CHECK (named): _rescan_writes_sync RE-READS device_config
-    # inside the write callable and compares against THAT, not against the
-    # `cfg` captured before the awaits. Both the prefix and fw_version writes
-    # are "update if different from stored", so a setup-wizard save_discovery
-    # landing during the registry fetch would otherwise be silently
-    # overwritten from stale premises. merge_optional_roles needs no re-check
-    # — it never overwrites a confirmed or non-empty mapping, so it is
-    # fill-only (monotonic exemption class).
+    # HOP-2 RE-CHECK: _rescan_writes_sync RE-READS device_config inside the
+    # write callable and compares against THAT, not against the `cfg` captured
+    # before the awaits. Both the prefix and fw_version writes are "update if
+    # different from stored", so a setup-wizard save_discovery landing during
+    # the registry fetch would otherwise be overwritten from stale premises.
+    # merge_optional_roles needs no re-check — it never overwrites a confirmed
+    # or non-empty mapping, so it is fill-only.
     from .database import run_db
     _w = await run_db(_rescan_writes_sync, db, circuits, circuit_matches,
                       target_device, _prefix)

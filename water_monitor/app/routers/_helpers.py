@@ -1,7 +1,7 @@
 """Shared helpers for routers.
 
-Async-safety convention (plan C-IQ-4 follow-up)
-================================================
+Async-safety convention
+=======================
 
 sqlite3 is sync. Multi-second queries inside an `async def` path
 block the event loop and stall every other ingress request for the
@@ -26,12 +26,11 @@ Use `run_blocking(fn, *args, **kwargs)` for one-off offloads. For
 hot paths, extract a `_xxx_sync(...)` helper that bundles ALL the
 sync DB calls so the executor hop happens once.
 
-dev46 (46a) — run_blocking is DB-ONLY
--------------------------------------
-Every caller of `run_blocking` passes a helper that takes `orch.db`,
-so it now dispatches to `database.run_db()` — the single-thread DB
-executor. The shared connection is `check_same_thread=False` and must
-be touched from exactly ONE thread, ever.
+run_blocking is DB-ONLY
+-----------------------
+`run_blocking` dispatches to `database.run_db()` — the single-thread
+DB executor. The shared connection is `check_same_thread=False` and
+must be touched from exactly ONE thread, ever.
 
 Blocking work that does NOT touch the DB (HA I/O, file writes,
 subprocess) must NOT use this helper — call
@@ -42,8 +41,8 @@ submit to `run_db` and wait (single worker → deadlock) — it would
 also create a re-entrancy foot-gun.
 
 
-HTTP status-code convention (plan C-IQ-24)
-==========================================
+HTTP status-code convention
+===========================
 
 Routers should follow these codes consistently. If you find yourself
 reaching for something outside this list, add a comment explaining why.
@@ -102,11 +101,9 @@ T = TypeVar("T")
 async def run_blocking(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """Run a blocking **DB** helper on the single DB thread and await it.
 
-    dev46 (46a): dispatches to ``database.run_db`` — the one-worker DB
-    executor — so page renders can never touch the shared connection
-    concurrently with startup/reseed work (the 8/15 + 8/16
-    ``InterfaceError``). All four callers pass ``orch.db``-taking
-    helpers, so the wholesale routing is correct.
+    Dispatches to ``database.run_db`` — the one-worker DB executor — so
+    page renders can never touch the shared connection concurrently with
+    startup/reseed work (the 8/15 + 8/16 ``InterfaceError``).
 
     NOT for non-DB blocking work: see the module docstring.
     """
@@ -116,29 +113,27 @@ async def run_blocking(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
 
 def startup_gate(request: Request, page: str, title: str,
                  retry_path: str):
-    """dev46 (46c) — readiness gate for pages with heavy DB work.
+    """Readiness gate for pages with heavy DB work.
 
     Returns a rendered "still starting" response when the orchestrator's
     startup replay is still running, else ``None`` (caller proceeds).
 
-    Why a PROACTIVE check rather than an exception handler: 46a routes every
-    DB touch through ONE worker thread, so a page opened during startup no
-    longer 500s with an ``InterfaceError`` — it QUEUES behind the boot pass.
-    Checking readiness BEFORE submitting means the user gets an instant,
-    honest answer instead of a request that hangs until it times out.
+    PROACTIVE rather than an exception handler: every DB touch goes through
+    ONE worker thread, so a page opened during startup QUEUES behind the boot
+    pass instead of failing. Checking readiness BEFORE submitting gives the
+    user an instant, honest answer instead of a request that hangs.
 
     Wording is shared with the Water Use page's 'starting' flash so the
     add-on says the same thing wherever this state surfaces.
     """
     orch = getattr(request.app.state, "orchestrator", None)
-    # dev46 (46k) — `startup_pages_ready`, NOT `startup_cluster_work_done`.
-    # The two answer different questions and the difference is ~145 s: the
-    # cluster-work flag means "every job that touches cluster references has
-    # finished" (what the repair route and the study export need), while a
-    # page only needs the cluster engine rebuilt and wired. Gating pages on
-    # the stricter flag is what kept the operator staring at a notice — or,
-    # before the flag was initialised at all, at a spinner — for the whole
-    # background classification pass.
+    # `startup_pages_ready`, NOT `startup_cluster_work_done`. The two answer
+    # different questions and the difference is ~145 s: the cluster-work flag
+    # means "every job that touches cluster references has finished" (what the
+    # repair route and the study export need), while a page only needs the
+    # cluster engine rebuilt and wired. Gating pages on the stricter flag
+    # leaves the operator staring at a notice for the whole background
+    # classification pass.
     if orch is None or getattr(orch, "startup_pages_ready", True):
         return None
     templates = request.app.state.templates

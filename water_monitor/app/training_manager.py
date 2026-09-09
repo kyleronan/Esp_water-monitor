@@ -4,11 +4,8 @@ Training state machine.
 States:
   idle         — no training in progress
   calibrating  — collecting events, timer running
-  labelling    — training period ended, user reviewing clusters (Phase 2)
+  labelling    — training period ended, user reviewing clusters
   live         — fixture library active, anomaly detection running
-
-Phase 1 implements idle → calibrating → live directly
-(skipping labelling until Phase 2 clustering is available).
 
 Publishes HA sensor entities for each circuit:
   sensor.water_training_status_<circuit>
@@ -32,13 +29,13 @@ from .ha_client import HaClient
 
 log = logging.getLogger(__name__)
 
-# Startup defaults vs. a concurrent heavy admin write (dev34). A user-triggered
-# regime recalibration / recompute runs on a private connection under the write
-# lock and can hold the SQLite file lock for tens of seconds — longer than the
-# 5 s busy_timeout. Before this, the resulting OperationalError crashed the
-# whole supervised training task, which restarted every 5 s and collided again
-# for the duration of the admin job (observed 2026-08-03: ~8 crash cycles).
-# Wait it out instead — ensure_circuit_defaults is idempotent.
+# Startup defaults vs. a concurrent heavy admin write. A user-triggered regime
+# recalibration / recompute runs on a private connection under the write lock
+# and can hold the SQLite file lock for tens of seconds — longer than the 5 s
+# busy_timeout. An OperationalError here kills the supervised training task,
+# which restarts every 5 s and collides again for the duration of the admin job
+# (~8 crash cycles, 2026-08-03). Wait it out — ensure_circuit_defaults is
+# idempotent.
 _INIT_LOCK_RETRIES: int = 12
 _INIT_LOCK_BACKOFF_S: float = 5.0
 
@@ -47,11 +44,10 @@ _INIT_LOCK_BACKOFF_S: float = 5.0
 # for the user to review clusters.
 LABELLING_AUTO_TIMEOUT_DAYS = 7
 
-# When a circuit has passed its calibration deadline but hasn't collected enough
-# events, re-checking happens every 60 s poll — but re-warning that often is
-# pointless for a sparse circuit (e.g. irrigation that only runs every few days).
-# Instead, stay quiet for roughly one observed inter-event interval between
-# warnings. These bound that quiet period.
+# A circuit past its calibration deadline but short on events is re-checked on
+# every 60 s poll; re-warning that often is pointless for a sparse circuit (e.g.
+# irrigation that only runs every few days). These bound a quiet period of
+# roughly one observed inter-event interval between warnings.
 RECHECK_GAP_FACTOR       = 1.25        # head-room past the median inter-event gap
 RECHECK_MIN_SECONDS      = 3600        # 1 h  — hard anti-spam floor
 RECHECK_MAX_SECONDS      = 7 * 86400   # 7 d  — cap on the quiet period
@@ -93,7 +89,7 @@ class TrainingManager:
         # sits loading that whole time, so users re-click, and two concurrent
         # _work() bodies on one connection die with sqlite3.InterfaceError
         # ("bad parameter or other API misuse") mid-backfill — observed
-        # 2026-08-15 11:56. One lock for ALL circuits: the engine + connection
+        # 2026-08-15. One lock for ALL circuits: the engine + connection
         # are shared, so even different-circuit re-seeds must not overlap.
         self._reseed_lock = asyncio.Lock()
 
@@ -102,18 +98,15 @@ class TrainingManager:
 
     async def run(self) -> None:
         """Background loop — check calibration progress every 60s."""
-        # Initial setup. A heavy admin write (regime recalibration, recompute)
-        # triggered while startup is still running can hold the SQLite write
-        # lock for longer than the 5 s busy_timeout — and an OperationalError
-        # here crashed the whole supervised task, which then retried every 5 s
-        # and collided again for as long as the admin job ran. Wait it out
-        # instead: the defaults are idempotent and nothing downstream needs
-        # them in the first seconds.
+        # Initial setup. Retry rather than fail: a heavy admin write can hold
+        # the SQLite write lock past the busy_timeout (see _INIT_LOCK_RETRIES),
+        # the defaults are idempotent, and nothing downstream needs them in the
+        # first seconds.
         for circuit_cfg in self._cfg.circuits:
             for attempt in range(_INIT_LOCK_RETRIES):
                 try:
-                    # dev46 (46a): one hop per attempt; the backoff sleep
-                    # stays on the loop so it never blocks the DB worker.
+                    # One hop per attempt; the backoff sleep stays on the
+                    # loop so it never blocks the DB worker.
                     await run_db(ensure_circuit_defaults, self._db,
                                  circuit_cfg.circuit, circuit_cfg.circuit_type)
                     break
@@ -155,15 +148,15 @@ class TrainingManager:
     def _reconcile_calibration_thresholds(self) -> None:
         """Lower stale ``minimum_events`` for in-progress calibrations.
 
-        Earlier builds applied the whole-home event target to every
-        circuit, leaving low-traffic zone (irrigation) circuits unable to
-        ever reach it — they froze at a time-capped 100% forever. For any
-        circuit still ``calibrating``, recompute the type-aware target and
-        lower the stored value if it now sits below the old one. Only ever
-        lower it, never raise, so a mid-run fixture circuit can't be
-        re-stuck. ``started_at``/``calibration_ends_at``/``events_collected``
-        are left untouched; the next ``_check_progress`` tick completes any
-        circuit whose time has already elapsed.
+        Rows written before the target became type-aware carry the whole-home
+        event target, which a low-traffic zone (irrigation) circuit can never
+        reach — it freezes at a time-capped 100% forever. For any circuit still
+        ``calibrating``, recompute the type-aware target and lower the stored
+        value if it now sits below the old one. Only ever lower, never raise,
+        so a mid-run fixture circuit can't be re-stuck.
+        ``started_at``/``calibration_ends_at``/``events_collected`` are left
+        untouched; the next ``_check_progress`` tick completes any circuit
+        whose time has already elapsed.
         """
         profile = get_home_profile(self._db)
         for circuit_cfg in self._cfg.circuits:
@@ -182,7 +175,7 @@ class TrainingManager:
             current_min = state_row["minimum_events"] or 0
             if new_min < current_min:
                 # Already ON the DB thread — this whole method is submitted via
-                # run_db by its caller (N2b: no re-entry from inside a callable).
+                # run_db by its caller — no re-entry from inside a callable.
                 upsert_training_state(
                     self._db, circuit, minimum_events=new_min)
                 log.info(
@@ -190,11 +183,10 @@ class TrainingManager:
                     circuit, current_min, new_min, circuit_kind)
 
     def _set_reseed_marker(self, circuit: str, active: bool) -> None:
-        """dev42 (F-C2) — persisted reseed-in-progress marker. Set at
-        clear-time, cleared ONLY on success: a crash mid-replay leaves it
-        stamped, and the boot / post-rebuild health checks warn loudly that
-        the model is untrusted until a rerun succeeds. Best-effort on a
-        pre-20260808 schema."""
+        """Persisted reseed-in-progress marker. Set at clear-time, cleared
+        ONLY on success: a crash mid-replay leaves it stamped, and the boot /
+        post-rebuild health checks warn loudly that the model is untrusted
+        until a rerun succeeds. Best-effort — older schemas lack the column."""
         from datetime import datetime, timezone
         try:
             self._db.execute(
@@ -208,17 +200,16 @@ class TrainingManager:
                         circuit, e)
 
     def _clear_unconfirmed_clusters(self, circuit: str) -> int:
-        """dev42 (U4) — delete this circuit's unconfirmed cluster rows AND
-        null their event references in the same transaction, mirroring
-        ``delete_cluster``'s semantics.
+        """Delete this circuit's unconfirmed cluster rows AND null their event
+        references in the same transaction, mirroring ``delete_cluster``'s
+        semantics.
 
-        The old bare DELETE left events pointing at the removed rows — and
-        because the engine's id map is rebuilt from those events' stored
-        votes, live matching kept assigning NEW events to the dead ids: the
-        self-perpetuating orphan loop behind the 990 → 1,772
-        events_orphaned climb (clusters 42/43 after the 8/15
-        reseed→recalibrate sequence). Confirmed clusters
-        (fixture_id IS NOT NULL) are untouched."""
+        Both halves are required. A bare DELETE leaves events pointing at the
+        removed rows, and because the engine's id map is rebuilt from those
+        events' stored votes, live matching keeps assigning NEW events to the
+        dead ids — a self-perpetuating orphan loop (observed: events_orphaned
+        990 → 1,772). Confirmed clusters (fixture_id IS NOT NULL) are
+        untouched."""
         unref = self._db.execute(
             "UPDATE events SET cluster_id = NULL, match_confidence = NULL, "
             "       match_level = NULL "
@@ -273,7 +264,7 @@ class TrainingManager:
             return True
 
         circuit_cfg = self._cfg.get_circuit(circuit)
-        # dev46 (46a): profile + circuit kind are adjacent reads — one hop.
+        # Profile + circuit kind are adjacent reads — one hop.
         _pk = await run_db(self._profile_and_kind_sync, circuit,
                            circuit_cfg.circuit_type if circuit_cfg else "fixture")
         profile, circuit_kind = _pk["profile"], _pk["kind"]
@@ -401,8 +392,8 @@ class TrainingManager:
             completed_at=now.isoformat(),
         )
         await self._publish_status(circuit)
-        # Phase 1: fit the per-home rule bands off this home's labels and FREEZE
-        # them + the cluster engine. The reference is now locked — live events match
+        # Fit the per-home rule bands off this home's labels and FREEZE them +
+        # the cluster engine. The reference is now locked — live events match
         # against it but never reshape it (the basis for leak / odd-usage detection).
         report = await self._fit_and_lock(circuit, source="activation")
         await self._notify_calibration_report(circuit, report)
@@ -418,9 +409,9 @@ class TrainingManager:
         activation sanity gate (in rule_calibration.fit_and_freeze) can never be skipped.
 
         The private ``conn`` (never the shared orch.db) keeps these heavy reclassify /
-        freeze writes off the live async writers — sharing the orchestrator connection
-        across this executor thread was the SQLITE_MISUSE ("bad parameter or other API
-        misuse") that silently skipped post-lock reclassify + anomaly rescore."""
+        freeze writes off the live async writers: sharing the orchestrator connection
+        across this executor thread raises SQLITE_MISUSE ("bad parameter or other API
+        misuse") and silently skips the post-lock reclassify + anomaly rescore."""
         from .rule_calibration import fit_and_freeze
         from .database import reclassify_all_events_from_signatures
         # Regime-aware: fit the bands for the CURRENT supply regime (falls back
@@ -437,7 +428,7 @@ class TrainingManager:
         except Exception as e:
             log.warning("[%s] post-lock reclassify failed (non-fatal): %s",
                         circuit, e)
-        # Phase 2: freeze the per-home usage baselines (envelopes + overall volume
+        # Freeze the per-home usage baselines (envelopes + overall volume
         # percentiles) AFTER reclassify so matched types are fresh. Frozen reference
         # for future leak / odd-usage detection.
         try:
@@ -446,7 +437,7 @@ class TrainingManager:
         except Exception as e:
             log.warning("[%s] usage-baseline freeze failed (non-fatal): %s",
                         circuit, e)
-        # Phase 2.4: freeze the per-home artifact-detector thresholds (phantom /
+        # Freeze the per-home artifact-detector thresholds (phantom /
         # cross-talk / dribble identifiers), safety-gated so a calibration can never
         # zero a confirmed-real event. Applies to new events + future recomputes.
         try:
@@ -455,11 +446,11 @@ class TrainingManager:
         except Exception as e:
             log.warning("[%s] artifact-threshold freeze failed (non-fatal): %s",
                         circuit, e)
-        # Phase 2.3: re-score anomalies now the baseline is frozen. The FIRST
-        # reclassify ran before the baseline existed (it had to — the baseline is fit
-        # FROM its matched types), so its anomaly verdicts were inert. This second
-        # pass scores history against the freshly-frozen baseline (the freeze
-        # invalidated the cache; invalidate again defensively). Idempotent on types.
+        # Re-score anomalies now the baseline is frozen. The FIRST reclassify runs
+        # before the baseline exists (it has to — the baseline is fit FROM its
+        # matched types), so its anomaly verdicts are inert. This second pass scores
+        # history against the freshly-frozen baseline (the freeze invalidated the
+        # cache; invalidate again defensively). Idempotent on types.
         try:
             from .anomaly_baseline import invalidate_baseline_cache
             invalidate_baseline_cache(circuit)
@@ -480,15 +471,15 @@ class TrainingManager:
         from .database import start_job, finish_job, run_isolated_write
         circuit_cfg = self._cfg.get_circuit(circuit)
         label = circuit_cfg.label if circuit_cfg else circuit
-        # §2.4 — track the (slow) re-lock so the UI can toast its success/failure.
+        # Track the (slow) re-lock so the UI can toast its success/failure.
         # Covers BOTH activation and the dev retrain (both route through here).
         job = await run_db(start_job, self._db, "calibration", circuit,
                            f"Calibrating {label}…")
         try:
             # Private connection + write lock (run_isolated_write) so the fit /
             # reclassify / freeze writes never share the orchestrator connection with
-            # the live async writers — the SQLITE_MISUSE that silently skipped
-            # post-lock reclassify + anomaly rescore. Mirrors feature_extractor /
+            # the live async writers — that sharing raises SQLITE_MISUSE and silently
+            # skips post-lock reclassify + anomaly rescore. Mirrors feature_extractor /
             # maturity_recheck, which use the same helper for the same reason.
             report = await run_isolated_write(
                 DB_PATH,
@@ -497,7 +488,7 @@ class TrainingManager:
                         if isinstance(r, dict) and r.get("status") == "fit")
             await run_db(finish_job, self._db, job, "done",
                          f"{label}: calibration locked ({n_fit} home-fit)")
-            # P6: validate the just-frozen detectors against HA history (diagnostic
+            # Validate the just-frozen detectors against HA history (diagnostic
             # only — never writes a threshold). Best-effort; a failure must not affect
             # the freeze.
             try:
@@ -583,12 +574,13 @@ class TrainingManager:
             log.warning("[%s] calibration report notify failed: %s", circuit, e)
 
     def _reseed_prepare_sync(self, eng, circuit: str, since_ts: str) -> int:
-        """dev46 (46a) — everything a reseed does BEFORE the replay, one hop.
+        """Everything a reseed does BEFORE the replay, one hop.
 
-        F-C2 marker, F-C1 deferral, the pressure-blind mode persist, and the
-        stale-assignment clear. One transaction: a crash between the marker
-        and the clear would otherwise leave the model half-torn with nothing
-        recording it. Returns the number of assignments cleared.
+        The in-progress marker, the live-match deferral, the pressure-blind
+        mode persist, and the stale-assignment clear. One transaction: a crash
+        between the marker and the clear would otherwise leave the model
+        half-torn with nothing recording it. Returns the number of assignments
+        cleared.
         """
         self._set_reseed_marker(circuit, True)      # F-C2, at clear
         eng.begin_reseed(circuit)                   # F-C1 defer
@@ -608,12 +600,12 @@ class TrainingManager:
 
     async def reseed_clusters_for_regime(self, circuit: str,
                                          since_ts: str) -> Dict[str, Any]:
-        """dev34 B2 — rebuild this circuit's cluster space from PUMP-ERA events
-        only, in the pressure-blind feature space.
+        """Rebuild this circuit's cluster space from PUMP-ERA events only, in
+        the pressure-blind feature space.
 
-        Why rebuild_from_db can't do this: it replays only rows that already
-        HAVE a cluster_id, so once live matching stops (the 2026-07 pump moved
-        the features out of every learned band), the replay pool drains and
+        rebuild_from_db cannot do this: it replays only rows that already HAVE
+        a cluster_id, so once live matching stops (the 2026-07 pump moved the
+        features out of every learned band), the replay pool drains and
         'no_centers' becomes permanent — production sat at 0% assignment with
         no cluster gaining a member after 07-21. This function replays the
         post-anchor events through learning instead, with every
@@ -642,18 +634,17 @@ class TrainingManager:
                              "wait for it to finish, then retry if needed"}
         eng = self.cluster_engine
 
-        # dev42 (F1): the replay runs ON the event loop in chunks — the 8/15
-        # crash was the executor thread and the loop sharing one SQLite
-        # connection (InterfaceError). dev42 (F2): any failure returns
-        # {"error": ...} instead of a raw 500. dev42 (F-C1/F-C2): live
-        # matches defer while the model is half-built, and a persisted
-        # marker survives a crash so an incomplete reseed is loud.
+        # The replay runs ON the event loop in chunks: an executor thread and
+        # the loop sharing one SQLite connection dies with InterfaceError. Any
+        # failure returns {"error": ...} instead of a raw 500. Live matches
+        # defer while the model is half-built, and a persisted marker survives
+        # a crash so an incomplete reseed is loud.
         async with self._reseed_lock:
             try:
-                # dev46 (46a): marker stamp, engine mode persist and the
-                # stale-assignment clear are one contiguous DB run — ONE hop,
-                # one transaction, so a crash cannot leave the marker set
-                # without the clear (or vice versa).
+                # Marker stamp, engine mode persist and the stale-assignment
+                # clear are one contiguous DB run — ONE hop, one transaction,
+                # so a crash cannot leave the marker set without the clear (or
+                # vice versa).
                 cleared = await run_db(self._reseed_prepare_sync, eng,
                                        circuit, since_ts)
                 eng.reset_circuit(circuit)
@@ -665,9 +656,9 @@ class TrainingManager:
                 assigned = await eng.backfill_unmatched_async(
                     circuit, since_ts=since_ts)
                 eng.freeze_circuit(circuit)
-                # F-C1 flush: live events that arrived mid-replay were
-                # stamped 'reseed_deferred' — re-match them through the
-                # COMPLETED model now.
+                # Live events that arrived mid-replay were stamped
+                # 'reseed_deferred' — re-match them through the COMPLETED
+                # model now.
                 eng.end_reseed(circuit)
                 flushed = await eng.backfill_unmatched_async(
                     circuit, since_ts=since_ts, only_deferred=True)
@@ -675,11 +666,11 @@ class TrainingManager:
                 result = {"cleared": cleared, "assigned": assigned,
                           "flushed": flushed}
             except Exception as e:
-                # F2: no raw ASGI 500. F-C2: the marker stays SET — the model
-                # is part-cleared and untrusted until a rerun succeeds; the
-                # boot/health check warns loudly. F-C1: the deferral flag
-                # also deliberately stays on (see begin_reseed) so a
-                # half-built model never matches live traffic.
+                # No raw ASGI 500. The marker stays SET — the model is
+                # part-cleared and untrusted until a rerun succeeds and the
+                # boot/health check warns loudly — and the deferral flag also
+                # deliberately stays on (see begin_reseed) so a half-built
+                # model never matches live traffic.
                 log.error("[%s] cluster re-seed FAILED mid-replay — model "
                           "incomplete, marker left set, rerun required: %s",
                           circuit, e)
@@ -725,9 +716,9 @@ class TrainingManager:
         # confirmed cluster centroids left in the DB would be inconsistent
         # with the empty in-memory model — new events would be type-gate-
         # rejected instead of matched against the stale centroid rows.
-        # dev46 (46a): the whole clear is ONE hop and ONE transaction — a
-        # half-cleared recalibration (some tables dropped, others not) is a
-        # far worse state than either endpoint.
+        # The whole clear is ONE hop and ONE transaction — a half-cleared
+        # recalibration (some tables dropped, others not) is a far worse state
+        # than either endpoint.
         await run_db(self._clear_for_recalibration_sync, circuit)
         return await self.start_calibration(circuit, days)
 
@@ -756,8 +747,8 @@ class TrainingManager:
     async def trigger_partial_recalibration(self, circuit: str) -> None:
         """
         Partial recalibration — reset behavioural patterns but keep
-        fixture signatures. In Phase 1 this just resets the training
-        state to idle and starts a new accelerated adaptation window.
+        fixture signatures. Resets the training state to idle and starts a
+        new accelerated adaptation window.
         """
         from .database import upsert_learning_config
         now = datetime.now(timezone.utc)
@@ -838,7 +829,7 @@ class TrainingManager:
 
         now = datetime.now(timezone.utc)
 
-        # P6: one-time interim (~day 7) self-validation ADVISORY so the user can label
+        # One-time interim (~day 7) self-validation ADVISORY so the user can label
         # better before the freeze locks calibration. Best-effort, diagnostic only.
         await self._maybe_interim_validation(circuit, state_row, now)
 
@@ -932,15 +923,13 @@ class TrainingManager:
                 # the whole-days component and this is the WITHIN-DAY hour
                 # remainder. settings.html / setup.html render the pair as
                 # "{{ days_remaining }}d {{ hours_remaining }}h"; total_seconds()
-                # here would print "3d 77h". Audited as a bug in 2.25 (d) and
-                # rejected — see test_remaining_over_24h_keeps_its_whole_days_component.
+                # here would print "3d 77h". Audited as a bug and rejected —
+                # see test_remaining_over_24h_keeps_its_whole_days_component.
                 remaining_hours = remaining_td.seconds // 3600
                 total_days = state_row["calibration_days"] or 14
                 time_pct = min(100, int(elapsed_days / max(total_days, 1) * 100))
-                # Progress is purely time-based for user-facing display.
-                # An earlier hybrid scheme also computed event_pct from
-                # events_collected / minimum_events, but the events
-                # metric is internal only and is no longer surfaced.
+                # Progress is purely time-based for user-facing display;
+                # events_collected / minimum_events is internal only.
                 pct = time_pct
             else:
                 remaining_days  = 0
@@ -998,10 +987,9 @@ class TrainingManager:
             # Paired within-day remainder — see the note in
             # _publish_training_status above. NOT a .total_seconds() bug.
             result["hours_remaining"] = remaining_td.seconds // 3600
-            # Percent complete is purely time-based — events_collected
-            # / minimum_events is an internal metric and doesn't affect
-            # the displayed progress. (Earlier code computed an event_pct
-            # here and discarded it.)
+            # Percent complete is purely time-based — events_collected /
+            # minimum_events is an internal metric and doesn't affect the
+            # displayed progress.
             result["percent_complete"] = time_pct
         else:
             # 'labelling' is post-calibration review — calibration itself

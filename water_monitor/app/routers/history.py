@@ -32,16 +32,16 @@ def _tmpl(r): return r.app.state.templates
 async def _bg_reclassify(circuit: str) -> None:
     """Fire-and-forget k-NN reclassify after a label change — offloaded so the
     label POST returns immediately (reclassify can be slow on a large history).
-    Runs on a private connection under the write lock (dev.8 run_isolated_write),
-    so it never races live writes. §2.4 — tracked as a job so a FAILURE is surfaced
-    to the UI (success is silent; the label change already gave instant feedback).
-    The user's own label + any cycle-mates are applied synchronously before this.
+    Runs on a private connection under the write lock (run_isolated_write), so it
+    never races live writes. Tracked as a job so a FAILURE is surfaced to the UI;
+    success is silent. The user's own label + any cycle-mates are applied
+    synchronously before this.
 
     Skipped once the baseline is LOCKED (training/labelling window closed, no active
     recalibration): the classifier is fit-once-at-activation then hard-locked, so a
     relabel after the window must not re-walk history — it spreads only to the event's
-    own cycle-mates (already applied synchronously). The full reclassify runs during the
-    training window, at startup, and on explicit recalibration — not on a stray label."""
+    own cycle-mates. The full reclassify runs during the training window, at startup,
+    and on explicit recalibration — not on a stray label."""
     from ..database import (reclassify_all_events_from_signatures, is_baseline_locked,
                             run_isolated_write, start_job, finish_job)
     from ..config import DB_PATH
@@ -66,19 +66,18 @@ async def _bg_reclassify(circuit: str) -> None:
 
 
 # Debounce state: coalesce a burst of label saves into ONE reclassify after a
-# quiet period. Without this, each save fired a full ~10s background reclassify;
-# rapid labelling stacked them and held the write lock continuously, so the next
-# save's own write timed out ("database is locked"). A monotonic generation per
-# circuit means only the LAST save in a burst actually runs the reclassify — and
-# we never cancel an already-running one (idempotent, but cancellation mid-write
-# is messy), we just let superseded delays no-op.
+# quiet period. One reclassify per save is ~10s and holds the write lock, so
+# rapid labelling stacks them until the next save's own write times out
+# ("database is locked"). A monotonic generation per circuit means only the LAST
+# save in a burst runs the reclassify. An already-running one is never cancelled
+# (idempotent, but cancellation mid-write is messy) — superseded delays no-op.
 _RECLASSIFY_DEBOUNCE_S: float = 8.0
 
-# dev51 (3.5) — how long a label save keeps trying when the database is busy
-# with a background job before it gives up and tells the user. The hourly
-# backlog drain now yields the file write-lock every ~40 rows (~3-4 s), so one
-# retry almost always suffices; three cover a reprocess landing at the same
-# moment. Total worst case ~7 s of waiting plus the per-attempt busy timeout.
+# How long a label save keeps trying when the database is busy with a background
+# job before it gives up and tells the user. The hourly backlog drain yields the
+# file write-lock every ~40 rows (~3-4 s), so one retry almost always suffices;
+# three cover a reprocess landing at the same moment. Worst case ~7 s of waiting
+# plus the per-attempt busy timeout.
 _PATCH_RETRY_BACKOFF_S: tuple = (1.0, 2.0, 4.0)
 
 
@@ -128,11 +127,10 @@ def _schedule_reclassify(circuit: str) -> None:
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def history_page(request: Request):
-    # dev46 (46c) — proactive readiness gate. This page's DB work is the
-    # heaviest in the addon and now shares ONE DB worker with the startup
-    # reclassify/backfill (46a). Checking readiness BEFORE submitting means a
-    # page opened during startup answers instantly instead of queueing behind
-    # minutes of boot work (the 8/16 11:02 repro, which used to 500 outright).
+    # Proactive readiness gate. This page's DB work is the heaviest in the addon
+    # and shares ONE DB worker with the startup reclassify/backfill. Checking
+    # readiness BEFORE submitting means a page opened during startup answers
+    # instantly instead of queueing behind minutes of boot work.
     gated = startup_gate(request, "history", "History", "/history")
     if gated is not None:
         return gated
@@ -187,13 +185,10 @@ FILTER_BAR_PARAMS = ("dur_min", "dur_max", "dp_min", "dp_max",
                      "fixture", "note")
 
 
-# Unit 6.6 retired the local `_parse_float` in favour of the shared
-# `forms.coerce_float`. Same contract, one implementation: `lo=0.0` drops
-# negatives (a negative duration/volume filter is not a thing the bar can
-# mean), `default=None` keeps "unusable" distinguishable from a real 0, and
-# the NaN/inf rejection that `_parse_float`'s `math.isfinite` provided now
-# comes from the shared helper — which grew it for the sensitivity form,
-# where a NaN sails past an unguarded range check.
+# `forms.coerce_float` contract as used here: `lo=0.0` drops negatives (a
+# negative duration/volume filter is not a thing the bar can mean),
+# `default=None` keeps "unusable" distinguishable from a real 0, and NaN/inf are
+# rejected — a NaN sails past an unguarded range check.
 def _filter_float(value):
     """Lenient non-negative float for the filter bar; garbage/blank → None."""
     return coerce_float(value, lo=0.0, default=None)
@@ -249,15 +244,14 @@ def _filters_to_storage(raw: dict, vol_factor: float,
 
 
 def waveform_time_axis(n_bins: int, duration_s: float, src_n, src_hz):
-    """dev38 — per-channel bin-centre times for a stored waveform envelope.
+    """Per-channel bin-centre times for a stored waveform envelope.
 
     ESP-sourced channel (``src_hz`` present, fixed-rate capture): the TRUE
     span is ``src_n / src_hz`` seconds, and ``t_k = (k+½)·src_n/(hz·N)``.
-    Duration-scaling would be wrong here — the audit established the capture
-    window ≠ the event window (per-event δ fits). The capture's wall-clock
-    start is NOT recoverable (WaveformRecord.start_ms is firmware millis(),
-    received_at is monotonic; neither persisted), so the axis is anchored at
-    event start with the residual offset disclosed:
+    Duration-scaling is wrong here — the capture window ≠ the event window.
+    The capture's wall-clock start is NOT recoverable (WaveformRecord.start_ms
+    is firmware millis(), received_at is monotonic; neither persisted), so the
+    axis is anchored at event start with the residual offset disclosed:
     basis = ``uniform_exact_unanchored`` (exact spacing/span, approximate
     anchor).
 
@@ -278,7 +272,7 @@ def waveform_time_axis(n_bins: int, duration_s: float, src_n, src_hz):
 
 
 def transient_dip_note(t: dict) -> "str | None":
-    """dev38 — advisory for a firmware-Failed test whose SUSTAINED drop
+    """Advisory for a firmware-Failed test whose SUSTAINED drop
     (median of the monitor window's tail) sits under half the threshold: the
     terminal verdict most likely latched on a momentary dip the line
     recovered from. DISPLAY ONLY — the verdict, badge and tallies are
@@ -308,16 +302,16 @@ def classify_leak_test(t: dict) -> dict:
     """Leak-test row → the verdict the page shows for it.
 
     ONE source of truth for the badge on each row AND the "Leak tests (last 20)"
-    summary tally, so the counts can never disagree with the badges (they did:
-    the strip counted every non-'Passed' result as a red failure, including
-    ignored ones, aborts and manual stops).
+    summary tally, so the counts cannot disagree with the badges. A non-'Passed'
+    result is NOT automatically a red failure — ignored ones, aborts and manual
+    stops are not.
 
     Follows leak_test_scheduler.py — a leak failure is 'Failed' or any 'leak'
     mention, with Passed excluded. Pre-flight skips ('Not run …', incl. the
     3-port "micro leak test not applicable" wording) short-circuit BEFORE that
-    check in the scheduler, so we match the skip/abort prefixes FIRST and only
-    then apply the 'leak' catch-all — otherwise the benign 3-port message would
-    read as a red leak.
+    check in the scheduler, so the skip/abort prefixes must be matched FIRST and
+    only then the 'leak' catch-all — otherwise the benign 3-port message reads
+    as a red leak.
 
     ``category`` is what the summary strip counts on:
       ``pass``    — a clean test
@@ -376,18 +370,17 @@ def annotate_pump_overnight(tests, nights_by_date, ha_tz=None) -> None:
     window couldn't judge the pump.
 
     The in-window cross-circuit check (classify_cross_circuit) needs ~3 recharge
-    cycles INSIDE the test window. A normal-length test on a slow pump can never
+    cycles INSIDE the test window. A normal-length test on a slow pump cannot
     hold that — this home's last confirmed period is ~8 min, so the bar is ~24
     minutes — and tests are deliberately SHORT (5–15 min): a longer isolation
     window invites false failures from occupant draws (icemaker, humidifier,
     someone up at night) and from thermal contraction (a winter test started
-    after a heater cycle reads the tank+piping cooling as a leak). So the answer
-    is never "run a longer test". Instead: the pump-regime detector already
-    watches a passive 3-hour window every night — the same small hours the
-    scheduled test runs in — closing no valves and immune to decay-shaped
-    thermal effects (it counts repeated recharge RISES, not slow decline). For
-    the reassurance direction that evidence is strictly stronger than anything
-    a short test window could say.
+    after a heater cycle reads the tank+piping cooling as a leak). "Run a longer
+    test" is never the answer. Instead the pump-regime detector's passive 3-hour
+    nightly window — the same small hours the scheduled test runs in — closes no
+    valves and is immune to decay-shaped thermal effects (it counts repeated
+    recharge RISES, not slow decline). For the reassurance direction that
+    evidence is strictly stronger than a short test window.
 
     Display-time on purpose: the same-night analysis lands ~30 min after the
     3-hour window ends — hours AFTER the 1–2 AM test wrote its verdict — so a
@@ -459,13 +452,12 @@ def _collect_circuit_history_sync(
         _ha_tz = None
     _nights_by_date = {n["night_date"]: bool(n["any_detected"])
                        for n in get_pump_regime_nights(db, limit=200)}
-    # Read the "hide not-real-use events" display preference once (same for all
-    # circuits). One unified toggle hides EVERY volume-zeroing verdict — phantom,
-    # cross-talk, and low-flow dribble — so the single "Not real use" label maps to a
-    # single switch. Display-only: their volume is already zeroed at detection, so
-    # hiding never changes any total — it only removes rows from the History list. OR
-    # of the two legacy columns (kept in lockstep by the settings save) so an older
-    # profile that set only one still hides all.
+    # The "hide not-real-use events" preference, read once for all circuits. One
+    # toggle hides EVERY volume-zeroing verdict — phantom, cross-talk, low-flow
+    # dribble — so the single "Not real use" label maps to a single switch.
+    # Display-only: their volume is already zeroed at detection, so hiding never
+    # changes a total. OR of the two legacy columns (kept in lockstep by the
+    # settings save) so an older profile that set only one still hides all.
     _profile = get_home_profile(db)
     hide_not_real = bool(_profile and (_profile["hide_pressure_artifact_events"]
                                        or _profile["hide_cross_talk_events"]))
@@ -505,21 +497,18 @@ def _collect_circuit_history_sync(
         _anomaly_view = filter_param in ("anomaly", "anomaly_unreviewed")
         # Settings "Hide not-real-use events" toggle — hides every volume-zeroing
         # verdict (phantom / cross-talk / dribble) so the one "Not real use" label
-        # maps to one switch. Pushed into the SQL WHERE (not a Python post-filter)
-        # so the recency limit counts VISIBLE rows — during the 2026-07 pump-
-        # cycling storm ~82 of the newest 100 rows were hidden artifacts and the
-        # post-filter starved the page down to ~18 events. The anomaly filters
-        # bypass hiding for the must-not-vanish reason, and so does the filter
-        # bar's Note = "Not real use" — the user just asked for exactly those
-        # rows (hiding them would render an empty list). ?show_hidden=1 bypasses
-        # for one render (presentation-only, viewer-safe).
-        # dev47 (47d): Water Use's "Label on History" link arrives as
-        # ?filter=review&circuit=… . Without it that button landed on the
-        # unfiltered page and the card's promise — "these are the 12 where your
-        # answer teaches it the most" — was unusable, because nothing said
-        # WHICH twelve. The card is rebuilt here rather than passing ids
-        # through the URL so the list and the card cannot disagree, and because
-        # ids in a query string go stale the moment the card is regenerated.
+        # maps to one switch. Must be pushed into the SQL WHERE, not applied as a
+        # Python post-filter, so the recency limit counts VISIBLE rows: during the
+        # 2026-07 pump-cycling storm ~82 of the newest 100 rows were hidden
+        # artifacts and a post-filter starves the page down to ~18 events. The
+        # anomaly filters bypass hiding for the must-not-vanish reason, and so
+        # does the filter bar's Note = "Not real use" — the user just asked for
+        # exactly those rows. ?show_hidden=1 bypasses for one render
+        # (presentation-only, viewer-safe).
+        # Water Use's "Label on History" link arrives as ?filter=review&circuit=…
+        # The review card is rebuilt here rather than passing ids through the URL
+        # so the list and the card cannot disagree, and because ids in a query
+        # string go stale the moment the card is regenerated.
         _review_ids = None
         if filter_param == "review":
             from ..review_queue import build_card
@@ -554,10 +543,9 @@ def _collect_circuit_history_sync(
                 # list was actually truncated. The condition is truncation,
                 # not "is there a date range": if every matching row is on
                 # screen, a hidden row OLDER than the oldest visible one is
-                # still inside what the user asked for, and flooring would
-                # undercount it. Verified against a real 12 h window — 27
-                # events, the oldest of which is hidden, so the badge read 5
-                # instead of 6.
+                # still inside what the user asked for, and flooring
+                # undercounts it (a real 12 h window of 27 events whose oldest
+                # is hidden badges 5 instead of 6).
                 since_ts=(events[-1]["start_ts"]
                           if events and len(events) >= DEFAULT_EVENT_LIMIT
                           else None),
@@ -675,8 +663,8 @@ def _collect_circuit_history_sync(
             # the tier agrees with the gal number shown in the row. The tier
             # blends peak flow and volume via MAX, so on a ZEROED event the
             # peak-flow dimension must be suppressed too — a phantom's peak
-            # reflects pressure-window noise, not real flow, and 246 zeroed
-            # events were rendering medium/large next to "0 gal" (2026-07 audit).
+            # reflects pressure-window noise, not real flow, and without this
+            # 246 zeroed events rendered medium/large next to "0 gal".
             _tier_vol = (e.get("volume_litres_effective")
                          if e.get("volume_litres_effective") is not None
                          else e.get("volume_litres"))
@@ -694,9 +682,8 @@ def _collect_circuit_history_sync(
             )
             # Embedded fixtures hidden inside this event (a toilet flushed mid-shower).
             # Display-only; the parent's volume/label are unchanged. The label is
-            # built here (not summarize_embedded's internal one) so it speaks the
-            # homeowner's language and uses their display units — the raw form
-            # ("toilet ×2 (~9 L)") showed litres to gallon homes.
+            # built here, not by summarize_embedded, so it uses the home's display
+            # units — the raw form ("toilet ×2 (~9 L)") shows litres to gallon homes.
             try:
                 _emb = json.loads(e.get("embedded_fixtures_json") or "[]")
             except (ValueError, TypeError):
@@ -725,12 +712,8 @@ def _collect_circuit_history_sync(
         # read the SAME classification (see classify_leak_test).
         for _t in leak_tests:
             _t["ui"] = classify_leak_test(_t)
-            # dev38 — transient-dip advisory. When the firmware said Failed but
-            # the SUSTAINED drop (median of the monitor window's tail) sits
-            # under half the threshold, the terminal verdict most likely
-            # latched on a momentary dip the line recovered from. DISPLAY
-            # ONLY: the verdict, badge and tallies are untouched, and the
-            # advice is always to RE-RUN the test — never to dismiss it.
+            # Transient-dip advisory — see _transient_dip_advice. DISPLAY ONLY:
+            # the verdict, badge and tallies are untouched.
             _t["transient_note"] = transient_dip_note(_t)
         annotate_pump_overnight(leak_tests, _nights_by_date, _ha_tz)
         summaries  = get_daily_summaries(
@@ -853,12 +836,11 @@ async def _history_page(request: Request):
     }
     chart_from = chart_from_map.get(chart_range, chart_from_map["30d"])
 
-    # All per-circuit DB work (recent events with full columns, leak
-    # test history, daily summaries, optional YoY summaries, hourly
-    # volume fallback) runs in a single thread-pool hop instead of
-    # blocking the event loop per query. On a 2-circuit deployment
-    # with a year of events this is the difference between a ~150 ms
-    # dashboard-fight and a clean async hand-off.
+    # All per-circuit DB work (recent events with full columns, leak test
+    # history, daily summaries, optional YoY summaries, hourly volume fallback)
+    # runs in a single thread-pool hop rather than blocking the event loop per
+    # query — on a 2-circuit deployment with a year of events, the difference
+    # between a ~150 ms dashboard-fight and a clean async hand-off.
     circuit_history = await run_blocking(
         _collect_circuit_history_sync,
         orch.db,
@@ -979,19 +961,17 @@ async def events_api(
 ):
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
-    # The plan wants this route DELETED — it has zero callers inside the
-    # add-on. That is blocked on a fact the codebase does not contain: whether
-    # an HA automation, Node-RED flow or curl habit calls it. Until that is
-    # answered the treatment is to HARDEN, not remove.
+    # This route has zero callers inside the add-on, but may have external ones
+    # (an HA automation, Node-RED flow, curl habit), so it is hardened rather
+    # than removed.
     #
-    # `limit` arrives straight from the query string with no ceiling, and
-    # every DB call runs on the single serialized executor — so one
-    # ?limit=999999 stalls page renders process-wide for every open tab.
-    # NOT `int(limit or DEFAULT_EVENT_LIMIT)`: 0 is falsy, so `or` would
-    # turn an explicit ?limit=0 back into 100 — the same falsy-default
-    # slip that puts a stored 0 back to 2 on the shutoff cap. FastAPI
-    # already supplies the default when the parameter is absent, so the
-    # only job here is the range.
+    # `limit` arrives straight from the query string with no ceiling, and every
+    # DB call runs on the single serialized executor — so one ?limit=999999
+    # stalls page renders process-wide for every open tab.
+    # NOT `int(limit or DEFAULT_EVENT_LIMIT)`: 0 is falsy, so `or` turns an
+    # explicit ?limit=0 back into 100 — the same falsy-default slip that puts a
+    # stored 0 back to 2 on the shutoff cap. FastAPI already supplies the default
+    # when the parameter is absent, so the only job here is the range.
     limit = max(1, min(int(limit), MAX_EVENT_LIMIT))
     # A malformed bound used to be an inert string comparison. Now that it
     # is parsed into a UTC window it has to be checked, and checked HERE —
@@ -1037,18 +1017,17 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                 status_code=400,
             )
 
-    # dev46 (46a) — ONE hop for the whole write path. This handler is the
-    # PATCH that races the chunked startup reclassify (see the write-time
-    # re-check in set_event_matched_fixture_type): it must never touch the
-    # shared connection from the loop thread while the DB worker holds it.
-    # dev51 (3.5) — a label must never lose to background maintenance. The
-    # hourly backlog drain holds the file write-lock in short bursts; the old
-    # behaviour answered the FIRST collision with "your change was NOT saved …
-    # restart the add-on" (observed live 2026-08-31, while the operator was
-    # labelling — the one activity that unfreezes the learning loop). Retry a
-    # few times with backoff, awaiting between attempts so the DB worker and
-    # the event loop stay free; the 503 is now the last resort, not the first
-    # response. The sync step is idempotent (a plain UPDATE of user fields).
+    # ONE hop for the whole write path. This handler is the PATCH that races the
+    # chunked startup reclassify (see the write-time re-check in
+    # set_event_matched_fixture_type): it must never touch the shared connection
+    # from the loop thread while the DB worker holds it.
+    #
+    # A label must never lose to background maintenance — labelling is the one
+    # activity that unfreezes the learning loop, and the hourly backlog drain
+    # holds the file write-lock in short bursts. Retry a few times with backoff,
+    # awaiting between attempts so the DB worker and the event loop stay free;
+    # the 503 is the last resort, not the first response. The sync step is
+    # idempotent (a plain UPDATE of user fields).
     outcome = await _patch_with_retry(db, event_id, circuit, payload)
     if "error" in outcome:
         return JSONResponse(outcome["error"], status_code=outcome["status"])
@@ -1061,26 +1040,24 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
 def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
     """Every DB touch of the event PATCH, in one DB-thread callable.
 
-    dev46 (46a): the handler used to run this inline on the event loop —
-    a dozen statements, several of them writes, on the shared connection.
     Returns either ``{"error": <json>, "status": <code>}`` for an early exit
     or ``{"ok": <json>, "reclassify": <bool>}``; the caller owns the
     HTTP response and the background-task scheduling (which needs the loop).
 
-    Self-contained transaction-wise (rule N2a): every write and its commit
-    happen inside this one call.
+    Self-contained transaction-wise: every write and its commit happen inside
+    this one call.
     """
     propagation_meta: dict = {}
     signature_meta: dict = {}
     classification_meta = None
 
-    # Sprint H — manual classification (independent checkboxes). Authoritative
-    # over auto-detection; a Phantom mark zeroes volume from totals. Sprint H.1:
-    # a manual save (incl. all-false = "normal") always locks; reset:true
-    # returns the event to automatic detection. Processed alongside (not
-    # instead of) a fixture-type change, so the single Save button persists
-    # both in one request — the client only sends `classification` when the
-    # user actually changed a checkbox, so labelling alone never locks it.
+    # Manual classification (independent checkboxes). Authoritative over
+    # auto-detection; a Phantom mark zeroes volume from totals. A manual save
+    # (incl. all-false = "normal") always locks; reset:true returns the event to
+    # automatic detection. Processed alongside — not instead of — a fixture-type
+    # change, so the single Save button persists both in one request. The client
+    # only sends `classification` when the user actually changed a checkbox, so
+    # labelling alone never locks it.
     if "classification" in payload:
         from ..database import (set_event_classification,
                                 clear_event_classification, classify_action)
@@ -1150,11 +1127,11 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
             }, "status": 200}
 
     if kwargs:
-        # A locked DB is a transient state (a background job writing, or —
-        # observed live 2026-08-03 — a wedged writer that held the lock for
-        # 27 min), not a server fault: answer 503 with words the user can act
-        # on instead of a raw 500 traceback, and feed the stuck-writer
-        # detector so a persistent holder names itself in the log.
+        # A locked DB is a transient state (a background job writing, or a
+        # wedged writer — one held the lock for 27 min on 2026-08-03), not a
+        # server fault: answer 503 with words the user can act on rather than a
+        # raw 500 traceback, and feed the stuck-writer detector so a persistent
+        # holder names itself in the log.
         import sqlite3 as _sqlite3
 
         from ..database import note_locked_write
@@ -1178,9 +1155,9 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
     # recovery path). revert_irrigation_cross_talk self-guards: it only touches
     # rows the auto pass flagged (never a user-classified cross-talk) and
     # audits the revert.
-    # dev33 (§1.1): this runs AFTER the classification block above, deliberately —
-    # a fresh fixture label is the newer, more specific user intent and must win
-    # over a checkbox verdict saved in the same request. revert_artifact_zeroing_
+    # ORDERING: this must run AFTER the classification block above — a fresh
+    # fixture label is the newer, more specific user intent and must win over a
+    # checkbox verdict saved in the same request. revert_artifact_zeroing_
     # on_relabel covers every zeroing verdict (dribble/below-meter-floor, the
     # phantom family, cross-talk); revert_irrigation_cross_talk stays for its
     # audit-row bookkeeping on the auto-flagged irrigation rows it owns.
@@ -1228,10 +1205,10 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
             elif row and not row["excluded_from_training"]:
                 # Event eligible for clustering but has no cluster_id yet (the
                 # preliminary-match-without-commit gap). The label IS recorded and
-                # trains the k-NN classifier — only the legacy cluster bulk-propagation
-                # is skipped until the next backfill assigns this event a cluster.
-                # DEBUG, not INFO: a known low-impact gap, not an error, and it would
-                # otherwise fire on every label of an un-clustered event.
+                # trains the k-NN classifier — only the legacy cluster
+                # bulk-propagation waits for the next backfill. DEBUG, not INFO:
+                # a known low-impact gap that would otherwise fire on every label
+                # of an un-clustered event.
                 log.debug(
                     "[%s] event %s labelled with cluster_id NULL — label recorded and "
                     "trains the classifier; cluster propagation follows once it is "
@@ -1427,7 +1404,7 @@ _REPROCESS_REFUSAL_TEXT = {
 
 @router.post("/api/events/{circuit}/{event_id}/reprocess")
 async def reprocess_event_api(circuit: str, event_id: str, request: Request):
-    """dev.26 — rebuild ONE event from HA history.
+    """Rebuild ONE event from HA history.
 
     Deletes this event (and any overlapping purely-machine-derived events),
     reversing their volume, then re-imports the event's own span — optionally
@@ -1463,14 +1440,12 @@ async def reprocess_event_api(circuit: str, event_id: str, request: Request):
         ).fetchone())
     if row is None:
         return JSONResponse({"error": "Event not found"}, status_code=404)
-    # dev.50 — delete_events_in_range PRESERVES anything the user has touched, so a
-    # reprocess of such an event deletes nothing and rebuilds nothing. That used to
-    # return deleted=0/imported=0, which the modal rendered as "✓ Deleted 0,
-    # re-importing 0 run(s)" — indistinguishable from success, and the reason a user
-    # could press this repeatedly on a labelled event and watch nothing happen. Say so
-    # instead. (The modal also hides this control for such events — that had been
-    # defeated by a CSS `display` rule outranking the `hidden` attribute; both ends are
-    # fixed, because an API caller must not get the hollow success either.)
+    # delete_events_in_range PRESERVES anything the user has touched, so a
+    # reprocess of such an event deletes nothing and rebuilds nothing. Returning
+    # deleted=0/imported=0 renders as "✓ Deleted 0, re-importing 0 run(s)" —
+    # indistinguishable from success — so say so explicitly. The modal also hides
+    # this control for such events, but an API caller must not get the hollow
+    # success either.
     if (row["user_fixture_type"] or row["user_classified"]
             or row["user_ignored"]):
         return JSONResponse(

@@ -224,15 +224,15 @@ def recenter_current_regime(db: sqlite3.Connection, circuit: str, tz,
                             *, reason: str = "post-repair") -> Optional[float]:
     """Re-fit the CURRENT regime's centre from its recent settled pressure.
 
-    Why this exists (dev33): a regime's centre is settle-fit from its first
-    days, so a regime opened while a plumbing defect was active inherits the
-    defect. This home's regime 2 was fitted across 7/19-7/26, when the supply
-    was sawtoothing 58 -> 54.4 psi on a leak-driven pump cycle: its centre
-    (54.3) is an artifact of the leak, and when the valve was repaired the
-    idle pressure settled at its TRUE value ~59-60 — more than the 5 psi shift
-    threshold above the artifact centre. Left alone the tracker would open a
-    regime 3 and encode *a valve repair* as a supply change, splitting the
-    per-regime rule-fit pools days after they were refit.
+    A regime's centre is settle-fit from its first days, so a regime opened
+    while a plumbing defect was active inherits the defect. This home's regime 2
+    was fitted across 7/19-7/26, when the supply was sawtoothing 58 -> 54.4 psi
+    on a leak-driven pump cycle: its centre (54.3) is an artifact of the leak,
+    and once the valve was repaired the idle pressure settled at its TRUE value
+    ~59-60 — more than the 5 psi shift threshold above the artifact centre.
+    Left alone the tracker opens a regime 3 and encodes *a valve repair* as a
+    supply change, splitting the per-regime rule-fit pools days after they were
+    refit.
 
     Uses the MEDIAN of recent daily medians: the thermal ratchet puts ~5% of
     idle time above 65 psi with +11 psi excursions, and a mean would chase
@@ -437,9 +437,9 @@ def supply_banner_state(db: sqlite3.Connection,
         "regime_id": current["id"],
         "old_psi": round(prev["center_psi"]) if prev else None,
         "new_psi": round(current["center_psi"]),
-        # unit 2.32 — ``started_at`` is a UTC instant (a local midnight), so the
-        # [:10] slice was the UTC date: identical west of UTC, a day early east
-        # of it. ``database.local_day_of`` is the DST-correct converter.
+        # ``started_at`` is a UTC instant (a local midnight), so a [:10] slice
+        # gives the UTC date: identical west of UTC, a day early east of it.
+        # ``database.local_day_of`` is the DST-correct converter.
         "since": _local_day_of(current["started_at"]),
     }
     if circuit:
@@ -455,12 +455,12 @@ def supply_banner_state(db: sqlite3.Connection,
 def _utc_iso_to_local_day(ts: str, tz) -> Optional[str]:
     """UTC ISO timestamp → the HOME-local calendar day, or None if unparseable.
 
-    unit 2.32 — the old fallback was ``str(ts)[:10]``: the raw **UTC** date
-    handed back labelled as a **local** day. In Denver that is silently wrong
-    for every timestamp between 00:00Z and 07:00Z (17:00–23:59 local the day
-    before), and the result feeds ``supply_pressure_daily.day_date`` and the
-    ``day_date >= start_day`` band-fit filter — a wrong answer presented as a
-    right one. Returning None makes the caller decide; it must NEVER substitute.
+    Never fall back to ``str(ts)[:10]``: that is the raw **UTC** date handed
+    back labelled as a **local** day, silently wrong in Denver for every
+    timestamp between 00:00Z and 07:00Z (17:00–23:59 local the day before). The
+    result feeds ``supply_pressure_daily.day_date`` and the
+    ``day_date >= start_day`` band-fit filter. Returning None makes the caller
+    decide; it must NEVER substitute.
     """
     try:
         dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
@@ -476,11 +476,11 @@ def _local_day_to_utc_iso(day_date: str, tz) -> Optional[str]:
     """HOME-local calendar day → the UTC ISO instant of its local midnight,
     or None if ``day_date`` is not a date.
 
-    unit 2.32 — the old fallback was ``f"{day_date}T00:00:00+00:00"``, i.e. the
-    local day RE-INTERPRETED as UTC midnight: a 6–7 h error in Denver written
-    straight into ``supply_regime.started_at`` / ``ended_at``, which are then
-    compared against event ``start_ts``. Return None instead of a plausible
-    wrong instant.
+    Never fall back to ``f"{day_date}T00:00:00+00:00"``, the local day
+    RE-INTERPRETED as UTC midnight: a 6–7 h error in Denver written straight
+    into ``supply_regime.started_at`` / ``ended_at``, which are then compared
+    against event ``start_ts``. Return None instead of a plausible wrong
+    instant.
     """
     try:
         local_midnight = datetime.fromisoformat(str(day_date)).replace(tzinfo=tz)
@@ -511,7 +511,7 @@ def bootstrap_from_events(db: sqlite3.Connection, circuit: str, tz) -> int:
     by_day: Dict[str, List[float]] = {}
     for ts, psi in rows:
         day = _utc_iso_to_local_day(ts, tz)
-        if day is None:                  # unit 2.32 — drop, never bucket by a guess
+        if day is None:                  # drop, never bucket by a guess
             continue
         by_day.setdefault(day, []).append(float(psi))
     for day, samples in by_day.items():
@@ -533,7 +533,7 @@ def bootstrap_from_events(db: sqlite3.Connection, circuit: str, tz) -> int:
     seed = days_old_to_new[:_SETTLE_FIT_DAYS]
     center = _median([float(d["median_psi"]) for d in seed])
     seed_start = _local_day_to_utc_iso(seed[0]["day_date"], tz)
-    if seed_start is None:               # unit 2.32 — no invented started_at
+    if seed_start is None:               # no invented started_at
         log.warning("supply-regime: bootstrap aborted — seed day %r is not a "
                     "date", seed[0]["day_date"])
         return 0
@@ -550,7 +550,7 @@ def bootstrap_from_events(db: sqlite3.Connection, circuit: str, tz) -> int:
         verdict = evaluate_regime_shift(newest_first, current["center_psi"])
         if verdict is not None:
             shift_at = _local_day_to_utc_iso(verdict["shift_day"], tz)
-            if shift_at is None:         # unit 2.32 — never close/open at a guess
+            if shift_at is None:         # never close/open at a guess
                 log.warning("supply-regime: replay skipped a shift — shift_day "
                             "%r is not a date", verdict["shift_day"])
                 continue
@@ -587,7 +587,7 @@ class SupplyRegimeTracker:
         self._db = db
         self._cfg = cfg
         self._settled_getter = settled_getter
-        # 2.25 (e): a SEED, not the answer — see the _ha_tz property.
+        # A SEED, not the answer — see the _ha_tz property.
         self._tz_seed = ha_tz
         self._alert_manager = alert_manager
         self._stop = asyncio.Event()
@@ -598,18 +598,16 @@ class SupplyRegimeTracker:
     def _ha_tz(self):
         """The home timezone, read LIVE from the ``event_rules`` registry.
 
-        2.25 (e): this used to be a plain attribute snapshotted at __init__
-        (``ha_tz or timezone.utc``). Every other local-day surface in the addon
-        reads ``event_rules.get_home_timezone()``, which the orchestrator sets
-        once HA reports its zone — so whenever that detection landed AFTER this
-        worker was constructed the two silently disagreed, and this tracker
-        kept bucketing days, evaluating shifts and re-fitting bands on a
-        different calendar from the rest of the addon. Nothing reconciled them:
-        ``set_timezone`` had no callers anywhere in the tree.
+        The registry is authoritative; do NOT snapshot it at __init__. Every
+        other local-day surface in the addon reads
+        ``event_rules.get_home_timezone()``, which the orchestrator sets once HA
+        reports its zone — a snapshot silently disagrees with the rest of the
+        addon whenever detection lands after this worker is constructed, and
+        this tracker then buckets days, evaluates shifts and re-fits bands on a
+        different calendar.
 
-        The registry is therefore authoritative. The constructor argument and
-        ``set_timezone`` only supply a value for the window before detection
-        (and for tests); UTC remains the last resort, exactly as before.
+        The constructor argument and ``set_timezone`` only supply a value for
+        the window before detection (and for tests); UTC is the last resort.
         """
         from .event_rules import get_home_timezone
         return get_home_timezone() or self._tz_seed or timezone.utc
@@ -648,7 +646,7 @@ class SupplyRegimeTracker:
         except asyncio.TimeoutError:
             pass
         try:
-            # dev46 (46a): bootstrap + banner read are adjacent — one hop.
+            # Bootstrap + banner read are adjacent — one hop.
             from .database import run_db
             created, banner = await run_db(
                 self._bootstrap_and_banner_sync, circuit)
@@ -661,9 +659,9 @@ class SupplyRegimeTracker:
         except Exception as e:
             log.warning("supply-regime bootstrap failed (non-fatal): %s", e)
 
-        # dev33 one-shot: a regime whose centre was settle-fit while a plumbing
-        # defect was active carries that defect. Recentre it (and merge back a
-        # regime the recentre step itself provoked) BEFORE the sampling loop can
+        # A regime whose centre was settle-fit while a plumbing defect was
+        # active carries that defect. Recentre it (and merge back a regime the
+        # recentre step itself provoked) BEFORE the sampling loop can
         # evaluate a shift against the stale centre. Both helpers are no-ops
         # once applied, and both are guarded per their own preconditions.
         try:
@@ -690,7 +688,7 @@ class SupplyRegimeTracker:
     # ── sampling / rollover ──────────────────────────────────────────────────
 
     def _sample(self, circuit: str) -> None:
-        # dev46 (46h): a winterized circuit is drained — its transducer reads
+        # A winterized circuit is drained — its transducer reads
         # ~0 psi for months. Sampling that would drag the regime centre to
         # zero and then declare a "shift" the moment spring re-pressurises.
         from .database import is_circuit_winterized
@@ -724,7 +722,7 @@ class SupplyRegimeTracker:
                 center = _median([float(d["median_psi"]) for d in seed])
                 started_at = _local_day_to_utc_iso(
                     min(d["day_date"] for d in seed), self._ha_tz)
-                if started_at is None:   # unit 2.32 — no invented started_at
+                if started_at is None:   # no invented started_at
                     log.warning("supply-regime: first live regime not opened — "
                                 "seed day is not a date")
                     return
@@ -737,7 +735,7 @@ class SupplyRegimeTracker:
         verdict = evaluate_regime_shift(days, current["center_psi"])
         if verdict is not None:
             shift_at = _local_day_to_utc_iso(verdict["shift_day"], self._ha_tz)
-            if shift_at is None:         # unit 2.32 — never close/open at a guess
+            if shift_at is None:         # never close/open at a guess
                 log.warning("supply-regime: shift NOT applied — shift_day %r is "
                             "not a date", verdict["shift_day"])
                 return
@@ -749,10 +747,9 @@ class SupplyRegimeTracker:
                      current["center_psi"], verdict["new_center"],
                      verdict["shift_day"])
             if self._alert_manager is not None:
-                # dev57 (2.24): task_registry.spawn holds the strong reference
-                # the bare loop.create_task() did not, and returns None (having
-                # closed the coroutine) when there is no running loop — sync
-                # tests reach here, and the banner still shows regardless.
+                # task_registry.spawn holds a strong reference, and returns None
+                # (having closed the coroutine) when there is no running loop —
+                # sync tests reach here, and the banner still shows regardless.
                 from .task_registry import spawn
                 spawn(self._alert_manager.alert_supply_regime_shift(
                           circuit, current["center_psi"],

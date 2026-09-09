@@ -1,4 +1,4 @@
-"""dev47 (47i) — fixture health: attribution adapts, baselines lock.
+"""Fixture health: attribution adapts, baselines lock.
 
 THE PROBLEM THIS SOLVES
 -----------------------
@@ -22,16 +22,13 @@ The two enemies are therefore **reference contamination** (comparing against
 anything that adapts) and **attribution discontinuity** (drift walking events
 across a class boundary, out of their own trend line).
 
-WHAT THE SIMULATIONS MEASURED, AND WHAT IT CHANGED
---------------------------------------------------
-V6 (2026-08-22) showed absorption does NOT blind detection under this design:
-the volume alarm fired on the same day with weekly retrains on or off. V6d then
-added a realistic review card and found the opposite risk — with a capped card,
-a FROZEN model never detected a +40% flapper at all in 21 days, because the
-events it rejected never reached the trend line. Adaptive classification is a
-detection *dependency* here, not a threat.
+Adaptive classification is a detection *dependency* here, not a threat.
+Absorption does NOT blind detection under this design: the volume alarm fires on
+the same day with weekly retrains on or off. The opposite is the real risk —
+behind a capped review card a FROZEN model never detected a +40% flapper at all
+in 21 days, because the events it rejected never reached the trend line.
 
-Three detector requirements come directly from those runs:
+Three detector requirements follow:
 
 1. **Rolling-EVENT windows, never calendar-day medians.** At real label density
    most days hold 0-1 toilet events, so a "N consecutive days above threshold"
@@ -39,7 +36,7 @@ Three detector requirements come directly from those runs:
    while the rolling-15 detector fired on day 12.5.
 2. **The unsolicited-refill rate is the fast signal** (fired day 3 vs day 12-14
    for the volume trend) and is immune to the dilution confound below.
-3. **Class share must NOT use median ± k·MAD.** That formulation computed a
+3. **Class share must NOT use median ± k·MAD.** That formulation computes a
    floor of −0.022 on this home — a negative threshold on a proportion, i.e. a
    detector structurally incapable of firing, which passes silently forever.
    It is a relative-drop test against the frozen share instead, and
@@ -78,7 +75,7 @@ MIN_TREND_EVENTS: int = 10        # need a partial window before evaluating
 MIN_TREND_VOLUME_L: float = 2.5
 
 # Unsolicited refills: refill-SHAPED draws with no preceding flush. Recognised
-# by shape rule, deliberately independent of attribution (47i-1) — a phantom
+# by shape rule, deliberately independent of attribution — a phantom
 # refill that the classifier mislabels must still count.
 UNSOLICITED_WINDOW_DAYS: int = 7
 UNSOLICITED_ALARM_COUNT: int = 8
@@ -98,7 +95,7 @@ UNSOLICITED_PEAK_LO_FRACTION: float = 0.6
 UNSOLICITED_PEAK_HI_FRACTION: float = 1.4
 
 # Class share: relative drop against the FROZEN share. Never median +/- k*MAD
-# on a proportion (V6d: that computed a negative floor).
+# on a proportion: that computes a negative floor.
 SHARE_WINDOW_DAYS: int = 14
 SHARE_DROP_RATIO: float = 0.8     # sustained below 80% of the frozen share
 SHARE_MIN_EVENTS: int = 20        # a window too thin to read
@@ -108,9 +105,8 @@ SIGNAL_DURATION = "duration_trend"
 SIGNAL_UNSOLICITED = "unsolicited_refills"
 SIGNAL_SHARE = "class_share"
 
-# Reason codes for unlocking a baseline (47i-2). A baseline may move only by
-# explicit confirmation, and the code is what distinguishes the three kinds of
-# drift the whole plan turns on.
+# Reason codes for unlocking a baseline. A baseline may move only by explicit
+# confirmation, and the code is what distinguishes the three kinds of drift.
 REASON_FIXTURE_REPLACED = "fixture_replaced"
 REASON_REPAIRED = "fixture_repaired"
 REASON_FALSE_ALARM = "false_alarm"
@@ -251,7 +247,7 @@ def build_baseline(circuit: str, fixture_type: str, events: Sequence[dict],
 
 def _cadence_days(events: Sequence[dict]) -> Optional[float]:
     """Median days between occurrences — meaningful for cyclic fixtures only
-    (softener regens, and the 47f cadence watch that is its first instance)."""
+    (softener regens, and the cadence watch built on them)."""
     ts = sorted(str(e.get("start_ts")) for e in events if e.get("start_ts"))
     if len(ts) < 3:
         return None
@@ -326,7 +322,7 @@ def volume_trend_alarm(baseline: FrozenBaseline,
     ``attributed`` is the classified stream: each item needs ``start_ts`` and
     ``volume_litres``. It is deliberately the attributed stream and not
     ground truth — that is what makes absorption harmless and what makes a
-    starved trend line (V6d's frozen arm) visible as silence.
+    starved trend line (a frozen model's) visible as silence.
     """
     values = [(str(e["start_ts"]), float(e["volume_litres"]))
               for e in sorted(attributed, key=lambda e: str(e["start_ts"]))
@@ -394,7 +390,7 @@ def find_unsolicited_refills(events: Sequence[dict],
                              baseline: FrozenBaseline) -> List[dict]:
     """Refill-shaped draws with no flush shortly before them.
 
-    Shape-based and attribution-independent by design (47i-1): a phantom refill
+    Shape-based and attribution-independent by design: a phantom refill
     the classifier gets wrong must still be counted, or the fast channel would
     inherit the classifier's blind spots.
 
@@ -446,8 +442,8 @@ def class_share_alarm(baseline: FrozenBaseline, attributed: Sequence[dict],
 
     This is the signal that survives when the volume trend cannot fire: under a
     capped review card, drifted events the model rejects never reach the trend
-    line at all, and their ABSENCE is then the only evidence. V6d measured the
-    share sagging .222 -> .167-.192 in exactly those arms.
+    line at all, and their ABSENCE is then the only evidence. Measured: the
+    share sags .222 -> .167-.192 in exactly those arms.
     """
     cls = fixture_type or baseline.fixture_type
     floor = baseline.share_floor()
@@ -494,10 +490,10 @@ def class_share_alarm(baseline: FrozenBaseline, attributed: Sequence[dict],
 def share_alarm_is_live(baseline: FrozenBaseline) -> bool:
     """Can this share alarm fire AT ALL?
 
-    Exists because of a real bug class: the previous median − 3·MAD formulation
-    produced a NEGATIVE floor on this home, so the detector was structurally
-    incapable of firing and its permanent silence was indistinguishable from
-    good health. Any proportion-valued signal added later gets the same check.
+    A median − 3·MAD formulation produces a NEGATIVE floor on this home, leaving
+    the detector structurally incapable of firing with its permanent silence
+    indistinguishable from good health. Any proportion-valued signal added later
+    gets the same check.
     """
     floor = baseline.share_floor()
     return floor is not None and 0.0 < floor <= 1.0
@@ -533,19 +529,18 @@ def observed_rate(events: Sequence[dict]) -> float:
 
 
 # ── persistence ─────────────────────────────────────────────────────────────
-# NONE OF THE WRITERS BELOW COMMIT, AND THAT IS THE CONTRACT (dev46 rule N2a).
+# NONE OF THE WRITERS BELOW COMMIT, AND THAT IS THE CONTRACT.
 # Each is a leaf; the caller that owns the ``run_db`` hop owns the transaction
 # and issues the commit — ``health_job.run_nightly`` for the nightly pass,
 # ``routers/fixtures.resolve_health_alert``'s ``_job`` for the operator path.
 # Adding a commit here would break both: the nightly pass would stop being one
 # atomic verdict, and resolve+unlock+delete would stop being one.
 #
-# The cost of getting this wrong is silent, which is why it is written down.
-# ``database.get_connection`` never sets ``isolation_level``, so sqlite3 opens
-# an implicit transaction before the first write and never closes it. A writer
-# whose caller forgets to commit does not raise, does not log, and reads back
-# perfectly on its own connection — it simply never reaches disk. That was
-# live for the whole nightly pass until dev57.
+# Getting this wrong fails SILENTLY. ``database.get_connection`` never sets
+# ``isolation_level``, so sqlite3 opens an implicit transaction before the first
+# write and never closes it. A writer whose caller forgets to commit does not
+# raise, does not log, and reads back perfectly on its own connection — it
+# simply never reaches disk.
 def save_baseline(conn: sqlite3.Connection, baseline: FrozenBaseline) -> None:
     conn.execute(
         "INSERT INTO fixture_baseline (circuit, fixture_type, baseline_hash, "
@@ -579,7 +574,7 @@ def load_baseline(conn: sqlite3.Connection, circuit: str,
 
 def unlock_baseline(conn: sqlite3.Connection, circuit: str, fixture_type: str,
                     reason: str) -> bool:
-    """Release a baseline so it can be re-pinned (47i-2).
+    """Release a baseline so it can be re-pinned.
 
     Only by explicit confirmation, and only with a reason code — the code is
     what separates the three kinds of drift: infrastructure (adapt), fixture

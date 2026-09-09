@@ -1,4 +1,4 @@
-"""Tight-fingerprint label propagator (2026-07 reality audit, Phase 3).
+"""Tight-fingerprint label propagator.
 
 An event's fully UN-normalized waveform trio — absolute-time flow (L/min),
 cumulative volume (L), and pressure drop below the pre-event baseline (psi) —
@@ -7,7 +7,7 @@ labeled events is close enough, it inherits that label. Validated on this
 home's data (two backups): 30% coverage at 96% precision standalone; on the
 events the production pipeline declined it labels ~29% of them at 94%.
 
-Design points (all measured, see scratchpad REALITY_VS_ADDON.md §1c Q7-Q8):
+Design points (all measured):
   * STORED waveforms beat raw-HA fingerprints (96% vs 92%) — systematic capture
     distortions match each other — so this works on event_waveforms as-is.
   * The distance threshold is SELF-CALIBRATING: a percentile of the library's
@@ -21,13 +21,12 @@ Design points (all measured, see scratchpad REALITY_VS_ADDON.md §1c Q7-Q8):
     whole-waveform match against a user-confirmed example, much stronger than
     a lone scalar k-NN vote — but only at the TIGHT (immature) threshold.
     Measured: dishwasher 83/83 correct at the standard threshold.
-  * VOLUME FLOOR (post-3.13 era correction): the numbers above were measured
-    on coarse-meter data whose sub-2 L draws never became events. The
-    pulse_meter firmware DOES eventize them, and the first fresh-DB review
-    (2026-07-08) overturned every fingerprint stamp — all 46 were sub-2 L
-    micro-draws (0/11 on the reviewed subset). Events under
-    MIN_MATCH_VOLUME_L effective litres neither join the library nor get
-    matched, restoring the event population the validation actually covered.
+  * VOLUME FLOOR: the numbers above were measured on coarse-meter data whose
+    sub-2 L draws never became events. The pulse_meter firmware DOES eventize
+    them, and every fingerprint stamp on such a micro-draw was wrong (0/11 on
+    a reviewed subset). Events under MIN_MATCH_VOLUME_L effective litres
+    neither join the library nor get matched, restoring the event population
+    the validation actually covered.
 
 Pure module: no DB writes, no asyncio. Callers (database.reclassify tier loop,
 feature_extractor live path) stamp results via set_event_matched_fixture_type
@@ -58,7 +57,7 @@ THRESHOLD_PCTL_MATURE: float = 30.0
 THRESHOLD_PCTL_TIGHT: float = 15.0
 MIN_LIBRARY_N: int = 10           # below this the matcher abstains entirely
 
-# ── dev46 (46q) — era weighting ──────────────────────────────────────────────
+# ── Era weighting ────────────────────────────────────────────────────────────
 #
 # The library spans a supply change: the booster pump went in 2026-07-19 and
 # moved every fixture's geometry (toilet ΔP by 2.6×). A pre-pump exemplar is
@@ -71,12 +70,10 @@ MIN_LIBRARY_N: int = 10           # below this the matcher abstains entirely
 # different answers month over month with no config change, boot reclassify
 # would silently re-label history, and no "classifier fingerprint" could ever
 # certify a stored match as still valid. Era age keeps matching a pure
-# function of stored data. It is also simply more correct: a July event should
-# be judged against July.
+# function of stored data.
 #
 # Applied as a distance MULTIPLIER, so an old exemplar has to be
-# proportionally closer to win. Constants are documented and hand-set — never
-# auto-fit (the same rule the T5 and flush-floor gates follow).
+# proportionally closer to win. Constants are hand-set, never auto-fit.
 FP_AGE_HALFLIFE_DAYS: float = 60.0   # penalty reaches half its range here
 FP_AGE_MAX_PENALTY: float = 4.0      # asymptote: 4x distance for ancient eras
 
@@ -188,8 +185,8 @@ class FingerprintLibrary:
         self.scales = scales          # per-channel std used to scale
         self.labels = labels
         self.event_ids = event_ids
-        # dev46 (46q): each member's OWN event time (epoch seconds), for
-        # era weighting. None where a row had no parseable timestamp — such
+        # Each member's OWN event time (epoch seconds), for era
+        # weighting. None where a row had no parseable timestamp — such
         # members simply take no penalty rather than being excluded.
         self.start_ts = start_ts if start_ts is not None else [None] * len(labels)
         self.threshold = threshold
@@ -266,9 +263,8 @@ class FingerprintLibrary:
 
         ``event_ts`` is the CANDIDATE event's own time (epoch seconds). When
         given, exemplars from a different era are pushed away in proportion to
-        the gap (dev46 46q) — an old exemplar must be proportionally closer to
-        win. Omitted, or where a member has no timestamp, no penalty applies,
-        so this can never make the matcher stricter than it was.
+        the gap — an old exemplar must be proportionally closer to win.
+        Omitted, or where a member has no timestamp, no penalty applies.
         """
         np = _np()
         if fingerprint is None:
@@ -278,7 +274,7 @@ class FingerprintLibrary:
             for c in range(3)])
         d = self.matrix - scaled[None, :]
         dist = np.sqrt((d * d).sum(-1))
-        # dev46 (46q): era weighting BEFORE picking the nearest neighbour —
+        # Era weighting BEFORE picking the nearest neighbour —
         # penalising only the winner would let a stale exemplar shut out a
         # better-era one that was a hair further away in raw distance.
         raw_dist = dist
@@ -379,6 +375,6 @@ def match_event_fingerprint(conn: sqlite3.Connection, circuit: str,
                            row["pre_event_pressure_psi"])
     if fp is None:
         return None
-    # dev46 (46q): the candidate's OWN time drives era weighting — never
+    # The candidate's OWN time drives era weighting — never
     # "now", so a stored match stays valid regardless of when it is re-derived.
     return lib.match(fp, event_ts=_parse_ts(row["start_ts"]))

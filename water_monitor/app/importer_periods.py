@@ -10,26 +10,23 @@ that forward to them.
 Every function takes ``p`` first: any object exposing the threshold constants
 (``MERGE_GAP_SECONDS``, ``MIN_FLOW_LPM``, ``PRESSURE_DIP_*`` ...). In production
 that is the ``HistoricalImporter`` instance, so a per-instance or per-class
-override of a threshold still takes effect exactly as it did when these were
-methods. It is NOT used for anything else, which is what makes this module pure.
+override of a threshold still takes effect. ``p`` is NOT used for anything
+else, which is what keeps this module pure.
 
 IMPORT DIRECTION IS ONE-WAY: this module must never import
-``historical_importer``. ``historical_importer`` imports the primitives it still
-uses (``_parse_ts``, ``_is_gap_marker``) from here at module level, and serves
-``_GAP_MARKER_STATES`` / ``_merge_periods`` -- which only its callers still want
--- through a PEP 562 module ``__getattr__``. Adding an import back the other way
-would recreate the partially-initialised-module ImportError that the
-``feature_extractor`` / ``feature_extractor_service`` split had to solve with the
-same ``__getattr__``. ``test_importer_periods_seam.py`` fails if it is added.
+``historical_importer``, which imports ``_parse_ts`` / ``_is_gap_marker`` from
+here at module level and serves ``_GAP_MARKER_STATES`` / ``_merge_periods``
+through a PEP 562 module ``__getattr__``. An import back the other way raises
+the partially-initialised-module ImportError; ``test_importer_periods_seam.py``
+fails if one is added.
 
 Sibling calls inside this module resolve through the MODULE globals, not through
-``p``, so a test that wants to substitute one (e.g. feeding a synthetic pressure
-envelope into ``_find_flow_periods``) must patch the attribute on THIS module:
+``p``, so a test substituting one (e.g. feeding a synthetic pressure envelope
+into ``_find_flow_periods``) must patch the attribute on THIS module:
 
     monkeypatch.setattr(importer_periods, "_pressure_to_periods", fake)
 
-Patching the importer instance instead binds a new attribute nobody reads --
-the substitution silently does nothing and the test measures nothing.
+Patching the importer instance instead binds an attribute nobody reads.
 """
 from __future__ import annotations
 
@@ -49,7 +46,7 @@ _GAP_MARKER_STATES = frozenset({"unavailable", "unknown", "none", ""})
 def _is_gap_marker(entry: Dict) -> bool:
     """True when an HA history entry marks a recorder/sensor gap rather than a
     reading ('unavailable' at HA restarts, 'unknown' on dropouts). Windows holding
-    these must not be trusted to reproduce live-recorded water (dev.41)."""
+    these must not be trusted to reproduce live-recorded water."""
     return str(entry.get("state", "")).strip().lower() in _GAP_MARKER_STATES
 
 
@@ -115,15 +112,15 @@ def _split_period_around_rows(
         e0 = _parse_ts(r.get("end_ts"))
         if s0 is None or e0 is None or e0 <= s0:
             continue
-        # dev57 (§2.36) — the guard's own threshold, not a second copy of
-        # the number: this is the same containment question over the same
-        # spans, so it must move with _CONTAINMENT_FRACTION.
+        # The guard's own threshold, not a second copy of the number: this is
+        # the same containment question over the same spans, so it must move
+        # with _CONTAINMENT_FRACTION.
         if contained_fraction((s0, e0), (ps, pe)) >= CONTAINMENT_FRACTION:
             contained.append((s0, e0, float(r.get("volume_litres") or 0.0)))
     if not contained:
         return "keep", [period], {}
     # top-level rows only: a row nested inside another contained row is the
-    # same water again (dev33 §1.3) and must not inflate the stored total.
+    # same water again and must not inflate the stored total.
     contained.sort(key=lambda t: (t[0], -(t[1] - t[0]).total_seconds()))
     top: List[Tuple[datetime, datetime, float]] = []
     for s0, e0, v in contained:
@@ -243,23 +240,21 @@ def _find_flow_periods(
         p, pressure_hist or [], query_end=query_end,
         using_avg_pressure=using_avg_pressure,
     )
-    # dev.39 — drop long pressure-dip envelopes that only bridge trivial noise
-    # (the bug: two ~0.3 L blips 20 min apart fused into one 20-min event).
-    # PROVABLY LEAK-NEUTRAL (hardened after an adversarial review): a dip is
-    # dropped ONLY when every condition holds, so dropping it can NEVER lose or
-    # under-count flow —
+    # Drop long pressure-dip envelopes that only bridge trivial noise (without
+    # this, two ~0.3 L blips 20 min apart fuse into one 20-min event).
+    # PROVABLY LEAK-NEUTRAL: a dip is dropped ONLY when every condition holds,
+    # so dropping it can NEVER lose or under-count flow —
     #   (a) it is long (>= LONG_SPAN), and
     #   (b) the measured flow inside is trivial (< MIN_VOLUME), and
     #   (c) there IS real flow inside (>=1 overlapping rate/onset period), and
     #   (d) EVERY overlapping flow fragment already survives on its own
     #       (>= MIN_DURATION_SECONDS) once the bridge is removed.
-    # So we only ever remove the empty *span between* fragments that stand alone.
-    # A pure-pressure dip with no flow (c fails) is KEPT → handled by the phantom
-    # guard at feature extraction, never silently dropped. A fragment too short to
-    # survive un-bridged (d fails) KEEPS its bridge, so it is never orphaned —
-    # closing the "sub-MIN_DURATION blip vanishes" and "recorder-gap masks a leak"
-    # holes the review raised (a real leak is flow >= MIN_FLOW → a surviving rate
-    # period, never only an empty envelope).
+    # Only the empty *span between* fragments that stand alone is ever removed.
+    # A pure-pressure dip with no flow (c fails) is KEPT → handled by the
+    # phantom guard at feature extraction, never silently dropped. A fragment
+    # too short to survive un-bridged (d fails) KEEPS its bridge, so it is never
+    # orphaned. A real leak is flow >= MIN_FLOW → a surviving rate period, never
+    # only an empty envelope.
     flow_only = onset_periods + rate_periods
     kept_dips = []
     for s, e in pressure_periods:
@@ -277,8 +272,8 @@ def _find_flow_periods(
                      "a real bridged event",
                      (e - s).total_seconds() / 60.0, span_vol, len(overlap))
             continue
-        # dev.50 — a kept bridge may still span a LONG proven-idle gap; break it
-        # there so the draws either side reconstruct as the separate events they are.
+        # A kept bridge may still span a LONG proven-idle gap; break it there so
+        # the draws either side reconstruct as the separate events they are.
         kept_dips.extend(_split_dip_on_idle_gaps(
             p, s, e, overlap, flow_rate_hist, onset_hist))
     pressure_periods = kept_dips
@@ -298,20 +293,20 @@ def _flow_stopped_across(
     gap_start: datetime,
     gap_end: datetime,
 ) -> bool:
-    """dev.50 — does the history PROVE flow stopped across ``[gap_start, gap_end]``?
+    """Does the history PROVE flow stopped across ``[gap_start, gap_end]``?
 
-    A flow sensor that goes dark mid-draw looks EXACTLY like an idle here, and the
-    distinction decides whether it is safe to break a pressure-dip bridge. HA's
-    recorder logs on CHANGE, so "samples exist and read zero" cannot be the test —
-    a genuine idle emits no samples either. Worse, ``_rate_to_periods`` refuses to
-    flush a period it never saw close, so a dropout mid-draw leaves no fragment at
-    all and the stretch reads as pure idle.
+    A flow sensor that goes dark mid-draw looks EXACTLY like an idle here, and
+    the distinction decides whether it is safe to break a pressure-dip bridge.
+    HA's recorder logs on CHANGE, so "samples exist and read zero" cannot be the
+    test — a genuine idle emits no samples either. ``_rate_to_periods`` also
+    refuses to flush a period it never saw close, so a dropout mid-draw leaves
+    no fragment at all and the stretch reads as pure idle.
 
-    The honest discriminator is the last sample AT OR BEFORE the gap — the same
-    reasoning the live detector uses for ``FLOW_SAMPLE_STALE_S`` ("the stuck-sensor
-    case goes SILENT"). Fails CLOSED: a recorder-gap marker inside, real flow
-    inside, or no sample to judge by at all all mean "not proven", and the caller
-    leaves the envelope whole.
+    The discriminator is the last sample AT OR BEFORE the gap — the same
+    reasoning the live detector uses for ``FLOW_SAMPLE_STALE_S`` (the
+    stuck-sensor case goes SILENT). Fails CLOSED: a recorder-gap marker inside,
+    real flow inside, or no sample to judge by all mean "not proven", and the
+    caller leaves the envelope whole.
     """
     last_before: Optional[float] = None
     for entry in flow_rate_hist:
@@ -350,16 +345,16 @@ def _split_dip_on_idle_gaps(
     flow_rate_hist: List[Dict],
     onset_hist: List[Dict],
 ) -> List[Tuple[datetime, datetime]]:
-    """dev.50 — break one kept dip envelope wherever it bridges a long PROVEN-idle
-    gap, returning the sub-envelopes (``[(dip_start, dip_end)]`` when it bridges
+    """Break one kept dip envelope wherever it bridges a long PROVEN-idle gap,
+    returning the sub-envelopes (``[(dip_start, dip_end)]`` when it bridges
     nothing).
 
     Boundaries land on the flow fragments themselves, so only the EMPTY span
-    between them is removed — never flow, keeping the volume and leak reasoning of
-    the drop-gate above intact. A dip with NO overlapping flow is returned whole:
-    that is a pure-pressure envelope, which the phantom guard at feature extraction
-    handles and this must never silently drop. The outer bounds stay at the dip's
-    own, so a lead-in / tail-out is preserved.
+    between them is removed — never flow, keeping the volume and leak reasoning
+    of the drop-gate above intact. A dip with NO overlapping flow is returned
+    whole: that is a pure-pressure envelope, handled by the phantom guard at
+    feature extraction and never to be silently dropped. The outer bounds stay
+    at the dip's own, so a lead-in / tail-out is preserved.
     """
     if not overlap:
         return [(dip_start, dip_end)]
@@ -369,10 +364,9 @@ def _split_dip_on_idle_gaps(
     run_end = frags[0][1]            # running max end — fragments may nest
     for next_start, next_end in frags[1:]:
         # Both sides must survive the MIN_DURATION filter at the end of
-        # _find_flow_periods. Splitting a bridge whose fragments are shorter than
-        # that ORPHANS them — the sub-envelopes are dropped and the flow vanishes,
-        # which is precisely the leak-safety hole dev.39's condition (d) closed.
-        # Too short on either side → keep bridging, exactly as the drop-gate does.
+        # _find_flow_periods. Splitting a bridge whose fragments are shorter
+        # ORPHANS them — the sub-envelopes are dropped and the flow vanishes.
+        # Too short on either side → keep bridging, as the drop-gate does.
         if ((next_start - run_end).total_seconds()
                 >= p.PRESSURE_DIP_BRIDGE_MAX_GAP_S
                 and (run_end - seg_start).total_seconds()
@@ -487,22 +481,18 @@ def _rate_to_periods(
     """
     periods: List[Tuple[datetime, datetime]] = []
     current_start: Optional[datetime] = None
-    # (no last_ts tracking — see the comment in the loop body
-    # below; off-transition `ts` is used directly.)
 
     for entry in history:
         ts = _parse_ts(entry.get("last_changed"))
         if ts is None:
             continue
         if _is_gap_marker(entry):
-            # A recorder/sensor gap is the ABSENCE of a reading, not a
-            # reading of zero. Falling through to `rate = 0.0` below closed
-            # the period at the dropout, truncating a draw that was still
-            # running — the water after the gap then became a separate event
-            # or none at all. _flow_stopped_across already refuses to read
-            # absence of data as absence of water ("a dark sensor looks
-            # EXACTLY like an idle here"); this applies the same rule where
-            # the periods are BUILT rather than where they are judged.
+            # A recorder/sensor gap is the ABSENCE of a reading, not a reading
+            # of zero. Falling through to `rate = 0.0` below closes the period
+            # at the dropout, truncating a draw that was still running, and the
+            # water after the gap becomes a separate event or none at all. Same
+            # rule as _flow_stopped_across, applied where the periods are BUILT
+            # rather than where they are judged.
             #
             # Bridging is bounded, not open-ended: flow_integral clamps any
             # inter-sample gap to _FLOW_INTEGRAL_MAX_DT_SECONDS (120 s) and
@@ -522,12 +512,10 @@ def _rate_to_periods(
                 current_start = ts
         else:
             if current_start is not None:
-                # Use ts (the off-transition) not last_ts, consistent with
+                # Close at the off-transition `ts`, consistent with
                 # _onset_to_periods which closes at the OFF timestamp.
                 periods.append((current_start, ts))
                 current_start = None
-        # (last_ts tracking removed — the off-transition `ts` is used
-        # directly above, per the same convention as _onset_to_periods.)
 
     # Same rationale as _onset_to_periods: do NOT flush still-active
     # flow-rate periods at query_end. The live detector / next importer

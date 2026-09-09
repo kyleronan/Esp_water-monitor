@@ -1,5 +1,5 @@
 """
-Event detector — Phase 1.
+Event detector.
 
 Subscribes to real-time state_changed events from HA for:
   - flow rate sensors       (1Hz smoothed)
@@ -48,12 +48,10 @@ from typing import Callable, Deque, List, Literal, Optional, Tuple
 
 from .event_rules import LOWFLOW_OFF_GRACE_S, is_low_flow_chatter
 
-# One logger for all three modules of the former single-file event_detector.
-# The name is pinned to the ORIGINAL module path rather than taken from
-# ``__name__``: logger names are observable (log-level config, log greps,
-# ``caplog.at_level(logger=...)``), and unit 7.3 was an extraction, not a
-# behaviour change. ``event_waveform`` and ``event_detector`` import this
-# object; they must not make their own.
+# One logger for all three event_detector modules, pinned to the ORIGINAL
+# module path rather than ``__name__``: logger names are observable (log-level
+# config, log greps, ``caplog.at_level(logger=...)``). ``event_waveform`` and
+# ``event_detector`` import this object; they must not make their own.
 log = logging.getLogger("water_monitor.app.event_detector")
 
 
@@ -90,12 +88,12 @@ class RawEvent:
     # 1Hz flow readings collected during the event
     flow_readings: List[float] = field(default_factory=list)
 
-    # dev46 (46i) — the REAL captured span of each signature channel, in
-    # seconds from start_ts to that channel's last appended sample. The two
-    # channels sample on independent callbacks and downsample independently,
-    # so their spans genuinely differ; without them the event modal can only
-    # stretch both signatures proportionally across the event duration and
-    # call it a time axis. None until the first sample lands.
+    # The REAL captured span of each signature channel, in seconds from
+    # start_ts to that channel's last appended sample. The two channels sample
+    # on independent callbacks and downsample independently, so their spans
+    # genuinely differ; without them the event modal can only stretch both
+    # signatures proportionally across the event duration and call it a time
+    # axis. None until the first sample lands.
     flow_sig_span_s: Optional[float] = None
     pressure_sig_span_s: Optional[float] = None
 
@@ -108,9 +106,9 @@ class RawEvent:
     # True if any other circuit's valve was open when this event started.
     # Helps distinguish main-circuit irrigation bleed-through from household demand.
     other_valve_open: Optional[bool] = None
-    # dev41 provenance for the tri-state above (supply_type_set_at precedent):
-    # how the underlying valve state was established ('ha_prime' at startup
-    # vs 'state_change') and when. None on legacy/unknown.
+    # Provenance for the tri-state above: how the underlying valve state was
+    # established ('ha_prime' at startup vs 'state_change') and when. None on
+    # legacy/unknown.
     other_valve_open_source: Optional[str] = None
     other_valve_open_set_at: Optional[str] = None
 
@@ -122,15 +120,15 @@ class RawEvent:
     is_composite: bool = False
     complete: bool = False
 
-    # dev.24 low-flow off-grace: when a sustained low draw dips below MIN_FLOW,
-    # the event is held open until this deadline instead of finalizing, so the
+    # Low-flow off-grace: when a sustained low draw dips below MIN_FLOW, the
+    # event is held open until this deadline instead of finalizing, so the
     # turbine's low-flow chatter doesn't fragment one draw into many events.
     # Cleared by on_flow_rate the instant flow resumes (bridging the dip).
     low_flow_hold_until: Optional[datetime] = None
 
 
 def _valve_meta_kwargs(meta: "Optional[Tuple[str, str]]") -> dict:
-    """dev41 — RawEvent kwargs for the other-valve provenance pair."""
+    """RawEvent kwargs for the other-valve provenance pair."""
     if not meta:
         return {}
     return {"other_valve_open_source": meta[0],
@@ -141,18 +139,12 @@ def _valve_meta_kwargs(meta: "Optional[Tuple[str, str]]") -> dict:
 # Propagation-delay scan — shared by live detection and the offline replay tool
 # --------------------------------------------------------------------------- #
 
-# Build identity lives in build_info (dev59 unit 6.12 — it had two
-# implementations, and main.py used both). Imported here for _ADDON_VERSION
-# below, and still RE-EXPORTED for database._code_fingerprint and
-# routers/backup, which import it from `event_detector`.
-#
-# Unit 6.12 left this as a one-line re-export precisely so unit 7.3 would move
-# a line rather than relocate a body — which is what happened: the import
-# followed _ADDON_VERSION into this module, and `event_detector` now forwards
-# all four names (_read_addon_version, _read_git_commit, _ADDON_VERSION,
-# _GIT_COMMIT) through its PEP 562 __getattr__, so neither external call site
-# changed. Deleting the re-export is still not free — see
-# test_unit612_migration_mechanics and test_unit73_event_detector_split.
+# Build identity lives in build_info. Imported here for _ADDON_VERSION below,
+# and RE-EXPORTED for database._code_fingerprint and routers/backup, which
+# import all four names (_read_addon_version, _read_git_commit, _ADDON_VERSION,
+# _GIT_COMMIT) from `event_detector` via its PEP 562 __getattr__. Deleting the
+# re-export is not free — see test_unit612_migration_mechanics and
+# test_unit73_event_detector_split.
 from .build_info import (_read_addon_version,  # noqa: F401 — re-export
                          _read_git_commit)
 
@@ -206,7 +198,7 @@ def scan_propagation_delay(
     """Find the pressure-transient onset and derive the propagation delay
     (flow onset minus transient onset, in ms).
 
-    This is the single scan implementation used by both live detection
+    The single scan implementation, used by both live detection
     (CircuitEventDetector._start_flow_event) and the offline replay harness —
     never duplicate it.
 
@@ -327,17 +319,14 @@ class CircuitEventDetector:
     # Tuning constants                                                     #
     # ------------------------------------------------------------------ #
 
-    # Pressure history buffer.
-    # At 40 Hz (25 ms/sample) this holds 10 seconds of readings.
-    # A large buffer is needed so we can look back far enough to get a
-    # clean pre-transient baseline even when the dip takes 2-5 seconds
-    # to fully develop.  A short rolling baseline would start chasing
-    # the dip and underestimate the actual pressure drop.
+    # Pressure history buffer. At 40 Hz (25 ms/sample) this holds 10 seconds.
+    # The buffer must reach back far enough for a clean pre-transient baseline
+    # even when the dip takes 2-5 s to fully develop; a short rolling baseline
+    # chases the dip and underestimates the actual pressure drop.
     PRESSURE_BUFFER_SIZE: int = 400         # 10 s x 40 Hz
 
-    # Historical baseline window.
-    # When checking for a transient we compare the current pressure against
-    # an average of samples BASELINE_LOOKBACK_SAMPLES to
+    # Historical baseline window: a transient check compares current pressure
+    # against an average of samples BASELINE_LOOKBACK_SAMPLES to
     # BASELINE_LOOKBACK_SAMPLES + BASELINE_WINDOW_SAMPLES old.
     #
     # With the defaults below:
@@ -358,9 +347,8 @@ class CircuitEventDetector:
     MIN_FLOW_LPM: float = 0.15
 
     # Maximum physically plausible flow rate for any residential/light-commercial
-    # system.  Readings above this are treated as sensor overflow / firmware error
-    # values (e.g. 1.58e+36 L/min from ESP ADC overflow) and clamped to 0.0.
-    # 1000 L/min ≈ 264 gal/min — well beyond any domestic water supply.
+    # system. Readings above this are sensor overflow / firmware error values
+    # (e.g. 1.58e+36 L/min from ESP ADC overflow) and are clamped to 0.0.
     MAX_FLOW_LPM: float = 200.0   # matches firmware v3.5 ADC overflow clamp ceiling
 
     # Minimum physically meaningful flow rate from this sensor.
@@ -380,15 +368,15 @@ class CircuitEventDetector:
     FLOW_START_DIP_TOLERANCE: int = 2
 
     # Maximum silent gap between flow samples an armed sustain timer survives.
-    # The dip tolerance counts SAMPLES, but flow_rate can simply stop ticking
-    # after a brief burst (fewer zero samples arrive than the tolerance), so a
-    # timer armed by a ~10 s slug can stay armed for minutes; the NEXT burst
-    # then instantly satisfies FLOW_START_SECONDS and _start_flow_event
-    # backdates start_ts across the whole quiet gap, and the volume integral
-    # forward-fills that gap at the old burst's flow (observed: booster-pump
-    # top-up slugs ~5 min apart merging into one ~300 s / ~5.4 L event). The
-    # firmware pulse_meter reports within 10 s of flow stopping, so a 30 s
-    # sample gap while the timer is armed can only mean the sensor went quiet.
+    # The dip tolerance counts SAMPLES, but flow_rate can stop ticking after a
+    # brief burst (fewer zero samples arrive than the tolerance), so a timer
+    # armed by a ~10 s slug stays armed for minutes; the NEXT burst then
+    # instantly satisfies FLOW_START_SECONDS, _start_flow_event backdates
+    # start_ts across the whole quiet gap, and the volume integral forward-fills
+    # it at the old burst's flow (booster-pump top-up slugs ~5 min apart merged
+    # into one ~300 s / ~5.4 L event). The firmware pulse_meter reports within
+    # 10 s of flow stopping, so a 30 s sample gap while the timer is armed can
+    # only mean the sensor went quiet.
     FLOW_START_STALE_GAP_S: float = 30.0
 
     # Composite: second transient must be >= this multiple of primary threshold
@@ -407,23 +395,23 @@ class CircuitEventDetector:
     PRESSURE_RECOVERY_DURATION_S: float = 10.0
     # Flow-override END: if pressure has been recovered for this much longer AND
     # the flow reading is STALE (no sample within FLOW_SAMPLE_STALE_S), end the
-    # event despite the last flow value. Covers a flow sensor that reports
-    # high while flowing but never reports 0 when it stops, leaving
-    # _current_flow_lpm stale-high so the flow<MIN gate never fires — the cause of
-    # the 27.6 h irrigation event. Pressure (40 Hz) is the authority once it has
+    # event despite the last flow value. Covers a flow sensor that reports high
+    # while flowing but never reports 0 when it stops, leaving
+    # _current_flow_lpm stale-high so the flow<MIN gate never fires (cause of a
+    # 27.6 h irrigation event). Pressure (40 Hz) is the authority once it has
     # sat at baseline this long; a real run keeps pressure DROPPED so the timer
     # only completes when the draw is genuinely over.
     PRESSURE_RECOVERY_FLOW_OVERRIDE_S: float = 300.0   # 5 min
     # The override additionally requires the flow READING itself to be stale —
     # a live, healthy flow sample vetoes the "pressure says we're done"
     # heuristic. A constant-pressure (VFD booster pump) home restores line
-    # pressure DURING a draw, so without this guard the override chopped one
-    # 42-minute shower into three events (2026-07-31: force-closed at 5 min of
-    # pump-held baseline pressure with 5.6 L/min still flowing, twice). The
-    # stuck-sensor case the override exists for goes SILENT (HA fires only on
-    # state change), so sample staleness is the honest proxy for "the flow
-    # reading can't be trusted". 120 s tolerates a perfectly steady reading
-    # that publishes rarely; a genuinely stuck sensor is silent for hours.
+    # pressure DURING a draw, and without this guard the override chopped one
+    # 42-minute shower into three events (force-closed at 5 min of pump-held
+    # baseline pressure with 5.6 L/min still flowing). The stuck-sensor case the
+    # override exists for goes SILENT (HA fires only on state change), so sample
+    # staleness is the honest proxy for "the flow reading can't be trusted".
+    # 120 s tolerates a steady reading that publishes rarely; a genuinely stuck
+    # sensor is silent for hours.
     FLOW_SAMPLE_STALE_S: float = 120.0
     # Absolute hard cap on event duration (watchdog). The longest legitimate run
     # (a multi-zone irrigation cycle) is ~2.8 h; anything past this is a missed
@@ -439,17 +427,15 @@ class CircuitEventDetector:
     # are never closed here. Conservative: flow has been zero for the whole event.
     SETTLED_NOFLOW_CLOSE_S: float = 60.0
 
-    # Sawtooth hold-open close (2026-08 export study; pump mode only). A pump's
-    # periodic recharge slugs peak above MIN_FLOW, so each top-up resets the
-    # normal end conditions and holds an open event through many minutes of
-    # real idle until the next genuine draw merges in (the overlap-duplicate
-    # wrappers — every one post-pump-install). Close once the trailing
-    # SAWTOOTH_HOLD_CLOSE_S seconds contain nothing but micro-pulses shorter
-    # than SAWTOOTH_PULSE_MAX_S over true idle. Study (08-09 export): closes
-    # 11/15 known long-idle wrappers, splits 0 washer/dishwasher (their
-    # internal gaps max 92 s), 0 softener (their inter-fill flow sits above
-    # the idle floor), 0 user-labeled events; the only "splits" were further
-    # mislabeled wrappers verified against raw HA history.
+    # Sawtooth hold-open close (pump mode only). A pump's periodic recharge
+    # slugs peak above MIN_FLOW, so each top-up resets the normal end
+    # conditions and holds an open event through many minutes of real idle
+    # until the next genuine draw merges in (the overlap-duplicate wrappers).
+    # Close once the trailing SAWTOOTH_HOLD_CLOSE_S seconds contain nothing but
+    # micro-pulses shorter than SAWTOOTH_PULSE_MAX_S over true idle. Measured:
+    # closes 11/15 known long-idle wrappers, splits 0 washer/dishwasher (their
+    # internal gaps max 92 s), 0 softener (their inter-fill flow sits above the
+    # idle floor), 0 user-labeled events.
     SAWTOOTH_PULSE_MAX_S: float = 25.0    # a real fill/draw runs longer
     SAWTOOTH_HOLD_CLOSE_S: float = 420.0  # washer max internal gap x 4.5
     SAWTOOTH_IDLE_FRACTION: float = 0.18  # idle floor = fraction of MIN_FLOW
@@ -500,9 +486,9 @@ class CircuitEventDetector:
         self._get_other_valve_open: Callable[[], Optional[bool]] = (
             get_other_valve_open or (lambda: None)
         )
-        # dev41: (source, set_at_iso) provenance for the valve tri-state, or
-        # None when the state is unknown. Optional so tests/legacy callers
-        # that only wire the bool keep working.
+        # (source, set_at_iso) provenance for the valve tri-state, or None when
+        # the state is unknown. Optional so tests/legacy callers that only wire
+        # the bool keep working.
         self._get_other_valve_meta: Callable[
             [], Optional[Tuple[str, str]]] = (
             get_other_valve_meta or (lambda: None)
@@ -510,22 +496,20 @@ class CircuitEventDetector:
 
         self._debug_capture_propagation: bool = debug_capture_propagation
 
-        # dev25 (pump plan Phase 4b) — pump-mode oscillation gate. None = off.
-        # When set (confirmed vfd pump mode), PRESSURE-initiated event starts
-        # are suppressed while the rolling 60 s pressure peak-to-peak exceeds
-        # this gate: a recharge sawtooth crosses the 1.2 PSI drop trigger on
-        # every cycle and each blip-opened event can swallow a real draw that
-        # starts before the 60 s settled-noflow close (the 2026-07-20 10:03
-        # double-counted flush). The FLOW path is untouched and remains the
+        # Pump-mode oscillation gate. None = off. When set (confirmed vfd pump
+        # mode), PRESSURE-initiated event starts are suppressed while the
+        # rolling 60 s pressure peak-to-peak exceeds this gate: a recharge
+        # sawtooth crosses the 1.2 PSI drop trigger on every cycle and each
+        # blip-opened event can swallow a real draw that starts before the 60 s
+        # settled-noflow close. The FLOW path is untouched and remains the
         # primary detector; firmware trickle detection is independent → the
-        # suppression can never mask a leak. The gate value is amplitude-
-        # derived by the parent (max(2.0, 0.15 × measured band)) so a milder
-        # pump than the incident's 12 PSI band still gates correctly.
+        # suppression can never mask a leak. The gate value is amplitude-derived
+        # by the parent (max(2.0, 0.15 × measured band)) so a milder pump than
+        # the incident's 12 PSI band still gates correctly.
         self.pump_osc_gate_psi: Optional[float] = None
-        # dev46 (46h) — the circuit is deliberately drained for the season;
-        # sample handlers return immediately so ~0 psi never becomes an event
-        # or an alarm. Refreshed from circuit_profile on setup and whenever
-        # settings change.
+        # The circuit is deliberately drained for the season; sample handlers
+        # return immediately so ~0 psi never becomes an event or an alarm.
+        # Refreshed from circuit_profile on setup and whenever settings change.
         self.winterized: bool = False
         # Surge-phantom rejection threshold as an INSTANCE attr: in pump mode
         # a recharge upswing during a real event is exactly the "max pressure
@@ -537,12 +521,12 @@ class CircuitEventDetector:
         # otherwise fire, so the steady-state cost is just the appends.
         self._minute_pressure: Deque[Tuple[datetime, float]] = deque(maxlen=2600)
 
-        # ── dev27 (Phase 6) low-pressure alert state machines ────────────────
-        # 6a zone under-load floor (zone circuits only; None = off): sustained
-        # low pressure WHILE a zone is flowing — heads may not pop up. Two-
-        # stage timing: fill grace after run start AND after any significant
-        # flow step (multi-zone controllers transition zones without flow
-        # hitting zero), then a multi-minute sustain.
+        # ── Low-pressure alert state machines ────────────────────────────────
+        # Zone under-load floor (zone circuits only; None = off): sustained low
+        # pressure WHILE a zone is flowing — heads may not pop up. Two-stage
+        # timing: fill grace after run start AND after any significant flow step
+        # (multi-zone controllers transition zones without flow hitting zero),
+        # then a multi-minute sustain.
         self.zone_low_floor_psi: Optional[float] = None
         self.LOW_PSI_FILL_GRACE_S: float = 120.0
         self.LOW_PSI_SUSTAIN_S: float = 180.0
@@ -555,11 +539,11 @@ class CircuitEventDetector:
         self._lp_flow_low_since: Optional[datetime] = None
         self.low_pressure_cb: Optional[Callable[[str, float], None]] = None
 
-        # 6b pump-failure floor (armed vfd pump homes, main circuit; None =
-        # off): pressure sustained below the pump's normal band. A recharge
-        # rise inside the window resets it (pump alive); at fire time the
-        # current flow branches failure vs overload copy (a maxed-out VFD
-        # serving heavy demand is NOT a dead pump).
+        # Pump-failure floor (armed vfd pump homes, main circuit; None = off):
+        # pressure sustained below the pump's normal band. A recharge rise
+        # inside the window resets it (pump alive); at fire time the current
+        # flow branches failure vs overload copy (a maxed-out VFD serving heavy
+        # demand is NOT a dead pump).
         self.pump_fail_floor_psi: Optional[float] = None
         self.PUMP_FAIL_SUSTAIN_S: float = 300.0
         self.PUMP_FAIL_RISE_RESET_PSI: float = 2.0
@@ -613,7 +597,7 @@ class CircuitEventDetector:
         self.pressure_drop_threshold = threshold_psi
 
     def set_winterized(self, winterized: bool) -> None:
-        """dev46 (46h) — pause detection while the circuit is drained.
+        """Pause detection while the circuit is drained.
 
         Set BEFORE the drain, so the drain-down itself is never seen as a
         catastrophic pressure event. Clearing it closes any event still open
@@ -628,7 +612,7 @@ class CircuitEventDetector:
             self._active_event = None
 
     def update_pump_gate(self, gate_psi: Optional[float]) -> None:
-        """Set/clear the pump-mode oscillation gate (dev25). Also widens the
+        """Set/clear the pump-mode oscillation gate. Also widens the
         surge-phantom rejection to effectively-off while pump mode is on."""
         self.pump_osc_gate_psi = gate_psi
         self.pressure_surge_phantom_psi = (
@@ -636,7 +620,7 @@ class CircuitEventDetector:
 
     def update_low_pressure_config(self, zone_floor_psi: Optional[float],
                                    pump_fail_floor_psi: Optional[float]) -> None:
-        """Set/clear the Phase 6 low-pressure floors (dev27)."""
+        """Set/clear the low-pressure floors."""
         self.zone_low_floor_psi = zone_floor_psi
         self.pump_fail_floor_psi = pump_fail_floor_psi
 
@@ -651,7 +635,7 @@ class CircuitEventDetector:
         return (self._settled_pressure_psi, self._settled_pressure_since)
 
     def _track_zone_flow(self, now: datetime, flow: float) -> None:
-        """6a run/grace bookkeeping, called from on_flow_rate on zone
+        """Zone run/grace bookkeeping, called from on_flow_rate on zone
         circuits. A run starts at the first above-floor flow after idle; the
         fill grace re-arms on any >=30% flow step (zone transition)."""
         if flow >= self.MIN_FLOW_LPM:
@@ -680,7 +664,7 @@ class CircuitEventDetector:
                     self._lp_below_since = None
 
     def _eval_zone_low_pressure(self, now: datetime, pressure: float) -> None:
-        """6a: floor check while a zone run is active and past its grace."""
+        """Floor check while a zone run is active and past its grace."""
         if (self.zone_low_floor_psi is None or self._lp_run_started is None
                 or self._lp_fired_this_run):
             return
@@ -703,7 +687,7 @@ class CircuitEventDetector:
                                 self.circuit, e)
 
     def _eval_pump_fail(self, now: datetime, pressure: float) -> None:
-        """6b: sustained sub-floor pressure = pump failed/off/overloaded."""
+        """Sustained sub-floor pressure = pump failed/off/overloaded."""
         floor = self.pump_fail_floor_psi
         if floor is None:
             return
@@ -764,21 +748,20 @@ class CircuitEventDetector:
         - Drives the FLOW start trigger via a sustained-flow timer.
         - Resets the timer when flow drops below MIN_FLOW_LPM.
         """
-        # NOTE: the winterized guard must stay BELOW the docstring — above it,
-        # the string literal is no longer the first statement and Python parses
-        # it as a discarded expression, leaving __doc__ == None.
+        # The winterized guard must stay BELOW the docstring: above it, the
+        # string literal is no longer the first statement and Python parses it
+        # as a discarded expression, leaving __doc__ == None.
         if self.winterized:
-            return          # dev46 (46h) — drained for the season
+            return          # drained for the season
         try:
             raw_flow = float(state)
         except (ValueError, TypeError):
             raw_flow = 0.0
 
-        # Guard against ESP firmware ADC garbage values. Two failure modes:
-        #   HIGH: overflow produces huge values (e.g. 1.58e+36 L/min).
-        #   LOW:  underflow/noise produces tiny near-zero values (e.g. 1.58e-36)
-        #         that are positive but below the minimum meaningful reading.
-        # Both are treated as zero so event end detection is not blocked.
+        # ESP firmware ADC garbage. HIGH: overflow produces huge values (e.g.
+        # 1.58e+36 L/min). LOW: underflow/noise produces tiny positive values
+        # (e.g. 1.58e-36) below the minimum meaningful reading. Both are treated
+        # as zero so event end detection is not blocked.
         if raw_flow > self.MAX_FLOW_LPM or raw_flow < 0.0 or (
                 0.0 < raw_flow < self.MIN_NOISE_LPM):
             log.warning(
@@ -808,30 +791,29 @@ class CircuitEventDetector:
             self._flow_start_dips = 0
         self._last_flow_sample_ts = now
 
-        # Phase 6a zone-run bookkeeping (no-op unless a zone floor is set).
+        # Zone-run bookkeeping (no-op unless a zone floor is set).
         if self.zone_low_floor_psi is not None:
             self._track_zone_flow(now, raw_flow)
 
         if self._active_event is not None:
             ev = self._active_event
-            # dev.24 low-flow off-grace: flow resuming bridges a held dip (the
-            # same event continues); a hold whose grace expired with no resume
+            # Low-flow off-grace: flow resuming bridges a held dip (the same
+            # event continues); a hold whose grace expired with no resume
             # finalizes here. Otherwise fall through and record as before.
             if ev.low_flow_hold_until is not None and self._current_flow_lpm >= self.MIN_FLOW_LPM:
                 ev.low_flow_hold_until = None
                 log.debug("[%s] low-flow hold released — flow resumed (%.3f L/min)",
                           self.circuit, self._current_flow_lpm)
-            # unit 2.34: one ordered ladder, shared with on_pressure_fast, so
-            # the end_ts never depends on which sensor ticked first. (Clearing
-            # the hold above makes the ladder's rung 1 a no-op, exactly as the
-            # previous `elif` did.)
+            # One ordered ladder, shared with on_pressure_fast, so the end_ts
+            # never depends on which sensor ticked first. (Clearing the hold
+            # above makes the ladder's rung 1 a no-op.)
             if self._run_close_ladder(now):
                 return
             elapsed = (now - self._active_event.start_ts).total_seconds()
             self._flow_sample_count += 1
             if elapsed < self._DOWNSAMPLE_AFTER_SECONDS or self._flow_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.flow_readings.append(self._current_flow_lpm)
-                # dev46 (46i): honest span for this channel's signature.
+                # Honest span for this channel's signature.
                 self._active_event.flow_sig_span_s = elapsed
             # Coalesced timestamped capture for the volume integral.
             fs = self._active_event.flow_samples
@@ -892,11 +874,11 @@ class CircuitEventDetector:
           short within-event baseline so the settled post-drop pressure is
           the reference, not the original pre-event baseline.
         """
-        # NOTE: the winterized guard must stay BELOW the docstring — above it,
-        # the string literal is no longer the first statement and Python parses
-        # it as a discarded expression, leaving __doc__ == None.
+        # The winterized guard must stay BELOW the docstring: above it, the
+        # string literal is no longer the first statement and Python parses it
+        # as a discarded expression, leaving __doc__ == None.
         if self.winterized:
-            return          # dev46 (46h) — drained for the season
+            return          # drained for the season
         if state in ("unavailable", "unknown"):
             # ESP reconnected or went offline — stale buffer readings would mix
             # with new data and could trigger a false pressure transient.
@@ -916,7 +898,7 @@ class CircuitEventDetector:
         self._pressure_ts_buf.append(now)
         if self.pump_osc_gate_psi is not None:
             self._minute_pressure.append((now, pressure))
-        # Phase 6 low-pressure monitors (no-ops unless a floor is configured).
+        # Low-pressure monitors (no-ops unless a floor is configured).
         self._eval_zone_low_pressure(now, pressure)
         self._eval_pump_fail(now, pressure)
 
@@ -956,10 +938,10 @@ class CircuitEventDetector:
                     )
                 elif (self.pump_osc_gate_psi is not None
                         and self._minute_p2p(now) > self.pump_osc_gate_psi):
-                    # dev25 pump-mode oscillation gate: the supply is mid-
-                    # sawtooth — a pressure-only start here is a recharge
-                    # artifact wrapper waiting to swallow a real draw. Flow
-                    # starts are unaffected.
+                    # Pump-mode oscillation gate: the supply is mid-sawtooth,
+                    # so a pressure-only start here is a recharge artifact
+                    # wrapper waiting to swallow a real draw. Flow starts are
+                    # unaffected.
                     log.debug(
                         "[%s] pressure start suppressed — pump oscillation "
                         "(60 s p2p %.1f > %.1f PSI gate)",
@@ -969,11 +951,11 @@ class CircuitEventDetector:
                 else:
                     self._start_pressure_event(now, baseline, pressure)
         else:
-            # dev.24 low-flow off-grace backstop: flow_rate can stop ticking at 0
-            # during a dip, but the fast-pressure sensor keeps sampling — so a
-            # held event whose grace expired is finalized here too.
-            # unit 2.34: one ordered ladder, shared with on_flow_rate, so the
-            # end_ts never depends on which sensor ticked first.
+            # Low-flow off-grace backstop: flow_rate can stop ticking at 0
+            # during a dip, but the fast-pressure sensor keeps sampling, so a
+            # held event whose grace expired is finalized here too. One
+            # ordered ladder, shared with on_flow_rate, so the end_ts never
+            # depends on which sensor ticked first.
             if self._run_close_ladder(now):
                 return
             elapsed_p = (now - self._active_event.start_ts).total_seconds()
@@ -982,7 +964,7 @@ class CircuitEventDetector:
             self._active_event.max_pressure_psi = max(self._active_event.max_pressure_psi, pressure)
             if elapsed_p < self._DOWNSAMPLE_AFTER_SECONDS or self._pressure_sample_count % self._DOWNSAMPLE_KEEP_EVERY == 0:
                 self._active_event.pressure_readings.append(pressure)
-                # dev46 (46i): honest span for this channel's signature.
+                # Honest span for this channel's signature.
                 self._active_event.pressure_sig_span_s = elapsed_p
 
             ev = self._active_event
@@ -1350,7 +1332,7 @@ class CircuitEventDetector:
     def _should_hold_low_flow(self, ev: RawEvent, ts: datetime) -> bool:
         """Whether to hold a low-flow event open through a sub-threshold dip.
         Returns False once the grace deadline passes (-> finalize) and for
-        normal-flow events (which end immediately, exactly as before dev.24)."""
+        normal-flow events, which end immediately."""
         if ev.low_flow_hold_until is not None and ts >= ev.low_flow_hold_until:
             return False
         return self._is_low_flow_event(ev)
@@ -1436,7 +1418,7 @@ class CircuitEventDetector:
         """Close an event held open only by pump recharge micro-pulses.
 
         Pump mode only (``pump_osc_gate_psi`` is the detector's pump-mode
-        signal, set with the dev25 oscillation gate). Walks the event's
+        signal, set with the oscillation gate). Walks the event's
         timestamped ``flow_samples`` step function backwards from ``now`` and
         finds the last REAL activity: either an above-MIN_FLOW run at least
         SAWTOOTH_PULSE_MAX_S long (a genuine draw/fill) or sub-threshold flow
@@ -1485,12 +1467,10 @@ class CircuitEventDetector:
     def _run_close_ladder(self, now: datetime) -> bool:
         """Evaluate every non-recovery close path in ONE fixed order.
 
-        unit 2.34. Both sensor callbacks used to test these paths in their own
-        hand-maintained order (on_flow_rate ran sawtooth before the watchdog and
-        never ran the settled-no-flow path at all; on_pressure_fast ran the
-        watchdog before both). An event that satisfied two rungs therefore got a
-        different ``end_ts`` depending on which sensor happened to tick first —
-        live nondeterminism in event boundaries. The two lists are now one list.
+        Both sensor callbacks share this list. With a per-callback order, an
+        event satisfying two rungs got a different ``end_ts`` depending on
+        which sensor happened to tick first — live nondeterminism in event
+        boundaries.
 
         Order is most-informed close first, generic watchdog last:
 
@@ -1504,13 +1484,10 @@ class CircuitEventDetector:
           4. ``_maybe_force_close_overlong``   -> end_ts = now.
 
         (4) is LAST because it is a failure path, not a close reason: it means
-        "we missed the end signal". If any of (1)-(3) fired, the end signal was
-        not missed — we know when the draw ended — and letting the watchdog win
-        would stamp the full 6 h cap onto an event that really ended earlier,
-        feeding a garbage duration to the classifier. This also makes the
-        pressure callback agree with the order the flow callback already shipped
-        (sawtooth before watchdog), so the common flow-sensor-ticking path keeps
-        its current behaviour and only the pressure path changes.
+        "we missed the end signal". If any of (1)-(3) fired the end signal was
+        not missed, and letting the watchdog win would stamp the full 6 h cap
+        onto an event that really ended earlier, feeding a garbage duration to
+        the classifier.
 
         Returns True when an event was finalized — the caller must then stop
         touching ``self._active_event``.
@@ -1524,11 +1501,11 @@ class CircuitEventDetector:
         ev = self._active_event
         if ev is None:
             return
-        # dev.24 low-flow off-grace: a sustained low draw the turbine chatters on
+        # Low-flow off-grace: a sustained low draw the turbine chatters on
         # must not finalize on a brief sub-threshold dip. Hold the event open
-        # until the grace deadline; on_flow_rate clears the hold the instant flow
-        # resumes, bridging the dip into one event. force=True (grace expired)
-        # skips the hold so the held event actually finalizes.
+        # until the grace deadline; on_flow_rate clears the hold the instant
+        # flow resumes, bridging the dip into one event. force=True (grace
+        # expired) skips the hold so the held event actually finalizes.
         if not force and self._should_hold_low_flow(ev, ts):
             if ev.low_flow_hold_until is None:
                 ev.low_flow_hold_until = ts + timedelta(seconds=LOWFLOW_OFF_GRACE_S)
@@ -1596,8 +1573,8 @@ class CircuitEventDetector:
             and ev.pre_event_pressure_psi > 0
             and ev.max_pressure_psi > 0
         ):
-            # Instance attr (dev25): widened to effectively-off in pump mode —
-            # a recharge upswing during a real event is exactly this pattern.
+            # Instance attr: widened to effectively-off in pump mode, where a
+            # recharge upswing during a real event is exactly this pattern.
             pressure_rise = ev.max_pressure_psi - ev.pre_event_pressure_psi
             if pressure_rise > self.pressure_surge_phantom_psi and ev.pressure_delta_psi <= 0:
                 log.info(

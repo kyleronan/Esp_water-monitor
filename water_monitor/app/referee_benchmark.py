@@ -1,21 +1,19 @@
-"""dev53 — the referee benchmark: ONE selection rule, ONE hash, app-side.
+"""The referee benchmark: ONE selection rule, ONE hash, app-side.
 
 The referee's benchmark leg scores every challenger against a frozen set of
-this home's own labelled events. Until dev53 that set was pinned by hand on a
-developer machine (``tools/eval_tinymodel.py --pin-benchmark``) and pasted into
-a Dev Tools card, which meant a second home never got one at all: its
-benchmark leg abstained forever and the referee ran single-legged. This module
-lets the add-on pin — and, deliberately, re-pin — its own.
+this home's own labelled events. The add-on pins — and, deliberately, re-pins
+— its own, so a home that never had a hand-pinned set is not left with a
+benchmark leg that abstains forever and a single-legged referee.
 
 It is deliberately pure: stdlib plus ``tinymodel.is_machine_label``. Every
 selection path (the weekly auto-pin, the Dev Tools button, the Water Use
 prompt, AND the dev-box tool) must call ``select_benchmark`` so that identical
-rows yield an identical id set and hash. Two things used to differ between the
-tool and the app and would have silently produced different benchmarks from
-the same data — the tool grouped days by Denver-local date while every
-app-side day grouping uses the UTC ``start_ts[:10]`` slice, and the tool's row
-loader skipped the quarantine/exclusion filters the training pool applies.
-Both are settled here: UTC days, human-source pool-eligible rows only.
+rows yield an identical id set and hash. Two rules make that hold, and either
+one broken silently produces a different benchmark from the same data: days
+are grouped by the UTC ``start_ts[:10]`` slice (never Denver-local, as every
+other app-side day grouping does), and the row pool is human-source and
+pool-eligible only — the quarantine/exclusion filters the training pool
+applies.
 
 SIZING IS DERIVED, NEVER FIXED. Pinning removes rows from training, and
 eligibility is enforced twice on the way to a model: ``tm.eligible(pool)`` on
@@ -157,11 +155,10 @@ def select_benchmark(rows: Sequence[dict], *, b_other: int = 0,
     """Pick the benchmark from ``rows`` (already the human pool), or None.
 
     Whole UTC days are taken round-robin across the calendar
-    (``days[::2] + days[1::2]``, the order the tool has always used) so no
-    appliance cycle is split between the benchmark and the training pool. A
-    day is added only if it FITS under the ceiling — the cap is a cap (the
-    old tool tested the cap before adding a day, so "150" produced ~165) — and
-    the loop stops once ``target`` is met. ``exclude_days`` lets an activation
+    (``days[::2] + days[1::2]``) so no appliance cycle is split between the
+    benchmark and the training pool. A day is added only if it FITS under the
+    ceiling — the cap is a cap, tested before the day is added, not after —
+    and the loop stops once ``target`` is met. ``exclude_days`` lets an activation
     re-selection avoid the days the freshly promoted champion trained on, so
     the new set is clean for the model it will judge.
     """
@@ -222,8 +219,8 @@ def ts_utc(value) -> Optional[datetime]:
     Accepts a datetime, or a string with ``T`` OR a space between date and
     time (the codebase's known ``'T' > ' '`` string-comparison trap), a ``Z``
     suffix, and naive values (treated as UTC). Callers treat None as "cannot
-    order" and FAIL CLOSED — abstain the leg, do not activate — because the
-    failure mode of guessing is the one dev51's gate exists to prevent.
+    order" and FAIL CLOSED — abstain the leg, do not activate — because
+    guessing an order is the failure the activation gate exists to prevent.
     """
     if value is None:
         return None

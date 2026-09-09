@@ -1,15 +1,14 @@
 """Per-event waveform capture — the firmware wire format and its reassembler.
 
-Unit 7.3 extracted this from ``event_detector.py`` unchanged. It is the MIDDLE
-layer of the three: it depends on ``event_detector_core`` (for the shared
-logger only) and knows nothing about ``EventDetector``, which is what makes the
-dependency graph acyclic — ``event_detector`` -> ``event_waveform`` ->
-``event_detector_core``, never back the other way.
+The MIDDLE layer of three: it depends on ``event_detector_core`` (for the
+shared logger only) and knows nothing about ``EventDetector``, which is what
+keeps the dependency graph acyclic — ``event_detector`` -> ``event_waveform``
+-> ``event_detector_core``, never back the other way.
 
 Every ``_WF_*`` constant here is FIRMWARE WIRE-FORMAT VOCABULARY: the values are
 fixed by what the ESP publishes, so this module is the one place they may be
-defined. See ``test_unit73_event_detector_split`` for the pin that keeps
-``_WF_FL_RESOLUTION_REDUCED`` from drifting away from feature_extractor's copy.
+defined. ``test_unit73_event_detector_split`` pins
+``_WF_FL_RESOLUTION_REDUCED`` against feature_extractor's copy.
 """
 from __future__ import annotations
 
@@ -38,27 +37,24 @@ _WF_START_SAMPLES: int = 150            # first slice of full_flow used as start
 _WF_MAX_RECORDS: int = 30               # max assembled records kept per circuit
 _WF_FLAG_VALID_MASK: int = 0x7F         # bits 0-6 only; bit 7 must be 0
 _WF_INFLIGHT_TTL_S: float = 7200.0      # 2 h — absolute upper bound on supported event length
-# Phase 3 — once the FINAL chunk has arrived (so `total` is known), a set still
-# missing chunks is a transport GAP: give up after this grace (rather than holding
-# memory for the full 2 h TTL) and count it. Generous enough for a delayed chunk.
+# Once the FINAL chunk has arrived (so `total` is known), a set still missing
+# chunks is a transport GAP: give up after this grace rather than holding memory
+# for the full 2 h TTL, and count it. Generous enough for a delayed chunk.
 _WF_FINAL_GAP_TIMEOUT_S: float = 120.0
 _WF_FL_RESOLUTION_REDUCED: int = 0x04   # firmware dropped/decimated samples (a hole)
 _WF_MAX_CHUNK_SAMPLES: int = 1500       # firmware buffer cap; bound decoded-payload length defensively
 _WF_MAX_TOTAL_CHUNKS: int = 600         # bound for the 'total' field (~5 hour event at 30s cadence)
 # Receiver-side reassembly bounds. Chunks arrive from a device over the HA
-# event bus; from this process's point of view the sender is untrusted input,
-# and unbounded reassembly state is a textbook denial-of-service primitive
-# (CVE-2018-5391 "FragmentSmack": IP fragments parked in a reassembly queue by
-# a sender that never completes them). Two dimensions must be bounded
-# INDEPENDENTLY, because bounding either one alone still leaves a way to grow
-# memory without limit:
-#   * how large ONE in-flight set may become  -> _WF_MAX_TOTAL_CHUNKS, now
-#     enforced against `seq` on every chunk (see on_waveform_chunk), not just
-#     against the wire `total` field that only arrives on the FINAL chunk.
+# event bus, so the sender is untrusted input and unbounded reassembly state is
+# a denial-of-service primitive (CVE-2018-5391 "FragmentSmack"). Two dimensions
+# must be bounded INDEPENDENTLY — bounding either alone still leaves a way to
+# grow memory without limit:
+#   * how large ONE in-flight set may become  -> _WF_MAX_TOTAL_CHUNKS, enforced
+#     against `seq` on every chunk (see on_waveform_chunk), not just against
+#     the wire `total` field that only arrives on the FINAL chunk.
 #   * how MANY in-flight sets may exist       -> _WF_MAX_INFLIGHT_SETS below.
-# The TTL sweep (_evict_stale) bounds TIME but not either of these: it only
-# runs when a chunk arrives, and a sender that keeps sending is exactly the
-# sender that never trips it.
+# The TTL sweep (_evict_stale) bounds TIME but neither of these: it only runs
+# when a chunk arrives, and a sender that keeps sending never trips it.
 #
 # High/low water marks follow the Linux ipfrag_high_thresh / ipfrag_low_thresh
 # shape: at the high mark, evict oldest-first down to the low mark, so the
@@ -91,11 +87,10 @@ class WaveformMetadata:
     # is resolved by the accumulator once chunk lengths are known.
     #
     # Default to -1 (not 0) so a record constructed without onset fields —
-    # malformed parse, future schema change, hand-built test fixture —
-    # cannot silently look like "onset at sample 0" and have downstream
-    # feature_extractor treat the pre-roll as the post-onset ramp. _assemble
-    # also validates that (onset_seq, onset_idx) is in bounds for the
-    # received chunks and writes -1 if not.
+    # malformed parse, future schema change, hand-built test fixture — cannot
+    # look like "onset at sample 0" and have feature_extractor treat the
+    # pre-roll as the post-onset ramp. _assemble also validates that
+    # (onset_seq, onset_idx) is in bounds for the received chunks.
     onset_seq: int = -1
     onset_idx: int = -1
     onset_index: int = -1
@@ -346,27 +341,26 @@ class WaveformChunkAccumulator:
         self._expected_node = _normalize_node_name(expected_node)
         self._inflight: Dict[Tuple[int, int], _InflightChunkSet] = {}
         self._records: List[WaveformRecord] = []
-        # Phase 3 transport-health counters (since boot/restart): total assembled,
-        # assembled-but-firmware-flagged-degraded (quality / resolution-reduced), and
-        # transport GAPS (final arrived but chunks lost → waveform discarded).
+        # Transport-health counters (since boot/restart): total assembled,
+        # assembled-but-firmware-flagged-degraded (quality / resolution-reduced),
+        # and transport GAPS (final arrived but chunks lost → discarded).
         self._n_assembled = 0
         self._n_degraded = 0
         self._n_gaps = 0
         # Reassembly-bound counters. Rejections/evictions are COUNTED rather
-        # than logged per chunk: the whole point of the bounds is to survive a
-        # flood, and a log line per rejected chunk would just move the
-        # denial-of-service from the heap to the log. Surfaced via
-        # transport_stats(); the first occurrence of each is logged at WARNING
-        # so the condition is visible without tailing DEBUG.
+        # than logged per chunk: the bounds exist to survive a flood, and a log
+        # line per rejected chunk moves the denial-of-service from the heap to
+        # the log. Surfaced via transport_stats(); the first occurrence of each
+        # is logged at WARNING so the condition is visible without tailing
+        # DEBUG.
         self._n_rejected_seq = 0        # chunk dropped: seq >= _WF_MAX_TOTAL_CHUNKS
         self._n_overflow_evicted = 0    # in-flight set dropped: table at capacity
-        # Phase 3 (3.2) — the transport_version gate is the STRICTEST test in
-        # this class (exact string "1") and, until now, the least observable:
-        # a firmware that bumps it drops 100% of chunks at log.debug, with no
-        # counter, no warning, and no visible difference from "the ESP is
-        # quiet". Counted here and surfaced via transport_stats(); the first
-        # occurrence also escalates through `on_degraded` so /health/detail
-        # names it instead of merely reporting zero waveforms.
+        # The transport_version gate is the STRICTEST test in this class (exact
+        # string "1") and the least observable: a firmware that bumps it drops
+        # 100% of chunks with no visible difference from "the ESP is quiet".
+        # Counted here and surfaced via transport_stats(); the first occurrence
+        # also escalates through `on_degraded` so /health/detail names it
+        # instead of merely reporting zero waveforms.
         self._n_rejected_version = 0
         self._on_degraded = on_degraded
         self._degraded_reported: set = set()
@@ -383,7 +377,7 @@ class WaveformChunkAccumulator:
                 self._circuit,
             )
         # Optional sink fired once a record finishes assembling (late-waveform
-        # upgrade, Fix 1). Kept DB-free; invoked in a try/except in _assemble so a
+        # upgrade). Kept DB-free; invoked in a try/except in _assemble so a
         # sink bug can never corrupt assembly. None in most tests.
         self._on_record_assembled = on_record_assembled
 
@@ -392,10 +386,9 @@ class WaveformChunkAccumulator:
 
         Wired by EventDetector to Orchestrator.mark_subsystem_degraded, which
         writes _supervise's record shape into ``worker_health`` — the surface
-        /health/detail already reads. Deliberately no second mechanism, and
-        deliberately fire-once: the conditions this reports are all-or-nothing
-        (a version bump drops every chunk), so repeating adds nothing and a
-        flood must never become a log/notification amplifier.
+        /health/detail already reads. Fire-once: the conditions reported are
+        all-or-nothing (a version bump drops every chunk), so repeating adds
+        nothing and a flood must never become a notification amplifier.
         """
         if key in self._degraded_reported:
             return
@@ -489,14 +482,13 @@ class WaveformChunkAccumulator:
 
         # Bound 1 — absolute cap on `seq`, enforced BEFORE `cs.total` is known.
         # `total` only arrives on the FINAL chunk, so the `seq >= cs.total`
-        # guard below is dead until then: a sender that streams non-final
-        # chunks with ever-increasing seq previously grew ONE set without
-        # limit (each entry up to _WF_MAX_CHUNK_SAMPLES floats x2 arrays) and
-        # held it for the full 2 h TTL. Because cs.chunks is keyed by seq,
-        # capping seq here also caps len(cs.chunks) at _WF_MAX_TOTAL_CHUNKS,
-        # which is the size the wire format already declares as the maximum.
-        # Checked before the in-flight set is looked up/created so a junk
-        # chunk cannot even allocate one.
+        # guard below is dead until then and a sender streaming non-final chunks
+        # with ever-increasing seq grows ONE set without limit (each entry up to
+        # _WF_MAX_CHUNK_SAMPLES floats x2 arrays) for the full 2 h TTL. Because
+        # cs.chunks is keyed by seq, capping seq also caps len(cs.chunks) at
+        # _WF_MAX_TOTAL_CHUNKS, the maximum the wire format declares. Checked
+        # before the in-flight set is looked up/created so a junk chunk cannot
+        # even allocate one.
         if seq >= _WF_MAX_TOTAL_CHUNKS:
             self._n_rejected_seq += 1
             if self._n_rejected_seq == 1:
@@ -518,9 +510,8 @@ class WaveformChunkAccumulator:
         if cs is None:
             # Bound 2 — admission control on the NUMBER of in-flight sets.
             # Every distinct (boot_id, event_id) past the node/circuit guards
-            # allocates a set, and nothing previously capped how many. Make
-            # room before allocating so the table can never exceed the high
-            # water mark.
+            # allocates one. Make room BEFORE allocating so the table can never
+            # exceed the high water mark.
             self._enforce_inflight_capacity()
             cs = _InflightChunkSet(first_received_at=now)
             self._inflight[key] = cs
@@ -618,10 +609,9 @@ class WaveformChunkAccumulator:
               - idx isn't a valid position inside that chunk
 
             Downstream feature_extractor treats -1 as "use legacy onset
-            detection from the waveform itself" rather than trusting a
-            silently-clamped value (the old behaviour clamped any negative
-            idx to 0, which made a missing-onset record look like onset
-            lived at sample 0 — wrong for any event with a pre-roll).
+            detection from the waveform itself". Do NOT clamp a negative idx
+            to 0: that makes a missing-onset record look like onset lived at
+            sample 0, wrong for any event with a pre-roll.
             """
             if seq < 0:
                 return -1
@@ -644,12 +634,11 @@ class WaveformChunkAccumulator:
         meta.start_points = len(start_flow)
 
         # feature_extractor derives per-sample dt from (pre_ms + post_ms) /
-        # start_points. The firmware streams at native ~50 Hz cadence (20 ms
-        # per sample); populate pre_ms / post_ms so dt resolves to 0.020 s
-        # and the onset position is recoverable. When the resolved onset lies
-        # within the start window we expose it via pre_ms/post_ms; otherwise
-        # we just describe the start window's full extent and downstream code
-        # falls back to legacy onset detection from the waveform itself.
+        # start_points. The firmware streams at native ~50 Hz (20 ms per
+        # sample); populating pre_ms / post_ms makes dt resolve to 0.020 s and
+        # keeps the onset position recoverable. An onset inside the start window
+        # is expressed through pre_ms/post_ms; otherwise these describe the
+        # window's full extent and downstream falls back to legacy detection.
         _SAMPLE_MS = 20
         if meta.start_points > 0:
             if 0 <= meta.onset_index < meta.start_points:
@@ -686,8 +675,8 @@ class WaveformChunkAccumulator:
         self._records.append(record)
         if len(self._records) > _WF_MAX_RECORDS:
             self._records = self._records[-_WF_MAX_RECORDS:]
-        # Phase 3 — count it; flag if the firmware self-reported a degraded capture
-        # (these still assemble, but their SIGNATURE is gated in _enrich_from_waveform).
+        # Flag if the firmware self-reported a degraded capture (these still
+        # assemble, but their SIGNATURE is gated in _enrich_from_waveform).
         self._n_assembled += 1
         if meta.quality != 0 or (meta.flags & _WF_FL_RESOLUTION_REDUCED):
             self._n_degraded += 1
@@ -722,19 +711,17 @@ class WaveformChunkAccumulator:
         """Evict oldest-first so a new set can be admitted within the cap.
 
         Called only from the allocation path in on_waveform_chunk. Modelled on
-        the Linux IP-fragment reassembly thresholds: at
-        _WF_MAX_INFLIGHT_SETS, drop the OLDEST sets (by first_received_at,
-        the same stamp the TTL sweep uses) down to _WF_INFLIGHT_LOW_WATER - 1
-        so there is room for the caller's new set. Batching to a low-water
-        mark — rather than evicting exactly one per arrival — means a sender
-        cannot hold the table pinned at capacity and force an eviction for
-        every chunk it sends.
+        the Linux IP-fragment reassembly thresholds: at _WF_MAX_INFLIGHT_SETS,
+        drop the OLDEST sets (by first_received_at, the same stamp the TTL sweep
+        uses) down to _WF_INFLIGHT_LOW_WATER - 1 so there is room for the
+        caller's new set. Batching to a low-water mark rather than evicting one
+        per arrival stops a sender pinning the table at capacity and forcing an
+        eviction for every chunk it sends.
 
-        Oldest-first is deliberate: the newest sets are the ones an event
-        actually in progress is still adding to, and the oldest is the most
-        likely to be abandoned. This bounds RETAINED memory even when the
-        stream stops entirely, which the TTL sweep cannot do on its own
-        (_evict_stale only runs when a chunk arrives).
+        Oldest-first: the newest sets are the ones an in-progress event is still
+        adding to, and the oldest is the most likely to be abandoned. This
+        bounds RETAINED memory even when the stream stops entirely, which
+        _evict_stale cannot do (it only runs when a chunk arrives).
         """
         if len(self._inflight) < _WF_MAX_INFLIGHT_SETS:
             return
@@ -798,16 +785,15 @@ class WaveformChunkAccumulator:
                 )
 
     def transport_stats(self) -> Dict[str, Any]:
-        """Phase 3 waveform-transport health since boot: how many waveforms
-        assembled, how many were firmware-flagged degraded, and how many were lost
-        to transport gaps (a final chunk arrived but predecessors never did).
+        """Waveform-transport health since boot: how many waveforms assembled,
+        how many were firmware-flagged degraded, and how many were lost to
+        transport gaps (a final chunk arrived but predecessors never did).
 
         Also reports the two conditions that are otherwise SILENT BY
-        CONSTRUCTION (unit 3.2) — a rejected transport_version, and a
-        node-identity check that is switched off because the derived ESP
-        prefix was empty. Both used to be indistinguishable from "the device
-        is quiet". Values are ints plus two non-counter fields; read it as a
-        report, never as a gate."""
+        CONSTRUCTION — a rejected transport_version, and a node-identity check
+        switched off because the derived ESP prefix was empty — both otherwise
+        indistinguishable from "the device is quiet". Read it as a report,
+        never as a gate."""
         return {"assembled": self._n_assembled,
                 "degraded": self._n_degraded,
                 "gaps": self._n_gaps,

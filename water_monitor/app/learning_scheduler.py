@@ -1,7 +1,7 @@
-"""dev47 — the two background jobs that keep the loop turning.
+"""The two background jobs that keep the loop turning.
 
 Both run daily, both are best-effort, and both do their DB work inside
-``run_db`` (46a). They are deliberately separate from the classification path:
+``run_db``. They are deliberately separate from the classification path:
 nothing here is on the critical path of recording an event, so a failure in
 either degrades the add-on to "no model refresh tonight" rather than to
 "events stop being classified".
@@ -133,12 +133,11 @@ class LearningScheduler:
                               trigger: Optional[str] = None):
         """Put ONE circuit through the referee, and return its outcome.
 
-        ``trigger`` is what the ledger records — ``weekly`` or ``on_demand``;
-        derived from ``reason`` when not given so the existing callers need
-        no change.
+        ``trigger`` is what the ledger records — ``weekly`` or ``on_demand``,
+        derived from ``reason`` when not given.
 
         Shared by the weekly pass and the on-demand Dev Tools button, so the
-        two cannot drift: same write lock, same single DB hop (46a), same cache
+        two cannot drift: same write lock, same single DB hop, same cache
         invalidation afterwards. On-demand does NOT touch ``_last_retrain_day``
         — forcing a retrain today should not silently cancel this week's
         scheduled one.
@@ -158,17 +157,16 @@ class LearningScheduler:
         trigger = trigger or ("weekly" if reason.startswith("weekly") else "on_demand")
         # Every outcome gets a job row, not just the ones that swap the model.
         # A referee that rejects week after week is a model that has stopped
-        # improving, and V6d's finding was that this failure is SILENT: a frozen
-        # champion serves exactly like a healthy one. Logging alone could not
-        # surface it, because nothing reads the log. This is the one place both
-        # the weekly pass and the Dev Tools button go through, so recording it
-        # here covers both.
+        # improving, and that failure is SILENT: a frozen champion serves
+        # exactly like a healthy one, and nothing reads the log. This is the
+        # one place both the weekly pass and the Dev Tools button go through,
+        # so recording it here covers both.
         job = await run_db(start_job, self._db, "tinymodel_retrain", circuit,
                            "Re-fitting the learned model…")
         try:
             async with get_write_lock():
-                # dev53 — a home that has enough labels pins its own benchmark
-                # here, BEFORE the benchmark is read and BEFORE retrain runs, so
+                # A home that has enough labels pins its own benchmark here,
+                # BEFORE the benchmark is read and BEFORE retrain runs, so
                 # the very first champion is trained with the set already
                 # reserved. No-op once a benchmark exists (replacing one is an
                 # operator decision). A pin fault must not fail the retrain.
@@ -182,11 +180,10 @@ class LearningScheduler:
                 except Exception as e:                      # noqa: BLE001
                     log.warning("[%s] benchmark auto-pin failed (non-fatal); retrain "
                                 "continues without it: %s", circuit, e)
-                # dev51 — the pinned benchmark lives in the DB (referee_benchmark,
-                # imported once via Dev Tools). Before this the call passed None
-                # here and the referee's PRIMARY leg had never run in production.
+                # The pinned benchmark lives in the DB (referee_benchmark,
+                # imported once via Dev Tools) and is the referee's PRIMARY leg.
                 # An empty table yields [] → the benchmark leg abstains, and an
-                # abstaining referee now KEEPS the incumbent rather than promoting.
+                # abstaining referee KEEPS the incumbent rather than promoting.
                 ref = await run_db(benchmark_ids_for_circuit, self._db, circuit)
                 out = await run_db(retrain, self._db, circuit,
                                    str(DATA_DIR), ref["ids"],
@@ -207,7 +204,7 @@ class LearningScheduler:
         try:
             # The decision row is written FIRST and carries the benchmark hash
             # the leg was actually scored on (captured inside retrain); only
-            # then may a pending re-pin take over (dev53 handover). A promotion
+            # then may a pending re-pin take over. A promotion
             # is never recorded under a hash that did not judge it.
             await run_db(record_retrain_decision, self._db, circuit, trigger, out)
             if getattr(out, "swapped", False):

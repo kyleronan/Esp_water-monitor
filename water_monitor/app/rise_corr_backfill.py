@@ -1,4 +1,4 @@
-"""One-shot rising-pressure-corr backfill (dev14).
+"""One-shot rising-pressure-corr backfill.
 
 Historical events predate ``events.flow_pressure_corr``, and their stored
 32-point signatures were VALIDATED as unusable for re-deriving it (the
@@ -9,8 +9,8 @@ correlation the only trustworthy way: re-fetching each candidate event's flow
 1 Hz grid, and running the same ``_flow_pressure_correlation`` the live path
 uses. Stored correlations then get the verdict applied by the same sync
 repair pass (``reprocess_rising_pressure_phantoms``) that reconciles live
-events — one verdict chokepoint, one ledger path (§2.5
-``apply_effective_volume``).
+events — one verdict chokepoint, one ledger path
+(``apply_effective_volume``).
 
 Candidates are ONLY events the live detector could have flagged: short
 (<= 120 s), small (0 < vol < 1 L), un-labelled, un-flagged, non-degraded,

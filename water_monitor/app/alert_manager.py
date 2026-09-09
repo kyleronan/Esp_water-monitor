@@ -132,17 +132,16 @@ class AlertManager:
                 if t.strip()]
 
     def _fire_prep_sync(self, circuit: str, alert_type: str) -> Dict[str, Any]:
-        """dev46 (46a) — every DB read ``fire`` needs, in one DB-thread hop.
+        """Every DB read ``fire`` needs, in one DB-thread hop.
 
-        Was three separate inline reads on the event-loop thread
-        (``_is_enabled`` / ``_mobile_targets``, plus ``load_unit_context`` in
-        each caller). Bundled here so an alert costs ONE trip over the wall
-        instead of several, and none of it races the DB worker.
+        ``_is_enabled`` / ``_mobile_targets`` / ``load_unit_context`` are
+        bundled here so an alert costs ONE trip over the wall instead of
+        several, and none of it races the DB worker.
 
-        Note for the audit: those reads were invisible to the connection-touch
-        grep because the async method called a SYNC helper that closed over
-        ``self._db`` — no ``conn`` argument to spot. Async-calls-sync-helper is
-        the same violation; grep for it by helper name, not just by conn.
+        Reads like these are invisible to the connection-touch grep when an
+        async method calls a SYNC helper that closes over ``self._db`` — there
+        is no ``conn`` argument to spot. Async-calls-sync-helper is the same
+        violation; grep for it by helper name, not just by conn.
         """
         from .units import load_unit_context
         return {
@@ -152,8 +151,8 @@ class AlertManager:
         }
 
     def _stamp_triggered_alert_sync(self, event_id: str) -> None:
-        """dev46 (46a) — audit stamp, on the DB thread. Self-contained
-        transaction (rule N2a): the write and its commit are both here."""
+        """Audit stamp, on the DB thread. Self-contained transaction: the write
+        and its commit are both here."""
         self._db.execute(
             "UPDATE events SET triggered_alert = 1 WHERE id = ?", (event_id,))
         self._db.commit()
@@ -176,19 +175,18 @@ class AlertManager:
 
         Returns an :class:`AlertResult` — ``sent`` (not suppressed by the
         per-type enable config) and ``delivered`` (the HA persistent
-        notification actually went out). Truthiness is ``sent``, which is what
-        this used to return.
+        notification actually went out). Truthiness is ``sent``.
 
         Callers recording "this event actually notified"
         (``events.triggered_alert``) must test ``.delivered``: HA being
-        unreachable, or the notify service being misconfigured, previously left
+        unreachable, or the notify service being misconfigured, otherwise leaves
         the database claiming the user had been warned about a leak when nothing
         was sent.
 
-        dev46 (46a): ``prep`` is the caller's already-fetched
-        ``_fire_prep_sync`` bundle. Callers that need the unit context to
-        BUILD the message fetch it once and hand it over, so the alert makes
-        one run_db hop rather than two. Omitted → fetched here.
+        ``prep`` is the caller's already-fetched ``_fire_prep_sync`` bundle.
+        Callers that need the unit context to BUILD the message fetch it once
+        and hand it over, so the alert makes one run_db hop rather than two.
+        Omitted → fetched here.
         """
         from .database import run_db
         if prep is None:
@@ -202,9 +200,9 @@ class AlertManager:
         nid = notification_id or f"water_{alert_type}_{circuit}"
 
         # 1. HA persistent notification (sidebar) — the PRIMARY channel.
-        # notify() returns call_service's bool and never raises, so discarding
-        # it (as this did) meant a completely undelivered alert still reported
-        # success and got stamped into events.triggered_alert.
+        # notify() returns call_service's bool and never raises, so its result
+        # must NOT be discarded: a completely undelivered alert would report
+        # success and get stamped into events.triggered_alert.
         delivered = bool(await self._ha.notify(
             title=title, message=message, notification_id=nid))
         if not delivered:
@@ -270,10 +268,10 @@ class AlertManager:
                 # call_service catches EVERYTHING and returns False rather than
                 # raising, so the except clauses below are unreachable for the
                 # ordinary failures (non-200, transport error). Without this
-                # branch _record_push_failure never ran, which means
-                # _TARGET_FAILURE_THRESHOLD and _TARGET_BACKOFF below were dead
-                # code: a permanently broken target was retried on every alert,
-                # forever, and never reported.
+                # branch _record_push_failure never runs, which makes
+                # _TARGET_FAILURE_THRESHOLD and _TARGET_BACKOFF below dead code:
+                # a permanently broken target retried on every alert, forever,
+                # and never reported.
                 raise _PushRejected(
                     "call_service returned False (non-200 or transport error)")
         except _EXPECTED_PUSH_EXCEPTIONS as e:
@@ -334,7 +332,7 @@ class AlertManager:
                                   shutoff: bool = False,
                                   event_id: Optional[str] = None,
                                   valve_entity: Optional[str] = None) -> None:
-        """Phase 2.3 — unusual-usage alert (frozen-baseline deviation).
+        """Unusual-usage alert (frozen-baseline deviation).
 
         On ``shutoff`` the valve was auto-closed: the message MUST say WHY and HOW to
         reopen in one action (toggle the named valve entity), and is sent ``critical``
@@ -375,11 +373,11 @@ class AlertManager:
         # alert was not suppressed by config, which says nothing about whether
         # it reached anyone.
         if dispatched.delivered and event_id:
-            # dev46 (46a): the stamp follows a non-DB await (the notify
-            # dispatch above), so it is its own hop — a write bundle, run on
-            # the DB thread. Idempotent single-column set, so nothing here
-            # needs a state re-check: it only ever sets the flag to 1, and a
-            # concurrent writer cannot make that wrong.
+            # The stamp follows a non-DB await (the notify dispatch above), so
+            # it is its own hop — a write bundle, run on the DB thread.
+            # Idempotent single-column set, so nothing here needs a state
+            # re-check: it only ever sets the flag to 1, and a concurrent writer
+            # cannot make that wrong.
             from .database import run_db
             try:
                 await run_db(self._stamp_triggered_alert_sync, event_id)
@@ -422,7 +420,7 @@ class AlertManager:
     async def alert_low_pressure_supply(self, circuit: str, psi: float,
                                         circuit_name: str,
                                         pump_active: bool) -> None:
-        """Phase 6a — sustained low pressure while a zone is flowing."""
+        """Sustained low pressure while a zone is flowing."""
         from .database import run_db
         from .units import convert_pressure
         _prep = await run_db(self._fire_prep_sync, circuit, "low_pressure_supply")
@@ -442,7 +440,7 @@ class AlertManager:
 
     async def alert_pump_low_pressure(self, circuit: str, psi: float,
                                       kind: str, circuit_name: str) -> None:
-        """Phase 6b — pressure sustained below the pump's normal band.
+        """Pressure sustained below the pump's normal band.
         kind='failure' (low/zero flow, no recharge rise) vs 'overload' (a
         maxed-out VFD serving heavy demand — NOT a dead pump)."""
         from .database import run_db
@@ -472,7 +470,7 @@ class AlertManager:
     async def alert_pump_leak_suspected(self, circuit: str, lpd: float,
                                         period_min: Optional[float],
                                         circuit_name: str) -> None:
-        """Pump plan Phase 5a — recharge-cycle slow-leak alert. NOTIFY-ONLY
+        """Recharge-cycle slow-leak alert. NOTIFY-ONLY
         by standing user decision (never shutoff: the leak is below both home
         meters' floors, so the firmware cannot corroborate). The copy teaches
         the valve bisect that located the 2026-07 zone-valve leak."""
@@ -559,12 +557,10 @@ class AlertManager:
 
     async def alert_away_mode_on(self) -> None:
         """Notify when away mode is activated."""
-        # dev46 (46a): the push-target read goes over the wall like every
-        # other DB touch. Fetched BEFORE the notify await so this method makes
-        # one hop, and because the targets are what the loop below needs —
-        # a stale-by-one-notification target list is not a correctness
-        # concern (the user changing targets mid-notify simply takes effect
-        # on the next alert).
+        # The push-target read goes over the wall like every other DB touch.
+        # Fetched BEFORE the notify await so this method makes one hop; a
+        # stale-by-one-notification target list is not a correctness concern
+        # (a user changing targets mid-notify takes effect on the next alert).
         from .database import run_db
         targets = await run_db(self._mobile_targets)
         await self._ha.notify(

@@ -19,16 +19,14 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
-# `river` is a runtime dependency of ClusterEngine but not of the rest of
-# the package, and importing it eagerly pulls in scipy — ~1.3 s of import
-# cost. Nothing outside ClusterEngine needs it: feature_extractor imports
-# this module only for a constant, and most tests never instantiate the
-# engine. So defer the import to ClusterEngine.__init__ via _load_river();
-# importing this module (or feature_extractor, or event_detector) no longer
-# pays the river/scipy cost, which is the single biggest chunk of the test
-# suite's fixed startup tax. It also keeps collection working where river
-# isn't installed (local runs without the add-on's full Dockerfile pip set):
-# only code that actually constructs the engine raises a clear error.
+# `river` is a runtime dependency of ClusterEngine but not of the rest of the
+# package, and importing it eagerly pulls in scipy — ~1.3 s of import cost.
+# Nothing outside ClusterEngine needs it (feature_extractor imports this module
+# only for a constant, and most tests never instantiate the engine), so the
+# import is deferred to ClusterEngine.__init__ via _load_river(). This also
+# keeps collection working where river isn't installed (local runs without the
+# add-on's full Dockerfile pip set): only code that constructs the engine
+# raises.
 cluster = None                         # populated by _load_river()
 preprocessing = None                   # populated by _load_river()
 _RIVER_IMPORT_ERROR: Optional[BaseException] = None
@@ -110,15 +108,15 @@ FEATURE_KEYS = [
 ]
 
 # Every pressure-derived dimension, for the pump-era "pressure-blind" cluster
-# space (dev34 B2). Under a VFD constant-pressure pump the supply servos
-# pressure flat, so ΔP measures pump droop-and-recovery instead of the fixture:
-# corr(ΔP, peak_flow²) fell 0.721 → 0.060 across the 2026-07 pump install, and
-# the class-matched F-ratio of the pressure-signature block — 36.6% of the
-# cluster distance, its largest single share — fell 5.53 → 2.15 (noise = 1.0)
-# while flow shape held at 6.38. Re-seeding on pressure features would also
-# mean re-seeding again at every pump setpoint change. propagation_delay_ms
-# rides along: it is a pressure-arrival measure (and was already ~noise,
-# F ≈ 0.2). has_pressure_transient stays — valve slam is a fixture property.
+# space. Under a VFD constant-pressure pump the supply servos pressure flat, so
+# ΔP measures pump droop-and-recovery instead of the fixture: across the 2026-07
+# pump install corr(ΔP, peak_flow²) fell 0.721 → 0.060, and the class-matched
+# F-ratio of the pressure-signature block — 36.6% of the cluster distance, its
+# largest single share — fell 5.53 → 2.15 (noise = 1.0) while flow shape held at
+# 6.38. Re-seeding on pressure features would also mean re-seeding again at
+# every pump setpoint change. propagation_delay_ms rides along: it is a
+# pressure-arrival measure, and ~noise at F ≈ 0.2. has_pressure_transient stays
+# — valve slam is a fixture property.
 PRESSURE_FEATURE_KEYS: frozenset = frozenset(
     {'pressure_delta_psi', 'pre_event_pressure_psi', 'min_pressure_psi',
      'hydraulic_resistance', 'pressure_transient_energy',
@@ -208,8 +206,7 @@ class ClusterEngine:
         # In-memory map: circuit -> {river_internal_id -> db_cluster_id}
         # Rebuilt from centroid similarity after each rebuild_from_db().
         self._river_id_map: Dict[str, Dict[int, int]]          = {}
-        # Phase 2.1 — type-aware match gate.
-        # circuit -> {db_cluster_id -> fixture_type}.
+        # Type-aware match gate. circuit -> {db_cluster_id -> fixture_type}.
         # Populated at startup from confirmed fixtures (see _init_circuit
         # and _refresh_type_cache); mutated live by notify_fixture_confirmed
         # / notify_fixture_removed when the user labels a cluster.
@@ -342,14 +339,14 @@ class ClusterEngine:
         """Build the full feature dict from an event DB row. Returns None if unusable."""
         if event.get('avg_flow_lpm') is None or not event.get('duration_seconds'):
             return None
-        # unit 2.32: an unparseable / missing start_ts used to fall back to
-        # ``hour = 0``, which is not "unknown" — it is a CONFIRMED midnight
-        # local, and hour_sin/hour_cos are real clustering features. A row that
-        # actually ran at 19:00 was placed at the far side of the time-of-day
-        # circle from where it belongs and dragged the DBSTREAM centre with it.
-        # There is no honest fallback for a time feature, so refuse the event:
-        # _extract_features is already Optional and BOTH call sites handle None
-        # (_match_and_learn_impl → 'features_missing'; the replay loop skips).
+        # An unparseable / missing start_ts must NOT fall back to ``hour = 0``:
+        # that is not "unknown", it is a CONFIRMED midnight local, and
+        # hour_sin/hour_cos are real clustering features — a row that ran at
+        # 19:00 lands on the far side of the time-of-day circle and drags the
+        # DBSTREAM centre with it. There is no honest fallback for a time
+        # feature, so refuse the event. _extract_features is Optional and BOTH
+        # call sites handle None (_match_and_learn_impl → 'features_missing';
+        # the replay loop skips).
         start_ts = event.get('start_ts')
         if not start_ts:
             return None
@@ -404,12 +401,10 @@ class ClusterEngine:
             'flow_cv':                variability / avg_flow if avg_flow > 0 else 0.0,
             # Compound event signals
             'is_composite':           float(event.get('is_composite')           or 0),
-            # dev41: `or 0` DELIBERATELY conflates NULL (unknown) with 0
-            # (closed) — splitting into two features (value + known) changes
-            # the clustering feature space, which requires a full re-seed
-            # (the dev39 outage was a feature-space shift). A future split is
-            # reseed-gated: it may only ship in the same build as a pending
-            # re-seed, never standalone.
+            # `or 0` DELIBERATELY conflates NULL (unknown) with 0 (closed).
+            # Splitting into two features (value + known) changes the clustering
+            # feature space and requires a full re-seed, so it may only ship in
+            # the same build as a pending re-seed, never standalone.
             'other_valve_open':       float(event.get('other_valve_open')       or 0),
             # Pressure scalars
             'pre_event_pressure_psi': float(event.get('pre_event_pressure_psi') or 0),
@@ -673,10 +668,11 @@ class ClusterEngine:
     def _update_cooccurrence(self, circuit: str, from_id: int, to_id: int,
                              gap_seconds: float) -> None:
         """Record a cluster→cluster transition in the cooccurrence table.
-        Uses a running mean for median_gap_seconds (approximation; exact median
-        would require storing all gaps, which is not worth the cost here).
-        Stage 3 will read this table to apply a confidence boost when a
-        candidate cluster frequently follows the previous event's cluster.
+
+        Uses a running mean for median_gap_seconds — an exact median would mean
+        storing every gap, which is not worth the cost. Stage 3 will read this
+        table to boost confidence when a candidate cluster frequently follows
+        the previous event's cluster.
         """
         now = datetime.now(timezone.utc).isoformat()
         try:
@@ -694,16 +690,16 @@ class ClusterEngine:
         except Exception as e:
             log.warning("[%s] cooccurrence update failed: %s", circuit, e)
 
-    # ── Freeze / unfreeze (Phase 1 hard lock) ───────────────────────────────────
+    # ── Freeze / unfreeze (hard lock) ───────────────────────────────────────────
     # A circuit FREEZES once it reaches the 'live' training state: the reference
-    # (scaler + DBSTREAM centers + cluster centroids) stops adapting and the engine
-    # only MATCHES against the locked reference — this is what stops a post-
-    # activation event (incl. a slow leak) from being silently learned as "normal".
-    # Per the plan's state→{frozen|unfrozen} table: unfrozen for every pre-'live'
-    # state (idle / calibrating / labelling), frozen once 'live'; fault/disabled
-    # inherit (no transition ⇒ no change). freeze_circuit/unfreeze_circuit set it
-    # on lifecycle transitions; the lazy fallback reads training_state so a fresh
-    # process is correct without waiting for a transition.
+    # (scaler + DBSTREAM centers + cluster centroids) stops adapting and the
+    # engine only MATCHES against the locked reference, which is what stops a
+    # post-activation event (incl. a slow leak) being silently learned as
+    # "normal". Unfrozen for every pre-'live' state (idle / calibrating /
+    # labelling), frozen once 'live'; fault/disabled inherit (no transition ⇒ no
+    # change). freeze_circuit/unfreeze_circuit set it on lifecycle transitions;
+    # the lazy fallback reads training_state so a fresh process is correct
+    # without waiting for a transition.
 
     def freeze_circuit(self, circuit: str) -> None:
         """Lock the circuit: match-only, no learning (called at activation)."""
@@ -754,12 +750,11 @@ class ClusterEngine:
 
         candidate_id = self._river_id_map.get(circuit, {}).get(nearest_id)
         if candidate_id is None:
-            # dev39 — an in-memory center with no DB mapping. Before this,
-            # the frozen path returned (None, conf, level, None): the caller
-            # stored cluster_id NULL with NO rejection reason, so a dead id
-            # map after a restart was indistinguishable from "never
-            # evaluated" (production: matching silently stopped 2026-08-13
-            # while the DB showed 30 healthy clusters). Reject explicitly.
+            # An in-memory center with no DB mapping must reject EXPLICITLY.
+            # Returning (None, conf, level, None) stores cluster_id NULL with no
+            # rejection reason, making a dead id map after a restart
+            # indistinguishable from "never evaluated" — matching stopped
+            # silently on 2026-08-13 while the DB showed 30 healthy clusters.
             n = self._unmapped_center_hits.get(circuit, 0) + 1
             self._unmapped_center_hits[circuit] = n
             if n == 1 or n % 25 == 0:
@@ -833,12 +828,11 @@ class ClusterEngine:
         within SEQUENCE_GAP_MAX_SECONDS, the cooccurrence table is updated.
         Stage 3 will apply a confidence boost from this table.
         """
-        # dev42 (F-C1): a reseed replay is rebuilding this circuit's model —
-        # matching now would consult a half-built center set and store a
-        # wrong-or-NULL id indistinguishable from an honest match. Defer:
-        # the reseed flushes 'reseed_deferred' rows through the completed
-        # model right after freeze. (The replay itself calls the internal
-        # path below, not this public method.)
+        # A reseed replay is rebuilding this circuit's model — matching now
+        # would consult a half-built center set and store a wrong-or-NULL id
+        # indistinguishable from an honest match. Defer: the reseed flushes
+        # 'reseed_deferred' rows through the completed model right after freeze.
+        # (The replay itself calls the internal path below, not this method.)
         if self._reseed_active.get(circuit):
             return (None, 0.0, '', 'reseed_deferred')
         return self._match_and_learn_impl(
@@ -978,7 +972,7 @@ class ClusterEngine:
     def rebuild_from_db(self, circuit: str, days: int = 60) -> int:
         """
         Replay recent matched events to reconstruct DBSTREAM + scaler state.
-        Called once per circuit at startup (via run_db — dev46 46a).
+        Called once per circuit at startup (via run_db).
         Does not modify the database — DB rows are already correct.
 
         After replaying, attempts to rebuild the river→DB ID mapping by
@@ -1008,12 +1002,11 @@ class ClusterEngine:
             count += 1
 
         if count == 0 and self._is_frozen(circuit):
-            # dev34 B2 — the death spiral, named. This replay reads only
-            # cluster_id IS NOT NULL rows; once live matching stops (e.g. a
-            # supply change moves the features), the pool drains, the next
-            # restart replays nothing, and every subsequent event rejects with
-            # 'no_centers' — permanently, and silently but for this line.
-            # Production hit exactly this after the 2026-07 pump install:
+            # The death spiral: this replay reads only cluster_id IS NOT NULL
+            # rows, so once live matching stops (e.g. a supply change moves the
+            # features) the pool drains, the next restart replays nothing, and
+            # every subsequent event rejects with 'no_centers' — permanently,
+            # and silently but for this line. After the 2026-07 pump install
             # weekly assignment went 75% → 58% → 45% → 8% → 0% and no cluster
             # gained a member after 07-21. rebuild_from_db CANNOT recover it
             # (nothing left to replay) — run the cluster re-seed
@@ -1030,12 +1023,12 @@ class ClusterEngine:
                 "from Settings.", circuit, n_unmatched)
 
         if count > 0:
-            # dev39 — ground the map in the replayed rows' OWN cluster_ids
-            # (majority vote) before falling back to centroid proximity.
-            # The proximity method alone silently killed live matching on
-            # 2026-08-13: any river center whose best DB centroid sat outside
-            # the acceptance bound stayed unmapped, and every live event
-            # landing on it stored cluster_id NULL with no rejection reason.
+            # Ground the map in the replayed rows' OWN cluster_ids (majority
+            # vote) before falling back to centroid proximity. Proximity alone
+            # killed live matching silently on 2026-08-13: any river center
+            # whose best DB centroid sat outside the acceptance bound stayed
+            # unmapped, and every live event landing on it stored cluster_id
+            # NULL with no rejection reason.
             self._rebuild_id_map_from_assignments(circuit, replayed)
             self._rebuild_id_map_from_centroids(circuit)
             if (self._streams[circuit].centers
@@ -1066,11 +1059,10 @@ class ClusterEngine:
         Called from orchestrator after rebuild_from_db and from
         training_manager after calibration completes.
 
-        since_ts (dev34 B2): window the pool to events at/after this
-        timestamp. The pump-era re-seed uses it so pre-anchor rows — recorded
-        before the fragmentation fixes and under the old supply — cannot seed
-        the new space; fragments below the training support would become
-        centers.
+        since_ts: window the pool to events at/after this timestamp. The
+        pump-era re-seed uses it so pre-anchor rows — recorded before the
+        fragmentation fixes and under the old supply — cannot seed the new
+        space, where fragments below the training support would become centers.
         """
         window_sql = "AND start_ts >= ?" if since_ts else ""
         params = (circuit, since_ts) if since_ts else (circuit,)
@@ -1127,25 +1119,22 @@ class ClusterEngine:
                                        since_ts: Optional[str] = None,
                                        batch: int = 100,
                                        only_deferred: bool = False) -> int:
-        """dev42 (F1) — ``backfill_unmatched`` in chunks, one chunk per hop.
+        """``backfill_unmatched`` in chunks, one chunk per hop.
 
-        dev46 (46a/C1) — each chunk's DB work is submitted to ``run_db``, the
-        SINGLE DB thread. dev42 moved this ON the event loop to escape the
-        8/15 crash (two threads sharing one ``check_same_thread=False``
-        connection → InterfaceError), but on-loop is only serialized against
-        other loop code: a concurrent page render on the DB executor would
-        reopen the exact same window. Routing every touch through the one DB
-        worker closes it for good, and hands the event loop back for the
-        reseed's whole duration (reversing dev42's responsiveness cost).
+        Each chunk's DB work is submitted to ``run_db``, the SINGLE DB thread.
+        Running it on the event loop instead is NOT enough: on-loop is only
+        serialized against other loop code, so a concurrent page render on the
+        DB executor reopens the two-threads-one-connection window
+        (InterfaceError). Routing every touch through the one DB worker closes
+        it and hands the event loop back for the reseed's whole duration.
 
-        Chunk boundary == transaction boundary (rule N2a): each
-        ``_backfill_chunk_sync`` call opens, writes, and commits entirely
-        inside one run_db callable, so no foreign statement can land inside
-        an open transaction.
+        Chunk boundary == transaction boundary: each ``_backfill_chunk_sync``
+        call opens, writes, and commits entirely inside one run_db callable, so
+        no foreign statement can land inside an open transaction.
 
-        ``only_deferred``: process only rows the F-C1 deferral stamped
+        ``only_deferred``: process only rows the reseed deferral stamped
         'reseed_deferred' — the post-freeze flush. Without it, a second full
-        pass would re-run every abstained row in the window.
+        pass re-runs every abstained row in the window.
         """
         from .database import run_db
         conds = ["circuit = ?", "cluster_id IS NULL",
@@ -1173,9 +1162,9 @@ class ClusterEngine:
     def _backfill_chunk_sync(self, chunk: list, circuit: str) -> int:
         """One chunk of the async backfill — runs on the single DB thread.
 
-        Self-contained transaction (dev46 rule N2a): every statement for this
-        chunk, plus its commit, happens inside this one callable. Returns the
-        number of events that received a cluster_id.
+        Self-contained transaction: every statement for this chunk, plus its
+        commit, happens inside this one callable. Returns the number of events
+        that received a cluster_id.
         """
         if not chunk:
             return 0
@@ -1340,13 +1329,13 @@ class ClusterEngine:
         rows' stored cluster_ids.
 
         The replay pool is `cluster_id IS NOT NULL` rows, so the DB already
-        says which cluster each event belongs to — re-deriving that link by
-        nearest-centroid proximity (the only method before dev39) threw that
-        truth away and depended on the freshly-replayed scaler placing old
-        stored centroids within an acceptance bound. Any drift (tz-feature
-        rewrite, scaler-stat shift across restarts) left centers unmapped and
-        live matching silently dead. A vote from actual assignments cannot
-        drift: the same rows that built each center name its cluster.
+        says which cluster each event belongs to. Re-deriving that link by
+        nearest-centroid proximity alone throws that truth away and depends on
+        the freshly-replayed scaler placing old stored centroids within an
+        acceptance bound; any drift (tz-feature rewrite, scaler-stat shift
+        across restarts) leaves centers unmapped and live matching silently
+        dead. A vote from actual assignments cannot drift: the same rows that
+        built each center name its cluster.
 
         Runs BEFORE the centroid fallback; centers with no votes (formed but
         never nearest to any replayed row) still get the proximity attempt.
@@ -1370,13 +1359,13 @@ class ClusterEngine:
                 continue
             winner = max(tally.items(), key=lambda kv: kv[1])[0]
             mapping[river_id] = winner
-            # Health metric (dev40): a healthy river↔DB mapping is a
-            # SUPERMAJORITY — the members that built a center agree on its
-            # cluster. A sub-50% plurality means the center sits across
-            # several DB clusters' members (degenerate geometry), which is
-            # the cheap early warning that fires before cluster-count
-            # collapse is visible (2026-08-15: three circuit_1 centers all
-            # plurality-mapped to one DB cluster at 40-49%).
+            # Health metric: a healthy river↔DB mapping is a SUPERMAJORITY —
+            # the members that built a center agree on its cluster. A sub-50%
+            # plurality means the center sits across several DB clusters'
+            # members (degenerate geometry), the cheap early warning that fires
+            # before cluster-count collapse is visible (2026-08-15: three
+            # circuit_1 centers all plurality-mapped to one DB cluster at
+            # 40-49%).
             frac = tally[winner] / max(sum(tally.values()), 1)
             log.debug("[%s] post-rebuild: river cluster %d → DB cluster %d "
                       "(%d/%d votes)", circuit, river_id, winner,

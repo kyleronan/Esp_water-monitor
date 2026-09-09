@@ -22,12 +22,12 @@ log = logging.getLogger(__name__)
 # ── HA volume-unit strings → the canonical vol_label below ──────────────
 #
 # Home Assistant entities are free to label a volume however their
-# integration likes ("gallons", "gal", "ft3"...). Two places used to key on
-# EXACT strings and silently treat anything unrecognised as litres, which on
-# a gallons meter is a 3.785x error — and on the calibration path that error
-# was written back into the firmware as pulses-per-litre.
+# integration likes ("gallons", "gal", "ft3"...). Silently treating an
+# unrecognised spelling as litres is a 3.785x error on a gallons meter, and on
+# the calibration path that error is written back into the firmware as
+# pulses-per-litre.
 #
-# Keep every spelling here so the parsers cannot drift apart again.
+# Keep every spelling here so the parsers cannot drift apart.
 VOL_UNIT_ALIASES: Dict[str, str] = {
     # litres
     "l": "L", "liter": "L", "liters": "L", "litre": "L", "litres": "L",
@@ -226,17 +226,16 @@ def load_unit_context(db) -> Dict[str, Any]:
         flow_key     = (row["flow_unit"]     if row else None) or "L/min"
         pressure_key = (row["pressure_unit"] if row else None) or "psi"
     except Exception as e:
-        # unit 2.33 — this used to swallow silently AND cache the fallback for
-        # the full TTL, so one transient DB error rendered EVERY number on the
-        # page in the wrong unit for 30 s: a US household reading litres as
-        # gallons with nothing on screen or in the log to say so. Wrong units
-        # are indistinguishable from wrong data to the person reading them.
-        #
-        # Return the fallback WITHOUT caching it, so the next request retries
-        # and correct units come back the moment the DB does. Log the first
-        # occurrence at WARNING and the rest at DEBUG: load_unit_context runs
-        # once per circuit on every dashboard poll, so an unconditional
-        # warning would flood the log during exactly the outage it reports.
+        # Return the fallback WITHOUT caching it: caching it for the full TTL
+        # renders EVERY number on the page in the wrong unit for 30 s after one
+        # transient DB error — a US household reading litres as gallons with
+        # nothing on screen or in the log to say so, and wrong units are
+        # indistinguishable from wrong data to the person reading them.
+        # Uncached, the next request retries and correct units come back the
+        # moment the DB does. Log the first occurrence at WARNING and the rest
+        # at DEBUG: load_unit_context runs once per circuit on every dashboard
+        # poll, so an unconditional warning would flood the log during exactly
+        # the outage it reports.
         global _UNIT_LOAD_FAILURES
         _UNIT_LOAD_FAILURES += 1
         if _UNIT_LOAD_FAILURES == 1:

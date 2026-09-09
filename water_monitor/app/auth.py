@@ -14,8 +14,8 @@ Tiers
   operator — user id is on the add-on operator allow-list (Settings → Access).
   viewer   — everyone else. **Default-deny**: an unknown / missing id is a viewer.
 
-Capabilities: admin = everything (current behaviour); operator = viewer + open /
-close the main valve; viewer = read-only.
+Capabilities: admin = everything; operator = viewer + open / close the main
+valve; viewer = read-only.
 
 Enforcement is centralised in two places (defence in depth):
   1. ``ingress_middleware`` mutation gate — the single chokepoint that rejects any
@@ -176,23 +176,15 @@ def require_operator(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Operator access required.")
 
 
-# ── CSRF token: OWASP "HMAC CSRF Token" recipe (unit 2.28) ────────────────────
+# ── CSRF token: OWASP "HMAC CSRF Token" recipe ────────────────────────────────
 #
-# The MECHANISM is unchanged and deliberately so: signed double-submit is the
-# OWASP-recommended pattern (only the *naive* unsigned variant is deprecated),
-# and it needs no server-side state. What changed is the HMAC *message*.
+# Signed double-submit: the OWASP-recommended pattern (only the *naive* unsigned
+# variant is deprecated), and it needs no server-side state.
 #
-# Before: message = session_id. The token was therefore a pure function of the
-# session cookie, i.e. one constant string for the cookie's whole 30-day life —
-# it appeared in every rendered page, every form, every fetch header, unchanged,
-# for a month.
-#
-# Now:    message = session_id + "!" + nonce, and the token is transmitted as
-#         "<nonce>.<hmac>". The nonce travels inside the token, so the server can
-#         still verify it with nothing but the secret and the cookie — the
-#         double-submit property (no server state) is preserved exactly.
-#
-# A fresh nonce is minted per request, so no two renders emit the same token.
+# message = session_id + "!" + nonce, transmitted as "<nonce>.<hmac>". The nonce
+# travels inside the token, so the server verifies it with nothing but the secret
+# and the cookie — the double-submit property (no server state) is preserved. A
+# fresh nonce is minted per request, so no two renders emit the same token.
 #
 # NOT included: OWASP's optional timestamp component. It would bound an
 # individual token's lifetime, but at the price of a hard expiry on any page
@@ -243,11 +235,9 @@ def issue_csrf_token(server_secret: str, session_id: str,
 def check_csrf_token(server_secret: str, session_id: str, token: str) -> bool:
     """Verify a token minted by :func:`issue_csrf_token`. Fails closed.
 
-    Tokens in the pre-2.28 format (a bare HMAC with no nonce) are NOT accepted:
-    they have no separator, so they fall out at the split. A browser holding one
-    gets a single 403, and both the 403 page and ``app.js``'s fetch wrapper tell
-    it to reload — the same path already taken whenever the add-on restarts with
-    a tab open.
+    A bare HMAC with no nonce is NOT accepted: no separator, so it falls out at
+    the split. A browser holding one gets a single 403, and both the 403 page
+    and ``app.js``'s fetch wrapper tell it to reload.
     """
     if not server_secret or not session_id or not token:
         return False

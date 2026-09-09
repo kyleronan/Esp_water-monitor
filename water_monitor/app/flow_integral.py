@@ -4,15 +4,13 @@ Shared by the live event detector, the historical importer, and the volume
 recompute backfill so all three compute volume and active-flow features
 *identically*. No DB / HA / app imports — keep it pure and unit-testable.
 
-Background: an event's water volume must be a TIME-INTEGRAL of the flow, not
+An event's water volume is a TIME-INTEGRAL of the flow, never
 ``mean(flow_samples) × pressure_event_duration``. The HA flow sensor reports
-on-change, so a brief burst trapped inside a long pressure-defined event would
-otherwise inflate volume by up to ~180x (the volume-over-count bug: 6 L of real
-flow stored as 1,089 L).
+on-change, so a brief burst trapped inside a long pressure-defined event
+inflates volume by up to ~180x that way (6 L of real flow stored as 1,089 L).
 
-Volume unit note: flow is L/min and intervals are in seconds, so a held flow of
-``f`` L/min over ``dt`` seconds contributes ``f * (dt / 60.0)`` litres — divide
-by 60, NOT 3600.
+Flow is L/min and intervals are in seconds, so a held flow of ``f`` L/min over
+``dt`` seconds contributes ``f * (dt / 60.0)`` litres — divide by 60, NOT 3600.
 """
 from __future__ import annotations
 
@@ -29,10 +27,9 @@ _ACTIVE_FLOW_MIN_LPM: float = 0.15
 _ACTIVE_FLOW_MIN_ON_SECONDS: float = 2.0
 _ACTIVE_FLOW_MERGE_GAP_SECONDS: float = 3.0
 # Cap a single inter-sample interval. A larger gap means the sensor/callback
-# stream paused (offline) — holding the last flow across hours would fabricate
-# volume. We clamp the interval AND signal ``capped`` so the caller can mark the
-# event's integration as degraded (and keep it out of classifier training)
-# rather than silently undercounting.
+# stream paused (offline); holding the last flow across hours would fabricate
+# volume. Clamping the interval also sets ``capped`` so the caller can mark the
+# event's integration as degraded and keep it out of classifier training.
 _FLOW_INTEGRAL_MAX_DT_SECONDS: float = 120.0
 
 
@@ -82,10 +79,10 @@ def integrate_litres(samples) -> Tuple[float, bool]:
     return round(litres, 4), capped
 
 
-# ── dev38: meter registration correction (ANNOTATION ONLY) ────────────────────
-# The 2026-08 audit inverted the pressure channel — an independent witness
-# that shares none of the oval-gear meter's pulse mechanism — and recovered
-# the meter's registration curve on the pre-pump eras (n=1,086 events):
+# ── meter registration correction (ANNOTATION ONLY) ───────────────────────────
+# The meter under-registers at low flow. The curve was recovered by inverting
+# the pressure channel — an independent witness that shares none of the
+# oval-gear meter's pulse mechanism — on the pre-pump eras (n=1,086 events):
 #
 #   band (L/min)   metered ÷ true    95% CI
 #   >= 8.0            0.999          0.971 – 1.030
@@ -95,11 +92,11 @@ def integrate_litres(samples) -> Tuple[float, bool]:
 #   1.0 – 1.5         0.59           0.316 – 1.767  (weak; n=20)
 #
 # The curve is RELATIVE to the meter's own >= 8 L/min band (a common-mode
-# scale error is invisible to it) and remains pending utility-anchor
-# validation — which is why the corrected figure is stored as a separate
-# estimate column and NEVER feeds volume_litres, volume_litres_effective or
-# any total (the orchestrator's historical-volumes-are-never-recomputed
-# invariant). Sub-1 L/min flow gets NO correction: non-registration cannot
+# scale error is invisible to it) and is pending utility-anchor validation —
+# which is why the corrected figure is stored as a separate estimate column
+# and NEVER feeds volume_litres, volume_litres_effective or any total (the
+# orchestrator's historical-volumes-are-never-recomputed invariant).
+# Sub-1 L/min flow gets NO correction: non-registration cannot
 # be recovered by a ratio, and extrapolating 0.59 downward would be
 # invention — those draws stay governed by the below-meter-floor verdict.
 _REGISTRATION_RATIO: Tuple[Tuple[float, float, float], ...] = (
@@ -113,11 +110,11 @@ _REGISTRATION_RATIO: Tuple[Tuple[float, float, float], ...] = (
 # fraction (mirrors the UI display threshold).
 _REGISTRATION_MIN_DELTA_FRAC = 0.02
 
-# dev41 (E1): the curve now LIVES IN DATA (registration_curve table, seeded
-# v1 = the constants above by migration 20260807) and is loaded here at boot
-# via set_registration_curve(). The constants remain only as the identical
-# fallback for a pre-20260807 schema. Every stored estimate is stamped with
-# the version that produced it (events.registration_curve_version).
+# The curve LIVES IN DATA (registration_curve table, seeded v1 = the constants
+# above by migration 20260807) and is loaded here at boot via
+# set_registration_curve(). The constants remain only as the identical fallback
+# for a pre-20260807 schema. Every stored estimate is stamped with the version
+# that produced it (events.registration_curve_version).
 _curve_bands: Tuple[Tuple[float, float, float], ...] = _REGISTRATION_RATIO
 _curve_version: int = 1
 _curve_status: str = "unvalidated"
@@ -151,7 +148,7 @@ def _registration_ratio(flow_lpm: float) -> float:
 
 
 def integrate_litres_registration_corrected(samples) -> Tuple[float, float]:
-    """dev38 — ``(raw_litres, corrected_litres)`` over the same sample walk.
+    """``(raw_litres, corrected_litres)`` over the same sample walk.
 
     Identical hold semantics to :func:`integrate_litres`; each sample's
     contribution in the 1.0–8.0 L/min correction band is divided by its
@@ -176,7 +173,7 @@ def integrate_litres_registration_corrected(samples) -> Tuple[float, float]:
 
 
 def registration_estimate(samples):
-    """dev38 — the value stored in ``events.registration_est_litres``.
+    """The value stored in ``events.registration_est_litres``.
 
     The corrected integral, or None when the correction is immaterial
     (< 2% above the raw integral) or nothing integrates. None is the common

@@ -3,12 +3,9 @@ Leak test scheduler.
 
 The scheduler decides WHEN to run — it learns the quietest hour of the day
 from historical usage data and schedules tests at that time (e.g. 1am).
-
-The scheduler picks a time when the house is statistically quiet rather than
-waiting for it to go quiet. That is still the right approach — but "usually
-quiet" is not "quiet right now", so _execute_test also refuses to start while
-water is actually moving (3.13.2). A test started mid-draw measures the draw,
-not the plumbing, and reports it as a leak.
+"Usually quiet" is not "quiet right now", so _execute_test also refuses to
+start while water is actually moving: a test started mid-draw measures the
+draw, not the plumbing, and reports it as a leak.
 
 Two code paths:
   run_now(triggered_by="manual")    — immediate, from web UI
@@ -78,22 +75,20 @@ RETRY_AFTER_DEMAND_MIN: int = 30
 
 # Post-restore watch (the reopen-slug backstop). Once the valve reopens,
 # anything drawn during the test has to come back through the meter. The window
-# and the demand bar are imported at the top from leak_test_refill, which owns
-# them: the refill reconcile needs the SAME numbers to re-derive the window for
-# tests that ran while the add-on was down. Re-exported here under their
-# original names — POST_RESTORE_WATCH_S / _LEAD_S / _DEMAND_L.
+# and the demand bar are imported from leak_test_refill, which owns them: the
+# refill reconcile needs the SAME numbers to re-derive the window for tests that
+# ran while the add-on was down. Re-exported here under their original names.
 
 # Compliance of the isolated section, mL per PSI — converts a decay rate into a
 # leak rate. Used only until a circuit calibrates its own from a reopen refill.
 # 9.5 measured on Main 2026-07-26 (257 mL lost for 27 PSI).
 DEFAULT_COMPLIANCE_ML_PSI: float = 9.5
 
-# dev.24 — water-softener regeneration blackout. A regen draws on the softener's
-# circuit (Main) and would read as a leak, so a leak test is kept out of
-# [regen_start − lead, regen_start + window] (local). In-sample placeholders: the
-# observed regen runs ~2.5 h; 210 min leaves margin. Static (deliberately NOT
-# coupled to the live softener detector) — a generous fixed window is simpler and
-# safer than per-run dynamic precision.
+# Water-softener regeneration blackout. A regen draws on the softener's circuit
+# (Main) and would read as a leak, so a leak test is kept out of
+# [regen_start − lead, regen_start + window] (local). The observed regen runs
+# ~2.5 h; 210 min leaves margin. Deliberately static, NOT coupled to the live
+# softener detector — a generous fixed window is safer than per-run precision.
 _SOFTENER_REGEN_LEAD_MIN: int = 20
 _SOFTENER_REGEN_WINDOW_MIN: int = 210
 
@@ -105,8 +100,7 @@ class SoftenerBlackoutUnknown(RuntimeError):
     every hour is fair game. This means we do not KNOW, and the two must never
     collapse into each other: a regen draws ~200 L on the main circuit, so a
     test run inside one reads as a catastrophic leak. Skipping a test costs a
-    night of cadence; running one blind costs a false verdict, and the operator
-    has already had a week of those.
+    night of cadence; running one blind costs a false verdict.
     """
 
 
@@ -224,11 +218,10 @@ class LeakTestScheduler:
 
     async def run_now(self, circuit: str,
                       triggered_by: str = "manual") -> Dict[str, Any]:
-        """
-        Run a leak test immediately.
+        """Run a leak test immediately.
 
-        The scheduler has already chosen the right time via learn_best_hour,
-        so there is no quiet-period wait here — the test starts immediately.
+        learn_best_hour has already chosen the right time, so there is no
+        quiet-period wait here.
         """
         if self._running_tests.get(circuit):
             raise ValueError(f"Leak test already running on {circuit}")
@@ -325,12 +318,12 @@ class LeakTestScheduler:
         return self._running_tests.get(circuit, False)
 
     def cancel(self, circuit: str) -> None:
-        """
-        Cancel a running leak test.  Cancels the asyncio task so _execute_test
-        stops polling immediately; is_running() returns False right away so the
-        UI reflects the abort without waiting for the next firmware poll cycle.
-        The firmware has already received the stop command from the abort route
-        before this method is called.
+        """Cancel a running leak test.
+
+        Cancels the asyncio task so _execute_test stops polling immediately;
+        is_running() returns False right away so the UI reflects the abort
+        without waiting for the next firmware poll. The firmware has already
+        received the stop command from the abort route by this point.
         """
         task = self._tasks.get(circuit)
         if task and not task.done():
@@ -371,12 +364,11 @@ class LeakTestScheduler:
         if not schedule or not schedule["enabled"]:
             return
 
-        # 3-port valves: silently skip scheduled checks. We don't write a
-        # skip row every cycle (would spam History); the user-facing
-        # explanation lives in Settings + Device-page UI annotations. The
-        # schedule row itself is preserved so switching back to 2_port
-        # resumes the schedule without reconfiguration. Manual triggers
-        # via run_now() DO record a skip row — see _execute_test().
+        # 3-port valves: silently skip scheduled checks. No skip row per cycle
+        # (it would spam History); the user-facing explanation lives in Settings
+        # + Device-page annotations. The schedule row is preserved so switching
+        # back to 2_port resumes without reconfiguration. Manual triggers via
+        # run_now() DO record a skip row — see _execute_test().
         if _valve_type == "3_port":
             return
 
@@ -408,22 +400,19 @@ class LeakTestScheduler:
             t = asyncio.create_task(_run_guarded())
             self._pending_scheduled.add(t)
             t.add_done_callback(self._pending_scheduled.discard)
-            # next_run_at is advanced here, immediately after dispatch —
-            # not after completion. A failed background start (rare) will
-            # still consume the slot. after_trigger=True prevents auto-
-            # learn from scheduling another run today if it picked a
-            # later hour. TODO: track dispatched vs completed if the
-            # consumed-slot edge case becomes a real problem.
+            # next_run_at is advanced immediately after dispatch, not after
+            # completion, so a failed background start still consumes the slot.
+            # after_trigger=True prevents auto-learn from scheduling another run
+            # today if it picked a later hour.
             await self._update_next_run(circuit, schedule, after_trigger=True)
 
     async def _update_next_run(self, circuit: str, schedule: Any,
                                *, after_trigger: bool = False) -> None:
-        """
-        Compute and store the next run timestamp.
+        """Compute and store the next run timestamp.
 
-        If auto_learn_hour is enabled (default), re-learn the best quiet
-        hour from usage history before scheduling.  If disabled, respect
-        the manually configured run_hour as-is.
+        With auto_learn_hour enabled (default) the best quiet hour is re-learned
+        from usage history first; disabled, the configured run_hour is used
+        as-is.
         """
         # Pull the flag from the schedule (defaults to True for backward compat)
         # SQLite Row supports .get-equivalent via try/except; dicts have .get()
@@ -487,13 +476,11 @@ class LeakTestScheduler:
         notify_fail: bool,
         triggered_by: str,
     ) -> Dict[str, Any]:
-        """
-        Execute a leak test on one circuit.
+        """Execute a leak test on one circuit.
 
-        The scheduler picks a statistically quiet hour, but "usually quiet" is
-        not "quiet right now" — a test started mid-draw reads the draw as a
-        leak (verified 2026-07-26). Pre-checks are valve / fault / valve-type /
-        softener-blackout / live-flow, then start.
+        "Usually quiet" is not "quiet right now" — a test started mid-draw reads
+        the draw as a leak (observed 2026-07-26). Pre-checks are valve / fault /
+        valve-type / softener-blackout / live-flow, then start.
         """
         circuit = circuit_cfg.circuit
         name    = circuit_cfg.label
@@ -519,12 +506,12 @@ class LeakTestScheduler:
             return {"result": result, "skipped": True}
 
         # --- Pre-check: valve type compatibility (3-port has a drain port
-        # that always reads as a leak, so the micro leak test does not
-        # apply). The Device-page button is also disabled for 3-port
-        # circuits, but the route is intentionally still reachable so
-        # automations / direct POSTs produce a visible skip row here. ---
-        # dev46 (46a): valve type + softener blackout are the two DB-backed
-        # pre-checks — one hop, taken before any of the awaits below.
+        # that always reads as a leak, so the micro leak test does not apply).
+        # The Device-page button is disabled for 3-port circuits, but the route
+        # stays reachable on purpose so automations / direct POSTs produce a
+        # visible skip row here. ---
+        # Valve type + softener blackout are the two DB-backed pre-checks — one
+        # hop, taken before any of the awaits below.
         _pre = await run_db(self._execute_preflight_sync, circuit)
         if _pre["valve_type"] == "3_port":
             log.info("[%s] leak test skipped — valve_type='3_port' "
@@ -596,15 +583,13 @@ class LeakTestScheduler:
 
         # --- Pre-close pressure ---
         # Context only. What the test JUDGES against is the firmware's
-        # post-settle baseline, read after the run below — reading pressure
-        # here and calling it the baseline (as this did before 3.13.2) folded
-        # the close transient and the whole settle-phase loss into every
-        # recorded drop.
-        # dev38: fast sensor FIRST — the averaged entity is snapped to 0.5 psi
-        # by the firmware (round→×2→round→×0.5 chain), and this value leaks
-        # into stored baselines through the fallbacks below. The audit found
-        # 76% of stored baselines sitting on 0.5-psi multiples while the
-        # sensor resolves 0.01.
+        # post-settle baseline, read after the run below. Treating this reading
+        # as the baseline folds the close transient and the whole settle-phase
+        # loss into every recorded drop.
+        # Fast sensor FIRST: the averaged entity is snapped to 0.5 psi by the
+        # firmware (round→×2→round→×0.5 chain) and that value leaks into stored
+        # baselines through the fallbacks below — 76% of stored baselines sit on
+        # 0.5-psi multiples while the sensor resolves 0.01.
         pre_close_psi = await self._read_float(circuit_cfg.pressure_fast_sensor)
         if pre_close_psi is None:
             pre_close_psi = await self._read_float(
@@ -612,13 +597,12 @@ class LeakTestScheduler:
 
         # --- Start the firmware leak test ---
         log.info("[%s] starting leak test (triggered_by=%s)", circuit, triggered_by)
-        # dev57 (2.24): turn_on() returns False when the HA service call did
-        # not succeed (no HTTP session, non-200, transport error). Discarding
-        # that bool meant a test that was never dispatched still entered the
-        # poll loop, sat out the full 60 s + duration + 2 min window, and was
-        # written to leak_test_history as "Timed out — no terminal result
-        # received" — an unrun test recorded as an inconclusive run. Report
-        # what actually happened instead, and skip the pointless wait.
+        # turn_on() returns False when the HA service call did not succeed (no
+        # HTTP session, non-200, transport error). That bool must not be
+        # discarded: a test that was never dispatched would otherwise enter the
+        # poll loop, sit out the full 60 s + duration + 2 min window and land in
+        # leak_test_history as "Timed out — no terminal result received", i.e.
+        # an unrun test recorded as an inconclusive run.
         started = await self._ha.turn_on(circuit_cfg.leak_test_switch)
         if not started:
             log.error("[%s] leak test could not be started — HA service call "
@@ -628,13 +612,10 @@ class LeakTestScheduler:
                                      None, None, None, None)
             return {"result": result, "skipped": True}
 
-        # Wait for result — firmware takes 60s settle + up to configured duration + 2min buffer.
-        # Fetch the firmware-configured test duration from the HA sensor entity.
-        # (duration_minutes is NOT a DB column; it lives on the ESP firmware entity.)
-        # An earlier version of this function also fetched the DB
-        # leak_test_schedules row here, but never read from it — duration
-        # always comes from the live HA entity below, so the extra DB
-        # roundtrip was deleted.
+        # Wait for result — firmware takes 60s settle + configured duration +
+        # 2min buffer. duration_minutes is NOT a DB column; it lives on the ESP
+        # firmware entity, so it is fetched from HA and never from
+        # leak_test_schedules.
         try:
             dur_str = await self._ha.get_state_value(
                 circuit_cfg.leak_test_duration_entity, "30")
@@ -648,13 +629,11 @@ class LeakTestScheduler:
         monitor_started_at: Optional[datetime] = None
 
         # A test interrupted part-way still happened, and the interruption is
-        # itself worth seeing. Before 3.13.2 both interruption paths returned
-        # without writing a row, so an aborted test vanished from history
-        # entirely (observed 2026-07-26: a run that measured for three minutes
-        # left no trace). The abort button cancels the task, so CancelledError
-        # — a BaseException — has to be caught explicitly, and re-raised so the
-        # cancellation still takes effect.
-        # (dev41 B3 helper is _other_valve_state on the class, below.)
+        # itself worth seeing, so both interruption paths MUST write a row —
+        # otherwise an aborted test vanishes from history entirely. The abort
+        # button cancels the task, so CancelledError — a BaseException — has to
+        # be caught explicitly, and re-raised so the cancellation still takes
+        # effect.
         def _interrupted_row(reason: str):
             return self._store_result(
                 circuit, run_at, triggered_by, reason,
@@ -668,12 +647,12 @@ class LeakTestScheduler:
         # multi-psi "drop" was a transient dip the raw trace had fully
         # recovered from by test end).
         monitor_samples: list = []          # (utc_datetime, psi)
-        # dev41 (B1 latency diagnostic): the firmware freezes its baseline at
-        # the moment it flips to "In progress"; the addon only SEES that flip
-        # on its next poll. The freeze therefore happened somewhere between
-        # the previous poll and the sighting — record that bound. Diagnostic
-        # only, never a gate (the magnitude uses the firmware's own frozen
-        # baseline, so the latency cannot bias it).
+        # Latency diagnostic: the firmware freezes its baseline the moment it
+        # flips to "In progress"; the addon only SEES that flip on its next
+        # poll, so the freeze happened somewhere between the previous poll and
+        # the sighting. Record that bound. Diagnostic only, never a gate — the
+        # magnitude uses the firmware's own frozen baseline, so latency cannot
+        # bias it.
         prev_poll_ts: Optional[datetime] = None
         sighting_latency_s: Optional[float] = None
         # dev41 (B3): the other circuit's valve state at monitor start. An
@@ -762,15 +741,15 @@ class LeakTestScheduler:
             else None
         )
 
-        # dev38 — sustained drop: baseline minus the MEDIAN of the tail of the
+        # Sustained drop: baseline minus the MEDIAN of the tail of the
         # monitor-window fast samples. Distinguishes a held drop from a
-        # transient dip the trace recovered from; stored beside — never
-        # instead of — the firmware verdict. pressure_drop keeps its
-        # historical single-read meaning for comparability with old rows.
-        # dev41 — the full addon-side measurement-quality pass (B1–B4):
-        # sustainedness (shape), per-phase minimum sample counts, a measured
-        # noise floor, and an 'ok'/'indeterminate' status that gates every
-        # addon-side consumer. The firmware verdict is untouched throughout.
+        # transient dip the trace recovered from; stored beside — never instead
+        # of — the firmware verdict. pressure_drop keeps its historical
+        # single-read meaning for comparability with old rows.
+        # The addon-side measurement-quality pass adds sustainedness (shape),
+        # per-phase minimum sample counts, a measured noise floor, and an
+        # 'ok'/'indeterminate' status gating every addon-side consumer. The
+        # firmware verdict is untouched throughout.
         stats = _monitor_stats(baseline_psi, monitor_samples,
                                other_valve_state)
         sustained_drop_psi = stats["sustained_drop_psi"]
@@ -789,16 +768,16 @@ class LeakTestScheduler:
                    ).total_seconds() / 60, 2)
             if monitor_started_at is not None else None
         )
-        # dev38: the leak-rate estimate divides the SUSTAINED drop when one was
+        # The leak-rate estimate divides the SUSTAINED drop when one was
         # measured — a transient dip that recovered is not water leaving the
         # line at a steady rate.
-        # dev41 (C1): when the addon-side measurement is INDETERMINATE, no
-        # estimate is computed at all — the old `sustained if not None else
-        # pressure_drop` fallback would have silently diverted the estimate
-        # to the raw two-point figure, a lower-quality number than the one
-        # just rejected. The pressure_drop fallback survives ONLY for rows
-        # that never had monitor samples (pre-3.13.2 firmware, aborts) —
-        # never for a figure deliberately withheld.
+        # When the addon-side measurement is INDETERMINATE, NO estimate is
+        # computed. A `sustained if not None else pressure_drop` fallback here
+        # would silently divert the estimate to the raw two-point figure, a
+        # lower-quality number than the one just rejected. The pressure_drop
+        # fallback is scoped to rows that never had monitor samples
+        # (pre-3.13.2 firmware, aborts) — never to a deliberately withheld
+        # figure.
         if stats["status"] == "indeterminate":
             est_leak = None
         else:
@@ -832,13 +811,12 @@ class LeakTestScheduler:
             monitor_samples_json=_samples_json(monitor_samples),
         )
 
-        # --- Pump plan Phase 5b: cross-circuit verdict (vfd pump mode only).
-        # While this circuit's valve was closed, did the UNTESTED circuit's
-        # pressure show pump recharge cycling? If yes, the leak feeding the
-        # pump is on the other line / upstream of this valve / inside the
-        # pump's own check valve. STRICT invariant: a 5b failure must never
-        # affect the leak test's own result — everything is best-effort and
-        # writes only the annotation columns.
+        # --- Cross-circuit verdict (vfd pump mode only). While this circuit's
+        # valve was closed, did the UNTESTED circuit's pressure show pump
+        # recharge cycling? If yes, the leak feeding the pump is on the other
+        # line / upstream of this valve / inside the pump's own check valve.
+        # STRICT invariant: a failure here must never affect the leak test's own
+        # result — everything is best-effort and writes only annotation columns.
         try:
             await self._pump_cross_check(
                 circuit, run_at, datetime.now(timezone.utc))
@@ -1074,12 +1052,12 @@ class LeakTestScheduler:
 
     async def _pump_cross_check(self, tested_circuit: str,
                                 start_dt, end_dt) -> None:
-        """Phase 5b (dev26): annotate the just-stored leak-test row with the
-        UNTESTED circuit's pump verdict. Runs only under confirmed vfd pump
-        mode; fetches the sibling circuit's pressure AND flow for the test
-        window (any registered flow there demotes to 'not_applicable' — an
-        icemaker fill would fake cycling). Writes 'unavailable' on fetch
-        failure so a blank column is distinguishable from "never ran"."""
+        """Annotate the just-stored leak-test row with the UNTESTED circuit's
+        pump verdict. Runs only under confirmed vfd pump mode; fetches the
+        sibling circuit's pressure AND flow for the test window (any registered
+        flow there demotes to 'not_applicable' — an icemaker fill would fake
+        cycling). Writes 'unavailable' on fetch failure so a blank column is
+        distinguishable from "never ran"."""
         from .config import pump_gates_active
         if not await run_db(pump_gates_active, self._db, tested_circuit):
             return
@@ -1317,15 +1295,15 @@ class LeakTestScheduler:
 
 
 def _sustained_drop(baseline_psi, samples):
-    """dev38 — (sustained_drop_psi, final_window_s, tail_ts) from the
-    monitor-window fast-pressure samples.
+    """(sustained_drop_psi, final_window_s, tail_ts) from the monitor-window
+    fast-pressure samples.
 
-    Sustained = baseline − median of the last up-to-3 samples (~20–30 s at
-    the scheduler's 10 s poll cadence). The median makes a single dipped
-    read harmless; the tail placement makes a dip the line RECOVERED from
-    read near zero — exactly the case the audit found the single-read drop
-    misreporting as a multi-psi leak. Returns (None, None, None) when there
-    is no baseline or no samples (aborts, pre-3.13.2 firmware).
+    Sustained = baseline − median of the last up-to-3 samples (~20–30 s at the
+    scheduler's 10 s poll cadence). The median makes a single dipped read
+    harmless; the tail placement makes a dip the line RECOVERED from read near
+    zero — the case a single-read drop misreports as a multi-psi leak. Returns
+    (None, None, None) when there is no baseline or no samples (aborts,
+    pre-3.13.2 firmware).
     """
     tail = list(samples)[-3:]
     if not tail or baseline_psi is None:
@@ -1353,23 +1331,16 @@ def _median(vals):
     """Median with the STANDARD even-n convention: the mean of the two middle
     elements, not the upper one.
 
-    2.25 (f): this returned ``s[len(s) // 2]`` unconditionally, which is the
-    upper middle for an even-length list. On the two even-n call sites below
-    (the detrended residuals and their absolute deviations, both length n of
-    the whole monitor window) that biased the MAD — and therefore the noise
-    floor — HIGH, so a genuine held decay could be written off as
-    'within_noise'. Empty input still returns None: that contract is relied on
-    by nothing here but is deliberately unchanged.
+    ``s[len(s) // 2]`` — the upper middle on an even-length list — biases the
+    MAD, and therefore the noise floor, HIGH on the two even-n call sites below
+    (the detrended residuals and their absolute deviations, both length n of the
+    whole monitor window), so a genuine held decay reads as 'within_noise'.
 
-    ⚠️ CORRECTED 2026-09-08 — the previous wording named the wrong reason.
-    It said this is not interchangeable with ``fixture_health._median`` /
-    ``_mad`` "which scale by MAD_SCALE". ``fixture_health._median`` does NOT
-    scale; only ``_mad`` does. Since 2.25(f) the two ``_median`` bodies are
-    identical except on EMPTY input — this one returns ``None``, that one
-    returns ``0.0``. That difference is the whole reason not to merge them:
-    a 0.0 median silently becomes a real data point, whereas None forces the
-    caller to decide. Merging the MADs is the separately unsafe one, because
-    only one of them applies MAD_SCALE.
+    Do NOT merge with ``fixture_health._median``: the bodies are identical
+    except on EMPTY input, where this returns ``None`` and that returns
+    ``0.0``. A 0.0 median silently becomes a real data point; None forces the
+    caller to decide. Merging the two ``_mad`` helpers is separately unsafe,
+    because only one of them applies MAD_SCALE.
     """
     s = sorted(vals)
     if not s:
@@ -1386,22 +1357,21 @@ def _samples_json(samples) -> Optional[str]:
 
 
 def _monitor_stats(baseline_psi, samples, other_valve_state="none"):
-    """dev41 — addon-side measurement statistics over the monitor window.
+    """Addon-side measurement statistics over the monitor window.
 
-    Magnitude (definition unchanged from dev38 / _sustained_drop): the
-    FIRMWARE frozen baseline − median of the tail samples. The firmware
-    baseline is deliberate — an addon-side baseline would start after decay
-    has already begun on a real leak and systematically understate the drop.
+    Magnitude (same definition as _sustained_drop): the FIRMWARE frozen
+    baseline − median of the tail samples. The firmware baseline is deliberate
+    — an addon-side baseline starts after decay has already begun on a real
+    leak and systematically understates the drop.
 
-    Shape (new): ``sustainedness_psi`` = head median − tail median. ~0 =
-    flat window; positive = pressure kept falling (held, leak-like);
-    negative = the line RECOVERED (transient dip). Shape only, never
-    magnitude.
+    Shape: ``sustainedness_psi`` = head median − tail median. ~0 = flat window;
+    positive = pressure kept falling (held, leak-like); negative = the line
+    RECOVERED (transient dip). Shape only, never magnitude.
 
     Status: 'ok' | 'indeterminate' (+reason) gates every addon-side consumer
     (leak-rate estimate, transient-dip note). None = no samples at all
     (pre-3.13.2 firmware, aborts) — the legacy pressure_drop fallback is
-    scoped to exactly that case, never to a withheld figure (C1).
+    scoped to exactly that case, never to a withheld figure.
 
     Noise floor: robust σ (1.4826 × MAD) of residuals from a least-squares
     line over the whole window — detrending removes the leak slope itself,

@@ -1,11 +1,10 @@
 """Event detector — top-level coordinator (``EventDetector``).
 
-Unit 7.3 split the former 3,013-line single file into three modules along the
-two seams that were already there, keeping every existing import site working:
+The subsystem is three modules:
 
   ``event_detector_core``  — ``RawEvent``, the propagation-delay scan and
                              ``CircuitEventDetector`` (the per-circuit state
-                             machine, including unit 2.34's single shared
+                             machine, including the single shared
                              ``_run_close_ladder`` that both the flow and the
                              pressure callback run).
   ``event_waveform``       — the firmware waveform wire format and
@@ -15,18 +14,16 @@ two seams that were already there, keeping every existing import site working:
                              circuit and wires them to HaClient subscriptions.
 
 Dependencies run ONE way (this module -> event_waveform -> event_detector_core);
-``test_unit73_event_detector_split`` fails if that ever re-tangles.
+``test_unit73_event_detector_split`` fails if that re-tangles.
 
-Names that moved are still readable from this module via the PEP 562
-``__getattr__`` at the bottom, so ``from .event_detector import RawEvent`` and
-friends keep resolving. Two things that does NOT do, deliberately:
+Moved names stay readable here via the PEP 562 ``__getattr__`` at the bottom.
+Two things it deliberately does NOT do:
 
-  * it never invents an attribute — an unknown name raises ``AttributeError``,
-    so ``hasattr`` still answers False for symbols that were deleted;
-  * it is a READ path only. ``monkeypatch.setattr(event_detector, "datetime",
-    ...)`` now sets a *local* attribute that the moved code never reads. Patch
-    the module the code actually lives in — see
-    ``test_flow_start_stale_guard``, which is where that bit.
+  * invent an attribute — an unknown name raises ``AttributeError``, so
+    ``hasattr`` still answers False for symbols that were deleted;
+  * offer a WRITE path. ``monkeypatch.setattr(event_detector, "datetime", ...)``
+    sets a *local* attribute the moved code never reads; patch the module the
+    code actually lives in (see ``test_flow_start_stale_guard``).
 """
 from __future__ import annotations
 
@@ -38,16 +35,14 @@ from .event_detector_core import CircuitEventDetector, RawEvent, log
 from .event_waveform import WaveformChunkAccumulator, WaveformRecord
 
 
-# ── Phase 3 (3.2) — firmware signals the add-on subscribes to for OBSERVABILITY
+# ── Firmware signals the add-on subscribes to for OBSERVABILITY ──────────────
 #
-# Every one of these was already on the wire and read by nobody. They are
-# mirrored into EventDetector._device_signals and surfaced on /health/detail.
+# Mirrored into EventDetector._device_signals and surfaced on /health/detail.
 #
 # HARD RULE: nothing in this process may branch on them. They are not gates,
-# not preconditions, and not inputs to any actuation decision — the whole
-# point of Phase 3 is to make silent things VISIBLE before Phase 8 decides
-# what to do about them. Adding a read of _device_signals to a code path that
-# opens or closes a valve is a behaviour change and belongs in unit 8.5.
+# not preconditions, and not inputs to any actuation decision. Adding a read of
+# _device_signals to a code path that opens or closes a valve is a behaviour
+# change.
 #
 # Per-circuit. Keys are roles in circuit_entity_map (see device_discovery).
 _DEVICE_TRUTH_ROLES: Tuple[str, ...] = (
@@ -102,41 +97,41 @@ class EventDetector:
         self._ha = ha_client
         self._queue = event_queue
         self._sensitivity_getter = sensitivity_getter
-        # dev25: returns the pump-mode oscillation gate (PSI) for a circuit,
-        # or None when pump-aware suppression is off. Wired by the
-        # orchestrator; None default keeps tests/imports gate-free.
+        # Returns the pump-mode oscillation gate (PSI) for a circuit, or None
+        # when pump-aware suppression is off. Wired by the orchestrator; None
+        # default keeps tests/imports gate-free.
         self._pump_gate_getter = pump_gate_getter or (lambda _c: None)
-        # dev27 (Phase 6): returns (zone_floor_psi|None, pump_fail_floor|None)
-        # per circuit; the callbacks fire the alerts (orchestrator wires them
-        # to AlertManager via create_task).
+        # Returns (zone_floor_psi|None, pump_fail_floor|None) per circuit; the
+        # callbacks fire the alerts (orchestrator wires them to AlertManager
+        # via create_task).
         self._low_pressure_getter = low_pressure_getter or (
             lambda _c: (None, None))
         self._low_pressure_cb = low_pressure_cb
-        # dev46 (46h): injected like the other DB-backed getters — this class
-        # has no connection of its own, and giving it one would break the
-        # single-connection invariant (46a). Optional so every existing
-        # construction site (tests, tools) keeps working.
+        # Injected like the other DB-backed getters — this class has no
+        # connection of its own, and giving it one would break the
+        # single-connection invariant. Optional so every existing construction
+        # site (tests, tools) keeps working.
         self._winterized_getter = winterized_getter
         self._pump_fail_cb = pump_fail_cb
         self._debug_capture_propagation = debug_capture_propagation
         self._detectors: Dict[str, CircuitEventDetector] = {}
         # Tracks live valve open/closed state per circuit for cross-circuit feature
         self._valve_open: Dict[str, bool] = {}
-        # dev41: (source, set_at_iso) provenance per circuit for the above.
+        # (source, set_at_iso) provenance per circuit for the above.
         self._valve_meta: Dict[str, Tuple[str, str]] = {}
         # Chunked HA-event waveform accumulators (firmware 3.9.0+) — sole transport.
         self._chunk_accumulators: Dict[str, WaveformChunkAccumulator] = {}
         self._wf_event_subscribed: bool = False
         self._is_configured = False
-        # Optional sink for late-assembled waveforms (signature upgrade, Fix 1).
+        # Optional sink for late-assembled waveforms (signature upgrade).
         # Wired by the orchestrator to FeatureExtractor.handle_late_waveform;
         # left None in tests / import → assembly notifies nothing.
         self._waveform_upgrade_sink: Optional[Callable[[str, WaveformRecord], None]] = None
-        # ── Phase 3 (3.2) — device-truth signals ──────────────────────────
+        # ── Device-truth signals ──────────────────────────────────────────
         # Returns {role: entity_id} for a circuit. Injected like the other
-        # DB-backed getters (this class owns no connection — 46a); invoked
-        # ONLY from collect_circuit_inputs, which the callers submit through
-        # run_db. audit-ok(run_db).
+        # DB-backed getters (this class owns no connection); invoked ONLY from
+        # collect_circuit_inputs, which the callers submit through run_db.
+        # audit-ok(run_db).
         self._entities_getter = entities_getter
         # Wired by the orchestrator to mark_subsystem_degraded, so a transport
         # condition lands in the SAME worker_health record /health/detail
@@ -144,9 +139,7 @@ class EventDetector:
         self._subsystem_degraded_cb = subsystem_degraded_cb
         #: circuit -> role -> {entity_id, state, changed_at}. Mirror of the
         #: firmware's end stops / valve-seal alerts / waveform stage counters.
-        #: OBSERVABILITY ONLY — nothing in this process may branch on it. Unit
-        #: 8.5 owns the decision about acting on valve truth; 3.2 only makes
-        #: it visible, so that decision has evidence to be made from.
+        #: OBSERVABILITY ONLY — nothing in this process may branch on it.
         self._device_signals: Dict[str, Dict[str, dict]] = {}
         self._device_signals_subscribed: bool = False
 
@@ -170,19 +163,16 @@ class EventDetector:
         return det.settled_pressure() if det is not None else None
 
     def collect_circuit_inputs(self, circuits=None) -> dict:
-        """dev46 (46a) — every DB-backed input the detector needs, one hop.
+        """Every DB-backed input the detector needs, in one hop.
 
-        The three getters injected by the orchestrator (sensitivity, pump
-        gate, low-pressure floors) each query the shared connection. They
-        used to be invoked inline from ``setup`` / ``update_thresholds``,
-        which run on the event loop — a deferred connection touch the
-        attribute grep could never see, because the orchestrator hands them
-        over as plain callables.
+        The getters injected by the orchestrator (sensitivity, pump gate,
+        low-pressure floors, winterized, entities) each query the shared
+        connection, so they must not be invoked inline from ``setup`` /
+        ``update_thresholds``, which run on the event loop.
 
-        Collected together here so the loop-side code below stays exactly as
-        it was: object construction and HA subscription must NOT move to the
-        DB thread (that would trade a DB race for a subscription-registry
-        one).
+        Collected here so the loop-side code stays where it is: object
+        construction and HA subscription must NOT move to the DB thread, which
+        would trade a DB race for a subscription-registry one.
         """
         out = {}
         for circuit in (circuits if circuits is not None
@@ -200,10 +190,9 @@ class EventDetector:
                               if self._winterized_getter else False)
             except Exception:
                 winterized = False
-            # Phase 3 (3.2): {role: entity_id} for this circuit, read on the
-            # DB thread with everything else this method collects. Best-effort
-            # — an unconfigured / partially-mapped install just yields {} and
-            # the device-signal subscriptions below are skipped.
+            # {role: entity_id} for this circuit, read on the DB thread with
+            # everything else. Best-effort — an unconfigured / partially-mapped
+            # install yields {} and the device-signal subscriptions are skipped.
             try:
                 entities = (dict(self._entities_getter(circuit))
                             if self._entities_getter else {})
@@ -270,10 +259,9 @@ class EventDetector:
 
             # Per-event waveform capture (firmware 3.9.0+, chunked streaming).
             # esp_device_prefix is e.g. "esp_water_main_"; strip the trailing
-            # underscore to get the normalized node name for identity comparison.
-            # removesuffix("_") strips exactly one trailing underscore;
-            # rstrip("_") was over-eager and would strip multiple if a
-            # prefix were ever configured with a double-underscore tail.
+            # underscore for the normalized node name. removesuffix("_") strips
+            # exactly one — rstrip("_") would strip several from a prefix
+            # configured with a double-underscore tail.
             expected_node = cfg.esp_device_prefix.removesuffix("_")
             accumulator = WaveformChunkAccumulator(
                 cfg.circuit, expected_node=expected_node,
@@ -282,8 +270,8 @@ class EventDetector:
             )
             self._chunk_accumulators[cfg.circuit] = accumulator
 
-            # Phase 3 (3.2) — mirror the firmware's valve-truth + waveform
-            # stage entities. Read-only: see _DEVICE_TRUTH_ROLES.
+            # Mirror the firmware's valve-truth + waveform stage entities.
+            # Read-only: see _DEVICE_TRUTH_ROLES.
             self._subscribe_device_signals(
                 cfg.circuit, inputs[cfg.circuit].get("entities") or {})
 
@@ -337,7 +325,7 @@ class EventDetector:
                             circuit, e)
 
     # ------------------------------------------------------------------
-    # Phase 3 — device-truth signals (OBSERVABILITY ONLY)
+    # Device-truth signals (OBSERVABILITY ONLY)
     # ------------------------------------------------------------------
 
     def _subscribe_device_signals(self, circuit: str,
@@ -383,9 +371,9 @@ class EventDetector:
     async def prime_device_signals(self) -> None:
         """Seed device-signal states from current HA state.
 
-        Same subscribe-then-prime shape as prime_valve_states (dev38): an end
-        stop that never changes after boot would otherwise read `null` forever,
-        which is indistinguishable from "not mapped". Best-effort per entity.
+        Same subscribe-then-prime shape as prime_valve_states: an end stop that
+        never changes after boot would otherwise read `null` forever, which is
+        indistinguishable from "not mapped". Best-effort per entity.
         """
         for circuit, slots in self._device_signals.items():
             for role, slot in slots.items():
@@ -463,27 +451,26 @@ class EventDetector:
     def _on_valve_state(self, circuit: str, state: str) -> None:
         """Update tracked valve state for cross-circuit feature."""
         self._valve_open[circuit] = state in ("open", "on")
-        # dev41 provenance: how/when this circuit's state was established.
+        # Provenance: how/when this circuit's state was established.
         self._valve_meta[circuit] = (
             "state_change", datetime.now(timezone.utc).isoformat())
 
     async def prime_valve_states(self) -> None:
-        """Seed other-valve tracking from current HA state (dev38).
+        """Seed other-valve tracking from current HA state.
 
         Subscribe-then-prime: setup() wires the change subscriptions FIRST,
-        then this fills ``self._valve_open`` for valves that simply never
-        change state after boot. Without it the dict stayed empty until the
-        first valve transition, so ``_get_other_valve_open`` returned None
-        ("unknown") indefinitely and ``other_valve_open`` could never record
-        a confirmed 0 — the 2026-08 audit found the column was only ever
-        1 or NULL across all 6,124 events. A change event that races in
-        during priming wins (checked before AND after the await).
+        then this fills ``self._valve_open`` for valves that never change state
+        after boot. Without it the dict stays empty until the first valve
+        transition, so ``_get_other_valve_open`` returns None ("unknown")
+        indefinitely and ``other_valve_open`` can never record a confirmed 0 —
+        an audit found the column was only ever 1 or NULL across all 6,124
+        events. A change event racing in during priming wins (checked before
+        AND after the await).
 
-        Phase 3 (3.2) also primes the mirrored device-truth signals from here,
-        rather than from a new call site: this method is already invoked on
-        BOTH paths that follow ``setup()`` — orchestrator boot and the setup
-        wizard's completion handler — so the end stops are populated in the
-        same two places the valve states are, with no third thing to remember.
+        Also primes the mirrored device-truth signals, rather than from a new
+        call site: this method is already invoked on BOTH paths that follow
+        ``setup()`` — orchestrator boot and the setup wizard's completion
+        handler — so there is no third place to remember.
         """
         try:
             await self.prime_device_signals()
@@ -526,10 +513,10 @@ class EventDetector:
 
     def _get_other_valve_meta(
             self, this_circuit: str) -> Optional[Tuple[str, str]]:
-        """dev41 — (source, set_at_iso) provenance for the aggregate the
-        method above returns: the most recently established other-circuit
-        state (in a two-circuit home there is exactly one). None when no
-        other state has been observed."""
+        """(source, set_at_iso) provenance for the aggregate the method above
+        returns: the most recently established other-circuit state (in a
+        two-circuit home there is exactly one). None when no other state has
+        been observed."""
         metas = [m for c, m in self._valve_meta.items()
                  if c != this_circuit and c in self._valve_open]
         if not metas:
@@ -566,7 +553,7 @@ class EventDetector:
         return accumulator.recent_records() if accumulator else []
 
     def waveform_transport_stats(self, circuit: str) -> Dict[str, Any]:
-        """Phase 3 — per-circuit waveform-transport health counters (or zeros).
+        """Per-circuit waveform-transport health counters (or zeros).
 
         The no-accumulator fallback carries every key transport_stats() emits,
         so a caller that reads one by name (routers/device.py, /health/detail)
@@ -591,14 +578,13 @@ class EventDetector:
 
 
 # --------------------------------------------------------------------------- #
-# Back-compat surface for unit 7.3's split (PEP 562)                          #
+# Back-compat surface for the split (PEP 562)                                 #
 # --------------------------------------------------------------------------- #
-# Everything below moved out of this file. A plain ``from .event_waveform
-# import X`` re-export line would be simpler, but a module ``__getattr__`` is
-# what keeps this safe: it resolves LAZILY, so no import order can catch a
-# partially-initialised module, and it cannot mask a genuinely missing symbol
-# because the fallback branch RAISES. (Returning None there would make every
-# ``hasattr`` in the suite answer True.)
+# Everything below moved out of this file. Eager ``from .event_waveform import
+# X`` re-export lines raise ImportError on one import order; a module
+# ``__getattr__`` resolves LAZILY, so no order can catch a partially-initialised
+# module. The fallback branch must keep RAISING — returning None there would
+# make every ``hasattr`` in the suite answer True.
 _MOVED_TO_CORE = (
     "StartTrigger",
     "_valve_meta_kwargs",

@@ -43,12 +43,11 @@ _DEV_MODE    = _os.environ.get("DEV_MODE", "false").lower() in ("true", "1", "ye
 # Session cookie used to bind a browser to its CSRF token via HMAC
 # double-submit. Persistent (30 days) and re-set on first response only.
 #
-# The name changed from "wm_session" in unit 2.28, and it had to. The old cookie
-# was scoped path="/", and a browser that already holds it keeps sending it —
-# so the middleware never sees a cookie-less client, never calls set_cookie
-# again, and the new path/SameSite would have reached NOBODY who had ever opened
-# the add-on. A new name forces exactly one re-issue per browser, under the new
-# scope; the stale one is explicitly deleted below.
+# Renaming this cookie is how a scope change reaches existing browsers: a
+# browser holding the old path="/" cookie keeps sending it, so the middleware
+# never sees a cookie-less client, never calls set_cookie again, and a new
+# path/SameSite would reach nobody who had ever opened the add-on. A new name
+# forces exactly one re-issue per browser; the stale one is deleted below.
 SESSION_COOKIE         = "wm_sid"
 LEGACY_SESSION_COOKIE  = "wm_session"   # pre-2.28, path="/" — deleted on sight
 SESSION_COOKIE_MAX_AGE = 30 * 86400  # 30 days
@@ -58,18 +57,17 @@ SESSION_COOKIE_MAX_AGE = 30 * 86400  # 30 days
 SESSION_COOKIE_MIN_LEN = 16
 
 # Cookie path. The Supervisor serves every ingress add-on under
-# /api/hassio_ingress/<token>/, so this prefix is the narrowest scope that is
-# still STABLE: the <token> segment is per-add-on and the add-on cannot assume
-# it is durable, and it only ever reaches us through the X-Ingress-Path REQUEST
-# header, which this codebase already treats as untrusted (see the sanitising
-# re.sub on the setup redirect below). Deriving a cookie path from that header
-# would mean one odd value breaks every POST in the app — for zero security
-# gain, because scoping to our own token does NOT keep a sibling add-on out
-# (see the ACCEPTED RISK note in ingress_middleware).
+# /api/hassio_ingress/<token>/, so this prefix is the narrowest STABLE scope:
+# the <token> segment is per-add-on, is not durable, and only ever reaches us
+# through the X-Ingress-Path REQUEST header, which this codebase treats as
+# untrusted (see the sanitising re.sub on the setup redirect below). Deriving a
+# cookie path from that header means one odd value breaks every POST in the app,
+# for zero security gain — scoping to our own token does NOT keep a sibling
+# add-on out (see the ACCEPTED RISK note in ingress_middleware).
 #
-# What it does buy, which path="/" did not: the cookie stops riding along on
-# Home Assistant's OWN requests — /api/websocket, /api/states, /auth/*, and
-# every frontend fetch on the HA origin.
+# What it buys over path="/": the cookie stops riding along on Home Assistant's
+# OWN requests — /api/websocket, /api/states, /auth/*, and every frontend fetch
+# on the HA origin.
 INGRESS_PATH_PREFIX = "/api/hassio_ingress/"
 
 
@@ -123,13 +121,13 @@ def _set_session_cookie(response, request: Request, session_id: str) -> None:
     whose cookie never round-trips could never present a matching token — the frontend
     reloads on 403, which then derives a valid token for this same session.
 
-    ``samesite="strict"`` (was "lax", unit 2.28): ingress is served from the Home
-    Assistant origin itself, and the panel is entered as a same-origin iframe from
-    the HA sidebar, so every legitimate request to this add-on — navigation, form
-    POST and fetch alike — is same-site and carries a Strict cookie. The one case
-    Strict withholds it that Lax would not is a top-level navigation arriving from
-    a genuinely different site (an emailed deep link); that request simply mints a
-    new session and renders a page whose token matches it, so nothing breaks.
+    ``samesite="strict"``: ingress is served from the Home Assistant origin
+    itself and the panel is entered as a same-origin iframe from the HA sidebar,
+    so every legitimate request — navigation, form POST and fetch alike — is
+    same-site and carries a Strict cookie. The one case Strict withholds it that
+    Lax would not is a top-level navigation from a genuinely different site (an
+    emailed deep link); that request mints a new session and renders a page whose
+    token matches it, so nothing breaks.
     """
     response.set_cookie(
         SESSION_COOKIE,
@@ -249,35 +247,30 @@ async def lifespan(app: FastAPI):
     logging.getLogger("multipart").setLevel(logging.WARNING)
     logging.getLogger("multipart.multipart").setLevel(logging.WARNING)
     log = logging.getLogger(__name__)
-    # dev46 (46g): announce the running build. Every deploy in the 2026-08
-    # arc needed migration log lines as a proxy for "did the new image
-    # actually start" — twice the supervisor served a stale build and the
-    # only tell was a missing migration. Best-effort: version/commit read
-    # failures must never block boot.
+    # Announce the running build. The supervisor can serve a stale image, and
+    # without this line the only tell is a missing migration log line.
+    # Best-effort: version/commit read failures must never block boot.
     try:
         _ver = _read_addon_version() or "unknown"
         _commit = _read_git_commit()
         _build = f"v{_ver}" + (f" ({_commit})" if _commit else "")
-        # dev46 (46k) — the build fingerprint, so two rebuilds of the SAME dev
-        # version are distinguishable in the log. The container has no .git, so
-        # without this every rebuild of a dev cycle prints an identical line and
-        # "did my change actually deploy?" cannot be answered from the log —
-        # which cost real time on 2026-08-17. Same value the verdict stamp uses,
-        # so a changed fingerprint here also explains why that boot re-derived
-        # every label.
+        # The build fingerprint, so two rebuilds of the SAME dev version are
+        # distinguishable in the log. The container has no .git, so without this
+        # every rebuild of a dev cycle prints an identical line and "did my
+        # change actually deploy?" is unanswerable from the log. Same value the
+        # verdict stamp uses, so a changed fingerprint here also explains why
+        # that boot re-derived every label.
         from .database import _code_fingerprint
         _build += f" build:{_code_fingerprint()[:8]}"
     except Exception:
         _build = "version unknown"
     log.info("Water Monitor %s starting — %d circuits configured",
              _build, len(cfg.circuits))
-    # dev47 — say at BOOT whether the model tier can serve. It is optional by
-    # design (an image without scikit-learn falls back to the kNN ladder), and
-    # scikit-learn ships no musllinux wheel, so whether it is present depends on
-    # Alpine's py3-scikit-learn resolving at build time. Without this line the
-    # only way to find out is to wait for the weekly retrain — which is exactly
-    # the "is my deploy actually doing what I think" problem the version line
-    # above was added to solve.
+    # Say at BOOT whether the model tier can serve. It is optional by design (an
+    # image without scikit-learn falls back to the kNN ladder), and scikit-learn
+    # ships no musllinux wheel, so its presence depends on Alpine's
+    # py3-scikit-learn resolving at build time. Without this line the only way to
+    # find out is to wait for the weekly retrain.
     try:
         from .tinymodel import sklearn_available
         if sklearn_available():
@@ -288,8 +281,8 @@ async def lifespan(app: FastAPI):
             # Report WHY, not just that. "No module named 'sklearn'" means the
             # package never installed; anything else (typically a numpy ABI
             # complaint) means it installed but cannot load — two different
-            # problems with two different fixes, and the build log cannot tell
-            # them apart because Supervisor only dumps build output on failure.
+            # fixes, and the build log cannot tell them apart because Supervisor
+            # only dumps build output on failure.
             try:
                 import sklearn  # noqa: F401
                 why = "imported but reported unavailable"
@@ -362,21 +355,15 @@ async def lifespan(app: FastAPI):
         autoescape=select_autoescape(["html", "htm"]),
     )
 
-    # Static-asset cache-buster.
-    #
-    # It used to be the addon version alone, and that is stable for a whole dev
-    # cycle: every rebuild of 0.3.1-dev46 emitted the same `?v=0.3.1-dev46`, so
-    # the browser kept serving a styles.css / app.js it had cached days and
-    # many deploys earlier. A front-end fix could be deployed repeatedly and
-    # never reach the page — with nothing in any log to say so.
-    #
-    # The build fingerprint changes whenever any module does, which is exactly
-    # the condition under which cached assets must be discarded. (Same root
-    # cause as the verdict stamp's code component — a version string is not a
-    # build identity inside a dev cycle.)
-    # 'dev' is the fallback the templates expect when config.yaml is
-    # unreadable — build_info returns None there rather than inventing a
-    # version string, so the sentinel is applied here, at the display edge.
+    # Static-asset cache-buster. NOT the addon version: that is stable for a
+    # whole dev cycle, so every rebuild emits the same `?v=…` and the browser
+    # keeps serving a styles.css / app.js cached many deploys earlier — a
+    # front-end fix can be deployed repeatedly and never reach the page, with
+    # nothing in any log to say so. The build fingerprint changes whenever any
+    # module does, which is exactly when cached assets must be discarded.
+    # 'dev' is the fallback the templates expect when config.yaml is unreadable
+    # — build_info returns None there rather than inventing a version string, so
+    # the sentinel is applied here, at the display edge.
     _asset_ver = _read_addon_version() or "dev"
     try:
         from .database import _code_fingerprint
@@ -389,12 +376,9 @@ async def lifespan(app: FastAPI):
     # Use Jinja's OWN htmlsafe_json_dumps rather than json.dumps wrapped in
     # Markup. json.dumps escapes " and \ but NOT <, >, & or U+2028/2029, and
     # the Markup wrapper then suppresses autoescape — so any value reaching a
-    # <script> block through this filter could close the tag and execute.
-    # dev49 (P0-5) found that live at three sinks: the cluster name in
-    # fixtures_merge.html (that template has since been deleted with the
-    # merge routes), ?range= via CHART_RANGE, and the X-Ingress-Path header
-    # via window.INGRESS_PATH. Kept as the reason this filter is shaped the
-    # way it is — the sinks are historical, the hazard is not.
+    # <script> block through this filter could close the tag and execute. That
+    # has been live at real sinks here (?range= via CHART_RANGE, the
+    # X-Ingress-Path header via window.INGRESS_PATH).
     #
     # htmlsafe_json_dumps escapes <, >, & and ' as \uXXXX and still returns
     # Markup, so the JSON stays parseable and cannot break out of the tag.
@@ -430,12 +414,12 @@ async def lifespan(app: FastAPI):
         if task.cancelled():
             return
         # A clean shutdown reaches here NOT cancelled, twice over: orch.stop()
-        # runs before runner.cancel(), so the supervised workers can exit on
-        # their own and gather() returns normally; and run()'s own
+        # runs before runner.cancel(), so the supervised workers exit on their
+        # own and gather() returns normally; and run()'s own
         # `except CancelledError: pass` absorbs the cancel when it does land.
         # Either way task.cancelled() is False and exception() is None, so
-        # without this the "no monitoring is happening" CRITICAL fired on every
-        # restart — which is exactly how an alarm gets ignored when it is real.
+        # without this guard the "no monitoring is happening" CRITICAL fires on
+        # every restart — which is how a real alarm gets ignored.
         if getattr(app.state, "shutting_down", False):
             log.info("Orchestrator stopped as part of shutdown")
             return
@@ -490,12 +474,10 @@ async def ingress_middleware(request: Request, call_next):
     path = request.url.path
 
     # Reject requests that did not arrive through the HA ingress proxy.
-    # /health (exact) is exempt so Docker and HA health probes (which
-    # come directly, not through ingress) continue to work. The previous
-    # startswith check also exempted /health-anything — that's fixed
-    # here by using an exact-match.
-    # Disabled when DEV_MODE=true or INGRESS_ALLOWED_IP="" for local
-    # dev/tests.
+    # /health (EXACT match, never startswith — that would exempt
+    # /health-anything) is the one exemption, so Docker and HA health probes,
+    # which come directly rather than through ingress, continue to work.
+    # Disabled when DEV_MODE=true or INGRESS_ALLOWED_IP="" for local dev/tests.
     if (not _DEV_MODE and _INGRESS_IP
             and not _is_health_path(path)):
         client_ip = request.client.host if request.client else ""
@@ -510,7 +492,7 @@ async def ingress_middleware(request: Request, call_next):
         log.info("POST %s (ingress=%r)", path, ingress_path)
 
     # ----- Session + CSRF token derivation ---------------------------
-    # Stateless HMAC double-submit (see plan A-1, revised by unit 2.28):
+    # Stateless HMAC double-submit:
     #   - browser carries a random session_id in a cookie
     #   - server caches the persistent HMAC secret on app.state
     #   - csrf_token = "<nonce>.<HMAC(server_secret, session_id + '!' + nonce)>"
@@ -678,19 +660,17 @@ async def ingress_middleware(request: Request, call_next):
 
     # ----- Setup-complete redirect -----------------------------------
     # First-run users get bounced to the setup wizard until it's done.
-    # The redirect-skip set still uses startswith for /setup so wizard
-    # sub-paths don't bounce-redirect into themselves; /health is now
-    # exact-match.
+    # The redirect-skip set uses startswith for /setup so wizard sub-paths don't
+    # bounce-redirect into themselves; /health is exact-match.
     #
-    # dev57 (2.18): `orch.setup_complete` used to be a live SQLite SELECT on
-    # the shared connection, executed HERE — on the event-loop thread, on every
-    # non-setup, non-static, non-health request, with app.js polling
-    # /api/dashboard/live every 5 s per open tab. That is the same
-    # single-connection violation dev46 (46a) exists to prevent, at the highest
-    # frequency in the app. It is now an in-memory read off the orchestrator's
-    # last-known-good cache (primed on the DB worker; see Orchestrator.
-    # setup_complete). Membership/attribute reads only on this path, like
-    # admin_ids above — do not reintroduce a DB call here.
+    # `orch.setup_complete` is an in-memory read off the orchestrator's
+    # last-known-good cache (primed on the DB worker; see
+    # Orchestrator.setup_complete). It must NOT become a live SQLite SELECT
+    # again: this runs on the event-loop thread for every non-setup,
+    # non-static, non-health request, with app.js polling
+    # /api/dashboard/live every 5 s per open tab — the highest-frequency
+    # single-connection violation in the app. Membership/attribute reads only
+    # on this path, like admin_ids above.
     skip_redirect = (
         path.startswith("/setup")
         or _is_static_path(path)
@@ -725,28 +705,23 @@ async def ingress_middleware(request: Request, call_next):
     return response
 
 
-# Defense-in-depth response headers (plan C-IQ-18). Applied to every
-# response on top of the per-route content. Behind HA ingress these
-# mostly guard against accidental drift (a future template that loads
-# a third-party script, a same-host XSS proxying through us); they
-# also harden the addon if a user ever exposes it directly.
+# Defense-in-depth response headers, applied to every response on top of the
+# per-route content. Behind HA ingress these mostly guard against accidental
+# drift (a future template that loads a third-party script, a same-host XSS
+# proxying through us); they also harden the addon if a user exposes it directly.
 #
-# CSP is deliberately permissive: the current UI has ~60 inline event
-# handlers (onclick="…") and a few inline <script> / <style> blocks,
-# plus Chart.js loaded from cdnjs. A strict CSP would require
-# refactoring all of those to external files + per-request nonces.
-# What we ship today catches the easy wins (frame-ancestors,
-# object-src, base-uri) and pins the CDN origin so a compromised
-# template can't pull script from anywhere new. Future tightening
-# (drop 'unsafe-inline' for script-src, self-host Chart.js) is its
-# own sprint.
+# CSP is deliberately permissive: the UI has ~60 inline event handlers
+# (onclick="…") and a few inline <script> / <style> blocks, plus Chart.js from
+# cdnjs, so a strict CSP would mean refactoring all of those to external files +
+# per-request nonces. This policy takes the easy wins (frame-ancestors,
+# object-src, base-uri) and pins the CDN origin so a compromised template can't
+# pull script from anywhere new.
 _CHART_CDN = "https://cdnjs.cloudflare.com"
-# styles.css line 4 does `@import url('https://fonts.googleapis.com/...')`, and
-# the CSP did not allow it — so the webfonts were blocked on every page load
-# since the policy shipped, silently falling back to system fonts and logging a
-# console violation each time. Pin the two origins Google Fonts actually uses:
-# the stylesheet comes from fonts.googleapis.com, the font files it references
-# from fonts.gstatic.com, so allowing only the first still blocks the fonts.
+# styles.css line 4 does `@import url('https://fonts.googleapis.com/...')`. Both
+# Google Fonts origins must be allowed: the stylesheet comes from
+# fonts.googleapis.com and the font files it references from fonts.gstatic.com,
+# so allowing only the first still blocks the fonts — silently, falling back to
+# system fonts with only a console violation.
 _FONT_CSS_CDN = "https://fonts.googleapis.com"
 _FONT_FILE_CDN = "https://fonts.gstatic.com"
 _CSP_DIRECTIVES = (
@@ -863,25 +838,24 @@ async def health_detail(request: Request):
         },
         "workers": workers,
         "unhealthy": unhealthy,
-        # Phase 3 (3.1) — waveform-transport counters the accumulator has
-        # always collected and nobody read: assembled / degraded / gaps, the
-        # reassembly-bound trips, and (3.2) the two conditions that were
-        # silent by construction — a rejected transport_version, and a
-        # node-identity check disabled by an empty esp_device_prefix.
+        # Waveform-transport counters from the accumulator: assembled /
+        # degraded / gaps, the reassembly-bound trips, and the two conditions
+        # that are otherwise silent by construction — a rejected
+        # transport_version, and a node-identity check disabled by an empty
+        # esp_device_prefix.
         "waveform_transport": _detector_report(orch, "waveform_transport_stats_all"),
-        # Phase 3 (3.2) — firmware signals now mirrored read-only: all four
-        # end stops (the only ground truth for valve position), both
-        # valve-seal alerts (flow against a closed valve), and the firmware's
-        # own waveform stage counters. Surfaced so unit 8.5 can decide what to
-        # do about them; NOTHING gates on them today.
+        # Firmware signals mirrored read-only: all four end stops (the only
+        # ground truth for valve position), both valve-seal alerts (flow against
+        # a closed valve), and the firmware's own waveform stage counters.
+        # NOTHING gates on them.
         "device_signals": _detector_report(orch, "device_signals"),
-        # 2.3 unit 0.9 — METERING TRUTH. An unbound flow-meter PPL entity used
-        # to have no symptom at all: the circuit silently ran on
+        # METERING TRUTH. An unbound flow-meter PPL entity otherwise has no
+        # symptom at all: the circuit silently runs on
         # circuit_profile.pulses_per_litre (column default 396.0), and on a
-        # 72-ppl oval-gear meter that is every volume 5.5x high. Setup now
-        # refuses to produce that configuration; this is how an install that
-        # ALREADY has it says so. Report only — nothing branches on it, and it
-        # reads in-memory config, so it does no I/O.
+        # 72-ppl oval-gear meter that is every volume 5.5x high. Setup refuses
+        # to produce that configuration; this is how an install that ALREADY
+        # has it says so. Report only — nothing branches on it, and it reads
+        # in-memory config, so it does no I/O.
         "metering": _metering_report(orch),
     }
 

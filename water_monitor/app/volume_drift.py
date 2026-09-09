@@ -1,4 +1,4 @@
-"""Whole-day volume drift — dev46 (46v), roadmap Phase 3 §2.
+"""Whole-day volume drift.
 
 NOT the same thing as ``recorder_reconcile.py``, and the difference is the
 entire point of this module. That one reconciles INDIVIDUAL events against the
@@ -12,8 +12,8 @@ is the only check in the add-on that measures our numbers against something we
 did not produce — the firmware's cumulative total, derived from the same pulses
 but never touched by detection, labelling or artifact logic.
 
-Two real incidents motivate it: the July live-miss class, and dev46's own boot
-regression, which recorded nothing for hours while every page looked healthy.
+Two real incidents motivate it: the July live-miss class, and a boot
+regression that recorded nothing for hours while every page looked healthy.
 
 WHAT IT DOES NOT DO
 -------------------
@@ -100,9 +100,9 @@ def events_volume_sync(conn, circuit: str, start_utc: str,
     "how much do we like it" — a reconciliation that excluded the rows it
     distrusts would hide precisely the drift it exists to find.
 
-    Uses volume_litres_effective, the same figure every total uses (the step-12
-    chokepoint), so this compares like with like: a zeroed phantom contributes
-    zero here exactly as it does to the dashboard.
+    Uses volume_litres_effective, the same figure every total uses, so this
+    compares like with like: a zeroed phantom contributes zero here exactly as
+    it does to the dashboard.
     """
     row = conn.execute(
         "SELECT COALESCE(SUM(COALESCE(volume_litres_effective, "
@@ -115,8 +115,8 @@ def events_volume_sync(conn, circuit: str, start_utc: str,
 async def check_yesterdays_drift(orch, circuit: str) -> Dict[str, Any]:
     """Compare yesterday's events against the firmware total. Annotate-only.
 
-    Yesterday, not today: a complete HA-local day (the dev36 boundary every
-    other total uses), so a draw still in progress cannot read as drift.
+    Yesterday, not today: a complete HA-local day (the boundary every other
+    total uses), so a draw still in progress cannot read as drift.
     """
     from .database import is_circuit_winterized, run_db, set_reconcile_state
 
@@ -124,8 +124,8 @@ async def check_yesterdays_drift(orch, circuit: str) -> Dict[str, Any]:
     if cfg is None or not getattr(cfg, "volume_sensor", None):
         return {"status": "skipped", "note": "no volume sensor configured"}
 
-    # dev46 (46h): a drained circuit has a frozen counter and no events. That
-    # is not drift, and dividing by it is not a comparison.
+    # A drained circuit has a frozen counter and no events. That is not
+    # drift, and dividing by it is not a comparison.
     if await run_db(is_circuit_winterized, orch.db, circuit):
         return {"status": "skipped", "note": "circuit is winterized"}
 
@@ -147,11 +147,8 @@ async def check_yesterdays_drift(orch, circuit: str) -> Dict[str, Any]:
         # check report a 3.785x "over-count" every single day — the ratio was
         # identical on both circuits (500.1/133.1 and 3805.4/1005.3), which is
         # what gave it away, and raw HA flow history confirmed the EVENTS were
-        # right to within 0.01%.
-        #
-        # recorder_reconcile has always done this correctly; this module was
-        # written without it. Same helper, same idiom — deliberately not a
-        # second implementation.
+        # right to within 0.01%. Same helper and idiom as recorder_reconcile,
+        # deliberately not a second implementation.
         from .ha_client import vol_to_litres as _v2l
 
         unit = ""

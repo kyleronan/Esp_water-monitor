@@ -1,47 +1,41 @@
-"""dev47 (47c) — the model referee: one compare-against-frozen-reference rule.
+"""The model referee: one compare-against-frozen-reference rule.
 
 Every unattended retrain produces a CHALLENGER. This module decides whether it
 replaces the serving CHAMPION. The same mechanism also gates anchor-ingestion
 admission and tier graduation, so all four decisions share one implementation
 and one set of statistics.
 
-WHY THE RULE LOOKS LIKE THIS (the V6d study, 2026-08-22)
---------------------------------------------------------
-The obvious rule — "swap only if the challenger BEATS the champion on the
-frozen benchmark AND on a recent labelled holdout" — was simulated and it
-failed, badly and silently:
-
-  * At realistic operator response rates (50%, 20% of carded events answered)
-    it rejected EVERY swap. The model froze, the frozen model rejected more and
-    more drifted events, those events fell off the health trend line, and the
-    fixture-failure alarm NEVER FIRED in 21 simulated days. Detection died
-    through the governance mechanism, not through the detector.
-
-Both halves of that rule were wrong:
+WHY THE RULE LOOKS LIKE THIS
+----------------------------
+"Swap only if the challenger BEATS the champion on the frozen benchmark AND on
+a recent labelled holdout" does not work. At realistic operator response rates
+(50%, 20% of carded events answered) it rejects EVERY swap: the model freezes,
+the frozen model rejects more and more drifted events, those events fall off
+the health trend line, and the fixture-failure alarm never fires in 21
+simulated days — detection dies through the governance mechanism, not through
+the detector. Both halves of that rule are wrong:
 
   1. **The frozen benchmark cannot certify an improvement.** It is pinned
      pre-drift, so by construction it contains none of the new information the
-     challenger learned. Asking it "is the challenger better?" asks the wrong
-     question of the wrong data — and at benchmark n≈58 the answer is ±2-4
-     points of pure sampling noise, which a `>=` rule turns into a veto. The
-     benchmark's real job is catching REGRESSIONS. So the test here is
-     **non-inferiority**: swap unless the challenger is worse by more than the
-     benchmark's own noise.
+     challenger learned; at benchmark n≈58 the answer is ±2-4 points of pure
+     sampling noise, which a `>=` rule turns into a veto. The benchmark's real
+     job is catching REGRESSIONS, so the test here is **non-inferiority**:
+     swap unless the challenger is worse by more than the benchmark's own
+     noise.
 
-  2. **The "recent labelled holdout" was degenerate.** Newly labelled events
-     are exactly the events the champion REJECTED (that is how they reached the
-     review card), and the challenger TRAINED on them. Measured: champion 0.0,
-     challenger 1.0, in every single comparison — a train-on-test result rigged
-     for the challenger that never changed a decision. A recent-labelled leg is
-     only meaningful on events held OUT of the challenger's pool, which is why
+  2. **A recent-labelled leg is degenerate unless truly held out.** Newly
+     labelled events are exactly the events the champion REJECTED (that is how
+     they reached the review card), and the challenger TRAINED on them:
+     champion 0.0, challenger 1.0, in every single comparison — a train-on-test
+     result rigged for the challenger that never changes a decision. Hence
      :func:`decide` REFUSES a leaked holdout rather than scoring it.
 
-Under the dev47 re-framing, fixture-failure detection lives DOWNSTREAM of
-attribution (see 47i): the referee is deliberately a bystander for drift-class
-failures, and a challenger that has absorbed drift while keeping events in
-their own class is the DESIRED outcome. This module therefore guards model
-quality only. It must never be made "smart" about drift — that is the health
-monitor's job, against a frozen baseline it owns.
+Fixture-failure detection lives DOWNSTREAM of attribution: the referee is
+deliberately a bystander for drift-class failures, and a challenger that has
+absorbed drift while keeping events in their own class is the DESIRED outcome.
+This module therefore guards model quality only. It must never be made "smart"
+about drift — that is the health monitor's job, against a frozen baseline it
+owns.
 """
 from __future__ import annotations
 
@@ -182,8 +176,7 @@ def decide(
     check. If both are supplied and they intersect, the "holdout" contains
     events the challenger trained on and scoring it is meaningless — this
     raises rather than returning a verdict, because a leaked holdout is a
-    programming error, not a runtime condition. V6d measured this exact leak
-    producing champion 0.0 / challenger 1.0 in every comparison.
+    programming error, not a runtime condition.
     """
     cfg = config or RefereeConfig()
 
@@ -211,13 +204,11 @@ def decide(
     if vetoes:
         return RefereeVerdict(False, f"{vetoes[0].name}: {vetoes[0].detail}",
                               tuple(legs))
-    # dev51 (dev49 P-2): abstention is not consent. When NO leg could score —
-    # an empty benchmark AND a holdout below the floor — nothing has been
-    # measured, and "nothing vetoed" would promote an unexamined challenger.
-    # That was the shipped state for weeks (the benchmark leg was never
-    # wired), so the safe direction is the one every other failure takes here:
-    # keep the incumbent. A leg that abstains while another scores still
-    # neither vetoes nor endorses — that behaviour is unchanged.
+    # Abstention is not consent. When NO leg could score — an empty benchmark
+    # AND a holdout below the floor — nothing has been measured, and "nothing
+    # vetoed" would promote an unexamined challenger, so keep the incumbent.
+    # A leg that abstains while another scores still neither vetoes nor
+    # endorses.
     if all(leg.outcome == "no_contest" for leg in legs):
         return RefereeVerdict(False, "no leg could score — keeping incumbent",
                               tuple(legs))

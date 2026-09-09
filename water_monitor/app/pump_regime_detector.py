@@ -1,8 +1,8 @@
-"""Nightly pump-regime detector (pump plan Phase 3, dev23).
+"""Nightly pump-regime detector.
 
 Analyzes each circuit's quiet-hour pressure/flow window from HA history with
-the STUDY-VALIDATED math in pump_regime_math (2026-07-21: 13/13 negative
-nights incl. softener regens, 2/2 positive) and records one row per circuit
+the STUDY-VALIDATED math in pump_regime_math (13/13 negative nights incl.
+softener regens, 2/2 positive) and records one row per circuit
 per EVALUATED night in pump_regime_nightly. Skipped nights (HA outage, no
 usable quiet window) write NO row and are invisible to the hysteresis
 counters by design.
@@ -15,18 +15,17 @@ pump-aware behavior):
     pump_mode_ack so a future re-detection re-banners. A user-confirmed
     supply_type keeps pump mode on regardless of clearing.
   * pump_detect_period_s refreshes on EVERY detected night (a stale period
-    drifts exactly when the Phase 5 period-shrink trigger cares); the
+    drifts exactly when the period-shrink trigger cares); the
     detecting circuit's period wins, circuit_1 preferred deterministically.
   * pump_profile is written ('vfd_constant_pressure') only when currently
     NULL — never over a user-set or previously-detected profile. (v1
     detection can only emit the vfd profile; switch_tank arrives via the
-    supply answer — see the plan's round-3 #7 correction.)
+    supply answer.)
 
-SCOPE HONESTY (plan finding #11): this detector structurally detects
-*pump + leak*, not pumps — a healthy pump on a tight home never cycles
-overnight, so auto-detection never fires for it. The setup supply question
-covers deliberate installs; detection exists for the mid-life-install case
-(exactly how this feature was born: 2026-07-19, ESYBOX + zone-valve leak).
+SCOPE: this detector structurally detects *pump + leak*, not pumps — a
+healthy pump on a tight home never cycles overnight, so auto-detection never
+fires for it. The setup supply question covers deliberate installs; detection
+exists for the mid-life-install case.
 """
 from __future__ import annotations
 
@@ -66,12 +65,11 @@ def evaluate_leak_alert(nights: List[Dict[str, Any]]) -> Optional[Dict[str, Any]
     carrying est_leak_lpd + period_s). TRANSITION-ONLY: fires when the
     condition holds now but did NOT hold one night earlier, so a persistent
     leak alerts once instead of nightly (the HA notification_id keeps the
-    sidebar entry alive regardless). Two triggers (plan 5a):
+    sidebar entry alive regardless). Two triggers:
       * threshold: est >= PUMP_LEAK_ALERT_LPD on 3 consecutive evaluated
         nights;
       * period-shrink: median period over the last 7 evaluated nights < 0.7 x
-        the previous 7 (the leak is growing) — "week" = evaluated nights
-        (plan round-1 #21).
+        the previous 7 (the leak is growing) — "week" = evaluated nights.
     """
     def _threshold_at(offset: int) -> bool:
         window = nights[offset:offset + _ALERT_CONSEC_NIGHTS]
@@ -107,7 +105,7 @@ def evaluate_hysteresis(nights: List[Dict[str, Any]],
                         currently_detected: bool) -> Optional[str]:
     """'set' / 'clear' / None from home-level EVALUATED nights (newest first,
     each {'night_date', 'any_detected'}). Skipped nights simply aren't in the
-    list — consecutive-ness is over evaluated nights only (plan finding #7).
+    list — consecutive-ness is over evaluated nights only.
     """
     if not currently_detected:
         recent = nights[:_SET_LOOKBACK]
@@ -124,8 +122,7 @@ def evaluate_hysteresis(nights: List[Dict[str, Any]],
 
 def pump_banner_state(db: sqlite3.Connection) -> Dict[str, Any]:
     """Whether the 'booster pump detected?' banner should show, plus copy
-    inputs. Conditions (plan round-3 #5, round-1 #5, round-1 #9/round-3 #11):
-    detected AND supply_type NOT a pump type (well homes are ALREADY pump
+    inputs. Conditions: detected AND supply_type NOT a pump type (well homes are ALREADY pump
     homes — Yes must never overwrite 'well') AND not confirmed AND no circuit
     forced pump_mode='off' AND (never dismissed, or detection persisted >=30
     evaluated nights since the dismissal — recurring, self-limiting).
@@ -148,9 +145,7 @@ def pump_banner_state(db: sqlite3.Connection) -> Dict[str, Any]:
     if ack.startswith("dismissed"):
         # Recurring re-banner: only after >=30 evaluated nights SINCE the
         # dismissal, all while detection persists. The dismissal night is
-        # carried inside the ack value ('dismissed:<YYYY-MM-DD>') — the
-        # 20260558 columns shipped before this detail existed, and the ack
-        # string was the designated free slot.
+        # carried inside the ack value ('dismissed:<YYYY-MM-DD>').
         since = ack.split(":", 1)[1] if ":" in ack else None
         nights = get_pump_regime_nights(db, limit=200)
         evaluated_since = [n for n in nights
@@ -165,11 +160,11 @@ def pump_banner_state(db: sqlite3.Connection) -> Dict[str, Any]:
 
 
 def pump_floor_hint(db: sqlite3.Connection) -> Optional[float]:
-    """Phase 6b suggested pump-failure floor: median quiet-window minimum
+    """Suggested pump-failure floor: median quiet-window minimum
     pressure (≈ pump cut-in on leak nights; the bottom of the normal band on
     healthy nights) minus 5 PSI. Uses ANY historical evaluated nights —
     detected nights preferred — so a home that fixes its leak early still
-    gets a hint (plan round-1 #18 / round-5 #3). Never auto-applied; the
+    gets a hint. Never auto-applied; the
     settings page offers it as a one-tap apply."""
     rows = db.execute(
         "SELECT min_psi, detected FROM pump_regime_nightly "
@@ -289,13 +284,13 @@ class PumpRegimeDetector:
         return ok
 
     def _night_row_exists_sync(self, circuit: str, night: str):
-        """dev46 (46a) — has this night already been evaluated?
+        """Has this night already been evaluated?
 
-        dev46 (46h): a winterized circuit reports "already done" so the
-        nightly skips it without writing a row. Writing no row is the
-        established way this detector represents an unevaluable night (see
-        the module docstring) — the hysteresis counters never see it, so a
-        drained winter cannot silently clear a real pump detection.
+        A winterized circuit reports "already done" so the nightly skips it
+        without writing a row. Writing no row is how this detector represents
+        an unevaluable night (see the module docstring) — the hysteresis
+        counters never see it, so a drained winter cannot silently clear a
+        real pump detection.
         """
         if is_circuit_winterized(self._db, circuit):
             return True
@@ -313,7 +308,7 @@ class PumpRegimeDetector:
                 "nights": get_pump_regime_nights(self._db, limit=40)}
 
     async def _maybe_leak_alert(self) -> None:
-        """Phase 5a: transition-only slow-leak alert. Gated on ARMED pump
+        """Transition-only slow-leak alert. Gated on ARMED pump
         mode (the arming rule — a confirmed/post-feature answer or observed
         evidence; pump_gates_active implies the confirmed half) and
         notify-only by standing decision."""
@@ -321,8 +316,6 @@ class PumpRegimeDetector:
             return
         try:
             circuits = [c.circuit for c in self._cfg.circuits]
-            # dev46 (46a): the gate check and the nights read are adjacent —
-            # one hop.
             _la = await run_db(self._leak_alert_inputs_sync, circuits)
             if not _la["any_pump"]:
                 return
@@ -415,7 +408,7 @@ class PumpRegimeDetector:
         s, e = max(spans, key=lambda x: x[1] - x[0])
         v = detect_pump_regime(pres[s:e], flow[s:e])
 
-        # dev33 — SIBLING-CIRCUIT contamination gate. quiet_windows() only
+        # SIBLING-CIRCUIT contamination gate. quiet_windows() only
         # screens THIS circuit's flow, so a draw on the other circuit leaves
         # the window looking quiet while its pressure signature is anything
         # but. The 2026-07-28 "110 L/day leak" was the 02:00 irrigation
@@ -429,10 +422,10 @@ class PumpRegimeDetector:
 
         from .database import upsert_pump_regime_night
         # Store the ROBUST period (median inter-rise spacing) — the raw
-        # autocorr peak locked onto a 62 s sub-harmonic on the first
-        # production night while the actual rises were ~259 s apart.
+        # autocorr peak locked onto a 62 s sub-harmonic while the actual
+        # rises were ~259 s apart.
         period = v.reported_period_s
-        # Phase 5a: leak estimate on detected nights only, scaled by the
+        # Leak estimate on detected nights only, scaled by the
         # street-meter calibration (the home meter registers ~half of each
         # slug) so the stored/alerted number is the TRUE rate.
         est_lpd = None
@@ -454,7 +447,7 @@ class PumpRegimeDetector:
             # can name the actual time range instead of "the night of".
             window_start_ts=(start + timedelta(seconds=int(s))).isoformat(),
             window_end_ts=(start + timedelta(seconds=int(e))).isoformat(),
-            # Quiet-window pressure floor ≈ pump cut-in — feeds the Phase 6b
+            # Quiet-window pressure floor ≈ pump cut-in — feeds the
             # suggested-floor hint (works on healthy homes too: the quiet
             # minimum is the bottom of the normal band).
             min_psi=round(float(pres[s:e].min()), 2))
@@ -480,13 +473,13 @@ class PumpRegimeDetector:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         # Refresh the stored period on EVERY detected latest night, flag
-        # state changes aside (plan finding #20).
+        # state changes aside.
         latest = nights[0] if nights else None
         updates: Dict[str, Any] = {}
         if latest and latest["any_detected"] and latest["period_s"]:
             updates["pump_detect_period_s"] = float(latest["period_s"])
 
-        # Phase 6b arming stamp (persisted — recomputing from history would
+        # Arming stamp (persisted — recomputing from history would
         # silently disarm when the HA fidelity window ages out): evidence =
         # any detected night, or a post-feature pump supply answer.
         if not prof["pump_alert_armed_at"]:

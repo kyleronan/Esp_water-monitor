@@ -50,9 +50,9 @@ class PresenceWatcher:
     async def setup(self) -> None:
         """Register HA callbacks for all configured presence entities.
 
-        dev46 (46a): async so the profile read can go through run_db — this
-        runs from the orchestrator's boot sequence, which shares the loop
-        with request handlers already submitting to the DB worker.
+        Async so the profile read can go through run_db — this runs from the
+        orchestrator's boot sequence, which shares the loop with request
+        handlers already submitting to the DB worker.
         """
         from .database import run_db
         profile = await run_db(self._load_profile)
@@ -98,14 +98,12 @@ class PresenceWatcher:
         Re-read config and re-subscribe.
         Call this after the user saves new presence settings.
 
-        dev57 (2.10): async, like its three siblings. This is called from
-        ``POST /settings/presence/update`` — i.e. from a request handler ON
-        THE EVENT LOOP — and it used to call ``_load_profile()`` directly,
-        touching the shared ``sqlite3.Connection`` from a second thread while
-        the DB worker could be mid-statement on it. That is exactly the
-        ``InterfaceError: bad parameter or other API misuse`` that dev46 (46a)
-        exists to prevent; see the header of database.py. The read now goes
-        through ``run_db`` like every other one.
+        Async, like its three siblings, because it is called from
+        ``POST /settings/presence/update`` — a request handler ON THE EVENT
+        LOOP — so the profile read must go through ``run_db``. Touching the
+        shared ``sqlite3.Connection`` from a second thread while the DB worker
+        may be mid-statement on it raises ``InterfaceError: bad parameter or
+        other API misuse``; see the header of database.py.
         """
         from .database import run_db
         profile = await run_db(self._load_profile)
@@ -148,8 +146,8 @@ class PresenceWatcher:
         """
         Decide whether to toggle away mode based on current entity states.
 
-        dev46 (46a): loads the profile itself when the caller did not — the
-        state-changed callback is sync and on the loop, so it cannot.
+        Loads the profile itself when the caller did not — the state-changed
+        callback is sync and on the loop, so it cannot.
         """
         if profile is None:
             from .database import run_db

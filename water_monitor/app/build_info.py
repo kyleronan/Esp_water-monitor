@@ -1,24 +1,15 @@
 """Build identity — the add-on version and git commit, read once from disk.
 
-Both readers used to exist TWICE: ``event_detector._read_addon_version``
-(returning ``Optional[str]``) and ``main._read_addon_version`` (returning
-``str`` with a ``'dev'`` fallback), and ``main.py`` called BOTH — the
-event_detector copy for the boot banner and its own copy for the static-asset
-cache-buster. Two parsers of one file is one parser too many: a fix to the
-version-line handling could land in either copy and silently not reach the
-other.
+The single parser for both. Deliberately dependency-free (``pathlib`` only):
+it is imported on the boot path by ``main``, by ``database._code_fingerprint``
+(through ``event_detector``'s re-export), and by ``routers/backup``, so it must
+never drag app logic in behind it.
 
-This module is deliberately dependency-free (``pathlib`` only). It is imported
-on the boot path by ``main``, by ``database._code_fingerprint`` (through
-``event_detector``'s re-export), and by ``routers/backup``, so it must never
-drag app logic in behind it.
-
-Both functions are best-effort by contract: they return ``None`` rather than
-raise, because every caller is either a log line or a cache key and none of
-them may block boot. Callers that need a display string supply their own
-fallback (``or "dev"`` / ``or "unknown"``) — the sentinel stays out of here so
-that "config.yaml was unreadable" is distinguishable from "the version really
-is the string 'dev'".
+Both functions are best-effort by contract — they return ``None`` rather than
+raise, because every caller is a log line or a cache key and none may block
+boot. Callers needing a display string supply their own fallback (``or "dev"``
+/ ``or "unknown"``); the sentinel stays out of here so that "config.yaml was
+unreadable" stays distinguishable from "the version really is 'dev'".
 """
 from __future__ import annotations
 

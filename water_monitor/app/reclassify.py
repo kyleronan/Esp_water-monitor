@@ -1,35 +1,26 @@
 """The reclassify pass: verdict stamps, staleness, and the chunked driver.
 
-Split out of ``database.py`` by unit 7.1. This is a MOVE — no behaviour
-changed, no thresholds touched. What lives here is one coherent subsystem:
-the verdict stamp (what makes an event's stored verdict re-usable), the
+Holds the verdict stamp (what makes an event's stored verdict re-usable), the
 things that release a stamp, and the three-phase pass — prepare, chunked row
 loop, finalize — plus its sync and async entry points.
 
-Direction of the dependency, which is the whole reason this file is shaped
-the way it is
---------------------------------------------------------------------------
-``reclassify`` depends on ``database``; ``database`` does NOT depend on
-``reclassify`` at import time. The one remaining in-file caller
-(``database.patch_event`` -> ``invalidate_cluster_verdict_stamps``) imports
-lazily, and every external caller reaches the moved names through
-``database.__getattr__`` (PEP 562), which forwards here. An eager
-``from .reclassify import ...`` at the bottom of database.py would close the
-loop and raise ``ImportError: cannot import name ... from partially
-initialized module`` whenever this module is imported first.
+Import direction: ``reclassify`` depends on ``database``; ``database`` does
+NOT depend on ``reclassify`` at import time. In-file callers import lazily and
+external callers reach the moved names through ``database.__getattr__``
+(PEP 562). An eager ``from .reclassify import ...`` in database.py closes the
+loop and raises ``ImportError: ... partially initialized module`` when this
+module is imported first.
 
-The siblings are reached through the MODULE object (``_db.run_db``), not
-through ``from .database import run_db``. That is deliberate and load-bearing:
-those names were module globals of ``database`` before the split, so tests and
-callers can substitute them with ``monkeypatch.setattr(database, ...)``. A
-from-import would snapshot the original object and the substitution would bind
-an attribute nobody reads — the pass would then run for real while the test
-that thinks it is watching measures nothing.
+Siblings are reached through the MODULE object (``_db.run_db``), never
+``from .database import run_db``: those names were module globals of
+``database`` before the split, so ``monkeypatch.setattr(database, ...)`` must
+keep working. A from-import snapshots the original object and the substitution
+binds an attribute nobody reads.
 
-``log`` is the SAME logger object database.py uses, not a fresh
-``getLogger(__name__)``. Renaming the channel would silently empty every
-``caplog.at_level(logger="water_monitor.app.database")`` that watches this
-pass, while leaving those tests green.
+``log`` is the SAME logger object database.py uses, not
+``getLogger(__name__)``. Renaming the channel silently empties every
+``caplog.at_level(logger="water_monitor.app.database")`` watching this pass,
+while leaving those tests green.
 """
 from __future__ import annotations
 
@@ -43,13 +34,9 @@ from . import database as _db
 log = _db.log
 
 
-# dev46 (46k) — bump when the STAMP'S OWN definition changes (a new input
-# folded in, a component computed differently). Every stamp then differs from
-# every stored one and the next pass re-derives everything, which is the
-# correct response to "the rule for deciding staleness just changed".
-# v2 (2026-08-18): the label pool left the stamp — a label now pushes an
-# invalidation to its own cluster instead. Bumping forces one full re-derive so
-# no row keeps a stamp computed under the old, stricter rule.
+# Bump when the STAMP'S OWN definition changes (a new input folded in, a
+# component computed differently). Every stamp then differs from every stored
+# one and the next pass re-derives everything.
 _VERDICT_STAMP_ALGO = 3
 
 # Force a full unstamped pass if the last one is older than this. The stamp can
@@ -63,39 +50,30 @@ def compute_verdict_stamp(conn: sqlite3.Connection, circuit: str) -> str:
     """Fingerprint of everything that can change an unlabelled event's verdict.
 
     Same stamp ⇒ the classifier would reach the same answer it already stored,
-    so the event needs no work. The components, and why each is here:
+    so the event needs no work. The components:
 
     * **classifier code version** — a deploy can change any rule, veto or
-      tier. This is also the safety net for any input NOT enumerated below:
-      whatever is missed, shipping a build invalidates everything, so
-      staleness can never outlive a release.
+      tier. Also the safety net for any input NOT enumerated below: shipping a
+      build invalidates everything, so staleness cannot outlive a release.
     * **rule bands, all regimes** — bands are fitted per supply regime and an
       event is judged by ITS era's bands, so a re-fit in any regime can move
       verdicts. Cheap: one row per regime.
-    **The label pool is deliberately NOT here, and that is the whole design.**
-    It was, and it made the stamp useless on the circuit that mattered: one
-    new label invalidated all ~5,400 events, so the boot pass ran in full
-    every time the operator labelled anything — which is constantly. Measured
-    on the production database: labelling 3 events re-derived 5,417 verdicts
-    in 85 s and moved **zero** of them. Three more examples of a class that
-    already has dozens does not shift a k-NN neighbourhood.
 
-    A label's realistic reach is events SIMILAR to it, which is a bounded set,
-    not the whole table — so a label PUSHES an invalidation to its own cluster
-    (``invalidate_cluster_verdict_stamps``) instead of the stamp polling every
-    row. That keeps the cost proportional to what could actually change, and
-    flat as the table grows: at 20,000 events the old rule would have swept
-    ~9 minutes per boot to conclude nothing had changed.
+    The label pool is deliberately NOT here. It made the stamp useless: one new
+    label invalidated all ~5,400 events, so the boot pass ran in full every
+    time the operator labelled anything. Measured on production, labelling 3
+    events re-derived 5,417 verdicts in 85 s and moved zero of them. Instead a
+    label PUSHES an invalidation to its own cluster
+    (``invalidate_cluster_verdict_stamps``), keeping cost proportional to what
+    can actually change and flat as the table grows.
 
-    Also deliberately not here: an individual event's own features. Those are
-    per-row, and a global stamp cannot express them — the invalidation trigger
-    handles those.
+    An individual event's own features are also not here — a global stamp
+    cannot express per-row state; the invalidation trigger handles those.
 
-    What makes both omissions safe is ``_VERDICT_STAMP_MAX_AGE_DAYS``: a
-    cluster is an imperfect proxy for similarity (46e measured DBSTREAM label
-    purity at 0.387), so a label CAN reach an event in another cluster. The
-    weekly unfiltered pass means anything the targeted invalidation misses
-    lands within days rather than never.
+    ``_VERDICT_STAMP_MAX_AGE_DAYS`` is what makes both omissions safe. A
+    cluster is an imperfect proxy for similarity (DBSTREAM label purity
+    measured at 0.387), so a label CAN reach an event in another cluster; the
+    weekly unfiltered pass catches what the targeted invalidation misses.
     """
     import hashlib
 
@@ -116,11 +94,10 @@ def compute_verdict_stamp(conn: sqlite3.Connection, circuit: str) -> str:
         h.update(b"|band:unavailable")
 
     # Settings the pass reads that are NOT rule bands. Enumerated column by
-    # column rather than hashing the rows, and that is not fussiness:
-    # home_profile.away_mode flips with presence and updated_at moves on any
-    # write, so `SELECT *` would re-stamp the whole table several times a day
-    # and quietly undo the entire optimisation. Same rule as the invalidation
-    # trigger's watch list — inputs only.
+    # column rather than hashing the row: home_profile.away_mode flips with
+    # presence and updated_at moves on any write, so `SELECT *` would re-stamp
+    # the whole table several times a day and undo the optimisation. Same rule
+    # as the invalidation trigger's watch list — inputs only.
     #
     #   has_water_softener / softener_circuit -> the softener session detector
     #   fingerprint_labeling_enabled          -> whether the fingerprint tier runs
@@ -136,7 +113,7 @@ def compute_verdict_stamp(conn: sqlite3.Connection, circuit: str) -> str:
     except sqlite3.OperationalError:
         h.update(b"|home:unavailable")
 
-    # circuit_type picks the rule set; winterized (46h) suspends the circuit.
+    # circuit_type picks the rule set; winterized suspends the circuit.
     try:
         row = conn.execute(
             "SELECT circuit_type, winterized FROM circuit_profile "
@@ -164,32 +141,27 @@ def invalidate_cluster_verdict_stamps(conn: sqlite3.Connection, circuit: str,
                                       event_id: str) -> int:
     """A new label PUSHES a re-check to the events it could plausibly affect.
 
-    Called when the operator labels an event. Its cluster is the set of
-    events the classifier considers similar, and therefore the set whose
-    verdicts a new exemplar can realistically move. Releasing those — rather
-    than the whole circuit — is what keeps the work proportional to the change
-    and flat as history grows.
+    Called when the operator labels an event. Its cluster is the set of events
+    the classifier considers similar, and therefore the set whose verdicts a
+    new exemplar can realistically move. Releasing those rather than the whole
+    circuit keeps the work proportional to the change.
 
-    The event itself does not need releasing: it now carries a user label, so
-    the pass skips it by definition (``user_fixture_type IS NULL``).
+    The event itself needs no releasing: it now carries a user label, so the
+    pass skips it by definition (``user_fixture_type IS NULL``).
 
-    Returns the number of peers released. Zero is normal and fine — an event
-    with no cluster yet simply has no known neighbours, and the weekly
-    unfiltered pass is the backstop for anything this misses.
+    Returns the number of peers released. Zero is normal — an event with no
+    cluster has no known neighbours, and the weekly unfiltered pass is the
+    backstop for anything this misses.
     """
     row = conn.execute(
         "SELECT cluster_id FROM events WHERE id = ? AND circuit = ?",
         (event_id, circuit)).fetchone()
     if row is None or row[0] is None:
         return 0
-    # Narrow further by TIER, and the reason is the locked-baseline design.
-    # The ladder tries the rule tier FIRST and the label-driven tiers only
-    # when it abstains. Rule bands are fit-once and hard-locked, and an
-    # event's features are immutable, so a peer already claimed by a rule
-    # (or by a cycle/session detector, which sit above the label tiers and
-    # are equally rule-driven) will return the identical verdict no matter
-    # how many labels exist. Re-deriving those is provably wasted work.
-    #
+    # Narrow further by TIER. Rule bands are fit-once and hard-locked and an
+    # event's features are immutable, so a peer already claimed by a rule (or
+    # by a cycle/session detector, equally rule-driven and above the label
+    # tiers) returns the identical verdict no matter how many labels exist.
     # Everything else — an abstention, a fingerprint hit, a k-NN hit — was
     # decided by evidence a new exemplar can move, so it is released.
     cur = conn.execute(
@@ -210,19 +182,15 @@ def release_settle_window(conn: sqlite3.Connection, circuit: str,
                           hours: int) -> int:
     """Re-open recent events for one pass — boot's CATCH-UP job.
 
-    The hourly maturity re-check (maturity_recheck.py) re-evaluates events
-    from the last few hours, because an event's cycle context arrives after
-    it closes. If the add-on was off — a power cut, a redeploy, a crash —
-    those hours had no re-check, and the stamp alone would not know: those
-    events were stamped when they were first classified, so they look settled.
-
-    Boot therefore releases the same window unconditionally. It is a handful
-    of events (the hourly pass logs 6-26), so it costs nothing, and it means a
-    restart can never leave an event stuck with a verdict taken before its
-    cycle context landed.
+    maturity_recheck.py re-evaluates the last few hours hourly, because an
+    event's cycle context arrives after it closes. If the add-on was off those
+    hours had no re-check, and the stamp cannot tell: those events were stamped
+    when first classified, so they look settled. Boot therefore releases the
+    same window unconditionally — a handful of events (the hourly pass logs
+    6-26), so it costs nothing.
 
     Events the add-on missed entirely arrive as NEW rows via the historical
-    importer and are unstamped already, so they need nothing here.
+    importer and are unstamped already.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     cur = conn.execute(
@@ -236,21 +204,17 @@ def release_settle_window(conn: sqlite3.Connection, circuit: str,
 def _verdict_stamp_pass_is_due(conn: sqlite3.Connection, circuit: str) -> bool:
     """True when the stamp filter must be BYPASSED and everything re-derived.
 
-    The stamp is only as complete as the input list baked into it. If some
-    input is ever missed, affected verdicts would stay stale silently and
-    nothing would ever say so. This bounds that failure to
-    ``_VERDICT_STAMP_MAX_AGE_DAYS`` instead of forever, at a cost of one full
-    pass a week — which the operator no longer waits on, since the pass runs
-    in the background (46k option B).
+    The stamp is only as complete as the input list baked into it. If an input
+    is ever missed, affected verdicts stay stale silently. This bounds that
+    failure to ``_VERDICT_STAMP_MAX_AGE_DAYS`` instead of forever, at a cost of
+    one background full pass a week.
 
-    Unreadable state returns True: forcing the expensive-but-correct path is
-    the right way to fail.
+    Unreadable state returns True: fail towards the expensive-but-correct path.
     """
     # The stamp is only trustworthy while the invalidation trigger exists to
-    # release rows whose own inputs changed. Without it a stamped row would
-    # keep a verdict derived from features it no longer has, and NOTHING would
-    # say so. So the skip refuses to engage rather than run unguarded — the
-    # optimisation cannot outlive the mechanism that keeps it correct.
+    # release rows whose own inputs changed. Without it a stamped row keeps a
+    # verdict derived from features it no longer has and nothing says so, so
+    # the skip refuses to engage rather than run unguarded.
     try:
         if conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
@@ -291,7 +255,7 @@ def _mark_full_reclassify(conn: sqlite3.Connection, circuit: str) -> None:
 
 
 def invalidate_verdict_stamps(conn: sqlite3.Connection, event_ids) -> int:
-    """Mark these events as needing re-classification (46k).
+    """Mark these events as needing re-classification.
 
     Call from ANY path that rewrites a feature the classifier reads —
     cycle-pulse recount, volume recompute, waveform repair, exclusion-verdict
@@ -299,8 +263,8 @@ def invalidate_verdict_stamps(conn: sqlite3.Connection, event_ids) -> int:
     inputs changed must be released explicitly or it keeps a verdict derived
     from features it no longer has.
 
-    Clearing is always safe: the worst case is one event re-derived
-    unnecessarily. NOT clearing is the unsafe direction.
+    Clearing is always safe: worst case is one event re-derived unnecessarily.
+    NOT clearing is the unsafe direction.
     """
     ids = [e for e in (event_ids or []) if e]
     if not ids:
@@ -318,25 +282,23 @@ def invalidate_verdict_stamps(conn: sqlite3.Connection, event_ids) -> int:
 def _new_reclassify_counters() -> Dict[str, Any]:
     """Fresh accumulator bundle for a reclassify pass.
 
-    dev46 (46a/C2a): the pass is driven in CHUNKS, so its loop-carried state
-    lives in one dict that is threaded through every batch instead of in
-    function locals. Six counters plus the flush-veto tally — nothing else
-    crosses a row boundary, which is exactly why the pass could be sliced.
+    The pass is driven in CHUNKS, so its loop-carried state lives in one dict
+    threaded through every batch instead of in function locals. Six counters
+    plus the flush-veto tally are all that crosses a row boundary, which is
+    what makes the pass sliceable.
 
-    dev46 (46k): ``changed`` counts rows whose verdict actually DIFFERED from
-    what was already stored — the number that decides whether this ~145 s boot
-    pass earns its cost. Every other counter reports what the pass PRODUCED,
-    which is why nobody could tell that a second boot nine minutes after the
-    first re-derived 5,417 identical answers (observed 2026-08-17 19:22 vs
-    19:31: the same events vetoed, in the same order, both times).
+    ``changed`` counts rows whose verdict actually DIFFERED from what was
+    stored — the number that decides whether this ~145 s boot pass earns its
+    cost. Every other counter reports what the pass PRODUCED, which hid the
+    fact that a second boot nine minutes after the first re-derived 5,417
+    identical answers.
     """
     return {"scanned": 0, "matched": 0, "rule_matched": 0,
             "softener_matched": 0, "cleared": 0, "abstained": 0,
             "changed": 0, "veto_counts": {},
-            # dev51 (3.2) — real buckets. Everything that was not softener or
-            # plain k-NN used to be logged as "via rules", so a TinyModel hit,
-            # a fingerprint hit and a k-NN-invariant hit were all invisible in
-            # the reclassify summary — the one line that says which tier did
+            # Per-tier buckets: anything that was not softener or plain k-NN
+            # used to be logged as "via rules", hiding TinyModel, fingerprint
+            # and k-NN-invariant hits in the one line that says which tier did
             # the work.
             "tinymodel_matched": 0, "fingerprint_matched": 0, "knn_matched": 0}
 
@@ -354,54 +316,48 @@ def _match_bucket(via: Optional[str]) -> str:
     return "rule_matched"          # rule_*, washer_cycle, dishwasher_cycle, composite
 
 
-# dev51 (3.3) — the backlog slice: NULL-stamp rows first and newest-first
-# (someone is waiting on those); the stale-stamp group OLDEST-first so the
-# historical tail drains front-to-back instead of being starved by fresh
-# invalidations. Kept as a constant so the ordering rule is unit-testable
-# without standing up the whole reclassify context.
+# The backlog slice: NULL-stamp rows first and newest-first (someone is
+# waiting on those); the stale-stamp group OLDEST-first so the historical tail
+# drains front-to-back instead of being starved by fresh invalidations. A
+# constant so the ordering rule is unit-testable without the whole context.
 _BACKLOG_ORDER_BY = ("(verdict_stamp IS NOT NULL), "
                      "CASE WHEN verdict_stamp IS NULL THEN start_ts END DESC, "
                      "start_ts ASC")
 
 
 def _forced_reopen_allowed(since_ts: Optional[str]) -> bool:
-    """dev51 (3.4): the periodic full re-open may fire only from an
-    UNWINDOWED pass (boot, the hourly backlog slice) — never from the hourly
-    settle-window call, which used to re-open a whole circuit from inside a
-    6-hour window."""
+    """The periodic full re-open may fire only from an UNWINDOWED pass (boot,
+    the hourly backlog slice) — never from the hourly settle-window call, which
+    would re-open a whole circuit from inside a 6-hour window."""
     return since_ts is None
 
 
-# dev51 (3.5) — how often the SYNC reclassify path commits so the SQLite file
-# write-lock is released. The default cadence (300 rows ≈ 26 s at ~87 ms/row)
-# was far longer than a user save's 5 s busy timeout, so a label landing
-# mid-slice was refused. ~40 rows ≈ 3-4 s keeps every hold under that timeout.
+# How often the SYNC reclassify path commits so the SQLite file write-lock is
+# released. The default cadence (300 rows ≈ 26 s at ~87 ms/row) exceeds a user
+# save's 5 s busy timeout, so a label landing mid-slice was refused. ~40 rows
+# ≈ 3-4 s keeps every hold under that timeout.
 _SYNC_YIELD_EVERY_ROWS: int = 40
 
 
-# dev46 (46k) — how many events one pass may re-derive. The backlog left by a
-# global change (a new build, a rules re-fit) is drained a slice at a time by
-# the hourly pass instead of in one burst, because NOBODY IS WAITING for it:
-# a deploy needs the work done eventually, not now, and doing it at boot put
-# it at the single worst moment — right when the operator wants to look at the
+# How many events one pass may re-derive. The backlog left by a global change
+# (a new build, a rules re-fit) drains a slice at a time via the hourly pass
+# rather than in one burst at boot, when the operator wants to look at the
 # add-on. ~400 costs a few seconds and drains 5,400 events overnight.
 #
 # Deliberately released rows (NULL stamp — new events, the settle window, a
-# label's cluster push) are prioritised inside this budget, because those DO
-# have someone waiting on them.
+# label's cluster push) are prioritised inside this budget.
 _VERDICT_BACKLOG_PER_PASS: int = 400
 
-# dev46 (46k) — the chunk budget, in SECONDS, because that is what the C2a
-# contract is actually about: how long one run_db call can hold the single DB
+# The chunk budget, in SECONDS: how long one run_db call may hold the single DB
 # worker before a queued page render notices. ~1 s is the threshold at which a
 # wait stops being distinguishable from a normal request.
 _CHUNK_TARGET_SECONDS: float = 1.0
 # First chunk of a pass, before there is a measurement to aim with. Small on
 # purpose: guessing low costs one extra round-trip, guessing high costs the
-# operator a visible stall on exactly the boot they are watching.
+# operator a visible stall on the boot they are watching.
 _CHUNK_START_ROWS: int = 25
-# Never go below this, or chunk overhead (a commit and a round-trip each) would
-# dominate on a slow event.
+# Below this, chunk overhead (a commit and a round-trip each) dominates on a
+# slow event.
 _CHUNK_MIN_ROWS: int = 5
 
 
@@ -410,9 +366,7 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
                         backlog_limit: Optional[int] = None):
     """Everything a reclassify pass computes ONCE, plus its candidate rows.
 
-    dev46 (46a/C2a) — split out of ``reclassify_all_events_from_signatures``
-    so the pass can be driven chunk-wise through ``run_db``. This half is the
-    expensive-but-bounded part: signature training, the per-regime calib
+    The expensive-but-bounded half: signature training, the per-regime calib
     cache, the whole-circuit cycle detectors (washer / softener / dishwasher),
     usage baselines, the fingerprint library and the toilet cap. All of it is
     READ-ONLY for the row loop, which is what makes batching safe.
@@ -443,14 +397,13 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     from .rule_calibration import load_rule_calibration
 
     # Frozen per-home rule bands (empty dict → predicates use shipped defaults).
-    # Regime-aware: bands are fitted per SUPPLY REGIME (migration 20260565), so
-    # the per-event rule tier below resolves each event's calib by its
-    # start_ts — a pre-pump event is judged by pre-pump bands even when the
-    # pass runs today. The window-scanning cycle detectors (washer/dishwasher/
-    # softener) take ONE calib per pass; they get the CURRENT regime's — the
-    # regime where new events land. (v1 limitation: a full reprocess spanning
-    # a regime boundary scans historical cycles with current bands; per-event
-    # rules, where the observed staleness actually bit, are fully resolved.)
+    # Regime-aware: bands are fitted per SUPPLY REGIME, so the per-event rule
+    # tier below resolves each event's calib by its start_ts — a pre-pump event
+    # is judged by pre-pump bands even when the pass runs today. The
+    # window-scanning cycle detectors (washer/dishwasher/softener) take ONE
+    # calib per pass: the CURRENT regime's, where new events land. Known
+    # limitation: a full reprocess spanning a regime boundary scans historical
+    # cycles with current bands.
     from .supply_regime import get_current_regime_id, get_regimes
     _regimes = get_regimes(conn)
     _calib_cache: Dict[int, Dict[str, Any]] = {
@@ -461,19 +414,19 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     calib = _calib_cache.get(get_current_regime_id(conn), _calib_cache[0])
     qfeats = tuple(dict.fromkeys(
         _db._SIGNATURE_MATCH_FEATURES + _db._SIGNATURE_KNN_ACTIVE_FEATURES
-        # dev34: the regime-invariant rung's shape features (the rest of its
-        # set is already covered by the tuples above).
+        # The regime-invariant rung's shape features (the rest of its set is
+        # already covered by the tuples above).
         + _db._SIGNATURE_KNN_INVARIANT_FEATURES
         + ("has_pressure_transient",)     # the flush predicate's extra input
-        # dev19: the edge tier reads these off the query dict (expanded inside
+        # The edge tier reads these off the query dict (expanded inside
         # match_event_to_signature_knn); harmless extras for the rules tier.
         + ("onset_signature_json", "offset_signature_json")))
     circuit_type = _db.get_circuit_type(conn, circuit)
-    # Windowed (periodic maturity re-check): bound the expensive per-event k-NN row
-    # loop below to events >= since_ts, but give the detectors a lookback (>= the
-    # softener's max session span) so a cycle straddling the window start is still seen
-    # WHOLE — otherwise its in-window members would be wrongly retracted. since_ts=None
-    # → full circuit (startup / manual reprocess).
+    # Windowed (periodic maturity re-check): bound the per-event k-NN row loop
+    # to events >= since_ts, but give the detectors a lookback (>= the
+    # softener's max session span) so a cycle straddling the window start is
+    # still seen WHOLE — otherwise its in-window members are wrongly retracted.
+    # since_ts=None → full circuit (startup / manual reprocess).
     detector_since = since_ts
     if since_ts is not None:
         _s = _db._parse_event_ts(since_ts)
@@ -484,7 +437,7 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     washer_ids = (detect_washer_cycles(conn, circuit, since_ts=detector_since,
                                        calib=calib)
                   if circuit_type != "zone" else {})
-    # dev.24 — water-softener sessions (hard-gated: enabled AND this circuit).
+    # Water-softener sessions (hard-gated: enabled AND this circuit).
     softener_ids: Dict[str, Any] = {}
     prof = _db.get_home_profile(conn)
     if (prof is not None and prof["has_water_softener"]
@@ -495,17 +448,17 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
             softener_ids = detect_softener_sessions(conn, circuit, band,
                                                     since_ts=detector_since, tz=tz,
                                                     calib=calib)
-    # dev.39 — dishwasher cycles: a chain of gentle small fills the per-event
-    # cycle-pulse rule misses. Exclude ids the washer/softener detectors already
-    # claimed so a brine chain / laundry top-off can't be re-read as a dishwasher.
+    # Dishwasher cycles: a chain of gentle small fills the per-event cycle-pulse
+    # rule misses. Exclude ids the washer/softener detectors already claimed so
+    # a brine chain / laundry top-off can't be re-read as a dishwasher.
     dishwasher_ids = (
         detect_dishwasher_cycles(conn, circuit, since_ts=detector_since, calib=calib,
                                  exclude_ids=set(washer_ids) | set(softener_ids))
         if circuit_type != "zone" else {})
-    # Phase 2.3 — re-score each scanned event against the FROZEN baseline (storage
-    # only; reclassify NEVER notifies or shuts off). Baseline + sensitivity loaded
-    # once for the whole pass; the extra SELECT columns the scorer needs are deduped
-    # into the query so a column already in qfeats isn't selected twice.
+    # Re-score each scanned event against the FROZEN baseline (storage only;
+    # reclassify NEVER notifies or shuts off). Baseline + sensitivity loaded
+    # once for the whole pass; the extra SELECT columns the scorer needs are
+    # deduped into the query so a column already in qfeats isn't selected twice.
     from .anomaly_baseline import load_usage_baselines
     _baselines = load_usage_baselines(conn, circuit)
     _sens = _db.get_sensitivity_config(conn, circuit)
@@ -514,9 +467,9 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
                    "is_low_flow_dribble", "user_ignored",
                    "phantom_suppression_averted")
 
-    # Fingerprint tier library (2026-07 audit Phase 3) — built ONCE per run,
-    # fresh (no cache; a reclassify usually follows a label change). Gated by
-    # the home_profile toggle; any failure just disables the tier for this run.
+    # Fingerprint tier library — built ONCE per run, fresh (no cache; a
+    # reclassify usually follows a label change). Gated by the home_profile
+    # toggle; any failure just disables the tier for this run.
     _fp_library = None
     try:
         _fp_row = conn.execute(
@@ -532,7 +485,7 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         except Exception as e:  # noqa: BLE001 — tier is optional, never fatal
             log.warning("[%s] fingerprint library unavailable: %s", circuit, e)
 
-    # Toilet physics veto (dev17) — cap computed once for the whole pass.
+    # Toilet physics veto — cap computed once for the whole pass.
     _toilet_cap = _db.get_toilet_flush_cap_litres(conn)
 
     where = "WHERE circuit = ? AND user_fixture_type IS NULL"
@@ -541,43 +494,27 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         where += " AND start_ts >= ?"
         qparams.append(since_ts)
 
-    # dev46 (46k) — skip events whose verdict provably cannot have changed.
-    #
-    # The pass always stored its answer (matched_fixture_type) but never
-    # stored whether that answer was still VALID, so every boot re-derived
-    # every unlabelled event to discover almost none of them had moved
-    # (2026-08-17: 151.7 s, 5,426 events, ~0 net changes on a repeat boot —
-    # and the same events re-vetoed since 2026-07-26).
-    #
-    # A row is a candidate when its stamp is NULL (new, or explicitly released
-    # by invalidate_verdict_stamps) or differs from the current one (code,
-    # bands or labels moved). Everything else already holds the answer this
-    # pass would compute. Skipping is therefore loss-free by construction, and
-    # every uncertain case falls on the recompute side.
+    # Skip events whose verdict provably cannot have changed. A row is a
+    # candidate when its stamp is NULL (new, or explicitly released by
+    # invalidate_verdict_stamps) or differs from the current one (code, bands
+    # or labels moved). Everything else already holds the answer this pass
+    # would compute, so skipping is loss-free by construction and every
+    # uncertain case falls on the recompute side.
     stamp = compute_verdict_stamp(conn, circuit)
-    # dev46 (46k) — the weekly backstop INVALIDATES; it does not bypass.
-    #
-    # It used to bypass the stamp filter for one pass. That worked while a
-    # pass meant "every candidate", and broke the moment the backlog trickle
-    # made every pass a slice: bypassing means rows already re-derived in this
-    # sweep stay candidates, so the sweep re-does the same slice forever and
-    # never finishes. Marking completion after one slice was no better — the
+    # The weekly backstop INVALIDATES; it does not bypass. Bypassing the stamp
+    # filter for one pass does not work now that every pass is a slice: rows
+    # already re-derived in the sweep stay candidates, so the sweep re-does the
+    # same slice forever. Marking completion after one slice is no better — the
     # backstop would cover 400 of ~5,500 rows and restart its own clock,
-    # becoming the permanent silent omission it exists to prevent.
+    # becoming the permanent silent omission it exists to prevent. Clearing the
+    # stamps makes the sweep ordinary work, and the clock restarts HERE, at the
+    # start, because the invalidation is what guarantees the coverage: the rows
+    # cannot be skipped again until re-stamped, one slice at a time.
     #
-    # Clearing the stamps instead makes the sweep ordinary work: every row is
-    # now genuinely un-derived, the normal filter picks it up, and the trickle
-    # drains it at the usual rate with no special case anywhere. The clock
-    # restarts HERE, at the start, because the invalidation is what guarantees
-    # the coverage happens — the rows cannot be skipped again until they are
-    # re-stamped, one slice at a time.
-    # dev51 (3.4) — only the UNWINDOWED invocations (boot, the hourly backlog
-    # slice) may fire the periodic full re-open. The hourly settle-window pass
-    # also reached here and, when the week rolled over, re-opened the WHOLE
-    # circuit from inside a 6-hour-windowed call — ~5,000 rows dumped back into
-    # the backlog at once, ~12 h to re-drain at 400/hr, and the write lock held
-    # by that pass for the duration (2026-08-31 23:21: "1440 still queued" and
-    # a label save refused in the same hour).
+    # Only the UNWINDOWED invocations (boot, the hourly backlog slice) may fire
+    # the re-open. From the hourly settle-window pass it re-opens the WHOLE
+    # circuit from inside a 6-hour window — ~5,000 rows into the backlog at
+    # once, ~12 h to re-drain at 400/hr, write lock held throughout.
     forced = _forced_reopen_allowed(since_ts) and _verdict_stamp_pass_is_due(conn, circuit)
     if forced:
         n = conn.execute(
@@ -591,16 +528,12 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     where += (" AND (verdict_stamp IS NULL OR verdict_stamp <> ?)")
     qparams.append(stamp)
 
-    # dev46 (46k) — an event younger than the settle horizon is NOT DECIDED
-    # YET, so it must not be stamped.
-    #
-    # maturity_recheck re-runs this pass hourly over recent events precisely
-    # because cycle context arrives AFTER an individual event closes: a
+    # An event younger than the settle horizon is NOT DECIDED YET, so it must
+    # not be stamped. maturity_recheck re-runs this pass hourly over recent
+    # events because cycle context arrives AFTER an individual event closes: a
     # dishwasher's third fill is what lets the cycle detector claim the first
-    # one. Stamping a young event on its first look would mark that
-    # conversation finished before it started, and the hourly pass would skip
-    # it for the rest of the settle window — silently disabling the mechanism
-    # (verified: passes 2 and 3 over a 1-hour-old event scanned nothing).
+    # one. Stamping a young event on its first look makes the hourly pass skip
+    # it for the rest of the settle window, silently disabling the mechanism.
     #
     # Leaving them unstamped also IS the offline catch-up: an event that ages
     # past the horizon while the add-on is down was never stamped, so the next
@@ -614,20 +547,16 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     select_cols = list(dict.fromkeys(
         ("id", "start_ts", "matched_fixture_type", "matched_via",
          "cycle_group_id", "excluded_from_training",
-         "match_rejection_reason",       # dev33: abstention marker mark/retract
-         "match_confidence",             # dev51 (3.1): so an unchanged model
-                                         # verdict is not rewritten every pass
+         "match_rejection_reason",       # abstention marker mark/retract
+         "match_confidence",             # so an unchanged model verdict is not
+                                         # rewritten every pass
          "active_flow_segment_count")
         + qfeats + _SCORE_COLS))
-    # dev46 (46k) — TRICKLE. With a budget, take the highest-priority slice
-    # and leave the rest for the next pass.
-    #
-    # The inner ORDER BY ranks by WHO IS WAITING:
-    #   verdict_stamp IS NULL first — deliberately released rows: a new event,
-    #     one still settling, a peer freed by a label you just saved. Someone
-    #     is looking at those.
-    #   then start_ts DESC — within the global backlog, recent events first,
-    #     because that is what the operator actually opens.
+    # TRICKLE. With a budget, take the highest-priority slice and leave the
+    # rest for the next pass. The inner ORDER BY ranks by WHO IS WAITING:
+    # verdict_stamp IS NULL first (deliberately released rows — a new event,
+    # one still settling, a peer freed by a label just saved), then start_ts
+    # DESC because recent events are what the operator opens.
     #
     # The subquery picks the slice; the outer ORDER BY start_ts keeps the row
     # loop's existing ascending order, so batching changes WHICH rows a pass
@@ -637,14 +566,12 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         total = conn.execute("SELECT COUNT(*) FROM events " + where,
                              qparams).fetchone()[0]
         backlog_remaining = max(0, total - backlog_limit)
-        # dev51 (3.3) — two queues, two directions. NULL-stamp rows (new,
-        # settling, freed by a label) go first and NEWEST-first, because
-        # someone is waiting on those. The STALE-stamp group — events a new
-        # build or a promotion re-opened — drains OLDEST-first. Newest-first
-        # there meant a steady trickle of fresh invalidations kept pushing the
-        # historical tail to the back of every slice: the ~1,041 July events
-        # were examined by no pass for weeks, not because the budget was too
-        # small but because they never reached the front of it.
+        # Two queues, two directions. NULL-stamp rows (new, settling, freed by
+        # a label) go first and NEWEST-first. The STALE-stamp group — events a
+        # new build or a promotion re-opened — drains OLDEST-first: newest-first
+        # there lets a steady trickle of fresh invalidations push the historical
+        # tail to the back of every slice (~1,041 July events went unexamined
+        # for weeks, never reaching the front of the budget).
         rows = conn.execute(
             "SELECT " + ", ".join(select_cols) + " FROM events "
             "WHERE id IN (SELECT id FROM events " + where + " "
@@ -676,8 +603,8 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         "baselines":          _baselines,
         "sens":               _sens,
         "score_cols":         _SCORE_COLS,
-        # dev46 (46k) — the stamp every row this pass touches gets written
-        # with, and whether the stamp filter was bypassed for a due full pass.
+        # The stamp every row this pass touches gets written with, and whether
+        # a due full pass re-opened the circuit.
         "verdict_stamp":      stamp,
         "forced_full":        forced,
         "stamp_before_ts":    stamp_before_ts,
@@ -691,15 +618,15 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                            yield_lock: bool = False) -> None:
     """One batch of the reclassify row loop — runs on the single DB thread.
 
-    dev46 rule N2a: self-contained transaction. Every statement for this
-    chunk, plus its commit, happens inside this one callable, so no foreign
-    statement can land inside an open transaction. Chunk boundary =
-    transaction boundary = where a queued page render gets to interleave.
+    Self-contained transaction: every statement for this chunk, plus its
+    commit, happens inside this one callable, so no foreign statement can land
+    inside an open transaction. Chunk boundary = transaction boundary = where a
+    queued page render gets to interleave.
 
     ``counters`` is mutated in place so the tallies survive across batches.
     The write-time ``user_fixture_type IS NULL`` guard inside
-    ``set_event_matched_fixture_type`` (dev46 R1/N1) is what makes an
-    interleaved user relabel safe here — do not weaken it.
+    ``set_event_matched_fixture_type`` is what makes an interleaved user
+    relabel safe here — do not weaken it.
     """
     from .event_rules import (CYCLE_ONLY_FIXTURE_TYPES, rule_classify_event,
                              toilet_burst_veto_reason,
@@ -734,33 +661,32 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     abstained        = counters["abstained"]
     changed          = counters["changed"]
     veto_counts      = counters["veto_counts"]
-    # dev48 — burst context for the toilet rule's appliance veto. Computed ONCE
-    # for the whole chunk: compute_for_events does a single windowed read over
-    # the id set, so hoisting it out of the loop is the difference between one
-    # query and one per event. MATURE here for the same reason the model tier
-    # uses it below — in a batch pass every sibling is already in the table.
-    # dev51 (3.1) — the model tier's confidence for the current row. Assigned
-    # in the TinyModel branch; the writer only consumes it when the verdict's
-    # provenance is 'tinymodel', so a value can never leak onto a row that
-    # another tier claimed.
+    # The model tier's confidence for the current row. Assigned in the TinyModel
+    # branch; the writer only consumes it when the verdict's provenance is
+    # 'tinymodel', so a value can never leak onto a row another tier claimed.
     new_conf = None
+    # Burst context for the toilet rule's appliance veto. Computed ONCE for the
+    # whole chunk: compute_for_events does a single windowed read over the id
+    # set, so hoisting it out of the loop is one query instead of one per event.
+    # MATURE because in a batch pass every sibling is already in the table.
     _burst_ctx = {}
     try:
         from . import burst_features as _bf
         _burst_ctx = _bf.compute_for_events(
             conn, circuit, [r["id"] for r in rows], config=_bf.CONFIG_MATURE)
     except Exception as _bf_exc:                       # noqa: BLE001
-        # No burst context means the veto abstains and the rule behaves exactly
-        # as it did before it existed — never a reason to fail a reclassify.
+        # No burst context means the veto abstains — never a reason to fail a
+        # reclassify.
         log.debug("burst context unavailable in reclassify: %s", _bf_exc)
     for r in rows:
         scanned += 1
         new_group = None
         if r["id"] in softener_ids:
-            # Softener is checked BEFORE the excluded gate — a deliberate exception
-            # to dev.23's "excluded → no identity": regen consumption is real, and
-            # matched_* is written separately from the volume verdict, so a
-            # dribble-flagged regen pulse keeps its verdict AND reads water_softener.
+            # Softener is checked BEFORE the excluded gate — a deliberate
+            # exception to "excluded → no identity": regen consumption is real,
+            # and matched_* is written separately from the volume verdict, so a
+            # dribble-flagged regen pulse keeps its verdict AND reads
+            # water_softener.
             _role, new_group = softener_ids[r["id"]]
             new_type, new_via = "water_softener", "softener_session"
         elif r["excluded_from_training"]:
@@ -787,10 +713,9 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
             if rule_hit is not None:
                 new_type, new_via = rule_hit
             else:
-                # Report the burst veto the same way the flush-physics floor is
-                # reported: DEBUG per event, one INFO summary at the end. The
-                # rule returns None either way, so without this a veto that
-                # fires and a veto that never fires look identical from outside.
+                # DEBUG per event, one INFO summary at the end. The rule returns
+                # None either way, so without this a veto that fires and a veto
+                # that never fires look identical from outside.
                 _bw = toilet_burst_veto_reason(feats, _ev_calib, _pump, _ev_burst)
                 if _bw:
                     log.debug("[%s] event %s: toilet match vetoed by burst "
@@ -798,11 +723,10 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                               r["volume_litres"])
                     _key = "in an appliance burst"
                     veto_counts[_key] = veto_counts.get(_key, 0) + 1
-                # dev47 (47b) — TinyModel tier, in the same ladder position the
-                # live path uses (anchors -> model -> fingerprint/k-NN). The
-                # batch pass uses MATURE burst features: every event's siblings
-                # are already in the table here, which is exactly the context
-                # the live pass could not have.
+                # TinyModel tier, in the same ladder position the live path
+                # uses (anchors -> model -> fingerprint/k-NN). The batch pass
+                # uses MATURE burst features: every event's siblings are already
+                # in the table, which the live pass cannot have.
                 _tm_hit = None
                 try:
                     from . import tinymodel as _tm
@@ -811,17 +735,17 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                 except Exception as _tm_exc:
                     log.debug("tinymodel tier unavailable in reclassify: %s",
                               _tm_exc)
-                # Fingerprint tier (2026-07 audit Phase 3) — whole-waveform NN
-                # against USER-labeled events, tight-threshold only. Sits between
-                # the structural rules and the scalar k-NN: stronger evidence
-                # than a scalar vote, weaker than cycle/session context above.
+                # Fingerprint tier — whole-waveform NN against USER-labeled
+                # events, tight-threshold only. Sits between the structural
+                # rules and the scalar k-NN: stronger evidence than a scalar
+                # vote, weaker than the cycle/session context above.
                 if _tm_hit is not None:
                     # The model claimed it; the tiers below are its fallback,
                     # not its reviewers.
                     new_type = _db._canonical_fixture_type(_tm_hit[0])
                     new_via = "tinymodel" if new_type is not None else None
-                    # dev51 (3.1) — carry the model's confidence to the row,
-                    # as the live path does. Only this tier has one.
+                    # Carry the model's confidence to the row, as the live path
+                    # does. Only this tier has one.
                     new_conf = float(_tm_hit[1]) if new_type is not None else None
                     fp_hit = None
                 else:
@@ -848,28 +772,28 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                     # tight threshold, enforced inside FingerprintLibrary.match.)
                     if new_type in CYCLE_ONLY_FIXTURE_TYPES:
                         new_type = None
-                    # dev34: distinguish the regime-invariant rung so its
-                    # contribution is measurable (and separable) in the data.
+                    # Distinguish the regime-invariant rung so its contribution
+                    # is measurable (and separable) in the data.
                     new_via = (
                         None if new_type is None
                         else "knn_invariant"
                         if hit.get("match_source") == "invariant_features"
                         else "knn")
-            # Toilet physics veto (dev17): whatever tier proposed 'toilet'
-            # (rule / fingerprint / k-NN), the event must be physically able
-            # to BE a flush. Vetoed → abstain (never re-guess another type).
+            # Toilet physics veto: whatever tier proposed 'toilet' (rule /
+            # fingerprint / k-NN), the event must be physically able to BE a
+            # flush. Vetoed → abstain (never re-guess another type).
             if new_type == "toilet":
                 vfeats = dict(feats)
                 vfeats["active_flow_segment_count"] = r["active_flow_segment_count"]
                 why = toilet_veto_reason(vfeats, _toilet_cap)
                 if why:
                     # DEBUG per event, one INFO summary at the end: ~60 of
-                    # these fire per reclassify and they are the veto WORKING
-                    # (investigated 2026-08-03: the recurring 2.2–2.8 L band
-                    # is the labelled dishwasher's upper fill-pulse tail — 9
-                    # user labels in-band, 0 of them toilet, every event has
-                    # a neighbour within 30 min — so the floor is what keeps
-                    # appliance pulses from being named flushes).
+                    # these fire per reclassify and they are the veto WORKING.
+                    # The recurring 2.2–2.8 L band is the labelled dishwasher's
+                    # upper fill-pulse tail (9 user labels in-band, 0 of them
+                    # toilet, every event has a neighbour within 30 min), so the
+                    # floor is what keeps appliance pulses from being named
+                    # flushes.
                     log.debug("[%s] event %s: toilet match (%s) vetoed by "
                               "flush physics — %s (vol=%s L)", circuit,
                               r["id"], new_via, why, r["volume_litres"])
@@ -884,35 +808,31 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
             _db.set_event_matched_fixture_type(conn, circuit, r["id"], new_type,
                                            via=new_via, cycle_group_id=new_group,
                                            confidence=_conf)
-            # dev46 (46k) — this branch IS the pass's real output. Counting it
-            # costs nothing and is the only way to see how much of the boot
-            # pass was necessary.
+            # This branch IS the pass's real output — the only way to see how
+            # much of the boot pass was necessary.
             changed += 1
             if new_type is None and prev is not None:
                 cleared += 1
-        # dev46 (46k) — stamp EVERY row examined, including the ones whose
-        # verdict was already right. That is the whole mechanism: without it
-        # an event the classifier agrees with is never recorded as decided,
-        # so it returns as a candidate on the next boot forever. `fb9d5fa5`
-        # was re-derived on every boot since 2026-07-26 for exactly this
-        # reason — the pass kept confirming an abstention it had no way to
-        # remember making.
+        # Stamp EVERY row examined, including ones whose verdict was already
+        # right. Without it an event the classifier agrees with is never
+        # recorded as decided and returns as a candidate on every boot forever.
         #
-        # The user_fixture_type re-check is the same N1 guard the verdict
-        # write carries: a PATCH landing mid-pass must not have its row
-        # stamped from premises that no longer hold.
-        # ...but only once the event is old enough to be DECIDED. A row still
-        # inside the settle horizon keeps its NULL stamp so the hourly
-        # maturity re-check can keep re-evaluating it as cycle context lands.
+        # The user_fixture_type re-check is the same guard the verdict write
+        # carries: a PATCH landing mid-pass must not have its row stamped from
+        # premises that no longer hold.
+        #
+        # Only once the event is old enough to be DECIDED: a row still inside
+        # the settle horizon keeps its NULL stamp so the hourly maturity
+        # re-check can keep re-evaluating it as cycle context lands.
         if r["start_ts"] and r["start_ts"] < _stamp_before:
             conn.execute(
                 "UPDATE events SET verdict_stamp = ? "
                 "WHERE id = ? AND user_fixture_type IS NULL",
                 (_stamp, r["id"]))
-        # dev33 (§2.1) — mark / retract classification-tier abstention so a
-        # silent outage is measurable and a recovery is visible. Only ever
-        # fills an EMPTY reason (artifact + cluster reasons are more specific),
-        # and is retracted the moment any tier names the event.
+        # Mark / retract classification-tier abstention so a silent outage is
+        # measurable and a recovery is visible. Only ever fills an EMPTY reason
+        # (artifact + cluster reasons are more specific), and is retracted the
+        # moment any tier names the event.
         from .feature_extractor import NO_TIER_MATCHED_REASON as _NTM
         _mrr = r["match_rejection_reason"] if "match_rejection_reason" in r.keys() \
             else None
@@ -939,8 +859,9 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                 rule_matched += 1
         else:
             abstained += 1
-        # Re-score against the frozen baseline + persist (storage only — no notify /
-        # shut-off from a backfill). flagged=1 marks a genuine (non-artifact) anomaly.
+        # Re-score against the frozen baseline + persist (storage only — no
+        # notify / shut-off from a backfill). flagged=1 marks a genuine
+        # (non-artifact) anomaly.
         sfeats = {c: r[c] for c in _SCORE_COLS}
         sfeats["matched_fixture_type"] = new_type
         av = score_event_anomaly(sfeats, _baselines, _sens)
@@ -950,21 +871,17 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
             (av.get("score"), av.get("anomaly_type"),
              1 if av.get("is_anomalous") else 0, r["id"]),
         )
-        # dev46 (46a/C2a + 46k): WHO OWNS THE TRANSACTION decides this.
+        # WHO OWNS THE TRANSACTION decides this. Through run_db the chunk IS
+        # the transaction and the single commit below is correct: yielding here
+        # would sleep 30 ms holding the single DB worker, delaying the very
+        # queue it exists to let through.
         #
-        # Through run_db the chunk IS the transaction (rule N2a) and the one
-        # commit below is correct: yielding here would sleep 30 ms holding the
-        # single DB worker, delaying the very queue it exists to let through.
-        #
-        # But the SYNC entry point is called from inside run_isolated_write by
-        # maturity_recheck, reprocess and training_manager — a PRIVATE
-        # connection whose contract is spelled out in run_isolated_write's own
-        # docstring: "the job's per-row commits release the file write-lock
-        # between rows". C2a removed this call for the run_db path and silently
-        # broke that contract for those three, so one long pass held the SQLite
-        # write lock for its whole duration and every concurrent user save got
-        # "database is locked" (observed 2026-08-18 22:47 onward: a label save
-        # and the supply-regime sampler both refused for minutes).
+        # But the SYNC entry point runs inside run_isolated_write (from
+        # maturity_recheck, reprocess and training_manager) on a PRIVATE
+        # connection whose contract is "the job's per-row commits release the
+        # file write-lock between rows". Without this call there, one long pass
+        # holds the SQLite write lock for its whole duration and every
+        # concurrent user save gets "database is locked".
         if yield_lock:
             _db.yield_write_lock(conn, scanned, every=_SYNC_YIELD_EVERY_ROWS)
     conn.commit()
@@ -990,11 +907,11 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
     abstained        = counters["abstained"]
     changed          = counters["changed"]
     veto_counts      = counters["veto_counts"]
-    # ── Composite annotation (dev.39, step 1) ────────────────────────────────
-    # Annotate sustained events with fixtures hidden inside them (a toilet flushed
-    # mid-shower), then upgrade events that abstained but clearly contain a second
-    # draw from "(none)" to "other"/composite. Wrapped so a waveform/JSON hiccup
-    # can never undo the classification that already committed above.
+    # ── Composite annotation ─────────────────────────────────────────────────
+    # Annotate sustained events with fixtures hidden inside them (a toilet
+    # flushed mid-shower), then upgrade events that abstained but clearly
+    # contain a second draw from "(none)" to "other"/composite. Wrapped so a
+    # waveform/JSON hiccup cannot undo the classification committed above.
     embedded_annotated = embedded_other = 0
     try:
         emb = _db.recompute_embedded_fixtures(conn, circuit, since_ts=since_ts)
@@ -1002,14 +919,15 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
     except Exception:                       # pragma: no cover - defensive
         log.exception("[%s] embedded-fixture annotation failed (classification "
                       "already committed)", circuit)
-    # Re-promote abstained events that hide a real second draw (ANY embedded kind
-    # — toilet, tap, …) to "other"/composite, from the STORED annotation so this
-    # re-applies every run — the main loop above just cleared these to NULL, and
-    # the embedded scan is incremental (won't re-report an already-annotated
-    # event). Separate try from the scan above: a waveform hiccup there must not
-    # also skip the re-promotion (that left prior 'other' events flickering to
-    # NULL until the next reclassify). Decided from the PARSED JSON, not a LIKE,
-    # so it can't drift from the detector's serialization or kind set.
+    # Re-promote abstained events that hide a real second draw (ANY embedded
+    # kind — toilet, tap, …) to "other"/composite, from the STORED annotation so
+    # this re-applies every run: the main loop above just cleared these to NULL
+    # and the embedded scan is incremental (won't re-report an already-annotated
+    # event). Separate try from the scan above — a waveform hiccup there must
+    # not also skip the re-promotion, which leaves prior 'other' events
+    # flickering to NULL until the next reclassify. Decided from the PARSED
+    # JSON, not a LIKE, so it can't drift from the detector's serialization or
+    # kind set.
     try:
         embedded_other = _db.promote_embedded_composites(conn, circuit,
                                                      since_ts=since_ts)
@@ -1028,11 +946,11 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
         "events_knn_matched": counters.get("knn_matched", 0),
         "events_cleared": cleared,
         "events_abstained": abstained,
-        # dev46 (46k) — rows whose verdict actually differed from the stored
-        # one. The pass's only real output; everything above is throughput.
+        # Rows whose verdict actually differed from the stored one. The pass's
+        # only real output; everything above is throughput.
         "events_changed": changed,
-        # dev46 (46k) — what this pass deliberately did NOT do. A capped pass
-        # that reports only what it processed reads as "everything is done".
+        # What this pass deliberately did NOT do. A capped pass that reports
+        # only what it processed reads as "everything is done".
         "events_backlog_remaining": ctx.get("backlog_remaining") or 0,
         "events_embedded_annotated": embedded_annotated,
         "events_composite_other": embedded_other,
@@ -1047,32 +965,25 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
         counters.get("knn_matched", 0), softener_matched, abstained,
         cleared, changed, embedded_other,
     )
-    # dev46 (46k) — the boot pass costs ~145 s on this install, so what it
-    # actually CHANGED is the evidence for whether it earns that.
-    #
-    # Read the two numbers together. The row loop abstains on composite events
-    # (no single tier names them) and CLEARS their stored verdict; then
-    # promote_embedded_composites, a few lines above, puts it straight back as
-    # 'other'/'composite'. That round-trip is internal to one pass and leaves
-    # the same final state, but it lands in `changed` — so `changed` on its
-    # own OVERSTATES churn by roughly the composite count. Measured 2026-08-17
-    # 21:00 boot: circuit_1 48 changed / 52 composites, circuit_2 1 / 1, i.e.
-    # net change ~0 on both. Anyone using these numbers to judge the pass —
-    # or to build a skip condition on it — needs both or they will conclude
-    # the boot pass is doing real work when it is chasing its own tail.
+    # `changed` and the composite count must be read TOGETHER. The row loop
+    # abstains on composite events (no single tier names them) and CLEARS their
+    # stored verdict; promote_embedded_composites, a few lines above, puts it
+    # straight back as 'other'/'composite'. That round-trip is internal to one
+    # pass and leaves the same final state, but it lands in `changed` — so
+    # `changed` alone OVERSTATES churn by roughly the composite count (measured
+    # boot: circuit_1 48 changed / 52 composites, circuit_2 1 / 1, net ~0 on
+    # both). Judging the pass, or building a skip condition, on `changed` alone
+    # concludes it is doing real work when it is chasing its own tail.
     if scanned and changed <= embedded_other:
         log.info("[%s] reclassify: no NET verdict change — this pass "
                  "re-derived %d stored answer(s) and every write it made was "
                  "the composite round-trip", circuit, scanned)
 
-    # dev46 (46k) — an UNFILTERED pass just covered every unlabelled event, so
-    # restart the max-age clock. Only a forced pass may do this: a stamped
-    # pass skips rows by design and must not be mistaken for full coverage,
-    # or the backstop would never fire and the omission it guards against
-    # would once again be permanent.
-    # NOTE: the periodic full re-derive is marked at its START, in prepare,
-    # where it clears the stamps. Nothing to record here — by the time this
-    # runs the rows are already un-stamped and will drain like any others.
+    # The max-age clock is restarted at the START of the periodic full
+    # re-derive, in prepare, where it clears the stamps. Nothing to record
+    # here — by the time this runs the rows are already un-stamped and will
+    # drain like any others. A stamped pass skips rows by design and must never
+    # be mistaken for full coverage, or the backstop would never fire.
     _left = ctx.get("backlog_remaining") or 0
     if _left:
         log.info("[%s] reclassify: %d event(s) re-derived, %d still queued — "
@@ -1094,12 +1005,12 @@ async def reclassify_all_events_from_signatures_async(
         conn: sqlite3.Connection, circuit: str, ha_tz=None,
         since_ts: Optional[str] = None, batch: int = 200,
         backlog_limit: Optional[int] = None) -> Dict[str, Any]:
-    """dev46 (46a/C2a) — ``reclassify_all_events_from_signatures`` in chunks.
+    """``reclassify_all_events_from_signatures`` in chunks.
 
     Same pass, same result, but the row loop is submitted to ``run_db`` one
     batch at a time instead of as a single multi-minute call. With ONE DB
-    worker, a monolithic submission makes every queued page render wait for
-    the whole pass; batching gives the queue a seam every ~batch rows.
+    worker, a monolithic submission makes every queued page render wait for the
+    whole pass; batching gives the queue a seam every ~batch rows.
 
     Mirrors ``ClusterEngine.backfill_unmatched_async`` — chunk = transaction =
     one run_db call. Prepare and finalize are their own submissions.
@@ -1107,21 +1018,17 @@ async def reclassify_all_events_from_signatures_async(
     ctx, rows = await _db.run_db(_reclassify_prepare, conn, circuit, ha_tz,
                              since_ts, backlog_limit)
     counters = _new_reclassify_counters()
-    # dev46 (46k) — ADAPTIVE batch, because a fixed row count is not a time
-    # budget and the contract is stated in time: "no single run_db call holds
-    # the worker for more than ~1 s" (C2a).
+    # ADAPTIVE batch: a fixed row count is not a time budget, and the contract
+    # is stated in time — no single run_db call holds the worker for more than
+    # ~1 s. A production event costs ~87 ms here, so a fixed batch=200 held the
+    # single worker ~17 s; with a 400-row slice that is two chunks, and a page
+    # render queued behind one waited ~17 s. Chunking that releases the worker
+    # twice is not chunking.
     #
-    # batch=200 met that on the machine it was written on and missed it by 17x
-    # on the target: a production event costs ~87 ms here, so 200 rows held the
-    # single worker ~17 s. With a 400-row slice that is two chunks, and a page
-    # render queued behind one waited ~17 s — the operator saw "pages are
-    # ready" logged and then could not open a page for 37 s (2026-08-18 23:11).
-    # Chunking that releases the worker twice is not chunking.
-    #
-    # So the driver measures its own throughput and re-aims each chunk at the
-    # budget. Self-tuning beats a tuned constant here: per-event cost varies
-    # with hardware, waveform size and how many tiers an event reaches, and no
-    # single number is right for a dev laptop and a HA host at once.
+    # The driver therefore measures its own throughput and re-aims each chunk
+    # at the budget: per-event cost varies with hardware, waveform size and how
+    # many tiers an event reaches, so no single constant suits both a dev laptop
+    # and a HA host.
     import time as _time
 
     i, size = 0, min(batch, _CHUNK_START_ROWS)
@@ -1148,15 +1055,16 @@ def reclassify_all_events_from_signatures(
     backlog_limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Retrain signatures, then backfill ``matched_fixture_type`` over every
-    unlabelled event on ``circuit`` — STRUCTURAL RULES FIRST (dev.24 precedence:
-    water-softener session, then dev.23's washer-cycle sweep, then the per-event
-    toilet/dishwasher/shower/zone rules), k-NN as the residual. Each write stamps
-    ``matched_via`` and ``cycle_group_id`` (the History rollup key, §7).
+    unlabelled event on ``circuit`` — STRUCTURAL RULES FIRST (precedence:
+    water-softener session, then the washer-cycle sweep, then the per-event
+    toilet/dishwasher/shower/zone rules), k-NN as the residual. Each write
+    stamps ``matched_via`` and ``cycle_group_id`` (the History rollup key).
 
-    ``ha_tz`` (the home timezone) is needed only for the water-softener regen-band
-    match (local clock vs UTC-stored timestamps) — pass it from EVERY caller so
-    the softener label is stable across reclassifies. Softener detection is
-    hard-gated by ``home_profile.has_water_softener`` + ``softener_circuit``.
+    ``ha_tz`` (the home timezone) is needed only for the water-softener
+    regen-band match (local clock vs UTC-stored timestamps) — pass it from
+    EVERY caller so the softener label is stable across reclassifies. Softener
+    detection is hard-gated by ``home_profile.has_water_softener`` +
+    ``softener_circuit``.
 
     NEVER touches user-labelled rows (WHERE user_fixture_type IS NULL). Writes
     the canonical matched type, or NULL on abstention — writing NULL clears a

@@ -1,4 +1,4 @@
-"""Per-home rule calibration (Phase 1 — fit-once-at-activation, then frozen).
+"""Per-home rule calibration: fit once at activation, then frozen.
 
 The structural-rules-tier bands in :mod:`event_rules` ship as developer-tuned
 module constants shaped by one home's data. At **activation** (labelling → live,
@@ -7,8 +7,6 @@ accepted-auto events and stored, frozen, in the ``rule_calibration`` table. The
 :mod:`event_rules` predicates read the fitted values through an optional ``calib``
 dict, falling back to ``event_rules.RULE_DEFAULTS`` for any band this home lacks
 enough labels to fit (or whose fit fails the sanity gate).
-
-Design (per the approved plan):
 
 * **Fit once, then freeze.** Calibration is written only at activation / explicit
   re-train — never on ordinary reclassify or live events. A locked baseline is
@@ -25,7 +23,7 @@ Design (per the approved plan):
 * **Artifacts.** Explicit labels count even when ``excluded_from_training=1`` (a
   human label overrides the auto artifact flag); artifact-flagged events with no
   explicit label are dropped (their flow/volume features are unreliable). The
-  phantom/dribble/cross-talk *detectors* are calibrated separately in Phase 2.
+  phantom/dribble/cross-talk *detectors* are calibrated separately.
 * **Bounded-expansion sanity gate (shared path).** Each fitted band is checked
   against absolute physical limits and a span cap relative to the default; a band
   that fails falls back to the default for that type. The gate lives HERE in the
@@ -48,15 +46,15 @@ log = logging.getLogger(__name__)
 # ── Gates / knobs (placeholders until the held-out eval locks them on real data) ─
 MIN_EXPLICIT_LABELS = 5        # ≥ this many user/training labels to AUTHORISE a fit
 MIN_FIT_WEIGHT = 8.0           # AND ≥ this weighted label mass
-# Do-no-harm noise margin (dev34). The frozen default must beat the fit by BOTH
-# of these before the fit is discarded — a 1-of-25 difference is a coin flip,
-# and treating it as evidence kept pre-pump toilet constants in force through a
-# regime whose ΔP had risen 2.6×. Both gates matter: the absolute one protects
-# small test sets, the fractional one protects large ones.
+# Do-no-harm noise margin. The frozen default must beat the fit by BOTH of these
+# before the fit is discarded — a 1-of-25 difference is a coin flip, and treating
+# it as evidence kept pre-pump toilet constants in force through a regime whose
+# ΔP had risen 2.6×. The absolute gate protects small test sets, the fractional
+# one large ones.
 _DO_NO_HARM_MIN_MARGIN = 2      # events
 _DO_NO_HARM_MIN_FRACTION = 0.05  # 5% of the held-out set
 _FIT_MAX_SPAN_FACTOR = 2.0     # a fitted range span may be at most this × default span
-# Bounded LOOSENING for scalar floor/ceiling bands (dev34 — see _is_sane).
+# Bounded LOOSENING for scalar floor/ceiling bands (see _is_sane).
 _FIT_MIN_FLOOR_FRACTION = 0.5   # a fitted floor may not drop below half the default
 _FIT_MAX_CEILING_FACTOR = 2.5   # a fitted ceiling may not exceed 2.5× the default
 
@@ -68,7 +66,7 @@ _RANGE_PAD = 0.10              # widen fitted [lo, hi] ranges by 10% each side
 _W_EXPLICIT = 1.0
 _W_KNN = 0.5
 _W_RULE = 0.25
-# dev41: cycle-tier outputs are EXCLUDED from rule fits entirely — the cycle
+# Cycle-tier outputs are EXCLUDED from rule fits entirely — the cycle
 # detectors are gated by the very bands being fit here, so feeding their
 # labels back in is a self-reinforcing loop (measured: the dishwasher band
 # walked 3.75 → 8.32 LPM across three fits on contaminated cycle labels).
@@ -97,11 +95,7 @@ _SANITY: Dict[str, Tuple[str, float, float]] = {
 # ── Weighted percentile helpers ─────────────────────────────────────────────────
 
 def _wpct(pairs: List[Tuple[float, float]], pct: float) -> Optional[float]:
-    """Weighted percentile of (value, weight) pairs, or None if empty.
-
-    Uses the standard weighted-percentile convention: order by value, walk the
-    cumulative weight, and interpolate at ``pct`` of the total weight.
-    """
+    """Weighted percentile of (value, weight) pairs, or None if empty."""
     pts = sorted((float(v), float(w)) for v, w in pairs if v is not None and w > 0)
     if not pts:
         return None
@@ -115,7 +109,6 @@ def _wpct(pairs: List[Tuple[float, float]], pct: float) -> Optional[float]:
     prev_v = pts[0][0]
     for v, w in pts:
         if cum + w >= target:
-            # linear interpolate between prev_v and v across this segment
             span = w if w > 0 else 1.0
             frac = max(0.0, min(1.0, (target - cum) / span))
             return prev_v + (v - prev_v) * frac
@@ -141,14 +134,14 @@ def _provenance_weight(uft, src, mft, via) -> Optional[Tuple[str, float, bool]]:
     skip (no usable type)."""
     if uft:
         if src == "cycle":
-            # dev41: cycle-stamped labels no longer feed rule fits at all —
-            # outputs of the bands being fit must not refine those bands.
+            # Cycle-stamped labels never feed rule fits: outputs of the bands
+            # being fit must not refine those bands.
             return None
         # 'user', 'training', or legacy NULL source on a user-set label → explicit
         return (uft, _W_EXPLICIT, True)
     if mft:
         if via in _CYCLE_VIAS:
-            # dev41: same self-training loop via the matcher tier — excluded.
+            # Same self-training loop via the matcher tier — excluded.
             return None
         if via == "knn":
             return (mft, _W_KNN, False)
@@ -334,21 +327,20 @@ def _is_sane(key: str, value: Any) -> bool:
         return False
     if not (lo_abs <= v <= hi_abs):
         return False
-    # dev34 — BOUNDED LOOSENING. The absolute bounds above are deliberately
-    # wide (a shower floor may legitimately sit anywhere in 0-600 L), which
-    # let a fit collapse a discriminative threshold to nothing: the 2026-08-02
-    # regime-2 refit produced SHOWER_BIG_VOL_L = 2.13 L and ZONE_MIN_DUR_S =
-    # 14.6 s against defaults of 30 L and 240 s — a "big shower" floor small
-    # enough to swallow a toilet flush. The cause is a percentile fit over a
-    # pool that contains fragments and the occasional mislabel; the p10 then
-    # sits far below the class's real lower edge.
+    # BOUNDED LOOSENING. The absolute bounds above are deliberately wide (a
+    # shower floor may legitimately sit anywhere in 0-600 L), which lets a fit
+    # collapse a discriminative threshold to nothing: a regime-2 refit produced
+    # SHOWER_BIG_VOL_L = 2.13 L and ZONE_MIN_DUR_S = 14.6 s against defaults of
+    # 30 L and 240 s — a "big shower" floor small enough to swallow a toilet
+    # flush. A percentile fit over a pool holding fragments and the occasional
+    # mislabel puts p10 far below the class's real lower edge.
     #
-    # This is the scalar analogue of _FIT_MAX_SPAN_FACTOR for ranges: a fit may
-    # tighten a threshold freely (that only ever makes the rule more selective)
-    # but may only loosen it within a bounded factor of the shipped default,
-    # which encodes the physics of the class. LOWERING a floor loosens; RAISING
-    # a ceiling loosens. 2.5x on ceilings keeps the legitimate pump-driven
-    # dishwasher change (3.6 -> 7.59 LPM = 2.1x) while still catching runaways.
+    # Scalar analogue of _FIT_MAX_SPAN_FACTOR for ranges: a fit may tighten a
+    # threshold freely (that only makes the rule more selective) but may only
+    # loosen it within a bounded factor of the shipped default, which encodes
+    # the physics of the class. LOWERING a floor loosens; RAISING a ceiling
+    # loosens. 2.5x on ceilings keeps the legitimate pump-driven dishwasher
+    # change (3.6 -> 7.59 LPM = 2.1x) while still catching runaways.
     if default is not None:
         try:
             d = float(default)
@@ -517,15 +509,13 @@ def _do_no_harm(conn: sqlite3.Connection, circuit: str,
     stay inside the regime's window so the check measures within-regime
     performance.
 
-    dev34 — the comparison now needs a MARGIN. Strict `fitted < frozen` made a
-    one-event difference decisive: on the 2026-08-02 regime-2 refit, toilet
-    scored 23 vs 24 correct of 25 and the fit was discarded, leaving pre-pump
-    constants in force in a regime where toilet ΔP had gone 4.37 → 11.32 psi.
-    A single held-out event is noise, not evidence. The fit is now kept unless
-    the frozen default wins by at least ``_DO_NO_HARM_MIN_MARGIN`` events AND
-    ``_DO_NO_HARM_MIN_FRACTION`` of the test set — so a real regression (which
-    shows up as several events, e.g. the 30% collapses this gate was built to
-    catch) still discards the fit, while a coin flip no longer does.
+    The comparison needs a MARGIN: a single held-out event is noise, not
+    evidence. Strict `fitted < frozen` discarded a toilet fit scoring 23 vs 24
+    correct of 25, leaving pre-pump constants in force in a regime where toilet
+    ΔP had gone 4.37 → 11.32 psi. The fit is kept unless the frozen default wins
+    by at least ``_DO_NO_HARM_MIN_MARGIN`` events AND ``_DO_NO_HARM_MIN_FRACTION``
+    of the test set — a real regression shows up as several events (e.g. the 30%
+    collapses this gate was built to catch).
     """
     try:
         from .database import get_circuit_type

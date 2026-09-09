@@ -50,21 +50,19 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/backup", dependencies=[Depends(require_admin)])
 MAX_BACKUP_BYTES = 50 * 1024 * 1024  # 50 MB hard limit
 
-# dev34 — the /share pickup path. Browser uploads pass through Home
-# Assistant's ingress proxy, which rejects large bodies before the add-on
-# ever sees them — fine for the ~1 MB history archive, fatal for a years-old
-# archive or a full export. Files placed here (Samba / File editor / SSH) are
-# read straight from disk, so size stops mattering. Requires `map: share:rw`
-# in config.yaml.
+# The /share pickup path. Browser uploads pass through Home Assistant's
+# ingress proxy, which rejects large bodies before the add-on ever sees them —
+# fine for the ~1 MB history archive, fatal for a years-old archive or a full
+# export. Files placed here (Samba / File editor / SSH) are read straight from
+# disk, so size stops mattering. Requires `map: share:rw` in config.yaml.
 SHARE_DIR = Path("/share/water_monitor")
 _SHARE_SUFFIXES = {".db", ".zip"}
 
 # ── /share import hardening (2.17) ──────────────────────────────────────────
-# "Size stops mattering" was true of the COMPRESSED input — it is read from
-# disk, not through ingress — and was silently carried over to the
-# DECOMPRESSED output, which nothing bounded at all. /share is writable by
-# every add-on holding `share:rw`, so the zip is attacker-supplied even though
-# the endpoint is admin-only.
+# /share is writable by every add-on holding `share:rw`, so the zip is
+# attacker-supplied even though the endpoint is admin-only. Reading the
+# COMPRESSED input off disk sidesteps the ingress size limit; the DECOMPRESSED
+# output needs a bound of its own.
 MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024   # 2 GB of decompressed database
 # A single member expanding more than this is the classic bomb signature and is
 # cheap to reject early. It is NOT the control: Fifield's non-recursive bomb
@@ -98,10 +96,10 @@ def _extract_dir() -> Path:
 # connect string. `?` and `#` are legal Linux filename characters, so
 # `x?mode=rwc&.db` passes a bare-basename + suffix check, then turns
 # `file:/share/water_monitor/x?mode=rwc&.db?mode=ro` into a READ-WRITE open of
-# a DIFFERENT file (`x`) — measured, not theorised: SQLite takes the path up to
-# the first `?` and honours the attacker's `mode`. URI mode is dropped below;
-# this allowlist is the belt to that braces, and also keeps `%` (URI escapes),
-# newlines and quoting out of the path entirely.
+# a DIFFERENT file (`x`): SQLite takes the path up to the first `?` and honours
+# the attacker's `mode`. URI mode is dropped below; this allowlist is the belt
+# to that braces, and also keeps `%` (URI escapes), newlines and quoting out of
+# the path entirely.
 _SHARE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 # Tables the full export must NOT carry off the add-on's own disk. /share is
@@ -122,8 +120,8 @@ EXPORT_SCRUBBED_COLUMNS = (("seen_users", "display_name"),
                            ("admin_ids_cache", "display_name"))
 
 # QUICK_RESTORE_TABLES is not just "settings" — see the invariant note on the
-# list itself. Named here so the test that guards it and the humans reading the
-# restore UI are looking at the same words.
+# list itself. Named here so the guarding test and the restore UI use the same
+# words.
 RETARGETING_RESTORE_TABLES = ("device_config", "circuit_entity_map",
                               "leak_test_schedule")
 
@@ -132,7 +130,7 @@ RETARGETING_RESTORE_TABLES = ("device_config", "circuit_entity_map",
 
 # Included in the quick-restore JSON (full rows, no date filter).
 #
-# INVARIANT (2.17) — this list is PRIVILEGED, not merely "settings". Three of
+# INVARIANT — this list is PRIVILEGED, not merely "settings". Three of
 # its members change what the add-on does to the house rather than what it
 # remembers about it:
 #   device_config / circuit_entity_map — WHICH Home Assistant entities the
@@ -193,16 +191,15 @@ def _row_counts(db, tables: List[str]) -> Dict[str, int]:
 def scrub_export_copy(conn: sqlite3.Connection) -> Dict[str, int]:
     """Strip the add-on's own secrets from a SNAPSHOT (never the live DB).
 
-    2.17(c). A full export lands in /share, which every add-on holding
-    `share:rw` can read, so anything in the file is published to them. The
-    answer is exclusion rather than encryption: the CSRF server secret is
-    regenerated on first use after a restore and carries no user value, so
-    there is nothing to weigh against removing it, and encrypting would only
-    replace one key-custody problem with another.
+    A full export lands in /share, which every add-on holding `share:rw` can
+    read, so anything in the file is published to them. Exclusion rather than
+    encryption: the CSRF server secret is regenerated on first use after a
+    restore and carries no user value, and encrypting would only replace one
+    key-custody problem with another.
 
     The caller MUST ``VACUUM`` afterwards. A DELETE moves pages onto the
     freelist; it does not erase them, and a freelist page in a shipped .db is
-    trivially recoverable — the scrub would be cosmetic without the rewrite.
+    trivially recoverable — the scrub is cosmetic without the rewrite.
     """
     removed: Dict[str, int] = {}
     for tbl in EXPORT_EXCLUDED_TABLES:
@@ -261,16 +258,12 @@ def _sanitized_snapshot(dest: Path) -> Dict[str, int]:
 async def _snapshot_db(db_path) -> bytes:
     """Consistent copy of the whole DB, WITHOUT touching the shared connection.
 
-    dev46 (46a/N3). The one-thread invariant applies to the SHARED connection,
-    not to the database FILE — so the snapshot opens its own short-lived
-    connection and runs on the default pool. Wrapping ``Connection.backup()``
-    in ``run_db`` would be wrong twice over: it has no per-step return, so one
-    call would hold the single DB worker for the whole copy INCLUDING its
-    sleeps, stalling every page render behind it.
-
-    This is the audit's sole "justified separate connection" (Verification #4,
-    bucket 3): source duplicate + destination file, neither of which is the
-    shared connection.
+    The one-thread invariant applies to the SHARED connection, not to the
+    database FILE — so the snapshot opens its own short-lived connection and
+    runs on the default pool. Wrapping ``Connection.backup()`` in ``run_db``
+    would be wrong: it has no per-step return, so one call would hold the
+    single DB worker for the whole copy INCLUDING its sleeps, stalling every
+    page render behind it.
     """
     import asyncio
 
@@ -288,10 +281,10 @@ async def _snapshot_db(db_path) -> bytes:
                     src.backup(dst, pages=512, sleep=0.005)
                 finally:
                     dst.close()
-                # 2.17(c) — a study snapshot is a file that gets copied to a
-                # laptop and passed around. It is read-only by intent and has
-                # no use for the CSRF key or for HA account names, so it leaves
-                # without them. Same helper, same VACUUM contract.
+                # A study snapshot gets copied to a laptop and passed around.
+                # It is read-only by intent and has no use for the CSRF key or
+                # for HA account names, so it leaves without them. Same helper,
+                # same VACUUM contract.
                 scrub = _sq.connect(str(dest_path))
                 try:
                     scrub_export_copy(scrub)
@@ -309,21 +302,19 @@ async def _snapshot_db(db_path) -> bytes:
 
 @router.get("/export/study-snapshot", response_class=Response)
 async def export_study_snapshot(request: Request):
-    """dev46 (46p) — one click for the "fresh export" every study needs.
+    """One click for the "fresh export" every study needs.
 
-    Pulling study data by hand is the step that has actually gated the
-    refill-shape, feature-space and idle-decay work, so it is worth a button.
     The payload is the whole database plus a manifest stamping schema version,
     add-on version and export time — a study that cannot say WHICH schema and
     build it was run against is not reproducible.
 
     Two gates, both because SQLite's backup restarts from scratch whenever
     another connection writes the source:
-      * startup (R2) — the boot pass writes at every chunk boundary, and
-        "export right after a restart" is exactly the workflow, so an
-        ungated export could restart indefinitely;
-      * an in-flight rebuild (R3) — same problem, minutes long, and the
-        operator gets no explanation for the wait.
+      * startup — the boot pass writes at every chunk boundary, and "export
+        right after a restart" is exactly the workflow, so an ungated export
+        could restart indefinitely;
+      * an in-flight rebuild — same problem, minutes long, and the operator
+        gets no explanation for the wait.
     """
     from ..config import DB_PATH
     from ..database import get_write_lock
@@ -332,9 +323,9 @@ async def export_study_snapshot(request: Request):
     orch = _orch(request)
     if not getattr(orch, "startup_cluster_work_done", True):
         return JSONResponse(
-            # dev46 (46k): pages are up by now, so "still starting up" would
-            # read as a contradiction the operator can see on screen. Name the
-            # thing that is actually still running.
+            # Pages are up by now, so "still starting up" would read as a
+            # contradiction the operator can see on screen. Name the thing that
+            # is actually still running.
             {"status": "starting",
              "message": "The add-on is still re-deriving event labels after "
                         "the restart — try again in a minute, once that "
@@ -499,10 +490,10 @@ async def export_full(request: Request):
 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
 
-        # Consistent SQLite snapshot, scrubbed of the add-on's own secrets
-        # (2.17(c)) — this zip can be written straight into /share, which every
-        # add-on with `share:rw` can read. VACUUM INTO needs a destination that
-        # does not exist yet, so a private directory rather than mkstemp.
+        # Consistent SQLite snapshot, scrubbed of the add-on's own secrets —
+        # this zip can be written straight into /share, which every add-on with
+        # `share:rw` can read. VACUUM INTO needs a destination that does not
+        # exist yet, so a private directory rather than mkstemp.
         with tempfile.TemporaryDirectory() as _td:
             snap_path = Path(_td) / "water_monitor.db"
             _sanitized_snapshot(snap_path)
@@ -591,9 +582,8 @@ def _resolve_share_file(filename: str) -> Path:
     the filename crosses a trust boundary (it names a server-side path)."""
     if not filename or Path(filename).name != filename:
         raise ValueError("Filename must be a bare name, not a path.")
-    # 2.17 — allowlist, not a denylist of the characters we happened to think
-    # of. Anything outside [A-Za-z0-9._-] is rejected before the name can be
-    # concatenated into a path or (historically) a SQLite URI. See
+    # Allowlist, not a denylist. Anything outside [A-Za-z0-9._-] is rejected
+    # before the name can be concatenated into a path or a SQLite URI. See
     # _SHARE_NAME_RE for the `x?mode=rwc&.db` case this stops.
     if not _SHARE_NAME_RE.fullmatch(filename):
         raise ValueError(
@@ -641,17 +631,16 @@ def _extract_db_member(src: Path) -> Path:
     back — decompressed bytes. ``ZipInfo.file_size`` is metadata the archive
     author chose, so it is only ever a pre-filter (``_precheck_member``).
 
-    Note for anyone re-reading this: CPython's ``ZipExtFile`` happens to clamp
-    its own output to the declared ``file_size`` and then fails the CRC, so on
-    CPython an UNDERSTATED size cannot actually overrun. That is an
-    implementation detail of one interpreter, not a guarantee of the format —
-    the counter below is what this code depends on.
+    CPython's ``ZipExtFile`` happens to clamp its own output to the declared
+    ``file_size`` and then fails the CRC, so on CPython an UNDERSTATED size
+    cannot actually overrun. That is an implementation detail of one
+    interpreter, not a guarantee of the format — the counter below is what
+    this code depends on.
 
     Zip-slip is deliberately not checked for, and adding a check would be
     cargo cult: no member name reaches the filesystem. The name is compared
     against the literal "water_monitor.db" to pick the member, and the output
-    path is a ``mkstemp`` name we generate. Verified by reading every use of
-    ``member`` below.
+    path is a ``mkstemp`` name we generate.
     """
     with zipfile.ZipFile(src) as zf:
         info = next((i for i in zf.infolist()
@@ -738,8 +727,8 @@ async def import_share_archive(
     labels_only: bool = Form(False),
 ):
     """Merge history from a file in /share/water_monitor — the no-size-limit
-    twin of the upload import, for archives the ingress proxy would reject
-    (a years-old history archive, or a full export). Accepts a raw SQLite
+    twin of the upload import, for archives the ingress proxy would reject.
+    Accepts a raw SQLite
     .db or a full-export .zip (the water_monitor.db member is used). Same
     merge semantics: existing rows kept, labels_only honoured, post-merge
     reprocess+reclassify runs."""
@@ -770,9 +759,9 @@ async def import_share_archive(
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     try:
         log.info("Importing history from %s (labels_only=%s)", src, labels_only)
-        # dev46 (46a): the whole merge — including its single `with orch.db:`
-        # transaction — runs in ONE run_db callable, so no foreign statement
-        # can land inside the open transaction (rule N2a).
+        # The whole merge — including its single `with orch.db:` transaction —
+        # runs in ONE run_db callable, so no foreign statement can land inside
+        # the open transaction.
         from ..database import run_db
         return await run_db(_merge_archive_from_path, orch, tmp_path,
                             labels_only)
@@ -843,26 +832,26 @@ async def import_quick_restore(
     db = orch.db
 
     def _restore_sync() -> dict:
-        """dev46 (46a): the entire quick-restore — PRAGMA toggles, the single
-        bulk transaction, the events normalize/dedup pass and the circuit-label
+        """The entire quick-restore — PRAGMA toggles, the single bulk
+        transaction, the events normalize/dedup pass and the circuit-label
         restore — in ONE DB-thread callable. Splitting it would leave the bulk
-        transaction open across a queue boundary (rule N2a); running it on the
-        loop thread would put multi-second DELETE/INSERT batches on the shared
-        connection while the DB worker may be mid-statement."""
+        transaction open across a queue boundary; running it on the loop thread
+        would put multi-second DELETE/INSERT batches on the shared connection
+        while the DB worker may be mid-statement."""
         imported: dict = {}
         # PRAGMA foreign_keys must be set outside the transaction — SQLite
         # ignores it when a transaction is already open.  Disable for the bulk
         # restore so cross-table FK ordering (e.g. events → fixtures) does not
         # block the DELETE pass, then re-enable immediately after.
         db.execute("PRAGMA foreign_keys = OFF")
-        # Wrap the entire restore in a single transaction.  If any table's
-        # DELETE or INSERT fails, all prior DELETEs are rolled back — avoiding
-        # a state where some tables are wiped but not restored.
+        # One transaction for the whole restore: if any table's DELETE or
+        # INSERT fails, all prior DELETEs roll back, so no state where some
+        # tables are wiped but not restored.
         #
         # Every table in the restore list is cleared unconditionally, even when
-        # the backup has an empty array or the table is absent from the backup
-        # entirely.  This ensures the DB reflects the exact state of the backup
-        # — stale rows from a previous restore cannot bleed through.
+        # the backup has an empty array or omits the table entirely, so the DB
+        # reflects the exact state of the backup — stale rows from a previous
+        # restore cannot bleed through.
         try:
             with db:
                 for tbl in restore:
@@ -960,11 +949,11 @@ async def import_history_archive(
 ):
     """Merge history rows from a SQLite archive. Existing rows are kept.
 
-    ``labels_only`` (dev34) merges ONLY the archive's user-labelled events —
-    the training fuel — instead of its full event history. Motivation: a
-    fresh start discarded 486 hand-made labels, and the classifier's coverage
-    (not its accuracy) collapsed afterwards. Importing the labels back roughly
-    triples the pool, particularly for the starved classes.
+    ``labels_only`` merges ONLY the archive's user-labelled events — the
+    training fuel — instead of the full event history. A fresh start discards
+    the hand-made labels (486 of them, once) and the classifier's coverage,
+    not its accuracy, collapses; importing the labels back roughly triples the
+    pool, particularly for the starved classes.
 
     Rows arrive with their FEATURES INTACT. Blanking the pressure columns
     would look conservative and is the opposite: `pressure_delta_psi` is a
@@ -973,7 +962,7 @@ async def import_history_archive(
     distance is already handled — the rule-fit pools are windowed by
     timestamp, the active/edge k-NN tiers hard-require active-flow columns
     that firmware-3.12 rows lack (so those rows serve the legacy tier), and
-    the dev32 pressure feature conditions on supply regime by design.
+    the pressure feature conditions on supply regime by design.
     """
     orch = _orch(request)
     raw = await file.read(MAX_BACKUP_BYTES + 1)
@@ -995,9 +984,9 @@ async def import_history_archive(
         tmp_path.unlink(missing_ok=True)
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     try:
-        # dev46 (46a): the whole merge — including its single `with orch.db:`
-        # transaction — runs in ONE run_db callable, so no foreign statement
-        # can land inside the open transaction (rule N2a).
+        # The whole merge — including its single `with orch.db:` transaction —
+        # runs in ONE run_db callable, so no foreign statement can land inside
+        # the open transaction.
         from ..database import run_db
         return await run_db(_merge_archive_from_path, orch, tmp_path,
                             labels_only)
@@ -1008,22 +997,21 @@ async def import_history_archive(
 def _merge_archive_from_path(orch, db_path: Path,
                              labels_only: bool) -> JSONResponse:
     """The history-archive merge core, shared by the upload endpoint and the
-    /share pickup (dev34): merge rows from the SQLite file at ``db_path`` into
+    /share pickup: merge rows from the SQLite file at ``db_path`` into
     the live DB, then run the post-merge verdict/reclassify pass. The caller
     owns ``db_path``'s lifetime."""
     imported, errors, ignored = {}, [], {}
     arc = None
 
     try:
-        # 2.17 — NOT a URI open. `sqlite3.connect(uri=True)` re-parses the
-        # path, so any `?`/`#`/`%` in a /share filename is interpreted as URI
-        # syntax: `x?mode=rwc&.db` truncates the path at the `?` and hands
-        # SQLite the attacker's own mode, opening a DIFFERENT file READ-WRITE.
-        # That defeats the one thing `mode=ro` was there for. A plain path plus
-        # `query_only` gives the same read-only guarantee with no parser
-        # between us and the filename. (`_resolve_share_file` also rejects such
-        # names outright now — this is the half that does not depend on the
-        # caller having validated anything.)
+        # NOT a URI open. `sqlite3.connect(uri=True)` re-parses the path, so
+        # any `?`/`#`/`%` in a /share filename is interpreted as URI syntax:
+        # `x?mode=rwc&.db` truncates the path at the `?` and hands SQLite the
+        # attacker's own mode, opening a DIFFERENT file READ-WRITE, defeating
+        # the one thing `mode=ro` was there for. A plain path plus `query_only`
+        # gives the same read-only guarantee with no parser between us and the
+        # filename. (`_resolve_share_file` rejects such names outright too;
+        # this is the half that does not depend on the caller.)
         arc = sqlite3.connect(str(db_path))
         arc.execute("PRAGMA query_only = ON")
         arc.row_factory = sqlite3.Row
@@ -1102,13 +1090,13 @@ def _merge_archive_from_path(orch, db_path: Path,
                         log.warning(
                             "Import archive %s: %d of %d row(s) skipped on id "
                             "collision (live rows kept)", tbl, skipped, len(rows))
-                    # Heal-on-reimport: rows a PRE-FIX import inserted still
-                    # carry the old install's cluster linkage (missing or,
+                    # Heal-on-reimport: rows inserted by an older build still
+                    # carry the source install's cluster linkage (missing or,
                     # worse, colliding ids). Re-importing the same archive is
-                    # otherwise a no-op (INSERT OR IGNORE), so use it as the
-                    # repair channel: clear linkage on every archive row that
-                    # already exists here. Safe — linkage is a derived cache
-                    # the startup backfill/reclassify re-derives against
+                    # otherwise a no-op (INSERT OR IGNORE), so it doubles as
+                    # the repair channel: clear linkage on every archive row
+                    # that already exists here. Safe — linkage is a derived
+                    # cache the startup backfill/reclassify re-derives against
                     # THIS db's clusters.
                     if tbl == "events":
                         ids = [r["id"] for r in rows if "id" in r.keys()]
@@ -1186,7 +1174,7 @@ async def backup_page(request: Request):
     all_tables = list(dict.fromkeys(
         QUICK_RESTORE_TABLES + QUICK_RESTORE_RECENT + HISTORY_ARCHIVE_TABLES))
     from ..database import run_db
-    # dev46 (46a): one COUNT(*) per table — off the loop thread.
+    # One COUNT(*) per table — off the loop thread.
     counts = await run_db(_row_counts, db, all_tables)
 
     try:

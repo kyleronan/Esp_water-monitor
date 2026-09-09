@@ -1,4 +1,4 @@
-"""Phase 2.4 — per-home artifact-detector calibration (SAFETY-CRITICAL).
+"""Per-home artifact-detector calibration (SAFETY-CRITICAL).
 
 The phantom / cross-talk detectors ZERO an event's volume; dribble excludes it from
 training (volume kept). This module calibrates ONLY the "long-quiet" / dribble
@@ -41,8 +41,8 @@ _MARGIN = 0.10
 # Absolute clamps for each calibratable threshold (key → (lo, hi)). The cross-talk
 # min-duration only LOWERS toward the floor (catch the home's shorter artifacts);
 # dribble ceilings only RAISE toward the cap. Anything fitted is clamped here.
-# Phantom duration is intentionally NOT here — its floors became frozen structural
-# constants (feature_extractor 2026-06-14) so the legacy floor can never be lowered.
+# Phantom duration is intentionally NOT here — its floors are frozen structural
+# constants (see feature_extractor) so the legacy floor can never be lowered.
 _BOUNDS: Dict[str, Tuple[float, float]] = {
     "XTALK_MIN_DURATION_S":   (60.0, 120.0),
     "DRIBBLE_MAX_VOLUME_L":   (0.5, 2.0),
@@ -169,11 +169,11 @@ def fit_artifact_thresholds(
         ("phantom", "ph", _phantom, {}),
         ("cross_talk", "ct", _xtalk,
          {"XTALK_MIN_DURATION_S": ("min", "duration_seconds")}),
-        # Dribble is no longer calibratable (2026-07-05): the below-meter-floor
-        # rule replaced the volume/flow/ΔP triple-gate with frozen physical
-        # registration floors (see feature_extractor's registration-floor
-        # block). Empty fit_keys keeps the report's confirmed-positive count
-        # for the UI, like phantom.
+        # Dribble is not calibratable: the below-meter-floor rule governs it
+        # via frozen physical registration floors (see feature_extractor's
+        # registration-floor block), not a volume/flow/ΔP triple-gate. Empty
+        # fit_keys keeps the report's confirmed-positive count for the UI,
+        # like phantom.
         ("dribble", "dr", _dribble, {}),
     ):
         accepted, rep = _fit_one(rows, flag, detect, fit_keys)

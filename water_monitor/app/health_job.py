@@ -1,4 +1,4 @@
-"""dev47 (47i) — the nightly fixture-health pass.
+"""The nightly fixture-health pass.
 
 This is the job that makes the frozen baselines actually watch something. Once
 a night it reads the CLASSIFIED event stream, compares each fixture against its
@@ -19,16 +19,16 @@ THE ONE THING THIS JOB MUST NEVER DO
 ------------------------------------
 Update a baseline from current data. A reference that follows the data detects
 nothing — a failing fixture would simply redefine normal, which is the entire
-failure mode dev47 exists to catch. Baselines are pinned once from an explicit
+failure mode this job exists to catch. Baselines are pinned once from an explicit
 window and move only by an operator unlock with a reason code. This job creates
 one when none exists and otherwise treats it as read-only.
 
 COVERAGE IS PART OF THE READING
 -------------------------------
-"No alarm" is only good news if events were actually arriving. V6d measured a
-frozen classifier starving its own trend line — the drifted events were
-rejected, never reached the card, and the detector went quiet while the fixture
-got worse. So every result carries the event count and the fixture's expected
+"No alarm" is only good news if events were actually arriving. A frozen
+classifier can starve its own trend line: the drifted events are rejected,
+never reach the card, and the detector goes quiet while the fixture gets
+worse. So every result carries the event count and the fixture's expected
 latency, and a class whose stream has dried up is reported as UNDER-COVERED
 rather than healthy.
 """
@@ -62,9 +62,9 @@ COVERAGE_WARN_RATIO: float = 0.4
 COVERAGE_WINDOW_DAYS: int = 30
 
 # The class-share signal is OFF by default on the nightly pass, and that is a
-# measured decision rather than caution. In simulation (V6d) share-sag was a
-# clean signal because classification coverage was held fixed. On the real
-# database it is not: the share of the attributed stream held by every class
+# measured decision rather than caution. In simulation share-sag was a clean
+# signal because classification coverage was held fixed. On the real database
+# it is not: the share of the attributed stream held by every class
 # moves as the backlog gets classified and as new tiers come online, so a
 # nightly run fired share alarms for toilet, dishwasher AND washing-machine at
 # once — three fixtures do not fail on the same night. Share only means
@@ -81,9 +81,9 @@ SHARE_SIGNAL_DEFAULT: bool = False
 # ordinary small household draws: enabled, it reported 245 "unsolicited
 # refills" across every class at 4/day.
 #
-# The simulation that promoted this to the "fast signal" (V6d, alarm on day 3)
-# injected phantom refills as distinct events, which is the plumbing model this
-# meter does not observe. A degrading flapper still shows up here — as the
+# The simulation that promoted this to the "fast signal" injected phantom
+# refills as distinct events, which is the plumbing model this meter does not
+# observe. A degrading flapper still shows up here — as the
 # flush event itself growing — and that is exactly what the volume trend reads.
 # Re-enable only against a meter (or a fixture) where refills are separately
 # metered, or with a formulation that keys on repetition during quiet periods
@@ -262,12 +262,12 @@ def run_nightly(conn: sqlite3.Connection, circuit: str,
                 ) -> Dict[str, dict]:
     """One night's pass over every watched fixture on a circuit.
 
-    Synchronous — the caller submits it through ``run_db`` (46a). Returns a
+    Synchronous — the caller submits it through ``run_db``. Returns a
     per-fixture summary; the caller logs or surfaces it. Never raises for the
     ordinary "not enough history yet" cases, which are states, not errors.
 
-    THE COMMIT LIVES HERE (dev46 rule N2a)
-    --------------------------------------
+    THE COMMIT LIVES HERE
+    ---------------------
     One ``run_db`` callable, one transaction, ending in its own commit. This
     pass is the ONLY production caller of ``fh.save_baseline``,
     ``fh.open_alert`` and ``fh.record_nightly_stats``, and none of those leaves
@@ -275,15 +275,14 @@ def run_nightly(conn: sqlite3.Connection, circuit: str,
     appending the night's evidence are one atomic verdict rather than three
     writes that can be torn apart by a crash.
 
-    Until dev57 nothing committed at all. ``database.get_connection`` never
-    sets ``isolation_level``, so sqlite3's default opens an implicit
-    transaction before the first write and never closes it; the whole nightly
-    pass sat unwritten on the shared connection, surviving only if some
-    unrelated code path happened to commit it later and vanishing on the next
-    ``_rollback_quietly``. Every existing test missed it because they all
-    assert through the SAME connection, where an open transaction reads back
-    exactly like a committed one — see
-    ``tests/test_health_job_commits.py``, which asserts from a second one.
+    That commit is load-bearing. ``database.get_connection`` never sets
+    ``isolation_level``, so sqlite3 opens an implicit transaction before the
+    first write and never closes it: without the commit the whole nightly pass
+    sits unwritten on the shared connection and vanishes on the next
+    ``_rollback_quietly``. A test asserting through the SAME connection cannot
+    see the difference — an open transaction reads back exactly like a
+    committed one — which is why ``tests/test_health_job_commits.py`` asserts
+    from a second one.
 
     ``transaction()`` also supplies the other half: a failure part-way through
     fixture three rolls back fixtures one and two instead of leaving a

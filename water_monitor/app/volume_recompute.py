@@ -77,13 +77,12 @@ async def build_flow_fetch(ha, flow_sensor: str, range_start: datetime,
 def _parse_ts(s) -> Optional[datetime]:
     """Parse a stored/HA timestamp to a UTC-AWARE datetime (None if unparseable).
 
-    unit 2.32 — this used to hand back whatever ``fromisoformat`` produced. HA
-    history timestamps always carry an offset, but legacy ``events.start_ts``
-    rows (pre-dev38) do not, so the naive value met the aware sample times in
-    ``build_flow_fetch``'s ``fetch()`` bisect and raised
-    ``TypeError: can't compare offset-naive and offset-aware datetimes`` —
-    aborting the whole "Fix volume totals" job on the FIRST legacy row (the
-    router catches it and redirects to a bare ``?msg=error``).
+    HA history timestamps always carry an offset, but legacy ``events.start_ts``
+    rows do not. A naive value meeting the aware sample times in
+    ``build_flow_fetch``'s ``fetch()`` bisect raises ``TypeError: can't compare
+    offset-naive and offset-aware datetimes``, aborting the whole "Fix volume
+    totals" job on the FIRST legacy row (the router catches it and redirects to
+    a bare ``?msg=error``).
 
     Naive input is treated as UTC, which is the storage convention (see the
     same assumption in ``cluster_engine._extract_features``).
@@ -180,10 +179,10 @@ def recompute_volume_and_active_flow(
         degraded = capped or no_prestate or max_gap > _MAX_GAP_DEGRADED_S
         quality = "degraded" if degraded else "ok"
 
-        # §2 coherence: the recorder cumulative-sensor delta is the authoritative volume
-        # for a healthy event — prefer it over this (re-integrated, lossy) value so a
-        # manual Recompute can't undo a recorder reconcile. Healthy only (un-flagged +
-        # not degraded); the verdict/effective logic below is unchanged.
+        # The recorder cumulative-sensor delta is the authoritative volume for a
+        # healthy event — prefer it over this (re-integrated, lossy) value so a
+        # manual Recompute can't undo a recorder reconcile. Healthy only
+        # (un-flagged + not degraded).
         # Scope: this substitution moves ``volume_litres`` ONLY. It must not reach
         # ``flow_integral_litres`` — see ``integral_litres`` above.
         rec = r["volume_recorder_litres"]
@@ -230,10 +229,10 @@ def recompute_volume_and_active_flow(
                 # verdict survives a manual full recompute (else _finalize would clear
                 # it — the main-only detector can't reproduce a short event).
                 "match_rejection_reason": r["match_rejection_reason"],
-                # Carry the stored correlation (dev14) — waveforms are gone at
-                # recompute time, so without this the rise-phantom verdict would
-                # silently clear (corr None ⇒ detector can't fire) and the false
-                # volume would return. _finalize re-derives the verdict from it.
+                # Carry the stored correlation: waveforms are gone at recompute
+                # time, so without it the rise-phantom verdict silently clears
+                # (corr None ⇒ detector can't fire) and the false volume
+                # returns. _finalize re-derives the verdict from it.
                 "flow_pressure_corr": r["flow_pressure_corr"],
                 # ...and the user's label, so _finalize's "a real fixture label wins
                 # over the cross-talk zeroing" escape hatch can actually fire here
@@ -283,8 +282,8 @@ def recompute_volume_and_active_flow(
                         feat["is_low_flow_dribble"],
                         # write is_cross_talk back too: _finalize either preserves
                         # the durable irrigation verdict (=1) or, when a user label
-                        # confirms real water, drops it (=0) — without this column
-                        # the flag stayed 1 while the volume was restored, a
+                        # confirms real water, drops it (=0). Without this column
+                        # the flag stays 1 while the volume is restored — a
                         # half-reverted row (hidden in History, counted in totals).
                         feat["is_cross_talk"],
                         feat.get("phantom_suppression_averted", 0),
