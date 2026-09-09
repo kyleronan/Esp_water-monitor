@@ -348,8 +348,12 @@ class AlertManager:
             dispatched = await self.fire(
                 circuit, "unusual_usage",
                 title=f"\U0001f6b1 Water shut off — {circuit_name}",
+                # "is being closed", not "was closed": at the instant this
+                # notification fires the valve is still travelling (38-62 s on
+                # this hardware), and nothing has read the position back yet.
+                # A separate critical alert follows if it fails to confirm.
                 message=(f"Automatic shut-off: {reason} (anomaly score {score:.0%}). "
-                         f"Water to {circuit_name} was closed as a precaution. "
+                         f"Water to {circuit_name} is being closed as a precaution. "
                          f"To restore water, {where}, or use the Open Valve button on "
                          f"the Water Monitor Valve & Tests page. If this was normal usage, "
                          f"recalibrate so it is not flagged again."),

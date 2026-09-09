@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -49,6 +50,11 @@ from .feature_extractor import (
 
 # Phase 2.3 — minimum gap between anomaly NOTIFY pushes per circuit (the shut-off
 # path is governed separately by the persistent per-12h cap, not this cooldown).
+# Real valve travel on this hardware is 38-62 s and the firmware allows 90 s
+# before it calls a motor fault, so a confirmation window shorter than that
+# would report a healthy slow close as a failure.
+_VALVE_CONFIRM_TIMEOUT_S: float = 100.0
+_VALVE_CONFIRM_POLL_S: float = 5.0
 _ANOMALY_ALERT_COOLDOWN_MIN = 15
 
 
@@ -894,6 +900,102 @@ class FeatureExtractor:
             "WHERE circuit = ? AND role = 'valve_entity'", (circuit,)).fetchone()
         return row[0] if row and row[0] else None
 
+    def _resolve_role_entity(self, circuit: str, role: str) -> Optional[str]:
+        """Any bound entity for a circuit, by discovery role."""
+        row = self._db.execute(
+            "SELECT entity_id FROM circuit_entity_map "
+            "WHERE circuit = ? AND role = ?", (circuit, role)).fetchone()
+        return row[0] if row and row[0] else None
+
+    async def _confirm_valve_closed(self, circuit: str, circuit_name: str,
+                                    valve: str, event_id) -> Optional[bool]:
+        """Read the valve position back after commanding a close.
+
+        ``close_valve`` returns True on HTTP 200 from the service call — "HA
+        accepted the request", not "the valve closed". Nothing verified it, so
+        the add-on could report the water shut off while it was still running.
+        This installation has a documented close-path hardware fault
+        (2026-07-18), which is what that failure looks like in practice.
+
+        Returns True (confirmed shut), False (did not confirm), or None
+        (no end-stop entity bound — cannot verify, and says so rather than
+        assuming either way).
+
+        Two distinct failures are checked, because they are different faults:
+          * the closed end stop never reads on — the valve did not travel;
+          * the end stop reads on but ``valve_seal_alert`` is also on — the
+            valve reports shut and water is still moving past it. That is the
+            signal §6.0-E identified as the one the firmware already had and
+            the add-on never read.
+        """
+        from .database import run_db
+        stop_entity = await run_db(
+            self._resolve_role_entity, circuit, "closed_end_stop_sensor")
+        if not stop_entity:
+            log.warning(
+                "[%s] valve close NOT VERIFIED — no closed-end-stop entity is "
+                "bound, so the add-on cannot tell whether the valve moved. The "
+                "notification says the close was commanded, which is all that "
+                "is known.", circuit)
+            return None
+
+        seal_entity = await run_db(
+            self._resolve_role_entity, circuit, "valve_seal_alert_sensor")
+
+        # Monotonic, not wall clock: an NTP step on a host without an RTC would
+        # otherwise stretch or truncate this window (audit §8E.5).
+        deadline = time.monotonic() + _VALVE_CONFIRM_TIMEOUT_S
+        seated = False
+        while time.monotonic() < deadline:
+            try:
+                state = await self._ha.get_state_value(stop_entity)
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("[%s] end-stop read failed while confirming the "
+                            "close: %s", circuit, exc)
+                state = None
+            if str(state).lower() == "on":
+                seated = True
+                break
+            await asyncio.sleep(_VALVE_CONFIRM_POLL_S)
+
+        leaking = False
+        if seated and seal_entity:
+            try:
+                seal = await self._ha.get_state_value(seal_entity)
+                leaking = str(seal).lower() == "on"
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("[%s] valve-seal read failed: %s", circuit, exc)
+
+        if seated and not leaking:
+            log.info("[%s] valve close CONFIRMED at the closed end stop (%s)",
+                     circuit, stop_entity)
+            return True
+
+        why = ("the valve reports shut but flow is still detected past it "
+               "(valve seal alert)" if leaking else
+               "the closed end stop never reported seated within %.0f s"
+               % _VALVE_CONFIRM_TIMEOUT_S)
+        log.error("[%s] VALVE CLOSE NOT CONFIRMED — %s. Water may still be "
+                  "flowing (event %s).", circuit, why, event_id)
+
+        am = self._alert_manager
+        if am:
+            await am.fire(
+                circuit, "unusual_usage",
+                title=f"\u26a0\ufe0f Water may still be running \u2014 {circuit_name}",
+                message=(
+                    f"The add-on commanded an automatic shut-off for "
+                    f"{circuit_name}, but could not confirm it: {why}. "
+                    f"Treat the water as STILL ON and check the valve. "
+                    f"The earlier notification said the shut-off was "
+                    f"commanded, not that it completed."),
+                # Distinct id so this does NOT overwrite the shut-off notice.
+                notification_id=f"water_shutoff_unconfirmed_{circuit}",
+                # critical bypasses the per-type enable: an unverified close on
+                # a leak is exactly the case a user preference must not mute.
+                critical=True)
+        return False
+
     def _shutoff_preflight_sync(self, circuit: str) -> dict:
         """dev46 (46a) — the two DB reads that must precede actuation.
 
@@ -983,6 +1085,12 @@ class FeatureExtractor:
             self._spawn_alert_task(am.alert_unusual_usage(
                 circuit, score, atype, circuit_name, shutoff=True,
                 event_id=event_id, valve_entity=valve))
+        # Verify OUT OF BAND. Travel is 38-62 s and the confirmation window is
+        # 100 s; awaiting that here would hold the event pipeline for the whole
+        # of it. The operator is already notified above, so the only thing
+        # still owed is the truth about whether the valve actually moved.
+        self._spawn_alert_task(
+            self._confirm_valve_closed(circuit, circuit_name, valve, event_id))
         return True
 
     def _notify_anomaly(self, circuit: str, circuit_name: str, score: float,
