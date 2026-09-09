@@ -2820,6 +2820,25 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
         # Phantom takes precedence over degraded: never let a degraded
         # re-verdict un-zero a pressure-restoration phantom's volume.
         + _NO_PHANTOM_SQL
+        # And never re-verdict a row whose provenance this scan would erase.
+        # The UPDATE below writes match_rejection_reason unconditionally - None
+        # on the not-degraded branch - and recomputes excluded_from_training
+        # from (composite OR degraded) alone. For a leak-test refill that means
+        # the verdict string is wiped AND the row is re-admitted to training at
+        # zero volume.
+        #
+        # A refill reaches this scan because degraded_diagnostic_json is
+        # written for EVERY extracted event, not just degraded ones, and a
+        # refill deliberately sets none of the three artifact bits, so
+        # _NO_PHANTOM_SQL does not exclude it. That is the same premise unit
+        # 6.5 established for the cross-talk scan.
+        #
+        # Guarded at the SELECT, the way the other scans do it, rather than by
+        # special-casing the UPDATE: this scan should not form an opinion about
+        # a row it must not rewrite.
+        + _LEAK_REFILL_GUARD_SQL
+        + _NOT_USER_CLASSIFIED_SQL
+        + _NO_USER_FIXTURE_TYPE_SQL
     ).fetchall()
 
     skipped_legacy_row = conn.execute(
