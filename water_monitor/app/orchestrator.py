@@ -17,8 +17,42 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from .config import AddonConfig, SENSITIVITY_PRESETS, DB_PATH
-from .database import (get_sensitivity_config, ensure_circuit_defaults, init_db)
+from .config import (
+    AddonConfig,
+    DB_PATH,
+    pump_gates_active,
+    pump_mode_effective_cached,
+    SENSITIVITY_PRESETS)
+from .database import (
+    backfill_time_features_tz,
+    compute_ha_daily_volume,
+    compute_ha_weekly_volume,
+    DEFAULT_PULSES_PER_LITRE,
+    ensure_circuit_defaults,
+    find_orphaned_cluster_references,
+    get_circuit_pulses_per_litre,
+    get_circuit_type,
+    get_daily_volume,
+    get_home_profile,
+    get_leak_test_schedule,
+    get_pump_regime_nights,
+    get_sensitivity_config,
+    get_valve_type,
+    get_weekly_volume,
+    init_db,
+    is_circuit_winterized,
+    load_cached_admin_ids,
+    load_circuit_labels,
+    load_operator_ids,
+    rebuild_daily_summaries,
+    recompute_all_user_label_suggestions,
+    recompute_cycle_pulse_counts,
+    resuggest_all_clusters,
+    run_db,
+    save_admin_ids_cache,
+    set_circuit_pulses_per_litre,
+    update_home_profile,
+    WINTERIZE_UNSET_GRACE_S)
 from .device_discovery import (load_circuit_entities, is_setup_complete,
                                 get_device_config, rescan_optional_roles,
                                 setup_complete_epoch)
@@ -222,7 +256,6 @@ class Orchestrator:
 
     async def set_away_mode(self, enabled: bool) -> None:
         """Enable or disable away mode. Notifies via HA when toggled."""
-        from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
 
@@ -230,7 +263,6 @@ class Orchestrator:
         # calibration extension and the profile write — goes over the wall in
         # ONE hop. They all precede the single HA await at the end: one
         # callable, one transaction.
-        from .database import run_db
         await run_db(self._set_away_mode_sync, enabled, now, now_iso)
 
         if self._alert_manager and enabled:
@@ -244,7 +276,6 @@ class Orchestrator:
         home_profile flip commit together, so a crash between them cannot
         leave timers extended for an away period that never got recorded.
         """
-        from datetime import datetime, timezone, timedelta
 
         if not enabled:
             # Extend calibration timers by the actual time spent away so the
@@ -383,7 +414,6 @@ class Orchestrator:
         write costs happens over the wall, instead of on the event loop inside
         whichever request reads the property next.
         """
-        from .database import run_db
         return await run_db(self._setup_complete_sync)
 
     # ── Loop-safe wrappers for the three sync reloaders ──────
@@ -397,17 +427,14 @@ class Orchestrator:
 
     async def reload_circuit_entities_async(self) -> None:
         """``reload_circuit_entities`` on the DB worker. Call this from the loop."""
-        from .database import run_db
         await run_db(self.reload_circuit_entities)
 
     async def reload_circuit_labels_async(self) -> None:
         """``reload_circuit_labels`` on the DB worker. Call this from the loop."""
-        from .database import run_db
         await run_db(self.reload_circuit_labels)
 
     async def reload_circuit_profiles_async(self) -> None:
         """``reload_circuit_profiles`` on the DB worker. Call this from the loop."""
-        from .database import run_db
         await run_db(self.reload_circuit_profiles)
 
     def reload_circuit_entities(self) -> None:
@@ -490,7 +517,6 @@ class Orchestrator:
         """
         if not self._db:
             return
-        from .database import load_circuit_labels
         labels = load_circuit_labels(self._db)
         for circuit_cfg in self._cfg.circuits:
             circuit_cfg.display_name = labels.get(circuit_cfg.circuit, "")
@@ -506,7 +532,6 @@ class Orchestrator:
         before serving) and again inside ``run()`` once the orchestrator's own
         connection is open.
         """
-        from .database import load_operator_ids, load_cached_admin_ids
         try:
             self.operator_ids = load_operator_ids(db)
             admins = load_cached_admin_ids(db)
@@ -523,7 +548,6 @@ class Orchestrator:
 
         Called by the Access page after an admin grants/revokes operator so the
         middleware sees the change immediately (no restart)."""
-        from .database import load_operator_ids
         if self._db:
             self.operator_ids = load_operator_ids(self._db)
 
@@ -540,7 +564,6 @@ class Orchestrator:
         except Exception as e:
             log.warning("role-sync fetch failed (keeping cached admin set): %s", e)
             return False
-        from .database import save_admin_ids_cache
         from .auth import admin_ids_from_users
         new_ids = admin_ids_from_users(users)
         if not new_ids:
@@ -557,7 +580,6 @@ class Orchestrator:
                   for u in users if u.get("is_admin")]
         if admins != getattr(self, "_last_saved_admins", None):
             # Change-gated write, over the wall like every other.
-            from .database import run_db
             await run_db(save_admin_ids_cache, self._db,
                          [u for u in users if u.get("is_admin")])
             self._last_saved_admins = admins
@@ -585,7 +607,6 @@ class Orchestrator:
         """
         if not self._db:
             return
-        from .database import get_circuit_type, get_circuit_pulses_per_litre
         for circuit_cfg in self._cfg.circuits:
             circuit_cfg.circuit_type = get_circuit_type(
                 self._db,
@@ -623,7 +644,6 @@ class Orchestrator:
                 # TOGETHER, which is why it looks plausible. Logged at ERROR and
                 # marked as a degraded subsystem below so it surfaces on
                 # /health/detail.
-                from .database import DEFAULT_PULSES_PER_LITRE
                 log.error(
                     "[%s] flow-meter PPL entity is NOT bound — using %.1f "
                     "pulses/litre from the local cache (column default %.1f). "
@@ -709,7 +729,6 @@ class Orchestrator:
             else "small trim, re-scaling anomaly thresholds (no relearn)")
         # 1) Persist to the DB cache + live config.
         try:
-            from .database import run_db, set_circuit_pulses_per_litre
             await run_db(set_circuit_pulses_per_litre, self._db, circuit,
                          new_ppl)
         except Exception as e:
@@ -737,7 +756,6 @@ class Orchestrator:
             # recompute historical event volumes (the never-recompute invariant holds).
             try:
                 from .anomaly_baseline import rescale_anomaly_percentiles
-                from .database import run_db
                 await run_db(rescale_anomaly_percentiles, self._db, circuit,
                              cached / new_ppl)
             except Exception as e:
@@ -853,7 +871,6 @@ class Orchestrator:
         # observable rather than silently mutated; the Fixtures-page banner is
         # the user-facing fix path.
         try:
-            from .database import find_orphaned_cluster_references
             _orphans = find_orphaned_cluster_references(self._db, repair=False)
             if any(_orphans.values()):
                 log.warning(
@@ -905,12 +922,9 @@ class Orchestrator:
         The pass is chunked, so it releases the single DB worker every ~1 s and
         a queued page render never waits longer than one chunk.
         """
-        from .database import (reclassify_all_events_from_signatures_async,
-                               recompute_cycle_pulse_counts,
-                               release_settle_window,
-                               resuggest_all_clusters,
-                               recompute_all_user_label_suggestions,
-                               run_db)
+        from .reclassify import (
+            reclassify_all_events_from_signatures_async,
+            release_settle_window)
         from .maturity_recheck import _SETTLE_HORIZON_HOURS
         try:
             for c in self._cfg.circuits:
@@ -941,7 +955,7 @@ class Orchestrator:
                 # at the add-on. Deliberately-released rows (settle window, new
                 # events, a label's cluster peers) sort first inside the budget,
                 # so the things someone IS waiting on land immediately.
-                from .database import _VERDICT_BACKLOG_PER_PASS
+                from .reclassify import _VERDICT_BACKLOG_PER_PASS
                 r = await _timed_startup_job(
                     f"reclassify[{c.circuit}]",
                     reclassify_all_events_from_signatures_async(
@@ -1030,7 +1044,6 @@ class Orchestrator:
         # wall in ONE hop. This is NOT startup-before-loop: main.py creates
         # run() as a task and immediately yields to uvicorn, so request handlers
         # are already submitting to run_db while this executes.
-        from .database import run_db
         await run_db(self._boot_db_preamble_sync)
 
         # HA client
@@ -1170,7 +1183,6 @@ class Orchestrator:
         # of already-matched events so DBSTREAM + scaler are warm on startup.
         try:
             from .cluster_engine import ClusterEngine
-            from .database import run_db
             self._cluster_engine = ClusterEngine(self._db, self._cfg)
             for c in self._cfg.circuits:
                 # Every DB touch goes through the single DB
@@ -1229,7 +1241,6 @@ class Orchestrator:
         # what makes the app usable during it. Both are needed — a backgrounded
         # monolith still holds the worker for ~145 s.
         try:
-            from .database import run_db
             from .feature_extractor import reprocess_event_exclusion_verdicts
             res = await _timed_startup_job(
                 "reprocess_event_exclusion_verdicts",
@@ -1440,10 +1451,8 @@ class Orchestrator:
         from pump_regime_nightly, fallback 2.0 when detection hasn't measured
         a band yet (setup-declared pump homes)."""
         try:
-            from .config import pump_gates_active
             if not pump_gates_active(self._db, circuit):
                 return None
-            from .database import get_pump_regime_nights
             nights = get_pump_regime_nights(self._db, limit=10)
             amp = next((n["amplitude_psi"] for n in nights
                         if n["any_detected"] and n["amplitude_psi"]), None)
@@ -1466,7 +1475,6 @@ class Orchestrator:
         zone_floor = None
         pump_floor = None
         try:
-            from .database import get_circuit_type, get_home_profile
             sens = self._get_sensitivity(circuit)
             if get_circuit_type(self._db, circuit, default="fixture") == "zone":
                 zone_floor = float(
@@ -1477,7 +1485,6 @@ class Orchestrator:
                     if get_circuit_type(self._db, c.circuit,
                                         default=c.circuit_type) == "fixture"]
                 if fixture_circuits and circuit == fixture_circuits[0]:
-                    from .config import pump_gates_active
                     if pump_gates_active(self._db, circuit):
                         prof = get_home_profile(self._db)
                         armed = bool(prof and (
@@ -1521,8 +1528,6 @@ class Orchestrator:
     async def _low_pressure_alert_async(self, circuit: str, psi: float,
                                         name: str) -> None:
         """The DB half of the 6a low-pressure alert."""
-        from .config import pump_mode_effective_cached
-        from .database import run_db
         try:
             pump_active = (await run_db(pump_mode_effective_cached,
                                         self._db, circuit))["active"]
@@ -1550,13 +1555,10 @@ class Orchestrator:
         courtesy, and a schema column would outlive its usefulness every
         spring. A restart mid-refill costs at most one dismissible alarm.
         """
-        from datetime import datetime, timezone
         self._winterize_cleared_at[circuit] = datetime.now(timezone.utc)
 
     def winterize_grace_active(self, circuit: str) -> bool:
         """True while ``circuit`` is inside its post-winterization grace."""
-        from datetime import datetime, timezone
-        from .database import WINTERIZE_UNSET_GRACE_S
         ts = self._winterize_cleared_at.get(circuit)
         if ts is None:
             return False
@@ -1569,7 +1571,6 @@ class Orchestrator:
         Handed to EventDetector as a getter (it has no connection of its own),
         alongside the sensitivity / pump-gate / low-pressure getters.
         """
-        from .database import is_circuit_winterized
         return is_circuit_winterized(self._db, circuit)
 
     def _get_sensitivity(self, circuit: str) -> dict:
@@ -1635,7 +1636,6 @@ class Orchestrator:
         # has their choice silently overwritten by HA's default. Not
         # exemption-class: the write is a value-set, not monotonic, so an
         # interleaved write can change the right outcome.
-        from .database import run_db
         from .units import defaults_from_ha, invalidate_unit_cache
         if not await run_db(self._display_units_are_default_sync):
             return
@@ -1714,8 +1714,6 @@ class Orchestrator:
         when the stored zone already matches, so the caller can skip its log
         line; otherwise the rebuild's result dict.
         """
-        from .database import (get_home_profile, rebuild_daily_summaries,
-                               update_home_profile)
         profile = get_home_profile(self._db)
         stored = (dict(profile or {}) or {}).get("daily_summary_tz")
         if stored == tz_name:
@@ -1738,7 +1736,6 @@ class Orchestrator:
         the add-on did not produce. Everything else compares our numbers with
         our other numbers, which cannot notice the detector going quiet.
         """
-        import asyncio
         from .volume_drift import check_yesterdays_drift
 
         # Stagger past the pruner's 03:00 nightly so two heavy jobs do not
@@ -1780,7 +1777,6 @@ class Orchestrator:
             # rebuild, and inside a single callable (one callable, one
             # transaction) it cannot. None means the stored zone already matches
             # and nothing was done.
-            from .database import run_db
             res = await run_db(self._resync_boundary_sync, tz_name)
             if res is None:
                 return
@@ -1801,7 +1797,6 @@ class Orchestrator:
         cluster rebuild (their supervised chain starts at +240 s; this completes
         in seconds for ~6k rows).
         """
-        from .database import backfill_time_features_tz, run_db
         try:
             res = await run_db(backfill_time_features_tz, self._db, tz_name)
             if res.get("rewritten"):
@@ -1856,7 +1851,6 @@ class Orchestrator:
         period_ts keys are the UTC equivalent of local midnight, stored as naive
         ISO strings, matching the keys produced by compute_ha_daily/weekly_volume.
         """
-        from datetime import datetime, timezone, timedelta
 
         today_midnight_ts   = self._local_midnight_utc(days_ago=0)
         seven_days_ago_ts   = self._local_midnight_utc(days_ago=7)
@@ -1897,7 +1891,6 @@ class Orchestrator:
                 # a forced rollover always re-derive from HA history.
                 # Hop 1 of a two-hop handler (the HA history
                 # fetch below is the non-DB await).
-                from .database import run_db
                 if not await run_db(self._volume_baseline_needs_fix_sync,
                                     circuit, period_ts, force):
                     continue   # already set to a real value
@@ -1995,7 +1988,6 @@ class Orchestrator:
         Invalid or unparsable existing values are logged and overwritten;
         naive datetimes are treated as UTC for the diff log.
         """
-        from .database import get_leak_test_schedule, run_db
 
         for circuit_cfg in self._cfg.circuits:
             circuit = circuit_cfg.circuit
@@ -2047,9 +2039,6 @@ class Orchestrator:
         state now all describe the same instant rather than whatever each
         separate touch happened to see.
         """
-        from .database import (compute_ha_daily_volume,
-                               compute_ha_weekly_volume, get_daily_volume,
-                               get_weekly_volume)
         from .units import load_unit_context
         if ha_volume_total is not None and ha_volume_total >= 0:
             volume_daily = compute_ha_daily_volume(
@@ -2131,7 +2120,6 @@ class Orchestrator:
         # are all reads and all independent of the HA state fetch above; done
         # separately they are nine event-loop-thread touches on a dashboard poll
         # that runs for every circuit on a timer.
-        from .database import run_db
         dbst = await run_db(self._live_state_db_sync, circuit,
                             ha_volume_total, today_ts, week_ts)
         volume_daily  = dbst["volume_daily"]
@@ -2244,7 +2232,6 @@ class Orchestrator:
     def _valve_type_for(self, circuit: str) -> str:
         """Return the current valve_type for a circuit (forgiving)."""
         try:
-            from .database import get_valve_type
             return get_valve_type(self._db, circuit)
         except Exception as e:
             log.warning("[%s] valve_type lookup failed: %s", circuit, e)
@@ -2334,7 +2321,6 @@ class Orchestrator:
         # Wait ~30s after startup so the rest of the boot sequence finishes
         # before the first purge runs.
         await asyncio.sleep(30)
-        from .database import run_db
         while not self._stop.is_set():
             try:
                 cutoff = (datetime.now(timezone.utc)

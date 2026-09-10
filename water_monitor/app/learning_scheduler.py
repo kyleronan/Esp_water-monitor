@@ -20,6 +20,8 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from .config import DATA_DIR
+from .database import finish_job, get_write_lock, run_db, start_job
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +67,6 @@ class LearningScheduler:
                 await asyncio.sleep(_ON_ERROR_S)
 
     async def _health_pass(self) -> None:
-        from .database import get_write_lock, run_db
         from .health_job import run_nightly
         for circ in self._cfg.circuits:
             if self._stop.is_set():
@@ -104,7 +105,6 @@ class LearningScheduler:
         which is something the operator should be able to see.
         """
         from . import tinymodel as tm
-        from .database import run_db
         from .learning_loop import weekly_retrain_recorded
 
         today = datetime.now(timezone.utc).strftime("%G-W%V")
@@ -147,8 +147,6 @@ class LearningScheduler:
         says which happened.
         """
         from . import tinymodel as tm
-        from .config import DATA_DIR
-        from .database import finish_job, get_write_lock, run_db, start_job
         from .learning_loop import (STALL_STREAK, activate_pending_benchmark,
                                     benchmark_ids_for_circuit, learning_status,
                                     maybe_auto_pin_benchmark,

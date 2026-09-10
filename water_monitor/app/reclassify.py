@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from . import database as _db
+from .config import pump_gates_active as _pga
 
 # Same channel as before the split — see the module docstring.
 log = _db.log
@@ -698,7 +699,6 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
             new_group = dishwasher_ids[r["id"]][1]
         else:
             feats = {f: r[f] for f in qfeats}
-            from .config import pump_gates_active as _pga
             try:
                 _pump = _pga(conn, circuit)
             except Exception:

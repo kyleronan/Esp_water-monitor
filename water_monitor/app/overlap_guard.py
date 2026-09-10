@@ -52,6 +52,11 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from .database import (
+    apply_effective_volume,
+    compute_daily_summary,
+    local_day_of,
+    mark_daily_summary_dirty)
 
 log = logging.getLogger(__name__)
 
@@ -250,8 +255,6 @@ def _refresh_daily_summary(conn: sqlite3.Connection, circuit: str,
     contract — a summary refresh may not break a de-duplication that has already
     written the ledger.
     """
-    from .database import (compute_daily_summary, local_day_of,
-                           mark_daily_summary_dirty)
     day = local_day_of(start_ts)
     if not day:
         return
@@ -269,7 +272,6 @@ def resolve_group(conn: sqlite3.Connection, group: List[dict],
     """Apply the resolution policy to one overlap group. Returns counters.
     Idempotent: an already-zeroed wrapper (mrr='overlap_duplicate') is a
     no-op, and audit rows are INSERT OR IGNORE on the wrapper id."""
-    from .database import apply_effective_volume
     stats = {"wrappers_zeroed": 0, "flag_only": 0, "ambiguous": 0,
              "partial_remainder": 0, "litres_recovered": 0.0}
     spans = {r["id"]: _span(r) for r in group}
@@ -487,7 +489,6 @@ def release_verdict_pin(conn: sqlite3.Connection, row: dict, *,
     cross-talk, dribble …) is left exactly as that detector decided — only the
     pin columns are cleared. The wrapper's live audit rows are marked stale with
     ``reason`` (MARK, never delete — provenance)."""
-    from .database import apply_effective_volume
     ours = row.get("match_rejection_reason") == OVERLAP_DUPLICATE_REASON
     raw = float(row.get("volume_litres") or 0.0)
     if ours:

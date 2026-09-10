@@ -39,7 +39,16 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from ..auth import require_admin
 from ..config import DATA_DIR, DB_PATH
-from ..database import get_data_retention
+from ..database import (
+    dedup_events,
+    get_data_retention,
+    get_incomplete_reseed,
+    get_write_lock,
+    load_circuit_labels,
+    load_circuit_labels as _load_labels,
+    normalize_events_utc,
+    run_db,
+    upsert_circuit_label)
 from ..restore_utils import (
     normalize_restore_row as _normalize_row,
     safe_insert_rows as _safe_insert,
@@ -316,8 +325,6 @@ async def export_study_snapshot(request: Request):
       * an in-flight rebuild — same problem, minutes long, and the operator
         gets no explanation for the wait.
     """
-    from ..config import DB_PATH
-    from ..database import get_write_lock
     from ..db_migrations import _CURRENT_VERSION
 
     orch = _orch(request)
@@ -336,7 +343,6 @@ async def export_study_snapshot(request: Request):
     rebuilding = lock.locked()
     if not rebuilding:
         try:
-            from ..database import get_incomplete_reseed, run_db
             for c in orch._cfg.circuits:
                 if await run_db(get_incomplete_reseed, orch.db, c.circuit):
                     rebuilding = True
@@ -373,7 +379,7 @@ def _addon_version() -> str:
     """Best-effort add-on version for the manifest (same source as the boot
     log line, 46g)."""
     try:
-        from ..event_detector import _read_addon_version
+        from ..event_detector_core import _read_addon_version
         return _read_addon_version() or "unknown"
     except Exception:                   # noqa: BLE001
         return "unknown"
@@ -409,7 +415,6 @@ async def export_quick_restore(request: Request):
             tables[tbl] = []
 
     # Include circuit labels so custom display names survive a restore
-    from ..database import load_circuit_labels
     circuit_labels = load_circuit_labels(db)
 
     payload = {
@@ -519,7 +524,6 @@ async def export_full(request: Request):
                 log.warning("Full export quick-restore %s: %s", tbl, e)
                 qr_tables[tbl] = []
 
-        from ..database import load_circuit_labels as _load_labels
         _circuit_labels = _load_labels(db)
         qr_payload = {
             "backup_type":  "quick_restore",
@@ -762,7 +766,6 @@ async def import_share_archive(
         # The whole merge — including its single `with orch.db:` transaction —
         # runs in ONE run_db callable, so no foreign statement can land inside
         # the open transaction.
-        from ..database import run_db
         return await run_db(_merge_archive_from_path, orch, tmp_path,
                             labels_only)
     finally:
@@ -869,7 +872,6 @@ async def import_quick_restore(
         # but different offset strings (+00:00 vs -06:00) collapse correctly.
         if "events" in restore:
             try:
-                from ..database import normalize_events_utc, dedup_events
                 normalize_events_utc(db)
                 removed = dedup_events(db)
                 if removed:
@@ -882,7 +884,6 @@ async def import_quick_restore(
         # Restore circuit display labels from backup, or seed defaults for old
         # backups.
         try:
-            from ..database import load_circuit_labels, upsert_circuit_label
             circuit_entries = payload.get("circuits", [])
             if circuit_entries:
                 for entry in circuit_entries:
@@ -906,7 +907,6 @@ async def import_quick_restore(
                         "(non-fatal): %s", e)
         return imported
 
-    from ..database import run_db
     try:
         imported = await run_db(_restore_sync)
     except Exception as e:
@@ -987,7 +987,6 @@ async def import_history_archive(
         # The whole merge — including its single `with orch.db:` transaction —
         # runs in ONE run_db callable, so no foreign statement can land inside
         # the open transaction.
-        from ..database import run_db
         return await run_db(_merge_archive_from_path, orch, tmp_path,
                             labels_only)
     finally:
@@ -1127,7 +1126,7 @@ def _merge_archive_from_path(orch, db_path: Path,
         if not errors:
             try:
                 from ..feature_extractor import reprocess_event_exclusion_verdicts
-                from ..database import reclassify_all_events_from_signatures
+                from ..reclassify import reclassify_all_events_from_signatures
                 vres = reprocess_event_exclusion_verdicts(orch.db)
                 matched = cleared = 0
                 for crow in orch.db.execute(
@@ -1173,7 +1172,6 @@ async def backup_page(request: Request):
 
     all_tables = list(dict.fromkeys(
         QUICK_RESTORE_TABLES + QUICK_RESTORE_RECENT + HISTORY_ARCHIVE_TABLES))
-    from ..database import run_db
     # One COUNT(*) per table — off the loop thread.
     counts = await run_db(_row_counts, db, all_tables)
 

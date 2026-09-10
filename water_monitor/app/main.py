@@ -28,12 +28,15 @@ from .auth import (
     issue_csrf_token,
     role_for_request,
 )
-from .config import load_config
+from .config import DB_PATH, load_config
 from .database import (
+    _code_fingerprint,
     get_or_create_csrf_server_secret,
+    get_registration_curve,
+    init_db,
     record_seen_user,
-    run_isolated_write,
-)
+    run_db,
+    run_isolated_write)
 
 # Ingress IP guard — only accept requests from the HA supervisor ingress proxy.
 # Override via env vars for non-standard deployments and local/pytest runs.
@@ -260,7 +263,6 @@ async def lifespan(app: FastAPI):
         # change actually deploy?" is unanswerable from the log. Same value the
         # verdict stamp uses, so a changed fingerprint here also explains why
         # that boot re-derived every label.
-        from .database import _code_fingerprint
         _build += f" build:{_code_fingerprint()[:8]}"
     except Exception:
         _build = "version unknown"
@@ -311,8 +313,6 @@ async def lifespan(app: FastAPI):
     # own connection (self._db) which is the one used by all components.
     # Leaving this first connection open leaks a SQLite handle and holds
     # a shared lock that can interfere with WAL checkpointing.
-    from .database import init_db
-    from .config import DB_PATH
     _db = init_db(DB_PATH)
     try:
         run_migrations(_db, db_path=DB_PATH)
@@ -332,7 +332,6 @@ async def lifespan(app: FastAPI):
         # code-constant fallback is byte-identical to seeded v1, so a load
         # failure changes nothing.
         try:
-            from .database import get_registration_curve
             from . import flow_integral
             _ver, _bands, _status = get_registration_curve(_db)
             if _bands:
@@ -366,7 +365,6 @@ async def lifespan(app: FastAPI):
     # the sentinel is applied here, at the display edge.
     _asset_ver = _read_addon_version() or "dev"
     try:
-        from .database import _code_fingerprint
         app.state.asset_version = f"{_asset_ver}-{_code_fingerprint()[:8]}"
     except Exception:                       # noqa: BLE001 — never block boot
         app.state.asset_version = _asset_ver
@@ -519,7 +517,6 @@ async def ingress_middleware(request: Request, call_next):
         # event-loop thread on whichever request happens to be first — so it
         # goes over the wall like every other DB touch. The app-state cache
         # above means this costs one hop on that first request only.
-        from .database import run_db
         server_secret = await run_db(get_or_create_csrf_server_secret, orch.db)
         request.app.state.csrf_server_secret = server_secret
 
@@ -561,7 +558,6 @@ async def ingress_middleware(request: Request, call_next):
 
             async def _log_seen_user(u: str, name: str) -> None:
                 try:
-                    from .config import DB_PATH
                     await run_isolated_write(
                         DB_PATH, lambda c: record_seen_user(c, u, name))
                 except Exception:

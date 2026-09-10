@@ -6,6 +6,7 @@ normalization behaviour on import.
 from __future__ import annotations
 
 import logging
+from .database import load_circuit_labels, upsert_circuit_label
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +61,6 @@ def restore_circuit_labels(db, payload: dict, commit: bool = True) -> None:
     If the payload has no 'circuits' key (legacy backup format), seeds
     default labels only when the circuit_labels table is empty.
     """
-    from .database import load_circuit_labels, upsert_circuit_label
     circuit_entries = payload.get("circuits", [])
     if circuit_entries:
         for entry in circuit_entries:

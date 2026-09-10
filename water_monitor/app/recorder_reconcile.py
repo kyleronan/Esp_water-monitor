@@ -26,6 +26,14 @@ import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from .database import (
+    apply_effective_volume,
+    finish_job,
+    get_reconcile_state,
+    get_sensitivity_config,
+    run_isolated_write,
+    set_reconcile_state,
+    start_job)
 
 log = logging.getLogger(__name__)
 
@@ -106,7 +114,6 @@ async def reconcile_circuit_volumes(db_path: str, ha: Any, cfg: Any, circuit: st
     floor = now - timedelta(hours=SETTLE_HORIZON_H)
 
     # 1. Read the checkpoint + the settled-window events + the auto toggle (short read).
-    from .database import get_reconcile_state, get_sensitivity_config
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -160,8 +167,6 @@ async def reconcile_circuit_volumes(db_path: str, ha: Any, cfg: Any, circuit: st
 
     # 4. Apply under the write lock: store the recorder value always; correct (auto) or
     #    just count (flag) the significant divergences; advance the checkpoint.
-    from .database import (run_isolated_write, apply_effective_volume,
-                           set_reconcile_state, start_job, finish_job)
     win_end_iso = win_end.isoformat()
     name = getattr(circuit_cfg, "label", circuit) or circuit
 
@@ -226,7 +231,6 @@ def apply_flagged_backlog(conn: sqlite3.Connection, circuit: str) -> Dict[str, i
     have a stored ``volume_recorder_litres`` and still diverge significantly — directly
     from the stored value (no HA re-fetch, no window limit). Runs under the caller's write
     lock. Returns ``{"applied": n}``."""
-    from .database import apply_effective_volume, set_reconcile_state
     rows = conn.execute(
         "SELECT id, start_ts, COALESCE(volume_litres,0) AS vol, volume_recorder_litres rec, "
         "       volume_litres_original orig "

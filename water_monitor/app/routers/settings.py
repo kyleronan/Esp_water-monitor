@@ -10,9 +10,43 @@ from ._helpers import (coerce_float, coerce_int, ingress_redirect,
 
 from ..auth import require_admin
 from ..circuit_compat import resolve_circuit
-from ..config import SENSITIVITY_PRESETS
-from ..database import (get_data_retention, local_day_of as _local_day_of,
-                        run_db, update_data_retention)
+from ..config import (
+    compute_suggested_calibration_days,
+    DATA_DIR,
+    DEV_TOOLS,
+    invalidate_pump_mode_cache,
+    pump_mode_effective_cached,
+    PUMP_SUPPLY_TYPES,
+    SENSITIVITY_PRESETS,
+    SUPPLY_TYPES)
+from ..database import (
+    cancel_exclusion_window,
+    create_exclusion_window,
+    extend_exclusion_window,
+    finish_job,
+    get_active_exclusion_window,
+    get_alert_configs,
+    get_data_retention,
+    get_home_profile,
+    get_incomplete_reseed,
+    get_pump_regime_nights,
+    get_reconcile_state,
+    get_sensitivity_config,
+    get_valve_type,
+    get_write_lock,
+    is_circuit_winterized,
+    local_day_of as _local_day_of,
+    run_db,
+    set_alert_enabled,
+    set_circuit_type,
+    set_circuit_winterized,
+    set_valve_type,
+    start_job,
+    update_data_retention,
+    update_home_profile,
+    upsert_circuit_label,
+    upsert_sensitivity_config,
+    upsert_training_state)
 
 log = logging.getLogger(__name__)
 
@@ -98,16 +132,11 @@ async def settings_page(request: Request):
     if gated is not None:
         return gated
     orch = _orch(request)
-    from ..database import (
-    is_circuit_winterized, get_incomplete_reseed, get_reconcile_state,
-    get_home_profile, get_sensitivity_config,
-                            get_alert_configs)
     from ..device_discovery import get_device_config
 
 
 
     # Fetch configurable device entities (number + select) from HA
-    from ..database import run_db
     device_cfg = await run_db(get_device_config, orch.db)   # dev46 (46a)
     # ``or ""`` not ``get(..., "")``: device_config row 1 exists as soon as
     # discovery writes anything, and esp_device_prefix is a NULLABLE column, so
@@ -297,7 +326,6 @@ async def settings_page(request: Request):
     from ..detector_validation import load_validation_report
     from ..anomaly_baseline import MIN_N_FOR_SHUTOFF, MIN_LIVE_DAYS_FOR_SHUTOFF
     _home_tz = get_home_timezone()
-    from ..database import get_active_exclusion_window, get_valve_type
     from ..supply_regime import get_current_regime_id
 
     def _per_circuit_db():
@@ -396,7 +424,6 @@ async def settings_page(request: Request):
     from ..fixtures import (CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP,
                             ZONE_ONLY_ALERT_TYPES,
                             VALVE_TYPES, VALVE_TYPE_LABELS, VALVE_TYPE_HELP)
-    from ..config import DEV_TOOLS
     # Phase 6b: derived pump-failure floor hint (one-tap apply). Shown only
     # for pump homes with nightly data; never auto-applied.
     def _tail_db():
@@ -404,7 +431,6 @@ async def settings_page(request: Request):
         regime summary, profile and retention — in one DB-thread callable."""
         pump_floor = {"hint": None, "current": None}
         try:
-            from ..config import pump_mode_effective_cached
             if pump_mode_effective_cached(orch.db, "circuit_1")["active"]:
                 from ..pump_regime_detector import pump_floor_hint
                 pump_floor["hint"] = pump_floor_hint(orch.db)
@@ -530,8 +556,6 @@ async def profile_update(request: Request):
     else:
         build_year = None
 
-    from ..database import update_home_profile, get_home_profile
-    from ..config import SUPPLY_TYPES, PUMP_SUPPLY_TYPES
 
     # Supply type: invalid submissions fall back to the EXISTING stored value,
     # never to 'mains' — a failed validation must not silently downgrade a
@@ -573,7 +597,6 @@ async def profile_update(request: Request):
         **pump_fields,
     )
     if supply_type != prev_supply:
-        from ..config import invalidate_pump_mode_cache
         invalidate_pump_mode_cache()
         if getattr(orch, "event_detector", None):
             try:
@@ -597,7 +620,6 @@ async def pump_floor_apply(request: Request):
     hint = await run_db(pump_floor_hint, orch.db)
     if hint is None:
         return ingress_redirect(request, "/settings#profile")
-    from ..database import upsert_sensitivity_config
     # dev46 (46a): every circuit's write in one DB-thread callable.
     await run_db(lambda: [
         upsert_sensitivity_config(orch.db, c.circuit,
@@ -624,7 +646,6 @@ async def pump_banner_confirm(request: Request):
     alert arming rule may trust it), and records the ack."""
     orch = _orch(request)
     from datetime import datetime as _dt, timezone as _tzinfo
-    from ..database import update_home_profile
     await run_db(                                             # dev46 (46a)
         update_home_profile,
         orch.db,
@@ -632,7 +653,6 @@ async def pump_banner_confirm(request: Request):
         supply_type_set_at=_dt.now(_tzinfo.utc).isoformat(),
         pump_mode_ack="confirmed",
     )
-    from ..config import invalidate_pump_mode_cache
     invalidate_pump_mode_cache()
     # dev25: flip the live detector's oscillation gate immediately too.
     if getattr(orch, "event_detector", None):
@@ -654,7 +674,6 @@ async def pump_banner_dismiss(request: Request):
     without a schema change."""
     orch = _orch(request)
     from datetime import datetime as _dt, timezone as _tzinfo
-    from ..database import update_home_profile
     today = _dt.now(_tzinfo.utc).date().isoformat()
     await run_db(update_home_profile, orch.db, pump_mode_ack=f"dismissed:{today}")
     log.info("pump banner: dismissed (re-banner only if detection persists "
@@ -673,7 +692,6 @@ async def leak_banner_dismiss(request: Request):
     alert path (evaluate_leak_alert) is untouched by this.
     """
     orch = _orch(request)
-    from ..database import get_pump_regime_nights, update_home_profile
     nights = await run_db(get_pump_regime_nights, orch.db, limit=14)
     latest = next((n for n in nights if n.get("est_leak_lpd")), None)
     if latest is None:
@@ -696,7 +714,6 @@ async def supply_banner_confirm(request: Request):
     orch = _orch(request)
     from datetime import datetime as _dt, timezone as _tzinfo
     from ..supply_regime import get_current_regime
-    from ..database import run_db
 
     def _confirm():
         # dev46 (46a/N2a): read the current regime and stamp it in ONE
@@ -727,7 +744,6 @@ async def supply_banner_dismiss(request: Request):
     orch = _orch(request)
     from datetime import datetime as _dt, timezone as _tzinfo
     from ..supply_regime import get_current_regime
-    from ..database import run_db
 
     def _dismiss():
         # dev46 (46a/N2a): read + stamp + commit in one callable.
@@ -798,7 +814,6 @@ async def sensitivity_update(circuit: str, request: Request):
     circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
-    from ..database import upsert_sensitivity_config
 
     mode = form.get("mode", "simple")
     level = form.get("simple_level", "medium")
@@ -882,7 +897,6 @@ async def anomaly_update(circuit: str, request: Request):
     circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
-    from ..database import upsert_sensitivity_config
 
     level = form.get("anomaly_response", "notify")
     if level not in _ANOMALY_RESPONSE_LEVELS:
@@ -898,7 +912,6 @@ async def reconcile_update(circuit: str, request: Request):
     circuit = resolve_circuit(circuit)
     form = await request.form()
     orch = _orch(request)
-    from ..database import upsert_sensitivity_config
 
     auto = 1 if form.get("recorder_reconcile_auto") == "on" else 0
     await run_db(upsert_sensitivity_config, orch.db, circuit, recorder_reconcile_auto=auto)
@@ -939,7 +952,6 @@ async def recalibrate(circuit: str, request: Request):
         if occupants_changed:
             # Household composition changed — reset to idle so
             # start_calibration can proceed, then begin a new run
-            from ..database import upsert_training_state
             await run_db(upsert_training_state, orch.db,      # dev46 (46a)
                          circuit, state="idle", events_collected=0)
             await orch.training_manager.start_calibration(
@@ -947,7 +959,6 @@ async def recalibrate(circuit: str, request: Request):
 
     # §2.4 — confirm the (fast) recalibration trigger; the slow re-lock at the next
     # activation is tracked separately by _fit_and_lock.
-    from ..database import start_job, finish_job
     job = await run_db(start_job, orch.db, "recalibration", circuit, "Recalibration…")
     await run_db(finish_job, orch.db, job, "done",            # dev46 (46a)
                  f"{circuit}: {kind} recalibration started — new learning period")
@@ -963,7 +974,6 @@ async def dev_retrain(circuit: str, request: Request):
     the reloaded page shows the updated 'Locked …' status. The per-type
     fit/fallback is surfaced via the HA 'calibration locked' notification + log
     (kept off the JS path so a stale app.js can't break the button)."""
-    from ..config import DEV_TOOLS
     if not DEV_TOOLS:
         return JSONResponse({"error": "dev tools disabled"}, status_code=404)
     circuit = resolve_circuit(circuit)
@@ -986,7 +996,6 @@ async def dev_retrain_model(circuit: str, request: Request):
 
     Plain form POST → redirect (kept off the JS path, like ``dev_retrain``);
     the outcome is surfaced through the jobs table the UI already polls."""
-    from ..config import DEV_TOOLS
     if not DEV_TOOLS:
         return JSONResponse({"error": "dev tools disabled"}, status_code=404)
     circuit = resolve_circuit(circuit)
@@ -1013,12 +1022,9 @@ async def dev_rollback_model(circuit: str, request: Request):
     answer differently, and records the action in the decision ledger. Plain
     form POST → redirect, outcome as a toast via the jobs table, like the
     other dev buttons. Gated behind ``dev_tools``."""
-    from ..config import DEV_TOOLS
     if not DEV_TOOLS:
         return JSONResponse({"error": "dev tools disabled"}, status_code=404)
     from .. import tinymodel as tm
-    from ..config import DATA_DIR
-    from ..database import finish_job, get_write_lock, start_job
     from ..learning_loop import rollback_serving_model
 
     circuit = resolve_circuit(circuit)
@@ -1051,10 +1057,8 @@ async def dev_pin_referee_benchmark(circuit: str, request: Request):
     until the next change-over. Exempt from the health-alert gate — the
     confirm dialog names any open alert so the operator decides with eyes
     open. Outcome as a toast via the jobs table; gated behind ``dev_tools``."""
-    from ..config import DEV_TOOLS
     if not DEV_TOOLS:
         return JSONResponse({"error": "dev tools disabled"}, status_code=404)
-    from ..database import finish_job, get_write_lock, start_job
     from ..learning_loop import benchmark_ids_for_circuit, pin_benchmark_for_circuit
 
     circuit = resolve_circuit(circuit)
@@ -1100,12 +1104,10 @@ async def dev_rebuild_overlaps(circuit: str, request: Request):
     with the same backoff the label PATCH uses before the press stops. Older
     groups are reported, not touched. Toast via the jobs table; gated behind
     ``dev_tools``."""
-    from ..config import DEV_TOOLS
     if not DEV_TOOLS:
         return JSONResponse({"error": "dev tools disabled"}, status_code=404)
     import asyncio
     from datetime import datetime as _dt
-    from ..database import finish_job, start_job
     from ..overlap_guard import summarize_overlap_groups
     from ..reprocess import _SPLIT_LOOKBACK_H, reprocess_window
 
@@ -1171,11 +1173,9 @@ async def dev_import_referee_benchmark(circuit: str, request: Request):
     Accepts the document pasted into the form field or attached as a file
     (multipart form POST with ``_csrf``, like the Re-fit button), or a JSON
     body. Gated behind ``dev_tools``."""
-    from ..config import DEV_TOOLS
     if not DEV_TOOLS:
         return JSONResponse({"error": "dev tools disabled"}, status_code=404)
     import json as _json
-    from ..database import get_write_lock
     from ..learning_loop import import_referee_benchmark
 
     circuit = resolve_circuit(circuit)
@@ -1225,7 +1225,6 @@ async def dev_validate_detectors(circuit: str, request: Request):
     re-scrapes from HA to confirm the phantom / cross-talk / dribble settings behave.
     Diagnostic only — writes no thresholds. Returns the report JSON. Gated behind
     ``dev_tools``."""
-    from ..config import DEV_TOOLS
     if not DEV_TOOLS:
         return JSONResponse({"error": "dev tools disabled"}, status_code=404)
     circuit = resolve_circuit(circuit)
@@ -1244,7 +1243,6 @@ async def dev_reimport_range(circuit: str, request: Request):
     the per-event Reprocess on the History modal (both share ``reprocess_window``);
     fixes a garbled/unclosed event that absorbed a whole day. User-labelled /
     classified / ignored events are preserved. Gated behind ``dev_tools``."""
-    from ..config import DEV_TOOLS
     if not DEV_TOOLS:
         return JSONResponse({"error": "dev tools disabled"}, status_code=404)
     from datetime import datetime, timezone
@@ -1294,8 +1292,6 @@ async def suggest_days(circuit: str, request: Request):
     """Return suggested calibration days based on home profile."""
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
-    from ..database import get_home_profile
-    from ..config import compute_suggested_calibration_days
 
     profile = await run_db(get_home_profile, orch.db) or {}   # dev46 (46a)
     days, tier = compute_suggested_calibration_days(
@@ -1317,7 +1313,6 @@ async def alert_toggle(circuit: str, alert_id: str, request: Request):
     form = await request.form()
     orch = _orch(request)
     enabled = form.get("enabled") == "true"
-    from ..database import set_alert_enabled
     await run_db(set_alert_enabled, orch.db, alert_id, enabled)
     return JSONResponse({"status": "updated", "enabled": enabled})
 
@@ -1462,7 +1457,6 @@ async def retention_update(request: Request):
 
 @router.post("/retention/prune-now")
 async def retention_prune_now(request: Request):
-    from ..database import run_db
     orch = _orch(request)
     if not orch.data_pruner:
         return JSONResponse({"ok": False, "error": "Pruner not available"}, status_code=503)
@@ -1479,7 +1473,6 @@ async def reprocess_degraded_supply(request: Request):
     stored diagnostics. Used after the guard's gates are tuned so past
     verdicts (and the daily-volume totals derived from them) match the
     new policy without waiting for new traffic."""
-    from ..database import run_db
     from ..feature_extractor import reprocess_degraded_supply_verdicts
 
     orch = _orch(request)
@@ -1503,7 +1496,6 @@ async def reprocess_degraded_supply(request: Request):
 
 @router.post("/setup/unlock")
 async def setup_unlock(request: Request):
-    from ..database import update_home_profile
     from ..device_discovery import unmark_setup_complete
     orch = _orch(request)
     # Both flags: the wizard lock (_block_if_setup_complete → orch.setup_complete)
@@ -1535,7 +1527,6 @@ async def mobile_notify_update(request: Request):
     form = await request.form()
     targets = form.get("mobile_notify_targets", "").strip()
     # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
-    from ..database import run_db
 
     def _save():
         orch.db.execute(
@@ -1558,7 +1549,6 @@ async def presence_update(request: Request):
     away_state = form.get("ha_away_state", "not_home").strip()
     home_state = form.get("ha_home_state", "home").strip()
     # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
-    from ..database import run_db
 
     def _save():
         orch.db.execute("""
@@ -1590,7 +1580,6 @@ async def units_update(request: Request):
     if pressure_key not in PRESSURE_OPTIONS:
         pressure_key = "psi"
     # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
-    from ..database import run_db
 
     def _save():
         orch.db.execute(
@@ -1624,7 +1613,6 @@ async def history_events_update(request: Request):
     # dev.38 — guarded auto-split (read fresh by the periodic maturity pass).
     auto_split = 1 if form.get("auto_split_enabled") == "1" else 0
     # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
-    from ..database import run_db
 
     def _save():
         orch.db.execute(
@@ -1646,7 +1634,6 @@ async def water_softener_update(request: Request):
     The live path reads this profile FRESH per event, so the toggle takes effect
     on the next event with no restart."""
     from ..event_rules import parse_hhmm_to_minutes
-    from ..database import update_home_profile
     orch = _orch(request)
     form = await request.form()
     enabled = form.get("has_water_softener") == "1"
@@ -1690,7 +1677,6 @@ async def circuit_rename(circuit: str, request: Request):
     except ValueError as exc:
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
 
-    from ..database import upsert_circuit_label
     await run_db(upsert_circuit_label, orch.db, circuit, display_name)
     await orch.reload_circuit_labels_async()   # dev57 (2.10) — off the loop
 
@@ -1705,7 +1691,6 @@ async def circuit_type_update(circuit: str, request: Request):
     They are never deleted when switching back to 'fixture' — the UI
     simply hides them via the zone_only_alert_types template filter.
     """
-    from ..circuit_compat import resolve_circuit
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
 
@@ -1719,7 +1704,6 @@ async def circuit_type_update(circuit: str, request: Request):
     from ..fixtures import (
         normalize_circuit_type, CIRCUIT_TYPES, zone_user_selectable_types,
     )
-    from ..database import set_circuit_type
 
     raw_type = form.get("circuit_type", "").strip()
     circuit_type = normalize_circuit_type(raw_type)
@@ -1810,8 +1794,6 @@ async def circuit_winterized_update(circuit: str, request: Request):
     has no grace by design — the operator sets it BEFORE draining, so there is
     nothing yet to suppress.
     """
-    from ..circuit_compat import resolve_circuit
-    from ..database import is_circuit_winterized, set_circuit_winterized
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
 
@@ -1864,7 +1846,6 @@ async def circuit_valve_type_update(circuit: str, request: Request):
     existing leak-test schedule row is preserved so switching back to
     '2_port' resumes the prior schedule without reconfiguration.
     """
-    from ..circuit_compat import resolve_circuit
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
 
@@ -1876,7 +1857,6 @@ async def circuit_valve_type_update(circuit: str, request: Request):
 
     form = await request.form()
     from ..fixtures import parse_valve_type
-    from ..database import set_valve_type, get_valve_type
 
     raw_vt = form.get("valve_type", "").strip()
     parsed = parse_valve_type(raw_vt)
@@ -1919,7 +1899,6 @@ async def start_exclusion_window(request: Request, circuit: str):
     """Open an exclusion window so events during a plumbing flush are not
     used for fixture training.  Duration: 5–60 min (clamped server-side)."""
     circuit = resolve_circuit(circuit)
-    from ..database import create_exclusion_window
     form    = await request.form()
     # 5..60 minutes — same clamp the old code applied, now expressed
     # as one helper call so out-of-range AND malformed inputs both
@@ -1935,7 +1914,6 @@ async def start_exclusion_window(request: Request, circuit: str):
 async def cancel_exclusion_window_endpoint(request: Request, circuit: str):
     """End the active exclusion window immediately."""
     circuit = resolve_circuit(circuit)
-    from ..database import cancel_exclusion_window
     await run_db(cancel_exclusion_window, _orch(request).db, circuit)
     log.info("[%s] exclusion window cancelled", circuit)
     return ingress_redirect(request, "/settings#maintenance")
@@ -1945,7 +1923,6 @@ async def cancel_exclusion_window_endpoint(request: Request, circuit: str):
 async def extend_exclusion_window_endpoint(request: Request, circuit: str):
     """Add 15 minutes to the active exclusion window (capped at 60 min from start)."""
     circuit = resolve_circuit(circuit)
-    from ..database import extend_exclusion_window
     await run_db(extend_exclusion_window, _orch(request).db, circuit, extra_minutes=15)
     log.info("[%s] exclusion window extended +15 min", circuit)
     return ingress_redirect(request, "/settings#maintenance")
@@ -1955,7 +1932,6 @@ async def extend_exclusion_window_endpoint(request: Request, circuit: str):
 async def units_detect(request: Request):
     """Query HA unit system and return the suggested unit keys."""
     from ..units import defaults_from_ha
-    from fastapi.responses import JSONResponse
     orch = _orch(request)
     try:
         ha_units = await orch.ha.get_ha_unit_system()

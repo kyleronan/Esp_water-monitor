@@ -21,10 +21,19 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from .config import AddonConfig, compute_minimum_events
-from .database import (get_training_state, upsert_training_state,
-                       get_home_profile, ensure_circuit_defaults,
-                       get_circuit_type, get_event_cadence_seconds, run_db)
+from .config import AddonConfig, compute_minimum_events, DB_PATH
+from .database import (
+    ensure_circuit_defaults,
+    finish_job,
+    get_circuit_type,
+    get_event_cadence_seconds,
+    get_home_profile,
+    get_training_state,
+    run_db,
+    run_isolated_write,
+    start_job,
+    upsert_learning_config,
+    upsert_training_state)
 from .ha_client import HaClient
 
 log = logging.getLogger(__name__)
@@ -187,7 +196,6 @@ class TrainingManager:
         ONLY on success: a crash mid-replay leaves it stamped, and the boot /
         post-rebuild health checks warn loudly that the model is untrusted
         until a rerun succeeds. Best-effort — older schemas lack the column."""
-        from datetime import datetime, timezone
         try:
             self._db.execute(
                 "UPDATE training_state SET reseed_in_progress = ? "
@@ -413,7 +421,7 @@ class TrainingManager:
         across this executor thread raises SQLITE_MISUSE ("bad parameter or other API
         misuse") and silently skips the post-lock reclassify + anomaly rescore."""
         from .rule_calibration import fit_and_freeze
-        from .database import reclassify_all_events_from_signatures
+        from .reclassify import reclassify_all_events_from_signatures
         # Regime-aware: fit the bands for the CURRENT supply regime (falls back
         # to the legacy whole-history fit / regime_id 0 when none is recorded).
         try:
@@ -467,8 +475,6 @@ class TrainingManager:
         return report
 
     async def _fit_and_lock(self, circuit: str, source: str) -> Dict[str, Any]:
-        from .config import DB_PATH
-        from .database import start_job, finish_job, run_isolated_write
         circuit_cfg = self._cfg.get_circuit(circuit)
         label = circuit_cfg.label if circuit_cfg else circuit
         # Track the (slow) re-lock so the UI can toast its success/failure.
@@ -750,7 +756,6 @@ class TrainingManager:
         fixture signatures. Resets the training state to idle and starts a
         new accelerated adaptation window.
         """
-        from .database import upsert_learning_config
         now = datetime.now(timezone.utc)
         accel_until = (now + timedelta(days=14)).isoformat()
         await run_db(

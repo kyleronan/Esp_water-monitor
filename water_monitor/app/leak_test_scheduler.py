@@ -22,9 +22,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from datetime import tzinfo
 
-from .config import AddonConfig
-from .database import (get_leak_test_schedule, upsert_leak_test_schedule,
-                       insert_leak_test_history, get_leak_test_history, run_db)
+from .config import AddonConfig, pump_gates_active
+from .database import (
+    get_home_profile,
+    get_leak_test_history,
+    get_leak_test_schedule,
+    get_valve_type,
+    insert_leak_test_history,
+    is_circuit_winterized,
+    run_db,
+    upsert_leak_test_schedule)
 from .ha_client import HaClient
 from .leak_test_refill import (POST_RESTORE_WATCH_S,
                                POST_RESTORE_DEMAND_L,
@@ -274,7 +281,6 @@ class LeakTestScheduler:
         Window = ``[regen_start − lead, regen_start + window]``; callers test a
         local minute m with ``lo <= m < hi`` (no-wrap — regen is overnight)."""
         try:
-            from .database import get_home_profile
             from .event_rules import parse_hhmm_to_minutes
             prof = get_home_profile(self._db)
             if not (prof is not None and prof["has_water_softener"]
@@ -344,7 +350,6 @@ class LeakTestScheduler:
         3-port valves silently skip scheduled checks; reading both together
         keeps that decision consistent with the row it is made against.
         """
-        from .database import get_valve_type, is_circuit_winterized
         return {"schedule": get_leak_test_schedule(self._db, circuit),
                 "valve_type": get_valve_type(self._db, circuit,
                                              default="2_port"),
@@ -430,7 +435,6 @@ class LeakTestScheduler:
             # does Python-side aggregation — offload to the single DB
             # thread (dev46 46a) so the scheduler's async loop stays
             # responsive while it runs.
-            from .database import run_db
             best_hour = await run_db(self.learn_best_hour, circuit)
             if best_hour is not None:
                 current_hour = schedule.get("run_hour") if isinstance(schedule, dict) \
@@ -459,7 +463,6 @@ class LeakTestScheduler:
         Valve type (3-port drains, so the micro test cannot apply) and the
         softener regeneration blackout window.
         """
-        from .database import get_valve_type
         try:
             blackout, unknown = self._softener_blackout_min(circuit), False
         except SoftenerBlackoutUnknown:
@@ -1058,7 +1061,6 @@ class LeakTestScheduler:
         flow there demotes to 'not_applicable' — an icemaker fill would fake
         cycling). Writes 'unavailable' on fetch failure so a blank column is
         distinguishable from "never ran"."""
-        from .config import pump_gates_active
         if not await run_db(pump_gates_active, self._db, tested_circuit):
             return
         other = next((c for c in self._cfg.circuits

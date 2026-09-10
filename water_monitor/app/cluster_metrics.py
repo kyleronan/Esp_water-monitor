@@ -21,6 +21,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from .config import AddonConfig
+from .database import run_db
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +49,6 @@ class ClusterMetrics:
             except asyncio.TimeoutError:
                 pass
 
-            from .database import run_db
             for circuit_cfg in self._cfg.circuits:
                 try:
                     # DB work runs on the single DB thread.

@@ -18,6 +18,7 @@ import math
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+from .database import cycle_pulse_count_for_event, merge_clusters, run_db
 
 # `river` is a runtime dependency of ClusterEngine but not of the rest of the
 # package, and importing it eagerly pulls in scipy — ~1.3 s of import cost.
@@ -940,7 +941,6 @@ class ClusterEngine:
         # FEATURE_KEYS). Best-effort past-only online; the startup / manual batch
         # recompute fills the full ±45 min window authoritatively.
         try:
-            from .database import cycle_pulse_count_for_event
             features['cycle_pulse_count'] = float(cycle_pulse_count_for_event(
                 self._db, circuit, event.get('id'),
                 event.get('start_ts'), event.get('volume_litres'), past_only=True))
@@ -1136,7 +1136,6 @@ class ClusterEngine:
         'reseed_deferred' — the post-freeze flush. Without it, a second full
         pass re-runs every abstained row in the window.
         """
-        from .database import run_db
         conds = ["circuit = ?", "cluster_id IS NULL",
                  "excluded_from_training = 0", "end_ts IS NOT NULL"]
         params: list = [circuit]
@@ -1210,7 +1209,6 @@ class ClusterEngine:
         Returns the number of merge operations executed.  Protected by
         _merge_lock so concurrent executor threads see consistent state.
         """
-        from .database import merge_clusters
         from .fixtures import get_match_threshold
 
         with self._merge_lock:

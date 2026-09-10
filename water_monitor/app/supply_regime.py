@@ -32,6 +32,11 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from .database import (
+    is_circuit_winterized,
+    local_day_of as _local_day_of,
+    note_locked_write,
+    run_db)
 
 log = logging.getLogger(__name__)
 
@@ -424,7 +429,6 @@ def supply_banner_state(db: sqlite3.Connection,
     copy inputs. Shows while the CURRENT regime was auto-detected and the user
     has neither confirmed (recalibrated) nor dismissed it. With a ``circuit``,
     also reports which fixture types still need post-shift labels."""
-    from .database import local_day_of as _local_day_of
     regimes = get_regimes(db)
     current = next((r for r in reversed(regimes) if r["ended_at"] is None), None)
     if (current is None or current["source"] != "detected"
@@ -647,7 +651,6 @@ class SupplyRegimeTracker:
             pass
         try:
             # Bootstrap + banner read are adjacent — one hop.
-            from .database import run_db
             created, banner = await run_db(
                 self._bootstrap_and_banner_sync, circuit)
             if created:
@@ -676,7 +679,6 @@ class SupplyRegimeTracker:
             except Exception as e:
                 log.warning("supply-regime sample failed (non-fatal): %s", e)
                 if "locked" in str(e).lower():
-                    from .database import note_locked_write
                     note_locked_write("supply_regime.sampler")
             try:
                 await asyncio.wait_for(self._stop.wait(),
@@ -691,7 +693,6 @@ class SupplyRegimeTracker:
         # A winterized circuit is drained — its transducer reads
         # ~0 psi for months. Sampling that would drag the regime centre to
         # zero and then declare a "shift" the moment spring re-pressurises.
-        from .database import is_circuit_winterized
         if is_circuit_winterized(self._db, circuit):
             return
         today = datetime.now(self._ha_tz).date().isoformat()

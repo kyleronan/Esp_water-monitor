@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .event_rules import RULE_DEFAULTS
+from .database import _canonical_fixture_type as _canon, get_circuit_type
 
 log = logging.getLogger(__name__)
 
@@ -464,7 +465,6 @@ def kfold_type_accuracy(pool_rows: List[dict], explicit_rows: List[dict],
     defaults, scored on the explicit (user/training) test rows. Deterministic
     round-robin folds; a held-out row is excluded from its fold's fit. Returns
     ``{type: {"fitted": n, "frozen": n, "n": n}}`` over the per-event rule types."""
-    from .database import _canonical_fixture_type as _canon
     from .event_rules import rule_classify_event
     test = [e for e in explicit_rows
             if _canon(e.get("user_fixture_type")) in _RULE_TYPES]
@@ -518,7 +518,6 @@ def _do_no_harm(conn: sqlite3.Connection, circuit: str,
     collapses this gate was built to catch).
     """
     try:
-        from .database import get_circuit_type
         circuit_type = get_circuit_type(conn, circuit)
     except Exception:
         circuit_type = "fixture"

@@ -40,6 +40,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from .database import mark_event_leak_test_refill
 
 log = logging.getLogger(__name__)
 
@@ -129,7 +130,6 @@ def reconcile_leak_test_refills(
 
     Returns ``{"tagged": n, "tests_scanned": n}``.
     """
-    from .database import mark_event_leak_test_refill
 
     if not _has_column(conn, "events", "leak_test_id"):
         return {"tagged": 0, "tests_scanned": 0}   # pre-20260570 schema

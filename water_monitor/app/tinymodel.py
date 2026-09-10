@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import burst_features as bf
+from .config import DATA_DIR
 
 log = logging.getLogger(__name__)
 
@@ -821,7 +822,6 @@ def classify(conn, circuit: str, event_id: str, features: dict,
     """
     try:
         if data_dir is None:
-            from .config import DATA_DIR
             data_dir = str(DATA_DIR)
         art = _artifact_for(data_dir, circuit)
         if art is None:

@@ -21,9 +21,14 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 from .database import (
-    get_data_retention, update_data_retention, compute_daily_summary,
-    local_day_of, local_day_bounds_utc,
-)
+    _home_tz,
+    compute_daily_summary,
+    drain_daily_summary_dirty,
+    get_data_retention,
+    local_day_bounds_utc,
+    local_day_of,
+    run_db,
+    update_data_retention)
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +86,6 @@ class DataPruner:
         offloaded to the single DB thread via run_db so the rest
         of the addon stays responsive to ingress requests.
         """
-        from .database import run_db
         await run_db(self._startup_backfill_sync)
 
         # The wait is INSIDE the loop, and re-derives 03:00 from the wall clock
@@ -131,7 +135,6 @@ class DataPruner:
         """Async wrapper kept for any external callers that expect the
         original signature. Delegates to the sync variant via the single
         DB thread so the heavy work happens off the event loop."""
-        from .database import run_db
         await run_db(self._startup_backfill_sync)
 
     # ── Nightly job ─────────────────────────────────────────────────────────
@@ -373,7 +376,6 @@ class DataPruner:
         # markers written by every event write / delete carry no such limits,
         # so late imports and reprocessed history heal here.
         try:
-            from .database import drain_daily_summary_dirty
             res = drain_daily_summary_dirty(self._db)
             if res.get("recomputed"):
                 log.info("Dirty daily summaries recomputed: %d day(s)",
@@ -469,7 +471,6 @@ class DataPruner:
 
     async def _run_auto_backup(self) -> None:
         """Write a Quick Restore JSON to the filesystem if due."""
-        from .database import run_db
         cfg = await run_db(get_data_retention, self._db)
         if not cfg.get("auto_backup_enabled"):
             return
@@ -479,7 +480,6 @@ class DataPruner:
         # day on a local-time calendar and the job fires at local 03:00. West
         # of UTC the two agree at 03:00; east of UTC 03:00 local is still the
         # PREVIOUS UTC day, which fires the weekly backup a day early.
-        from .database import _home_tz
         if datetime.now(_home_tz()).weekday() != target_dow:
             return
 
@@ -575,7 +575,6 @@ class DataPruner:
         Pure and side-effect free so the DST behaviour is testable without a
         clock: pass any instant, get the instant the job should next fire.
         """
-        from .database import _home_tz          # the one home-timezone source
         tz = _home_tz()
         now_utc = now_utc or datetime.now(timezone.utc)
         if now_utc.tzinfo is None:

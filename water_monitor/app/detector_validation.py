@@ -24,6 +24,7 @@ import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from .database import run_db
 
 log = logging.getLogger(__name__)
 
@@ -516,7 +517,6 @@ async def run_detector_validation(db: sqlite3.Connection, ha: Any, cfg: Any,
     # is DIAGNOSTIC ONLY (it never writes a threshold), and the report it
     # stores describes the history window it just read, so nothing an
     # interleaved write could change makes the stored report wrong.
-    from .database import run_db
     report = await run_db(
         _validate_and_persist_sync, db, circuit, flow_histories,
         (start, end), getattr(circuit_cfg, "min_flow_lpm", MIN_FLOW_LPM),

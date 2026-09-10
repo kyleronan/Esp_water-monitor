@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, Optional
+from .database import is_circuit_winterized, run_db, set_reconcile_state
 
 log = logging.getLogger(__name__)
 
@@ -118,7 +119,6 @@ async def check_yesterdays_drift(orch, circuit: str) -> Dict[str, Any]:
     Yesterday, not today: a complete HA-local day (the boundary every other
     total uses), so a draw still in progress cannot read as drift.
     """
-    from .database import is_circuit_winterized, run_db, set_reconcile_state
 
     cfg = orch._cfg.get_circuit(circuit)
     if cfg is None or not getattr(cfg, "volume_sensor", None):

@@ -53,6 +53,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from .config import DB_PATH
+from .database import run_db, run_isolated_write
 
 log = logging.getLogger(__name__)
 
@@ -422,7 +423,6 @@ class WfRepairBackfill:
         # features.
         affected: set = set()
         try:
-            from .database import run_isolated_write
             res = await run_isolated_write(self._db_path,
                                            repair_misattached_waveforms)
             if res.get("misattached"):
@@ -432,7 +432,6 @@ class WfRepairBackfill:
 
         if _SHARED_CAPTURE_SWEEP_ENABLED:
             try:
-                from .database import run_isolated_write
                 res2 = await run_isolated_write(self._db_path,
                                                 repair_shared_captures)
                 if res2.get("losers"):
@@ -458,7 +457,6 @@ class WfRepairBackfill:
 
     async def _replay_clusters(self, circuits) -> None:
         """Rebuild in-memory cluster state so it stops carrying the outliers."""
-        from .database import run_db
         for circuit in circuits:
             if self._stop.is_set():
                 return

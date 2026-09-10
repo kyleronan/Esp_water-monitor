@@ -26,6 +26,7 @@ import asyncio
 import logging
 import sqlite3
 from typing import Dict, List, Optional
+from .database import run_db
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +55,6 @@ class PresenceWatcher:
         orchestrator's boot sequence, which shares the loop with request
         handlers already submitting to the DB worker.
         """
-        from .database import run_db
         profile = await run_db(self._load_profile)
         if not profile:
             return
@@ -76,7 +76,6 @@ class PresenceWatcher:
         Called once at startup — read current entity states from HA and
         immediately sync away mode without waiting for a state_changed event.
         """
-        from .database import run_db
         profile = await run_db(self._load_profile)
         if not profile:
             return
@@ -105,7 +104,6 @@ class PresenceWatcher:
         may be mid-statement on it raises ``InterfaceError: bad parameter or
         other API misuse``; see the header of database.py.
         """
-        from .database import run_db
         profile = await run_db(self._load_profile)
         if not profile:
             return
@@ -150,7 +148,6 @@ class PresenceWatcher:
         callback is sync and on the loop, so it cannot.
         """
         if profile is None:
-            from .database import run_db
             profile = await run_db(self._load_profile)
         if not profile:
             return

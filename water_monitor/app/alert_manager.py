@@ -24,6 +24,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, NamedTuple, Optional
+from .database import run_db
 
 log = logging.getLogger(__name__)
 
@@ -188,7 +189,6 @@ class AlertManager:
         and hand it over, so the alert makes one run_db hop rather than two.
         Omitted → fetched here.
         """
-        from .database import run_db
         if prep is None:
             prep = await run_db(self._fire_prep_sync, circuit, alert_type)
 
@@ -378,7 +378,6 @@ class AlertManager:
             # Idempotent single-column set, so nothing here needs a state
             # re-check: it only ever sets the flag to 1, and a concurrent writer
             # cannot make that wrong.
-            from .database import run_db
             try:
                 await run_db(self._stamp_triggered_alert_sync, event_id)
             except Exception as e:  # noqa: BLE001 — audit write is non-critical
@@ -421,7 +420,6 @@ class AlertManager:
                                         circuit_name: str,
                                         pump_active: bool) -> None:
         """Sustained low pressure while a zone is flowing."""
-        from .database import run_db
         from .units import convert_pressure
         _prep = await run_db(self._fire_prep_sync, circuit, "low_pressure_supply")
         uc = _prep["unit_context"]
@@ -443,7 +441,6 @@ class AlertManager:
         """Pressure sustained below the pump's normal band.
         kind='failure' (low/zero flow, no recharge rise) vs 'overload' (a
         maxed-out VFD serving heavy demand — NOT a dead pump)."""
-        from .database import run_db
         from .units import convert_pressure
         _prep = await run_db(self._fire_prep_sync, circuit, "pump_low_pressure")
         uc = _prep["unit_context"]
@@ -474,7 +471,6 @@ class AlertManager:
         by standing user decision (never shutoff: the leak is below both home
         meters' floors, so the firmware cannot corroborate). The copy teaches
         the valve bisect that located the 2026-07 zone-valve leak."""
-        from .database import run_db
         _prep = await run_db(self._fire_prep_sync, circuit, "pump_leak")
         uc = _prep["unit_context"]
         gal = lpd / 3.785
@@ -505,7 +501,6 @@ class AlertManager:
         change, municipal shift). Transition-only by construction — fired once
         when the tracker opens the new regime. Informational: nothing changes
         until the user confirms the dashboard banner's recalibration."""
-        from .database import run_db
         from .units import convert_pressure
         _prep = await run_db(self._fire_prep_sync, circuit, "supply_regime_shift")
         uc = _prep["unit_context"]
@@ -530,7 +525,6 @@ class AlertManager:
     async def alert_leak_test_failed(self, circuit: str,
                                       pressure_drop_psi: float,
                                       circuit_name: str) -> None:
-        from .database import run_db
         from .units import convert_pressure
         _prep = await run_db(self._fire_prep_sync, circuit, "leak_test")
         uc = _prep["unit_context"]
@@ -561,7 +555,6 @@ class AlertManager:
         # Fetched BEFORE the notify await so this method makes one hop; a
         # stale-by-one-notification target list is not a correctness concern
         # (a user changing targets mid-notify takes effect on the next alert).
-        from .database import run_db
         targets = await run_db(self._mobile_targets)
         await self._ha.notify(
             title="🏖 Away mode activated — Water Monitor",

@@ -10,6 +10,23 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from ._helpers import ingress_redirect, startup_gate
 from ..circuit_compat import resolve_circuit
+from ..config import DATA_DIR, DB_PATH, DEV_TOOLS
+from ..database import (
+    cleanup_composite_flags,
+    coalesce_low_flow_events,
+    find_orphaned_cluster_references,
+    get_active_exclusion_window,
+    get_all_cluster_stats,
+    get_category_rollup,
+    get_clusters_with_fixtures,
+    get_orphaned_fixtures,
+    get_write_lock,
+    recompute_all_user_label_suggestions,
+    recompute_cycle_pulse_counts,
+    resuggest_all_clusters,
+    run_db,
+    run_isolated_write,
+    snapshot_database)
 
 log = logging.getLogger(__name__)
 
@@ -94,7 +111,6 @@ async def fixtures_page(request: Request, preview: bool = False):
     # wall in ONE hop: per-circuit rollups, publish maps, exclusion windows,
     # orphan lists and the stale-link count. Run inline on the event loop they
     # contend with the DB worker statement by statement.
-    from ..database import run_db
     circuits_ctx, stale_link_count, health_ctx = await run_db(
         _fixtures_page_payload, orch, range_start_utc)
 
@@ -113,7 +129,6 @@ async def fixtures_page(request: Request, preview: bool = False):
 
 
 def _dev_tools_enabled() -> bool:
-    from ..config import DEV_TOOLS
     return bool(DEV_TOOLS)
 
 
@@ -124,8 +139,6 @@ def _fixtures_page_payload(orch, range_start_utc):
     the handler so no statement runs on the event-loop thread; the health and
     review reads ride the SAME hop for the same reason.
     """
-    from ..database import (get_active_exclusion_window, get_category_rollup,
-                            get_orphaned_fixtures)
     from ..fixtures import (FIXTURE_TYPE_LABELS,
                             fixture_user_selectable_types,
                             normalize_fixture_type_for_circuit,
@@ -236,7 +249,6 @@ def _fixtures_page_payload(orch, range_start_utc):
             # ledger. Best-effort like everything else here; absent on a home
             # with no decision on record.
             try:
-                from ..config import DATA_DIR
                 from ..learning_loop import learning_status
                 st = learning_status(orch.db, cid, str(DATA_DIR))
                 if st.get("available"):
@@ -385,7 +397,6 @@ async def resolve_health_alert(alert_id: int, request: Request):
         return True
 
     try:
-        from ..database import get_write_lock, run_db
         async with get_write_lock():
             ok = await run_db(_job)
     except Exception as e:                          # noqa: BLE001
@@ -416,7 +427,6 @@ async def repin_benchmark(circuit: str, request: Request):
         return ingress_redirect(request, "/fixtures?msg=error")
     circuit = resolve_circuit(circuit)
     try:
-        from ..database import get_write_lock, run_db
         async with get_write_lock():
             res = await run_db(pin_benchmark_for_circuit, orch.db, circuit,
                                trigger=trigger, source="auto",
@@ -443,7 +453,6 @@ async def dismiss_repin_benchmark(circuit: str, request: Request):
     circuit = resolve_circuit(circuit)
     from ..learning_loop import dismiss_repin_prompt
     try:
-        from ..database import get_write_lock, run_db
         async with get_write_lock():
             await run_db(dismiss_repin_prompt, orch.db, circuit, [key])
     except Exception as e:                          # noqa: BLE001
@@ -459,7 +468,6 @@ async def repair_stale_links(request: Request):
     from those events' votes) can no longer resurrect the dead ids. Without
     the rebuild, live matching re-mints stale references immediately."""
     orch = _orch(request)
-    from ..database import find_orphaned_cluster_references, get_write_lock
     engine = getattr(orch, "cluster_engine", None)
     # Refuse while the startup cluster work is still replaying: it holds a
     # pre-repair snapshot in executor threads, and whichever rebuild finishes
@@ -468,7 +476,6 @@ async def repair_stale_links(request: Request):
     if not getattr(orch, "startup_cluster_work_done", True):
         return ingress_redirect(request, "/fixtures?msg=starting")
     try:
-        from ..database import run_db
         # The write lock is async and is acquired OUTSIDE
         # run_db — never inside a callable on the single DB worker.
         async with get_write_lock():
@@ -504,7 +511,6 @@ async def retrigger_cluster(request: Request, circuit: str = Depends(_valid_circ
     if not engine:
         return ingress_redirect(request, "/fixtures?msg=error")
     try:
-        from ..database import get_write_lock, run_db
         # Serialise against recompute/reclassify/other rebuilds — all share the
         # write lock so heavy DB writers never run concurrently on the engine's
         # shared connection. The lock is held OUTSIDE run_db.
@@ -545,9 +551,7 @@ async def reclassify_circuit(request: Request, circuit: str = Depends(_valid_cir
     Idempotent and safe: never touches user-labelled rows, writes NULL on
     abstention (clearing stale matches), and never persists 'other'.
     """
-    from ..database import (reclassify_all_events_from_signatures,
-                            run_isolated_write, get_write_lock)
-    from ..config import DB_PATH
+    from ..reclassify import reclassify_all_events_from_signatures
     if get_write_lock().locked():
         return ingress_redirect(request, "/fixtures?msg=busy")
     try:
@@ -579,14 +583,7 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
     try:
         from ..volume_recompute import (build_flow_fetch,
                                          recompute_volume_and_active_flow)
-        from ..database import (reclassify_all_events_from_signatures,
-                                cleanup_composite_flags, run_isolated_write,
-                                get_write_lock, recompute_cycle_pulse_counts,
-                                resuggest_all_clusters,
-                                recompute_all_user_label_suggestions,
-                                coalesce_low_flow_events, run_db,
-                                snapshot_database)
-        from ..config import DB_PATH
+        from ..reclassify import reclassify_all_events_from_signatures
         # Reject (don't silently queue for many seconds) if another heavy DB
         # write is already running — recompute/reclassify/recluster all share
         # the write lock. Best-effort UX guard; correctness is the lock itself.
@@ -654,7 +651,6 @@ async def recompute_circuit(request: Request, circuit: str = Depends(_valid_circ
 
 @router.get("/api/{circuit}/clusters")
 async def api_clusters(request: Request, circuit: str = Depends(_valid_circuit)):
-    from ..database import get_clusters_with_fixtures, get_all_cluster_stats
     db = _orch(request).db
     all_stats = get_all_cluster_stats(db, circuit)
     clusters = [{**cl, **all_stats.get(cl["id"], {})}

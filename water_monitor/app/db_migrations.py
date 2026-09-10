@@ -17,6 +17,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from .database import (
+    apply_effective_volume,
+    dedup_events,
+    find_orphaned_cluster_references,
+    local_day_of,
+    repair_misflagged_phantom_events,
+    rezero_rows_with_zeroing_flag)
 
 log = logging.getLogger(__name__)
 
@@ -293,7 +300,6 @@ def _apply_unique_events_index(conn: sqlite3.Connection) -> None:
     """
     # Import here so the module remains importable without database.py side
     # effects during test collection.
-    from .database import dedup_events
     removed = dedup_events(conn, commit=False)
     if removed:
         log.info(
@@ -637,7 +643,6 @@ def _apply_manual_classification_columns(conn: sqlite3.Connection) -> None:
                  (("user_classified", "INTEGER DEFAULT 0"),))
     conn.commit()
 
-    from .database import repair_misflagged_phantom_events
     result = repair_misflagged_phantom_events(conn)
     log.info(
         "Migration 20260534: manual-classification columns ready; repaired %d "
@@ -1064,7 +1069,6 @@ def _apply_phantom_suppression_averted(conn: sqlite3.Connection) -> None:
             log.info("Migration 20260551: column added; backfill skipped "
                      "(events table lacks %r)", _needed)
             return
-    from .database import apply_effective_volume
     from .feature_extractor import _PHANTOM_REVIEW_FLAG_LITRES
     rows = conn.execute(
         "SELECT id, circuit, start_ts, volume_litres FROM events "
@@ -1258,7 +1262,6 @@ def _apply_orphan_repair(conn: sqlite3.Connection) -> None:
 
     # Lazy import — keeps this module importable without database.py
     # side effects during test collection.
-    from .database import find_orphaned_cluster_references
     counts = find_orphaned_cluster_references(conn, repair=True)
     total = sum(counts.values())
     if total:
@@ -2417,7 +2420,6 @@ def _apply_training_quarantine(conn: sqlite3.Connection) -> None:
     window [2026-08-13, open) — the 07-22..08-13 outage window is deliberately
     NOT flagged here: it is sequenced for re-attribution off the reseeded
     cluster model first. Idempotent (only NULL-reason rows are stamped)."""
-    from datetime import datetime, timezone
     _add_columns(conn, "events", (("training_quarantine_reason", "TEXT"),
                                   ("training_quarantined_at",  "TEXT")))
     # The backfill reads columns older migrations add (a DB walking forward
@@ -2471,7 +2473,6 @@ def _apply_training_quarantine_sweep(conn: sqlite3.Connection) -> None:
     (database.py set_user_fixture_type) clears the column unconditionally, so
     flagged rows lift identically regardless of reason. Idempotent (only
     NULL-reason rows are stamped); labels, verdicts and volumes untouched."""
-    from datetime import datetime, timezone
     _add_columns(conn, "events", (("training_quarantine_reason", "TEXT"),
                                   ("training_quarantined_at",  "TEXT")))
     if all(_has_column(conn, "events", c) for c in
@@ -2546,7 +2547,6 @@ def _apply_dev41_conformance_ddl(conn: sqlite3.Connection) -> None:
                                                the audit inversion (E1)
 
     Additive, idempotent, tables-absent-safe."""
-    from datetime import datetime, timezone
     _add_columns(conn, "events", _DEV41_EVENT_COLUMNS, if_table_exists=True)
     _add_columns(conn, "leak_test_history", _DEV41_LEAK_TEST_COLUMNS,
                  if_table_exists=True)
@@ -3138,7 +3138,6 @@ def _apply_daily_summary_drift_markers(conn: sqlite3.Connection) -> None:
         log.info("Migration 20260813: no daily_summary yet — nothing to mark")
         return
 
-    from .database import local_day_of
 
     # Bucket events by local day, the same way compute_daily_summary does.
     totals: dict = {}
@@ -3407,7 +3406,6 @@ def _apply_verdict_pin(conn: sqlite3.Connection) -> None:
     # did not set means zero. The other eight rows' original verdicts are
     # unrecoverable (the phantom bit was overwritten); they stay as the
     # guard's own remainder (I-4: over-count-and-flag beats guessing).
-    from .database import rezero_rows_with_zeroing_flag
     try:
         repaired = rezero_rows_with_zeroing_flag(conn)
     except sqlite3.Error as e:

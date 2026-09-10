@@ -31,6 +31,21 @@ from ..device_discovery import (
     MIN_FIRMWARE_VERSION,
     PPL_ROLE,
 )
+from ..config import compute_suggested_calibration_days, SUPPLY_TYPES
+from ..database import (
+    dedup_events,
+    get_circuit_type,
+    get_home_profile,
+    get_valve_type,
+    get_write_lock,
+    normalize_events_utc,
+    run_db,
+    set_circuit_type,
+    set_valve_type,
+    transaction,
+    update_home_profile,
+    update_import_state,
+    upsert_circuit_label)
 
 log = logging.getLogger(__name__)
 # Admin-only router — with a fresh-install bootstrap carve-out: while setup is
@@ -96,7 +111,6 @@ def _block_if_setup_complete(request: Request):
 @router.get("/", response_class=HTMLResponse)  # matches /setup/
 async def setup_home(request: Request):
     orch = _orch(request)
-    from ..database import run_db
     device_cfg = await run_db(get_device_config, orch.db)
     initial_name = (
         device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
@@ -118,7 +132,6 @@ async def setup_home(request: Request):
 @router.get("/new", response_class=HTMLResponse)
 async def setup_new(request: Request):
     orch = _orch(request)
-    from ..database import run_db
     device_cfg = await run_db(get_device_config, orch.db)
     initial_name = (
         device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
@@ -144,7 +157,6 @@ async def setup_restore(request: Request):
     from ..routers.backup import (
         QUICK_RESTORE_TABLES, QUICK_RESTORE_RECENT, MAX_BACKUP_BYTES,
     )
-    from ..database import normalize_events_utc, dedup_events
     from ..restore_utils import safe_insert_rows, restore_circuit_labels
 
     orch = _orch(request)
@@ -245,7 +257,6 @@ async def setup_restore(request: Request):
     # The write lock makes this restore exclusive against the other admin
     # writes (recompute, reclassify, the backup router's own restore) — the
     # read-only export takes it, so the paths that DESTROY data must too.
-    from ..database import get_write_lock, run_db
     try:
         async with get_write_lock():
             total = await run_db(_restore_sync)
@@ -288,7 +299,6 @@ async def setup_restore(request: Request):
              len(groups_to_restore))
 
     # Pull the saved device name so step 1 pre-fills it
-    from ..database import run_db
     device_cfg   = await run_db(get_device_config, orch.db)
     initial_name = (
         device_cfg.get("esp_device_name") or orch._cfg.esp_device_name or ""
@@ -318,7 +328,6 @@ async def setup_search(
     orch = _orch(request)
 
     # Persist the searched name
-    from ..database import run_db
 
     def _save_name():
         # Write + commit in one DB-thread callable.
@@ -409,7 +418,6 @@ async def setup_discover(device_id: str, request: Request, error: str = ""):
     # so non-default circuit names (e.g. "Zone A") are recognised in tier 1.
     diag_labels = await _resolve_labels_from_diagnostics(orch.ha, entities)
     if diag_labels:
-        from ..database import run_db, upsert_circuit_label
         # N label upserts in one DB-thread callable.
         await run_db(lambda: [upsert_circuit_label(orch.db, cid, lbl)
                               for cid, lbl in diag_labels.items()])
@@ -430,7 +438,6 @@ async def setup_discover(device_id: str, request: Request, error: str = ""):
         circuit_matches=circuit_matches,
         esp_device_prefix=prefix,
     )
-    from ..database import run_db
     await run_db(save_discovery, orch.db, result)
     # save_discovery clears device_config.setup_complete. It
     # bumps the epoch itself, so the cache is already unknown; re-prime on the
@@ -453,7 +460,6 @@ async def setup_discover(device_id: str, request: Request, error: str = ""):
             for m in matches
         ]
 
-    from ..device_discovery import MIN_FIRMWARE_VERSION
     min_fw = ".".join(str(x) for x in MIN_FIRMWARE_VERSION)
 
     return _tmpl(request).TemplateResponse("setup.html", {
@@ -528,7 +534,6 @@ async def setup_confirm(device_id: str, request: Request):
                     """, (circuit, role, value.strip()))
         orch.db.commit()
 
-    from ..database import run_db
     await run_db(_save_map)
 
     # ── 2.3 unit 0.9 — the two server-side refusals ────────────────────────
@@ -588,7 +593,6 @@ def _step3b_template_context(orch, **extra):
     Pulls current values from circuit_profile so the form pre-fills
     correctly on re-render (initial load AND validation-error re-render).
     """
-    from ..database import get_circuit_type, get_valve_type
     from ..fixtures import (CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS,
                             CIRCUIT_TYPE_HELP,
                             VALVE_TYPES, VALVE_TYPE_LABELS, VALVE_TYPE_HELP)
@@ -638,8 +642,6 @@ async def setup_circuit_names_save(request: Request):
     if blocked is not None:
         return blocked
     from ..circuit_compat import validate_display_name
-    from ..database import (upsert_circuit_label, set_circuit_type,
-                            set_valve_type)
     from ..fixtures import (normalize_circuit_type, CIRCUIT_TYPES,
                             parse_valve_type)
     orch = _orch(request)
@@ -691,7 +693,6 @@ async def setup_circuit_names_save(request: Request):
     # All three setters accept commit=False, so the commit boundary is here.
     # A runtime DB error mid-chain rolls back every prior write, so a circuit
     # cannot end up with the new display_name but the old circuit_type.
-    from ..database import run_db, transaction
 
     def _save_names():
         # The whole transaction lives in ONE callable.
@@ -743,9 +744,7 @@ async def setup_circuit_names_save(request: Request):
 async def setup_units(request: Request):
     """Step 4 — choose preferred display units."""
     orch = _orch(request)
-    from ..database import get_home_profile
     from ..units import load_unit_context, FLOW_OPTIONS, PRESSURE_OPTIONS
-    from ..database import run_db
     profile, uc = await run_db(
         lambda: (dict(get_home_profile(orch.db) or {}),
                  load_unit_context(orch.db)))
@@ -776,7 +775,6 @@ async def setup_units_save(request: Request):
     pressure_key = form.get("pressure_unit", "psi")
     if flow_key     not in FLOW_OPTIONS:     flow_key     = "L/min"
     if pressure_key not in PRESSURE_OPTIONS: pressure_key = "psi"
-    from ..database import run_db
 
     def _save_units():
         # Write + commit in one DB-thread callable.
@@ -794,7 +792,6 @@ async def setup_units_save(request: Request):
 @router.get("/home", response_class=HTMLResponse)
 async def setup_home_details(request: Request):
     orch = _orch(request)
-    from ..database import get_home_profile, run_db
     profile = dict(await run_db(get_home_profile, orch.db) or {})
     return _tmpl(request).TemplateResponse("setup.html", {
         "request": request,
@@ -813,8 +810,6 @@ async def setup_home_details_save(request: Request):
     orch = _orch(request)
     form = await request.form()
 
-    from ..database import update_home_profile
-    from ..config import compute_suggested_calibration_days
 
     # Bounded coercion — out-of-range submissions (negative bathrooms,
     # occupants=0, sqft=-1, build_year=99999) fall back to the listed
@@ -824,7 +819,6 @@ async def setup_home_details_save(request: Request):
     bathrooms_half             = coerce_int(form.get("bathrooms_half"), lo=0, hi=20, default=0)
     floors                     = coerce_int(form.get("floors"),         lo=1, hi=10, default=1)
     occupants                  = coerce_int(form.get("occupants"),      lo=1, hi=30, default=2)
-    from ..config import SUPPLY_TYPES
     supply_type                = form.get("supply_type", "mains")
     if supply_type not in SUPPLY_TYPES:
         supply_type = "mains"   # wizard has no prior value to preserve
@@ -847,7 +841,6 @@ async def setup_home_details_save(request: Request):
     softener_start = (form.get("softener_regen_start") or "").strip()
     softener_circuit = (form.get("softener_circuit") or "").strip() or None
     if has_softener and parse_hhmm_to_minutes(softener_start) is None:
-        from ..database import get_home_profile, run_db
         return _tmpl(request).TemplateResponse("setup.html", {
             "request": request, "step": 5, "page": "setup",
             "profile": dict(await run_db(get_home_profile, orch.db) or {}),
@@ -857,7 +850,6 @@ async def setup_home_details_save(request: Request):
         })
 
     from datetime import datetime as _dt, timezone as _tzinfo
-    from ..database import run_db
     await run_db(
         update_home_profile,
         orch.db,
@@ -891,7 +883,6 @@ async def setup_home_details_save(request: Request):
     # checkpoint, so no events before the setup moment will ever be imported.
     if not historical_import_enabled:
         from datetime import datetime, timezone as _tz
-        from ..database import update_import_state
         now_ts = datetime.now(_tz.utc).isoformat()
         # All circuits' checkpoints in one DB-thread callable.
         await run_db(lambda: [
@@ -976,7 +967,6 @@ async def setup_home_details_save(request: Request):
 @router.get("/complete", response_class=HTMLResponse)
 async def setup_complete(request: Request):
     orch = _orch(request)
-    from ..database import run_db
     cfg = await run_db(get_device_config, orch.db)
 
     # Pick up calibration info passed as query params from the /home POST,

@@ -22,7 +22,7 @@ from ..database import (
     list_seen_users,
     load_operator_ids,
     remove_operator,
-)
+    run_db)
 from ._helpers import ingress_redirect
 
 log = logging.getLogger(__name__)
@@ -44,7 +44,6 @@ async def access_page(request: Request):
     """Render the access-management page: every known HA user with its resolved
     role and an operator toggle for non-admins."""
     orch = _orch(request)
-    from ..database import run_db
     db = orch.db
     # Every DB read on this page goes through the single DB
     # thread. The seen-users fallback below is fetched here too — one hop,
@@ -118,7 +117,6 @@ async def grant_operator(
     """Grant the operator tier (read + valve control) to a HA user."""
     orch = _orch(request)
     actor = request.headers.get(REMOTE_USER_ID_HEADER, "")
-    from ..database import run_db
 
     def _grant():
         # The write AND the allow-list reload it invalidates are
@@ -140,7 +138,6 @@ async def revoke_operator(
     """Revoke the operator tier from a HA user (they fall back to viewer)."""
     orch = _orch(request)
     actor = request.headers.get(REMOTE_USER_ID_HEADER, "")
-    from ..database import run_db
 
     def _revoke():
         # Write + allow-list reload in one DB-thread callable.

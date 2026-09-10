@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 import re
 from typing import Iterable
+from .database import derive_csrf_token, validate_csrf_token
 
 try:
     # Runtime import (NOT TYPE_CHECKING-only): FastAPI resolves the
@@ -227,7 +228,6 @@ def issue_csrf_token(server_secret: str, session_id: str,
         nonce = _secrets.token_hex(CSRF_NONCE_BYTES)
     # Reuse database.derive_csrf_token rather than re-implementing the HMAC, so
     # the two can never drift. Imported lazily to keep this module import-light.
-    from .database import derive_csrf_token
     mac = derive_csrf_token(server_secret, _csrf_message(session_id, nonce))
     return f"{nonce}{_CSRF_TOKEN_SEP}{mac}"
 
@@ -244,6 +244,5 @@ def check_csrf_token(server_secret: str, session_id: str, token: str) -> bool:
     nonce, sep, mac = token.partition(_CSRF_TOKEN_SEP)
     if not sep or not _CSRF_NONCE_RE.match(nonce) or not mac:
         return False
-    from .database import validate_csrf_token
     return validate_csrf_token(
         server_secret, _csrf_message(session_id, nonce), mac)

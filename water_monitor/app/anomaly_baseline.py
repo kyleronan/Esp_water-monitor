@@ -24,6 +24,7 @@ import math
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from .database import upsert_sensitivity_config
 
 log = logging.getLogger(__name__)
 
@@ -227,7 +228,6 @@ def restore_usage_baselines(conn: sqlite3.Connection, circuit: str,
     sens = json.loads(row["sensitivity_json"] or "{}")
     sens = {k: v for k, v in sens.items() if v is not None}
     if sens:
-        from .database import upsert_sensitivity_config
         upsert_sensitivity_config(conn, circuit, baseline_computed_at=now,
                                   **sens)
     conn.commit()
@@ -267,7 +267,6 @@ def freeze_usage_baselines(conn: sqlite3.Connection, circuit: str,
         (circuit, json.dumps(envelopes), source, now, now),
     )
     if overall:
-        from .database import upsert_sensitivity_config
         upsert_sensitivity_config(conn, circuit, baseline_computed_at=now, **overall)
     conn.commit()
     invalidate_baseline_cache(circuit)
@@ -308,7 +307,6 @@ def rescale_anomaly_percentiles(conn: sqlite3.Connection, circuit: str,
                 pass
     if not updates:
         return False
-    from .database import upsert_sensitivity_config
     upsert_sensitivity_config(conn, circuit, **updates)
     conn.commit()
     invalidate_baseline_cache(circuit)

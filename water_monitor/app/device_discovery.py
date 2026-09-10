@@ -24,6 +24,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from .database import run_db
 
 log = logging.getLogger(__name__)
 
@@ -1125,7 +1126,6 @@ async def rescan_optional_roles(
     # the registry fetch would otherwise be overwritten from stale premises.
     # merge_optional_roles needs no re-check — it never overwrites a confirmed
     # or non-empty mapping, so it is fill-only.
-    from .database import run_db
     _w = await run_db(_rescan_writes_sync, db, circuits, circuit_matches,
                       target_device, _prefix)
     prefix_updated    = _w["prefix_updated"]

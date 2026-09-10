@@ -8,10 +8,37 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from ..circuit_compat import resolve_circuit
 from ..fixtures import FIXTURE_TYPE_LABELS, user_selectable_types
-from ..database import patch_event as _patch_event
+from ..database import (
+    _CYCLE_PULSE_WINDOW_SECONDS,
+    _NOTE_KIND_SQL,
+    _parse_event_ts,
+    classify_action,
+    clear_auto_labels,
+    clear_event_classification,
+    count_not_real_events,
+    finish_job,
+    get_daily_summaries,
+    get_home_profile,
+    get_leak_test_history,
+    get_pump_regime_nights,
+    get_recent_events,
+    is_baseline_locked,
+    local_day_of,
+    note_locked_write,
+    patch_event as _patch_event,
+    propagate_cycle_label,
+    recompute_cluster_suggestion_from_user_labels,
+    revert_artifact_zeroing_on_relabel,
+    revert_irrigation_cross_talk,
+    run_db,
+    run_isolated_write,
+    set_event_classification,
+    start_job,
+    upsert_fixture_signature)
 from ..task_registry import spawn
 from ._helpers import (coerce_float, ingress_redirect, run_blocking,
                        startup_gate)
+from ..config import DB_PATH
 
 _VALID_USER_FIXTURE_TYPES: frozenset = frozenset(user_selectable_types())
 
@@ -42,9 +69,7 @@ async def _bg_reclassify(circuit: str) -> None:
     relabel after the window must not re-walk history — it spreads only to the event's
     own cycle-mates. The full reclassify runs during the training window, at startup,
     and on explicit recalibration — not on a stray label."""
-    from ..database import (reclassify_all_events_from_signatures, is_baseline_locked,
-                            run_isolated_write, start_job, finish_job)
-    from ..config import DB_PATH
+    from ..reclassify import reclassify_all_events_from_signatures
 
     def _work(c):
         if is_baseline_locked(c, circuit):
@@ -87,7 +112,6 @@ async def _patch_with_retry(db, event_id: str, circuit: str, payload: dict,
     ``locked``. Split out so the retry policy is testable without a Request.
     ``sleep`` is injectable for tests; defaults to ``asyncio.sleep``."""
     import asyncio
-    from ..database import run_db
     _sleep = sleep or asyncio.sleep
     outcome = await run_db(_patch_event_sync, db, event_id, circuit, payload)
     attempt = 0
@@ -207,8 +231,6 @@ def _filters_to_storage(raw: dict, vol_factor: float,
     storage = display / factor. Unknown fixture/note values are dropped
     (never trusted into SQL); blanks/garbage are ignored.
     """
-    from ..database import _NOTE_KIND_SQL
-    from ..fixtures import FIXTURE_TYPE_LABELS
     out: dict = {}
     dur_min = _filter_float(raw.get("dur_min"))
     dur_max = _filter_float(raw.get("dur_max"))
@@ -436,9 +458,6 @@ def _collect_circuit_history_sync(
     plain sqlite3 + dict assembly — no awaits.
     """
     import json
-    from ..database import (get_recent_events, get_leak_test_history,
-                            get_daily_summaries, get_home_profile,
-                            get_pump_regime_nights)
     from ..feature_extractor import (SIGNATURE_POINTS, _wf_resample,
                                      classify_flow_shape, classify_magnitude_tier)
     from ..units import load_unit_context
@@ -534,7 +553,6 @@ def _collect_circuit_history_sync(
         # badge keeps meaning "hidden among what you're looking at".
         hidden_not_real = 0
         if _hiding_active:
-            from ..database import count_not_real_events
             hidden_not_real = count_not_real_events(
                 db, circuit_cfg.circuit,
                 date_from=date_from or None,
@@ -742,7 +760,6 @@ def _collect_circuit_history_sync(
             # fallback has to land on the same LOCAL day boundary the real
             # summaries use, or the first-day chart disagrees with every chart
             # that follows it.
-            from ..database import local_day_of
             hv_rows = db.execute("""
                 SELECT hour_ts, volume_litres
                 FROM hourly_volume
@@ -902,7 +919,6 @@ async def event_waveform(event_id: str, request: Request):
     """
     import json as _json
     orch = _orch(request)
-    from ..database import run_db
     # dev46 (46a): waveform rows are the largest BLOBs in the schema and this
     # fires on every modal open — never query it inline from the loop thread.
     row = await run_db(
@@ -987,7 +1003,6 @@ async def events_api(
                 {"error": "bad_date",
                  "message": f"{name} must be a real date as YYYY-MM-DD"},
                 status_code=400)
-    from ..database import get_recent_events, run_db
     events = await run_db(                                    # dev46 (46a)
         get_recent_events, orch.db, circuit,
         limit=limit,
@@ -1059,8 +1074,6 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
     # only sends `classification` when the user actually changed a checkbox, so
     # labelling alone never locks it.
     if "classification" in payload:
-        from ..database import (set_event_classification,
-                                clear_event_classification, classify_action)
         action, data = classify_action(payload["classification"])
         if action == "error":
             return {"error": {"error": data["msg"]}, "status": 400}
@@ -1134,7 +1147,6 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
         # holder names itself in the log.
         import sqlite3 as _sqlite3
 
-        from ..database import note_locked_write
         try:
             found = _patch_event(db, event_id, circuit, **kwargs)
         except _sqlite3.OperationalError as e:
@@ -1163,8 +1175,6 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
     # audit-row bookkeeping on the auto-flagged irrigation rows it owns.
     if kwargs.get("user_fixture_type"):
         try:
-            from ..database import (revert_artifact_zeroing_on_relabel,
-                                    revert_irrigation_cross_talk)
             if revert_irrigation_cross_talk(db, event_id, circuit):
                 log.info("[%s] relabel to %r reverted auto cross-talk on %s",
                          circuit, kwargs["user_fixture_type"], event_id)
@@ -1181,10 +1191,6 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
     reclassify = False
     if "user_fixture_type" in payload:
         try:
-            from ..database import (
-                recompute_cluster_suggestion_from_user_labels,
-                upsert_fixture_signature,
-            )
             row = db.execute(
                 "SELECT cluster_id, excluded_from_training "
                 "FROM events WHERE id = ? AND circuit = ?",
@@ -1233,7 +1239,6 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
             # so one label seeds several. No-op for non-appliance types. Commit so
             # the cycle labels are durable + visible to the History reload and the
             # background reclassify below.
-            from ..database import propagate_cycle_label
             cycle_propagated = propagate_cycle_label(db, circuit, event_id, new_type)
             if cycle_propagated:
                 db.commit()
@@ -1277,8 +1282,6 @@ async def undo_auto_cycle_api(circuit: str, request: Request):
     `source='cycle'` label within ±45 min of it (the cycle), then refreshes the
     k-NN in the background. Never touches 'user'/'training'/legacy labels."""
     from datetime import timedelta
-    from ..database import (clear_auto_labels, _parse_event_ts,
-                            _CYCLE_PULSE_WINDOW_SECONDS)
     db = _orch(request).db
     try:
         payload = await request.json()
@@ -1325,7 +1328,6 @@ async def undo_auto_cycle_api(circuit: str, request: Request):
         return {"cleared": clear_auto_labels(db, circuit, event_ids=ids)
                 if ids else 0}
 
-    from ..database import run_db
     outcome = await run_db(_undo_sync)
     if "error" in outcome:
         return JSONResponse(outcome["error"], status_code=outcome["status"])
@@ -1358,7 +1360,6 @@ async def dismiss_leak_test(test_id: int, request: Request):
         db.commit()
         return new_val
 
-    from ..database import run_db
     new_val = await run_db(_toggle_sync)
     if new_val is None:
         return JSONResponse({"status": "error", "error": "not_found"},
@@ -1417,7 +1418,6 @@ async def reprocess_event_api(circuit: str, event_id: str, request: Request):
     """
     from datetime import timedelta, timezone
     from ..reprocess import reprocess_window
-    from ..database import _parse_event_ts
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
     db = orch.db
@@ -1431,7 +1431,6 @@ async def reprocess_event_api(circuit: str, event_id: str, request: Request):
         buffer_min = 0
     buffer_min = max(0, min(buffer_min, 240))            # clamp 0..4 h
 
-    from ..database import run_db
     row = await run_db(                                       # dev46 (46a)
         lambda: db.execute(
             "SELECT start_ts, end_ts, user_fixture_type, user_classified, "

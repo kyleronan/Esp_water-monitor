@@ -73,11 +73,16 @@ from .overlap_guard import OVERLAP_NEGLIGIBLE_L, VOLUME_COVERAGE_FRACTION
 from . import importer_periods as _periods
 from .importer_periods import _is_gap_marker, _parse_ts
 from .database import (
-    run_db, contained_stored_rows,
-    get_import_state, update_import_state,
-    get_last_event_ts, find_overlapping_event,
+    compute_daily_summary,
+    contained_stored_rows,
+    find_overlapping_event,
+    get_import_state,
+    get_last_event_ts,
+    local_day_of,
     mark_event_irrigation_cross_talk,
-)
+    note_locked_write,
+    run_db,
+    update_import_state)
 from .feature_extractor import (
     _detect_irrigation_cross_talk, _XTALK_IRR_MIN_FLOW_LPM, _XTALK_IRR_MAX_VOLUME_L,
 )
@@ -315,7 +320,6 @@ class HistoricalImporter:
                 log.error("Historical importer periodic check failed: %s", e,
                           exc_info=True)
                 if "locked" in str(e).lower():
-                    from .database import note_locked_write
                     note_locked_write("historical_importer.catch_up")
 
     def stop(self) -> None:
@@ -625,7 +629,6 @@ class HistoricalImporter:
 
     def _recompute_days_sync(self, circuit: str, days) -> None:
         """One daily-summary recompute per affected day."""
-        from .database import compute_daily_summary
         for day in days:
             compute_daily_summary(self._db, circuit, day)
         self._db.commit()
@@ -715,7 +718,6 @@ class HistoricalImporter:
                     ratio=round(pid / pmd, 3) if pmd > 0 else None,
                     recompute_summary=False):
                 flagged += 1
-                from .database import local_day_of
                 day = local_day_of(ev["start_ts"])
                 if day:
                     affected_days.add(day)
@@ -1311,26 +1313,3 @@ def _resample_step_function_1hz(
         out.append(current)
 
     return out
-
-
-# ── Moved to importer_periods ─────────────────────────────────
-# ``_parse_ts`` / ``_is_gap_marker`` are imported eagerly above because THIS
-# module's own functions call them, and a module ``__getattr__`` is not
-# consulted for a global-name lookup inside a function body (that would be a
-# NameError). The two below have no caller left here, only importers of this
-# module, so they resolve lazily.
-#
-# PEP 562, not a bottom-of-file ``from .importer_periods import``: an eager
-# re-export closes the import loop the moment the other module is imported
-# first, which is the ImportError the feature_extractor split hit.
-#
-# The ``raise AttributeError`` fall-through is load-bearing: returning None
-# would make ``hasattr(historical_importer, <anything>)`` answer True.
-_MOVED_TO_PERIODS = ("_GAP_MARKER_STATES", "_merge_periods")
-
-
-def __getattr__(name: str):
-    if name in _MOVED_TO_PERIODS:
-        from . import importer_periods as _m
-        return getattr(_m, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

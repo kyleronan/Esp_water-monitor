@@ -35,7 +35,14 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from .database import is_circuit_winterized, run_db
+from .database import (
+    get_home_profile,
+    get_pump_regime_nights,
+    is_circuit_winterized,
+    run_db,
+    update_home_profile,
+    upsert_pump_regime_night)
+from .config import pump_gates_active, PUMP_PROFILE_VFD, PUMP_SUPPLY_TYPES
 
 log = logging.getLogger(__name__)
 
@@ -127,8 +134,6 @@ def pump_banner_state(db: sqlite3.Connection) -> Dict[str, Any]:
     forced pump_mode='off' AND (never dismissed, or detection persisted >=30
     evaluated nights since the dismissal — recurring, self-limiting).
     """
-    from .config import PUMP_SUPPLY_TYPES
-    from .database import get_home_profile, get_pump_regime_nights
     prof = get_home_profile(db)
     if not prof or not prof["pump_mode_detected"]:
         return {"show": False}
@@ -301,8 +306,6 @@ class PumpRegimeDetector:
 
     def _leak_alert_inputs_sync(self, circuits) -> dict:
         """Pump-gate check + the nightly history, one hop."""
-        from .config import pump_gates_active
-        from .database import get_pump_regime_nights
         return {"any_pump": any(pump_gates_active(self._db, c)
                                 for c in circuits),
                 "nights": get_pump_regime_nights(self._db, limit=40)}
@@ -420,7 +423,6 @@ class PumpRegimeDetector:
             circuit_cfg.circuit, start + timedelta(seconds=int(s)),
             start + timedelta(seconds=int(e)))
 
-        from .database import upsert_pump_regime_night
         # Store the ROBUST period (median inter-rise spacing) — the raw
         # autocorr peak locked onto a 62 s sub-harmonic while the actual
         # rises were ~259 s apart.
@@ -462,8 +464,6 @@ class PumpRegimeDetector:
     # ── home-level flag ──────────────────────────────────────────────────────
 
     def _apply_hysteresis(self) -> None:
-        from .database import (get_home_profile, get_pump_regime_nights,
-                               update_home_profile)
         prof = get_home_profile(self._db)
         if prof is None:
             return
@@ -498,7 +498,6 @@ class PumpRegimeDetector:
             if not prof["pump_profile"]:
                 # v1 detection can only identify the vfd signature; never
                 # overwrite a user-set/previous profile.
-                from .config import PUMP_PROFILE_VFD
                 updates["pump_profile"] = PUMP_PROFILE_VFD
             log.info("pump-regime: home flag SET (>=%d of last %d evaluated "
                      "nights) — banner pending user confirmation",

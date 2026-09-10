@@ -16,14 +16,9 @@ The subsystem is three modules:
 Dependencies run ONE way (this module -> event_waveform -> event_detector_core);
 ``test_unit73_event_detector_split`` fails if that re-tangles.
 
-Moved names stay readable here via the PEP 562 ``__getattr__`` at the bottom.
-Two things it deliberately does NOT do:
-
-  * invent an attribute — an unknown name raises ``AttributeError``, so
-    ``hasattr`` still answers False for symbols that were deleted;
-  * offer a WRITE path. ``monkeypatch.setattr(event_detector, "datetime", ...)``
-    sets a *local* attribute the moved code never reads; patch the module the
-    code actually lives in (see ``test_flow_start_stale_guard``).
+Import a moved name from the module it lives in, not from here. Patching also
+goes there: ``monkeypatch.setattr(event_detector, "datetime", ...)`` would set a
+local attribute the moved code never reads (see ``test_flow_start_stale_guard``).
 """
 from __future__ import annotations
 
@@ -33,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .event_detector_core import CircuitEventDetector, RawEvent, log
 from .event_waveform import WaveformChunkAccumulator, WaveformRecord
+from .database import run_db
 
 
 # ── Firmware signals the add-on subscribes to for OBSERVABILITY ──────────────
@@ -216,7 +212,6 @@ class EventDetector:
             return
         self._is_configured = True
         if inputs is None:
-            from .database import run_db
             inputs = await run_db(self.collect_circuit_inputs)
         for cfg in self._circuits:
             sens = inputs[cfg.circuit]["sens"]
@@ -304,7 +299,6 @@ class EventDetector:
         (also re-resolves the pump-mode oscillation gate — the banner-confirm
         route calls this so pump suppression flips without a restart)."""
         if inputs is None:
-            from .database import run_db
             inputs = await run_db(self.collect_circuit_inputs,
                                   list(self._detectors))
         for circuit, detector in self._detectors.items():
@@ -575,61 +569,3 @@ class EventDetector:
         """Remove and return the WaveformRecord for (boot_id, event_id), or None."""
         accumulator = self._chunk_accumulators.get(circuit)
         return accumulator.pop_record(boot_id, event_id) if accumulator else None
-
-
-# --------------------------------------------------------------------------- #
-# Back-compat surface for the split (PEP 562)                                 #
-# --------------------------------------------------------------------------- #
-# Everything below moved out of this file. Eager ``from .event_waveform import
-# X`` re-export lines raise ImportError on one import order; a module
-# ``__getattr__`` resolves LAZILY, so no order can catch a partially-initialised
-# module. The fallback branch must keep RAISING — returning None there would
-# make every ``hasattr`` in the suite answer True.
-_MOVED_TO_CORE = (
-    "StartTrigger",
-    "_valve_meta_kwargs",
-    "_read_addon_version",
-    "_read_git_commit",
-    "_ADDON_VERSION",
-    "_GIT_COMMIT",
-    "_PROP_MAX_LOOKBACK_S",
-    "_PROP_BASELINE_GUARD_S",
-    "_PROP_MA_HALF_S",
-    "_PROP_NOISE_BAND",
-    "_PROP_ABOVE_RUN",
-    "_PROP_MIN_BASELINE_SAMPLES",
-    "_median",
-    "PropagationScanResult",
-    "scan_propagation_delay",
-)
-
-_MOVED_TO_WAVEFORM = (
-    "_WF_START_SAMPLES",
-    "_WF_MAX_RECORDS",
-    "_WF_FLAG_VALID_MASK",
-    "_WF_INFLIGHT_TTL_S",
-    "_WF_FINAL_GAP_TIMEOUT_S",
-    "_WF_FL_RESOLUTION_REDUCED",
-    "_WF_MAX_CHUNK_SAMPLES",
-    "_WF_MAX_TOTAL_CHUNKS",
-    "_WF_MAX_INFLIGHT_SETS",
-    "_WF_INFLIGHT_LOW_WATER",
-    "WaveformMetadata",
-    "_InflightChunkSet",
-    "_parse_wire_bool",
-    "_normalize_int_field",
-    "_parse_chunk_scalars",
-    "_parse_final_metadata",
-    "_decode_waveform",
-    "_normalize_node_name",
-)
-
-
-def __getattr__(name: str):
-    if name in _MOVED_TO_CORE:
-        from . import event_detector_core as _m
-        return getattr(_m, name)
-    if name in _MOVED_TO_WAVEFORM:
-        from . import event_waveform as _m
-        return getattr(_m, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

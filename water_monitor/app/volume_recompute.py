@@ -28,6 +28,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .flow_integral import integrate_litres, active_flow_features
+from .config import pump_gates_active as _pga
+from .database import apply_effective_volume, compute_daily_summary, local_day_of, transaction
 
 log = logging.getLogger(__name__)
 
@@ -130,8 +132,6 @@ def recompute_volume_and_active_flow(
 
     Returns counts: recomputed, skipped (no history), degraded, unchanged.
     """
-    from .database import (transaction, compute_daily_summary,
-                           apply_effective_volume, local_day_of)
     from .feature_extractor import _finalize_derived_verdicts
     from .artifact_calibration import load_artifact_calibration
 
@@ -243,7 +243,6 @@ def recompute_volume_and_active_flow(
                 "verdict_pin": r["verdict_pin"],
                 "verdict_pin_veff": r["verdict_pin_veff"],
             }
-            from .config import pump_gates_active as _pga
             try:
                 _pump = _pga(conn, circuit)
             except Exception:

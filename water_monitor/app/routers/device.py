@@ -8,6 +8,15 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from ._helpers import coerce_int, ingress_redirect
 from ..circuit_compat import resolve_circuit
 from ..task_registry import spawn
+from ..config import DB_PATH
+from ..database import (
+    get_leak_test_schedule,
+    get_reconcile_state,
+    get_sensitivity_config,
+    run_db,
+    run_isolated_write,
+    set_alert_enabled,
+    upsert_leak_test_schedule)
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +60,6 @@ async def device_page(request: Request):
     # Every DB read this page needs, in ONE hop off the loop
     # thread. The per-circuit loop below still awaits HA (natively async) but
     # never touches the shared connection.
-    from ..database import run_db
     db_payload = await run_db(_device_db_payload, orch.db, list(cfg.circuits))
 
     circuit_states = []
@@ -105,8 +113,6 @@ def _device_db_payload(db, circuits) -> dict:
     statements on the shared connection whenever a background job is mid-write.
     Best-effort per circuit so one bad row can't blank the page.
     """
-    from ..database import (get_leak_test_schedule, get_reconcile_state,
-                            get_sensitivity_config)
     from ..recorder_reconcile import count_flagged_backlog
     from ..routers.settings import _fmt_local_ts
     from ..event_rules import get_home_timezone
@@ -220,7 +226,6 @@ async def fault_reset(circuit: str, request: Request):
     log.info(">>> fault_reset called for circuit=%s", circuit)
     orch = _orch(request)
     from ..device_discovery import load_circuit_entities
-    from ..database import run_db
     entities = await run_db(load_circuit_entities, orch.db, circuit)
     entity_id = entities.get("fault_reset_button")
     if not entity_id:
@@ -245,7 +250,6 @@ async def trickle_reset(circuit: str, request: Request):
     log.info(">>> trickle_reset called for circuit=%s", circuit)
     orch = _orch(request)
     from ..device_discovery import load_circuit_entities
-    from ..database import run_db
     entities = await run_db(load_circuit_entities, orch.db, circuit)
     entity_id = entities.get("trickle_reset_button")
     if not entity_id:
@@ -285,7 +289,6 @@ async def threshold_update(
 
     # Build allowlist from only the writable threshold roles for this circuit
     from ..device_discovery import load_circuit_entities
-    from ..database import run_db
     entities = await run_db(load_circuit_entities, orch.db, circuit)
     allowed = {v for k, v in entities.items() if k in _THRESHOLD_ROLES and v}
     if entity_id not in allowed:
@@ -337,7 +340,6 @@ async def alert_toggle(
             status_code=404,
         )
     from ..device_discovery import load_circuit_entities
-    from ..database import run_db
     entities = await run_db(load_circuit_entities, orch.db, circuit)
     role = f"alert_{alert_type}_switch"
     entity_id = entities.get(role)
@@ -356,7 +358,6 @@ async def alert_toggle(
         )
 
     # Update local alert_config only after HA confirms
-    from ..database import set_alert_enabled
     await run_db(set_alert_enabled, orch.db,
                  f"{alert_type}_{circuit}", enabled)
 
@@ -497,7 +498,6 @@ async def leaktest_schedule(circuit: str, request: Request):
     form = await request.form()
     orch = _orch(request)
 
-    from ..database import run_db, upsert_leak_test_schedule
     # Bounded coercion: out-of-range form values (run_hour=99,
     # day_of_week=-1, etc.) fall back to the listed default rather
     # than being persisted as garbage. The numeric bounds match the
@@ -532,8 +532,6 @@ async def reconcile_apply(circuit: str, request: Request):
     Runs under the write lock (serialized with recompute/reclassify)."""
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
-    from ..database import run_isolated_write
-    from ..config import DB_PATH
     from ..recorder_reconcile import apply_flagged_backlog
 
     def _job(conn):

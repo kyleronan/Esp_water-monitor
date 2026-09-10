@@ -90,6 +90,7 @@ from fastapi.responses import RedirectResponse
 # imports keep working. The implementation lives in `..forms` so it
 # can be unit-tested without pulling in FastAPI.
 from ..forms import coerce_float, coerce_int
+from ..database import run_db
 
 __all__ = ["coerce_float", "coerce_int", "ingress_redirect", "run_blocking",
            "startup_gate"]
@@ -107,7 +108,6 @@ async def run_blocking(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
 
     NOT for non-DB blocking work: see the module docstring.
     """
-    from ..database import run_db
     return await run_db(fn, *args, **kwargs)
 
 

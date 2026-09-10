@@ -1132,7 +1132,7 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
 
 def _invalidate(conn: sqlite3.Connection, circuit: str,
                 art: tm.Artifact) -> int:
-    from .database import invalidate_verdict_stamps
+    from .reclassify import invalidate_verdict_stamps
     ids = scoped_invalidation_ids(conn, circuit, art.threshold, art.trained_at)
     if not ids:
         return 0

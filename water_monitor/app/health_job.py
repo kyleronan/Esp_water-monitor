@@ -40,6 +40,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence
 
 from . import fixture_health as fh
+from .database import transaction
 
 log = logging.getLogger(__name__)
 
@@ -286,7 +287,6 @@ def run_nightly(conn: sqlite3.Connection, circuit: str,
     fixture three rolls back fixtures one and two instead of leaving a
     half-applied pass behind for the next writer to inherit.
     """
-    from .database import transaction
     day = as_of_day or _utc_now().strftime("%Y-%m-%d")
     out: Dict[str, dict] = {}
     # The commit fires on every exit path, including the empty-stream return:

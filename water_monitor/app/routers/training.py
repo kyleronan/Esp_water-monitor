@@ -19,12 +19,23 @@ from ..task_registry import spawn
 from ..fixtures import (FIXTURE_TYPE_LABELS, fixture_user_selectable_types,
                         zone_user_selectable_types)
 from ..database import (
-    get_circuit_type, training_capturable_types, training_window_options,
-    arm_training_capture, cancel_training_capture, confirm_training_capture,
-    reject_training_capture, extend_training_capture,
-    expire_stale_training_captures, get_active_training_capture,
-    get_training_checklist, training_capture_band_match,
-)
+    arm_training_capture,
+    cancel_training_capture,
+    confirm_training_capture,
+    expire_stale_training_captures,
+    extend_training_capture,
+    finish_job,
+    get_active_training_capture,
+    get_circuit_type,
+    get_training_checklist,
+    reject_training_capture,
+    run_db,
+    run_isolated_write,
+    start_job,
+    training_capturable_types,
+    training_capture_band_match,
+    training_window_options)
+from ..config import DB_PATH
 
 log = logging.getLogger(__name__)
 # Admin-only router: the training helper writes model-training labels.
@@ -63,9 +74,7 @@ async def _bg_reclassify_training(circuit: str) -> None:
     """Single deferred reclassify after a checklist item is accepted/rejected —
     serialized + private connection, so it never races live writes. Tracked as
     a job so a FAILURE surfaces to the UI (success is silent)."""
-    from ..database import (reclassify_all_events_from_signatures,
-                            run_isolated_write, start_job, finish_job)
-    from ..config import DB_PATH
+    from ..reclassify import reclassify_all_events_from_signatures
 
     def _work(c):
         job = start_job(c, "reclassify", circuit, "Reclassifying events…")
@@ -113,8 +122,6 @@ async def start_regime_recalibration(orch) -> bool:
                  "request (dev46 46l)")
         return False
 
-    from ..config import DB_PATH
-    from ..database import run_db, run_isolated_write
     from ..supply_regime import get_current_regime
     regime = await run_db(get_current_regime, orch.db)
     if regime is None:
@@ -122,9 +129,7 @@ async def start_regime_recalibration(orch) -> bool:
     circuits = [c.circuit for c in orch._cfg.circuits]
 
     def _work(conn):
-        from ..database import (finish_job,
-                                reclassify_all_events_from_signatures,
-                                start_job)
+        from ..reclassify import reclassify_all_events_from_signatures
         from ..rule_calibration import MIN_EXPLICIT_LABELS, fit_and_freeze
         for circuit in circuits:
             job = start_job(conn, "regime_recalibration", circuit,
@@ -226,7 +231,6 @@ async def training_page(request: Request):
     orch = _orch(request)
     # The per-circuit type lookup + checklist are DB reads — one
     # hop for all circuits instead of 2N inline queries on the loop thread.
-    from ..database import run_db
 
     def _checklists():
         out = {}
@@ -283,7 +287,6 @@ async def training_state_api(request: Request):
     # This endpoint is polled by the training wizard. The stale
     # expiry (a WRITE) and every circuit's active-capture read go through the
     # single DB thread in one hop, before the per-circuit HA awaits below.
-    from ..database import run_db
 
     def _captures():
         expire_stale_training_captures(db)
@@ -329,7 +332,6 @@ async def training_state_api(request: Request):
 @router.post("/api/{circuit}/arm")
 async def arm_api(circuit: str, request: Request):
     orch = _orch(request)
-    from ..database import run_db
     if await run_db(get_active_training_capture, orch.db, circuit):
         return JSONResponse(
             {"error": f"Another capture is in progress for {circuit} — "
@@ -350,7 +352,6 @@ async def arm_api(circuit: str, request: Request):
 
 @router.post("/api/{circuit}/cancel")
 async def cancel_api(circuit: str, request: Request):
-    from ..database import run_db
     n = await run_db(cancel_training_capture,
                      _orch(request).db, circuit)
     return JSONResponse({"ok": True, "cancelled": n})
@@ -359,7 +360,6 @@ async def cancel_api(circuit: str, request: Request):
 @router.post("/api/{circuit}/confirm")
 @router.post("/api/{circuit}/done")
 async def confirm_api(circuit: str, request: Request):
-    from ..database import run_db
     res = await run_db(confirm_training_capture,
                        _orch(request).db, circuit)
     if res.get("labeled"):
@@ -373,7 +373,6 @@ async def confirm_api(circuit: str, request: Request):
 async def reject_api(circuit: str, request: Request):
     orch = _orch(request)
     payload = await _json(request)
-    from ..database import run_db
     cid = payload.get("capture_id")
     if cid is None:
         cap = await run_db(get_active_training_capture, orch.db, circuit)
@@ -392,7 +391,6 @@ async def reject_api(circuit: str, request: Request):
 @router.post("/api/{circuit}/extend")
 async def extend_api(circuit: str, request: Request):
     payload = await _json(request)
-    from ..database import run_db
     res = await run_db(extend_training_capture,
                        _orch(request).db, circuit,
                        payload.get("add_minutes", 15))

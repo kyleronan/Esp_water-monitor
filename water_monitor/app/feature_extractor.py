@@ -1300,7 +1300,6 @@ def _circuit_min_flow(conn, circuit: str) -> float:
     Feeds the coarse-meter dribble guard on reprocess paths. Falls back to the
     396-ppl turbine floor on any error."""
     try:
-        from .database import get_circuit_pulses_per_litre
         ppl = get_circuit_pulses_per_litre(conn, circuit)
         if ppl and ppl >= 1.0:
             return 60.0 / ppl
@@ -1807,7 +1806,6 @@ def _pump_gate_blocks(conn, row, label: str) -> bool:
     destructive action — skip loudly and keep the volume.
     """
     try:
-        from .config import pump_gates_active as _pga_sweep
         return bool(_pga_sweep(conn, row["circuit"]))
     except Exception as e:   # noqa: BLE001
         log.warning("[%s] %s sweep: pump-gate check failed for event %s (%s) "
@@ -1831,8 +1829,6 @@ def _sweep_zeroing_verdict(conn, rows, *, detect, set_sql, set_params=None,
     Returns ``(flagged, litres, days)`` — ``days`` is the set of
     ``(circuit, home-local day)`` pairs whose summary was rebuilt.
     """
-    from .database import (transaction, compute_daily_summary,
-                           apply_effective_volume, local_day_of)
     flagged = 0
     litres = 0.0
     days: set = set()
@@ -1873,7 +1869,6 @@ def backfill_silent_exclusion_reasons(conn: sqlite3.Connection) -> dict:
     it cannot be *explained*. Never touches a row that already has a reason,
     and never changes ``excluded_from_training`` itself.
     """
-    from .database import transaction
     cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
     if "match_rejection_reason" not in cols:
         return {"backfilled": 0}
@@ -2080,7 +2075,6 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
     # irrigation_cross_talk / rising_pressure_phantom / pump_recharge, whose
     # survival across reprocessing rests entirely on that string — is fixed inside
     # rezero_rows_with_zeroing_flag, which fixes it for the migration caller too.
-    from .database import rezero_rows_with_zeroing_flag
     rezeroed = rezero_rows_with_zeroing_flag(conn)
     if excluded_fixed or pairs_resolved or unresolved or rezeroed:
         conn.commit()
@@ -2124,8 +2118,6 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     is intentionally NOT nulled, preserving existing assignments) — a deliberate
     scope decision, not an oversight.
     """
-    from .database import (transaction, compute_daily_summary,
-                           apply_effective_volume, local_day_of)
 
     # Repair any cross-cutting flag-consistency violations first (P2): zeroed events
     # that slipped through still feeding training, and stale mutually-exclusive flags.
@@ -2535,7 +2527,6 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     # 685.3 L / 8.7 LPM draw and a 3.9 L / 6.3 LPM toilet — and leaves 18
     # sub-0.2 L micro-phantoms zeroed. Rows with real-water shape but NO fixture
     # type are reported for manual review, never auto-restored.
-    from .database import _RELABEL_REVERTIBLE_REASONS
     relabel_restored = 0
     relabel_review: list = []
     if _events_has_column(conn, "user_classified") and has_af:
@@ -2755,8 +2746,6 @@ def reprocess_degraded_supply_verdicts(conn: sqlite3.Connection) -> dict:
 
     Returns a summary dict with the counts the endpoint relays to the UI.
     """
-    from .database import (transaction, apply_effective_volume,
-                           compute_daily_summary, local_day_of)
     from .supply_regime import pump_era_start
     era_start = pump_era_start(conn)
 
@@ -3786,9 +3775,18 @@ _WF_FL_FULL_COMPLETE:      int = 0x02  # full-window capture is complete
 # copies drift silently — they only disagree once the firmware changes the bit.
 # It comes from event_waveform rather than the event_detector facade because
 # event_waveform imports only event_detector_core, whereas this module already
-# does `from .event_detector import RawEvent, WaveformRecord` at module level,
+# does `from .event_detector import RawEvent, WaveformRecord` at module level
 # so sourcing it from there would close a real cycle.
 from .event_waveform import _WF_FL_RESOLUTION_REDUCED  # noqa: E402
+from .config import pump_gates_active as _pga_sweep
+from .database import (
+    _RELABEL_REVERTIBLE_REASONS,
+    apply_effective_volume,
+    compute_daily_summary,
+    get_circuit_pulses_per_litre,
+    local_day_of,
+    rezero_rows_with_zeroing_flag,
+    transaction)
 
 _WF_FLOW_SIG_MIN_PEAK_LPM:   float = 0.05   # ignore near-zero / noisy full_flow arrays
 _WF_PRESS_SIG_MIN_DELTA_PSI:  float = 0.15   # ignore pressure noise below this drop
@@ -4591,23 +4589,3 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
     # assembled feature values (single source of truth).
     _finalize_derived_verdicts(result, min_flow_lpm=min_flow_lpm)
     return result
-
-
-# ── back-compat re-export (unit 7.2) ─────────────────────────────────────────
-# ``FeatureExtractor`` and its alert cooldown moved to
-# :mod:`.feature_extractor_service`; every existing
-# ``from .feature_extractor import FeatureExtractor`` keeps resolving here.
-#
-# A PEP 562 module ``__getattr__`` rather than a plain bottom-of-file import ON
-# PURPOSE: the service module imports 14 names OUT of this module at its top
-# level, so an eager import here would close that loop and raise ImportError
-# whenever the service module was imported first — which is exactly what
-# ``orchestrator`` does. Resolving lazily keeps the edge one-way at import time.
-_MOVED_TO_SERVICE = ("FeatureExtractor", "_ANOMALY_ALERT_COOLDOWN_MIN")
-
-
-def __getattr__(name: str):
-    if name in _MOVED_TO_SERVICE:
-        from . import feature_extractor_service as _svc
-        return getattr(_svc, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

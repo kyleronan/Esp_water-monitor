@@ -10,6 +10,16 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ._helpers import run_blocking, startup_gate
+from ..config import pump_gates_active
+from ..database import (
+    downsample_pressure_series,
+    get_home_profile,
+    get_hourly_volumes,
+    get_jobs_since,
+    get_leak_test_schedule,
+    get_pump_regime_nights,
+    recent_pressure_baseline,
+    run_db)
 
 router = APIRouter()
 log = logging.getLogger(__name__)
@@ -87,7 +97,6 @@ async def dashboard(request: Request):
     # profile, per-circuit training + leak schedules, both banners, the
     # pump-regime nights). Nothing below may query the shared connection
     # inline: the loop thread and the DB worker must never touch it at once.
-    from ..database import get_home_profile
     dashboard_payload = await run_blocking(
         _build_dashboard_sync_payload, orch.db, cfg.circuits, get_home_profile,
         orch.training_manager,
@@ -193,7 +202,6 @@ async def dashboard_live(request: Request):
     # endpoint is polled by the dashboard's auto-refresh, so an inline query
     # here was the most frequent loop-thread contact with the shared
     # connection in the whole addon. One run_db hop covers every circuit.
-    from ..database import run_db
     _idle = {"state": "idle", "events_collected": 0, "minimum_events": 0,
              "days_remaining": 0, "percent_complete": 0}
     tm = orch.training_manager
@@ -218,7 +226,6 @@ async def jobs_poll(request: Request, since: int = 0):
     """Recent background-job statuses with id > ``since`` for the UI poll-and-toast
     (reclassify / calibration feedback). Newest first."""
     orch = _get_orchestrator(request)
-    from ..database import get_jobs_since, run_db
     # Polled endpoint — off the loop thread, onto the DB worker.
     jobs = await run_db(get_jobs_since, orch.db, since_id=since)
     return JSONResponse({"jobs": jobs})
@@ -240,7 +247,6 @@ async def dashboard_pressure(circuit: str, request: Request):
     modal chart. Reads live from HA — the addon stores no pressure time series. Never
     500s; failure modes are surfaced via `error` so the modal shows the right hint."""
     from ..circuit_compat import resolve_circuit
-    from ..database import downsample_pressure_series, recent_pressure_baseline
     orch = _get_orchestrator(request)
     circuit = resolve_circuit(circuit)
 
@@ -296,7 +302,6 @@ def _build_dashboard_sync_payload(db, circuits, get_home_profile,
     profile = dict(get_home_profile(db) or {})
 
     # Per-circuit training state + leak-test schedule.
-    from ..database import get_leak_test_schedule
     training: Dict[str, Any] = {}
     schedules: Dict[str, Any] = {}
     for c in circuits:
@@ -331,8 +336,6 @@ def _build_dashboard_sync_payload(db, circuits, get_home_profile,
     # Leak-watch tile: the nights feeding the latest nightly
     # street-calibrated estimate, only when pump mode is armed.
     try:
-        from ..config import pump_gates_active
-        from ..database import get_pump_regime_nights
         nights = (get_pump_regime_nights(db, limit=14)
                   if any(pump_gates_active(db, c.circuit) for c in circuits)
                   else [])
@@ -359,7 +362,6 @@ def _build_chart_data(db, circuit: str) -> Dict[str, Any]:
     are the home's local clock — labelling with the raw UTC hour draws a 05:00
     shower at "11:00", six hours out of step with every other time on the page.
     """
-    from ..database import get_hourly_volumes
     from ..event_rules import get_home_timezone
     rows = get_hourly_volumes(db, circuit, hours=24)
 

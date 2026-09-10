@@ -129,7 +129,6 @@ def note_locked_write(source: str) -> None:
     its purpose (worst case an extra log line). A gap of _LOCKED_RESET_GAP_S
     without failures starts a new episode."""
     global _LOCKED_EPISODE_START, _LOCKED_LAST, _LOCKED_COUNT, _LOCKED_ESCALATED
-    import time
     now = time.monotonic()
     if now - _LOCKED_LAST > _LOCKED_RESET_GAP_S:
         _LOCKED_EPISODE_START, _LOCKED_COUNT, _LOCKED_ESCALATED = now, 0, False
@@ -4002,7 +4001,6 @@ def upsert_fixture_from_cluster(
     a chunked writer, so nothing relies on a mid-loop commit.
     """
     import uuid as _uuid
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
 
     row = conn.execute(
@@ -5059,7 +5057,6 @@ def upsert_fixture_signature(
         if vals:
             centroid[feat] = sum(vals) / len(vals)
 
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """INSERT INTO fixture_type_signatures
@@ -5618,7 +5615,7 @@ def _code_fingerprint() -> str:
 
     h = hashlib.sha256()
     try:
-        from .event_detector import _read_addon_version, _read_git_commit
+        from .event_detector_core import _read_addon_version, _read_git_commit
         h.update(f"v={_read_addon_version()}/{_read_git_commit()}".encode())
     except Exception:                       # noqa: BLE001 — never block a pass
         h.update(b"v=unknown")
@@ -6923,65 +6920,3 @@ def upsert_circuit_label(
             db.execute(sql, (circuit_id, display_name.strip()))
     else:
         db.execute(sql, (circuit_id, display_name.strip()))
-
-
-
-
-# ── 7.1: the reclassify pass moved to app/reclassify.py ─────────────────────
-#
-# Every name below used to be defined in THIS module and is still imported from
-# it by orchestrator, maturity_recheck, learning_loop and a dozen tests. The
-# forwarding is a module ``__getattr__`` (PEP 562) rather than an eager
-# ``from .reclassify import ...``: reclassify.py does ``from . import
-# database``, so an eager import here closes the loop and importing
-# ``water_monitor.app.reclassify`` first would raise ``ImportError: cannot
-# import name ... from partially initialized module``. ``__getattr__`` defers
-# resolution to first ACCESS, by which point both modules are fully
-# initialised, so either import order works.
-#
-# Two limits worth knowing before adding to this list:
-#
-#  * ``__getattr__`` answers ``database.X`` and ``from .database import X``. It
-#    is NOT consulted for a bare global load inside a function body in this
-#    file, so any name database.py still calls ITSELF needs a real import (see
-#    ``patch_event``), not an entry here.
-#  * the ``raise AttributeError`` fallback is load-bearing. Returning None
-#    instead would make ``hasattr(database, <anything>)`` answer True, which
-#    quietly changes the behaviour of every feature-probe in the app.
-_MOVED_TO_RECLASSIFY = frozenset({
-    "_VERDICT_STAMP_ALGO",
-    "_VERDICT_STAMP_MAX_AGE_DAYS",
-    "compute_verdict_stamp",
-    "invalidate_cluster_verdict_stamps",
-    "release_settle_window",
-    "_verdict_stamp_pass_is_due",
-    "_mark_full_reclassify",
-    "invalidate_verdict_stamps",
-    "_new_reclassify_counters",
-    "_match_bucket",
-    "_BACKLOG_ORDER_BY",
-    "_forced_reopen_allowed",
-    "_SYNC_YIELD_EVERY_ROWS",
-    "_VERDICT_BACKLOG_PER_PASS",
-    "_CHUNK_TARGET_SECONDS",
-    "_CHUNK_START_ROWS",
-    "_CHUNK_MIN_ROWS",
-    "_reclassify_prepare",
-    "_reclassify_chunk_sync",
-    "_reclassify_finalize",
-    "reclassify_all_events_from_signatures_async",
-    "reclassify_all_events_from_signatures",
-})
-
-
-def __getattr__(name: str):
-    """Forward the 7.1 names to ``app/reclassify.py`` — see the note above."""
-    if name in _MOVED_TO_RECLASSIFY:
-        from . import reclassify as _reclassify_mod
-        return getattr(_reclassify_mod, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__():
-    """Keep the moved names discoverable (``dir()`` skips ``__getattr__``)."""
-    return sorted(set(globals()) | _MOVED_TO_RECLASSIFY)

@@ -34,7 +34,7 @@ from typing import List, Optional, Tuple
 
 from .config import AddonConfig, DB_PATH
 
-from .database import run_db
+from .database import run_db, run_isolated_write
 
 log = logging.getLogger(__name__)
 
@@ -189,7 +189,6 @@ class RiseCorrBackfill:
                              flow_entity: str, pressure_entity: str,
                              ) -> Tuple[int, int]:
         """Fetch + compute + store corr for one batch. Returns (stored, errors)."""
-        from .database import run_isolated_write
         updates: List[Tuple[float, str]] = []
         errors = 0
         for r in rows:
@@ -276,7 +275,6 @@ class RiseCorrBackfill:
 
     async def _apply_verdicts(self) -> None:
         """Run the sync rise repair pass under the write lock (idempotent)."""
-        from .database import run_isolated_write
         from .feature_extractor import reprocess_rising_pressure_phantoms
         try:
             res = await run_isolated_write(

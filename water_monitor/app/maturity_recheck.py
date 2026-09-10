@@ -35,6 +35,11 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from .config import AddonConfig, DB_PATH
+from .database import (
+    get_write_lock,
+    recompute_cycle_pulse_counts,
+    resuggest_all_clusters,
+    run_isolated_write)
 
 log = logging.getLogger(__name__)
 
@@ -109,9 +114,7 @@ class MaturityRecheck:
                               circuit_cfg.circuit, e, exc_info=True)
 
     async def _recheck_circuit(self, circuit: str) -> None:
-        from .database import (get_write_lock, recompute_cycle_pulse_counts,
-                               reclassify_all_events_from_signatures,
-                               resuggest_all_clusters, run_isolated_write)
+        from .reclassify import reclassify_all_events_from_signatures
         # If a manual reprocess / retrain (or a still-running re-check) holds
         # the write lock, wait a bounded while for it rather than forfeit the
         # hour (dev51, 3.4). Still never queues behind a genuinely wedged
@@ -153,7 +156,7 @@ class MaturityRecheck:
             # NULL stamp — new events, ones still settling, peers freed by a
             # label — sort first inside the budget, because those DO have
             # someone waiting.
-            from .database import _VERDICT_BACKLOG_PER_PASS
+            from .reclassify import _VERDICT_BACKLOG_PER_PASS
             b = reclassify_all_events_from_signatures(
                 conn, circuit, backlog_limit=_VERDICT_BACKLOG_PER_PASS)
             resuggest_all_clusters(conn, circuit)

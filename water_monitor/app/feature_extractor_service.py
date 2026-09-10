@@ -43,6 +43,22 @@ from .feature_extractor import (
     # operators grep the add-on log for it.
     log,
 )
+from .config import DB_PATH, pump_gates_active, pump_gates_active as _pga
+from .database import (
+    drain_daily_summary_dirty,
+    find_overlapping_event,
+    get_circuit_type,
+    get_home_profile,
+    get_sensitivity_config,
+    get_toilet_flush_cap_litres,
+    is_baseline_locked,
+    is_event_in_exclusion_window,
+    is_retryable_db_error,
+    match_event_to_signature_knn,
+    record_training_candidate,
+    run_db,
+    run_isolated_write,
+    upsert_event_and_apply_hourly_volume)
 
 
 # Minimum gap between anomaly NOTIFY pushes per circuit (the shut-off path is
@@ -154,7 +170,6 @@ class FeatureExtractor:
             return
         self._closed_day_drain_at = now
         try:
-            from .database import drain_daily_summary_dirty, run_db
             res = await run_db(drain_daily_summary_dirty, self._db)
             if res.get("recomputed"):
                 log.info("daily summary refreshed for %d closed day(s) after a store",
@@ -176,7 +191,6 @@ class FeatureExtractor:
           - 'pressure'               flow_onset_ts is the flow onset (start_ts
             is the threshold crossing, not the true transient onset).
         """
-        from datetime import timedelta
 
         if not event.propagation_delay_ms:
             # No measured transient delay — nothing to refine.
@@ -300,8 +314,6 @@ class FeatureExtractor:
             self, circuit: str, record: WaveformRecord) -> None:
         """Run the reverse-match + signature upgrade off the event loop, serialised
         through the write lock on its OWN connection (never the shared one)."""
-        from .config import DB_PATH
-        from .database import run_isolated_write
 
         def _job(conn):
             return _late_waveform_upgrade_job(conn, circuit, record)
@@ -317,7 +329,6 @@ class FeatureExtractor:
 
     def _pre_store_reads_sync(self, event) -> dict:
         """Pump-era/gate state plus the waveform lookup, one hop."""
-        from .config import pump_gates_active
         from .supply_regime import pump_era_start
         try:
             era = pump_era_start(self._db)
@@ -337,7 +348,6 @@ class FeatureExtractor:
         allows; bundling them keeps that property while removing two
         loop-thread touches.
         """
-        from .database import find_overlapping_event
         blocking = None
         if event.end_ts is not None:
             blocking = find_overlapping_event(
@@ -363,7 +373,6 @@ class FeatureExtractor:
     def _verdict_inputs_sync(self, circuit) -> dict:
         """Frozen artifact calibration + pump-gate state."""
         from .artifact_calibration import load_artifact_calibration
-        from .config import pump_gates_active
         acal = load_artifact_calibration(self._db, circuit)
         try:
             pump = pump_gates_active(self._db, circuit)
@@ -378,7 +387,6 @@ class FeatureExtractor:
         Mutates ``features`` in place (exclusion flags) — safe because the
         caller is awaiting this call and nothing else reads the dict meanwhile.
         """
-        from .database import is_event_in_exclusion_window
             # ── Plumbing-event exclusion window ───────────────
         # If the user opened an exclusion window (e.g. post-winterization
         # flush), flag the event so the cluster engine skips it. Volume tracking
@@ -453,7 +461,6 @@ class FeatureExtractor:
         The capture hook is best-effort exactly as it was inline: a bug in
         capture logic must never block event storage.
         """
-        from .database import record_training_candidate
         try:
             record_training_candidate(self._db, circuit, features)
         except Exception as e:      # noqa: BLE001 — never block storage
@@ -495,7 +502,6 @@ class FeatureExtractor:
         #
         # Pump era + gate + the waveform lookup are three reads with only pure
         # computation between them — one hop.
-        from .database import run_db
         _pre = await run_db(self._pre_store_reads_sync, event)
         _pump_ripple = False
         try:
@@ -536,8 +542,6 @@ class FeatureExtractor:
                 )
 
         try:
-            from .database import (upsert_event_and_apply_hourly_volume,
-                                   is_retryable_db_error)
 
             # Writer-boundary duplicate guard: two importer catch-up runs can
             # both queue a reconstruction before either has written to the DB,
@@ -769,7 +773,6 @@ class FeatureExtractor:
         'live' state gate. Returns the inert verdict for artifact / excluded events
         or when no baseline exists."""
         from .anomaly_baseline import load_usage_baselines, score_event_anomaly
-        from .database import get_sensitivity_config
         baselines = load_usage_baselines(self._db, circuit)
         sens = get_sensitivity_config(self._db, circuit)
         return score_event_anomaly(features, baselines, sens)
@@ -788,7 +791,6 @@ class FeatureExtractor:
         # shut off in response to it (the event is also excluded from training).
         if self._is_calibrating(circuit):
             return
-        from .database import get_sensitivity_config, run_db
         from .anomaly_baseline import _row_get, MIN_LIVE_DAYS_FOR_SHUTOFF
         sens = await run_db(get_sensitivity_config, self._db, circuit)
         response = (_row_get(sens, "anomaly_response", "notify") or "notify")
@@ -859,7 +861,6 @@ class FeatureExtractor:
         Delegates to ``database.is_baseline_locked`` — the ONE definition of
         "baseline locked", shared with the label-reclassify skip gate, so the two
         notions of locked can't drift (they used to be line-for-line copies)."""
-        from .database import is_baseline_locked
         return is_baseline_locked(self._db, circuit)
 
     def _fingerprint_enabled(self) -> bool:
@@ -908,7 +909,6 @@ class FeatureExtractor:
           * the end stop reads on but ``valve_seal_alert`` is also on — the
             valve reports shut and water is still moving past it.
         """
-        from .database import run_db
         stop_entity = await run_db(
             self._resolve_role_entity, circuit, "closed_end_stop_sensor")
         if not stop_entity:
@@ -1016,7 +1016,6 @@ class FeatureExtractor:
         # and the valve lookup are both DB reads that must happen immediately
         # before actuation, so they cross together in ONE hop — the gate stays
         # the last thing checked before the valve moves.
-        from .database import run_db
         gate = await run_db(self._shutoff_preflight_sync, circuit)
         if not gate["state_ok"]:
             log.warning("[%s] anomaly auto-shutoff refused — circuit is not in a live, "
@@ -1087,7 +1086,6 @@ class FeatureExtractor:
         suggestion recompute and fixtures.last_seen_at now commit together
         (rule N2a) instead of as a scatter of independent statements.
         """
-        from .database import run_db
         await run_db(self._cluster_event_sync, circuit, features)
 
     def _cluster_event_sync(self, circuit: str, features: dict) -> None:
@@ -1194,11 +1192,9 @@ class FeatureExtractor:
                 detect_softener_sessions, detect_washer_cycles, get_home_timezone,
                 parse_hhmm_to_minutes, rule_classify_event,
             )
-            from .database import get_home_profile
             from .rule_calibration import load_rule_calibration
             ctype = self._circuit_type_cache.get(circuit)
             if ctype is None:
-                from .database import get_circuit_type
                 ctype = get_circuit_type(self._db, circuit)
                 self._circuit_type_cache[circuit] = ctype
             # Frozen per-home rule bands (empty → shipped defaults). Read fresh so
@@ -1263,7 +1259,6 @@ class FeatureExtractor:
                                                      "dishwasher_cycle")
                 cycle_group_id = dishwasher_members[event_id][1]
             else:
-                from .config import pump_gates_active as _pga
                 try:
                     _pump = _pga(self._db, circuit)
                 except Exception:
@@ -1360,7 +1355,6 @@ class FeatureExtractor:
                             circuit, e)
         if matched_fixture_type is None and weak_match:
             try:
-                from .database import match_event_to_signature_knn
                 from .event_rules import CYCLE_ONLY_FIXTURE_TYPES
                 sig_hit = match_event_to_signature_knn(
                     self._db, circuit, features
@@ -1397,7 +1391,6 @@ class FeatureExtractor:
         # Vetoed → abstain (never re-guess another type). Never fatal.
         if matched_fixture_type == "toilet":
             try:
-                from .database import get_toilet_flush_cap_litres
                 from .event_rules import toilet_veto_reason
                 cap = get_toilet_flush_cap_litres(self._db)
                 why = toilet_veto_reason(features, cap)

@@ -22,7 +22,12 @@ from fastapi.responses import JSONResponse
 
 from ..auth import require_admin
 from ..circuit_compat import resolve_circuit
-from ..database import run_db
+from ..database import (
+    insert_meter_anchor_point,
+    insert_utility_register_reading,
+    list_meter_anchor_points,
+    list_utility_register_readings,
+    run_db)
 from ..units import load_unit_context, resolve_vol_factor
 from ..calibration_math import (
     BUCKET_MIN_L, MUNICIPAL_MIN_L, METER_UNIT_FACTORS, gate, pooled, run_ppl, to_litres,
@@ -271,7 +276,6 @@ async def cancel(circuit: str, request: Request):
 
 @router.get("/anchors")
 async def list_anchors(request: Request):
-    from ..database import list_meter_anchor_points
     anchors = await run_db(list_meter_anchor_points,
                            _orch(request).db)
     return JSONResponse({"ok": True, "anchors": anchors})
@@ -289,7 +293,6 @@ async def add_anchor(request: Request):
                     "are required numbers")
     if reference <= 0:
         return _err("reference_volume_l must be > 0")
-    from ..database import insert_meter_anchor_point
     row_id = await run_db(
         insert_meter_anchor_point,
         _orch(request).db,
@@ -304,7 +307,6 @@ async def add_anchor(request: Request):
 
 @router.get("/register-readings")
 async def list_register_readings(request: Request):
-    from ..database import list_utility_register_readings
     readings = await run_db(list_utility_register_readings,
                             _orch(request).db)
     return JSONResponse({"ok": True, "readings": readings})
@@ -318,7 +320,6 @@ async def add_register_reading(request: Request):
         ts = str(body["reading_ts"])
     except (KeyError, TypeError, ValueError):
         return _err("reading_value (number) and reading_ts are required")
-    from ..database import insert_utility_register_reading
     row_id = await run_db(
         insert_utility_register_reading,
         _orch(request).db,
