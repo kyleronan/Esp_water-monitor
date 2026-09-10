@@ -39,15 +39,12 @@ MIN_POSITIVES = 8       # confirmed positives before a detector is calibrated
 _MARGIN = 0.10
 
 # Absolute clamps for each calibratable threshold (key → (lo, hi)). The cross-talk
-# min-duration only LOWERS toward the floor (catch the home's shorter artifacts);
-# dribble ceilings only RAISE toward the cap. Anything fitted is clamped here.
+# min-duration only LOWERS toward the floor (catch the home's shorter artifacts).
+# Anything fitted is clamped here.
 # Phantom duration is intentionally NOT here — its floors are frozen structural
 # constants (see feature_extractor) so the legacy floor can never be lowered.
 _BOUNDS: Dict[str, Tuple[float, float]] = {
     "XTALK_MIN_DURATION_S":   (60.0, 120.0),
-    "DRIBBLE_MAX_VOLUME_L":   (0.5, 2.0),
-    "DRIBBLE_MAX_FLOW_LPM":   (1.0, 2.0),
-    "DRIBBLE_MAX_DELTA_PSI":  (1.5, 3.0),
 }
 
 

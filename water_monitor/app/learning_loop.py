@@ -577,9 +577,8 @@ def scoped_invalidation_ids(conn: sqlite3.Connection, circuit: str,
 def parse_benchmark_payload(data) -> Tuple[List[str], Optional[str]]:
     """``(event_ids, benchmark_hash)`` from a pinned-benchmark JSON document.
 
-    ONE parser for the file loader and the Dev Tools import, so the two cannot
-    drift. Ids are de-duplicated in first-seen order; the hash is whatever the
-    document declares (the eval harness writes ``benchmark_hash``).
+    Ids are de-duplicated in first-seen order; the hash is whatever the document
+    declares (the eval harness writes ``benchmark_hash``).
     """
     if not isinstance(data, dict):
         raise ValueError("benchmark JSON must be an object with an 'event_ids' list")
@@ -595,26 +594,6 @@ def parse_benchmark_payload(data) -> Tuple[List[str], Optional[str]]:
             ids.append(s)
     h = data.get("benchmark_hash")
     return ids, (str(h) if h else None)
-
-
-def load_benchmark_ids(path: str) -> List[str]:
-    """Event ids of the pinned frozen benchmark, if one is configured.
-
-    The benchmark FILE lives outside the repo and outside the add-on's config:
-    it is real events with real timestamps, i.e. a record of when this
-    household used water. Only its hash is ever quoted. A home without one is
-    normal — the referee then runs on the recent holdout alone and declines to
-    decide when that is too small.
-    """
-    import json as _json
-    try:
-        with open(path, encoding="utf-8") as fh:
-            ids, _ = parse_benchmark_payload(_json.load(fh))
-            return ids
-    except (OSError, ValueError) as exc:
-        log.warning("pinned benchmark %s unreadable (%s); referee will run "
-                    "without its primary reference", path, exc)
-        return []
 
 
 _NO_BENCHMARK: dict = {

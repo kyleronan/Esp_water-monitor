@@ -9,7 +9,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from ._helpers import _orch, run_blocking, startup_gate
+from ._helpers import _orch, startup_gate
 from ..config import pump_gates_active
 from ..database import (
     downsample_pressure_series,
@@ -93,7 +93,7 @@ async def dashboard(request: Request):
     # profile, per-circuit training + leak schedules, both banners, the
     # pump-regime nights). Nothing below may query the shared connection
     # inline: the loop thread and the DB worker must never touch it at once.
-    dashboard_payload = await run_blocking(
+    dashboard_payload = await run_db(
         _build_dashboard_sync_payload, orch.db, cfg.circuits, get_home_profile,
         orch.training_manager,
     )
@@ -233,7 +233,7 @@ async def chart_data(circuit: str, request: Request):
     from ..circuit_compat import resolve_circuit
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
-    data = await run_blocking(_build_chart_data, orch.db, circuit)
+    data = await run_db(_build_chart_data, orch.db, circuit)
     return JSONResponse(data)
 
 
@@ -267,7 +267,7 @@ async def dashboard_pressure(circuit: str, request: Request):
 
     points = downsample_pressure_series(
         states, start.timestamp(), end.timestamp(), buckets=288)
-    baseline = await run_blocking(
+    baseline = await run_db(
         recent_pressure_baseline, orch.db, circuit, start.isoformat())
     if not any(p["v"] is not None for p in points):
         return _fail("no_history", baseline)

@@ -337,9 +337,10 @@ def _max_iso(a, b):
 
 # ── Per-category publish toggle ─────────────────────────────────────────────
 
-# ── The per-cluster routes (confirm, delete, merge, migrate,
-#    forget-signature, relink) have no HTTP handlers. Their backend helpers in
-#    database.py stay — cluster_engine and the tests consume them.
+# ── The per-cluster routes (confirm, merge, migrate, relink) have no HTTP
+#    handlers. merge_clusters is called by cluster_engine; relink is the only
+#    writer that clears fixtures.cluster_backfill_needed, so the orphan banner
+#    below has no other way back to zero.
 # ────────────────────────────────────────────────────────────────────────────
 
 

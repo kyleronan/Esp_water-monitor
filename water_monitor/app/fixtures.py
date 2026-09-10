@@ -95,52 +95,6 @@ FIXTURE_TYPE_LABELS: Dict[str, str] = {
 # they never show up as a real fixture for clustering or HA publishing.
 INTERNAL_FIXTURE_TYPES: List[str] = ["leak_test"]
 
-# HA publishing categories. Each fixture type is its own category — the
-# taxonomy IS the category set. Never stored in the database, and nothing
-# reads it today (the MQTT publisher that did was deleted); kept as the
-# taxonomy's category mapping for a future publisher.
-FIXTURE_CATEGORIES: Dict[str, Optional[str]] = {
-    "toilet":           "toilet",
-    "shower_tub":       "shower_tub",
-    "tap":              "tap",
-    "washing_machine":  "washing_machine",
-    "dishwasher":       "dishwasher",
-    "water_softener":   "water_softener",
-    "irrigation_zone":  "irrigation_zone",
-    "other":            "other",
-    "leak_test":        None,    # never publish
-}
-
-FIXTURE_CATEGORY_LABELS: Dict[str, str] = {
-    "toilet":           "Toilet",
-    "shower_tub":       "Shower / Tub",
-    "tap":              "Tap",
-    "washing_machine":  "Washing Machine",
-    "dishwasher":       "Dishwasher",
-    "water_softener":   "Water Softener",
-    "irrigation_zone":  "Irrigation Zone",
-    "other":            "Other",
-}
-
-
-def get_fixture_category(fixture_type: Optional[str]) -> Optional[str]:
-    """Return the HA publishing category for a fixture type.
-
-    The type IS the category, so this is effectively an identity for known
-    types.
-    Returns None for leak_test (never published).
-    Returns 'other' for None or any type not in FIXTURE_CATEGORIES.
-    """
-    if fixture_type is None:
-        return "other"
-    return FIXTURE_CATEGORIES.get(fixture_type, "other")
-
-
-def is_valid_fixture_type(name: Optional[str]) -> bool:
-    """True if `name` is a recognised fixture type (or None)."""
-    return name is None or name in FIXTURE_TYPES
-
-
 def user_selectable_types() -> List[str]:
     """Fixture types the user can pick from in the UI."""
     return [t for t in FIXTURE_TYPES if t not in INTERNAL_FIXTURE_TYPES]

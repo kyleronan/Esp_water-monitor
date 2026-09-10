@@ -14,7 +14,7 @@ import logging
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from ._helpers import _orch, _tmpl, coerce_int, ingress_redirect
 from ..auth import require_admin_or_bootstrap
 
@@ -991,37 +991,6 @@ async def setup_complete(request: Request):
         "cal_reason": cal_reason,
         "page":       "setup",
     })
-
-
-# ------------------------------------------------------------------
-# API — re-run discovery for one circuit (after manual override)
-# ------------------------------------------------------------------
-@router.post("/api/rediscover/{device_id}/{circuit}")
-async def rediscover_circuit(device_id: str, circuit: str, request: Request):
-    blocked = _block_if_setup_complete(request)
-    if blocked is not None:
-        # Same JSON shape as the error branch below — keep the client
-        # happy. 409 Conflict — state forbids the operation; not an
-        # auth failure.
-        return JSONResponse({"error": "setup already complete"}, status_code=409)
-    from ..circuit_compat import resolve_circuit
-    circuit = resolve_circuit(circuit)
-    orch = _orch(request)
-    try:
-        entities = await orch.ha.get_entity_registry()
-        diag_labels = await _resolve_labels_from_diagnostics(orch.ha, entities)
-        circuit_matches, _ = match_entities_to_roles(
-            device_id, entities, [circuit], labels=diag_labels)
-        matches = circuit_matches.get(circuit, [])
-        return JSONResponse({
-            "matches": [
-                {"role": m.role, "entity_id": m.entity_id,
-                 "matched": m.matched}
-                for m in matches
-            ]
-        })
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ------------------------------------------------------------------

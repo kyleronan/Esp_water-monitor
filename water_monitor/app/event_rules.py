@@ -284,11 +284,17 @@ def toilet_veto_reason(features: Dict[str, Any],
                        cap_litres: float) -> Optional[str]:
     """Which physics test rejects this event as a single flush, or None.
 
-    Same logic as ``toilet_physics_veto`` (which wraps this); split out so the
-    log line can name the condition that actually fired. Logging only the volume
-    and the era cap makes a 2.5 L event rejected by the 2.8 L manufactured floor
-    read as "vol=2.5 L, cap=30.5 L" — indistinguishable from a passing event
-    when dozens scroll past in one reclassify.
+    Returns the reason rather than a bool so the log line can name the condition
+    that actually fired. Logging only the volume and the era cap makes a 2.5 L
+    event rejected by the 2.8 L manufactured floor read as "vol=2.5 L,
+    cap=30.5 L" — indistinguishable from a passing event when dozens scroll past
+    in one reclassify.
+
+    Reads ``volume_litres``, ``peak_flow_lpm`` and ``active_flow_segment_count``;
+    a missing/None value never vetoes (no evidence, no veto). Deliberately NOT
+    symmetric with is_flush_shaped: that rule says "looks like a flush", this one
+    says "cannot be a flush" — only the latter may override another tier's
+    positive evidence (e.g. a k-NN vote).
     """
     vol = _f(features, "volume_litres")
     if vol is not None:
@@ -305,18 +311,6 @@ def toilet_veto_reason(features: Dict[str, Any],
         return (f"{int(seg)} flow segments > {TOILET_VETO_MAX_SEGMENTS} "
                 "(a refill is one continuous segment)")
     return None
-
-
-def toilet_physics_veto(features: Dict[str, Any], cap_litres: float) -> bool:
-    """True = this event physically cannot be a single toilet flush.
-
-    Reads ``volume_litres``, ``peak_flow_lpm`` and ``active_flow_segment_count``
-    from ``features``; a missing/None value never vetoes (no evidence, no veto).
-    Deliberately NOT symmetric with is_flush_shaped: that rule says "looks like
-    a flush", this one says "cannot be a flush" — only the latter may override
-    another tier's positive evidence (e.g. a k-NN vote).
-    """
-    return toilet_veto_reason(features, cap_litres) is not None
 
 
 # ── Per-home calibration plumbing ───────────────────────────────────────────────

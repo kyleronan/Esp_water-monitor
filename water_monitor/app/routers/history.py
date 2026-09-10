@@ -38,7 +38,6 @@ from ._helpers import (
     coerce_float,
     ingress_redirect,
     reclassify_in_background,
-    run_blocking,
     startup_gate)
 _VALID_USER_FIXTURE_TYPES: frozenset = frozenset(user_selectable_types())
 
@@ -423,7 +422,7 @@ def _collect_circuit_history_sync(
     """Synchronous bundle of the history page's per-circuit DB work.
 
     Owns the per-circuit loop so the calling async handler can offload
-    it via run_blocking() in one executor hop. Everything inside is
+    it via run_db() in one executor hop. Everything inside is
     plain sqlite3 + dict assembly — no awaits.
     """
     import json
@@ -827,7 +826,7 @@ async def _history_page(request: Request):
     # runs in a single thread-pool hop rather than blocking the event loop per
     # query — on a 2-circuit deployment with a year of events, the difference
     # between a ~150 ms dashboard-fight and a clean async hand-off.
-    circuit_history = await run_blocking(
+    circuit_history = await run_db(
         _collect_circuit_history_sync,
         orch.db,
         list(cfg.circuits),

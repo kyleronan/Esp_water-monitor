@@ -209,8 +209,7 @@ class TrainingManager:
 
     def _clear_unconfirmed_clusters(self, circuit: str) -> int:
         """Delete this circuit's unconfirmed cluster rows AND null their event
-        references in the same transaction, mirroring ``delete_cluster``'s
-        semantics.
+        references in the same transaction.
 
         Both halves are required. A bare DELETE leaves events pointing at the
         removed rows, and because the engine's id map is rebuilt from those

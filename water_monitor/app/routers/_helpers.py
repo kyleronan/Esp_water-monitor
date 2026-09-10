@@ -22,15 +22,15 @@ context-switch overhead outweighs the actual query time. Wrap when:
   - The handler does any blocking I/O other than SQLite (file
     write, subprocess, etc.) — wrap to keep the loop responsive.
 
-Use `run_blocking(fn, *args, **kwargs)` for one-off offloads. For
-hot paths, extract a `_xxx_sync(...)` helper that bundles ALL the
-sync DB calls so the executor hop happens once.
+Use `run_db(fn, *args, **kwargs)` for one-off offloads. For hot
+paths, extract a `_xxx_sync(...)` helper that bundles ALL the sync
+DB calls so the executor hop happens once.
 
-run_blocking is DB-ONLY
------------------------
-`run_blocking` dispatches to `database.run_db()` — the single-thread
-DB executor. The shared connection is `check_same_thread=False` and
-must be touched from exactly ONE thread, ever.
+run_db is DB-ONLY
+-----------------
+`run_db()` is the single-thread DB executor. The shared connection is
+`check_same_thread=False` and must be touched from exactly ONE thread,
+ever.
 
 Blocking work that does NOT touch the DB (HA I/O, file writes,
 subprocess) must NOT use this helper — call
@@ -82,7 +82,6 @@ reaching for something outside this list, add a comment explaining why.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, TypeVar
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -93,16 +92,13 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from ..forms import coerce_float, coerce_int
 from ..config import DB_PATH
 from ..database import (finish_job, is_baseline_locked,
-                        run_db, run_isolated_write, start_job)
+                        run_isolated_write, start_job)
 
 __all__ = ["_json", "_orch", "_tmpl", "coerce_float", "coerce_int",
            "dev_tools_disabled", "ingress_redirect", "reclassify_in_background",
-           "run_blocking", "startup_gate", "unknown_circuit"]
+           "startup_gate", "unknown_circuit"]
 
 log = logging.getLogger(__name__)
-
-
-T = TypeVar("T")
 
 
 def _orch(request: Request):
@@ -183,18 +179,6 @@ def unknown_circuit(circuit: str) -> JSONResponse:
         {"status": "error", "message": f"Unknown circuit: {circuit}"},
         status_code=404,
     )
-
-
-async def run_blocking(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-    """Run a blocking **DB** helper on the single DB thread and await it.
-
-    Dispatches to ``database.run_db`` — the one-worker DB executor — so
-    page renders can never touch the shared connection concurrently with
-    startup/reseed work (the 8/15 + 8/16 ``InterfaceError``).
-
-    NOT for non-DB blocking work: see the module docstring.
-    """
-    return await run_db(fn, *args, **kwargs)
 
 
 def startup_gate(request: Request, page: str, title: str,

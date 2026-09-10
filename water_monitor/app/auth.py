@@ -21,8 +21,9 @@ Enforcement is centralised in two places (defence in depth):
   1. ``ingress_middleware`` mutation gate — the single chokepoint that rejects any
      state-changing request a role isn't allowed to make. No mutating route can be
      missed because it keys on the HTTP method, not a per-route opt-in.
-  2. ``require_admin`` / ``require_operator`` dependencies — attached to sensitive
-     *GET* routers (settings/backup/setup/…), which the method-based gate can't catch.
+  2. ``require_admin`` / ``require_admin_or_bootstrap`` dependencies — attached to
+     sensitive *GET* routers (settings/backup/setup/…), which the method-based
+     gate can't catch.
 
 This module is import-light (no DB / FastAPI app imports beyond the request type)
 so it stays unit-testable offline. The CSRF helpers at the bottom pull two pure
@@ -38,7 +39,7 @@ from .database import derive_csrf_token, validate_csrf_token
 
 try:
     # Runtime import (NOT TYPE_CHECKING-only): FastAPI resolves the
-    # `request: Request` annotation on require_admin/require_operator via
+    # `request: Request` annotation on require_admin via
     # get_type_hints at request time. With `from __future__ import annotations`
     # the hint is a string, so `Request` MUST exist in this module's runtime
     # globals — otherwise FastAPI can't recognise it as the request object and
@@ -167,14 +168,6 @@ def require_admin_or_bootstrap(request: Request) -> None:
         return
     from fastapi import HTTPException
     raise HTTPException(status_code=403, detail="Admin access required.")
-
-
-def require_operator(request: Request) -> None:
-    """Dependency: 403 unless the request's role can control the valve
-    (operator or admin)."""
-    if getattr(request.state, "role", VIEWER) not in (ADMIN, OPERATOR):
-        from fastapi import HTTPException
-        raise HTTPException(status_code=403, detail="Operator access required.")
 
 
 # ── CSRF token: OWASP "HMAC CSRF Token" recipe ────────────────────────────────

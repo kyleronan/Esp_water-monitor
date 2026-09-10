@@ -773,7 +773,7 @@ app.include_router(access.router)
 async def _http_403_html(request: Request, exc: HTTPException):
     """Browser-friendly 403 for page GETs.
 
-    require_admin/require_operator raise plain HTTPExceptions, whose default
+    require_admin raises plain HTTPExceptions, whose default
     rendering is raw JSON ``{"detail": "..."}`` — what a viewer hits from a
     bookmark, a stale tab, or (pre-setup) the wizard redirect. Render the small
     403 page instead, but ONLY for GETs that want HTML: API calls and the

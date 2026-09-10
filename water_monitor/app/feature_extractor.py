@@ -411,22 +411,15 @@ _XTALK_MIN_DURATION_S: float = 120.0
 # pressure-equalisation blips registering as flow. In the May-2026 ground-truth
 # export the events the user hand-marked as artifacts clustered at median
 # duration 12 s, volume 0.10 L, avg_flow 0.30 lpm, ΔP 0.00 — the long-duration
-# rule caught only 1 of 49. These thresholds (derived from that labelled set,
-# ~76% recall / ~73% precision) catch them.
+# rule caught only 1 of 49.
 #
 # A dribble is a VOLUME-ZEROING verdict: it sets is_low_flow_dribble +
 # excluded_from_training AND zeroes volume_litres_effective, removing the brief
-# blip from totals like a phantom does. Leak-safe because the flow<1 L·min⁻¹
-# gate excludes real small draws (icemaker / fridge dispenser run ~3 L·min⁻¹)
-# and a sustained slow flow accumulates past _DRIBBLE_MAX_VOLUME_L, so it stays
-# a counted long event — a continuous leak is never fragmented into zeroed
-# dribbles (verified on the archive: 0 / 347 auto dribbles moved
-# >= SUSPECT_ZERO_LITRES of real HA flow). detector_validation holds dribble to
-# the same suspect-zeroing leak-safety bar as phantom/cross-talk.
-# Re-tune here as more labelled data arrives.
-_DRIBBLE_MAX_VOLUME_L:  float = 0.5   # legacy calib key — no longer read by the detector
-_DRIBBLE_MAX_FLOW_LPM:  float = 1.0   # legacy calib key — no longer read by the detector
-_DRIBBLE_MAX_DELTA_PSI: float = 1.5   # legacy calib key — no longer read by the detector
+# blip from totals like a phantom does. The gate is the meter registration floor
+# below, NOT the old volume/flow/ΔP triple — see _detect_low_flow_dribble for why
+# volume and ΔP are deliberately not gates. detector_validation holds dribble to
+# the same suspect-zeroing leak-safety bar as phantom/cross-talk (verified on the
+# archive: 0 / 347 auto dribbles moved >= SUSPECT_ZERO_LITRES of real HA flow).
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Meter registration floor (2026-07-05) — REPLACES the dribble triple-gate.
@@ -610,8 +603,8 @@ SPARSE_ENVELOPE_REASON: str = "sparse_envelope"
 
 # ── Per-home artifact-detector calibration (Phase 2.4) ──────────────────────────
 # A frozen per-home calib (artifact_calibration.py) may override ONLY the cross-talk
-# min-duration and the dribble IDENTIFIER thresholds below. Two sets stay FROZEN /
-# never calibratable and so are absent from ARTIFACT_DEFAULTS:
+# min-duration. Two sets stay FROZEN / never calibratable and so are absent from
+# ARTIFACT_DEFAULTS:
 #   • the phantom duration floors (_PHANTOM_MIN_DURATION_S / _PHANTOM_NOFLOW_MIN_DURATION_S) —
 #     structural constants since 2026-06-14 (the legacy floor must never be lowerable, else a
 #     no-metrics legacy event could be zeroed on duration+ΔP alone);
@@ -624,9 +617,6 @@ SPARSE_ENVELOPE_REASON: str = "sparse_envelope"
 ARTIFACT_DEFAULTS: Dict[str, float] = {
     "PHANTOM_MAX_DELTA_PSI":  _PHANTOM_MAX_DELTA_PSI,
     "XTALK_MIN_DURATION_S":   _XTALK_MIN_DURATION_S,
-    "DRIBBLE_MAX_VOLUME_L":   _DRIBBLE_MAX_VOLUME_L,
-    "DRIBBLE_MAX_FLOW_LPM":   _DRIBBLE_MAX_FLOW_LPM,
-    "DRIBBLE_MAX_DELTA_PSI":  _DRIBBLE_MAX_DELTA_PSI,
     # dev14 rise phantom. In DEFAULTS for _ac() consistency but deliberately NOT
     # in artifact_calibration._BOUNDS (frozen v1 — the PHANTOM_MAX_DELTA_PSI
     # precedent): the validation margin to the nearest labelled real draw
@@ -2705,22 +2695,11 @@ def reprocess_rising_pressure_phantoms(conn: sqlite3.Connection) -> dict:
     return {"rise_flagged": rise_flagged}
 
 
-def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
-    """Back-compat alias for the phantom component of the exclusion reprocess.
-
-    Retained because the 20260532 migration calls this name. Delegates to
-    ``reprocess_event_exclusion_verdicts``; the dribble half is a no-op there
-    when the is_low_flow_dribble column doesn't exist yet (sequential upgrade).
-    """
-    return reprocess_event_exclusion_verdicts(conn)
-
-
 # Why these probes exist, and why they stay.
 #
-# They were LOAD-BEARING while migration 20260532 called
-# reprocess_pressure_restoration_phantoms mid-chain — twenty-two steps before
-# 20260554 added flow_pressure_corr, so the column was legitimately absent and
-# an unguarded read aborted the upgrade. The schema squash put 20260532 below
+# They were LOAD-BEARING while migration 20260532 called into this module
+# mid-chain — twenty-two steps before 20260554 added flow_pressure_corr, so the
+# column was legitimately absent and an unguarded read aborted the upgrade. The schema squash put 20260532 below
 # _BASELINE_VERSION and deleted it, so that path is gone and the columns now
 # exist at every live call site.
 #
@@ -3224,7 +3203,7 @@ def _flow_signature(flow_readings: list, peak: float, n: int = SIGNATURE_POINTS)
 # shower still gets ~10 s/pt), each edge cell is exactly EDGE_SIG_CELL_SECONDS
 # of absolute time anchored at the event's start (onset) or end (offset), so
 # valve ramps / closing steps / toilet fill-tapers align across durations.
-# Validated LOO over 344 labelled events (see tools/validate_edge_signatures):
+# Validated LOO over 344 labelled events:
 # 32 cells × 1 s (a 32 s window each end — wide enough for toilet fill-tapers,
 # which is where the win came from: toilet recall 0.783→0.870, shower
 # 0.878→0.927, tap 0.429→0.486) beat 16-cell and 0.5 s-cell variants; finer

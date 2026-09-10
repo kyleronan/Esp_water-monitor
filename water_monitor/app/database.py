@@ -904,10 +904,6 @@ def upsert_sensitivity_config(conn: sqlite3.Connection, circuit: str, **kwargs) 
     _upsert_by_circuit(conn, "sensitivity_config", circuit, **kwargs)
 
 
-def get_learning_config(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
-    return _get_by_circuit(conn, "learning_config", circuit)
-
-
 def upsert_learning_config(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
     _upsert_by_circuit(conn, "learning_config", circuit, **kwargs)
 
@@ -4018,36 +4014,6 @@ def upsert_fixture_from_cluster(
     return fixture_id
 
 
-def get_fixture_id_for_cluster(
-    conn: sqlite3.Connection,
-    circuit: str,
-    cluster_id: int,
-) -> Optional[str]:
-    """Return the fixture_id linked to a cluster, or None."""
-    row = conn.execute(
-        "SELECT fixture_id FROM fixture_clusters WHERE circuit = ? AND id = ?",
-        (circuit, cluster_id)
-    ).fetchone()
-    return row["fixture_id"] if row and row["fixture_id"] else None
-
-
-def delete_cluster(
-    conn: sqlite3.Connection,
-    circuit: str,
-    cluster_id: int,
-) -> None:
-    """Remove a cluster and null out its cluster_id on linked events."""
-    conn.execute(
-        "UPDATE events SET cluster_id = NULL, fixture_id = NULL WHERE circuit = ? AND cluster_id = ?",
-        (circuit, cluster_id),
-    )
-    conn.execute(
-        "DELETE FROM fixture_clusters WHERE circuit = ? AND id = ?",
-        (circuit, cluster_id),
-    )
-    conn.commit()
-
-
 def merge_clusters(
     conn: sqlite3.Connection,
     circuit: str,
@@ -4823,8 +4789,8 @@ _SIGNATURE_KNN_INVARIANT_SCALES: dict = {
 # tier. Cell count/size pinned to feature_extractor.EDGE_SIG_CELLS /
 # EDGE_SIG_CELL_SECONDS (32 × 1 s — asserted equal by test_edge_signatures);
 # duplicated here to avoid a module-level import cycle. Per-dim scale 1.0 and
-# the 32×1 s grid are the LOO-sweep optimum (tools/validate_edge_signatures on
-# 344 labelled events: toilet recall 0.783→0.870, shower 0.878→0.927, tap
+# the 32×1 s grid are the LOO-sweep optimum (344 labelled events: toilet
+# recall 0.783→0.870, shower 0.878→0.927, tap
 # 0.429→0.486; wider window beat finer cells — the toilet fill-taper needs
 # ~30 s of tail). Cells are linear in [0, 1], never log-compressed.
 _EDGE_SIG_CELLS: int = 32
@@ -5087,24 +5053,6 @@ def get_fixture_type_signatures(
             "updated_at": r["updated_at"],
         })
     return out
-
-
-def delete_fixture_signature(
-    conn: sqlite3.Connection,
-    circuit: str,
-    fixture_type: str,
-) -> bool:
-    """Forget a signature so the user can recover from bad labels.
-
-    Returns True if a row was deleted, False if none existed.
-    """
-    cur = conn.execute(
-        "DELETE FROM fixture_type_signatures "
-        "WHERE circuit = ? AND fixture_type = ?",
-        (circuit, fixture_type),
-    )
-    conn.commit()
-    return cur.rowcount > 0
 
 
 # ── Sprint F: Per-category Fixtures-page rollup ─────────────────────────────
