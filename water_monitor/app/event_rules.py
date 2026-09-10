@@ -87,6 +87,19 @@ def get_home_timezone():
     return _HOME_TZ
 
 
+def home_timezone_or_utc():
+    """The home timezone, or UTC when detection has not run yet.
+
+    THE definition — ``database._home_tz`` and the feature extractor's
+    time-of-day features both resolve here, so a day boundary can never be
+    computed against two different zones.
+
+    Goes through ``get_home_timezone()`` rather than reading ``_HOME_TZ``: the
+    function is the seam tests patch to pin a zone.
+    """
+    return get_home_timezone() or timezone.utc
+
+
 # ── Washer cycle detector constants (audit Pass 4; in-sample, eval-gated) ──────
 _WASHER_ANCHOR_MIN_VOL_L: float = 9.0
 _WASHER_ANCHOR_DUR_S: Tuple[float, float] = (80.0, 400.0)

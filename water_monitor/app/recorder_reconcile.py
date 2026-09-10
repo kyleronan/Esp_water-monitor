@@ -34,6 +34,7 @@ from .database import (
     run_isolated_write,
     set_reconcile_state,
     start_job)
+from .timeutil import to_utc as _to_utc
 
 log = logging.getLogger(__name__)
 
@@ -45,15 +46,6 @@ RECONCILE_FRAC: float = 0.20       # relative divergence floor
 _FETCH_MARGIN_S: float = 60.0      # widen the HA fetch a touch past the window
 
 
-def _to_utc(ts: Any) -> Optional[datetime]:
-    """ISO/datetime → aware UTC datetime (naive ⇒ UTC), or None."""
-    if isinstance(ts, datetime):
-        return ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-    try:
-        d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-    return d.astimezone(timezone.utc) if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
 def firmware_volume_delta(volume_hist: Any, start: datetime, end: datetime,

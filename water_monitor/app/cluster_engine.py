@@ -491,6 +491,26 @@ class ClusterEngine:
             log.info("[%s] type cache: cluster %d removed (was %s)",
                      circuit, cluster_id, removed)
 
+    def _type_gate_distance(self, circuit, candidate_id, fixture_type,
+                            x, scaler) -> Optional[float]:
+        """Weighted distance from ``x`` to a cluster's stored centroid.
+
+        None when the cluster has no centroid to compare against, which the two
+        callers both read as "no gate to apply". Both live inside a fail-closed
+        try/except, so a raise here still rejects the match.
+        """
+        row = self._db.execute(
+            "SELECT centroid FROM fixture_clusters WHERE circuit = ? AND id = ?",
+            (circuit, candidate_id),
+        ).fetchone()
+        if not (row and row["centroid"]):
+            return None
+        db_orig   = _load_centroid(row["centroid"])
+        db_feat   = {k: float(db_orig.get(k, 0)) for k in FEATURE_KEYS}
+        db_scaled = scaler.transform_one(db_feat)
+        weights   = self._build_match_weights(fixture_type)
+        return self._weighted_distance(x, db_scaled, weights)
+
     def _build_match_weights(self, fixture_type: str) -> Dict[str, float]:
         """Per-feature weight vector for a fixture type. Default 1.0.
 
@@ -769,17 +789,9 @@ class ClusterEngine:
         if fixture_type:
             try:
                 from .fixtures import get_match_threshold
-                row = self._db.execute(
-                    "SELECT centroid FROM fixture_clusters "
-                    "WHERE circuit = ? AND id = ?",
-                    (circuit, candidate_id),
-                ).fetchone()
-                if row and row["centroid"]:
-                    db_orig   = _load_centroid(row["centroid"])
-                    db_feat   = {k: float(db_orig.get(k, 0)) for k in FEATURE_KEYS}
-                    db_scaled = scaler.transform_one(db_feat)
-                    weights   = self._build_match_weights(fixture_type)
-                    wdist     = self._weighted_distance(x, db_scaled, weights)
+                wdist = self._type_gate_distance(
+                    circuit, candidate_id, fixture_type, x, scaler)
+                if wdist is not None:
                     if wdist > get_match_threshold(fixture_type):
                         return (None, 0.0, '', 'type_gate_rejected')
             except Exception as e:
@@ -890,17 +902,9 @@ class ClusterEngine:
         if fixture_type:
             try:
                 from .fixtures import get_match_threshold
-                row = self._db.execute(
-                    "SELECT centroid FROM fixture_clusters "
-                    "WHERE circuit = ? AND id = ?",
-                    (circuit, candidate_id),
-                ).fetchone()
-                if row and row["centroid"]:
-                    db_orig   = _load_centroid(row["centroid"])
-                    db_feat   = {k: float(db_orig.get(k, 0)) for k in FEATURE_KEYS}
-                    db_scaled = scaler.transform_one(db_feat)
-                    weights   = self._build_match_weights(fixture_type)
-                    wdist     = self._weighted_distance(x, db_scaled, weights)
+                wdist = self._type_gate_distance(
+                    circuit, candidate_id, fixture_type, x, scaler)
+                if wdist is not None:
                     threshold = get_match_threshold(fixture_type)
                     if wdist > threshold:
                         log.info(

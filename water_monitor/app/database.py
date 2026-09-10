@@ -304,8 +304,8 @@ def _create_schema(conn: sqlite3.Connection) -> None:
 
 def _home_tz():
     """Home timezone (HA's), or UTC when detection hasn't run yet."""
-    from .event_rules import get_home_timezone
-    return get_home_timezone() or timezone.utc
+    from .event_rules import home_timezone_or_utc
+    return home_timezone_or_utc()
 
 
 def local_midnight_utc_iso(days_ago: int = 0) -> str:

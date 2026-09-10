@@ -59,6 +59,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Optional, Sequence, Tuple
+from .stats import median as _median
 
 log = logging.getLogger(__name__)
 
@@ -184,15 +185,6 @@ class FrozenBaseline:
     def from_json(cls, d: dict) -> "FrozenBaseline":
         return cls(**{k: v for k, v in d.items()
                       if k in cls.__dataclass_fields__})
-
-
-def _median(xs: Sequence[float]) -> float:
-    s = sorted(xs)
-    n = len(s)
-    if not n:
-        return 0.0
-    mid = n // 2
-    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
 
 
 def _mad(xs: Sequence[float], centre: Optional[float] = None) -> float:

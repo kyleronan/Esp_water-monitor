@@ -3421,10 +3421,6 @@ def flow_plateau_lpm(series) -> Optional[float]:
     if len(on) < 4:
         return None
 
-    def _median(seq):
-        mid = len(seq) // 2
-        return seq[mid] if len(seq) % 2 else (seq[mid - 1] + seq[mid]) / 2.0
-
     # The reference is the MEDIAN of the flowing samples, not their max. A
     # max-anchored floor is defeated by exactly one spike: half of a 22 L/min
     # transient is 11, which excludes a genuine 9 L/min plateau and hands back
@@ -3787,6 +3783,7 @@ from .database import (
     local_day_of,
     rezero_rows_with_zeroing_flag,
     transaction)
+from .stats import median as _median
 
 _WF_FLOW_SIG_MIN_PEAK_LPM:   float = 0.05   # ignore near-zero / noisy full_flow arrays
 _WF_PRESS_SIG_MIN_DELTA_PSI:  float = 0.15   # ignore pressure noise below this drop
@@ -4292,16 +4289,6 @@ def _late_waveform_upgrade_job(conn, circuit: str, record: WaveformRecord):
     return best["id"] if cur.rowcount > 0 else None
 
 
-def _get_home_tz_or_utc():
-    """Home timezone for time-of-day features, UTC until detection has run.
-
-    Deferred import mirrors the file's database-import style and avoids any
-    import-order coupling with event_rules at module load.
-    """
-    from .event_rules import get_home_timezone
-    return get_home_timezone() or timezone.utc
-
-
 def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
                      pump_mode: bool = False) -> Dict[str, Any]:
     """Compute the full feature vector from a RawEvent.
@@ -4450,7 +4437,8 @@ def extract_features(event: RawEvent, *, min_flow_lpm: float = 0.15,
     # fell on the next UTC day). Falls back to UTC only when tz detection
     # hasn't run yet; the deferred backfill task re-stamps those rows once
     # the tz is known (events.time_features_tz marker).
-    _home_tz = _get_home_tz_or_utc()
+    from .event_rules import home_timezone_or_utc
+    _home_tz = home_timezone_or_utc()
     _local = start_utc.astimezone(_home_tz)
     hour = _local.hour
     dow = _local.weekday()

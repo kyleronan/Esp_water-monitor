@@ -37,6 +37,7 @@ from .database import (
     local_day_of as _local_day_of,
     note_locked_write,
     run_db)
+from .stats import median as _median
 
 log = logging.getLogger(__name__)
 
@@ -51,12 +52,6 @@ _BOOTSTRAP_LOOKBACK_DAYS = 120
 
 
 # ── pure math ─────────────────────────────────────────────────────────────────
-
-def _median(vals: List[float]) -> float:
-    s = sorted(vals)
-    mid = len(s) // 2
-    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2.0
-
 
 def _pctl(vals: List[float], frac: float) -> float:
     s = sorted(vals)

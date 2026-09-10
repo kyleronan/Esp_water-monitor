@@ -147,6 +147,7 @@ def _valve_meta_kwargs(meta: "Optional[Tuple[str, str]]") -> dict:
 # test_unit73_event_detector_split.
 from .build_info import (_read_addon_version,  # noqa: F401 — re-export
                          _read_git_commit)
+from .stats import median as _median
 
 _ADDON_VERSION = _read_addon_version()
 _GIT_COMMIT = _read_git_commit()
@@ -160,13 +161,6 @@ _PROP_MA_HALF_S = 0.5            # centered moving-average half-width (-> 1 s wi
 _PROP_NOISE_BAND = 0.10          # PSI below the local baseline that marks transient onset
 _PROP_ABOVE_RUN = 5              # consecutive at-baseline samples confirming pre-drop
 _PROP_MIN_BASELINE_SAMPLES = 5   # minimum samples required in the baseline-guard region
-
-
-def _median(values: List[float]) -> float:
-    s = sorted(values)
-    k = len(s)
-    mid = k // 2
-    return s[mid] if k % 2 else (s[mid - 1] + s[mid]) / 2.0
 
 
 @dataclass

@@ -22,9 +22,10 @@ import json
 import logging
 import math
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .database import run_db
+from .timeutil import to_utc as _to_utc
 
 log = logging.getLogger(__name__)
 
@@ -58,15 +59,6 @@ EDGE_GUARD_S = 2.0
 
 # ── time + integration helpers ──────────────────────────────────────────────────
 
-def _to_utc(ts: Any) -> Optional[datetime]:
-    """Parse an ISO timestamp (or datetime) to an aware UTC datetime. Naive ⇒ assumed UTC."""
-    if isinstance(ts, datetime):
-        return ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-    try:
-        d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-    return d.astimezone(timezone.utc) if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
 def normalize_series(series: Sequence[Tuple[Any, Any]]) -> List[Tuple[datetime, float]]:
