@@ -9,7 +9,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from ._helpers import run_blocking, startup_gate
+from ._helpers import _orch, run_blocking, startup_gate
 from ..config import pump_gates_active
 from ..database import (
     downsample_pressure_series,
@@ -23,10 +23,6 @@ from ..database import (
 
 router = APIRouter()
 log = logging.getLogger(__name__)
-
-
-def _get_orchestrator(request: Request):
-    return request.app.state.orchestrator
 
 
 # Leak-watch freshness: the estimate must come from one of the N most recent
@@ -78,7 +74,7 @@ def _fresh_leak_estimate(nights: list, ack: str | None) -> Dict[str, Any] | None
 
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    orch = _get_orchestrator(request)
+    orch = _orch(request)
 
     # The LANDING page needs the readiness gate most of all: this is where
     # ingress drops the operator after every restart, so it is the first thing
@@ -195,7 +191,7 @@ async def dashboard(request: Request):
 @router.get("/api/dashboard/live")
 async def dashboard_live(request: Request):
     """JSON endpoint for polling live state (used by JS auto-refresh)."""
-    orch = _get_orchestrator(request)
+    orch = _orch(request)
     cfg = orch._cfg
 
     # get_training_info reads training_state — a DB touch. This
@@ -225,7 +221,7 @@ async def dashboard_live(request: Request):
 async def jobs_poll(request: Request, since: int = 0):
     """Recent background-job statuses with id > ``since`` for the UI poll-and-toast
     (reclassify / calibration feedback). Newest first."""
-    orch = _get_orchestrator(request)
+    orch = _orch(request)
     # Polled endpoint — off the loop thread, onto the DB worker.
     jobs = await run_db(get_jobs_since, orch.db, since_id=since)
     return JSONResponse({"jobs": jobs})
@@ -236,7 +232,7 @@ async def chart_data(circuit: str, request: Request):
     """Return hourly volume data for chart refresh."""
     from ..circuit_compat import resolve_circuit
     circuit = resolve_circuit(circuit)
-    orch = _get_orchestrator(request)
+    orch = _orch(request)
     data = await run_blocking(_build_chart_data, orch.db, circuit)
     return JSONResponse(data)
 
@@ -247,7 +243,7 @@ async def dashboard_pressure(circuit: str, request: Request):
     modal chart. Reads live from HA — the addon stores no pressure time series. Never
     500s; failure modes are surfaced via `error` so the modal shows the right hint."""
     from ..circuit_compat import resolve_circuit
-    orch = _get_orchestrator(request)
+    orch = _orch(request)
     circuit = resolve_circuit(circuit)
 
     def _fail(err: str, baseline=None):

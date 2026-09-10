@@ -5,7 +5,7 @@ import logging
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from ._helpers import coerce_int, ingress_redirect
+from ._helpers import _orch, _tmpl, coerce_int, ingress_redirect, unknown_circuit
 from ..circuit_compat import resolve_circuit
 from ..task_registry import spawn
 from ..config import DB_PATH
@@ -41,14 +41,6 @@ _THRESHOLD_ROLES: frozenset[str] = frozenset({
     "trickle_max_flow",
     "trickle_duration",
 })
-
-
-def _orch(request: Request):
-    return request.app.state.orchestrator
-
-
-def _templates(request: Request):
-    return request.app.state.templates
 
 
 @router.get("", response_class=HTMLResponse)
@@ -99,7 +91,7 @@ async def device_page(request: Request):
 
         circuit_states.append(state)
 
-    return _templates(request).TemplateResponse("device.html", {
+    return _tmpl(request).TemplateResponse("device.html", {
         "request": request,
         "circuits": circuit_states,
         "page": "device",
@@ -155,10 +147,18 @@ def _device_db_payload(db, circuits) -> dict:
 # ------------------------------------------------------------------
 # Valve control
 # ------------------------------------------------------------------
-@router.post("/valve/{circuit}/open")
-async def valve_open(circuit: str, request: Request):
+async def _valve_command(circuit: str, request: Request, *, opening: bool):
+    """Open or close a circuit's valve through HA.
+
+    502, not 200, when the HA round-trip fails: that is the documented 502 case
+    (_helpers.py) and the other device routes already use it. Returning 200 with
+    {"status":"error"} would make every ``fetch(...).ok`` check, every
+    automation and every log scrape read a command that never reached the
+    hardware as a success — worst of all on a close, which is the safety action.
+    """
+    verb = "open" if opening else "close"
     circuit = resolve_circuit(circuit)
-    log.info(">>> valve_open called for circuit=%s", circuit)
+    log.info(">>> valve_%s called for circuit=%s", verb, circuit)
     orch = _orch(request)
     cfg = orch._cfg.get_circuit(circuit)
     if not cfg or not cfg.valve_entity:
@@ -169,69 +169,46 @@ async def valve_open(circuit: str, request: Request):
                         "(or re-run Setup if first install)."},
             status_code=404,
         )
-    ok = await orch.ha.open_valve(cfg.valve_entity)
-    # 502, not 200. A failed HA round-trip is exactly the
-    # documented 502 case (_helpers.py) and the other four device routes
-    # already use it. Returning 200 with {"status":"error"} means every
-    # `fetch(...).ok` check, every automation, and every log scrape reads a
-    # valve command that never reached the hardware as a success.
+    drive = orch.ha.open_valve if opening else orch.ha.close_valve
+    ok = await drive(cfg.valve_entity)
     return JSONResponse(
         {
             "status": "ok" if ok else "error",
             "entity_id": cfg.valve_entity,
-            "message": "Valve open command sent." if ok
-                       else f"Failed to open valve {cfg.valve_entity}. "
+            "message": f"Valve {verb} command sent." if ok
+                       else f"Failed to {verb} valve {cfg.valve_entity}. "
                             "Check the addon log for details.",
         },
         status_code=200 if ok else 502,
     )
+
+
+@router.post("/valve/{circuit}/open")
+async def valve_open(circuit: str, request: Request):
+    return await _valve_command(circuit, request, opening=True)
 
 
 @router.post("/valve/{circuit}/close")
 async def valve_close(circuit: str, request: Request):
-    circuit = resolve_circuit(circuit)
-    log.info(">>> valve_close called for circuit=%s", circuit)
-    orch = _orch(request)
-    cfg = orch._cfg.get_circuit(circuit)
-    if not cfg or not cfg.valve_entity:
-        return JSONResponse(
-            {"status": "error",
-             "message": f"No valve entity configured for circuit '{circuit}'. "
-                        "Go to Settings → Advanced → Re-discover devices "
-                        "(or re-run Setup if first install)."},
-            status_code=404,
-        )
-    ok = await orch.ha.close_valve(cfg.valve_entity)
-    # 502 on failure — see valve_open above. This one matters
-    # most: a close is the safety action, and a silent 200 on a close that
-    # never happened is the worst possible lie this API can tell.
-    return JSONResponse(
-        {
-            "status": "ok" if ok else "error",
-            "entity_id": cfg.valve_entity,
-            "message": "Valve close command sent." if ok
-                       else f"Failed to close valve {cfg.valve_entity}. "
-                            "Check the addon log for details.",
-        },
-        status_code=200 if ok else 502,
-    )
+    return await _valve_command(circuit, request, opening=False)
 
 
 # ------------------------------------------------------------------
 # Fault resets
 # ------------------------------------------------------------------
-@router.post("/fault/{circuit}/reset")
-async def fault_reset(circuit: str, request: Request):
+async def _press_reset_button(circuit: str, request: Request, *,
+                              entity_key: str, label: str):
+    """Press one of the per-circuit reset buttons via HA."""
     circuit = resolve_circuit(circuit)
-    log.info(">>> fault_reset called for circuit=%s", circuit)
+    log.info(">>> %s reset called for circuit=%s", label.lower(), circuit)
     orch = _orch(request)
     from ..device_discovery import load_circuit_entities
     entities = await run_db(load_circuit_entities, orch.db, circuit)
-    entity_id = entities.get("fault_reset_button")
+    entity_id = entities.get(entity_key)
     if not entity_id:
         return JSONResponse(
             {"status": "error",
-             "message": "Fault reset button not found for this circuit. "
+             "message": f"{label} reset button not found for this circuit. "
                         "Re-run device discovery to map the entity."},
             status_code=404,
         )
@@ -242,30 +219,18 @@ async def fault_reset(circuit: str, request: Request):
             status_code=502,
         )
     return JSONResponse({"status": "reset"})
+
+
+@router.post("/fault/{circuit}/reset")
+async def fault_reset(circuit: str, request: Request):
+    return await _press_reset_button(circuit, request,
+                                     entity_key="fault_reset_button", label="Fault")
 
 
 @router.post("/trickle/{circuit}/reset")
 async def trickle_reset(circuit: str, request: Request):
-    circuit = resolve_circuit(circuit)
-    log.info(">>> trickle_reset called for circuit=%s", circuit)
-    orch = _orch(request)
-    from ..device_discovery import load_circuit_entities
-    entities = await run_db(load_circuit_entities, orch.db, circuit)
-    entity_id = entities.get("trickle_reset_button")
-    if not entity_id:
-        return JSONResponse(
-            {"status": "error",
-             "message": "Trickle reset button not found for this circuit. "
-                        "Re-run device discovery to map the entity."},
-            status_code=404,
-        )
-    ok = await orch.ha.call_service("button", "press", {"entity_id": entity_id})
-    if not ok:
-        return JSONResponse(
-            {"status": "error", "message": "HA button press failed — check device connectivity"},
-            status_code=502,
-        )
-    return JSONResponse({"status": "reset"})
+    return await _press_reset_button(circuit, request,
+                                     entity_key="trickle_reset_button", label="Trickle")
 
 
 # ------------------------------------------------------------------
@@ -282,10 +247,7 @@ async def threshold_update(
     orch = _orch(request)
     circuit_cfg = orch._cfg.get_circuit(circuit)
     if not circuit_cfg:
-        return JSONResponse(
-            {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=404,
-        )
+        return unknown_circuit(circuit)
 
     # Build allowlist from only the writable threshold roles for this circuit
     from ..device_discovery import load_circuit_entities
@@ -335,10 +297,7 @@ async def alert_toggle(
     orch = _orch(request)
     circuit_cfg = orch._cfg.get_circuit(circuit)
     if not circuit_cfg:
-        return JSONResponse(
-            {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=404,
-        )
+        return unknown_circuit(circuit)
     from ..device_discovery import load_circuit_entities
     entities = await run_db(load_circuit_entities, orch.db, circuit)
     role = f"alert_{alert_type}_switch"
@@ -375,10 +334,7 @@ async def leaktest_run(circuit: str, request: Request):
     cfg = orch._cfg.get_circuit(circuit)
 
     if not cfg:
-        return JSONResponse(
-            {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=404,
-        )
+        return unknown_circuit(circuit)
 
     if not cfg.leak_test_switch:
         return JSONResponse(
@@ -453,10 +409,7 @@ async def leaktest_abort(circuit: str, request: Request):
     cfg = orch._cfg.get_circuit(circuit)
 
     if not cfg:
-        return JSONResponse(
-            {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=404,
-        )
+        return unknown_circuit(circuit)
 
     # Turn off the leak test switch on the ESP (stops the test)
     errors = []
@@ -531,7 +484,6 @@ async def reconcile_apply(circuit: str, request: Request):
     still diverges from its volume, from the STORED recorder value (no HA re-fetch).
     Runs under the write lock (serialized with recompute/reclassify)."""
     circuit = resolve_circuit(circuit)
-    orch = _orch(request)
     from ..recorder_reconcile import apply_flagged_backlog
 
     def _job(conn):

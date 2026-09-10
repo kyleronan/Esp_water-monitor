@@ -203,7 +203,6 @@ def evaluate_fixture(conn: sqlite3.Connection, circuit: str, fixture_type: str,
     """Run every enabled signal for one fixture against its frozen reference."""
     after = [e for e in stream if str(e["start_ts"]) >= baseline.window_end]
     mine = [e for e in after if e["cls"] == fixture_type]
-    rate = fh.observed_rate(mine)
 
     # Coverage is judged on the TRAILING window only. The lifetime average
     # would hide exactly the case that matters: a stream that was healthy for

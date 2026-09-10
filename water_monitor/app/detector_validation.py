@@ -319,7 +319,6 @@ def _on_windows(series: List[Tuple[datetime, float]], times: List[datetime],
     ``[start, end]`` intervals."""
     raw: List[Tuple[datetime, datetime]] = []
     start = None
-    n = len(series)
     for i, (ts, f) in enumerate(series):
         if f >= min_flow:
             if start is None:

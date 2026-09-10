@@ -23,19 +23,11 @@ from ..database import (
     load_operator_ids,
     remove_operator,
     run_db)
-from ._helpers import ingress_redirect
+from ._helpers import _orch, _tmpl, ingress_redirect
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/access", dependencies=[Depends(require_admin)])
-
-
-def _orch(request: Request):
-    return request.app.state.orchestrator
-
-
-def _templates(request: Request):
-    return request.app.state.templates
 
 
 @router.get("", response_class=HTMLResponse)
@@ -98,7 +90,7 @@ async def access_page(request: Request):
     users.sort(key=lambda u: (u["role"] != ADMIN, u["role"] != OPERATOR,
                               u["name"].lower()))
 
-    return _templates(request).TemplateResponse("access.html", {
+    return _tmpl(request).TemplateResponse("access.html", {
         "request": request,
         "page": "access",
         "users": users,

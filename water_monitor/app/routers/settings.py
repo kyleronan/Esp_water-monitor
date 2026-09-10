@@ -5,8 +5,15 @@ import logging
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from ._helpers import (coerce_float, coerce_int, ingress_redirect,
-                       startup_gate)
+from ._helpers import (
+    _orch,
+    _tmpl,
+    coerce_float,
+    coerce_int,
+    dev_tools_disabled,
+    ingress_redirect,
+    startup_gate,
+    unknown_circuit)
 
 from ..auth import require_admin
 from ..circuit_compat import resolve_circuit
@@ -54,14 +61,6 @@ log = logging.getLogger(__name__)
 # and destructive maintenance. Enforced here (covers GET pages the method-based
 # mutation gate can't catch) and again by the central gate for the POSTs.
 router = APIRouter(prefix="/settings", dependencies=[Depends(require_admin)])
-
-
-def _orch(request: Request):
-    return request.app.state.orchestrator
-
-
-def _tmpl(request: Request):
-    return request.app.state.templates
 
 
 def _fmt_local_ts(iso, tz) -> "str | None":
@@ -975,7 +974,7 @@ async def dev_retrain(circuit: str, request: Request):
     fit/fallback is surfaced via the HA 'calibration locked' notification + log
     (kept off the JS path so a stale app.js can't break the button)."""
     if not DEV_TOOLS:
-        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+        return dev_tools_disabled()
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
     if orch.training_manager:
@@ -997,7 +996,7 @@ async def dev_retrain_model(circuit: str, request: Request):
     Plain form POST → redirect (kept off the JS path, like ``dev_retrain``);
     the outcome is surfaced through the jobs table the UI already polls."""
     if not DEV_TOOLS:
-        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+        return dev_tools_disabled()
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
     if orch.learning is None:
@@ -1023,7 +1022,7 @@ async def dev_rollback_model(circuit: str, request: Request):
     form POST → redirect, outcome as a toast via the jobs table, like the
     other dev buttons. Gated behind ``dev_tools``."""
     if not DEV_TOOLS:
-        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+        return dev_tools_disabled()
     from .. import tinymodel as tm
     from ..learning_loop import rollback_serving_model
 
@@ -1058,7 +1057,7 @@ async def dev_pin_referee_benchmark(circuit: str, request: Request):
     confirm dialog names any open alert so the operator decides with eyes
     open. Outcome as a toast via the jobs table; gated behind ``dev_tools``."""
     if not DEV_TOOLS:
-        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+        return dev_tools_disabled()
     from ..learning_loop import benchmark_ids_for_circuit, pin_benchmark_for_circuit
 
     circuit = resolve_circuit(circuit)
@@ -1105,7 +1104,7 @@ async def dev_rebuild_overlaps(circuit: str, request: Request):
     groups are reported, not touched. Toast via the jobs table; gated behind
     ``dev_tools``."""
     if not DEV_TOOLS:
-        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+        return dev_tools_disabled()
     import asyncio
     from datetime import datetime as _dt
     from ..overlap_guard import summarize_overlap_groups
@@ -1174,7 +1173,7 @@ async def dev_import_referee_benchmark(circuit: str, request: Request):
     (multipart form POST with ``_csrf``, like the Re-fit button), or a JSON
     body. Gated behind ``dev_tools``."""
     if not DEV_TOOLS:
-        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+        return dev_tools_disabled()
     import json as _json
     from ..learning_loop import import_referee_benchmark
 
@@ -1226,7 +1225,7 @@ async def dev_validate_detectors(circuit: str, request: Request):
     Diagnostic only — writes no thresholds. Returns the report JSON. Gated behind
     ``dev_tools``."""
     if not DEV_TOOLS:
-        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+        return dev_tools_disabled()
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
     if orch.training_manager:
@@ -1244,7 +1243,7 @@ async def dev_reimport_range(circuit: str, request: Request):
     fixes a garbled/unclosed event that absorbed a whole day. User-labelled /
     classified / ignored events are preserved. Gated behind ``dev_tools``."""
     if not DEV_TOOLS:
-        return JSONResponse({"error": "dev tools disabled"}, status_code=404)
+        return dev_tools_disabled()
     from datetime import datetime, timezone
     from ..reprocess import reprocess_window
     circuit = resolve_circuit(circuit)
@@ -1666,10 +1665,7 @@ async def circuit_rename(circuit: str, request: Request):
     # Validate circuit exists
     circuit_cfg = orch._cfg.get_circuit(circuit)
     if not circuit_cfg:
-        return JSONResponse(
-            {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=404,
-        )
+        return unknown_circuit(circuit)
 
     from ..circuit_compat import validate_display_name
     try:
@@ -1695,10 +1691,7 @@ async def circuit_type_update(circuit: str, request: Request):
     orch = _orch(request)
 
     if not orch._cfg.get_circuit(circuit):
-        return JSONResponse(
-            {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=404,
-        )
+        return unknown_circuit(circuit)
 
     form = await request.form()
     from ..fixtures import (
@@ -1798,10 +1791,7 @@ async def circuit_winterized_update(circuit: str, request: Request):
     orch = _orch(request)
 
     if not orch._cfg.get_circuit(circuit):
-        return JSONResponse(
-            {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=404,
-        )
+        return unknown_circuit(circuit)
 
     form = await request.form()
     raw = str(form.get("winterized", "")).strip().lower()
@@ -1850,10 +1840,7 @@ async def circuit_valve_type_update(circuit: str, request: Request):
     orch = _orch(request)
 
     if not orch._cfg.get_circuit(circuit):
-        return JSONResponse(
-            {"status": "error", "message": f"Unknown circuit: {circuit}"},
-            status_code=404,
-        )
+        return unknown_circuit(circuit)
 
     form = await request.form()
     from ..fixtures import parse_valve_type

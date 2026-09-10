@@ -650,57 +650,34 @@ class HaClient:
         return await self.call_service("number", "set_value",
                                        {"entity_id": entity_id, "value": value})
 
-    async def open_valve(self, entity_id: str) -> bool:
-        """
-        Open a valve. Supports multiple HA domains:
-          valve.*  → valve.open_valve
-          cover.*  → cover.open_cover
-          switch.* → switch.turn_on (assumes switch ON = valve open)
-        Logs the action and returns success/failure.
-        """
+    # domain -> (open service, close service). switch ON = valve open.
+    _VALVE_SERVICES = {
+        "valve":  ("open_valve", "close_valve"),
+        "cover":  ("open_cover", "close_cover"),
+        "switch": ("turn_on",    "turn_off"),
+    }
+
+    async def _set_valve(self, entity_id: str, *, opening: bool) -> bool:
+        """Drive a valve that may be exposed as valve.*, cover.* or switch.*."""
+        verb = "open" if opening else "close"
         domain = entity_id.split(".", 1)[0]
-        if domain == "valve":
-            ok = await self.call_service("valve", "open_valve",
-                                          {"entity_id": entity_id})
-        elif domain == "cover":
-            ok = await self.call_service("cover", "open_cover",
-                                          {"entity_id": entity_id})
-        elif domain == "switch":
-            ok = await self.call_service("switch", "turn_on",
-                                          {"entity_id": entity_id})
-        else:
-            log.error("Cannot open valve %s — unsupported domain %r",
-                      entity_id, domain)
+        services = self._VALVE_SERVICES.get(domain)
+        if services is None:
+            log.error("Cannot %s valve %s — unsupported domain %r",
+                      verb, entity_id, domain)
             return False
-        log.info("open_valve(%s) → %s", entity_id,
-                 "OK" if ok else "FAILED")
+        ok = await self.call_service(domain, services[0 if opening else 1],
+                                     {"entity_id": entity_id})
+        log.info("%s_valve(%s) → %s", verb, entity_id, "OK" if ok else "FAILED")
         return ok
 
+    async def open_valve(self, entity_id: str) -> bool:
+        """Open a valve. Logs the action and returns success/failure."""
+        return await self._set_valve(entity_id, opening=True)
+
     async def close_valve(self, entity_id: str) -> bool:
-        """
-        Close a valve. Supports multiple HA domains:
-          valve.*  → valve.close_valve
-          cover.*  → cover.close_cover
-          switch.* → switch.turn_off (assumes switch OFF = valve closed)
-        Logs the action and returns success/failure.
-        """
-        domain = entity_id.split(".", 1)[0]
-        if domain == "valve":
-            ok = await self.call_service("valve", "close_valve",
-                                          {"entity_id": entity_id})
-        elif domain == "cover":
-            ok = await self.call_service("cover", "close_cover",
-                                          {"entity_id": entity_id})
-        elif domain == "switch":
-            ok = await self.call_service("switch", "turn_off",
-                                          {"entity_id": entity_id})
-        else:
-            log.error("Cannot close valve %s — unsupported domain %r",
-                      entity_id, domain)
-            return False
-        log.info("close_valve(%s) → %s", entity_id,
-                 "OK" if ok else "FAILED")
-        return ok
+        """Close a valve. Logs the action and returns success/failure."""
+        return await self._set_valve(entity_id, opening=False)
 
     async def notify(self, title: str, message: str,
                      notification_id: Optional[str] = None) -> bool:

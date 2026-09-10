@@ -8,7 +8,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from ._helpers import ingress_redirect, startup_gate
+from ._helpers import _orch, _tmpl, ingress_redirect, startup_gate
 from ..circuit_compat import resolve_circuit
 from ..config import DATA_DIR, DB_PATH, DEV_TOOLS
 from ..database import (
@@ -31,14 +31,6 @@ from ..database import (
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/fixtures")
-
-
-def _orch(request: Request):
-    return request.app.state.orchestrator
-
-
-def _tmpl(request: Request):
-    return request.app.state.templates
 
 
 def _valid_circuit(circuit: str, request: Request) -> str:
@@ -369,7 +361,6 @@ async def resolve_health_alert(alert_id: int, request: Request):
 
     CSRF is enforced by the project-wide middleware.
     """
-    orch = _orch(request)
     form = await request.form()
     reason = str(form.get("reason") or "").strip()
     from ..fixture_health import (REASON_REPAIRED,

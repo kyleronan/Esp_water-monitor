@@ -47,12 +47,13 @@ from ..database import (
     load_circuit_labels,
     load_circuit_labels as _load_labels,
     normalize_events_utc,
-    run_db,
-    upsert_circuit_label)
+    run_db)
 from ..restore_utils import (
     normalize_restore_row as _normalize_row,
+    restore_circuit_labels,
     safe_insert_rows as _safe_insert,
 )
+from ._helpers import _orch, _tmpl
 
 log = logging.getLogger(__name__)
 # Admin-only router: exports contain the entire database; imports overwrite it.
@@ -171,8 +172,6 @@ HISTORY_ARCHIVE_TABLES = ["events", "hourly_volume",
                           "zone_flow_history", "leak_test_history"]
 
 
-def _orch(r): return r.app.state.orchestrator
-def _tmpl(r): return r.app.state.templates
 def _ts():    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
@@ -882,26 +881,10 @@ async def import_quick_restore(
                 log.warning("Quick Restore dedup failed (non-fatal): %s", e)
 
         # Restore circuit display labels from backup, or seed defaults for old
-        # backups.
+        # backups. Shared with the setup wizard's restore — restore_utils
+        # exists so the two paths cannot drift apart.
         try:
-            circuit_entries = payload.get("circuits", [])
-            if circuit_entries:
-                for entry in circuit_entries:
-                    cid   = entry.get("circuit_id", "")
-                    label = entry.get("display_name", "")
-                    if cid and label:
-                        upsert_circuit_label(db, cid, label)
-                log.info("Quick Restore: restored %d circuit label(s)",
-                         len(circuit_entries))
-            else:
-                # Old backup without circuit metadata — seed defaults if the
-                # table is empty.
-                existing = load_circuit_labels(db)
-                if not existing:
-                    upsert_circuit_label(db, "circuit_1", "Main")
-                    upsert_circuit_label(db, "circuit_2", "Irrigation")
-                    log.info("Quick Restore: seeded default circuit labels "
-                             "(legacy backup)")
+            restore_circuit_labels(db, payload)
         except Exception as e:
             log.warning("Quick Restore: circuit label restore failed "
                         "(non-fatal): %s", e)

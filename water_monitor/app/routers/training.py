@@ -36,6 +36,7 @@ from ..database import (
     training_capture_band_match,
     training_window_options)
 from ..config import DB_PATH
+from ._helpers import _json, _orch, _tmpl, reclassify_in_background
 
 log = logging.getLogger(__name__)
 # Admin-only router: the training helper writes model-training labels.
@@ -49,17 +50,6 @@ _FLOW_FLOOR = 0.15
 _INSTANT_TYPES = ("toilet", "tap")
 
 
-def _orch(r): return r.app.state.orchestrator
-def _tmpl(r): return r.app.state.templates
-
-
-async def _json(request: Request) -> dict:
-    try:
-        return await request.json() or {}
-    except Exception:
-        return {}
-
-
 def _applicable_types(orch, circuit) -> list:
     """The wizard checklist types for a circuit: its user-selectable types,
     restricted to the ones the helper can capture (drops 'other')."""
@@ -68,27 +58,6 @@ def _applicable_types(orch, circuit) -> list:
             else fixture_user_selectable_types())
     cap = training_capturable_types()
     return [t for t in base if t in cap]
-
-
-async def _bg_reclassify_training(circuit: str) -> None:
-    """Single deferred reclassify after a checklist item is accepted/rejected —
-    serialized + private connection, so it never races live writes. Tracked as
-    a job so a FAILURE surfaces to the UI (success is silent)."""
-    from ..reclassify import reclassify_all_events_from_signatures
-
-    def _work(c):
-        job = start_job(c, "reclassify", circuit, "Reclassifying events…")
-        try:
-            reclassify_all_events_from_signatures(c, circuit)
-            finish_job(c, job, "done", "Reclassify complete")
-        except Exception:
-            finish_job(c, job, "error", "Reclassify failed — see addon log")
-            raise
-
-    try:
-        await run_isolated_write(DB_PATH, _work)
-    except Exception as e:
-        log.warning("[%s] training reclassify failed: %s", circuit, e)
 
 
 # A startup or import reclassify holds the write lock for minutes; the
@@ -364,7 +333,8 @@ async def confirm_api(circuit: str, request: Request):
                        _orch(request).db, circuit)
     if res.get("labeled"):
         # spawn() holds the strong reference (see task_registry).
-        spawn(_bg_reclassify_training(circuit),
+        spawn(reclassify_in_background(circuit, skip_when_baseline_locked=False,
+                                   what="training"),
               name=f"training_reclassify[{circuit}]")
     return JSONResponse({"ok": True, **res})
 
@@ -383,7 +353,8 @@ async def reject_api(circuit: str, request: Request):
                        orch.db, circuit, int(cid))
     if res.get("cleared"):
         # spawn() holds the strong reference (see task_registry).
-        spawn(_bg_reclassify_training(circuit),
+        spawn(reclassify_in_background(circuit, skip_when_baseline_locked=False,
+                                   what="training"),
               name=f"training_reclassify[{circuit}]")
     return JSONResponse({"ok": True, **res})
 

@@ -16,13 +16,11 @@ from ..database import (
     clear_auto_labels,
     clear_event_classification,
     count_not_real_events,
-    finish_job,
     get_daily_summaries,
     get_home_profile,
     get_leak_test_history,
     get_pump_regime_nights,
     get_recent_events,
-    is_baseline_locked,
     local_day_of,
     note_locked_write,
     patch_event as _patch_event,
@@ -31,15 +29,17 @@ from ..database import (
     revert_artifact_zeroing_on_relabel,
     revert_irrigation_cross_talk,
     run_db,
-    run_isolated_write,
     set_event_classification,
-    start_job,
     upsert_fixture_signature)
 from ..task_registry import spawn
-from ._helpers import (coerce_float, ingress_redirect, run_blocking,
-                       startup_gate)
-from ..config import DB_PATH
-
+from ._helpers import (
+    _orch,
+    _tmpl,
+    coerce_float,
+    ingress_redirect,
+    reclassify_in_background,
+    run_blocking,
+    startup_gate)
 _VALID_USER_FIXTURE_TYPES: frozenset = frozenset(user_selectable_types())
 
 log = logging.getLogger(__name__)
@@ -52,42 +52,11 @@ DEFAULT_EVENT_LIMIT = 100
 MAX_EVENT_LIMIT = 1000
 
 
-def _orch(r): return r.app.state.orchestrator
-def _tmpl(r): return r.app.state.templates
-
-
 async def _bg_reclassify(circuit: str) -> None:
-    """Fire-and-forget k-NN reclassify after a label change — offloaded so the
-    label POST returns immediately (reclassify can be slow on a large history).
-    Runs on a private connection under the write lock (run_isolated_write), so it
-    never races live writes. Tracked as a job so a FAILURE is surfaced to the UI;
-    success is silent. The user's own label + any cycle-mates are applied
-    synchronously before this.
-
-    Skipped once the baseline is LOCKED (training/labelling window closed, no active
-    recalibration): the classifier is fit-once-at-activation then hard-locked, so a
-    relabel after the window must not re-walk history — it spreads only to the event's
-    own cycle-mates. The full reclassify runs during the training window, at startup,
-    and on explicit recalibration — not on a stray label."""
-    from ..reclassify import reclassify_all_events_from_signatures
-
-    def _work(c):
-        if is_baseline_locked(c, circuit):
-            log.info("[%s] label-triggered reclassify skipped — baseline locked "
-                     "(training window closed); relabel stays local", circuit)
-            return
-        job = start_job(c, "reclassify", circuit, "Reclassifying events…")
-        try:
-            reclassify_all_events_from_signatures(c, circuit)
-            finish_job(c, job, "done", "Reclassify complete")
-        except Exception:
-            finish_job(c, job, "error", "Reclassify failed — see addon log")
-            raise
-
-    try:
-        await run_isolated_write(DB_PATH, _work)
-    except Exception as e:
-        log.warning("[%s] background reclassify failed: %s", circuit, e)
+    """The label-change reclassify. Named here because the debounce below and
+    ``test_dangling_tasks`` both reach for it by name."""
+    await reclassify_in_background(circuit, skip_when_baseline_locked=True,
+                                   what="background")
 
 
 # Debounce state: coalesce a burst of label saves into ONE reclassify after a

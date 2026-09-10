@@ -15,7 +15,7 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from ._helpers import coerce_int, ingress_redirect
+from ._helpers import _orch, _tmpl, coerce_int, ingress_redirect
 from ..auth import require_admin_or_bootstrap
 
 from ..device_discovery import (
@@ -56,14 +56,6 @@ log = logging.getLogger(__name__)
 # bootstrap_admin_user_id option remains the ultimate fallback for later.
 router = APIRouter(prefix="/setup",
                    dependencies=[Depends(require_admin_or_bootstrap)])
-
-
-def _orch(r: Request):
-    return r.app.state.orchestrator
-
-
-def _tmpl(r: Request):
-    return r.app.state.templates
 
 
 def _block_if_setup_complete(request: Request):

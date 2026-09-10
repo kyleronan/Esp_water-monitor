@@ -32,6 +32,7 @@ from ..units import load_unit_context, resolve_vol_factor
 from ..calibration_math import (
     BUCKET_MIN_L, MUNICIPAL_MIN_L, METER_UNIT_FACTORS, gate, pooled, run_ppl, to_litres,
 )
+from ._helpers import _json, _orch
 
 log = logging.getLogger(__name__)
 # Admin-only router: calibration writes the firmware PPL entity + re-baselines.
@@ -39,16 +40,6 @@ router = APIRouter(prefix="/calibrate", dependencies=[Depends(require_admin)])
 
 _SESSION_TTL_S = 1800.0      # stale-session auto-expiry (30 min)
 _sessions: Dict[str, Dict[str, Any]] = {}   # per-circuit, never persisted
-
-
-def _orch(r): return r.app.state.orchestrator
-
-
-async def _json(request: Request) -> dict:
-    try:
-        return await request.json() or {}
-    except Exception:
-        return {}
 
 
 def _err(msg: str, code: int = 400):
