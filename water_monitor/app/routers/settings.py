@@ -438,8 +438,10 @@ async def settings_page(request: Request):
                     "WHERE pump_low_pressure_alert_psi IS NOT NULL LIMIT 1"
                 ).fetchone()
                 pump_floor["current"] = row[0] if row else None
-        except Exception:
-            pass
+        except Exception as e:
+            # Best-effort: this card can be missing, the page cannot 500.
+            # Logged rather than passed — a bare pass hid real breakage.
+            log.warning("settings: %s unavailable (%s)", "pump-floor hint", e)
         # Supply-pressure regime summary for the Recalibration card
         # (best-effort).
         supply_regime_ctx = {"exists": False}
@@ -461,8 +463,10 @@ async def settings_page(request: Request):
                                                            _cur)
                                       if _primary else ""),
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            # Best-effort: this card can be missing, the page cannot 500.
+            # Logged rather than passed — a bare pass hid real breakage.
+            log.warning("settings: %s unavailable (%s)", "supply-regime summary", e)
         # dev53 — per-circuit reference-set status for the Dev Tools card,
         # including any open health alerts the confirm dialog must name.
         benchmark_status = {}
@@ -488,8 +492,10 @@ async def settings_page(request: Request):
                     "open_alerts": sorted({a["fixture_type"] for a in
                                            open_health_alerts_for(orch.db, _c.circuit)}),
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            # Best-effort: this card can be missing, the page cannot 500.
+            # Logged rather than passed — a bare pass hid real breakage.
+            log.warning("settings: %s unavailable (%s)", "benchmark status", e)
         # dev56 — duplicated spans per circuit for the Dev Tools card.
         overlap_repair = {}
         try:
@@ -505,8 +511,10 @@ async def settings_page(request: Request):
                     "litres": round(sum(g["excess_l"] for g in _og), 1),
                     "rebuildable": sum(1 for g in _og if g["within_retention"]),
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            # Best-effort: this card can be missing, the page cannot 500.
+            # Logged rather than passed — a bare pass hid real breakage.
+            log.warning("settings: %s unavailable (%s)", "overlap repair", e)
         return (pump_floor, supply_regime_ctx,
                 dict(get_home_profile(orch.db) or {}),
                 get_data_retention(orch.db), benchmark_status, overlap_repair)

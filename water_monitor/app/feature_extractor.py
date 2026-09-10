@@ -1453,6 +1453,29 @@ def _merge_degraded_diag(features: dict, extra: dict) -> None:
     features["degraded_diagnostic_json"] = json.dumps(diag, allow_nan=False)
 
 
+#: Every flag that marks an event's volume as an artifact. A verdict taking over
+#: a row clears all of them and then sets its own, so two verdicts can never
+#: both claim it. Add a new artifact flag HERE, not at each call site.
+_ARTIFACT_FLAGS = ("is_pressure_restoration_phantom", "is_cross_talk",
+                   "is_low_flow_dribble", "phantom_suppression_averted")
+
+
+def _claim_zeroing_verdict(features: dict, *, method: str, reason: str,
+                           veff: float = 0.0, flag: str = "") -> None:
+    """One artifact verdict takes over an event: record it and clear the rest.
+
+    ``flag`` is the single ``_ARTIFACT_FLAGS`` member this verdict sets; the
+    others are cleared. Leave it empty for a verdict that zeroes volume without
+    raising a flag bit (leak-test refill stays VISIBLE in History).
+    """
+    features["volume_litres_effective"] = veff
+    features["volume_estimation_method"] = method
+    features["match_rejection_reason"] = reason
+    features["excluded_from_training"] = 1
+    for f in _ARTIFACT_FLAGS:
+        features[f] = 1 if f == flag else 0
+
+
 def apply_pinned_verdict(features: dict) -> bool:
     """dev56 — enforce ``verdict_pin`` on a features dict. Returns True when a
     pin decided the volume (callers return early). The overlap family: the
@@ -1467,14 +1490,9 @@ def apply_pinned_verdict(features: dict) -> bool:
         return False
     veff = float(features.get("verdict_pin_veff") or 0.0)
     raw = float(features.get("volume_litres") or 0.0)
-    features["volume_litres_effective"] = round(min(veff, raw) if raw else veff, 3)
-    features["volume_estimation_method"] = "overlap_duplicate"
-    features["match_rejection_reason"] = "overlap_duplicate"
-    features["excluded_from_training"] = 1
-    features["is_pressure_restoration_phantom"] = 0
-    features["is_cross_talk"] = 0
-    features["is_low_flow_dribble"] = 0
-    features["phantom_suppression_averted"] = 0
+    _claim_zeroing_verdict(
+        features, method="overlap_duplicate", reason="overlap_duplicate",
+        veff=round(min(veff, raw) if raw else veff, 3))
     return True
 
 
@@ -1530,14 +1548,9 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     # fixture type, in which case real water wins and the verdict is dropped.
     if (features.get("match_rejection_reason") == _IRRIGATION_XTALK_REASON
             and not str(features.get("user_fixture_type") or "").strip()):
-        features["is_cross_talk"] = 1
-        features["volume_litres_effective"] = 0.0
-        features["volume_estimation_method"] = "cross_talk"
-        features["excluded_from_training"] = 1
-        features["match_rejection_reason"] = _IRRIGATION_XTALK_REASON
-        features["is_pressure_restoration_phantom"] = 0
-        features["is_low_flow_dribble"] = 0
-        features["phantom_suppression_averted"] = 0
+        _claim_zeroing_verdict(features, method="cross_talk",
+                               reason=_IRRIGATION_XTALK_REASON,
+                               flag="is_cross_talk")
         return
 
     # Durable leak-test reopen refill — set out-of-band by
@@ -1550,14 +1563,8 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     # training but stays VISIBLE in History (see the leak_test_refill module).
     if (features.get("match_rejection_reason") == _LEAK_TEST_REFILL_REASON
             and not str(features.get("user_fixture_type") or "").strip()):
-        features["volume_litres_effective"] = 0.0
-        features["volume_estimation_method"] = _LEAK_TEST_REFILL_REASON
-        features["excluded_from_training"] = 1
-        features["match_rejection_reason"] = _LEAK_TEST_REFILL_REASON
-        features["is_pressure_restoration_phantom"] = 0
-        features["is_cross_talk"] = 0
-        features["is_low_flow_dribble"] = 0
-        features["phantom_suppression_averted"] = 0
+        _claim_zeroing_verdict(features, method=_LEAK_TEST_REFILL_REASON,
+                               reason=_LEAK_TEST_REFILL_REASON)
         return
 
     # A PINNED verdict (cross-event evidence the single-event detectors below
@@ -2708,6 +2715,18 @@ def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
     return reprocess_event_exclusion_verdicts(conn)
 
 
+# ⛔ THESE GUARDS ARE LOAD-BEARING — do not delete them as "dead schema checks".
+#
+# The 48-checker boot gate that guarantees every column lives inside
+# ``if version == _CURRENT_VERSION:`` (db_migrations.py) and returns immediately,
+# so it NEVER runs on the upgrade path. Migration 20260532 calls
+# ``reprocess_pressure_restoration_phantoms`` (db_migrations.py:561), which lands
+# in ``reprocess_event_exclusion_verdicts`` and from there in
+# ``repair_artifact_flag_consistency`` and ``reprocess_rising_pressure_phantoms``
+# — twenty-two steps BEFORE 20260554 adds ``flow_pressure_corr``. Every column
+# probed below is legitimately absent in that window on a sequential upgrade from
+# a stamp at or near _BASELINE_VERSION, and ``_create_schema`` cannot supply it
+# (it never adds columns to an existing table).
 def _events_has_column(conn: sqlite3.Connection, col: str) -> bool:
     """True if the events table has ``col``. Used to make the dribble scan
     safe to call before its migration has added the column."""

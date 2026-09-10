@@ -1067,7 +1067,11 @@ def get_incomplete_reseed(conn: sqlite3.Connection,
             "SELECT reseed_in_progress FROM training_state WHERE circuit = ?",
             (circuit,)).fetchone()
     except sqlite3.OperationalError:
-        return None                       # pre-20260808 schema
+        # NOT only a pre-20260808 schema. sqlite3.OperationalError is also
+        # "database is locked" — this read runs on the shared connection while a
+        # restore or reclassify may hold the write lock past busy_timeout. Both
+        # reasons are live; deleting this guard turns either into a 500.
+        return None
     return (row["reseed_in_progress"] or None) if row else None
 
 
@@ -1085,7 +1089,10 @@ def is_circuit_winterized(conn: sqlite3.Connection, circuit: str) -> bool:
     try:
         return bool(_get_circuit_profile(conn, circuit, "winterized"))
     except sqlite3.OperationalError:
-        return False                      # pre-20260809 schema
+        # Covers a locked database as well as a pre-20260809 schema — see
+        # get_incomplete_reseed. Fail soft: a read that loses to the write lock
+        # must not mute or unmute a live circuit.
+        return False
 
 
 def set_circuit_winterized(conn: sqlite3.Connection, circuit: str,
@@ -1819,7 +1826,8 @@ def release_kept_event_memos(
              row["end_ts_eff"], row["start_ts"]),
         )
     except sqlite3.OperationalError as e:
-        log.debug("kept-event memo release skipped (pre-20260814 schema?): %s", e)
+        # Either a pre-20260814 schema or a locked database; both are real.
+        log.debug("kept-event memo release skipped (schema or lock): %s", e)
         return 0
     return cur.rowcount
 
@@ -2198,7 +2206,7 @@ def get_toilet_flush_cap_litres(conn: sqlite3.Connection) -> float:
         if row is not None:
             build_year = row["build_year"]
             enabled = bool(row["epa_flush_cap_enabled"])
-    except sqlite3.OperationalError:     # column mid-migration
+    except sqlite3.OperationalError:     # column mid-migration, or db locked
         pass
     return toilet_flush_cap_litres(build_year, enabled)
 

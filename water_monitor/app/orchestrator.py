@@ -1742,7 +1742,7 @@ class Orchestrator:
         # contend for the write lock.
         while not self._stop.is_set():
             try:
-                now = datetime.now(getattr(self, "_ha_tz", timezone.utc))
+                now = datetime.now(self._ha_tz)
                 target = now.replace(hour=4, minute=15, second=0, microsecond=0)
                 if target <= now:
                     target += timedelta(days=1)
@@ -1811,7 +1811,7 @@ class Orchestrator:
         Uses the cached HA timezone from _init_ha_timezone(); falls back to UTC.
         """
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-        ha_tz = getattr(self, "_ha_tz", _tz.utc)
+        ha_tz = self._ha_tz
         now_local = _dt.now(ha_tz)
         midnight_local = now_local.replace(
             hour=0, minute=0, second=0, microsecond=0
@@ -1822,7 +1822,7 @@ class Orchestrator:
     def _seconds_until_next_local_midnight(self) -> float:
         """Seconds from now until the next local midnight (DST-aware)."""
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-        ha_tz = getattr(self, "_ha_tz", _tz.utc)
+        ha_tz = self._ha_tz
         now_local = _dt.now(ha_tz)
         next_midnight_local = now_local.replace(
             hour=0, minute=0, second=0, microsecond=0
