@@ -28,216 +28,10 @@ from .database import (
 log = logging.getLogger(__name__)
 
 _BASELINE_VERSION: int = 20260523
-# Version bumps:
-#   20260524 — retired text-sensor waveform roles
-#   20260525 — UNIQUE(circuit, start_ts) on events (dedup runs first)
-#   20260526 — degraded-supply guard: new event columns, event_waveforms table,
-#              rebuild hourly_volume from events
-#   20260527 — circuit_profile.valve_type
-#   20260528 — Sprint A orphan repair: fixtures.cluster_backfill_needed + a
-#              one-shot repair of orphaned cluster/fixture refs
-#   20260529 — Sprint B: fixture_clusters.suggestion_source
-#              ('heuristic' | 'user_labels' | NULL)
-#   20260530 — Sprint C signature matcher: fixture_type_signatures table +
-#              events.matched_fixture_type
-#   20260531 — Sprint D taxonomy consolidation: 23 → 8 fixture types; rewrites
-#              stored type strings in events, fixtures and fixture_clusters, and
-#              clears fixture_type_signatures
-#   20260532 — Sprint E phantom guard: events.is_pressure_restoration_phantom +
-#              home_profile.hide_pressure_artifact_events; one-shot reprocess
-#              zeroes phantom volume and reverses hourly_volume
-#   20260533 — Sprint F: category_publish table (per-(circuit, fixture_type) HA
-#              publish gate), seeded from MIN(fixtures.publish_to_ha) so an
-#              existing off preference carries over
-#   20260534 — Sprint H: events.user_ignored + user_classified; one-shot repair
-#              un-flags wrongly-flagged phantoms (delta>=2.0) and restores their
-#              real volume to hourly_volume + daily_summary
-#   20260535 — events.is_low_flow_dribble + two indexes backing the
-#              label-training and reclassify-backfill queries. DDL only; the
-#              verdict backfill runs from the startup / import / reprocess paths
-#   20260536 — active-flow features (flow_integral_litres,
-#              active_flow_duration_seconds, true_avg_flow_lpm, flow_on_ratio,
-#              active_flow_segment_count, flow_cv_on_segments,
-#              integration_quality) + the volume audit columns
-#              (volume_litres_original, volume_recomputed_at). All NULLABLE,
-#              DDL only — the per-event recompute runs after migration
-#   20260537 — events.cycle_pulse_count (similar-volume neighbours within
-#              ±45 min). DDL only; the backfill + cluster re-suggest run after
-#   20260538 — events.fixture_label_source ('user'/'cycle'/'training';
-#              NULL = legacy/explicit). No backfill — NULL is correct
-#   20260539 — training_capture + training_capture_candidates tables
-#   20260540 — events.is_cross_talk + home_profile.hide_cross_talk_events. DDL
-#              only; the flag backfill runs from the startup / recompute paths
-#   20260541 — events.matched_via ('knn', 'washer_cycle', 'rule_toilet',
-#              'rule_dishwasher', 'rule_shower', 'zone_default';
-#              NULL = legacy/cluster). No backfill
-#   20260542 — opt-in water-softener config (home_profile.has_water_softener,
-#              softener_regen_start, softener_circuit) + events.cycle_group_id
-#   20260543 — sensitivity_config.anomaly_response (DEFAULT 'notify') +
-#              baseline_anomaly_n (the event count behind the frozen
-#              percentiles, read by the shut-off confidence gate)
-#   20260544 — events.volume_recorder_litres (the firmware cumulative-sensor
-#              delta; NULL = not reconciled) + sensitivity_config.
-#              recorder_reconcile_auto (DEFAULT 1 — auto-correct vs flag-only)
-#   20260545 — home_profile.auto_split_enabled
-#   20260546 — circuit_profile.pulses_per_litre (REAL DEFAULT 396.0) — the
-#              add-on cache of the firmware PPL entity; the low-flow floor is
-#              derived as 60 ÷ ppl. The DEFAULT is correct for existing rows
-#   20260547 — RBAC: operator_users, admin_ids_cache, seen_users. An empty
-#              allow-list means everyone non-admin is a viewer until promoted
-#   20260548 — events.embedded_fixtures_json (composite_detector's annotation;
-#              metadata only, never alters volume or the primary label). The
-#              annotation backfill runs from the reclassify path after migration
-#   20260549 — backfill home_profile.auto_split_enabled = 1 (reprocess is atomic
-#              and dry-run-gated, so the background re-import is safe by default)
-#   20260551 — events.phantom_suppression_averted + a one-time re-evaluation of
-#              already-zeroed LARGE phantom draws (>= 10 L measured): volume
-#              restored through apply_effective_volume and flagged
-#              'suppression_averted' for review. User-classified rows untouched
-#   20260552 — home_profile.fingerprint_labeling_enabled (DEFAULT 1)
-#   20260553 — events.review_verdict ('normal'/'unknown'/NULL). 'unknown' events
-#              are held out of anomaly-baseline refits (fit_usage_baselines);
-#              existing user_reviewed=1 rows keep NULL
-#   20260554 — events.flow_pressure_corr (Pearson r of flow vs index-binned
-#              pressure — the rise-phantom discriminator) + home_profile.
-#              rise_corr_backfill_done. The column backfill is the
-#              rise_corr_backfill worker, NOT a migration (it needs HA fetches)
-#   20260555 — home_profile.epa_flush_cap_enabled (DEFAULT 1): the toilet
-#              physics veto's flush ceiling, derived from build_year via the
-#              EPA/federal flush-standard eras. The veto applies at
-#              display/rollup/classify time, so no backfill
-#   20260556 — 256-pt signatures: one-shot rebuild from event_waveforms
-#              envelopes where the envelope is finer than the stored signature.
-#              No-waveform rows keep shorter sigs (consumers resample on load)
-#   20260557 — events.onset_signature_json / offset_signature_json (32×1 s
-#              fixed-time cells for the k-NN edge tier) + a one-shot backfill
-#              from every event_waveforms envelope
-#   20260558 — pump-aware detection Phase 1. home_profile: pump_mode_detected
-#              /_at, pump_detect_period_s, pump_mode_ack, pump_profile,
-#              supply_type_set_at (answer provenance — the alert arming rule must
-#              not trust pre-feature supply answers), pump_alert_armed_at.
-#              sensitivity_config: pump_mode ('auto'|'on'|'off' per-circuit
-#              override), low_pressure_alert_psi (irrigation under-load floor,
-#              default 25)
-#   20260559 — leak_test_history cross-circuit pump verdict columns
-#              (other_circuit_cycles, other_circuit_period_s, pump_verdict):
-#              during a valve-closed test on circuit A, recharge cycling on the
-#              UNTESTED circuit B means the leak is on the other line, upstream,
-#              or inside the pump's own check valve
-#   20260560 — sensitivity_config.pump_low_pressure_alert_psi (DEFAULT NULL —
-#              NULL resolves the per-supply default at read time, so only
-#              explicit user action writes a value, which doubles as the arming
-#              rule's "user-set floor" signal) + pump_regime_nightly.min_psi (the
-#              quiet-window pressure floor ≈ pump cut-in)
-#   20260561 — overlap-guard cleanup: a one-shot sweep for same-circuit
-#              overlapping events (the same water recorded twice — ~127 L in the
-#              2026-07 pump incident). Wrapper events whose span+volume reconcile
-#              with their contained members are zeroed through the ledger
-#              chokepoint with mrr='overlap_duplicate'; user-labeled and
-#              ambiguous cases are audit-flagged only. Idempotent
-#   20260562 — leak_test_history.user_dismissed: an acknowledged failed test
-#              (benign cause) renders amber instead of red. Display-only
-#   20260563 — leak test measures the right interval and reports a rate.
-#              leak_test_history: closed_psi, settle_loss_psi, monitor_minutes,
-#              threshold_psi, est_leak_ml_min, post_restore_volume_l,
-#              draw_verdict; sensitivity_config.compliance_ml_psi (mL per PSI of
-#              the isolated section, calibrated from the reopen refill).
-#              baseline_psi was read BEFORE the valve closed, so every historical
-#              row carries the close transient plus the settle-phase loss and
-#              cannot be corrected
-#   20260564 — supply_pressure_daily + supply_regime tables (a booster-pump
-#              install or removal opens a new regime instead of silently
-#              degrading classification). No backfill — the tracker bootstraps
-#              from events.pre_event_pressure_psi on first run
-#   20260565 — rule_calibration rebuilt with PRIMARY KEY (circuit, regime_id):
-#              rule bands are fitted once PER SUPPLY REGIME. The existing row is
-#              copied as regime_id=0, so behaviour with no regimes recorded is
-#              bit-identical to before
-#   20260566 — home_profile.pump_era_start: the PINNED start of this home's
-#              booster-pump era. Retroactive pump-era sweeps (the VFD-ripple
-#              exemption) gate on it instead of live pump state or the current
-#              regime, so neither a gate flip nor a later supply transition can
-#              re-flag events that were already exempted
-#   20260567 — home_profile.leak_watch_ack ('dismissed:<night_date>')
-#   20260568 — training_state.cluster_features_mode ('full' | 'pressure_blind'):
-#              the startup replay must rebuild the SAME space the centers were
-#              learned in — replaying pressure-blind centers with pressure
-#              features on shifts every distance and breaks the id-map rebuild
-#   20260569 — baseline_snapshot table: the frozen usage baseline + anomaly
-#              percentiles before each freeze, so a bad regime refit is revertable
-#   20260570 — events.leak_test_id: provenance for the reopen-refill verdict
-#              (the add-on's own leak test cycling the valve logs a short flow
-#              burst that is neither fixture use nor a sensor phantom). DDL plus
-#              a one-time backfill over leak_test_history
-#   20260571 — one day boundary. volume_snapshots.last_reading (a high-water
-#              mark per period, so a meter reset carries the period's volume over
-#              instead of zeroing the TODAY tile) + home_profile.daily_summary_tz
-#              (daily_summary rows move from the UTC day to the home-local day,
-#              rebuilt by the orchestrator once HA answers with the timezone)
-#   20260572 — sawtooth pump-recharge backfill: a one-shot re-verdict of stored
-#              pump-era events under the widened third prong of
-#              _detect_pump_recharge. Data-only
-#   20260573 — waveform claim ledger + mis-attachment repair audit:
-#              events.waveform_boot_id (completes the firmware-capture identity
-#              so one capture can enrich only one event), the *_pre_repair audit
-#              trio, wf_repair_at / wf_repair_verdict, idx_events_wf_claim. The
-#              repair sweep itself runs as the wf_repair_backfill worker
-#   20260574 — pump_regime_nightly.window_start_ts / window_end_ts, so the
-#              leak-watch banner can say WHEN the cycling was observed instead of
-#              the ambiguous "night of <date>". Old rows stay NULL and the banner
-#              falls back to date-only copy
-#   20260801 — dev38 audit-fix DDL: events.time_features_tz (the deferred
-#              local-time feature backfill marker) + events.registration_est_litres;
-#              event_waveforms per-channel source metadata (flow/press _src_n,
-#              _src_hz) for an honest waveform time axis; overlap_audit.stale_reason
-#              (dangling refs are MARKED, never deleted); leak_test_history
-#              measurement-provenance columns; daily_summary_dirty table
-#   20260802 — backfill: raise peak_flow_lpm to ceil(true_avg*1000)/1000 where
-#              true_avg_flow_lpm > peak_flow_lpm (825 physically impossible
-#              software-sourced rows; the live path now clamps too)
-#   20260803 — backfill: recompute hydraulic_resistance = ΔP/avg on ESP-enriched
-#              rows (1,324 rows carried the pre-enrichment ΔP ratio)
-#   20260804 — NULL the contaminated (foreign-draw) signatures + signature_source
-#              on the 31 dev37 'misattached' rows the repair sweep left labelled
-#              esp_* (their signature bytes came from the mis-attached capture)
-#   20260805 — dev40 training quarantine: events.training_quarantine_reason /
-#              training_quarantined_at + a backfill flagging unreviewed machine
-#              dishwasher-cycle labels (pre-outage + post-reseed windows) out of
-#              every training/exemplar pool — measured 9/19 and 1/10 precision on
-#              user reviews, and the labels had widened the fitted DW band
-#              3.75→8.32 LPM. Labels/verdicts/volumes untouched
-#   20260806 — dev41 quarantine sweep: flag ALL remaining unreviewed machine
-#              dishwasher-cycle labels, no time bounds — the 20260805 mid-window
-#              exemption protected nothing, since re-attribution touches cluster
-#              ids and never labels (~48 pre-July rows from the same over-firing
-#              gate ride along). Distinct reason string
-#              'dev40_precision_quarantine_sweep'; lift is reason-agnostic
-#   20260807 — dev41 conformance DDL: other_valve_open provenance,
-#              registration_curve_version, leak-test measurement-quality columns
-#              (sustainedness/status/noise/raw samples), overlap_audit.stale_at,
-#              utility_register_readings, meter_anchor_points, registration_curve
-#              (v1 seeded 'unvalidated' from the audit inversion)
-#   20260808 — training_state.reseed_in_progress marker (F-C2): a crashed
-#              re-seed leaves it set and boot warns until a rerun
-#   20260809 — dev46: events.training_excluded_by_user (46f), events
-#              flow_sig_span_s / pressure_sig_span_s (46i), and
-#              circuit_profile.winterized (46h)
-#   20260810 — dev46 (46k): events.verdict_stamp + training_state
-#              .last_full_reclassify_at — lets the boot reclassify SKIP an event
-#              whose verdict provably cannot have changed
-#   20260811 — dev47 (47i): fixture health baselines, nightly stats and alerts
-#              (fixture_baseline / fixture_health_stat / fixture_health_alert)
-#   20260812 — dev48: events.flow_plateau_lpm + waveform backfill
-#   20260813 — dev49 (P0-4): mark daily_summary days that drifted from events
-#              (markers only — the shipped drain does the recompute)
-#   20260814 — dev50: events.split_evaluated_at / split_evaluation_outcome (the
-#              over-merge job's decision memo) + stale_reason / stale_at on
-#              anomaly_shutoff_log and cross_talk_audit
-#   20260815 — dev51: the model referee's tables — referee_benchmark +
-#              referee_benchmark_meta (the pinned frozen benchmark, imported once
-#              via Dev Tools; its ids never enter the repo) and retrain_ledger
-#              (every referee decision, durably — the jobs table prunes after two
-#              days)
+# What each version did is the _MIGRATIONS table at the bottom of this file:
+# every entry pairs the number with the function that implements it, and the
+# function's own docstring says why. A prose list here duplicated that for 65
+# versions and had already drifted, so it is gone.
 #
 # VERSION-NUMBER CONVENTION: versions are YYYYMM + a 2-digit per-month sequence
 # (20260801 = August 2026 #01; September rolls to 20260901). The historical
@@ -252,13 +46,6 @@ _BASELINE_VERSION: int = 20260523
 # delete themselves. 20260901 followed it (September 2026, #01), then 20260902;
 # THE NEXT MIGRATION IS 20260903.
 _CURRENT_VERSION: int = 20260902
-# Intermediate stepping-stone version for the dedup-then-unique-index
-# migration. Existing DBs at this version have had their wf rows dropped
-# but still need the unique index applied.
-_VERSION_PRE_UNIQUE_INDEX: int = 20260524
-# Intermediate stepping-stone for the degraded-supply migration. Existing
-# DBs at this version have the unique index but lack the degraded columns.
-_VERSION_PRE_DEGRADED: int = 20260525
 
 # Roles removed when the firmware switched waveform delivery from 5 chunked
 # text sensors to a single HA event (firmware 3.8.0). Old DBs may still carry
@@ -1587,158 +1374,96 @@ _DEGRADED_EVENT_COLUMNS: frozenset = frozenset({
 })
 
 
+#: Columns a database stamped at _CURRENT_VERSION must carry, and the name the
+#: boot error reports for each. This replaces 29 hand-written _missing_*
+#: verifiers that each restated a column list its own migration already declares
+#: — the same list living in three places was how they drifted.
+#:
+#: A third element overrides the reported name, preserving the exact strings the
+#: old verifiers produced (some reported a bare column, most "table.column").
+#: Table-CONDITIONAL requirements are not here: those verifiers still exist
+#: below, because "required only when the table exists" is a different rule.
+_REQUIRED_COLUMNS: tuple = (
+    ('circuit_profile'    , 'pulses_per_litre'               ),
+    ('circuit_profile'    , 'valve_type'                     , 'valve_type'),
+    ('events'             , 'active_flow_duration_seconds'   , 'active_flow_duration_seconds'),
+    ('events'             , 'active_flow_segment_count'      , 'active_flow_segment_count'),
+    ('events'             , 'cycle_group_id'                 ),
+    ('events'             , 'cycle_pulse_count'              , 'cycle_pulse_count'),
+    ('events'             , 'degraded_supply'                , 'degraded_supply'),
+    ('events'             , 'embedded_fixtures_json'         ),
+    ('events'             , 'esp_waveform_used'              , 'esp_waveform_used'),
+    ('events'             , 'fixture_label_source'           , 'fixture_label_source'),
+    ('events'             , 'flow_cv_on_segments'            , 'flow_cv_on_segments'),
+    ('events'             , 'flow_integral_litres'           , 'flow_integral_litres'),
+    ('events'             , 'flow_on_ratio'                  , 'flow_on_ratio'),
+    ('events'             , 'flow_pressure_corr'             ),
+    ('events'             , 'hourly_volume_applied_bucket'   , 'hourly_volume_applied_bucket'),
+    ('events'             , 'integration_quality'            , 'integration_quality'),
+    ('events'             , 'is_cross_talk'                  ),
+    ('events'             , 'is_low_flow_dribble'            , 'is_low_flow_dribble'),
+    ('events'             , 'is_pressure_restoration_phantom', 'is_pressure_restoration_phantom'),
+    ('events'             , 'leak_test_id'                   ),
+    ('events'             , 'matched_fixture_type'           , 'matched_fixture_type'),
+    ('events'             , 'matched_via'                    ),
+    ('events'             , 'offset_signature_json'          ),
+    ('events'             , 'onset_signature_json'           ),
+    ('events'             , 'pressure_signature_json'        , 'pressure_signature_json'),
+    ('events'             , 'signature_source'               , 'signature_source'),
+    ('events'             , 'true_avg_flow_lpm'              , 'true_avg_flow_lpm'),
+    ('events'             , 'user_classified'                , 'user_classified'),
+    ('events'             , 'user_ignored'                   , 'user_ignored'),
+    ('events'             , 'volume_litres_effective'        , 'volume_litres_effective'),
+    ('events'             , 'volume_litres_original'         , 'volume_litres_original'),
+    ('events'             , 'volume_recomputed_at'           , 'volume_recomputed_at'),
+    ('events'             , 'volume_recorder_litres'         ),
+    ('events'             , 'waveform_overlap_score'         , 'waveform_overlap_score'),
+    ('fixture_clusters'   , 'suggestion_source'              , 'suggestion_source'),
+    ('fixtures'           , 'cluster_backfill_needed'        , 'cluster_backfill_needed'),
+    ('home_profile'       , 'auto_split_enabled'             ),
+    ('home_profile'       , 'epa_flush_cap_enabled'          ),
+    ('home_profile'       , 'has_water_softener'             ),
+    ('home_profile'       , 'hide_cross_talk_events'         ),
+    ('home_profile'       , 'pump_alert_armed_at'            ),
+    ('home_profile'       , 'pump_detect_period_s'           ),
+    ('home_profile'       , 'pump_mode_ack'                  ),
+    ('home_profile'       , 'pump_mode_detected'             ),
+    ('home_profile'       , 'pump_mode_detected_at'          ),
+    ('home_profile'       , 'pump_profile'                   ),
+    ('home_profile'       , 'rise_corr_backfill_done'        ),
+    ('home_profile'       , 'softener_circuit'               ),
+    ('home_profile'       , 'softener_regen_start'           ),
+    ('home_profile'       , 'supply_type_set_at'             ),
+    ('leak_test_history'  , 'closed_psi'                     ),
+    ('leak_test_history'  , 'draw_verdict'                   ),
+    ('leak_test_history'  , 'est_leak_ml_min'                ),
+    ('leak_test_history'  , 'monitor_minutes'                ),
+    ('leak_test_history'  , 'other_circuit_cycles'           ),
+    ('leak_test_history'  , 'other_circuit_period_s'         ),
+    ('leak_test_history'  , 'post_restore_volume_l'          ),
+    ('leak_test_history'  , 'pump_verdict'                   ),
+    ('leak_test_history'  , 'settle_loss_psi'                ),
+    ('leak_test_history'  , 'threshold_psi'                  ),
+    ('leak_test_history'  , 'user_dismissed'                 ),
+    ('pump_regime_nightly', 'min_psi'                        ),
+    ('sensitivity_config' , 'anomaly_response'               ),
+    ('sensitivity_config' , 'baseline_anomaly_n'             ),
+    ('sensitivity_config' , 'compliance_ml_psi'              ),
+    ('sensitivity_config' , 'low_pressure_alert_psi'         ),
+    ('sensitivity_config' , 'pump_low_pressure_alert_psi'    ),
+    ('sensitivity_config' , 'pump_mode'                      ),
+    ('sensitivity_config' , 'recorder_reconcile_auto'        ),
+)
+
+
+# Kept as named functions rather than folded into _REQUIRED_COLUMNS: the
+# first two are also called from the fresh-DB and baseline branches below,
+# and the third is asserted by name in tests/test_softener_config.py.
 def _missing_degraded_columns(conn: sqlite3.Connection) -> set[str]:
     return {
         col for col in _DEGRADED_EVENT_COLUMNS
         if not _has_column(conn, "events", col)
     }
-
-
-# Columns added by the 20260527 valve-type migration. Verified the same way
-# as the degraded-supply columns — catches a DB whose _schema_version was
-# stamped without the migration body running.
-_VALVE_TYPE_COLUMNS: frozenset = frozenset({"valve_type"})
-
-
-def _missing_valve_type_columns(conn: sqlite3.Connection) -> set[str]:
-    return {
-        col for col in _VALVE_TYPE_COLUMNS
-        if not _has_column(conn, "circuit_profile", col)
-    }
-
-
-# Columns added by the 20260528 orphan-repair migration. Same verification
-# pattern as above — catches a DB whose _schema_version was stamped without
-# the migration body running.
-_ORPHAN_REPAIR_COLUMNS: frozenset = frozenset({"cluster_backfill_needed"})
-
-
-def _missing_orphan_repair_columns(conn: sqlite3.Connection) -> set[str]:
-    return {
-        col for col in _ORPHAN_REPAIR_COLUMNS
-        if not _has_column(conn, "fixtures", col)
-    }
-
-
-# Columns added by the 20260529 suggestion-source migration (Sprint B).
-_SUGGESTION_SOURCE_COLUMNS: frozenset = frozenset({"suggestion_source"})
-
-
-def _missing_suggestion_source_columns(conn: sqlite3.Connection) -> set[str]:
-    return {
-        col for col in _SUGGESTION_SOURCE_COLUMNS
-        if not _has_column(conn, "fixture_clusters", col)
-    }
-
-
-# Columns added by the 20260530 signature-matcher migration (Sprint C).
-_SIGNATURE_MATCHER_COLUMNS: frozenset = frozenset({"matched_fixture_type"})
-
-
-def _missing_signature_matcher_columns(conn: sqlite3.Connection) -> set[str]:
-    return {
-        col for col in _SIGNATURE_MATCHER_COLUMNS
-        if not _has_column(conn, "events", col)
-    }
-
-
-# Column added by the 20260532 phantom-guard migration (Sprint E) on events.
-_PHANTOM_COLUMNS: frozenset = frozenset({"is_pressure_restoration_phantom"})
-
-
-def _missing_phantom_columns(conn: sqlite3.Connection) -> set[str]:
-    return {
-        col for col in _PHANTOM_COLUMNS
-        if not _has_column(conn, "events", col)
-    }
-
-
-# Table added by the 20260533 category-publish migration (Sprint F).
-# A "missing column" here is actually a missing TABLE check — the verifier
-# treats the table's absence as a single missing-column-equivalent entry.
-# Columns added by the 20260534 manual-classification migration (Sprint H).
-_MANUAL_CLASSIFICATION_COLUMNS: frozenset = frozenset({"user_ignored", "user_classified"})
-
-
-def _missing_manual_classification_columns(conn: sqlite3.Connection) -> set[str]:
-    return {
-        col for col in _MANUAL_CLASSIFICATION_COLUMNS
-        if not _has_column(conn, "events", col)
-    }
-
-
-# Column added by the 20260535 low-flow-dribble migration on events.
-_LOW_FLOW_DRIBBLE_COLUMNS: frozenset = frozenset({"is_low_flow_dribble"})
-
-
-def _missing_low_flow_dribble_columns(conn: sqlite3.Connection) -> set[str]:
-    return {
-        col for col in _LOW_FLOW_DRIBBLE_COLUMNS
-        if not _has_column(conn, "events", col)
-    }
-
-
-# Columns added by the 20260536 active-flow migration on events.
-_ACTIVE_FLOW_COLUMNS: frozenset = frozenset(c for c, _ in _ACTIVE_FLOW_NEW_COLUMNS)
-
-
-def _missing_active_flow_columns(conn: sqlite3.Connection) -> set[str]:
-    return {
-        col for col in _ACTIVE_FLOW_COLUMNS
-        if not _has_column(conn, "events", col)
-    }
-
-
-# Columns added by the 20260537 cycle-pulse migration on events.
-_CYCLE_PULSE_COLUMNS: frozenset = frozenset(c for c, _ in _CYCLE_PULSE_NEW_COLUMNS)
-
-
-def _missing_cycle_pulse_columns(conn: sqlite3.Connection) -> set[str]:
-    return {
-        col for col in _CYCLE_PULSE_COLUMNS
-        if not _has_column(conn, "events", col)
-    }
-
-
-# Columns added by the 20260538 label-provenance migration on events.
-_LABEL_SOURCE_COLUMNS: frozenset = frozenset(c for c, _ in _LABEL_SOURCE_NEW_COLUMNS)
-
-
-def _missing_label_source_columns(conn: sqlite3.Connection) -> set[str]:
-    return {
-        col for col in _LABEL_SOURCE_COLUMNS
-        if not _has_column(conn, "events", col)
-    }
-
-
-def _missing_training_capture_table(conn: sqlite3.Connection) -> set[str]:
-    """Return any of the 20260539 training-capture tables that are absent."""
-    needed = {"training_capture", "training_capture_candidates"}
-    present = {
-        r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name IN ('training_capture','training_capture_candidates')"
-        ).fetchall()
-    }
-    return needed - present
-
-
-def _missing_cross_talk_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260540 cross-talk columns that are absent (events + home_profile)."""
-    missing: set[str] = set()
-    if not _has_column(conn, "events", "is_cross_talk"):
-        missing.add("events.is_cross_talk")
-    if not _has_column(conn, "home_profile", "hide_cross_talk_events"):
-        missing.add("home_profile.hide_cross_talk_events")
-    return missing
-
-
-def _missing_matched_via_column(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260541 provenance column if absent from events."""
-    if not _has_column(conn, "events", "matched_via"):
-        return {"events.matched_via"}
-    return set()
-
 
 def _missing_dev24_columns(conn: sqlite3.Connection) -> set[str]:
     """Return the 20260542 dev.24 columns that are absent (home_profile + events).
@@ -1754,38 +1479,79 @@ def _missing_dev24_columns(conn: sqlite3.Connection) -> set[str]:
         missing.add("events.cycle_group_id")
     return missing
 
-
-def _missing_anomaly_response_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260543 anomaly-response columns absent from sensitivity_config."""
+def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
+    """Return the set of required baseline columns absent from the events table."""
     return {
-        f"sensitivity_config.{col}"
-        for col in ("anomaly_response", "baseline_anomaly_n")
-        if not _has_column(conn, "sensitivity_config", col)
+        col for col in _BASELINE_EVENT_COLUMNS
+        if not _has_column(conn, "events", col)
     }
 
 
-def _missing_recorder_reconcile_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260544 recorder-reconcile columns absent (events + sensitivity_config)."""
-    missing: set[str] = set()
-    if not _has_column(conn, "events", "volume_recorder_litres"):
-        missing.add("events.volume_recorder_litres")
-    if not _has_column(conn, "sensitivity_config", "recorder_reconcile_auto"):
-        missing.add("sensitivity_config.recorder_reconcile_auto")
-    return missing
+def _missing_required_columns(conn: sqlite3.Connection) -> set[str]:
+    """Every _REQUIRED_COLUMNS entry the database does not have."""
+    return {
+        (row[2] if len(row) > 2 else f"{row[0]}.{row[1]}")
+        for row in _REQUIRED_COLUMNS
+        if not _has_column(conn, row[0], row[1])
+    }
+
+# Columns added by the 20260527 valve-type migration. Verified the same way
+# as the degraded-supply columns — catches a DB whose _schema_version was
+# stamped without the migration body running.
+_VALVE_TYPE_COLUMNS: frozenset = frozenset({"valve_type"})
 
 
-def _missing_dev38_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260545 dev.38 auto-split flag if absent from home_profile."""
-    if not _has_column(conn, "home_profile", "auto_split_enabled"):
-        return {"home_profile.auto_split_enabled"}
-    return set()
+# Columns added by the 20260528 orphan-repair migration. Same verification
+# pattern as above — catches a DB whose _schema_version was stamped without
+# the migration body running.
+_ORPHAN_REPAIR_COLUMNS: frozenset = frozenset({"cluster_backfill_needed"})
 
 
-def _missing_ppl_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260546 pulses_per_litre column if absent from circuit_profile."""
-    if not _has_column(conn, "circuit_profile", "pulses_per_litre"):
-        return {"circuit_profile.pulses_per_litre"}
-    return set()
+# Columns added by the 20260529 suggestion-source migration (Sprint B).
+_SUGGESTION_SOURCE_COLUMNS: frozenset = frozenset({"suggestion_source"})
+
+
+# Columns added by the 20260530 signature-matcher migration (Sprint C).
+_SIGNATURE_MATCHER_COLUMNS: frozenset = frozenset({"matched_fixture_type"})
+
+
+# Column added by the 20260532 phantom-guard migration (Sprint E) on events.
+_PHANTOM_COLUMNS: frozenset = frozenset({"is_pressure_restoration_phantom"})
+
+
+# Table added by the 20260533 category-publish migration (Sprint F).
+# A "missing column" here is actually a missing TABLE check — the verifier
+# treats the table's absence as a single missing-column-equivalent entry.
+# Columns added by the 20260534 manual-classification migration (Sprint H).
+_MANUAL_CLASSIFICATION_COLUMNS: frozenset = frozenset({"user_ignored", "user_classified"})
+
+
+# Column added by the 20260535 low-flow-dribble migration on events.
+_LOW_FLOW_DRIBBLE_COLUMNS: frozenset = frozenset({"is_low_flow_dribble"})
+
+
+# Columns added by the 20260536 active-flow migration on events.
+_ACTIVE_FLOW_COLUMNS: frozenset = frozenset(c for c, _ in _ACTIVE_FLOW_NEW_COLUMNS)
+
+
+# Columns added by the 20260537 cycle-pulse migration on events.
+_CYCLE_PULSE_COLUMNS: frozenset = frozenset(c for c, _ in _CYCLE_PULSE_NEW_COLUMNS)
+
+
+# Columns added by the 20260538 label-provenance migration on events.
+_LABEL_SOURCE_COLUMNS: frozenset = frozenset(c for c, _ in _LABEL_SOURCE_NEW_COLUMNS)
+
+
+def _missing_training_capture_table(conn: sqlite3.Connection) -> set[str]:
+    """Return any of the 20260539 training-capture tables that are absent."""
+    needed = {"training_capture", "training_capture_candidates"}
+    present = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('training_capture','training_capture_candidates')"
+        ).fetchall()
+    }
+    return needed - present
 
 
 def _missing_rbac_tables(conn: sqlite3.Connection) -> set[str]:
@@ -1800,45 +1566,12 @@ def _missing_rbac_tables(conn: sqlite3.Connection) -> set[str]:
     return needed - present
 
 
-def _missing_embedded_fixtures_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260548 embedded_fixtures_json column if absent from events."""
-    if not _has_column(conn, "events", "embedded_fixtures_json"):
-        return {"events.embedded_fixtures_json"}
-    return set()
-
-
 def _missing_cross_talk_audit_table(conn: sqlite3.Connection) -> set[str]:
     """Return the 20260550 cross_talk_audit table if absent."""
     present = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cross_talk_audit'"
     ).fetchone()
     return set() if present else {"cross_talk_audit"}
-
-
-def _missing_edge_signature_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260557 edge-signature columns absent from events."""
-    return {
-        f"events.{col}"
-        for col in ("onset_signature_json", "offset_signature_json")
-        if not _has_column(conn, "events", col)
-    }
-
-
-def _missing_flow_pressure_corr_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260554 rise-phantom columns absent (events + home_profile)."""
-    missing: set[str] = set()
-    if not _has_column(conn, "events", "flow_pressure_corr"):
-        missing.add("events.flow_pressure_corr")
-    if not _has_column(conn, "home_profile", "rise_corr_backfill_done"):
-        missing.add("home_profile.rise_corr_backfill_done")
-    return missing
-
-
-def _missing_epa_flush_cap_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260555 epa_flush_cap_enabled column if absent."""
-    if not _has_column(conn, "home_profile", "epa_flush_cap_enabled"):
-        return {"home_profile.epa_flush_cap_enabled"}
-    return set()
 
 
 # 20260558 (dev21) — pump-aware detection Phase 1 columns. Single source for
@@ -1893,12 +1626,6 @@ def _apply_leak_test_pump_columns(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260559: leak-test pump-verdict columns ready")
 
 
-def _missing_leak_test_pump_columns(conn: sqlite3.Connection) -> set[str]:
-    return {f"leak_test_history.{col}"
-            for col, _ddl in _LEAK_TEST_PUMP_COLUMNS
-            if not _has_column(conn, "leak_test_history", col)}
-
-
 # 20260562 (dev30) — dismissible failed leak tests.
 def _apply_leak_test_dismissed_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260562. Guarded + idempotent."""
@@ -1907,12 +1634,6 @@ def _apply_leak_test_dismissed_column(conn: sqlite3.Connection) -> None:
                  if_table_exists=True)
     conn.commit()
     log.info("Migration 20260562: leak-test dismissed flag ready")
-
-
-def _missing_leak_test_dismissed_column(conn: sqlite3.Connection) -> set[str]:
-    if not _has_column(conn, "leak_test_history", "user_dismissed"):
-        return {"leak_test_history.user_dismissed"}
-    return set()
 
 
 # 20260563 — leak test measures the right interval, and reports a rate.
@@ -1946,15 +1667,6 @@ def _apply_leak_test_measurement_columns(conn: sqlite3.Connection) -> None:
                  (("compliance_ml_psi", "REAL"),), if_table_exists=True)
     conn.commit()
     log.info("Migration 20260563: leak-test measurement columns ready")
-
-
-def _missing_leak_test_measurement_columns(conn: sqlite3.Connection) -> set[str]:
-    missing = {f"leak_test_history.{col}"
-               for col, _ddl in _LEAK_TEST_MEASUREMENT_COLUMNS
-               if not _has_column(conn, "leak_test_history", col)}
-    if not _has_column(conn, "sensitivity_config", "compliance_ml_psi"):
-        missing.add("sensitivity_config.compliance_ml_psi")
-    return missing
 
 
 # 20260561 (dev28) — one-shot overlap cleanup.
@@ -2006,16 +1718,6 @@ def _apply_pump_low_pressure_column(conn: sqlite3.Connection) -> None:
                  if_table_exists=True)
     conn.commit()
     log.info("Migration 20260560: pump low-pressure alert columns ready")
-
-
-def _missing_pump_low_pressure_columns(conn: sqlite3.Connection) -> set[str]:
-    missing: set[str] = set()
-    if not _has_column(conn, "sensitivity_config",
-                       "pump_low_pressure_alert_psi"):
-        missing.add("sensitivity_config.pump_low_pressure_alert_psi")
-    if not _has_column(conn, "pump_regime_nightly", "min_psi"):
-        missing.add("pump_regime_nightly.min_psi")
-    return missing
 
 
 # 20260564 — supply-pressure regime tracking tables.
@@ -2173,12 +1875,6 @@ def _apply_leak_test_refill_column(conn: sqlite3.Connection) -> None:
         _record_migration_failure(conn, 20260570, "leak-test refill backfill", e)
 
 
-def _missing_leak_test_refill_columns(conn: sqlite3.Connection) -> set[str]:
-    if not _has_column(conn, "events", "leak_test_id"):
-        return {"events.leak_test_id"}
-    return set()
-
-
 # 20260571 — one day boundary.
 def _apply_local_day_boundary(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260571 — the columns behind the unified
@@ -2234,7 +1930,6 @@ def _apply_regime_window_bounds(conn: sqlite3.Connection) -> None:
     _add_columns(conn, "pump_regime_nightly",
                  (("window_start_ts", "TEXT"), ("window_end_ts", "TEXT")),
                  if_table_exists=True)
-    _ensure_wf_claim_index(conn)
     conn.commit()
     log.info("Migration 20260574: regime window-bound columns ready")
 
@@ -2396,7 +2091,6 @@ def _apply_misattached_signature_null(conn: sqlite3.Connection) -> None:
         # FOREIGN draw's signature bytes under an 'esp' provenance label.
         _record_migration_failure(
             conn, 20260804, "mis-attached signature retro-fix", e)
-    _ensure_wf_claim_index(conn)
 
 
 # 20260805 — dev40 training quarantine for the over-firing dishwasher-cycle tier.
@@ -2447,7 +2141,6 @@ def _apply_training_quarantine(conn: sqlite3.Connection) -> None:
         log.info("Migration 20260805: label/provenance columns absent — "
                  "quarantine backfill skipped (nothing to flag)")
     conn.commit()
-    _ensure_wf_claim_index(conn)
 
 
 # 20260806 — dev41 quarantine sweep: ALL remaining unreviewed machine
@@ -2496,7 +2189,6 @@ def _apply_training_quarantine_sweep(conn: sqlite3.Connection) -> None:
         log.info("Migration 20260806: label/provenance columns absent — "
                  "quarantine sweep skipped (nothing to flag)")
     conn.commit()
-    _ensure_wf_claim_index(conn)
 
 
 # 20260807 — dev41 conformance-review DDL (all in one step, dev38 pattern).
@@ -2580,7 +2272,6 @@ def _apply_dev41_conformance_ddl(conn: sqlite3.Connection) -> None:
             " 'audit_2026-08_pressure_witness_inversion', ?)",
             (lo, hi, ratio, now))
     conn.commit()
-    _ensure_wf_claim_index(conn)
     log.info("Migration 20260807: dev41 conformance-review DDL ready")
 
 
@@ -2595,7 +2286,6 @@ def _apply_reseed_marker_column(conn: sqlite3.Connection) -> None:
     _add_columns(conn, "training_state", (("reseed_in_progress", "TEXT"),),
                  if_table_exists=True)
     conn.commit()
-    _ensure_wf_claim_index(conn)
     log.info("Migration 20260808: reseed-in-progress marker column ready")
 
 
@@ -2631,7 +2321,6 @@ def _apply_dev46_columns(conn: sqlite3.Connection) -> None:
     _add_columns(conn, "circuit_profile",
                  (("winterized", "INTEGER DEFAULT 0"),), if_table_exists=True)
     conn.commit()
-    _ensure_wf_claim_index(conn)
     log.info("Migration 20260809: training-exclusion flag, signature spans "
              "and winterized flag ready")
 
@@ -2686,7 +2375,6 @@ def _apply_verdict_stamp(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_verdict_stamp "
             "ON events (circuit, user_fixture_type, verdict_stamp)")
-    _ensure_wf_claim_index(conn)
     conn.commit()
     # Recreated (not IF NOT EXISTS alone) so that changing the watched-column
     # list in a later release replaces the old trigger instead of silently
@@ -2847,18 +2535,6 @@ def _missing_regime_calibration_columns(conn: sqlite3.Connection) -> set[str]:
     return set()
 
 
-def _missing_pump_mode_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260558 pump-mode columns absent (home_profile +
-    sensitivity_config)."""
-    missing: set[str] = set()
-    for table, cols in (("home_profile", _PUMP_MODE_HOME_COLUMNS),
-                        ("sensitivity_config", _PUMP_MODE_SENS_COLUMNS)):
-        for col, _ddl in cols:
-            if not _has_column(conn, table, col):
-                missing.add(f"{table}.{col}")
-    return missing
-
-
 # 20260573 — waveform claim ledger + mis-attachment repair audit.
 _WF_CLAIM_COLUMNS: tuple = (
     # Completes the firmware-capture identity. The ESP event counter restarts
@@ -2908,14 +2584,6 @@ def _missing_wf_claim_columns(conn: sqlite3.Connection) -> set[str]:
         return set()
     return {
         f"events.{col}" for col, _ddl in _WF_CLAIM_COLUMNS
-        if not _has_column(conn, "events", col)
-    }
-
-
-def _missing_baseline_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the set of required baseline columns absent from the events table."""
-    return {
-        col for col in _BASELINE_EVENT_COLUMNS
         if not _has_column(conn, "events", col)
     }
 
@@ -3041,7 +2709,6 @@ def _apply_fixture_health(conn: sqlite3.Connection) -> None:
     #  20260902, which also DROPs it — it duplicated the table's own
     #  UNIQUE (circuit, fixture_type, as_of_day) index column for column.
     #  Removing it from database.py alone would have been a silent no-op.)
-    _ensure_wf_claim_index(conn)
     conn.commit()
     log.info("Migration 20260811: fixture health baselines ready")
 
@@ -3198,7 +2865,6 @@ def _apply_auto_split_memo(conn: sqlite3.Connection) -> None:
                                  ("stale_at",     "TEXT")),
                      if_table_exists=True)
     conn.commit()
-    _ensure_wf_claim_index(conn)
     log.info("Migration 20260814: auto-split memo columns + audit stale marks ready")
 
 
@@ -3243,7 +2909,6 @@ def _apply_referee_tables(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_retrain_ledger_circuit_decided "
         "ON retrain_ledger (circuit, decided_at)")
     conn.commit()
-    _ensure_wf_claim_index(conn)
     log.info("Migration 20260815: referee benchmark + retrain ledger tables ready")
 
 
@@ -3305,7 +2970,6 @@ def _apply_referee_meta_columns(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE referee_benchmark")
         conn.execute("ALTER TABLE referee_benchmark__dev53 RENAME TO referee_benchmark")
     conn.commit()
-    _ensure_wf_claim_index(conn)
     log.info("Migration 20260816: referee benchmark provenance + pending slot ready")
 
 
@@ -3412,7 +3076,6 @@ def _apply_verdict_pin(conn: sqlite3.Connection) -> None:
         repaired = 0
         log.info("Migration 20260818: flag/volume consistency pass skipped: %s", e)
     conn.commit()
-    _ensure_wf_claim_index(conn)
     log.info("Migration 20260818: pinned verdict columns ready (%d overlap "
              "wrapper(s) tagged, no volume rewritten; %d row(s) whose zeroing flag "
              "disagreed with their volume re-zeroed)", cur.rowcount or 0, repaired)
@@ -3641,7 +3304,6 @@ def _apply_dead_schema_and_event_indexes(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_events_fixture "
                 "ON events (fixture_id)")
-        _ensure_wf_claim_index(conn)
 
     conn.commit()
     log.info("Migration 20260902: dropped %d dead table(s) + %d redundant "
@@ -3797,38 +3459,11 @@ def _run_migrations_impl(
 
     if version == _CURRENT_VERSION:
         missing = (
-            _missing_baseline_columns(conn)
-            | _missing_degraded_columns(conn)
-            | _missing_valve_type_columns(conn)
-            | _missing_orphan_repair_columns(conn)
-            | _missing_suggestion_source_columns(conn)
-            | _missing_signature_matcher_columns(conn)
-            | _missing_phantom_columns(conn)
-            | _missing_manual_classification_columns(conn)
-            | _missing_low_flow_dribble_columns(conn)
-            | _missing_active_flow_columns(conn)
-            | _missing_cycle_pulse_columns(conn)
-            | _missing_label_source_columns(conn)
+            _missing_required_columns(conn)
             | _missing_training_capture_table(conn)
-            | _missing_cross_talk_columns(conn)
-            | _missing_matched_via_column(conn)
-            | _missing_dev24_columns(conn)
-            | _missing_anomaly_response_columns(conn)
-            | _missing_recorder_reconcile_columns(conn)
-            | _missing_dev38_columns(conn)
-            | _missing_ppl_columns(conn)
             | _missing_rbac_tables(conn)
-            | _missing_embedded_fixtures_columns(conn)
             | _missing_cross_talk_audit_table(conn)
-            | _missing_flow_pressure_corr_columns(conn)
-            | _missing_epa_flush_cap_columns(conn)
-            | _missing_edge_signature_columns(conn)
-            | _missing_pump_mode_columns(conn)
-            | _missing_leak_test_pump_columns(conn)
-            | _missing_pump_low_pressure_columns(conn)
             | _missing_overlap_audit_table(conn)
-            | _missing_leak_test_dismissed_column(conn)
-            | _missing_leak_test_measurement_columns(conn)
             # 20260564-68 (dev32/33/34). These five verifiers were written with
             # their migrations and then never wired in here, so a DB stamped
             # CURRENT with any of those five bodies un-run passed this guard and
@@ -3838,7 +3473,6 @@ def _run_migrations_impl(
             | _missing_pump_era_columns(conn)
             | _missing_leak_watch_columns(conn)
             | _missing_cluster_mode_columns(conn)
-            | _missing_leak_test_refill_columns(conn)
             | _missing_local_day_columns(conn)
             | _missing_wf_claim_columns(conn)
             | _missing_202608_columns(conn)
@@ -3946,6 +3580,11 @@ def _run_migrations_impl(
              ", ".join(str(v) for v, _fn in steps))
     for _v, _fn in steps:
         _run_migration_step(conn, _v, _fn)
+    # Version-independent, so it can never be forgotten on a new tail migration.
+    # A DB stamped after 20260573 never walks back through the step that creates
+    # this index, and schema.sql deliberately omits it (see the helper). Fourteen
+    # migrations used to re-add it belt-and-braces; once here does the same job.
+    _ensure_wf_claim_index(conn)
     _set_version(conn, _CURRENT_VERSION)
     log.info("Database upgraded %d → %d (%d forward step(s))",
              version, _CURRENT_VERSION, len(steps))
