@@ -1672,3 +1672,19 @@ CREATE TABLE IF NOT EXISTS fixture_daily_summary (
     peak_flow_lpm        REAL,
     PRIMARY KEY (circuit, fixture_id, day)
 );
+
+
+-- ==========================================================================
+-- EVENT INDEXES THAT USED TO COME FROM A PRE-BASELINE MIGRATION
+-- Created by migrations 20260526 and 20260535, which are now below
+-- _BASELINE_VERSION and no longer shipped. Every column they cover is declared
+-- above, and the baseline guarantees any accepted database already has them, so
+-- these are safe here — unlike idx_events_wf_claim / idx_events_verdict_pin,
+-- which still come from a migration (see _ensure_wf_claim_index).
+-- ==========================================================================
+CREATE INDEX IF NOT EXISTS idx_events_degraded
+    ON events (circuit, start_ts) WHERE degraded_supply = 1;
+CREATE INDEX IF NOT EXISTS idx_events_training_labels
+    ON events (circuit, user_fixture_type, excluded_from_training);
+CREATE INDEX IF NOT EXISTS idx_events_unlabelled_reclassify
+    ON events (circuit, user_fixture_type, matched_fixture_type);

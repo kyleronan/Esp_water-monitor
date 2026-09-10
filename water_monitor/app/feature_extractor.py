@@ -2715,18 +2715,20 @@ def reprocess_pressure_restoration_phantoms(conn: sqlite3.Connection) -> dict:
     return reprocess_event_exclusion_verdicts(conn)
 
 
-# ⛔ THESE GUARDS ARE LOAD-BEARING — do not delete them as "dead schema checks".
+# Why these probes exist, and why they stay.
 #
-# The 48-checker boot gate that guarantees every column lives inside
-# ``if version == _CURRENT_VERSION:`` (db_migrations.py) and returns immediately,
-# so it NEVER runs on the upgrade path. Migration 20260532 calls
-# ``reprocess_pressure_restoration_phantoms`` (db_migrations.py:561), which lands
-# in ``reprocess_event_exclusion_verdicts`` and from there in
-# ``repair_artifact_flag_consistency`` and ``reprocess_rising_pressure_phantoms``
-# — twenty-two steps BEFORE 20260554 adds ``flow_pressure_corr``. Every column
-# probed below is legitimately absent in that window on a sequential upgrade from
-# a stamp at or near _BASELINE_VERSION, and ``_create_schema`` cannot supply it
-# (it never adds columns to an existing table).
+# They were LOAD-BEARING while migration 20260532 called
+# reprocess_pressure_restoration_phantoms mid-chain — twenty-two steps before
+# 20260554 added flow_pressure_corr, so the column was legitimately absent and
+# an unguarded read aborted the upgrade. The schema squash put 20260532 below
+# _BASELINE_VERSION and deleted it, so that path is gone and the columns now
+# exist at every live call site.
+#
+# Kept anyway: they cost one PRAGMA, and the invariant that makes them
+# unnecessary is "no migration calls into this module before its columns
+# exist", which nothing enforces. Before deleting them, check db_migrations for
+# mid-chain imports of this module — at the time of writing the only ones are
+# flow_plateau_lpm (pure) and overlap_guard.cleanup_all_overlaps.
 def _events_has_column(conn: sqlite3.Connection, col: str) -> bool:
     """True if the events table has ``col``. Used to make the dribble scan
     safe to call before its migration has added the column."""
