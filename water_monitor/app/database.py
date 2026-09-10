@@ -232,15 +232,13 @@ def verdict_write(conn: sqlite3.Connection, circuit: str,
     ``recompute_summary=False`` is the importer's batch path: skip the
     per-event rollup and do ONE per affected day after its own loop.
     """
-    try:
+    # Same commit/rollback shape as ``transaction`` — the recompute simply runs
+    # inside it, before the commit, so a failure there rolls the verdict back too.
+    with transaction(conn):
         yield conn
         day = local_day_of(start_ts) if recompute_summary else None
         if day:
             compute_daily_summary(conn, circuit, day)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
 
 
 def init_db(db_path: Path) -> sqlite3.Connection:
@@ -735,9 +733,7 @@ def update_home_profile(conn: sqlite3.Connection, **kwargs) -> None:
 
 
 def get_training_state(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM training_state WHERE circuit = ?", (circuit,)
-    ).fetchone()
+    return _get_by_circuit(conn, "training_state", circuit)
 
 
 def is_baseline_locked(conn: sqlite3.Connection, circuit: str) -> bool:
@@ -783,6 +779,19 @@ def is_baseline_locked(conn: sqlite3.Connection, circuit: str) -> bool:
         if t > datetime.now(timezone.utc):
             return False   # active (re)calibration / adaptation window
     return True
+
+
+def _get_by_circuit(
+    conn: sqlite3.Connection, table: str, circuit: str
+) -> Optional[sqlite3.Row]:
+    """The one row a single-circuit config table holds for ``circuit``.
+
+    Table name comes exclusively from internal string literals — never user
+    input — so the f-string interpolation does not introduce injection risk.
+    """
+    return conn.execute(
+        f"SELECT * FROM {table} WHERE circuit = ?", (circuit,)
+    ).fetchone()
 
 
 def _upsert_by_circuit(
@@ -888,9 +897,7 @@ def set_reconcile_state(conn: sqlite3.Connection, circuit: str, *,
 
 
 def get_sensitivity_config(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM sensitivity_config WHERE circuit = ?", (circuit,)
-    ).fetchone()
+    return _get_by_circuit(conn, "sensitivity_config", circuit)
 
 
 def upsert_sensitivity_config(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
@@ -898,9 +905,7 @@ def upsert_sensitivity_config(conn: sqlite3.Connection, circuit: str, **kwargs) 
 
 
 def get_learning_config(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM learning_config WHERE circuit = ?", (circuit,)
-    ).fetchone()
+    return _get_by_circuit(conn, "learning_config", circuit)
 
 
 def upsert_learning_config(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
@@ -917,6 +922,48 @@ def get_alert_configs(conn: sqlite3.Connection, circuit: str) -> List[sqlite3.Ro
 VALID_CIRCUIT_TYPES = frozenset({"fixture", "zone"})
 
 
+def _event_row(conn: sqlite3.Connection, event_id: str, circuit: str,
+               columns: str) -> Optional[sqlite3.Row]:
+    """One event's ``columns`` by id, or None when the row is gone.
+
+    Ten call sites wrote this SELECT out; the id+circuit predicate is the thing
+    worth having in one place. Column list comes exclusively from internal
+    string literals — never user input.
+    """
+    return conn.execute(
+        f"SELECT {columns} FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit),
+    ).fetchone()
+
+
+def _get_circuit_profile(conn: sqlite3.Connection, circuit: str, column: str):
+    """One ``circuit_profile`` column, or None when the row does not exist yet.
+
+    Column name comes exclusively from internal string literals — never user
+    input — so the f-string interpolation does not introduce injection risk.
+    """
+    row = conn.execute(
+        f"SELECT {column} FROM circuit_profile WHERE circuit = ?", (circuit,)
+    ).fetchone()
+    return row[column] if row else None
+
+
+def _set_circuit_profile(conn: sqlite3.Connection, circuit: str, column: str,
+                         value, commit: bool = True) -> None:
+    """UPSERT one ``circuit_profile`` column.
+
+    Safe to call before ``ensure_circuit_defaults()`` — it creates the row.
+    Pass ``commit=False`` when this is part of a multi-step write sequence the
+    caller wants to make atomic via ``with transaction(conn):``.
+    """
+    conn.execute(
+        f"INSERT INTO circuit_profile (circuit, {column}) VALUES (?, ?) "
+        f"ON CONFLICT(circuit) DO UPDATE SET {column} = excluded.{column}",
+        (circuit, value))
+    if commit:
+        conn.commit()
+
+
 def get_circuit_type(
     conn: sqlite3.Connection,
     circuit: str,
@@ -928,12 +975,8 @@ def get_circuit_type(
     Normalises legacy "irrigation" values to "zone" transparently.
     """
     from .fixtures import normalize_circuit_type
-    row = conn.execute(
-        "SELECT circuit_type FROM circuit_profile WHERE circuit = ?",
-        (circuit,)
-    ).fetchone()
-    raw = row["circuit_type"] if row else default
-    return normalize_circuit_type(raw)
+    raw = _get_circuit_profile(conn, circuit, "circuit_type")
+    return normalize_circuit_type(default if raw is None else raw)
 
 
 def _seed_zone_alerts_only(conn: sqlite3.Connection, circuit: str) -> None:
@@ -979,11 +1022,8 @@ def set_circuit_type(
     circuit_type = normalize_circuit_type(circuit_type)
     if circuit_type not in VALID_CIRCUIT_TYPES:
         raise ValueError(f"Invalid circuit_type {circuit_type!r}; must be 'fixture' or 'zone'")
-    conn.execute("""
-        INSERT INTO circuit_profile (circuit, circuit_type)
-        VALUES (?, ?)
-        ON CONFLICT(circuit) DO UPDATE SET circuit_type = excluded.circuit_type
-    """, (circuit, circuit_type))
+    _set_circuit_profile(conn, circuit, "circuit_type", circuit_type,
+                         commit=False)
     if circuit_type == "zone":
         _seed_zone_alerts_only(conn, circuit)
     if commit:
@@ -1000,12 +1040,8 @@ def get_valve_type(
     (forgiving) so callers always get a canonical string they can render safely.
     """
     from .fixtures import normalize_valve_type
-    row = conn.execute(
-        "SELECT valve_type FROM circuit_profile WHERE circuit = ?",
-        (circuit,)
-    ).fetchone()
-    raw = row["valve_type"] if row and row["valve_type"] else default
-    return normalize_valve_type(raw)
+    raw = _get_circuit_profile(conn, circuit, "valve_type")
+    return normalize_valve_type(raw or default)
 
 
 # dev46 (46h) — winterization. After a circuit is un-winterized the plumbing
@@ -1047,12 +1083,9 @@ def is_circuit_winterized(conn: sqlite3.Connection, circuit: str) -> bool:
     so a partially-migrated DB never silently mutes a live circuit.
     """
     try:
-        row = conn.execute(
-            "SELECT winterized FROM circuit_profile WHERE circuit = ?",
-            (circuit,)).fetchone()
+        return bool(_get_circuit_profile(conn, circuit, "winterized"))
     except sqlite3.OperationalError:
         return False                      # pre-20260809 schema
-    return bool(row and row["winterized"])
 
 
 def set_circuit_winterized(conn: sqlite3.Connection, circuit: str,
@@ -1063,12 +1096,8 @@ def set_circuit_winterized(conn: sqlite3.Connection, circuit: str,
     grace is a boot-scoped courtesy, a restart during re-pressurisation is rare,
     and the worst case is one spurious alarm the operator can dismiss.
     """
-    conn.execute(
-        "INSERT INTO circuit_profile (circuit, winterized) VALUES (?, ?) "
-        "ON CONFLICT(circuit) DO UPDATE SET winterized = excluded.winterized",
-        (circuit, 1 if winterized else 0))
-    if commit:
-        conn.commit()
+    _set_circuit_profile(conn, circuit, "winterized",
+                         1 if winterized else 0, commit=commit)
 
 
 def set_valve_type(
@@ -1092,13 +1121,7 @@ def set_valve_type(
     parsed = parse_valve_type(valve_type)
     if parsed is None:
         raise ValueError(f"Invalid valve_type {valve_type!r}")
-    conn.execute("""
-        INSERT INTO circuit_profile (circuit, valve_type)
-        VALUES (?, ?)
-        ON CONFLICT(circuit) DO UPDATE SET valve_type = excluded.valve_type
-    """, (circuit, parsed))
-    if commit:
-        conn.commit()
+    _set_circuit_profile(conn, circuit, "valve_type", parsed, commit=commit)
 
 
 #: Reference-turbine default pulses-per-litre (YF-B5). Mirrors the firmware
@@ -1119,11 +1142,7 @@ def get_circuit_pulses_per_litre(
     circuit_profile row exists yet or the stored value is unusable (NULL /
     non-numeric / out of range).
     """
-    row = conn.execute(
-        "SELECT pulses_per_litre FROM circuit_profile WHERE circuit = ?",
-        (circuit,)
-    ).fetchone()
-    raw = row["pulses_per_litre"] if row else None
+    raw = _get_circuit_profile(conn, circuit, "pulses_per_litre")
     try:
         ppl = float(raw)
     except (TypeError, ValueError):
@@ -1147,13 +1166,7 @@ def set_circuit_pulses_per_litre(
     ppl = float(pulses_per_litre)
     if not (1.0 <= ppl <= 5000.0):
         raise ValueError(f"Invalid pulses_per_litre {pulses_per_litre!r}")
-    conn.execute("""
-        INSERT INTO circuit_profile (circuit, pulses_per_litre)
-        VALUES (?, ?)
-        ON CONFLICT(circuit) DO UPDATE SET pulses_per_litre = excluded.pulses_per_litre
-    """, (circuit, ppl))
-    if commit:
-        conn.commit()
+    _set_circuit_profile(conn, circuit, "pulses_per_litre", ppl, commit=commit)
 
 
 def set_alert_enabled(conn: sqlite3.Connection, alert_id: str, enabled: bool) -> None:
@@ -1791,9 +1804,9 @@ def release_kept_event_memos(
     them. Range query on existing columns; no blocker-id list is stored anywhere.
     Returns the number of memos released; 0 on a pre-20260814 schema.
     """
-    row = conn.execute(
-        "SELECT start_ts, COALESCE(end_ts, start_ts) AS end_ts_eff "
-        "FROM events WHERE id = ? AND circuit = ?", (event_id, circuit)).fetchone()
+    row = _event_row(
+        conn, event_id, circuit,
+        "start_ts, COALESCE(end_ts, start_ts) AS end_ts_eff")
     if row is None or not row["start_ts"]:
         return 0
     try:
@@ -1953,6 +1966,17 @@ def restore_deleted_events(
     return restored
 
 
+def _volume_since(conn: sqlite3.Connection, circuit: str, cutoff: str) -> float:
+    """Total hourly_volume litres at or after ``cutoff`` (a UTC ISO string)."""
+    row = conn.execute("""
+        SELECT COALESCE(SUM(volume_litres), 0)
+        FROM hourly_volume
+        WHERE circuit = ?
+          AND hour_ts >= ?
+    """, (circuit, cutoff)).fetchone()
+    return round(row[0], 1)
+
+
 def get_daily_volume(conn: sqlite3.Connection, circuit: str,
                      since_utc: str = "") -> float:
     """Total volume since local midnight (expressed as a UTC ISO string).
@@ -1962,13 +1986,7 @@ def get_daily_volume(conn: sqlite3.Connection, circuit: str,
     since_utc is not provided.
     """
     cutoff = since_utc or datetime.now(timezone.utc).strftime('%Y-%m-%dT00:00:00')
-    row = conn.execute("""
-        SELECT COALESCE(SUM(volume_litres), 0)
-        FROM hourly_volume
-        WHERE circuit = ?
-          AND hour_ts >= ?
-    """, (circuit, cutoff)).fetchone()
-    return round(row[0], 1) if row else 0.0
+    return _volume_since(conn, circuit, cutoff)
 
 
 def get_weekly_volume(conn: sqlite3.Connection, circuit: str,
@@ -1978,17 +1996,9 @@ def get_weekly_volume(conn: sqlite3.Connection, circuit: str,
     Pass since_utc as the UTC equivalent of local midnight 7 days ago.
     Falls back to UTC midnight 7 days ago when since_utc is not provided.
     """
-    if since_utc:
-        cutoff = since_utc
-    else:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime('%Y-%m-%dT00:00:00')
-    row = conn.execute("""
-        SELECT COALESCE(SUM(volume_litres), 0)
-        FROM hourly_volume
-        WHERE circuit = ?
-          AND hour_ts >= ?
-    """, (circuit, cutoff)).fetchone()
-    return round(row[0], 1) if row else 0.0
+    cutoff = since_utc or (datetime.now(timezone.utc)
+                           - timedelta(days=7)).strftime('%Y-%m-%dT00:00:00')
+    return _volume_since(conn, circuit, cutoff)
 
 
 def get_hourly_volumes(
@@ -2133,6 +2143,16 @@ def _get_volume_baseline(
     return baseline
 
 
+def _ha_volume_since(conn: sqlite3.Connection, circuit: str,
+                     current_ha_value: float, period_ts: str,
+                     days_back: int) -> float:
+    """HA cumulative reading minus the baseline stamped at the period start."""
+    if not period_ts:
+        period_ts = local_midnight_utc_iso(days_back)
+    baseline = _get_volume_baseline(conn, circuit, period_ts, current_ha_value)
+    return round(max(0.0, current_ha_value - baseline), 1)
+
+
 def compute_ha_daily_volume(
     conn: sqlite3.Connection,
     circuit: str,
@@ -2145,10 +2165,7 @@ def compute_ha_daily_volume(
     (e.g. '2026-05-17T05:00:00').  Falls back to local midnight when not provided.
     Must match the key written by _init_volume_baselines().
     """
-    if not period_ts:
-        period_ts = local_midnight_utc_iso(0)
-    baseline = _get_volume_baseline(conn, circuit, period_ts, current_ha_value)
-    return round(max(0.0, current_ha_value - baseline), 1)
+    return _ha_volume_since(conn, circuit, current_ha_value, period_ts, 0)
 
 
 def compute_ha_weekly_volume(
@@ -2162,10 +2179,7 @@ def compute_ha_weekly_volume(
     period_ts is the UTC equivalent of local midnight 7 days ago, as a naive
     ISO string.  Falls back to local midnight 7 days ago when not provided.
     """
-    if not period_ts:
-        period_ts = local_midnight_utc_iso(7)
-    baseline = _get_volume_baseline(conn, circuit, period_ts, current_ha_value)
-    return round(max(0.0, current_ha_value - baseline), 1)
+    return _ha_volume_since(conn, circuit, current_ha_value, period_ts, 7)
 
 
 def get_toilet_flush_cap_litres(conn: sqlite3.Connection) -> float:
@@ -2306,6 +2320,26 @@ def _local_day_bound_or_none(day, which: int):
         return None
 
 
+def _append_day_window(conditions: List[str], params: list,
+                       date_from, date_to) -> None:
+    """Add the History bar's LOCAL calendar-day window to a WHERE build.
+
+    date_from / date_to are LOCAL calendar days; start_ts is stored UTC.
+    Comparing them directly shifts the window by the UTC offset — in Denver that
+    returns the previous evening from 18:00 and cuts the selected day off at
+    17:59. ``local_day_bounds_utc`` is DST-correct (a spring-forward day is 23 h
+    wide). Half-open [lo, hi), which also uses the index instead of scanning.
+    """
+    lo_bound = _local_day_bound_or_none(date_from, 0)
+    if lo_bound is not None:
+        conditions.append("e.start_ts >= ?")
+        params.append(lo_bound)
+    hi_bound = _local_day_bound_or_none(date_to, 1)
+    if hi_bound is not None:
+        conditions.append("e.start_ts < ?")
+        params.append(hi_bound)
+
+
 def get_recent_events(
     conn: sqlite3.Connection,
     circuit: str,
@@ -2400,48 +2434,22 @@ def get_recent_events(
         else:
             conditions.append("e.id IN (%s)" % ",".join("?" * len(_ids)))
             params.extend(_ids)
-    # date_from / date_to are LOCAL calendar days from the History filter bar;
-    # start_ts is stored UTC. Comparing them directly shifts the window by the
-    # UTC offset — in Denver that returns the previous evening from 18:00 and
-    # cuts the selected day off at 17:59. local_day_bounds_utc is DST-correct (a
-    # spring-forward day is 23 h wide). Half-open [lo, hi) — matching the
-    # helper's contract, and it uses the index instead of scanning.
-    lo_bound = _local_day_bound_or_none(date_from, 0)
-    if lo_bound is not None:
-        conditions.append("e.start_ts >= ?")
-        params.append(lo_bound)
-    hi_bound = _local_day_bound_or_none(date_to, 1)
-    if hi_bound is not None:
-        conditions.append("e.start_ts < ?")
-        params.append(hi_bound)
-    if dur_min_s is not None:
-        conditions.append("e.duration_seconds >= ?")
-        params.append(dur_min_s)
-    if dur_max_s is not None:
-        conditions.append("e.duration_seconds <= ?")
-        params.append(dur_max_s)
-    if dp_min is not None:
-        conditions.append("COALESCE(e.pressure_delta_psi, 0) >= ?")
-        params.append(dp_min)
-    if dp_max is not None:
-        conditions.append("COALESCE(e.pressure_delta_psi, 0) <= ?")
-        params.append(dp_max)
-    if vol_min_l is not None:
-        conditions.append(
-            "COALESCE(e.volume_litres_effective, e.volume_litres, 0) >= ?")
-        params.append(vol_min_l)
-    if vol_max_l is not None:
-        conditions.append(
-            "COALESCE(e.volume_litres_effective, e.volume_litres, 0) <= ?")
-        params.append(vol_max_l)
-    if flow_min_lpm is not None:
-        conditions.append(
-            "COALESCE(e.true_avg_flow_lpm, e.avg_flow_lpm, 0) >= ?")
-        params.append(flow_min_lpm)
-    if flow_max_lpm is not None:
-        conditions.append(
-            "COALESCE(e.true_avg_flow_lpm, e.avg_flow_lpm, 0) <= ?")
-        params.append(flow_max_lpm)
+    _append_day_window(conditions, params, date_from, date_to)
+    _DURATION = "e.duration_seconds"
+    _DELTA_P  = "COALESCE(e.pressure_delta_psi, 0)"
+    _VOLUME   = "COALESCE(e.volume_litres_effective, e.volume_litres, 0)"
+    _FLOW     = "COALESCE(e.true_avg_flow_lpm, e.avg_flow_lpm, 0)"
+    for bound, expr, op in ((dur_min_s,     _DURATION, ">="),
+                            (dur_max_s,     _DURATION, "<="),
+                            (dp_min,        _DELTA_P,  ">="),
+                            (dp_max,        _DELTA_P,  "<="),
+                            (vol_min_l,     _VOLUME,   ">="),
+                            (vol_max_l,     _VOLUME,   "<="),
+                            (flow_min_lpm,  _FLOW,     ">="),
+                            (flow_max_lpm,  _FLOW,     "<=")):
+        if bound is not None:
+            conditions.append(f"{expr} {op} ?")
+            params.append(bound)
     if fixture_type == "unlabelled":
         conditions.append(f"{_effective_sql} IS NULL")
     elif fixture_type:
@@ -2525,20 +2533,7 @@ def count_not_real_events(
     Guard ``fetchone()`` only where an empty result is a legitimate state."""
     conditions = ["e.circuit = ?", _NOT_REAL_SQL]
     params: list = [circuit]
-    # date_from / date_to are LOCAL calendar days from the History filter bar;
-    # start_ts is stored UTC. Comparing them directly shifts the window by the
-    # UTC offset — in Denver that returns the previous evening from 18:00 and
-    # cuts the selected day off at 17:59. local_day_bounds_utc is DST-correct (a
-    # spring-forward day is 23 h wide). Half-open [lo, hi) — matching the
-    # helper's contract, and it uses the index instead of scanning.
-    lo_bound = _local_day_bound_or_none(date_from, 0)
-    if lo_bound is not None:
-        conditions.append("e.start_ts >= ?")
-        params.append(lo_bound)
-    hi_bound = _local_day_bound_or_none(date_to, 1)
-    if hi_bound is not None:
-        conditions.append("e.start_ts < ?")
-        params.append(hi_bound)
+    _append_day_window(conditions, params, date_from, date_to)
     if since_ts:
         conditions.append("e.start_ts >= ?")
         params.append(since_ts)
@@ -2583,12 +2578,9 @@ def patch_event(
     if review_verdict is not _PATCH_UNSET and review_verdict not in (
             None, "normal", "unknown"):
         raise ValueError(f"invalid review_verdict: {review_verdict!r}")
-    row = conn.execute(
-        "SELECT id, is_pressure_restoration_phantom, degraded_supply, "
-        "       is_low_flow_dribble "
-        "FROM events WHERE id = ? AND circuit = ?",
-        (event_id, circuit),
-    ).fetchone()
+    row = _event_row(
+        conn, event_id, circuit,
+        "id, is_pressure_restoration_phantom, degraded_supply, is_low_flow_dribble")
     if row is None:
         return False
     if user_fixture_type is not _PATCH_UNSET:
@@ -2733,13 +2725,9 @@ def _apply_event_verdicts(
     back ``hourly_volume_applied_litres = new_effective``. Repeated toggles
     therefore never drift. Returns False if no such event.
     """
-    row = conn.execute(
-        "SELECT volume_litres, volume_litres_estimated, flow_integral_litres, "
-        "       user_ignored, verdict_pin, verdict_pin_veff, "
-        "       hourly_volume_applied_litres, hourly_volume_applied_bucket, start_ts "
-        "FROM events WHERE id = ? AND circuit = ?",
-        (event_id, circuit),
-    ).fetchone()
+    row = _event_row(
+        conn, event_id, circuit,
+        "volume_litres, volume_litres_estimated, flow_integral_litres, user_ignored, verdict_pin, verdict_pin_veff, hourly_volume_applied_litres, hourly_volume_applied_bucket, start_ts")
     if row is None:
         return False
 
@@ -2886,13 +2874,9 @@ def clear_event_classification(
     )
     from .artifact_calibration import load_artifact_calibration
 
-    row = conn.execute(
-        "SELECT duration_seconds, pressure_delta_psi, degraded_supply, "
-        "       volume_litres, avg_flow_lpm, true_avg_flow_lpm, "
-        "       peak_flow_lpm, flow_integral_litres, flow_on_ratio "
-        "FROM events WHERE id = ? AND circuit = ?",
-        (event_id, circuit),
-    ).fetchone()
+    row = _event_row(
+        conn, event_id, circuit,
+        "duration_seconds, pressure_delta_psi, degraded_supply, volume_litres, avg_flow_lpm, true_avg_flow_lpm, peak_flow_lpm, flow_integral_litres, flow_on_ratio")
     if row is None:
         return False
     # Apply the frozen per-home artifact calibration so a manual reset re-derives
@@ -2957,12 +2941,9 @@ def mark_event_irrigation_cross_talk(
     """
     from .feature_extractor import _IRRIGATION_XTALK_REASON
 
-    row = conn.execute(
-        "SELECT volume_litres, start_ts, user_classified, is_cross_talk, "
-        "       user_fixture_type "
-        "FROM events WHERE id = ? AND circuit = ?",
-        (event_id, circuit),
-    ).fetchone()
+    row = _event_row(
+        conn, event_id, circuit,
+        "volume_litres, start_ts, user_classified, is_cross_talk, user_fixture_type")
     if row is None:
         return False
     if (row["user_classified"] or row["is_cross_talk"]
@@ -3032,12 +3013,9 @@ def mark_event_leak_test_refill(
     """
     from .leak_test_refill import LEAK_TEST_REFILL_REASON
 
-    row = conn.execute(
-        "SELECT volume_litres, start_ts, user_classified, user_ignored, "
-        "       user_fixture_type, match_rejection_reason, degraded_supply "
-        "FROM events WHERE id = ? AND circuit = ?",
-        (event_id, circuit),
-    ).fetchone()
+    row = _event_row(
+        conn, event_id, circuit,
+        "volume_litres, start_ts, user_classified, user_ignored, user_fixture_type, match_rejection_reason, degraded_supply")
     if row is None:
         return False
     if (row["user_classified"] or row["user_ignored"]
@@ -3082,11 +3060,9 @@ def revert_irrigation_cross_talk(
     """
     from .feature_extractor import _IRRIGATION_XTALK_REASON
 
-    row = conn.execute(
-        "SELECT volume_litres, start_ts, match_rejection_reason, user_classified "
-        "FROM events WHERE id = ? AND circuit = ?",
-        (event_id, circuit),
-    ).fetchone()
+    row = _event_row(
+        conn, event_id, circuit,
+        "volume_litres, start_ts, match_rejection_reason, user_classified")
     if row is None or row["user_classified"]:
         return False
     if row["match_rejection_reason"] != _IRRIGATION_XTALK_REASON:
@@ -3156,13 +3132,9 @@ def revert_artifact_zeroing_on_relabel(
 
     Returns the reverted reason (for logging) or None when nothing changed.
     """
-    row = conn.execute(
-        "SELECT volume_litres, volume_litres_effective, start_ts, user_ignored, "
-        "       match_rejection_reason, is_pressure_restoration_phantom, "
-        "       is_low_flow_dribble, is_cross_talk, is_composite "
-        "FROM events WHERE id = ? AND circuit = ?",
-        (event_id, circuit),
-    ).fetchone()
+    row = _event_row(
+        conn, event_id, circuit,
+        "volume_litres, volume_litres_effective, start_ts, user_ignored, match_rejection_reason, is_pressure_restoration_phantom, is_low_flow_dribble, is_cross_talk, is_composite")
     if row is None or row["user_ignored"]:
         return None
     reason = row["match_rejection_reason"]
@@ -3195,9 +3167,7 @@ def revert_artifact_zeroing_on_relabel(
 
 
 def get_leak_test_schedule(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM leak_test_schedule WHERE circuit = ?", (circuit,)
-    ).fetchone()
+    return _get_by_circuit(conn, "leak_test_schedule", circuit)
 
 
 def upsert_leak_test_schedule(conn: sqlite3.Connection, circuit: str, **kwargs) -> None:
@@ -6087,10 +6057,9 @@ def propagate_cycle_label(conn: sqlite3.Connection, circuit: str, event_id,
     """
     if fixture_type not in _CYCLE_APPLIANCE_TYPES:
         return 0
-    anchor = conn.execute(
-        "SELECT start_ts, volume_litres, avg_flow_lpm, peak_flow_lpm "
-        "FROM events WHERE id = ? AND circuit = ?", (event_id, circuit),
-    ).fetchone()
+    anchor = _event_row(
+        conn, event_id, circuit,
+        "start_ts, volume_litres, avg_flow_lpm, peak_flow_lpm")
     if anchor is None:
         return 0
     a_ts = _parse_event_ts(anchor["start_ts"])
