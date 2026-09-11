@@ -1,0 +1,60 @@
+{# Fragments rendered by more than one page. static/app.js updates the
+   valve-controls / etc-* fragments live by id and reads their data-*
+   attributes — keep every id and attribute name as-is. #}
+
+{% macro valve_controls(c, cls, can_control_valve, trickle_reset=false) %}
+  <div class="{{ cls }}" id="valve-controls-{{ c.circuit }}"
+       data-fault="{{ 'true' if c.fault_active else 'false' }}"
+       data-fault-reason="{{ c.fault_reason or '' }}"
+       data-display-name="{{ c.display_name }}">
+    {% if can_control_valve %}
+    {% if c.valve_state == 'open' %}
+    <button class="btn btn-danger btn-sm" onclick="valveCloseModal('{{ c.circuit }}', this)">Close Valve</button>
+    {% elif c.valve_state == 'closed' %}
+      {% if c.fault_active %}
+      <button class="btn btn-secondary btn-sm btn-fault-warn"
+              onclick="valveOpenWithFaultWarning('{{ c.circuit }}', this)">
+        Open Valve
+      </button>
+      {% else %}
+      <button class="btn btn-primary btn-sm" onclick="valveOpenModal('{{ c.circuit }}', this)">Open Valve</button>
+      {% endif %}
+    {% else %}
+    <button class="btn btn-secondary btn-sm" disabled>{{ c.valve_state | title }}</button>
+    {% endif %}
+    {% if trickle_reset %}
+    <button class="btn btn-warning btn-sm" onclick="resetTrickle('{{ c.circuit }}')">Reset Trickle</button>
+    {% endif %}
+    {% else %}
+    <span class="muted" style="font-size:.85rem">View only — ask an admin for valve-control access.</span>
+    {% endif %}
+  </div>
+{% endmacro %}
+
+{% macro leak_running(c) %}
+        <div class="leak-running-indicator"
+             id="etc-{{ c.circuit }}"
+             data-start="{{ c.leak_test_started_at or '' }}"
+             data-duration="{{ c.leak_test_duration_secs or '' }}"
+             data-circuit="{{ c.circuit }}">
+          <span class="leak-running-dot"></span>
+          <span class="leak-running-label">Leak test running</span>
+          <span class="leak-running-etc">{{ c.leak_test_etc or "Running…" }}</span>
+        </div>
+{% endmacro %}
+
+{% macro radio_option(name, value, label, help, checked, current=none) -%}
+        <label style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem;cursor:pointer">
+          <input type="radio"
+                 name="{{ name }}"
+                 value="{{ value }}"
+                 {% if current is not none %}data-current="{{ current }}"
+                 {% endif %}{% if checked %}checked{% endif %}{% if caller is defined %}
+                 {{ caller() }}{% endif %}
+                 style="margin-top:3px;flex-shrink:0">
+          <span>
+            <strong>{{ label }}</strong>
+            <span class="muted" style="font-size:.8125rem;display:block">{{ help }}</span>
+          </span>
+        </label>
+{%- endmacro %}

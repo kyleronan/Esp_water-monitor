@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import valve_controls, leak_running %}
 {% block content %}
 
 {# ── Away mode banner (only when active) ─────────────────────────── #}
@@ -312,43 +313,13 @@
     </div>
 
     {# Valve control — single button that flips by current state #}
-    <div class="dash-valve-controls" id="valve-controls-{{ c.circuit }}"
-         data-fault="{{ 'true' if c.fault_active else 'false' }}"
-         data-fault-reason="{{ c.fault_reason or '' }}"
-         data-display-name="{{ c.display_name }}">
-      {% if can_control_valve %}
-      {% if c.valve_state == 'open' %}
-      <button class="btn btn-danger btn-sm" onclick="valveCloseModal('{{ c.circuit }}', this)">Close Valve</button>
-      {% elif c.valve_state == 'closed' %}
-        {% if c.fault_active %}
-        <button class="btn btn-secondary btn-sm btn-fault-warn"
-                onclick="valveOpenWithFaultWarning('{{ c.circuit }}', this)">
-          Open Valve
-        </button>
-        {% else %}
-        <button class="btn btn-primary btn-sm" onclick="valveOpenModal('{{ c.circuit }}', this)">Open Valve</button>
-        {% endif %}
-      {% else %}
-      <button class="btn btn-secondary btn-sm" disabled>{{ c.valve_state | title }}</button>
-      {% endif %}
-      {% else %}
-      <span class="muted" style="font-size:.85rem">View only — ask an admin for valve-control access.</span>
-      {% endif %}
-    </div>
+    {{ valve_controls(c, 'dash-valve-controls', can_control_valve) }}
 
     {# Leak test row — separator above, status on left, abort on right when running #}
     <div class="dash-leak-row">
       <div class="dash-leak-status">
         {% if c.leak_test_active or c.leak_test_running %}
-        <div class="leak-running-indicator"
-             id="etc-{{ c.circuit }}"
-             data-start="{{ c.leak_test_started_at or '' }}"
-             data-duration="{{ c.leak_test_duration_secs or '' }}"
-             data-circuit="{{ c.circuit }}">
-          <span class="leak-running-dot"></span>
-          <span class="leak-running-label">Leak test running</span>
-          <span class="leak-running-etc">{{ c.leak_test_etc or "Running…" }}</span>
-        </div>
+        {{ leak_running(c) }}
         {% elif c.last_leak_result %}
         <span class="pill {% if 'Passed' in c.last_leak_result %}pill-green{% else %}pill-amber{% endif %}">
           {{ c.last_leak_result[:30] }}

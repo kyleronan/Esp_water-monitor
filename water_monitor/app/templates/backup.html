@@ -185,8 +185,10 @@
 
 {% block scripts %}
 <script>
-// Build a two-line result safely without innerHTML (XSS-safe).
-function _setResult(el, headline, detail) {
+// Show a one- or two-line result; built without innerHTML (XSS-safe).
+function _setResult(el, kind, headline, detail) {
+  el.style.display = '';
+  el.className = 'bk-result bk-result-' + kind;
   el.replaceChildren();
   el.appendChild(document.createTextNode(headline));
   if (detail) {
@@ -211,24 +213,19 @@ async function doQuickRestore() {
   form.append('import_settings', wantSett ? '1' : '');
   form.append('import_history',  wantHist ? '1' : '');
   form.append('_csrf', window.CSRF_TOKEN || '');
-  resultEl.style.display = '';
-  resultEl.className = 'bk-result bk-result-info';
-  resultEl.textContent = 'Restoring… please wait.';
+  _setResult(resultEl, 'info', 'Restoring… please wait.');
   try {
     const resp = await fetch(`${window.INGRESS_PATH}/backup/import/quick-restore`,
                              { method: 'POST', body: form });
     const data = await resp.json();
     if (data.ok) {
-      resultEl.className = 'bk-result bk-result-ok';
-      _setResult(resultEl, '✓ Restored', data.summary);
+      _setResult(resultEl, 'ok', '✓ Restored', data.summary);
       setTimeout(() => location.reload(), 2500);
     } else {
-      resultEl.className = 'bk-result bk-result-err';
-      _setResult(resultEl, `✗ ${data.error || 'Failed'}`, (data.errors || []).join('\n'));
+      _setResult(resultEl, 'err', `✗ ${data.error || 'Failed'}`, (data.errors || []).join('\n'));
     }
   } catch (e) {
-    resultEl.className = 'bk-result bk-result-err';
-    resultEl.textContent = `✗ Network error: ${e.message}`;
+    _setResult(resultEl, 'err', `✗ Network error: ${e.message}`);
   }
 }
 
@@ -309,32 +306,25 @@ async function doShareImport(name) {
   form.append('filename', name);
   if (labelsOnly) form.append('labels_only', '1');
   form.append('_csrf', window.CSRF_TOKEN || '');
-  resultEl.style.display = '';
-  resultEl.className = 'bk-result bk-result-info';
-  resultEl.textContent = `Importing ${name} from /share… large archives can take a while.`;
+  _setResult(resultEl, 'info', `Importing ${name} from /share… large archives can take a while.`);
   try {
     const resp = await fetch(`${window.INGRESS_PATH}/backup/import/share-archive`,
                              { method: 'POST', body: form });
     const data = await resp.json();
     if (data.ok) {
-      resultEl.className = 'bk-result bk-result-ok';
-      _setResult(resultEl, `✓ ${data.summary}`, 'Existing rows kept; archive rows merged in.');
+      _setResult(resultEl, 'ok', `✓ ${data.summary}`, 'Existing rows kept; archive rows merged in.');
     } else {
-      resultEl.className = 'bk-result bk-result-err';
-      _setResult(resultEl, `✗ ${data.error || 'Failed'}`, (data.errors || []).join('\n'));
+      _setResult(resultEl, 'err', `✗ ${data.error || 'Failed'}`, (data.errors || []).join('\n'));
     }
   } catch (e) {
-    resultEl.className = 'bk-result bk-result-err';
-    resultEl.textContent = `✗ Network error: ${e.message}`;
+    _setResult(resultEl, 'err', `✗ Network error: ${e.message}`);
   }
 }
 
 async function saveFullToShare(btn) {
   const resultEl = document.getElementById('share-save-result');
   btn.disabled = true;
-  resultEl.style.display = '';
-  resultEl.className = 'bk-result bk-result-info';
-  resultEl.textContent = 'Writing full export to /share…';
+  _setResult(resultEl, 'info', 'Writing full export to /share…');
   try {
     const form = new FormData();
     form.append('_csrf', window.CSRF_TOKEN || '');
@@ -342,15 +332,12 @@ async function saveFullToShare(btn) {
                              { method: 'POST', body: form });
     const data = await resp.json();
     if (data.ok) {
-      resultEl.className = 'bk-result bk-result-ok';
-      resultEl.textContent = `✓ Saved ${data.file} (${data.size_mb} MB)`;
+      _setResult(resultEl, 'ok', `✓ Saved ${data.file} (${data.size_mb} MB)`);
     } else {
-      resultEl.className = 'bk-result bk-result-err';
-      resultEl.textContent = `✗ ${data.error || 'Failed'}`;
+      _setResult(resultEl, 'err', `✗ ${data.error || 'Failed'}`);
     }
   } catch (e) {
-    resultEl.className = 'bk-result bk-result-err';
-    resultEl.textContent = `✗ Network error: ${e.message}`;
+    _setResult(resultEl, 'err', `✗ Network error: ${e.message}`);
   } finally {
     btn.disabled = false;
   }
@@ -365,9 +352,7 @@ async function doHistoryImport() {
   // error before the add-on ever sees them. A full water_monitor.db is tens
   // of MB; the intended file here is the small History Archive export.
   if (fileEl.files[0].size > 8 * 1024 * 1024) {
-    resultEl.style.display = '';
-    resultEl.className = 'bk-result bk-result-err';
-    _setResult(resultEl,
+    _setResult(resultEl, 'err',
       `✗ File too large to upload through Home Assistant (${(fileEl.files[0].size/1048576).toFixed(0)} MB).`,
       'This looks like a full database, not a History Archive. Use the small ' +
       '"Download History Archive (.db)" file from the old install, or a ' +
@@ -381,9 +366,7 @@ async function doHistoryImport() {
   form.append('file', fileEl.files[0]);
   if (labelsOnly) form.append('labels_only', '1');
   form.append('_csrf', window.CSRF_TOKEN || '');
-  resultEl.style.display = '';
-  resultEl.className = 'bk-result bk-result-info';
-  resultEl.textContent = 'Importing… this may take a moment for large archives.';
+  _setResult(resultEl, 'info', 'Importing… this may take a moment for large archives.');
   try {
     const resp = await fetch(`${window.INGRESS_PATH}/backup/import/history-archive`,
                              { method: 'POST', body: form });
@@ -396,15 +379,12 @@ async function doHistoryImport() {
       data = { ok: false, error: `Upload rejected before reaching the add-on: ${raw.slice(0, 200)}` };
     }
     if (data.ok) {
-      resultEl.className = 'bk-result bk-result-ok';
-      _setResult(resultEl, `✓ ${data.summary}`, 'Existing rows kept; archive rows merged in.');
+      _setResult(resultEl, 'ok', `✓ ${data.summary}`, 'Existing rows kept; archive rows merged in.');
     } else {
-      resultEl.className = 'bk-result bk-result-err';
-      _setResult(resultEl, `✗ ${data.error || 'Failed'}`, (data.errors || []).join('\n'));
+      _setResult(resultEl, 'err', `✗ ${data.error || 'Failed'}`, (data.errors || []).join('\n'));
     }
   } catch (e) {
-    resultEl.className = 'bk-result bk-result-err';
-    resultEl.textContent = `✗ Network error: ${e.message}`;
+    _setResult(resultEl, 'err', `✗ Network error: ${e.message}`);
   }
 }
 </script>

@@ -1,5 +1,41 @@
 {% extends "base.html" %}
+{% from "_macros.html" import radio_option %}
 {% block content %}
+{% macro device_entity_grid(entities) %}
+        <div class="device-entity-grid">
+          {% for e in entities %}
+          <div class="device-entity-row">
+            <div class="device-entity-label-group">
+              <label class="device-entity-label" title="{{ e.entity_id }}">
+                {{ e.short_label or e.friendly_name }}
+              </label>
+              {% if e.description %}
+              <span class="device-entity-desc muted">{{ e.description }}</span>
+              {% endif %}
+            </div>
+            {% if e.domain in ('select', 'input_select') %}
+            <select class="device-entity-input"
+                    onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
+              {% for opt in e.options %}
+              <option value="{{ opt }}" {% if opt == e.state %}selected{% endif %}>{{ opt }}</option>
+              {% endfor %}
+            </select>
+            {% else %}
+            <div class="device-entity-number">
+              <input type="number" class="device-entity-input"
+                     value="{{ e.state }}"
+                     data-native-step="{{ e.native_step or '' }}"
+                     {% if e.min is not none %}min="{{ e.min }}"{% endif %}
+                     {% if e.max is not none %}max="{{ e.max }}"{% endif %}
+                     {% if e.step is not none %}step="{{ e.step }}"{% endif %}
+                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value, this.dataset.nativeStep)">
+              {% if e.unit %}<span class="unit-label">{{ e.unit }}</span>{% endif %}
+            </div>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+{% endmacro %}
 
 <div class="sett-layout">
 
@@ -288,18 +324,9 @@
           recalibrate for best results.
         </p>
         {% for t in circuit_types %}
-        <label style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem;cursor:pointer">
-          <input type="radio"
-                 name="circuit_type_{{ c.circuit }}"
-                 value="{{ t }}"
-                 {% if t == c.circuit_type %}checked{% endif %}
+        {% call radio_option('circuit_type_' ~ c.circuit, t, circuit_type_labels[t], circuit_type_help[t], t == c.circuit_type) -%}
                  onchange="settingsCircuitTypeUpdate('{{ c.circuit }}', '{{ t }}')"
-                 style="margin-top:3px;flex-shrink:0">
-          <span>
-            <strong>{{ circuit_type_labels[t] }}</strong>
-            <span class="muted" style="font-size:.8125rem;display:block">{{ circuit_type_help[t] }}</span>
-          </span>
-        </label>
+        {%- endcall %}
         {% endfor %}
         <p class="sett-card-desc" id="circuit-type-saving-{{ c.circuit }}"
            style="display:none;color:var(--amber-text);margin-top:.5rem">Saving…</p>
@@ -314,19 +341,9 @@
           before any change here takes effect.
         </p>
         {% for vt in valve_types %}
-        <label style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem;cursor:pointer">
-          <input type="radio"
-                 name="valve_type_{{ c.circuit }}"
-                 value="{{ vt }}"
-                 data-current="{{ c.valve_type }}"
-                 {% if vt == c.valve_type %}checked{% endif %}
+        {% call radio_option('valve_type_' ~ c.circuit, vt, valve_type_labels[vt], valve_type_help[vt], vt == c.valve_type, current=c.valve_type) -%}
                  onchange="settingsValveTypeUpdate('{{ c.circuit }}', '{{ vt }}', this)"
-                 style="margin-top:3px;flex-shrink:0">
-          <span>
-            <strong>{{ valve_type_labels[vt] }}</strong>
-            <span class="muted" style="font-size:.8125rem;display:block">{{ valve_type_help[vt] }}</span>
-          </span>
-        </label>
+        {%- endcall %}
         {% endfor %}
         <p class="sett-card-desc" id="valve-type-saving-{{ c.circuit }}"
            style="display:none;color:var(--amber-text);margin-top:.5rem">Saving…</p>
@@ -663,39 +680,7 @@
       <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">ESP Device Settings</h3>
         <p class="sett-card-desc">Stored on the ESP device and applied immediately.</p>
-        <div class="device-entity-grid">
-          {% for e in c.device_entities %}
-          <div class="device-entity-row">
-            <div class="device-entity-label-group">
-              <label class="device-entity-label" title="{{ e.entity_id }}">
-                {{ e.short_label or e.friendly_name }}
-              </label>
-              {% if e.description %}
-              <span class="device-entity-desc muted">{{ e.description }}</span>
-              {% endif %}
-            </div>
-            {% if e.domain in ('select', 'input_select') %}
-            <select class="device-entity-input"
-                    onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
-              {% for opt in e.options %}
-              <option value="{{ opt }}" {% if opt == e.state %}selected{% endif %}>{{ opt }}</option>
-              {% endfor %}
-            </select>
-            {% else %}
-            <div class="device-entity-number">
-              <input type="number" class="device-entity-input"
-                     value="{{ e.state }}"
-                     data-native-step="{{ e.native_step or '' }}"
-                     {% if e.min is not none %}min="{{ e.min }}"{% endif %}
-                     {% if e.max is not none %}max="{{ e.max }}"{% endif %}
-                     {% if e.step is not none %}step="{{ e.step }}"{% endif %}
-                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value, this.dataset.nativeStep)">
-              {% if e.unit %}<span class="unit-label">{{ e.unit }}</span>{% endif %}
-            </div>
-            {% endif %}
-          </div>
-          {% endfor %}
-        </div>
+        {{ device_entity_grid(c.device_entities) }}
       </div>
       {% else %}
       <div class="sett-card sett-adv-card">
@@ -872,39 +857,7 @@
       <h2 class="sett-section-title">ESP Device — General Settings</h2>
       <p class="sett-section-desc">Non-circuit settings stored on the ESP device and applied immediately.</p>
       <div class="sett-card">
-        <div class="device-entity-grid">
-          {% for e in general_entities %}
-          <div class="device-entity-row">
-            <div class="device-entity-label-group">
-              <label class="device-entity-label" title="{{ e.entity_id }}">
-                {{ e.short_label or e.friendly_name }}
-              </label>
-              {% if e.description %}
-              <span class="device-entity-desc muted">{{ e.description }}</span>
-              {% endif %}
-            </div>
-            {% if e.domain in ('select', 'input_select') %}
-            <select class="device-entity-input"
-                    onchange="updateDeviceEntity('{{ e.entity_id }}', this.value)">
-              {% for opt in e.options %}
-              <option value="{{ opt }}" {% if opt == e.state %}selected{% endif %}>{{ opt }}</option>
-              {% endfor %}
-            </select>
-            {% else %}
-            <div class="device-entity-number">
-              <input type="number" class="device-entity-input"
-                     value="{{ e.state }}"
-                     data-native-step="{{ e.native_step or '' }}"
-                     {% if e.min is not none %}min="{{ e.min }}"{% endif %}
-                     {% if e.max is not none %}max="{{ e.max }}"{% endif %}
-                     {% if e.step is not none %}step="{{ e.step }}"{% endif %}
-                     onchange="updateDeviceEntity('{{ e.entity_id }}', this.value, this.dataset.nativeStep)">
-              {% if e.unit %}<span class="unit-label">{{ e.unit }}</span>{% endif %}
-            </div>
-            {% endif %}
-          </div>
-          {% endfor %}
-        </div>
+        {{ device_entity_grid(general_entities) }}
       </div>
     </div>
     {% endif %}
