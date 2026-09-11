@@ -560,7 +560,7 @@
     </table>
   </div>
   {% if ch.leak_tests|length > 3 %}
-  <div class="hist-see-more-wrap" style="margin-top:8px">
+  <div style="margin-top:8px">
     <button type="button" class="btn btn-ghost btn-sm hist-see-more" data-expanded="0"
             data-more-label="See {{ ch.leak_tests|length - 3 }} more">See {{ ch.leak_tests|length - 3 }} more</button>
   </div>
@@ -769,7 +769,7 @@
     </table>
   </div>
   {% if ch.events|length > 25 %}
-  <div class="hist-see-more-wrap" style="margin-top:8px">
+  <div style="margin-top:8px">
     <button type="button" class="btn btn-ghost btn-sm hist-see-more" data-expanded="0"
             data-more-label="See {{ ch.events|length - 25 }} more">See {{ ch.events|length - 25 }} more</button>
   </div>
@@ -786,7 +786,7 @@
   <div class="evt-modal">
     <div class="evt-modal-header">
       <h3 class="evt-modal-title" id="evt-modal-title">Event detail</h3>
-      <button id="evt-modal-close" class="icon-btn" aria-label="Close">✕</button>
+      <button id="evt-modal-close" aria-label="Close">✕</button>
     </div>
     <dl class="evt-modal-dl">
       <dt>Time</dt>       <dd id="emd-start"></dd>
@@ -988,7 +988,7 @@
   <div class="evt-modal">
     <div class="evt-modal-header">
       <h3 class="evt-modal-title" id="lt-modal-title">Leak test detail</h3>
-      <button id="lt-modal-close" class="icon-btn" aria-label="Close">✕</button>
+      <button id="lt-modal-close" aria-label="Close">✕</button>
     </div>
     <p class="lt-modal-status"><span id="ltm-badge" class="pill pill-neutral"></span></p>
     <p id="ltm-explain" class="lt-modal-explain"></p>
@@ -1270,7 +1270,6 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       parent.appendChild(td);
       first.parentNode.insertBefore(parent, first);
       members.forEach(m => {
-        m.classList.add('hist-group-member');
         m.classList.remove('hist-extra-row');         // hand visibility to the group
         m.style.display = 'none';
       });
@@ -1986,7 +1985,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         });
       const data = await resp.json().catch(() => ({}));
       if (resp.ok) {
-        errBox.style.color = 'var(--ok, #2e7d32)';
+        errBox.style.color = '#2e7d32';
         errBox.textContent = `✓ Deleted ${data.deleted}, re-importing ${data.imported} `
           + `run(s)${data.widened ? ' (range widened to rebuild a long event)' : ''}`
           + ' — new events appear shortly. Reloading…';

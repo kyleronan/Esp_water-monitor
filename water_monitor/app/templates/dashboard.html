@@ -153,7 +153,7 @@
     <button type="submit"
             class="dash-away-toggle {% if away_mode %}is-away{% endif %}">
       <span class="dash-away-toggle-icon">{% if away_mode %}🏖{% else %}🏠{% endif %}</span>
-      <span class="dash-away-toggle-label">
+      <span>
         {% if away_mode %}Away — tap to return home{% else %}Home{% endif %}
       </span>
     </button>
@@ -165,7 +165,7 @@
   <span class="dash-away-toggle dash-away-static {% if away_mode %}is-away{% endif %}"
         title="Away mode is set by an admin">
     <span class="dash-away-toggle-icon">{% if away_mode %}🏖{% else %}🏠{% endif %}</span>
-    <span class="dash-away-toggle-label">{% if away_mode %}Away{% else %}Home{% endif %}</span>
+    <span>{% if away_mode %}Away{% else %}Home{% endif %}</span>
   </span>
   {% endif %}
 </div>

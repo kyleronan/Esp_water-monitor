@@ -175,7 +175,7 @@
             </div>
           </div>
           <div class="sett-toggle-row" style="margin:10px 0 14px">
-            <div class="sett-toggle-info">
+            <div>
               <span class="sett-toggle-label">Use home age to size toilet flushes</span>
               <span class="sett-toggle-desc">
                 US flush standards changed over time (up to 7 gal before 1982,
@@ -255,8 +255,7 @@
           Internal ID (<code>{{ c.circuit }}</code>) is never changed.
         </p>
         <form method="post"
-              action="{{ ingress_path }}/settings/circuit/{{ c.circuit }}/rename"
-              class="sett-form-inline">
+              action="{{ ingress_path }}/settings/circuit/{{ c.circuit }}/rename">
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
           <div class="sett-form-group" style="flex:1">
             <label for="rename_{{ c.circuit }}">Display name</label>
@@ -264,8 +263,7 @@
                    id="rename_{{ c.circuit }}"
                    name="display_name"
                    value="{{ c.display_name }}"
-                   maxlength="40"
-                   class="form-control">
+                   maxlength="40">
           </div>
           <button type="submit" class="btn btn-secondary btn-sm" style="align-self:flex-end">
             Rename
@@ -275,7 +273,7 @@
 
       {# Installer-grade Config cards (circuit/valve type are set at install and
          rarely touched) stay behind ⚙ Show Advanced; a one-line hint says so. #}
-      <p class="sett-help sett-adv-hint muted" style="margin:.25rem 0 .75rem">
+      <p class="sett-adv-hint muted" style="margin:.25rem 0 .75rem">
         Installer settings (circuit type, valve type) are hidden — use
         <strong>⚙ Show Advanced</strong> below the menu to see them.
       </p>
@@ -373,7 +371,7 @@
           {{ '%.1f'|format(c.reconcile.last_delta_litres|abs)
              if c.reconcile.last_delta_litres is not none else '0.0' }} L.</p>
         {% endif %}
-        <p class="sett-help">Checked {{ c.reconcile.last_run_at[:16]|replace('T',' ') }}
+        <p>Checked {{ c.reconcile.last_run_at[:16]|replace('T',' ') }}
           {%- if c.reconcile.flagged %} · {{ c.reconcile.flagged }} day(s) flagged so far{% endif %}.</p>
       </div>
       {% endif %}
@@ -531,7 +529,7 @@
               Re-fit rules for current pressure
             </button>
           </form>
-          <p class="sett-help" style="margin-top:.35rem">
+          <p style="margin-top:.35rem">
             Quick re-fit of the fixture recognition bands on events from the
             current supply pressure — no learning period, nothing is deleted,
             leak protection unaffected. Use after a booster pump or pressure
@@ -541,7 +539,7 @@
           {# dev46 (46j) — the F-C2 marker, surfaced at the control that fixes
              it. dev42 only logged it, and a warning in the boot log is not
              somewhere the operator ever looks. #}
-          <p class="sett-help" style="margin-top:.5rem;padding:.5rem .65rem;
+          <p style="margin-top:.5rem;padding:.5rem .65rem;
                     border-radius:6px;background:var(--amber-bg);
                     color:var(--amber-text);border:1px solid var(--amber-border)">
             <strong>A fixture-grouping rebuild was interrupted</strong>
@@ -559,7 +557,7 @@
               Rebuild fixture grouping for current pressure
             </button>
           </form>
-          <p class="sett-help" style="margin-top:.35rem">
+          <p style="margin-top:.35rem">
             Rebuilds the automatic fixture grouping from events recorded since
             the pump was installed, ignoring pressure readings (a
             constant-pressure pump makes them describe the pump, not the
@@ -575,7 +573,7 @@
       {# Anomaly response #}
       <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Anomaly Response</h3>
-        <p class="sett-help" style="margin:.25rem 0 .75rem">
+        <p style="margin:.25rem 0 .75rem">
           What happens when an event deviates from your home's frozen baseline.
           Detection Sensitivity (on the Detection tab) controls <em>how much</em> deviation counts;
           this controls the <em>response</em>.
@@ -621,7 +619,7 @@
             </div>
           </label>
           {% if ar in ('notify_shutoff_severe', 'shutoff_any') and not c.anomaly_shutoff_ready %}
-          <div class="sett-help" style="margin-top:.5rem;color:#b8860b">
+          <div style="margin-top:.5rem;color:#b8860b">
             ⓘ Auto-shutoff is held back (currently notify-only): the baseline must be fit
             from ≥{{ c.anomaly_shutoff_min_n }} events and run for
             ~{{ c.anomaly_shutoff_min_days }} days before it can close your water. It
@@ -636,7 +634,7 @@
       {% if c.has_volume_sensor %}
       <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Volume reconciliation</h3>
-        <p class="sett-help" style="margin:.25rem 0 .75rem">
+        <p style="margin:.25rem 0 .75rem">
           Live event volumes are integrated from the flow stream, which can under-count when
           samples drop. The firmware's cumulative volume sensor is the source of truth.
           When on, a settled event whose volume diverges from the recorder is corrected
@@ -714,7 +712,7 @@
 
       <div class="sett-card">
         <h3 class="sett-card-title">Detection Sensitivity</h3>
-        <p class="sett-help" style="margin:.25rem 0 .6rem">
+        <p style="margin:.25rem 0 .6rem">
           Also tunes anomaly detection against your frozen baseline: <strong>Low</strong>
           alerts only on the most extreme events (p99), <strong>High</strong> is the most
           sensitive (p85). Lower this if you get too many false alarms.
@@ -742,7 +740,7 @@
                 this.closest('form').querySelector('[name=mode]').value = 'advanced';
               }">
             <summary>Advanced settings</summary>
-            <p class="sett-help" style="margin:.5rem 0">
+            <p style="margin:.5rem 0">
               These raw values are set automatically by the Low / Medium / High picker
               above. Only change them if you know exactly what you're tuning — the picker
               covers almost every home.
@@ -815,7 +813,7 @@
           continues as normal.
         </p>
         {% if c.active_exclusion %}
-        <div class="excl-status" style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin-bottom:.75rem">
+        <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin-bottom:.75rem">
           <span class="pill pill-warning">
             ⏱ Exclusion active — {{ c.active_exclusion.minutes_remaining }} min remaining
           </span>
@@ -1070,7 +1068,7 @@
         <form method="post" action="{{ ingress_path }}/settings/history-events/update">
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
           <div class="sett-toggle-row" style="margin-bottom:14px">
-            <div class="sett-toggle-info">
+            <div>
               <span class="sett-toggle-label">Hide not-real-use events from History</span>
               <span class="sett-toggle-desc">
                 The monitor automatically flags readings that aren't real water use —
@@ -1089,7 +1087,7 @@
             </label>
           </div>
           <div class="sett-toggle-row" style="margin-bottom:14px;padding-top:.75rem;border-top:1px solid var(--border)">
-            <div class="sett-toggle-info">
+            <div>
               <span class="sett-toggle-label">Automatically split merged events</span>
               <span class="sett-toggle-desc">
                 Sometimes several quick uses close together get recorded as one long
@@ -1123,7 +1121,7 @@
         <form method="post" action="{{ ingress_path }}/settings/water-softener/update">
           <input type="hidden" name="_csrf" value="{{ csrf_token }}">
           <div class="sett-toggle-row" style="margin-bottom:14px">
-            <div class="sett-toggle-info">
+            <div>
               <span class="sett-toggle-label">I have a water softener</span>
               <span class="sett-toggle-desc">
                 Off by default. When on, set the regeneration start time below —
@@ -1349,14 +1347,14 @@
       </p>
       <div class="sett-card">
         <h3 class="sett-card-title">Re-train rule calibration</h3>
-        <p class="sett-help" style="margin:.25rem 0 .75rem">
+        <p style="margin:.25rem 0 .75rem">
           Instantly re-fit + re-lock the per-home rule bands from the CURRENT
           labels — no new learning period. Runs the same activation fit+freeze
           (sanity gate included) and re-types events. The fit-vs-fallback result
           is shown as a toast.
         </p>
         {% for c in circuits %}
-        <div class="dev-retrain-row"
+        <div
              style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
           <div>
             <strong>{{ c.display_name }}</strong>
@@ -1383,7 +1381,7 @@
 
       <div class="sett-card">
         <h3 class="sett-card-title">Re-fit the learned model</h3>
-        <p class="sett-help" style="margin:.25rem 0 .75rem">
+        <p style="margin:.25rem 0 .75rem">
           Re-fits the learned classifier from your current labels straight away,
           instead of waiting for the weekly pass. This forces a <em>decision</em>,
           not a swap: the new fit only takes over if it measures at least as well
@@ -1393,7 +1391,7 @@
           run still happens as normal.
         </p>
         {% for c in circuits %}
-        <div class="dev-refit-row"
+        <div
              style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
           <div><strong>{{ c.display_name }}</strong></div>
           <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
@@ -1417,7 +1415,7 @@
           </div>
         </div>
         {% endfor %}
-        <p class="sett-help" style="margin:.5rem 0 0">
+        <p style="margin:.5rem 0 0">
           <em>Restore previous model</em> puts back the model that was running
           before the last change-over, if one is retained, and re-checks the
           events it would answer differently.
@@ -1426,7 +1424,7 @@
 
       <div class="sett-card">
         <h3 class="sett-card-title">The model's reference benchmark</h3>
-        <p class="sett-help" style="margin:.25rem 0 .75rem">
+        <p style="margin:.25rem 0 .75rem">
           When the learned model is re-fitted, the new fit is checked against a
           fixed set of events labelled before it existed, so a fit that quietly
           got worse is not put into service. The add-on pins that reference set
@@ -1443,12 +1441,12 @@
           <div>
             <strong>{{ c.display_name }}</strong>
             {%- if bs and bs.n %}
-            <span class="sett-help"> — {{ bs.n }} events pinned {{ bs.pinned_at }}
+            <span> — {{ bs.n }} events pinned {{ bs.pinned_at }}
               {%- if bs.source == 'import' %} (loaded from a file){% else %} (pinned by the add-on){% endif %}
               {%- if bs.pending %}; a refreshed set is waiting for the next change-over{% endif %}
               <span style="opacity:.65;font-family:monospace;font-size:.85em"> {{ bs.hash }}</span></span>
             {%- elif bs %}
-            <span class="sett-help"> — no reference set yet ({{ bs.human_labels }} of the
+            <span> — no reference set yet ({{ bs.human_labels }} of the
               {{ bs.threshold }} labels needed before one is pinned automatically)</span>
             {%- endif %}
           </div>
@@ -1484,7 +1482,7 @@
 
       <div class="sett-card">
         <h3 class="sett-card-title">Artifact-detector calibration</h3>
-        <p class="sett-help" style="margin:.25rem 0 .75rem">
+        <p style="margin:.25rem 0 .75rem">
           Per-home phantom / cross-talk / dribble thresholds, frozen at activation
           (and re-frozen by Re-train above). Each is applied only if it would flag
           <em>none</em> of your confirmed-real events — otherwise it keeps the safe
@@ -1514,14 +1512,14 @@
 
       <div class="sett-card">
         <h3 class="sett-card-title">Detector self-validation</h3>
-        <p class="sett-help" style="margin:.25rem 0 .75rem">
+        <p style="margin:.25rem 0 .75rem">
           Reconciles detected events against the raw flow re-scraped from HA (the last
           ≤10 days of high-fidelity history) to confirm the phantom / cross-talk / dribble
           settings behave. Runs automatically at activation / re-train.
           <strong>Diagnostic only — never changes a threshold.</strong>
         </p>
         {% for c in circuits %}
-        <div class="dev-retrain-row"
+        <div
              style="display:flex;gap:.5rem;align-items:flex-start;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
           <div style="min-width:60%">
             <strong>{{ c.display_name }}</strong>
@@ -1582,7 +1580,7 @@
 
       <div class="sett-card">
         <h3 class="sett-card-title">Duplicated spans</h3>
-        <p class="sett-help" style="margin:.25rem 0 .75rem">
+        <p style="margin:.25rem 0 .75rem">
           Spans where the add-on recorded the same water twice and both copies
           still count. Those inside Home Assistant's history window can be rebuilt
           from that history (your own labels are never removed — a span they block
@@ -1593,9 +1591,9 @@
         {% set og = overlap_repair.get(c.circuit) if overlap_repair else none %}
         <div style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
           <div><strong>{{ c.display_name }}</strong>
-            {%- if og and og.groups %} <span class="sett-help">— {{ og.groups|length }} span(s), about
+            {%- if og and og.groups %} <span>— {{ og.groups|length }} span(s), about
               {{ og.litres }} L counted twice, {{ og.rebuildable }} rebuildable</span>
-            {%- else %} <span class="sett-help">— none on the books</span>{% endif %}</div>
+            {%- else %} <span>— none on the books</span>{% endif %}</div>
           {% if og and og.rebuildable %}
           <form method="post" action="{{ ingress_path }}/settings/dev/rebuild-overlaps/{{ c.circuit }}"
                 style="margin:0"
@@ -1614,7 +1612,7 @@
               <td>{{ g.n }}</td><td>{{ g.excess_l }} L</td><td>{{ g.state|replace('_', ' ') }}</td>
               <td>{% if g.within_retention %}rebuildable{% else %}older than history{% endif %}</td></tr>
           {% endfor %}
-          {% if og.groups|length > 12 %}<tr><td colspan="5" class="sett-help">… and {{ og.groups|length - 12 }} more</td></tr>{% endif %}
+          {% if og.groups|length > 12 %}<tr><td colspan="5">… and {{ og.groups|length - 12 }} more</td></tr>{% endif %}
           </tbody>
         </table>
         {% endif %}
@@ -1623,7 +1621,7 @@
 
       <div class="sett-card">
         <h3 class="sett-card-title">Reprocess range</h3>
-        <p class="sett-help" style="margin:.25rem 0 .75rem">
+        <p style="margin:.25rem 0 .75rem">
           Delete a circuit's auto events in a date range and rebuild them from HA
           flow history — the bulk counterpart to the per-event <em>Reprocess</em>
           on the History event modal. Fixes a garbled/unclosed event that absorbed
@@ -1631,7 +1629,7 @@
           re-imported events appear shortly as they finish processing.
         </p>
         {% for c in circuits %}
-        <div class="dev-retrain-row"
+        <div
              style="display:flex;gap:.5rem;align-items:center;justify-content:space-between;margin:.6rem 0;flex-wrap:wrap">
           <strong>{{ c.display_name }}</strong>
           <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">

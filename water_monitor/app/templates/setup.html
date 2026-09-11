@@ -68,7 +68,7 @@
     {% endif %}
 
     <form method="post" action="{{ ingress_path }}/setup/restore"
-          enctype="multipart/form-data" class="restore-form">
+          enctype="multipart/form-data">
 
       <div class="restore-file-row">
         <label class="btn btn-secondary" for="restore-file">
@@ -152,7 +152,7 @@
       {% for d in suggestions %}
       <label class="device-option">
         <input type="radio" name="device_id" value="{{ d.id }}" required>
-        <div class="device-option-body">
+        <div>
           <div class="device-option-name">{{ d.name }}</div>
           <div class="device-option-meta muted">
             {% if d.manufacturer %}{{ d.manufacturer }}{% endif %}
@@ -350,7 +350,6 @@
         value="{{ c.display_name }}"
         maxlength="40"
         placeholder="e.g. Main, Garden, Unit A"
-        class="form-control"
         style="margin-bottom:1rem"
       >
 
@@ -412,7 +411,7 @@
     {% endif %}
   </p>
 
-  <form method="post" action="{{ ingress_path }}/setup/units" class="home-form">
+  <form method="post" action="{{ ingress_path }}/setup/units">
     <input type="hidden" name="_csrf" value="{{ csrf_token }}">
 
     <div class="form-grid" style="align-items: end">
@@ -468,7 +467,7 @@
     detection thresholds. You can update these later in Settings.
   </p>
 
-  <form method="post" action="{{ ingress_path }}/setup/home" class="home-form">
+  <form method="post" action="{{ ingress_path }}/setup/home">
 
     <fieldset class="form-fieldset">
       <legend>Bathrooms</legend>
@@ -549,13 +548,13 @@
       </div>
     </fieldset>
 
-    <fieldset class="form-section" style="margin-top:1.5rem">
+    <fieldset style="margin-top:1.5rem">
       <legend>Water softener</legend>
       {% if error %}
       <p class="form-hint" style="color:#c0392b">{{ error }}</p>
       {% endif %}
-      <div class="form-group form-group--checkbox">
-        <label class="checkbox-label">
+      <div class="form-group">
+        <label>
           <input type="checkbox" id="has_water_softener" name="has_water_softener"
                  value="1"
                  onchange="document.getElementById('softener-cfg').style.display = this.checked ? '' : 'none'"
@@ -590,10 +589,10 @@
       </div>
     </fieldset>
 
-    <fieldset class="form-section" style="margin-top:1.5rem">
+    <fieldset style="margin-top:1.5rem">
       <legend>Historical data</legend>
-      <div class="form-group form-group--checkbox">
-        <label class="checkbox-label">
+      <div class="form-group">
+        <label>
           <input type="checkbox" name="historical_import_enabled" value="1" checked>
           <span>Import historical events</span>
         </label>

@@ -18,7 +18,7 @@
     <h2 class="dev-card-title">{{ c.display_name }}</h2>
     <div class="dev-card-readings">
       <span class="pill {% if c.fault_active %}pill-red{% elif c.valve_state == 'open' %}pill-green{% else %}pill-neutral{% endif %}">
-        <span class="dev-valve-dot dev-valve-{{ c.valve_state | lower }}">⬤</span>
+        <span class="dev-valve-dot">⬤</span>
         <span id="valve-label-{{ c.circuit }}">{{ c.valve_state | upper }}</span>
       </span>
       <span class="dev-reading-mono"><span id="pressure-{{ c.circuit }}">{{ c.pressure }}</span> {{ pressure_unit }}</span>
@@ -90,7 +90,7 @@
         </div>
         {% elif c.leak_test_result and c.leak_test_result not in ('No test run', 'unknown', 'unavailable') %}
         {# Latest result only — links to the full log on the History page. #}
-        <a class="dev-leak-result-link" style="text-decoration:none"
+        <a style="text-decoration:none"
            href="{{ ingress_path }}/history#leak-test-history"
            title="View full leak-test history">
           <span class="pill {% if 'Passed' in c.leak_test_result %}pill-green{% else %}pill-amber{% endif %}">
@@ -122,7 +122,7 @@
       {% endif %}
     </div>
     {% if c.valve_type == "3_port" %}
-    <p class="dev-schedule-note muted" style="margin-top:.5rem;font-size:.85rem">
+    <p class="muted" style="margin-top:.5rem;font-size:.85rem">
       Micro leak test disabled for this circuit (3-port drain-capable valve).
       The schedule below is preserved and will resume if you switch back to
       a 2-port valve under Settings.
@@ -227,7 +227,7 @@
   <div class="dev-leak-card">
     <details class="advanced-details">
       <summary>Waveform health</summary>
-      <div class="sett-help" style="margin:.4rem 0 .6rem">
+      <div style="margin:.4rem 0 .6rem">
         The high-resolution waveform stream is best-effort. A dropped/degraded
         capture never poisons fixture training — it falls back to the software
         signature. These counters reset when the add-on restarts.
@@ -265,7 +265,7 @@
   <div class="dev-leak-card">
     <details class="advanced-details">
       <summary>Volume reconciliation</summary>
-      <div class="sett-help" style="margin:.4rem 0 .6rem">
+      <div style="margin:.4rem 0 .6rem">
         Live event volumes are integrated from the flow stream, which can under-count when
         samples drop. The firmware's cumulative volume sensor is the source of truth — its
         recorder delta over each settled event is compared hourly.

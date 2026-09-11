@@ -123,14 +123,6 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Numeric readouts use the mono font for tabular alignment */
-.mono, .num, .reading,
-.dashboard-stat-value, .live-reading,
-.event-volume, .event-flow, .event-pressure {
-  font-family: var(--mono);
-  font-variant-numeric: tabular-nums;
-}
-
 /* ============================================================
    Layout / Chrome — header + nav (Page 1 of design refresh)
    ============================================================ */
@@ -209,27 +201,6 @@ body {
   margin: 0 auto;
 }
 
-.page-title {
-  font-size: 18px; font-weight: 700; letter-spacing: -.02em;
-  margin-bottom: 16px;
-}
-
-/* ============================================================
-   Pill component (inline status badges)
-   ============================================================ */
-.pill {
-  display: inline-flex; align-items: center; gap: .25rem;
-  padding: 2px 9px; border-radius: 999px;
-  font-size: 11px; font-weight: 600; letter-spacing: .01em;
-  white-space: nowrap; line-height: 1.4;
-  background: var(--surface-2); color: var(--text-2);
-  border: 1px solid var(--border);
-}
-.pill-green   { background: var(--green-bg);  color: var(--green-text); border-color: transparent; }
-.pill-amber   { background: var(--amber-bg);  color: var(--amber-text); border-color: transparent; }
-.pill-red     { background: var(--red-bg);    color: var(--red-text);   border-color: transparent; }
-.pill-blue    { background: var(--accent-bg2);color: var(--accent);     border-color: transparent; }
-.pill-neutral { /* default */ }
 
 /* ============================================================
    Form control polish
@@ -242,26 +213,8 @@ input[type="email"],
 input[type="password"],
 select,
 textarea {
-  font-family: var(--font);
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
   padding: .35rem .5rem;
   font-size: 13px;
-  transition: border-color .12s, box-shadow .12s;
-}
-input[type="text"]:focus,
-input[type="number"]:focus,
-input[type="date"]:focus,
-input[type="time"]:focus,
-input[type="email"]:focus,
-input[type="password"]:focus,
-select:focus,
-textarea:focus {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-bg);
 }
 
 input[disabled] {
@@ -271,24 +224,11 @@ input[disabled] {
 }
 
 /* ============================================================
-   Headings
-   ============================================================ */
-h1, h2, h3, h4 { letter-spacing: -.02em; }
-
-/* ============================================================
    Misc utilities
    ============================================================ */
-.muted { color: var(--text-3); font-size: .82rem; }
 
 .control-row { display: flex; gap: .5rem; margin-bottom: .75rem;
                flex-wrap: wrap; }
-.toggle-row {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: .35rem 0; border-bottom: 1px solid var(--border);
-}
-.toggle-row:last-child { border-bottom: none; }
-.toggle-label { font-size: .82rem; }
-.toggle-desc  { font-size: .72rem; color: var(--muted); display: block; }
 
 .toggle { position: relative; display: inline-block; width: 36px; height: 20px; flex-shrink: 0; }
 .toggle input { position: absolute; opacity: 0; width: 0; height: 0; -webkit-appearance: none; appearance: none; }
@@ -314,8 +254,6 @@ input:checked + .toggle-slider:before { transform: translateX(16px); }
   padding: .3rem .5rem; border: 1px solid var(--border); border-radius: 6px;
   font-size: .85rem;
 }
-.sens-option.active { border-color: var(--accent); background: var(--accent-bg); }
-.radio-option .muted { font-size: .78rem; }
 
 details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
                   margin-bottom: .5rem; user-select: none; }
@@ -330,20 +268,7 @@ details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
   text-align: left; font-weight: 600; border-bottom: 2px solid var(--border); }
 .data-table td { padding: .3rem .5rem; border-bottom: 1px solid var(--border); }
 .data-table tr:last-child td { border-bottom: none; }
-.row-ok td { background: var(--green-bg); }
 .row-warn td { background: var(--amber-bg); }
-.row-composite td { opacity: .7; font-style: italic; }
-
-/* ── Fixtures placeholder ─────────────────────────────────────────── */
-.placeholder-card {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 2rem; text-align: center;
-}
-.placeholder-icon { font-size: 3rem; margin-bottom: 1rem; }
-.placeholder-card h2 { margin-bottom: .5rem; }
-.placeholder-card p { color: var(--muted); margin-bottom: .75rem; }
-.placeholder-card ul { text-align: left; display: inline-block;
-  color: var(--muted); font-size: .85rem; line-height: 1.8; }
 
 /* ── Badge ────────────────────────────────────────────────────────── */
 .badge { padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: .01em; }
@@ -353,33 +278,6 @@ details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
 /* ── Misc ─────────────────────────────────────────────────────────── */
 .muted { color: var(--muted); font-size: .8rem; }
 /* ── Setup wizard ─────────────────────────────────────────────────── */
-.setup-container { max-width: 720px; margin: 0 auto; }
-
-.setup-steps {
-  display: flex; align-items: center; margin-bottom: 1.5rem; padding: .5rem 0;
-}
-.setup-step {
-  display: flex; flex-direction: column; align-items: center; gap: .25rem;
-  flex: 0 0 auto;
-}
-.step-num {
-  width: 28px; height: 28px; border-radius: 50%;
-  display: flex; align-items: center; justify-content: center;
-  font-size: .8rem; font-weight: 700;
-  background: var(--bg); border: 2px solid var(--border); color: var(--muted);
-}
-.step-label { font-size: .72rem; color: var(--muted); white-space: nowrap; }
-.setup-step.active .step-num { border-color: var(--accent); color: var(--accent); }
-.setup-step.active .step-label { color: var(--accent); font-weight: 600; }
-.setup-step.done .step-num { background: var(--green); border-color: var(--green); color: white; }
-.step-connector { flex: 1; height: 2px; background: var(--border); margin: 0 .5rem; margin-bottom: 1rem; }
-
-.setup-card {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 1.5rem; margin-bottom: 1rem;
-}
-.setup-card h2 { font-size: 1.1rem; font-weight: 700; margin-bottom: .5rem; }
-.setup-card h3 { font-size: .9rem; font-weight: 600; }
 
 .search-form { margin-top: 1rem; }
 .search-row { display: flex; gap: .5rem; }
@@ -390,14 +288,6 @@ details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
 .search-input:focus { outline: none; border-color: var(--accent); }
 
 .device-list { display: flex; flex-direction: column; gap: .5rem; }
-.device-option {
-  display: flex; gap: .75rem; align-items: flex-start; cursor: pointer;
-  padding: .75rem; border: 2px solid var(--border); border-radius: 6px;
-}
-.device-option:has(input:checked) { border-color: var(--accent); background: var(--accent-bg); }
-.device-option input { margin-top: .2rem; flex-shrink: 0; }
-.device-option-name { font-weight: 600; font-size: .9rem; }
-.device-option-meta { font-size: .78rem; margin-top: .1rem; }
 
 .entity-id { font-size: .78rem; background: var(--bg); padding: .1rem .3rem;
              border-radius: 4px; word-break: break-all; }
@@ -421,10 +311,6 @@ details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
   border-bottom: 1px solid var(--border);
 }
 .device-entity-row:last-child { border-bottom: none; }
-.device-entity-label {
-  flex: 1; font-size: .85rem; font-weight: 500;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
 .device-entity-input {
   width: 120px; padding: .25rem .4rem;
   border: 1px solid var(--border); border-radius: 4px;
@@ -432,12 +318,6 @@ details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
 }
 .device-entity-number { display: flex; align-items: center; gap: .35rem; }
 .unit-label { font-size: .78rem; color: var(--muted); white-space: nowrap; }
-
-/* ── Leak test ETC ─────────────────────────────────────────────── */
-.leak-test-etc {
-  font-size: .78rem; font-weight: 600;
-  color: var(--accent); white-space: nowrap;
-}
 
 /* ── Setup wizard optional rows ────────────────────────────────── */
 .row-optional td { opacity: .75; }
@@ -483,39 +363,8 @@ details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
 .training-callout-icon { font-size: 2rem; line-height: 1; }
 .training-callout-body p { margin: .4rem 0 0; font-size: .9rem; }
 .circuit-summary-right { display: flex; gap: .5rem; align-items: center; }
-.status-training { background: var(--accent-bg2); color: var(--accent); }
 
 .import-check     { display: flex; align-items: center; gap: .4rem; cursor: pointer; font-size: .9rem; }
-/* ── Setup step 0 — new/restore choice ─────────────────────────────── */
-.choice-cards {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1rem;
-  margin: 1.25rem 0;
-}
-@media (max-width: 560px) { .choice-cards { grid-template-columns: 1fr; } }
-
-.choice-card {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: .5rem;
-  padding: 1.25rem;
-  background: var(--surface);
-  border: 2px solid var(--border);
-  border-radius: var(--radius);
-  cursor: pointer;
-  text-align: left;
-  transition: border-color .15s, box-shadow .15s;
-}
-.choice-card:hover {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
-}
-.choice-icon   { font-size: 2rem; line-height: 1; }
-.choice-card strong { font-size: 1.05rem; }
-.choice-card .muted { font-size: .83rem; line-height: 1.4; }
-
 /* restore form inside step 0 */
 .restore-file-row  { display: flex; align-items: center; gap: .75rem; margin-bottom: 1rem; }
 .restore-groups    { display: flex; gap: 1.5rem; margin-bottom: .5rem; }
@@ -530,30 +379,13 @@ details summary { cursor: pointer; font-size: .85rem; color: var(--accent);
 
 input[type=range] { flex: 1; accent-color: var(--accent); }
 
-.chart-range-btn.active {
-  background: var(--accent); border-color: var(--accent); color: #fff;
-}
-/* ── Away mode banner ───────────────────────────────────────────────── */
-.away-banner {
-  background: var(--amber-bg); color: var(--amber-text);
-  border: 1px solid var(--amber-border);
-  border-radius: var(--radius);
-  padding: .65rem 1rem; margin-bottom: 1rem;
-  font-size: .88rem; display: flex;
-  align-items: center; gap: .75rem;
-}
-.away-status-row {
-  display: flex; justify-content: space-between;
-  align-items: center; gap: 1rem; flex-wrap: wrap;
-}
-
 /* ── ESP Device Settings — label + description ──────────────────────── */
 .device-entity-label-group {
   display: flex; flex-direction: column; gap: .15rem;
   min-width: 0;  /* allows text truncation */
 }
 .device-entity-label {
-  font-weight: 600; font-size: .9rem;
+  flex: 1; font-weight: 600; font-size: .9rem;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .device-entity-desc {
@@ -676,7 +508,7 @@ textarea:focus {
    ============================================================ */
 h1, h2, h3, h4 { letter-spacing: -.02em; }
 
-.page-title { font-size: 1.125rem; font-weight: 700; }
+.page-title { font-size: 1.125rem; font-weight: 700; letter-spacing: -.02em; margin-bottom: 16px; }
 
 /* ============================================================
    DASHBOARD PAGE — design refresh page 2/7
@@ -1011,23 +843,8 @@ a.dash-next-chip:hover { text-decoration: underline; }
   margin-bottom: .75rem; display: flex; align-items: center;
   justify-content: space-between;
 }
-.alert-ok   { background: var(--green-bg); color: var(--green-text); }
 .alert-warn { background: var(--amber-bg); color: var(--amber-text); }
 .alert-fault{ background: var(--red-bg); color: var(--red-text); }
-
-/* Away banner (legacy — settings page) */
-.away-banner {
-  background: var(--amber-bg); color: var(--amber-text);
-  border: 1px solid var(--amber);
-  border-radius: var(--radius);
-  padding: .65rem 1rem; margin-bottom: 1rem;
-  font-size: .88rem; display: flex;
-  align-items: center; gap: .75rem;
-}
-.away-status-row {
-  display: flex; justify-content: space-between;
-  align-items: center; gap: 1rem; flex-wrap: wrap;
-}
 
 .valve-open   { color: var(--green); }
 .valve-closed { color: var(--red); }
@@ -1288,11 +1105,11 @@ a.dash-next-chip:hover { text-decoration: underline; }
   font-weight: 600;
   color: var(--text);
 }
-.hist-summary-pass { color: var(--green, oklch(55% .18 145)); }
-.hist-summary-fail { color: var(--red,   oklch(55% .22 25)); }
+.hist-summary-pass { color: var(--green); }
+.hist-summary-fail { color: var(--red); }
 /* Failures the user marked known/benign — amber, deliberately NOT red: they are
    still shown, just not counted against the failure tally. */
-.hist-summary-ignored { color: var(--amber, oklch(68% .18 70)); }
+.hist-summary-ignored { color: var(--amber); }
 
 /* Shared card shell for all history sections */
 .hist-card {
@@ -1435,7 +1252,6 @@ a.dash-next-chip:hover { text-decoration: underline; }
 /* Row backgrounds for leak test results */
 .hist-row-pass { background: var(--green-bg); }
 .hist-row-fail { background: var(--red-bg); }
-.hist-row-composite { background: var(--accent-bg); }
 .hist-row-degraded  { background: var(--amber-bg); }
 .hist-row-phantom   { background: var(--violet-bg); }
 .hist-row-skip      { background: var(--surface-2); }   /* leak test not-run / stopped / cancelled */
@@ -1556,9 +1372,9 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 }
 .evt-modal-degraded .evt-modal-dl-extra { margin-top: 0; }
 .evt-modal-error {
-  font-size: 12px; color: var(--red, oklch(55% .22 25));
+  font-size: 12px; color: var(--red);
   margin-bottom: 8px; padding: 6px 8px;
-  background: var(--red-bg, oklch(97% .02 25));
+  background: var(--red-bg);
   border-radius: 4px;
 }
 .evt-modal-btns {
@@ -1800,7 +1616,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 
 .setup-step {
   display: flex; flex-direction: column; align-items: center;
-  gap: 4px; flex-shrink: 0;
+  gap: 4px; flex: 0 0 auto;
 }
 
 .step-num {
@@ -1843,6 +1659,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 24px;
+  margin-bottom: 1rem;
   box-shadow: var(--shadow-md);
 }
 .setup-card h2 {
@@ -1861,7 +1678,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 .choice-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 12px; margin-bottom: 20px;
+  gap: 12px; margin: 1.25rem 0 20px;
 }
 @media (max-width: 480px) { .choice-cards { grid-template-columns: 1fr; } }
 
@@ -1897,7 +1714,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   border-color: var(--accent);
   background: var(--accent-bg);
 }
-.device-option input { accent-color: var(--accent); flex-shrink: 0; }
+.device-option input { margin-top: .2rem; accent-color: var(--accent); flex-shrink: 0; }
 .device-option-name { font-weight: 700; font-size: 14px; color: var(--text); }
 .device-option-meta { font-size: 12px; color: var(--text-3); margin-top: 2px; }
 
@@ -1971,7 +1788,7 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   font-size: .75rem;
   font-weight: 400;
   color: var(--muted);
-  font-family: var(--font-mono, "JetBrains Mono", monospace);
+  font-family: "JetBrains Mono", monospace;
   margin-top: 2px;
 }
 
@@ -2230,8 +2047,6 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 }
 
 /* 5. Device: readings wrap below circuit name on narrow screens */
-.dev-card-readings { flex-wrap: wrap; }
-
 @media (max-width: 520px) {
   .dev-card-header { flex-direction: column; align-items: flex-start; gap: 8px; }
 }
@@ -2312,16 +2127,6 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 .fx-msg-ok  { background: var(--green-bg);  color: var(--green-text);  border: 1px solid var(--green-border); }
 .fx-msg-warn{ background: var(--amber-bg);  color: var(--amber-text);  border: 1px solid var(--amber-border); }
 .fx-msg-err { background: var(--red-bg);    color: var(--red-text);    border: 1px solid var(--red-border);   }
-.fx-preview-banner {
-  background: var(--amber-bg);
-  color: var(--amber-text);
-  border: 1px solid var(--amber-border);
-  border-radius: var(--radius-sm);
-  padding: 10px 14px;
-  font-size: 13px;
-  font-weight: 500;
-  margin-bottom: 16px;
-}
 
 /* Page header row */
 .fx-header {
@@ -2329,23 +2134,6 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   margin-bottom: 20px; flex-wrap: wrap;
 }
 .fx-header h1 { font-size: 20px; font-weight: 700; letter-spacing: -.02em; color: var(--text); }
-
-/* Unreviewed clusters banner */
-.fx-review-banner {
-  background: var(--amber-bg);
-  border: 1px solid var(--amber-border);
-  border-radius: var(--radius-sm);
-  padding: 10px 14px;
-  font-size: 13px; color: var(--amber-text);
-  margin-bottom: 20px;
-}
-/* Stronger emphasis when at least one circuit is in labelling phase —
-   this is a call to action, not a passive review prompt. */
-.fx-review-banner.fx-review-banner--labelling {
-  background: var(--accent-bg);
-  border-color: var(--accent-border);
-  color: var(--accent-text);
-}
 
 /* Labelling-phase callout (per-circuit) — "training complete, please review
    then activate".  Sits between the circuit heading and the cluster grid. */
@@ -2366,26 +2154,6 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   margin-bottom: 12px; margin-top: 4px;
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border);
-}
-
-/* Empty state */
-.fx-empty {
-  background: var(--surface);
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius);
-  padding: 28px 20px;
-  text-align: center;
-  margin-bottom: 20px;
-}
-.fx-empty-icon { font-size: 28px; display: block; margin-bottom: 8px; }
-.fx-empty p    { font-size: 13px; color: var(--text-2); }
-
-/* Cluster card grid */
-.fx-cluster-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 14px;
-  margin-bottom: 24px;
 }
 
 /* ── Sprint F: per-category rollup cards ───────────────────────────────── */
@@ -2454,103 +2222,6 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 }
 .fx-cat-last-seen {
   font-size: 11px;
-}
-.fx-cat-publish {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
-}
-.fx-cat-publish-label {
-  font-size: 12px;
-  color: var(--text-2);
-}
-
-/* Individual cluster card */
-.fx-cluster-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 16px;
-  box-shadow: var(--shadow);
-  display: flex; flex-direction: column; gap: 12px;
-  transition: box-shadow .15s;
-}
-.fx-cluster-card:hover { box-shadow: var(--shadow-md); }
-.fx-cluster-card.needs-review {
-  border-color: var(--amber-border);
-  background: var(--amber-bg);
-}
-.fx-cluster-card.confirmed {
-  border-color: var(--green-border);
-  background: var(--green-bg);
-}
-
-/* Card header: icon + name/count + confidence pill */
-.fx-card-header {
-  display: flex; align-items: flex-start; gap: 10px;
-}
-.fx-card-icon  { font-size: 22px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
-.fx-card-title { font-size: 14px; font-weight: 600; color: var(--text); line-height: 1.3; }
-.fx-cluster-id { font-size: 11px; font-weight: 400; color: var(--text-3); }
-.fx-card-sub   { font-size: 11px; color: var(--text-3); margin-top: 2px; }
-.fx-needs-review-label { color: var(--amber, oklch(72% .18 80)); font-weight: 600; }
-.fx-not-enough-label   { color: var(--muted); font-style: italic; }
-
-/* Stats row */
-.fx-stats {
-  display: flex; gap: 0;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-}
-.fx-stat {
-  flex: 1; text-align: center;
-  padding: 8px 6px;
-  border-right: 1px solid var(--border);
-}
-.fx-stat:last-child { border-right: none; }
-.fx-stat-label { font-size: 10px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: .04em; }
-.fx-stat-value { font-size: 14px; font-weight: 600; color: var(--text); font-family: var(--mono); margin-top: 2px; }
-.fx-stat-value small { font-size: 10px; font-weight: 400; color: var(--text-3); }
-
-/* Confirm / rename form */
-.fx-confirm-form  { display: flex; flex-direction: column; gap: 8px; }
-.fx-confirm-row   { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.fx-name-input {
-  flex: 1; min-width: 0;
-  font-size: 12px; padding: 5px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--text);
-  font-family: var(--font);
-}
-.fx-name-input:focus {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-bg2);
-}
-.fx-type-select {
-  font-size: 12px; padding: 5px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--text);
-  font-family: var(--font);
-  flex: 1; min-width: 0;
-}
-.fx-type-select:focus {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-bg2);
-}
-
-/* Responsive: single column on narrow screens */
-@media (max-width: 520px) {
-  .fx-cluster-grid { grid-template-columns: 1fr; }
-  .fx-card { padding: 14px; }
 }
 
 /* ── Toast notification system ────────────────────────────────── */
@@ -2723,9 +2394,9 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
 
 /* ── RBAC — Access page + role badges (viewer / operator / admin) ─────────── */
 .card {
-  background: var(--surface-1, var(--surface, #fff));
-  border: 1px solid var(--border, rgba(0, 0, 0, .12));
-  border-radius: var(--radius, 10px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
   padding: 16px 18px;
   margin: 0 0 16px;
 }
@@ -2739,8 +2410,8 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   border-radius: 999px;
   border: 1px solid transparent;
 }
-.role-admin    { background: var(--green-bg, #e6f4ea); border-color: var(--green-border, #b7e1c4); color: var(--green-text, #1c6b35); }
-.role-operator { background: var(--amber-bg, #fdf3e2); border-color: var(--amber-border, #f0d3a0); color: var(--amber-text, #8a5a00); }
+.role-admin    { background: var(--green-bg); border-color: var(--green-border); color: var(--green-text); }
+.role-operator { background: var(--amber-bg); border-color: var(--amber-border); color: var(--amber-text); }
 .role-viewer   { background: var(--surface-2); border-color: var(--border); color: var(--text-2); }
 .nav-role-badge {
   margin-left: auto;
@@ -2755,15 +2426,15 @@ details[open] .evt-modal-summary::before { content: '▼ '; }
   color: var(--text-2);
 }
 .banner {
-  border-radius: var(--radius-sm, 8px);
+  border-radius: var(--radius-sm);
   padding: 8px 12px;
   margin: 0 0 12px;
   font-size: 13px;
 }
 .banner-warn {
-  background: var(--amber-bg, #fdf3e2);
-  border: 1px solid var(--amber-border, #f0d3a0);
-  color: var(--amber-text, #8a5a00);
+  background: var(--amber-bg);
+  border: 1px solid var(--amber-border);
+  color: var(--amber-text);
 }
 
 /* ── Access page (RBAC) ─────────────────────────────────────────────── */

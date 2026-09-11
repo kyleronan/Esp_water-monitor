@@ -44,7 +44,7 @@
     </header>
     <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-top:6px">
       {% if it.windows %}
-      <select class="tr-window" id="tr-win-{{ circ.circuit }}-{{ it.type }}"
+      <select id="tr-win-{{ circ.circuit }}-{{ it.type }}"
               style="padding:4px 6px;font-size:12px">
         {% for w in it.windows %}<option value="{{ w }}">monitor {% if w >= 60 %}{{ w // 60 }} hr{% if w % 60 %} {{ w % 60 }} min{% endif %}{% else %}{{ w }} min{% endif %}</option>{% endfor %}
       </select>
