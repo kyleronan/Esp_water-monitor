@@ -53,7 +53,9 @@ sensitive.
 
 ## Releasing
 
-Before tagging a firmware release, run the release-check script:
+Before tagging a firmware release, run the release-check script (it lives
+in `scripts/`, which is kept out of version control — a fresh clone does not
+have it):
 
 ```bash
 python scripts/check_firmware_release.py

@@ -1,29 +1,11 @@
-# Ruff configuration.
+# One rule, enforced from the test suite (there is no CI): tests/test_dangling_tasks.py
+# shells out to ruff and skips cleanly when it is absent.
 #
-# There is NO CI in this repo, so the rule below is enforced from the TEST
-# SUITE instead: water_monitor/tests/test_dangling_tasks.py shells out to ruff
-# and skips cleanly when it is absent (the add-on image installs no test deps).
-# Install it locally with:
-#
-#     py -m pip install --user ruff
-#     py -m ruff check .
-#
-# It exists so the one rule below is enforced MECHANICALLY rather than by eye.
-#
-# RUF006 (asyncio-dangling-task) is the whole point of the file: asyncio holds
-# only a weak reference to a running task, so a bare
-# `asyncio.create_task(...)` / `asyncio.ensure_future(...)` /
-# `loop.create_task(...)` whose result is thrown away can be collected
-# mid-flight and the coroutine silently stops. Use `app.task_registry.spawn()`,
-# which holds the strong reference and logs failures.
-#
-# KNOWN BLIND SPOT: ruff does NOT flag the chained
-# `asyncio.get_running_loop().create_task(...)` form — same bug, no finding.
-# main.py had exactly that. test_dangling_tasks.py greps for it separately.
-#
-# The select list is deliberately minimal. Turning on ruff's defaults across a
-# ~50k-line codebase would produce thousands of findings and drown the one
-# rule that encodes a real, observed failure mode.
+# RUF006: asyncio holds only a weak reference to a running task, so a bare
+# create_task()/ensure_future() whose result is discarded can be collected
+# mid-flight and the coroutine silently stops. Use app.task_registry.spawn().
+# Blind spot: ruff does NOT flag the chained get_running_loop().create_task()
+# form — test_dangling_tasks.py greps for it separately.
 
 target-version = "py311"
 line-length = 100
@@ -31,7 +13,6 @@ line-length = 100
 exclude = [
     "water_monitor/tests",
     "firmware",
-    "integration",
 ]
 
 [lint]

@@ -118,8 +118,8 @@ that's great. I'm probably not going to build another one for myself.
 
 ## Repository structure
 
-This is a Home Assistant addon repository. It also contains the firmware,
-documentation, and (eventually) a companion native HA integration.
+This is a Home Assistant addon repository. It also contains the firmware
+and the documentation.
 
 ```
 .
@@ -129,11 +129,16 @@ documentation, and (eventually) a companion native HA integration.
 │   ├── Dockerfile
 │   ├── icon.png         # Addon icon (128 × 128) — shown on HA addon card
 │   ├── logo.png         # Addon logo (250 × 100) — shown on HA store detail page
+│   ├── CHANGELOG.md
 │   └── app/
 ├── firmware/            # ESPHome firmware for the ESP32-S3-WROOM-1
-├── integration/         # Native HA integration (planned for v0.4)
-└── docs/                # Hardware build notes, pinouts, parts list
+├── docs/                # Hardware build notes, pinouts, parts list, and
+│                        #   PIPELINE.md — how a drop of water becomes a number
+└── ruff.toml            # The one lint rule, enforced from the test suite
 ```
+
+The test suite, the analysis tools and the release scripts are kept out of
+version control (see `.gitignore`), so a fresh clone has none of them.
 
 ## Installation
 
@@ -233,16 +238,14 @@ non-admins at all.
 | **0.2.2** | Runtime per-circuit flow-meter PPL + guided flow-calibration helper (bucket / municipal), Phase 2.3 anomaly detection, degraded-supply guard, per-circuit valve type (2-port / 3-port), per-session CSRF refactor, autocorrelation correctness fix, firmware release-gate script, migration transaction safety, async/blocking SQLite audit, live-capture reliability fixes (importer catch-up checkpoint + stuck no-flow phantom close) | Shipped |
 | **0.3.0** | Role-based access control — viewer / operator / admin (see [Access control](#access-control)) | Shipped |
 | **0.3.1** | Pressure-aware classification that survives a change in water supply, full booster-pump support, a learned per-home classifier, and a long run of volume-accounting fixes. Per-circuit pressure-sensor calibration **infrastructure** shipped in firmware 3.14 (eight `pressure_cal_*` substitutions + a documented bench procedure) — performing the calibration on a given install is a manual hardware step | Shipping incrementally (currently `0.3.1-dev56`, unreleased) |
-| **0.3.x** | esp_idf framework migration with a proper top-level task watchdog (the arduino framework this firmware uses does not expose one — see [`docs/TODO.md`](docs/TODO.md)) | Planned |
+| **0.3.x** | esp_idf framework migration with a proper top-level task watchdog (the arduino framework this firmware uses does not expose one) | Planned |
 | **0.4.x** | Native Home Assistant integration (alongside the addon, eventually replacing the WebSocket bridge for users who prefer pip-installable components) | Planned |
 
 Firmware ships on its own version line and has its own entries in the same
 changelog (currently **3.14.0**).
 
 See [`water_monitor/CHANGELOG.md`](water_monitor/CHANGELOG.md) for detailed
-release notes, and [`docs/TODO.md`](docs/TODO.md) for the running list of
-manual follow-ups (real-sample capture for the degraded-supply detector,
-per-circuit pressure calibration, etc).
+release notes.
 
 ## License
 
