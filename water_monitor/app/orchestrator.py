@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -85,7 +86,6 @@ async def _timed_startup_job(name: str, awaitable):
     Failure is not swallowed — the timing line is emitted either way and the
     exception propagates to the caller's existing handler.
     """
-    import time
     t0 = time.monotonic()
     try:
         return await awaitable
@@ -94,7 +94,7 @@ async def _timed_startup_job(name: str, awaitable):
 
 
 def _fmt_sensor(
-    raw: Optional[str],
+    raw: Optional[str | float],
     decimals: int = 1,
     fallback: str = "—",
     factor: float = 1.0,
@@ -153,7 +153,7 @@ class Orchestrator:
         self.startup_pages_ready = False
         # Strong ref for the background classification task — without it the
         # only reference is create_task's return value and Python may GC the
-        # task mid-pass (same trap as _ppl_tasks below).
+        # task mid-pass (the trap task_registry.spawn exists for).
         self._startup_classify_task: Optional[asyncio.Task] = None
         self._db: Optional[sqlite3.Connection] = None
         self._ha: Optional[HaClient] = None
@@ -180,10 +180,6 @@ class Orchestrator:
         self.worker_health: Dict[str, dict] = {}
         self._live_state_cache: Dict[str, Any] = {}
         self._ha_tz = timezone.utc
-        # Strong refs for fire-and-forget PPL-change re-baseline tasks (scheduled
-        # from the sync HA state_changed callback). Without this the only reference
-        # is create_task's return value, which Python may GC before the task runs.
-        self._ppl_tasks: set = set()
         # Circuits with an active calibration session (bucket / municipal test). A
         # deliberate calibration draw must not trip auto-shutoff or pollute training /
         # anomaly stats — see is_calibrating + the FeatureExtractor suppression.
@@ -239,20 +235,6 @@ class Orchestrator:
     @property
     def data_pruner(self) -> DataPruner:
         return self._data_pruner
-
-    @property
-    def alert_manager(self) -> AlertManager:
-        return self._alert_manager
-
-    @property
-    def away_mode(self) -> bool:
-        """True if the home is currently in away/vacation mode."""
-        try:
-            row = self._db.execute(
-                "SELECT away_mode FROM home_profile WHERE id = 1").fetchone()
-            return bool(row["away_mode"]) if row else False
-        except Exception:
-            return False
 
     async def set_away_mode(self, enabled: bool) -> None:
         """Enable or disable away mode. Notifies via HA when toggled."""
@@ -538,7 +520,7 @@ class Orchestrator:
         except Exception as e:  # pragma: no cover - defensive
             log.warning("load_roles_from_db failed (keeping current sets): %s", e)
             return
-        boot = (getattr(self._cfg, "bootstrap_admin_user_id", "") or "").strip()
+        boot = (self._cfg.bootstrap_admin_user_id or "").strip()
         self.admin_ids = (admins | {boot}) if boot else admins
         log.info("RBAC roles loaded — %d admin(s) cached, %d operator(s)",
                  len(self.admin_ids), len(self.operator_ids))
@@ -570,7 +552,7 @@ class Orchestrator:
             log.warning("role-sync: config/auth/list returned no admins — keeping "
                         "cached set (%d)", len(self.admin_ids))
             return False
-        boot = (getattr(self._cfg, "bootstrap_admin_user_id", "") or "").strip()
+        boot = (self._cfg.bootstrap_admin_user_id or "").strip()
         self.admin_ids = (new_ids | {boot}) if boot else new_ids
         # Persist only on CHANGE: the sync runs every 10 min forever and the
         # admin set almost never changes — an unconditional DELETE+INSERT is
@@ -592,11 +574,8 @@ class Orchestrator:
         so the admin set is ready before normal traffic, not after full startup."""
         while not self._stop.is_set():
             await self._refresh_admin_ids_once()
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=600)
+            if await self._sleep_or_stop(600):
                 return
-            except asyncio.TimeoutError:
-                pass
 
     def reload_circuit_profiles(self) -> None:
         """Re-read circuit_type from circuit_profile into the live CircuitConfig objects.
@@ -632,7 +611,7 @@ class Orchestrator:
         watched = False
         unbound: list = []
         for cfg in self._cfg.circuits:
-            entity = getattr(cfg, "flow_meter_ppl_entity", "")
+            entity = cfg.flow_meter_ppl_entity
             if not entity:
                 # No firmware PPL entity bound for this circuit, so the add-on
                 # runs on circuit_profile.pulses_per_litre, whose column DEFAULT
@@ -694,10 +673,8 @@ class Orchestrator:
         cfg = self._cfg.get_circuit(circuit)
         if cfg is None:
             return
-        task = asyncio.create_task(
-            self._apply_ppl_change(cfg, state, reason="runtime"))
-        self._ppl_tasks.add(task)
-        task.add_done_callback(self._ppl_tasks.discard)
+        spawn(self._apply_ppl_change(cfg, state, reason="runtime"),
+              name=f"ppl_change[{circuit}]")
 
     async def _apply_ppl_change(self, cfg: Any, raw_value: Any, *,
                                 reason: str) -> None:
@@ -716,7 +693,7 @@ class Orchestrator:
             return  # 'unknown' / 'unavailable' / None — ignore
         if not (1.0 <= new_ppl <= 5000.0):
             return
-        cached = float(getattr(cfg, "pulses_per_litre", 396.0) or 396.0)
+        cached = float(cfg.pulses_per_litre or 396.0)
         if abs(new_ppl - cached) < 0.5:
             return  # same value (NVS restore / redundant publish) — no-op
         circuit = cfg.circuit
@@ -793,26 +770,14 @@ class Orchestrator:
         # already done is durable and the rest is re-derived on the next boot.
         if self._startup_classify_task is not None:
             self._startup_classify_task.cancel()
-        if self._feature_extractor:
-            self._feature_extractor.stop()
-        if self._training_manager:
-            self._training_manager.stop()
-        if self._data_pruner:
-            self._data_pruner.stop()
-        if self._maturity_recheck:
-            self._maturity_recheck.stop()
-        if self._learning:
-            self._learning.stop()
-        if self._rise_corr_backfill:
-            self._rise_corr_backfill.stop()
-        if self._wf_repair_backfill:
-            self._wf_repair_backfill.stop()
-        if self._leak_test_scheduler:
-            self._leak_test_scheduler.stop()
-        if getattr(self, "_supply_regime", None):
-            self._supply_regime.stop()
-        if self._ha:
-            self._ha.stop()
+        for component in (self._feature_extractor, self._training_manager,
+                          self._data_pruner, self._maturity_recheck,
+                          self._learning, self._rise_corr_backfill,
+                          self._wf_repair_backfill, self._leak_test_scheduler,
+                          # only exists once run() has got that far
+                          getattr(self, "_supply_regime", None), self._ha):
+            if component:
+                component.stop()
 
     def _setup_complete_sync(self) -> bool:
         """``setup_complete`` is a PROPERTY that queries the DB on every
@@ -1027,14 +992,27 @@ class Orchestrator:
             log.info("startup: background classification complete")
 
 
+    async def _best_effort(self, what: str, fn, *args, **kwargs) -> None:
+        """Await a best-effort startup step: log the failure and keep booting.
+
+        Takes the CALLABLE, not a coroutine, so the call is inside the try.
+        Not for a handler that wraps more than one statement, logs a different
+        message, or also marks a subsystem degraded / releases a flag.
+        """
+        try:
+            await fn(*args, **kwargs)
+        except Exception as e:
+            log.warning("%s failed (non-fatal): %s", what, e)
+
+
     async def run(self) -> None:
         """Initialise and run all components concurrently."""
+
         # So the readiness line states its own elapsed time.
         # Reading it used to mean subtracting two timestamps several hundred
         # log lines apart, which is exactly how a 61 s time-to-usable got
         # reported (by me) as the 24 s that the flag flipped at.
-        import time as _time
-        _run_t0 = _time.monotonic()
+        _run_t0 = time.monotonic()
         # Database
         self._db = init_db(DB_PATH)
 
@@ -1058,10 +1036,7 @@ class Orchestrator:
         # up), before the heavy startup work below, so admins are recognised before
         # normal traffic rather than only after _run_role_sync's first tick at the
         # end of startup. Best-effort — keeps the cached set on failure.
-        try:
-            await self._refresh_admin_ids_once()
-        except Exception as e:  # pragma: no cover - defensive
-            log.warning("initial role refresh failed (non-fatal): %s", e)
+        await self._best_effort("initial role refresh", self._refresh_admin_ids_once)
 
         # On already-configured systems, scan for optional roles that may have appeared
         # after a firmware upgrade (e.g. waveform entities added in 3.7.0).
@@ -1114,10 +1089,8 @@ class Orchestrator:
         # stale next_run_at values (from prior bad scheduler state,
         # timezone changes, or the same-day-duplicate bug) are corrected
         # before the scheduler task starts polling.
-        try:
-            await self._recompute_leak_test_schedules()
-        except Exception as e:
-            log.warning("Leak-test schedule recompute failed (non-fatal): %s", e)
+        await self._best_effort("Leak-test schedule recompute",
+                                self._recompute_leak_test_schedules)
 
         # Historical importer — backfills missed events and runs periodic catch-up.
         # Pass `self` so the importer can consult the live EventDetector and skip
@@ -1151,17 +1124,12 @@ class Orchestrator:
             # Seed valve states AFTER the change subscriptions are wired
             # (subscribe-then-prime) so other_valve_open can record a confirmed
             # 0 even for valves that never transition after boot.
-            try:
-                await self._event_detector.prime_valve_states()
-            except Exception as e:
-                log.warning("Valve-state prime failed (non-fatal): %s", e)
+            await self._best_effort("Valve-state prime",
+                                    self._event_detector.prime_valve_states)
             # Runtime per-circuit flow-meter PPL: sync current values from the firmware
             # number entities (the source of truth) into the cache + detector floor, and
             # watch for changes. A change forces a non-destructive re-baseline.
-            try:
-                await self._sync_ppl_and_watch()
-            except Exception as e:
-                log.warning("Flow-meter PPL sync/watch failed (non-fatal): %s", e)
+            await self._best_effort("Flow-meter PPL sync/watch", self._sync_ppl_and_watch)
         else:
             log.info("Setup not complete — event detection paused until wizard finishes")
 
@@ -1266,7 +1234,7 @@ class Orchestrator:
             # changed ZERO verdicts (see events_changed).
             self.startup_pages_ready = True
             log.info("startup: pages are ready after %.1fs — classification "
-                     "continues in the background", _time.monotonic() - _run_t0)
+                     "continues in the background", time.monotonic() - _run_t0)
 
             self._startup_classify_task = asyncio.create_task(
                 self._run_startup_classification())
@@ -1299,17 +1267,12 @@ class Orchestrator:
         # CORRECTS a stale or wrong-but-nonzero baseline immediately, instead of
         # leaving the dashboard inflated until the next midnight rollover. When
         # HA history is unavailable the existing value is left untouched.
-        try:
-            await self._init_volume_baselines(force=True)
-        except Exception as e:
-            log.warning("Volume baseline init failed (non-fatal): %s", e)
+        await self._best_effort("Volume baseline init", self._init_volume_baselines,
+                                force=True)
 
         # Auto-detect HA unit system and apply defaults if the user hasn't
         # explicitly chosen units yet (flow_unit still at schema default).
-        try:
-            await self._init_display_units()
-        except Exception as e:
-            log.warning("Unit auto-detection failed (non-fatal): %s", e)
+        await self._best_effort("Unit auto-detection", self._init_display_units)
 
         # Cluster quality metrics — background task writing to cluster_metrics_history
         self._cluster_metrics = ClusterMetrics(self._db, self._cfg)
@@ -1408,7 +1371,21 @@ class Orchestrator:
             type(exc).__name__, exc, (" — " + detail) if detail else "")
         h["last_error_at"] = datetime.now(timezone.utc).isoformat()
 
+    async def _sleep_or_stop(self, seconds: float) -> bool:
+        """Wait up to ``seconds``; True as soon as ``stop()`` fires.
+
+        The worker loops in this class sleep through this so shutdown is never
+        blocked for a whole interval — the waveform purger's is 24h. False
+        means the interval elapsed: run the next pass.
+        """
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def _supervise(self, name: str, coro_fn) -> None:
+
         """Run coro_fn() in a restart loop. A crash restarts after 5s.
 
         Also records per-worker state in ``self.worker_health`` so a crash is
@@ -1437,11 +1414,8 @@ class Orchestrator:
                 h["last_error"] = "%s: %s" % (type(exc).__name__, exc)
                 h["last_error_at"] = datetime.now(timezone.utc).isoformat()
                 log.exception("%s crashed — restarting in 5s", name)
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=5)
+                if await self._sleep_or_stop(5):
                     return
-                except asyncio.TimeoutError:
-                    pass
 
     def _get_pump_osc_gate(self, circuit: str):
         """Pump-mode oscillation gate for the live detector, or None.
@@ -1589,24 +1563,14 @@ class Orchestrator:
         # Use `is not None` rather than truthiness — 0.0 is a valid user-set
         # threshold but is falsy, so `row[x] or preset[x]` would silently
         # revert a user-set zero back to the preset value.
-        def _eff(key: str):
-            v = row[key]
-            return v if v is not None else preset[key]
-
-        return {
-            "pressure_drop_event_psi":    _eff("pressure_drop_event_psi"),
-            "min_event_duration_seconds": _eff("min_event_duration_seconds"),
-            "score_alert":                _eff("score_alert"),
-            "score_shutoff":              _eff("score_shutoff"),
-            "flow_tolerance_pct":         _eff("flow_tolerance_pct"),
-            "duration_tolerance_pct":     _eff("duration_tolerance_pct"),
-            "schedule_window_minutes":    _eff("schedule_window_minutes"),
-            "sustained_alert_minutes":    _eff("sustained_alert_minutes"),
-        }
+        return {k: (row[k] if row[k] is not None else preset[k]) for k in (
+            "pressure_drop_event_psi", "min_event_duration_seconds",
+            "score_alert", "score_shutoff", "flow_tolerance_pct",
+            "duration_tolerance_pct", "schedule_window_minutes",
+            "sustained_alert_minutes")}
 
     async def get_live_state_async(self, circuit: str) -> Dict[str, Any]:
         """Async version — fetches fresh state from HA REST API, cached for 3s."""
-        import time
         now_ts = time.monotonic()
 
         # Return cached result if it's fresh enough (3 second window)
@@ -1698,8 +1662,7 @@ class Orchestrator:
             self._ha_tz = ZoneInfo(tz_name)
             log.info("HA timezone: %s", tz_name)
         except Exception as e:
-            from datetime import timezone as _tz
-            self._ha_tz = _tz.utc
+            self._ha_tz = timezone.utc
             log.warning("Could not determine HA timezone (%s) — using UTC", e)
         # Cache for the softener regen-band match (reclassify + live path
         # read this without threading a tzinfo through every caller).
@@ -1741,16 +1704,12 @@ class Orchestrator:
         # Stagger past the pruner's 03:00 nightly so two heavy jobs do not
         # contend for the write lock.
         while not self._stop.is_set():
-            try:
-                now = datetime.now(self._ha_tz)
-                target = now.replace(hour=4, minute=15, second=0, microsecond=0)
-                if target <= now:
-                    target += timedelta(days=1)
-                await asyncio.wait_for(self._stop.wait(),
-                                       timeout=(target - now).total_seconds())
+            now = datetime.now(self._ha_tz)
+            target = now.replace(hour=4, minute=15, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            if await self._sleep_or_stop((target - now).total_seconds()):
                 return                              # stop requested
-            except asyncio.TimeoutError:
-                pass
             for c in self._cfg.circuits:
                 try:
                     await check_yesterdays_drift(self, c.circuit)
@@ -1805,29 +1764,23 @@ class Orchestrator:
             log.warning("Time-feature tz backfill failed (retried next boot, "
                         "non-fatal): %s", e)
 
-    def _local_midnight_utc(self, days_ago: int = 0) -> str:
-        """Return the UTC equivalent of local midnight (or N days ago) as a naive ISO string.
+    def _local_midnight(self, days: int = 0) -> datetime:
+        """Local midnight, ``days`` from today's (negative = in the past).
 
         Uses the cached HA timezone from _init_ha_timezone(); falls back to UTC.
         """
-        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-        ha_tz = self._ha_tz
-        now_local = _dt.now(ha_tz)
-        midnight_local = now_local.replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ) - _td(days=days_ago)
-        midnight_utc = midnight_local.astimezone(_tz.utc).replace(tzinfo=None)
-        return midnight_utc.isoformat(timespec="seconds")
+        return datetime.now(self._ha_tz).replace(
+            hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days)
+
+    def _local_midnight_utc(self, days_ago: int = 0) -> str:
+        """The UTC equivalent of local midnight (or N days ago), naive ISO."""
+        return self._local_midnight(-days_ago).astimezone(
+            timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
     def _seconds_until_next_local_midnight(self) -> float:
         """Seconds from now until the next local midnight (DST-aware)."""
-        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-        ha_tz = self._ha_tz
-        now_local = _dt.now(ha_tz)
-        next_midnight_local = now_local.replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ) + _td(days=1)
-        delta = next_midnight_local.astimezone(_tz.utc) - _dt.now(_tz.utc)
+        delta = (self._local_midnight(1).astimezone(timezone.utc)
+                 - datetime.now(timezone.utc))
         return max(0.0, delta.total_seconds())
 
     async def _init_volume_baselines(self, force: bool = False) -> None:
@@ -1985,8 +1938,7 @@ class Orchestrator:
         learn_best_hour pass per circuit is cheap and the next-run after boot
         becomes deterministic.
 
-        Invalid or unparsable existing values are logged and overwritten;
-        naive datetimes are treated as UTC for the diff log.
+        Invalid or unparsable existing values are logged and overwritten.
         """
 
         for circuit_cfg in self._cfg.circuits:
@@ -2002,13 +1954,11 @@ class Orchestrator:
                 continue
 
             prior_str = schedule["next_run_at"]
-            prior_dt: Optional[datetime] = None
             if prior_str:
+                # Parsed only to validate — an unparsable value is logged here
+                # and overwritten by the recompute below.
                 try:
-                    prior_dt = datetime.fromisoformat(
-                        prior_str.replace("Z", "+00:00"))
-                    if prior_dt.tzinfo is None:
-                        prior_dt = prior_dt.replace(tzinfo=timezone.utc)
+                    datetime.fromisoformat(prior_str.replace("Z", "+00:00"))
                 except (ValueError, TypeError):
                     log.warning("[%s] unparsable next_run_at %r — recomputing",
                                 circuit, prior_str)
@@ -2157,35 +2107,23 @@ class Orchestrator:
 
         uc = dbst["unit_context"]
 
-        # The lifetime tile reads the SAME entity as ha_volume_total above and
-        # must go through vol_to_litres first. uc['vol_factor'] multiplies a
-        # STORED LITRE value to get display volume; the firmware publishes
-        # device_class: water, so HA re-presents the entity in the user's own
-        # unit system and on a US install the state arrives in GALLONS. Putting
-        # gallons through the L→gal factor leaves the tile 3.785x adrift from
-        # the daily/weekly figures beside it. Same root cause as the
-        # _init_volume_baselines inflation above and the daily 3.785x
-        # over-count in volume_drift.py; all three convert with the entity's
-        # OWN unit first, via the one shared helper.
+        # The lifetime tile is the SAME entity as ha_volume_total above, so it
+        # reuses that already-normalised litre value instead of re-converting.
+        # uc['vol_factor'] multiplies a STORED LITRE value to get display
+        # volume; the firmware publishes device_class: water, so HA re-presents
+        # the entity in the user's own unit system and on a US install the state
+        # arrives in GALLONS. Putting gallons through the L→gal factor leaves
+        # the tile 3.785x adrift from the daily/weekly figures beside it. Same
+        # root cause as the _init_volume_baselines inflation above and the daily
+        # 3.785x over-count in volume_drift.py; all three convert with the
+        # entity's OWN unit first, via the one shared helper.
         #
         # The volume_daily / volume_weekly lines below are deliberately NOT
         # changed: they come out of compute_ha_daily_volume(), which was fed the
         # already-normalised ha_volume_total, so those really are stored litres
         # and vol_factor alone is correct for them.
-        _vt_raw = states.get(circuit_cfg.volume_sensor, "")
-        try:
-            if _vt_raw in ("", "unknown", "unavailable"):
-                _vt = "—"
-            else:
-                from .ha_client import vol_to_litres as _v2l_tile
-                _vt_attrs = (full_states.get(circuit_cfg.volume_sensor)
-                             or {}).get("attributes") or {}
-                _vt_litres = _v2l_tile(
-                    float(_vt_raw),
-                    _vt_attrs.get("unit_of_measurement", ""))
-                _vt = f"{_vt_litres * uc['vol_factor']:.{uc['vol_decimals']}f}"
-        except (ValueError, TypeError):
-            _vt = "—"
+        _vt = _fmt_sensor(ha_volume_total, decimals=uc["vol_decimals"],
+                          fallback="—", factor=uc["vol_factor"])
 
         return {
             "circuit": circuit,
@@ -2294,11 +2232,8 @@ class Orchestrator:
             # recorder has the post-midnight reading on hand). Interruptible by
             # the stop event so shutdown isn't blocked for hours.
             delay = self._seconds_until_next_local_midnight() + 120.0
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=delay)
+            if await self._sleep_or_stop(delay):
                 return  # stop requested during the wait
-            except asyncio.TimeoutError:
-                pass
             try:
                 await self._init_volume_baselines(force=True)
                 log.info("Volume baselines refreshed after local-midnight rollover")
@@ -2332,10 +2267,7 @@ class Orchestrator:
             except Exception as e:
                 log.warning("Waveform purge failed (non-fatal): %s", e)
             # Sleep 24h, exiting promptly if stop is signaled.
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=24 * 3600)
-            except asyncio.TimeoutError:
-                pass
+            await self._sleep_or_stop(24 * 3600)
 
     def _purge_waveforms_sync(self, cutoff: str) -> int:
         """DELETE old event_waveforms rows. Runs on the single DB thread —
@@ -2367,13 +2299,11 @@ class Orchestrator:
         The Leak Test Active binary sensor is ON throughout the full period.
         last_changed on that sensor is therefore the switch-on moment.
         """
-        import datetime as dt
-
         last_changed_str = leak_test_state.get("last_changed")
         if not last_changed_str:
             return None, None, None
         try:
-            started = dt.datetime.fromisoformat(
+            started = datetime.fromisoformat(
                 last_changed_str.replace("Z", "+00:00"))
         except (ValueError, TypeError):
             return None, None, None
@@ -2401,7 +2331,7 @@ class Orchestrator:
         SETTLE_SECS = 60
         total_secs = SETTLE_SECS + duration_mins * 60
 
-        now = dt.datetime.now(dt.timezone.utc)
+        now = datetime.now(timezone.utc)
         elapsed = (now - started).total_seconds()
         remaining = total_secs - elapsed
 
