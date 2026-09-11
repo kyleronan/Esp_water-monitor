@@ -1779,25 +1779,12 @@ function calOpen(circuit, label) {
   document.getElementById('cal-modal').style.display = 'flex';
 }
 async function _calPost(path, body) {
-  const r = await fetch(_calBase + '/' + _calCircuit + path, {
-    method:'POST',
-    headers:{'Content-Type':'application/json', 'X-CSRF-Token': window.CSRF_TOKEN || ''},
-    body: JSON.stringify(body || {})});
-  if (r.status === 403) {
-    // RBAC denial (JSON {"error":"forbidden"}) → surface the message; only a
-    // stale CSRF token (add-on restarted/updated while this tab was open) gets
-    // the reload-to-refresh-token treatment — reloading on a role denial would
-    // just loop silently.
-    let d = null;
-    try { d = await r.json(); } catch {}
-    if (d && d.error === 'forbidden') {
-      _calErr(d.message || "You don't have permission to do that.");
-      return d;
-    }
-    location.reload();
-    return new Promise(() => {});  // never resolves — the page is reloading
-  }
-  return r.json();
+  // post() owns the CSRF header and both 403 branches (RBAC → toast, stale
+  // token → reload). Callers key on the body itself (res.ok / res.error), so
+  // hand back the parsed JSON; a non-JSON reply rejects as r.json() used to.
+  const { data } = await post('/calibrate/' + _calCircuit + path, body || {});
+  if (data === null) throw new Error('Unexpected non-JSON response');
+  return data;
 }
 async function calStart() {
   _calErr('');
@@ -2016,12 +2003,8 @@ async function settingsCircuitTypeUpdate(circuit, circuitType) {
   const note = document.getElementById(`circuit-type-saving-${circuit}`);
   if (note) note.style.display = 'block';
   try {
-    const resp = await fetch(`${window.INGRESS_PATH}/settings/circuit/${circuit}/type`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&circuit_type=${encodeURIComponent(circuitType)}`,
-    });
-    const data = await resp.json().catch(() => ({}));
+    const data = (await postForm(`/settings/circuit/${circuit}/type`,
+                                 new URLSearchParams({ circuit_type: circuitType }))).data || {};
     if (data.status !== 'updated') {
       toast('Could not update circuit type: ' + (data.message || 'unknown error'), 'error');
       document.querySelectorAll(`input[name="circuit_type_${circuit}"]`)
@@ -2060,12 +2043,8 @@ async function settingsValveTypeUpdate(circuit, valveType, radio) {
   const note = document.getElementById(`valve-type-saving-${circuit}`);
   if (note) note.style.display = 'block';
   try {
-    const resp = await fetch(`${window.INGRESS_PATH}/settings/circuit/${circuit}/valve-type`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&valve_type=${encodeURIComponent(valveType)}`,
-    });
-    const data = await resp.json().catch(() => ({}));
+    const data = (await postForm(`/settings/circuit/${circuit}/valve-type`,
+                                 new URLSearchParams({ valve_type: valveType }))).data || {};
     if (data.status === 'updated') {
       // Reload to surface the conditional "leak test disabled" note,
       // and so Device-page button state recomputes on next visit.
@@ -2108,12 +2087,8 @@ async function settingsWinterizedUpdate(circuit, box) {
   const note = document.getElementById(`winterized-saving-${circuit}`);
   if (note) note.style.display = 'block';
   try {
-    const resp = await fetch(`${window.INGRESS_PATH}/settings/circuit/${circuit}/winterized`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&winterized=${on ? 1 : 0}`
-    });
-    const data = await resp.json().catch(() => ({}));
+    const data = (await postForm(`/settings/circuit/${circuit}/winterized`,
+                                 new URLSearchParams({ winterized: on ? '1' : '0' }))).data || {};
     if (data.status === 'updated') {
       window.location.reload();          // surface the paused-state notes
     } else {
@@ -2138,12 +2113,8 @@ async function settingsAlertToggle(alertId, enabled, box) {
   const parts = alertId.split('_');
   const circuit = parts[parts.length - 1];
   try {
-    const resp = await fetch(`${window.INGRESS_PATH}/settings/alert/${circuit}/${alertId}/toggle`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}&enabled=${enabled}`
-    });
-    const data = await resp.json().catch(() => ({}));
+    const data = (await postForm(`/settings/alert/${circuit}/${alertId}/toggle`,
+                                 new URLSearchParams({ enabled: String(enabled) }))).data || {};
     if (data.status === 'updated') return;
     toast('Could not update: ' + (data.message || data.error || 'unknown error'),
           'error');
@@ -2158,15 +2129,8 @@ async function settingsAlertToggle(alertId, enabled, box) {
 }
 
 async function updateDeviceEntity(entityId, value, nativeStep) {
-  const resp = await fetch(`${window.INGRESS_PATH}/settings/device-entity/update`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: `_csrf=${encodeURIComponent(window.CSRF_TOKEN)}`
-        + `&entity_id=${encodeURIComponent(entityId)}`
-        + `&value=${encodeURIComponent(value)}`
-        + `&native_step=${encodeURIComponent(nativeStep || '')}`,
-  });
-  const data = await resp.json().catch(() => ({}));
+  const data = (await postForm('/settings/device-entity/update', new URLSearchParams({
+    entity_id: entityId, value: value, native_step: nativeStep || '' }))).data || {};
   if (data.status !== 'ok') {
     toast('Failed to update: ' + (data.message || 'unknown error'), 'error');
   }
@@ -2206,20 +2170,16 @@ async function pruneNow(evt) {
   btn.disabled = true;
   btn.textContent = 'Pruning…';
   try {
-    const resp = await fetch(`${window.INGRESS_PATH}/settings/retention/prune-now`, {
-      method: 'POST',
-      headers: { 'X-CSRF-Token': window.CSRF_TOKEN || '' },
-    });
-    const data = await resp.json().catch(() => ({}));
+    const { ok, status, data } = await post('/settings/retention/prune-now');
     // unit 2.33 — this used to read the body and report success regardless of
     // status. A 403 (RBAC denial, or a stale CSRF token) has no `deleted` key,
     // so the sum came out 0 and the user was told "Pruning complete — 0 rows
     // deleted" for an operation that never ran. Same class as the alert
     // toggle above: a destructive action reporting success it never got.
-    if (!resp.ok) {
-      throw new Error(data.message || data.error || `HTTP ${resp.status}`);
+    if (!ok) {
+      throw new Error((data && (data.message || data.error)) || `HTTP ${status}`);
     }
-    const total = Object.values(data.deleted || {}).reduce((a, b) => a + b, 0);
+    const total = Object.values((data && data.deleted) || {}).reduce((a, b) => a + b, 0);
     toast(`Pruning complete — ${total} rows deleted.`, 'success');
   } catch (e) {
     toast('Pruning failed: ' + e.message, 'error');
@@ -2235,12 +2195,8 @@ async function reprocessDegraded(evt) {
   btn.disabled = true;
   btn.textContent = 'Re-evaluating…';
   try {
-    const resp = await fetch(`${window.INGRESS_PATH}/settings/reprocess/degraded-supply`, {
-      method: 'POST',
-      headers: { 'X-CSRF-Token': window.CSRF_TOKEN || '' },
-    });
-    const data = await resp.json();
-    if (!data.ok) throw new Error(data.error || 'unknown error');
+    const { data } = await post('/settings/reprocess/degraded-supply');
+    if (!data || !data.ok) throw new Error((data && data.error) || 'unknown error');
     const flipped = (data.flipped_to_degraded || 0) + (data.flipped_to_clean || 0);
     toast(
       `Re-evaluated ${data.evaluated} events — ${data.flipped_to_clean} flipped to clean, `

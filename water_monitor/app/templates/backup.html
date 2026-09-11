@@ -212,12 +212,12 @@ async function doQuickRestore() {
   form.append('file', fileEl.files[0]);
   form.append('import_settings', wantSett ? '1' : '');
   form.append('import_history',  wantHist ? '1' : '');
-  form.append('_csrf', window.CSRF_TOKEN || '');
   _setResult(resultEl, 'info', 'Restoring… please wait.');
   try {
-    const resp = await fetch(`${window.INGRESS_PATH}/backup/import/quick-restore`,
-                             { method: 'POST', body: form });
-    const data = await resp.json();
+    const r = await postForm('/backup/import/quick-restore', form);
+    // A non-JSON body means the ingress proxy (not the add-on) answered —
+    // usually a body-size rejection in plain text. Show its words.
+    const data = r.data || { ok: false, error: `Upload rejected before reaching the add-on: ${r.text.slice(0, 200)}` };
     if (data.ok) {
       _setResult(resultEl, 'ok', '✓ Restored', data.summary);
       setTimeout(() => location.reload(), 2500);
@@ -305,12 +305,10 @@ async function doShareImport(name) {
   const form = new FormData();
   form.append('filename', name);
   if (labelsOnly) form.append('labels_only', '1');
-  form.append('_csrf', window.CSRF_TOKEN || '');
   _setResult(resultEl, 'info', `Importing ${name} from /share… large archives can take a while.`);
   try {
-    const resp = await fetch(`${window.INGRESS_PATH}/backup/import/share-archive`,
-                             { method: 'POST', body: form });
-    const data = await resp.json();
+    const r = await postForm('/backup/import/share-archive', form);
+    const data = r.data || { ok: false, error: `Unexpected reply (HTTP ${r.status}): ${r.text.slice(0, 200)}` };
     if (data.ok) {
       _setResult(resultEl, 'ok', `✓ ${data.summary}`, 'Existing rows kept; archive rows merged in.');
     } else {
@@ -326,11 +324,8 @@ async function saveFullToShare(btn) {
   btn.disabled = true;
   _setResult(resultEl, 'info', 'Writing full export to /share…');
   try {
-    const form = new FormData();
-    form.append('_csrf', window.CSRF_TOKEN || '');
-    const resp = await fetch(`${window.INGRESS_PATH}/backup/export/full-to-share`,
-                             { method: 'POST', body: form });
-    const data = await resp.json();
+    const r = await post('/backup/export/full-to-share');
+    const data = r.data || { ok: false, error: `Unexpected reply (HTTP ${r.status}): ${r.text.slice(0, 200)}` };
     if (data.ok) {
       _setResult(resultEl, 'ok', `✓ Saved ${data.file} (${data.size_mb} MB)`);
     } else {
@@ -365,19 +360,12 @@ async function doHistoryImport() {
   const form = new FormData();
   form.append('file', fileEl.files[0]);
   if (labelsOnly) form.append('labels_only', '1');
-  form.append('_csrf', window.CSRF_TOKEN || '');
   _setResult(resultEl, 'info', 'Importing… this may take a moment for large archives.');
   try {
-    const resp = await fetch(`${window.INGRESS_PATH}/backup/import/history-archive`,
-                             { method: 'POST', body: form });
-    let data;
-    const raw = await resp.text();
-    try { data = JSON.parse(raw); }
-    catch {
-      // The ingress proxy (not the add-on) answered — usually a body-size
-      // rejection in plain text. Show its words instead of a JSON parse error.
-      data = { ok: false, error: `Upload rejected before reaching the add-on: ${raw.slice(0, 200)}` };
-    }
+    const r = await postForm('/backup/import/history-archive', form);
+    // A non-JSON body means the ingress proxy (not the add-on) answered —
+    // usually a body-size rejection in plain text. Show its words.
+    const data = r.data || { ok: false, error: `Upload rejected before reaching the add-on: ${r.text.slice(0, 200)}` };
     if (data.ok) {
       _setResult(resultEl, 'ok', `✓ ${data.summary}`, 'Existing rows kept; archive rows merged in.');
     } else {

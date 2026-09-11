@@ -1,17 +1,22 @@
 // Shared UI actions for Water Monitor add-on
 const BASE = window.INGRESS_PATH || "";
 
-async function post(url, body = {}) {
-  const resp = await fetch(BASE + url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-CSRF-Token": window.CSRF_TOKEN || "",
-    },
-    body: JSON.stringify(body),
+// The one fetch core for every mutating request the pages make. Adds the
+// X-CSRF-Token header (the ingress middleware reads it before it looks at a
+// body, so multipart uploads need no _csrf field) and resolves
+// {ok, status, data, text}: `data` is the parsed JSON body or null when the
+// body was not JSON (the ingress proxy answers oversized uploads and restarts
+// in plain text/HTML), `text` is the raw body either way. Network errors are
+// NOT caught — fetch's rejection propagates to the caller, which owns the
+// "could not reach the add-on" UI.
+async function _send(url, init) {
+  const headers = Object.assign({}, init.headers, {
+    "X-CSRF-Token": window.CSRF_TOKEN || "",
   });
+  const resp = await fetch(BASE + url, Object.assign({}, init, { headers }));
+  const text = await resp.text();
   let data = null;
-  try { data = await resp.json(); } catch {}
+  try { data = JSON.parse(text); } catch {}
   if (resp.status === 403) {
     // Two DIFFERENT 403s share the status code:
     //  - RBAC denial (JSON {"error":"forbidden"}) — the user's role may not do
@@ -21,12 +26,27 @@ async function post(url, body = {}) {
     //    token rather than fail silently.
     if (data && data.error === "forbidden") {
       toast(data.message || "You don't have permission to do that.", "error");
-      return { ok: false, status: 403, data };
+      return { ok: false, status: 403, data, text };
     }
     location.reload();
     return new Promise(() => {});  // never resolves — the page is reloading
   }
-  return { ok: resp.ok, status: resp.status, data };
+  return { ok: resp.ok, status: resp.status, data, text };
+}
+
+// JSON request — every page's ordinary mutating call.
+async function post(url, body = {}, method = "POST") {
+  return _send(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+// Form POST for handlers that read request.form(): `form` is a URLSearchParams
+// (urlencoded) or a FormData (multipart — the browser sets the boundary).
+async function postForm(url, form) {
+  return _send(url, { method: "POST", body: form });
 }
 
 // ── Toast notifications ────────────────────────────────────────────

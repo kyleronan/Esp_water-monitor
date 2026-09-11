@@ -1853,20 +1853,10 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     saveBtn.disabled = true;
     ignBtn.disabled  = true;
     try {
-      // X-CSRF-Token required since the middleware now gates PATCH the
-      // same as POST. window.CSRF_TOKEN is injected by IngressTemplates
-      // (main.py) into every page render.
-      const resp = await fetch(`${INGRESS}/history/api/events/${circuit}/${eventId}`, {
-        method:  'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-CSRF-Token': window.CSRF_TOKEN || '',
-        },
-        body:    JSON.stringify(payload),
-      });
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({}));
-        errBox.textContent = data.error || `Error ${resp.status}`;
+      const { ok, status, data } = await post(
+        `/history/api/events/${circuit}/${eventId}`, payload, 'PATCH');
+      if (!ok) {
+        errBox.textContent = (data && data.error) || `Error ${status}`;
         errBox.hidden = false;
         return false;
       }
@@ -1874,8 +1864,6 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       // can see in DevTools whether a label fed back into a cluster.
       // The visible-on-Fixtures hint is the user-facing surface; this
       // console line is the diagnostic surface.
-      let data = null;
-      try { data = await resp.json(); } catch (_) { /* tolerate parse hiccup */ }
       if (data && data.needs_confirm) {
         // B7 — excluding a setup training example: single confirm, then re-send.
         saveBtn.disabled = false; ignBtn.disabled = false;
@@ -1948,12 +1936,9 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     if (!window.confirm('Clear the auto labels applied to this appliance cycle?')) return;
     undoCycleBtn.disabled = true; errBox.hidden = true;
     try {
-      const resp = await fetch(`${INGRESS}/history/api/events/${circuit}/undo_auto_cycle`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': window.CSRF_TOKEN || '' },
-        body: JSON.stringify({ event_id: eventId }),
-      });
-      if (resp.ok) { location.reload(); return; }
+      const { ok } = await post(`/history/api/events/${circuit}/undo_auto_cycle`,
+                                { event_id: eventId });
+      if (ok) { location.reload(); return; }
     } catch (_) {}
     undoCycleBtn.disabled = false;
     errBox.textContent = 'Undo failed — see the addon log.';
@@ -1969,15 +1954,12 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const buffer_minutes = parseInt((reproBuf && reproBuf.value) || '0', 10) || 0;
     reproBtn.disabled = true; errBox.hidden = true; errBox.style.color = '';
     try {
-      const resp = await fetch(
-        `${INGRESS}/history/api/events/${circuit}/${eventId}/reprocess`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json',
-                     'X-CSRF-Token': window.CSRF_TOKEN || '' },
-          body: JSON.stringify({ buffer_minutes }),
-        });
-      const data = await resp.json().catch(() => ({}));
-      if (resp.ok) {
+      const { ok, status, data: body } = await post(
+        `/history/api/events/${circuit}/${eventId}/reprocess`, { buffer_minutes });
+      // post() gives null for a non-JSON body; keep the old `{}` so `data.error`
+      // and `data.deleted` never throw.
+      const data = body || {};
+      if (ok) {
         errBox.style.color = '#2e7d32';
         errBox.textContent = `✓ Deleted ${data.deleted}, re-importing ${data.imported} `
           + `run(s)${data.widened ? ' (range widened to rebuild a long event)' : ''}`
@@ -1986,7 +1968,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         setTimeout(() => location.reload(), 1600);
         return;
       }
-      errBox.textContent = data.error || `Error ${resp.status}`;
+      errBox.textContent = data.error || `Error ${status}`;
       errBox.hidden = false;
     } catch (_) {
       errBox.textContent = 'Network error — please try again.';
