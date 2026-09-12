@@ -31,6 +31,7 @@ from ..database import (
     run_db,
     set_event_classification,
     upsert_fixture_signature)
+from ..anomaly_baseline import rescore_stored_event
 from ..task_registry import spawn
 from ._helpers import (
     _orch,
@@ -659,6 +660,8 @@ def _collect_circuit_history_sync(
                     e["anomaly_reason"] = "review_draw"
                 elif _vem == "pulsing_supply_envelope" or e.get("degraded_supply"):
                     e["anomaly_reason"] = "estimated"
+                elif "high_volume_type" in _at:
+                    e["anomaly_reason"] = "high_usage_type"
                 else:
                     e["anomaly_reason"] = "high_usage"
             else:
@@ -1109,6 +1112,17 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
         except Exception:
             log.exception("artifact revert on relabel failed (label saved)")
 
+    # A label changes what the event is judged AS: the anomaly verdict is
+    # re-derived against the new type's own frozen band (a labelled shower is
+    # measured against showers, not the circuit's pooled percentile), so the
+    # "unusual" flag follows the label instead of outliving it. Storage only.
+    if "user_fixture_type" in payload:
+        try:
+            rescore_stored_event(db, circuit, event_id)
+            db.commit()
+        except Exception:
+            log.exception("anomaly re-score on relabel failed (label saved)")
+
     # Sprint B — if the patch touched user_fixture_type, propagate the
     # signal into the cluster's suggested_type (soft hint; never silently
     # links a cluster to a fixture). When the event has no cluster_id we
@@ -1166,6 +1180,11 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
             # background reclassify below.
             cycle_propagated = propagate_cycle_label(db, circuit, event_id, new_type)
             if cycle_propagated:
+                # The mates now carry the label too: judge them as that fixture.
+                for (mate_id,) in db.execute(
+                        "SELECT id FROM events WHERE circuit = ? AND cycle_group_id = ? "
+                        "AND id <> ?", (circuit, str(event_id), event_id)).fetchall():
+                    rescore_stored_event(db, circuit, mate_id)
                 db.commit()
                 propagation_meta["cycle_propagated"] = cycle_propagated
 

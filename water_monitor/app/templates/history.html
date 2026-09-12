@@ -750,6 +750,7 @@
                 {%- if e.review_verdict == 'unknown' %}<span class="pill pill-amber js-anomaly-pill" title="You reviewed this but didn't recognize it. It's kept out of the app's learned idea of normal, so it can never widen your baseline. If you later figure out what it was, open it and label it.">❓ Reviewed — unrecognized</span>
                 {%- elif e.review_verdict == 'normal' %}<span class="pill pill-neutral js-anomaly-pill" title="You confirmed this was normal use (a long shower, guests, filling something). It no longer counts toward the dashboard's unusual-events card.">✓ Reviewed — normal use</span>
                 {%- else %}<span class="pill pill-neutral js-anomaly-pill" title="Flagged as unusual for your home's pattern, and you've reviewed it. It no longer counts toward the dashboard's unusual-events card.">✓ Reviewed — was unusual</span>{% endif %}
+              {% elif e.anomaly_reason == 'high_usage_type' %}<span class="pill pill-amber js-anomaly-pill" title="Far more water than this fixture normally uses. If the fixture label is wrong, change it; if it really was this fixture, open it and mark Normal use.">⚠ Unusual for this fixture</span>
               {% elif e.anomaly_reason == 'high_usage' %}<span class="pill pill-amber js-anomaly-pill" title="Unusually large water use for your home's learned pattern. The measurement itself is trustworthy — open it and mark reviewed if this was normal (a long shower, guests, etc.).">⚠ Unusual — high use</span>
               {% elif e.anomaly_reason == 'estimated' %}<span class="pill pill-amber js-anomaly-pill" title="Flagged as unusual, but the volume is an ESTIMATE (pressure was unsteady) — the big number may not be real water. Open it to review.">⚠ Unusual (estimated)</span>
               {% elif e.anomaly_reason == 'review_draw' %}<span class="pill pill-amber js-anomaly-pill" title="This looked like a pressure blip, but it carried too much measured water to dismiss — the volume was KEPT and it needs your eyes. If it was real use, relabel it; if not, relabel as Not real use.">⚠ Large draw — review</span>{% endif %}
@@ -1610,6 +1611,10 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const anSection = document.getElementById('emd-anomaly-section');
     if (d.flagged === '1') {
       const REASON_TEXT = {
+        high_usage_type: 'This event used much more water than this fixture ' +
+          'normally does. If the fixture label is wrong, change it above; if it ' +
+          'really was this fixture and the use was normal, mark it Normal use; ' +
+          'if you can’t place it, mark Don’t recognize it.',
         high_usage: 'This event used much more water than your home’s ' +
           'learned pattern. The measurement itself is trustworthy — if this ' +
           'was a long shower, guests, or filling something, mark it Normal use; ' +
@@ -1626,8 +1631,10 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         REASON_TEXT[d.anomalyReason] ||
         'This event didn’t fit your home’s learned pattern. Review it, then pick a verdict below.';
       const reviewed = d.reviewed === '1';
-      document.getElementById('emd-review-btns').hidden = reviewed
-        || document.getElementById('emd-edit-region')?.hidden === true;
+      // The verdict stays changeable after a review — a label marks the event
+      // reviewed with no verdict, and "Normal use" must still be reachable.
+      document.getElementById('emd-review-btns').hidden =
+        document.getElementById('emd-edit-region')?.hidden === true;
       const badge = document.getElementById('emd-reviewed-badge');
       badge.textContent = d.reviewVerdict === 'normal' ? '✓ Reviewed — normal use'
         : d.reviewVerdict === 'unknown' ? '❓ Reviewed — unrecognized'
@@ -1892,7 +1899,12 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
 
   saveBtn.addEventListener('click', async () => {
     if (!activeRow) return;
-    const payload = { user_fixture_type: selFix.value || null };
+    const payload = {};
+    // Only send the label when it changed — the server treats a label write as
+    // a review and clears any verdict, which must not happen on an unchanged Save.
+    if ((selFix.value || '') !== (activeRow.dataset.userType || '')) {
+      payload.user_fixture_type = selFix.value || null;
+    }
     // Only include classification if the user actually toggled a box — so a
     // type-only edit never locks auto-detection off. Sending it always sets
     // user_classified=1 (incl. all-false = "manually normal"), which sticks.

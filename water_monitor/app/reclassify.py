@@ -430,7 +430,7 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     _sens = _db.get_sensitivity_config(conn, circuit)
     _SCORE_COLS = ("volume_litres_effective", "volume_litres", "duration_seconds",
                    "peak_flow_lpm", "is_pressure_restoration_phantom", "is_cross_talk",
-                   "is_low_flow_dribble", "user_ignored",
+                   "is_low_flow_dribble", "user_ignored", "excluded_from_training",
                    "phantom_suppression_averted")
 
     # Fingerprint tier library — built ONCE per run, fresh (no cache; a

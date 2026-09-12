@@ -93,11 +93,14 @@ def _humanize_anomaly_type(atype: Optional[str]) -> str:
     """Turn the stored anomaly_type tag into a human reason for the notification."""
     a = atype or ""
     vol = "high_volume" in a
+    typed = "high_volume_type" in a
     shape = "envelope" in a or "abnormal_shape" in a
     if vol and shape:
-        return "Unusually high volume and an abnormal pattern"
+        return ("Far more water than this fixture normally uses, and an abnormal pattern"
+                if typed else "Unusually high volume and an abnormal pattern")
     if vol:
-        return "Unusually high water volume"
+        return ("Far more water than this fixture normally uses" if typed
+                else "Unusually high water volume")
     if shape:
         return "An abnormal usage pattern for this fixture"
     return "Unusual water usage"

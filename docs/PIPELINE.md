@@ -580,7 +580,7 @@ events keeps its all-time envelope, and the overall percentiles stay all-time be
 freeze snapshots the previous state to `baseline_snapshot` first, and a restore snapshots what it
 displaces, so a restore is itself undoable.
 
-The core scoring math is unchanged, and dev9 wired up the surfacing that was previously dead:
+The volume channel is fixture-relative: a typed event is judged against its own type's frozen band (notify above the band's ceiling; severe only by gross exceedance or the 2oo3 envelope vote), while the pooled p85/p95/p99 percentiles apply to events that fit no known fixture — untyped or `other` — which is where a leak or a hose lands. Surfacing:
 
 - **Suppression-averted override:** a `phantom_suppression_averted` event (step 7e backstop) is forced
   anomalous *before* the artifact gate, so an excluded-from-training big draw still shows up for review.

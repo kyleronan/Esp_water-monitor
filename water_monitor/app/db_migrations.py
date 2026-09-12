@@ -17,6 +17,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from .anomaly_baseline import (load_sensitivity_row, load_usage_baselines,
+                               rescore_stored_event)
 from .database import local_day_of, rezero_rows_with_zeroing_flag
 
 log = logging.getLogger(__name__)
@@ -33,8 +35,8 @@ _BASELINE_VERSION: int = 20260801
 # reorder a shipped number: 20260819 shipped in September under August's prefix
 # and STAYS that way — renumbering it would make the live databases it stamped
 # fail the _UPGRADEABLE_VERSIONS check below and be told to delete themselves.
-# THE NEXT MIGRATION IS 20260903.
-_CURRENT_VERSION: int = 20260902
+# THE NEXT MIGRATION IS 20260904.
+_CURRENT_VERSION: int = 20260903
 
 # Roles removed when the firmware switched waveform delivery from 5 chunked
 # text sensors to a single HA event (firmware 3.8.0). Old DBs may still carry
@@ -1779,6 +1781,53 @@ def _apply_dead_schema_and_event_indexes(conn: sqlite3.Connection) -> None:
              " + events.flow_onset_delay_seconds" if dropped_col else "")
 
 
+def _apply_per_type_anomaly_rescore(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260903 — re-judge every currently-flagged event
+    under the per-fixture volume rule.
+
+    The scorer used to flag ANY event whose volume beat the circuit's pooled
+    p95, a percentile taps and flushes dominate (16.7 L on the reference home),
+    so every shower on record was "unusual" and a label could not clear it.
+    A typed event is now judged against its own type's frozen band. This step
+    re-scores only rows that are flagged today against the CURRENT frozen
+    baseline, so it can un-flag a normal shower (or a stale flag from a
+    superseded baseline) but never raises a new flag itself; the routine
+    reclassify pass judges unlabelled history under the new rule as it always
+    has, and new events are scored live. A circuit with nothing frozen is
+    skipped outright — with no reference, un-flagging would just erase the
+    flags. Data-only, idempotent (a pure function of the frozen baseline),
+    best-effort.
+    """
+    if not _has_table(conn, "sensitivity_config") or not _has_table(conn, "usage_baseline"):
+        conn.commit()
+        return
+    cleared = kept = 0
+    for (circuit,) in conn.execute(
+            "SELECT DISTINCT circuit FROM events WHERE flagged = 1").fetchall():
+        frozen = conn.execute(
+            "SELECT 1 FROM usage_baseline WHERE circuit = ?", (circuit,)).fetchone()
+        sens = load_sensitivity_row(conn, circuit)
+        if frozen is None or sens is None or sens.get("baseline_anomaly_p95") is None:
+            log.info("Migration 20260903: [%s] no frozen baseline — flags left as-is", circuit)
+            continue
+        baselines = load_usage_baselines(conn, circuit, use_cache=False)
+        ids = [r[0] for r in conn.execute(
+            "SELECT id FROM events WHERE circuit = ? AND flagged = 1", (circuit,))]
+        for event_id in ids:
+            try:
+                av = rescore_stored_event(conn, circuit, event_id, baselines, sens)
+            except Exception as e:                       # best-effort per row
+                log.warning("Migration 20260903: %s re-score failed: %s", event_id, e)
+                continue
+            if av is not None and not av.get("is_anomalous"):
+                cleared += 1
+            else:
+                kept += 1
+    conn.commit()
+    log.info("Migration 20260903: re-judged flagged events per fixture type — "
+             "%d no longer unusual, %d still flagged", cleared, kept)
+
+
 # Ordered forward-migration chain, (introduced_in_version, apply_fn): a DB
 # stamped at V already HAS every step with introduced <= V and needs exactly
 # the steps with introduced > V, in this order. Every apply fn is idempotent,
@@ -1806,6 +1855,7 @@ _MIGRATIONS: tuple = (
     (20260819, _apply_wf_src_hz_correction),
     (20260901, _apply_drop_mqtt_schema),
     (20260902, _apply_dead_schema_and_event_indexes),
+    (20260903, _apply_per_type_anomaly_rescore),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

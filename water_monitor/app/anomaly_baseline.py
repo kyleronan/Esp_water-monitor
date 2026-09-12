@@ -48,6 +48,13 @@ _NOTIFY_PCT_BY_LEVEL = {"low": "p99", "medium": "p95", "high": "p85"}
 # behind it was fit from at least this many events — a thin or default baseline
 # must never close the user's water.
 MIN_N_FOR_SHUTOFF = 30
+# A typed event is SEVERE on volume only when it grossly exceeds its own type —
+# beyond this multiple of the type's band ceiling AND beyond the pooled p99.
+# Rule-tier labels are floor-only (rule_shower is ">= 30 L, >= 300 s, >= 6 L/min",
+# no ceiling), so a burst hose at 8 L/min is typed "shower_tub" and its peak
+# sits inside the shower band: the 2oo3 vote alone never reaches severe. 3x
+# keeps every normal shower on record (max 432 L vs a ~250 L ceiling) clear.
+_GROSS_EXCEEDANCE = 3.0
 # A shut-off response also requires the baseline to have been live (seen real usage)
 # for at least this many days since activation — earned trust before it can close
 # the user's water. Below this, shut-off levels degrade to notify.
@@ -501,10 +508,25 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
 
     Returns ``{score, anomaly_type, is_anomalous, is_severe, shutoff_ok_severe,
     shutoff_ok_any}``:
-      * ``is_anomalous`` — crossed the sensitivity NOTIFY threshold (volume beyond
-        the level's percentile, or shape beyond ``score_alert``).
-      * ``is_severe`` — crossed the SEVERE threshold (volume beyond p99, or shape
-        beyond ``score_shutoff``).
+      * ``is_anomalous`` — crossed the NOTIFY threshold: volume beyond the
+        event's reference, or shape beyond ``score_alert``.
+      * ``is_severe`` — crossed the SEVERE threshold: volume beyond the pooled
+        p99 (untyped events only), or shape beyond ``score_shutoff``.
+
+    The volume REFERENCE depends on whether the event has a fixture type with a
+    frozen envelope. A typed event (a toilet, a shower, a washer…) is judged
+    against ITS OWN type's volume band — a toilet that starts using more water
+    than toilets do notifies; a 35-gal shower does not, even though it dwarfs
+    the circuit's pooled percentile, which taps and flushes dominate. The
+    pooled percentiles (``baseline_anomaly_p85/p95/p99``, chosen by the
+    sensitivity level) apply only to events that fit no known fixture —
+    untyped or 'other' — which is where a hose filling a pool, or a leak, lands.
+    A typed event is severe on volume only by GROSS exceedance — beyond both
+    the pooled p99 and ``_GROSS_EXCEEDANCE`` x its type's ceiling — or by the
+    envelope's 2oo3 vote; a type whose envelope is too thin to back a close
+    (n < MIN_N_FOR_SHUTOFF) notifies on its own band but defers the severe /
+    shut-off decision to the pooled rule. 'other' keeps the pooled volume rule
+    and its own envelope for the shape vote.
       * ``shutoff_ok_*`` — the firing signal is backed by a baseline fit from
         ≥ ``MIN_N_FOR_SHUTOFF`` events, so it may authorise a valve close. A thin /
         default baseline yields False → the response degrades to notify.
@@ -574,8 +596,23 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
         dq.append("thin_shape_evidence")
 
     vol_scorable = eff_vol is not None
-    vol_notify = vol_scorable and notify_p is not None and eff_vol > notify_p
-    vol_severe = vol_scorable and p99 is not None and eff_vol > p99
+    ftype = nov.get("fixture_type")
+    type_env = (baselines or {}).get(ftype) if ftype else None
+    env_n_ok = int((type_env or {}).get("n", 0)) >= MIN_N_FOR_SHUTOFF
+    type_vol = (_usable_band(type_env.get("vol"))
+                if type_env and ftype != "other" else None)
+    if type_vol is not None and type_vol[1] <= type_vol[0]:
+        type_vol = None     # identical training volumes: no width, no reference
+    pooled_notify = vol_scorable and notify_p is not None and eff_vol > notify_p
+    pooled_severe = vol_scorable and p99 is not None and eff_vol > p99
+    if type_vol is not None:
+        vol_notify = vol_scorable and eff_vol > type_vol[1]
+        gross = _GROSS_EXCEEDANCE * type_vol[1]
+        vol_severe = (vol_scorable and eff_vol > max(gross, p99 if p99 is not None else gross)
+                      if env_n_ok else pooled_severe)
+        vol_tag = "high_volume_type"
+    else:
+        vol_notify, vol_severe, vol_tag = pooled_notify, pooled_severe, "high_volume"
     shape_notify = shape is not None and shape >= score_alert
     shape_severe = shape is not None and shape >= score_shutoff
 
@@ -590,15 +627,21 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
     # ── Shut-off confidence gate — the firing signal must be WELL-FIT ────────────
     baseline_n = _row_get(sens_row, "baseline_anomaly_n")
     n_ok = baseline_n is not None and int(baseline_n) >= MIN_N_FOR_SHUTOFF
-    type_env = (baselines or {}).get(nov.get("fixture_type")) or {}
-    env_n_ok = int(type_env.get("n", 0)) >= MIN_N_FOR_SHUTOFF
-    shutoff_ok_severe = (vol_severe and n_ok) or (shape_severe and env_n_ok)
-    shutoff_ok_any = (vol_notify and n_ok) or (shape_notify and env_n_ok)
+    if type_vol is not None and env_n_ok:
+        shutoff_ok_severe = vol_severe or shape_severe
+        shutoff_ok_any = vol_notify or shape_notify
+    elif type_vol is not None:
+        # Thin type: its band may notify, but only pooled evidence may close.
+        shutoff_ok_severe = pooled_severe and n_ok
+        shutoff_ok_any = pooled_notify and n_ok
+    else:
+        shutoff_ok_severe = (vol_severe and n_ok) or (shape_severe and env_n_ok)
+        shutoff_ok_any = (vol_notify and n_ok) or (shape_notify and env_n_ok)
 
     score = max(shape or 0.0, 1.0 if vol_notify else 0.0)
     reasons: List[str] = []
     if vol_notify:
-        reasons.append("high_volume")
+        reasons.append(vol_tag)
     if shape_notify:
         reasons.append("envelope_" + "_".join(outside) if outside else "abnormal_shape")
     return {"score": round(score, 3), "anomaly_type": "+".join(reasons) or None,
@@ -609,3 +652,47 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
             # is_anomalous / is_severe so bad data can never masquerade as a leak.
             "data_quality": "+".join(dq) or None,
             "shape_evidence": nov.get("evidence")}
+
+
+def load_sensitivity_row(conn: sqlite3.Connection, circuit: str) -> Optional[Dict[str, Any]]:
+    """The circuit's sensitivity_config row as a dict (None when absent),
+    independent of the connection's row factory."""
+    cur = conn.execute("SELECT * FROM sensitivity_config WHERE circuit = ?", (circuit,))
+    row = cur.fetchone()
+    return dict(zip([d[0] for d in cur.description], tuple(row))) if row else None
+
+
+# Every column the scorer reads off a stored event row.
+SCORE_COLUMNS = ("volume_litres_effective", "volume_litres", "duration_seconds",
+                 "peak_flow_lpm", "phantom_suppression_averted",
+                 "user_fixture_type", "matched_fixture_type") + _ARTIFACT_FLAGS
+
+
+def rescore_stored_event(conn: sqlite3.Connection, circuit: str, event_id: str,
+                         baselines: Optional[Dict[str, Any]] = None,
+                         sens_row=None) -> Optional[Dict[str, Any]]:
+    """Re-judge ONE stored event against the frozen baseline and persist the
+    verdict (anomaly_score / anomaly_type / flagged). Storage only — never
+    notifies or closes a valve; the live response ran when the event was
+    stored. Used when the event's TYPE changes under it (a user label) and by
+    the one-shot migration that re-judged old flags. ``baselines`` / ``sens_row``
+    may be passed in by a caller looping over many events. Returns the scorer's
+    result, or None when the event does not exist. Does not commit.
+    """
+    row = conn.execute(
+        f"SELECT {', '.join(SCORE_COLUMNS)} FROM events WHERE id = ? AND circuit = ?",
+        (event_id, circuit)).fetchone()
+    if row is None:
+        return None
+    if baselines is None:
+        baselines = load_usage_baselines(conn, circuit)
+    if sens_row is None:
+        sens_row = load_sensitivity_row(conn, circuit)
+    # Positional, so a plain-tuple connection scores the same as a Row one.
+    av = score_event_anomaly(dict(zip(SCORE_COLUMNS, tuple(row))), baselines, sens_row)
+    conn.execute(
+        "UPDATE events SET anomaly_score = ?, anomaly_type = ?, flagged = ? "
+        "WHERE id = ? AND circuit = ?",
+        (av.get("score"), av.get("anomaly_type"),
+         1 if av.get("is_anomalous") else 0, event_id, circuit))
+    return av
