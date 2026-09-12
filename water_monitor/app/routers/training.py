@@ -77,12 +77,14 @@ _RECAL_LOCK_BACKOFF_S: float = 20.0
 _RECAL_IN_FLIGHT: bool = False
 
 
-async def start_regime_recalibration(orch) -> bool:
-    """Kick off the supply-regime recalibration in the background: fit each
-    circuit's rule bands on the CURRENT regime's events (source
-    'regime_shift') and reclassify everything since the shift. Job-tracked so
-    pollJobs toasts the per-type outcome. Returns False (nothing started)
-    when no current regime exists."""
+async def start_regime_recalibration(orch, circuits=None) -> bool:
+    """Kick off the supply-regime recalibration in the background: fit the
+    rule bands on the CURRENT regime's events (source 'regime_shift') and
+    reclassify everything since the shift, for ``circuits`` (default: every
+    configured circuit — the home-level supply banner's Confirm; a circuit's
+    own Settings button passes just itself). Job-tracked so pollJobs toasts
+    the per-type outcome. Returns False (nothing started) when no current
+    regime exists."""
     import asyncio
 
     global _RECAL_IN_FLIGHT
@@ -95,7 +97,7 @@ async def start_regime_recalibration(orch) -> bool:
     regime = await run_db(get_current_regime, orch.db)
     if regime is None:
         return False
-    circuits = [c.circuit for c in orch._cfg.circuits]
+    circuits = list(circuits or [c.circuit for c in orch._cfg.circuits])
 
     def _work(conn):
         from ..reclassify import reclassify_all_events_from_signatures

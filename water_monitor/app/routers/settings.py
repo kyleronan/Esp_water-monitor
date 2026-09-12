@@ -758,12 +758,16 @@ async def supply_banner_dismiss(request: Request):
 
 @router.post("/recalibrate-regime/{circuit}")
 async def recalibrate_regime(circuit: str, request: Request):
-    """Re-fit the rule bands on the CURRENT supply regime's events (all
-    circuits) + reclassify since the shift. Admin action from the Settings
-    calibration card; the dashboard banner's Confirm runs the same job."""
+    """Re-fit THIS circuit's rule bands on the CURRENT supply regime's events
+    + reclassify since the shift. Admin action from the circuit's Settings
+    calibration card; the dashboard supply banner's Confirm runs the same job
+    for every circuit."""
+    circuit = resolve_circuit(circuit)
     orch = _orch(request)
+    if orch._cfg.get_circuit(circuit) is None:
+        return unknown_circuit(circuit)
     from .training import start_regime_recalibration
-    started = await start_regime_recalibration(orch)
+    started = await start_regime_recalibration(orch, circuits=[circuit])
     if not started:
         return JSONResponse(
             {"error": "No supply regime recorded yet — the tracker needs a "
@@ -1289,8 +1293,15 @@ async def suggest_days(circuit: str, request: Request):
 @router.post("/alert/{circuit}/{alert_id}/toggle")
 async def alert_toggle(circuit: str, alert_id: str, request: Request):
     circuit = resolve_circuit(circuit)
-    form = await request.form()
     orch = _orch(request)
+    if orch._cfg.get_circuit(circuit) is None:
+        return unknown_circuit(circuit)
+    # Alert ids are "<type>_<circuit>"; the row written must be this circuit's.
+    if not alert_id.endswith("_" + circuit):
+        return JSONResponse({"status": "error",
+                             "message": f"{alert_id} does not belong to {circuit}"},
+                            status_code=400)
+    form = await request.form()
     enabled = form.get("enabled") == "true"
     await run_db(set_alert_enabled, orch.db, alert_id, enabled)
     return JSONResponse({"status": "updated", "enabled": enabled})

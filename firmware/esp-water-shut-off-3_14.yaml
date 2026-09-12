@@ -1345,22 +1345,6 @@ sensor:
               return;
             }
 
-            // --- Sensor saturated: a rise past the ceiling is invisible ---
-            // pressure is clamped to 104 PSI, so once the line saturates `drop`
-            // can never go more negative and thermal expansion past the ceiling
-            // reads as a perfectly stable line — the exact condition the rise
-            // abort below exists to catch. Checked against the PRE-clamp value.
-            if (id(pressure_unclamped_psi_irr) > 104.0f) {
-              id(leak_test_active_irr) = false;
-              id(leak_test_elapsed_irr) = 0.0f;
-              id(leak_test_result_irr) = 4;  // Aborted — external pressure influence
-              id(leak_test_restore_irr).execute();
-              ESP_LOGW("leak_test", "IRRIGATION: leak test aborted — pressure sensor is saturated "
-                "(%.1f PSI before clamping, ceiling 104). A rise beyond the ceiling cannot be "
-                "measured, so the result would be meaningless.", id(pressure_unclamped_psi_irr));
-              return;
-            }
-
             // --- Pressure increase detected ---
             // A rising pressure with the valve closed means something external is
             // influencing the system (thermal expansion, water hammer, upstream pump,
@@ -1548,6 +1532,22 @@ sensor:
             }
             id(leak_test_prev_psi_irr) = x;
             id(leak_test_prev_ms_irr)  = now_ms;
+
+            // --- Sensor saturated: a rise past the ceiling is invisible ---
+            // pressure is clamped to 104 PSI, so once the line saturates `drop`
+            // can never go more negative and thermal expansion past the ceiling
+            // reads as a perfectly stable line — the exact condition the rise
+            // abort below exists to catch. Checked against the PRE-clamp value.
+            if (id(pressure_unclamped_psi_irr) > 104.0f) {
+              id(leak_test_active_irr) = false;
+              id(leak_test_elapsed_irr) = 0.0f;
+              id(leak_test_result_irr) = 4;  // Aborted — external pressure influence
+              id(leak_test_restore_irr).execute();
+              ESP_LOGW("leak_test", "IRRIGATION: leak test aborted — pressure sensor is saturated "
+                "(%.1f PSI before clamping, ceiling 104). A rise beyond the ceiling cannot be "
+                "measured, so the result would be meaningless.", id(pressure_unclamped_psi_irr));
+              return;
+            }
 
             if (drop < -id(leak_threshold_psi_irr).state) {
               id(leak_test_active_irr) = false;

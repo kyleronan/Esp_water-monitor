@@ -780,7 +780,7 @@
           </div>
           <label class="toggle">
             <input type="checkbox" {% if alert.enabled %}checked{% endif %}
-                   onchange="settingsAlertToggle('{{ alert.id }}', this.checked, this)">
+                   onchange="settingsAlertToggle('{{ c.circuit }}', '{{ alert.id }}', this.checked, this)">
             <span class="toggle-slider"></span>
           </label>
         </div>
@@ -2108,9 +2108,7 @@ async function settingsWinterizedUpdate(circuit, box) {
 // box on anything other than a confirmed update, and say why. `box` is the
 // input element, passed as `this` from the onchange handler, so the revert
 // targets the control the user actually clicked.
-async function settingsAlertToggle(alertId, enabled, box) {
-  const parts = alertId.split('_');
-  const circuit = parts[parts.length - 1];
+async function settingsAlertToggle(circuit, alertId, enabled, box) {
   try {
     const data = (await postForm(`/settings/alert/${circuit}/${alertId}/toggle`,
                                  new URLSearchParams({ enabled: String(enabled) }))).data || {};
