@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev56 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev57 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -145,6 +145,20 @@ git history.)
   would-be phantom carrying ≥10 L is kept and flagged for review rather than
   silently zeroed. Migration 20260551 restores already-zeroed large draws
   through the volume ledger.
+
+- **Each fixture is judged against its own normal** — an event was called
+  unusual when it beat the circuit's 95th-percentile draw, which on a home where
+  most events are toilet flushes puts that line near 17 litres and flags nearly
+  every shower. An event that is labelled or matched as a fixture is now
+  compared with what *that* fixture normally uses: a toilet that starts taking
+  more per flush, or a washer that fills a gallon heavier, is flagged even
+  though both are small next to a shower, and an ordinary shower is not. A draw
+  that fits no fixture, or a fixture with fewer than 30 examples on file, still
+  falls back to the whole-home rule, and a runaway that happens to look like a
+  shower (a hose left on, a fill that never stops) is still severe once it
+  passes three times the shower's normal ceiling. History shows these as
+  "⚠ Unusual for this fixture", and existing flags are re-judged once on upgrade
+  (migration 20260903; 256 → 79 on the developer's system) — dev57.
 
 ### Booster-pump and supply-change support
 
@@ -480,6 +494,20 @@ makes the add-on survive that.
   history in one press, never removing anything you labelled. A rebuilt day's
   total now refreshes right away instead of after the nightly pass — dev56.
 
+- **Labelling an event re-judges it, and "Normal use" is reachable** — giving a
+  flagged event a fixture label left it "Reviewed — was unusual" with no way to
+  say the use was normal: the verdict buttons were hidden unless the event was
+  still unusual, and Save re-sent the label even when it had not changed, which
+  wiped a verdict you had just set. The label now re-scores the event (and any
+  fills grouped with it) against that fixture's band, the verdict buttons show
+  whenever you can edit the event, and Save sends the label only when you
+  changed it — dev57.
+
+- **Alert switches and Re-fit act on one circuit** — an alert switch on the
+  Settings page could be pointed at the other circuit's alert, and "Re-fit rules
+  for current pressure" re-fitted both circuits when pressed on one. Both now
+  act only on the circuit they sit under — dev57.
+
 - **The learned model can improve again** — every weekly re-fit had been
   rejected in favour of the model already running, for weeks, with an identical
   result each time. The check that decides between them was unfair in three
@@ -748,6 +776,16 @@ makes the add-on survive that.
 - **Tuning the 2-cluster collapse** — a 30-configuration offline sweep found
   no setting that escapes it. The fix is a feature-space redesign, queued
   deliberately rather than another hopeful re-seed.
+
+## [firmware 3.14.1] — Unreleased
+
+- **A saturated irrigation sensor no longer interferes with a main leak test.**
+  Both circuits' saturation aborts had been pasted into the main test, so a
+  saturated or floating irrigation transducer opened the irrigation valve and
+  stalled a *main* leak test, while the irrigation test never checked its own
+  sensor. Each test now aborts only on its own sensor and touches only its own
+  valve. (In the repo after the v3.14.0 tag; needs a 3.14.1 tag for package
+  installs to pick it up.)
 
 ## [firmware 3.14.0] — 2026-09-07
 

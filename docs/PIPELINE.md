@@ -7,7 +7,7 @@ Every step below names the responsible **file/function**, the **gates with their
 the **DB columns written**, and an **"if it breaks here"** symptom so you can jump from a wrong number
 straight to the code that produced it.
 
-> Verified against **0.3.1-dev56 + firmware 3.14.0**. Since the dev31 revision this
+> Verified against **0.3.1-dev57 + firmware 3.14.0**. Since the dev31 revision this
 > doc last described: the training pool gained two independent exclusion filters
 > (dev40 quarantine, dev46 user flag), the labeling ladder gained validated shape
 > gates for dishwasher cycles and toilet flushes, the fingerprint tier began
