@@ -54,7 +54,7 @@
 <div class="fx-msg fx-msg-err">Action failed — check the addon log for details.</div>
 {% endif %}
 
-{# ── dev42: stale group-link repair. Events can point at fixture groups a
+{# ── Stale group-link repair. Events can point at fixture groups a
      recalibration deleted; until cleared, the matcher keeps assigning new
      events to those deleted groups. Admin-only, shown only when needed. ── #}
 {% if is_admin and stale_link_count and stale_link_count > 0 %}
@@ -85,7 +85,7 @@
   <a href="{{ ingress_path }}/training">Training helper</a>.
 </p>
 
-{# ── dev47 (47i): fixture health. Classification adapts; these baselines do
+{# ── Fixture health. Classification adapts; these baselines do
      not — so a fixture whose draws are drifting shows up here even though its
      events are still labelled correctly. Wording avoids diagnosing the cause:
      the add-on can see that refills grew, not why. ─────────────────────── #}
@@ -155,7 +155,7 @@
 {% endfor %}
 {% endif %}
 
-{# ── dev47 (47d): the weekly review queue. Deliberately a POINTER to History
+{# ── The weekly review queue. Deliberately a POINTER to History
      rather than a second labelling interface — History already does this, and
      two ways to label the same event is how they drift apart. ──────────── #}
 {% if health and health.queue %}
@@ -201,7 +201,7 @@
 {% endfor %}
 {% endif %}
 
-{# ── dev51 (2.1): what the learning loop has been deciding, from its ledger.
+{# ── What the learning loop has been deciding, from its ledger.
      A model that has stopped improving is SILENT — a frozen fit serves exactly
      like a healthy one — so this is the one place the operator can see a run
      of rejections. A banner, never a knob: the referee is not relaxed from
@@ -246,7 +246,7 @@
     {%- if l.coverage_warning %}
     The newest fit answers noticeably fewer events on its own than the previous one did.
     {%- endif %}
-    {#- dev53: the reference set's own state #}
+    {#- the reference set's own state #}
     {%- if l.benchmark and l.benchmark.pending %}
     A refreshed reference set is waiting for the next change-over.
     {%- elif l.benchmark and l.benchmark.decay_warning and not l.repin_suggested %}
@@ -261,7 +261,7 @@
     <span style="opacity:.65;font-family:monospace;font-size:.85em"> model {{ l.serving_hash }}</span>
     {%- endif %}
   </span>
-  {#- dev53 (D3): never re-pinned silently. Same shape as the health-alert
+  {#- Never re-pinned silently. Same shape as the health-alert
       controls above: inline forms, CSRF, admin-only, outcome via ?msg=. #}
   {% if is_admin and l.repin_suggested %}
   {% for t in l.repin_suggested %}
@@ -296,8 +296,8 @@
 {% endfor %}
 {% endif %}
 
-{# ── dev56: overlapping events that both still count their water. dev49 D4:
-     visibility only — no volume policy is changed from here. ─────────── #}
+{# ── Overlapping events that both still count their water. Visibility only —
+     no volume policy is changed from here. ────────────────────────────── #}
 {% if health and health.overlaps %}
 {% for cid, o in health.overlaps.items() %}
 <div class="fx-msg fx-msg-warn" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">

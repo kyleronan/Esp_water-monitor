@@ -1,21 +1,11 @@
 """
-Device discovery — queries the HA device and entity registries to
-automatically find the ESP device and map its entities to circuit roles.
+Device discovery — finds the ESP device in the HA device registry, maps its
+entities to circuit roles, and persists the mapping in circuit_entity_map;
+unmatched required roles are left for manual selection in the setup wizard.
 
-Flow:
-  1. Query device registry for all devices
-  2. Find devices matching the configured name
-     - Exact match (case-insensitive) → auto-select
-     - Partial matches → present as suggestions
-     - No matches → show all ESPHome devices
-  3. Once a device is selected, query entity registry for its entities
-  4. Match entities to circuit roles using name patterns
-  5. Store discovered entity IDs in circuit_entity_map (SQLite)
-  6. Any unmatched roles are flagged for manual selection in the UI
-
-Matching uses the entity's original_name (from the ESPHome YAML `name:`
-field) rather than the entity_id, so it works regardless of how HA
-normalises the device name into the entity ID prefix.
+Roles match on the entity's original_name (the ESPHome YAML `name:`), with
+entity_id only as a fallback, so matching survives however HA normalises the
+device name into the entity_id prefix.
 """
 from __future__ import annotations
 
@@ -28,30 +18,20 @@ from .database import run_db
 
 log = logging.getLogger(__name__)
 
-# Minimum firmware version required for full feature support.
-# Checked against the device registry sw_version field (set via project.version
-# in the ESPHome YAML).
+# Firmware floor, checked against device-registry sw_version (project.version in
+# the ESPHome YAML). 3.13.0 is the last release that changed what the add-on
+# READS: 3.12.0 added the flow_meter_ppl number entity (without it the add-on
+# runs on the 396 ppl default — 5.5x high on a 72 ppl oval-gear meter, see
+# Orchestrator._sync_ppl_and_watch) and 3.13.0 moved flow from pulse_counter to
+# pulse_meter.
 #
-# 3.13.0 is the floor because it is the last change that altered what the add-on
-# READS, not just what the firmware does: 3.12.0 added the runtime flow_meter_ppl
-# number entity (without it the add-on falls back to a 396 ppl default, which on
-# a 72 ppl oval-gear meter mis-scales every volume by 5.5x — see
-# Orchestrator._sync_ppl_and_watch), and 3.13.0 rewrote flow measurement from
-# pulse_counter to pulse_meter.
-#
-# Three states, not two:
-#
-#   "ok"       parsed and >= floor.
-#   "too_old"  parsed and < floor.  VERIFIED bad → blocks setup.
-#   "unknown"  absent, or not parseable as N.N.N ("dev", "", "unknown").
-#              NOT verified bad → warns loudly, does not block.
-#
-# "unknown" must not block: ESPHome's project.version is a free-form string the
-# operator writes in their own YAML, HA appends " (ESPHome x.y.z)" to it, and a
-# device_registry entry created before the `project:` block existed carries no
-# sw_version at all. Every one of those is a correctly-flashed device, and
-# refusing would strand a working install with no escape hatch inside the
-# wizard. "too_old" is safe to block on because it is a positive measurement.
+# firmware_status has three states, not two: "too_old" (parsed, < floor) is a
+# positive measurement and blocks setup; "unknown" (absent, or not N.N.N — "dev",
+# "", "unknown") warns loudly but must NOT block. project.version is free-form
+# operator text, HA appends " (ESPHome x.y.z)", and a registry entry created
+# before the `project:` block existed has no sw_version at all — every one of
+# those is a correctly-flashed device, and refusing would strand a working
+# install with no escape hatch inside the wizard.
 MIN_FIRMWARE_VERSION: tuple = (3, 13, 0)
 
 #: sw_version strings that carry no version information at all.
@@ -136,36 +116,24 @@ OPTIONAL_ROLES = {
 #: things key on it.
 PPL_ROLE = "flow_meter_ppl"
 
-# ── Why PPL is REQUIRED, and what "refuse" means here ───────────────────────
+# Why PPL is REQUIRED: unbound, the add-on runs on circuit_profile.pulses_per_litre
+# (column DEFAULT 396.0) and nothing corrects it — the HA number-entity
+# subscription is ppl's only write path and is skipped when unbound. This
+# install's MAIN meter is 72-ppl oval-gear: 396 / 72 = 5.5, and every volume, the
+# low-flow floor (60 / ppl) and every threshold scaled off them are wrong by 5.5x
+# TOGETHER, which is why the result looks plausible rather than broken. A circuit
+# rename unbinds it: every entity NAME is `${circuit_N_name}`-interpolated and HA
+# derives entity_id from the name, so ~sixty ROLE_PATTERNS regexes fail at once.
 #
-# An unbound `flow_meter_ppl` leaves the add-on running on
-# circuit_profile.pulses_per_litre, whose column DEFAULT is 396.0. On this
-# install the MAIN meter is a 72-ppl oval-gear PD meter: 396 / 72 = 5.5, so
-# every computed volume, the low-flow floor (60 / ppl) and every threshold
-# scaled off them are wrong by 5.5x TOGETHER — which is precisely why the
-# result looks plausible instead of broken. Nothing else corrects it: the HA
-# number-entity subscription is the only write path for ppl, and it is skipped
-# when the entity is unbound.
-#
-# What unbinds it is a circuit rename: every entity NAME on a circuit is
-# `${circuit_N_name}`-interpolated and HA derives the entity_id from the name,
-# so a rename moves both handles the ROLE_PATTERNS regexes below match on and
-# about sixty patterns stop binding at once.
-#
-# "REFUSE" is not an exception and not a crash-loop — a stuck add-on measures
-# nothing at all, which is strictly worse. It means the wizard will not hand
-# back a runnable configuration:
-#
-#   * Keeping the role out of OPTIONAL_ROLES makes DiscoveryResult.all_matched
-#     False when ppl is unbound, which makes setup.html render its entity
-#     <select> with `required` — the browser will not submit step 3.
-#   * A LIVE install that predates this (ppl row empty) is not killed. It keeps
-#     running on its cached ppl, `unbound_ppl_circuits()` names the circuits,
-#     and /health/detail reports them under "metering".
-#
-# Orchestrator._sync_ppl_and_watch could additionally call
-# `mark_subsystem_degraded("flow_meter_ppl", ...)` and stop the circuit's
-# detector outright. It does not today.
+# "Refuse" means the wizard will not hand back a runnable configuration, not an
+# exception or crash-loop (a stuck add-on measures nothing, which is worse): out
+# of OPTIONAL_ROLES, an unbound ppl makes DiscoveryResult.all_matched False, so
+# setup.html renders the entity <select> `required` and step 3 cannot submit. A
+# LIVE install that predates this (ppl row empty) is not killed — it keeps its
+# cached ppl, the wizard names the circuits via unbound_ppl_circuits(),
+# /health/detail reports them under "metering", and
+# Orchestrator._sync_ppl_and_watch marks "flow_meter_ppl" degraded without
+# stopping the circuit's detector.
 
 #: Roles the optional-role rescan may FILL IN on an already-configured install.
 #: OPTIONAL_ROLES plus `flow_meter_ppl`, which is required at setup but must
@@ -175,21 +143,13 @@ PPL_ROLE = "flow_meter_ppl"
 RESCAN_FILLABLE_ROLES = OPTIONAL_ROLES | {PPL_ROLE}
 
 
-# ------------------------------------------------------------------
-# Role patterns — circuit → role → (name pattern, domain)
-# ------------------------------------------------------------------
-# Patterns are matched case-insensitively against the entity's original_name
-# from the HA entity registry; the domain narrows the match when several
-# entities share a similar name.
-#
-# The regexes search for "main" and "irrigation" because those are the keywords
-# in the DEFAULT firmware entity names (e.g. "Main Water Valve", "Water Flow
-# Rate - Irrigation"). Firmware with non-default label substitutions (e.g.
-# duplex installs) will not match them, and the setup wizard's manual entity
-# assignment UI must be used instead.
-#
-# Discovery priority: the diagnostic Circuit ID/Label text sensors (firmware
-# v3.6+) are checked first; these regexes are the fallback for older firmware.
+# Role patterns — circuit → role → (name regex, domain). Matched
+# case-insensitively against original_name (entity_id as fallback); the domain
+# disambiguates similarly-named entities. "main"/"irrigation" are the keywords in
+# the DEFAULT firmware entity names; a renamed circuit binds through the
+# diagnostic Circuit ID/Label sensors (tier 1 in match_entities_to_roles), which
+# are tried first — these regexes are the fallback — and failing that through the
+# wizard's manual entity assignment.
 ROLE_PATTERNS: Dict[str, Dict[str, Tuple[str, str]]] = {
     "circuit_1": {   # regex patterns match the default firmware entity names
         "flow_sensor":             (r"water flow rate.*main",                           "sensor"),
@@ -394,16 +354,11 @@ def find_matching_devices(
     devices: List[Dict[str, Any]],
     search_name: str,
 ) -> Tuple[Optional[DiscoveredDevice], List[DiscoveredDevice]]:
-    """
-    Search for devices matching search_name.
+    """Search for devices matching search_name.
 
-    Returns:
-        (exact_match, suggestions)
-        - exact_match: single DiscoveredDevice if name matches exactly
-                       (case-insensitive), otherwise None
-        - suggestions: all devices whose name contains search_name as a
-                       substring, or all ESPHome devices if no substring
-                       matches found
+    Returns ``(exact_match, suggestions)``: a case-insensitive exact name match
+    (else None), and otherwise substring matches, falling back to every ESPHome
+    device when nothing matches.
     """
     all_devices = [_to_device(d) for d in devices]
     search_lower = search_name.strip().lower()
@@ -452,27 +407,19 @@ async def resolve_circuit_identity(
 ) -> Tuple[Dict[str, str], List[str]]:
     """Resolve circuit identity from the v3.6+ diagnostic sensors.
 
-    Returns ``(labels, circuits_seen)``:
+    Returns ``(labels, circuits_seen)``: ``{circuit_id: display_label}`` and
+    every circuit the DEVICE reports, whether or not its label resolved;
+    ``({}, [])`` when no diagnostic sensors are present.
 
-    * ``labels``       {circuit_id: display_label}, e.g. {"circuit_1": "Zone A"}
-    * ``circuits_seen`` every circuit the DEVICE says it has, whether or not
-      its label resolved.
-
-    Binding is anchored on the **ID** sensor, not the Label sensor's name: the
-    ID sensor's STATE is the firmware's own circuit key ("circuit_1"), so a
-    duplex/swapped install attaches its label to the circuit the device claims
-    rather than to the ordinal in the sensor's name. The Label sensor is paired
-    to it by that ordinal (both are hardcoded "Circuit N ..." names).
-
-    The second return value exists because a device can report "circuit_1
-    exists" while its Label sensor is still `unknown` (both template sensors
-    have `update_interval: 60s`, so there is a real window after boot where
-    identity is known and the label is not). Without it that case is
-    indistinguishable from "older firmware, no diagnostic sensors", which falls
-    back to the "main"/"irrigation" regexes — the path that fails silently on a
-    renamed circuit.
-
-    Returns ``({}, [])`` when no diagnostic sensors are present at all.
+    Binding is anchored on the ID sensor's STATE — the firmware's own circuit
+    key ("circuit_1") — not on the ordinal in the sensor's name, so a
+    duplex/swapped install attaches its label to the circuit the device claims;
+    the Label sensor is paired to it by that ordinal (both names are hardcoded
+    "Circuit N ..."). ``circuits_seen`` is separate because both are
+    `update_interval: 60s` templates: after boot the ID can resolve while the
+    Label is still `unknown`, and without it that window is indistinguishable
+    from "older firmware, no diagnostic sensors" — the "main"/"irrigation"
+    regex fallback, which fails silently on a renamed circuit.
     """
     id_entities: Dict[str, Dict[str, Any]] = {}
     label_entities: Dict[str, Dict[str, Any]] = {}
@@ -558,20 +505,14 @@ def match_entities_to_roles(
 ) -> Tuple[Dict[str, List[EntityMatch]], str]:
     """Match entities belonging to device_id to circuit roles.
 
-    *labels* — optional dict of {circuit_id: display_label} from
-    :func:`_resolve_labels_from_diagnostics`.  When provided, matching uses
-    three ordered tiers per role:
+    Three ordered tiers per role: (1) the circuit's diagnostic *label* (from
+    :func:`_resolve_labels_from_diagnostics`) substituted into the pattern —
+    ``re.escape``d, since labels are user-controlled — which binds a renamed
+    circuit; then the ROLE_PATTERNS regex itself, which carries (2) the default
+    "main"/"irrigation" display terms and (3) the ``_main`` / ``_irr\\b``
+    entity_id suffix fallback.
 
-    1. Escaped diagnostic label against ``original_name`` (handles user-renamed
-       circuits — ``re.escape`` is applied because labels are user-controlled).
-    2. Hardcoded display-name terms ("main" / "irrigation") in ``original_name``.
-    3. Entity object_id / entity_id suffix fallback (``_main`` / ``_irr\\b``).
-
-    Tiers 2 and 3 are already encoded in the ROLE_PATTERNS regexes; tier 1 is
-    attempted first by substituting the escaped label into the pattern.
-
-    Returns:
-        (circuit_matches, esp_device_prefix)
+    Returns ``(circuit_matches, esp_device_prefix)``.
     """
     labels = labels or {}
     device_entities = [e for e in entities if e.get("device_id") == device_id]
@@ -673,16 +614,12 @@ def _derive_prefix(entities: List[Dict[str, Any]]) -> str:
     e.g. from 'sensor.esp_water_shut_off_3_water_flow_rate_main'
     extracts 'esp_water_shut_off_3_'
     """
-    # Known suffixes used to strip the device prefix from entity IDs, in
-    # PREFERENCE order. Each suffix MUST be tried against ALL entities before
-    # falling through to the next: with entities in the outer loop the result
-    # depends on registry order, because `button.<prefix>reset_safety_fault_main`
-    # also ends with "safety_fault_main" and yields a prefix with a bogus
-    # "reset_" tail — which breaks the waveform accumulator's expected-node
-    # check (chunk rejected — node != expected) and every other prefix
-    # consumer. "water_flow_rate_*" have no such trap variants.
-    # If the firmware adds new entity types, extend this list or switch to
-    # a longest-common-prefix approach across all device entity IDs.
+    # Suffixes in PREFERENCE order. Suffix is the OUTER loop on purpose: with
+    # entities outermost the result depends on registry order, because
+    # `button.<prefix>reset_safety_fault_main` also ends in "safety_fault_main"
+    # and yields a prefix with a bogus "reset_" tail that makes the waveform
+    # accumulator reject every chunk (node != expected). "water_flow_rate_*"
+    # have no such trap variants. New firmware entity types: extend this list.
     known_suffixes = [
         # The four diagnostic identity sensors first: every other suffix below
         # is `${circuit_N_name}`-derived, so renaming a circuit deletes ALL of
@@ -713,14 +650,12 @@ def _derive_prefix(entities: List[Dict[str, Any]]) -> str:
                     log.debug("Derived ESP prefix: %r", prefix)
                     return prefix
 
-    # An empty prefix is not harmless: it is stored as
-    # device_config.esp_device_prefix and becomes the waveform accumulator's
-    # `expected_node`, whose identity guard reads
-    # `if self._expected_node and node != ...`. So an empty prefix does not
-    # reject chunks — it DISABLES the node-identity check for the life of the
-    # process, with no other symptom. Hence the warning.
-    # WaveformChunkAccumulator.transport_stats() ("node_check_enabled") is
-    # where /health/detail reads it back.
+    # Not harmless: the empty prefix is stored as device_config.esp_device_prefix
+    # and becomes the waveform accumulator's `expected_node`, whose guard is
+    # `if self._expected_node and node != ...` — so it DISABLES the node-identity
+    # check for the life of the process rather than rejecting chunks. The only
+    # other symptom is WaveformChunkAccumulator.transport_stats()
+    # ["node_check_enabled"] on /health/detail.
     log.warning(
         "Could not derive an ESP device prefix from %d entity id(s) — none "
         "ended in a known suffix (%s). The waveform node-identity check will "
@@ -744,9 +679,7 @@ def _to_device(raw: Dict[str, Any]) -> DiscoveredDevice:
     )
 
 
-# ------------------------------------------------------------------
 # Database helpers for persisting discovery results
-# ------------------------------------------------------------------
 
 def save_discovery(
     db: sqlite3.Connection,
@@ -796,16 +729,14 @@ def save_discovery(
     bump_setup_complete_epoch()
 
 
-# ── Wizard-completion epoch ─────────────────────────────────────────────────
-# is_setup_complete() below is a real SQLite SELECT, and ingress_middleware
-# would otherwise run it on the EVENT-LOOP thread for every non-setup request
-# (app.js polls /api/dashboard/live every 5 s per open tab). The Orchestrator
-# keeps the answer in memory; this counter is how that cache learns it is
-# stale. A module counter rather than a per-writer invalidation call because
-# every statement that writes device_config.setup_complete lives in THIS module
-# (save_discovery, mark_setup_complete, unmark_setup_complete). A cache
-# carrying an older epoch is treated as unknown and re-read, so it can never
-# answer from a value that predates a write.
+# Wizard-completion epoch. is_setup_complete() is a real SQLite SELECT, which
+# ingress_middleware would otherwise run on the EVENT-LOOP thread for every
+# non-setup request (app.js polls /api/dashboard/live every 5 s per tab); the
+# Orchestrator caches the answer and this counter is how it learns it is stale.
+# A module counter rather than per-writer invalidation because every write to
+# device_config.setup_complete lives in THIS module (save_discovery,
+# mark_setup_complete, unmark_setup_complete). An older epoch reads as unknown
+# and is re-read, so the cache never answers from a value that predates a write.
 _SETUP_COMPLETE_EPOCH = 0
 
 
@@ -885,17 +816,14 @@ def unbound_ppl_circuits(
     db: sqlite3.Connection,
     circuits: Optional[List[str]] = None,
 ) -> List[str]:
-    """Circuits whose flow-meter PPL entity is NOT bound in circuit_entity_map.
+    """Circuits whose flow-meter PPL entity is NOT bound in circuit_entity_map —
+    i.e. computing volumes from the UNVERIFIED circuit_profile cache (column
+    default 396.0; a silent 5.5x over-count on a 72-ppl oval-gear meter — see
+    the PPL_ROLE note).
 
-    A non-empty result means those circuits are computing volumes from an
-    UNVERIFIED pulses-per-litre — the circuit_profile cache, whose column
-    default is 396.0. On a 72-ppl oval-gear meter that is a silent 5.5x
-    over-count of every volume on the circuit.
-
-    Both shapes count as unbound: no row at all (setup never matched the role)
-    and a row with an empty entity_id (matched=False was persisted). Read-only
-    and cheap; /health/detail and the setup wizard both use it to REPORT the
-    condition rather than let it stay invisible.
+    Both shapes count as unbound: no row at all (the role never matched) and a
+    row with an empty entity_id (matched=False was persisted). Read-only; the
+    setup wizard uses it to REPORT the condition rather than let it stay invisible.
     """
     rows = db.execute(
         "SELECT circuit, entity_id FROM circuit_entity_map WHERE role = ?",
@@ -912,9 +840,7 @@ def unbound_ppl_circuits(
     return [c for c in known if c not in bound]
 
 
-# ------------------------------------------------------------------
 # Optional-role re-discovery after firmware upgrades
-# ------------------------------------------------------------------
 
 # sw_version values that must never be written to fw_version.
 # Checked case-insensitively after stripping whitespace.
@@ -926,21 +852,18 @@ def merge_optional_roles(
     circuit: str,
     matches: List[EntityMatch],
 ) -> int:
-    """Insert or update optional-role rows in circuit_entity_map without
-    overwriting user-confirmed or already-mapped entries.
+    """Fill optional-role rows in circuit_entity_map without overwriting
+    user-confirmed or already-mapped entries. Rules, in order per match:
 
-    Rules (applied in order per match):
-    1. Skip if ``not m.matched``, ``not m.entity_id``, or
-       ``m.role not in RESCAN_FILLABLE_ROLES`` (OPTIONAL_ROLES plus the
-       now-required ``flow_meter_ppl``, which must still heal on an install
-       set up before firmware 3.12.0 published the entity).
+    1. Skip unless ``m.matched``, ``m.entity_id`` and
+       ``m.role in RESCAN_FILLABLE_ROLES``.
     2. Row missing → INSERT with confirmed=0.
-    3. Row exists, entity_id NULL/empty, confirmed=0 → UPDATE entity_id and entity_name.
+    3. Row exists, entity_id NULL/empty, confirmed=0 → UPDATE entity_id/entity_name.
     4. Row exists, entity_id non-empty → do NOT overwrite.
-    5. Row exists, confirmed=1 → do NOT overwrite (even if entity_id is empty).
+    5. Row exists, confirmed=1 → do NOT overwrite, even with an empty entity_id.
 
-    Returns the number of rows inserted or updated.  Idempotent: a second run
-    with the same data returns 0.  Commits only when at least one row changed.
+    Returns rows inserted or updated; idempotent (a second run returns 0) and
+    commits only when something changed.
     """
     changed = 0
     cursor = db.cursor()
@@ -1114,18 +1037,13 @@ async def rescan_optional_roles(
         ha_device_id, device_entities, circuits, labels=diag_labels
     )
 
-    # Heal a stale/mis-derived esp_device_prefix. The prefix is otherwise only
-    # written by save_discovery (setup wizard), so a bad stored value persists
-    # across restarts and keeps the waveform accumulator rejecting every chunk
-    # on its expected-node check.
-    #
-    # HOP-2 RE-CHECK: _rescan_writes_sync RE-READS device_config inside the
-    # write callable and compares against THAT, not against the `cfg` captured
-    # before the awaits. Both the prefix and fw_version writes are "update if
-    # different from stored", so a setup-wizard save_discovery landing during
-    # the registry fetch would otherwise be overwritten from stale premises.
-    # merge_optional_roles needs no re-check — it never overwrites a confirmed
-    # or non-empty mapping, so it is fill-only.
+    # Heals a stale/mis-derived esp_device_prefix, which save_discovery is
+    # otherwise the only writer of — so a bad stored value persists across
+    # restarts and the waveform accumulator rejects every chunk (node != expected).
+    # The writes re-read device_config inside the callable (see
+    # _rescan_writes_sync): a save_discovery landing during the registry fetch
+    # above would otherwise be overwritten from the stale `cfg`.
+    # merge_optional_roles is fill-only, so it needs no re-check.
     _w = await run_db(_rescan_writes_sync, db, circuits, circuit_matches,
                       target_device, _prefix)
     prefix_updated    = _w["prefix_updated"]

@@ -1,40 +1,20 @@
 """The continuous-learning loop.
 
-THE GOAL THIS SERVES
---------------------
-A home should need roughly a hundred labels in its first weeks and then run for
-years without the operator policing it. That cannot be a frozen model: every
-frozen classifier plateaus, and the k-NN ladder actively DEGRADES as its pool
-grows across a supply-regime change (.50 to .35 on the variant house). Homes
-change — this one grew a booster pump mid-dataset — so this is a loop.
+A home needs roughly a hundred labels in its first weeks and then runs for years
+without policing. A frozen classifier plateaus, and the k-NN ladder DEGRADES as
+its pool grows across a supply-regime change (.50 to .35 on the variant house),
+so this is a loop: cycle detectors produce anchor exemplars label-free, new
+review-card labels join the pool, a retrain produces a CHALLENGER the referee
+must pass, and a swap invalidates a SCOPED set of stored verdicts.
 
-THE LOOP
---------
-1. Cycle detectors keep producing anchor exemplars forever, label-free.
-2. Newly-labelled events (review card) join the pool.
-3. A retrain produces a CHALLENGER; the referee decides whether it serves.
-4. A swap invalidates a SCOPED set of stored verdicts, not the whole history.
-
-WHY THE INVALIDATION IS SCOPED
-------------------------------
-The model hash must stay OUT of ``compute_verdict_stamp``. That stamp is a
-GLOBAL fingerprint, so a model hash inside it makes every stored verdict stale
-the instant a model is retrained — a full-history re-derive on every retrain,
-the same trap the stamp's own docstring describes for the label pool
-("labelling 3 events re-derived 5,417 verdicts in 85 s and moved zero of them").
-
-A retrain instead pushes a targeted invalidation over the set that can actually
-change:
-
-  * events with no stored classification (the backlog),
-  * machine verdicts whose confidence sits below the NEW threshold,
-  * everything after the retrain (forward events are classified by the new
-    model anyway).
-
-User-labelled events are never touched, and neither are confident machine
-verdicts from a model that just passed a non-inferiority test against the
-frozen benchmark. Code changes still sweep everything, because
-``_code_fingerprint`` is in the stamp — staleness cannot outlive a release.
+The model hash must stay OUT of ``compute_verdict_stamp``: that stamp is GLOBAL,
+so a model hash inside it re-derives the whole history on every retrain (the
+same trap the stamp's own docstring records for the label pool). A retrain
+instead invalidates only what the new model can change — events with no stored
+classification, machine verdicts below the NEW threshold, and everything after
+the retrain. User labels and confident verdicts from a model that passed the
+referee's non-inferiority test are never touched; ``_code_fingerprint`` in the
+stamp still sweeps everything on a release.
 """
 from __future__ import annotations
 
@@ -51,39 +31,29 @@ from .model_referee import RefereeConfig, RefereeVerdict, Score, decide
 log = logging.getLogger(__name__)
 
 # ── anchor pool policy ──────────────────────────────────────────────────────
-# NOT "anchors <= 2x user labels per class": that starves the classes anchors
-# exist to serve, because dishwasher and washing-machine are user-label-POOR
-# precisely BECAUSE the cycle detectors handle them, so 2x0 gives zero exemplars
-# for the two best-taught fixtures in the house.
-#
-# Instead: a floor that guarantees every anchor-backed class real
-# representation, and ceilings that stop the daily cycle detectors out-massing a
-# hundred-odd hand labels (they would, roughly 10:1 within two years, whatever
-# per-label weight is applied).
+# NOT "anchors <= 2x user labels per class": dishwasher and washing-machine are
+# user-label-POOR precisely because the cycle detectors handle them, so 2x0
+# starves the classes anchors exist to serve. Instead a floor guarantees every
+# anchor-backed class representation, and ceilings stop the daily cycle
+# detectors out-massing a hundred-odd hand labels (~10:1 within two years,
+# whatever per-label weight is applied).
 ANCHOR_FLOOR_PER_CLASS: int = 50
 ANCHOR_MAX_CLASS_FRACTION: float = 2.0 / 3.0
 ANCHOR_MAX_POOL_FRACTION: float = 0.5
 
 # ── which detectors may teach ───────────────────────────────────────────────
-# A detector earns the right to contribute training exemplars by DEMONSTRATING
-# precision on current-era events — it is not granted by a constant.
-#
-# The cycle detectors are NOT near-perfect teachers: archive-wide, anchor
-# precision totals 0.781 and no tier reaches 0.97 even at its ceiling (assuming
-# every unlabelled claim correct), so anchors carry real label noise and cannot
-# be ingested unconditionally.
-#
-# But the archive-wide figure estimates the WRONG THING. A machine verdict is
-# frozen when the operator labels that event (reclassify skips labelled rows),
-# so those verdicts are never re-derived and the archive averages every code era
-# ever shipped. Restricted to the current era, dishwasher_cycle is 14/14 where
-# archive-wide it reads 0.742.
-#
-# Hence: measure per tier, over the current detector era, and require a LOWER
-# CONFIDENCE BOUND to clear the bar rather than a point estimate. Certifying a
-# teacher on 3 events repeats the small-n error the referee's non-inferiority
-# rule exists to avoid, and a tier with too little current-era evidence is
-# simply not yet eligible — the honest state after any detector change.
+# A detector EARNS the right to contribute exemplars by demonstrating precision
+# on current-era labelled events; it is not granted by a constant. Archive-wide
+# anchor precision is 0.781 and no tier reaches 0.97 even at its ceiling (every
+# unlabelled claim assumed correct), so anchors carry real label noise — but the
+# archive measures the WRONG THING: a machine verdict is frozen when the
+# operator labels the event (reclassify skips labelled rows), so the archive
+# averages every code era ever shipped (dishwasher_cycle reads 0.742
+# archive-wide, 14/14 in the current era). Hence: per tier, current era only,
+# and the Wilson LOWER BOUND must clear the bar — certifying a teacher on 3
+# events repeats the small-n error the referee's non-inferiority rule exists to
+# avoid. Too little current-era evidence means not yet eligible, the honest
+# state after any detector change.
 ANCHOR_MIN_TIER_PRECISION: float = 0.80
 ANCHOR_MIN_TIER_EVENTS: int = 10
 
@@ -120,7 +90,7 @@ def pool_machine_sources() -> tuple:
 # Water Use page shows a banner. It never relaxes the referee.
 STALL_STREAK: int = 4
 
-# dev53 — the ONE definition of "eligible for the training pool". The benchmark
+# The ONE definition of "eligible for the training pool". The benchmark
 # selector, the cheap auto-pin pre-check and the pool loader all read it, so
 # they cannot drift apart (the dev-box tool used to skip two of these filters
 # and would have pinned rows the pool never trains on).
@@ -217,7 +187,7 @@ class PoolStats:
 
 @dataclass
 class RetrainOutcome:
-    # trained | kept | ineligible | unavailable | rolled_back | pinned (dev53: a
+    # trained | kept | ineligible | unavailable | rolled_back | pinned (a
     # benchmark pin / re-pin / import / activation — swap=0, never a decision
     # about a challenger, so learning_status' streak loop steps over it)
     status: str
@@ -226,8 +196,8 @@ class RetrainOutcome:
     artifact: Optional[tm.Artifact] = None
     pool: Optional[PoolStats] = None
     invalidated: int = 0
-    # dev51 — what the referee actually measured. Carried here so the ledger
-    # (S2) can record it without re-plumbing the retrain.
+    # What the referee actually measured, carried here so the ledger can
+    # record it without re-plumbing the retrain.
     benchmark_hash: Optional[str] = None
     benchmark_requested_n: int = 0        # ids the import asked for
     benchmark_matched_n: int = 0          # of those, present in tonight's pool
@@ -237,7 +207,7 @@ class RetrainOutcome:
     scores: Optional[dict] = None         # argmax + serving-threshold score sets
     challenger_hash: Optional[str] = None
     champion_hash: Optional[str] = None   # the incumbent BEFORE this decision
-    # dev53 — free-form provenance for pin/activate rows and for the advisory
+    # Free-form provenance for pin/activate rows and for the advisory
     # benchmark scores; and whether the benchmark leg was demoted to advisory
     # (a supply-regime re-pin is pending, so the active set is scored and
     # recorded but cannot veto).
@@ -312,13 +282,10 @@ def build_training_pool(conn: sqlite3.Connection, circuit: str,
                         ) -> Tuple[List[dict], PoolStats]:
     """User labels (all of them) plus a bounded, regime-stratified anchor set.
 
-    ``anchor_since_ts`` overrides the detector era used to decide which tiers
-    have earned the right to teach (default: ``DETECTOR_ERA_START``).
-
-    Anchors are subsampled newest-first within each supply regime, so a pool
-    trimmed for size still spans the home's pressure eras — trimming purely by
-    recency would quietly drop every pre-pump exemplar and re-create the drift
-    the regime feature exists to handle.
+    ``anchor_since_ts`` overrides the detector era that decides which tiers may
+    teach (default ``DETECTOR_ERA_START``). Anchors are subsampled newest-first
+    WITHIN each supply regime: trimming purely by recency would drop every
+    pre-pump exemplar and re-create the drift the regime feature handles.
     """
     rows = _load_rows(conn, circuit, POOL_ELIGIBLE_WHERE, ())
     for r in rows:
@@ -468,18 +435,15 @@ def clean_recent_holdout(holdout: Sequence[dict], champion: tm.Artifact,
                          challenger: tm.Artifact) -> Tuple[List[dict], str]:
     """Holdout rows on days NEITHER model trained on.
 
-    Scoring the champion on the CHALLENGER's holdout is wrong: the champion was
-    fitted on an earlier pool that generally INCLUDED those days (a different
-    day stride, more labels since), while the challenger is holdout-free by
-    construction — so guarding only the challenger's side scores the incumbent
-    on memorised days and it wins every night. Day-granular because leakage is
-    day-level, the same reason ``split_holdout`` groups by day.
+    The champion's earlier pool generally INCLUDED the challenger's holdout days
+    (a different day stride, fewer labels), so guarding only the challenger's
+    side scores the incumbent on memorised days and it wins every night.
+    Day-granular because leakage is day-level, as in ``split_holdout``.
 
-    Legacy fallback: an artifact from before ``train_days`` existed reports an
-    empty list, so the only honest "days it did not see" are days strictly after
-    it was trained. On the first retrain that set is normally EMPTY (the
-    challenger trained on everything up to today), the leg abstains, and the
-    referee keeps the incumbent — a property of the first cycle, not a fault.
+    Legacy fallback: an artifact predating ``train_days`` reports an empty
+    list, so its only provable clean days are those strictly after it was
+    trained. On the first retrain that set is normally EMPTY, the leg abstains
+    and the incumbent is kept — a property of the first cycle, not a fault.
     """
     def _day(r: dict) -> str:
         return str(r.get("start_ts"))[:10]
@@ -499,39 +463,29 @@ def split_holdout(pool: Sequence[dict], fraction: float = 0.25
                   ) -> Tuple[List[dict], List[dict]]:
     """Day-grouped split whose holdout carries USER labels only.
 
-    Two invariants, and the interesting part is how they interact.
+    DAY-GROUPED: an appliance cycle's fills are near-duplicates, and scoring a
+    challenger on an event it memorised is degenerate (champion 0.0 /
+    challenger 1.0 in every row).
 
-    DAY-GROUPED. A day is never split, because an appliance cycle's fills are
-    near-duplicates of one another, and scoring the challenger on an event it
-    effectively memorised is degenerate (champion 0.0 / challenger 1.0 in every
-    row).
+    USER-ONLY HOLDOUT: this is the loop's only measurement against human truth
+    — ``tm.train`` calibrates the serving threshold on it and it is the
+    referee's recent leg. An anchor row in it turns both into machine-vs-machine
+    agreement, which reads as a spuriously perfect score.
 
-    USER-ONLY HOLDOUT. This holdout is the only measurement of precision against
-    human truth anywhere in the loop: ``tm.train`` calibrates the serving
-    threshold on it, and it is the referee's recent leg. An anchor row in it
-    converts both into machine-vs-machine agreement, which reads as a spuriously
-    perfect score.
-
-    Satisfying only the second gives a subtly broken split. Filtering anchors
-    out of an already-built holdout leaves that day's ANCHOR rows sitting in
-    ``train_rows`` while its user rows are scored — reintroducing, through the
-    back door, the near-duplicate leak the day-grouping exists to prevent. So
-    the partition happens BEFORE the split: an anchor landing on a held-out day
-    is DROPPED rather than moved across the boundary. That costs a little
-    training signal (anchors are free and capped anyway) and buys an honest
-    measurement.
-
-    Held-out days are chosen among days that actually carry user labels. An
-    anchor-only day would otherwise consume a holdout slot and contribute
-    nothing to it, shrinking the very sample whose size already binds — the
-    tier serves at the 0.90 grid ceiling because the Wilson lower bound at
-    n≈200 will not clear the 0.85 target, so every holdout row is coverage.
+    The partition happens BEFORE the split and an anchor landing on a held-out
+    day is DROPPED, not moved (cheap: anchors are capped anyway): filtering
+    anchors out of a built holdout would leave that day's anchor rows in
+    ``train_rows`` and reintroduce the near-duplicate leak. Held-out days are
+    chosen among days that carry user labels, because every holdout row is
+    coverage — the tier serves at the 0.90 grid ceiling since the Wilson lower
+    bound at n≈200 will not clear the 0.85 target — and an anchor-only day
+    would consume a slot for nothing.
     """
     def _day(row: dict) -> str:
         return str(row.get("start_ts"))[:10]
 
     def _is_user(row: dict) -> bool:
-        # dev51: 'cycle' rows are machine labels and never measure the model —
+        # 'cycle' rows are machine labels and never measure the model —
         # regardless of DEMOTE_CYCLE_TO_ANCHOR, which governs the POOL only.
         return not tm.is_machine_label(row)
 
@@ -657,10 +611,10 @@ def _install_benchmark(conn: sqlite3.Connection, circuit: str, ids: Sequence[str
                        source_hash: str, *, source: str, pinned_from_n: Optional[int],
                        trigger: str, reason: str, stamp: str) -> dict:
     """Write a benchmark. With no active set it becomes ACTIVE at once; over an
-    existing active set it becomes PENDING (dev53 handover) — the active set
-    keeps judging until the next promotion, and a later pending write simply
-    replaces the earlier one (latest wins, no queue). One transaction, so a
-    failure leaves the previous state intact rather than half of each."""
+    existing active set it becomes PENDING — the active set keeps judging until
+    the next promotion, and a later pending write simply replaces the earlier
+    one (latest wins, no queue). One transaction, so a failure leaves the
+    previous state intact rather than half of each."""
     existing = benchmark_ids_for_circuit(conn, circuit)
     role = "pending" if existing["ids"] else "active"
     try:
@@ -731,7 +685,7 @@ def import_referee_benchmark(conn: sqlite3.Connection, circuit: str,
             "role": res["role"]}
 
 
-# ── dev53: the add-on pins its own benchmark ────────────────────────────────
+# ── the add-on pins its own benchmark ───────────────────────────────────────
 def pin_benchmark_for_circuit(conn: sqlite3.Connection, circuit: str, *,
                               trigger: str, source: str = "auto", reason: str = "",
                               now: Optional[str] = None) -> dict:
@@ -819,16 +773,15 @@ def activate_pending_benchmark(conn: Optional[sqlite3.Connection], circuit: str,
                                now: Optional[str] = None) -> Optional[dict]:
     """After a PROMOTION: the pending set takes over and the old one retires.
 
-    A pending set can wait months; its rows decay exactly like the active
-    set's, but nothing measures them (decay reads the active hash's ledger
-    rows). So activation first recomputes the pending set's matched count
-    against the current pool; below the 70 % line it is NOT activated as-is —
-    a fresh selection is drawn (around the new champion's training days, so
-    it is clean for the model it will judge) with the same, already
-    operator-confirmed trigger and reason, and both hashes are logged. The
-    operator confirmed the intent; the row selection was never what they were
-    asked to approve. ``pinned_from_n`` is refreshed to current H so the growth
-    prompt measures from the set's birth.
+    A pending set can wait months and decays like the active set, but nothing
+    measures it (decay reads the active hash's ledger rows). So activation
+    recomputes its matched count against the current pool; below the
+    ``REPIN_DECAY_RATIO`` line a fresh selection is drawn around the new
+    champion's training days (clean for the model it will judge) under the
+    same, already operator-confirmed trigger and reason, both hashes logged —
+    the operator approved the intent, never the row selection.
+    ``pinned_from_n`` is refreshed to current H so the growth prompt measures
+    from the set's birth.
     """
     from . import referee_benchmark as rb
     if conn is None:
@@ -938,14 +891,12 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
             benchmark_meta: Optional[dict] = None) -> RetrainOutcome:
     """Train a challenger and let the referee decide whether it serves.
 
-    Synchronous — the caller submits it through ``run_db``. Returns an outcome
-    rather than raising for the ordinary "not yet" cases: a home below the
-    graduation floor, or an image without scikit-learn, are STATES, and the k-NN
-    ladder keeps serving in both.
-
-    ``benchmark_meta`` is the import record behind ``benchmark_ids`` —
-    ``source_hash`` and ``requested_n`` — carried onto the outcome so a retrain
-    can say how much of the pinned reference actually met tonight's pool.
+    Synchronous — the caller submits it through ``run_db``. "Not yet" cases (a
+    home below the graduation floor, an image without scikit-learn) are STATES
+    returned as outcomes, not raised; the k-NN ladder keeps serving in both.
+    ``benchmark_meta`` is the import record behind ``benchmark_ids``
+    (``source_hash``, ``requested_n``), carried onto the outcome so the ledger
+    can say how much of the pinned reference met tonight's pool.
     """
     if not tm.sklearn_available():
         return RetrainOutcome("unavailable",
@@ -957,9 +908,9 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
 
     meta = benchmark_meta or {}
     bench_ids = {str(x) for x in (benchmark_ids or [])}
-    # dev53 — training holds out the ACTIVE set and any PENDING re-pin (the
-    # pending set must be clean for the challenger that will one day be
-    # judged against it); the referee scores the active set only.
+    # Training holds out the ACTIVE set and any PENDING re-pin (the pending
+    # set must be clean for the challenger that will one day be judged
+    # against it); the referee scores the active set only.
     reserved = (bench_ids
                 | {str(x) for x in (meta.get("reserved_ids") or [])}
                 | {str(x) for x in (meta.get("pending_ids") or [])})
@@ -993,9 +944,9 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
                               target_precision=target_precision,
                               notes=reason)
     except tm.TinyModelUnavailable as exc:
-        # dev53 (F3b) — if un-reserving the benchmark would restore
-        # eligibility, say so: this is erosion, not a small pool, and the
-        # fix is labels or a smaller re-pin — never a silent auto-shrink.
+        # If un-reserving the benchmark would restore eligibility, say so:
+        # this is erosion, not a small pool, and the fix is labels or a
+        # smaller re-pin — never a silent auto-shrink.
         cause = _reservation_cause(pool, train_rows, reserved)
         return RetrainOutcome("ineligible", cause.get("reason") or str(exc),
                               pool=stats, detail=cause.get("detail"), **bench_fields)
@@ -1014,30 +965,23 @@ def retrain(conn: sqlite3.Connection, circuit: str, data_dir: str,
                               challenger_hash=challenger.model_hash,
                               **bench_fields)
 
-    # dev51 — symmetric leak fix: score the recent leg only on days NEITHER
-    # model trained on. See clean_recent_holdout for why the old comparison
-    # was one-sided.
+    # Score the recent leg only on days NEITHER model trained on; see
+    # clean_recent_holdout for why a one-sided guard favours the incumbent.
     clean_holdout, basis = clean_recent_holdout(holdout, champion, challenger)
     log.info("[%s] referee recent leg: holdout %d row(s), %d clean of both "
              "models' training days (%s)", circuit, len(holdout),
              len(clean_holdout), basis)
 
-    # Threshold-fair scoring: the referee compares DISCRIMINATION (argmax),
-    # never coverage. Serving precision stays choose_threshold's contract; the
-    # serving-threshold scores are kept alongside for the ledger.
-    #
-    # The benchmark is RESERVED from training, but a legacy incumbent (no
-    # train_days recorded) trained on those very rows and has memorised them —
-    # a ~14-point head start on a set it had already seen. Scoring such a
-    # champion on the benchmark is not a comparison, so the leg abstains until
-    # the first promotion installs a clean one and the recent leg (clean days
-    # after the champion's fit) decides meanwhile. Day-based, not clock-based.
-    #
-    # A pending re-pin never darkens the active leg — EXCEPT a supply-regime
-    # re-pin, where the active set encodes pre-regime signatures and is no
-    # longer a valid reference: it is scored and recorded (advisory) but cannot
-    # veto, and the recent leg — post-regime data — decides alone until
-    # activation.
+    # The referee compares DISCRIMINATION (argmax), never coverage; serving
+    # precision stays choose_threshold's contract and the serving-threshold
+    # scores ride along for the ledger. A legacy incumbent (no train_days)
+    # memorised the reserved benchmark rows (~14-point head start), so the leg
+    # abstains until the first promotion installs a clean champion and the
+    # recent leg decides meanwhile (see _benchmark_clean_for). A pending re-pin
+    # never darkens the active leg EXCEPT a supply-regime re-pin: the active set
+    # then encodes pre-regime signatures, so it is scored and recorded as
+    # ADVISORY but cannot veto, and the recent leg (post-regime data) decides
+    # alone until activation.
     bench_for_referee = benchmark
     advisory = False
     advisory_scores = None
@@ -1118,7 +1062,7 @@ def _invalidate(conn: sqlite3.Connection, circuit: str,
     return invalidate_verdict_stamps(conn, ids)
 
 
-# ── the decision ledger (dev51, 1.6) ────────────────────────────────────────
+# ── the decision ledger ─────────────────────────────────────────────────────
 # The jobs table prunes finished rows after two days, so "the referee has
 # rejected every challenger for a month" left no trace anywhere. This is the
 # record: one row per decision, never pruned, read by the weekly cadence, the
@@ -1206,10 +1150,10 @@ def learning_status(conn: Optional[sqlite3.Connection], circuit: str,
             continue                            # not a decision about a challenger
         else:
             break
-    # dev53 (R2-3) — a streak of kept decisions is only a STUCK signal when
-    # the challenger never changed (no new labels) or the benchmark leg could
-    # not score for at least half of it. Four fair fights lost by four
-    # different challengers is a good champion, and renders as neutral.
+    # A streak of kept decisions is only a STUCK signal when the challenger
+    # never changed (no new labels) or the benchmark leg could not score for
+    # at least half of it. Four fair fights lost by four different
+    # challengers is a good champion, and renders as neutral.
     stall_reason = None
     if streak >= STALL_STREAK:
         hashes = {r[4] for r in streak_rows}
@@ -1267,8 +1211,8 @@ def learning_status(conn: Optional[sqlite3.Connection], circuit: str,
         "benchmark_n": detail.get("benchmark_matched_n"),
         "decisions_on_record": len(rows),
     })
-    # dev53 — the benchmark's own state and whether a re-pin is worth asking
-    # for. Best-effort: a pre-migration DB still renders dev51's shape.
+    # The benchmark's own state and whether a re-pin is worth asking for.
+    # Best-effort: a pre-migration DB still renders the ledger-only shape.
     try:
         from . import referee_benchmark as rb
         ref = benchmark_ids_for_circuit(conn, circuit)
@@ -1328,7 +1272,7 @@ def rollback_serving_model(conn: sqlite3.Connection, circuit: str,
             "trained_at": art.trained_at, "invalidated": invalidated}
 
 
-# ── dev53 Phase 2: when a re-pin is worth asking for (D3/D4/F2/F3b) ──────────
+# ── when a re-pin is worth asking for (D3/D4/F2/F3b) ─────────────────────────
 REPIN_TRIGGER_REASONS = ("regime", "decay", "growth", "shrink")
 _ALERT_GATED_TRIGGERS = ("decay", "growth", "shrink")
 
@@ -1411,16 +1355,14 @@ def _dismissed_keys(ref: dict) -> set:
 def repin_triggers(conn: Optional[sqlite3.Connection], circuit: str,
                    ref: Optional[dict] = None,
                    human_n: Optional[int] = None) -> list:
-    """Why the operator might want a fresh reference set — each with a key
-    that embeds the triggering value, so a dismissal silences only that
-    instance (``growth:388`` dismissed does not silence ``growth:776``).
-
-    Nothing is suggested while a pending set already waits (the answer to
-    every trigger is the same handover). While a fixture-health alert is open,
-    decay/growth/shrink are SUPPRESSED — a set drawn now would freeze a
-    quarantined class's skew in — and the regime prompt is shown but
-    ``deferred`` when an alert predates the regime.
-    """
+    """Why the operator might want a fresh reference set. Each key embeds the
+    triggering value, so a dismissal silences only that instance
+    (``growth:388`` dismissed does not silence ``growth:776``). Nothing is
+    suggested while a pending set already waits (every trigger's answer is the
+    same handover). Under an open fixture-health alert, decay/growth/shrink are
+    SUPPRESSED — a set drawn now would freeze a quarantined class's skew in —
+    and the regime prompt is shown but ``deferred`` when an alert predates the
+    regime."""
     from . import referee_benchmark as rb
     ref = ref or benchmark_ids_for_circuit(conn, circuit)
     if not ref.get("ids") or ref.get("pending"):

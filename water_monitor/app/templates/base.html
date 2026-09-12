@@ -55,7 +55,7 @@
     {% block content %}{% endblock %}
   </main>
 
-  {# dev49 (P0-5): `(csrf_token or '')|tojson`, never a bare '""' fallback.
+  {# `(csrf_token or '')|tojson`, never a bare '""' fallback.
      The inline-if's false branch produced a plain Python str, not Markup, so
      autoescape encoded it and the browser received &#34;&#34; — a SyntaxError
      that killed this whole script element, and every page's bootstrap with it,
@@ -80,7 +80,7 @@
   <script>
   // Auto-inject CSRF token into every HTML form on the page
   (function() {
-    const token = {{ (csrf_token or '')|tojson }};   {# dev49 (P0-5) — see above #}
+    const token = {{ (csrf_token or '')|tojson }};   {# see above #}
     if (!token) return;
     document.addEventListener('DOMContentLoaded', () => {
       document.querySelectorAll('form[method="post"],form[method="POST"]').forEach(f => {

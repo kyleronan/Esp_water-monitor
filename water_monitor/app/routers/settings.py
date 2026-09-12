@@ -126,7 +126,6 @@ def _anomaly_shutoff_ready(sdict: dict) -> bool:
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def settings_page(request: Request):
-    # dev46 (46c): per-circuit calibration meta + validation reports.
     gated = startup_gate(request, "settings", "Settings", "/settings")
     if gated is not None:
         return gated
@@ -136,7 +135,7 @@ async def settings_page(request: Request):
 
 
     # Fetch configurable device entities (number + select) from HA
-    device_cfg = await run_db(get_device_config, orch.db)   # dev46 (46a)
+    device_cfg = await run_db(get_device_config, orch.db)
     # ``or ""`` not ``get(..., "")``: device_config row 1 exists as soon as
     # discovery writes anything, and esp_device_prefix is a NULLABLE column, so
     # dict.get returns an explicit None (the default only fires for a MISSING
@@ -172,7 +171,7 @@ async def settings_page(request: Request):
     # Load unit context once so descriptions and state values are shown in
     # the user's chosen units (e.g. gal/min instead of L/min).
     from ..units import load_unit_context
-    _uc              = await run_db(load_unit_context, orch.db)  # dev46 (46a)
+    _uc              = await run_db(load_unit_context, orch.db)
     _flow_label      = _uc["flow_unit"]       # e.g. "gal/min"
     _flow_factor     = _uc["flow_factor"]     # multiply L/min → display
     _flow_dec        = _uc["flow_decimals"]   # display precision for that unit
@@ -180,17 +179,14 @@ async def settings_page(request: Request):
     _pressure_factor = _uc["pressure_factor"] # multiply PSI → display
     _pressure_dec    = _uc["pressure_decimals"]
 
-    # Display truth. Do NOT hardcode ``round(..., 3)`` here: every other
-    # flow/pressure display in the app uses ``uc['flow_decimals']`` /
-    # ``uc['pressure_decimals']`` (units.fmt_flow, orchestrator's tile, app.js,
-    # history.html). 3 matches ft³/min and bar, but is too FINE for L/min,
-    # gal/min, PSI and kPa (0.264 where the rest of the UI shows 0.26) and too
-    # COARSE for m³/min (4 decimals).
-    # Rounding the *step* to display precision can land on 0.0 — an invalid HTML
-    # step attribute the browser silently replaces with 1, which then rejects
-    # every fractional entry — so a step is floored at one unit in the last
-    # displayed place. The POST handler re-snaps to ``native_step`` before it
-    # reaches HA, so display rounding never changes the stored value.
+    # Never a fixed ``round(..., 3)``: every other flow/pressure display uses
+    # ``uc['flow_decimals']`` / ``uc['pressure_decimals']`` (units.fmt_flow, the
+    # orchestrator tile, app.js, history.html); 3 is too fine for L/min, gal/min,
+    # PSI, kPa and too coarse for m³/min. A *step* rounded to display precision
+    # can land on 0.0 — an invalid HTML step the browser replaces with 1, which
+    # rejects every fractional entry — so steps floor at one unit in the last
+    # displayed place. The POST handler re-snaps to ``native_step`` before HA,
+    # so display rounding never changes the stored value.
     def _disp(value, factor: float, decimals: int, *, is_step: bool = False):
         out = round(float(value) * factor, decimals)
         if is_step and out <= 0:
@@ -328,8 +324,8 @@ async def settings_page(request: Request):
     from ..supply_regime import get_current_regime_id
 
     def _per_circuit_db():
-        """dev46 (46a): every per-circuit DB read for this page in ONE hop —
-        ~10 queries per circuit used to run inline on the event loop."""
+        """Every per-circuit DB read (~10 queries per circuit) in ONE hop, off
+        the event loop."""
         out = {}
         for cc in orch._cfg.circuits:
             cid = cc.circuit
@@ -426,8 +422,7 @@ async def settings_page(request: Request):
     # Phase 6b: derived pump-failure floor hint (one-tap apply). Shown only
     # for pump homes with nightly data; never auto-applied.
     def _tail_db():
-        """dev46 (46a): the page's remaining reads — pump-floor hint, supply
-        regime summary, profile and retention — in one DB-thread callable."""
+        """The page's remaining reads in one DB-thread callable."""
         pump_floor = {"hint": None, "current": None}
         try:
             if pump_mode_effective_cached(orch.db, "circuit_1")["active"]:
@@ -467,8 +462,8 @@ async def settings_page(request: Request):
             # Best-effort: this card can be missing, the page cannot 500.
             # Logged rather than passed — a bare pass hid real breakage.
             log.warning("settings: %s unavailable (%s)", "supply-regime summary", e)
-        # dev53 — per-circuit reference-set status for the Dev Tools card,
-        # including any open health alerts the confirm dialog must name.
+        # Per-circuit reference-set status for the Dev Tools card, including
+        # any open health alerts the confirm dialog must name.
         benchmark_status = {}
         try:
             from ..learning_loop import (benchmark_ids_for_circuit,
@@ -496,7 +491,7 @@ async def settings_page(request: Request):
             # Best-effort: this card can be missing, the page cannot 500.
             # Logged rather than passed — a bare pass hid real breakage.
             log.warning("settings: %s unavailable (%s)", "benchmark status", e)
-        # dev56 — duplicated spans per circuit for the Dev Tools card.
+        # Duplicated spans per circuit for the Dev Tools card.
         overlap_repair = {}
         try:
             from ..overlap_guard import summarize_overlap_groups
@@ -545,9 +540,7 @@ async def settings_page(request: Request):
     })
 
 
-# ------------------------------------------------------------------
-# Home profile
-# ------------------------------------------------------------------
+# ── Home profile ───────────────────────────────────────────────────────────
 @router.post("/profile/update")
 async def profile_update(request: Request):
     form = await request.form()
@@ -588,7 +581,7 @@ async def profile_update(request: Request):
             pump_fields["pump_mode_ack"] = None
             pump_fields["pump_alert_armed_at"] = None
 
-    await run_db(                                             # dev46 (46a)
+    await run_db(
         update_home_profile,
         orch.db,
         bathrooms_full=coerce_int(form.get("bathrooms_full"), lo=0, hi=20, default=1),
@@ -614,9 +607,7 @@ async def profile_update(request: Request):
     return ingress_redirect(request, "/settings#profile")
 
 
-# ------------------------------------------------------------------
-# Pump-failure alert floor — one-tap hint apply (dev27, Phase 6b)
-# ------------------------------------------------------------------
+# ── Pump-failure alert floor — one-tap hint apply ──────────────────────────
 @router.post("/pump-floor/apply")
 async def pump_floor_apply(request: Request):
     """Apply the derived pump-failure floor (quiet-window cut-in − 5 PSI) to
@@ -627,7 +618,7 @@ async def pump_floor_apply(request: Request):
     hint = await run_db(pump_floor_hint, orch.db)
     if hint is None:
         return ingress_redirect(request, "/settings#profile")
-    # dev46 (46a): every circuit's write in one DB-thread callable.
+    # Every circuit's write in one DB-thread callable.
     await run_db(lambda: [
         upsert_sensitivity_config(orch.db, c.circuit,
                                   pump_low_pressure_alert_psi=hint)
@@ -642,9 +633,7 @@ async def pump_floor_apply(request: Request):
     return ingress_redirect(request, "/settings#profile")
 
 
-# ------------------------------------------------------------------
-# Pump-regime detection banner (dev23, pump plan Phase 3)
-# ------------------------------------------------------------------
+# ── Pump-regime detection banner (pump plan Phase 3) ───────────────────────
 @router.post("/pump-banner/confirm")
 async def pump_banner_confirm(request: Request):
     """User confirmed the detected booster pump. This is the ONLY auto-path
@@ -653,7 +642,7 @@ async def pump_banner_confirm(request: Request):
     alert arming rule may trust it), and records the ack."""
     orch = _orch(request)
     from datetime import datetime as _dt, timezone as _tzinfo
-    await run_db(                                             # dev46 (46a)
+    await run_db(
         update_home_profile,
         orch.db,
         supply_type="city_pump",
@@ -661,7 +650,7 @@ async def pump_banner_confirm(request: Request):
         pump_mode_ack="confirmed",
     )
     invalidate_pump_mode_cache()
-    # dev25: flip the live detector's oscillation gate immediately too.
+    # Flip the live detector's oscillation gate immediately too.
     if getattr(orch, "event_detector", None):
         try:
             await orch.event_detector.update_thresholds()
@@ -703,16 +692,14 @@ async def leak_banner_dismiss(request: Request):
     latest = next((n for n in nights if n.get("est_leak_lpd")), None)
     if latest is None:
         return ingress_redirect(request, "/")
-    await run_db(update_home_profile, orch.db,                # dev46 (46a)
+    await run_db(update_home_profile, orch.db,
                  leak_watch_ack=f"dismissed:{latest['night_date']}")
     log.info("leak-watch banner: dismissed through night %s (a newer estimate "
              "re-shows it)", latest["night_date"])
     return ingress_redirect(request, "/")
 
 
-# ------------------------------------------------------------------
-# Supply-pressure regime banner
-# ------------------------------------------------------------------
+# ── Supply-pressure regime banner ──────────────────────────────────────────
 @router.post("/supply-banner/confirm")
 async def supply_banner_confirm(request: Request):
     """User confirmed the detected supply-pressure regime: stamp the ack and
@@ -723,8 +710,8 @@ async def supply_banner_confirm(request: Request):
     from ..supply_regime import get_current_regime
 
     def _confirm():
-        # dev46 (46a/N2a): read the current regime and stamp it in ONE
-        # callable — the id must not be read in one hop and written in another.
+        # Read the current regime and stamp it in ONE callable — the id must
+        # not be read in one hop and written in another.
         cur = get_current_regime(orch.db)
         if cur is None:
             return None
@@ -753,7 +740,7 @@ async def supply_banner_dismiss(request: Request):
     from ..supply_regime import get_current_regime
 
     def _dismiss():
-        # dev46 (46a/N2a): read + stamp + commit in one callable.
+        # Read + stamp + commit in one callable.
         cur = get_current_regime(orch.db)
         if cur is None:
             return None
@@ -813,9 +800,7 @@ async def reseed_clusters(circuit: str, request: Request):
     return ingress_redirect(request, "/settings#sett-advanced")
 
 
-# ------------------------------------------------------------------
-# Sensitivity
-# ------------------------------------------------------------------
+# ── Sensitivity ────────────────────────────────────────────────────────────
 @router.post("/sensitivity/{circuit}/update")
 async def sensitivity_update(circuit: str, request: Request):
     circuit = resolve_circuit(circuit)
@@ -827,7 +812,7 @@ async def sensitivity_update(circuit: str, request: Request):
     preset = SENSITIVITY_PRESETS.get(level, SENSITIVITY_PRESETS["medium"])
 
     if mode == "simple":
-        await run_db(                                         # dev46 (46a)
+        await run_db(
             upsert_sensitivity_config,
             orch.db, circuit,
             mode=mode,
@@ -836,7 +821,7 @@ async def sensitivity_update(circuit: str, request: Request):
         )
     else:
         # Advanced — read individual fields
-        await run_db(                                         # dev46 (46a)
+        await run_db(
             upsert_sensitivity_config,
             orch.db, circuit,
             mode=mode,
@@ -893,9 +878,7 @@ async def sensitivity_update(circuit: str, request: Request):
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
-# ------------------------------------------------------------------
-# Anomaly response (Phase 2.3)
-# ------------------------------------------------------------------
+# ── Anomaly response (Phase 2.3) ───────────────────────────────────────────
 _ANOMALY_RESPONSE_LEVELS = {"off", "notify", "notify_shutoff_severe", "shutoff_any"}
 
 
@@ -925,9 +908,7 @@ async def reconcile_update(circuit: str, request: Request):
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
 
-# ------------------------------------------------------------------
-# Recalibration
-# ------------------------------------------------------------------
+# ── Recalibration ──────────────────────────────────────────────────────────
 @router.post("/recalibrate/{circuit}")
 async def recalibrate(circuit: str, request: Request):
     circuit = resolve_circuit(circuit)
@@ -959,7 +940,7 @@ async def recalibrate(circuit: str, request: Request):
         if occupants_changed:
             # Household composition changed — reset to idle so
             # start_calibration can proceed, then begin a new run
-            await run_db(upsert_training_state, orch.db,      # dev46 (46a)
+            await run_db(upsert_training_state, orch.db,
                          circuit, state="idle", events_collected=0)
             await orch.training_manager.start_calibration(
                 circuit, calibration_days)
@@ -967,7 +948,7 @@ async def recalibrate(circuit: str, request: Request):
     # §2.4 — confirm the (fast) recalibration trigger; the slow re-lock at the next
     # activation is tracked separately by _fit_and_lock.
     job = await run_db(start_job, orch.db, "recalibration", circuit, "Recalibration…")
-    await run_db(finish_job, orch.db, job, "done",            # dev46 (46a)
+    await run_db(finish_job, orch.db, job, "done",
                  f"{circuit}: {kind} recalibration started — new learning period")
     return ingress_redirect(request, f"/settings#circuit-{circuit}")
 
@@ -992,17 +973,13 @@ async def dev_retrain(circuit: str, request: Request):
 
 @router.post("/dev/retrain-model/{circuit}")
 async def dev_retrain_model(circuit: str, request: Request):
-    """DEV/testing only — run the learned-model retrain NOW instead of waiting
-    for the weekly pass (10:00 UTC, once per ISO week).
-
-    Deliberately the same call the scheduler makes, so the button cannot drift
-    from the job: same training pool, same referee, same scoped invalidation.
-    That means it forces a DECISION, not a swap — if the challenger is not
-    better than the incumbent the referee keeps the incumbent, and the job
-    message says so. It also leaves the weekly schedule alone.
-
-    Plain form POST → redirect (kept off the JS path, like ``dev_retrain``);
-    the outcome is surfaced through the jobs table the UI already polls."""
+    """DEV/testing only — run the learned-model retrain now instead of at the
+    weekly pass (10:00 UTC, once per ISO week). Deliberately the same call the
+    scheduler makes — same pool, referee and scoped invalidation — so the
+    button cannot drift from the job; it forces a DECISION, not a swap: if the
+    challenger is no better, the referee keeps the incumbent and the job
+    message says so. Leaves the weekly schedule alone. Plain form POST →
+    redirect (off the JS path, like ``dev_retrain``); outcome via the jobs table."""
     if not DEV_TOOLS:
         return dev_tools_disabled()
     circuit = resolve_circuit(circuit)
@@ -1171,15 +1148,12 @@ async def dev_rebuild_overlaps(circuit: str, request: Request):
 async def dev_import_referee_benchmark(circuit: str, request: Request):
     """DEV/testing only — load the referee's frozen benchmark for a circuit.
 
-    The pinned benchmark (the eval harness writes it as JSON with ``event_ids``
-    + ``benchmark_hash``) is a record of when this household used water, so it
-    lives outside the repo. This stores the ids in the DB — delete-then-insert
-    for the circuit, under the same write lock a retrain takes — and returns
-    ``{circuit, source_hash, requested_n, inserted_n}``.
-
-    Accepts the document pasted into the form field or attached as a file
-    (multipart form POST with ``_csrf``, like the Re-fit button), or a JSON
-    body. Gated behind ``dev_tools``."""
+    The pinned benchmark JSON (``event_ids`` + ``benchmark_hash``, written by
+    the eval harness) records when this household used water, so it lives
+    outside the repo. Delete-then-insert for the circuit under the retrain's
+    write lock; returns ``{circuit, source_hash, requested_n, inserted_n}``.
+    Accepts pasted text, an uploaded file (multipart with ``_csrf``, like the
+    Re-fit button) or a JSON body. Gated behind ``dev_tools``."""
     if not DEV_TOOLS:
         return dev_tools_disabled()
     import json as _json
@@ -1283,7 +1257,7 @@ async def dev_reimport_range(circuit: str, request: Request):
         return JSONResponse(
             {"error": "Another volume operation is running — try again shortly."},
             status_code=409)
-    # dev.50 — probe-first: the rebuild was refused before anything was deleted.
+    # Probe-first: the rebuild was refused before anything was deleted.
     # Shares the History modal's wording so both UIs explain a refusal identically.
     refused = result.get("refused")
     if refused:
@@ -1300,7 +1274,7 @@ async def suggest_days(circuit: str, request: Request):
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
 
-    profile = await run_db(get_home_profile, orch.db) or {}   # dev46 (46a)
+    profile = await run_db(get_home_profile, orch.db) or {}
     days, tier = compute_suggested_calibration_days(
         profile.get("bathrooms_full") or 1,
         profile.get("bathrooms_half") or 0,
@@ -1311,9 +1285,7 @@ async def suggest_days(circuit: str, request: Request):
     return JSONResponse({"suggested_days": days, "tier": tier})
 
 
-# ------------------------------------------------------------------
-# Alert enable/disable
-# ------------------------------------------------------------------
+# ── Alert enable/disable ───────────────────────────────────────────────────
 @router.post("/alert/{circuit}/{alert_id}/toggle")
 async def alert_toggle(circuit: str, alert_id: str, request: Request):
     circuit = resolve_circuit(circuit)
@@ -1339,9 +1311,7 @@ _SETTINGS_MUTABLE_ROLES: frozenset[str] = frozenset({
 })
 
 
-# ------------------------------------------------------------------
-# Device entity updates (number entities on the ESP)
-# ------------------------------------------------------------------
+# ── Device entity updates (number entities on the ESP) ─────────────────────
 @router.post("/device-entity/update")
 async def device_entity_update(request: Request):
     """Update a number entity value on the ESP via HA.
@@ -1415,10 +1385,10 @@ async def device_entity_update(request: Request):
             status_code=400,
         )
 
-    # dev57 (2.33): 502 on failure — an HA round-trip that failed is the
-    # documented 502 case (_helpers.py), and the device router's fault-reset /
-    # trickle-reset / button routes already answer that way. A 200 here told
-    # the settings page the ESP had accepted a threshold it never received.
+    # 502 on failure — an HA round-trip that failed is the documented 502 case
+    # (_helpers.py), and the device router's fault-reset / trickle-reset /
+    # button routes already answer that way. A 200 here told the settings page
+    # the ESP had accepted a threshold it never received.
     return JSONResponse(
         {
             "status": "ok" if ok else "error",
@@ -1445,7 +1415,7 @@ async def retention_update(request: Request):
     # deletes EVERY event row. The browser cannot send that — both are
     # `<input type="range" min="1" max="10">` — but the form's declared bounds
     # are client-side only. day_of_week is a 7-option <select>, so [0, 6].
-    await run_db(                                             # dev46 (46a)
+    await run_db(
         update_data_retention,
         orch.db,
         events_retain_years=coerce_int(
@@ -1468,8 +1438,8 @@ async def retention_prune_now(request: Request):
     if not orch.data_pruner:
         return JSONResponse({"ok": False, "error": "Pruner not available"}, status_code=503)
     # prune_now() runs synchronous SQLite DELETEs that can block for several
-    # seconds on large tables. Run it on the single DB thread (dev46 46a) so
-    # the asyncio event loop stays responsive during the operation.
+    # seconds on large tables. Run it on the single DB thread so the asyncio
+    # event loop stays responsive.
     deleted = await run_db(orch.data_pruner.prune_now)
     return JSONResponse({"ok": True, "deleted": deleted})
 
@@ -1533,7 +1503,7 @@ async def mobile_notify_update(request: Request):
     orch = _orch(request)
     form = await request.form()
     targets = form.get("mobile_notify_targets", "").strip()
-    # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
+    # Write + commit in ONE DB-thread callable.
 
     def _save():
         orch.db.execute(
@@ -1555,7 +1525,7 @@ async def presence_update(request: Request):
     entities = form.get("ha_presence_entities", "").strip()
     away_state = form.get("ha_away_state", "not_home").strip()
     home_state = form.get("ha_home_state", "home").strip()
-    # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
+    # Write + commit in ONE DB-thread callable.
 
     def _save():
         orch.db.execute("""
@@ -1569,7 +1539,7 @@ async def presence_update(request: Request):
         orch.db.commit()
 
     await run_db(_save)
-    await orch.reload_presence_watcher()   # dev57 (2.10) — now async
+    await orch.reload_presence_watcher()
     return ingress_redirect(request, "/settings#away")
 
 # ── Display units ─────────────────────────────────────────────────────────────
@@ -1586,7 +1556,7 @@ async def units_update(request: Request):
         flow_key = "L/min"
     if pressure_key not in PRESSURE_OPTIONS:
         pressure_key = "psi"
-    # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
+    # Write + commit in ONE DB-thread callable.
 
     def _save():
         orch.db.execute(
@@ -1617,9 +1587,9 @@ async def history_events_update(request: Request):
     # single checkbox drives BOTH legacy columns in lockstep so any reader stays
     # consistent and a legacy split state is normalised on save.
     hide_not_real = 1 if form.get("hide_pressure_artifact_events") == "1" else 0
-    # dev.38 — guarded auto-split (read fresh by the periodic maturity pass).
+    # Guarded auto-split (read fresh by the periodic maturity pass).
     auto_split = 1 if form.get("auto_split_enabled") == "1" else 0
-    # dev46 (46a/N2a): write + commit in ONE DB-thread callable.
+    # Write + commit in ONE DB-thread callable.
 
     def _save():
         orch.db.execute(
@@ -1635,7 +1605,7 @@ async def history_events_update(request: Request):
 
 @router.post("/water-softener/update")
 async def water_softener_update(request: Request):
-    """dev.24 — persist the opt-in water-softener config. The regen start time is
+    """Persist the opt-in water-softener config. The regen start time is
     REQUIRED when enabled (the session detector + leak-test blackout key on it),
     so an enabled-but-invalid submission is rejected rather than stored blank.
     The live path reads this profile FRESH per event, so the toggle takes effect
@@ -1649,7 +1619,7 @@ async def water_softener_update(request: Request):
     if enabled and parse_hhmm_to_minutes(start) is None:
         return ingress_redirect(
             request, "/settings?msg=softener_time_required#water-softener")
-    await run_db(                                             # dev46 (46a)
+    await run_db(
         update_home_profile,
         orch.db,
         has_water_softener=1 if enabled else 0,
@@ -1659,9 +1629,7 @@ async def water_softener_update(request: Request):
     return ingress_redirect(request, "/settings#water-softener")
 
 
-# ------------------------------------------------------------------
-# Circuit display name rename
-# ------------------------------------------------------------------
+# ── Circuit display name rename ────────────────────────────────────────────
 
 @router.post("/circuit/{circuit}/rename")
 async def circuit_rename(circuit: str, request: Request):
@@ -1682,7 +1650,7 @@ async def circuit_rename(circuit: str, request: Request):
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
 
     await run_db(upsert_circuit_label, orch.db, circuit, display_name)
-    await orch.reload_circuit_labels_async()   # dev57 (2.10) — off the loop
+    await orch.reload_circuit_labels_async()
 
     return JSONResponse({"status": "renamed", "circuit": circuit, "display_name": display_name})
 
@@ -1715,17 +1683,13 @@ async def circuit_type_update(circuit: str, request: Request):
             status_code=400,
         )
 
-    # When switching to 'zone', refuse if the circuit already has
-    # confirmed fixtures whose type is not appropriate for a zone
-    # (e.g. toilet, shower, kitchen_tap). Otherwise the type system
-    # silently goes inconsistent — a "zone" circuit with toilet
-    # fixtures attached. Suggested types from clustering are NOT
-    # blockers: only user-confirmed `fixtures.fixture_type` counts.
-    # Zone → fixture is always allowed (zone alert rows are preserved
-    # and just hidden by the template filter).
+    # Refuse the flip to 'zone' while confirmed fixtures of a non-zone type
+    # (toilet, shower, …) are attached — otherwise a "zone" circuit carries
+    # toilet fixtures. Only user-confirmed `fixtures.fixture_type` counts, not
+    # clustering suggestions. Zone → fixture is always allowed (see docstring).
     if circuit_type == "zone":
         allowed_zone_types = set(zone_user_selectable_types())
-        rows = await run_db(                                  # dev46 (46a)
+        rows = await run_db(
             lambda: orch.db.execute(
                 """SELECT f.id, f.fixture_type,
                           COALESCE(f.display_name, f.name) AS name
@@ -1771,7 +1735,7 @@ async def circuit_type_update(circuit: str, request: Request):
         log.error("[%s] set_circuit_type failed: %s", circuit, exc)
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
 
-    await orch.reload_circuit_profiles_async()   # dev57 (2.10) — off the loop
+    await orch.reload_circuit_profiles_async()
     log.info("[%s] circuit_type changed to %r", circuit, circuit_type)
 
     return JSONResponse({
@@ -1785,15 +1749,13 @@ async def circuit_type_update(circuit: str, request: Request):
 async def circuit_winterized_update(circuit: str, request: Request):
     """Mark a circuit drained for the season, or back in service.
 
-    While set, the event detector skips the circuit, supply-regime sampling
-    and the pump-regime nightly leave it out, and leak tests do not run: its
-    meter and transducer are downstream of the shutoff and drain with it, so
-    ~0 psi is EXPECTED rather than a catastrophic pressure event.
-
-    Clearing it re-arms everything immediately and starts a short grace window
-    so the refill/re-pressurisation itself does not alarm. The set direction
-    has no grace by design — the operator sets it BEFORE draining, so there is
-    nothing yet to suppress.
+    While set, the event detector, supply-regime sampling, the pump-regime
+    nightly and leak tests all skip the circuit: its meter and transducer sit
+    downstream of the shutoff and drain with it, so ~0 psi is EXPECTED, not a
+    catastrophic pressure event. Clearing re-arms everything immediately and
+    opens a short grace window so the refill itself does not alarm; setting
+    has no grace by design — the operator sets it BEFORE draining, so there
+    is nothing yet to suppress.
     """
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
@@ -1834,15 +1796,12 @@ async def circuit_winterized_update(circuit: str, request: Request):
 
 @router.post("/circuit/{circuit}/valve-type")
 async def circuit_valve_type_update(circuit: str, request: Request):
-    """Update the valve_type for a circuit.
+    """Update the valve_type for a circuit (invalid input → 400).
 
-    Strict validation: invalid input returns HTTP 400. Mirrors the
-    circuit_type endpoint's CSRF behavior (the project uses
-    middleware-driven CSRF on the settings router — see main.py).
-    Switching to '3_port' disables the micro leak test for this circuit
-    (see leak_test_scheduler._execute_test and _check_schedule); the
-    existing leak-test schedule row is preserved so switching back to
-    '2_port' resumes the prior schedule without reconfiguration.
+    '3_port' disables the micro leak test for the circuit (see
+    leak_test_scheduler._execute_test and _check_schedule); the schedule row
+    is preserved so switching back to '2_port' resumes it unchanged. CSRF is
+    middleware-driven on this router (see main.py), as for circuit_type.
     """
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
@@ -1885,9 +1844,7 @@ async def circuit_valve_type_update(circuit: str, request: Request):
     })
 
 
-# ------------------------------------------------------------------
-# Plumbing-event exclusion windows
-# ------------------------------------------------------------------
+# ── Plumbing-event exclusion windows ───────────────────────────────────────
 
 @router.post("/circuit/{circuit}/exclusion_window")
 async def start_exclusion_window(request: Request, circuit: str):

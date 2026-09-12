@@ -358,7 +358,7 @@
         {% endif %}
       </div>
 
-      {# Volume cross-check (dev46 46v) #}
+      {# Volume cross-check #}
       {% if c.reconcile and c.reconcile.last_run_at %}
       <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Volume cross-check</h3>
@@ -393,7 +393,7 @@
       </div>
       {% endif %}
 
-      {# Winterized (dev46 46h) #}
+      {# Winterized #}
       <div class="sett-card sett-adv-card">
         <h3 class="sett-card-title">Winterized for the season</h3>
         <p class="sett-card-desc">
@@ -553,9 +553,8 @@
             regulator change.
           </p>
           {% if c.incomplete_reseed %}
-          {# dev46 (46j) — the F-C2 marker, surfaced at the control that fixes
-             it. dev42 only logged it, and a warning in the boot log is not
-             somewhere the operator ever looks. #}
+          {# The F-C2 marker, surfaced at the control that fixes it — a warning
+             in the boot log is not somewhere the operator ever looks. #}
           <p style="margin-top:.5rem;padding:.5rem .65rem;
                     border-radius:6px;background:var(--amber-bg);
                     color:var(--amber-text);border:1px solid var(--amber-border)">
@@ -1386,7 +1385,7 @@
           by hand; over an existing set the new one waits for the next
           change-over. Loading a file below is the developer override.
         </p>
-        {#- dev53: per-circuit status + Pin / Re-pin. The confirm names any open
+        {#- Per-circuit status + Pin / Re-pin. The confirm names any open
             health alert, so a set drawn during one is drawn with eyes open. #}
         {% for c in circuits %}
         {% set bs = benchmark_status.get(c.circuit) if benchmark_status else none %}

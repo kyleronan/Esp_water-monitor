@@ -1,20 +1,13 @@
-"""Feature-extractor SERVICE half — the async queue consumer.
+"""Feature-extractor SERVICE half: ``FeatureExtractor``, the queue-consuming,
+DB-writing, alert-firing service only :mod:`orchestrator` imports. The pure
+computation half lives in :mod:`feature_extractor`.
 
-:mod:`feature_extractor` holds the pure computation half, which is what most
-of the app imports; this module holds ``class FeatureExtractor``, the
-queue-consuming, DB-writing, alert-firing service that only
-:mod:`orchestrator` wants.
-
-The dependency runs ONE WAY: this module reads 14 names out of
-``feature_extractor``; ``feature_extractor`` references nothing defined here.
-That is why the back-compat re-export left in ``feature_extractor`` is a PEP
-562 module ``__getattr__`` and not a bottom-of-file import — an eager import
-there closes the loop and raises ImportError whenever this module is imported
-first, which is what ``orchestrator`` does.
-
-The ``database`` <-> ``feature_extractor`` import cycle is untouched by this
-split: it sits between ``database`` and the PURE half, and is lazy on both
-sides.
+The dependency runs ONE WAY (this module imports from ``feature_extractor``,
+never the reverse). The back-compat re-export in ``feature_extractor`` must
+stay a lazy PEP 562 ``__getattr__``: an eager import closes the loop and raises
+ImportError when this module is imported first, as ``orchestrator`` does. The
+``database`` <-> ``feature_extractor`` cycle sits on the pure half and is lazy
+on both sides.
 """
 from __future__ import annotations
 
@@ -178,18 +171,14 @@ class FeatureExtractor:
             log.debug("closed-day summary drain skipped: %s", e)
 
     async def _enrich_propagation_delay(self, event: RawEvent) -> None:
-        """Refine propagation_delay_ms with the precise server-side last_changed
-        timestamp of the flow-onset entity from HA history.
+        """Sharpen propagation_delay_ms (flow_onset − true transient onset) with
+        the flow-onset entity's server-side last_changed from HA history.
 
-        propagation_delay_ms is, for every trigger type, the buffer-scan delay
-        flow_onset − true_transient_onset.  The true onset is recovered here and
-        the flow-onset side is sharpened with the precise HA-history timestamp.
-        HA's recorder does not retain the 40 Hz pressure sensor at full
-        resolution, so the buffer scan stays authoritative for the pressure side.
-
-          - 'flow' / 'pressure+flow' start_ts IS the flow onset.
-          - 'pressure'               flow_onset_ts is the flow onset (start_ts
-            is the threshold crossing, not the true transient onset).
+        Only the flow side is refined: HA's recorder does not keep the 40 Hz
+        pressure sensor at full resolution, so the buffer scan stays
+        authoritative for the pressure onset. For a 'pressure' trigger the flow
+        onset is flow_onset_ts (start_ts is the threshold crossing, not the
+        transient onset); for 'flow' / 'pressure+flow' it is start_ts.
         """
 
         if not event.propagation_delay_ms:
@@ -227,20 +216,16 @@ class FeatureExtractor:
 
     def _find_waveform(self, event: RawEvent) -> "Optional[WaveformRecord]":
         """
-        Find the buffered WaveformRecord that best correlates with this RawEvent.
+        Find the buffered WaveformRecord that best overlaps this RawEvent.
 
-        Scans ALL buffered records for the circuit (not just the latest): a
-        pulsed fixture (washer fill pauses) splits one add-on event into
-        several firmware captures, and a tiny trailing capture can land AFTER
-        the one that actually spans the event — picking "latest" discards the
-        real match (a washer's fw-event 21, full=7249, was superseded by a
-        9-second fw-event 23 five seconds before completion).
-
-        Returns the record with the highest duration-overlap score among those
-        assembled within _WF_MATCH_WINDOW_S, when that score reaches
-        _WF_MATCH_MIN_SCORE; otherwise None. Records already claimed by a
-        stored event are skipped entirely, so the next-best unclaimed record
-        can still win rather than the event falling back to software.
+        Scans ALL buffered records, not just the latest: a pulsed fixture
+        (washer fill pauses) splits one event into several firmware captures,
+        and a tiny trailing capture can land AFTER the spanning one (a washer's
+        full=7249 capture was superseded by a 9-second one), so "latest"
+        discards the real match. Returns the best duration-overlap record
+        assembled within _WF_MATCH_WINDOW_S when its score reaches
+        _WF_MATCH_MIN_SCORE, else None; records already claimed by a stored
+        event are skipped so the runner-up can still win.
         """
         import time as _time
 
@@ -495,13 +480,10 @@ class FeatureExtractor:
             min_flow_lpm = self._event_detector.min_flow_for(event.circuit)
         # VFD ripple exemption (see _VFD_RIPPLE_MAX_PERIOD_S). Live and
         # retroactive verdicts must answer the SAME question, so the live path
-        # takes the era predicate too, OR'd with current gate state. Once
-        # pump_era_start is pinned in the past the OR is permanently true; the
-        # gate term is kept because it is the only branch that fires on a home
-        # with pump mode confirmed but no era pinned yet.
-        #
-        # Pump era + gate + the waveform lookup are three reads with only pure
-        # computation between them — one hop.
+        # takes the era predicate OR'd with current gate state. Keep the gate
+        # term even though the OR is permanently true once an era is pinned:
+        # it is the only branch that fires with pump mode confirmed but no era
+        # pinned yet.
         _pre = await run_db(self._pre_store_reads_sync, event)
         _pump_ripple = False
         try:
@@ -574,15 +556,12 @@ class FeatureExtractor:
                     return
 
             # ── Honour stored user intent ──────────────────────
-            # extract_features() computes verdicts fresh from the RawEvent and
-            # has no knowledge of stored user choices. Pull them from the
-            # existing row (if any) and apply BEFORE the upsert:
-            #   • user_ignored — folded into excluded_from_training (which is
-            #     a derived column, no longer preserved by the upsert, so a
-            #     re-import would otherwise silently un-ignore the event).
-            #   • user_classified — manual classification is authoritative:
-            #     copy the stored category flags and SKIP the auto finalizer
-            #     so auto-detection / waveform enrichment never overrides it.
+            # extract_features() knows nothing of stored user choices, so apply
+            # them from the existing row BEFORE the upsert: user_ignored folds
+            # into excluded_from_training (a derived column the upsert does not
+            # preserve, so a re-import would silently un-ignore the event), and
+            # user_classified copies the stored flags and SKIPS the auto
+            # finalizer so enrichment never overrides a manual classification.
             if existing is not None and existing["user_classified"]:
                 features["user_classified"] = 1
                 features["user_ignored"] = int(existing["user_ignored"] or 0)
@@ -687,19 +666,14 @@ class FeatureExtractor:
 
             # ── Sequence context + cluster matching ───────────────
             await self._cluster_event(event.circuit, features)
-            # ──────────────────────────────────────────────────────────────
 
             # Training-helper capture: if a capture is armed on this circuit,
-            # record this just-completed event as a candidate (writes NO label —
-            # the user confirms in the wizard). Cheap (one indexed SELECT; free
-            # when idle). Lazy import matches this module's
-            # circular-import-avoidance pattern; best-effort — a capture-logic
-            # bug must never block event storage.
-            #
-            # HOP after the _cluster_event await, with no hop-2 re-check:
+            # record the event as a candidate (writes NO label — the user
+            # confirms in the wizard). Cheap: one indexed SELECT, free when
+            # idle. No re-check after the _cluster_event await:
             # record_training_candidate re-reads the armed-capture row at write
             # time (that IS its gate), so a capture disarmed during clustering
-            # records nothing. The adjacent 'live' state read is bundled with it.
+            # records nothing.
             _post = await run_db(self._post_cluster_sync, event.circuit,
                                  features)
             _live_state = _post["state"]
@@ -822,16 +796,13 @@ class FeatureExtractor:
     def _anomaly_shutoff_gates_sync(self, circuit: str, sens) -> bool:
         """The DB-backed shut-off gate, one hop.
 
-        There is deliberately NO per-12h rate limit. The add-on has no
-        automatic reopen — the only open path is the manual, operator-gated
-        `/device/valve/{circuit}/open` route — so such a counter could only
-        reach 2 if the operator personally reopened the valve in between. It
-        would bound how often the add-on may overrule a human who has just
-        deliberately reopened, not guard an unnoticed runaway; a shut valve is
-        the loudest notification the system has.
-
-        ``anomaly_shutoff_log`` is still written: it is the audit record that
-        the valve was physically closed.
+        Deliberately NO per-12h rate limit: the add-on has no automatic reopen
+        (the only open path is the manual, operator-gated
+        `/device/valve/{circuit}/open` route), so such a counter could only
+        reach 2 if the operator reopened in between — it would bound overruling
+        a human, not guard an unnoticed runaway. A shut valve is the loudest
+        notification the system has. ``anomaly_shutoff_log`` is still written
+        as the audit record that the valve was physically closed.
         """
         return self._anomaly_shutoff_state_ok(circuit)
 
@@ -852,15 +823,13 @@ class FeatureExtractor:
 
     def _anomaly_shutoff_state_ok(self, circuit: str) -> bool:
         """HARD safety gate — an automated valve close is permitted ONLY when the
-        circuit is locked ('live') AND not in an active (re)calibration / accelerated-
-        adaptation window. Blocks auto-shutoff during setup, learning, labelling, and
-        BOTH full recalibration (state ≠ 'live') and partial recalibration (stays
-        'live' but opens a 14-day adaptation window): the system must never cut the
-        user's water while it is still (re)learning what normal looks like.
-
-        Delegates to ``database.is_baseline_locked`` — the ONE definition of
-        "baseline locked", shared with the label-reclassify skip gate, so the two
-        notions of locked can't drift (they used to be line-for-line copies)."""
+        circuit is 'live' AND outside any (re)calibration / accelerated-adaptation
+        window: setup, learning, labelling, full recalibration (state ≠ 'live')
+        and partial recalibration (stays 'live' but opens a 14-day adaptation
+        window) all block it, so the water is never cut while the system is
+        still (re)learning what normal looks like. Delegates to
+        ``database.is_baseline_locked``, the ONE definition of "baseline locked"
+        (shared with the label-reclassify skip gate) so the two cannot drift."""
         return is_baseline_locked(self._db, circuit)
 
     def _fingerprint_enabled(self) -> bool:
@@ -894,20 +863,16 @@ class FeatureExtractor:
                                     valve: str, event_id) -> Optional[bool]:
         """Read the valve position back after commanding a close.
 
-        ``close_valve`` returns True on HTTP 200 from the service call — "HA
-        accepted the request", not "the valve closed". Without this the add-on
-        reports the water shut off while it is still running. This installation
-        has a documented close-path hardware fault, which is what that failure
-        looks like in practice.
+        ``close_valve`` returning True means HTTP 200 — "HA accepted the
+        request", not "the valve closed" — and this installation has a
+        documented close-path hardware fault, so without this read-back the
+        add-on would report the water shut off while it is still running.
 
-        Returns True (confirmed shut), False (did not confirm), or None
-        (no end-stop entity bound — cannot verify, and says so rather than
-        assuming either way).
-
-        Two distinct failures are checked, because they are different faults:
-          * the closed end stop never reads on — the valve did not travel;
-          * the end stop reads on but ``valve_seal_alert`` is also on — the
-            valve reports shut and water is still moving past it.
+        Returns True (confirmed shut), False (did not confirm), or None (no
+        end-stop entity bound — cannot verify, and says so). Two distinct faults
+        are checked: the closed end stop never reads on (the valve did not
+        travel), and the end stop reads on but ``valve_seal_alert`` is also on
+        (shut, yet water still moving past it).
         """
         stop_entity = await run_db(
             self._resolve_role_entity, circuit, "closed_end_stop_sensor")
@@ -989,13 +954,10 @@ class FeatureExtractor:
                           score: float) -> None:
         """Append the shut-off audit row, on the DB thread.
 
-        Store closed_at as an explicit UTC ISO timestamp, NOT the
-        CURRENT_TIMESTAMP default. SQLite's default renders
-        'YYYY-MM-DD HH:MM:SS' — space-separated — and ' ' (0x20) sorts BELOW
-        'T' (0x54), so a space-format row compares as EARLIER than every
-        T-format row regardless of the instant it records, and any range query
-        over this column silently mis-selects. The T form is the repo's
-        canonical timestamp shape.
+        closed_at is an explicit UTC ISO timestamp, NOT the CURRENT_TIMESTAMP
+        default: SQLite renders that 'YYYY-MM-DD HH:MM:SS', and ' ' (0x20) sorts
+        below 'T' (0x54), so a space-format row compares EARLIER than every
+        T-format row whatever instant it records and range queries mis-select.
         """
         self._db.execute(
             "INSERT INTO anomaly_shutoff_log "
@@ -1033,18 +995,11 @@ class FeatureExtractor:
             return False
         if not ok:
             return False
-        # Store closed_at as an explicit UTC ISO timestamp, NOT the
-        # CURRENT_TIMESTAMP default: its space-separated form sorts below every
-        # T-separated row, so any range query over this column mis-selects.
-        #
-        # HOP 2, after the valve await, deliberately with NO re-check:
-        #   * The valve is ALREADY CLOSED. This row records a physical action
-        #     that definitively happened, so a re-check that could skip the
-        #     write would make the add-on's bookkeeping lie about the valve.
-        #   * It is an append of an immutable fact — the log only ever grows,
-        #     and no interleaved write can make this row wrong or redundant.
-        #   * It is the ONLY durable record that the add-on physically closed
-        #     the valve.
+        # Deliberately NO state re-check after the valve await: the valve is
+        # ALREADY CLOSED, and this append-only row (the log only grows, so no
+        # interleaved write can make it wrong or redundant) is the only durable
+        # record of that physical action — a re-check that could skip the
+        # write would make the add-on's bookkeeping lie about the valve.
         await run_db(self._log_shutoff_sync, circuit, event_id, atype, score)
         log.warning("[%s] ANOMALY AUTO-SHUTOFF — closed valve %s (event %s, %s, "
                     "score %.2f)", circuit, valve, event_id, atype, score)
@@ -1225,14 +1180,13 @@ class FeatureExtractor:
                          - timedelta(minutes=50)).isoformat()
                 washer_members = detect_washer_cycles(
                     self._db, circuit, since_ts=since, limit=400, calib=calib)
-            # Dishwasher cycle: only worth scanning when THIS event is a gentle
-            # small fill (a cheap, deliberately-loose pre-gate; the detector then
-            # applies the precise calib-aware band AND needs >=3 such fills
-            # chained). Span covers a full cycle (~2.5h lookback). The loose
-            # bounds are DERIVED from the same calib values the detector uses
-            # (×1.4 slack) — a hardcoded 5.0s stops invoking the detector for
-            # homes whose fitted DW_* band was calibrated wider, flipping labels
-            # between the live path and batch reclassify.
+            # Dishwasher cycle: scan only when THIS event is a gentle small fill
+            # (the 2.5 h lookback spans a full cycle). The pre-gate is loose —
+            # the detector applies the precise calib-aware band and needs >=3
+            # chained fills — but DERIVED from the detector's own calib values
+            # (×1.4 slack): a hardcoded bound would stop invoking it for homes
+            # whose fitted DW_* band is wider, flipping labels between the live
+            # path and batch reclassify.
             from .event_rules import _cv as _rule_cv
             _dw_vol_hi = float(_rule_cv(calib, "DW_VOL_L")[1]) * 1.4
             _dw_pk_hi = float(_rule_cv(calib, "DW_MAX_PK_LPM")) * 1.4
@@ -1296,15 +1250,12 @@ class FeatureExtractor:
             log.warning("[%s] structural rules tier failed (non-fatal): %s",
                         circuit, e)
 
-        # TinyModel tier, between the label-free anchors above and the k-NN
-        # residual below. That position is the design: the anchors work on day
-        # one, the model is per-home and beats the ladder's house-tuned scales
-        # once it has labels, and the k-NN remains the fallback for everything
-        # the model abstains on.
-        #
-        # `immature` burst features here by necessity — a fill's siblings have
-        # not happened yet when it is first classified. The deferred re-classify
-        # revisits with `mature` features, which is the whole reason it exists.
+        # TinyModel tier sits between the label-free anchors above and the k-NN
+        # residual below by design: the anchors work on day one, the per-home
+        # model beats the ladder's house-tuned scales once it has labels, and
+        # the k-NN catches what the model abstains on. `immature` burst
+        # features by necessity — a fill's siblings have not happened yet; the
+        # deferred re-classify revisits with `mature` ones.
         if matched_fixture_type is None:
             try:
                 from . import tinymodel as _tm
@@ -1453,14 +1404,13 @@ class FeatureExtractor:
              event_id)
         )
 
-        # Trailing retro-scan: a washer cycle (~45 min), a softener session
-        # (~3 h) and a dishwasher cycle (~2 h) COMPLETE over time, so earlier
-        # members were classified before the family reached its >=3-fill
-        # threshold (there is no periodic reprocess on the live path).
-        # Retro-stamp the window's members now WITH their cycle_group_id.
-        # Cycle/session context outranks a per-event machine match, so this MAY
-        # overwrite a prior knn/rule_* match (e.g. a backwash mis-typed
-        # shower_tub); user labels are never touched.
+        # Trailing retro-scan: cycles complete over time (washer ~45 min,
+        # softener ~3 h, dishwasher ~2 h), so earlier members were classified
+        # before the family reached its >=3-fill threshold and there is no
+        # periodic reprocess on the live path. Cycle context outranks a
+        # per-event machine match, so this MAY overwrite a prior knn/rule_*
+        # match (e.g. a backwash mis-typed shower_tub); user labels are never
+        # touched.
         for _members, _mtype, _mvia in (
                 (softener_members, "water_softener", "softener_session"),
                 (washer_members, "washing_machine", "washer_cycle"),

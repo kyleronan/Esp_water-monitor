@@ -1,24 +1,23 @@
 """Event-level structural rules tier — runs BEFORE the k-NN matcher.
 
-* ``detect_washer_cycles`` — a washing-machine cycle is a SAME-PEAK family with
-  wildly varying volumes: main fills (>=9 L, 80-400 s) plus sub-2.5 L top-offs,
-  all at ~constant peak (+/-15-30%), 2-45 min apart. Volume-ratio approaches
-  (``cycle_pulse_count``, the dishwasher cycle propagation) structurally split
-  these cycles (15x fill-to-top-off spread); keying the family on PEAK reaches
-  0.73 recall with zero toilet contamination.
-* ``rule_classify_event`` — high-precision per-event rules (toilet / dishwasher /
-  shower / zone-default) that classify their shapes better than the k-NN does
-  (toilet 0.95-1.00 vs 0.75), leaving the k-NN as the residual.
+* ``detect_washer_cycles`` keys a washer cycle on PEAK, not volume: main fills
+  and sub-2.5 L top-offs share a ~constant peak while their volumes spread 15x,
+  so volume-ratio approaches (``cycle_pulse_count``, the dishwasher cycle
+  propagation) split the cycle. Same-peak families reach 0.73 recall with zero
+  toilet contamination.
+* ``rule_classify_event`` — per-event toilet / dishwasher / shower / zone-default
+  rules that beat the k-NN on their shapes (toilet 0.95-1.00 vs 0.75); the k-NN
+  is the residual.
 
-Everything here writes/feeds ``matched_fixture_type`` (the machine-opinion column)
-only — user labels are never touched, and every verdict is recomputed on each
-reclassify, so the tier is fully reversible.
+Writes only ``matched_fixture_type`` (the machine opinion): user labels are never
+touched and every verdict is recomputed on each reclassify, so the tier is fully
+reversible.
 
-⚠ CALIBRATION: every constant below is shaped by THIS home's labeled data (15
-washer labels, one washer, one supply pressure). A structural rule asserts rather
-than abstains, so these do NOT generalize automatically — a different home needs
-its own calibration or multi-home re-validation. tools/eval_knn_classifier.py
---with-rules is the (in-sample) fit gate; its output overrides these numbers.
+⚠ CALIBRATION: every constant below is fit to THIS home (15 washer labels, one
+washer, one supply pressure). A structural rule asserts rather than abstains, so
+nothing here generalizes on its own — another home needs its own calibration or
+multi-home re-validation. tools/eval_knn_classifier.py --with-rules is the
+in-sample fit gate; its output overrides these numbers.
 """
 from __future__ import annotations
 
@@ -119,27 +118,22 @@ WASHER_FAMILY_PK_ENVELOPE: Tuple[float, float] = (
     _WASHER_ANCHOR_PK_LPM[1] * _WASHER_FAMILY_PK_RATIO[1],   # 19.5
 )
 
-# Cycle/session-detected fixtures are NEVER typed from a lone k-NN signature:
-# washing_machine comes only from detect_washer_cycles (anchor + >=2 same-peak fills),
-# dishwasher only from its cycle-pulse rule, and water_softener only from detect_softener_
-# sessions (a scheduled multi-draw regen). The k-NN residual must NOT stamp these onto a
-# single event — a lone draw resembling one is a tap / quick fill / slow trickle. Shared by
-# the reclassify and live k-NN write paths so the guard can never drift apart. A real
-# cycle/session member suppressed here is re-stamped by its session detector (the washer
-# retro-scan live, or the softener/washer sweep on the next full reclassify).
+# Cycle/session fixtures (CYCLE_ONLY_FIXTURE_TYPES, below) are NEVER typed from a
+# lone k-NN signature: washing_machine comes only from detect_washer_cycles,
+# dishwasher from its cycle-pulse rule, water_softener from detect_softener_sessions.
+# A lone draw resembling one is a tap / quick fill / slow trickle. Shared by the
+# reclassify and live k-NN write paths so the guard cannot drift; a real member
+# suppressed here is re-stamped by its detector (washer retro-scan live,
+# softener/washer sweep on the next full reclassify).
 # ── detector era ────────────────────────────────────────────────────────────
-# The date the newest DETECTOR change shipped. A stored machine verdict is
-# frozen the moment the operator labels that event —
-# `reclassify_all_events_from_signatures` skips user-labelled rows by design —
-# so verdicts on labelled events are never re-derived and an archive-wide
-# precision figure silently averages every code era the add-on has ever run.
-# The difference is not academic: dishwasher_cycle reads 0.742 archive-wide and
-# 1.000 (14/14) since the T5 shape gate.
-#
-# BUMP THIS whenever a detector or rule constant changes, and expect
-# `measure_anchor_precision` to report "not enough current-era data" for a
-# while afterwards — that is the honest state, not a regression.
-DETECTOR_ERA_START: str = "2026-08-22"   # dev47: toilet average-flow floor
+# The date the newest DETECTOR change shipped. Verdicts on user-labelled events
+# are frozen (`reclassify_all_events_from_signatures` skips labelled rows), so an
+# archive-wide precision figure averages every code era ever run: dishwasher_cycle
+# reads 0.742 archive-wide vs 1.000 (14/14) since the T5 shape gate. BUMP THIS
+# whenever a detector or rule constant changes; `measure_anchor_precision`
+# reporting "not enough current-era data" afterwards is the honest state, not a
+# regression.
+DETECTOR_ERA_START: str = "2026-08-22"   # toilet average-flow floor
 
 CYCLE_ONLY_FIXTURE_TYPES: frozenset = frozenset(
     {"washing_machine", "dishwasher", "water_softener"})
@@ -153,43 +147,31 @@ _FLUSH_DUR_S: Tuple[float, float] = (20.0, 150.0)
 # Reviewed-set precision 0.81 → 0.87 at 89/90 recall. Calibratable: a per-regime
 # fit with explicit labels may lower it, and do-no-harm arbitrates.
 _FLUSH_MIN_PK_LPM: float = 7.5
-# AVERAGE-flow floor for a toilet CLAIM. The peak floor above does not catch the
-# draw that is slow THROUGHOUT and still lands inside the flush volume/duration
-# box: on the labelled archive the toilet rule's false positives sit at median
-# true-avg 5.2 L/min against 8.8 for real flushes — a flush empties a cistern at
-# a rate a tap or an appliance fill does not sustain.
-#
-# Effect on rule_toilet's claims (labelled archive, n=169): precision
-# 0.763 -> 0.842 while keeping 128 of 129 genuine flushes (recall 0.992). On
-# post-T5 events alone (n=30): 0.700 -> 0.778 at recall 1.000. The 17 events it
-# rejects are 6 'other', 6 tap, 2 dishwasher, 2 washer and 1 toilet.
-#
-# 5.0 rather than the 5.5 the sweep also supports: recall on the highest-
-# frequency fixture in the house is the expensive side of this trade, and 5.5
-# buys ~3 more points of precision for 3 more vetoed flushes. Calibratable,
-# never auto-fit.
+# AVERAGE-flow floor for a toilet CLAIM: catches the draw that is slow THROUGHOUT
+# yet inside the flush volume/duration box, which the peak floor misses. Labelled
+# archive: the rule's false positives sit at median true-avg 5.2 L/min vs 8.8 for
+# real flushes; the floor lifts precision 0.763 -> 0.842 at recall 0.992 (128/129,
+# n=169; post-T5 n=30: 0.700 -> 0.778 at recall 1.0), rejecting 6 'other', 6 tap,
+# 2 dishwasher, 2 washer, 1 toilet. 5.0 rather than 5.5: 5.5 buys ~3 points of
+# precision for 3 more vetoed flushes, and recall on the house's most frequent
+# fixture is the expensive side. Calibratable, never auto-fit.
 _FLUSH_MIN_AVG_FLOW_LPM: float = 5.0
 
-# Burst veto on the toilet rule. A flush judged alone is a volume and a flow
-# rate; judged in company it is often an appliance filling in stages.
-#
-# The threshold is set by BASE RATE, not by the widest separation: a threshold
-# of >3 heavy neighbours fires on 40% of every event on the reference home and
-# denies the rule 29 of 177 real flushes, and a veto that routine is not a veto.
-# Measured across the whole stream (3,979 events, 177 labelled toilets, 128
-# labelled washers):
+# Burst veto on the toilet rule: a flush judged alone is a volume and a rate;
+# judged in company it is often an appliance filling in stages. The threshold is
+# set by BASE RATE, not widest separation — >3 heavy neighbours fires on 40% of
+# events and denies the rule 29 of 177 real flushes, and a veto that routine is
+# not a veto. Whole stream (3,979 events, 177 labelled toilets, 128 washers):
 #
 #     heavy >    all events   labelled toilets   labelled washers
 #        3          20.2%           6.8%              46.9%
 #        4          11.5%           1.7%              19.5%
 #        6           2.5%           0.0%               0.8%
 #
-# 6 costs NO labelled flush at all while still catching the case it exists for,
-# and on the claims it does veto the rule was right 0 times out of 4 and the
-# model 3. Do NOT add an n_ev_30m clause: counting any draw, including tiny
-# taps, fires on 36% of events and measures "busy household" rather than
-# "appliance cycle". n_heavy_2h is the targeted signal — it counts only
-# neighbours that are themselves fill-sized (3-25 L, >=8 L/min).
+# 6 costs no labelled flush and still catches its case; on the 4 claims it vetoes
+# the rule was right 0 times, the model 3. Do NOT add an n_ev_30m clause — counting
+# every draw fires on 36% of events and measures "busy household", not "appliance
+# cycle". n_heavy_2h counts only fill-sized neighbours (3-25 L, >=8 L/min).
 _TOILET_VETO_HEAVY_2H: int = 6
        # any draws within +/-30 min
 _FLUSH_MIN_DELTA_PSI: float = 1.5
@@ -235,25 +217,17 @@ _ZONE_MIN_DUR_S: float = 240.0
 _ZONE_MIN_PK_LPM: float = 5.0
 
 # ── Toilet physics veto ─────────────────────────────────────────────────────────
-# A toilet flush is a SINGLE continuous cistern refill with a hard physical
-# volume floor and an era-bounded ceiling. Any tier proposing 'toilet' for an
-# event that violates these bounds is wrong by construction — the veto turns
-# that proposal into an abstention (the event falls to the "Other" catch-all,
-# never to a different fixture guess). STRUCTURAL — never in RULE_DEFAULTS:
-# these are manufacturing/regulatory facts, not per-home behaviour to calibrate.
-#
-# Floor: the smallest flush ever manufactured is 0.8 gpf ≈ 3.0 L (ultra-high-
-# efficiency full flush; dual-flush half-flush bottoms out at the same 0.8 gal).
-# 2.8 L = that floor minus a margin for mfg-rating-vs-metered mismatch.
-#
-# Era ceilings (US federal/EPA history), applied from home_profile.build_year
-# when the epa_flush_cap_enabled toggle is on:
-#   pre-1982 homes ..... conventional cisterns up to 7 gpf (26.5 L)
-#   1982–1993 .......... 3.5 gpf (13.2 L) reduced-flush era
-#   1994+ .............. Energy Policy Act of 1992: 1.6 gpf (6.1 L) legal max
-# Each ceiling gets a margin for bowl-refill draw + rating tolerance. A home
-# older than its toilets only over-allows (never vetoes a real flush), so the
-# build year is a safe upper-bound proxy; renovated homes can turn the cap off.
+# A flush is a SINGLE continuous cistern refill with a manufactured volume floor
+# and an era-bounded ceiling; a 'toilet' proposal outside those bounds is wrong by
+# construction, so the veto turns it into an abstention (the event falls to the
+# "Other" catch-all, never to another fixture guess). STRUCTURAL — never in
+# RULE_DEFAULTS: manufacturing/regulatory facts, not per-home behaviour.
+# Floor: the smallest flush ever manufactured is 0.8 gpf ≈ 3.0 L (dual-flush
+# half-flush bottoms out there too); 2.8 L is that minus a rating-vs-metered
+# margin. Ceilings (US EPA history, _TOILET_ERA_CAPS_L) apply from
+# home_profile.build_year when epa_flush_cap_enabled is on. A home older than its
+# toilets only over-allows, so the build year is a safe upper-bound proxy;
+# renovated homes can turn the cap off.
 TOILET_MIN_FLUSH_L: float = 2.8
 TOILET_VETO_MIN_PK_LPM: float = 3.0     # matches the cluster toilet rule's flow floor
 TOILET_VETO_MAX_SEGMENTS: int = 2       # one refill; allow 2 for sampling jitter
@@ -284,17 +258,12 @@ def toilet_veto_reason(features: Dict[str, Any],
                        cap_litres: float) -> Optional[str]:
     """Which physics test rejects this event as a single flush, or None.
 
-    Returns the reason rather than a bool so the log line can name the condition
-    that actually fired. Logging only the volume and the era cap makes a 2.5 L
-    event rejected by the 2.8 L manufactured floor read as "vol=2.5 L,
-    cap=30.5 L" — indistinguishable from a passing event when dozens scroll past
-    in one reclassify.
-
-    Reads ``volume_litres``, ``peak_flow_lpm`` and ``active_flow_segment_count``;
-    a missing/None value never vetoes (no evidence, no veto). Deliberately NOT
-    symmetric with is_flush_shaped: that rule says "looks like a flush", this one
-    says "cannot be a flush" — only the latter may override another tier's
-    positive evidence (e.g. a k-NN vote).
+    A reason string, not a bool, so the log names the condition that fired — a
+    2.5 L event rejected by the 2.8 L floor otherwise logs as "vol=2.5 L,
+    cap=30.5 L", indistinguishable from a pass. A missing feature never vetoes
+    (no evidence, no veto). Deliberately NOT symmetric with is_flush_shaped:
+    that says "looks like a flush", this says "cannot be one" — only the latter
+    may override another tier's positive evidence (e.g. a k-NN vote).
     """
     vol = _f(features, "volume_litres")
     if vol is not None:
@@ -401,25 +370,21 @@ def is_flush_shaped(features: Dict[str, Any],
     transient = features.get("has_pressure_transient")
     delta = _f(features, "pressure_delta_psi")
     if pump_mode:
-        # dev24 (pump plan Phase 4): under a booster pump the flush's pressure
-        # signature rides the recharge sawtooth — the delta depends on where in
-        # the cycle the flush lands, so the pressure corroboration requirement
-        # is waived and the flow-only shape gates above decide.
+        # Under a booster pump the flush's pressure signature rides the recharge
+        # sawtooth — the delta depends on where in the cycle the flush lands — so
+        # pressure corroboration is waived and the flow-only gates above decide.
         return True
     return bool(transient) or (delta is not None and delta >= _FLUSH_MIN_DELTA_PSI)
 
 
 def in_appliance_burst(burst: Optional[Dict[str, Any]]) -> bool:
-    """Is this draw sitting inside a run of activity that a flush would not be?
+    """Is this draw sitting inside a run of activity a flush would not be in?
 
-    A toilet flushes and then the room goes quiet. An appliance fills in stages,
-    so its members arrive surrounded by siblings. The threshold counts
-    NEIGHBOURS, never the event itself, so a lone flush can never trip it
-    however large it is.
-
-    ``burst`` is the label-free burst-context dict. ``None`` means the caller
-    could not compute it — a fitting path, or a stream too short — and the
-    answer is then False: silence is not evidence of a burst.
+    An appliance fills in stages, so its members arrive surrounded by siblings;
+    a flush arrives alone. The threshold counts NEIGHBOURS, never the event
+    itself, so a lone flush, however large, can never trip it. ``burst`` is the
+    label-free burst-context dict; ``None`` (a fitting path, or a stream too
+    short to compute it) answers False — silence is not evidence of a burst.
     """
     if not burst:
         return False
@@ -443,13 +408,11 @@ def toilet_burst_veto_reason(features: Dict[str, Any],
     """Why the burst veto suppressed a toilet claim, or None if it did not.
 
     ``rule_classify_event`` returns None without a reason, so a caller that
-    wants to REPORT a veto asks separately — the same shape as
-    ``toilet_veto_reason`` for the flush-physics floor: a guard nobody can see
-    firing is indistinguishable from a guard that is not there.
-
-    Answers only for draws that WOULD otherwise have been claimed. An event
-    that is not flush-shaped was never a toilet, and reporting a veto on it
-    would inflate the count with cases the veto had no part in.
+    wants to REPORT a veto asks here (as with ``toilet_veto_reason``): a guard
+    nobody can see firing is indistinguishable from one that is not there.
+    Answers only for draws that WOULD otherwise have been claimed — a veto
+    reported on a non-flush-shaped event would inflate the count with cases the
+    veto had no part in.
     """
     if not in_appliance_burst(burst):
         return None
@@ -465,18 +428,13 @@ def has_flush_flow_signature(features: Dict[str, Any],
                              calib: Optional[Dict[str, Any]] = None) -> bool:
     """Does this draw move water at the RATE a flush does, throughout?
 
-    Deliberately NOT folded into ``is_flush_shaped``. That predicate is shared:
-    the toilet rule uses it to CLAIM, while the washer sweep, the dishwasher
-    cycle detector and the softener session detector use it to EXCLUDE. Adding
-    a floor there would narrow what counts as a flush everywhere, which quietly
-    LOOSENS all three of those detectors — a change to three tiers that has not
-    been measured. So the floor lives here and is required only where a claim
-    is made.
-
-    ``true_avg_flow_lpm`` is preferred (it excludes the pressure-window padding
-    in ``avg_flow_lpm``); legacy rows without it fall back, and rows with
-    neither pass unchallenged rather than being delabelled by a feature they
-    never had.
+    Deliberately NOT folded into ``is_flush_shaped``: the toilet rule uses that
+    to CLAIM, but the washer, dishwasher-cycle and softener detectors use it to
+    EXCLUDE, so a floor there would narrow "flush" and quietly LOOSEN all three —
+    an unmeasured change. The floor lives here, where a claim is made.
+    ``true_avg_flow_lpm`` is preferred (no pressure-window padding, unlike
+    ``avg_flow_lpm``); legacy rows fall back to it, and rows with neither pass
+    unchallenged rather than being delabelled by a feature they never had.
     """
     flow = _f(features, "true_avg_flow_lpm")
     # A draw that moved water cannot average zero. A non-positive value here
@@ -508,16 +466,16 @@ def detect_washer_cycles(
     limit: int = 4000,
     calib: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Tuple[str, str]]:
-    """Find washer-cycle members on ``circuit``: anchors (main fills) that have at
-    least one same-peak sibling 2-45 min away, plus the family's non-flush-shaped
-    members (top-offs + secondary fills). Returns ``{event_id: (role, group_id)}``
-    where role is ``'anchor'``/``'member'`` and group_id is the anchor's event id
-    (the History cycle-rollup key).
+    """Find washer-cycle members on ``circuit``: anchors (main fills) with at least
+    ``_WASHER_FAMILY_MIN_SIBLINGS`` same-peak siblings 2-45 min away, plus the
+    family's non-flush-shaped members (top-offs + secondary fills). Returns
+    ``{event_id: (role, group_id)}``, role ``'anchor'``/``'member'``, group_id the
+    anchor's event id (the History cycle-rollup key).
 
-    ``since_ts`` bounds the scan for the live trailing pass (the window also
-    extends one family-width before since_ts so an anchor just before the bound
-    still claims members inside it). Reads ONLY feature/timestamp columns — never
-    a label column — so the eval harness's leave-one-out stays honest.
+    ``since_ts`` bounds the live trailing pass; callers back it off by a family
+    width so an anchor just before the bound still claims members inside it.
+    Reads ONLY feature/timestamp columns — never a label — so the eval harness's
+    leave-one-out stays honest.
     """
     where = "WHERE circuit = ?"
     params: list = [circuit]
@@ -591,19 +549,17 @@ def detect_dishwasher_cycles(
     calib: Optional[Dict[str, Any]] = None,
     exclude_ids: Optional[set] = None,
 ) -> Dict[str, Tuple[str, str]]:
-    """Find dishwasher-cycle members on ``circuit``: a chain of >= _DW_CYCLE_MIN_MEMBERS
-    small, gentle fills (vol in ``DW_VOL_L``, peak <= ``DW_MAX_PK_LPM``, not flush-shaped),
-    each within ``_DW_CYCLE_CHAIN_GAP_MIN`` of the previous and the whole run within
-    ``_DW_CYCLE_MAX_SPAN_MIN``. Returns ``{event_id: (role, group_id)}`` where role is
-    ``'anchor'``/``'member'`` and group_id is the session's first event id (the History
-    cycle-rollup key, like the washer detector).
+    """Find dishwasher-cycle members on ``circuit``: a chain of gentle fills as
+    defined by the ``_DW_CYCLE_*`` constants. Returns ``{event_id: (role, group_id)}``,
+    role ``'anchor'``/``'member'``, group_id the session's first event id (the
+    History cycle-rollup key, like the washer detector).
 
-    Catches dishwasher runs the per-event cycle-pulse rule misses: gentle fills fail the
-    fill-shaped gate inside ``cycle_pulse_count`` and sit at cpc<3, so a real cycle (e.g.
-    running concurrent with a washer) goes unlabelled. Reads ONLY feature/timestamp
-    columns — never a label — so the eval harness's leave-one-out stays honest. Skips
-    artifact-flagged events (phantom / cross-talk / dribble / excluded) and any id in
-    ``exclude_ids`` (the washer/softener members the caller already claimed)."""
+    Exists because gentle fills fail the fill-shaped gate inside ``cycle_pulse_count``
+    (cpc<3), so the per-event rule misses a real cycle — e.g. one concurrent with a
+    washer. Reads ONLY feature/timestamp columns — never a label — so the eval
+    harness's leave-one-out stays honest. Skips artifact-flagged events (phantom /
+    cross-talk / dribble / excluded) and ``exclude_ids`` (washer/softener members
+    the caller already claimed)."""
     where = ("WHERE circuit = ? AND COALESCE(excluded_from_training, 0) = 0 "
              "AND " + NOT_ARTIFACT_SQL)
     params: list = [circuit]
@@ -629,14 +585,10 @@ def detect_dishwasher_cycles(
         v, pk = r["volume_litres"], r["peak_flow_lpm"]
         if v is None or pk is None or not (dw_vol[0] <= v <= dw_vol[1]) or pk > dw_pk:
             continue
-        # Per-candidate shape gate: a genuine fill is a gentle, steady draw,
-        # while the burst-chaining failure mode (short faucet bursts strung into
-        # a fake fill-and-drain sequence — 1/10 precision post-reseed) rides on
-        # spiky, unsteady candidates. Validated out-of-sample at recall 0.889 /
-        # precision 0.727. Configured constants, NOT auto-fit — LOO shows the
-        # thresholds are weakly identified at n=50. NULL features (legacy rows)
-        # pass unchallenged: the gate must not silently delabel history the
-        # features can't vet.
+        # Per-candidate shape gate (see _DW_CYCLE_MAX_FLOW_VARIABILITY): burst-
+        # chaining rides on spiky, unsteady candidates; a genuine fill is steady.
+        # NULL features (legacy rows) pass unchallenged — the gate must not
+        # silently delabel history the features can't vet.
         fv, ssf = r["flow_variability"], r["steady_state_fraction"]
         if fv is not None and fv > _DW_CYCLE_MAX_FLOW_VARIABILITY:
             continue
@@ -702,14 +654,11 @@ def rule_classify_event(
             return "irrigation_zone", "zone_default"
         return None
 
-    # Two vetoes, and they catch different mistakes. The flow signature rejects
-    # draws that are the wrong SIZE or SHAPE for a flush; the burst check
-    # rejects draws that are the right size in the wrong COMPANY — a washer
-    # filling in stages produces a middle draw indistinguishable from a flush
-    # in isolation, which is exactly what a per-event rule cannot see. A vetoed
-    # claim is not a rejection: it falls through to the model tier, which has
-    # the burst features and was measured to be right 53% of the time on these
-    # against the rule's 24%.
+    # Two vetoes for two mistakes: the flow signature rejects the wrong SIZE or
+    # SHAPE, the burst check the right size in the wrong COMPANY (a washer's
+    # middle fill is a flush in isolation). A vetoed claim falls through to the
+    # model tier, which has the burst features and was right 53% of the time on
+    # these against the rule's 24%.
     if (is_flush_shaped(features, calib, pump_mode=pump_mode)
             and has_flush_flow_signature(features, calib)
             and not in_appliance_burst(burst)):
@@ -736,14 +685,12 @@ def rule_classify_event(
 
 
 # ── Water-softener session detector (in-sample, eval-gated) ───────────────────
-# A regeneration is a long LOW-flow brine draw at a fixed overnight clock time,
-# followed by one or more steady backwash/rinse fills. It is demand-initiated
-# (runs every ~2 weeks, not nightly) but ALWAYS starts at the same time — so the
-# configured start band + the >=90-min span are the discriminators, NOT a pulse
-# count (coalescing reduces the brine to a few long events, so a count gate would
-# be fragile). The backwash looks like a shower (vol ~219 L, peak ~20) and only
-# SESSION CONTEXT disambiguates it — within a confirmed session window a non-flush
-# fill IS the backwash.
+# A regen is a long LOW-flow brine draw at a fixed overnight clock time, then one
+# or more steady backwash/rinse fills. Demand-initiated (every ~2 weeks) but ALWAYS
+# the same start time, so the discriminators are the start band + the >=90-min
+# span — NOT a pulse count, which coalescing (brine -> a few long events) makes
+# fragile. The backwash looks like a shower (~219 L, peak ~20 L/min); only session
+# context says otherwise: a non-flush fill inside a confirmed session IS the backwash.
 _SOFTENER_LOWFLOW_CEIL_LPM: float = 1.5     # brine draw mean-flow ceiling
 _SOFTENER_MIN_SPAN_MIN: float = 90.0        # a real regen runs ~2.5 h; >=90 min gate
 _SOFTENER_MAX_SPAN_MIN: float = 210.0       # ...and <=3.5 h — caps the chain so it
@@ -791,38 +738,29 @@ def detect_softener_sessions(
 ) -> Dict[str, Tuple[str, str]]:
     """Find water-softener regeneration sessions on ``circuit``.
 
-    Returns ``{event_id: (role, group_id)}`` where role is ``'span'`` (a low-flow
-    brine/rinse event) or ``'backwash'`` (a non-flush steady fill within the
-    session window), and group_id is the session's first chain-event id (the
-    History rollup key).
+    Returns ``{event_id: (role, group_id)}``: role ``'span'`` (a low-flow
+    brine/rinse event) or ``'backwash'`` (a non-flush steady fill in the session
+    window), group_id the session's first chain-event id (the History rollup key).
 
-    A session is a run of consecutive NON-flush events — each within
-    ``_SOFTENER_CHAIN_GAP_MIN`` of the previous (and within ``_SOFTENER_MAX_SPAN_
-    MIN`` of the start) — that STARTS with a low-flow event whose local clock time
-    falls within ``band_center_min`` ± ``_SOFTENER_START_BAND_MIN``, AND whose
-    LOW-FLOW brine itself spans >= ``_SOFTENER_MIN_SPAN_MIN`` (a single low-flow
-    blip followed by moderate-flow draws is incidental morning activity, not a
-    regen), AND that contains a REAL backwash — a >= ``_SOFTENER_BACKWASH_MIN_VOL_L``
-    non-low fill, in-chain or trailing. A low-flow chain with no such fill (however
-    many fragments) is rejected: a real regen always ends with a backwash/refill.
-    A flush-shaped event ends the run (a 3 am flush during laundry/regen is
-    irreducibly ambiguous, left to the per-event tiers). A trailing backwash up to
-    ``_SOFTENER_BACKWASH_TAIL_MIN`` past the run is also claimed.
+    A session is a run of consecutive NON-flush events (chain gap / max span per
+    the ``_SOFTENER_*`` constants) that STARTS with a low-flow event inside
+    ``band_center_min`` ± ``_SOFTENER_START_BAND_MIN`` (local clock), whose brine
+    spans >= ``_SOFTENER_MIN_SPAN_MIN``, and that contains a REAL backwash (a
+    >= ``_SOFTENER_BACKWASH_MIN_VOL_L`` non-low fill, in-chain or trailing up to
+    ``_SOFTENER_BACKWASH_TAIL_MIN`` past the run). A flush-shaped event ends the
+    run — a 3 am flush during a regen is irreducibly ambiguous and stays with the
+    per-event tiers.
 
-    ``band_center_min`` is minutes-since-LOCAL-midnight (parse_hhmm_to_minutes of
-    the user's regen time). ``tz`` is the home timezone used to convert each
-    event's stored-UTC start_ts to local for the band test — pass it so the band
-    is DST-correct; tz=None compares in the stored (UTC) clock (tests/eval).
-    ``since_ts`` bounds the scan for the live trailing pass. Reads only feature/
-    timestamp columns plus the phantom/cross-talk ARTIFACT verdicts (never a fixture
-    LABEL), so the eval's label-free LOO stays honest.
-
-    Pressure-restoration phantoms and cross-talk are EXCLUDED from the candidate
-    stream: both moved no real water on this circuit (volume_litres_effective == 0),
-    so neither can be part of a brine draw. A 66-min phantom must not anchor a session
-    or bridge an 80-min gap between unrelated drips — on 2026-06-16 a phantom-bridged
-    chain walked 3 h and absorbed a real 97 L shower as a fake "backwash", clearing
-    even the backwash gate.
+    ``band_center_min`` is minutes-since-LOCAL-midnight (parse_hhmm_to_minutes);
+    ``tz`` converts each stored-UTC start_ts to local so the band is DST-correct,
+    and tz=None compares in UTC (tests/eval). ``since_ts`` bounds the live
+    trailing pass. Reads feature/timestamp columns plus the phantom/cross-talk
+    ARTIFACT verdicts, never a fixture LABEL, so the eval's label-free LOO stays
+    honest. Phantoms and cross-talk are EXCLUDED because they moved no real water
+    (volume_litres_effective == 0): a 66-min phantom must not anchor a session or
+    bridge an 80-min gap between unrelated drips — a phantom-bridged chain once
+    walked 3 h and absorbed a real 97 L shower as a fake "backwash", clearing even
+    the backwash gate.
     """
     where = ("WHERE circuit = ? "
              "AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
@@ -924,14 +862,11 @@ def detect_softener_sessions(
                         or (r2["volume_litres"] or 0.0) < _SOFTENER_BACKWASH_MIN_VOL_L
                         or is_flush_shaped(_softener_feat(r2), calib))
 
-        # A real regen ALWAYS ends with a backwash/refill — a big (>= _SOFTENER_BACKWASH_
-        # MIN_VOL_L), non-low, non-flush fill (~220 L observed), either in the chain
-        # (last_bw_end, the >=30 L test above) or just past it (_is_trailing_bw, same
-        # floor). A multi-event low-flow chain with NO such fill — e.g. scattered overnight
-        # drips bridged across a gap by a zero-volume pressure-restoration phantom — is
-        # incidental activity, not a regen, however many fragments it has. The backwash is
-        # high-flow (~15 L/min) so coalescing (low-flow chatter only) can never absorb it
-        # into the brine span, so requiring it never drops a real coalesced regen.
+        # A real regen ALWAYS ends with a backwash/refill (~220 L), in-chain
+        # (last_bw_end) or trailing (_is_trailing_bw); a low-flow chain with no such
+        # fill — e.g. overnight drips bridged by a zero-volume phantom — is incidental
+        # however many fragments it has. Safe to require: the backwash is high-flow
+        # (~15 L/min), so low-flow coalescing can never fold it into the brine span.
         has_backwash = last_bw_end is not None or any(
             _is_trailing_bw(s2, r2) for (s2, _e2, r2) in evs)
         if not has_backwash:

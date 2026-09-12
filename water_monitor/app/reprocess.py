@@ -1,18 +1,15 @@
 """Shared reprocess-window orchestration.
 
-A "reprocess" deletes a circuit's purely-machine-derived events overlapping a time
-window (reversing their volume) and re-imports that window from HA flow history, so
-a garbled stored event — e.g. an irrigation run that failed to close and absorbed a
-whole day — is rebuilt as the real runs. Two UIs drive it through the SAME core:
-
-  * the History event modal (window = the clicked event's own span ± a buffer), and
-  * the Settings → Dev tools date tool (window = a local calendar range).
-
-Keeping the delete + auto-widen + import logic here (not duplicated in each router)
-guarantees both paths behave identically. Reuses ``delete_events_in_range`` (the
-overlap-aware, volume-reversing, label-preserving delete),
-``historical_importer.import_range`` (HA reconstruction), and the
-``run_isolated_write`` / ``get_write_lock`` admin-write serialisation.
+A reprocess deletes a circuit's purely-machine-derived events overlapping a time
+window (reversing their volume) and re-imports that window from HA flow history,
+so a garbled stored event (an irrigation run that failed to close and absorbed a
+whole day) is rebuilt as the real runs. The History event modal (window = the
+clicked event's span ± a buffer) and the Settings → Dev tools date tool (window =
+a local calendar range) both drive this ONE core, so the delete + auto-widen +
+import path cannot diverge between them. Built on ``delete_events_in_range``
+(overlap-aware, volume-reversing, label-preserving), ``import_range`` (HA
+reconstruction) and the ``run_isolated_write`` / ``get_write_lock`` admin-write
+serialisation.
 """
 from __future__ import annotations
 
@@ -32,21 +29,19 @@ from .database import (delete_events_in_range, find_overlapping_event,
 
 log = logging.getLogger(__name__)
 
-# ── dev.38 guarded auto-split ────────────────────────────────────────────────
+# ── guarded auto-split ───────────────────────────────────────────────────────
 # Over-merged events (the live detector welds draws 30 s–5 min apart into one
 # envelope; the importer reconstructs at 15 s granularity). These gate which stored
 # events are CANDIDATES and confirm a real over-merge via a dry-run reconstruction.
 _SPLIT_MIN_IDLE_S: float = 60.0   # internal idle gap (dur − active) the importer's 15 s splits
 _SPLIT_MIN_PERIODS: int = 2       # dry-run must find >= 2 draws (1 = single draw, skip)
 _SPLIT_MAX_PERIODS: int = 10      # ...and <= K — more is chatter (e.g. softener brine), skip
-# Scan the whole window HA can still rebuild from, not just recently-settled events:
-# an over-merged event that was missed (or one freed later by a label being cleared)
-# must still be reconsidered. This is a fast-path SKIP HINT, never a
+# Scan the whole window HA can still rebuild from (a missed over-merge, or one
+# freed by a cleared label, must be reconsidered). A fast-path SKIP HINT, never a
 # correctness boundary: purge_keep_days is user-configurable and NOT queryable
-# (ha_client.get_ha_config wraps HA's core config, which does not expose recorder
-# options), and HA's purge runs on a daily schedule, so a window "9.8 days old" may
-# already be gone. _probe_refusal decides per window; the margin below just keeps this
-# hint on the safe side of that schedule so we do not spend fetches on dead candidates.
+# (ha_client.get_ha_config does not expose recorder options) and HA purges on a
+# daily schedule, so a window "9.8 days old" may already be gone. _probe_refusal
+# decides per window; the margin keeps this hint clear of that schedule.
 _SPLIT_RETENTION_MARGIN_H: int = 12
 _SPLIT_LOOKBACK_H: int = HA_HIGH_FIDELITY_DAYS * 24 - _SPLIT_RETENTION_MARGIN_H
 _SPLIT_SETTLE_MIN: int = 60       # ...older than this, so the event is done being extended
@@ -94,13 +89,11 @@ def compute_widened_window(
 def _probe_refusal(dry: Dict[str, Any], stored_volume_l: float) -> Optional[str]:
     """Why this window must NOT be rebuilt, or ``None`` to proceed.
 
-    The single place both reprocess UIs and the hourly auto-split decide whether HA's
-    history can be trusted to reproduce what a delete would remove. Fails CLOSED: any
-    doubt is a refusal, because the cost of a wrong "yes" is deleted water and the cost
-    of a wrong "no" is an event left exactly as it is.
-
-    Reasons are stable identifiers — routers map them to user-facing text and the
-    auto-split records them in ``events.split_evaluation_outcome``.
+    The single place both reprocess UIs and the hourly auto-split decide whether
+    HA's history can reproduce what a delete would remove. Fails CLOSED: a wrong
+    "yes" is deleted water, a wrong "no" is an event left exactly as it is.
+    Reasons are stable identifiers — routers map them to user-facing text and
+    the auto-split records them in ``events.split_evaluation_outcome``.
     """
     if dry.get("fetch_failed"):
         return "fetch_failed"          # transient — the caller may retry later
@@ -127,19 +120,16 @@ def _kept_event_blockers(
 ) -> Tuple[int, list]:
     """Simulate the importer's insert-time overlap skip BEFORE the delete.
 
-    ``_import_range`` drops a reconstructed period shorter than the importer's
-    minimum, and skips one that meaningfully overlaps an existing event
-    (``find_overlapping_event`` — most-protected row first; a contained machine row
-    blocks like any other). After a reprocess delete the only rows left to collide
-    with are the ones the delete KEEPS: user-labelled, user-classified, user-ignored,
-    or machine rows outside its selection (a row whose label the cycle/anchor
-    detectors wrote is machine output and IS in the delete selection, so it does not
-    block). This asks that exact question against those exact rows by excluding the
-    deletable ids in-query, so its answer is the importer's answer.
-
-    One connection, one loop — never one ``run_db`` per period (the interleave
-    window). Returns ``(rebuildable_count, blockers)`` where ``blockers`` is a list of
-    ``(period_index, blocking_row)`` for the periods that would be skipped.
+    ``_import_range`` drops a reconstructed period shorter than its minimum and
+    skips one that overlaps an existing event (``find_overlapping_event``,
+    most-protected row first; a contained machine row blocks like any other).
+    After a reprocess delete the only rows left to collide with are the ones it
+    KEEPS — user-labelled, user-classified, user-ignored, or machine rows outside
+    its selection (cycle/anchor-labelled rows are machine output and ARE in the
+    selection, so they do not block) — so the deletable ids are excluded
+    in-query and the answer is the importer's answer. One connection, one loop,
+    never one ``run_db`` per period (the interleave window). Returns
+    ``(rebuildable_count, blockers)``, blockers as ``(period_index, row)``.
     """
     rebuildable = 0
     blockers: list = []
@@ -161,21 +151,16 @@ def _kept_event_refusal(
 ) -> Tuple[Optional[str], float, float]:
     """Turn ``_kept_event_blockers``'s answer into a refusal reason.
 
-    * no rebuildable period at all → ``blocked_by_kept_events`` (the delete would
-      remove the event and the importer would then insert nothing: delete,
-      0 imported, restore, "see addon log");
-    * some periods blocked → compare the water HA shows in the blocked periods
-      against the stored water on the distinct rows blocking them. If the kept rows
-      cover it (within the same coverage tolerance as the volume gate) the rebuild
-      may proceed: the importer skips those periods and their water is already on
-      the record. If they don't, ``kept_events_underfit`` — deleting the wrapper
-      would make the difference vanish, and the truth pipeline never makes real
-      water invisible.
-    A dry-run that carries no ``period_volumes_l`` (an older caller) can't be
-    weighed, so it is only ever refused on the no-period case.
-
-    Both volumes are computed BEFORE any branch returns, so the caller's log
-    never prints a figure that was not measured -- see the comment below.
+    No rebuildable period at all → ``blocked_by_kept_events`` (otherwise: delete,
+    0 imported, restore, "see addon log"). Some periods blocked → weigh the water
+    HA shows in them against the stored water on the distinct rows blocking them:
+    if the kept rows cover it (same tolerance as the volume gate) the rebuild may
+    proceed — the importer skips those periods and their water is already on the
+    record; if not, ``kept_events_underfit``, because deleting the wrapper would
+    make the difference vanish and real water must never become invisible. A
+    dry-run without ``period_volumes_l`` (an older caller) cannot be weighed, so
+    it is refused only on the no-period case. Both volumes are computed BEFORE
+    any branch returns, so the caller's log never prints an unmeasured figure.
     Returns ``(reason_or_None, blocked_period_volume_l, blocker_volume_l)``.
     """
     # Weigh the water FIRST, so every branch reports what it actually measured.
@@ -217,40 +202,33 @@ async def reprocess_window(
     """Delete ``circuit``'s machine events overlapping ``[from_dt, to_dt]`` and
     re-import the (auto-widened) span from HA history.
 
-    Returns ``{"deleted", "imported", "widened", "from", "to"}``, or
-    ``{"busy": True}`` when another admin write is already running, or
-    ``{"refused": <reason>}`` when the probe below says the rebuild cannot be
-    trusted. Deliberately does NOT call ``update_import_state`` — re-importing a
-    past range must never move the catch-up checkpoint backward.
+    Returns ``{"deleted", "imported", "widened", "from", "to"}``, ``{"busy":
+    True}`` when another admin write is running, or ``{"refused": <reason>}``
+    when the probe says the rebuild cannot be trusted. Never calls
+    ``update_import_state`` — re-importing a past range must not move the
+    catch-up checkpoint backward.
 
-    PROBE FIRST. An empty-but-SUCCESSFUL fetch is not an error: ``import_range``
-    returns 0 without raising, so a delete-then-fetch order leaves the events deleted
-    with their volume reversed and the restore path never firing — which is exactly
-    what reprocessing anything past the HA recorder's window does. The fetch happens
-    BEFORE the delete, via the importer's existing ``dry_run_reconstruction``, and
-    the delete only proceeds against history proven able to rebuild the water:
+    PROBE FIRST. ``import_range`` returns 0 on an empty-but-successful fetch
+    without raising, so delete-then-fetch would leave the events deleted, their
+    volume reversed, and the restore path never firing — exactly what
+    reprocessing past the HA recorder's window does. The fetch
+    (``dry_run_reconstruction``) therefore precedes the delete, which proceeds
+    only against history proven able to rebuild the water: fetch succeeded,
+    periods found, no recorder-gap markers, and >= ``_SPLIT_MIN_VOLUME_COVERAGE``
+    of the stored volume re-integrated. Shared so BOTH UIs inherit it, and
+    independent of ``purge_keep_days`` (user-configurable, not queryable): the
+    probe answers per window, so 3 days of retention is as safe as 30.
 
-      * the fetch succeeded (``fetch_failed``),
-      * it found something to rebuild (non-empty ``periods``),
-      * it has no recorder-gap markers (``gappy``), and
-      * its re-integrated flow accounts for >= ``_SPLIT_MIN_VOLUME_COVERAGE`` of
-        the stored volume the delete would remove.
-
-    That last gate is the trust check, shared so BOTH UIs inherit it. It
-    deliberately does NOT depend on any assumption about ``purge_keep_days``, which
-    is user-configurable and not queryable. A home keeping 3 days is as safe as one
-    keeping 30 — the probe answers per window.
-
-    ``probe`` lets a caller that has ALREADY dry-run this exact window pass the
-    result in (the hourly auto-split has one in hand), avoiding a second fetch. It
-    is ignored if the window widens below, because then it covers the wrong span.
+    ``probe`` lets a caller that has ALREADY dry-run this exact window (the
+    hourly auto-split) pass the result in; it is ignored if the window widens,
+    since it then covers the wrong span.
 
     Atomicity: probe-first makes the empty-rebuild case impossible rather than
-    recoverable, and ``restore_deleted_events`` is the defence for what remains — an
-    exception mid-rebuild, or a purge landing between the probe and the import. NOT
-    crash-atomic: a hard kill in the sub-second window between the committed delete
-    and the re-import leaves the events deleted with no restore. A durable
-    pending-reprocess journal is deliberate future work.
+    recoverable; ``restore_deleted_events`` covers what remains (an exception
+    mid-rebuild, a purge between probe and import). NOT crash-atomic: a hard
+    kill between the committed delete and the re-import leaves the events
+    deleted with no restore; a durable pending-reprocess journal is deliberate
+    future work.
     """
     importer = getattr(orch, "historical_importer", None)
     if importer is None:
@@ -404,26 +382,22 @@ async def auto_split_merged_events(
     """Guarded auto-split of over-merged events. OFF unless
     ``home_profile.auto_split_enabled``.
 
-    Scans recently-settled, UNLABELLED, multi-segment events with a large internal idle
-    gap (likely several distinct draws welded into one envelope), confirms each via a
-    DRY-RUN reconstruction (``importer.dry_run_reconstruction`` — the importer's
-    15 s-granular period detection, no delete/store), and only then re-imports it split
-    via ``reprocess_window``. Candidates include inflated ``sparse_envelope`` singles (the
-    "brief use, long idle tail" events — excluded_from_training=1 but exactly what this
-    cleans). Guards: user-labelled / user-classified / user-ignored, ARTIFACT verdicts
-    (phantom / cross-talk / dribble — never reprocessed, they may carry a zeroed volume),
-    anomaly-flagged, and softener-brine (``softener_session`` / ``water_softener``) events
-    are never candidates; the dry-run gate (split ``_SPLIT_MIN_PERIODS..._SPLIT_MAX_PERIODS``
-    or a single-draw SHRINK) skips clean singles and many-pulse chatter; and
-    a window whose history is UNTRUSTWORTHY (gap markers, or a reconstructed flow volume
-    that can't account for ~90% of the stored volume) is never reprocessed, so incomplete
-    recorder data can never shrink away real recorded water. Volume stays balanced
-    through ``reprocess_window``'s ledger chokepoint. Re-imported sub-draws are
-    single-segment, so they never re-trigger (no oscillation — structural, restart-safe).
-    ``checked`` (an in-memory id set the caller carries across passes) avoids re-fetching
-    a SETTLED decision every pass; transient outcomes (fetch failure, writer busy) are
-    deliberately NOT added, so they retry on the next pass.
-    Best-effort. Returns ``{"scanned","split","skipped","disabled?"}``."""
+    Scans recently-settled, UNLABELLED events with a large internal idle gap —
+    several draws welded into one envelope, or an inflated ``sparse_envelope``
+    single (excluded_from_training=1, but exactly what this cleans) — confirms
+    each by a DRY-RUN reconstruction, and only then rebuilds it via
+    ``reprocess_window`` (which keeps the volume ledger balanced). Never
+    candidates: user-labelled / user-classified / user-ignored rows, ARTIFACT
+    verdicts (phantom / cross-talk / dribble may carry a zeroed volume),
+    anomaly-flagged events, and softener brine. The dry-run gate
+    (``_SPLIT_MIN_PERIODS..._SPLIT_MAX_PERIODS`` draws, or a single-draw
+    SHRINK) skips clean singles and chatter; ``_probe_refusal`` refuses gappy
+    or volume-unaccounted history, so incomplete recorder data can never shrink
+    real recorded water. Re-imported sub-draws are single-segment, so they
+    never re-trigger (no oscillation, restart-safe). ``checked`` is carried
+    across passes to skip SETTLED decisions; transient outcomes (fetch failure,
+    writer busy) are deliberately NOT added, so they retry. Best-effort.
+    Returns ``{"scanned","split","skipped","disabled?"}``."""
     importer = getattr(orch, "historical_importer", None)
     if importer is None:
         return {"scanned": 0, "split": 0, "skipped": 0}

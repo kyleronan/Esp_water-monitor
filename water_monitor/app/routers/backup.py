@@ -1,25 +1,11 @@
-"""
-Backup / restore router — three-tier design.
+"""Backup / restore router — three tiers.
 
-EXPORT
-  GET /backup/export/quick-restore
-      JSON — settings + training + last 365 days. Small (~1-5 MB).
-             Used for reinstall recovery and setup wizard restore.
-
-  GET /backup/export/history-archive
-      SQLite (.db) — events + hourly_volume, all history.
-                     Compact binary. Import post-setup to restore long-term history.
-
-  GET /backup/export/full
-      ZIP — raw water_monitor.db + settings.json summary.
-            Full data archive. Not designed for import.
-
-IMPORT
-  POST /backup/import/quick-restore    — restore from quick-restore JSON
-  POST /backup/import/history-archive  — merge history from SQLite archive
-
-UI
-  GET /backup  — backup/restore page
+Quick-restore JSON: QUICK_RESTORE_TABLES plus the last QUICK_RESTORE_DAYS of
+events / hourly_volume (~1-5 MB); reinstall recovery and the setup wizard's
+restore. History archive (.db): HISTORY_ARCHIVE_TABLES, all history; imported
+post-setup as a merge that keeps existing rows. Full ZIP: the scrubbed raw
+database plus a settings summary; an archive, not designed for import. Large
+files bypass the ingress body limit through /share/water_monitor, both ways.
 """
 from __future__ import annotations
 
@@ -102,25 +88,21 @@ def _extract_dir() -> Path:
     return d
 
 
-# A /share filename is attacker-chosen and is about to become part of a SQLite
-# connect string. `?` and `#` are legal Linux filename characters, so
-# `x?mode=rwc&.db` passes a bare-basename + suffix check, then turns
-# `file:/share/water_monitor/x?mode=rwc&.db?mode=ro` into a READ-WRITE open of
-# a DIFFERENT file (`x`): SQLite takes the path up to the first `?` and honours
-# the attacker's `mode`. URI mode is dropped below; this allowlist is the belt
-# to that braces, and also keeps `%` (URI escapes), newlines and quoting out of
-# the path entirely.
+# A /share filename is attacker-chosen and becomes part of a SQLite path. `?`
+# and `#` are legal filename characters, so `x?mode=rwc&.db` passes a
+# bare-basename + suffix check and, opened as a URI, becomes a READ-WRITE open
+# of a DIFFERENT file (`x`): SQLite stops at the first `?` and honours the
+# attacker's `mode`. _merge_archive_from_path drops URI mode (braces); this
+# allowlist is the belt, and keeps `%`, newlines and quoting out of the path.
 _SHARE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
-# Tables the full export must NOT carry off the add-on's own disk. /share is
-# readable by every add-on that maps it, so exporting there publishes whatever
-# is in the file.
-#   csrf_server_secret — the HMAC key behind every CSRF token. Regenerable and
-#     of no value in a restore, so there is nothing to trade off: exclude it.
-#     (Encrypting the export instead would only move the key problem.)
-#   seen_users.display_name — Home Assistant account names, harvested by
-#     first-sight upsert. Nothing restores from them; the user_id is what the
-#     RBAC tables key on, so the names are pure disclosure.
+# What the full export must NOT carry off the add-on's disk: /share is readable
+# by every add-on that maps it, so exporting there publishes the file.
+#   csrf_server_secret — the HMAC key behind every CSRF token; regenerated on
+#     first use after a restore, so exclude rather than encrypt (encrypting
+#     would only move the key-custody problem).
+#   seen_users.display_name — HA account names from the first-sight upsert;
+#     nothing restores from them (RBAC keys on user_id), so pure disclosure.
 EXPORT_EXCLUDED_TABLES = ("csrf_server_secret", "csrf_tokens")
 # operator_users.display_name is deliberately KEPT: it is the label an admin
 # attached to a grant, and a restored install that lost it shows a bare user id
@@ -140,19 +122,15 @@ RETARGETING_RESTORE_TABLES = ("device_config", "circuit_entity_map",
 
 # Included in the quick-restore JSON (full rows, no date filter).
 #
-# INVARIANT — this list is PRIVILEGED, not merely "settings". Three of
-# its members change what the add-on does to the house rather than what it
-# remembers about it:
-#   device_config / circuit_entity_map — WHICH Home Assistant entities the
-#       add-on reads and drives, valve switches included. A restore can point
-#       the valve control at a different entity.
-#   leak_test_schedule — WHEN the add-on closes the main valve by itself.
-# So importing a quick-restore file is a control-plane change, not a data
-# import. That is defensible — it is admin-only, behind an explicit "restore
-# settings" checkbox, and a restore that could not re-point entities would be
-# useless after a rebuild — but it must be a DECISION, not a side effect of
-# whatever happens to be in this list. Adding another table with the same
-# reach means updating RETARGETING_RESTORE_TABLES and its test, deliberately.
+# INVARIANT — this list is PRIVILEGED, not merely "settings": device_config /
+# circuit_entity_map decide WHICH HA entities the add-on reads and drives
+# (valve switches included — a restore can re-point valve control), and
+# leak_test_schedule decides WHEN it closes the main valve by itself. Importing
+# a quick-restore file is therefore a control-plane change. Defensible (admin-
+# only, behind an explicit checkbox, and a restore that could not re-point
+# entities would be useless after a rebuild) but it must stay a DECISION:
+# adding a table with that reach means updating RETARGETING_RESTORE_TABLES
+# and its test, deliberately.
 QUICK_RESTORE_TABLES = [
     "device_config", "circuit_entity_map", "home_profile",
     "circuit_profile", "learning_config", "sensitivity_config",
@@ -194,20 +172,15 @@ def _row_counts(db, tables: List[str]) -> Dict[str, int]:
 
 
 
-# ── Export: study snapshot (dev46 46p) ────────────────────────────────────────
+# ── Export: study snapshot ────────────────────────────────────────────────────
 
 def scrub_export_copy(conn: sqlite3.Connection) -> Dict[str, int]:
     """Strip the add-on's own secrets from a SNAPSHOT (never the live DB).
 
-    A full export lands in /share, which every add-on holding `share:rw` can
-    read, so anything in the file is published to them. Exclusion rather than
-    encryption: the CSRF server secret is regenerated on first use after a
-    restore and carries no user value, and encrypting would only replace one
-    key-custody problem with another.
-
-    The caller MUST ``VACUUM`` afterwards. A DELETE moves pages onto the
-    freelist; it does not erase them, and a freelist page in a shipped .db is
-    trivially recoverable — the scrub is cosmetic without the rewrite.
+    Why these tables and columns: see EXPORT_EXCLUDED_TABLES. The caller MUST
+    ``VACUUM`` afterwards: a DELETE only moves pages onto the freelist, and a
+    freelist page in a shipped .db is trivially recoverable — without the
+    rewrite the scrub is cosmetic.
     """
     removed: Dict[str, int] = {}
     for tbl in EXPORT_EXCLUDED_TABLES:
@@ -310,19 +283,15 @@ async def _snapshot_db(db_path) -> bytes:
 
 @router.get("/export/study-snapshot", response_class=Response)
 async def export_study_snapshot(request: Request):
-    """One click for the "fresh export" every study needs.
-
-    The payload is the whole database plus a manifest stamping schema version,
-    add-on version and export time — a study that cannot say WHICH schema and
-    build it was run against is not reproducible.
+    """One click for the "fresh export" every study needs: the whole database
+    plus a manifest stamping schema version, add-on version and export time —
+    a study that cannot say which build it ran against is not reproducible.
 
     Two gates, both because SQLite's backup restarts from scratch whenever
-    another connection writes the source:
-      * startup — the boot pass writes at every chunk boundary, and "export
-        right after a restart" is exactly the workflow, so an ungated export
-        could restart indefinitely;
-      * an in-flight rebuild — same problem, minutes long, and the operator
-        gets no explanation for the wait.
+    another connection writes the source: the boot pass (writes at every chunk
+    boundary, and "export right after a restart" is exactly the workflow, so an
+    ungated copy could restart indefinitely) and an in-flight rebuild (minutes
+    long, and the operator would get no explanation for the wait).
     """
     from ..db_migrations import _CURRENT_VERSION
 
@@ -376,7 +345,7 @@ async def export_study_snapshot(request: Request):
 
 def _addon_version() -> str:
     """Best-effort add-on version for the manifest (same source as the boot
-    log line, 46g)."""
+    log line)."""
     try:
         from ..event_detector_core import _read_addon_version
         return _read_addon_version() or "unknown"
@@ -577,7 +546,7 @@ async def export_full(request: Request):
                      "application/zip")
 
 
-# ── /share pickup + drop-off (dev34) ─────────────────────────────────────────
+# ── /share pickup + drop-off ─────────────────────────────────────────────────
 
 def _resolve_share_file(filename: str) -> Path:
     """Validate a user-supplied /share filename: bare basename, allowed
@@ -630,20 +599,16 @@ def _precheck_member(info: zipfile.ZipInfo) -> None:
 def _extract_db_member(src: Path) -> Path:
     """Stream `water_monitor.db` out of a /share zip under a hard byte cap.
 
-    The cap is a running counter on what ``ZipExtFile.read`` actually hands
-    back — decompressed bytes. ``ZipInfo.file_size`` is metadata the archive
-    author chose, so it is only ever a pre-filter (``_precheck_member``).
+    The cap is a running counter on decompressed bytes as ``ZipExtFile.read``
+    hands them back; ``ZipInfo.file_size`` is author-chosen metadata, so it is
+    only a pre-filter (``_precheck_member``). CPython's ``ZipExtFile`` happens
+    to clamp output to the declared size and then fail the CRC, so an
+    UNDERSTATED size cannot overrun there — an implementation detail, not a
+    format guarantee; the counter is what this code depends on.
 
-    CPython's ``ZipExtFile`` happens to clamp its own output to the declared
-    ``file_size`` and then fails the CRC, so on CPython an UNDERSTATED size
-    cannot actually overrun. That is an implementation detail of one
-    interpreter, not a guarantee of the format — the counter below is what
-    this code depends on.
-
-    Zip-slip is deliberately not checked for, and adding a check would be
-    cargo cult: no member name reaches the filesystem. The name is compared
-    against the literal "water_monitor.db" to pick the member, and the output
-    path is a ``mkstemp`` name we generate.
+    Zip-slip is deliberately not checked for — no member name reaches the
+    filesystem: the name is only compared against the literal
+    "water_monitor.db", and the output path is a ``mkstemp`` name we generate.
     """
     with zipfile.ZipFile(src) as zf:
         info = next((i for i in zf.infolist()
@@ -846,14 +811,10 @@ async def import_quick_restore(
         # restore so cross-table FK ordering (e.g. events → fixtures) does not
         # block the DELETE pass, then re-enable immediately after.
         db.execute("PRAGMA foreign_keys = OFF")
-        # One transaction for the whole restore: if any table's DELETE or
-        # INSERT fails, all prior DELETEs roll back, so no state where some
-        # tables are wiped but not restored.
-        #
-        # Every table in the restore list is cleared unconditionally, even when
-        # the backup has an empty array or omits the table entirely, so the DB
-        # reflects the exact state of the backup — stale rows from a previous
-        # restore cannot bleed through.
+        # One transaction: any DELETE/INSERT failure rolls back every prior
+        # DELETE, so no table is left wiped-but-not-restored. Every listed table
+        # is cleared unconditionally — even when the backup has an empty array
+        # or omits it — so stale rows from a previous restore cannot bleed through.
         try:
             with db:
                 for tbl in restore:
@@ -932,20 +893,18 @@ async def import_history_archive(
 ):
     """Merge history rows from a SQLite archive. Existing rows are kept.
 
-    ``labels_only`` merges ONLY the archive's user-labelled events — the
-    training fuel — instead of the full event history. A fresh start discards
-    the hand-made labels (486 of them, once) and the classifier's coverage,
-    not its accuracy, collapses; importing the labels back roughly triples the
-    pool, particularly for the starved classes.
+    ``labels_only`` merges ONLY the archive's user-labelled events — training
+    fuel, not history. A fresh start once discarded 486 hand labels and the
+    classifier's coverage (not its accuracy) collapsed; importing them back
+    roughly triples the pool, most of all for the starved classes.
 
-    Rows arrive with their FEATURES INTACT. Blanking the pressure columns
-    would look conservative and is the opposite: `pressure_delta_psi` is a
-    LINEAR k-NN dimension, so a NULL becomes a fabricated "0 psi drop" that
-    pulls every imported row into one corner of the space. Cross-regime
-    distance is already handled — the rule-fit pools are windowed by
-    timestamp, the active/edge k-NN tiers hard-require active-flow columns
-    that firmware-3.12 rows lack (so those rows serve the legacy tier), and
-    the pressure feature conditions on supply regime by design.
+    Rows arrive with FEATURES INTACT. Blanking pressure columns looks
+    conservative and is the opposite: `pressure_delta_psi` is a LINEAR k-NN
+    dimension, so NULL becomes a fabricated "0 psi drop" that pulls every
+    imported row into one corner. Cross-regime distance is already handled:
+    rule-fit pools are windowed by timestamp, the active/edge k-NN tiers
+    hard-require active-flow columns firmware-3.12 rows lack (those serve the
+    legacy tier), and the pressure feature conditions on supply regime.
     """
     orch = _orch(request)
     raw = await file.read(MAX_BACKUP_BYTES + 1)
@@ -986,14 +945,11 @@ def _merge_archive_from_path(orch, db_path: Path,
     arc = None
 
     try:
-        # NOT a URI open. `sqlite3.connect(uri=True)` re-parses the path, so
-        # any `?`/`#`/`%` in a /share filename is interpreted as URI syntax:
-        # `x?mode=rwc&.db` truncates the path at the `?` and hands SQLite the
-        # attacker's own mode, opening a DIFFERENT file READ-WRITE, defeating
-        # the one thing `mode=ro` was there for. A plain path plus `query_only`
-        # gives the same read-only guarantee with no parser between us and the
-        # filename. (`_resolve_share_file` rejects such names outright too;
-        # this is the half that does not depend on the caller.)
+        # NOT a URI open: `connect(uri=True)` re-parses `?`/`#`/`%` in the
+        # filename as URI syntax, so `x?mode=rwc&.db` would open a DIFFERENT
+        # file READ-WRITE (see _SHARE_NAME_RE). A plain path plus `query_only`
+        # gives the read-only guarantee with no parser between us and the name,
+        # and does not depend on the caller having validated it.
         arc = sqlite3.connect(str(db_path))
         arc.execute("PRAGMA query_only = ON")
         arc.row_factory = sqlite3.Row
@@ -1030,14 +986,12 @@ def _merge_archive_from_path(orch, db_path: Path,
                         f"PRAGMA table_info({tbl})").fetchall()}
                     # Cluster linkage is a DB-LOCAL derived cache, never
                     # portable: fixture_clusters ids are small autoincrements,
-                    # so an archive row's cluster_id points at a missing
-                    # cluster here at best and a DIFFERENT one at worst
-                    # (observed live: 272 orphaned + 11 silently joined to
-                    # wrong clusters and replayed into cluster state every
-                    # boot). Imported rows arrive unlinked; the post-merge
-                    # backfill re-derives membership against THIS db's
-                    # clusters. Features stay intact — they are measurements,
-                    # not references.
+                    # so an archive cluster_id is a missing cluster here at
+                    # best and a DIFFERENT one at worst (observed: 272 orphaned
+                    # + 11 joined to wrong clusters, replayed every boot).
+                    # Rows arrive unlinked; the post-merge backfill re-derives
+                    # membership here. Features are measurements, not
+                    # references — they stay.
                     drop = ({"cluster_id", "match_confidence", "match_level"}
                             if tbl == "events" else set())
                     cols = [c for c in rows[0].keys()
@@ -1073,13 +1027,11 @@ def _merge_archive_from_path(orch, db_path: Path,
                             "Import archive %s: %d of %d row(s) skipped on id "
                             "collision (live rows kept)", tbl, skipped, len(rows))
                     # Heal-on-reimport: rows inserted by an older build still
-                    # carry the source install's cluster linkage (missing or,
-                    # worse, colliding ids). Re-importing the same archive is
-                    # otherwise a no-op (INSERT OR IGNORE), so it doubles as
-                    # the repair channel: clear linkage on every archive row
-                    # that already exists here. Safe — linkage is a derived
-                    # cache the startup backfill/reclassify re-derives against
-                    # THIS db's clusters.
+                    # carry the source install's (missing or colliding) cluster
+                    # linkage. Re-importing is otherwise a no-op (INSERT OR
+                    # IGNORE), so it doubles as the repair channel: clear the
+                    # linkage on every archive row already here. Safe — the
+                    # startup backfill/reclassify re-derives it locally.
                     if tbl == "events":
                         ids = [r["id"] for r in rows if "id" in r.keys()]
                         healed = 0

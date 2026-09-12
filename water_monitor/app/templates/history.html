@@ -10,7 +10,7 @@
 .shape-cell    { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .shape-spark   { display: block; flex-shrink: 0; opacity: .85; }
 
-/* dev15 filter bar — dual-range sliders (no deps). The number inputs are the
+/* Filter bar — dual-range sliders (no deps). The number inputs are the
    real named form fields; JS overlays the sliders and keeps them in sync, so
    no-JS still gets working min/max boxes. */
 .hf-range      { min-width: 170px; }
@@ -76,7 +76,7 @@
   way.{% endcall %}
 {% endif %}
 
-{# ── Filter bar (dev15): date · duration · ΔP · volume · fixture · note ── #}
+{# ── Filter bar: date · duration · ΔP · volume · fixture · note ─────────── #}
 {# Filters the event lists below (pushed into SQL, so the recency limit counts
    MATCHING rows); the daily charts are unaffected. Sliders are progressive
    enhancement over plain min/max number inputs. #}
@@ -252,7 +252,7 @@
 </div>
 
 <script>
-/* dev15 filter bar: dual-range slider enhancement.
+/* Filter bar: dual-range slider enhancement.
    The number inputs are the real named form fields (no-JS fallback). Each
    .hf-range gets two overlaid range inputs synced to them; on submit, values
    still at the full range are blanked and every empty field is disabled so
@@ -505,7 +505,7 @@
               sustained {{ (t.sustained_drop_psi * pressure_factor)|round(pressure_decimals) }} {{ pressure_unit }}
             </span>
             {% endif %}
-            {# dev30 — acknowledge a benign failure (or undo). Display-only. #}
+            {# Acknowledge a benign failure (or undo). Display-only. #}
             {% if _r.startswith('Failed') and is_admin %}
             <form method="post" action="{{ ingress_path }}/history/api/leak-tests/{{ t.id }}/dismiss"
                   style="display:inline;margin:0 0 0 6px"
@@ -1232,7 +1232,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       const first = members[0];                        // latest (start_ts DESC)
       let totVol = 0, unit = '';
       members.forEach(m => {
-        // dev56: effective volume when present, so a de-duplicated wrapper
+        // Effective volume when present, so a de-duplicated wrapper
         // does not inflate the group's total
         const effStr = m.getAttribute('data-volume-effective');
         const dv = ((effStr !== null && effStr !== '')
@@ -1340,7 +1340,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
   // (labelling alone must not silently lock auto-detection off).
   let noTrainInitial = false;
   let clsInitial = { phantom: false, supply_pressure: false, dribble: false, cross_talk: false };
-  // dev33 (§1.1) — the boxes are PRE-CHECKED from the row's *automatic* flags,
+  // The boxes are PRE-CHECKED from the row's *automatic* flags,
   // so a diff against that render state can fire without the user touching a
   // classification box (any drift between d.* and the rendered checkbox posts
   // a `classification` payload, which sets user_classified=1 and rewrites the
@@ -1372,7 +1372,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     document.getElementById('emd-flow').textContent     = d.flow;
     document.getElementById('emd-pressure').textContent = d.pressure;
     document.getElementById('emd-volume').textContent   = d.volume;
-    // dev38 — annotate-only registration estimate (hidden when immaterial).
+    // Annotate-only registration estimate (hidden when immaterial).
     const regDt = document.getElementById('emd-reg-est-dt');
     const regDd = document.getElementById('emd-reg-est');
     if (d.registrationEst) {
@@ -1451,7 +1451,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     document.getElementById('emd-other-valve').textContent =
       ov === '1' ? 'Yes (open)' : ov === '0' ? 'No' : '—';
 
-    // Flow–pressure correlation (dev14) — signed, 2 dp; '—' when not computed.
+    // Flow–pressure correlation — signed, 2 dp; '—' when not computed.
     const corrV = parseFloat(d.corr);
     document.getElementById('emd-corr').textContent =
       Number.isFinite(corrV) ? (corrV > 0 ? '+' : '') + corrV.toFixed(2) : '—';
@@ -1509,7 +1509,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     const phSection = document.getElementById('emd-phantom-section');
     if (d.phantom === '1' || d.mrr === 'overlap_duplicate') {
       // Verdict-specific copy (mirrors the list pill wording). Reset on every
-      // open — the modal is reused across rows. dev56: wrappers carry no
+      // open — the modal is reused across rows. Wrappers carry no
       // phantom bit any more; the duplicate banner opens on the reason.
       const phTitle = document.getElementById('emd-ph-title');
       const phText = document.getElementById('emd-ph-text');
@@ -1668,7 +1668,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
       try { pressPts = pressSig ? JSON.parse(pressSig) : []; }
       catch (err) { console.warn('[evt-modal] invalid pressure signature JSON', err); }
 
-      /* dev38: the flow and pressure arrays are binned from DIFFERENT source
+      /* The flow and pressure arrays are binned from DIFFERENT source
          streams (an ESP 200 Hz flow capture can pair with the ~5 s HA
          pressure series in one row), so drawing both on one shared index
          axis misaligned them on 18.2% of events (audit §3.5). The hi-res
@@ -1754,7 +1754,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         const note = document.createElement('span');
         let noteText = 'Flow curve height reflects the event\'s size tier; values are normalized, not actual units.';
         if (timeAxis) {
-          // dev38 basis caveats from the API.
+          // Basis caveats from the API.
           if (ax.fBasis === 'uniform_exact_unanchored'
               || ax.pBasis === 'uniform_exact_unanchored') {
             noteText += ' Time axis: exact sample spacing; capture start alignment approximate.';
@@ -1767,7 +1767,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         wfMeta.appendChild(note);
       };
 
-      // dev46 (46i): give the SIGNATURE render an honest per-channel time
+      // Give the SIGNATURE render an honest per-channel time
       // axis when the event stored one. The two channels sample on separate
       // callbacks and downsample independently, so their captured spans
       // genuinely differ — without the spans both signatures get stretched
@@ -1788,10 +1788,10 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
         .then(w => {
           if (!w || activeRow !== row) return;   // modal closed / row changed
           const fMax = Array.isArray(w.flow_max) ? w.flow_max.map(Number) : [];
-          // dev44: the old guard here skipped the upgrade when the hi-res
+          // The old guard here skipped the upgrade when the hi-res
           // envelope had fewer points than the signature ("no more detail").
           // It predates the 32→256-pt signature widening, after which it
-          // skipped nearly ALWAYS — leaving the dev38 per-channel TIME AXIS
+          // skipped nearly ALWAYS — leaving the per-channel TIME AXIS
           // unreachable and every modal on the axis-less shared-index
           // overlay. The envelope's value is its real timestamps, not its
           // point count: upgrade whenever it can draw an honest axis.
@@ -1905,7 +1905,7 @@ document.querySelectorAll('time[data-ts]').forEach(el => {
     // Both gates: the user must have TOUCHED a classification box in this modal
     // session (clsTouched) AND the result must differ from what was rendered.
     // The touch gate is the load-bearing one — see the clsTouched note above.
-    // dev46 (46f): its own field, deliberately NOT part of `classification`
+    // Its own field, deliberately NOT part of `classification`
     // — that payload sets user_classified and freezes auto-detection, and
     // this flag must do neither. Sent only when actually changed.
     if (noTrainBox && noTrainBox.checked !== noTrainInitial) {
@@ -2144,7 +2144,7 @@ document.querySelectorAll('canvas.shape-spark').forEach(canvas => {
   let sig;
   try { sig = JSON.parse(canvas.dataset.sig || '[]'); } catch { return; }
   if (!sig.length) return;
-  /* dev38 note: the sparkline's x axis is PROPORTIONAL, not linear time —
+  /* The sparkline's x axis is PROPORTIONAL, not linear time —
      point i sits at i/N through the sample list, and for a software series
      (event-driven ~5 s cadence, every-5th decimated past 120 s) that is not
      linear in seconds. Single-channel, so no cross-channel misalignment;

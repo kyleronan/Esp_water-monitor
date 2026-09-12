@@ -1,58 +1,31 @@
 """
 Historical event importer.
 
-Reconstructs water usage events from HA sensor history and stores any
-that are missing from the addon database. Fills gaps caused by addon
-restarts, HA recorder downtime, or the initial setup period before the
-addon was installed.
+Reconstructs water-usage events from HA sensor history and queues any the
+addon database is missing (addon restarts, recorder downtime, the window
+before the addon was installed).
 
-Event detection strategy
-------------------------
-(The derivation lives in ``importer_periods``; this class keeps thin forwarding
-methods. See that module's docstring for the seam's rules.)
+Period sources (derivation in ``importer_periods``; this class only forwards):
+flow_pulse_onset ON/OFF transitions are primary — HA records every transition,
+and gaps < MERGE_GAP_SECONDS are bridged because slow flow flickers the sensor
+(~2.6 s gap at 0.86 L/min). flow_rate > MIN_FLOW_LPM fills in where onset
+history has holes. A sustained pressure dip is a third source (see the
+PRESSURE_DIP_* constants). The sources are merged and deduplicated.
 
-Primary: flow_pulse_onset ON/OFF transitions
-  - HA records every binary-sensor transition (event-driven, not polled)
-  - Short gaps between ON periods (< MERGE_GAP_SECONDS=15s) are bridged
-    to handle slow-flow sensor flicker (~2.6s gap at 0.86 L/min)
+Pressure: pressure_history_sensor (2 Hz, 1.375 s smoothing) preferred, else
+pressure_avg_sensor (1 Hz, 25 s smoothing). Events are always
+start_trigger='flow'; a clear drop additionally sets has_pressure_transient
+with the measured delta. No 40 Hz shape is available for fingerprinting, but
+duration / flow / delta are accurate enough for volume accounting and coarse
+clustering.
 
-Secondary: flow_rate > MIN_FLOW_LPM sustained readings
-  - Fills in when flow_pulse_onset history has gaps (HA restart, etc.)
-  - Consecutive above-threshold 1Hz readings with < MERGE_GAP_SECONDS gap
+Duplicates: a period is skipped when an event already overlaps it by >= 30 s,
+or >= 10 s and >= 80 % of the shorter one, so re-running a window is safe.
 
-Both sets of detected periods are merged and deduplicated.
-
-Pressure data
--------------
-Tries pressure_history_sensor (pressure_main, 2Hz, 1.375s smoothing)
-first — available after the firmware change that removed entity_category:
-diagnostic.  Falls back to pressure_avg_sensor (pressure_main_avg, 1Hz,
-25s smoothing) if the history sensor entity isn't available.
-
-Historical events are always flagged start_trigger='flow'. If a clear
-pressure drop is detected from the 1Hz or 2Hz recorded data, the event
-is additionally flagged has_pressure_transient=True with the measured
-delta. Without the 40Hz fast sensor, transient *shape* is unavailable
-for fixture fingerprinting, but duration / flow / pressure delta are
-accurate and suitable for volume accounting and coarse clustering.
-
-Duplicate prevention
---------------------
-Before queuing any reconstructed event, checks whether a meaningfully
-overlapping event already exists (overlap >= 30 s, or >= 10 s and >= 80 %
-of the shorter event). Safe to run multiple times over the same window.
-
-Scheduling
-----------
-  Startup backfill — runs once at addon start, covering from the most
-    recent event in the DB back to at most MAX_BACKFILL_DAYS ago (HA
-    recorder default retention = 10 days).
-
-  Periodic catch-up — runs every CHECK_INTERVAL_MINUTES, covering the
-    window since last_check_ts stored in the import_state table.
-
-  Manual import — callable from the settings UI with an arbitrary
-    date range; returns count of events imported.
+Scheduling: startup backfill from the last stored event back to at most
+MAX_BACKFILL_DAYS (= HA recorder default retention); catch-up every
+CHECK_INTERVAL_MINUTES from import_state.last_check_ts; manual import from the
+settings UI over an arbitrary range.
 """
 from __future__ import annotations
 
@@ -198,14 +171,12 @@ class HistoricalImporter:
     CHECK_INTERVAL_MINUTES: int = 30
     MERGE_GAP_SECONDS: int = 15       # bridge flow_pulse_onset gaps shorter than this
     MIN_DURATION_SECONDS: float = 3.0
-    # Containment rule (docs/PIPELINE.md "Duplicate gate"). A reconstructed
-    # period that CONTAINS rows already stored is either already on the record
-    # (stored rows hold >= CONTAINED_ROWS_COVERAGE of its water → dropped) or is
-    # split AROUND those rows so only the water nobody recorded becomes an event.
-    # Runs before find_overlapping_event, whose coverage block stays behind it as
-    # defence in depth. Remainders below the negligible floor, without a flow-rate
-    # fragment inside them (a pressure sag tail is not a draw), or beyond the
-    # per-period cap are dropped and logged — never written on top of a row.
+    # Containment rule (docs/PIPELINE.md "Duplicate gate"): a period that CONTAINS
+    # stored rows is dropped when they hold >= CONTAINED_ROWS_COVERAGE of its water,
+    # else split AROUND them so only unrecorded water becomes an event. Runs before
+    # find_overlapping_event (whose coverage block stays as defence in depth).
+    # Remainders under the negligible floor, holding no flow-rate fragment (a
+    # pressure sag tail is not a draw), or past the cap are dropped, never written.
     CONTAINED_ROWS_COVERAGE: float = VOLUME_COVERAGE_FRACTION
     CONTAINED_REMAINDER_MIN_L: float = OVERLAP_NEGLIGIBLE_L
     MAX_REMAINDERS_PER_PERIOD: int = 10     # = reprocess._SPLIT_MAX_PERIODS (a test pins it)
@@ -240,28 +211,21 @@ class HistoricalImporter:
     # from only one or two pre-dip samples and triggering a spurious period.
     PRESSURE_DIP_MIN_BASELINE_SAMPLES: int = 3
     PRESSURE_DIP_MIN_BASELINE_SPAN_S: float = 5.0
-    # Anti-noise bridge gate. The pressure-dip source exists to BRIDGE the gaps
-    # between real flow bursts (pulsed irrigation), but a LONG dip envelope
-    # containing almost NO flow stitches unrelated trivial blips into one bogus
-    # multi-minute event (two ~0.3 L blips 20 min apart fused into a 20 min
-    # event). A dip period earns its bridge only when it is NOT both long and
-    # near-empty; the underlying flow fragments still import on their own
-    # (subject to MIN_DURATION). Leak-safe: a real draw or a running-toilet
-    # leak's fills carry real volume and never trip this — only an empty
-    # pressure envelope is ever dropped, never flow.
+    # Bridge gate: the dip source exists to bridge gaps between real flow bursts
+    # (pulsed irrigation), but a LONG envelope holding almost NO flow welds
+    # unrelated blips into one bogus event (two ~0.3 L blips 20 min apart → a
+    # 20 min event). A dip bridges only when NOT both long and near-empty; its
+    # flow fragments still import on their own (subject to MIN_DURATION). Leak-safe:
+    # a real draw or running-toilet fill carries volume, so only EMPTY span is dropped.
     PRESSURE_DIP_BRIDGE_LONG_SPAN_S: float = 300.0   # "long" envelope (5 min)
     PRESSURE_DIP_BRIDGE_MIN_VOLUME_L: float = 2.0    # real flow needed to earn a long bridge
-    # The volume gate above only drops a bridge whose flow is TRIVIAL, so a dip
-    # carrying real water would bridge without limit: on a pump-held line the dip
-    # never recovers to its frozen baseline between draws, _pressure_to_periods
-    # emits ONE envelope (measured: 182 min spanning ~14 min of flow and ~99 L,
-    # far over the 2 L gate) and _merge_periods welds every draw into a single
-    # event no reprocess could split. A bridge exists to span the ~40 s
-    # inter-burst gaps, not a 90-minute idle, so cap the gap it may span. 300 s
-    # sits well above those bursts and above the measured 92 s maximum internal
-    # washer/dishwasher gap. Same leak/volume reasoning as the gate above: only
-    # EMPTY span is removed, never flow — and only when the history PROVES the
-    # flow stopped (see _flow_stopped_across; a dark sensor is not an idle).
+    # The volume gate cannot limit a dip carrying real water: on a pump-held line
+    # the dip never recovers to its frozen baseline between draws, so one envelope
+    # (measured: 182 min spanning ~14 min of flow, ~99 L) welds every draw into a
+    # single event no reprocess can split. So cap the gap a bridge may span: 300 s
+    # clears the ~40 s inter-burst gaps and the 92 s max internal washer/dishwasher
+    # gap. Only EMPTY span is removed, never flow, and only where history PROVES
+    # the flow stopped (_flow_stopped_across; a dark sensor is not an idle).
     PRESSURE_DIP_BRIDGE_MAX_GAP_S: float = 300.0     # bridges inter-burst gaps, not idles
 
     def __init__(
@@ -283,9 +247,7 @@ class HistoricalImporter:
         self._orch = orchestrator
         self._running = False
 
-    # ------------------------------------------------------------------ #
-    # Lifecycle                                                            #
-    # ------------------------------------------------------------------ #
+    # ── Lifecycle ──
 
     async def run(self) -> None:
         self._running = True
@@ -325,9 +287,7 @@ class HistoricalImporter:
     def stop(self) -> None:
         self._running = False
 
-    # ------------------------------------------------------------------ #
-    # Public API (settings UI / setup wizard)                              #
-    # ------------------------------------------------------------------ #
+    # ── Public API (settings UI / setup wizard) ──
 
     async def import_range(
         self,
@@ -360,22 +320,19 @@ class HistoricalImporter:
         start: datetime,
         end: datetime,
     ) -> dict:
-        """Dry-run: what would the importer reconstruct over [start, end], WITHOUT
-        deleting or storing anything. The guarded auto-split uses this to decide
-        whether ONE stored event is really several distinct draws, and whether the
-        window's history can be TRUSTED to reproduce the stored water.
+        """What the importer would reconstruct over [start, end]; stores and deletes
+        nothing. The guarded auto-split uses it to decide whether ONE stored event
+        is really several draws and whether the window's history can be TRUSTED.
 
         Returns ``{"periods": [(start_dt, end_dt), ...],
                    "period_volumes_l": [<litres per period, same order>],
                    "flow_volume_l": <integrated flow over the window>,
                    "fetch_failed": bool,   # transient — retry next pass
                    "gappy": bool}``        # 'unavailable'/'unknown' samples in window
-        ``period_volumes_l`` integrates the SAME history slice per period, so the
-        reprocess probe can weigh a period a kept event would block against that
-        event's stored water without re-deriving anything from stored rows.
-        On an unconfigured circuit or a fetch failure the periods are empty and
-        ``fetch_failed`` is set (fail-safe — a dry-run that can't see history must
-        never trigger a split)."""
+        ``period_volumes_l`` integrates the same history slice per period so the
+        reprocess probe can weigh a blocked period against stored water without
+        re-deriving from rows. Unconfigured circuit or fetch failure → empty periods
+        with ``fetch_failed`` set: a dry-run that cannot see history never splits."""
         cfg = self._cfg.get_circuit(circuit)
         pressure_entity = cfg and (cfg.pressure_history_sensor or cfg.pressure_avg_sensor)
         if (not cfg or not self._circuit_has_sensors(cfg)
@@ -411,9 +368,7 @@ class HistoricalImporter:
                     flow_rate_hist, start, end),
                 "fetch_failed": False, "gappy": gappy}
 
-    # ------------------------------------------------------------------ #
-    # Scheduled operations                                                 #
-    # ------------------------------------------------------------------ #
+    # ── Scheduled operations ──
 
     async def _backfill(self) -> None:
         """
@@ -472,23 +427,15 @@ class HistoricalImporter:
                                 window_end.isoformat(), exc)
                     n = 0
                 total += n
-                # Without the rewind, a draw crossing a chunk boundary is stored
-                # as its TAIL only: the period builders never emit a still-active
-                # period, so this chunk stores nothing for it, and the next chunk
-                # sees it already running and opens the event at the boundary.
-                #
-                # `retry_from` is the earliest point whose events were NOT
-                # stored — set only when an event was dropped to a full queue
-                # (which `continue`s before `imported += 1`) or when a period was
-                # still active at the window end (never emitted). Rewinding to it
-                # re-fetches ONLY things that were never written, so it cannot
-                # duplicate — which is what makes it safe here even though the
-                # backfill, unlike _catch_up, has no persistent checkpoint.
-                #
-                # The `> window_start` test is the loop-progress guard: an event
-                # active from the very start of a chunk would rewind to where we
-                # already are and spin forever. That case means a draw longer
-                # than the chunk itself, and is left to a later run.
+                # Without the rewind a draw crossing a chunk boundary is stored as
+                # its TAIL only (builders never emit a still-active period; the
+                # next chunk opens it at the boundary). retry_from is the earliest
+                # point whose events were NOT stored — queue-full drop or still
+                # active at window end — so rewinding re-fetches only unwritten
+                # water and cannot duplicate, despite the backfill having no
+                # checkpoint. `> window_start` is the loop-progress guard: a draw
+                # active from the chunk's very start would spin forever; it is left
+                # to a later run.
                 if retry_from is not None and retry_from > window_start:
                     log.info(
                         "[%s] backfill: rewinding chunk boundary %s → %s "
@@ -543,9 +490,7 @@ class HistoricalImporter:
                 log.info("[%s] catch-up: imported %d new event(s)",
                          cfg.circuit, n)
 
-    # ------------------------------------------------------------------ #
-    # Irrigation zone-switch cross-talk reconciliation                     #
-    # ------------------------------------------------------------------ #
+    # ── Irrigation zone-switch cross-talk reconciliation ──
 
     def _xtalk_watermark_key(self, main_circuit: str) -> str:
         """Synthetic import_state key for the per-main-circuit reconcile watermark
@@ -561,19 +506,15 @@ class HistoricalImporter:
         return None
 
     async def _reconcile_cross_talk(self) -> None:
-        """Irrigation cross-talk reconciliation — ONE watermark-driven pass that is
-        both the backfill and the periodic catch-up. Two near-identical methods
-        here let the watermark advance even when every history fetch failed,
-        permanently skipping outage windows.
-
-        Per eligible main circuit: reconcile [watermark − margin, now] — or the full
-        HA-retention window when no watermark exists yet — in ≤1-day chunks (a
-        full-day 4 Hz pressure pull would overflow the WS frame). The watermark
-        advances ONLY past chunks whose history fetch succeeded
-        (``_reconcile_irrigation_cross_talk`` returns None on a failed fetch); a
-        failure stops the pass so the remaining window is retried next tick, never
-        recorded as done. Idempotent: candidates exclude already-flagged rows, so
-        the margin overlap re-scans harmlessly."""
+        """One watermark-driven pass serving as both backfill and periodic catch-up
+        (split into two near-identical methods, it once let the watermark advance
+        over a window whose every fetch had failed). Per eligible main circuit:
+        reconcile [watermark − margin, now] — the full HA-retention window when no
+        watermark exists — in ≤1-day chunks (a full-day 4 Hz pressure pull overflows
+        the WS frame). The watermark advances ONLY past chunks whose fetch succeeded;
+        ``_reconcile_irrigation_cross_talk`` returns None on a failed fetch, which
+        stops the pass so the rest is retried next tick. Idempotent: candidates
+        exclude already-flagged rows, so the margin overlap re-scans harmlessly."""
         irr = self._irrigation_circuit()
         if irr is None:
             return
@@ -642,16 +583,14 @@ class HistoricalImporter:
     ) -> Optional[int]:
         """Flag main events in [start, end] that are irrigation zone-switch cross-talk.
 
-        Single coherent activity definition (merged irrigation-flow intervals) is used
-        for BOTH candidate selection and the detector's ``irrigation_active``; PiΔ and
-        PmΔ are computed from one history batch over the SAME padded window per event.
-        Returns the count flagged — or **None on a history-fetch failure**, so the
-        caller can hold the watermark and retry. A swallowed failure is recorded
-        as "reconciled" and permanently skips the outage window.
-
-        Cheapest checks first (this runs every catch-up tick, mostly finding
-        nothing): the local candidate SQL, then the small irrigation-flow series,
-        and only when both hit does it pull the two heavy 4 Hz pressure series."""
+        One activity definition (merged irrigation-flow intervals) serves both
+        candidate selection and the detector's ``irrigation_active``; PiΔ and PmΔ
+        come from one history batch over the SAME padded window per event. Returns
+        the count flagged, or **None on a history-fetch failure** so the caller
+        holds the watermark (a swallowed failure permanently skips the outage
+        window). Cheapest checks first, since this runs every catch-up tick: the
+        candidate SQL, then the small irrigation-flow series, and only when both
+        hit the two heavy 4 Hz pressure series."""
         main_press_e = main_cfg.pressure_history_sensor or main_cfg.pressure_avg_sensor
         irr_press_e = irr_cfg.pressure_history_sensor or irr_cfg.pressure_avg_sensor
         irr_flow_e = irr_cfg.flow_sensor
@@ -729,9 +668,7 @@ class HistoricalImporter:
                          sorted(affected_days))
         return flagged
 
-    # ------------------------------------------------------------------ #
-    # Core import logic                                                    #
-    # ------------------------------------------------------------------ #
+    # ── Core import logic ──
 
     async def _import_range(
         self,
@@ -790,18 +727,13 @@ class HistoricalImporter:
             except Exception:
                 pass
 
-        # Checkpoint watermark for the periodic catch-up: the start of any flow
-        # period still ON at the end of this window (onset still ON, or flow_rate
-        # still >= MIN_FLOW_LPM with no OFF transition after). _find_flow_periods
-        # correctly refuses to flush a still-active period, but the catch-up loop
-        # advances last_check_ts to `now` regardless — so an event LONGER than the
-        # catch-up interval has its start march behind the checkpoint and can then
-        # only be recovered by a much-later startup backfill (a 133-min irrigation
-        # run was recovered 4 days late). Returning this start as
-        # retry_from holds the checkpoint at the event's start until it actually
-        # ends, so the next catch-up after it closes reconstructs the full period.
-        # Flow signals only (not the pressure-dip state machine) so a stuck/shifted
-        # pressure baseline can never pin the checkpoint indefinitely.
+        # Start of any flow period still ON at window end (onset ON, or rate >=
+        # MIN_FLOW_LPM with no OFF after). _find_flow_periods refuses to flush a
+        # still-active period while the catch-up advances last_check_ts to `now`,
+        # so an event LONGER than the catch-up interval is otherwise lost until a
+        # much later backfill (a 133-min irrigation run surfaced 4 days late).
+        # Returned as retry_from it holds the checkpoint until the draw ends. Flow
+        # signals only: a stuck pressure baseline must never pin the checkpoint.
         active_since = self._trailing_active_start(onset_hist, flow_rate_hist)
 
         # Detect flow periods — pressure_hist is passed so the state machine can
@@ -932,9 +864,7 @@ class HistoricalImporter:
                           else min(retry_from, active_since))
         return imported, retry_from
 
-    # ------------------------------------------------------------------ #
-    # Containment rule                                                    #
-    # ------------------------------------------------------------------ #
+    # ── Containment rule ──
 
     async def _apply_containment_rule(
         self, cfg, periods: List[Tuple[datetime, datetime]],
@@ -976,17 +906,11 @@ class HistoricalImporter:
                 out.extend(subs)
         return out
 
-    # ------------------------------------------------------------------ #
-    # Period derivation  (bodies live in importer_periods)                #
-    # ------------------------------------------------------------------ #
-    # These forward to the pure module. ``self`` is passed only as the
-    # threshold provider, so an instance- or class-level override of any
-    # constant below still reaches the calculation.
-    #
-    # FOR TESTS: the pure functions call each other through
-    # ``importer_periods``' own globals, NOT back through ``self``. Rebinding
-    # ``imp._pressure_to_periods`` intercepts nothing — patch the module:
-    # ``monkeypatch.setattr(importer_periods, "_pressure_to_periods", ...)``.
+    # ── Period derivation (bodies live in importer_periods) ──
+    # Thin forwards; ``self`` is only the threshold provider, so overriding a
+    # class constant still reaches the calculation. Siblings dispatch through
+    # importer_periods' globals, not ``self`` — to stub one, patch the module
+    # (``monkeypatch.setattr(importer_periods, "_pressure_to_periods", ...)``).
 
     def _split_period_around_rows(
         self, period: Tuple[datetime, datetime], rows: List[Dict],
@@ -1064,9 +988,7 @@ class HistoricalImporter:
             self, history, query_end=query_end,
             using_avg_pressure=using_avg_pressure)
 
-    # ------------------------------------------------------------------ #
-    # Event reconstruction                                                 #
-    # ------------------------------------------------------------------ #
+    # ── Event reconstruction ──
 
     def _reconstruct_event(
         self,
@@ -1173,24 +1095,16 @@ class HistoricalImporter:
         )
 
         # ── Volume from firmware integration sensor ────────────────────
-        # Prefer the cumulative sensor delta over avg_flow × duration to avoid
-        # downsampling errors in long events with fill-pause-fill patterns. The
-        # cumulative-delta computation is shared with the §2 recorder reconcile
-        # (single source of truth).
-        #
-        # ENDPOINT-GAP GUARD — firmware_volume_delta returns a_ts/b_ts
-        # *specifically* so the caller can apply this. The delta is measured
-        # between the FIRST and LAST recorder samples inside the window, so any
-        # water that moved before the first sample or after the last is not in
-        # it. That is a silent UNDER-COUNT that wins, because feature_extractor
-        # prefers volume_litres_measured over the flow integral. Declining here
-        # falls back to the integral, the honest answer when the recorder did not
-        # bracket the event.
-        #
-        # Known residual: the tolerance is absolute (120 s) and a sample can only
-        # land inside the window, so the guard cannot fire on an event shorter
-        # than the tolerance — a 30 s draw whose first sample arrives 25 s in
-        # still yields a delta covering ~5 s.
+        # Prefer the cumulative sensor delta to avg_flow × duration (downsampling
+        # errors in long fill-pause-fill events); firmware_volume_delta is shared
+        # with the recorder reconcile. ENDPOINT-GAP GUARD: the delta spans only the
+        # FIRST..LAST recorder samples inside the window, so unbracketed water is a
+        # silent UNDER-COUNT that wins (feature_extractor prefers
+        # volume_litres_measured over the integral) — hence a_ts/b_ts are returned
+        # and a lead/lag over ENDPOINT_TOL_S declines to the integral. Residual:
+        # the tolerance is absolute (120 s) and samples only land inside the window,
+        # so the guard cannot fire on a draw shorter than it (a 30 s draw sampled
+        # first at 25 s still yields a delta covering ~5 s).
         from .recorder_reconcile import ENDPOINT_TOL_S, firmware_volume_delta
         _vd = firmware_volume_delta(volume_hist, start, end, vol_unit)
         volume_litres_measured: Optional[float] = None
@@ -1266,9 +1180,7 @@ class HistoricalImporter:
             complete=True,
         )
 
-    # ------------------------------------------------------------------ #
-    # Helpers                                                              #
-    # ------------------------------------------------------------------ #
+    # ── Helpers ──
 
     @staticmethod
     def _circuit_has_sensors(cfg: CircuitConfig) -> bool:
@@ -1282,18 +1194,13 @@ def _resample_step_function_1hz(
     end: datetime,
     default: float = 0.0,
 ) -> List[float]:
-    """Resample a step-function history to 1 Hz over [start, end] (inclusive).
+    """Forward-fill a step-function history onto a 1 Hz grid over [start, end]
+    (inclusive), so FeatureExtractor sees a uniform series rather than HA's
+    sparse state-change events.
 
-    HA records state-change events only, not a regular time series.  This
-    function forward-fills the last known value at each integer second so
-    that FeatureExtractor sees a uniform time series rather than sparse
-    change-event indices.
-
-    ``samples`` must be sorted by timestamp.  ``default`` is used before the
-    first sample (e.g. the last known value before ``start``).
-
-    Output length = int((end - start).total_seconds()) + 1.
-    Returns [default] when end <= start.
+    ``samples`` must be sorted by timestamp; ``default`` holds before the first
+    sample (the last known value before ``start``). Output length is
+    int((end - start).total_seconds()) + 1; ``[default]`` when end <= start.
     """
     total_s = int((end - start).total_seconds())
     if total_s <= 0:

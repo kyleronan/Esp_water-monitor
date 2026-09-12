@@ -109,10 +109,9 @@ def _schedule_reclassify(circuit: str) -> None:
             return                      # a newer save superseded this one
         await _bg_reclassify(circuit)
 
-    # dev57 (2.24): via task_registry.spawn. A bare create_task() left the
-    # only reference to this task in asyncio's weak set, so the debounced
-    # reclassify could be collected mid-sleep and the just-saved label would
-    # never propagate — silently, with no traceback.
+    # task_registry.spawn, not a bare create_task(): asyncio holds tasks only
+    # weakly, so the debounced reclassify could be collected mid-sleep and the
+    # just-saved label would silently never propagate.
     spawn(_delayed(), name=f"history_reclassify[{circuit}]")
 
 
@@ -170,8 +169,8 @@ def _embedded_display_label(embedded: list, vol_factor: float,
     return " + ".join(parts) + f" (~{vol_txt} {vol_unit or 'L'})"
 
 
-# Filter-bar query-param names (dev15). Raw display-unit strings from the GET
-# form; _filters_to_storage validates + converts them for the SQL pushdown.
+# Filter-bar query-param names. Raw display-unit strings from the GET form;
+# _filters_to_storage validates + converts them for the SQL pushdown.
 FILTER_BAR_PARAMS = ("dur_min", "dur_max", "dp_min", "dp_max",
                      "vol_min", "vol_max", "flow_min", "flow_max",
                      "fixture", "note")
@@ -189,16 +188,11 @@ def _filter_float(value):
 def _filters_to_storage(raw: dict, vol_factor: float,
                         pressure_factor: float,
                         flow_factor: float = 1.0) -> dict:
-    """Convert the filter bar's display-unit values to get_recent_events
-    kwargs in STORAGE units (litres / PSI / L·min⁻¹ / seconds). Pure —
-    unit-tested.
-
-    Inputs arrive as the user typed/slid them: duration in MINUTES, volume /
-    ΔP / avg flow in the home's display units. The factors are the
+    """Convert the filter bar's display-unit values (duration in minutes) to
+    get_recent_events kwargs in storage units. The factors are the
     storage→display multipliers from units.build_unit_context, so
-    storage = display / factor. Unknown fixture/note values are dropped
-    (never trusted into SQL); blanks/garbage are ignored.
-    """
+    storage = display / factor. Unknown fixture/note values are dropped, never
+    trusted into SQL; blanks/garbage are ignored."""
     out: dict = {}
     dur_min = _filter_float(raw.get("dur_min"))
     dur_max = _filter_float(raw.get("dur_max"))
@@ -236,19 +230,14 @@ def _filters_to_storage(raw: dict, vol_factor: float,
 def waveform_time_axis(n_bins: int, duration_s: float, src_n, src_hz):
     """Per-channel bin-centre times for a stored waveform envelope.
 
-    ESP-sourced channel (``src_hz`` present, fixed-rate capture): the TRUE
-    span is ``src_n / src_hz`` seconds, and ``t_k = (k+½)·src_n/(hz·N)``.
-    Duration-scaling is wrong here — the capture window ≠ the event window.
-    The capture's wall-clock start is NOT recoverable (WaveformRecord.start_ms
-    is firmware millis(), received_at is monotonic; neither persisted), so the
-    axis is anchored at event start with the residual offset disclosed:
-    basis = ``uniform_exact_unanchored`` (exact spacing/span, approximate
-    anchor).
-
-    Software channel / rows without metadata (pre-20260801 backlog, cleared
-    by the 60-day retention): the event-driven series has NO recoverable
-    axis, so the fallback stretches bins uniformly across the event window:
-    ``t_k = duration·(k+½)/N``, basis = ``uniform_approx``.
+    ESP channel (``src_hz`` present): the true span is ``src_n / src_hz``; the
+    capture window ≠ the event window, so duration-scaling would be wrong. Its
+    wall-clock start is not recoverable (WaveformRecord.start_ms is firmware
+    millis(), received_at is monotonic, neither persisted), so the axis is
+    anchored at event start — basis ``uniform_exact_unanchored`` (exact
+    spacing/span, approximate anchor). Software channel / rows without
+    metadata have no recoverable axis, so bins are stretched uniformly across
+    the event window — ``uniform_approx``.
     """
     if n_bins <= 0:
         return [], "empty"
@@ -269,10 +258,9 @@ def transient_dip_note(t: dict) -> "str | None":
     untouched, and the advice is always to RE-RUN the test, never to
     dismiss it. Requires t["ui"] to be set (classify_leak_test)."""
     try:
-        # dev41 (B4/C1): an indeterminate addon-side measurement must not
-        # fire the note — one noisy baseline capture, an under-sampled
-        # window or an open other valve can't be allowed to flip it.
-        # Legacy rows (status NULL) keep the dev38 behavior.
+        # An indeterminate addon-side measurement must not fire the note — one
+        # noisy baseline capture, an under-sampled window or an open other
+        # valve can't be allowed to flip it. Legacy rows (status NULL) still do.
         if t.get("addon_measure_status") == "indeterminate":
             return None
         sus = t.get("sustained_drop_psi")
@@ -289,27 +277,19 @@ def transient_dip_note(t: dict) -> "str | None":
 
 
 def classify_leak_test(t: dict) -> dict:
-    """Leak-test row → the verdict the page shows for it.
+    """Leak-test row → the verdict the page shows for it: the ONE source of
+    truth for both the row badge and the "Leak tests (last 20)" tally, so the
+    two cannot disagree. A non-'Passed' result is not automatically red.
 
-    ONE source of truth for the badge on each row AND the "Leak tests (last 20)"
-    summary tally, so the counts cannot disagree with the badges. A non-'Passed'
-    result is NOT automatically a red failure — ignored ones, aborts and manual
-    stops are not.
+    Mirrors leak_test_scheduler.py: a leak failure is 'Failed' or any 'leak'
+    mention, Passed excluded. The skip/abort prefixes MUST be matched before
+    the 'leak' catch-all — the 3-port "Not run … micro leak test not
+    applicable" pre-flight skip contains "leak" and would otherwise read red.
 
-    Follows leak_test_scheduler.py — a leak failure is 'Failed' or any 'leak'
-    mention, with Passed excluded. Pre-flight skips ('Not run …', incl. the
-    3-port "micro leak test not applicable" wording) short-circuit BEFORE that
-    check in the scheduler, so the skip/abort prefixes must be matched FIRST and
-    only then the 'leak' catch-all — otherwise the benign 3-port message reads
-    as a red leak.
-
-    ``category`` is what the summary strip counts on:
-      ``pass``    — a clean test
-      ``fail``    — an unexplained failure (the only red one, the only one tallied
-                    as failed)
-      ``ignored`` — an admin marked the failure known/benign; counted apart
-      ``other``   — no verdict either way (aborted, timed out, stopped, not run)
-      ``none``    — still running / no result yet
+    ``category`` is what the summary strip counts on: ``pass``; ``fail`` (the
+    only red one, the only one tallied as failed); ``ignored`` (admin marked
+    the failure benign, counted apart); ``other`` (no verdict either way);
+    ``none`` (no result yet).
     """
     r = (t.get("result") or "")
     if not r:
@@ -324,8 +304,8 @@ def classify_leak_test(t: dict) -> dict:
         return {"category": "other", "label": "Aborted — water in use",
                 "pill": "pill-amber", "row": "hist-row-degraded"}
     if r.startswith("Failed") and t.get("user_dismissed"):
-        # dev30 — user acknowledged this failure as benign (interrupted by an
-        # update, known coincident draw): amber, not red.
+        # User acknowledged this failure as benign (interrupted by an update,
+        # known coincident draw): amber, not red.
         return {"category": "ignored", "label": "Failed — ignored",
                 "pill": "pill-amber", "row": "hist-row-degraded"}
     if r.startswith("Failed"):
@@ -359,28 +339,25 @@ def annotate_pump_overnight(tests, nights_by_date, ha_tz=None) -> None:
     """Attach the nightly pressure watch's verdict to leak-test rows whose own
     window couldn't judge the pump.
 
-    The in-window cross-circuit check (classify_cross_circuit) needs ~3 recharge
-    cycles INSIDE the test window. A normal-length test on a slow pump cannot
-    hold that — this home's last confirmed period is ~8 min, so the bar is ~24
-    minutes — and tests are deliberately SHORT (5–15 min): a longer isolation
-    window invites false failures from occupant draws (icemaker, humidifier,
-    someone up at night) and from thermal contraction (a winter test started
-    after a heater cycle reads the tank+piping cooling as a leak). "Run a longer
-    test" is never the answer. Instead the pump-regime detector's passive 3-hour
-    nightly window — the same small hours the scheduled test runs in — closes no
-    valves and is immune to decay-shaped thermal effects (it counts repeated
-    recharge RISES, not slow decline). For the reassurance direction that
-    evidence is strictly stronger than a short test window.
+    The in-window check (classify_cross_circuit) needs ~3 recharge cycles in
+    the test window (~24 min at this home's ~8 min period), but tests are
+    deliberately SHORT (5–15 min): a longer isolation window invites false
+    failures from occupant draws (icemaker, humidifier, someone up at night)
+    and from thermal contraction (a winter test after a heater cycle reads the
+    cooling tank+piping as a leak). "Run a longer test" is never the answer.
+    The pump-regime detector's passive 3-hour nightly window covers the same
+    small hours, closes no valves and counts recharge RISES, not slow decline,
+    so it is immune to thermal decay — stronger evidence for reassurance.
 
-    Display-time on purpose: the same-night analysis lands ~30 min after the
-    3-hour window ends — hours AFTER the 1–2 AM test wrote its verdict — so a
-    stored-at-test-time fallback would permanently miss the most relevant night.
+    Resolved at display time: the same-night analysis lands ~30 min after its
+    window ends, hours AFTER the 1–2 AM test wrote its verdict, so a
+    stored-at-test-time value would always miss the most relevant night.
 
-    Verdicts that DID rule in-window ('untested_side', 'quiet') are left alone:
-    localization to the isolated line is exactly what the overnight watch cannot
-    provide. Eligible rows get ``t['pump_overnight']`` = 'quiet' | 'active' and
-    ``t['pump_overnight_night']`` = the analysis night used (the test's local
-    date, else the day before — the watch whose window most recently ended).
+    Verdicts that DID rule in-window ('untested_side', 'quiet') are left alone
+    — localizing to the isolated line is what the watch cannot provide. Sets
+    ``t['pump_overnight']`` = 'quiet' | 'active' and
+    ``t['pump_overnight_night']`` = the test's local date, else the day before
+    (the watch whose window most recently ended).
     """
     from datetime import datetime, timedelta, timezone
     tz = ha_tz or timezone.utc
@@ -462,8 +439,8 @@ def _collect_circuit_history_sync(
             _pump_judge_min = int(-(-3.0 * _pp // 60.0))   # ceil to minutes
     except (IndexError, KeyError, TypeError, ValueError):
         pass
-    # dev15 filter bar: convert the raw display-unit params ONCE (same units
-    # for every circuit) into storage-unit pushdown kwargs.
+    # Filter bar: convert the raw display-unit params ONCE (same units for
+    # every circuit) into storage-unit pushdown kwargs.
     bar_filters = _filters_to_storage(
         filter_bar_raw or {}, _units["vol_factor"], _units["pressure_factor"],
         _units["flow_factor"])
@@ -471,30 +448,24 @@ def _collect_circuit_history_sync(
     for circuit_cfg in circuits:
         if filter_circuit and circuit_cfg.circuit != filter_circuit:
             continue
-        # Dashboard "Degraded supply" / "Unusual events" links arrive as
-        # ?filter=degraded / ?filter=anomaly / ?filter=anomaly_unreviewed.
-        # The filter is pushed into the SQL WHERE (not a Python post-filter)
-        # so the recency limit counts MATCHING events — otherwise a flagged
-        # event older than the newest `limit` rows silently vanishes from the
-        # very view meant to surface it. The anomaly views show every flagged
-        # event, INCLUDING volume-zeroed ones — an anomaly on a zeroed event
-        # is exactly the case that must not stay hidden. anomaly_unreviewed
-        # (the dashboard card's Review link) further restricts to events
-        # awaiting triage, matching the card's count.
+        # Dashboard links arrive as ?filter=degraded / anomaly /
+        # anomaly_unreviewed (the card's Review link: awaiting triage only, so
+        # it matches the card's count). Pushed into the SQL WHERE, never a
+        # Python post-filter, so the recency limit counts MATCHING rows — a
+        # flagged event older than the newest `limit` rows must not vanish
+        # from the very view meant to surface it. The anomaly views include
+        # volume-zeroed events: an anomaly on a zeroed event must not hide.
         _anomaly_view = filter_param in ("anomaly", "anomaly_unreviewed")
-        # Settings "Hide not-real-use events" toggle — hides every volume-zeroing
-        # verdict (phantom / cross-talk / dribble) so the one "Not real use" label
-        # maps to one switch. Must be pushed into the SQL WHERE, not applied as a
-        # Python post-filter, so the recency limit counts VISIBLE rows: during the
-        # 2026-07 pump-cycling storm ~82 of the newest 100 rows were hidden
-        # artifacts and a post-filter starves the page down to ~18 events. The
-        # anomaly filters bypass hiding for the must-not-vanish reason, and so
-        # does the filter bar's Note = "Not real use" — the user just asked for
-        # exactly those rows. ?show_hidden=1 bypasses for one render
+        # The hide-not-real toggle (hide_not_real above) is likewise pushed into
+        # the SQL WHERE so the recency limit counts VISIBLE rows: during a
+        # pump-cycling storm ~82 of the newest 100 rows were hidden artifacts
+        # and a post-filter starved the page down to ~18 events. Bypassed by the
+        # anomaly views (must-not-vanish), by Note = "Not real use" (the user
+        # asked for exactly those rows) and by ?show_hidden=1 for one render
         # (presentation-only, viewer-safe).
         # Water Use's "Label on History" link arrives as ?filter=review&circuit=…
-        # The review card is rebuilt here rather than passing ids through the URL
-        # so the list and the card cannot disagree, and because ids in a query
+        # The review card is rebuilt here rather than passing ids in the URL so
+        # the list and the card cannot disagree, and because ids in a query
         # string go stale the moment the card is regenerated.
         _review_ids = None
         if filter_param == "review":
@@ -536,23 +507,22 @@ def _collect_circuit_history_sync(
                           if events and len(events) >= DEFAULT_EVENT_LIMIT
                           else None),
             )
-        # Display-time signature upgrade: historical events store a 32-pt
-        # signature, but many carry a hi-res event_waveforms envelope with real
-        # pulse detail. When the envelope is finer than the stored signature,
+        # Display-time signature upgrade (below): when an event's hi-res
+        # event_waveforms envelope is finer than its stored 32-pt signature,
         # rebuild a SIGNATURE_POINTS display signature from the per-bin peak
-        # envelope (same normalization + onset anchor as _flow_signature).
-        # Presentation-only — the stored flow_signature_json is a cluster
-        # feature and is never rewritten; the flow_shape word below derives
-        # from the same upgraded array the sparkline draws, so they agree.
+        # envelope (same normalization + onset anchor as _flow_signature). The
+        # stored flow_signature_json is a cluster feature and is never
+        # rewritten; flow_shape derives from the same upgraded array, so the
+        # word and the sparkline agree.
         # Overlap-duplicate provenance: link each zeroed wrapper to the kept
-        # event(s) that actually count its water (overlap_audit, dev28), so the
-        # modal banner can point at where the "ignored" volume went instead of
-        # reading like a loss. Display-only.
+        # event(s) that count its water (overlap_audit) so the modal banner can
+        # show where the "ignored" volume went rather than reading like a loss.
+        # Display-only.
         _dup_ids = [e["id"] for e in events
                     if e.get("match_rejection_reason") == "overlap_duplicate"]
-        # dev56 — the UI keys the duplicate surfaces on the REASON, not the
-        # phantom bit (wrappers no longer carry it). Full vs partial matters:
-        # a partial wrapper still holds real water and must not read as zeroed.
+        # The UI keys the duplicate surfaces on the REASON, not the phantom bit
+        # (wrappers do not carry it). Full vs partial matters: a partial wrapper
+        # still holds real water and must not read as zeroed.
         for e in events:
             _mrr_dup = e.get("match_rejection_reason") == "overlap_duplicate"
             _veff = float(e.get("volume_litres_effective") or 0.0)
@@ -561,10 +531,10 @@ def _collect_circuit_history_sync(
         _covering: dict = {}
         if _dup_ids:
             _ph = ",".join("?" * len(_dup_ids))
-            # dev38: stale audit rows (events superseded by reprocess or
-            # removed by retention) are SKIPPED — their kept ids point at
-            # rows that no longer exist, which previously rendered as blank
-            # "covering event" chips (43 dangling wrappers on the audited DB).
+            # Stale audit rows (events superseded by reprocess or removed by
+            # retention) are SKIPPED — their kept ids point at rows that no
+            # longer exist and would render as blank "covering event" chips
+            # (43 dangling wrappers on the audited DB).
             for _row in db.execute(
                     f"SELECT wrapper_event_id, kept_event_ids FROM overlap_audit "
                     f"WHERE wrapper_event_id IN ({_ph}) "
@@ -740,10 +710,9 @@ def _collect_circuit_history_sync(
                 if _d:
                     hv_daily[_d] = hv_daily.get(_d, 0.0) + (_r["volume_litres"] or 0.0)
 
-        # dev15 filter-bar slider bounds — per-circuit maxima in DISPLAY units
-        # (minutes / display-ΔP / display-volume), ceil'd to whole numbers so
-        # the sliders get stable, friendly tops. The page aggregates across
-        # circuits (one shared bar filters every circuit's list).
+        # Filter-bar slider bounds — per-circuit maxima in DISPLAY units,
+        # ceil'd to whole numbers for stable, friendly tops. The page takes the
+        # max across circuits (one shared bar filters every circuit's list).
         import math as _math
         _b = db.execute(
             "SELECT MAX(duration_seconds) AS d, "
@@ -791,8 +760,8 @@ async def _history_page(request: Request):
     filter_circuit = resolve_circuit(request.query_params.get("circuit", "").strip())
     # "N hidden — show them" escape hatch for the Settings hide toggle.
     show_hidden = request.query_params.get("show_hidden", "") == "1"
-    # dev15 filter bar — raw display-unit values; validated/converted in the
-    # sync collector (_filters_to_storage). Kept raw here for the form echo.
+    # Filter bar — raw display-unit values; validated/converted in the sync
+    # collector (_filters_to_storage). Kept raw here for the form echo.
     filter_bar_raw = {k: request.query_params.get(k, "").strip()
                       for k in FILTER_BAR_PARAMS}
     filters_active = any(filter_bar_raw.values())
@@ -887,8 +856,8 @@ async def event_waveform(event_id: str, request: Request):
     """
     import json as _json
     orch = _orch(request)
-    # dev46 (46a): waveform rows are the largest BLOBs in the schema and this
-    # fires on every modal open — never query it inline from the loop thread.
+    # Waveform rows are the largest BLOBs in the schema and this fires on
+    # every modal open — never query it inline from the loop thread.
     row = await run_db(
         lambda: orch.db.execute(
             """SELECT w.flow_min_json, w.flow_max_json,
@@ -920,11 +889,11 @@ async def event_waveform(event_id: str, request: Request):
             "flow_max":         flow_max,
             "pressure_min":     _json.loads(row["pressure_min_json"]),
             "pressure_max":     press_max,
-            # dev38 — per-channel time axes. The two channels are binned from
-            # DIFFERENT source streams (an ESP flow capture can pair with the
-            # ~5 s HA pressure series in one row), so index i of one array is
-            # NOT the same instant as index i of the other; the audit found
-            # 18.2% of events visibly misaligned on the shared index axis.
+            # Per-channel time axes: the two channels are binned from DIFFERENT
+            # source streams (an ESP flow capture can pair with the ~5 s HA
+            # pressure series in one row), so index i of one array is NOT the
+            # same instant as index i of the other — 18.2% of audited events
+            # were visibly misaligned on a shared index axis.
             "times_flow":       times_flow,
             "times_pressure":   times_press,
             "flow_time_basis":  flow_basis,
@@ -945,17 +914,12 @@ async def events_api(
 ):
     circuit = resolve_circuit(circuit)
     orch = _orch(request)
-    # This route has zero callers inside the add-on, but may have external ones
-    # (an HA automation, Node-RED flow, curl habit), so it is hardened rather
-    # than removed.
-    #
-    # `limit` arrives straight from the query string with no ceiling, and every
-    # DB call runs on the single serialized executor — so one ?limit=999999
-    # stalls page renders process-wide for every open tab.
-    # NOT `int(limit or DEFAULT_EVENT_LIMIT)`: 0 is falsy, so `or` turns an
-    # explicit ?limit=0 back into 100 — the same falsy-default slip that puts a
-    # stored 0 back to 2 on the shutoff cap. FastAPI already supplies the default
-    # when the parameter is absent, so the only job here is the range.
+    # Zero callers inside the add-on, but possibly external ones (an HA
+    # automation, Node-RED flow, curl habit) — hardened rather than removed.
+    # An uncapped ?limit= stalls the single serialized executor process-wide.
+    # Clamp, NOT `int(limit or DEFAULT_EVENT_LIMIT)`: 0 is falsy, so `or` would
+    # turn an explicit ?limit=0 into 100 (the same falsy-default slip as the
+    # shutoff cap). FastAPI supplies the default when the parameter is absent.
     limit = max(1, min(int(limit), MAX_EVENT_LIMIT))
     # A malformed bound used to be an inert string comparison. Now that it
     # is parsed into a UTC window it has to be checked, and checked HERE —
@@ -971,7 +935,7 @@ async def events_api(
                 {"error": "bad_date",
                  "message": f"{name} must be a real date as YYYY-MM-DD"},
                 status_code=400)
-    events = await run_db(                                    # dev46 (46a)
+    events = await run_db(
         get_recent_events, orch.db, circuit,
         limit=limit,
         date_from=date_from or None,
@@ -1000,17 +964,13 @@ async def patch_event_api(circuit: str, event_id: str, request: Request):
                 status_code=400,
             )
 
-    # ONE hop for the whole write path. This handler is the PATCH that races the
-    # chunked startup reclassify (see the write-time re-check in
-    # set_event_matched_fixture_type): it must never touch the shared connection
-    # from the loop thread while the DB worker holds it.
-    #
-    # A label must never lose to background maintenance — labelling is the one
-    # activity that unfreezes the learning loop, and the hourly backlog drain
-    # holds the file write-lock in short bursts. Retry a few times with backoff,
-    # awaiting between attempts so the DB worker and the event loop stay free;
-    # the 503 is the last resort, not the first response. The sync step is
-    # idempotent (a plain UPDATE of user fields).
+    # ONE DB hop for the whole write path: this PATCH races the chunked startup
+    # reclassify (see the write-time re-check in set_event_matched_fixture_type)
+    # and must never touch the shared connection from the loop thread.
+    # A label must never lose to background maintenance — labelling is what
+    # unfreezes the learning loop — so a locked DB is retried with backoff,
+    # awaiting between attempts to keep the DB worker and the loop free; the
+    # 503 is the last resort. The sync step is idempotent (a plain UPDATE).
     outcome = await _patch_with_retry(db, event_id, circuit, payload)
     if "error" in outcome:
         return JSONResponse(outcome["error"], status_code=outcome["status"])
@@ -1067,9 +1027,9 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
         # patch_event re-derives effective excluded_from_training.
         kwargs["user_ignored"] = bool(payload["excluded_from_training"])
     if "training_excluded_by_user" in payload:
-        # dev46 (46f): "keep my label, but don't learn from this event."
-        # Annotate-don't-modify — never touches the label, verdict or volume,
-        # and is NOT cleared by a later relabel (review is what sets it).
+        # "Keep my label, but don't learn from this event." Annotate-don't-modify
+        # — never touches the label, verdict or volume, and is NOT cleared by a
+        # later relabel (review is what sets it).
         kwargs["training_excluded_by_user"] = bool(
             payload["training_excluded_by_user"])
     if "user_reviewed" in payload:
@@ -1109,7 +1069,7 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
 
     if kwargs:
         # A locked DB is a transient state (a background job writing, or a
-        # wedged writer — one held the lock for 27 min on 2026-08-03), not a
+        # wedged writer — one once held the lock for 27 min), not a
         # server fault: answer 503 with words the user can act on rather than a
         # raw 500 traceback, and feed the stuck-writer detector so a persistent
         # holder names itself in the log.
@@ -1129,18 +1089,15 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
         if not found:
             return {"error": {"error": "Event not found"}, "status": 404}
 
-    # A real fixture label = "confirmed real water" — it must also undo an
-    # automatic irrigation cross-talk zeroing, restoring the event's volume
-    # (the UI frames these flags as "relabel if wrong", so relabeling IS the
-    # recovery path). revert_irrigation_cross_talk self-guards: it only touches
-    # rows the auto pass flagged (never a user-classified cross-talk) and
-    # audits the revert.
-    # ORDERING: this must run AFTER the classification block above — a fresh
-    # fixture label is the newer, more specific user intent and must win over a
-    # checkbox verdict saved in the same request. revert_artifact_zeroing_
-    # on_relabel covers every zeroing verdict (dribble/below-meter-floor, the
-    # phantom family, cross-talk); revert_irrigation_cross_talk stays for its
-    # audit-row bookkeeping on the auto-flagged irrigation rows it owns.
+    # A real fixture label = "confirmed real water", so it undoes an automatic
+    # zeroing and restores the volume (the UI says "relabel if wrong", so
+    # relabelling IS the recovery path). ORDERING: after the classification
+    # block above — a fresh label is the newer, more specific intent and must
+    # win over a checkbox verdict saved in the same request.
+    # revert_irrigation_cross_talk self-guards (auto-flagged rows only, never a
+    # user-classified cross-talk) and is kept for its audit-row bookkeeping;
+    # revert_artifact_zeroing_on_relabel covers every zeroing verdict
+    # (dribble/below-meter-floor, the phantom family, cross-talk).
     if kwargs.get("user_fixture_type"):
         try:
             if revert_irrigation_cross_talk(db, event_id, circuit):
@@ -1260,8 +1217,8 @@ async def undo_auto_cycle_api(circuit: str, request: Request):
         return JSONResponse({"error": "event_id required"}, status_code=400)
 
     def _undo_sync():
-        # dev46 (46a): the anchor lookup, the id sweep and the clear are one
-        # DB-thread callable — never inline on the loop.
+        # The anchor lookup, the id sweep and the clear are one DB-thread
+        # callable — never inline on the loop.
         anchor = db.execute(
             "SELECT start_ts, cycle_group_id FROM events "
             "WHERE id = ? AND circuit = ?",
@@ -1271,16 +1228,16 @@ async def undo_auto_cycle_api(circuit: str, request: Request):
             return {"error": {"error": "Event not found"}, "status": 404}
         gid = anchor["cycle_group_id"]
         if gid:
-            # dev.24 — precise: clear by the persisted cycle-group key (the
-            # rollup grouping), so exactly this cycle's auto labels are undone.
+            # Precise: clear by the persisted cycle-group key (the rollup
+            # grouping), so exactly this cycle's auto labels are undone.
             ids = [r["id"] for r in db.execute(
                 "SELECT id FROM events WHERE circuit = ? AND cycle_group_id = ? "
                 "  AND fixture_label_source = 'cycle'",
                 (circuit, gid),
             ).fetchall()]
         else:
-            # Legacy fallback — pre-dev.24 cycle labels have no group id, so
-            # undo by the original ±45-min proximity window around the anchor.
+            # Legacy fallback — older cycle labels have no group id, so undo by
+            # the original ±45-min proximity window around the anchor.
             a_ts = _parse_event_ts(anchor["start_ts"])
             if a_ts is None:
                 return {"error": {"error": "Event has no usable timestamp"},
@@ -1307,15 +1264,15 @@ async def undo_auto_cycle_api(circuit: str, request: Request):
 
 @router.post("/api/leak-tests/{test_id}/dismiss")
 async def dismiss_leak_test(test_id: int, request: Request):
-    """dev30 — toggle a failed leak test's user-dismissed flag. Display-only
+    """Toggle a failed leak test's user-dismissed flag. Display-only
     acknowledgement ("I know why this failed — update interrupted it, someone
     ran water"): the row renders amber instead of red; the record itself is
     never altered and future tests are unaffected."""
     db = _orch(request).db
 
     def _toggle_sync():
-        # dev46 (46a/N2a): read-modify-write + commit in ONE callable, so the
-        # toggle's transaction can't be split across a queue boundary.
+        # Read-modify-write + commit in ONE callable, so the toggle's
+        # transaction can't be split across a queue boundary.
         row = db.execute(
             "SELECT user_dismissed FROM leak_test_history WHERE id = ?",
             (test_id,)).fetchone()
@@ -1337,7 +1294,7 @@ async def dismiss_leak_test(test_id: int, request: Request):
     return ingress_redirect(request, "/history")
 
 
-# dev.50 — plain-language text for each reprocess.  _probe_refusal reason. Every one of
+# Plain-language text for each reprocess._probe_refusal reason. Every one of
 # these means the SAME thing operationally: nothing was deleted and the event is
 # untouched, because HA's history could not prove it can rebuild the water.
 _REPROCESS_REFUSAL_TEXT = {
@@ -1356,7 +1313,7 @@ _REPROCESS_REFUSAL_TEXT = {
     "volume_unaccounted":
         "The history that's left only accounts for part of this event's water, so a "
         "rebuild would under-count it. Nothing was changed.",
-    # dev52 — the KEPT rows, not HA history, refuse the rebuild.
+    # The KEPT rows, not HA history, refuse the rebuild.
     "blocked_by_kept_events":
         "This span already holds an event you labelled or marked yourself, and the "
         "rebuilt draw would land on top of it. Your labelled events are always kept, "
@@ -1375,14 +1332,12 @@ _REPROCESS_REFUSAL_TEXT = {
 async def reprocess_event_api(circuit: str, event_id: str, request: Request):
     """Rebuild ONE event from HA history.
 
-    Deletes this event (and any overlapping purely-machine-derived events),
-    reversing their volume, then re-imports the event's own span — optionally
-    padded by ``buffer_minutes`` — so a garbled/unclosed event (e.g. an irrigation
-    run that failed to close and absorbed a whole day) becomes the real runs. The
-    window comes from the event's authoritative ``start_ts``/``end_ts``, so the
-    user never has to guess which day a long event began. User-labelled / classified
-    / ignored events are preserved (``delete_events_in_range`` skips them); the
-    re-import deliberately does not move the catch-up checkpoint.
+    Deletes this event and any overlapping purely-machine-derived events,
+    reversing their volume, then re-imports the event's own ``start_ts`` /
+    ``end_ts`` span (optionally padded by ``buffer_minutes``) so an unclosed
+    event that absorbed a whole day becomes the real runs. User-labelled /
+    classified / ignored events are preserved (``delete_events_in_range`` skips
+    them); the re-import deliberately does not move the catch-up checkpoint.
     """
     from datetime import timedelta, timezone
     from ..reprocess import reprocess_window
@@ -1399,7 +1354,7 @@ async def reprocess_event_api(circuit: str, event_id: str, request: Request):
         buffer_min = 0
     buffer_min = max(0, min(buffer_min, 240))            # clamp 0..4 h
 
-    row = await run_db(                                       # dev46 (46a)
+    row = await run_db(
         lambda: db.execute(
             "SELECT start_ts, end_ts, user_fixture_type, user_classified, "
             "       user_ignored FROM events WHERE id = ? AND circuit = ?",
@@ -1446,9 +1401,9 @@ async def reprocess_event_api(circuit: str, event_id: str, request: Request):
         return JSONResponse(
             {"error": "Another volume operation is running — try again shortly."},
             status_code=409)
-    # dev.50 — the probe refused BEFORE anything was deleted. Each reason is a real
-    # answer, not a failure: the event is still there, intact, and rebuilding it from
-    # the history that exists would have lost water.
+    # The probe refused BEFORE anything was deleted. Each reason is a real
+    # answer, not a failure: the event is still there, intact, and rebuilding it
+    # from the history that exists would have lost water.
     refused = result.get("refused")
     if refused:
         return JSONResponse({"error": _REPROCESS_REFUSAL_TEXT.get(

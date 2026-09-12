@@ -43,14 +43,11 @@ from .database import (
 _INGRESS_IP  = _os.environ.get("INGRESS_ALLOWED_IP", "172.30.32.2")
 _DEV_MODE    = _os.environ.get("DEV_MODE", "false").lower() in ("true", "1", "yes")
 
-# Session cookie used to bind a browser to its CSRF token via HMAC
-# double-submit. Persistent (30 days) and re-set on first response only.
-#
-# Renaming this cookie is how a scope change reaches existing browsers: a
-# browser holding the old path="/" cookie keeps sending it, so the middleware
-# never sees a cookie-less client, never calls set_cookie again, and a new
-# path/SameSite would reach nobody who had ever opened the add-on. A new name
-# forces exactly one re-issue per browser; the stale one is deleted below.
+# Session cookie binding a browser to its CSRF token (HMAC double-submit).
+# Persistent (30 days), re-set on first response only — so a path/SameSite
+# change reaches existing browsers ONLY by renaming the cookie: a browser still
+# sending the old one never looks cookie-less, so set_cookie never runs again.
+# A new name forces exactly one re-issue per browser; the stale one is deleted.
 SESSION_COOKIE         = "wm_sid"
 LEGACY_SESSION_COOKIE  = "wm_session"   # pre-2.28, path="/" — deleted on sight
 SESSION_COOKIE_MAX_AGE = 30 * 86400  # 30 days
@@ -59,18 +56,14 @@ SESSION_COOKIE_MAX_AGE = 30 * 86400  # 30 days
 # format means the cookie was tampered with or rotated — treat as new.
 SESSION_COOKIE_MIN_LEN = 16
 
-# Cookie path. The Supervisor serves every ingress add-on under
-# /api/hassio_ingress/<token>/, so this prefix is the narrowest STABLE scope:
-# the <token> segment is per-add-on, is not durable, and only ever reaches us
-# through the X-Ingress-Path REQUEST header, which this codebase treats as
-# untrusted (see the sanitising re.sub on the setup redirect below). Deriving a
-# cookie path from that header means one odd value breaks every POST in the app,
-# for zero security gain — scoping to our own token does NOT keep a sibling
-# add-on out (see the ACCEPTED RISK note in ingress_middleware).
-#
-# What it buys over path="/": the cookie stops riding along on Home Assistant's
-# OWN requests — /api/websocket, /api/states, /auth/*, and every frontend fetch
-# on the HA origin.
+# Cookie path: the narrowest STABLE scope. The Supervisor serves every ingress
+# add-on under /api/hassio_ingress/<token>/, but <token> is not durable and only
+# reaches us via the untrusted X-Ingress-Path header (see the sanitising re.sub
+# on the setup redirect) — deriving the path from it means one odd value breaks
+# every POST, for zero gain: scoping to our own token does NOT keep a sibling
+# add-on out (see the ACCEPTED RISK note in ingress_middleware). Over path="/"
+# it stops the cookie riding on HA's OWN requests (/api/websocket, /api/states,
+# /auth/*, every frontend fetch on the HA origin).
 INGRESS_PATH_PREFIX = "/api/hassio_ingress/"
 
 
@@ -118,19 +111,16 @@ def _cookie_path(request: Request) -> str:
 
 
 def _set_session_cookie(response, request: Request, session_id: str) -> None:
-    """Attach the session cookie. Shared by the normal new-session response and the
-    CSRF-reject 403 so a cookie-less client always leaves with a session it can reuse.
-    The reject path returns before the normal cookie-set, so without this a client
-    whose cookie never round-trips could never present a matching token — the frontend
-    reloads on 403, which then derives a valid token for this same session.
+    """Attach the session cookie. Shared by the new-session response and the
+    CSRF-reject 403, which returns before the normal cookie-set: a cookie-less
+    client must still leave with a session or it can never present a matching
+    token (the frontend reloads on 403 and derives one for this session).
 
-    ``samesite="strict"``: ingress is served from the Home Assistant origin
-    itself and the panel is entered as a same-origin iframe from the HA sidebar,
-    so every legitimate request — navigation, form POST and fetch alike — is
-    same-site and carries a Strict cookie. The one case Strict withholds it that
-    Lax would not is a top-level navigation from a genuinely different site (an
-    emailed deep link); that request mints a new session and renders a page whose
-    token matches it, so nothing breaks.
+    ``samesite="strict"``: ingress is served from the HA origin and the panel is
+    a same-origin iframe, so every legitimate request is same-site. The one case
+    Strict withholds the cookie and Lax would not — a top-level navigation from
+    another site (an emailed deep link) — mints a new session and renders a page
+    whose token matches it, so nothing breaks.
     """
     response.set_cookie(
         SESSION_COOKIE,
@@ -327,10 +317,9 @@ async def lifespan(app: FastAPI):
             orch.load_roles_from_db(_db)
         except Exception as e:
             log.warning("RBAC role pre-load failed (non-fatal): %s", e)
-        # dev41 (E1): install the DB-backed registration curve so every
-        # stored estimate is stamped with the version that produced it. The
-        # code-constant fallback is byte-identical to seeded v1, so a load
-        # failure changes nothing.
+        # Install the DB-backed registration curve so every stored estimate is
+        # stamped with the version that produced it. The code-constant fallback
+        # is byte-identical to seeded v1, so a load failure changes nothing.
         try:
             from . import flow_integral
             _ver, _bands, _status = get_registration_curve(_db)
@@ -354,33 +343,26 @@ async def lifespan(app: FastAPI):
         autoescape=select_autoescape(["html", "htm"]),
     )
 
-    # Static-asset cache-buster. NOT the addon version: that is stable for a
-    # whole dev cycle, so every rebuild emits the same `?v=…` and the browser
-    # keeps serving a styles.css / app.js cached many deploys earlier — a
-    # front-end fix can be deployed repeatedly and never reach the page, with
-    # nothing in any log to say so. The build fingerprint changes whenever any
-    # module does, which is exactly when cached assets must be discarded.
-    # 'dev' is the fallback the templates expect when config.yaml is unreadable
-    # — build_info returns None there rather than inventing a version string, so
-    # the sentinel is applied here, at the display edge.
+    # Static-asset cache-buster. NOT the addon version alone: it is stable for a
+    # whole dev cycle, so every rebuild would emit the same `?v=…` and a browser
+    # would keep a styles.css / app.js cached deploys earlier — a front-end fix
+    # never reaching the page, with nothing in any log to say so. The build
+    # fingerprint changes whenever any module does. 'dev' is the sentinel the
+    # templates expect when config.yaml is unreadable (build_info returns None
+    # rather than inventing a version), applied here at the display edge.
     _asset_ver = _read_addon_version() or "dev"
     try:
         app.state.asset_version = f"{_asset_ver}-{_code_fingerprint()[:8]}"
     except Exception:                       # noqa: BLE001 — never block boot
         app.state.asset_version = _asset_ver
 
-    # Register tojson filter (not included by default in FastAPI's Jinja2).
-    #
-    # Use Jinja's OWN htmlsafe_json_dumps rather than json.dumps wrapped in
-    # Markup. json.dumps escapes " and \ but NOT <, >, & or U+2028/2029, and
-    # the Markup wrapper then suppresses autoescape — so any value reaching a
-    # <script> block through this filter could close the tag and execute. That
-    # has been live at real sinks here (?range= via CHART_RANGE, the
-    # X-Ingress-Path header via window.INGRESS_PATH).
-    #
-    # htmlsafe_json_dumps escapes <, >, & and ' as \uXXXX and still returns
-    # Markup, so the JSON stays parseable and cannot break out of the tag.
-    # It applies the same policy as Jinja's built-in tojson.
+    # tojson filter (FastAPI's Jinja2 env has none). Jinja's OWN
+    # htmlsafe_json_dumps, never json.dumps wrapped in Markup: json.dumps leaves
+    # <, >, & and U+2028/2029 unescaped and Markup suppresses autoescape, so a
+    # value reaching a <script> block could close the tag and execute — real
+    # sinks: ?range= via CHART_RANGE, X-Ingress-Path via window.INGRESS_PATH.
+    # htmlsafe_json_dumps escapes <, >, & and ' as \uXXXX (same policy as the
+    # built-in tojson) and still returns Markup, so the JSON stays parseable.
     from jinja2.utils import htmlsafe_json_dumps as _htmlsafe_json_dumps
     app.state.templates.env.filters["tojson"] = _htmlsafe_json_dumps
 
@@ -490,33 +472,27 @@ async def ingress_middleware(request: Request, call_next):
         log.info("POST %s (ingress=%r)", path, ingress_path)
 
     # ----- Session + CSRF token derivation ---------------------------
-    # Stateless HMAC double-submit:
-    #   - browser carries a random session_id in a cookie
-    #   - server caches the persistent HMAC secret on app.state
-    #   - csrf_token = "<nonce>.<HMAC(server_secret, session_id + '!' + nonce)>"
-    #     with a fresh nonce per request (auth.issue_csrf_token)
+    # Stateless HMAC double-submit: random session_id in a cookie, persistent
+    # HMAC secret cached on app.state, and per request a fresh nonce
+    # (auth.issue_csrf_token):
+    #   csrf_token = "<nonce>.<HMAC(server_secret, session_id + '!' + nonce)>"
     # No DB write per request; no shared process-wide cache.
     #
-    # ACCEPTED RISK — a compromised sibling add-on. Every ingress add-on is
-    # served from the Home Assistant ORIGIN, not just the same site. A page from
-    # any other ingress add-on is therefore same-origin with this UI: it can
-    # fetch() our pages with credentials, read the CSRF token straight out of the
-    # returned HTML, and POST with it. No CSRF token, no SameSite value, no
-    # Origin/Referer check and no cookie path can prevent that — it is a property
-    # of the ingress architecture, and the only real mitigations live in Home
-    # Assistant (per-add-on origins) or in not installing untrusted add-ons.
-    # This is recorded deliberately and is NOT to be engineered around here; the
-    # measures below defend against genuinely CROSS-site attackers, which is the
-    # threat they can actually address.
+    # ACCEPTED RISK — a compromised sibling add-on. Every ingress add-on is served
+    # from the Home Assistant ORIGIN, so a page from any other add-on can fetch()
+    # our pages with credentials, read the CSRF token out of the HTML and POST
+    # with it. No token, SameSite, Origin/Referer check or cookie path prevents
+    # that; the only mitigations are HA's (per-add-on origins) or not installing
+    # untrusted add-ons. Recorded deliberately, NOT to be engineered around here:
+    # the measures below defend against genuinely CROSS-site attackers.
     orch = getattr(request.app.state, "orchestrator", None)
     server_secret: str = getattr(
         request.app.state, "csrf_server_secret", ""
     )
     if not server_secret and orch and getattr(orch, "db", None):
-        # dev46 (46a): once-per-process lazy init, but it still runs on the
-        # event-loop thread on whichever request happens to be first — so it
-        # goes over the wall like every other DB touch. The app-state cache
-        # above means this costs one hop on that first request only.
+        # Once-per-process lazy init, but it runs on the event-loop thread on
+        # whichever request is first — so it goes over the wall (run_db) like
+        # every other DB touch. The app-state cache makes it one hop, once.
         server_secret = await run_db(get_or_create_csrf_server_secret, orch.db)
         request.app.state.csrf_server_secret = server_secret
 
@@ -563,10 +539,9 @@ async def ingress_middleware(request: Request, call_next):
                 except Exception:
                     seen.discard(u)   # retry on a later request
 
-            # dev57 (2.24): via task_registry.spawn. RUF006 does NOT flag the
-            # chained `get_running_loop().create_task(...)` form, but the bug is
-            # identical — nothing held this task, so the seen-user write could
-            # be collected before the serialized writer ever ran it.
+            # task_registry.spawn holds the task: a bare or chained create_task
+            # could be collected before the serialized writer ran it (RUF006
+            # rationale and its blind spot: ruff.toml).
             spawn(_log_seen_user(uid, _uname), name=f"record_seen_user[{uid}]")
 
     # Central mutation gate: reject any state-changing request the role isn't
@@ -593,15 +568,12 @@ async def ingress_middleware(request: Request, call_next):
     # session cookie and provides the token.
     if request.method in ("POST", "PUT", "PATCH", "DELETE") and not (
             _is_health_path(path) or _is_static_path(path)):
-        # 0. Fetch Metadata (defence in depth, ~98% of browsers). The browser —
-        #    not the page — states where the request came from, so it cannot be
-        #    spoofed by script. "cross-site" can never describe a legitimate
-        #    request to this add-on: the UI is served from the HA origin and only
-        #    ever talks to itself. Absent header (old browser, curl, our own
-        #    TestClient) falls through to the CSRF token check, which is still
-        #    the primary control. Note this does NOT help against the sibling
-        #    add-on above — that attacker is same-origin, so it sends
-        #    Sec-Fetch-Site: same-origin.
+        # 0. Fetch Metadata (defence in depth, ~98% of browsers): set by the
+        #    browser, not the page, so script cannot spoof it, and "cross-site"
+        #    never describes a legitimate request — the UI only talks to itself
+        #    on the HA origin. Absent header (old browser, curl, TestClient)
+        #    falls through to the CSRF token check, still the primary control.
+        #    No help against the sibling add-on above: it is same-origin.
         if request.headers.get("Sec-Fetch-Site", "") == "cross-site":
             log.warning("Fetch-Metadata rejected cross-site %s %s",
                         request.method, path)
@@ -655,18 +627,13 @@ async def ingress_middleware(request: Request, call_next):
             return resp
 
     # ----- Setup-complete redirect -----------------------------------
-    # First-run users get bounced to the setup wizard until it's done.
-    # The redirect-skip set uses startswith for /setup so wizard sub-paths don't
-    # bounce-redirect into themselves; /health is exact-match.
-    #
-    # `orch.setup_complete` is an in-memory read off the orchestrator's
-    # last-known-good cache (primed on the DB worker; see
-    # Orchestrator.setup_complete). It must NOT become a live SQLite SELECT
-    # again: this runs on the event-loop thread for every non-setup,
-    # non-static, non-health request, with app.js polling
-    # /api/dashboard/live every 5 s per open tab — the highest-frequency
-    # single-connection violation in the app. Membership/attribute reads only
-    # on this path, like admin_ids above.
+    # First-run users are bounced to the wizard until setup is done. startswith
+    # for /setup so wizard sub-paths don't redirect into themselves; /health is
+    # exact-match. `orch.setup_complete` is an in-memory last-known-good cache
+    # (primed on the DB worker; see Orchestrator.setup_complete) and must NOT
+    # become a live SQLite SELECT again: this runs on the event-loop thread for
+    # every other request, and app.js polls /api/dashboard/live every 5 s per
+    # open tab. Attribute/membership reads only here, like admin_ids above.
     skip_redirect = (
         path.startswith("/setup")
         or _is_static_path(path)
@@ -701,15 +668,13 @@ async def ingress_middleware(request: Request, call_next):
     return response
 
 
-# Defense-in-depth response headers, applied to every response on top of the
-# per-route content. Behind HA ingress these mostly guard against accidental
-# drift (a future template that loads a third-party script, a same-host XSS
-# proxying through us); they also harden the addon if a user exposes it directly.
+# Defense-in-depth headers on every response. Behind ingress they mostly guard
+# against drift (a template that loads a third-party script, a same-host XSS
+# proxying through us); they also harden a directly-exposed addon.
 #
-# CSP is deliberately permissive: the UI has ~60 inline event handlers
-# (onclick="…") and a few inline <script> / <style> blocks, plus Chart.js from
-# cdnjs, so a strict CSP would mean refactoring all of those to external files +
-# per-request nonces. This policy takes the easy wins (frame-ancestors,
+# CSP is deliberately permissive: ~60 inline onclick handlers plus inline
+# <script>/<style> blocks and Chart.js from cdnjs, so a strict policy would mean
+# external files + per-request nonces. It takes the easy wins (frame-ancestors,
 # object-src, base-uri) and pins the CDN origin so a compromised template can't
 # pull script from anywhere new.
 _CHART_CDN = "https://cdnjs.cloudflare.com"
@@ -808,15 +773,12 @@ async def health():
 async def health_detail(request: Request):
     """Per-subsystem state for humans. NOT a probe.
 
-    Deliberately NOT exempted from the ingress-IP and RBAC guards: subsystem
+    Deliberately NOT exempt from the ingress-IP and RBAC guards (subsystem
     names, versions and error strings should not be readable by anything that
-    can reach the port. `_is_health_path` matches "/health" exactly, so this
-    path falls through to the normal guarded pipeline — which is why it cannot
-    be used as a watchdog target.
-
-    Reads only in-memory state written by Orchestrator._supervise and the
-    event detector's own mirrors, so it does no I/O and cannot itself be the
-    thing that hangs. Every field is a REPORT: nothing here is a gate, and
+    can reach the port): `_is_health_path` matches "/health" exactly, so this
+    falls through the guarded pipeline — which is why it cannot be a watchdog
+    target. Reads only in-memory state (Orchestrator._supervise, the detector's
+    mirrors): no I/O, so it cannot itself hang. Every field is a REPORT —
     nothing in the add-on branches on what this returns.
     """
     orch = getattr(request.app.state, "orchestrator", None)

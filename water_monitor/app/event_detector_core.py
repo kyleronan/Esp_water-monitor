@@ -1,40 +1,25 @@
 """
-Event detector.
+Event detector: per-circuit event lifecycle driven by HA state_changed events.
 
-Subscribes to real-time state_changed events from HA for:
-  - flow rate sensors       (1Hz smoothed)
-  - pressure_*_fast         (40Hz, 50ms sliding window)
-  - flow_pulse_onset_*      (template binary, 8s delayed_off)
+Inputs: flow rate (1 Hz smoothed), pressure_*_fast (40 Hz, 50 ms sliding
+window), flow_pulse_onset_* (template binary, 8 s delayed_off).
 
-Event lifecycle
----------------
-START — triggered by ANY of the following, whichever fires first:
+START on whichever fires first: FLOW (>= MIN_FLOW_LPM sustained for
+FLOW_START_SECONDS — also catches slow ramps, slow-flow fixtures and flows
+already running when the addon connected), PRESSURE (drop >=
+pressure_drop_threshold_psi in the fast window; usually earliest for
+quick-opening fixtures), or PRESSURE+FLOW (the first to cross opens the
+event, the second enriches it).
 
-  1. FLOW   — flow rate >= MIN_FLOW_LPM sustained for >= FLOW_START_SECONDS.
-               Covers appliances with slow ramp-up, slow-flow fixtures, and
-               flows that were already running when the addon connected.
+END on flow_pulse_onset OFF *and* flow_rate < MIN_FLOW_LPM — both, because
+the 8 s delayed_off flickers at slow flow. The pressure-recovery END in
+on_pressure_fast and the ordered _run_close_ladder are the other close paths.
 
-  2. PRESSURE — pressure drops >= pressure_drop_threshold_psi in the fast
-                sensor rolling window. Typically the earliest indicator for
-                fixtures that open quickly (taps, toilets, washing machines).
-
-  3. PRESSURE+FLOW — both signals arrive close together. The first to cross
-                     its threshold opens the event; the second enriches it.
-
-END — flow_pulse_onset transitions OFF *and* flow_rate < MIN_FLOW_LPM.
-      Both conditions must be met to prevent false-ends during slow flows
-      where the 8s delayed_off causes the binary sensor to flicker.
-
-Pressure transient as enrichment
----------------------------------
-A pressure transient is not required for a valid event. When present it adds:
-  - pre_event_pressure_psi / pressure_delta_psi  (fixture load signature)
-  - propagation_delay_seconds                    (pipe distance heuristic)
-  - pressure_readings[]                          (transient shape)
-  - is_composite flag                            (multiple fixtures opened)
-
-The start_trigger field on RawEvent records which signal(s) opened the event
-so the feature extractor can weight pressure data appropriately.
+A pressure transient is enrichment, never required: pre_event_pressure_psi /
+pressure_delta_psi (fixture load signature), propagation_delay_ms (pipe
+distance heuristic), pressure_readings (transient shape), is_composite
+(multiple fixtures opened). RawEvent.start_trigger records which signal(s)
+opened the event so the feature extractor can weight pressure data.
 """
 from __future__ import annotations
 
@@ -135,9 +120,7 @@ def _valve_meta_kwargs(meta: "Optional[Tuple[str, str]]") -> dict:
             "other_valve_open_set_at": meta[1]}
 
 
-# --------------------------------------------------------------------------- #
-# Propagation-delay scan — shared by live detection and the offline replay tool
-# --------------------------------------------------------------------------- #
+# --- Propagation-delay scan — shared by live detection and the offline replay tool
 
 # Build identity lives in build_info. Imported here for _ADDON_VERSION below,
 # and RE-EXPORTED for database._code_fingerprint and routers/backup, which
@@ -192,22 +175,14 @@ def scan_propagation_delay(
     """Find the pressure-transient onset and derive the propagation delay
     (flow onset minus transient onset, in ms).
 
-    The single scan implementation, used by both live detection
-    (CircuitEventDetector._start_flow_event) and the offline replay harness —
-    never duplicate it.
-
-    The fast-pressure buffer is event-driven and variable-rate, so the scan is
-    fully timestamp-based — there is no samples-per-second assumption:
-
-      1. Restrict to a recent window (_PROP_MAX_LOOKBACK_S before flow onset)
-         so the search cannot wander back across earlier events.
-      2. Centered 1-second time-windowed moving average to reject noise.
-      3. Local resting baseline = median of the smoothed samples older than
-         _PROP_BASELINE_GUARD_S before flow onset (guaranteed pre-drop for
-         realistic 1-3 s delays) — NOT the global max, which sits above the
-         noisy / incompletely-recovered resting level.
-      4. Walk newest->oldest to the transient onset (last sample at the local
-         baseline); delay = flow_onset_ts - onset_ts from the real timestamps.
+    The single scan implementation for live detection
+    (CircuitEventDetector._run_propagation_scan) and the offline replay
+    harness — never duplicate it. Fully timestamp-based: the fast-pressure
+    buffer is event-driven and variable-rate, so there is no samples-per-second
+    assumption. The _PROP_MAX_LOOKBACK_S window keeps the search from wandering
+    back across earlier events. The baseline is the median of the guard region
+    (pre-drop for realistic 1-3 s delays) — NOT the global max, which sits
+    above the noisy / incompletely-recovered resting level.
     """
     n = len(pressure)
     ts_ok = bool(timestamps) and len(timestamps) == n and n > 0
@@ -309,9 +284,7 @@ class CircuitEventDetector:
     required for an event to be recorded.
     """
 
-    # ------------------------------------------------------------------ #
-    # Tuning constants                                                     #
-    # ------------------------------------------------------------------ #
+    # --- Tuning constants ---
 
     # Pressure history buffer. At 40 Hz (25 ms/sample) this holds 10 seconds.
     # The buffer must reach back far enough for a clean pre-transient baseline
@@ -319,14 +292,10 @@ class CircuitEventDetector:
     # chases the dip and underestimates the actual pressure drop.
     PRESSURE_BUFFER_SIZE: int = 400         # 10 s x 40 Hz
 
-    # Historical baseline window: a transient check compares current pressure
-    # against an average of samples BASELINE_LOOKBACK_SAMPLES to
-    # BASELINE_LOOKBACK_SAMPLES + BASELINE_WINDOW_SAMPLES old. At the defaults
-    # that sources the baseline from 3-5 s ago (120 x 25 ms lookback, 80 x
-    # 25 ms window), so a transient taking up to 5 s to reach minimum is still
-    # compared against a baseline pre-dating the dip entirely. Detection begins
-    # once LOOKBACK + WINDOW samples have accumulated (~5 s warm-up, well
-    # inside the 30 s firmware startup grace period).
+    # Baseline = mean of samples LOOKBACK..LOOKBACK+WINDOW old, i.e. 3-5 s ago
+    # at 25 ms/sample, so a dip taking up to 5 s to bottom out is still measured
+    # against pressure that pre-dates it. ~5 s warm-up before detection starts,
+    # inside the 30 s firmware startup grace period.
     BASELINE_LOOKBACK_SAMPLES: int = 120    # 3 s lookback
     BASELINE_WINDOW_SAMPLES: int = 80       # 2 s averaging window
 
@@ -356,16 +325,14 @@ class CircuitEventDetector:
     # slow ramp-up, and a single glitch must not reset a nearly-complete timer.
     FLOW_START_DIP_TOLERANCE: int = 2
 
-    # Maximum silent gap between flow samples an armed sustain timer survives.
-    # The dip tolerance counts SAMPLES, but flow_rate can stop ticking after a
-    # brief burst (fewer zero samples arrive than the tolerance), so a timer
-    # armed by a ~10 s slug stays armed for minutes; the NEXT burst then
-    # instantly satisfies FLOW_START_SECONDS, _start_flow_event backdates
-    # start_ts across the whole quiet gap, and the volume integral forward-fills
-    # it at the old burst's flow (booster-pump top-up slugs ~5 min apart merged
-    # into one ~300 s / ~5.4 L event). The firmware pulse_meter reports within
-    # 10 s of flow stopping, so a 30 s sample gap while the timer is armed can
-    # only mean the sensor went quiet.
+    # Longest silent gap between flow samples an armed sustain timer survives.
+    # The dip tolerance counts SAMPLES, but flow_rate stops ticking after a
+    # brief burst, so a timer armed by a ~10 s slug stayed armed for minutes:
+    # the next burst instantly satisfied FLOW_START_SECONDS, start_ts was
+    # backdated across the gap and the volume integral forward-filled it (pump
+    # top-up slugs ~5 min apart merged into one ~300 s / ~5.4 L event). The
+    # firmware pulse_meter reports within 10 s of flow stopping, so 30 s of
+    # silence can only mean the sensor went quiet.
     FLOW_START_STALE_GAP_S: float = 30.0
 
     # Composite: second transient must be >= this multiple of primary threshold
@@ -382,49 +349,39 @@ class CircuitEventDetector:
     # dip has recovered to ≤ FRACTION of its starting magnitude for this many seconds.
     PRESSURE_RECOVERY_FRACTION: float = 0.5
     PRESSURE_RECOVERY_DURATION_S: float = 10.0
-    # Flow-override END: if pressure has been recovered for this much longer AND
-    # the flow reading is STALE (no sample within FLOW_SAMPLE_STALE_S), end the
-    # event despite the last flow value. Covers a flow sensor that reports high
-    # while flowing but never reports 0 when it stops, leaving
-    # _current_flow_lpm stale-high so the flow<MIN gate never fires (cause of a
-    # 27.6 h irrigation event). Pressure (40 Hz) is the authority once it has
-    # sat at baseline this long; a real run keeps pressure DROPPED so the timer
-    # only completes when the draw is genuinely over.
+    # Flow-override END: pressure recovered for this long AND a STALE flow
+    # reading (no sample within FLOW_SAMPLE_STALE_S) ends the event despite the
+    # last flow value. A flow sensor that never reports 0 on stop leaves
+    # _current_flow_lpm stale-high so flow<MIN never fires (a 27.6 h irrigation
+    # event). A real run keeps pressure DROPPED, so the timer cannot complete.
     PRESSURE_RECOVERY_FLOW_OVERRIDE_S: float = 300.0   # 5 min
-    # The override additionally requires the flow READING itself to be stale —
-    # a live, healthy flow sample vetoes the "pressure says we're done"
-    # heuristic. A constant-pressure (VFD booster pump) home restores line
-    # pressure DURING a draw, and without this guard the override chopped one
-    # 42-minute shower into three events (force-closed at 5 min of pump-held
-    # baseline pressure with 5.6 L/min still flowing). The stuck-sensor case the
-    # override exists for goes SILENT (HA fires only on state change), so sample
-    # staleness is the honest proxy for "the flow reading can't be trusted".
-    # 120 s tolerates a steady reading that publishes rarely; a genuinely stuck
+    # A live flow sample vetoes the override: a VFD booster pump restores line
+    # pressure DURING a draw, and pressure alone chopped a 42-minute shower into
+    # three events (closed at 5 min of pump-held baseline with 5.6 L/min still
+    # flowing). The stuck sensor the override exists for goes SILENT (HA fires
+    # on change only), so staleness is the honest proxy for an untrustworthy
+    # reading. 120 s tolerates a rarely-publishing steady reading; a stuck
     # sensor is silent for hours.
     FLOW_SAMPLE_STALE_S: float = 120.0
     # Absolute hard cap on event duration (watchdog). The longest legitimate run
     # (a multi-zone irrigation cycle) is ~2.8 h; anything past this is a missed
     # end signal, so force-close. Bounds the blast radius of ANY unclosed event.
     MAX_EVENT_DURATION_S: float = 21600.0              # 6 h
-    # Fast-close for a pure-pressure transient that never moved water. A small
-    # dip whose pressure SETTLES below the recovery line (common on the irrigation
-    # circuit when a zone solenoid shifts the steady pressure) never satisfies the
-    # recovery END, so without this it stays open until the 6 h watchdog above —
-    # and while open it blocks every new event on the circuit (the _active_event
-    # is None gate), so the next real draw / irrigation run is missed live. Real
-    # draws register flow (>= MIN_FLOW) or keep pressure actively dipping, so they
-    # are never closed here. Conservative: flow has been zero for the whole event.
+    # Fast-close for a pure-pressure transient that never moved water and whose
+    # pressure SETTLED below the recovery line (an irrigation zone solenoid
+    # shifting the steady pressure). Otherwise it stays open to the 6 h watchdog
+    # and, via the _active_event-is-None gate, blocks every new event on the
+    # circuit — the next real draw is missed live. See _maybe_close_settled_noflow.
     SETTLED_NOFLOW_CLOSE_S: float = 60.0
 
-    # Sawtooth hold-open close (pump mode only). A pump's periodic recharge
-    # slugs peak above MIN_FLOW, so each top-up resets the normal end
-    # conditions and holds an open event through many minutes of real idle
-    # until the next genuine draw merges in (the overlap-duplicate wrappers).
-    # Close once the trailing SAWTOOTH_HOLD_CLOSE_S seconds contain nothing but
-    # micro-pulses shorter than SAWTOOTH_PULSE_MAX_S over true idle. Measured:
-    # closes 11/15 known long-idle wrappers, splits 0 washer/dishwasher (their
-    # internal gaps max 92 s), 0 softener (their inter-fill flow sits above the
-    # idle floor), 0 user-labeled events.
+    # Sawtooth hold-open close (pump mode only): recharge slugs peak above
+    # MIN_FLOW, so each top-up resets the end conditions and holds an idle event
+    # open until the next real draw merges in (the overlap-duplicate wrappers).
+    # Close once the trailing SAWTOOTH_HOLD_CLOSE_S seconds hold only micro-pulses
+    # shorter than SAWTOOTH_PULSE_MAX_S over true idle. Measured: closes 11/15
+    # known long-idle wrappers; splits 0 washer/dishwasher (internal gaps max
+    # 92 s), 0 softener (inter-fill flow sits above the idle floor), 0
+    # user-labeled events.
     SAWTOOTH_PULSE_MAX_S: float = 25.0    # a real fill/draw runs longer
     SAWTOOTH_HOLD_CLOSE_S: float = 420.0  # washer max internal gap x 4.5
     SAWTOOTH_IDLE_FRACTION: float = 0.18  # idle floor = fraction of MIN_FLOW
@@ -485,16 +442,15 @@ class CircuitEventDetector:
 
         self._debug_capture_propagation: bool = debug_capture_propagation
 
-        # Pump-mode oscillation gate. None = off. When set (confirmed vfd pump
-        # mode), PRESSURE-initiated event starts are suppressed while the
-        # rolling 60 s pressure peak-to-peak exceeds this gate: a recharge
-        # sawtooth crosses the 1.2 PSI drop trigger on every cycle and each
-        # blip-opened event can swallow a real draw that starts before the 60 s
-        # settled-noflow close. The FLOW path is untouched and remains the
-        # primary detector; firmware trickle detection is independent → the
-        # suppression can never mask a leak. The gate value is amplitude-derived
-        # by the parent (max(2.0, 0.15 × measured band)) so a milder pump than
-        # the incident's 12 PSI band still gates correctly.
+        # Pump-mode oscillation gate, None = off (set in confirmed vfd pump mode).
+        # PRESSURE-initiated starts are suppressed while the rolling 60 s
+        # peak-to-peak exceeds it: a recharge sawtooth crosses the 1.2 PSI drop
+        # trigger every cycle and each blip-opened event swallows a real draw
+        # that starts before the 60 s settled-noflow close. The FLOW path is
+        # untouched and firmware trickle detection is independent, so this can
+        # never mask a leak. The parent derives the value, max(2.0, 0.15 ×
+        # measured band) in orchestrator._get_pump_osc_gate, so a milder pump
+        # than the incident's 12 PSI band still gates.
         self.pump_osc_gate_psi: Optional[float] = None
         # The circuit is deliberately drained for the season; sample handlers
         # return immediately so ~0 psi never becomes an event or an alarm.
@@ -578,9 +534,7 @@ class CircuitEventDetector:
         self._PRETRIGGER_WINDOW_S: float = 5.0
         self._pretrigger_flow: Deque[Tuple[datetime, float]] = deque(maxlen=64)
 
-    # ------------------------------------------------------------------ #
-    # Public                                                               #
-    # ------------------------------------------------------------------ #
+    # --- Public ---
 
     def update_threshold(self, threshold_psi: float) -> None:
         self.pressure_drop_threshold = threshold_psi
@@ -725,9 +679,7 @@ class CircuitEventDetector:
         """Update the meter-derived low-flow floor live (after a PPL change)."""
         self.MIN_FLOW_LPM = min_flow_lpm
 
-    # ------------------------------------------------------------------ #
-    # HA state_changed callbacks                                           #
-    # ------------------------------------------------------------------ #
+    # --- HA state_changed callbacks ---
 
     def on_flow_rate(self, entity_id: str, state: str, attributes: dict) -> None:
         """
@@ -850,18 +802,11 @@ class CircuitEventDetector:
 
     def on_pressure_fast(self, entity_id: str, state: str, attributes: dict) -> None:
         """
-        40 Hz fast pressure sensor.
-
-        - Maintains a 10-second rolling history buffer.
-        - Computes baseline from samples 3-5 seconds in the past so that
-          a slow transient (2-5 s dip) is always compared against clean
-          pre-event pressure, not against a baseline that has started
-          tracking the dip itself.
-        - Fires PRESSURE start trigger if a transient is detected while idle.
-        - Enriches an active flow-event with transient metadata if one arrives.
-        - Detects composite events (second significant transient) using a
-          short within-event baseline so the settled post-drop pressure is
-          the reference, not the original pre-event baseline.
+        40 Hz fast pressure sensor: 10 s rolling buffer, baseline from samples
+        3-5 s old (see BASELINE_LOOKBACK_SAMPLES). Opens a PRESSURE event while
+        idle, enriches an active flow event with the transient, runs the
+        recovery END and the close ladder, and flags composites against a short
+        within-event baseline (settled post-drop pressure, not the pre-event one).
         """
         # The winterized guard must stay BELOW the docstring: above it, the
         # string literal is no longer the first statement and Python parses it
@@ -969,14 +914,9 @@ class CircuitEventDetector:
                         rec_secs = (now - self._pressure_recovered_since).total_seconds()
                         flow_stopped = self._current_flow_lpm < self.MIN_FLOW_LPM
                         # Normal END: pressure back >= 10 s AND flow stopped.
-                        # Flow-override END: pressure back for a LONG time AND
-                        # the flow reading is STALE — a flow sensor that never
-                        # reports 0 on stop goes silent (HA fires on change
-                        # only), leaving _current_flow_lpm stale-high so
-                        # flow<MIN never fires. A live flow sample vetoes the
-                        # override: a VFD booster pump restores line pressure
-                        # mid-draw, and closing on pressure alone split one
-                        # 42-min shower into three events.
+                        # Flow-override END: back >= 5 min AND the flow READING
+                        # is stale — the stuck-sensor and VFD-pump cases are on
+                        # PRESSURE_RECOVERY_FLOW_OVERRIDE_S / FLOW_SAMPLE_STALE_S.
                         flow_stale = (
                             self._last_flow_sample_ts is None
                             or (now - self._last_flow_sample_ts).total_seconds()
@@ -1060,9 +1000,7 @@ class CircuitEventDetector:
                         self.circuit, self._current_flow_lpm,
                     )
 
-    # ------------------------------------------------------------------ #
-    # Internal lifecycle                                                   #
-    # ------------------------------------------------------------------ #
+    # --- Internal lifecycle ---
 
     def _run_propagation_scan(
         self, trigger: str, event_start_ts: datetime, flow_onset_ts: datetime,
@@ -1357,17 +1295,14 @@ class CircuitEventDetector:
 
     def _maybe_close_settled_noflow(self, now: datetime) -> bool:
         """Close a pure-pressure transient that never moved water once pressure
-        has SETTLED (stable, even at a shifted baseline below the recovery line).
-
-        Without this, a small pressure dip that settles below the recovery line
-        — e.g. an irrigation zone solenoid that nudges the steady pressure —
-        never satisfies the recovery END and stays open until the 6 h watchdog,
-        blinding the circuit to new events the whole time (chronic 6 h
-        force-closes on circuit_2 blocked irrigation starts). A real draw
-        registers flow or keeps pressure actively dipping, so it is never closed
-        here. The closed event carries ~0 volume and is discarded by _end_event.
-        Returns True when it finalized (the caller must then stop touching
-        self._active_event)."""
+        has SETTLED, even at a shifted baseline below the recovery line (an
+        irrigation zone solenoid nudging the steady pressure). Otherwise it
+        never satisfies the recovery END and sits open to the 6 h watchdog,
+        blinding the circuit (chronic 6 h force-closes on circuit_2 blocked
+        irrigation starts). A real draw registers flow or keeps pressure
+        actively dipping, so it is never closed here; the ~0 L result is
+        discarded by _end_event. Returns True when it finalized (the caller
+        must then stop touching self._active_event)."""
         ev = self._active_event
         if ev is None:
             return False
@@ -1401,19 +1336,16 @@ class CircuitEventDetector:
         return True
 
     def _maybe_close_sawtooth_hold(self, now: datetime) -> bool:
-        """Close an event held open only by pump recharge micro-pulses.
+        """Close an event held open only by pump recharge micro-pulses (pump
+        mode only — ``pump_osc_gate_psi`` is the detector's pump-mode signal).
 
-        Pump mode only (``pump_osc_gate_psi`` is the detector's pump-mode
-        signal, set with the oscillation gate). Walks the event's
-        timestamped ``flow_samples`` step function backwards from ``now`` and
-        finds the last REAL activity: either an above-MIN_FLOW run at least
-        SAWTOOTH_PULSE_MAX_S long (a genuine draw/fill) or sub-threshold flow
-        above the idle floor (a softener/low-draw — breaks the idle stretch).
-        If everything since then — for SAWTOOTH_HOLD_CLOSE_S or longer — was
-        micro-pulses over true idle, the event is finalized AT that last real
-        activity, so the recharge tail never inflates duration. Subsequent
-        recharge pulses then open their own events and the sawtooth prong of
-        the recharge detector absorbs them. Returns True when it finalized."""
+        Last REAL activity in the ``flow_samples`` step function = an
+        above-MIN_FLOW run at least SAWTOOTH_PULSE_MAX_S long (a draw/fill) or
+        sub-threshold flow above the idle floor (softener/low-draw). If the
+        SAWTOOTH_HOLD_CLOSE_S since then held only micro-pulses over true idle,
+        finalize AT that activity so the recharge tail never inflates duration;
+        later pulses open their own events and the recharge detector's sawtooth
+        prong absorbs them. Returns True when it finalized."""
         ev = self._active_event
         if ev is None or self.pump_osc_gate_psi is None:
             return False
@@ -1451,29 +1383,17 @@ class CircuitEventDetector:
         return True
 
     def _run_close_ladder(self, now: datetime) -> bool:
-        """Evaluate every non-recovery close path in ONE fixed order.
+        """Evaluate every non-recovery close path in ONE fixed order, shared by
+        both sensor callbacks so an event satisfying two rungs gets the same
+        ``end_ts`` whichever sensor ticks first (test_close_path_order).
 
-        Both sensor callbacks share this list. With a per-callback order, an
-        event satisfying two rungs got a different ``end_ts`` depending on
-        which sensor happened to tick first — live nondeterminism in event
-        boundaries.
-
-        Order is most-informed close first, generic watchdog last:
-
-          1. ``_maybe_finalize_held_low_flow`` -> end_ts = the recorded dip time.
-             An explicit decision already taken (a deadline is pending) with an
-             exact end time; nothing may pre-empt it.
-          2. ``_maybe_close_settled_noflow``   -> end_ts = now. Narrowest rung:
-             a pure-pressure transient that never moved water, so no metered
-             water can be lost here whatever it pre-empts.
-          3. ``_maybe_close_sawtooth_hold``    -> end_ts = last real activity.
-          4. ``_maybe_force_close_overlong``   -> end_ts = now.
-
-        (4) is LAST because it is a failure path, not a close reason: it means
-        "we missed the end signal". If any of (1)-(3) fired the end signal was
-        not missed, and letting the watchdog win would stamp the full 6 h cap
-        onto an event that really ended earlier, feeding a garbage duration to
-        the classifier.
+        Most-informed close first, watchdog last: (1) held low-flow has an
+        exact recorded dip time and a decision already taken — nothing may
+        pre-empt it; (2) settled no-flow is a pure-pressure transient, so
+        pre-empting loses no metered water; (3) sawtooth trims to last real
+        activity; (4) the over-long watchdog is a failure path ("missed end
+        signal"), and letting it win would stamp the 6 h cap onto an event that
+        ended earlier and feed a garbage duration to the classifier.
 
         Returns True when an event was finalized — the caller must then stop
         touching ``self._active_event``.

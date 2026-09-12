@@ -23,21 +23,16 @@ log = logging.getLogger(__name__)
 
 _BASELINE_VERSION: int = 20260801
 # What each version did is the _MIGRATIONS table at the bottom of this file:
-# every entry pairs the number with the function that implements it, and the
-# function's own docstring says why. A prose list here duplicated that for 65
-# versions and had already drifted, so it is gone.
+# each entry pairs the number with the function that implements it, and that
+# function's docstring says why.
 #
-# VERSION-NUMBER CONVENTION: versions are YYYYMM + a 2-digit per-month sequence
-# (20260801 = August 2026 #01; September rolls to 20260901). The historical
-# 202605xx run reads the same way with the month stuck at 05 (it drifted into a
-# plain sequence). Everything stays strictly increasing, so stamped DBs walk
-# forward unchanged. Never reuse or reorder a shipped number.
-#
-# EXCEPTION ON THE RECORD: 20260819 landed in SEPTEMBER but reused August's
-# prefix. It stays as-is because it shipped and stamped live databases, and
-# "never reuse or reorder a shipped number" outranks tidiness — renumbering it
-# would make those DBs fail the _UPGRADEABLE_VERSIONS check below and be told to
-# delete themselves. 20260901 followed it (September 2026, #01), then 20260902;
+# VERSION-NUMBER CONVENTION: YYYYMM + a 2-digit per-month sequence (20260801 =
+# August 2026 #01; September rolls to 20260901). The historical 202605xx run
+# drifted into a plain sequence with the month stuck at 05. Everything stays
+# strictly increasing, so stamped DBs walk forward unchanged. Never reuse or
+# reorder a shipped number: 20260819 shipped in September under August's prefix
+# and STAYS that way — renumbering it would make the live databases it stamped
+# fail the _UPGRADEABLE_VERSIONS check below and be told to delete themselves.
 # THE NEXT MIGRATION IS 20260903.
 _CURRENT_VERSION: int = 20260902
 
@@ -95,47 +90,34 @@ def _set_version(conn: sqlite3.Connection, version: int) -> None:
     conn.commit()
 
 
-# ---------------------------------------------------------------------------
 # Column lookups — one PRAGMA per table per schema change, not one per question.
-# ---------------------------------------------------------------------------
-# The chain asks `_has_column` 106 times on an ordinary boot (a DB already at
-# the current version, re-verifying every column it must have), and every
-# question used to build and throw away its own `PRAGMA table_info` result set —
-# 122 rows of it for `events`, 160 µs a call. Measured on this schema:
+# An ordinary boot asks `_has_column` 106 times across 15 tables; each question
+# ran its own `PRAGMA table_info` (122 rows for `events`, 160 µs a call) while
+# `PRAGMA schema_version` costs 1.5 µs. Measured: ordinary boot 106 PRAGMAs ->
+# 14, full walk from the baseline 259 -> 40, the boot guard 11.1 ms -> 1.65 ms.
 #
-#     ordinary boot   106 questions / 15 tables : 106 PRAGMAs -> 14
-#     full walk from the baseline               : 259 PRAGMAs -> 40
-#     the boot guard itself                     : 11.1 ms -> 1.65 ms
+# ⛔ MIGRATIONS ADD COLUMNS AS THEY RUN. A cache answering a stale "column is
+# missing" makes a later step re-run an ALTER that already happened, or run a
+# backfill guarded on the column being new — schema corruption mid-chain, where
+# a wrong answer costs the user their database. Two INDEPENDENT guards, either
+# sufficient on its own:
 #
-# `PRAGMA schema_version` costs 1.5 µs against those 160, which is what makes
-# re-validating on every question affordable.
-#
-# ⛔ MIGRATIONS ADD COLUMNS AS THEY RUN. A cache that answers a stale "that
-# column is missing" makes a later step re-run an ALTER that already happened,
-# or run a backfill guarded on the column being new — it corrupts the schema in
-# the middle of the chain, the one place in this codebase where a wrong answer
-# costs the user their database. Two INDEPENDENT guards, either sufficient on
-# its own:
-#
-#   1. `PRAGMA schema_version` is SQLite's own schema cookie. It increments on
-#      every schema change — ALTER ADD/DROP COLUMN, CREATE/DROP TABLE or INDEX,
-#      RENAME — and never on plain DML (verified on the 3.39 this ships with).
-#      The snapshot carries the cookie it was read at and is dropped whole the
-#      moment the cookie moves, so a change made by ANY code path — this module,
-#      database.py, a helper nobody remembered — invalidates it. Nothing has to
-#      remember to call an invalidate function; that is the point.
+#   1. `PRAGMA schema_version` is SQLite's schema cookie: it increments on every
+#      schema change (ALTER ADD/DROP COLUMN, CREATE/DROP TABLE or INDEX, RENAME)
+#      and never on plain DML (verified on the 3.39 this ships with). The
+#      snapshot carries the cookie it was read at and is dropped whole when the
+#      cookie moves, so a change made by ANY code path invalidates it — there is
+#      no invalidate hook for a writer to forget.
 #   2. A snapshot may only ever answer TRUE. "Column is missing" always re-reads
-#      the PRAGMA first, so the stale-False failure above is unreachable even if
-#      guard 1 were wrong somewhere (a SQLite build that does not bump the
-#      cookie, say). Missing-column answers therefore cost exactly what they
-#      cost today; present-column answers — the every-boot case — become a dict
-#      lookup.
+#      the PRAGMA first, so the stale-False failure is unreachable even on a
+#      SQLite build that did not bump the cookie. Missing-column answers cost
+#      what they always did; present-column answers become a dict lookup.
 #
 # The snapshot holds ONE connection at a time, by strong reference, compared
-# with `is`. Keying on `id(conn)` would be a correctness bug rather than a style
-# one: sqlite3.Connection supports neither weak references nor attributes, ids
-# are recycled once a connection is freed, and cookie values are small integers
-# that collide readily across the many databases one test run builds.
+# with `is`. Keying on `id(conn)` would be a correctness bug: sqlite3.Connection
+# supports neither weak references nor attributes, ids are recycled once a
+# connection is freed, and cookie values are small integers that collide
+# readily across the many databases one test run builds.
 _SNAPSHOT_LOCK = threading.Lock()
 _COLUMN_SNAPSHOT: dict = {"conn": None, "cookie": None, "tables": {}}
 
@@ -184,20 +166,14 @@ def _add_columns(conn: sqlite3.Connection, table: str, columns,
                  *, if_table_exists: bool = False) -> list:
     """ADD COLUMN every ``(name, decl)`` pair ``table`` is missing.
 
-    Returns the columns actually added, so a caller whose backfill must run
-    only for a NEWLY added column can keep that coupling explicit.
+    Returns the columns actually added, so a backfill that must run only for a
+    NEWLY added column can keep that coupling explicit.
 
-    This is the preamble 48 migrations wrote out by hand — guard on
-    ``_has_column``, ``ALTER TABLE … ADD COLUMN``, sometimes log it, sometimes
-    not. Twenty of them looped, twenty-eight repeated the block per column.
-
-    ``if_table_exists=True`` reproduces the ``sqlite_master`` probe the later
-    migrations wrote in front of their adds. It is NOT the default, and the
-    difference matters: a step that raises today on a missing table must keep
-    raising, because the chain stamps the schema version only after every step
-    RETURNS. A step that silently skipped instead would let the DB stamp itself
-    current with the column absent, and the next boot's guard answers that with
-    "Delete the database file and restart the add-on."
+    ``if_table_exists=True`` is deliberately NOT the default: a step that raises
+    on a missing table must keep raising, because the chain stamps the schema
+    version only after every step RETURNS. A silent skip would let the DB stamp
+    itself current with the column absent, and the next boot's guard answers
+    that with "Delete the database file and restart the add-on."
     """
     if if_table_exists and not _has_table(conn, table):
         return []
@@ -211,9 +187,7 @@ def _add_columns(conn: sqlite3.Connection, table: str, columns,
     return added
 
 
-# ---------------------------------------------------------------------------
-# The waveform-claim index — the one index every tail migration re-adds.
-# ---------------------------------------------------------------------------
+# The waveform-claim index — re-added after every chain run (see the helper).
 _WF_CLAIM_INDEX_COLUMNS: tuple = ("circuit", "waveform_boot_id",
                                   "waveform_event_id")
 _WF_CLAIM_INDEX_DDL = (
@@ -225,38 +199,35 @@ _WF_CLAIM_INDEX_DDL = (
 def _ensure_wf_claim_index(conn: sqlite3.Connection) -> None:
     """Create ``idx_events_wf_claim`` when the columns it covers exist.
 
-    ⛔ THIS INDEX MUST NOT MOVE INTO THE SCHEMA DDL SCRIPT. ⛔
-    ``_create_schema`` / ``schema.sql`` runs against UPGRADE databases too, and
-    it runs BEFORE any migration. The index covers ``events.waveform_boot_id``,
-    a column that only arrives with migration 20260573, so an index statement in
-    the DDL script executes against a pre-20260573 database that does not have
-    the column yet — SQLite raises, and the add-on cannot boot (see the matching
-    NOTE beside the events DDL in database.py). The same argument applies to
-    ``idx_events_verdict_pin`` (20260818) and to the two indexes 20260902 adds.
+    ⛔ THIS INDEX MUST NOT MOVE INTO THE SCHEMA DDL SCRIPT. ``_create_schema`` /
+    ``schema.sql`` also runs against UPGRADE databases, BEFORE any migration,
+    and the index covers ``events.waveform_boot_id``, which only arrives with
+    migration 20260573 — against a pre-20260573 database SQLite raises and the
+    add-on cannot boot (see the NOTE beside the events indexes in schema.sql).
+    The same applies to ``idx_events_verdict_pin`` (20260818) and to the two
+    indexes 20260902 adds.
 
-    So the index can only ever come from a migration: 20260573 creates it and
-    every LAST migration since re-adds it belt-and-braces — a documented
-    convention, not copy-paste. A database stamped at a version AFTER 20260573
-    is built by the current schema script (which omits the index) and never
-    walks back through 20260573, so without the re-add on the tail migration it
-    would end the walk without the index and every claim lookup would table-scan
-    ``events`` on add-on hardware. ``test_migrations_forward.py`` asserts the
-    index after a walk that passes through 20260573.
+    So the index can only come from a migration — and a database stamped AFTER
+    20260573 is built by the current schema script (which omits it) and never
+    walks back through the step that created it, so without a re-add at the end
+    of every chain run (``_run_migrations_impl`` does it, version-independently)
+    it would end the walk without the index and every claim lookup would
+    table-scan ``events`` on add-on hardware. ``test_migration_file_cleanups.py``
+    asserts the index after a fresh install and after forward walks.
 
     Plain, NOT unique: the live path writes events through a wide upsert, and a
     constraint violation there would abort event storage entirely. The
     check-first SELECT in ``_wf_already_claimed`` is the enforcement.
 
-    NOTE for the schema-drift check: this index is present in a migration-built
-    database and deliberately ABSENT from the schema DDL, so a drift test must
-    carry an allowlist entry for ``idx_events_wf_claim`` (likewise
-    ``idx_events_verdict_pin``, ``idx_events_circuit_cluster`` and
-    ``idx_events_fixture``). Grep for ``_ensure_wf_claim_index``.
+    Schema-drift check: this index is present in a migration-built database and
+    deliberately ABSENT from the schema DDL, so a drift test must allowlist
+    ``idx_events_wf_claim`` (likewise ``idx_events_verdict_pin``,
+    ``idx_events_circuit_cluster`` and ``idx_events_fixture``).
 
-    Guarded on every indexed column: other migration tests exercise this chain
-    against stub ``events`` tables carrying only the columns their own step
-    needs, and an index over a missing column aborts the whole run. Idempotent
-    (``IF NOT EXISTS``) and safe to call from any migration body.
+    Guarded on every indexed column: other migration tests run this chain
+    against stub ``events`` tables carrying only their own step's columns, and
+    an index over a missing column aborts the whole run. Idempotent
+    (``IF NOT EXISTS``), safe to call from any migration body.
     """
     if not _has_table(conn, "events"):
         return
@@ -275,27 +246,24 @@ _VERDICT_PIN_COLUMNS: tuple = (
 
 
 def _ensure_verdict_pin_columns(conn: sqlite3.Connection) -> None:
-    """Add the dev56 pin columns (+ their index) when absent. Idempotent.
+    """Add the verdict-pin columns (+ their index) when absent. Idempotent.
 
-    Called from the TOP of BOTH 20260817 and 20260818, and that is load-bearing.
-    20260817 replays ``cleanup_all_overlaps`` over all history and that resolver
-    WRITES the pin, but the columns nominally arrive one migration later —
-    creating them here closes the window, so by the time any overlap code runs
-    the shape is the current shape, everywhere.
+    Called from the TOP of BOTH 20260817 and 20260818, and that is load-bearing:
+    20260817 replays ``cleanup_all_overlaps`` over all history, and that
+    resolver WRITES the pin although the columns nominally arrive one migration
+    later — creating them here closes the window.
 
-    ⛔ SWAPPING 20260817 and 20260818 so the columns simply land first is a
-    BOOT-BREAKER and must never be done. ``_run_migrations_impl`` selects
-    ``[fn for v, fn in _MIGRATIONS if v > version]`` and then stamps
-    ``_CURRENT_VERSION`` unconditionally. A database stamped exactly 20260817 is
-    a REAL state (dev55 shipped as its own commits, ahead of dev56); after a
-    swap it would run only the re-sweep, never receive these three ALTERs, still
-    be stamped current, and then fail every subsequent boot on the
-    current-version guard with "Delete the database file." Shipped migration
-    numbers do not move.
+    ⛔ SWAPPING 20260817 and 20260818 so the columns land first is a
+    BOOT-BREAKER. ``_run_migrations_impl`` runs ``[fn for v, fn in _MIGRATIONS
+    if v > version]`` and then stamps ``_CURRENT_VERSION`` unconditionally. A
+    database stamped exactly 20260817 is a REAL shipped state; after a swap it
+    would run only the re-sweep, never receive these three ALTERs, still be
+    stamped current, and fail every later boot on the current-version guard
+    with "Delete the database file." Shipped migration numbers do not move.
 
     Guarded for stub ``events`` tables (older migration tests build one with
-    only the columns their own step needs), and the index is created only once
-    ``circuit`` exists — the same guard 20260802-04 use.
+    only their own step's columns); the index is created only once ``circuit``
+    exists.
     """
     if not _has_table(conn, "events"):
         return
@@ -306,18 +274,12 @@ def _ensure_verdict_pin_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-# ---------------------------------------------------------------------------
-# Best-effort backfill failures — loud, and on the record.
-# ---------------------------------------------------------------------------
-# Several one-shot DATA repairs (20260570/72, 20260802/03/04) are deliberately
-# best-effort: a backfill must never keep the add-on from booting. What was
-# NOT deliberate is that they used to fail at log.warning and vanish — the
-# chain still stamps _CURRENT_VERSION afterwards, and the `_missing_*`
-# verifiers only check SCHEMA, so a DB reporting itself fully current could be
-# one where the repair never ran and never will. These failures are now logged
-# at ERROR with the migration id and recorded here, so "did the repair run?"
-# is an answerable question instead of a guess.
-#
+# Best-effort backfill failures — loud, and on the record. The one-shot DATA
+# repairs (20260802/03/04) must never keep the add-on from booting, but the
+# chain stamps _CURRENT_VERSION afterwards and the `_missing_*` verifiers only
+# check SCHEMA, so a DB reporting itself current can be one where a repair
+# never ran and never will. Such failures are logged at ERROR with the
+# migration id and recorded here, so "did the repair run?" is answerable.
 # Created on demand (nothing reads it on the happy path, so _create_schema
 # deliberately does not mirror it) and never itself allowed to break boot.
 _MIGRATION_FAILURES_DDL = (
@@ -389,14 +351,11 @@ _DEGRADED_EVENT_COLUMNS: frozenset = frozenset({
 
 
 #: Columns a database stamped at _CURRENT_VERSION must carry, and the name the
-#: boot error reports for each. This replaces 29 hand-written _missing_*
-#: verifiers that each restated a column list its own migration already declares
-#: — the same list living in three places was how they drifted.
-#:
-#: A third element overrides the reported name, preserving the exact strings the
-#: old verifiers produced (some reported a bare column, most "table.column").
-#: Table-CONDITIONAL requirements are not here: those verifiers still exist
-#: below, because "required only when the table exists" is a different rule.
+#: boot error reports for each — ONE list, because per-migration verifiers that
+#: each restated their own column list drifted apart. A third element overrides
+#: the reported name (some report a bare column, most "table.column").
+#: Table-CONDITIONAL requirements are not here: "required only when the table
+#: exists" is a different rule, and those verifiers live below.
 _REQUIRED_COLUMNS: tuple = (
     ('circuit_profile'    , 'pulses_per_litre'               ),
     ('circuit_profile'    , 'valve_type'                     , 'valve_type'),
@@ -480,7 +439,7 @@ def _missing_degraded_columns(conn: sqlite3.Connection) -> set[str]:
     }
 
 def _missing_dev24_columns(conn: sqlite3.Connection) -> set[str]:
-    """Return the 20260542 dev.24 columns that are absent (home_profile + events).
+    """Return the 20260542 columns that are absent (home_profile + events).
 
     Spans TWO tables — without the events check a DB missing only
     ``events.cycle_group_id`` would pass and the rollup would fail at runtime.
@@ -588,8 +547,7 @@ def _missing_cross_talk_audit_table(conn: sqlite3.Connection) -> set[str]:
     return set() if present else {"cross_talk_audit"}
 
 
-# 20260558 (dev21) — pump-aware detection Phase 1 columns. Single source for
-# the apply fn AND the verifier so the two can never drift apart.
+# 20260558 — pump-aware detection Phase 1 columns.
 _PUMP_MODE_HOME_COLUMNS: tuple = (
     ("pump_mode_detected",    "INTEGER NOT NULL DEFAULT 0"),
     ("pump_mode_detected_at", "TEXT"),
@@ -605,7 +563,7 @@ _PUMP_MODE_SENS_COLUMNS: tuple = (
 )
 
 
-# 20260559 (dev26) — Phase 5b cross-circuit leak-test verdict columns.
+# 20260559 — Phase 5b cross-circuit leak-test verdict columns.
 _LEAK_TEST_PUMP_COLUMNS: tuple = (
     ("other_circuit_cycles",   "INTEGER"),
     ("other_circuit_period_s", "REAL"),
@@ -615,11 +573,10 @@ _LEAK_TEST_PUMP_COLUMNS: tuple = (
 
 # 20260563 — leak test measures the right interval, and reports a rate.
 # baseline_psi was read BEFORE the valve closed, so every stored row carried
-# the close transient plus the whole settle-phase loss (measured 2026-07-26:
-# a row read 1.0 PSI where the monitored decay was 0.28, and another read
-# 21.5 where it was ~3). Firmware 3.13.2 publishes the values the test
-# actually judged against; these columns store them, plus the derived leak
-# rate and the demand verdict.
+# the close transient plus the whole settle-phase loss (measured: a row read
+# 1.0 PSI where the monitored decay was 0.28, another 21.5 where it was ~3).
+# Firmware 3.13.2 publishes the values the test actually judged against; these
+# columns store them, plus the derived leak rate and the demand verdict.
 _LEAK_TEST_MEASUREMENT_COLUMNS: tuple = (
     ("closed_psi",            "REAL"),     # pressure the instant the valve sealed
     ("settle_loss_psi",       "REAL"),     # closed_psi - baseline_psi
@@ -684,7 +641,7 @@ def _missing_local_day_columns(conn: sqlite3.Connection) -> set[str]:
     return missing
 
 
-# 20260801 — dev38 audit-fix columns (all DDL for the release in one step).
+# 20260801 — audit-fix columns (all DDL for the release in one step).
 _202608_EVENT_COLUMNS = (
     ("time_features_tz", "TEXT"),
     ("registration_est_litres", "REAL"),
@@ -708,12 +665,12 @@ _202608_LEAK_TEST_COLUMNS = (
 def _apply_peak_consistency_backfill(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260802 — raise ``peak_flow_lpm`` to
     ``ceil(true_avg*1000)/1000`` wherever ``true_avg_flow_lpm`` exceeds it
-    (physically impossible; 825 rows in the 2026-08 audit, all software-
-    sourced — avg/peak come from ``flow_readings`` while true_avg comes from
-    the timestamped ``flow_samples``). Matches the dev37 repair convention
-    (ceil, never round down; never lower true_avg). Data-only, idempotent,
-    best-effort — a failure must never block boot (the live write path now
-    clamps at extract time, so the population cannot regrow)."""
+    (physically impossible; 825 audited rows, all software-sourced — avg/peak
+    come from ``flow_readings`` while true_avg comes from the timestamped
+    ``flow_samples``). Repair convention: ceil, never round down; never lower
+    true_avg. Data-only, idempotent, best-effort — a failure must never block
+    boot (the live write path clamps at extract time, so the population cannot
+    regrow)."""
     try:
         rows = conn.execute(
             "SELECT id, true_avg_flow_lpm FROM events "
@@ -738,18 +695,16 @@ def _apply_peak_consistency_backfill(conn: sqlite3.Connection) -> None:
 # 20260803 — stale hydraulic_resistance backfill.
 def _apply_resistance_backfill(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260803 — recompute the stored
-    ``hydraulic_resistance`` on ESP-enriched rows from the CURRENT ΔP.
+    ``hydraulic_resistance`` on ESP-enriched rows from the CURRENT ΔP, using
+    the definition ``extract_features`` and ``_finalize_derived_verdicts`` pin
+    (ΔP / avg_flow_lpm, gated on avg >= 0.15 AND has_pressure_transient AND
+    ΔP > 0). 1,324 audited rows carried a ratio computed before the ESP
+    metadata overwrote pressure_delta_psi.
 
-    Pinned definition (identical to extract_features / the dev38 finalize
-    recompute): ΔP / avg_flow_lpm, gated on avg >= 0.15 AND
-    has_pressure_transient AND ΔP > 0. The 2026-08 audit found 1,324 rows
-    whose ratio still reflected the pre-enrichment ΔP (resistance was
-    computed before the ESP metadata overwrote pressure_delta_psi).
-
-    Ordering vs the +240 s shared-capture sweep is safe by construction:
-    rows the sweep has not yet de-enriched still carry the ESP ΔP, so
-    ΔP/avg is CONSISTENT for them; the sweep then NULLs both ΔP and
-    resistance on its losers. Data-only, idempotent, best-effort."""
+    Ordering vs the +240 s shared-capture sweep is safe by construction: rows
+    the sweep has not yet de-enriched still carry the ESP ΔP, so ΔP/avg is
+    CONSISTENT for them, and the sweep then NULLs both ΔP and resistance on
+    its losers. Data-only, idempotent, best-effort."""
     try:
         cur = conn.execute(
             "UPDATE events SET hydraulic_resistance = "
@@ -767,20 +722,19 @@ def _apply_resistance_backfill(conn: sqlite3.Connection) -> None:
             conn, 20260803, "hydraulic-resistance recompute backfill", e)
 
 
-# 20260804 — retro-fix the dev37-repaired rows' contaminated signatures.
+# 20260804 — retro-fix the repair sweep's contaminated signatures.
 def _apply_misattached_signature_null(conn: sqlite3.Connection) -> None:
-    """Forward migration to version 20260804 — NULL the signatures of rows
-    the dev37 sweep marked ``misattached`` but left carrying esp-labelled
-    signature bytes (31 rows in the 2026-08 audit).
+    """Forward migration to version 20260804 — NULL the signatures of rows the
+    repair sweep marked ``misattached`` but left carrying esp-labelled
+    signature bytes (31 audited rows).
 
-    VERIFIED PROVENANCE: when an ESP capture is claimed, the flow/pressure/
-    edge signatures are regenerated FROM the capture arrays
-    (feature_extractor._enrich_from_waveform), so a mis-attached row's
-    signature is a FOREIGN draw's shape. No HA-derived signature was ever
-    persisted for these rows, and the dev37 sweep already deleted their
-    envelopes — so the signatures are NULLed and signature_source is set
-    NULL (NOT 'software', which would launder contaminated shape data under
-    a trusted label). Data-only, idempotent."""
+    When an ESP capture is claimed the flow/pressure/edge signatures are
+    regenerated FROM the capture arrays (feature_extractor
+    ``_enrich_from_waveform``), so a mis-attached row's signature is a FOREIGN
+    draw's shape; no HA-derived signature was ever persisted for these rows,
+    and the sweep already deleted their envelopes. ``signature_source`` is set
+    NULL — NOT 'software', which would launder contaminated shape data under a
+    trusted label. Data-only, idempotent."""
     try:
         cur = conn.execute(
             "UPDATE events SET flow_signature_json = NULL, "
@@ -798,27 +752,25 @@ def _apply_misattached_signature_null(conn: sqlite3.Connection) -> None:
             conn, 20260804, "mis-attached signature retro-fix", e)
 
 
-# 20260805 — dev40 training quarantine for the over-firing dishwasher-cycle tier.
+# 20260805 — training quarantine for the over-firing dishwasher-cycle tier.
 def _apply_training_quarantine(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260805 — annotate-don't-modify quarantine
     of machine dishwasher-cycle labels from every training/exemplar pool.
 
-    The 2026-08-15 precision readout measured the dishwasher_cycle tier at
-    9/19 on pre-outage user reviews and 1/10 post-reseed (faucet bursts chained
-    into fake fill sequences), and the contaminated labels had already widened
-    the fitted DW band 3.75 → 8.32 LPM across three calibration fits — a
-    self-reinforcing loop. Until the grouping gate is fixed, unreviewed events
-    carrying a machine dishwasher label (either matched_via='dishwasher_cycle'
-    or a cycle-stamped user_fixture_type) are excluded from training pools via
-    ``training_quarantine_reason`` — labels, verdicts and volumes untouched, so
-    History display and the user's ability to review/relabel are unchanged, and
-    a later review lifts the quarantine's effect by supplying real ground truth.
+    The dishwasher_cycle tier measured 9/19 precision on pre-outage user reviews
+    and 1/10 post-reseed (faucet bursts chained into fake fill sequences), and
+    the contaminated labels had widened the fitted DW band 3.75 → 8.32 LPM
+    across three calibration fits — a self-reinforcing loop. Unreviewed events
+    carrying a machine dishwasher label (matched_via='dishwasher_cycle', or a
+    cycle-stamped user_fixture_type) are excluded from training pools via
+    ``training_quarantine_reason``; labels, verdicts and volumes are untouched,
+    so History and review/relabel are unchanged, and a later review lifts the
+    quarantine by supplying real ground truth.
 
-    Windows (UTC bounds of the audited Denver-local windows): the pre-outage
-    calibration-source window [2026-07-01, 2026-07-22) and the post-reseed
-    window [2026-08-13, open) — the 07-22..08-13 outage window is deliberately
-    NOT flagged here: it is sequenced for re-attribution off the reseeded
-    cluster model first. Idempotent (only NULL-reason rows are stamped)."""
+    The start_ts bounds are the UTC edges of Denver-local windows: pre-outage
+    [07-01, 07-22) and post-reseed [08-13, open). The 07-22..08-13 outage
+    window is deliberately left to 20260806. Idempotent (only NULL-reason rows
+    are stamped)."""
     _add_columns(conn, "events", (("training_quarantine_reason", "TEXT"),
                                   ("training_quarantined_at",  "TEXT")))
     # The backfill reads columns older migrations add (a DB walking forward
@@ -848,29 +800,25 @@ def _apply_training_quarantine(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-# 20260806 — dev41 quarantine sweep: ALL remaining unreviewed machine
-# dishwasher labels, no time bounds.
+# 20260806 — quarantine sweep: ALL remaining unreviewed machine dishwasher
+# labels, no time bounds.
 def _apply_training_quarantine_sweep(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260806 — sweep the remaining unreviewed
     machine dishwasher-cycle labels into the training quarantine, with NO
     start_ts bounds.
 
-    20260805 flagged two audited windows and deliberately exempted the
-    07-22..08-13 outage mid-window, reasoning it was sequenced for
-    re-attribution first — but re-attribution touches cluster ids, never
-    labels, so the exemption protected nothing while the mid-window rows kept
-    feeding every training pool (the post-quarantine refit still fit
-    DW_MAX_PK ≈ 8.59 from them). Planning review also surfaced ~48 more
-    unreviewed machine-DW rows predating 07-01, minted by the same over-firing
-    gate under the older band. Rather than a third hand-written window, this
-    sweep drops the window arithmetic entirely: every unreviewed machine
-    dishwasher label still unflagged is quarantined.
+    20260805's exemption of the 07-22..08-13 mid-window protected nothing:
+    re-attribution touches cluster ids, never labels, so those rows kept
+    feeding every training pool (the post-quarantine refit still fit DW_MAX_PK
+    ≈ 8.59 from them), and ~48 more unreviewed machine-DW rows predate 07-01.
+    So no window arithmetic: every unreviewed machine dishwasher label still
+    unflagged is quarantined.
 
-    Distinct reason string ('dev40_precision_quarantine_sweep') gives real
-    per-migration provenance; readers only test IS NULL, and the relabel lift
-    (database.py set_user_fixture_type) clears the column unconditionally, so
-    flagged rows lift identically regardless of reason. Idempotent (only
-    NULL-reason rows are stamped); labels, verdicts and volumes untouched."""
+    The distinct reason string ('dev40_precision_quarantine_sweep') is
+    per-migration provenance only: readers test IS NULL, and the relabel lift
+    (``database.patch_event``) clears the column unconditionally, so flagged
+    rows lift identically regardless of reason. Idempotent (only NULL-reason
+    rows are stamped); labels, verdicts and volumes untouched."""
     _add_columns(conn, "events", (("training_quarantine_reason", "TEXT"),
                                   ("training_quarantined_at",  "TEXT")))
     if all(_has_column(conn, "events", c) for c in
@@ -896,7 +844,7 @@ def _apply_training_quarantine_sweep(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-# 20260807 — dev41 conformance-review DDL (all in one step, dev38 pattern).
+# 20260807 — conformance-review DDL (all in one step).
 _DEV41_EVENT_COLUMNS = (
     ("other_valve_open_set_at", "TEXT"),
     ("other_valve_open_source", "TEXT"),
@@ -914,9 +862,9 @@ _DEV41_LEAK_TEST_COLUMNS = (
     ("monitor_samples_json", "TEXT"),
 )
 # v1 registration curve — seeded from the audit's pressure-witness inversion
-# (flow_integral historically carried these as the _REGISTRATION_RATIO code
-# constants; dev41 moves them into data with provenance). Relative to the
-# meter's own >=8 L/min band; 'unvalidated' until a low-flow anchor lands.
+# (the same ratios flow_integral carries as the _REGISTRATION_RATIO constants,
+# now data with provenance). Relative to the meter's own >=8 L/min band;
+# 'unvalidated' until a low-flow anchor lands.
 _DEV41_CURVE_V1 = (
     (8.0, None, 0.999),
     (4.0, 8.0, 0.941),
@@ -927,23 +875,18 @@ _DEV41_CURVE_V1 = (
 
 
 def _apply_dev41_conformance_ddl(conn: sqlite3.Connection) -> None:
-    """Forward migration to version 20260807 — dev41 conformance-review DDL:
+    """Forward migration to version 20260807 — conformance-review DDL.
 
-      events.other_valve_open_set_at/_source — tri-state provenance (D6)
-      events.registration_curve_version      — estimate provenance (E1)
-      leak_test_history.*                    — addon-side measurement quality:
-                                               sustainedness (shape), sample
-                                               counts, sighting latency,
-                                               indeterminate status+reason,
-                                               noise floor, raw samples (B1-B4)
-      overlap_audit.stale_at                 — when the stale mark landed (D5)
-      utility_register_readings              — manual register pairs (item 7)
-      meter_anchor_points                    — bucket/timed-fill anchors (D1)
-      registration_curve                     — versioned correction curve,
-                                               v1 seeded 'unvalidated' from
-                                               the audit inversion (E1)
-
-    Additive, idempotent, tables-absent-safe."""
+    ``events.other_valve_open_set_at/_source`` (tri-state provenance),
+    ``events.registration_curve_version`` (estimate provenance), the
+    ``leak_test_history`` addon-side measurement-quality columns
+    (sustainedness, sample counts, sighting latency, indeterminate
+    status+reason, noise floor, raw samples), ``overlap_audit.stale_at``, and
+    three tables: ``utility_register_readings`` (manual register pairs),
+    ``meter_anchor_points`` (bucket/timed-fill anchors) and
+    ``registration_curve`` (versioned correction curve, v1 seeded
+    'unvalidated' from the audit inversion). Additive, idempotent,
+    tables-absent-safe."""
     _add_columns(conn, "events", _DEV41_EVENT_COLUMNS, if_table_exists=True)
     _add_columns(conn, "leak_test_history", _DEV41_LEAK_TEST_COLUMNS,
                  if_table_exists=True)
@@ -980,44 +923,40 @@ def _apply_dev41_conformance_ddl(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260807: dev41 conformance-review DDL ready")
 
 
-# 20260808 — dev42: reseed completion marker (F-C2).
+# 20260808 — reseed completion marker.
 def _apply_reseed_marker_column(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260808 —
     ``training_state.reseed_in_progress``: ISO timestamp stamped when a
     cluster re-seed clears assignments, cleared only on success. A crash
-    mid-replay leaves it set (the 2026-08-15 11:56 reseed crash stranded a
-    part-cleared model with no persistent trace); boot and the post-rebuild
-    health pass warn loudly until a rerun succeeds. Additive, idempotent."""
+    mid-replay leaves it set (a reseed crash once stranded a part-cleared
+    model with no persistent trace); boot and the post-rebuild health pass
+    warn loudly until a rerun succeeds. Additive, idempotent."""
     _add_columns(conn, "training_state", (("reseed_in_progress", "TEXT"),),
                  if_table_exists=True)
     conn.commit()
     log.info("Migration 20260808: reseed-in-progress marker column ready")
 
 
-# 20260809 — dev46: training-exclusion flag (46f), per-channel signature
-# spans (46i), and the winterized-circuit flag (46h).
+# 20260809 — training-exclusion flag, per-channel signature spans, and the
+# winterized-circuit flag.
 def _apply_dev46_columns(conn: sqlite3.Connection) -> None:
     """Forward migration to version 20260809 — three additive flags.
 
-    ``events.training_excluded_by_user`` (46f) — "keep my label, but don't
-    train on this event". Four confirmed cases exist where a user label is
-    TRUE while the event's features describe a composite draw; before this,
-    the only way to keep such an event out of training was to lie about its
-    label. Deliberately DISTINCT from training_quarantine_reason and NOT
+    ``events.training_excluded_by_user`` — "keep my label, but don't train on
+    this event" (four confirmed cases where a user label is TRUE while the
+    features describe a composite draw; the only alternative was to lie about
+    the label). Deliberately DISTINCT from training_quarantine_reason and NOT
     lifted by review — review is what SETS it.
 
-    ``events.flow_sig_span_s`` / ``pressure_sig_span_s`` (46i) — the real
-    captured span of each signature channel, so the event modal can draw an
-    honest per-channel time axis. Forward-only: legacy rows stay NULL and
-    keep the proportional overlay, because their spans are unknowable
-    (annotate-don't-modify).
+    ``events.flow_sig_span_s`` / ``pressure_sig_span_s`` — the real captured
+    span of each signature channel, for an honest per-channel time axis in the
+    event modal. Forward-only: legacy rows stay NULL and keep the proportional
+    overlay, because their spans are unknowable.
 
-    ``circuit_profile.winterized`` (46h) — the circuit is deliberately
-    drained for winter, so ~0 psi is EXPECTED rather than a catastrophic
-    pressure event. Consumers pause detection, regime sampling, baselines
-    and leak-test scheduling for the circuit while set.
-
-    All additive and idempotent."""
+    ``circuit_profile.winterized`` — the circuit is deliberately drained, so
+    ~0 psi is EXPECTED rather than a catastrophic pressure event; consumers
+    pause detection, regime sampling, baselines and leak-test scheduling for
+    the circuit while set. All additive and idempotent."""
     _add_columns(conn, "events",
                  (("training_excluded_by_user", "INTEGER DEFAULT 0"),
                   ("flow_sig_span_s",           "REAL"),
@@ -1030,7 +969,7 @@ def _apply_dev46_columns(conn: sqlite3.Connection) -> None:
              "and winterized flag ready")
 
 
-# 20260810 — dev46 (46k): per-event verdict validity stamp.
+# 20260810 — per-event verdict validity stamp.
 # Must match the trigger's UPDATE OF list below — the guard checks these exist
 # before creating it, and a mismatch would create a trigger that never fires.
 _VERDICT_STAMP_WATCHED = (
@@ -1047,25 +986,16 @@ def _apply_verdict_stamp(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260810 — make the boot reclassify skippable.
 
     ``events.verdict_stamp`` records WHICH inputs produced the row's stored
-    verdict. The boot pass then scans only events whose stamp differs from the
-    current one, instead of re-deriving every unlabelled event every boot.
+    verdict, so the boot pass scans only events whose stamp differs from the
+    current one. Without it the pass recomputed ~5,400 verdicts per boot to
+    find ~5,400 unchanged — measured 151.7 s, growing 45-60 events/day with the
+    unlabelled backlog and no ceiling. NULL means "never stamped" and is always
+    a candidate, so no backfill: the first pass after upgrade stamps every row.
 
-    Why this is needed at all: the pass already stores its answer in
-    matched_fixture_type, but stored nothing that said whether that answer was
-    still valid — so it recomputed ~5,400 verdicts to discover that ~5,400 of
-    them were unchanged. Measured 2026-08-17: 151.7 s per boot, growing by
-    roughly 45-60 events/day as the unlabelled backlog grows, with no ceiling.
-
-    NULL means "never stamped" and therefore always a candidate, so the
-    migration needs no backfill: the first pass after upgrade stamps every row
-    and behaves exactly as today.
-
-    ``training_state.last_full_reclassify_at`` is the max-age backstop. If an
-    input is ever left out of the stamp, staleness would otherwise be
-    invisible; forcing a full pass when the last one is old bounds that to
-    days rather than forever.
-
-    Both additive and idempotent."""
+    ``training_state.last_full_reclassify_at`` is the max-age backstop: if an
+    input is ever left out of the stamp, staleness would be invisible; forcing
+    a full pass when the last one is old bounds that to days rather than
+    forever. Both additive and idempotent."""
     _add_columns(conn, "events", (("verdict_stamp", "TEXT"),),
                  if_table_exists=True)
     _add_columns(conn, "training_state",
@@ -1193,19 +1123,15 @@ def _missing_wf_claim_columns(conn: sqlite3.Connection) -> set[str]:
 def _log_schema_state(conn: sqlite3.Connection) -> None:
     """Emit a single INFO line summarising the current schema.
 
-    Plan C-IQ-15 / C-IQ-22 (lightweight variant). Walks `sqlite_master`
-    for user tables and reports each table's column count alongside
-    the stamped schema version. A divergent DB (e.g. a partially
-    restored backup, or a hand-edited database) will be loud in the
-    logs without forcing a hard-fail boot abort — which the plan
-    downgraded over dev-time false-alarm risk.
-
-    Format chosen so the line is greppable but compact:
+    Walks `sqlite_master` for user tables and reports each table's column count
+    alongside the stamped schema version, so a divergent DB (a partially
+    restored backup, a hand-edited database) is loud in the logs without a
+    hard-fail boot abort. Greppable but compact:
         Schema v=20260527  tables: events(56), fixtures(11), ...
 
-    Best-effort: any SQL error here is swallowed so a deeply broken DB
-    doesn't keep the addon from starting in the diagnose-and-restore
-    path. The migration verification block above is the real guard.
+    Best-effort: any SQL error is swallowed so a deeply broken DB can still
+    start into the diagnose-and-restore path. The verification in
+    ``_run_migrations_impl`` is the real guard.
     """
     try:
         version = _get_version(conn)
@@ -1237,38 +1163,28 @@ def _log_schema_state(conn: sqlite3.Connection) -> None:
         log.info("Schema diagnostic failed (non-fatal): %s", exc)
 
 
-# ── Ordered forward-migration chain ────────────────────────────────────────────
-# (introduced_in_version, apply_fn): a DB stamped at version V already HAS every
-# step with introduced <= V and needs exactly the steps with introduced > V,
-# applied in this order. Every apply fn is idempotent, so the whole dispatch is
-# one loop — adding a migration is ONE line here (plus bumping _CURRENT_VERSION),
-# not an edit to ~28 hand-maintained per-version branches (the old ladder, where
-# one missed branch stamped a DB current while silently missing a table).
-# 20260811 — dev47 (47i): fixture health baselines, stats and alerts.
+# 20260811 — fixture health baselines, stats and alerts.
 def _apply_fixture_health(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260811 — three tables for fixture health.
 
-    dev47 separates two things the label schema conflates: WHICH fixture a
-    draw came from, and whether that fixture is healthy. Classification stays
-    adaptive (a leaking toilet is still a toilet, and the model may absorb its
-    new shape); health is measured downstream against a reference that does
-    NOT adapt. These tables hold that reference and its evidence.
+    Classification stays adaptive (a leaking toilet is still a toilet, and the
+    model may absorb its new shape); health is measured downstream against a
+    reference that does NOT adapt. These tables hold that reference and its
+    evidence.
 
-    ``fixture_baseline`` — one frozen row per (circuit, fixture_type),
-    pinned over an explicit window. ``locked`` defaults to 1 and only an
-    explicit unlock with a reason code clears it, because a baseline that
-    could drift with the data would detect nothing: a degrading flapper would
-    simply redefine normal, which is exactly the failure this exists to catch.
+    ``fixture_baseline`` — one frozen row per (circuit, fixture_type), pinned
+    over an explicit window. ``locked`` defaults to 1 and only an explicit
+    unlock with a reason code clears it: a baseline that drifted with the data
+    would let a degrading flapper redefine normal, the exact failure this
+    exists to catch.
 
-    ``fixture_health_stat`` — append-only nightly observations. The series is
-    the evidence a health card is built from; rewriting it would make an alarm
-    unexplainable afterwards. UNIQUE on (circuit, fixture_type, as_of_day) so
-    a re-run of the nightly job updates that day rather than duplicating it.
+    ``fixture_health_stat`` — append-only nightly observations, the evidence a
+    health card is built from; rewriting it would make an alarm unexplainable
+    afterwards. UNIQUE on (circuit, fixture_type, as_of_day) so a re-run of the
+    nightly job updates that day rather than duplicating it.
 
-    ``fixture_health_alert`` — open/resolved alerts. The retrain reads the
-    open set for holdout hygiene; it is NOT the detector.
-
-    All three are additive and idempotent."""
+    ``fixture_health_alert`` — open/resolved alerts. The retrain reads the open
+    set for holdout hygiene; it is NOT the detector. All additive, idempotent."""
     conn.execute(
         """CREATE TABLE IF NOT EXISTS fixture_baseline (
                circuit         TEXT NOT NULL,
@@ -1315,24 +1231,20 @@ def _apply_fixture_health(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260811: fixture health baselines ready")
 
 
-# 20260812 — dev48: flow_plateau_lpm, the rate a draw runs at once running.
+# 20260812 — flow_plateau_lpm, the rate a draw runs at once running.
 def _apply_flow_plateau(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260812 — one column, backfilled from waveforms.
 
-    Neither stored flow number answers "how fast does this fixture actually
-    run": the average is diluted by ramp and off-time, the peak is one sample.
-    The plateau is the median of the flowing samples, so it describes the valve
-    and the supply pressure rather than the length of the draw.
+    The plateau is the median of the flowing samples: it describes the valve
+    and the supply pressure rather than the length of the draw (the average is
+    diluted by ramp and off-time, the peak is one sample). Backfilled because
+    the model can only learn from it where it exists, and the history is where
+    the labels are. Only events with a stored waveform get a value; the rest
+    stay NULL, which the model reads as missing rather than zero. On the
+    reference home that is ~60% coverage, and the feature bought +2.3 accuracy
+    points (excluding 'other') on exactly that subset.
 
-    Backfilled here rather than left to accumulate because the model can only
-    learn from it where it exists, and the history is where the labels are. Only
-    events with a stored waveform get a value; the rest stay NULL, which the
-    model reads as missing rather than as zero. On the reference home that is
-    about 60% coverage, and the feature bought +2.3 accuracy points (excluding
-    'other') on exactly that subset.
-
-    Additive and idempotent: the column is added only if absent, and the
-    backfill only ever fills rows that are still NULL, so re-running cannot
+    Idempotent: the backfill fills only rows still NULL, so a re-run cannot
     overwrite a value the live path has since computed."""
     import json
 
@@ -1372,34 +1284,28 @@ def _apply_flow_plateau(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260812: flow_plateau_lpm ready (%d of %d waveform "
              "row(s) backfilled)", filled, len(rows))
 
-# 20260813 — dev49 (P0-4): mark days whose daily_summary drifted from `events`.
+# 20260813 — mark days whose daily_summary drifted from `events`.
 def _apply_daily_summary_drift_markers(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260813 — MARK drifted days, recompute nothing.
 
-    ``mark_daily_summary_dirty`` had exactly one caller repo-wide while ~20
-    paths route volume through ``apply_effective_volume``, so every reprocess,
-    recompute, merge and overlap resolution left the cached day behind. dev49
-    moved the mark into the chokepoint, which stops NEW drift — it does not
-    repair the drift already recorded. Measured on the reference home:
-    17 of 92 days disagreed with `events` by more than 0.5 L, 468.5 L in total,
-    worst single day -93.2 L.
+    ``mark_daily_summary_dirty`` had one caller while ~20 paths route volume
+    through ``apply_effective_volume``, so every reprocess, recompute, merge
+    and overlap resolution left the cached day behind. The mark now lives in
+    that chokepoint, which stops NEW drift; this repairs what was already
+    recorded. Measured on the reference home: 17 of 92 days disagreed with
+    `events` by more than 0.5 L, 468.5 L in total, worst single day -93.2 L.
 
-    WHY THIS IS NOT A HISTORICAL VOLUME RECOMPUTE (the standing invariant).
-    ``daily_summary`` is a DERIVED CACHE over the event ledger. This migration
-    writes nothing but ``daily_summary_dirty`` markers; the recompute is done
-    later, by ``drain_daily_summary_dirty`` — already-shipped code with a
-    no-lookback contract — and it re-derives each day from events that this
-    migration does not touch. No event's ``volume_litres`` or
-    ``volume_litres_effective`` changes here or afterwards. The invariant
-    governs the ledger, and the ledger is untouched.
-
-    Marking rather than recomputing inline also keeps the migration fast and
-    interruptible: a marker left undrained is retried on the next pruner pass.
+    NOT a historical volume recompute (the standing invariant): ``daily_summary``
+    is a DERIVED CACHE over the event ledger. This writes nothing but
+    ``daily_summary_dirty`` markers; ``drain_daily_summary_dirty`` (no-lookback
+    contract) re-derives each day later from events this migration does not
+    touch, so no ``volume_litres`` / ``volume_litres_effective`` changes here or
+    afterwards. Marking also keeps the migration fast and interruptible: an
+    undrained marker is retried on the next pruner pass.
 
     Idempotent: INSERT OR IGNORE on the (circuit, day) primary key. Days are
     bucketed with ``local_day_of`` so the comparison matches how the summary
-    was written; a day that has since been corrected simply fails the >0.5 L
-    test and is not marked.
+    was written; a day since corrected fails the >0.5 L test and is not marked.
     """
     if not (_has_table(conn, "daily_summary")
             and _has_table(conn, "daily_summary_dirty")):
@@ -1439,25 +1345,24 @@ def _apply_daily_summary_drift_markers(conn: sqlite3.Connection) -> None:
              "them", marked, drift_litres)
 
 
-# 20260814 — dev50: auto-split memo + stale marks for the two audit tables whose
+# 20260814 — auto-split memo + stale marks for the two audit tables whose
 # event_id had no foreign key.
 def _apply_auto_split_memo(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260814 — additive, idempotent, no backfill.
 
-    Two dev50 changes make reprocess a CONTINUOUS background action rather than a
-    rare manual one (the over-merge job now scans the whole HA recorder window
-    instead of 24 h), and that turns two latent problems into ongoing ones:
+    Reprocess is a CONTINUOUS background action (the over-merge job scans the
+    whole HA recorder window, not 24 h), which turns two latent problems into
+    ongoing ones:
 
     * ``events.split_evaluated_at`` / ``split_evaluation_outcome`` — the job's
       checked-set lived only in memory, so every restart re-evaluated the whole
-      backlog, and post-dev50 each re-evaluation costs an HA history fetch. NULL
-      means "never evaluated", so the columns need no backfill and every existing
-      event is considered exactly once after this lands.
-    * ``anomaly_shutoff_log`` / ``cross_talk_audit`` ``stale_reason`` + ``stale_at``
-      — both carry an ``event_id`` with no FK and no cleanup, so each reprocess left
-      them pointing at an id that no longer exists. Marked, never deleted, exactly
-      as ``overlap_audit`` has been since 20260801: these rows are provenance (a
-      shutoff that fired, a cross-talk verdict that was applied).
+      backlog at one HA history fetch per event. NULL means "never evaluated",
+      so no backfill, and every existing event is considered exactly once.
+    * ``anomaly_shutoff_log`` / ``cross_talk_audit`` ``stale_reason`` +
+      ``stale_at`` — both carry an ``event_id`` with no FK and no cleanup, so
+      each reprocess left them pointing at a deleted id. Marked, never deleted,
+      as ``overlap_audit`` is: these rows are provenance (a shutoff that fired,
+      a cross-talk verdict that was applied).
     """
     _add_columns(conn, "events", (("split_evaluated_at",       "TEXT"),
                                   ("split_evaluation_outcome", "TEXT")),
@@ -1470,7 +1375,7 @@ def _apply_auto_split_memo(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260814: auto-split memo columns + audit stale marks ready")
 
 
-# 20260815 — dev51: the model referee's benchmark + decision ledger.
+# 20260815 — the model referee's benchmark + decision ledger.
 _REFEREE_TABLES_DDL: tuple = (
     ("referee_benchmark",
      "CREATE TABLE IF NOT EXISTS referee_benchmark ("
@@ -1493,17 +1398,15 @@ _REFEREE_TABLES_DDL: tuple = (
 def _apply_referee_tables(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260815 — three new tables, no backfill, idempotent.
 
-    The referee (dev47) was designed with two legs: a pinned frozen benchmark
-    as the primary guard and a recent labelled holdout as the secondary. In
-    production the benchmark leg never ran — nothing wired the pinned file in —
-    and the referee rejected the identical challenger night after night. dev51
-    moves the benchmark INTO the database (``referee_benchmark`` + one
-    ``referee_benchmark_meta`` row per circuit holding the import's hash and
-    requested count), imported once through Dev Tools so the ids never enter
-    the repo, and adds ``retrain_ledger`` because the jobs table prunes at two
-    days and "a run of rejections" was therefore invisible. Empty tables are
-    the correct state on a fresh install: the benchmark leg abstains, and an
-    abstaining referee keeps the incumbent.
+    The referee's primary leg is a pinned frozen benchmark (the secondary is a
+    recent labelled holdout); with nothing wiring a benchmark in it rejected
+    the identical challenger night after night. The benchmark therefore lives
+    IN the database: ``referee_benchmark`` plus one ``referee_benchmark_meta``
+    row per circuit holding the import's hash and requested count, imported
+    through Dev Tools so the ids never enter the repo. ``retrain_ledger``
+    exists because the jobs table prunes at two days, which made "a run of
+    rejections" invisible. Empty tables are the correct fresh-install state:
+    the benchmark leg abstains, and an abstaining referee keeps the incumbent.
     """
     for _name, ddl in _REFEREE_TABLES_DDL:
         conn.execute(ddl)
@@ -1519,7 +1422,7 @@ def _missing_referee_tables(conn: sqlite3.Connection) -> set[str]:
     return {name for name, _ in _REFEREE_TABLES_DDL if not _has_table(conn, name)}
 
 
-# 20260816 — dev53: the add-on pins its own benchmark (provenance + pending slot).
+# 20260816 — the add-on pins its own benchmark (provenance + pending slot).
 _REFEREE_META_COLUMNS: tuple = (
     ("source", "TEXT NOT NULL DEFAULT 'import'"),
     ("pinned_from_n", "INTEGER"),
@@ -1536,8 +1439,7 @@ _REFEREE_META_COLUMNS: tuple = (
 def _apply_referee_meta_columns(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260816 — additive, idempotent, no backfill.
 
-    dev51 stored ONE hand-imported benchmark per circuit. dev53 lets the add-on
-    pin its own and, deliberately, re-pin it. Two shape changes:
+    The add-on pins its own benchmark and, deliberately, re-pins it:
 
     * ``referee_benchmark`` gains ``role`` ('active' | 'pending') and its
       primary key becomes (circuit, event_id, role). A re-pin is written as
@@ -1548,9 +1450,8 @@ def _apply_referee_meta_columns(conn: sqlite3.Connection) -> None:
     * ``referee_benchmark_meta`` gains provenance (``source``,
       ``pinned_from_n``), the pending slot, and the Water Use prompt's
       dismissal record. Existing import rows read as source='import' with an
-      unknown ``pinned_from_n`` — the growth trigger simply cannot fire for
-      them, which is correct: nothing knows what label count they were drawn
-      from.
+      unknown ``pinned_from_n``, so the growth trigger cannot fire for them —
+      correct, since nothing knows what label count they were drawn from.
     """
     # a 20260814 DB runs 20260815 first, so the tables exist; be defensive anyway
     for _name, ddl in _REFEREE_TABLES_DDL:
@@ -1588,25 +1489,24 @@ def _missing_referee_meta_columns(conn: sqlite3.Connection) -> set[str]:
 
 
 def _apply_overlap_resweep(conn: sqlite3.Connection) -> None:
-    """Forward migration to 20260817 — dev55. Re-run the same-circuit overlap
-    sweep over all history.
+    """Forward migration to 20260817 — re-run the same-circuit overlap sweep
+    over all history.
 
-    20260561 (dev28) ran this once. Since then the importer kept writing a long
-    reconstructed parent on top of the live children inside it: each child is
-    individually >= 3x shorter than the parent, so find_overlapping_event's
-    "longer wins over short unlabeled stub" heal waved every one of them through
-    one at a time. dev55 refuses those writes going forward; this clears what
-    already accumulated. Measured on a 2026-09-05 copy of the live DB: 323
-    overlap groups, 249 unresolved, of which 179 carry no user label and hold
-    ~265 L of double-counted water — replaying the resolver's own policy
-    de-duplicates 165 of them.
+    The importer kept writing a long reconstructed parent on top of the live
+    children inside it: each child is individually >= 3x shorter than the
+    parent, so ``find_overlapping_event``'s "longer wins over short unlabeled
+    stub" heal waved every one of them through one at a time. The write guard
+    now refuses those; this clears what already accumulated. Measured on a copy
+    of the live DB: 323 overlap groups, 249 unresolved, of which 179 carry no
+    user label and hold ~265 L of double-counted water — replaying the
+    resolver's own policy de-duplicates 165 of them.
 
     Idempotent by contract: an already-zeroed wrapper is a no-op and audit rows
     are INSERT OR IGNORE. User-labelled wrappers get an audit row only and keep
-    every litre. Guarded for stub DBs. No schema change of its OWN — but it does
-    call ``_ensure_verdict_pin_columns`` first, because the resolver it replays
-    writes the 20260818 pin columns and they must exist before it runs (see that
-    helper: the columns are hoisted, the migration numbers are NOT swapped).
+    every litre. Guarded for stub DBs. No schema change of its OWN — but it
+    calls ``_ensure_verdict_pin_columns`` first, because the resolver it replays
+    writes the 20260818 pin columns (see that helper: the columns are hoisted,
+    the migration numbers are NOT swapped).
     """
     _ensure_verdict_pin_columns(conn)
     has_events = conn.execute(
@@ -1627,23 +1527,21 @@ def _apply_overlap_resweep(conn: sqlite3.Connection) -> None:
 
 
 def _apply_verdict_pin(conn: sqlite3.Connection) -> None:
-    """Forward migration to 20260818 — dev56. The PINNED VERDICT.
+    """Forward migration to 20260818 — the PINNED VERDICT.
 
     Three columns on ``events`` (``verdict_pin``, ``verdict_pin_veff``,
     ``verdict_pin_set_at``) plus an index on (circuit, verdict_pin). Backfill is
     TAG ONLY: every row already carrying ``match_rejection_reason =
     'overlap_duplicate'`` gets the pin with ``verdict_pin_veff`` = its CURRENT
-    effective volume — no litre is rewritten (a partial-remainder wrapper keeps its
-    remainder). The phantom bit is cleared on those rows: wrappers are not
-    phantoms — their water is real, merely counted by another row — and carrying
-    the bit put them in the phantom repair's path and under the phantom pill. That
-    is a one-time semantic change of the bit; the History surfaces key on the
-    reason from dev56 on. Idempotent: guarded ALTERs, an UPDATE whose WHERE is
-    empty on a second run.
+    effective volume — no litre is rewritten (a partial-remainder wrapper keeps
+    its remainder). The phantom bit is cleared on those rows: wrappers are not
+    phantoms — their water is real, merely counted by another row — and the bit
+    put them in the phantom repair's path and under the phantom pill; History
+    surfaces key on the reason instead. Idempotent: guarded ALTERs, an UPDATE
+    whose WHERE is empty on a second run.
 
-    The DDL itself lives in ``_ensure_verdict_pin_columns``, which 20260817 also
-    calls — the re-sweep replays a resolver that writes these columns. Only the
-    TAG backfill below is unique to this step.
+    The DDL lives in ``_ensure_verdict_pin_columns``, which 20260817 also calls;
+    only the TAG backfill below is unique to this step.
     """
     _ensure_verdict_pin_columns(conn)
     if not _has_table(conn, "events"):
@@ -1664,14 +1562,14 @@ def _apply_verdict_pin(conn: sqlite3.Connection) -> None:
         "  verdict_pin_set_at = ?, is_pressure_restoration_phantom = 0 "
         "WHERE match_rejection_reason = 'overlap_duplicate' "
         "  AND verdict_pin IS NULL", (now,))
-    # dev56 — the 20260817 re-sweep ran before the direction rule (6322179)
+    # The 20260817 re-sweep once ran before the resolver's direction rule
     # existed and raised ten wrappers another verdict had zeroed; the guard's
-    # UPDATE never touches is_cross_talk / is_low_flow_dribble, so two rows
-    # were left saying "cross-talk" with 0.71 / 0.57 L still counted, and no
-    # sweep re-derives cross-talk. Generic rule: a zeroing flag the operator
-    # did not set means zero. The other eight rows' original verdicts are
-    # unrecoverable (the phantom bit was overwritten); they stay as the
-    # guard's own remainder (I-4: over-count-and-flag beats guessing).
+    # UPDATE never touches is_cross_talk / is_low_flow_dribble, so two rows were
+    # left saying "cross-talk" with 0.71 / 0.57 L still counted, and no sweep
+    # re-derives cross-talk. Generic rule: a zeroing flag the operator did not
+    # set means zero. The other eight rows' original verdicts are unrecoverable
+    # (the phantom bit was overwritten); they stay as the guard's own remainder
+    # — over-count-and-flag beats guessing.
     try:
         repaired = rezero_rows_with_zeroing_flag(conn)
     except sqlite3.Error as e:
@@ -1696,20 +1594,17 @@ def _apply_wf_src_hz_correction(conn: sqlite3.Connection) -> None:
 
     ``event_waveforms.flow_src_hz`` / ``press_src_hz`` record the fixed sample
     rate of an ESP-sourced series so a renderer can build an honest time axis.
-    They were written as 200.0, which is the pressure ADC READ rate, not the
-    capture rate: the firmware's waveform_capture interval is 20 ms (~50 Hz),
-    stated in its own header. The add-on's matching constant is a function-local
-    ``_SAMPLE_MS = 20`` in ``event_waveform.py`` (unit 7.3 moved it there); it
-    is NOT importable from ``event_detector`` and never was module-level.
+    They were written as 200.0, the pressure ADC READ rate, not the capture
+    rate: the firmware's waveform_capture interval is 20 ms (~50 Hz). The
+    add-on's matching constant is a function-local ``_SAMPLE_MS = 20`` in
+    ``event_waveform.py``; it is NOT importable from ``event_detector`` and
+    never was module-level. Every ESP-sourced waveform therefore rendered on a
+    4x-compressed time axis (a 30 s capture drawn as 7.5 s). Only the stored
+    metadata is rewritten; the sample arrays were always correct.
 
-    Every ESP-sourced waveform therefore rendered on a 4x-compressed time axis —
-    a 30 s capture drawn as 7.5 s. This rewrites the stored metadata; the sample
-    arrays themselves were always correct and are untouched.
-
-    Idempotent: only rows still holding exactly 200.0 are changed, and the write
-    is value-scoped rather than blanket, so a genuinely different stored rate
-    (none exist today) would survive. No schema change, so _create_schema needs
-    no mirroring. Guarded for stub DBs.
+    Idempotent and value-scoped: only rows still holding exactly 200.0 change,
+    so a genuinely different stored rate would survive. No schema change, so
+    _create_schema needs no mirroring. Guarded for stub DBs.
     """
     if not _has_table(conn, "event_waveforms"):
         conn.commit()
@@ -1729,39 +1624,28 @@ def _apply_wf_src_hz_correction(conn: sqlite3.Connection) -> None:
 def _apply_drop_mqtt_schema(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260901 — remove the MQTT publisher's schema.
 
-    MQTT was part of an original roadmap the operator is no longer pursuing. It
-    had never worked on this install in any case: ``config.yaml`` declared no
-    ``services:`` block, so the Supervisor answered the broker-credentials query
-    with 403 and the publisher returned at ``status=not_configured`` without
-    ever connecting.
+    MQTT is off the roadmap and never worked on this install (``config.yaml``
+    declared no ``services:`` block, so the Supervisor answered 403 and the
+    publisher stopped at ``status=not_configured``), so nothing here ever held
+    live data:
 
-    Drops, in order of how sure we are they are unused:
-
-    * ``home_profile.mqtt_publish_enabled`` and
-      ``home_profile.publish_fixtures_to_ha`` — zero readers even before the
-      code removal; a repo-wide grep found only their DDL lines.
-    * ``fixture_ha_entity_map`` — the schema census found it had never held a
-      row: a CREATE, one DELETE, and nothing else.
+    * ``home_profile.mqtt_publish_enabled`` / ``publish_fixtures_to_ha`` —
+      zero readers.
+    * ``fixture_ha_entity_map`` — never held a row.
     * ``category_publish`` — backed the per-category "publish to HA" checkbox,
       which controlled only MQTT output.
 
-    ``fixtures.publish_to_ha`` is deliberately LEFT ALONE. Unlike these it is
-    written by the live confirm path (``upsert_fixture_from_cluster``) and read
-    back at database.py's fixture rollup, so removing it is a change to that
-    flow rather than to MQTT.
+    ``fixtures.publish_to_ha`` is deliberately LEFT ALONE: it is written by the
+    live confirm path (``upsert_fixture_from_cluster``) and read back at the
+    fixture rollup, so removing it changes that flow, not MQTT.
 
-    Idempotent: DROP ... IF EXISTS, and each column is checked first. Column
-    drops are wrapped because ``ALTER TABLE ... DROP COLUMN`` needs SQLite
-    3.35+; on anything older the columns are simply left in place, which is
-    harmless — nothing reads them. No data is migrated: every object here is
-    either empty or write-only.
-
-    NOTE: ``fixture_ha_entity_map`` was also removed from QUICK_RESTORE_TABLES
-    (routers/backup.py) and RESTORABLE_TABLES (restore_utils.py) in the same
-    commit. Those lists are NOT optional to update: the restore path runs
-    ``DELETE FROM {tbl}`` for every name in the quick-restore list with no
-    existence check, so a dropped-but-still-listed table makes Quick Restore
-    fail outright.
+    Idempotent: DROP ... IF EXISTS, each column checked first. Column drops are
+    wrapped because ``ALTER TABLE ... DROP COLUMN`` needs SQLite 3.35+; older
+    builds keep the columns, harmlessly (nothing reads them). A dropped table
+    must ALSO leave QUICK_RESTORE_TABLES (routers/backup.py) and
+    RESTORABLE_TABLES (restore_utils.py): the restore path runs ``DELETE FROM
+    {tbl}`` for every quick-restore name with no existence check, so a
+    dropped-but-still-listed table makes Quick Restore fail outright.
     """
     for table in ("category_publish", "fixture_ha_entity_map"):
         try:
@@ -1805,73 +1689,54 @@ _V20260902_DROP_INDEXES: tuple = (
 def _apply_dead_schema_and_event_indexes(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260902 — drop dead schema, fix events' indexes.
 
-    (1) DEAD OBJECTS. Two tables and one column with no reader and no writer
-    anywhere in the repo:
+    (1) DEAD OBJECTS — no reader and no writer anywhere in the repo.
+    ``csrf_tokens``: CSRF is stateless double-submit off ``csrf_server_secret``
+    and nothing ever issued or checked a row; its remaining mention in
+    ``EXPORT_EXCLUDED_TABLES`` (routers/backup.py) DELETEs inside a
+    ``try/except sqlite3.Error: continue``, so unlike the quick-restore
+    allowlist it tolerates a dropped name. ``cluster_sequences``: a placeholder
+    that never gained a writer. ``events.flow_onset_delay_seconds``: never in
+    the feature dict the live upsert builds its column list from, so dropping
+    it cannot break ingestion, and no query selects it.
 
-    * ``csrf_tokens`` — a pre-HMAC leftover. CSRF has been stateless
-      double-submit off ``csrf_server_secret`` for a long time; nothing ever
-      issued or checked a row here. Its only other mention in the tree is
-      ``EXPORT_EXCLUDED_TABLES`` in ``routers/backup.py``, which DELETEs from
-      each listed table inside a ``try/except sqlite3.Error: continue`` — so
-      unlike the quick-restore allowlist (which has no existence check and WOULD
-      500), leaving the name there after the drop is exactly the handled case.
-    * ``cluster_sequences`` — a Phase 2.2 placeholder that never gained a
-      writer; a repo-wide grep found its CREATE and nothing else.
-    * ``events.flow_onset_delay_seconds`` — never in the feature dict the live
-      upsert builds its column list from, so dropping it cannot break event
-      ingestion, and no query selects it.
+    NOT dropped, though proposed: ``zone_flow_history`` — never populated, but
+    it IS in ``RESTORABLE_TABLES`` (restore_utils.py) and
+    ``HISTORY_ARCHIVE_TABLES`` (routers/backup.py), and data_pruner prunes it by
+    ``recorded_at``. ``events.propagation_delay_seconds`` — no reader in the
+    add-on, but ``tools/audit/scripts/p4_fields.py`` SELECTs it by name against
+    a copy of the live database.
 
-    NOT dropped, though the audit proposed them:
+    (2) REDUNDANT INDEXES (``_V20260902_DROP_INDEXES``): six non-UNIQUE indexes
+    whose key is already indexed, column for column, by the table's PRIMARY KEY
+    / UNIQUE constraint (or, for ``jobs``, the rowid its INTEGER PRIMARY KEY
+    aliases). No ``ON CONFLICT`` target can depend on them (a target must be
+    UNIQUE), and each cost a write on tables the live path writes constantly.
+    Two were ALSO created inside earlier migrations (20260530, 20260811); those
+    CREATE lines are gone, because a forward walk re-creating them two steps
+    earlier would have made this drop a silent no-op. NOT dropped:
+    ``idx_cross_talk_audit_event`` — ``cross_talk_audit`` has no other index on
+    ``event_id``, and the reprocess delete loop in database.py runs ``UPDATE
+    cross_talk_audit SET stale_reason = … WHERE event_id = ?`` once per deleted
+    event; without it that is a table scan per row.
 
-    * ``zone_flow_history`` — it IS in ``RESTORABLE_TABLES`` (restore_utils.py)
-      and ``HISTORY_ARCHIVE_TABLES`` (routers/backup.py), and data_pruner prunes
-      it by ``recorded_at``. Never-populated is not the same as unreferenced.
-    * ``events.propagation_delay_seconds`` — no reader in the add-on, but
-      ``tools/audit/scripts/p4_fields.py`` SELECTs it by name against a copy of
-      the live database, so dropping it would break the audit harness.
-
-    (2) REDUNDANT INDEXES (``_V20260902_DROP_INDEXES``). Six non-UNIQUE indexes
-    whose key is already indexed, column for column, by the table's own PRIMARY
-    KEY / UNIQUE constraint (or, for ``jobs``, by the rowid the INTEGER PRIMARY
-    KEY aliases). No ``ON CONFLICT`` target can depend on them — a conflict
-    target must be UNIQUE — and every one of them cost a write on tables the
-    live path writes to constantly. Two of the six were ALSO created inside
-    earlier migrations (20260530, 20260811); those CREATE lines are removed in
-    the same commit, because dropping here while a forward walk re-created them
-    two steps earlier would have been a silent no-op.
-
-    NOT dropped: ``idx_cross_talk_audit_event``. The audit listed it, but it is
-    not redundant — ``cross_talk_audit`` has no other index on ``event_id``, and
-    the reprocess delete loop in database.py runs
-    ``UPDATE cross_talk_audit SET stale_reason = … WHERE event_id = ?`` once per
-    deleted event. Dropping it would have turned that into a table scan per row.
-
-    (3) THE TWO MISSING EVENTS INDEXES.
-
-    * ``idx_events_circuit_cluster (circuit, cluster_id)`` — ``cluster_id`` is
-      the join key of the whole clustering layer and had no index at all. Nearly
-      every filter site pairs it with ``circuit`` (``WHERE circuit = ? AND
-      cluster_id = ?``, ``… AND cluster_id IS NULL``), and cluster ids are only
-      unique per circuit, so the composite is the right key rather than a bare
-      one.
-    * ``idx_events_fixture (fixture_id)`` — ``fixture_id`` is a declared FK to
-      ``fixtures(id)`` with no ON DELETE action, so SQLite must check the child
-      rows on every fixture delete or merge. Unindexed that was a full scan of
-      ``events``; the FK check keys on ``fixture_id`` alone, so this index is
-      deliberately NOT circuit-led.
-
-    Both live here rather than in ``_create_schema`` for the reason the
-    ``idx_events_wf_claim`` / ``idx_events_verdict_pin`` notes in database.py
-    give: that DDL script also runs against upgrade databases, and an index
-    statement there executes before any ALTER has run. Fresh installs still get
-    them — the version==0 path runs this whole chain.
+    (3) THE TWO MISSING EVENTS INDEXES. ``idx_events_circuit_cluster (circuit,
+    cluster_id)`` — ``cluster_id`` is the join key of the whole clustering layer
+    and had no index; nearly every filter site pairs it with ``circuit``, and
+    cluster ids are only unique per circuit, so the composite is the right key
+    rather than a bare one. ``idx_events_fixture (fixture_id)`` — ``fixture_id``
+    is a declared FK to ``fixtures(id)`` with no ON DELETE action, so SQLite
+    checks the child rows on every fixture delete or merge — unindexed, a full
+    scan of ``events``; the FK check keys on ``fixture_id`` alone, so this index
+    is deliberately NOT circuit-led. Both live here rather than in
+    ``_create_schema`` for the reason ``_ensure_wf_claim_index`` gives (that DDL
+    runs against upgrade databases before any ALTER); fresh installs still get
+    them because the version==0 path runs the whole chain.
 
     Idempotent throughout: ``DROP … IF EXISTS``, ``CREATE INDEX IF NOT EXISTS``,
-    and the column drop is checked with ``_has_column`` first and wrapped
-    (``ALTER TABLE … DROP COLUMN`` needs SQLite 3.35+; on anything older the
-    column is simply left in place, harmless now that ``_create_schema`` no
-    longer emits it). No data is migrated — every object removed here is empty
-    or write-never-read.
+    and the column drop is checked with ``_has_column`` and wrapped (``ALTER
+    TABLE … DROP COLUMN`` needs SQLite 3.35+; older builds keep the column,
+    harmless now that ``_create_schema`` no longer emits it). No data is
+    migrated — every object removed is empty or write-never-read.
     """
     for table in _V20260902_DROP_TABLES:
         try:
@@ -1914,6 +1779,12 @@ def _apply_dead_schema_and_event_indexes(conn: sqlite3.Connection) -> None:
              " + events.flow_onset_delay_seconds" if dropped_col else "")
 
 
+# Ordered forward-migration chain, (introduced_in_version, apply_fn): a DB
+# stamped at V already HAS every step with introduced <= V and needs exactly
+# the steps with introduced > V, in this order. Every apply fn is idempotent,
+# so dispatch is one loop; adding a migration is ONE line here plus bumping
+# _CURRENT_VERSION — never a per-version branch (the old ladder, where one
+# missed branch stamped a DB current while silently missing a table).
 _MIGRATIONS: tuple = (
     (20260802, _apply_peak_consistency_backfill),
     (20260803, _apply_resistance_backfill),
@@ -1945,18 +1816,12 @@ _UPGRADEABLE_VERSIONS: frozenset = frozenset(
 def _run_migration_step(conn: sqlite3.Connection, version: int, fn) -> None:
     """Run one migration body and NAME IT in the log, before and after.
 
-    Until dev59 the chain logged one summary line ("Database upgraded X → Y,
-    N forward step(s)") and nothing else, so 26 of the 48 migrations were
-    completely silent: any migration whose body logs nothing left no trace it
-    had run. That makes crash resumption unauditable — after a boot that died
-    mid-chain there was no way to say from the log which step was running when
-    it died, and the chain deliberately re-runs every step it predates on the
-    next boot (nothing is stamped until the end), so "did 20260807 already
-    run?" could only be answered by inspecting the schema by hand.
-
-    The BEFORE line is the load-bearing one: it is the last thing in the log
-    when a step hangs or is killed. The AFTER line separates "crashed INSIDE
-    20260807" from "finished 20260807 and crashed on the step after it".
+    A body that logs nothing would otherwise leave no trace it ran, and the
+    chain deliberately re-runs every step it predates on the next boot (nothing
+    is stamped until the end), so a boot that died mid-chain must be auditable
+    from the log. The BEFORE line is the load-bearing one: it is the last thing
+    in the log when a step hangs or is killed. The AFTER line separates
+    "crashed INSIDE this step" from "finished it and crashed on the next".
     """
     log.info("Migration %d: running %s", version, fn.__name__)
     _t0 = time.monotonic()
@@ -1978,19 +1843,16 @@ def run_migrations(
     conn: sqlite3.Connection,
     db_path: Optional[Path] = None,
 ) -> None:
-    """
-    Enforce baseline schema version. Called once at startup after init_db().
+    """Enforce the schema version. Called once at startup, after init_db() has
+    already created the tables.
 
-    CRITICAL: tables are already created by database.py before this is called.
-    Version 0 is ambiguous — could be fresh DB OR old pre-squash DB without
-    _schema_version. Distinguish by checking for ALL required baseline columns:
-      - All present  → fresh DB created by current schema → stamp baseline
-      - Any absent   → old pre-squash DB → fail fast
+    Version 0 is ambiguous — a fresh DB, or an old pre-squash DB with no
+    _schema_version — and is resolved by checking for ALL baseline columns:
+    all present → fresh DB → stamp; any absent → pre-squash → fail fast.
 
-    Always emits the schema-state diagnostic line at the end (via the
-    `finally` below), even when migration aborts with a RuntimeError —
-    that way the supervisor logs show exactly what tables/columns the
-    on-disk DB had at the moment things went wrong.
+    The schema-state diagnostic line is always emitted (``finally``), even when
+    migration aborts with a RuntimeError, so the supervisor log shows exactly
+    what the on-disk DB had at the moment things went wrong.
     """
     try:
         _run_migrations_impl(conn, db_path)
@@ -2014,10 +1876,9 @@ def _run_migrations_impl(
             | _missing_rbac_tables(conn)
             | _missing_cross_talk_audit_table(conn)
             | _missing_overlap_audit_table(conn)
-            # 20260564-68 (dev32/33/34). These five verifiers were written with
-            # their migrations and then never wired in here, so a DB stamped
-            # CURRENT with any of those five bodies un-run passed this guard and
-            # only failed later, at the first query against the missing column.
+            # 20260564-68 — table-conditional verifiers. A DB stamped CURRENT
+            # with any of these bodies un-run must fail HERE, not at the first
+            # query against the missing column.
             | _missing_supply_regime_tables(conn)
             | _missing_regime_calibration_columns(conn)
             | _missing_pump_era_columns(conn)

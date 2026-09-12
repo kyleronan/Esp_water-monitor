@@ -1,14 +1,10 @@
 """
-Online clustering engine — Phase 2.1 Stage 2.
+Online clustering engine: per-circuit DBSTREAM + StandardScaler (river).
 
-Per-circuit DBSTREAM + StandardScaler (river library).  Called from
-feature_extractor.py after each event is stored.  The orchestrator
-instantiates this class on startup and calls rebuild_from_db() to
-replay the last 60 days of already-matched events to reconstruct
-in-memory state.
-
-State persistence: rebuild from DB, never pickle.  See ADR 008.
-Algorithm choice: DBSTREAM, not batch DBSCAN.  See ADR 003.
+The feature-extractor service feeds each stored event through match_and_learn;
+the orchestrator constructs the engine at startup and calls rebuild_from_db to
+replay the last 60 days of matched events. State is rebuilt from the DB, never
+pickled; DBSTREAM (online), not batch DBSCAN.
 """
 from __future__ import annotations
 
@@ -20,14 +16,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from .database import cycle_pulse_count_for_event, merge_clusters, run_db
 
-# `river` is a runtime dependency of ClusterEngine but not of the rest of the
-# package, and importing it eagerly pulls in scipy — ~1.3 s of import cost.
-# Nothing outside ClusterEngine needs it (feature_extractor imports this module
-# only for a constant, and most tests never instantiate the engine), so the
-# import is deferred to ClusterEngine.__init__ via _load_river(). This also
-# keeps collection working where river isn't installed (local runs without the
-# add-on's full Dockerfile pip set): only code that constructs the engine
-# raises.
+# `river` is deferred to ClusterEngine.__init__ (_load_river): importing it
+# eagerly pulls in scipy (~1.3 s), nothing outside the engine needs it
+# (feature_extractor imports this module only for a constant), and the module
+# must stay importable where river isn't installed — only constructing the
+# engine raises.
 cluster = None                         # populated by _load_river()
 preprocessing = None                   # populated by _load_river()
 _RIVER_IMPORT_ERROR: Optional[BaseException] = None
@@ -108,16 +101,15 @@ FEATURE_KEYS = [
     f'pressure_sig_{i:02d}' for i in range(SIG_POINTS)
 ]
 
-# Every pressure-derived dimension, for the pump-era "pressure-blind" cluster
-# space. Under a VFD constant-pressure pump the supply servos pressure flat, so
-# ΔP measures pump droop-and-recovery instead of the fixture: across the 2026-07
-# pump install corr(ΔP, peak_flow²) fell 0.721 → 0.060, and the class-matched
-# F-ratio of the pressure-signature block — 36.6% of the cluster distance, its
-# largest single share — fell 5.53 → 2.15 (noise = 1.0) while flow shape held at
-# 6.38. Re-seeding on pressure features would also mean re-seeding again at
-# every pump setpoint change. propagation_delay_ms rides along: it is a
-# pressure-arrival measure, and ~noise at F ≈ 0.2. has_pressure_transient stays
-# — valve slam is a fixture property.
+# Every pressure-derived dimension, zeroed in the pump-era "pressure-blind"
+# cluster space. A VFD constant-pressure pump servos pressure flat, so ΔP
+# measures pump droop-and-recovery instead of the fixture: across the pump
+# install corr(ΔP, peak_flow²) fell 0.721 → 0.060 and the class-matched F-ratio
+# of the pressure-signature block (36.6% of the cluster distance, its largest
+# share) fell 5.53 → 2.15 (noise = 1.0) while flow shape held at 6.38. Seeding
+# on pressure would also mean re-seeding at every pump setpoint change.
+# propagation_delay_ms rides along (pressure-arrival measure, ~noise at
+# F ≈ 0.2); has_pressure_transient stays — valve slam is a fixture property.
 PRESSURE_FEATURE_KEYS: frozenset = frozenset(
     {'pressure_delta_psi', 'pre_event_pressure_psi', 'min_pressure_psi',
      'hydraulic_resistance', 'pressure_transient_energy',
@@ -225,18 +217,18 @@ class ClusterEngine:
         # rejects the match rather than silently accepting a possibly-wrong one), so
         # this surfaces a gate that's quietly erroring on every event.
         self._type_gate_errors: Dict[str, int] = {}
-        # dev34 B2 — circuit -> pressure-blind feature mode (see
-        # PRESSURE_FEATURE_KEYS). Loaded from training_state in _init_circuit.
+        # circuit -> pressure-blind feature mode (see PRESSURE_FEATURE_KEYS).
+        # Loaded from training_state in _init_circuit.
         self._pressure_blind: Dict[str, bool] = {}
-        # dev39 — count frozen matches landing on river centers the id-map
-        # rebuild failed to attach (rejection 'unmapped_center'). Nonzero and
-        # climbing = the restart desync; used to rate-limit the warning.
+        # Frozen matches landing on river centers the id-map rebuild failed to
+        # attach (rejection 'unmapped_center'). Nonzero and climbing = the
+        # restart desync; used to rate-limit the warning.
         self._unmapped_center_hits: Dict[str, int] = {}
-        # dev42 (F-C1) — circuits with a reseed replay in flight. While set,
-        # live match_and_learn calls DEFER (store NULL + 'reseed_deferred')
-        # instead of matching a partially rebuilt model; the reseed flushes
-        # them through the completed model after freeze. Never stores a
-        # wrong id — annotate-don't-modify favors no id over a bad one.
+        # Circuits with a reseed replay in flight. While set, live
+        # match_and_learn calls DEFER (store NULL + 'reseed_deferred') instead
+        # of matching a partially rebuilt model; the reseed flushes them through
+        # the completed model after freeze. Annotate-don't-modify: no id beats a
+        # wrong one.
         self._reseed_active: Dict[str, bool] = {}
 
         for c in cfg.circuits:
@@ -258,10 +250,10 @@ class ClusterEngine:
         ).fetchone()
         self._next_cluster_id[circuit] = (row[0] if row[0] is not None else -1) + 1
         self._refresh_type_cache(circuit)
-        # dev34 B2 — the feature mode is persisted so a restart rebuilds the
-        # SAME space the centers were seeded in. A pressure-blind center set
-        # replayed with pressure features on (or vice versa) is silent
-        # nonsense: every distance shifts and the id-map rebuild mismatches.
+        # The feature mode is persisted so a restart rebuilds the SAME space the
+        # centers were seeded in: a pressure-blind center set replayed with
+        # pressure features on (or vice versa) shifts every distance and the
+        # id-map rebuild mismatches.
         try:
             r = self._db.execute(
                 "SELECT cluster_features_mode FROM training_state "
@@ -316,20 +308,12 @@ class ClusterEngine:
                       circuit, len(cache))
 
     def reset_circuit(self, circuit: str) -> None:
-        """
-        Clear all in-memory state for one circuit and re-seed from DB.
-
-        Called by training_manager.start_calibration() when a new
-        calibration cycle begins, so DBSTREAM and the scaler don't carry
-        over state from the previous run that has just had its
-        unconfirmed clusters wiped.
-
-        Confirmed clusters in fixture_clusters (fixture_id IS NOT NULL)
-        are unaffected — only the in-memory DBSTREAM, scaler,
-        river_id_map and next_cluster_id sequence are reset.  The
-        next_cluster_id is re-derived from MAX(id) across surviving
-        rows so confirmed cluster IDs don't collide.
-        """
+        """Clear one circuit's in-memory state (DBSTREAM, scaler, river_id_map,
+        next_cluster_id) and re-init from the DB; fixture_clusters rows are
+        untouched. training_manager.start_calibration calls it so a new cycle
+        doesn't inherit state from the run whose unconfirmed clusters were just
+        wiped; next_cluster_id is re-derived from MAX(id) over surviving rows so
+        confirmed cluster IDs don't collide."""
         self._init_circuit(circuit)
 
     # ── Feature extraction ─────────────────────────────────────────────────────
@@ -340,22 +324,17 @@ class ClusterEngine:
         """Build the full feature dict from an event DB row. Returns None if unusable."""
         if event.get('avg_flow_lpm') is None or not event.get('duration_seconds'):
             return None
-        # An unparseable / missing start_ts must NOT fall back to ``hour = 0``:
-        # that is not "unknown", it is a CONFIRMED midnight local, and
-        # hour_sin/hour_cos are real clustering features — a row that ran at
-        # 19:00 lands on the far side of the time-of-day circle and drags the
-        # DBSTREAM centre with it. There is no honest fallback for a time
-        # feature, so refuse the event. _extract_features is Optional and BOTH
-        # call sites handle None (_match_and_learn_impl → 'features_missing';
-        # the replay loop skips).
+        # A missing / unparseable start_ts must NOT fall back to hour = 0: that
+        # is a CONFIRMED midnight, not "unknown", and hour_sin/hour_cos would
+        # drag the DBSTREAM centre across the time-of-day circle. Refuse the
+        # event instead — both callers handle None (_match_and_learn_impl →
+        # 'features_missing'; the replay loop skips).
         start_ts = event.get('start_ts')
         if not start_ts:
             return None
         try:
-            # dev38: stored start_ts is UTC — convert to the HOME timezone
-            # before taking .hour (second instance of the audit's UTC
-            # time-feature bug; naive timestamps are treated as UTC, the
-            # storage convention).
+            # Stored start_ts is UTC (naive = UTC, the storage convention) —
+            # convert to the HOME timezone before taking .hour.
             _dt = datetime.fromisoformat(str(start_ts))
         except (ValueError, TypeError):
             log.warning("cluster: event %s has an unparseable start_ts (%r) — "
@@ -434,11 +413,10 @@ class ClusterEngine:
             for i in range(SIG_POINTS):
                 features.setdefault(f'{prefix}_{i:02d}', 0.0)
 
-        # dev34 B2 — pressure-blind mode: every pressure-derived dimension is
-        # pinned to 0.0 for EVERY event, so the block carries no variance and
-        # no distance. Zeroing at extraction (not in the weights) is what makes
-        # it reach DBSTREAM's internal clustering, which ignores the weight
-        # table.
+        # Pressure-blind mode pins every pressure-derived dimension to 0.0 for
+        # EVERY event, so the block carries no variance and no distance. Zeroing
+        # at extraction (not in the weights) is what reaches DBSTREAM's internal
+        # clustering, which ignores the weight table.
         key = circuit if circuit is not None else str(event.get('circuit') or '')
         if self._pressure_blind.get(key):
             for k in PRESSURE_FEATURE_KEYS:
@@ -712,15 +690,13 @@ class ClusterEngine:
             log.warning("[%s] cooccurrence update failed: %s", circuit, e)
 
     # ── Freeze / unfreeze (hard lock) ───────────────────────────────────────────
-    # A circuit FREEZES once it reaches the 'live' training state: the reference
-    # (scaler + DBSTREAM centers + cluster centroids) stops adapting and the
-    # engine only MATCHES against the locked reference, which is what stops a
-    # post-activation event (incl. a slow leak) being silently learned as
-    # "normal". Unfrozen for every pre-'live' state (idle / calibrating /
-    # labelling), frozen once 'live'; fault/disabled inherit (no transition ⇒ no
-    # change). freeze_circuit/unfreeze_circuit set it on lifecycle transitions;
-    # the lazy fallback reads training_state so a fresh process is correct
-    # without waiting for a transition.
+    # Once a circuit is 'live' the reference (scaler + DBSTREAM centers + cluster
+    # centroids) stops adapting and the engine only MATCHES against it, so a
+    # post-activation event (incl. a slow leak) is never learned as "normal".
+    # Pre-'live' states (idle / calibrating / labelling) are unfrozen; fault /
+    # disabled inherit (no transition ⇒ no change). freeze_circuit /
+    # unfreeze_circuit set it on lifecycle transitions; the lazy fallback reads
+    # training_state so a fresh process is correct before any transition.
 
     def freeze_circuit(self, circuit: str) -> None:
         """Lock the circuit: match-only, no learning (called at activation)."""
@@ -771,11 +747,11 @@ class ClusterEngine:
 
         candidate_id = self._river_id_map.get(circuit, {}).get(nearest_id)
         if candidate_id is None:
-            # An in-memory center with no DB mapping must reject EXPLICITLY.
-            # Returning (None, conf, level, None) stores cluster_id NULL with no
-            # rejection reason, making a dead id map after a restart
-            # indistinguishable from "never evaluated" — matching stopped
-            # silently on 2026-08-13 while the DB showed 30 healthy clusters.
+            # An in-memory center with no DB mapping must reject EXPLICITLY:
+            # returning (None, conf, level, None) stores cluster_id NULL with no
+            # rejection reason, so a dead id map after a restart is
+            # indistinguishable from "never evaluated" — matching once stopped
+            # silently while the DB showed 30 healthy clusters.
             n = self._unmapped_center_hits.get(circuit, 0) + 1
             self._unmapped_center_hits[circuit] = n
             if n == 1 or n % 25 == 0:
@@ -825,21 +801,17 @@ class ClusterEngine:
         prev_cluster_id: Optional[int] = None,
         seconds_since_prev: Optional[float] = None,
     ) -> Tuple[Optional[int], float, str, Optional[str]]:
-        """
-        Feed one event through DBSTREAM.
+        """Feed one event through DBSTREAM.
 
-        Returns ``(cluster_id, confidence, level, rejection_reason)``.
-
-        * On success: cluster_id is the DB row id, rejection_reason is None.
-        * On rejection: cluster_id is None and rejection_reason is one of
-          ``'features_missing'``, ``'no_centers'``, ``'type_gate_rejected'``.
-          The caller writes ``rejection_reason`` into
-          ``events.match_rejection_reason`` so the events page can explain
-          why a row has ``cluster_id IS NULL``.
-
-        prev_cluster_id / seconds_since_prev: when provided and the gap is
-        within SEQUENCE_GAP_MAX_SECONDS, the cooccurrence table is updated.
-        Stage 3 will apply a confidence boost from this table.
+        Returns ``(cluster_id, confidence, level, rejection_reason)``: on
+        success cluster_id is the DB row id and rejection_reason is None; on
+        rejection cluster_id is None and rejection_reason names why
+        ('features_missing', 'no_centers', 'type_gate_rejected',
+        'type_gate_error', 'unmapped_center', 'reseed_deferred'). The caller
+        stores it in events.match_rejection_reason so the events page can
+        explain a NULL cluster_id. prev_cluster_id / seconds_since_prev update
+        the cooccurrence table when the gap is under SEQUENCE_GAP_MAX_SECONDS
+        (the Stage 3 confidence boost reads it; not applied yet).
         """
         # A reseed replay is rebuilding this circuit's model — matching now
         # would consult a half-built center set and store a wrong-or-NULL id
@@ -852,9 +824,9 @@ class ClusterEngine:
             event, circuit, prev_cluster_id, seconds_since_prev)
 
     def begin_reseed(self, circuit: str) -> None:
-        """dev42 (F-C1) — defer live matching while a reseed replay runs.
-        Deliberately NOT cleared by a crashed reseed: a half-built model must
-        not resume matching; the F-C2 marker tells the user to rerun."""
+        """Defer live matching while a reseed replay runs. Deliberately NOT
+        cleared by a crashed reseed: a half-built model must not resume
+        matching; the reseed_in_progress marker tells the user to rerun."""
         self._reseed_active[circuit] = True
 
     def end_reseed(self, circuit: str) -> None:
@@ -974,16 +946,11 @@ class ClusterEngine:
     # ── Startup rebuild ────────────────────────────────────────────────────────
 
     def rebuild_from_db(self, circuit: str, days: int = 60) -> int:
-        """
-        Replay recent matched events to reconstruct DBSTREAM + scaler state.
-        Called once per circuit at startup (via run_db).
-        Does not modify the database — DB rows are already correct.
-
-        After replaying, attempts to rebuild the river→DB ID mapping by
-        comparing each DBSTREAM centre to the stored centroids so that
-        new events continue updating existing clusters rather than creating
-        duplicates.
-        """
+        """Replay recent matched events to reconstruct DBSTREAM + scaler state
+        (once per circuit at startup, via run_db; read-only on the DB), then
+        rebuild the river→DB id map — majority vote of the replayed rows' own
+        cluster_ids first, centroid proximity for the rest — so new events keep
+        updating existing clusters instead of creating duplicates."""
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         rows = self._db.execute(
             """SELECT * FROM events
@@ -1006,15 +973,13 @@ class ClusterEngine:
             count += 1
 
         if count == 0 and self._is_frozen(circuit):
-            # The death spiral: this replay reads only cluster_id IS NOT NULL
+            # The death spiral: the replay reads only cluster_id IS NOT NULL
             # rows, so once live matching stops (e.g. a supply change moves the
             # features) the pool drains, the next restart replays nothing, and
-            # every subsequent event rejects with 'no_centers' — permanently,
-            # and silently but for this line. After the 2026-07 pump install
-            # weekly assignment went 75% → 58% → 45% → 8% → 0% and no cluster
-            # gained a member after 07-21. rebuild_from_db CANNOT recover it
-            # (nothing left to replay) — run the cluster re-seed
-            # (training_manager.reseed_clusters_for_regime) instead.
+            # every event rejects 'no_centers' — permanently, silently but for
+            # this line (after the pump install weekly assignment went 75% → 58%
+            # → 45% → 8% → 0%). rebuild_from_db CANNOT recover it; run
+            # training_manager.reseed_clusters_for_regime instead.
             n_unmatched = self._db.execute(
                 "SELECT COUNT(*) FROM events WHERE circuit = ? "
                 "AND cluster_id IS NULL AND end_ts >= ?",
@@ -1029,10 +994,10 @@ class ClusterEngine:
         if count > 0:
             # Ground the map in the replayed rows' OWN cluster_ids (majority
             # vote) before falling back to centroid proximity. Proximity alone
-            # killed live matching silently on 2026-08-13: any river center
-            # whose best DB centroid sat outside the acceptance bound stayed
-            # unmapped, and every live event landing on it stored cluster_id
-            # NULL with no rejection reason.
+            # once killed live matching silently: a river center whose best DB
+            # centroid sat outside the acceptance bound stayed unmapped, and
+            # every live event landing on it stored cluster_id NULL with no
+            # rejection reason.
             self._rebuild_id_map_from_assignments(circuit, replayed)
             self._rebuild_id_map_from_centroids(circuit)
             if (self._streams[circuit].centers
@@ -1053,21 +1018,13 @@ class ClusterEngine:
 
     def backfill_unmatched(self, circuit: str,
                            since_ts: Optional[str] = None) -> int:
-        """
-        Assign cluster_id to events that were collected before the DBSTREAM
-        engine existed (v0.1.x upgrades) or before a full recalibration.
-        Processes cluster_id IS NULL events in chronological order, feeding
-        each through match_and_learn and writing the result back.
-
-        Safe to call multiple times — only processes unmatched rows.
-        Called from orchestrator after rebuild_from_db and from
-        training_manager after calibration completes.
-
-        since_ts: window the pool to events at/after this timestamp. The
-        pump-era re-seed uses it so pre-anchor rows — recorded before the
-        fragmentation fixes and under the old supply — cannot seed the new
-        space, where fragments below the training support would become centers.
-        """
+        """Assign cluster_id to cluster_id IS NULL events (rows collected before
+        the engine existed or before a recalibration), oldest first, writing
+        each _match_and_learn_impl result back. Idempotent — only unmatched
+        rows are touched. since_ts windows the pool: the pump-era re-seed uses
+        it so pre-anchor rows (old supply, before the fragmentation fixes)
+        cannot seed the new space, where fragments below the training support
+        would become centers."""
         window_sql = "AND start_ts >= ?" if since_ts else ""
         params = (circuit, since_ts) if since_ts else (circuit,)
         rows = self._db.execute(
@@ -1086,8 +1043,8 @@ class ClusterEngine:
         count = 0
         for row in rows:
             event = dict(row)
-            # dev42: the internal path — the replay must keep working while
-            # the F-C1 deferral flag is set for live traffic.
+            # The internal path — the replay must keep working while the reseed
+            # deferral flag is set for live traffic.
             cluster_id, confidence, level, reason = \
                 self._match_and_learn_impl(event, circuit)
             if cluster_id is None:
@@ -1123,22 +1080,18 @@ class ClusterEngine:
                                        since_ts: Optional[str] = None,
                                        batch: int = 100,
                                        only_deferred: bool = False) -> int:
-        """``backfill_unmatched`` in chunks, one chunk per hop.
+        """``backfill_unmatched`` in chunks, each chunk one ``run_db`` hop.
 
-        Each chunk's DB work is submitted to ``run_db``, the SINGLE DB thread.
-        Running it on the event loop instead is NOT enough: on-loop is only
-        serialized against other loop code, so a concurrent page render on the
-        DB executor reopens the two-threads-one-connection window
-        (InterfaceError). Routing every touch through the one DB worker closes
-        it and hands the event loop back for the reseed's whole duration.
+        Every DB touch goes through run_db — the SINGLE DB thread — not the
+        event loop: on-loop work is only serialized against other loop code, so
+        a concurrent page render on the DB executor reopens the
+        two-threads-one-connection window (InterfaceError). Chunk boundary ==
+        transaction boundary: ``_backfill_chunk_sync`` opens, writes and commits
+        inside one run_db callable, so no foreign statement lands inside an open
+        transaction, and the loop is handed back between chunks.
 
-        Chunk boundary == transaction boundary: each ``_backfill_chunk_sync``
-        call opens, writes, and commits entirely inside one run_db callable, so
-        no foreign statement can land inside an open transaction.
-
-        ``only_deferred``: process only rows the reseed deferral stamped
-        'reseed_deferred' — the post-freeze flush. Without it, a second full
-        pass re-runs every abstained row in the window.
+        ``only_deferred``: only rows stamped 'reseed_deferred' — the post-freeze
+        flush. Without it a second full pass re-runs every abstained row.
         """
         conds = ["circuit = ?", "cluster_id IS NULL",
                  "excluded_from_training = 0", "end_ts IS NOT NULL"]
@@ -1198,21 +1151,14 @@ class ClusterEngine:
     # ── Type-level auto-merge ──────────────────────────────────────────────────
 
     def auto_merge_same_type_clusters(self, circuit: str) -> int:
-        """Merge clusters that have converged to the same fixture type.
+        """Merge clusters that have converged to the same fixture type
+        (effective type = user label, else suggestion; never None / 'other').
 
-        Conservative safety gate — all conditions must hold before merging:
-        - Effective type is not None and not 'other'
-        - Both clusters have member_count >= 5
-        - If neither is confirmed: suggested_confidence >= 0.75 for both
-        - Centroid weighted-distance <= get_match_threshold(effective_type)
-
-        Survivor selection is deterministic: confirmed fixture row first,
-        then highest member_count, then most recent last_match_at, then
-        lowest cluster_id.
-
-        Returns the number of merge operations executed.  Protected by
-        _merge_lock so concurrent executor threads see consistent state.
-        """
+        Gate: member_count >= 5, unconfirmed clusters need
+        suggested_confidence >= 0.75, and at least one eligible pair within
+        get_match_threshold(type). Survivor: confirmed first, then member_count,
+        then last_match_at, then lowest id. Returns the merge count; holds
+        _merge_lock so executor threads never read a half-merged id map."""
         from .fixtures import get_match_threshold
 
         with self._merge_lock:
@@ -1330,18 +1276,13 @@ class ClusterEngine:
         """Map river centers to DB clusters by majority vote of the replayed
         rows' stored cluster_ids.
 
-        The replay pool is `cluster_id IS NOT NULL` rows, so the DB already
-        says which cluster each event belongs to. Re-deriving that link by
-        nearest-centroid proximity alone throws that truth away and depends on
-        the freshly-replayed scaler placing old stored centroids within an
-        acceptance bound; any drift (tz-feature rewrite, scaler-stat shift
-        across restarts) leaves centers unmapped and live matching silently
-        dead. A vote from actual assignments cannot drift: the same rows that
-        built each center name its cluster.
-
-        Runs BEFORE the centroid fallback; centers with no votes (formed but
-        never nearest to any replayed row) still get the proximity attempt.
-        """
+        The replay pool already says which cluster each event belongs to.
+        Proximity alone depends on the freshly-replayed scaler placing old
+        stored centroids inside an acceptance bound, and any drift (tz-feature
+        rewrite, scaler-stat shift across restarts) leaves centers unmapped and
+        live matching silently dead; a vote from the rows that built each
+        center cannot drift. Runs BEFORE the centroid fallback, which still
+        covers centers with no votes."""
         stream = self._streams[circuit]
         scaler = self._scalers[circuit]
         if not stream.centers or not replayed:
@@ -1364,10 +1305,9 @@ class ClusterEngine:
             # Health metric: a healthy river↔DB mapping is a SUPERMAJORITY —
             # the members that built a center agree on its cluster. A sub-50%
             # plurality means the center sits across several DB clusters'
-            # members (degenerate geometry), the cheap early warning that fires
-            # before cluster-count collapse is visible (2026-08-15: three
-            # circuit_1 centers all plurality-mapped to one DB cluster at
-            # 40-49%).
+            # members (degenerate geometry), the cheap early warning before
+            # cluster-count collapse is visible (seen as three circuit_1 centers
+            # all plurality-mapped to one DB cluster at 40-49%).
             frac = tally[winner] / max(sum(tally.values()), 1)
             log.debug("[%s] post-rebuild: river cluster %d → DB cluster %d "
                       "(%d/%d votes)", circuit, river_id, winner,
@@ -1383,11 +1323,11 @@ class ClusterEngine:
         self._log_cluster_diversity_48h(circuit)
 
     def _log_cluster_diversity_48h(self, circuit: str) -> None:
-        """Health metric (dev40): distinct DB clusters actually receiving
-        events in the last rolling 48 h. Logged at rebuild time next to the
-        vote fractions — a collapse from the circuit's usual spread down to
-        1-2 clusters is the other face of the same degeneracy the sub-50%
-        plurality warning catches. Log/metric only; never changes behavior."""
+        """Health metric: distinct DB clusters actually receiving events in the
+        last rolling 48 h, logged at rebuild time next to the vote fractions —
+        a collapse from the circuit's usual spread to 1-2 clusters is the other
+        face of the degeneracy the sub-50% plurality warning catches. Log only;
+        never changes behavior."""
         try:
             row = self._db.execute(
                 "SELECT COUNT(DISTINCT cluster_id), COUNT(*) FROM events "
@@ -1401,10 +1341,9 @@ class ClusterEngine:
         except Exception as e:
             log.debug("[%s] 48h cluster-diversity metric failed "
                       "(non-fatal): %s", circuit, e)
-        # dev42 (F-C2): a stale reseed marker means a re-seed crashed
-        # mid-replay and never finished — the model this rebuild just
-        # replayed is part-cleared. Warn at every health pass until a rerun
-        # succeeds.
+        # A stale reseed marker means a re-seed crashed mid-replay and never
+        # finished — the model this rebuild just replayed is part-cleared. Warn
+        # at every health pass until a rerun succeeds.
         try:
             r = self._db.execute(
                 "SELECT reseed_in_progress FROM training_state "
