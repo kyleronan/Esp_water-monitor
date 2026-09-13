@@ -7,7 +7,7 @@ Every step below names the responsible **file/function**, the **gates with their
 the **DB columns written**, and an **"if it breaks here"** symptom so you can jump from a wrong number
 straight to the code that produced it.
 
-> Verified against **0.3.1-dev57 + firmware 3.14.0**. Since the dev31 revision this
+> Verified against **0.3.1-dev58 + firmware 3.14.0**. Since the dev31 revision this
 > doc last described: the training pool gained two independent exclusion filters
 > (dev40 quarantine, dev46 user flag), the labeling ladder gained validated shape
 > gates for dishwasher cycles and toilet flushes, the fingerprint tier began
@@ -570,8 +570,8 @@ matcher is never consulted. The tiers below the model are its fallback, not its 
 ### 11 · Anomaly score + surfacing (every event)
 **`app/anomaly_baseline.py`, `app/alert_manager.py`, `app/routers/history.py`**
 
-Scored against the per-home baseline: volume, type, and time-of-day pattern → `anomaly_score` /
-`anomaly_type`, setting `flagged = 1`. The baseline is **frozen, but re-frozen on demand** — never
+Scored against the per-home baseline → `anomaly_score` (how far past the line, ≥ 1.0 when
+flagged) / `anomaly_type`, setting `flagged = 1`. The baseline is **frozen, but re-frozen on demand** — never
 online-adapted, yet deliberately re-fit at activation, at retrain, and at the end of a regime
 recalibration (`source='regime_shift'`). In a pump home the fit **windows on the pinned era anchor**
 (dev34): toilet fills shortened 2.6× under the pump, so the pre-pump envelope flagged every normal
@@ -580,7 +580,54 @@ events keeps its all-time envelope, and the overall percentiles stay all-time be
 freeze snapshots the previous state to `baseline_snapshot` first, and a restore snapshots what it
 displaces, so a restore is itself undoable.
 
-The volume channel is fixture-relative: a typed event is judged against its own type's frozen band (notify above the band's ceiling; severe only by gross exceedance or the 2oo3 envelope vote), while the pooled p85/p95/p99 percentiles apply to events that fit no known fixture — untyped or `other` — which is where a leak or a hose lands. Surfacing:
+**Nothing is judged while the home is (re)learning (dev58).** An event is scored only when the
+circuit is live with its baseline locked (`database.is_baseline_locked`) *and* it started after the
+most recent learning window closed — `anomaly_baseline.judged_from` =
+`max(training_state.completed_at, learning_config.accelerated_adaptation_until)`. The gate is keyed
+on the event's own start time, so the live path, `reclassify`, `rescore_stored_event` and the
+migrations all agree, and a later re-scan can never back-flag a training-period or
+recalibration-window event.
+
+Four channels, OR-ed into the flag (dev58):
+
+- **Size, per fixture.** A typed event notifies above `max(vol_p99 × margin, user_ok_hi)` —
+  the fixture's frozen p99 volume times the sensitivity margin (Low 2× / Medium 1.5× / High 1.25×),
+  or the largest volume the user has reviewed "Normal use" for that fixture. (dev57's `[p5, p95]`
+  band flagged the top 5 % of normal use by construction; those bands are still stored but only
+  *explain* a flag via `+envelope_…` tags.) Untyped and `other` draws use the pooled p85/p95/p99
+  the level picks — the leak channel; `other` is only ever a user label, so its own clearances
+  raise its line, and an untyped repeat that stage 1 of the novelty check vouches for a user label
+  is judged as that label. **Severe (the only channel that can authorise a valve close)** = beyond
+  2× the ceiling *and* the pooled p99; a type with fewer than 30 examples defers severe to the
+  pooled rule.
+- **Hour, per fixture.** `hour_bins` (48 half-hour counts of local start hour, all-time) freeze
+  when the fixture normally runs; an event is `odd_hours` unless ≥ 2 frozen events or ≥ 1 user
+  statement (a label or a "Normal use" verdict, `user_hour_bins`) sit within ±1.5 h (Low 2 h /
+  High 1 h). Untyped and `other` events are not judged on time.
+- **Novelty, home-wide, staged.** Ten always-populated shape columns (log volume / duration /
+  peak / true-average flow, flow variability, steady-state fraction, on-ratio, segment and edge
+  counts, on-segment CV; no pressure, no time), robust-scaled, for draws ≥ 2.5 L. *Stage 1* — every
+  event the user labelled or cleared, all-time, refreshed on every edit — passes on its nearest
+  match. *Stage 2* — the app's own matches, current era, the most recent 250 per type, open flags
+  held out, frozen — needs the 3rd-nearest within tolerance. Tolerance = K × the pool's typical
+  (median) leave-one-out spacing, measured on a 300-row time-even subsample so it means the same
+  thing as the pool grows (Medium K = 4). No match at either stage → `novel_pattern`. Shape alone
+  cannot tell a steady hose from a shower, or a steam humidifier's 1.5 L canister fill from a
+  softener refill — those are known limits; the size channel catches the first once it passes the
+  shower's ceiling.
+- **Only what you say teaches.** A flagged row is held out of the hour histogram and the stage-2
+  pool until reviewed "Normal use" (`_OPEN_FLAG`); the size p99 needs no hold-out (it is robust to
+  a few outliers, and holding the flags out would be circular). Every event PATCH — label, verdict,
+  ignore, classification — recomputes the user-taught keys (`refresh_user_knowledge`), re-judges
+  that event and then every flagged row of the circuit (`rejudge_flagged_events`: clears only, so
+  a batch of twins clears in one click). Every freeze re-judges the flags the same way, so a flag
+  never outlives the envelope that raised it. The "raise" direction after a freeze stays with the
+  live path and the reclassify pass (whose verdict stamp does not cover `usage_baseline`).
+- Pushes: one per open question per day for the learning channels (a humidifier's first winter
+  day is a hundred fills, one notification), on top of the 15-min cooldown. A slow drift (a
+  growing flapper) is fixture_health's job, not a per-event flag.
+
+Surfacing:
 
 - **Suppression-averted override:** a `phantom_suppression_averted` event (step 7e backstop) is forced
   anomalous *before* the artifact gate, so an excluded-from-training big draw still shows up for review.
@@ -588,15 +635,17 @@ The volume channel is fixture-relative: a typed event is judged against its own 
   an audit trail of "this event alerted" (previously never populated).
 - **History surfacing:** a `?filter=anomaly` view lists every `flagged` event (bypassing the "hide
   not-real" toggle); a display-time `anomaly_reason` splits the flag into user-facing badges —
-  `review_draw` (suppression-averted), `estimated` (degraded/envelope), `high_usage` (rest). Marking an
-  event reviewed sets `user_reviewed = 1` and clears it from the dashboard's unreviewed-anomaly count.
+  `review_draw` (suppression-averted), `estimated` (degraded/envelope), `high_usage_type` ("⚠ Unusual
+  for this fixture"), `novel` ("⚠ Unusual — new pattern"), `odd_time` ("⚠ Unusual time for this
+  fixture"), `high_usage` (rest). Marking an event reviewed sets `user_reviewed = 1` and clears it from
+  the dashboard's unreviewed-anomaly count.
 - **Review verdicts (dev13):** the review records *why* — `review_verdict` (column added by migration
   `20260553`) is `normal` (confirmed legit use) or `unknown` (looked, didn't recognise it). Both stamp
-  `user_reviewed = 1`. The verdict is **display + training-workflow only** — it never touches
-  `volume_litres_effective` or the live (frozen-baseline) anomaly score. Its one job: `fit_usage_baselines()`
-  **holds `unknown` events out** of the next deliberate baseline refit (`WHERE COALESCE(review_verdict,'')
-  <> 'unknown'`), so an unidentified draw can never stretch a fixture envelope toward "normal". Labeling
-  the event later clears an `unknown` verdict (identifying it supersedes "don't know").
+  `user_reviewed = 1`. It never touches `volume_litres_effective`. `normal` teaches (see the dev58
+  channels above); `fit_usage_baselines()` **holds `unknown` events out** of every reference (`WHERE
+  COALESCE(review_verdict,'') <> 'unknown'`), so an unidentified draw can never stretch a fixture
+  envelope toward "normal". Labeling the event later clears an `unknown` verdict (identifying it
+  supersedes "don't know").
 - **Fixture health is a *second*, independent frozen reference (dev47).** Where the classifier adapts,
   health baselines lock: `fixture_health.py` tracks five per-fixture signals (`volume_trend`,
   `duration_trend`, `unsolicited_refills`, `class_share`, `anchor_claim_rate`) over **rolling

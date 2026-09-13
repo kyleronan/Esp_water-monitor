@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev57 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev58 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -159,6 +159,19 @@ git history.)
   passes three times the shower's normal ceiling. History shows these as
   "⚠ Unusual for this fixture", and existing flags are re-judged once on upgrade
   (migration 20260903; 256 → 79 on the developer's system) — dev57.
+- **"Unusual" now means unusual, and reviewing it teaches the app** — the
+  per-fixture line was a 95th-percentile band, which by construction flagged the
+  top 5% of *normal* use (2 a day here) and, being two-sided, called a 0.1 gal
+  draw "high use". The line is now the fixture's p99 × a margin the sensitivity
+  level sets (Low 2× / Medium 1.5× / High 1.25×); marking an event **Normal use**
+  raises that fixture's line to it and makes its hour known; nothing is judged
+  while the home is training or re-learning; a fixture at an hour it has never
+  run ("⚠ Unusual time for this fixture") and a draw unlike anything the home
+  has labelled or matched ("⚠ Unusual — new pattern": a power washer typed as a
+  shower no longer slips through) are new channels that never authorise a
+  shut-off and stop asking once you answer. The two "Anomaly score" fields are
+  gone (nothing read them any more). Migration 20260904 re-judges the flags
+  (121 → 9 on the developer's system) — dev58.
 
 ### Booster-pump and supply-change support
 
