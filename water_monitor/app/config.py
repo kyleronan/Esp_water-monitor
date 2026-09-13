@@ -187,8 +187,6 @@ SENSITIVITY_PRESETS = {
     "low": {
         "pressure_drop_event_psi": 3.0,
         "min_event_duration_seconds": 5.0,
-        "score_alert": 0.80,
-        "score_shutoff": 0.95,
         "flow_tolerance_pct": 30.0,
         "duration_tolerance_pct": 50.0,
         "schedule_window_minutes": 30.0,
@@ -197,8 +195,6 @@ SENSITIVITY_PRESETS = {
     "medium": {
         "pressure_drop_event_psi": 1.2,
         "min_event_duration_seconds": 3.0,
-        "score_alert": 0.60,
-        "score_shutoff": 0.80,
         "flow_tolerance_pct": 20.0,
         "duration_tolerance_pct": 30.0,
         "schedule_window_minutes": 15.0,
@@ -207,8 +203,6 @@ SENSITIVITY_PRESETS = {
     "high": {
         "pressure_drop_event_psi": 1.0,
         "min_event_duration_seconds": 2.0,
-        "score_alert": 0.40,
-        "score_shutoff": 0.65,
         "flow_tolerance_pct": 10.0,
         "duration_tolerance_pct": 15.0,
         "schedule_window_minutes": 5.0,

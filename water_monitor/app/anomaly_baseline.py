@@ -1,20 +1,28 @@
-"""Locked statistical baseline (leak / odd-usage foundation).
+"""Locked statistical baseline — what "unusual" is judged against.
 
-At activation (alongside the rule calibration) this freezes a per-home model of
-"normal":
+Frozen at activation / retrain / regime re-fit (``freeze_usage_baselines``),
+never on an ordinary event, so a slow leak cannot drift it. Stored per circuit
+in ``usage_baseline.params`` as a dict of per-fixture-type envelopes plus one
+reserved ``_novelty`` key:
 
-* **Per-fixture usage envelopes** — padded [p5, p95] bands of volume / duration /
-  peak for each fixture type, from this home's labelled + matched events. Stored
-  frozen in ``usage_baseline``.
-* **Overall volume percentiles** — p85/p95/p99 of per-event effective volume,
-  written into the dormant ``sensitivity_config.baseline_anomaly_p*`` columns.
+* per type — the padded ``[p5, p95]`` ``vol``/``dur``/``peak`` bands (advisory:
+  they only explain a flag), ``vol_p99`` (the size reference), ``hour_bins``
+  (48 half-hour counts: when the fixture normally runs), and what the user has
+  said since the freeze — ``user_ok_hi`` (largest volume reviewed "Normal use")
+  and ``user_hour_bins``. The user keys are recomputed from the DB on every
+  event edit (``refresh_user_knowledge``), so a verdict teaches the same day.
+* ``_novelty`` — the home-wide "does anything on file look like this?" check:
+  a standardised 10-feature shape space, ``stage1`` (what the user labelled or
+  cleared, all-time, live-refreshed) and ``stage2`` (what the app matched on
+  its own, current era, capped), and the pool's typical spacing.
+* the pooled ``baseline_anomaly_p85/p95/p99`` volume percentiles live in
+  ``sensitivity_config`` and judge events that fit no fixture.
 
-Because the baseline is FROZEN at activation, a slow leak cannot drift it (the
-boiling-frog protection). A future leak / odd-usage detector compares a live event
-against its type's frozen envelope (``event_novelty``); this module lays that
-foundation — it does not itself raise alerts.
-
-Frozen at activation/retrain only — never on ordinary reclassify or live events.
+``score_event_anomaly`` combines four channels into one verdict: fixture size
+(volume beyond the fixture's tail), fixture hour (an hour the fixture has never
+run), home-wide novelty (a shape unlike anything known) and the pooled rule for
+untyped draws. Only the size channel can authorise a valve close. Nothing is
+judged while the circuit is (re)learning — ``judged_from``.
 """
 from __future__ import annotations
 
@@ -23,8 +31,8 @@ import logging
 import math
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-from .database import upsert_sensitivity_config
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from .database import upsert_sensitivity_config, is_baseline_locked
 
 log = logging.getLogger(__name__)
 
@@ -38,31 +46,31 @@ MIN_EVENTS_FOR_ENVELOPE = 8     # a type needs this many events to fit an envelo
 MIN_EVENTS_FOR_OVERALL = 30
 _LO_PCT = 5.0
 _HI_PCT = 95.0
-_PAD = 0.10                     # widen each band by 10% of its span
+_PAD = 0.10                     # widen each advisory band by 10% of its span
 
-# Anomaly scoring / shut-off guardrails.
-# Which overall-volume percentile the NOTIFY threshold uses, by sensitivity level
-# (low = least sensitive → only the most extreme 1% alert).
+# ── Size channel ──────────────────────────────────────────────────────────────
+# Which overall-volume percentile the pooled NOTIFY threshold uses, by
+# sensitivity level (low = least sensitive → only the most extreme 1% alert).
 _NOTIFY_PCT_BY_LEVEL = {"low": "p99", "medium": "p95", "high": "p85"}
+# A typed event's notify ceiling is its fixture's p99 volume times this margin.
+# p99, not p95: a p95 ceiling flags the top 5% of NORMAL use forever; p99 is
+# about the second-largest value up to n≈200, so one mislabelled outlier
+# barely moves it, and the margin gives the tail room.
+_TYPE_CEILING_PCT = 99.0
+_TYPE_MARGIN_BY_LEVEL = {"low": 2.0, "medium": 1.5, "high": 1.25}
+# SEVERE on volume = beyond this multiple of the notify ceiling AND beyond the
+# pooled p99 — a runaway typed as a shower (a hose left on) still goes severe.
+_GROSS_EXCEEDANCE = 2.0
 # A signal may authorise an automated VALVE CLOSE only if the percentile/envelope
 # behind it was fit from at least this many events — a thin or default baseline
 # must never close the user's water.
 MIN_N_FOR_SHUTOFF = 30
-# A typed event is SEVERE on volume only when it grossly exceeds its own type —
-# beyond this multiple of the type's band ceiling AND beyond the pooled p99.
-# Rule-tier labels are floor-only (rule_shower is ">= 30 L, >= 300 s, >= 6 L/min",
-# no ceiling), so a burst hose at 8 L/min is typed "shower_tub" and its peak
-# sits inside the shower band: the 2oo3 vote alone never reaches severe. 3x
-# keeps every normal shower on record (max 432 L vs a ~250 L ceiling) clear.
-_GROSS_EXCEEDANCE = 3.0
 # A shut-off response also requires the baseline to have been live (seen real usage)
 # for at least this many days since activation — earned trust before it can close
 # the user's water. Below this, shut-off levels degrade to notify.
 MIN_LIVE_DAYS_FOR_SHUTOFF = 7
-# 2oo3 voting for the shape (envelope) channel. At least this many of
-# {volume, duration, peak} must be usable before ``event_novelty`` scores at all;
-# below it the channel abstains. Otherwise a 1-of-1 outlier reads as novelty 1.0
-# → severe → shut-off authorised: maximal confidence from minimal evidence.
+# The advisory envelope vote needs this many usable metrics before it says
+# anything ("1 of 1" is not evidence).
 _MIN_METRICS_FOR_SHAPE = 2
 # Verdict flags that mark an event as already-known-not-real-water (or explicitly
 # excluded). Such an event is inert for anomaly scoring — it must never score or
@@ -70,8 +78,64 @@ _MIN_METRICS_FOR_SHAPE = 2
 _ARTIFACT_FLAGS = ("is_pressure_restoration_phantom", "is_cross_talk",
                    "is_low_flow_dribble", "excluded_from_training", "user_ignored")
 
+# ── Hour channel ──────────────────────────────────────────────────────────────
+_HOUR_BINS = 48                 # half-hour bins of local start hour
+# An hour is known when the frozen histogram holds this many events within
+# ±window of it, or ONE user statement (a label or a "Normal use" verdict).
+_HOUR_MIN_SUPPORT = 2
+_HOUR_WINDOW_BY_LEVEL = {"low": 2.0, "medium": 1.5, "high": 1.0}
 
-def _pct(vals: List[Optional[float]], p: float) -> Optional[float]:
+# ── Novelty channel ───────────────────────────────────────────────────────────
+# (column, transform): the 10 always-populated shape columns; no pressure (it
+# moves with the supply regime) and no time (that is the hour channel's job).
+_NOVELTY_FEATURES: Tuple[Tuple[str, str], ...] = (
+    ("volume_litres", "log"), ("duration_seconds", "log"),
+    ("peak_flow_lpm", "log"), ("true_avg_flow_lpm", "log"),
+    ("flow_variability", "log1p"), ("steady_state_fraction", "raw"),
+    ("flow_on_ratio", "raw"), ("active_flow_segment_count", "log1p"),
+    ("flow_edge_count", "log1p"), ("flow_cv_on_segments", "log1p"))
+_NOVELTY_MIN_VOLUME_L = 2.5     # below this the shape columns are noise
+_NOVELTY_MIN_POOL = 100         # calibration needs this many pooled events
+_NOVELTY_MIN_STAGE = 20         # a stage thinner than this cannot vouch
+_NOVELTY_STAGE2_CAP = 250       # most recent machine matches kept per type
+_NOVELTY_NEIGHBOURS = 3         # stage 2 needs the 3rd-nearest within tolerance
+_NOVELTY_VOUCH_MIN = 2          # stage-1 neighbours sharing a label to vouch a type
+# Tolerance = K × the pool's typical (median) leave-one-out spacing. A median,
+# not a tail percentile: p99 inflates on a thin or mixed-era pool and let a
+# power washer pass as known.
+_NOVELTY_K_BY_LEVEL = {"low": 6.0, "medium": 4.0, "high": 3.0}
+# The spacing is measured on a fixed-size, time-even subsample so the
+# tolerance means the same thing in a two-month-old home and a two-year-old
+# one (nearest-neighbour spacing shrinks as a pool densifies).
+_NOVELTY_CALIB_N = 300
+_NOVELTY_SCALE_FLOOR = 0.05
+
+# ── Selections ────────────────────────────────────────────────────────────────
+# Rows that may define "normal". An open flag (flagged, not yet reviewed
+# "Normal use") is a question, not an answer: it is held out of every reference
+# where ONE event would vouch — the hour histogram and the machine-match pool —
+# but not of the size fit, whose p99 is robust to a few outliers by
+# construction (holding it out there is circular: the flags ARE the tail).
+_BASE_EXCLUSIONS = (
+    "COALESCE(excluded_from_training, 0) = 0 "
+    "AND training_quarantine_reason IS NULL "
+    "AND COALESCE(training_excluded_by_user, 0) = 0 "
+    "AND COALESCE(review_verdict, '') <> 'unknown' "
+    "AND COALESCE(is_pressure_restoration_phantom, 0) = 0 "
+    "AND COALESCE(is_cross_talk, 0) = 0 "
+    "AND COALESCE(is_low_flow_dribble, 0) = 0 "
+    "AND COALESCE(user_ignored, 0) = 0")
+_OPEN_FLAG = "(COALESCE(flagged, 0) = 1 AND COALESCE(review_verdict, '') <> 'normal')"
+_FIT_WHERE = ("COALESCE(user_fixture_type, matched_fixture_type) IS NOT NULL AND "
+              + _BASE_EXCLUSIONS)
+# What the user has said: a label, or a "Normal use" verdict.
+_USER_SAID = "(user_fixture_type IS NOT NULL OR review_verdict = 'normal')"
+_EFF_VOL = "COALESCE(volume_litres_effective, volume_litres)"
+_NOVELTY_COLS = ", ".join(c for c, _ in _NOVELTY_FEATURES)
+_NOVELTY_NOT_NULL = " AND ".join(f"{c} IS NOT NULL" for c, _ in _NOVELTY_FEATURES)
+
+
+def _pct(vals: Sequence[Optional[float]], p: float) -> Optional[float]:
     xs = sorted(float(v) for v in vals if v is not None)
     if not xs:
         return None
@@ -92,38 +156,280 @@ def _band(vals: List[Optional[float]]) -> Optional[List[float]]:
     return [max(0.0, lo - span * _PAD), hi + span * _PAD]
 
 
+def _hour_bins(hours: Sequence[Optional[float]]) -> List[int]:
+    bins = [0] * _HOUR_BINS
+    for h in hours:
+        v = _finite(h)
+        if v is None:
+            continue
+        bins[int((v % 24.0) * 2) % _HOUR_BINS] += 1
+    return bins
+
+
+def _type_keys(params: Dict[str, Any]) -> List[str]:
+    """Fixture-type keys of a params dict (reserved ``_`` keys skipped)."""
+    return [k for k in params if not k.startswith("_")]
+
+
+# ── Novelty feature space ─────────────────────────────────────────────────────
+
+def _novelty_vector(features: Dict[str, Any]) -> Optional[List[float]]:
+    """The raw (untransformed-then-transformed) shape vector, or None when any
+    input is missing / non-finite — an unscorable event abstains, it never
+    counts as far or near."""
+    out: List[float] = []
+    for col, tf in _NOVELTY_FEATURES:
+        v = _finite(features.get(col))
+        if v is None:
+            return None
+        if tf == "log":
+            out.append(math.log(max(v, 0.01)))
+        elif tf == "log1p":
+            out.append(math.log1p(max(v, 0.0)))
+        else:
+            out.append(v)
+    return out
+
+
+def _standardise(vec: Sequence[float], center: Sequence[float],
+                 scale: Sequence[float]) -> List[float]:
+    return [(v - c) / s for v, c, s in zip(vec, center, scale)]
+
+
+def _sq_dist(a: Sequence[float], b: Sequence[float]) -> float:
+    return sum((x - y) * (x - y) for x, y in zip(a, b))
+
+
+def _kth_nearest(z: Sequence[float], pool: Sequence[Sequence[float]], k: int,
+                 offset: int = 0) -> Optional[float]:
+    """Distance to the k-th nearest pool vector (vectors start at ``offset``)."""
+    if len(pool) < k:
+        return None
+    ds = sorted(_sq_dist(z, row[offset:]) for row in pool)
+    return math.sqrt(ds[k - 1])
+
+
+def _fit_novelty_space(calib_rows: List[List[float]]) -> Optional[Dict[str, Any]]:
+    """Centre/scale the space on ``calib_rows`` and measure its typical
+    leave-one-out spacing. None when the pool is too thin to calibrate."""
+    if len(calib_rows) < _NOVELTY_MIN_POOL:
+        return None
+    dims = len(_NOVELTY_FEATURES)
+    cols = [[r[i] for r in calib_rows] for i in range(dims)]
+    center = [_pct(c, 50.0) or 0.0 for c in cols]
+    scale = [max(((_pct(c, 95.0) or 0.0) - (_pct(c, 5.0) or 0.0)) / 3.29,
+                 _NOVELTY_SCALE_FLOOR) for c in cols]
+    zc = [_standardise(r, center, scale) for r in calib_rows]
+    try:
+        import numpy as np
+        arr = np.asarray(zc)
+        d = np.sqrt(((arr[:, None, :] - arr[None, :, :]) ** 2).sum(-1))
+        np.fill_diagonal(d, np.inf)
+        kth = np.sort(d, axis=1)[:, _NOVELTY_NEIGHBOURS - 1]
+        spacing = float(np.median(kth[np.isfinite(kth)]))
+    except ImportError:                     # pragma: no cover — numpy is a hard dep
+        kths = []
+        for i, z in enumerate(zc):
+            ds = sorted(_sq_dist(z, o) for j, o in enumerate(zc) if j != i)
+            kths.append(math.sqrt(ds[_NOVELTY_NEIGHBOURS - 1]))
+        spacing = _pct(kths, 50.0) or 0.0
+    if not (spacing > 0.0):
+        return None
+    return {"features": [c for c, _ in _NOVELTY_FEATURES],
+            "center": [round(c, 4) for c in center],
+            "scale": [round(s, 4) for s in scale],
+            "spacing": round(spacing, 4), "n": len(calib_rows)}
+
+
+def _stage1_rows(conn: sqlite3.Connection, circuit: str,
+                 center: Sequence[float], scale: Sequence[float]) -> List[List[Any]]:
+    """[label, z1..z10] for every event the user labelled or cleared, all-time.
+    ``label`` is the user's fixture label ('' for a verdict-only row) — only a
+    label may vouch a type for an untyped repeat."""
+    rows = conn.execute(
+        f"SELECT COALESCE(user_fixture_type, '') AS lbl, {_NOVELTY_COLS} "
+        f"FROM events WHERE circuit = ? AND {_USER_SAID} AND {_BASE_EXCLUSIONS} "
+        f"  AND {_EFF_VOL} >= ? AND {_NOVELTY_NOT_NULL}",
+        (circuit, _NOVELTY_MIN_VOLUME_L)).fetchall()
+    out: List[List[Any]] = []
+    for r in rows:
+        v = _novelty_vector({c: r[c] for c, _ in _NOVELTY_FEATURES})
+        if v is not None:
+            out.append([r["lbl"]] + [round(x, 3) for x in _standardise(v, center, scale)])
+    return out
+
+
+def _stage1_raw(conn: sqlite3.Connection, circuit: str) -> List[List[float]]:
+    rows = conn.execute(
+        f"SELECT {_NOVELTY_COLS}, start_ts FROM events WHERE circuit = ? AND {_USER_SAID} "
+        f"  AND {_BASE_EXCLUSIONS} AND {_EFF_VOL} >= ? AND {_NOVELTY_NOT_NULL}",
+        (circuit, _NOVELTY_MIN_VOLUME_L)).fetchall()
+    out = []
+    for r in rows:
+        v = _novelty_vector({c: r[c] for c, _ in _NOVELTY_FEATURES})
+        if v is not None:
+            out.append((r["start_ts"], v))
+    return out
+
+
+def _stage2_raw(conn: sqlite3.Connection, circuit: str,
+                era_start: Optional[str]) -> List[Tuple[str, List[float]]]:
+    """(start_ts, vector) for the app's own matches: current era, most recent
+    ``_NOVELTY_STAGE2_CAP`` per type, open flags held out."""
+    types = [r[0] for r in conn.execute(
+        "SELECT DISTINCT matched_fixture_type FROM events WHERE circuit = ? "
+        "  AND user_fixture_type IS NULL AND matched_fixture_type IS NOT NULL",
+        (circuit,))]
+    out: List[Tuple[str, List[float]]] = []
+    for t in types:
+        args: List[Any] = [circuit, t, _NOVELTY_MIN_VOLUME_L]
+        era_sql = ""
+        if era_start:
+            era_sql = " AND start_ts >= ?"
+            args.append(era_start)
+        args.append(_NOVELTY_STAGE2_CAP)
+        rows = conn.execute(
+            f"SELECT start_ts, {_NOVELTY_COLS} FROM events WHERE circuit = ? "
+            f"  AND user_fixture_type IS NULL AND matched_fixture_type = ? "
+            f"  AND {_BASE_EXCLUSIONS} AND NOT {_OPEN_FLAG} "
+            f"  AND {_EFF_VOL} >= ? AND {_NOVELTY_NOT_NULL}{era_sql} "
+            f"ORDER BY start_ts DESC LIMIT ?", args).fetchall()
+        for r in rows:
+            v = _novelty_vector({c: r[c] for c, _ in _NOVELTY_FEATURES})
+            if v is not None:
+                out.append((r["start_ts"], v))
+    return out
+
+
+def _time_even_subsample(rows: List[Tuple[str, List[float]]],
+                         n: int) -> List[List[float]]:
+    """Every k-th row in time order, ``n`` of them (all when fewer)."""
+    ordered = [v for _, v in sorted(rows, key=lambda tv: tv[0])]
+    if len(ordered) <= n:
+        return ordered
+    return [ordered[int(i * len(ordered) / n)] for i in range(n)]
+
+
+def fit_novelty(conn: sqlite3.Connection, circuit: str,
+                era_start: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """The ``_novelty`` block for a circuit, or None when too thin. Pure read."""
+    s1 = _stage1_raw(conn, circuit)
+    s2 = _stage2_raw(conn, circuit, era_start)
+    all_rows = s1 + s2
+    era_rows = ([tv for tv in s1 if tv[0] >= era_start] + s2) if era_start else all_rows
+    use_era = bool(era_start) and len(era_rows) >= _NOVELTY_MIN_POOL
+    calib = era_rows if use_era else all_rows
+    fitted = _fit_novelty_space(_time_even_subsample(calib, _NOVELTY_CALIB_N))
+    if fitted is None:
+        return None
+    center, scale = fitted["center"], fitted["scale"]
+    fitted["stage1"] = _stage1_rows(conn, circuit, center, scale)
+    fitted["stage2"] = [[round(x, 3) for x in _standardise(v, center, scale)] for _, v in s2]
+    fitted["era"] = use_era
+    return fitted
+
+
+# ── What the user has said ────────────────────────────────────────────────────
+
+def user_clearances(conn: sqlite3.Connection, circuit: str) -> Dict[str, float]:
+    """Per type, the largest effective volume the user reviewed "Normal use"."""
+    rows = conn.execute(
+        f"SELECT COALESCE(user_fixture_type, matched_fixture_type) AS t, "
+        f"       MAX({_EFF_VOL}) AS m FROM events "
+        f"WHERE circuit = ? AND review_verdict = 'normal' AND {_BASE_EXCLUSIONS} "
+        f"  AND COALESCE(user_fixture_type, matched_fixture_type) IS NOT NULL "
+        f"GROUP BY 1", (circuit,)).fetchall()
+    out: Dict[str, float] = {}
+    for r in rows:
+        m = _finite(r["m"])
+        if m is not None and m > 0:
+            out[r["t"]] = round(m, 3)
+    return out
+
+
+def user_hours(conn: sqlite3.Connection, circuit: str) -> Dict[str, List[int]]:
+    """Per type, half-hour bins of the hours the user labelled or cleared."""
+    rows = conn.execute(
+        f"SELECT COALESCE(user_fixture_type, matched_fixture_type) AS t, hour_of_day "
+        f"FROM events WHERE circuit = ? AND {_USER_SAID} AND {_BASE_EXCLUSIONS} "
+        f"  AND COALESCE(user_fixture_type, matched_fixture_type) IS NOT NULL "
+        f"  AND hour_of_day IS NOT NULL", (circuit,)).fetchall()
+    by: Dict[str, List[float]] = {}
+    for r in rows:
+        by.setdefault(r["t"], []).append(r["hour_of_day"])
+    return {t: _hour_bins(hs) for t, hs in by.items()}
+
+
+def refresh_user_knowledge(conn: sqlite3.Connection, circuit: str) -> bool:
+    """Recompute the user-taught keys of the frozen params from the DB —
+    ``user_ok_hi`` / ``user_hour_bins`` per type and the novelty ``stage1``
+    pool — and persist them. Recomputed, never incremented, so clearing a
+    verdict lowers a ceiling again (a type with nothing left loses the key).
+    The fitted keys are untouched. Does not commit. False when nothing is
+    frozen for the circuit."""
+    row = conn.execute("SELECT params FROM usage_baseline WHERE circuit = ?",
+                       (circuit,)).fetchone()
+    if row is None or not row["params"]:
+        return False
+    try:
+        params = json.loads(row["params"])
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(params, dict):
+        return False
+    ok_hi = user_clearances(conn, circuit)
+    hours = user_hours(conn, circuit)
+    for t in _type_keys(params):
+        env = params[t]
+        if not isinstance(env, dict):
+            continue
+        if t in ok_hi:
+            env["user_ok_hi"] = ok_hi[t]
+        else:
+            env.pop("user_ok_hi", None)
+        if t in hours:
+            env["user_hour_bins"] = hours[t]
+        else:
+            env.pop("user_hour_bins", None)
+    nov = params.get("_novelty")
+    if isinstance(nov, dict) and nov.get("center") and nov.get("scale"):
+        nov["stage1"] = _stage1_rows(conn, circuit, nov["center"], nov["scale"])
+    conn.execute("UPDATE usage_baseline SET params = ?, updated_at = ? WHERE circuit = ?",
+                 (json.dumps(params), datetime.now(timezone.utc).isoformat(), circuit))
+    invalidate_baseline_cache(circuit)
+    return True
+
+
+# ── Fit / freeze ──────────────────────────────────────────────────────────────
+
 def fit_usage_baselines(
         conn: sqlite3.Connection,
         circuit: str,
         era_start: Optional[str] = None
         ) -> Tuple[Dict[str, Any], Dict[str, float]]:
-    """Compute (per-type envelopes, overall volume percentiles) from this circuit's
-    labelled + matched, non-excluded events. Pure read — does not persist.
+    """Compute (per-type envelopes + ``_novelty``, overall volume percentiles)
+    from this circuit's labelled + matched events. Pure read — does not persist.
 
-    Events the user reviewed as 'unknown' ("I don't recognise this") are held
-    out: a draw the user couldn't identify must never stretch a fixture
-    envelope or the overall percentiles toward "normal", even when a machine
-    label matched it. A later relabel clears the verdict and readmits it.
+    Held out: events the user reviewed "unknown" (everywhere) and open flags
+    (from the hour histogram — a question must not make an hour known).
 
-    era_start: when given (the PINNED pump-era anchor — the era,
-    not the current regime, which a recenter/merge can move), each fit prefers
+    era_start: when given (the PINNED pump-era anchor — the era, not the
+    current regime, which a recenter/merge can move), each fit prefers
     era-only events and falls back PER TYPE to all-time when the era pool is
     too thin: toilet durations shortened 2.6× under the pump, so a pre-pump
     toilet envelope flags every normal post-pump flush — but a type with 3
     era events can't re-fit yet, and keeping its stale envelope (stamped
     ``era: False``) beats having none. The overall percentiles window the same
-    way at MIN_EVENTS_FOR_OVERALL.
+    way at MIN_EVENTS_FOR_OVERALL. Hours are all-time (habits don't move with
+    the pump); the hour histogram reads the stored ``hour_of_day``, which the
+    boot-time tz backfill keeps in the home zone.
     """
     rows = conn.execute(
         "SELECT COALESCE(user_fixture_type, matched_fixture_type) AS t, "
         "       start_ts, volume_litres, duration_seconds, peak_flow_lpm, "
-        "       COALESCE(volume_litres_effective, volume_litres) AS eff_vol "
-        "FROM events WHERE circuit = ? "
-        "  AND COALESCE(user_fixture_type, matched_fixture_type) IS NOT NULL "
-        "  AND COALESCE(excluded_from_training, 0) = 0 "
-        "  AND training_quarantine_reason IS NULL "
-        "  AND COALESCE(training_excluded_by_user, 0) = 0 "
-        "  AND COALESCE(review_verdict, '') <> 'unknown'",
+        f"       {_EFF_VOL} AS eff_vol, hour_of_day, "
+        f"       {_OPEN_FLAG} AS open_flag "
+        f"FROM events WHERE circuit = ? AND {_FIT_WHERE}",
         (circuit,),
     ).fetchall()
 
@@ -133,20 +439,29 @@ def fit_usage_baselines(
         for r in rows:
             if only_era and era_start and r["start_ts"] < era_start:
                 continue
-            d = by_type.setdefault(r["t"], {"vol": [], "dur": [], "pk": []})
+            d = by_type.setdefault(r["t"], {"vol": [], "dur": [], "pk": [], "eff": []})
             d["vol"].append(r["volume_litres"])
             d["dur"].append(r["duration_seconds"])
             d["pk"].append(r["peak_flow_lpm"])
             if r["eff_vol"] is not None:
+                d["eff"].append(r["eff_vol"])
                 vols.append(r["eff_vol"])
         return by_type, vols
 
     all_types, all_vols = _collect(only_era=False)
     era_types, era_vols = ((all_types, all_vols) if not era_start
                            else _collect(only_era=True))
+    hours_by_type: Dict[str, List[float]] = {}
+    for r in rows:
+        if not r["open_flag"]:
+            hours_by_type.setdefault(r["t"], []).append(r["hour_of_day"])
+    ok_hi = user_clearances(conn, circuit)
+    u_hours = user_hours(conn, circuit)
 
     envelopes: Dict[str, Any] = {}
     for t in all_types:
+        if t.startswith("_"):
+            continue            # a reserved name can never be a fixture type
         # Per-type: era window when it can support a fit, all-time otherwise.
         use_era = (era_start is not None
                    and len(era_types.get(t, {}).get("vol", []))
@@ -154,14 +469,25 @@ def fit_usage_baselines(
         d = era_types[t] if use_era else all_types[t]
         if len(d["vol"]) < MIN_EVENTS_FOR_ENVELOPE:
             continue
-        env = {"n": len(d["vol"])}
+        env: Dict[str, Any] = {"n": len(d["vol"])}
         if era_start is not None:
             env["era"] = use_era
         for key, src in (("vol", "vol"), ("dur", "dur"), ("peak", "pk")):
             b = _band(d[src])
             if b is not None:
                 env[key] = b
+        p99 = _pct(d["eff"], _TYPE_CEILING_PCT)
+        if p99 is not None and p99 > 0:
+            env["vol_p99"] = round(p99, 3)
+        env["hour_bins"] = _hour_bins(hours_by_type.get(t, []))
+        if t in ok_hi:
+            env["user_ok_hi"] = ok_hi[t]
+        if t in u_hours:
+            env["user_hour_bins"] = u_hours[t]
         envelopes[t] = env
+    nov = fit_novelty(conn, circuit, era_start)
+    if nov is not None:
+        envelopes["_novelty"] = nov
 
     use_era_overall = (era_start is not None
                        and len(era_vols) >= MIN_EVENTS_FOR_OVERALL)
@@ -213,7 +539,8 @@ def restore_usage_baselines(conn: sqlite3.Connection, circuit: str,
                             snapshot_id: Optional[int] = None) -> bool:
     """Restore the frozen baseline from a snapshot (newest by default).
     Returns False when no snapshot exists. The replaced state is itself
-    snapshotted first, so a restore is undoable."""
+    snapshotted first, so a restore is undoable. The user-taught keys are
+    re-derived from today's verdicts, not the snapshot's."""
     q = "SELECT * FROM baseline_snapshot WHERE circuit = ?"
     args: list = [circuit]
     if snapshot_id is not None:
@@ -237,6 +564,10 @@ def restore_usage_baselines(conn: sqlite3.Connection, circuit: str,
     if sens:
         upsert_sensitivity_config(conn, circuit, baseline_computed_at=now,
                                   **sens)
+    try:
+        refresh_user_knowledge(conn, circuit)
+    except Exception as e:                          # noqa: BLE001
+        log.warning("[%s] user-knowledge refresh after restore failed: %s", circuit, e)
     conn.commit()
     invalidate_baseline_cache(circuit)
     log.info("[%s] usage baseline restored from snapshot %s", circuit,
@@ -247,11 +578,13 @@ def restore_usage_baselines(conn: sqlite3.Connection, circuit: str,
 def freeze_usage_baselines(conn: sqlite3.Connection, circuit: str,
                            source: str = "activation") -> Dict[str, Any]:
     """Fit + persist (freeze) the usage baselines for a circuit. Returns the
-    per-type envelope dict.
+    params dict (per-type envelopes + ``_novelty``).
 
     In a pump-era home the fit windows on the PINNED era anchor
     (per-type/overall fallback inside fit_usage_baselines), and the previous
-    frozen state is snapshotted first so a refit is revertable."""
+    frozen state is snapshotted first so a refit is revertable. The circuit's
+    currently-flagged events are then re-judged against the new reference so
+    a flag never outlives the envelope that raised it (clears only)."""
     era = None
     try:
         from .supply_regime import pump_era_start
@@ -277,22 +610,33 @@ def freeze_usage_baselines(conn: sqlite3.Connection, circuit: str,
         upsert_sensitivity_config(conn, circuit, baseline_computed_at=now, **overall)
     conn.commit()
     invalidate_baseline_cache(circuit)
-    log.info("[%s] usage baseline frozen (%s): %d type envelope(s); overall %s",
-             circuit, source, len(envelopes), overall or "n/a")
+    log.info("[%s] usage baseline frozen (%s): %d type envelope(s), novelty %s; "
+             "overall %s", circuit, source, len(_type_keys(envelopes)),
+             "fit" if "_novelty" in envelopes else "too thin", overall or "n/a")
+    try:
+        cleared, kept = rejudge_flagged_events(conn, circuit)
+        if cleared or kept:
+            log.info("[%s] flagged events re-judged after freeze: %d cleared, "
+                     "%d still flagged", circuit, cleared, kept)
+    except Exception as e:                          # noqa: BLE001 — the freeze itself is done
+        log.warning("[%s] post-freeze re-judge failed (baseline is frozen): %s",
+                    circuit, e)
     return envelopes
 
 
 def rescale_anomaly_percentiles(conn: sqlite3.Connection, circuit: str,
                                 ratio: float) -> bool:
-    """Scale the frozen overall-volume anomaly percentiles (p85/p95/p99) by ``ratio``.
+    """Scale every frozen volume reference by ``ratio``: the pooled p85/p95/p99
+    and each type's ``vol`` band, ``vol_p99`` and ``user_ok_hi``.
 
-    Used after a SMALL flow-meter PPL (calibration) trim that did not warrant a full
-    re-baseline: future volume readings shift scale by ppl_old/ppl_new, so the frozen
-    shut-off / notify thresholds are multiplied by the same factor (``ratio = ppl_old /
-    ppl_new``) to stay aligned with the new scale WITHOUT a re-learning window. This
-    adjusts forward-looking DETECTION thresholds only — it does NOT touch historical
-    event volumes (the never-recompute invariant holds). No-op on a non-finite /
-    out-of-range ratio or when no frozen percentiles exist. Returns True if it rescaled.
+    Used after a SMALL flow-meter PPL (calibration) trim that did not warrant a
+    full re-baseline: future volume readings shift scale by ppl_old/ppl_new, so
+    the frozen thresholds are multiplied by the same factor (``ratio = ppl_old /
+    ppl_new``) to stay aligned WITHOUT a re-learning window. Forward-looking
+    detection thresholds only — historical event volumes are never recomputed.
+    The novelty pool's log-volume axis shifts by ln(ratio), far inside its
+    scale for a trim, and is left alone. No-op on a non-finite / out-of-range
+    ratio or when nothing is frozen. Returns True if it rescaled.
     """
     if not (0.0 < ratio < 1e6):
         return False
@@ -315,10 +659,25 @@ def rescale_anomaly_percentiles(conn: sqlite3.Connection, circuit: str,
     if not updates:
         return False
     upsert_sensitivity_config(conn, circuit, **updates)
+    params = load_usage_baselines(conn, circuit, use_cache=False)
+    if params:
+        for t in _type_keys(params):
+            env = params[t]
+            if not isinstance(env, dict):
+                continue
+            band = _usable_band(env.get("vol"))
+            if band is not None:
+                env["vol"] = [round(band[0] * ratio, 3), round(band[1] * ratio, 3)]
+            for key in ("vol_p99", "user_ok_hi"):
+                v = _finite(env.get(key))
+                if v is not None:
+                    env[key] = round(v * ratio, 3)
+        conn.execute("UPDATE usage_baseline SET params = ? WHERE circuit = ?",
+                     (json.dumps(params), circuit))
     conn.commit()
     invalidate_baseline_cache(circuit)
-    log.info("[%s] anomaly percentiles re-scaled ×%.4f (calibration trim, no relearn)",
-             circuit, ratio)
+    log.info("[%s] anomaly volume references re-scaled ×%.4f (calibration trim, "
+             "no relearn)", circuit, ratio)
     return True
 
 
@@ -336,7 +695,8 @@ def invalidate_baseline_cache(circuit: Optional[str] = None) -> None:
 
 def load_usage_baselines(conn: sqlite3.Connection, circuit: str,
                          *, use_cache: bool = True) -> Dict[str, Any]:
-    """Return the frozen per-type envelopes for a circuit, or ``{}``."""
+    """Return the frozen params for a circuit (per-type envelopes plus the
+    reserved ``_novelty`` key), or ``{}``."""
     if use_cache and circuit in _baseline_cache:
         return _baseline_cache[circuit]
     data: Dict[str, Any] = {}
@@ -357,6 +717,8 @@ def load_usage_baselines(conn: sqlite3.Connection, circuit: str,
         _baseline_cache[circuit] = data
     return data
 
+
+# ── Boundary validation ───────────────────────────────────────────────────────
 
 def _finite(v: Any) -> Optional[float]:
     """Validate at the BOUNDARY (MISRA C:2023 Dir 4.15).
@@ -392,32 +754,78 @@ def _usable_band(band: Any) -> Optional[Tuple[float, float]]:
     return lo, hi
 
 
+def _parse_ts(v: Any) -> Optional[datetime]:
+    """An aware UTC datetime from a stored ISO timestamp, or None."""
+    if not v:
+        return None
+    try:
+        t = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return t
+
+
+# ── Part 0: when is anything judged at all ────────────────────────────────────
+
+def judged_from(conn: sqlite3.Connection, circuit: str) -> Optional[datetime]:
+    """The instant from which this circuit's events are judged, or None while
+    nothing is: the circuit must be live with its baseline locked
+    (``database.is_baseline_locked`` — no open recalibration / adaptation
+    window), and only events that started after the most recent learning
+    window closed — ``max(training_state.completed_at,
+    learning_config.accelerated_adaptation_until)`` — are judged. Keyed on the
+    event's own start time, so a later re-scan can never back-flag an event
+    that happened while the home was (re)learning."""
+    try:
+        row = conn.execute(
+            "SELECT state, completed_at FROM training_state WHERE circuit = ?",
+            (circuit,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row or row["state"] != "live":
+        return None
+    if not is_baseline_locked(conn, circuit):
+        return None
+    marks = [_parse_ts(row["completed_at"])]
+    try:
+        lc = conn.execute(
+            "SELECT accelerated_adaptation_until FROM learning_config WHERE circuit = ?",
+            (circuit,)).fetchone()
+        if lc:
+            marks.append(_parse_ts(lc["accelerated_adaptation_until"]))
+    except sqlite3.OperationalError:
+        pass
+    marks = [m for m in marks if m is not None]
+    return max(marks) if marks else datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def is_judged(start_ts: Any, judged: Optional[datetime]) -> bool:
+    """True when an event that started at ``start_ts`` is judged at all."""
+    if judged is None:
+        return False
+    t = _parse_ts(start_ts)
+    return t is not None and t >= judged
+
+
+# ── Channels ──────────────────────────────────────────────────────────────────
+
 def event_novelty(features: Dict[str, Any],
                   baselines: Dict[str, Any]) -> Dict[str, Any]:
-    """Score a typed event against its type's FROZEN envelope (read-only).
+    """Advisory envelope vote: which of {volume, duration, peak} sit ABOVE the
+    fixture's frozen ``[p5, p95]`` band. One-sided — a smaller, shorter or
+    slower draw is not unusual use. It explains a flag (``+envelope_vol_dur``
+    tags, ``shape_evidence``) and never decides one.
 
     Returns ``{fixture_type, fits_baseline, novelty, outside, checked,
-    n_metrics, evidence, unusable}``:
-      * ``fits_baseline`` True when the usable metrics all fall inside the
-        envelope, False when any is outside, or None when unscorable.
-      * ``novelty`` = fraction of checked metrics outside the band (0.0–1.0), or
-        None when unscorable. This is the hook the leak/odd-usage detector
-        consumes — it is NOT an alert by itself.
-      * ``evidence`` = the count WITH its denominator ("2 of 3"). A bare ratio
-        erases the information that says what the number is worth: 1/1 and 3/3
-        are both 1.0, and only one of them is evidence.
-
-    2oo3 voting. ``novelty`` feeds the severe/shut-off threshold, so a single
-    populated metric with a single outlier would otherwise yield novelty = 1.0 →
-    severe → shut-off authorised: *maximal* confidence from the weakest possible
-    evidence. At least ``_MIN_METRICS_FOR_SHAPE`` of {volume, duration, peak}
-    must be usable or the shape channel ABSTAINS (novelty None) rather than
-    scoring. With the existing shut-off threshold (0.80) an abstain floor of 2
-    also means severe requires ≥2 metrics actually exceeded — 2 of 2, or 3 of 3;
-    2 of 3 is 0.667, which notifies but cannot close the valve.
+    n_metrics, evidence, unusable}``; ``novelty`` = fraction of checked metrics
+    above their band, or None when fewer than ``_MIN_METRICS_FOR_SHAPE`` are
+    usable (abstain: "1 of 1" is not evidence). ``evidence`` keeps the
+    denominator ("2 of 3").
     """
     ftype = features.get("user_fixture_type") or features.get("matched_fixture_type")
-    env = baselines.get(ftype) if ftype else None
+    env = baselines.get(ftype) if ftype and not str(ftype).startswith("_") else None
     checks = (("vol", "volume_litres"), ("dur", "duration_seconds"),
               ("peak", "peak_flow_lpm"))
     n_metrics = len(checks)
@@ -428,16 +836,15 @@ def event_novelty(features: Dict[str, Any],
                 "evidence": f"abstained ({checked} of {n_metrics} usable)",
                 "unusable": unusable}
 
-    if not env:
+    if not isinstance(env, dict):
         return _abstain(0, [])
     checked = 0
     outside: List[str] = []
     unusable: List[str] = []
     for ekey, fkey in checks:
-        # Boundary validation, both sides: a malformed/partial stored band (e.g.
-        # an empty list — the IndexError that broke rescore during retrain) and a
-        # non-finite value are BOTH unusable, and an unusable metric is skipped,
-        # never counted as evidence in either direction.
+        # Boundary validation, both sides: a malformed/partial stored band and
+        # a non-finite value are BOTH unusable, and an unusable metric is
+        # skipped, never counted as evidence in either direction.
         bounds = _usable_band(env.get(ekey))
         raw = features.get(fkey)
         val = _finite(raw)
@@ -446,15 +853,13 @@ def event_novelty(features: Dict[str, Any],
                 unusable.append(ekey)      # present but not a finite number
             continue
         checked += 1
-        if not (bounds[0] <= val <= bounds[1]):
+        if val > bounds[1]:
             outside.append(ekey)
     if unusable:
         log.warning("novelty: %s metric(s) %s are present but not finite — "
                     "excluded from scoring (they can neither raise nor suppress)",
                     ftype, unusable)
     if checked < _MIN_METRICS_FOR_SHAPE:
-        # Not enough independent evidence to vote. Abstain — a thin shape channel
-        # must never authorise an actuation, and must never mask one either.
         log.debug("novelty: %s abstained — only %d of %d metric(s) usable "
                   "(need %d)", ftype, checked, n_metrics, _MIN_METRICS_FOR_SHAPE)
         return _abstain(checked, unusable)
@@ -462,6 +867,103 @@ def event_novelty(features: Dict[str, Any],
             "novelty": round(len(outside) / checked, 3), "outside": outside,
             "checked": checked, "n_metrics": n_metrics,
             "evidence": f"{len(outside)} of {checked}", "unusable": unusable}
+
+
+def hour_known(features: Dict[str, Any], env: Optional[Dict[str, Any]],
+               level: str) -> Optional[bool]:
+    """Has this fixture run at this local hour before? True / False, or None
+    when it cannot say (no hour, no histogram). Known = ``_HOUR_MIN_SUPPORT``
+    frozen events within ±window (circular), or ONE user statement within it —
+    what the user labelled or cleared counts on its own."""
+    hour = _finite(features.get("hour_of_day")) if features else None
+    bins = env.get("hour_bins") if isinstance(env, dict) else None
+    if hour is None or not isinstance(bins, list) or len(bins) != _HOUR_BINS:
+        return None
+    if sum(int(_finite(b) or 0) for b in bins) < _HOUR_MIN_SUPPORT:
+        return None                 # no hour reference for this fixture at all
+    window = _HOUR_WINDOW_BY_LEVEL.get(level, _HOUR_WINDOW_BY_LEVEL["medium"])
+    hour %= 24.0
+    idx = []
+    for i in range(_HOUR_BINS):
+        centre = (i + 0.5) / 2.0
+        d = abs(centre - hour) % 24.0
+        if min(d, 24.0 - d) <= window:
+            idx.append(i)
+    frozen = sum(int(_finite(bins[i]) or 0) for i in idx)
+    if frozen >= _HOUR_MIN_SUPPORT:
+        return True
+    ubins = env.get("user_hour_bins")
+    if isinstance(ubins, list) and len(ubins) == _HOUR_BINS:
+        if sum(int(_finite(ubins[i]) or 0) for i in idx) >= 1:
+            return True
+    return False
+
+
+def novelty_check(features: Dict[str, Any], baselines: Dict[str, Any],
+                  level: str) -> Dict[str, Any]:
+    """Does anything on file look like this event? Staged: stage 1 (what the
+    user labelled or cleared) passes on its nearest match; stage 2 (what the
+    app matched on its own) needs the ``_NOVELTY_NEIGHBOURS``-th nearest within
+    tolerance. No match at either stage → novel.
+
+    Returns ``{novel, d1, d3, tolerance, stage, vouch}``: ``novel`` None when
+    the channel abstains (nothing fitted, a thin pool, a draw under
+    ``_NOVELTY_MIN_VOLUME_L``, a missing feature); ``stage`` names the stage
+    that vouched; ``vouch`` is the user label that at least
+    ``_NOVELTY_VOUCH_MIN`` of the nearest stage-1 matches share (for an untyped
+    repeat of something the user has logged), else None."""
+    out: Dict[str, Any] = {"novel": None, "d1": None, "d3": None,
+                           "tolerance": None, "stage": None, "vouch": None}
+    nov = (baselines or {}).get("_novelty")
+    if not isinstance(nov, dict):
+        return out
+    eff = _finite(features.get("volume_litres_effective"))
+    if eff is None:
+        eff = _finite(features.get("volume_litres"))
+    if eff is None or eff < _NOVELTY_MIN_VOLUME_L:
+        return out
+    spacing = _finite(nov.get("spacing"))
+    center, scale = nov.get("center"), nov.get("scale")
+    dims = len(_NOVELTY_FEATURES)
+    if (spacing is None or spacing <= 0 or not isinstance(center, list)
+            or not isinstance(scale, list) or len(center) != dims or len(scale) != dims):
+        return out
+    raw = _novelty_vector(features)
+    if raw is None:
+        return out
+    z = _standardise(raw, center, scale)
+    tol = spacing * _NOVELTY_K_BY_LEVEL.get(level, _NOVELTY_K_BY_LEVEL["medium"])
+    stage1 = nov.get("stage1") or []
+    stage2 = nov.get("stage2") or []
+    usable1 = len(stage1) >= _NOVELTY_MIN_STAGE
+    usable2 = len(stage2) >= _NOVELTY_MIN_STAGE + _NOVELTY_NEIGHBOURS
+    if not usable1 and not usable2:
+        return out
+    out["tolerance"] = round(tol, 4)
+    if usable1:
+        scored = sorted((_sq_dist(z, row[1:]), row[0]) for row in stage1)
+        d1 = math.sqrt(scored[0][0])
+        out["d1"] = round(d1, 4)
+        if d1 <= tol:
+            out["novel"] = False
+            out["stage"] = "stage1"
+            near = [lbl for d, lbl in scored[:_NOVELTY_NEIGHBOURS]
+                    if math.sqrt(d) <= tol and lbl]
+            for lbl in set(near):
+                if near.count(lbl) >= _NOVELTY_VOUCH_MIN:
+                    out["vouch"] = lbl
+                    break
+            return out
+    if usable2:
+        d3 = _kth_nearest(z, stage2, _NOVELTY_NEIGHBOURS)
+        if d3 is not None:
+            out["d3"] = round(d3, 4)
+            if d3 <= tol:
+                out["novel"] = False
+                out["stage"] = "stage2"
+                return out
+    out["novel"] = True
+    return out
 
 
 def _is_artifact(features: Dict[str, Any]) -> bool:
@@ -485,21 +987,36 @@ def _row_get(row, key, default=None):
 
 _INERT = {"score": None, "anomaly_type": None, "is_anomalous": False,
           "is_severe": False, "shutoff_ok_severe": False, "shutoff_ok_any": False,
-          "data_quality": None, "shape_evidence": None}
+          "data_quality": None, "shape_evidence": None, "novelty": None,
+          "hour_known": None}
 
 
-def _threshold(sens_row, key: str, default: float) -> float:
-    """A configured threshold, boundary-validated. A NaN/inf/garbage
-    threshold silently disables the comparison it guards (every ordered
-    comparison against NaN is false), so fall back to the documented default
-    and say so, rather than running with a dead gate."""
-    raw = _row_get(sens_row, key, default)
-    v = _finite(raw)
-    if v is None:
-        log.warning("sensitivity_config.%s is not a finite number (%r) — using "
-                    "the default %s", key, raw, default)
-        return default
-    return v
+def inert_verdict() -> Dict[str, Any]:
+    """The verdict of an event that is not judged at all."""
+    return dict(_INERT)
+
+
+def _type_ceiling(env: Optional[Dict[str, Any]], margin: float) -> Optional[float]:
+    """A typed event's notify ceiling from its envelope: ``vol_p99 × margin``,
+    or — for a params blob frozen before ``vol_p99`` existed — the old band
+    ceiling (never the pooled rule, which would flag every shower of the
+    type); raised to ``user_ok_hi`` when the user has cleared something bigger."""
+    if not isinstance(env, dict):
+        return None
+    p99 = _finite(env.get("vol_p99"))
+    ceiling: Optional[float] = None
+    if p99 is not None and p99 > 0:
+        ceiling = p99 * margin
+    else:
+        band = _usable_band(env.get("vol"))
+        if band is not None and band[1] > band[0]:
+            ceiling = band[1]
+    if ceiling is None:
+        return None
+    ok_hi = _finite(env.get("user_ok_hi"))
+    if ok_hi is not None and ok_hi > ceiling:
+        ceiling = ok_hi
+    return ceiling
 
 
 def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
@@ -507,78 +1024,67 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
     """Score one event against the FROZEN baseline (read-only).
 
     Returns ``{score, anomaly_type, is_anomalous, is_severe, shutoff_ok_severe,
-    shutoff_ok_any}``:
-      * ``is_anomalous`` — crossed the NOTIFY threshold: volume beyond the
-        event's reference, or shape beyond ``score_alert``.
-      * ``is_severe`` — crossed the SEVERE threshold: volume beyond the pooled
-        p99 (untyped events only), or shape beyond ``score_shutoff``.
+    shutoff_ok_any, data_quality, shape_evidence, novelty, hour_known}``.
 
-    The volume REFERENCE depends on whether the event has a fixture type with a
-    frozen envelope. A typed event (a toilet, a shower, a washer…) is judged
-    against ITS OWN type's volume band — a toilet that starts using more water
-    than toilets do notifies; a 35-gal shower does not, even though it dwarfs
-    the circuit's pooled percentile, which taps and flushes dominate. The
-    pooled percentiles (``baseline_anomaly_p85/p95/p99``, chosen by the
-    sensitivity level) apply only to events that fit no known fixture —
-    untyped or 'other' — which is where a hose filling a pool, or a leak, lands.
-    A typed event is severe on volume only by GROSS exceedance — beyond both
-    the pooled p99 and ``_GROSS_EXCEEDANCE`` x its type's ceiling — or by the
-    envelope's 2oo3 vote; a type whose envelope is too thin to back a close
-    (n < MIN_N_FOR_SHUTOFF) notifies on its own band but defers the severe /
-    shut-off decision to the pooled rule. 'other' keeps the pooled volume rule
-    and its own envelope for the shape vote.
-      * ``shutoff_ok_*`` — the firing signal is backed by a baseline fit from
-        ≥ ``MIN_N_FOR_SHUTOFF`` events, so it may authorise a valve close. A thin /
-        default baseline yields False → the response degrades to notify.
-      * ``data_quality`` — DIAGNOSTIC channel: a '+'-joined tag naming the
-        input that could not be scored (``non_finite_volume``,
-        ``non_finite_metric``, ``thin_shape_evidence``), or None. Deliberately
-        SEPARATE from ``is_anomalous``/``is_severe``: per IEC 61511 degraded-mode
-        handling, unusable data must never authorise an actuation and must never
-        be folded into the leak alarm either — it abstains and reports itself.
-      * ``shape_evidence`` — the envelope vote with its denominator ("2 of 3").
+    Four channels, OR-ed into ``is_anomalous``:
+      * size — a typed event beyond its fixture's ceiling (``vol_p99`` × the
+        level's margin, or anything the user has cleared as normal); an
+        untyped / ``other`` draw beyond the pooled percentile the level picks
+        (``other`` may be raised by its own clearances; an untyped draw that
+        stage 1 of the novelty check vouches for a user label is judged as
+        that label). Tags ``high_volume_type`` / ``high_volume``.
+      * hour — a typed event at an hour its fixture has never run
+        (``hour_known``). Tag ``odd_hours``.
+      * novelty — a shape unlike anything the user labelled or the app matched
+        (``novelty_check``). Tag ``novel_pattern``.
+      * the envelope vote is advisory only: ``+envelope_…`` tags explain a flag.
+    ``is_severe`` (and any shut-off authorisation) comes from the size channel
+    alone: gross exceedance — beyond ``_GROSS_EXCEEDANCE`` × the ceiling AND
+    the pooled p99 — or, for untyped draws, beyond the pooled p99. A type
+    whose envelope is too thin to back a close (n < MIN_N_FOR_SHUTOFF) notifies
+    on its own ceiling but defers severe / shut-off to the pooled rule.
+    ``shutoff_ok_*`` add the confidence gate: the reference behind the firing
+    signal was fit from ≥ MIN_N_FOR_SHUTOFF events. ``score`` is the
+    exceedance ratio (≥ 1.0 when flagged, None otherwise). ``data_quality``
+    names input that could not be scored (``non_finite_volume``,
+    ``non_finite_metric``, ``thin_shape_evidence``) — abstention is reported,
+    never folded into the alarm.
 
-    Inert (everything False/None) for artifact / excluded events, or when no
-    baseline exists for the event. NEVER raises an alert or closes a valve — the
-    response policy in feature_extractor does that, behind a 'live' state gate.
+    Inert for artifact / excluded events or when no baseline exists. NEVER
+    raises an alert or closes a valve — the response policy in
+    feature_extractor does that, behind the live-state gate.
     """
-    # Suppression-averted: the phantom guard would have zeroed a
-    # LARGE measured draw; the volume was kept and the event needs the user's
-    # eyes. Checked BEFORE the artifact gate (the event is excluded_from_training
-    # until reviewed, which would otherwise make it inert) and deterministic
-    # across every rescore (column-driven). Never authorises a shut-off — the
-    # draw is presumed real use pending review.
+    # Suppression-averted: the phantom guard would have zeroed a LARGE
+    # measured draw; the volume was kept and the event needs the user's eyes.
+    # Checked BEFORE the artifact gate (the event is excluded_from_training
+    # until reviewed) and deterministic across every rescore. Never authorises
+    # a shut-off — the draw is presumed real use pending review.
     if features.get("phantom_suppression_averted"):
-        return {"score": 1.0, "anomaly_type": "suppression_averted",
-                "is_anomalous": True, "is_severe": False,
-                "shutoff_ok_severe": False, "shutoff_ok_any": False,
-                "data_quality": None, "shape_evidence": None}
+        out = dict(_INERT)
+        out.update({"score": 1.0, "anomaly_type": "suppression_averted",
+                    "is_anomalous": True})
+        return out
     if _is_artifact(features):
         return dict(_INERT)
 
     level = (_row_get(sens_row, "simple_level", "medium") or "medium")
-    score_alert = _threshold(sens_row, "score_alert", 0.60)
-    score_shutoff = _threshold(sens_row, "score_shutoff", 0.80)
-    # Percentiles are boundary-validated too: a non-finite stored percentile
-    # makes every ``eff_vol > p`` false, i.e. it silently disables the volume
-    # channel. Treat it as absent (unscorable) and say so.
+    margin = _TYPE_MARGIN_BY_LEVEL.get(level, _TYPE_MARGIN_BY_LEVEL["medium"])
+    # Percentiles are boundary-validated: a non-finite stored percentile makes
+    # every ``eff_vol > p`` false, i.e. it silently disables the volume
+    # channel. Treat it as absent (unscorable).
     p85 = _finite(_row_get(sens_row, "baseline_anomaly_p85"))
     p95 = _finite(_row_get(sens_row, "baseline_anomaly_p95"))
     p99 = _finite(_row_get(sens_row, "baseline_anomaly_p99"))
     notify_p = {"p85": p85, "p95": p95, "p99": p99}.get(
         _NOTIFY_PCT_BY_LEVEL.get(level, "p95"))
 
-    # ── the volume boundary ─────────────────────────────────────────────────────
-    # A non-finite volume makes ``eff_vol > p`` false, which would suppress the
-    # leak alert ENTIRELY — the mirror image of the envelope path, where the same
-    # NaN counts as "outside" and could close the valve. Both abstain, and bad
-    # data raises its OWN diagnostic instead of being folded into the alarm.
+    # ── the volume boundary ─────────────────────────────────────────────────
     raw_vol = features.get("volume_litres_effective")
     if raw_vol is None:
         raw_vol = features.get("volume_litres")
     dq: List[str] = []
     if raw_vol is None:
-        eff_vol: Optional[float] = 0.0        # absent volume: scores as zero, as before
+        eff_vol: Optional[float] = 0.0        # absent volume: scores as zero
     else:
         eff_vol = _finite(raw_vol)
         if eff_vol is None:
@@ -586,72 +1092,114 @@ def score_event_anomaly(features: Dict[str, Any], baselines: Dict[str, Any],
             log.warning("anomaly scoring: event volume is not a finite number "
                         "(%r) — the volume channel ABSTAINS (no alert, no "
                         "shut-off) pending data repair", raw_vol)
+    vol_scorable = eff_vol is not None
 
-    nov = event_novelty(features, baselines or {})
-    shape = _finite(nov.get("novelty"))   # 0..1 or None (unscorable / abstained)
+    baselines = baselines or {}
+    nov = event_novelty(features, baselines)
     outside = nov.get("outside") or []
     if nov.get("unusable"):
         dq.append("non_finite_metric")
     if nov.get("checked", 0) and nov.get("novelty") is None:
         dq.append("thin_shape_evidence")
-
-    vol_scorable = eff_vol is not None
     ftype = nov.get("fixture_type")
-    type_env = (baselines or {}).get(ftype) if ftype else None
-    env_n_ok = int((type_env or {}).get("n", 0)) >= MIN_N_FOR_SHUTOFF
-    type_vol = (_usable_band(type_env.get("vol"))
-                if type_env and ftype != "other" else None)
-    if type_vol is not None and type_vol[1] <= type_vol[0]:
-        type_vol = None     # identical training volumes: no width, no reference
+    type_env = baselines.get(ftype) if ftype and not str(ftype).startswith("_") else None
+    if not isinstance(type_env, dict):
+        type_env = None
+    env_n_ok = int((type_env or {}).get("n", 0) or 0) >= MIN_N_FOR_SHUTOFF
+
+    nv = novelty_check(features, baselines, level)
+    novel = nv.get("novel") is True
+
+    # ── size channel ────────────────────────────────────────────────────────
+    ceiling: Optional[float] = None
+    judged_as = ftype
+    if type_env is not None and ftype != "other":
+        ceiling = _type_ceiling(type_env, margin)
+    elif not ftype and nv.get("vouch"):
+        vouch_env = baselines.get(nv["vouch"])
+        if isinstance(vouch_env, dict) and nv["vouch"] != "other":
+            ceiling = _type_ceiling(vouch_env, margin)
+            if ceiling is not None:
+                judged_as = nv["vouch"]
+                type_env, env_n_ok = vouch_env, int(vouch_env.get("n", 0) or 0) >= MIN_N_FOR_SHUTOFF
+    typed = ceiling is not None
     pooled_notify = vol_scorable and notify_p is not None and eff_vol > notify_p
     pooled_severe = vol_scorable and p99 is not None and eff_vol > p99
-    if type_vol is not None:
-        vol_notify = vol_scorable and eff_vol > type_vol[1]
-        gross = _GROSS_EXCEEDANCE * type_vol[1]
-        vol_severe = (vol_scorable and eff_vol > max(gross, p99 if p99 is not None else gross)
-                      if env_n_ok else pooled_severe)
+    if typed:
+        vol_notify = vol_scorable and eff_vol > ceiling
+        # Severe needs BOTH lines; an unusable pooled p99 abstains rather than
+        # letting the type line alone authorise a close.
+        gross = _GROSS_EXCEEDANCE * ceiling
+        vol_severe = (vol_notify and p99 is not None and eff_vol > max(gross, p99)
+                      if env_n_ok else (vol_notify and pooled_severe))
         vol_tag = "high_volume_type"
     else:
-        vol_notify, vol_severe, vol_tag = pooled_notify, pooled_severe, "high_volume"
-    shape_notify = shape is not None and shape >= score_alert
-    shape_severe = shape is not None and shape >= score_shutoff
+        # Untyped / other / thin: the pooled rule. 'other' is only ever a user
+        # label, so what the user cleared as normal raises its line; a vouched
+        # 'other' repeat is judged the same way.
+        pooled_line = notify_p
+        other_key = "other" if (ftype == "other" or nv.get("vouch") == "other") else None
+        if other_key and isinstance(baselines.get(other_key), dict):
+            ok_hi = _finite(baselines[other_key].get("user_ok_hi"))
+            if ok_hi is not None and pooled_line is not None and ok_hi > pooled_line:
+                pooled_line = ok_hi
+        vol_notify = vol_scorable and pooled_line is not None and eff_vol > pooled_line
+        vol_severe = vol_notify and pooled_severe
+        vol_tag = "high_volume"
+        ceiling = pooled_line
 
-    is_anomalous = vol_notify or shape_notify
-    is_severe = vol_severe or shape_severe
-    if not is_anomalous and not is_severe:
+    # ── hour channel (typed events with a fixture of their own) ─────────────
+    hk = None
+    if type_env is not None and judged_as and judged_as != "other" and ftype:
+        hk = hour_known(features, type_env, level)
+    odd_hours = hk is False
+
+    is_anomalous = bool(vol_notify or novel or odd_hours)
+    is_severe = bool(vol_severe)
+    if not is_anomalous:
         out = dict(_INERT)
         out["data_quality"] = "+".join(dq) or None
         out["shape_evidence"] = nov.get("evidence")
+        out["novelty"] = nv
+        out["hour_known"] = hk
         return out
 
-    # ── Shut-off confidence gate — the firing signal must be WELL-FIT ────────────
+    # ── Shut-off confidence gate — only the size channel may close ──────────
     baseline_n = _row_get(sens_row, "baseline_anomaly_n")
     n_ok = baseline_n is not None and int(baseline_n) >= MIN_N_FOR_SHUTOFF
-    if type_vol is not None and env_n_ok:
-        shutoff_ok_severe = vol_severe or shape_severe
-        shutoff_ok_any = vol_notify or shape_notify
-    elif type_vol is not None:
-        # Thin type: its band may notify, but only pooled evidence may close.
-        shutoff_ok_severe = pooled_severe and n_ok
-        shutoff_ok_any = pooled_notify and n_ok
-    else:
-        shutoff_ok_severe = (vol_severe and n_ok) or (shape_severe and env_n_ok)
-        shutoff_ok_any = (vol_notify and n_ok) or (shape_notify and env_n_ok)
+    shutoff_ok_severe = shutoff_ok_any = False
+    if vol_notify:
+        if typed and env_n_ok:
+            shutoff_ok_severe, shutoff_ok_any = vol_severe, True
+        elif typed:
+            # Thin type: its ceiling may notify, but only pooled evidence may close.
+            shutoff_ok_severe = pooled_severe and n_ok
+            shutoff_ok_any = pooled_notify and n_ok
+        else:
+            shutoff_ok_severe, shutoff_ok_any = vol_severe and n_ok, n_ok
 
-    score = max(shape or 0.0, 1.0 if vol_notify else 0.0)
+    if vol_notify and ceiling:
+        score = eff_vol / ceiling
+    elif novel and nv.get("tolerance"):
+        dist = min(d for d in (nv.get("d1"), nv.get("d3")) if d is not None)
+        score = dist / nv["tolerance"]
+    else:
+        score = 1.0
     reasons: List[str] = []
     if vol_notify:
         reasons.append(vol_tag)
-    if shape_notify:
-        reasons.append("envelope_" + "_".join(outside) if outside else "abnormal_shape")
-    return {"score": round(score, 3), "anomaly_type": "+".join(reasons) or None,
-            "is_anomalous": is_anomalous, "is_severe": is_severe,
+    if novel:
+        reasons.append("novel_pattern")
+    if odd_hours:
+        reasons.append("odd_hours")
+    if outside:
+        reasons.append("envelope_" + "_".join(outside))
+    return {"score": round(max(score, 1.0), 3), "anomaly_type": "+".join(reasons),
+            "is_anomalous": True, "is_severe": is_severe,
             "shutoff_ok_severe": shutoff_ok_severe, "shutoff_ok_any": shutoff_ok_any,
-            # The count WITH its denominator ("2 of 3"), and a diagnostic
-            # channel for unusable input that is deliberately kept OUT of
-            # is_anomalous / is_severe so bad data can never masquerade as a leak.
             "data_quality": "+".join(dq) or None,
-            "shape_evidence": nov.get("evidence")}
+            "shape_evidence": nov.get("evidence"),
+            "novelty": nv, "hour_known": hk}
 
 
 def load_sensitivity_row(conn: sqlite3.Connection, circuit: str) -> Optional[Dict[str, Any]]:
@@ -663,36 +1211,84 @@ def load_sensitivity_row(conn: sqlite3.Connection, circuit: str) -> Optional[Dic
 
 
 # Every column the scorer reads off a stored event row.
-SCORE_COLUMNS = ("volume_litres_effective", "volume_litres", "duration_seconds",
-                 "peak_flow_lpm", "phantom_suppression_averted",
-                 "user_fixture_type", "matched_fixture_type") + _ARTIFACT_FLAGS
+SCORE_COLUMNS = (("volume_litres_effective", "volume_litres", "duration_seconds",
+                  "peak_flow_lpm", "phantom_suppression_averted",
+                  "user_fixture_type", "matched_fixture_type", "hour_of_day")
+                 + tuple(c for c, _ in _NOVELTY_FEATURES
+                         if c not in ("volume_litres", "duration_seconds", "peak_flow_lpm"))
+                 + _ARTIFACT_FLAGS)
 
 
 def rescore_stored_event(conn: sqlite3.Connection, circuit: str, event_id: str,
                          baselines: Optional[Dict[str, Any]] = None,
-                         sens_row=None) -> Optional[Dict[str, Any]]:
+                         sens_row=None, judged: Any = "unset") -> Optional[Dict[str, Any]]:
     """Re-judge ONE stored event against the frozen baseline and persist the
     verdict (anomaly_score / anomaly_type / flagged). Storage only — never
     notifies or closes a valve; the live response ran when the event was
-    stored. Used when the event's TYPE changes under it (a user label) and by
-    the one-shot migration that re-judged old flags. ``baselines`` / ``sens_row``
-    may be passed in by a caller looping over many events. Returns the scorer's
-    result, or None when the event does not exist. Does not commit.
+    stored. An event outside the judged window (``judged_from``) gets the
+    inert verdict. ``baselines`` / ``sens_row`` / ``judged`` may be passed in
+    by a caller looping over many events. Returns the scorer's result, or None
+    when the event does not exist. Does not commit.
     """
     row = conn.execute(
-        f"SELECT {', '.join(SCORE_COLUMNS)} FROM events WHERE id = ? AND circuit = ?",
-        (event_id, circuit)).fetchone()
+        f"SELECT start_ts, {', '.join(SCORE_COLUMNS)} FROM events "
+        "WHERE id = ? AND circuit = ?", (event_id, circuit)).fetchone()
     if row is None:
         return None
+    if judged == "unset":
+        judged = judged_from(conn, circuit)
     if baselines is None:
         baselines = load_usage_baselines(conn, circuit)
     if sens_row is None:
         sens_row = load_sensitivity_row(conn, circuit)
     # Positional, so a plain-tuple connection scores the same as a Row one.
-    av = score_event_anomaly(dict(zip(SCORE_COLUMNS, tuple(row))), baselines, sens_row)
+    vals = tuple(row)
+    if is_judged(vals[0], judged):
+        av = score_event_anomaly(dict(zip(SCORE_COLUMNS, vals[1:])), baselines, sens_row)
+    else:
+        av = dict(_INERT)
     conn.execute(
         "UPDATE events SET anomaly_score = ?, anomaly_type = ?, flagged = ? "
         "WHERE id = ? AND circuit = ?",
         (av.get("score"), av.get("anomaly_type"),
          1 if av.get("is_anomalous") else 0, event_id, circuit))
     return av
+
+
+def rejudge_flagged_events(conn: sqlite3.Connection, circuit: str,
+                           baselines: Optional[Dict[str, Any]] = None,
+                           sens_row=None, commit: bool = True) -> Tuple[int, int]:
+    """Re-judge every currently-flagged event of a circuit against the CURRENT
+    frozen reference. Visits only ``flagged = 1`` rows, so it can clear a flag
+    (a normal draw under a new ceiling, a verdict that raised one, a stale flag
+    from a superseded baseline, an event from before go-live) but never raises
+    one. Skipped when nothing is frozen — with no reference, un-flagging would
+    just erase the flags. Returns (cleared, kept). Commits unless told not to
+    (the freeze callers run on a private connection that is closed afterwards,
+    so an uncommitted re-judge would be lost)."""
+    frozen = conn.execute("SELECT 1 FROM usage_baseline WHERE circuit = ?",
+                          (circuit,)).fetchone()
+    if sens_row is None:
+        sens_row = load_sensitivity_row(conn, circuit)
+    if frozen is None or sens_row is None or sens_row.get("baseline_anomaly_p95") is None:
+        return (0, 0)
+    if baselines is None:
+        baselines = load_usage_baselines(conn, circuit, use_cache=False)
+    judged = judged_from(conn, circuit)
+    ids = [r[0] for r in conn.execute(
+        "SELECT id FROM events WHERE circuit = ? AND flagged = 1", (circuit,))]
+    cleared = kept = 0
+    for event_id in ids:
+        try:
+            av = rescore_stored_event(conn, circuit, event_id, baselines, sens_row,
+                                      judged=judged)
+        except Exception as e:                       # best-effort per row
+            log.warning("[%s] re-judge of %s failed: %s", circuit, event_id, e)
+            continue
+        if av is not None and not av.get("is_anomalous"):
+            cleared += 1
+        else:
+            kept += 1
+    if commit:
+        conn.commit()
+    return cleared, kept

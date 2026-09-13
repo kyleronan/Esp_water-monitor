@@ -31,7 +31,8 @@ from ..database import (
     run_db,
     set_event_classification,
     upsert_fixture_signature)
-from ..anomaly_baseline import rescore_stored_event
+from ..anomaly_baseline import (refresh_user_knowledge, rejudge_flagged_events,
+                                rescore_stored_event)
 from ..task_registry import spawn
 from ._helpers import (
     _orch,
@@ -648,11 +649,12 @@ def _collect_circuit_history_sync(
             e["embedded_label"] = _embedded_display_label(
                 _emb, _units["vol_factor"], _units["vol_unit"]) if _emb else ""
             # Homeowner-facing anomaly reason for flagged events. Splits the one
-            # internal "flagged" bit into the three cases that mean different
-            # things to the user: a genuinely big real draw, a flag raised on an
-            # ESTIMATED number (pulsing supply — the number itself may be wrong),
-            # and a large draw the phantom guard kept-but-questioned
-            # (anomaly_type 'suppression_averted'). Presentation-only.
+            # internal "flagged" bit into the cases that mean different things
+            # to the user: far more than this fixture uses, a shape unlike
+            # anything on file, an hour the fixture never runs, a big untyped
+            # draw, a flag raised on an ESTIMATED number (pulsing supply — the
+            # number itself may be wrong), and a large draw the phantom guard
+            # kept-but-questioned ('suppression_averted'). Presentation-only.
             if e.get("flagged"):
                 _at = e.get("anomaly_type") or ""
                 _vem = e.get("volume_estimation_method") or "raw"
@@ -662,6 +664,10 @@ def _collect_circuit_history_sync(
                     e["anomaly_reason"] = "estimated"
                 elif "high_volume_type" in _at:
                     e["anomaly_reason"] = "high_usage_type"
+                elif "novel_pattern" in _at:
+                    e["anomaly_reason"] = "novel"
+                elif "odd_hours" in _at:
+                    e["anomaly_reason"] = "odd_time"
                 else:
                     e["anomaly_reason"] = "high_usage"
             else:
@@ -1112,16 +1118,23 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
         except Exception:
             log.exception("artifact revert on relabel failed (label saved)")
 
-    # A label changes what the event is judged AS: the anomaly verdict is
-    # re-derived against the new type's own frozen band (a labelled shower is
-    # measured against showers, not the circuit's pooled percentile), so the
-    # "unusual" flag follows the label instead of outliving it. Storage only.
-    if "user_fixture_type" in payload:
+    # Any edit can change what the frozen reference knows and what this event
+    # is judged AS: a label or a "Normal use" verdict teaches (it raises the
+    # fixture's ceiling, makes the hour known, joins the novelty pool), a
+    # cleared verdict un-teaches, an ignore / classification makes the row
+    # inert. So: refresh the user-taught keys first (the rescore reads the
+    # cache they invalidate), re-judge this event, then re-judge every flagged
+    # row of the circuit so twins clear in the same click. Storage only —
+    # never notifies. A failure rolls back: this is the shared connection.
+    if kwargs or classification_meta is not None:
         try:
+            refresh_user_knowledge(db, circuit)
             rescore_stored_event(db, circuit, event_id)
+            rejudge_flagged_events(db, circuit, commit=False)
             db.commit()
         except Exception:
-            log.exception("anomaly re-score on relabel failed (label saved)")
+            log.exception("anomaly re-judge after event edit failed (edit saved)")
+            db.rollback()
 
     # Sprint B — if the patch touched user_fixture_type, propagate the
     # signal into the cluster's suggested_type (soft hint; never silently

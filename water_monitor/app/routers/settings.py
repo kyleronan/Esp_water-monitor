@@ -843,15 +843,6 @@ async def sensitivity_update(circuit: str, request: Request):
             min_event_duration_seconds=coerce_float(
                 form.get("min_event_duration_seconds"), lo=1.0, hi=30.0,
                 default=preset["min_event_duration_seconds"]),
-            # score_alert / score_shutoff are the anomaly-score gates. The form
-            # declares min=0.1: a stored 0.0 would make shape_severe true for
-            # every event that has an envelope at all.
-            score_alert=coerce_float(
-                form.get("score_alert"), lo=0.1, hi=1.0,
-                default=preset["score_alert"]),
-            score_shutoff=coerce_float(
-                form.get("score_shutoff"), lo=0.1, hi=1.0,
-                default=preset["score_shutoff"]),
             flow_tolerance_pct=coerce_float(
                 form.get("flow_tolerance_pct"), lo=5.0, hi=80.0,
                 default=preset["flow_tolerance_pct"]),

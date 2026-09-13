@@ -645,7 +645,7 @@
             data-peak-flow="{{ (e.peak_flow_lpm * flow_factor)|round(flow_decimals) if e.peak_flow_lpm is not none else '' }}"
             data-pre-pressure="{{ (e.pre_event_pressure_psi * pressure_factor)|round(pressure_decimals) if e.pre_event_pressure_psi is not none else '' }}"
             data-prop-ms="{{ e.propagation_delay_ms | int if e.propagation_delay_ms else '0' }}"
-            data-anomaly-score="{{ (e.anomaly_score * 100)|round(1) if e.anomaly_score is not none else '' }}"
+            data-anomaly-score="{{ e.anomaly_score|round(2) if e.anomaly_score is not none else '' }}"
             data-anomaly-type="{{ e.anomaly_type or '' }}"
             data-flagged="{{ '1' if e.flagged else '0' }}"
             data-anomaly-reason="{{ e.anomaly_reason or '' }}"
@@ -750,8 +750,10 @@
                 {%- if e.review_verdict == 'unknown' %}<span class="pill pill-amber js-anomaly-pill" title="You reviewed this but didn't recognize it. It's kept out of the app's learned idea of normal, so it can never widen your baseline. If you later figure out what it was, open it and label it.">❓ Reviewed — unrecognized</span>
                 {%- elif e.review_verdict == 'normal' %}<span class="pill pill-neutral js-anomaly-pill" title="You confirmed this was normal use (a long shower, guests, filling something). It no longer counts toward the dashboard's unusual-events card.">✓ Reviewed — normal use</span>
                 {%- else %}<span class="pill pill-neutral js-anomaly-pill" title="Flagged as unusual for your home's pattern, and you've reviewed it. It no longer counts toward the dashboard's unusual-events card.">✓ Reviewed — was unusual</span>{% endif %}
-              {% elif e.anomaly_reason == 'high_usage_type' %}<span class="pill pill-amber js-anomaly-pill" title="Far more water than this fixture normally uses. If the fixture label is wrong, change it; if it really was this fixture, open it and mark Normal use.">⚠ Unusual for this fixture</span>
-              {% elif e.anomaly_reason == 'high_usage' %}<span class="pill pill-amber js-anomaly-pill" title="Unusually large water use for your home's learned pattern. The measurement itself is trustworthy — open it and mark reviewed if this was normal (a long shower, guests, etc.).">⚠ Unusual — high use</span>
+              {% elif e.anomaly_reason == 'high_usage_type' %}<span class="pill pill-amber js-anomaly-pill" title="Far more water than this fixture normally uses. If the fixture label is wrong, change it; if it really was this fixture, open it and mark Normal use — that raises this fixture's normal ceiling so draws this size won't be flagged again.">⚠ Unusual for this fixture</span>
+              {% elif e.anomaly_reason == 'novel' %}<span class="pill pill-amber js-anomaly-pill" title="Doesn't resemble any use you've labelled or the app has matched — size, length, flow and on/off pattern all differ. If you know what it was, label it or mark Normal use; from then on repeats are known and won't be flagged.">⚠ Unusual — new pattern</span>
+              {% elif e.anomaly_reason == 'odd_time' %}<span class="pill pill-amber js-anomaly-pill" title="This fixture has never run at this time of day, going by your training period and what you've marked normal since. If it was normal, mark Normal use and this hour becomes known for it; if the fixture label is wrong, change it.">⚠ Unusual time for this fixture</span>
+              {% elif e.anomaly_reason == 'high_usage' %}<span class="pill pill-amber js-anomaly-pill" title="Unusually large water use for your home's learned pattern. The measurement itself is trustworthy — open it and mark Normal use if this was normal (a long shower, guests, etc.).">⚠ Unusual — high use</span>
               {% elif e.anomaly_reason == 'estimated' %}<span class="pill pill-amber js-anomaly-pill" title="Flagged as unusual, but the volume is an ESTIMATE (pressure was unsteady) — the big number may not be real water. Open it to review.">⚠ Unusual (estimated)</span>
               {% elif e.anomaly_reason == 'review_draw' %}<span class="pill pill-amber js-anomaly-pill" title="This looked like a pressure blip, but it carried too much measured water to dismiss — the volume was KEPT and it needs your eyes. If it was real use, relabel it; if not, relabel as Not real use.">⚠ Large draw — review</span>{% endif %}
             </div>
@@ -1251,6 +1253,11 @@ document.addEventListener('DOMContentLoaded', () => {
         ' · ' + members.length + ' events · ' +
         (Math.round(totVol * 10) / 10) + (unit ? ' ' + unit : '') +
         (tNew && tOld ? ' · ' + tOld + '–' + tNew : '');
+      // A collapsed cycle must not hide an open question: an unreviewed
+      // unusual member surfaces on the parent row.
+      if (members.some(m => m.dataset.flagged === '1' && m.dataset.reviewed !== '1')) {
+        td.innerHTML += ' <span class="pill pill-amber" title="One or more events in this cycle are flagged as unusual and not yet reviewed — expand the cycle to see them.">⚠ Unusual event inside</span>';
+      }
       parent.appendChild(td);
       first.parentNode.insertBefore(parent, first);
       members.forEach(m => {
@@ -1435,8 +1442,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const aScore = d.anomalyScore;
     const aType  = d.anomalyType;
+    // The score is how far past the line the event sits (1.6 = 60% beyond).
     document.getElementById('emd-anomaly').textContent =
-      aScore ? `${aScore}%${aType ? ' · ' + aType.replace(/_/g, ' ') : ''}` : '—';
+      aScore ? `${aScore}× the line${aType ? ' · ' + aType.replace(/_/g, ' ').replace(/\+/g, ', ') : ''}` : '—';
 
     const ov = d.otherValve;
     document.getElementById('emd-other-valve').textContent =
@@ -1603,8 +1611,18 @@ document.addEventListener('DOMContentLoaded', () => {
       const REASON_TEXT = {
         high_usage_type: 'This event used much more water than this fixture ' +
           'normally does. If the fixture label is wrong, change it above; if it ' +
-          'really was this fixture and the use was normal, mark it Normal use; ' +
-          'if you can’t place it, mark Don’t recognize it.',
+          'really was this fixture and the use was normal, mark it Normal use — ' +
+          'that raises the fixture’s normal ceiling, so draws this size are not ' +
+          'flagged again; if you can’t place it, mark Don’t recognize it.',
+        novel: 'This event doesn’t resemble any use you’ve labelled or the app ' +
+          'has matched — its size, length, flow and on/off pattern are all new. ' +
+          'If you know what it was, label it above or mark it Normal use; from ' +
+          'then on repeats are known and won’t be flagged. If you can’t place ' +
+          'it, mark Don’t recognize it.',
+        odd_time: 'This fixture has never run at this time of day, going by your ' +
+          'training period and what you’ve marked normal since. If it was ' +
+          'normal, mark it Normal use and this hour becomes known for the ' +
+          'fixture; if the fixture label is wrong, change it above.',
         high_usage: 'This event used much more water than your home’s ' +
           'learned pattern. The measurement itself is trustworthy — if this ' +
           'was a long shower, guests, or filling something, mark it Normal use; ' +

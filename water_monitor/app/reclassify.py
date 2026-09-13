@@ -422,16 +422,18 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
                                  exclude_ids=set(washer_ids) | set(softener_ids))
         if circuit_type != "zone" else {})
     # Re-score each scanned event against the FROZEN baseline (storage only;
-    # reclassify NEVER notifies or shuts off). Baseline + sensitivity loaded
-    # once for the whole pass; the extra SELECT columns the scorer needs are
-    # deduped into the query so a column already in qfeats isn't selected twice.
-    from .anomaly_baseline import load_usage_baselines
-    _baselines = load_usage_baselines(conn, circuit)
+    # reclassify NEVER notifies or shuts off). Sensitivity is loaded once for
+    # the pass (the baseline per chunk, see _reclassify_chunk_sync); the extra
+    # SELECT columns the scorer needs are deduped into the query so a column
+    # already in qfeats isn't selected twice.
+    from .anomaly_baseline import SCORE_COLUMNS, judged_from, load_usage_baselines
+    _baselines = load_usage_baselines(conn, circuit)    # warms the per-circuit cache
     _sens = _db.get_sensitivity_config(conn, circuit)
-    _SCORE_COLS = ("volume_litres_effective", "volume_litres", "duration_seconds",
-                   "peak_flow_lpm", "is_pressure_restoration_phantom", "is_cross_talk",
-                   "is_low_flow_dribble", "user_ignored", "excluded_from_training",
-                   "phantom_suppression_averted")
+    # Nothing before this instant is judged (the circuit's most recent learning
+    # window); None while the circuit is (re)learning — every scanned row then
+    # gets the inert verdict.
+    _judged_from = judged_from(conn, circuit)
+    _SCORE_COLS = tuple(c for c in SCORE_COLUMNS if c != "matched_fixture_type")
 
     # Fingerprint tier library — built ONCE per run, fresh (no cache; a
     # reclassify usually follows a label change). Gated by the home_profile
@@ -558,6 +560,7 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         "baselines":          _baselines,
         "sens":               _sens,
         "score_cols":         _SCORE_COLS,
+        "judged_from":        _judged_from,
         # The stamp every row this pass touches gets written with, and whether
         # a due full pass re-opened the circuit.
         "verdict_stamp":      stamp,
@@ -584,7 +587,8 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                              toilet_burst_veto_reason,
                               toilet_veto_reason)
     from .supply_regime import resolve_regime_for_ts
-    from .anomaly_baseline import score_event_anomaly
+    from .anomaly_baseline import (inert_verdict, is_judged, load_usage_baselines,
+                                   score_event_anomaly)
 
     softener_ids   = ctx["softener_ids"]
     washer_ids     = ctx["washer_ids"]
@@ -596,9 +600,14 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     _regimes       = ctx["regimes"]
     _fp_library    = ctx["fp_library"]
     _toilet_cap    = ctx["toilet_cap"]
-    _baselines     = ctx["baselines"]
+    # Re-read per chunk (a cache hit when nothing changed): a verdict landing
+    # mid-pass rewrites the user-taught keys and invalidates the cache, and a
+    # chunk scored against the pre-verdict params would re-raise a flag the
+    # verdict just cleared, with nothing to re-judge it afterwards.
+    _baselines     = load_usage_baselines(conn, circuit)
     _sens          = ctx["sens"]
     _SCORE_COLS    = ctx["score_cols"]
+    _judged_from   = ctx["judged_from"]
     _stamp         = ctx["verdict_stamp"]
     _stamp_before  = ctx["stamp_before_ts"]
 
@@ -810,7 +819,8 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
         # (non-artifact) anomaly.
         sfeats = {c: r[c] for c in _SCORE_COLS}
         sfeats["matched_fixture_type"] = new_type
-        av = score_event_anomaly(sfeats, _baselines, _sens)
+        av = (score_event_anomaly(sfeats, _baselines, _sens)
+              if is_judged(r["start_ts"], _judged_from) else inert_verdict())
         conn.execute(
             "UPDATE events SET anomaly_score = ?, anomaly_type = ?, flagged = ? "
             "WHERE id = ?",

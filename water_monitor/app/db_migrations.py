@@ -9,6 +9,7 @@ fails fast at startup: delete the DB and restart.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import sqlite3
@@ -17,8 +18,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from .anomaly_baseline import (load_sensitivity_row, load_usage_baselines,
-                               rescore_stored_event)
+from .anomaly_baseline import (fit_usage_baselines, invalidate_baseline_cache,
+                               rejudge_flagged_events)
 from .database import local_day_of, rezero_rows_with_zeroing_flag
 
 log = logging.getLogger(__name__)
@@ -35,8 +36,8 @@ _BASELINE_VERSION: int = 20260801
 # reorder a shipped number: 20260819 shipped in September under August's prefix
 # and STAYS that way — renumbering it would make the live databases it stamped
 # fail the _UPGRADEABLE_VERSIONS check below and be told to delete themselves.
-# THE NEXT MIGRATION IS 20260904.
-_CURRENT_VERSION: int = 20260903
+# THE NEXT MIGRATION IS 20260905.
+_CURRENT_VERSION: int = 20260904
 
 # Roles removed when the firmware switched waveform delivery from 5 chunked
 # text sensors to a single HA event (firmware 3.8.0). Old DBs may still carry
@@ -1783,20 +1784,13 @@ def _apply_dead_schema_and_event_indexes(conn: sqlite3.Connection) -> None:
 
 def _apply_per_type_anomaly_rescore(conn: sqlite3.Connection) -> None:
     """Forward migration to 20260903 — re-judge every currently-flagged event
-    under the per-fixture volume rule.
+    under the per-fixture volume rule (dev57).
 
     The scorer used to flag ANY event whose volume beat the circuit's pooled
-    p95, a percentile taps and flushes dominate (16.7 L on the reference home),
-    so every shower on record was "unusual" and a label could not clear it.
-    A typed event is now judged against its own type's frozen band. This step
-    re-scores only rows that are flagged today against the CURRENT frozen
-    baseline, so it can un-flag a normal shower (or a stale flag from a
-    superseded baseline) but never raises a new flag itself; the routine
-    reclassify pass judges unlabelled history under the new rule as it always
-    has, and new events are scored live. A circuit with nothing frozen is
-    skipped outright — with no reference, un-flagging would just erase the
-    flags. Data-only, idempotent (a pure function of the frozen baseline),
-    best-effort.
+    p95, so every shower on record was "unusual". Re-scores only rows that
+    are flagged today against the CURRENT frozen baseline (it can un-flag,
+    never flags), skipping a circuit with nothing frozen — with no reference,
+    un-flagging would just erase the flags. Data-only, idempotent, best-effort.
     """
     if not _has_table(conn, "sensitivity_config") or not _has_table(conn, "usage_baseline"):
         conn.commit()
@@ -1804,28 +1798,73 @@ def _apply_per_type_anomaly_rescore(conn: sqlite3.Connection) -> None:
     cleared = kept = 0
     for (circuit,) in conn.execute(
             "SELECT DISTINCT circuit FROM events WHERE flagged = 1").fetchall():
-        frozen = conn.execute(
-            "SELECT 1 FROM usage_baseline WHERE circuit = ?", (circuit,)).fetchone()
-        sens = load_sensitivity_row(conn, circuit)
-        if frozen is None or sens is None or sens.get("baseline_anomaly_p95") is None:
-            log.info("Migration 20260903: [%s] no frozen baseline — flags left as-is", circuit)
-            continue
-        baselines = load_usage_baselines(conn, circuit, use_cache=False)
-        ids = [r[0] for r in conn.execute(
-            "SELECT id FROM events WHERE circuit = ? AND flagged = 1", (circuit,))]
-        for event_id in ids:
-            try:
-                av = rescore_stored_event(conn, circuit, event_id, baselines, sens)
-            except Exception as e:                       # best-effort per row
-                log.warning("Migration 20260903: %s re-score failed: %s", event_id, e)
-                continue
-            if av is not None and not av.get("is_anomalous"):
-                cleared += 1
-            else:
-                kept += 1
+        c, k = rejudge_flagged_events(conn, circuit, commit=False)
+        cleared += c
+        kept += k
     conn.commit()
     log.info("Migration 20260903: re-judged flagged events per fixture type — "
              "%d no longer unusual, %d still flagged", cleared, kept)
+
+
+def _apply_tail_ceiling_and_novelty(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260904 — give every frozen baseline the dev58
+    references and re-judge the flags.
+
+    The frozen params gain, per type, ``vol_p99`` (the size ceiling is now the
+    fixture's p99 × the level's margin, not a p95 band that flagged the top 5%
+    of normal use), ``hour_bins`` / ``user_hour_bins`` (the hour channel) and
+    ``user_ok_hi`` (what the user has reviewed as normal), plus the ``_novelty``
+    block. The stored types and their ``vol``/``dur``/``peak``/``n``/``era``
+    keys are left exactly as frozen. Then every currently-flagged event is
+    re-judged (clears only): flags from before go-live, flags a fixture's
+    tail now covers, flags the user already cleared. Two passes, because the
+    old-rule flags are held out of the hour histogram until re-judged.
+    Skips a circuit with nothing frozen; best-effort per circuit; idempotent.
+    """
+    if not _has_table(conn, "sensitivity_config") or not _has_table(conn, "usage_baseline"):
+        conn.commit()
+        return
+    try:
+        from .supply_regime import pump_era_start
+        era = pump_era_start(conn)
+    except Exception as e:                          # noqa: BLE001
+        log.warning("Migration 20260904: pump-era anchor unavailable (%s) — all-time fit", e)
+        era = None
+    for (circuit,) in conn.execute("SELECT circuit FROM usage_baseline").fetchall():
+        try:
+            for _pass in (1, 2):
+                row = conn.execute("SELECT params FROM usage_baseline WHERE circuit = ?",
+                                   (circuit,)).fetchone()
+                params = json.loads(row["params"]) if row and row["params"] else {}
+                if not isinstance(params, dict):
+                    params = {}
+                fitted, _overall = fit_usage_baselines(conn, circuit, era_start=era)
+                for t, env in params.items():
+                    if t.startswith("_") or not isinstance(env, dict):
+                        continue
+                    new_env = fitted.get(t)
+                    if not isinstance(new_env, dict):
+                        continue
+                    for key in ("vol_p99", "hour_bins", "user_hour_bins", "user_ok_hi"):
+                        if key in new_env:
+                            env[key] = new_env[key]
+                        else:
+                            env.pop(key, None)
+                if "_novelty" in fitted:
+                    params["_novelty"] = fitted["_novelty"]
+                else:
+                    params.pop("_novelty", None)
+                conn.execute("UPDATE usage_baseline SET params = ? WHERE circuit = ?",
+                             (json.dumps(params), circuit))
+                conn.commit()
+                invalidate_baseline_cache(circuit)
+                cleared, kept = rejudge_flagged_events(conn, circuit)
+                log.info("Migration 20260904: [%s] pass %d — %d flag(s) cleared, %d kept",
+                         circuit, _pass, cleared, kept)
+        except Exception as e:                      # noqa: BLE001 — best-effort per circuit
+            log.warning("Migration 20260904: [%s] skipped: %s", circuit, e)
+            conn.rollback()
+    conn.commit()
 
 
 # Ordered forward-migration chain, (introduced_in_version, apply_fn): a DB
@@ -1856,6 +1895,7 @@ _MIGRATIONS: tuple = (
     (20260901, _apply_drop_mqtt_schema),
     (20260902, _apply_dead_schema_and_event_indexes),
     (20260903, _apply_per_type_anomaly_rescore),
+    (20260904, _apply_tail_ceiling_and_novelty),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

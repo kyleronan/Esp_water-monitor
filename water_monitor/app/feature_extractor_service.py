@@ -12,6 +12,7 @@ on both sides.
 from __future__ import annotations
 
 import asyncio
+import math
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -744,9 +745,14 @@ class FeatureExtractor:
     def _score_anomaly(self, circuit: str, features: dict) -> dict:
         """Score an event against the FROZEN baseline (Phase 2.3). Read-only — the
         notify / shut-off response is applied separately in ``_process`` behind a
-        'live' state gate. Returns the inert verdict for artifact / excluded events
-        or when no baseline exists."""
-        from .anomaly_baseline import load_usage_baselines, score_event_anomaly
+        'live' state gate. Returns the inert verdict for artifact / excluded
+        events, when no baseline exists, or when nothing is judged at all — the
+        circuit is still (re)learning, or the event started before its most
+        recent learning window closed (``anomaly_baseline.judged_from``)."""
+        from .anomaly_baseline import (inert_verdict, is_judged, judged_from,
+                                       load_usage_baselines, score_event_anomaly)
+        if not is_judged(features.get("start_ts"), judged_from(self._db, circuit)):
+            return inert_verdict()
         baselines = load_usage_baselines(self._db, circuit)
         sens = get_sensitivity_config(self._db, circuit)
         return score_event_anomaly(features, baselines, sens)
@@ -790,7 +796,13 @@ class FeatureExtractor:
                                  sens)):
             if await self._auto_shutoff(circuit, circuit_name, score, atype, event_id):
                 return   # the shut-off path already notified (why + reopen)
-        # Off-ramp: degrade to / default notify, rate-limited so it cannot spam.
+        # Off-ramp: degrade to / default notify, rate-limited so it cannot
+        # spam, and held while the same open question (a new pattern, a
+        # fixture at an odd hour) already asked in the last 24 h — a DB read,
+        # so it goes over the wall like the shut-off gates.
+        if await run_db(self._same_open_question, circuit, atype, event_id,
+                        datetime.now(timezone.utc)):
+            return
         self._notify_anomaly(circuit, circuit_name, score, atype, event_id)
 
     def _anomaly_shutoff_gates_sync(self, circuit: str, sens) -> bool:
@@ -1019,7 +1031,8 @@ class FeatureExtractor:
     def _notify_anomaly(self, circuit: str, circuit_name: str, score: float,
                         atype, event_id) -> None:
         """Notify (persistent + push) with a per-circuit cooldown so a stream of
-        anomalous events can't spam."""
+        anomalous events can't spam. No DB here — the open-question hold
+        (``_same_open_question``) runs on the DB thread before this is called."""
         am = self._alert_manager
         if not am:
             return
@@ -1030,6 +1043,58 @@ class FeatureExtractor:
         self._last_anomaly_alert_at[circuit] = now
         self._spawn_alert_task(am.alert_unusual_usage(
             circuit, score, atype, circuit_name, shutoff=False, event_id=event_id))
+
+    def _same_open_question(self, circuit: str, atype, event_id, now) -> bool:
+        """One push per OPEN QUESTION per day for the learning channels: a new
+        pattern (a humidifier's first winter day is a hundred fills) or a
+        fixture at an odd hour asks once until the user answers — the rows
+        still flag, only the push is held. True when an un-reviewed flag of
+        the same kind — the same new pattern (within the novelty tolerance) or
+        the same fixture at an odd hour — already exists in the last 24 h.
+        Size flags are never held. Fails open (False). DB thread only."""
+        a = atype or ""
+        if "high_volume" in a or not ("novel_pattern" in a or "odd_hours" in a):
+            return False
+        try:
+            from .anomaly_baseline import (SCORE_COLUMNS, _NOVELTY_FEATURES,
+                                           _NOVELTY_K_BY_LEVEL, _finite, _novelty_vector,
+                                           _sq_dist, _standardise, load_usage_baselines)
+            since = (now - timedelta(hours=24)).isoformat()
+            me = self._db.execute(
+                f"SELECT {', '.join(SCORE_COLUMNS)} FROM events WHERE id = ?",
+                (event_id,)).fetchone()
+            if me is None:
+                return False
+            me_type = me["user_fixture_type"] or me["matched_fixture_type"]
+            if "odd_hours" in a and me_type:
+                dup = self._db.execute(
+                    "SELECT 1 FROM events WHERE circuit = ? AND id <> ? AND flagged = 1 "
+                    "  AND COALESCE(user_reviewed, 0) = 0 AND anomaly_type LIKE '%odd_hours%' "
+                    "  AND COALESCE(user_fixture_type, matched_fixture_type) = ? "
+                    "  AND start_ts >= ? LIMIT 1", (circuit, event_id, me_type, since)).fetchone()
+                if dup:
+                    return True
+            if "novel_pattern" in a:
+                nov = (load_usage_baselines(self._db, circuit) or {}).get("_novelty") or {}
+                center, scale, spacing = nov.get("center"), nov.get("scale"), _finite(nov.get("spacing"))
+                mine = _novelty_vector({c: me[c] for c, _ in _NOVELTY_FEATURES})
+                if not (center and scale and spacing and mine):
+                    return False
+                sens = get_sensitivity_config(self._db, circuit)
+                level = (sens["simple_level"] if sens and sens["simple_level"] else "medium")
+                tol = spacing * _NOVELTY_K_BY_LEVEL.get(level, _NOVELTY_K_BY_LEVEL["medium"])
+                z = _standardise(mine, center, scale)
+                cols = ", ".join(c for c, _ in _NOVELTY_FEATURES)
+                for r in self._db.execute(
+                        f"SELECT {cols} FROM events WHERE circuit = ? AND id <> ? AND flagged = 1 "
+                        "  AND COALESCE(user_reviewed, 0) = 0 AND anomaly_type LIKE '%novel_pattern%' "
+                        "  AND start_ts >= ?", (circuit, event_id, since)):
+                    v = _novelty_vector({c: r[c] for c, _ in _NOVELTY_FEATURES})
+                    if v is not None and math.sqrt(_sq_dist(z, _standardise(v, center, scale))) <= tol:
+                        return True
+        except Exception as e:  # noqa: BLE001 — a dedupe failure must never eat an alert
+            log.debug("[%s] open-question check failed (alert sent): %s", circuit, e)
+        return False
 
     async def _cluster_event(self, circuit: str, features: dict) -> None:
         """Compute sequence context, run cluster matching, write results back.

@@ -1493,9 +1493,8 @@ class Orchestrator:
         # revert a user-set zero back to the preset value.
         return {k: (row[k] if row[k] is not None else preset[k]) for k in (
             "pressure_drop_event_psi", "min_event_duration_seconds",
-            "score_alert", "score_shutoff", "flow_tolerance_pct",
-            "duration_tolerance_pct", "schedule_window_minutes",
-            "sustained_alert_minutes")}
+            "flow_tolerance_pct", "duration_tolerance_pct",
+            "schedule_window_minutes", "sustained_alert_minutes")}
 
     async def get_live_state_async(self, circuit: str) -> Dict[str, Any]:
         """Async version — fetches fresh state from HA REST API, cached for 3s."""

@@ -697,9 +697,11 @@
       <div class="sett-card">
         <h3 class="sett-card-title">Detection Sensitivity</h3>
         <p style="margin:.25rem 0 .6rem">
-          Also tunes anomaly detection against your frozen baseline: <strong>Low</strong>
-          alerts only on the most extreme events (p99), <strong>High</strong> is the most
-          sensitive (p85). Lower this if you get too many false alarms.
+          Also sets how far from normal an event must be before it is called unusual:
+          how far past a fixture's largest normal draw (<strong>Low</strong> 2×,
+          <strong>Medium</strong> 1.5×, <strong>High</strong> 1.25×), how far from any
+          use this home has on file, and how far outside a fixture's usual hours.
+          Lower this if you get too many false alarms.
         </p>
         <form method="post" action="{{ ingress_path }}/settings/sensitivity/{{ c.circuit }}/update"
               id="sens-form-{{ c.circuit }}">
@@ -739,16 +741,6 @@
                 <label title="How long flow must last to count as an event. Higher = ignores very brief blips.">Min event duration (seconds)</label>
                 <input type="number" name="min_event_duration_seconds" step="0.5" min="1" max="30"
                        value="{{ c.sensitivity.min_event_duration_seconds or 3.0 }}">
-              </div>
-              <div class="sett-form-group">
-                <label title="How unusual an event must be before you get a notification. Lower = more alerts (more false alarms); higher = fewer.">Anomaly score to alert (0–1)</label>
-                <input type="number" name="score_alert" step="0.05" min="0.1" max="1"
-                       value="{{ c.sensitivity.score_alert or 0.6 }}">
-              </div>
-              <div class="sett-form-group">
-                <label title="How unusual an event must be before the valve auto-closes (once auto-shutoff is trusted). Higher = only the most extreme events.">Anomaly score to auto-shutoff (0–1)</label>
-                <input type="number" name="score_shutoff" step="0.05" min="0.1" max="1"
-                       value="{{ c.sensitivity.score_shutoff or 0.8 }}">
               </div>
               <div class="sett-form-group">
                 <label title="How far flow can drift from normal before it counts as off. Higher = more forgiving.">Flow tolerance (%)</label>

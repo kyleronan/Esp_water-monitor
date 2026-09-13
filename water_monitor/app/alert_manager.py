@@ -90,20 +90,23 @@ except ImportError:  # pragma: no cover — aiohttp is a hard dep, defensive onl
 
 
 def _humanize_anomaly_type(atype: Optional[str]) -> str:
-    """Turn the stored anomaly_type tag into a human reason for the notification."""
+    """Turn the stored anomaly_type tag into a human reason for the notification.
+    One clause per channel that fired; the envelope tags only add colour."""
     a = atype or ""
-    vol = "high_volume" in a
-    typed = "high_volume_type" in a
-    shape = "envelope" in a or "abnormal_shape" in a
-    if vol and shape:
-        return ("Far more water than this fixture normally uses, and an abnormal pattern"
-                if typed else "Unusually high volume and an abnormal pattern")
-    if vol:
-        return ("Far more water than this fixture normally uses" if typed
-                else "Unusually high water volume")
-    if shape:
-        return "An abnormal usage pattern for this fixture"
-    return "Unusual water usage"
+    parts = []
+    if "high_volume_type" in a:
+        parts.append("Far more water than this fixture normally uses")
+    elif "high_volume" in a:
+        parts.append("Unusually high water volume")
+    if "novel_pattern" in a:
+        parts.append("A pattern of use this home hasn't seen before")
+    if "odd_hours" in a:
+        parts.append("At an hour this fixture has never run before")
+    if not parts:
+        return "Unusual water usage"
+    if "envelope" in a and "high_volume" in a:
+        parts[0] += " (longer or faster than usual too)"
+    return "; ".join(parts)
 
 
 class AlertManager:
@@ -353,7 +356,7 @@ class AlertManager:
                 # notification fires the valve is still travelling (38-62 s on
                 # this hardware), and nothing has read the position back yet.
                 # A separate critical alert follows if it fails to confirm.
-                message=(f"Automatic shut-off: {reason} (anomaly score {score:.0%}). "
+                message=(f"Automatic shut-off: {reason}. "
                          f"Water to {circuit_name} is being closed as a precaution. "
                          f"To restore water, {where}, or use the Open Valve button on "
                          f"the Water Monitor Valve & Tests page. If this was normal usage, "
@@ -365,10 +368,11 @@ class AlertManager:
             dispatched = await self.fire(
                 circuit, "unusual_usage",
                 title=f"\U0001f50d Unusual water usage — {circuit_name}",
-                message=(f"{reason} (anomaly score {score:.0%}). This did not fit "
-                         f"{circuit_name}'s learned pattern — review the History "
-                         f"page, under the Unusual events filter. Lower Detection "
-                         f"Sensitivity if these are false alarms."),
+                message=(f"{reason}. Review it on the History page, under the "
+                         f"Unusual events filter — marking it Normal use (or "
+                         f"labelling it) teaches the app, so it won't ask about "
+                         f"that again. Lower Detection Sensitivity if these are "
+                         f"false alarms."),
             )
         # Audit trail: record that this event actually notified. Best-effort —
         # a DB hiccup must never fail (or retry-spam) the alert itself.
