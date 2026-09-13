@@ -208,7 +208,7 @@
      here. ─────────────────────────────────────────────────────────────── #}
 {% if health and health.learning %}
 {% for cid, l in health.learning.items() %}
-<div class="fx-msg {{ 'fx-msg-warn' if (l.stalled or l.paused_by_reservation) else 'fx-msg-ok' }}"
+<div class="fx-msg {{ 'fx-msg-warn' if (l.stalled or l.paused_by_reservation or l.tier_skipped) else 'fx-msg-ok' }}"
      style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
   <span>
     {%- if l.stalled %}
@@ -242,6 +242,15 @@
     {%- if l.days_since_swap is not none %}
       Last change-over {{ l.days_since_swap }} day{{ '' if l.days_since_swap == 1 else 's' }} ago.
     {%- endif %}
+    {%- endif %}
+    {%- if l.tier_skipped %}
+    <strong>That model is not in service</strong> —
+    {%- if l.tier_skipped == 'unsigned' %} its file predates artifact signing, so the
+    app skips it{% else %} the app could not use its file (the add-on log says
+    why){% endif %} and the k-NN and fingerprint tiers answer instead. The next
+    re-fit that trains a model replaces it
+    {%- if dev_tools and is_admin %}; <strong>Re-fit now</strong> under Settings →
+    Dev Tools does that today{% endif %}.
     {%- endif %}
     {%- if l.coverage_warning %}
     The newest fit answers noticeably fewer events on its own than the previous one did.

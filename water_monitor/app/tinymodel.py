@@ -753,6 +753,30 @@ def load(data_dir: str, circuit: str, allow_previous: bool = True
     return None
 
 
+def refusal_reason(data_dir: str, circuit: str) -> Optional[str]:
+    """Why ``load`` serves nothing for this circuit although an artifact file
+    exists — for the UI, which otherwise shows the ledger's last decision as
+    if that model were in service. ``'unsigned'`` (written before artifact
+    signing; the next retrain replaces it), ``'refused'`` (bad signature,
+    hash mismatch or unreadable), or None (nothing on disk, or it loads)."""
+    path = artifact_path(data_dir, circuit)
+    if not os.path.exists(path):
+        return None
+    try:
+        key = _stat_key(path)
+        if _REFUSED.get(path) != key:
+            # Not judged yet (or the file changed): judge it now, once.
+            if load(data_dir, circuit, allow_previous=False) is not None:
+                return None
+            if _REFUSED.get(path) != key:
+                return "refused"      # skipped without a refusal record (feature-set mismatch)
+        with open(path, encoding="utf-8") as fh:
+            signed = bool((json.load(fh) or {}).get("model_signature"))
+    except Exception:                                       # noqa: BLE001
+        return "refused"
+    return "refused" if signed else "unsigned"
+
+
 def rollback(data_dir: str, circuit: str) -> Optional[Artifact]:
     """Promote the retained artifact back to serving (47i health rollback)."""
     prev = previous_path(data_dir, circuit)

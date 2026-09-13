@@ -508,6 +508,41 @@ makes the add-on survive that.
   for current pressure" re-fitted both circuits when pressed on one. Both now
   act only on the circuit they sit under — dev57.
 
+- **Washing-machine cycles are found again after the first 4,000 events** — the
+  cycle detectors scanned only a home's oldest 4,000 events whenever they ran
+  over the whole circuit (at start-up, in the hourly catch-up and after a
+  re-fit), so past that point no load was ever named automatically, and the
+  catch-up quietly withdrew the names the live detector had just given. On the
+  developer's system no washer had been named since late July. The scan now
+  covers the whole circuit — dev57.
+
+- **"Counted twice" says what is actually counted twice** — the Water Use and
+  Dev Tools cards summed every event in an overlapping group beyond its
+  largest, so a duplicate the app had already zeroed, sitting over three
+  fills that never overlap each other, was reported as two of them counted
+  twice (162 spans and 731 L on the developer's system; the real figure is 47
+  and 404 L, and Irrigation's "8 L" was nothing at all). Only events that still
+  count their water *and* overlap each other in time are added up now — dev57.
+
+- **Water Use "last seen" is in your local time** — it showed the UTC clock, so
+  an evening event read as tomorrow's date. It now goes through the converter
+  History already had, which moved into the shared script so any page can use
+  it — dev57.
+
+- **The learned-model note says when the model is not in service** — after
+  artifact signing arrived, a model written before it was refused (as
+  designed) but the Water Use note still read "a new fit took over … model …"
+  for a week. It now says the model is skipped, that the k-NN and fingerprint
+  tiers are answering, and that **Re-fit now** under Dev Tools writes a signed
+  one — dev57.
+
+- **Re-fit says which bands kept their defaults** — a fixture type read "fit"
+  when any one of its bands fit, so a dishwasher whose flow ceiling fell back
+  to the shipped default (the fitted value was over the guardrail) looked
+  fully fitted for a month while its cycles went unnamed. The re-fit message,
+  the calibration notification and the log line now name each band that kept
+  its default, and each type the do-no-harm check dropped — dev57.
+
 - **The learned model can improve again** — every weekly re-fit had been
   rejected in favour of the model already running, for weeks, with an identical
   result each time. The check that decides between them was unfair in three

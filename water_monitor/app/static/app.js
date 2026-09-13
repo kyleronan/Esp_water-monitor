@@ -254,6 +254,18 @@ async function pollJobs() {
   } catch (_) {}
 }
 
+// Every <time data-ts="…UTC ISO…"> on any page renders in the browser's local
+// time. The server-rendered text is the UTC prefix, so a page without this
+// (Water Use's "last seen" for months) shows tomorrow's date in the evening.
+window.addEventListener('DOMContentLoaded', () => {
+  const pad = n => String(n).padStart(2, '0');
+  document.querySelectorAll('time[data-ts]').forEach(el => {
+    const d = new Date(el.dataset.ts || '');
+    if (isNaN(d)) return;
+    el.textContent = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  });
+});
+
 // Start polling on page load — always runs
 window.addEventListener('DOMContentLoaded', () => {
   fetchLiveState();                    // immediate first update

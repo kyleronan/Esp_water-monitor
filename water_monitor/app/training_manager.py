@@ -569,6 +569,11 @@ class TrainingManager:
         msg = (f"{label}: rule calibration locked. "
                f"Home-fit: {', '.join(sorted(fit)) or 'none'}. "
                f"Using defaults: {', '.join(sorted(fell)) or 'none'}.")
+        # "Home-fit" means at least one band fit; name the ones that did not.
+        from .rule_calibration import describe_fit_report
+        extra = describe_fit_report(report)
+        if extra:
+            msg += f" {extra[0].upper()}{extra[1:]}."
         log.info("[%s] calibration report — %s", circuit, msg)
         try:
             await self._ha.notify(

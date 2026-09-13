@@ -429,9 +429,36 @@ def save_rule_calibration(conn: sqlite3.Connection, circuit: str,
          source, now, now),
     )
     conn.commit()
-    log.info("[%s] rule calibration frozen (%s, regime %d): %d band(s) fit — %s",
+    extra = describe_fit_report(report or {})
+    log.info("[%s] rule calibration frozen (%s, regime %d): %d band(s) fit — %s%s",
              circuit, source, regime_id, len(calib),
-             ", ".join(sorted(calib)) or "none")
+             ", ".join(sorted(calib)) or "none", f"; {extra}" if extra else "")
+
+
+def describe_fit_report(report: Dict[str, Any], brief: bool = False) -> str:
+    """The parts of a fit report an operator would otherwise only find in the
+    JSON: which bands kept their shipped default although the type had enough
+    labels — a fit outside the guardrail (per key) or one that did worse than
+    the default on held-out labels (per type). Empty when every fitted type
+    fit cleanly. ``brief`` is the one-line form for a toast that dismisses
+    itself in seconds; the full form goes to the log and HA notification."""
+    outside = [(t, r.get("keys_fallback") or [])
+               for t, r in sorted(report.items())
+               if isinstance(r, dict) and r.get("keys_fallback")
+               and r.get("status") in ("fit", "sanity_fallback")]
+    worse = [t for t, r in sorted(report.items())
+             if isinstance(r, dict) and r.get("status") == "regressed_kept_default"]
+    if brief:
+        names = [f"{t} ({', '.join(keys)})" for t, keys in outside] + worse
+        return "kept defaults for " + ", ".join(names) + " (why: add-on log)" if names else ""
+    parts = []
+    if outside:
+        parts.append("kept the default where the fit fell outside the guardrail: "
+                     + "; ".join(f"{t} ({', '.join(keys)})" for t, keys in outside))
+    if worse:
+        parts.append("kept the default for " + ", ".join(worse)
+                     + " (the fit did worse on held-out labels)")
+    return "; ".join(parts)
 
 
 def _load_pool_rows(conn: sqlite3.Connection, circuit: str,

@@ -517,21 +517,69 @@ def release_verdict_pin(conn: sqlite3.Connection, row: dict, *,
             "reason": reason}
 
 
+def _still_counting(group: List[dict]) -> List[tuple]:
+    """``(start, end, applied_l, row)`` for the members still applying volume
+    to the hourly ledger, oldest first. A wrapper the guard judged a duplicate
+    is not here: zeroed, it applies nothing; with a partial remainder, what it
+    applies is already net of the children it spans, so it neither duplicates
+    them nor bridges them into one run. A member with no usable span carries
+    ``(None, None)``."""
+    out = []
+    for r in group:
+        applied = float(r.get("hourly_volume_applied_litres") or 0.0)
+        if applied <= 0.0 or OVERLAP_DUPLICATE_REASON in (
+                r.get("verdict_pin"), r.get("match_rejection_reason")):
+            continue
+        try:
+            span = _span(r)
+        except (KeyError, IndexError, TypeError):
+            span = None
+        out.append((span[0] if span else None, span[1] if span else None, applied, r))
+    out.sort(key=lambda t: (t[0] is None, t[0] or 0))
+    return out
+
+
+def _overlapping_runs(members: List[tuple]) -> List[List[tuple]]:
+    """Split ``_still_counting`` output into runs of members that overlap each
+    other in time (the same transitive rule ``summarize_overlap_groups`` uses
+    to form a group). Without spans there is nothing to split on: the group
+    was formed by overlap, so it is one run."""
+    if any(m[0] is None for m in members):
+        return [list(members)] if members else []
+    runs: List[List[tuple]] = []
+    run_end = None
+    for m in members:
+        if runs and run_end is not None and m[0] < run_end:
+            runs[-1].append(m)
+            run_end = max(run_end, m[1])
+        else:
+            runs.append([m])
+            run_end = m[1]
+    return runs
+
+
 def group_excess_litres(group: List[dict]) -> float:
-    """Litres this group still counts twice: everything APPLIED to the
-    hourly ledger beyond the largest member (one meter, one draw)."""
-    applied = sorted((float(r.get("hourly_volume_applied_litres") or 0.0) for r in group),
-                     reverse=True)
-    return round(sum(applied[1:]), 2) if len(applied) > 1 else 0.0
+    """Litres this group still counts twice: within each run of members that
+    still APPLY volume to the hourly ledger and overlap each other in time,
+    everything beyond the largest (one meter, one draw). Members are judged
+    pairwise in time, not group-wide: a zeroed wrapper over three sequential
+    children is one transitive group, but the children never overlap and the
+    wrapper applies nothing, so it counts nothing twice."""
+    total = 0.0
+    for run in _overlapping_runs(_still_counting(group)):
+        if len(run) > 1:
+            total += sum(sorted((m[2] for m in run), reverse=True)[1:])
+    return round(total, 2)
 
 
 def classify_group(conn: sqlite3.Connection, group: List[dict]) -> str:
     """One vocabulary for the offline scanner and the in-app surfaces:
     ``resolved`` (a de-duplication stands AND nothing meaningful is still counted
     twice), ``double_zeroed`` (two members zeroed), ``user_flagged`` (a
-    user-labelled wrapper keeps its litres by policy), ``ambiguous`` (partial
-    overlap, both kept), else ``unresolved``. An audit row alone is NOT proof of
-    resolution — 49 wrappers that had to be restored all had one."""
+    user-labelled member that overlaps another keeps its litres by policy),
+    ``ambiguous`` (partial overlap, both kept), else ``unresolved``. An audit
+    row alone is NOT proof of resolution — 49 wrappers that had to be restored
+    all had one."""
     zeroed = [r for r in group if r.get("match_rejection_reason") == OVERLAP_DUPLICATE_REASON
               and float(r.get("volume_litres_effective") or 0.0) <= OVERLAP_NEGLIGIBLE_L]
     excess = group_excess_litres(group)
@@ -539,7 +587,9 @@ def classify_group(conn: sqlite3.Connection, group: List[dict]) -> str:
         return "double_zeroed"
     if excess < OVERLAP_NEGLIGIBLE_L:
         return "resolved"
-    if any(str(r.get("user_fixture_type") or "").strip() for r in group):
+    if any(str(m[3].get("user_fixture_type") or "").strip()
+           for run in _overlapping_runs(_still_counting(group)) if len(run) > 1
+           for m in run):
         return "user_flagged"
     try:
         ph = ",".join("?" * len(group))

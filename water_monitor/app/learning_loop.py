@@ -1186,10 +1186,13 @@ def learning_status(conn: Optional[sqlite3.Connection], circuit: str,
         detail = {}
     cov = detail.get("coverage_delta")
     serving_hash = None
+    tier_skipped = None      # 'unsigned' / 'refused' when the artifact on disk is not served
     if data_dir:
         try:
             art = tm.load(data_dir, circuit)
             serving_hash = art.model_hash if art else None
+            if art is None:
+                tier_skipped = tm.refusal_reason(data_dir, circuit)
         except Exception:                                   # noqa: BLE001
             serving_hash = None
     out.update({
@@ -1206,6 +1209,7 @@ def learning_status(conn: Optional[sqlite3.Connection], circuit: str,
         # incumbent does.
         "serving_hash": (serving_hash
                          or ((last[4] or last[5]) if last[3] else (last[5] or last[4]))),
+        "tier_skipped": tier_skipped,
         "coverage_delta": cov,
         "coverage_warning": (cov is not None and cov < -0.05),
         "benchmark_n": detail.get("benchmark_matched_n"),

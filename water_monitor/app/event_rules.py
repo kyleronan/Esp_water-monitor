@@ -22,6 +22,7 @@ in-sample fit gate; its output overrides these numbers.
 from __future__ import annotations
 
 import sqlite3
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -459,11 +460,26 @@ def _is_washer_anchor(vol, dur, pk, calib: Optional[Dict[str, Any]] = None) -> b
             and anchor_pk[0] <= pk <= anchor_pk[1])
 
 
+def _detector_rows(conn: sqlite3.Connection, cols: str, where: str, params: list,
+                   since_ts: Optional[str], limit: Optional[int]) -> list:
+    """Rows for a cycle detector, oldest first; uncapped unless the caller
+    passes ``limit`` (the live trailing pass does, with its 50-min window)."""
+    params = list(params)
+    if since_ts is not None:
+        where += " AND start_ts >= ?"
+        params.append(since_ts)
+    sql = f"SELECT {cols} FROM events WHERE {where} ORDER BY start_ts"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    return conn.execute(sql, params).fetchall()
+
+
 def detect_washer_cycles(
     conn: sqlite3.Connection,
     circuit: str,
     since_ts: Optional[str] = None,
-    limit: int = 4000,
+    limit: Optional[int] = None,
     calib: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Tuple[str, str]]:
     """Find washer-cycle members on ``circuit``: anchors (main fills) with at least
@@ -474,21 +490,16 @@ def detect_washer_cycles(
 
     ``since_ts`` bounds the live trailing pass; callers back it off by a family
     width so an anchor just before the bound still claims members inside it.
-    Reads ONLY feature/timestamp columns — never a label — so the eval harness's
-    leave-one-out stays honest.
+    ``limit`` is for that windowed pass only. An UNWINDOWED pass (boot, the
+    hourly backlog slice, a re-fit) must see the whole circuit: a cap here once
+    hid every fill after the oldest 4,000 rows, so the batch pass retracted the
+    washer verdicts the live path had just written. Reads ONLY feature/timestamp
+    columns — never a label — so the eval harness's leave-one-out stays honest.
     """
-    where = "WHERE circuit = ?"
-    params: list = [circuit]
-    if since_ts is not None:
-        where += " AND start_ts >= ?"
-        params.append(since_ts)
-    params.append(limit)
-    rows = conn.execute(
-        "SELECT id, start_ts, duration_seconds, volume_litres, peak_flow_lpm, "
-        "       has_pressure_transient, pressure_delta_psi "
-        f"FROM events {where} ORDER BY start_ts LIMIT ?",
-        params,
-    ).fetchall()
+    rows = _detector_rows(
+        conn, "id, start_ts, duration_seconds, volume_litres, peak_flow_lpm, "
+        "has_pressure_transient, pressure_delta_psi",
+        "circuit = ?", [circuit], since_ts, limit)
 
     evs = []
     for r in rows:
@@ -499,9 +510,13 @@ def detect_washer_cycles(
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         evs.append((ts, r))
+    # ORDER BY start_ts is string order; the window below bisects on parsed time.
+    evs.sort(key=lambda t: t[0])
+    keys = [ts for ts, _ in evs]
 
     out: Dict[str, Tuple[str, str]] = {}
     win = _WASHER_FAMILY_WINDOW_MIN * 60.0
+    win_td = timedelta(seconds=win)
     min_gap = _WASHER_FAMILY_MIN_GAP_MIN * 60.0
     fam_ratio = _cv(calib, "WASHER_FAMILY_PK_RATIO")
     for ts_a, a in evs:
@@ -510,7 +525,12 @@ def detect_washer_cycles(
             continue
         pk_a = a["peak_flow_lpm"]
         family = []
-        for ts_o, o in evs:
+        # Only rows within the family window can be siblings: with the whole
+        # circuit on the table (no row cap), a full rescan per anchor is
+        # O(anchors x rows) — a minute per pass at a few years of events.
+        lo_i = bisect_left(keys, ts_a - win_td)
+        hi_i = bisect_right(keys, ts_a + win_td)
+        for ts_o, o in evs[lo_i:hi_i]:
             if o["id"] == a["id"]:
                 continue
             gap = abs((ts_o - ts_a).total_seconds())
@@ -545,7 +565,7 @@ def detect_dishwasher_cycles(
     conn: sqlite3.Connection,
     circuit: str,
     since_ts: Optional[str] = None,
-    limit: int = 4000,
+    limit: Optional[int] = None,
     calib: Optional[Dict[str, Any]] = None,
     exclude_ids: Optional[set] = None,
 ) -> Dict[str, Tuple[str, str]]:
@@ -560,20 +580,12 @@ def detect_dishwasher_cycles(
     harness's leave-one-out stays honest. Skips artifact-flagged events (phantom /
     cross-talk / dribble / excluded) and ``exclude_ids`` (washer/softener members
     the caller already claimed)."""
-    where = ("WHERE circuit = ? AND COALESCE(excluded_from_training, 0) = 0 "
-             "AND " + NOT_ARTIFACT_SQL)
-    params: list = [circuit]
-    if since_ts is not None:
-        where += " AND start_ts >= ?"
-        params.append(since_ts)
-    params.append(limit)
-    rows = conn.execute(
-        "SELECT id, start_ts, duration_seconds, volume_litres, peak_flow_lpm, "
-        "       has_pressure_transient, pressure_delta_psi, "
-        "       flow_variability, steady_state_fraction "
-        f"FROM events {where} ORDER BY start_ts LIMIT ?",
-        params,
-    ).fetchall()
+    rows = _detector_rows(
+        conn, "id, start_ts, duration_seconds, volume_litres, peak_flow_lpm, "
+        "has_pressure_transient, pressure_delta_psi, flow_variability, "
+        "steady_state_fraction",
+        "circuit = ? AND COALESCE(excluded_from_training, 0) = 0 AND " + NOT_ARTIFACT_SQL,
+        [circuit], since_ts, limit)
 
     dw_vol = _cv(calib, "DW_VOL_L")
     dw_pk = _cv(calib, "DW_MAX_PK_LPM")

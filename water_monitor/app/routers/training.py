@@ -101,7 +101,8 @@ async def start_regime_recalibration(orch, circuits=None) -> bool:
 
     def _work(conn):
         from ..reclassify import reclassify_all_events_from_signatures
-        from ..rule_calibration import MIN_EXPLICIT_LABELS, fit_and_freeze
+        from ..rule_calibration import (MIN_EXPLICIT_LABELS, describe_fit_report,
+                                        fit_and_freeze)
         for circuit in circuits:
             job = start_job(conn, "regime_recalibration", circuit,
                             "Recalibrating for new supply pressure…")
@@ -137,6 +138,12 @@ async def start_regime_recalibration(orch, circuits=None) -> bool:
                 if short:
                     msg += (f" — label {MIN_EXPLICIT_LABELS}+ recent events to "
                             f"also fit: {', '.join(short)}")
+                # A type reads "fit" when ANY of its bands fit; the one that
+                # fell back (a dishwasher ceiling over the guardrail, for a
+                # month) was visible only in the report JSON.
+                extra = describe_fit_report(report, brief=True)
+                if extra:
+                    msg += f" — {extra}"
                 finish_job(conn, job, "done", msg)
             except Exception:
                 finish_job(conn, job, "error",
